@@ -176,6 +176,44 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       if (draftID) removeDraftPersisted(draftID)
     }
 
+    // Shared by the batch close actions: closes the given store indices in
+    // descending order via closeTab (single-source semantics), then fixes up
+    // navigation when the previously-active tab is inside the closed range.
+    // closeTab computes its post-close neighbour against the array as it is at
+    // call time, which mid-batch can point at a tab a later close removes —
+    // after the splices land, navigate to the nearest surviving tab (right
+    // first, then left, mirroring nextTabAfterClose) or home.
+    const closeBatch = (indices: number[]) => {
+      const original = [...store]
+      const activeBefore = recentKey()
+      const onActive = activeBefore !== undefined && location.pathname !== "/"
+      const closed = new Set<string>()
+      for (const index of indices) {
+        const tab = original[index]
+        if (!tab) continue
+        closed.add(tabKey(tab))
+        actions.closeTab(index)
+      }
+      if (!onActive || !closed.has(activeBefore)) return
+      void Promise.resolve().then(() => {
+        const survivors = store
+        if (survivors.length === 0) {
+          setRecentKey(undefined)
+          navigate("/")
+          return
+        }
+        const activeIndex = original.findIndex((tab) => tabKey(tab) === activeBefore)
+        const next =
+          original.slice(activeIndex + 1).find((tab) => !closed.has(tabKey(tab))) ??
+          original.slice(0, activeIndex).reverse().find((tab) => !closed.has(tabKey(tab)))
+        if (next) navigateTab(next)
+        else {
+          setRecentKey(undefined)
+          navigate("/")
+        }
+      })
+    }
+
     const actions = {
       addSessionTab: (tab: Omit<SessionTab, "type">) => {
         const next = { type: "session" as const, ...tab }
@@ -255,6 +293,30 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
         if (!tab) return
         if (tab.type === "session") updateClosed((stack) => pushClosedTab(stack, tab, index))
         removeTab(index)
+      },
+      // Batch closes reuse closeTab per target index in descending order so
+      // reopen-stack recording, draft persisted-state cleanup, memory/info
+      // removal, recentKey and navigation all inherit single-close semantics.
+      closeTabsLeftOf(index: number) {
+        const indices: number[] = []
+        for (let i = index - 1; i >= 0; i--) indices.push(i)
+        closeBatch(indices)
+      },
+      closeTabsRightOf(index: number) {
+        const indices: number[] = []
+        for (let i = store.length - 1; i > index; i--) indices.push(i)
+        closeBatch(indices)
+      },
+      closeOtherTabs(index: number) {
+        const indices: number[] = []
+        for (let i = store.length - 1; i > index; i--) indices.push(i)
+        for (let i = index - 1; i >= 0; i--) indices.push(i)
+        closeBatch(indices)
+      },
+      closeAllTabs() {
+        const indices: number[] = []
+        for (let i = store.length - 1; i >= 0; i--) indices.push(i)
+        closeBatch(indices)
       },
       reopenClosedTab() {
         if (!closedReady()) {

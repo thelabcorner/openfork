@@ -10,6 +10,7 @@ import { arrayMove } from "@dnd-kit/helpers"
 import { tabHref, tabKey, type SessionTab, type Tab } from "@/context/tabs"
 import { ServerConnection } from "@/context/server"
 import { DraftTabItem, TabNavItem } from "@/components/titlebar-tab-nav"
+import { TitlebarTabContextMenu } from "@/components/titlebar-tab-context-menu"
 import { useGlobal, type ServerCtx } from "@/context/global"
 import { useLanguage } from "@/context/language"
 import { useCommand } from "@/context/command"
@@ -51,21 +52,23 @@ function SessionTabSlot(props: {
       data-active={props.active()}
       class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
     >
-      <TabNavItem
-        ref={(el) => {
-          ref = el
-        }}
-        href={tabHref(props.tab)}
-        server={props.tab.server}
-        session={props.session}
-        fallbackTitle={props.fallbackTitle}
-        onRename={props.onRename}
-        onNavigate={() => props.onNavigate(ref)}
-        onClose={props.onClose}
-        active={props.active()}
-        forceTruncate={props.forceTruncate}
-        dragging={sortable.isDragSource()}
-      />
+      <TitlebarTabContextMenu id={props.id}>
+        <TabNavItem
+          ref={(el) => {
+            ref = el
+          }}
+          href={tabHref(props.tab)}
+          server={props.tab.server}
+          session={props.session}
+          fallbackTitle={props.fallbackTitle}
+          onRename={props.onRename}
+          onNavigate={() => props.onNavigate(ref)}
+          onClose={props.onClose}
+          active={props.active()}
+          forceTruncate={props.forceTruncate}
+          dragging={sortable.isDragSource()}
+        />
+      </TitlebarTabContextMenu>
     </div>
   )
 }
@@ -194,17 +197,19 @@ function DraftTabSlot(props: {
       data-active={props.active()}
       class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
     >
-      <DraftTabItem
-        ref={(el) => {
-          ref = el
-        }}
-        href={tabHref(props.tab)}
-        title={props.title}
-        onNavigate={() => props.onNavigate(ref)}
-        onClose={props.onClose}
-        active={props.active()}
-        dragging={sortable.isDragSource()}
-      />
+      <TitlebarTabContextMenu id={props.id}>
+        <DraftTabItem
+          ref={(el) => {
+            ref = el
+          }}
+          href={tabHref(props.tab)}
+          title={props.title}
+          onNavigate={() => props.onNavigate(ref)}
+          onClose={props.onClose}
+          active={props.active()}
+          dragging={sortable.isDragSource()}
+        />
+      </TitlebarTabContextMenu>
     </div>
   )
 }
