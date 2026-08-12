@@ -159,6 +159,10 @@ export const dict = {
 
   "command.tab.close": "关闭标签页",
   "command.tab.reopenClosed": "重新打开已关闭的标签页",
+  "command.tab.closeLeft": "Close tabs to the left",
+  "command.tab.closeRight": "Close tabs to the right",
+  "command.tab.closeOthers": "Close other tabs",
+  "command.tab.closeAll": "Close all tabs",
 
   "command.context.addSelection": "将所选内容添加到上下文",
   "command.context.addSelection.description": "添加当前文件中选中的行",

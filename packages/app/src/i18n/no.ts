@@ -1086,6 +1086,10 @@ export const dict = {
   "command.project.next": "Neste prosjekt",
   "command.project.index": "Bytt til prosjekt {{index}}",
   "command.tab.reopenClosed": "Åpne lukket fane på nytt",
+  "command.tab.closeLeft": "Close tabs to the left",
+  "command.tab.closeRight": "Close tabs to the right",
+  "command.tab.closeOthers": "Close other tabs",
+  "command.tab.closeAll": "Close all tabs",
 
   "model.tooltip.context.label": "Kontekst",
   "model.tooltip.inputs": "Inndata",
