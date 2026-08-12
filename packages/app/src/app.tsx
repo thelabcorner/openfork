@@ -41,6 +41,7 @@ import { makeEventListener } from "@solid-primitives/event-listener"
 import { CommandProvider, useCommand, type CommandOption } from "@/context/command"
 import { CommentsProvider } from "@/context/comments"
 import { FileProvider } from "@/context/file"
+import { ForkUsageProvider } from "@/context/fork-usage"
 import { ServerSDKProvider } from "@/context/server-sdk"
 import { ServerSyncProvider, useServerSync } from "@/context/server-sync"
 import { GlobalProvider, useGlobal } from "@/context/global"
@@ -121,7 +122,9 @@ function TargetServerRoute(props: ParentProps) {
     // re-resolves reactively instead); both rely on this key for server changes.
     <Show when={requireServerKey(params.serverKey)} keyed>
       <ServerSDKProvider server={conn}>
-        <ServerSyncProvider server={conn}>{props.children}</ServerSyncProvider>
+        <ServerSyncProvider server={conn}>
+          <ForkUsageProvider>{props.children}</ForkUsageProvider>
+        </ServerSyncProvider>
       </ServerSDKProvider>
     </Show>
   )
@@ -168,7 +171,9 @@ function SelectedServerProviders(props: ParentProps) {
   return (
     <ServerKey>
       <ServerSDKProvider>
-        <ServerSyncProvider>{props.children}</ServerSyncProvider>
+        <ServerSyncProvider>
+          <ForkUsageProvider>{props.children}</ForkUsageProvider>
+        </ServerSyncProvider>
       </ServerSDKProvider>
     </ServerKey>
   )
@@ -216,15 +221,17 @@ function ResolvedDraftRoute(props: { draft: DraftTab }) {
     <Show when={`${props.draft.server}\0${props.draft.directory}`} keyed>
       <ServerSDKProvider server={conn}>
         <ServerSyncProvider server={conn}>
-          <ModelsProvider directory={directory}>
-            <SDKProvider directory={directory}>
-              <DirectoryDataProvider directory={directory} server={serverKey}>
-                <DraftProviders>
-                  <NewSession />
-                </DraftProviders>
-              </DirectoryDataProvider>
-            </SDKProvider>
-          </ModelsProvider>
+          <ForkUsageProvider>
+            <ModelsProvider directory={directory}>
+              <SDKProvider directory={directory}>
+                <DirectoryDataProvider directory={directory} server={serverKey}>
+                  <DraftProviders>
+                    <NewSession />
+                  </DraftProviders>
+                </DirectoryDataProvider>
+              </SDKProvider>
+            </ModelsProvider>
+          </ForkUsageProvider>
         </ServerSyncProvider>
       </ServerSDKProvider>
     </Show>

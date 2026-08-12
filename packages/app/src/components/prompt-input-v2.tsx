@@ -3,6 +3,7 @@ import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
+import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
@@ -23,9 +24,11 @@ import { usePermission } from "@/context/permission"
 import { type ImageAttachmentPart, usePrompt } from "@/context/prompt"
 import { usePlatform } from "@/context/platform"
 import { useSDK } from "@/context/sdk"
+import { useForkUsage } from "@/context/fork-usage"
 import { useSync } from "@/context/sync"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { showToast } from "@/utils/toast"
+import type { ForkWindowUsage } from "@/utils/fork-client"
 import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
 import {
   createPromptInputV2Controller,
@@ -58,6 +61,7 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
         variantControlVisible={!props.controller.model.loading}
         attachKeybind={command.keybindParts("file.attach")}
         attachShortcut={command.keybind("file.attach")}
+        usageControl={<PromptInputV2UsageArc />}
         modelControl={
           <PromptInputV2ModelControl
             loading={props.controller.model.loading}
@@ -76,6 +80,96 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
       />
     </div>
   )
+}
+
+function PromptInputV2UsageArc() {
+  const dialog = useDialog()
+  const language = useLanguage()
+  const sdk = useSDK()
+  const forkUsage = useForkUsage()
+  const activeCredentialID = () => forkUsage.activeCredentialID()
+  const windows = () =>
+    forkUsage.usage.latest?.byCredential.find((entry) => entry.credentialID === activeCredentialID())?.windows ??
+    forkUsage.usage.latest?.aggregate ??
+    []
+  const remaining = (label: ForkWindowUsage["label"]) => {
+    const window = windows().find((item) => item.label === label)
+    if (!window) return 100
+    return Math.max(0, Math.min(100, 100 - usedPercent(window)))
+  }
+  const openCredentials = (event: MouseEvent & { currentTarget: HTMLButtonElement }) => {
+    event.currentTarget.blur()
+    void import("./dialog-credential-switcher").then((module) => {
+      void dialog.show(() => <module.DialogCredentialSwitcherV2 directory={() => sdk().directory} />)
+    })
+  }
+
+  return (
+    <TooltipV2 placement="top" gutter={4} value={language.t("dialog.credential.manageKeys")}>
+      <IconButtonV2
+        type="button"
+        data-action="prompt-usage"
+        variant="ghost-muted"
+        size="large"
+        icon={<TripartiteArc rolling={remaining("5h")} weekly={remaining("week")} monthly={remaining("month")} />}
+        aria-label={language.t("dialog.credential.manageKeys")}
+        onClick={openCredentials}
+      />
+    </TooltipV2>
+  )
+}
+
+function TripartiteArc(props: { rolling: number; weekly: number; monthly: number }) {
+  const sector = (start: number, end: number, remaining: number, color: string) => {
+    const bounded = Math.max(0, Math.min(100, remaining))
+    const span = end >= start ? end - start : end + 360 - start
+    const finish = start + span * (bounded / 100)
+    return (
+      <g>
+        <path d={arcPath(12, 12, 7.5, start, end)} fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity="0.22" />
+        <Show when={bounded > 0}>
+          <path d={arcPath(12, 12, 7.5, start, finish)} fill="none" stroke={color} stroke-width="2.2" stroke-linecap="round" />
+        </Show>
+      </g>
+    )
+  }
+
+  return (
+    <svg viewBox="0 0 24 24" class="size-5" role="presentation" aria-hidden="true">
+      {sector(0, 115, props.rolling, remainingColor(props.rolling, 0))}
+      {sector(120, 235, props.weekly, remainingColor(props.weekly, 1))}
+      {sector(240, 355, props.monthly, remainingColor(props.monthly, 2))}
+    </svg>
+  )
+}
+
+function remainingColor(remaining: number, base: number) {
+  if (remaining <= 8) return "color-mix(in srgb, var(--v2-state-fg-danger) 72%, currentColor)"
+  if (remaining <= 35) return "color-mix(in srgb, var(--v2-state-fg-warning) 68%, currentColor)"
+  if (base === 0) return "color-mix(in srgb, var(--v2-icon-icon-base) 72%, currentColor)"
+  if (base === 1) return "color-mix(in srgb, var(--v2-icon-icon-base) 62%, currentColor)"
+  return "color-mix(in srgb, var(--v2-icon-icon-base) 52%, currentColor)"
+}
+
+function usedPercent(window: ForkWindowUsage) {
+  if (window.estimatedPercent !== undefined) return Math.max(0, Math.min(100, window.estimatedPercent))
+  if (window.limitUSD <= 0) return 0
+  return Math.max(0, Math.min(100, (window.spentUSD / window.limitUSD) * 100))
+}
+
+function arcPath(cx: number, cy: number, r: number, start: number, end: number) {
+  const startPoint = polar(cx, cy, r, end)
+  const endPoint = polar(cx, cy, r, start)
+  const delta = end >= start ? end - start : end + 360 - start
+  return ["M", startPoint.x, startPoint.y, "A", r, r, 0, delta <= 180 ? 0 : 1, 0, endPoint.x, endPoint.y].join(" ")
+}
+
+function polar(cx: number, cy: number, r: number, angle: number) {
+  const radian = ((angle - 90) * Math.PI) / 180
+  return {
+    x: cx + r * Math.cos(radian),
+    y: cy + r * Math.sin(radian),
+  }
 }
 
 export function usePromptInputV2Controller(props: PromptInputV2ControllerProps): PromptInputV2ComposerController {
