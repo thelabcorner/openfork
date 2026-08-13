@@ -142,6 +142,7 @@ export default {
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
           \`data\` text NOT NULL,
+          \`search_text\` text DEFAULT '' NOT NULL,
           CONSTRAINT \`fk_part_message_id_message_id_fk\` FOREIGN KEY (\`message_id\`) REFERENCES \`message\`(\`id\`) ON DELETE CASCADE
         );
       `)
@@ -175,6 +176,7 @@ export default {
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
           \`data\` text NOT NULL,
+          \`search_text\` text DEFAULT '' NOT NULL,
           CONSTRAINT \`fk_session_message_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
@@ -268,6 +270,75 @@ export default {
       yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
+      yield* tx.run(`CREATE INDEX \`session_directory_idx\` ON \`session\` (\`directory\`);`)
+      yield* tx.run(`
+        CREATE VIRTUAL TABLE \`session_message_fts\` USING fts5(
+          search_text,
+          content='session_message',
+          content_rowid='rowid',
+          tokenize='unicode61'
+        );
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER \`session_message_fts_ai\` AFTER INSERT ON \`session_message\` BEGIN
+          INSERT INTO \`session_message_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER \`session_message_fts_ad\` AFTER DELETE ON \`session_message\` BEGIN
+          INSERT INTO \`session_message_fts\`(\`session_message_fts\`, rowid, search_text)
+          VALUES ('delete', old.rowid, old.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER \`session_message_fts_au\` AFTER UPDATE ON \`session_message\` BEGIN
+          INSERT INTO \`session_message_fts\`(\`session_message_fts\`, rowid, search_text)
+          VALUES ('delete', old.rowid, old.search_text);
+          INSERT INTO \`session_message_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`search_backfill\` (
+          \`id\` integer PRIMARY KEY,
+          \`watermark_rowid\` integer NOT NULL DEFAULT -1,
+          \`done\` integer NOT NULL DEFAULT 0
+        );
+      `)
+      yield* tx.run(`INSERT INTO \`search_backfill\` (\`id\`, \`watermark_rowid\`, \`done\`) VALUES (1, -1, 0);`)
+      yield* tx.run(`
+        CREATE VIRTUAL TABLE \`part_fts\` USING fts5(
+          search_text,
+          content='part',
+          content_rowid='rowid',
+          tokenize='unicode61'
+        );
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER \`part_fts_ai\` AFTER INSERT ON \`part\` BEGIN
+          INSERT INTO \`part_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER \`part_fts_ad\` AFTER DELETE ON \`part\` BEGIN
+          INSERT INTO \`part_fts\`(\`part_fts\`, rowid, search_text)
+          VALUES ('delete', old.rowid, old.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER \`part_fts_au\` AFTER UPDATE ON \`part\` BEGIN
+          INSERT INTO \`part_fts\`(\`part_fts\`, rowid, search_text)
+          VALUES ('delete', old.rowid, old.search_text);
+          INSERT INTO \`part_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`part_search_backfill\` (
+          \`id\` integer PRIMARY KEY,
+          \`watermark_rowid\` integer NOT NULL DEFAULT -1,
+          \`done\` integer NOT NULL DEFAULT 0
+        );
+      `)
+      yield* tx.run(`INSERT INTO \`part_search_backfill\` (\`id\`, \`watermark_rowid\`, \`done\`) VALUES (1, -1, 0);`)
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
     })
   },

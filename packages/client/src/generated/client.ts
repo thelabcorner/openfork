@@ -6,6 +6,8 @@ import type {
   AgentsListOutput,
   SessionsListInput,
   SessionsListOutput,
+  SessionsSearchInput,
+  SessionsSearchOutput,
   SessionsCreateInput,
   SessionsCreateOutput,
   SessionsActiveOutput,
@@ -63,6 +65,9 @@ import type {
   CredentialsUpdateOutput,
   CredentialsRemoveInput,
   CredentialsRemoveOutput,
+  CredentialsSelectInput,
+  CredentialsSelectOutput,
+  UsageGoOutput,
   PermissionsListRequestsInput,
   PermissionsListRequestsOutput,
   PermissionsListSavedInput,
@@ -304,6 +309,24 @@ export function make(options: ClientOptions) {
           },
           requestOptions,
         ),
+      search: (input: SessionsSearchInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionsSearchOutput }>(
+          {
+            method: "GET",
+            path: `/api/session/search`,
+            query: {
+              query: input["query"],
+              directory: input["directory"],
+              workspace: input["workspace"],
+              project: input["project"],
+              limit: input["limit"],
+            },
+            successStatus: 200,
+            declaredStatuses: [400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
       create: (input?: SessionsCreateInput, requestOptions?: RequestOptions) =>
         request<{ readonly data: SessionsCreateOutput }>(
           {
@@ -660,6 +683,25 @@ export function make(options: ClientOptions) {
             declaredStatuses: [401, 400],
             empty: true,
           },
+          requestOptions,
+        ),
+      select: (input: CredentialsSelectInput, requestOptions?: RequestOptions) =>
+        request<CredentialsSelectOutput>(
+          {
+            method: "POST",
+            path: `/api/credential/${encodeURIComponent(input.credentialID)}/select`,
+            query: { location: input["location"] },
+            successStatus: 204,
+            declaredStatuses: [401, 400],
+            empty: true,
+          },
+          requestOptions,
+        ),
+    },
+    usage: {
+      go: (requestOptions?: RequestOptions) =>
+        request<UsageGoOutput>(
+          { method: "GET", path: `/api/usage/go`, successStatus: 200, declaredStatuses: [401, 400], empty: false },
           requestOptions,
         ),
     },

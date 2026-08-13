@@ -6,6 +6,7 @@ import { SessionsCursor } from "@opencode-ai/protocol/groups/session"
 import {
   ConflictError,
   InvalidCursorError,
+  InvalidRequestError,
   MessageNotFoundError,
   ServiceUnavailableError,
   SessionNotFoundError,
@@ -74,6 +75,33 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
               model: ctx.payload.model,
               location: ctx.payload.location ?? { directory: AbsolutePath.make(process.cwd()) },
             }),
+          }
+        }),
+      )
+      .handle(
+        "session.search",
+        Effect.fn(function* (ctx) {
+          const query = ctx.query.query.trim()
+          if (query.length === 0) return yield* new InvalidRequestError({ message: "Search query must not be empty" })
+          return {
+            data: yield* session
+              .search({
+                query,
+                directory: ctx.query.directory,
+                workspaceID: ctx.query.workspace,
+                project: ctx.query.project,
+                limit: ctx.query.limit,
+              })
+              .pipe(
+                Effect.catchTag("Session.SearchError", (error) =>
+                  Effect.fail(
+                    new InvalidRequestError({
+                      message: `Search query is not valid: ${error.message}`,
+                      kind: "search",
+                    }),
+                  ),
+                ),
+              ),
           }
         }),
       )

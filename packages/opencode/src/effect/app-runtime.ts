@@ -5,6 +5,7 @@ import * as Observability from "@opencode-ai/core/observability"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Database } from "@opencode-ai/core/database/database"
 import { Auth } from "@/auth"
+import { ForkCredentials } from "@/fork/credentials"
 import { Account } from "@/account/account"
 import { Config } from "@/config/config"
 import { Git } from "@/git"
@@ -61,6 +62,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     FSUtil.node,
     Database.node,
     Auth.node,
+    ForkCredentials.node,
     Account.node,
     Config.node,
     Git.node,

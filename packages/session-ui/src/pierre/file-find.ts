@@ -65,7 +65,10 @@ function installShortcuts() {
         return
       }
 
-      const host = hostForNode(document.activeElement) ?? hostForNode(event.target) ?? target ?? Array.from(hosts)[0]
+      // Only claim mod+f when a file host is actually (or was last) focused, so it
+      // doesn't steal the shortcut from other find handlers (e.g. session find) when
+      // a file viewer is merely mounted somewhere without ever having had focus.
+      const host = hostForNode(document.activeElement) ?? hostForNode(event.target) ?? target
       if (!host) return
 
       event.preventDefault()

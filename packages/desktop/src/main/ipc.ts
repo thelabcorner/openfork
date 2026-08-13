@@ -24,6 +24,7 @@ import type { UpdaterController } from "./updater-controller"
 import { createUpdaterSubscriptions } from "./updater-subscriptions"
 import { createDesktopDraftStore } from "./draft-store"
 import { nativeT } from "./native-translations"
+import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
 
 const pickerFilters = (ext?: string[]) => {
   if (!ext || ext.length === 0) return undefined
@@ -305,4 +306,61 @@ export function sendMenuCommand(win: BrowserWindow, id: string) {
 
 export function sendDeepLinks(win: BrowserWindow, urls: string[]) {
   win.webContents.send("deep-link", urls)
+}
+
+// --- browser engine IPC (window.api.browser) ---------------------------------
+
+export function registerBrowserIpcHandlers(engine: BrowserEngine) {
+  // Only the app's own renderer windows may drive the browser engine; a guest
+  // webview or any other webContents must not reach these handlers.
+  const trusted = (event: IpcMainInvokeEvent): boolean =>
+    BrowserWindow.fromWebContents(event.sender) !== null
+
+  ipcMain.handle("browser-get-state", (event) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.getState()
+  })
+
+  ipcMain.handle("browser-open-tab", (event, url: string, opts?: { activate?: boolean; newTab?: boolean }) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.openTab(url, opts)
+  })
+
+  ipcMain.handle("browser-activate-tab", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.activateTab(tabId)
+  })
+
+  ipcMain.handle("browser-close-tab", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.closeTab(tabId)
+  })
+
+  ipcMain.handle("browser-register-webview", (event, runtimeTabId: string, webContentsId: number, generation?: number) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.registerWebview(runtimeTabId, webContentsId, generation)
+  })
+
+  ipcMain.handle("browser-unregister-webview", (event, runtimeTabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.unregisterWebview(runtimeTabId)
+  })
+
+  ipcMain.handle("browser-human-input", (event, runtimeTabId: string, signal: unknown) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    engine.api.humanInput(runtimeTabId, signal)
+  })
+
+  ipcMain.handle(
+    "browser-set-session-context",
+    (event, sessionId: string, opts?: { workspaceId?: string; directory?: string }) => {
+      if (!trusted(event)) throw new Error("Untrusted browser sender")
+      engine.api.setSessionContext(sessionId, opts)
+    },
+  )
+
+  ipcMain.handle("browser-get-guest-preload", (event) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return resolveGuestPreloadPath()
+  })
 }

@@ -242,6 +242,11 @@ export function SessionHeader() {
     reviewVisible: isDesktop(),
     reviewOpened: view().reviewPanel.opened(),
     onReviewToggle: () => view().reviewPanel.toggle(),
+    browserLabel: language.t("command.browser.toggle"),
+    browserKeybind: command.keybindParts("browser.toggle"),
+    browserVisible: isDesktop(),
+    browserOpened: view().browserPanel.opened(),
+    onBrowserToggle: () => view().browserPanel.toggle(),
   }))
 
   const selectApp = (app: OpenApp) => {
@@ -524,6 +529,11 @@ type SessionHeaderV2ActionsState = {
   reviewVisible: boolean
   reviewOpened: boolean
   onReviewToggle: () => void
+  browserLabel: string
+  browserKeybind: string[]
+  browserVisible: boolean
+  browserOpened: boolean
+  onBrowserToggle: () => void
 }
 
 function SessionHeaderV2Actions(props: { state: SessionHeaderV2ActionsState }) {
@@ -560,6 +570,33 @@ function SessionHeaderV2Actions(props: { state: SessionHeaderV2ActionsState }) {
             aria-expanded={props.state.reviewOpened}
             aria-controls="review-panel"
             icon={<IconV2 name="sidebar-right" />}
+          />
+        </TooltipV2>
+      </Show>
+      <Show when={props.state.browserVisible}>
+        <TooltipV2
+          class="shrink-0"
+          placement="bottom"
+          value={
+            <>
+              {props.state.browserLabel}
+              <Show when={props.state.browserKeybind.length > 0}>
+                <KeybindV2 keys={props.state.browserKeybind} variant="neutral" />
+              </Show>
+            </>
+          }
+        >
+          <IconButtonV2
+            type="button"
+            variant="ghost-muted"
+            size="large"
+            class="!w-9 shrink-0"
+            state={props.state.browserOpened ? "pressed" : undefined}
+            onClick={props.state.onBrowserToggle}
+            aria-label={props.state.browserLabel}
+            aria-expanded={props.state.browserOpened}
+            aria-controls="browser-panel"
+            icon={<IconV2 name="globe" />}
           />
         </TooltipV2>
       </Show>

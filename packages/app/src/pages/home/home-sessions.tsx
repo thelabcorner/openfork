@@ -19,6 +19,9 @@ export function HomeSessions(props: {
       searchPlaceholder={props.search.query.placeholder}
       searchOpen={props.search.query.open}
       searchLoading={props.search.result.loading}
+      searchError={props.search.result.error}
+      searchSessions={props.search.result.sessions}
+      searchMessages={props.search.result.messages}
       searchResults={props.search.result.list}
       searchActive={props.search.result.active}
       searchNoResultsLabel={props.search.result.noResultsLabel}

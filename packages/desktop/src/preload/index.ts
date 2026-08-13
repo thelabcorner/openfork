@@ -1,5 +1,5 @@
 import { contextBridge, ipcRenderer, webUtils } from "electron"
-import type { ElectronAPI, WslServersEvent } from "./types"
+import type { BrowserAPI, ElectronAPI, WslServersEvent } from "./types"
 import type { UpdaterState } from "@opencode-ai/app/updater"
 
 const updaterCallbacks = new Set<(state: UpdaterState) => void>()
@@ -8,6 +8,43 @@ let updaterSubscription: Promise<void> | undefined
 const updaterHandler = (_: unknown, state: UpdaterState) => {
   updaterState = state
   updaterCallbacks.forEach((callback) => callback(state))
+}
+
+const browserApi: BrowserAPI = {
+  getState: () => ipcRenderer.invoke("browser-get-state"),
+  openTab: (url, opts) => ipcRenderer.invoke("browser-open-tab", url, opts),
+  activateTab: (tabId) => ipcRenderer.invoke("browser-activate-tab", tabId),
+  closeTab: (tabId) => ipcRenderer.invoke("browser-close-tab", tabId),
+  registerWebview: (runtimeTabId, webContentsId) =>
+    ipcRenderer.invoke("browser-register-webview", runtimeTabId, webContentsId),
+  unregisterWebview: (runtimeTabId) => ipcRenderer.invoke("browser-unregister-webview", runtimeTabId),
+  getGuestPreloadPath: () => ipcRenderer.invoke("browser-get-guest-preload"),
+  setSessionContext: (sessionId, opts) => ipcRenderer.invoke("browser-set-session-context", sessionId, opts),
+  onState: (cb) => {
+    const handler = (_: unknown, tab: Parameters<typeof cb>[0]) => cb(tab)
+    ipcRenderer.on("browser-state", handler)
+    return () => ipcRenderer.removeListener("browser-state", handler)
+  },
+  onTabRequest: (cb) => {
+    const handler = (_: unknown, request: Parameters<typeof cb>[0]) => cb(request)
+    ipcRenderer.on("browser-tab-request", handler)
+    return () => ipcRenderer.removeListener("browser-tab-request", handler)
+  },
+  onTabClose: (cb) => {
+    const handler = (_: unknown, request: Parameters<typeof cb>[0]) => cb(request)
+    ipcRenderer.on("browser-tab-close", handler)
+    return () => ipcRenderer.removeListener("browser-tab-close", handler)
+  },
+  onPointerEvent: (cb) => {
+    const handler = (_: unknown, event: Parameters<typeof cb>[0]) => cb(event)
+    ipcRenderer.on("browser-pointer-event", handler)
+    return () => ipcRenderer.removeListener("browser-pointer-event", handler)
+  },
+  onHostState: (cb) => {
+    const handler = (_: unknown, state: Parameters<typeof cb>[0]) => cb(state)
+    ipcRenderer.on("browser-host-state", handler)
+    return () => ipcRenderer.removeListener("browser-host-state", handler)
+  },
 }
 
 const api: ElectronAPI = {
@@ -133,6 +170,7 @@ const api: ElectronAPI = {
   setForceFocus: (enabled) => ipcRenderer.invoke("set-force-focus", enabled),
   recordFatalRendererError: (error) => ipcRenderer.invoke("record-fatal-renderer-error", error),
   setNativeTranslations: (bundle) => ipcRenderer.invoke("set-native-translations", bundle),
+  browser: browserApi,
 }
 
 contextBridge.exposeInMainWorld("api", api)

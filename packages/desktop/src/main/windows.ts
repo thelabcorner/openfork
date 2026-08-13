@@ -8,6 +8,7 @@ import { app, BrowserWindow, dialog, net, nativeImage, nativeTheme, protocol, sh
 import { dirname, isAbsolute, join, relative, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 import type { TitlebarTheme } from "../preload/types"
+import { BROWSER_PARTITION } from "./browser/contracts"
 import { exportDebugLogs, write as writeLog } from "./logging"
 import { getStore, removeStoreFile } from "./store"
 import { PINCH_ZOOM_ENABLED_KEY, WINDOW_IDS_KEY } from "./store-keys"
@@ -142,6 +143,37 @@ export function getPinchZoomEnabled() {
   return getStore().get(PINCH_ZOOM_ENABLED_KEY) === true
 }
 
+export function wireWebviewHardening(guestPreloadPath: string) {
+  app.on("web-contents-created", (_event, contents) => {
+    contents.on("will-attach-webview", (event, webPreferences, params) => {
+      // Never inherit the embedder's preload or any caller-supplied one: all
+      // browser guests run our dedicated guest preload or none.
+      delete webPreferences.preload
+      webPreferences.nodeIntegration = false
+      webPreferences.nodeIntegrationInSubFrames = false
+      webPreferences.contextIsolation = true
+      webPreferences.sandbox = true
+      webPreferences.webSecurity = true
+      webPreferences.allowRunningInsecureContent = false
+      webPreferences.experimentalFeatures = false
+      // Nested webviews are not supported; the guest never gets webviewTag.
+      webPreferences.webviewTag = false
+      webPreferences.preload = guestPreloadPath
+      // Defense-in-depth: force the browser partition at attach time so guest
+      // cookies/storage can never land in the app's default session, even if
+      // the renderer omits/forges the partition attribute.
+      webPreferences.partition = BROWSER_PARTITION
+      // Guests may only load http(s)/about:blank — block custom schemes/file.
+      try {
+        const protocol = new URL(params.src).protocol
+        if (!["http:", "https:", "about:"].includes(protocol)) event.preventDefault()
+      } catch {
+        event.preventDefault()
+      }
+    })
+  })
+}
+
 export function getWindowID(win: BrowserWindow) {
   return windowIDs.get(win)
 }
@@ -201,6 +233,10 @@ export function createMainWindow(id: string = randomUUID()) {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
+      // Browser feature: <webview> guests for the collaborative visible browser.
+      // Hardened in wireWebviewHardening (will-attach-webview); webviews are
+      // sandboxed, stripped of node integration, and forced onto our guest preload.
+      webviewTag: true,
     },
   })
 

@@ -90,6 +90,10 @@ export const PartTable = sqliteTable(
     session_id: text().$type<SessionSchema.ID>().notNull(),
     ...Timestamps,
     data: text({ mode: "json" }).notNull().$type<V1PartData>(),
+    // Extracted searchable text backing the part_fts FTS5 index. Populated by
+    // the SessionProjector via SessionSearch.partSearchText; the FTS triggers
+    // keep the virtual table in sync on every write.
+    search_text: text().notNull().default(""),
   },
   (table) => [
     index("part_message_id_id_idx").on(table.message_id, table.id),
@@ -128,6 +132,10 @@ export const SessionMessageTable = sqliteTable(
     seq: integer().notNull(),
     ...Timestamps,
     data: text({ mode: "json" }).notNull().$type<SessionMessageData>(),
+    // Extracted searchable text backing the session_message_fts FTS5 index.
+    // Populated by the SessionProjector via SessionSearch.searchText; the FTS
+    // triggers keep the virtual table in sync on every write.
+    search_text: text().notNull().default(""),
   },
   (table) => [
     uniqueIndex("session_message_session_seq_idx").on(table.session_id, table.seq),
@@ -173,4 +181,20 @@ export const SessionContextEpochTable = sqliteTable("session_context_epoch", {
   baseline: text().notNull(),
   snapshot: text({ mode: "json" }).notNull().$type<SystemContext.Snapshot>(),
   baseline_seq: integer().notNull(),
+})
+
+// Single-row backfill cursor for the session_message_fts index: rowid
+// high-watermark of messages whose search_text still needs computing.
+export const SearchBackfillTable = sqliteTable("search_backfill", {
+  id: integer().primaryKey(),
+  watermark_rowid: integer().notNull().default(-1),
+  done: integer().notNull().default(0),
+})
+
+// Single-row backfill cursor for the part_fts (V1) index: rowid
+// high-watermark of parts whose search_text still needs computing.
+export const PartSearchBackfillTable = sqliteTable("part_search_backfill", {
+  id: integer().primaryKey(),
+  watermark_rowid: integer().notNull().default(-1),
+  done: integer().notNull().default(0),
 })

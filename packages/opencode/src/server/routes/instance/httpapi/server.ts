@@ -62,6 +62,7 @@ import { PermissionSaved } from "@opencode-ai/core/permission/saved"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectCopy } from "@opencode-ai/core/project/copy"
 import { PtyTicket } from "@opencode-ai/core/pty/ticket"
+import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -271,6 +272,7 @@ const app = LayerNode.group([
   ProjectV2.node,
   ProjectCopy.node,
   PtyTicket.node,
+  BrowserHostBroker.node,
 ])
 
 export function createRoutes(

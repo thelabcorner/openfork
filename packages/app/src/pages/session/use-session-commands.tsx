@@ -27,6 +27,12 @@ export type SessionCommandContext = {
   focusInput: () => void
   review?: () => boolean
   fileBrowser?: () => boolean
+  find?: {
+    open: () => void
+    next: () => void
+    prev: () => void
+    isOpen: () => boolean
+  }
 }
 
 const withCategory = (category: string) => {
@@ -553,6 +559,12 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       keybind: "mod+shift+r",
       onSelect: () => view().reviewPanel.toggle(),
     }),
+    viewCommand({
+      id: "browser.toggle",
+      title: language.t("command.browser.toggle"),
+      keybind: "mod+shift+b",
+      onSelect: () => view().browserPanel.toggle(),
+    }),
     ...(shown()
       ? [
           viewCommand({
@@ -608,6 +620,33 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     }),
   ]
 
+  const findCmds = () => [
+    sessionCommand({
+      id: "session.find",
+      title: language.t("command.session.find"),
+      description: language.t("command.session.find.description"),
+      keybind: "mod+f",
+      disabled: !params.id,
+      onSelect: () => actions.find?.open(),
+    }),
+    sessionCommand({
+      id: "session.find.next",
+      title: language.t("command.session.find"),
+      keybind: "mod+g",
+      hidden: true,
+      disabled: !actions.find?.isOpen(),
+      onSelect: () => actions.find?.next(),
+    }),
+    sessionCommand({
+      id: "session.find.previous",
+      title: language.t("command.session.find"),
+      keybind: "shift+mod+g",
+      hidden: true,
+      disabled: !actions.find?.isOpen(),
+      onSelect: () => actions.find?.prev(),
+    }),
+  ]
+
   const mcpCmds = () => [
     mcpCommand({
       id: "mcp.toggle",
@@ -639,6 +678,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     ...viewCmds(),
     ...terminalCmds(),
     ...messageCmds(),
+    ...findCmds(),
     ...mcpCmds(),
     ...permissionsCmds(),
   ])

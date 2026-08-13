@@ -12,6 +12,7 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { type LanguageModelV3 } from "@ai-sdk/provider"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Auth } from "../auth"
+import { ForkCredentials } from "../fork/credentials"
 import { Env } from "../env"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { iife } from "@/util/iife"
@@ -1335,6 +1336,7 @@ const layer = Layer.effect(
     const fs = yield* FSUtil.Service
     const config = yield* Config.Service
     const auth = yield* Auth.Service
+    const forkCredentials = yield* ForkCredentials.Service
     const env = yield* Env.Service
     const plugin = yield* Plugin.Service
     const modelsDevSvc = yield* ModelsDev.Service
@@ -1542,6 +1544,18 @@ const layer = Layer.effect(
               source: "api",
               key: provider.key,
             })
+          }
+        }
+
+        // Fork: the opencode/opencode-go key is managed by our own multi-key
+        // credential store rather than auth.json once the user has connected
+        // through it — override with whichever credential is marked active.
+        const forkActive = yield* forkCredentials.active()
+        if (forkActive) {
+          for (const id of ["opencode", "opencode-go"]) {
+            const providerID = ProviderV2.ID.make(id)
+            if (disabled.has(providerID)) continue
+            mergeProvider(providerID, { source: "api", key: forkActive.key })
           }
         }
 
@@ -2005,7 +2019,7 @@ export function parseModel(model: string) {
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [FSUtil.node, Config.node, Auth.node, Env.node, Plugin.node, ModelsDev.node, RuntimeFlags.node],
+  deps: [FSUtil.node, Config.node, Auth.node, ForkCredentials.node, Env.node, Plugin.node, ModelsDev.node, RuntimeFlags.node],
 })
 
 export * as Provider from "./provider"

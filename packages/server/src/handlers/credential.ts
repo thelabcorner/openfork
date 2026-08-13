@@ -18,5 +18,12 @@ export const CredentialHandler = HttpApiBuilder.group(Api, "server.credential", 
         yield* (yield* Integration.Service).connection.remove(ctx.params.credentialID)
         return HttpApiSchema.NoContent.make()
       }),
+    )
+    .handle(
+      "credential.select",
+      Effect.fn(function* (ctx) {
+        yield* (yield* Integration.Service).connection.select(ctx.params.credentialID)
+        return HttpApiSchema.NoContent.make()
+      }),
     ),
 )

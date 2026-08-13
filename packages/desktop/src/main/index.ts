@@ -49,6 +49,9 @@ import { migrate } from "./migrate"
 import { cleanupStoreFiles } from "./store-cleanup"
 import { startBackgroundCli } from "./background-cli"
 import { setNativeTranslations } from "./native-translations"
+import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
+import { registerBrowserIpcHandlers } from "./ipc"
+import { wireWebviewHardening } from "./windows"
 
 const APP_NAMES: Record<string, string> = {
   dev: "OpenCode Dev",
@@ -66,6 +69,8 @@ const jsCallStackFeature = "DocumentPolicyIncludeJSCallStacksInCrashReports"
 
 let logger: ReturnType<typeof initLogging>
 let server: SidecarListener | null = null
+let readyData: ServerReadyData | null = null
+let browserEngine: BrowserEngine | null = null
 
 const pendingDeepLinks: string[] = []
 
@@ -270,6 +275,7 @@ const main = Effect.gen(function* () {
   )
   app.setAsDefaultProtocolClient("opencode")
   registerRendererProtocol()
+  wireWebviewHardening(resolveGuestPreloadPath())
   setDockIcon()
   const updater = setupAutoUpdater(stopSidecars)
   const menuDeps = {
@@ -312,6 +318,27 @@ const main = Effect.gen(function* () {
     },
   })
   registerWslIpcHandlers(wslServers)
+
+  // Browser engine: guest registry + CDP control + arbitration + host bridge.
+  // Constructed once; start() (host hello) happens after the sidecar is up.
+  browserEngine = new BrowserEngine({
+    windowId: app.isPackaged ? APP_IDS[CHANNEL] : "dev",
+    sidecarProvider: () =>
+      readyData ? { url: readyData.url, username: readyData.username ?? "opencode", password: readyData.password ?? "" } : null,
+    broadcast: (channel, payload) => {
+      for (const win of BrowserWindow.getAllWindows()) {
+        if (win.isDestroyed() || win.webContents.isDestroyed()) continue
+        win.webContents.send(channel, payload)
+      }
+    },
+    getLastFocusedWebContents: () => getLastFocusedWindow()?.webContents ?? null,
+    recordingDirectory: join(app.getPath("userData"), "browser-recordings"),
+    logger: {
+      log: (message, meta) => writeLog("browser", message, meta as Record<string, unknown>),
+      error: (message, meta) => writeLog("browser", message, meta as Record<string, unknown>, "error"),
+    },
+  })
+  registerBrowserIpcHandlers(browserEngine)
   void updater.start()
   const updateTimer = setInterval(() => void updater.check(), 10 * 60 * 1000)
   updateTimer.unref()
@@ -333,11 +360,8 @@ const main = Effect.gen(function* () {
     if (SIDECAR_VERSION === "v2") {
       logger.log("spawning v2 sidecar")
       const sidecar = yield* Effect.promise(() => startBackgroundCli(logger, shellEnv?.XDG_STATE_HOME))
-      yield* Deferred.succeed(serverReady, {
-        url: sidecar.url,
-        username: sidecar.username,
-        password: sidecar.password,
-      })
+      readyData = { url: sidecar.url, username: sidecar.username, password: sidecar.password }
+      yield* Deferred.succeed(serverReady, readyData)
 
       if (process.platform === "win32") {
         void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
@@ -384,11 +408,8 @@ const main = Effect.gen(function* () {
       }),
     )
     server = listener
-    yield* Deferred.succeed(serverReady, {
-      url,
-      username: "opencode",
-      password,
-    })
+    readyData = { url, username: "opencode", password }
+    yield* Deferred.succeed(serverReady, readyData)
 
     if (process.platform === "win32") {
       void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
@@ -419,6 +440,23 @@ const main = Effect.gen(function* () {
 
   const windows = restoreMainWindows()
   if (windows.length) createMenu(menuDeps)
+
+  // Sidecar is up (serverReady settled by the loadingTask above): start the
+  // browser host bridge (loopback listener + sidecar hello registration).
+  const engine = browserEngine
+  if (engine) {
+    yield* Effect.promise(() => engine.start()).pipe(
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          logger.error("failed to start browser host", error)
+        }),
+      ),
+    )
+  }
+
+  app.once("will-quit", () => {
+    void browserEngine?.stop()
+  })
 })
 
 Effect.runFork(main)

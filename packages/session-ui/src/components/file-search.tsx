@@ -3,7 +3,7 @@ import { useI18n } from "@opencode-ai/ui/context/i18n"
 import { Icon } from "@opencode-ai/ui/icon"
 
 export function FileSearchBar(props: {
-  pos: () => { top: number; right: number }
+  pos: () => { top: number; left?: number; right?: number }
   query: () => string
   index: () => number
   count: () => number
@@ -22,7 +22,7 @@ export function FileSearchBar(props: {
         class="fixed z-50 flex h-8 items-center gap-2 rounded-md border border-border-base bg-background-base px-3 shadow-md"
         style={{
           top: `${props.pos().top}px`,
-          right: `${props.pos().right}px`,
+          ...(props.pos().left !== undefined ? { left: `${props.pos().left}px` } : { right: `${props.pos().right}px` }),
         }}
         onPointerDown={(e) => e.stopPropagation()}
       >

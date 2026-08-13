@@ -29,6 +29,28 @@ import { WebSearchTool } from "./websearch"
 import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
+import { BrowserStatusTool } from "./browser/status"
+import { BrowserOpenTool } from "./browser/open"
+import { BrowserNavigateTool } from "./browser/navigate"
+import { BrowserResizeTool } from "./browser/resize"
+import { BrowserSetAppearanceTool } from "./browser/set-appearance"
+import { BrowserSnapshotTool } from "./browser/snapshot"
+import { BrowserScreenshotTool } from "./browser/screenshot"
+import { BrowserClickTool } from "./browser/click"
+import { BrowserTypeTool } from "./browser/type"
+import { BrowserPressTool } from "./browser/press"
+import { BrowserScrollTool } from "./browser/scroll"
+import { BrowserEvaluateTool } from "./browser/evaluate"
+import { BrowserWaitForTool } from "./browser/wait-for"
+import { BrowserRecordingStartTool } from "./browser/recording-start"
+import { BrowserRecordingStopTool } from "./browser/recording-stop"
+import { BrowserCloseTool } from "./browser/close"
+import { BrowserQueryTool } from "./browser/query"
+import { BrowserHighlightTool } from "./browser/highlight"
+import { BrowserAnnotateTool } from "./browser/annotate"
+import { BrowserProfilerStartTool } from "./browser/profiler-start"
+import { BrowserProfilerStopTool } from "./browser/profiler-stop"
+import { BrokerClient } from "@/browser/broker-client"
 import { Glob } from "@opencode-ai/core/util/glob"
 import path from "path"
 import { pathToFileURL } from "url"
@@ -109,6 +131,27 @@ const layer = Layer.effect(
     const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
+    const browserStatus = yield* BrowserStatusTool
+    const browserOpen = yield* BrowserOpenTool
+    const browserNavigate = yield* BrowserNavigateTool
+    const browserResize = yield* BrowserResizeTool
+    const browserSetAppearance = yield* BrowserSetAppearanceTool
+    const browserSnapshot = yield* BrowserSnapshotTool
+    const browserScreenshot = yield* BrowserScreenshotTool
+    const browserClick = yield* BrowserClickTool
+    const browserType = yield* BrowserTypeTool
+    const browserPress = yield* BrowserPressTool
+    const browserScroll = yield* BrowserScrollTool
+    const browserEvaluate = yield* BrowserEvaluateTool
+    const browserWaitFor = yield* BrowserWaitForTool
+    const browserRecordingStart = yield* BrowserRecordingStartTool
+    const browserRecordingStop = yield* BrowserRecordingStopTool
+    const browserClose = yield* BrowserCloseTool
+    const browserQuery = yield* BrowserQueryTool
+    const browserHighlight = yield* BrowserHighlightTool
+    const browserAnnotate = yield* BrowserAnnotateTool
+    const browserProfilerStart = yield* BrowserProfilerStartTool
+    const browserProfilerStop = yield* BrowserProfilerStopTool
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
@@ -218,6 +261,27 @@ const layer = Layer.effect(
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
+          browserStatus: Tool.init(browserStatus),
+          browserOpen: Tool.init(browserOpen),
+          browserNavigate: Tool.init(browserNavigate),
+          browserResize: Tool.init(browserResize),
+          browserSetAppearance: Tool.init(browserSetAppearance),
+          browserSnapshot: Tool.init(browserSnapshot),
+          browserScreenshot: Tool.init(browserScreenshot),
+          browserClick: Tool.init(browserClick),
+          browserType: Tool.init(browserType),
+          browserPress: Tool.init(browserPress),
+          browserScroll: Tool.init(browserScroll),
+          browserEvaluate: Tool.init(browserEvaluate),
+          browserWaitFor: Tool.init(browserWaitFor),
+          browserRecordingStart: Tool.init(browserRecordingStart),
+          browserRecordingStop: Tool.init(browserRecordingStop),
+          browserClose: Tool.init(browserClose),
+          browserQuery: Tool.init(browserQuery),
+          browserHighlight: Tool.init(browserHighlight),
+          browserAnnotate: Tool.init(browserAnnotate),
+          browserProfilerStart: Tool.init(browserProfilerStart),
+          browserProfilerStop: Tool.init(browserProfilerStop),
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
 
@@ -238,6 +302,27 @@ const layer = Layer.effect(
             tool.search,
             tool.skill,
             tool.patch,
+            tool.browserStatus,
+            tool.browserOpen,
+            tool.browserNavigate,
+            tool.browserResize,
+            tool.browserSetAppearance,
+            tool.browserSnapshot,
+            tool.browserScreenshot,
+            tool.browserClick,
+            tool.browserType,
+            tool.browserPress,
+            tool.browserScroll,
+            tool.browserEvaluate,
+            tool.browserWaitFor,
+            tool.browserRecordingStart,
+            tool.browserRecordingStop,
+            tool.browserClose,
+            tool.browserQuery,
+            tool.browserHighlight,
+            tool.browserAnnotate,
+            tool.browserProfilerStart,
+            tool.browserProfilerStop,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
@@ -444,6 +529,7 @@ export const node = LayerNode.make({
     MCP.node,
     Database.node,
     Ripgrep.node,
+    BrokerClient.node,
   ],
 })
 

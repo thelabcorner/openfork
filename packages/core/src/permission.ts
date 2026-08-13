@@ -180,6 +180,12 @@ const layer = Layer.effect(
           const item = { request, agent, deferred }
           if (pending.has(request.id)) return yield* EffectRuntime.die(`Duplicate pending permission ID: ${request.id}`)
           pending.set(request.id, item)
+          yield* EffectRuntime.logInfo("asking", {
+            id: request.id,
+            sessionID: request.sessionID,
+            action: request.action,
+            resources: request.resources,
+          })
           yield* events
             .publish(Event.Asked, request)
             .pipe(EffectRuntime.onError(() => EffectRuntime.sync(() => pending.delete(request.id))))

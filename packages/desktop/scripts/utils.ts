@@ -1,5 +1,5 @@
 import { $ } from "bun"
-import { chmod, copyFile, mkdtemp, rm } from "node:fs/promises"
+import { chmod, copyFile, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 
@@ -74,6 +74,10 @@ export async function downloadCliToResources() {
   const directory = await mkdtemp(join(tmpdir(), "opencode-cli-"))
   const dest = windowsify("resources/opencode-cli")
   try {
+    await writeFile(
+      join(directory, "package.json"),
+      JSON.stringify({ name: "opencode-cli-install", private: true }),
+    )
     await $`bun install --no-save --cwd ${directory} ${`${cli.package}@${CLI_VERSION}`} ${`--os=${cli.os}`} ${`--cpu=${cli.cpu}`}`
     await copyFile(
       join(directory, "node_modules", cli.package, "bin", cli.os === "win32" ? "opencode2.exe" : "opencode2"),

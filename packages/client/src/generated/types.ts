@@ -266,6 +266,99 @@ export type SessionsListOutput = {
   readonly cursor: { readonly previous?: string | null; readonly next?: string | null }
 }
 
+export type SessionsSearchInput = {
+  readonly query: {
+    readonly query: string
+    readonly directory?: string | undefined
+    readonly workspace?: string | undefined
+    readonly project?: string | undefined
+    readonly limit?: number | undefined
+  }["query"]
+  readonly directory?: {
+    readonly query: string
+    readonly directory?: string | undefined
+    readonly workspace?: string | undefined
+    readonly project?: string | undefined
+    readonly limit?: number | undefined
+  }["directory"]
+  readonly workspace?: {
+    readonly query: string
+    readonly directory?: string | undefined
+    readonly workspace?: string | undefined
+    readonly project?: string | undefined
+    readonly limit?: number | undefined
+  }["workspace"]
+  readonly project?: {
+    readonly query: string
+    readonly directory?: string | undefined
+    readonly workspace?: string | undefined
+    readonly project?: string | undefined
+    readonly limit?: number | undefined
+  }["project"]
+  readonly limit?: {
+    readonly query: string
+    readonly directory?: string | undefined
+    readonly workspace?: string | undefined
+    readonly project?: string | undefined
+    readonly limit?: number | undefined
+  }["limit"]
+}
+
+export type SessionsSearchOutput = {
+  readonly data: {
+    readonly titleMatches: ReadonlyArray<{
+      readonly id: string
+      readonly parentID?: string
+      readonly projectID: string
+      readonly agent?: string
+      readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string }
+      readonly cost: number
+      readonly tokens: {
+        readonly input: number
+        readonly output: number
+        readonly reasoning: number
+        readonly cache: { readonly read: number; readonly write: number }
+      }
+      readonly time: { readonly created: number; readonly updated: number; readonly archived?: number }
+      readonly title: string
+      readonly location: { readonly directory: string; readonly workspaceID?: string }
+      readonly subpath?: string
+      readonly revert?: {
+        readonly messageID: string
+        readonly partID?: string
+        readonly snapshot?: string
+        readonly diff?: string
+        readonly files?: ReadonlyArray<{
+          readonly path: string
+          readonly status: "added" | "modified" | "deleted"
+          readonly additions: number
+          readonly deletions: number
+          readonly patch: string
+        }>
+      }
+    }>
+    readonly messageMatches: ReadonlyArray<{
+      readonly sessionID: string
+      readonly messageID: string
+      readonly sessionTitle: string
+      readonly directory: string
+      readonly projectID: string
+      readonly time: { readonly created: number | "Infinity" | "-Infinity" | "NaN" }
+      readonly type:
+        | "user"
+        | "assistant"
+        | "shell"
+        | "synthetic"
+        | "system"
+        | "compaction"
+        | "agent-switched"
+        | "model-switched"
+      readonly snippet: string
+      readonly matchedTerms: ReadonlyArray<string>
+    }>
+  }
+}["data"]
+
 export type SessionsCreateInput = {
   readonly id?: {
     readonly id?: string | null
@@ -2096,7 +2189,7 @@ export type IntegrationsListOutput = {
       | { readonly type: "env"; readonly names: ReadonlyArray<string> }
     >
     readonly connections: ReadonlyArray<
-      | { readonly type: "credential"; readonly id: string; readonly label: string }
+      | { readonly type: "credential"; readonly id: string; readonly label: string; readonly active?: boolean | null }
       | { readonly type: "env"; readonly name: string }
     >
   }>
@@ -2148,7 +2241,7 @@ export type IntegrationsGetOutput = {
       | { readonly type: "env"; readonly names: ReadonlyArray<string> }
     >
     readonly connections: ReadonlyArray<
-      | { readonly type: "credential"; readonly id: string; readonly label: string }
+      | { readonly type: "credential"; readonly id: string; readonly label: string; readonly active?: boolean | null }
       | { readonly type: "env"; readonly name: string }
     >
   } | null
@@ -2287,6 +2380,23 @@ export type CredentialsRemoveInput = {
 }
 
 export type CredentialsRemoveOutput = void
+
+export type CredentialsSelectInput = {
+  readonly credentialID: { readonly credentialID: string }["credentialID"]
+  readonly location?: {
+    readonly location?: { readonly directory?: string | undefined; readonly workspace?: string | undefined } | undefined
+  }["location"]
+}
+
+export type CredentialsSelectOutput = void
+
+export type UsageGoOutput = ReadonlyArray<{
+  readonly label: "5h" | "week" | "month"
+  readonly spentUSD: number
+  readonly limitUSD: number
+  readonly resetsAt: number
+  readonly callsInWindow: number
+}>
 
 export type PermissionsListRequestsInput = {
   readonly location?: {

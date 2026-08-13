@@ -74,6 +74,18 @@ import type {
   FindSymbolsResponses,
   FindTextErrors,
   FindTextResponses,
+  ForkCredentialAddErrors,
+  ForkCredentialAddResponses,
+  ForkCredentialListErrors,
+  ForkCredentialListResponses,
+  ForkCredentialRemoveErrors,
+  ForkCredentialRemoveResponses,
+  ForkCredentialRenameErrors,
+  ForkCredentialRenameResponses,
+  ForkCredentialSelectErrors,
+  ForkCredentialSelectResponses,
+  ForkUsageGetErrors,
+  ForkUsageGetResponses,
   FormatterStatusErrors,
   FormatterStatusResponses,
   GlobalConfigGetErrors,
@@ -265,10 +277,18 @@ import type {
   TuiSubmitPromptResponses,
   V2AgentListErrors,
   V2AgentListResponses,
+  V2BrowserEventErrors,
+  V2BrowserEventResponses,
+  V2BrowserHostHelloErrors,
+  V2BrowserHostHelloResponses,
+  V2BrowserHostsErrors,
+  V2BrowserHostsResponses,
   V2CommandListErrors,
   V2CommandListResponses,
   V2CredentialRemoveErrors,
   V2CredentialRemoveResponses,
+  V2CredentialSelectErrors,
+  V2CredentialSelectResponses,
   V2CredentialUpdateErrors,
   V2CredentialUpdateResponses,
   V2EventSubscribeErrors,
@@ -377,6 +397,8 @@ import type {
   V2SessionRevertCommitResponses,
   V2SessionRevertStageErrors,
   V2SessionRevertStageResponses,
+  V2SessionSearchErrors,
+  V2SessionSearchResponses,
   V2SessionSwitchAgentErrors,
   V2SessionSwitchAgentResponses,
   V2SessionSwitchModelErrors,
@@ -385,6 +407,8 @@ import type {
   V2SessionWaitResponses,
   V2SkillListErrors,
   V2SkillListResponses,
+  V2UsageGoErrors,
+  V2UsageGoResponses,
   VcsApplyErrors,
   VcsApplyResponses,
   VcsDiffErrors,
@@ -1274,6 +1298,178 @@ export class Experimental extends HeyApiClient {
   private _workspace?: Workspace
   get workspace(): Workspace {
     return (this._workspace ??= new Workspace({ client: this.client }))
+  }
+}
+
+export class Credential extends HeyApiClient {
+  /**
+   * List OpenCode credentials
+   */
+  public list<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<ForkCredentialListResponses, ForkCredentialListErrors, ThrowOnError>({
+      url: "/fork/credential",
+      ...options,
+    })
+  }
+
+  /**
+   * Add an OpenCode key
+   */
+  public add<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      key?: string
+      label?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "body", key: "key" },
+            { in: "body", key: "label" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ForkCredentialAddResponses, ForkCredentialAddErrors, ThrowOnError>({
+      url: "/fork/credential",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Select the active credential
+   */
+  public select<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      ForkCredentialSelectResponses,
+      ForkCredentialSelectErrors,
+      ThrowOnError
+    >({
+      url: "/fork/credential/{id}/select",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Remove a credential
+   */
+  public remove<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      directory?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "query", key: "directory" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<
+      ForkCredentialRemoveResponses,
+      ForkCredentialRemoveErrors,
+      ThrowOnError
+    >({
+      url: "/fork/credential/{id}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Rename a credential
+   */
+  public rename<ThrowOnError extends boolean = false>(
+    parameters: {
+      id: string
+      label?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "id" },
+            { in: "body", key: "label" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      ForkCredentialRenameResponses,
+      ForkCredentialRenameErrors,
+      ThrowOnError
+    >({
+      url: "/fork/credential/{id}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class Usage extends HeyApiClient {
+  /**
+   * Get OpenCode Go usage
+   */
+  public get<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<ForkUsageGetResponses, ForkUsageGetErrors, ThrowOnError>({
+      url: "/fork/usage",
+      ...options,
+    })
+  }
+}
+
+export class Fork extends HeyApiClient {
+  private _credential?: Credential
+  get credential(): Credential {
+    return (this._credential ??= new Credential({ client: this.client }))
+  }
+
+  private _usage?: Usage
+  get usage(): Usage {
+    return (this._usage ??= new Usage({ client: this.client }))
   }
 }
 
@@ -5506,6 +5702,42 @@ export class Session3 extends HeyApiClient {
   }
 
   /**
+   * Search sessions and messages
+   *
+   * Search session titles (LIKE, back-compatible) and session message content (FTS5, BM25-ranked). Message content matches require a query of at least 3 characters.
+   */
+  public search<ThrowOnError extends boolean = false>(
+    parameters: {
+      query: string
+      directory?: string
+      workspace?: string
+      project?: string
+      limit?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "query" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "project" },
+            { in: "query", key: "limit" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<V2SessionSearchResponses, V2SessionSearchErrors, ThrowOnError>({
+      url: "/api/session/search",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * List active sessions
    *
    * Retrieve foreground Session drains currently owned by this OpenCode process. Sessions absent from the result are inactive.
@@ -6239,7 +6471,7 @@ export class Integration extends HeyApiClient {
   }
 }
 
-export class Credential extends HeyApiClient {
+export class Credential2 extends HeyApiClient {
   /**
    * Remove credential
    *
@@ -6312,6 +6544,53 @@ export class Credential extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+
+  /**
+   * Select credential
+   *
+   * Mark a stored credential as the active connection for its integration.
+   */
+  public select<ThrowOnError extends boolean = false>(
+    parameters: {
+      credentialID: string
+      location?: {
+        directory?: string
+        workspace?: string
+      }
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "credentialID" },
+            { in: "query", key: "location" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<V2CredentialSelectResponses, V2CredentialSelectErrors, ThrowOnError>({
+      url: "/api/credential/{credentialID}/select",
+      ...options,
+      ...params,
+    })
+  }
+}
+
+export class Usage2 extends HeyApiClient {
+  /**
+   * Get OpenCode Go usage
+   *
+   * Retrieve OpenCode Go plan spend against its 5-hour, weekly, and monthly budgets.
+   */
+  public go<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<V2UsageGoResponses, V2UsageGoErrors, ThrowOnError>({
+      url: "/api/usage/go",
+      ...options,
     })
   }
 }
@@ -6987,6 +7266,143 @@ export class ProjectCopy2 extends HeyApiClient {
   }
 }
 
+export class Host extends HeyApiClient {
+  /**
+   * Register a Desktop browser host
+   *
+   * Register (or re-register) a Desktop browser host connection. Last hello wins per stickiness key; a new connectionId supersedes the old one and in-flight requests against the old connection fail with BrowserControlInterrupted.
+   */
+  public hello<ThrowOnError extends boolean = false>(
+    parameters?: {
+      protocolVersion?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      hostId?: string
+      hostEpoch?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      connectionId?: string
+      windowId?: string
+      capabilities?: {
+        maxSnapshotBytes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        maxResultBytes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        supportedAppearances: Array<"system" | "light" | "dark">
+        supportsRecording: boolean
+        cdp: boolean
+      }
+      guest?: {
+        attached: boolean
+        activeTabId: string
+        url: string
+      }
+      sessionId?: string
+      workspaceId?: string
+      directory?: string
+      callbackUrl?: string
+      callbackToken?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "protocolVersion" },
+            { in: "body", key: "hostId" },
+            { in: "body", key: "hostEpoch" },
+            { in: "body", key: "connectionId" },
+            { in: "body", key: "windowId" },
+            { in: "body", key: "capabilities" },
+            { in: "body", key: "guest" },
+            { in: "body", key: "sessionId" },
+            { in: "body", key: "workspaceId" },
+            { in: "body", key: "directory" },
+            { in: "body", key: "callbackUrl" },
+            { in: "body", key: "callbackToken" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<V2BrowserHostHelloResponses, V2BrowserHostHelloErrors, ThrowOnError>({
+      url: "/api/browser/host/hello",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class Browser extends HeyApiClient {
+  /**
+   * Push a host event
+   *
+   * Host-side events: guest crashed, guest state changed, host stopping, or a request-abort acknowledgement.
+   */
+  public event<ThrowOnError extends boolean = false>(
+    parameters: {
+      body:
+        | {
+            type: "guest.crashed"
+            tabId: string
+            timestamp: string
+          }
+        | {
+            type: "guest.stateChanged"
+            tab: {
+              tabId: string
+              url: string
+              title: string
+              readyState: "Idle" | "Loading" | "Success" | "LoadFailed"
+              controller: "human" | "agent" | "none"
+              zoomFactor: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              attached: boolean
+            }
+            timestamp: string
+          }
+        | {
+            type: "host.stopping"
+            timestamp: string
+          }
+        | {
+            type: "request.aborted"
+            requestId: string
+            timestamp: string
+          }
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ key: "body", map: "body" }] }])
+    return (options?.client ?? this.client).post<V2BrowserEventResponses, V2BrowserEventErrors, ThrowOnError>({
+      url: "/api/browser/event",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * List registered browser hosts
+   *
+   * Debug listing of the currently registered Desktop browser host connections.
+   */
+  public hosts<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<V2BrowserHostsResponses, V2BrowserHostsErrors, ThrowOnError>({
+      url: "/api/browser/hosts",
+      ...options,
+    })
+  }
+
+  private _host?: Host
+  get host(): Host {
+    return (this._host ??= new Host({ client: this.client }))
+  }
+}
+
 export class V2 extends HeyApiClient {
   private _health?: Health
   get health(): Health {
@@ -7023,9 +7439,14 @@ export class V2 extends HeyApiClient {
     return (this._integration ??= new Integration({ client: this.client }))
   }
 
-  private _credential?: Credential
-  get credential(): Credential {
-    return (this._credential ??= new Credential({ client: this.client }))
+  private _credential?: Credential2
+  get credential(): Credential2 {
+    return (this._credential ??= new Credential2({ client: this.client }))
+  }
+
+  private _usage?: Usage2
+  get usage(): Usage2 {
+    return (this._usage ??= new Usage2({ client: this.client }))
   }
 
   private _permission?: Permission3
@@ -7072,6 +7493,11 @@ export class V2 extends HeyApiClient {
   get projectCopy(): ProjectCopy2 {
     return (this._projectCopy ??= new ProjectCopy2({ client: this.client }))
   }
+
+  private _browser?: Browser
+  get browser(): Browser {
+    return (this._browser ??= new Browser({ client: this.client }))
+  }
 }
 
 export class OpencodeClient extends HeyApiClient {
@@ -7095,6 +7521,11 @@ export class OpencodeClient extends HeyApiClient {
   private _experimental?: Experimental
   get experimental(): Experimental {
     return (this._experimental ??= new Experimental({ client: this.client }))
+  }
+
+  private _fork?: Fork
+  get fork(): Fork {
+    return (this._fork ??= new Fork({ client: this.client }))
   }
 
   private _global?: Global

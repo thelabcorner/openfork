@@ -21,6 +21,10 @@ const icons = {
     viewBox: "0 0 16 16",
     body: `<path d="M13.9948 11.668H9.32812M11.6641 9.33203V13.9987M6.66667 9.33203V13.9987H2V9.33203H6.66667ZM6.66667 2V6.66667H2V2H6.66667ZM13.9948 2V6.66667H9.32812V2H13.9948Z" stroke="currentColor" stroke-miterlimit="10" stroke-linecap="square"/>`,
   },
+  globe: {
+    viewBox: "0 0 20 20",
+    body: `<circle cx="10" cy="10" r="7.25" stroke="currentColor"/><path d="M2.75 10H17.25" stroke="currentColor"/><ellipse cx="10" cy="10" rx="3" ry="7.25" stroke="currentColor"/>`,
+  },
   help: {
     viewBox: "0 0 16 16",
     body: `<path d="M6.33345 6.33349V5.00015H9.66679V7.00015L8.00015 8.00015V9.66679M8.27485 11.6819H7.71897M14.4446 8.00011C14.4446 11.5593 11.5593 14.4446 8.00011 14.4446C4.44094 14.4446 1.55566 11.5593 1.55566 8.00011C1.55566 4.44094 4.44094 1.55566 8.00011 1.55566C11.5593 1.55566 14.4446 4.44094 14.4446 8.00011Z" stroke="currentColor" stroke-linecap="square"/>`,
@@ -92,6 +96,10 @@ const icons = {
   "outline-xmark": {
     viewBox: "0 0 16 16",
     body: `<path fill-rule="evenodd" clip-rule="evenodd" d="M4.99487 5.70186L7.29297 7.99995L4.99487 10.2981L5.70198 11.0052L8.00008 8.70706L10.2982 11.0052L11.0053 10.2981L8.70718 7.99995L11.0053 5.70186L10.2982 4.99475L8.00008 7.29285L5.70198 4.99475L4.99487 5.70186Z" fill="currentColor"/>`,
+  },
+  trash: {
+    viewBox: "0 0 16 16",
+    body: `<path d="M2.5 4H13.5M6 4V2.75C6 2.612 6.112 2.5 6.25 2.5H9.75C9.888 2.5 10 2.612 10 2.75V4M3.5 4L4.25 13.25C4.28 13.671 4.63 14 5.05 14H10.95C11.37 14 11.72 13.671 11.75 13.25L12.5 4M6.5 6.5V11.5M9.5 6.5V11.5" stroke="currentColor" stroke-width="1.3" stroke-linecap="round" stroke-linejoin="round"/>`,
   },
   "outline-chevron-down": {
     viewBox: "0 0 16 16",

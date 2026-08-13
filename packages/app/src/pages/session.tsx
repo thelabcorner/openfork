@@ -1,4 +1,4 @@
-import type { FilePart, Project, UserMessage, VcsFileDiff } from "@opencode-ai/sdk/v2"
+import type { FilePart, Part, Project, UserMessage, VcsFileDiff } from "@opencode-ai/sdk/v2"
 import { getFilename } from "@opencode-ai/core/util/path"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { createQuery, skipToken, useMutation, useQueryClient } from "@tanstack/solid-query"
@@ -35,6 +35,7 @@ import { Tabs } from "@opencode-ai/ui/tabs"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { createAutoScroll } from "@opencode-ai/ui/hooks"
 import { previewSelectedLines } from "@opencode-ai/session-ui/pierre/selection-bridge"
+import { FileSearchBar } from "@opencode-ai/session-ui/file-search"
 import { Button } from "@opencode-ai/ui/button"
 import { showToast } from "@/utils/toast"
 import { base64Encode, checksum } from "@opencode-ai/core/util/encode"
@@ -73,6 +74,7 @@ import {
 import { createOpenReviewFile, createSessionTabs, createSizing, shouldShowFileTree } from "@/pages/session/helpers"
 import { MessageTimeline } from "@/pages/session/timeline/message-timeline"
 import { createTimelineModel } from "@/pages/session/timeline/model"
+import { createSessionFindBarPosition, createSessionFindMatcher } from "@/pages/session/session-find"
 import { type DiffStyle, SessionReviewTab, type SessionReviewTabProps } from "@/pages/session/review-tab"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { restorePromptModel, syncPromptModel, syncSessionModel } from "@/pages/session/session-model-helpers"
@@ -88,6 +90,9 @@ import { SessionReviewEmptyNoGitV2 } from "@opencode-ai/session-ui/v2/session-re
 import { SessionReviewV2SidebarToggle } from "@opencode-ai/session-ui/v2/session-review-v2"
 import { ReviewPanelV2 } from "@/pages/session/v2/review-panel-v2"
 import { createReviewPanelV2State } from "@/pages/session/v2/review-panel-v2-state"
+import { BrowserPanelV2 } from "@/pages/session/v2/browser-panel-v2"
+import { createBrowserPanelV2State } from "@/pages/session/v2/browser-panel-v2-state"
+import { browserHostClient } from "@/pages/session/v2/browser/browserHostClient"
 import { reviewDiffDirectory, reviewDiffNeedsLoad, reviewRootDirectory } from "@/pages/session/v2/review-diff-kinds"
 import { TerminalPanel } from "@/pages/session/terminal-panel"
 import { TerminalPanelV2 } from "@/pages/session/terminal-panel-v2"
@@ -449,6 +454,7 @@ export default function Page() {
   const size = createSizing()
   const desktopReviewOpen = createMemo(() => isDesktop() && view().reviewPanel.opened())
   const desktopV2ReviewOpen = createMemo(() => newSessionDesign() && desktopReviewOpen() && !!params.id)
+  const desktopBrowserOpen = createMemo(() => newSessionDesign() && isDesktop() && view().browserPanel.opened())
   const terminalOpen = createMemo(() => view().terminal.opened())
   const desktopTerminalOpen = createMemo(() => isDesktop() && terminalOpen())
   const desktopInlineTerminalOnlyOpen = createMemo(
@@ -463,7 +469,7 @@ export default function Page() {
       }),
   )
   const desktopSessionResizeOpen = createMemo(() =>
-    newSessionDesign() ? desktopV2ReviewOpen() || desktopTerminalOpen() : desktopReviewOpen(),
+    newSessionDesign() ? desktopV2ReviewOpen() || desktopTerminalOpen() || desktopBrowserOpen() : desktopReviewOpen(),
   )
   const desktopSidePanelOpen = createMemo(() => desktopSessionResizeOpen() || desktopFileTreeOpen())
   let panelRow: HTMLDivElement | undefined
@@ -507,7 +513,11 @@ export default function Page() {
       review: desktopV2ReviewOpen(),
       terminal: desktopTerminalOpen(),
       files: desktopFileTreeOpen(),
+      browser: desktopBrowserOpen(),
     }),
+  )
+  const desktopBrowserFillRemaining = createMemo(
+    () => desktopBrowserOpen() && !desktopV2ReviewOpen() && !desktopFileTreeOpen() && !desktopTerminalOpen(),
   )
 
   function normalizeTab(tab: string) {
@@ -876,6 +886,22 @@ export default function Page() {
   let scrollMark = 0
   let messageMark = 0
 
+  const emptyFindParts: Part[] = []
+  const sessionFind = createSessionFindMatcher({
+    turns: visibleUserMessages,
+    sessionMessages: messages,
+    parts: (messageID) => sync().data.part[messageID] ?? emptyFindParts,
+  })
+  createEffect(
+    on(sessionFind.activeTurnID, (id) => {
+      if (!id) return
+      autoScroll.pause()
+      revealMessage(id)
+    }),
+  )
+  let sessionFindInput: HTMLInputElement | undefined
+  const sessionFindPos = createSessionFindBarPosition(() => content ?? scroller)
+
   const scrollGestureWindowMs = 250
 
   const markScrollGesture = (target?: EventTarget | null) => {
@@ -1143,6 +1169,18 @@ export default function Page() {
     focusInput,
     review: reviewTab,
     fileBrowser: () => newSessionDesign() && isDesktop() && !!params.id,
+    find: {
+      open: () => {
+        sessionFind.focus()
+        requestAnimationFrame(() => {
+          sessionFindInput?.focus()
+          sessionFindInput?.select()
+        })
+      },
+      next: sessionFind.next,
+      prev: sessionFind.prev,
+      isOpen: sessionFind.open,
+    },
   })
   command.register("session-palette", () => [
     {
@@ -1294,6 +1332,27 @@ export default function Page() {
 
   const reviewV2State = createReviewPanelV2State()
 
+  // Host the browser client once per page mount; the engine's tab-request
+  // broadcast is the signal to surface the browser pane (auto-open).
+  createEffect(() => {
+    void browserHostClient.init()
+    const unsubscribe = browserHostClient.onTabRequest(() => {
+      if (view().browserPanel.opened()) return
+      view().browserPanel.open()
+    })
+    onCleanup(unsubscribe)
+  })
+
+  // Keep the engine's session context aligned with the open session so
+  // browser tabs are attributed to it.
+  createEffect(() => {
+    const sessionId = params.id
+    if (!sessionId) return
+    void browserHostClient.setSessionContext(sessionId)
+  })
+
+  const browserV2State = createBrowserPanelV2State()
+
   // Getters defer reactive reads to the consuming scope. Eager reads here ran inside
   // the side panel's Show children and remounted the whole review panel on unrelated
   // updates such as session switches.
@@ -1352,6 +1411,22 @@ export default function Page() {
     <div class="flex flex-col h-full overflow-hidden bg-v2-background-bg-base contain-strict">
       <Show when={reviewPanelV2Rendered()}>
         <ReviewPanelV2 {...reviewPanelV2Props()} />
+      </Show>
+    </div>
+  )
+
+  // Latch: defer only the first browser render off the mount critical path,
+  // mirroring the review pane so session tab switches stay cheap.
+  const browserPanelV2Rendered = createMemo<boolean>((prev) => prev || !store.deferRender, false)
+
+  const browserPanelV2 = () => (
+    <div class="flex flex-col h-full overflow-hidden bg-v2-background-bg-base contain-strict">
+      <Show when={browserPanelV2Rendered()}>
+        <BrowserPanelV2
+          state={browserV2State}
+          opened={view().browserPanel.opened()}
+          onClose={() => view().browserPanel.close()}
+        />
       </Show>
     </div>
   )
@@ -1614,6 +1689,29 @@ export default function Page() {
       owner.run(onHistoryScroll)
     })
   }
+  // Find must see the whole session, not just whatever page happens to be
+  // loaded — otherwise matches appear/disappear as the user scrolls up and
+  // pulls in more history, which reads as broken. Pull every older page in
+  // while find is open; `loadOlder` already dedupes concurrent calls.
+  let findHistoryLoadID: string | undefined
+  const loadAllSessionHistoryForFind = async () => {
+    const id = params.id
+    if (!id || findHistoryLoadID === id) return
+    findHistoryLoadID = id
+    try {
+      while (params.id === id && sessionFind.open() && historyMore()) {
+        await loadOlder()
+      }
+    } finally {
+      if (findHistoryLoadID === id) findHistoryLoadID = undefined
+    }
+  }
+  createEffect(
+    on(sessionFind.open, (open) => {
+      if (open) void loadAllSessionHistoryForFind()
+    }),
+  )
+
   const onHistoryScroll = () => {
     if (
       historyRequests.has(sessionOwnership.key()) ||
@@ -2118,8 +2216,38 @@ export default function Page() {
                   setScrollToEnd={(fn) => {
                     scrollToEnd = fn
                   }}
+                  findMatches={{
+                    matched: sessionFind.matchedTurnIDs,
+                    active: sessionFind.activeTurnID,
+                  }}
                 />
               )}
+            </Show>
+            <Show when={sessionFind.open()}>
+              <FileSearchBar
+                pos={sessionFindPos}
+                query={sessionFind.query}
+                index={sessionFind.index}
+                count={sessionFind.count}
+                setInput={(el) => {
+                  sessionFindInput = el
+                }}
+                onInput={sessionFind.setQuery}
+                onKeyDown={(event) => {
+                  if (event.key === "Escape") {
+                    event.preventDefault()
+                    sessionFind.close()
+                    return
+                  }
+                  if (event.key !== "Enter") return
+                  event.preventDefault()
+                  if (event.shiftKey) sessionFind.prev()
+                  else sessionFind.next()
+                }}
+                onClose={sessionFind.close}
+                onPrev={sessionFind.prev}
+                onNext={sessionFind.next}
+              />
             </Show>
           </Match>
           <Match when={true}>
@@ -2321,64 +2449,83 @@ export default function Page() {
         </Show>
         <Show when={newSessionDesign()}>
           <Show when={isDesktop() ? desktopV2PanelLayout().visible : terminalOpen()}>
-            <div class="min-w-0 h-full flex flex-1 flex-col">
-              <Show when={isDesktop() && (desktopV2ReviewOpen() || desktopFileTreeOpen())}>
-                <div class="min-h-0 flex-1">
-                  <Suspense>
-                    <SessionSidePanel
-                      canReview={canReview}
-                      diffs={reviewDiffs}
-                      diffsReady={reviewReady}
-                      empty={reviewEmptyText}
-                      hasReview={hasReview}
-                      reviewHasFocusableContent={() => hasReview() || reviewV2State.sidebarOpened()}
-                      reviewCount={reviewCount}
-                      reviewPanel={reviewPanelV2}
-                      reviewSidebarToggle={(disabled) => (
-                        <SessionReviewV2SidebarToggle
-                          opened={reviewV2State.sidebarOpened()}
-                          disabled={disabled}
-                          onToggle={reviewV2State.toggleSidebar}
-                        />
-                      )}
-                      fileBrowserState={reviewV2State}
-                      activeDiff={activeReviewFile()}
-                      focusReviewDiff={focusReviewDiff}
-                      reviewSnap={ui.reviewSnap}
-                      size={size}
-                      stacked={desktopV2PanelLayout().stacked}
+            <Show
+              when={
+                (isDesktop() && (desktopV2ReviewOpen() || desktopFileTreeOpen())) ||
+                terminalOpen()
+              }
+            >
+              <div class="min-w-0 h-full flex flex-1 flex-col">
+                <Show when={isDesktop() && (desktopV2ReviewOpen() || desktopFileTreeOpen())}>
+                  <div class="min-h-0 flex-1">
+                    <Suspense>
+                      <SessionSidePanel
+                        canReview={canReview}
+                        diffs={reviewDiffs}
+                        diffsReady={reviewReady}
+                        empty={reviewEmptyText}
+                        hasReview={hasReview}
+                        reviewHasFocusableContent={() => hasReview() || reviewV2State.sidebarOpened()}
+                        reviewCount={reviewCount}
+                        reviewPanel={reviewPanelV2}
+                        reviewSidebarToggle={(disabled) => (
+                          <SessionReviewV2SidebarToggle
+                            opened={reviewV2State.sidebarOpened()}
+                            disabled={disabled}
+                            onToggle={reviewV2State.toggleSidebar}
+                          />
+                        )}
+                        fileBrowserState={reviewV2State}
+                        activeDiff={activeReviewFile()}
+                        focusReviewDiff={focusReviewDiff}
+                        reviewSnap={ui.reviewSnap}
+                        size={size}
+                        stacked={desktopV2PanelLayout().stacked}
+                      />
+                    </Suspense>
+                  </div>
+                </Show>
+                <Show when={desktopV2PanelLayout().stacked}>
+                  <div class="relative h-2 shrink-0" onPointerDown={() => size.start()}>
+                    <ResizeHandle
+                      class="!relative !inset-auto !h-full !w-full !transform-none"
+                      direction="vertical"
+                      size={layout.terminal.height()}
+                      min={100}
+                      max={typeof window === "undefined" ? 600 : window.innerHeight * 0.6}
+                      collapseThreshold={50}
+                      onResize={(height) => {
+                        size.touch()
+                        layout.terminal.resize(height)
+                      }}
+                      onCollapse={() => view().terminal.close()}
                     />
-                  </Suspense>
-                </div>
-              </Show>
-              <Show when={desktopV2PanelLayout().stacked}>
-                <div class="relative h-2 shrink-0" onPointerDown={() => size.start()}>
-                  <ResizeHandle
-                    class="!relative !inset-auto !h-full !w-full !transform-none"
-                    direction="vertical"
-                    size={layout.terminal.height()}
-                    min={100}
-                    max={typeof window === "undefined" ? 600 : window.innerHeight * 0.6}
-                    collapseThreshold={50}
-                    onResize={(height) => {
-                      size.touch()
-                      layout.terminal.resize(height)
+                  </div>
+                </Show>
+                <Show when={terminalOpen()}>
+                  <div
+                    classList={{
+                      "min-h-0 shrink-0": desktopV2PanelLayout().stacked,
+                      "min-h-0 flex-1": !desktopV2PanelLayout().stacked,
                     }}
-                    onCollapse={() => view().terminal.close()}
-                  />
-                </div>
-              </Show>
-              <Show when={terminalOpen()}>
-                <div
-                  classList={{
-                    "min-h-0 shrink-0": desktopV2PanelLayout().stacked,
-                    "min-h-0 flex-1": !desktopV2PanelLayout().stacked,
-                  }}
-                >
-                  <TerminalPanelV2 stacked={desktopV2PanelLayout().stacked} />
-                </div>
-              </Show>
-            </div>
+                  >
+                    <TerminalPanelV2 stacked={desktopV2PanelLayout().stacked} />
+                  </div>
+                </Show>
+              </div>
+            </Show>
+            <Show when={isDesktop() && desktopBrowserOpen()}>
+              <div
+                class="h-full overflow-hidden"
+                classList={{
+                  "min-w-0 flex-1": desktopBrowserFillRemaining(),
+                  "shrink-0": !desktopBrowserFillRemaining(),
+                }}
+                style={{ width: desktopBrowserFillRemaining() ? undefined : `${browserV2State.sidebarWidth()}px` }}
+              >
+                <Suspense>{browserPanelV2()}</Suspense>
+              </div>
+            </Show>
           </Show>
         </Show>
       </div>

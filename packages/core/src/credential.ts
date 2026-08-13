@@ -25,6 +25,7 @@ export class Info extends Schema.Class<Info>("Credential.Info")({
   integrationID: Integration.ID,
   label: Schema.String,
   value: Value,
+  active: Schema.optional(Schema.Boolean),
 }) {}
 
 export interface Interface {
@@ -40,8 +41,16 @@ export interface Interface {
     readonly value: Value
     readonly label?: string
   }) => Effect.Effect<Info>
+  /** Adds a new credential for an integration without removing existing ones. */
+  readonly add: (input: {
+    readonly integrationID: Integration.ID
+    readonly value: Value
+    readonly label?: string
+  }) => Effect.Effect<Info>
   /** Updates the label or secret value of a stored credential. */
   readonly update: (id: ID, updates: Partial<Pick<Info, "label" | "value">>) => Effect.Effect<void>
+  /** Marks one credential as the active selection for its integration, clearing any other. */
+  readonly select: (id: ID) => Effect.Effect<void>
   /** Removes a stored credential. */
   readonly remove: (id: ID) => Effect.Effect<void>
 }
@@ -60,6 +69,7 @@ const layer = Layer.effect(
         integrationID: row.integration_id,
         label: row.label,
         value: decode(row.value),
+        active: row.active ?? undefined,
       })
     }
 
@@ -119,6 +129,25 @@ const layer = Layer.effect(
           .pipe(Effect.orDie)
         return credential
       }),
+      add: Effect.fn("Credential.add")(function* (input) {
+        const credential = new Info({
+          id: ID.create(),
+          integrationID: input.integrationID,
+          label: input.label ?? "default",
+          value: input.value,
+        })
+        yield* db
+          .insert(CredentialTable)
+          .values({
+            id: credential.id,
+            integration_id: credential.integrationID,
+            label: credential.label,
+            value: credential.value,
+          })
+          .run()
+          .pipe(Effect.orDie)
+        return credential
+      }),
       update: Effect.fn("Credential.update")(function* (id, updates) {
         if (!updates.label && !updates.value) return
         yield* db
@@ -126,6 +155,23 @@ const layer = Layer.effect(
           .set({ label: updates.label, value: updates.value })
           .where(eq(CredentialTable.id, id))
           .run()
+          .pipe(Effect.orDie)
+      }),
+      select: Effect.fn("Credential.select")(function* (id) {
+        const row = yield* db.select().from(CredentialTable).where(eq(CredentialTable.id, id)).get().pipe(Effect.orDie)
+        const integrationID = row?.integration_id
+        if (!integrationID) return
+        yield* db
+          .transaction((tx) =>
+            Effect.gen(function* () {
+              yield* tx
+                .update(CredentialTable)
+                .set({ active: null })
+                .where(eq(CredentialTable.integration_id, integrationID))
+                .run()
+              yield* tx.update(CredentialTable).set({ active: true }).where(eq(CredentialTable.id, id)).run()
+            }),
+          )
           .pipe(Effect.orDie)
       }),
       remove: Effect.fn("Credential.remove")(function* (id) {

@@ -91,6 +91,43 @@ export const SessionHistoryQuery = Schema.Struct({
   after: Schema.NumberFromString.pipe(Schema.decodeTo(NonNegativeInt), Schema.optional),
 })
 
+const SessionSearchLimit = PositiveInt.check(Schema.isLessThanOrEqualTo(100))
+
+export const SessionSearchQuery = Schema.Struct({
+  query: Schema.String,
+  directory: AbsolutePath.pipe(Schema.optional),
+  workspace: Workspace.ID.pipe(Schema.optional),
+  project: Project.ID.pipe(Schema.optional),
+  limit: Schema.NumberFromString.pipe(Schema.decodeTo(SessionSearchLimit), Schema.optional),
+}).annotate({ identifier: "SessionSearchQuery" })
+
+export interface SessionSearchMessageMatch extends Schema.Schema.Type<typeof SessionSearchMessageMatch> {}
+export const SessionSearchMessageMatch = Schema.Struct({
+  sessionID: Session.ID,
+  messageID: SessionMessage.ID,
+  sessionTitle: Schema.String,
+  directory: Schema.String,
+  projectID: Project.ID,
+  time: Schema.Struct({ created: Schema.Number }),
+  type: Schema.Literals([
+    "user",
+    "assistant",
+    "shell",
+    "synthetic",
+    "system",
+    "compaction",
+    "agent-switched",
+    "model-switched",
+  ]),
+  snippet: Schema.String,
+  matchedTerms: Schema.Array(Schema.String),
+}).annotate({ identifier: "SessionSearchMessageMatch" })
+
+export const SessionSearchResponse = Schema.Struct({
+  titleMatches: Schema.Array(Session.Info),
+  messageMatches: Schema.Array(SessionSearchMessageMatch),
+}).annotate({ identifier: "SessionSearchResponse" })
+
 const SessionsQueryCursor = SessionsCursor.annotate({
   description: "Opaque pagination cursor returned as cursor.previous or cursor.next in the previous response.",
 })
@@ -122,6 +159,20 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
           summary: "List sessions",
           description:
             "Retrieve sessions in the requested order. Items keep that order across pages; use cursor.next or cursor.previous to move through the ordered list.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.search", "/api/session/search", {
+        query: SessionSearchQuery,
+        success: Schema.Struct({ data: SessionSearchResponse }),
+        error: InvalidRequestError,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.session.search",
+          summary: "Search sessions and messages",
+          description:
+            "Search session titles (LIKE, back-compatible) and session message content (FTS5, BM25-ranked). Message content matches require a query of at least 3 characters.",
         }),
       ),
     )

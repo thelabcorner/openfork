@@ -25,6 +25,7 @@ import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
+import { ForkCredentials } from "@/fork/credentials"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -94,6 +95,7 @@ const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
+    const forkCredentials = yield* ForkCredentials.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
@@ -454,6 +456,14 @@ const layer = Layer.effect(
               cost: usage.cost,
             })
             yield* session.updateMessage(ctx.assistantMessage)
+            if (ctx.model.providerID === "opencode" || ctx.model.providerID === "opencode-go") {
+              const credential = yield* forkCredentials.active()
+              if (credential)
+                yield* forkCredentials.recordUsage({
+                  messageID: ctx.assistantMessage.id,
+                  credentialID: credential.id,
+                })
+            }
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
               if (patch.files.length) {
@@ -712,6 +722,7 @@ export const node = LayerNode.make({
     Image.node,
     EventV2Bridge.node,
     Database.node,
+    ForkCredentials.node,
   ],
 })
 

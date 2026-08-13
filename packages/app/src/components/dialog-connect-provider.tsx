@@ -800,6 +800,7 @@ function ProviderConnection(props: {
     const errorID = createUniqueId()
     const [formStore, setFormStore] = createStore({
       value: "",
+      label: "",
       error: undefined as string | undefined,
     })
 
@@ -825,6 +826,7 @@ function ProviderConnection(props: {
         integrationID: props.provider,
         location: location(),
         key: apiKey,
+        label: formStore.label.trim() || undefined,
       })
       await complete()
     }
@@ -866,6 +868,19 @@ function ProviderConnection(props: {
                 autocomplete="off"
                 spellcheck={false}
                 onInput={(event) => setFormStore("value", event.currentTarget.value)}
+              />
+            </label>
+            <label class="flex w-full flex-col gap-1 font-[530] leading-4 text-v2-text-text-base">
+              {language.t("provider.connect.apiKey.labelName")}
+              <TextInputV2
+                class="!w-full"
+                name="label"
+                data-input="provider-api-key-label"
+                placeholder={language.t("provider.connect.apiKey.labelPlaceholder")}
+                value={formStore.label}
+                autocomplete="off"
+                spellcheck={false}
+                onInput={(event) => setFormStore("label", event.currentTarget.value)}
               />
             </label>
             <Show when={formStore.error}>

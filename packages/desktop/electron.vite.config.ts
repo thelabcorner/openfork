@@ -82,7 +82,13 @@ const require = __cjs_mod__.createRequire(import.meta.url);
   preload: {
     build: {
       rollupOptions: {
-        input: { index: "src/preload/index.ts" },
+        input: {
+          index: "src/preload/index.ts",
+          // Browser-guest preload: loaded inside each <webview> guest via the
+          // preload attribute; the path is handed to the renderer through
+          // window.api.browser.getGuestPreloadPath().
+          preview: "src/guest/preview-preload.ts",
+        },
         output: {
           format: "cjs",
           entryFileNames: "[name].js",

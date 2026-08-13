@@ -26,6 +26,7 @@ import path from "path"
 import { fromRow } from "./session/info"
 import { SessionRunner } from "./session/runner/index"
 import { SessionStore } from "./session/store"
+import { SessionSearch } from "./session/search"
 import { SessionExecution } from "./session/execution"
 import { makeGlobalNode } from "./effect/app-node"
 import { LocationServiceMap } from "./location-service-map"
@@ -112,6 +113,9 @@ export type Error = NotFoundError | MessageDecodeError | OperationUnavailableErr
 
 export interface Interface {
   readonly list: (input?: ListInput) => Effect.Effect<SessionSchema.Info[]>
+  readonly search: (
+    input: SessionSearch.SearchInput,
+  ) => Effect.Effect<SessionSearch.SearchResult, SessionSearch.SearchError>
   readonly create: (input: CreateInput) => Effect.Effect<SessionSchema.Info>
   readonly get: (sessionID: SessionSchema.ID) => Effect.Effect<SessionSchema.Info, NotFoundError>
   readonly messages: (input: {
@@ -203,6 +207,15 @@ const layer = Layer.effect(
             }),
         ),
       )
+
+    // Resumable one-time backfill of the FTS index for pre-existing messages,
+    // forked so startup is not blocked on large databases. It runs on a
+    // dedicated SQLite connection (same file, its own semaphore) so it can
+    // never hold the shared client permit that live queries wait on.
+    yield* SessionSearch.backfillOnOwnConnection(database.filename).pipe(
+      Effect.forkScoped,
+      Effect.andThen(Effect.void),
+    )
 
     const result = Service.of({
       create: Effect.fn("V2Session.create")(function* (input) {
@@ -301,6 +314,7 @@ const layer = Layer.effect(
         )
         return (direction === "previous" ? rows.toReversed() : rows).map((row) => fromRow(row))
       }),
+      search: (input) => SessionSearch.search(db, input),
       messages: Effect.fn("V2Session.messages")(function* (input) {
         yield* result.get(input.sessionID)
         const direction = input.cursor?.direction ?? "next"

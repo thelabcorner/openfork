@@ -346,4 +346,85 @@ describe("Integration", () => {
         }),
     )
   })
+
+  it.effect("connecting with a key twice keeps both credentials", () =>
+    Effect.gen(function* () {
+      const integrations = yield* Integration.Service
+      const credentials = yield* Credential.Service
+      const integrationID = Integration.ID.make("openai")
+      yield* integrations.transform((editor) =>
+        editor.method.update({ integrationID, method: { type: "key", label: "API key" } }),
+      )
+
+      yield* integrations.connection.key({ integrationID, key: "first", label: "Personal" })
+      yield* integrations.connection.key({ integrationID, key: "second", label: "Work" })
+
+      expect((yield* credentials.list(integrationID)).map((credential) => credential.label)).toEqual([
+        "Personal",
+        "Work",
+      ])
+    }),
+  )
+
+  it.effect("defaults the active connection to the newest credential", () =>
+    Effect.gen(function* () {
+      const integrations = yield* Integration.Service
+      const integrationID = Integration.ID.make("openai")
+      yield* integrations.transform((editor) =>
+        editor.method.update({ integrationID, method: { type: "key", label: "API key" } }),
+      )
+
+      yield* integrations.connection.key({ integrationID, key: "first", label: "Personal" })
+      yield* integrations.connection.key({ integrationID, key: "second", label: "Work" })
+
+      const active = yield* integrations.connection.active(integrationID)
+      expect(active && active.type === "credential" ? active.label : undefined).toBe("Work")
+    }),
+  )
+
+  it.effect("selecting a credential makes it the active connection and marks it on the wire", () =>
+    Effect.gen(function* () {
+      const integrations = yield* Integration.Service
+      const credentials = yield* Credential.Service
+      const integrationID = Integration.ID.make("openai")
+      yield* integrations.transform((editor) =>
+        editor.method.update({ integrationID, method: { type: "key", label: "API key" } }),
+      )
+
+      yield* integrations.connection.key({ integrationID, key: "first", label: "Personal" })
+      yield* integrations.connection.key({ integrationID, key: "second", label: "Work" })
+      const [older] = yield* credentials.list(integrationID)
+
+      yield* integrations.connection.select(older.id)
+
+      const active = yield* integrations.connection.active(integrationID)
+      expect(active && active.type === "credential" ? active.id : undefined).toBe(older.id)
+
+      const connections = (yield* integrations.get(integrationID))?.connections ?? []
+      const activeConnections = connections.filter((connection) => connection.type === "credential" && connection.active)
+      expect(activeConnections).toHaveLength(1)
+      expect(activeConnections[0]).toMatchObject({ id: older.id })
+    }),
+  )
+
+  it.effect("removing the active credential falls back to the newest remaining one", () =>
+    Effect.gen(function* () {
+      const integrations = yield* Integration.Service
+      const credentials = yield* Credential.Service
+      const integrationID = Integration.ID.make("openai")
+      yield* integrations.transform((editor) =>
+        editor.method.update({ integrationID, method: { type: "key", label: "API key" } }),
+      )
+
+      yield* integrations.connection.key({ integrationID, key: "first", label: "Personal" })
+      yield* integrations.connection.key({ integrationID, key: "second", label: "Work" })
+      const [older, newer] = yield* credentials.list(integrationID)
+
+      // "Work" (newer) is active by default; remove it and confirm fallback to "Personal".
+      yield* integrations.connection.remove(newer.id)
+
+      const active = yield* integrations.connection.active(integrationID)
+      expect(active && active.type === "credential" ? active.id : undefined).toBe(older.id)
+    }),
+  )
 })

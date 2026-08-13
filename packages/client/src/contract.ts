@@ -26,6 +26,7 @@ export const groupNames = {
   "server.provider": "providers",
   "server.integration": "integrations",
   "server.credential": "credentials",
+  "server.usage": "usage",
   "server.permission": "permissions",
   "server.fs": "files",
   "server.command": "commands",
@@ -50,4 +51,14 @@ export const endpointNames = {
   "question.request.list": "listRequests",
 } as const
 
-export const omitEndpoints = new Set(["fs.read", "pty.connect", "pty.connectToken"])
+export const omitEndpoints = new Set([
+  "fs.read",
+  "pty.connect",
+  "pty.connectToken",
+  // server.browser: broker endpoints are consumed by the Desktop host (main
+  // process, plain fetch) and the agent tools (sidecar-side), not by client SDK
+  // consumers. Renderer-side browser surface goes through window.api.
+  "browser.host.hello",
+  "browser.event",
+  "browser.hosts",
+])

@@ -4,6 +4,8 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Credential } from "@opencode-ai/core/credential"
+import { SessionUsage } from "@opencode-ai/core/session/usage"
+import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { PermissionSaved } from "@opencode-ai/core/permission/saved"
 import { PtyTicket } from "@opencode-ai/core/pty/ticket"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -32,8 +34,10 @@ const applicationServices = LayerNode.group([
   PermissionSaved.node,
   PtyTicket.node,
   Credential.node,
+  SessionUsage.node,
   PtyEnvironment.node,
   LocationServiceMap.node,
+  BrowserHostBroker.node,
 ])
 
 export function createRoutes(password?: string) {

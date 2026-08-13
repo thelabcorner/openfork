@@ -229,6 +229,8 @@ export function ModelSelectorPopoverV2(props: {
   onClose?: () => void
 }) {
   const dialog = useDialog()
+  const local = useLocal()
+  const directory = () => decode64(local.slug())
   const controller = createModelSelectorController({
     model: props.model,
     provider: () => props.provider,
@@ -245,6 +247,11 @@ export function ModelSelectorPopoverV2(props: {
       onManage={() => {
         void import("./dialog-manage-models").then((module) => {
           void dialog.show(() => <module.DialogManageModelsV2 />)
+        })
+      }}
+      onManageCredentials={() => {
+        void import("./dialog-credential-switcher").then((module) => {
+          void dialog.show(() => <module.DialogCredentialSwitcherV2 directory={directory} />)
         })
       }}
       onClose={() => props.onClose?.()}
@@ -298,6 +305,7 @@ function ModelSelectorPopoverV2View(props: {
   current: () => string | undefined
   select: (item: ModelItem) => void
   onManage: () => void
+  onManageCredentials: () => void
   onClose: () => void
 }) {
   const language = useLanguage()
@@ -451,7 +459,21 @@ function ModelSelectorPopoverV2View(props: {
                   {(group) => (
                     <MenuV2.Group>
                       <MenuV2.GroupLabel class="gap-2 px-3">
-                        <span class="min-w-0 truncate">{group.items[0].provider.name}</span>
+                        <span class="min-w-0 flex-1 truncate">{group.items[0].provider.name}</span>
+                        <Show when={group.category === "opencode"}>
+                          <button
+                            type="button"
+                            class="flex size-5 shrink-0 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"
+                            aria-label={language.t("dialog.credential.manageKeys")}
+                            onPointerDown={(event) => event.preventDefault()}
+                            onClick={(event) => {
+                              event.stopPropagation()
+                              props.onManageCredentials()
+                            }}
+                          >
+                            <Icon name="outline-sliders" size="small" />
+                          </button>
+                        </Show>
                       </MenuV2.GroupLabel>
                       <MenuV2.RadioGroup value={props.current()}>
                         <For each={group.items}>

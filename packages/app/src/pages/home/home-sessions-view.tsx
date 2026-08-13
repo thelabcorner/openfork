@@ -1,23 +1,25 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
 import { type Accessor, createMemo, For, Show, Suspense } from "solid-js"
-import { Spinner } from "@opencode-ai/ui/spinner"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
+import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useLanguage } from "@/context/language"
 import { ServerConnection } from "@/context/server"
 import { SessionTabAvatarView } from "@/pages/layout/session-tab-avatar"
 import { sessionTitle } from "@/utils/session-title"
+import { getRelativeTime } from "@/utils/time"
 import { shouldOpenSessionInBackground } from "../home-session-open"
 import {
   HomeSessionStatusController,
-  homeSessionSearchKey,
   type HomeSessionGroup,
   type HomeSessionRecord,
   type OpenSessionOptions,
 } from "./home-sessions-controller"
+import type { HomeSearchHit } from "./home-session-search-controller"
+import type { SessionSearchMessageMatch } from "./home-session-search-response"
 
 const SHOW_HOME_SESSION_ARCHIVE = false
 const HOME_SECTION_LABEL = "text-v2-text-text-muted [font-weight:440]"
@@ -46,7 +48,10 @@ export type HomeSessionsViewProps = {
   searchPlaceholder: Accessor<string>
   searchOpen: Accessor<boolean>
   searchLoading: Accessor<boolean>
-  searchResults: Accessor<HomeSessionRecord[]>
+  searchError: Accessor<string | undefined>
+  searchSessions: Accessor<Session[]>
+  searchMessages: Accessor<SessionSearchMessageMatch[]>
+  searchResults: Accessor<HomeSearchHit[]>
   searchActive: Accessor<string>
   searchNoResultsLabel: Accessor<string>
   titleOpacity: (id: HomeSessionGroup["id"]) => number
@@ -67,8 +72,8 @@ export type HomeSessionsViewProps = {
   onSearchClose: () => void
   onSearchMove: (delta: number) => void
   onSearchSelectActive: () => void
-  onSearchHighlight: (record: HomeSessionRecord) => void
-  onSearchSelect: (record: HomeSessionRecord, options?: OpenSessionOptions) => void
+  onSearchHighlight: (hit: HomeSearchHit) => void
+  onSearchSelect: (hit: HomeSearchHit, options?: OpenSessionOptions) => void
 }
 
 export function HomeSessionsView(props: HomeSessionsViewProps) {
@@ -202,6 +207,11 @@ function HomeSessionLeading(props: {
 }
 
 function HomeSessionSearch(props: HomeSessionsViewProps) {
+  const sessionCountLabel = () =>
+    props.language.plural("home.sessions.search.sessionsResult", props.searchSessions().length)
+  const messageCountLabel = () =>
+    props.language.plural("home.sessions.search.messagesResult", props.searchMessages().length)
+
   return (
     <div class="w-full">
       <div ref={props.onSetSearchRoot} data-component="home-session-search" class="relative z-30 w-full">
@@ -215,51 +225,75 @@ function HomeSessionSearch(props: HomeSessionsViewProps) {
             style={{ top: "-6px", left: "-6px", width: "calc(100% + 12px)" }}
           >
             <div class="flex flex-col pt-9">
-              <div id={HOME_SESSION_SEARCH_RESULTS_ID} role="listbox" class="flex flex-col gap-4 pt-4">
+              <div id={HOME_SESSION_SEARCH_RESULTS_ID} role="listbox" class="flex flex-col pt-2">
                 <Show
                   when={!props.searchLoading()}
-                  fallback={
-                    <div class="flex items-center justify-center px-4 py-3 text-v2-text-text-muted [font-weight:440]">
-                      <Spinner class="size-4" />
-                    </div>
-                  }
+                  fallback={<HomeSessionSearchLoading language={props.language} />}
                 >
                   <Show
-                    when={props.searchResults().length > 0}
-                    fallback={
-                      <p
-                        class={`
-                          my-1.5 px-4 pb-2 text-[13px] leading-4 tracking-[-0.04px]
-                          text-v2-text-text-muted [font-weight:440]
-                        `}
-                      >
-                        {props.searchNoResultsLabel()}
-                      </p>
-                    }
+                    when={!props.searchError()}
+                    fallback={<HomeSessionSearchError language={props.language} detail={props.searchError()} />}
                   >
-                    <div class="flex flex-col">
-                      <p
-                        class={`
-                          my-1.5 pl-[18px] pr-6 text-[13px] leading-4 tracking-[-0.04px]
-                          text-v2-text-text-muted [font-weight:440]
-                        `}
-                      >
-                        {props.language.t("home.sessions.search.sessions")}
-                      </p>
-                      <ScrollView class="max-h-80" viewportRef={props.onSetSearchList}>
-                        <div class="flex flex-col gap-px pb-2">
+                    <Show
+                      when={props.searchResults().length > 0}
+                      fallback={
+                        <p
+                          class={`
+                            my-1.5 px-4 pb-2 text-[13px] leading-4 tracking-[-0.04px]
+                            text-v2-text-text-muted [font-weight:440]
+                          `}
+                        >
+                          {props.searchNoResultsLabel()}
+                        </p>
+                      }
+                    >
+                      <ScrollView class="max-h-[min(480px,50vh)]" viewportRef={props.onSetSearchList}>
+                        <div class="flex flex-col pb-2">
                           <For each={props.searchResults()}>
-                            {(record) => (
-                              <HomeSessionSearchResultRow
-                                {...props}
-                                record={record}
-                                selected={props.searchActive() === homeSessionSearchKey(record)}
-                              />
-                            )}
+                            {(hit, index) => {
+                              const previous = index() > 0 ? props.searchResults()[index() - 1] : undefined
+                              return (
+                                <>
+                                  <Show when={hit.kind === "session" && (!previous || previous.kind !== "session")}>
+                                    <HomeSessionSearchGroupHeader
+                                      label={props.language.t("home.sessions.search.sessions")}
+                                      count={props.searchSessions().length}
+                                      countLabel={sessionCountLabel()}
+                                    />
+                                  </Show>
+                                  <Show when={hit.kind === "message" && (!previous || previous.kind !== "message")}>
+                                    <HomeSessionSearchGroupHeader
+                                      label={props.language.t("home.sessions.search.messages")}
+                                      count={props.searchMessages().length}
+                                      countLabel={messageCountLabel()}
+                                    />
+                                  </Show>
+                                  <Show
+                                    when={hit.kind === "session"}
+                                    fallback={
+                                      hit.kind === "message" ? (
+                                        <HomeSessionSearchMessageRow
+                                          {...props}
+                                          hit={hit}
+                                          selected={props.searchActive() === hit.key}
+                                        />
+                                      ) : null
+                                    }
+                                  >
+                                    <HomeSessionSearchRow
+                                      {...props}
+                                      hit={hit}
+                                      selected={props.searchActive() === hit.key}
+                                    />
+                                  </Show>
+                                </>
+                              )
+                            }}
                           </For>
                         </div>
                       </ScrollView>
-                    </div>
+                      <HomeSessionSearchHints language={props.language} />
+                    </Show>
                   </Show>
                 </Show>
               </div>
@@ -338,15 +372,93 @@ function HomeSessionSearch(props: HomeSessionsViewProps) {
   )
 }
 
-function HomeSessionSearchResultRow(
+function HomeSessionSearchGroupHeader(props: { label: string; count: number; countLabel: string }) {
+  return (
+    <div
+      role="group"
+      aria-label={props.countLabel}
+      class="my-1.5 flex h-6 items-center justify-between pl-[18px] pr-6"
+    >
+      <p
+        class={`
+          text-[13px] leading-4 tracking-[-0.04px]
+          text-v2-text-text-muted [font-weight:440]
+        `}
+      >
+        {props.label}
+      </p>
+      <span
+        aria-hidden="true"
+        class="rounded-[4px] px-1.5 py-px text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440] bg-v2-background-bg-layer-02"
+      >
+        {props.count}
+      </span>
+    </div>
+  )
+}
+
+function HomeSessionSearchHints(props: { language: ReturnType<typeof useLanguage> }) {
+  return (
+    <div class="flex items-center justify-end gap-3 border-t border-v2-border-border-muted px-4 py-2">
+      <span class="flex items-center gap-1.5">
+        <KeybindV2 keys={["↑", "↓"]} variant="ghost" />
+        <span class="text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440]">
+          {props.language.t("home.sessions.search.hint.navigate")}
+        </span>
+      </span>
+      <span class="flex items-center gap-1.5">
+        <KeybindV2 keys={["↵"]} variant="ghost" />
+        <span class="text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440]">
+          {props.language.t("home.sessions.search.hint.open")}
+        </span>
+      </span>
+      <span class="flex items-center gap-1.5">
+        <KeybindV2 keys={["esc"]} variant="ghost" />
+        <span class="text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440]">
+          {props.language.t("home.sessions.search.hint.close")}
+        </span>
+      </span>
+    </div>
+  )
+}
+
+function HomeSessionSearchLoading(props: { language: ReturnType<typeof useLanguage> }) {
+  return (
+    <div class="flex flex-col gap-px px-4 py-2" aria-busy="true" aria-label={props.language.t("common.loading")}>
+      <For each={[0, 1, 2]}>
+        {() => <div class="h-8 rounded-[6px] bg-v2-background-bg-layer-02 animate-pulse" />}
+      </For>
+    </div>
+  )
+}
+
+function HomeSessionSearchError(props: { language: ReturnType<typeof useLanguage>; detail?: string }) {
+  return (
+    <div class="px-3 pb-3 pt-2" role="alert">
+      <div class="flex flex-col gap-1 rounded-[8px] border border-v2-state-border-danger/40 bg-v2-state-bg-danger/10 px-3 py-2.5">
+        <div class="flex items-center gap-2">
+          <span aria-hidden="true" class="size-1.5 shrink-0 rounded-full bg-v2-state-border-danger" />
+          <p class="text-[13px] leading-4 tracking-[-0.04px] text-v2-text-text-base [font-weight:530]">
+            {props.language.t("home.sessions.search.error")}
+          </p>
+        </div>
+        <p class="pl-5 text-[12px] leading-4 tracking-[-0.04px] text-v2-text-text-muted [font-weight:440]">
+          {props.detail || props.language.t("home.sessions.search.error.description")}
+        </p>
+      </div>
+    </div>
+  )
+}
+
+function HomeSessionSearchRow(
   props: HomeSessionsViewProps & {
-    record: HomeSessionRecord
+    hit: HomeSearchHit
     selected: boolean
   },
 ) {
-  const title = createMemo(() => sessionTitle(props.record.session.title) || props.record.session.id)
-  const showProjectName = () => props.showProjectName() && props.record.projectName
-  const key = () => homeSessionSearchKey(props.record)
+  const title = createMemo(() => sessionTitle(props.hit.session.title) || props.hit.session.id)
+  const showProjectName = () => props.showProjectName() && props.hit.projectName
+  const key = () => props.hit.key
 
   return (
     <button
@@ -365,28 +477,116 @@ function HomeSessionSearchResultRow(
         "bg-v2-overlay-simple-overlay-hover": props.selected,
         group: !!showProjectName(),
       }}
-      onMouseEnter={() => props.onSearchHighlight(props.record)}
+      onMouseEnter={() => props.onSearchHighlight(props.hit)}
       onMouseDown={(event) => {
         if (event.button === 1) event.preventDefault()
       }}
-      onClick={(event) => props.onSearchSelect(props.record, { background: isBackgroundOpen(event) })}
+      onClick={(event) => props.onSearchSelect(props.hit, { background: isBackgroundOpen(event) })}
       onAuxClick={(event) => {
         if (!isBackgroundOpen(event)) return
         event.preventDefault()
-        props.onSearchSelect(props.record, { background: true })
+        props.onSearchSelect(props.hit, { background: true })
       }}
     >
       <HomeSessionLeadingController
         server={props.server}
         isOpenTab={props.isOpenTab}
-        record={props.record}
+        record={{
+          session: props.hit.session,
+          project: props.hit.project,
+          projectName: props.hit.projectName,
+        }}
         revealProjectOnHover={!!showProjectName()}
       />
       <div class="flex min-w-0 flex-1 items-center gap-1.5">
         <HomeSessionTitle title={title()} showProjectName={!!showProjectName()} search />
         <Show when={showProjectName()}>
-          <HomeSessionProjectName name={props.record.projectName} search />
+          <HomeSessionProjectName name={props.hit.projectName} search />
         </Show>
+      </div>
+    </button>
+  )
+}
+
+function HomeSessionSearchMessageRow(
+  props: HomeSessionsViewProps & {
+    hit: Extract<HomeSearchHit, { kind: "message" }>
+    selected: boolean
+  },
+) {
+  const title = createMemo(() => sessionTitle(props.hit.session.title) || props.hit.session.id)
+  const showProjectName = () => props.showProjectName() && props.hit.projectName
+  const key = () => props.hit.key
+  const time = createMemo(() =>
+    getRelativeTime(
+      new Date(props.hit.message.time.created).toISOString(),
+      props.language.t,
+    ),
+  )
+
+  return (
+    <button
+      type="button"
+      id={`home-session-search-option-${key()}`}
+      data-key={key()}
+      data-component="home-session-search-message-row"
+      role="option"
+      aria-selected={props.selected}
+      class={`
+        flex min-h-10 w-full shrink-0 cursor-default items-center gap-2 border-0 py-1.5 pl-[18px] pr-6 text-left
+        transition-[background-color] duration-[120ms] ease-in-out
+        hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none
+      `}
+      classList={{
+        "bg-v2-overlay-simple-overlay-hover": props.selected,
+        group: !!showProjectName(),
+      }}
+      onMouseEnter={() => props.onSearchHighlight(props.hit)}
+      onMouseDown={(event) => {
+        if (event.button === 1) event.preventDefault()
+      }}
+      onClick={(event) => props.onSearchSelect(props.hit, { background: isBackgroundOpen(event) })}
+      onAuxClick={(event) => {
+        if (!isBackgroundOpen(event)) return
+        event.preventDefault()
+        props.onSearchSelect(props.hit, { background: true })
+      }}
+    >
+      <HomeSessionLeadingController
+        server={props.server}
+        isOpenTab={props.isOpenTab}
+        record={{
+          session: props.hit.session,
+          project: props.hit.project,
+          projectName: props.hit.projectName,
+        }}
+        revealProjectOnHover={!!showProjectName()}
+      />
+      <div class="flex min-w-0 flex-1 flex-col gap-0.5">
+        <div class="flex min-w-0 items-center gap-1.5">
+          <HomeSessionTitle title={title()} showProjectName={!!showProjectName()} search />
+          <Show when={showProjectName()}>
+            <HomeSessionProjectName name={props.hit.projectName} search />
+          </Show>
+          <span class="ml-auto shrink-0 pl-2 text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440]">
+            {time()}
+          </span>
+        </div>
+        <p class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[12px] leading-4 tracking-[-0.04px] text-v2-text-text-muted [font-weight:440]">
+          <For each={props.hit.segments}>
+            {(segment) =>
+              segment.match ? (
+                <mark
+                  class="rounded-[3px] bg-v2-state-bg-info/70 px-[1px] text-v2-text-text-base [font-weight:530]"
+                >
+                  {segment.text}
+                </mark>
+              ) : (
+                segment.text
+              )
+            }
+          </For>
+        </p>
       </div>
     </button>
   )

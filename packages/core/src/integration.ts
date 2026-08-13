@@ -175,6 +175,8 @@ export interface Interface extends State.Transformable<Draft> {
       credentialID: Credential.ID,
       updates: Partial<Pick<Credential.Info, "label">>,
     ) => Effect.Effect<void>
+    /** Marks one stored credential as the active connection for its integration. */
+    readonly select: (credentialID: Credential.ID) => Effect.Effect<void>
     /** Removes a stored credential connection. */
     readonly remove: (credentialID: Credential.ID) => Effect.Effect<void>
   }
@@ -291,6 +293,7 @@ export const locationLayer = Layer.effect(
           type: "credential" as const,
           id: credential.id,
           label: credential.label,
+          ...(credential.active ? { active: true as const } : {}),
         }))
         .toReversed()
       const env = (entry?.methods ?? [])
@@ -332,7 +335,7 @@ export const locationLayer = Layer.effect(
       if (!result) return
       if (Exit.isSuccess(exit)) {
         const implementation = state.get().integrations.get(result.integrationID)?.implementations.get(result.methodID)
-        yield* credentials.create({
+        yield* credentials.add({
           integrationID: result.integrationID,
           label: result.label ?? implementation?.label?.(exit.value),
           value: exit.value,
@@ -380,7 +383,8 @@ export const locationLayer = Layer.effect(
       connection: {
         active: Effect.fn("Integration.connection.active")(function* (id) {
           const entry = state.get().integrations.get(id)
-          return resolveConnections(entry, yield* credentials.list(id))[0]
+          const list = resolveConnections(entry, yield* credentials.list(id))
+          return list.find((connection) => connection.type === "credential" && connection.active) ?? list[0]
         }),
         resolve: Effect.fn("Integration.connection.resolve")(function* (connection) {
           if (connection.type === "env") {
@@ -407,7 +411,7 @@ export const locationLayer = Layer.effect(
             .integrations.get(input.integrationID)
             ?.methods.some((method) => method.type === "key")
           if (!method) return yield* Effect.die(`Key method not found: ${input.integrationID}`)
-          yield* credentials.create({
+          yield* credentials.add({
             integrationID: input.integrationID,
             label: input.label,
             value: Credential.Key.make({ type: "key", key: input.key }),
@@ -458,6 +462,14 @@ export const locationLayer = Layer.effect(
         update: Effect.fn("Integration.connection.update")(function* (credentialID, updates) {
           const credential = yield* credentials.get(credentialID)
           yield* credentials.update(credentialID, updates)
+          if (credential) {
+            yield* events.publish(Event.ConnectionUpdated, { integrationID: credential.integrationID })
+          }
+          yield* events.publish(Event.Updated, {})
+        }),
+        select: Effect.fn("Integration.connection.select")(function* (credentialID) {
+          const credential = yield* credentials.get(credentialID)
+          yield* credentials.select(credentialID)
           if (credential) {
             yield* events.publish(Event.ConnectionUpdated, { integrationID: credential.integrationID })
           }

@@ -5,6 +5,7 @@ import { MessageV2 } from "../../session/message-v2"
 import { CliError, effectCmd } from "../effect-cmd"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionTable, MessageTable, PartTable } from "@opencode-ai/core/session/sql"
+import { partSearchText } from "@opencode-ai/core/session/search-text"
 import { InstanceRef } from "@/effect/instance-ref"
 import { ShareNext } from "@/share/share-next"
 import { EOL } from "os"
@@ -218,6 +219,7 @@ const runImport = Effect.fn("Cli.import.body")(function* (file: string, ctx: Ins
           message_id: messageID,
           session_id: row.id,
           data: partData,
+          search_text: partSearchText(partInfo),
         })
         .onConflictDoNothing()
         .run()

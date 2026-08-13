@@ -255,6 +255,7 @@ export function MessageTimeline(props: {
   setRevealMessage?: (fn: (id: string) => void) => void
   setScrollToEnd?: (fn: () => void) => void
   setHistoryAnchor?: (handlers: { capture: () => void; restore: (done: boolean) => void }) => void
+  findMatches?: { matched: () => Set<string>; active: () => string | undefined }
 }) {
   let touchGesture: number | undefined
 
@@ -1108,6 +1109,9 @@ export function MessageTimeline(props: {
           "md:max-w-200 2xl:max-w-[1000px]": props.centered,
           "md:mx-auto": props.centered,
           "pt-3": previousAssistantPart(),
+          "bg-v2-background-bg-accent/8": props.findMatches?.matched().has(input.row().userMessageID) ?? false,
+          "bg-v2-background-bg-accent/14 outline outline-1 -outline-offset-1 outline-v2-border-border-focus/60":
+            props.findMatches?.active() === input.row().userMessageID,
         }}
       >
         <div data-component="session-turn" class="min-w-0 w-full relative" style={{ height: "auto" }}>

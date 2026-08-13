@@ -2695,6 +2695,25 @@ export type InvalidCursorError = {
   message: string
 }
 
+export type SessionSearchMessageMatch = {
+  sessionID: string
+  messageID: string
+  sessionTitle: string
+  directory: string
+  projectID: string
+  time: {
+    created: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  type: "user" | "assistant" | "shell" | "synthetic" | "system" | "compaction" | "agent-switched" | "model-switched"
+  snippet: string
+  matchedTerms: Array<string>
+}
+
+export type SessionSearchResponse = {
+  titleMatches: Array<SessionV2Info>
+  messageMatches: Array<SessionSearchMessageMatch>
+}
+
 export type SessionActive = {
   type: "running"
 }
@@ -4922,6 +4941,7 @@ export type ConnectionCredentialInfo = {
   type: "credential"
   id: string
   label: string
+  active?: boolean
 }
 
 export type ConnectionEnvInfo = {
@@ -7222,6 +7242,216 @@ export type ExperimentalControlPlaneMoveSessionResponses = {
 
 export type ExperimentalControlPlaneMoveSessionResponse =
   ExperimentalControlPlaneMoveSessionResponses[keyof ExperimentalControlPlaneMoveSessionResponses]
+
+export type ForkCredentialListData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/fork/credential"
+}
+
+export type ForkCredentialListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ForkCredentialListError = ForkCredentialListErrors[keyof ForkCredentialListErrors]
+
+export type ForkCredentialListResponses = {
+  /**
+   * Stored OpenCode credentials
+   */
+  200: Array<{
+    id: string
+    label: string
+    active: boolean
+    timeCreated: number
+  }>
+}
+
+export type ForkCredentialListResponse = ForkCredentialListResponses[keyof ForkCredentialListResponses]
+
+export type ForkCredentialAddData = {
+  body?: {
+    key: string
+    label?: string
+  }
+  path?: never
+  query?: {
+    directory?: string
+  }
+  url: "/fork/credential"
+}
+
+export type ForkCredentialAddErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type ForkCredentialAddError = ForkCredentialAddErrors[keyof ForkCredentialAddErrors]
+
+export type ForkCredentialAddResponses = {
+  /**
+   * Added credential
+   */
+  200: {
+    id: string
+    label: string
+    active: boolean
+    timeCreated: number
+  }
+}
+
+export type ForkCredentialAddResponse = ForkCredentialAddResponses[keyof ForkCredentialAddResponses]
+
+export type ForkCredentialSelectData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+  }
+  url: "/fork/credential/{id}/select"
+}
+
+export type ForkCredentialSelectErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ForkCredentialSelectError = ForkCredentialSelectErrors[keyof ForkCredentialSelectErrors]
+
+export type ForkCredentialSelectResponses = {
+  /**
+   * Selected credential
+   */
+  200: boolean
+}
+
+export type ForkCredentialSelectResponse = ForkCredentialSelectResponses[keyof ForkCredentialSelectResponses]
+
+export type ForkCredentialRemoveData = {
+  body?: never
+  path: {
+    id: string
+  }
+  query?: {
+    directory?: string
+  }
+  url: "/fork/credential/{id}"
+}
+
+export type ForkCredentialRemoveErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ForkCredentialRemoveError = ForkCredentialRemoveErrors[keyof ForkCredentialRemoveErrors]
+
+export type ForkCredentialRemoveResponses = {
+  /**
+   * Removed credential
+   */
+  200: boolean
+}
+
+export type ForkCredentialRemoveResponse = ForkCredentialRemoveResponses[keyof ForkCredentialRemoveResponses]
+
+export type ForkCredentialRenameData = {
+  body?: {
+    label: string
+  }
+  path: {
+    id: string
+  }
+  query?: never
+  url: "/fork/credential/{id}"
+}
+
+export type ForkCredentialRenameErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ForkCredentialRenameError = ForkCredentialRenameErrors[keyof ForkCredentialRenameErrors]
+
+export type ForkCredentialRenameResponses = {
+  /**
+   * Renamed credential
+   */
+  200: boolean
+}
+
+export type ForkCredentialRenameResponse = ForkCredentialRenameResponses[keyof ForkCredentialRenameResponses]
+
+export type ForkUsageGetData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/fork/usage"
+}
+
+export type ForkUsageGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ForkUsageGetError = ForkUsageGetErrors[keyof ForkUsageGetErrors]
+
+export type ForkUsageGetResponses = {
+  /**
+   * Aggregate and per-credential OpenCode Go usage
+   */
+  200: {
+    aggregate: Array<{
+      label: "5h" | "week" | "month"
+      spentUSD: number
+      limitUSD: number
+      estimatedPercent?: number
+      resetsAt: number
+      clearsAt: number
+      lastUsedAt?: number
+      callsInWindow: number
+      source?: "api" | "local"
+      status?: string
+    }>
+    byCredential: Array<{
+      credentialID: string
+      windows: Array<{
+        label: "5h" | "week" | "month"
+        spentUSD: number
+        limitUSD: number
+        estimatedPercent?: number
+        resetsAt: number
+        clearsAt: number
+        lastUsedAt?: number
+        callsInWindow: number
+        source?: "api" | "local"
+        status?: string
+      }>
+      official?: {
+        fetchedAt: number
+        ageMs: number
+        status: "ok" | "stale" | "error"
+      }
+    }>
+  }
+}
+
+export type ForkUsageGetResponse = ForkUsageGetResponses[keyof ForkUsageGetResponses]
 
 export type GlobalHealthData = {
   body?: never
@@ -11406,6 +11636,43 @@ export type V2SessionCreateResponses = {
 
 export type V2SessionCreateResponse = V2SessionCreateResponses[keyof V2SessionCreateResponses]
 
+export type V2SessionSearchData = {
+  body?: never
+  path?: never
+  query: {
+    query: string
+    directory?: string
+    workspace?: string
+    project?: string
+    limit?: string
+  }
+  url: "/api/session/search"
+}
+
+export type V2SessionSearchErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2SessionSearchError = V2SessionSearchErrors[keyof V2SessionSearchErrors]
+
+export type V2SessionSearchResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: SessionSearchResponse
+  }
+}
+
+export type V2SessionSearchResponse = V2SessionSearchResponses[keyof V2SessionSearchResponses]
+
 export type V2SessionActiveData = {
   body?: never
   path?: never
@@ -12512,6 +12779,77 @@ export type V2CredentialUpdateResponses = {
 
 export type V2CredentialUpdateResponse = V2CredentialUpdateResponses[keyof V2CredentialUpdateResponses]
 
+export type V2CredentialSelectData = {
+  body?: never
+  path: {
+    credentialID: string
+  }
+  query?: {
+    location?: {
+      directory?: string
+      workspace?: string
+    }
+  }
+  url: "/api/credential/{credentialID}/select"
+}
+
+export type V2CredentialSelectErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2CredentialSelectError = V2CredentialSelectErrors[keyof V2CredentialSelectErrors]
+
+export type V2CredentialSelectResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type V2CredentialSelectResponse = V2CredentialSelectResponses[keyof V2CredentialSelectResponses]
+
+export type V2UsageGoData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/api/usage/go"
+}
+
+export type V2UsageGoErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2UsageGoError = V2UsageGoErrors[keyof V2UsageGoErrors]
+
+export type V2UsageGoResponses = {
+  /**
+   * Success
+   */
+  200: Array<{
+    label: "5h" | "week" | "month"
+    spentUSD: number
+    limitUSD: number
+    resetsAt: number
+    callsInWindow: number
+  }>
+}
+
+export type V2UsageGoResponse = V2UsageGoResponses[keyof V2UsageGoResponses]
+
 export type V2PermissionRequestListData = {
   body?: never
   path?: never
@@ -13584,6 +13922,177 @@ export type V2ProjectCopyRefreshResponses = {
 }
 
 export type V2ProjectCopyRefreshResponse = V2ProjectCopyRefreshResponses[keyof V2ProjectCopyRefreshResponses]
+
+export type V2BrowserHostHelloData = {
+  body: {
+    protocolVersion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    hostId: string
+    hostEpoch: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    connectionId: string
+    windowId: string
+    capabilities: {
+      maxSnapshotBytes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      maxResultBytes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      supportedAppearances: Array<"system" | "light" | "dark">
+      supportsRecording: boolean
+      cdp: boolean
+    }
+    guest: {
+      attached: boolean
+      activeTabId: string
+      url: string
+    }
+    sessionId: string
+    workspaceId?: string
+    directory?: string
+    callbackUrl: string
+    callbackToken: string
+  }
+  path?: never
+  query?: never
+  url: "/api/browser/host/hello"
+}
+
+export type V2BrowserHostHelloErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2BrowserHostHelloError = V2BrowserHostHelloErrors[keyof V2BrowserHostHelloErrors]
+
+export type V2BrowserHostHelloResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: {
+      accepted: boolean
+      brokerProtocolVersion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      hostId: string
+      replacement?: boolean
+    }
+  }
+}
+
+export type V2BrowserHostHelloResponse = V2BrowserHostHelloResponses[keyof V2BrowserHostHelloResponses]
+
+export type V2BrowserEventData = {
+  body:
+    | {
+        type: "guest.crashed"
+        tabId: string
+        timestamp: string
+      }
+    | {
+        type: "guest.stateChanged"
+        tab: {
+          tabId: string
+          url: string
+          title: string
+          readyState: "Idle" | "Loading" | "Success" | "LoadFailed"
+          controller: "human" | "agent" | "none"
+          zoomFactor: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+          attached: boolean
+        }
+        timestamp: string
+      }
+    | {
+        type: "host.stopping"
+        timestamp: string
+      }
+    | {
+        type: "request.aborted"
+        requestId: string
+        timestamp: string
+      }
+  path?: never
+  query?: never
+  url: "/api/browser/event"
+}
+
+export type V2BrowserEventErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2BrowserEventError = V2BrowserEventErrors[keyof V2BrowserEventErrors]
+
+export type V2BrowserEventResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type V2BrowserEventResponse = V2BrowserEventResponses[keyof V2BrowserEventResponses]
+
+export type V2BrowserHostsData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/api/browser/hosts"
+}
+
+export type V2BrowserHostsErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2BrowserHostsError = V2BrowserHostsErrors[keyof V2BrowserHostsErrors]
+
+export type V2BrowserHostsResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: Array<{
+      sessionId: string
+      workspaceId?: string
+      directory?: string
+      callbackUrl: string
+      protocolVersion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      hostId: string
+      hostEpoch: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      connectionId: string
+      windowId: string
+      capabilities: {
+        maxSnapshotBytes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        maxResultBytes: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        supportedAppearances: Array<"system" | "light" | "dark">
+        supportsRecording: boolean
+        cdp: boolean
+      }
+      guest: {
+        attached: boolean
+        activeTabId: string
+        url: string
+      }
+      status: "live" | "superseded" | "dead"
+      registeredAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      lastSeenAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }>
+  }
+}
+
+export type V2BrowserHostsResponse = V2BrowserHostsResponses[keyof V2BrowserHostsResponses]
 
 export type PtyConnectData = {
   body?: never

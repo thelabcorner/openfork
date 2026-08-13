@@ -32,6 +32,7 @@ const DEFAULT_FILE_TREE_WIDTH = 200
 const DEFAULT_SESSION_WIDTH = 600
 const DEFAULT_TERMINAL_HEIGHT = 280
 const DEFAULT_REVIEW_PANEL_OPENED = false
+const DEFAULT_BROWSER_PANEL_OPENED = false
 export type AvatarColorKey = (typeof AVATAR_COLOR_KEYS)[number]
 
 export function getAvatarColors(key?: string) {
@@ -284,6 +285,9 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         review: {
           diffStyle: "split" as ReviewDiffStyle,
           panelOpened: DEFAULT_REVIEW_PANEL_OPENED,
+        },
+        browser: {
+          panelOpened: DEFAULT_BROWSER_PANEL_OPENED,
         },
         fileTree: {
           opened: false,
@@ -819,6 +823,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         })
         const terminalOpened = createMemo(() => store.terminal?.opened ?? false)
         const reviewPanelOpened = createMemo(() => store.review?.panelOpened ?? DEFAULT_REVIEW_PANEL_OPENED)
+        const browserPanelOpened = createMemo(() => store.browser?.panelOpened ?? DEFAULT_BROWSER_PANEL_OPENED)
         const reviewPanelSource = createMemo(() => (reviewPanelOpened() ? ephemeral.reviewPanelSource : "other"))
 
         function setTerminalOpened(next: boolean) {
@@ -897,6 +902,31 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
             },
             toggle() {
               setReviewPanelOpened(!reviewPanelOpened(), "other")
+            },
+          },
+          browserPanel: {
+            opened: browserPanelOpened,
+            open() {
+              if (!store.browser) {
+                setStore("browser", { panelOpened: true })
+                return
+              }
+              setStore("browser", "panelOpened", true)
+            },
+            close() {
+              if (!store.browser) {
+                setStore("browser", { panelOpened: false })
+                return
+              }
+              setStore("browser", "panelOpened", false)
+            },
+            toggle() {
+              const current = store.browser?.panelOpened ?? DEFAULT_BROWSER_PANEL_OPENED
+              if (!store.browser) {
+                setStore("browser", { panelOpened: !current })
+                return
+              }
+              setStore("browser", "panelOpened", !current)
             },
           },
           review: {

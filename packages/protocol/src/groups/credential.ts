@@ -35,3 +35,18 @@ export const CredentialGroup = HttpApiGroup.make("server.credential")
         }),
       ),
   )
+  .add(
+    HttpApiEndpoint.post("credential.select", "/api/credential/:credentialID/select", {
+      params: { credentialID: Credential.ID },
+      query: LocationQuery,
+      success: HttpApiSchema.NoContent,
+    })
+      .annotateMerge(locationQueryOpenApi)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.credential.select",
+          summary: "Select credential",
+          description: "Mark a stored credential as the active connection for its integration.",
+        }),
+      ),
+  )

@@ -27,4 +27,26 @@ export const dict = {
 
   "desktop.error.dev.rootNotFound":
     "Root element not found. Did you forget to add it to your index.html? Or maybe the id attribute got misspelled?",
+
+  "desktop.browser.panel.open": "Open browser panel",
+  "desktop.browser.viewportMode": "Viewport mode",
+  "desktop.browser.mode.fill": "Fill",
+  "desktop.browser.mode.freeform": "Freeform",
+  "desktop.browser.mode.preset": "Preset",
+  "desktop.browser.rotate": "Rotate",
+  "desktop.browser.aspectLock": "Lock aspect ratio",
+  "desktop.browser.badges": "Element badges",
+  "desktop.browser.badges.toggle": "Toggle element badges",
+  "desktop.browser.device.laptop": "Laptop",
+  "desktop.browser.device.smallLaptop": "Small laptop",
+  "desktop.browser.device.desktopHd": "Desktop HD",
+  "desktop.browser.device.ipadAir": "iPad Air",
+  "desktop.browser.device.iphone15": "iPhone 15",
+  "desktop.browser.device.iphoneSe": "iPhone SE",
+  "desktop.browser.device.pixel8": "Pixel 8",
+  "desktop.browser.resize.west": "Resize from left edge",
+  "desktop.browser.resize.east": "Resize from right edge",
+  "desktop.browser.resize.south": "Resize from bottom edge",
+  "desktop.browser.resize.southwest": "Resize from bottom-left corner",
+  "desktop.browser.resize.southeast": "Resize from bottom-right corner",
 }

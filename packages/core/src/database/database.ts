@@ -9,35 +9,59 @@ import { isAbsolute, join } from "path"
 import { DatabaseMigration } from "./migration"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
+import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 type DatabaseShape = Effect.Success<typeof makeDatabase>
 
 export interface Interface {
   db: DatabaseShape
+  filename: string
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/storage/Database") {}
 
-const layer = Layer.effect(
-  Service,
-  Effect.gen(function* () {
-    const db = yield* makeDatabase
+const layer = (filename: string) =>
+  Layer.effect(
+    Service,
+    Effect.gen(function* () {
+      const db = yield* makeDatabase
 
+      yield* db.run("PRAGMA journal_mode = WAL")
+      yield* db.run("PRAGMA synchronous = NORMAL")
+      yield* db.run("PRAGMA busy_timeout = 5000")
+      yield* db.run("PRAGMA cache_size = -64000")
+      yield* db.run("PRAGMA foreign_keys = ON")
+      yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
+      yield* DatabaseMigration.apply(db)
+
+      return { db, filename }
+    }).pipe(Effect.orDie),
+  )
+
+export function layerFromPath(filename: string) {
+  return layer(filename).pipe(Layer.provide(sqliteLayer({ filename })))
+}
+
+// Runs `body` with a dedicated second SQLite connection to the same database
+// file, built through the same sqlite layer factory: its own native connection
+// and its own single-permit semaphore, completely separate from the shared
+// client that serializes live queries — so a long-running maintenance pass can
+// never starve them. Same PRAGMAs as the primary connection; migrations are
+// skipped (already applied by the Database layer). The connection stays open
+// for the whole `body` and is closed when the effect completes.
+export function withBackfillDb<A, E, R>(
+  filename: string,
+  body: (db: DatabaseShape) => Effect.Effect<A, E, R>,
+): Effect.Effect<A, EffectDrizzleQueryError | E, R> {
+  return Effect.gen(function* () {
+    const db = yield* makeDatabase
     yield* db.run("PRAGMA journal_mode = WAL")
     yield* db.run("PRAGMA synchronous = NORMAL")
     yield* db.run("PRAGMA busy_timeout = 5000")
-    yield* db.run("PRAGMA cache_size = -64000")
     yield* db.run("PRAGMA foreign_keys = ON")
-    yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
-    yield* DatabaseMigration.apply(db)
-
-    return { db }
-  }).pipe(Effect.orDie),
-)
-
-export function layerFromPath(filename: string) {
-  return layer.pipe(Layer.provide(sqliteLayer({ filename })))
+    return yield* body(db)
+  }).pipe(Effect.provide(sqliteLayer({ filename })))
 }
 
 export function path() {

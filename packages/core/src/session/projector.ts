@@ -14,6 +14,8 @@ import { SessionInput } from "./input"
 import { WorkspaceV2 } from "../workspace"
 import { SessionContextEpoch } from "./context-epoch"
 import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
+import { SessionSearch } from "./search"
+import { searchText, partSearchText } from "./search-text"
 import type { DeepMutable } from "../schema"
 
 type DatabaseService = Database.Interface["db"]
@@ -119,7 +121,7 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
       const { id, type, ...data } = encoded
       return db
         .update(SessionMessageTable)
-        .set({ type, time_created: DateTime.toEpochMillis(message.time.created), data })
+        .set({ type, time_created: DateTime.toEpochMillis(message.time.created), data, search_text: searchText(message) })
         .where(
           and(
             eq(SessionMessageTable.id, SessionMessage.ID.make(id)),
@@ -203,6 +205,7 @@ function insertMessage(db: DatabaseService, event: SessionEvent.Event, message: 
       seq: event.durable.seq,
       time_created: DateTime.toEpochMillis(message.time.created),
       data,
+      search_text: searchText(message),
     })
     .run()
     .pipe(Effect.orDie)
@@ -211,7 +214,14 @@ function insertMessage(db: DatabaseService, event: SessionEvent.Event, message: 
 const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const events = yield* EventV2.Service
-    const { db } = yield* Database.Service
+    const { db, filename } = yield* Database.Service
+    // The projector is the write boundary for V1 message/part tables, so it
+    // constructs in v1-only desktop deployments where the lazy SessionV2 layer
+    // (which forks the V2 search backfill) may never run. Fork the resumable
+    // V1 part backfill here so the index is populated for pre-existing rows.
+    // It runs on a dedicated connection (same file, its own semaphore) so it
+    // never holds the shared client permit that live queries wait on.
+    yield* SessionSearch.backfillPartsOnOwnConnection(filename).pipe(Effect.forkScoped, Effect.andThen(Effect.void))
     yield* events.project(SessionV1.Event.Created, (event) =>
       Effect.gen(function* () {
         const stored = yield* db
@@ -318,8 +328,18 @@ const layer = Layer.effectDiscard(
         const row = yield* db.select().from(PartTable).where(eq(PartTable.id, id)).get().pipe(Effect.orDie)
         yield* db
           .insert(PartTable)
-          .values({ id, message_id: messageID, session_id: sessionID, time_created: event.data.time, data })
-          .onConflictDoUpdate({ target: PartTable.id, set: { data } })
+          .values({
+            id,
+            message_id: messageID,
+            session_id: sessionID,
+            time_created: event.data.time,
+            data,
+            search_text: partSearchText(event.data.part),
+          })
+          .onConflictDoUpdate({
+            target: PartTable.id,
+            set: { data, search_text: partSearchText(event.data.part) },
+          })
           .run()
           .pipe(Effect.orDie)
         const previous = row && usage(row.data)

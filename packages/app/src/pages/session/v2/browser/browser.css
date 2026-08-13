@@ -1,0 +1,38 @@
+/* Browser panel + agent cursor chrome (v2 zinc tokens; tiny, local to the
+   renderer browser feature). The `status-ping` keyframe mirrors tailwind's
+   `ping` so the click burst matches the T3 spec exactly. */
+
+@keyframes browser-status-ping {
+  75%,
+  100% {
+    transform: scale(2.4);
+    opacity: 0;
+  }
+}
+
+.animate-status-ping {
+  animation: browser-status-ping 0.9s cubic-bezier(0, 0, 0.2, 1) infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-status-ping {
+    animation: none;
+  }
+}
+
+/* Subtle non-blocking loading strip at the top of the browser canvas. */
+@keyframes browser-loading-indeterminate {
+  0% {
+    transform: translateX(-100%);
+  }
+  50% {
+    transform: translateX(0%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+.browser-loading-indeterminate {
+  animation: browser-loading-indeterminate 1.2s ease-in-out infinite;
+}

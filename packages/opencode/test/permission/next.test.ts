@@ -5,6 +5,7 @@ import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Permission } from "../../src/permission"
+import { Plugin } from "../../src/plugin"
 import { InstanceBootstrap } from "../../src/project/bootstrap"
 import { InstanceStore } from "../../src/project/instance-store"
 import { TestInstance, tmpdirScoped } from "../fixture/fixture"
@@ -73,6 +74,39 @@ const list = () =>
     const permission = yield* Permission.Service
     return yield* permission.list()
   })
+
+// `permission.ask` plugin hook tests: a mock Plugin.Service that observes the
+// trigger and can override the ask decision (the hook's output contract).
+const pluginIt = (onAsk: (input: unknown, output: { status: "ask" | "deny" | "allow" }) => void) => {
+  const mock = Layer.succeed(
+    Plugin.Service,
+    Plugin.Service.of({
+      trigger: (name, input, output) =>
+        Effect.sync(() => {
+          if (name === "permission.ask") onAsk(input, output as { status: "ask" | "deny" | "allow" })
+          return output
+        }),
+      list: () => Effect.succeed([]),
+      init: () => Effect.void,
+    }),
+  )
+  return testEffect(Layer.provideMerge(env, mock))
+}
+
+const hookSeen: { input: Record<string, unknown> | undefined; status: "ask" | "deny" | "allow" | undefined } = {
+  input: undefined,
+  status: undefined,
+}
+const itHook = pluginIt((input, output) => {
+  hookSeen.input = input as Record<string, unknown>
+  hookSeen.status = output.status
+})
+const itDeny = pluginIt((_input, output) => {
+  output.status = "deny"
+})
+const itAllow = pluginIt((_input, output) => {
+  output.status = "allow"
+})
 
 // fromConfig tests
 
@@ -1169,6 +1203,80 @@ it.instance(
       const exit = yield* Fiber.await(fiber)
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(PermissionV1.RejectedError)
+    }),
+  { git: true },
+)
+
+// permission.ask plugin hook tests
+
+itHook.instance(
+  "ask - fires permission.ask plugin hook with legacy shape and keeps ask pending",
+  () =>
+    Effect.gen(function* () {
+      hookSeen.input = undefined
+      hookSeen.status = undefined
+      const fiber = yield* ask({
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: { cmd: "ls" },
+        always: ["ls"],
+        tool: { messageID: MessageID.make("msg_test"), callID: "call_test" },
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+
+      expect(yield* waitForPending(1)).toHaveLength(1)
+      expect(hookSeen).toMatchObject({
+        status: "ask",
+        input: {
+          type: "bash",
+          pattern: "ls",
+          sessionID: "session_test",
+          messageID: "msg_test",
+          callID: "call_test",
+        },
+      })
+
+      yield* rejectAll()
+      yield* Fiber.await(fiber)
+    }),
+  { git: true },
+)
+
+itDeny.instance(
+  "ask - plugin deny overrides the ask with RejectedError and creates no pending",
+  () =>
+    Effect.gen(function* () {
+      const err = yield* fail(
+        ask({
+          sessionID: SessionID.make("session_test"),
+          permission: "bash",
+          patterns: ["ls"],
+          metadata: {},
+          always: [],
+          ruleset: [],
+        }),
+      )
+      expect(err).toBeInstanceOf(PermissionV1.RejectedError)
+      expect(yield* list()).toHaveLength(0)
+    }),
+  { git: true },
+)
+
+itAllow.instance(
+  "ask - plugin allow overrides the ask and resolves immediately",
+  () =>
+    Effect.gen(function* () {
+      const result = yield* ask({
+        sessionID: SessionID.make("session_test"),
+        permission: "bash",
+        patterns: ["ls"],
+        metadata: {},
+        always: [],
+        ruleset: [],
+      })
+      expect(result).toBeUndefined()
+      expect(yield* list()).toHaveLength(0)
     }),
   { git: true },
 )

@@ -2,10 +2,11 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ConfigPermissionV1 } from "@opencode-ai/core/v1/config/permission"
 import { InstanceState } from "@/effect/instance-state"
 import { Wildcard } from "@opencode-ai/core/util/wildcard"
-import { Deferred, Effect, Layer, Context } from "effect"
+import { Deferred, Effect, Layer, Context, Option } from "effect"
 import os from "os"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { Plugin } from "@/plugin"
 
 export const Event = PermissionV1.Event
 
@@ -93,6 +94,11 @@ const layer = Layer.effect(
         always: request.always,
         tool: request.tool,
       }
+
+      const status = yield* askThroughPlugin(info)
+      if (status === "deny") return yield* new PermissionV1.RejectedError()
+      if (status === "allow") return
+
       yield* Effect.logInfo("asking", { id, permission: info.permission, patterns: info.patterns })
 
       const deferred = yield* Deferred.make<void, PermissionV1.RejectedError | PermissionV1.CorrectedError>()
@@ -221,3 +227,37 @@ export function visibleTools<T>(tools: Record<string, T>, ruleset: PermissionV1.
 export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
 
 export * as Permission from "."
+
+// Legacy `permission.ask` plugin hook surface: fires once per ask decision so
+// plugins can observe pending permission walls and override the outcome. The
+// hook input uses the legacy SDK `Permission` shape (id/type/pattern/…). It is
+// skipped when the plugin system is absent (headless/tests) and plugin errors
+// never fail the ask — the decision falls back to "ask".
+function askThroughPlugin(request: PermissionV1.Request): Effect.Effect<PermissionV1.Action> {
+  return Effect.gen(function* () {
+    const plugin = yield* Effect.serviceOption(Plugin.Service)
+    if (Option.isNone(plugin)) return "ask"
+    const decision = yield* plugin.value
+      .trigger(
+        "permission.ask",
+        {
+          id: request.id,
+          type: request.permission,
+          pattern: request.patterns.length === 1 ? request.patterns[0] : request.patterns,
+          sessionID: request.sessionID,
+          messageID: request.tool?.messageID ?? "",
+          callID: request.tool?.callID,
+          title: request.permission,
+          metadata: request.metadata ?? {},
+          time: { created: Date.now() },
+        },
+        { status: "ask" as const },
+      )
+      .pipe(
+        Effect.catch(() =>
+          Effect.logError("permission.ask hook failed").pipe(Effect.as({ status: "ask" as const })),
+        ),
+      )
+    return decision.status
+  })
+}

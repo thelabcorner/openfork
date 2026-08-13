@@ -103,12 +103,15 @@ const layer = Layer.effect(
           .pipe(Effect.mapError((error) => new ApplyChangesError({ message: error.message })))
       }
 
+      // Event-level location metadata carries the NEW root so location-routed
+      // consumers (instance SSE, plugin event hook) can observe re-roots;
+      // without it the moved event only survives on the unfiltered server SSE.
       yield* events.publish(SessionEvent.Moved, {
         sessionID: input.sessionID,
         location: Location.Ref.make({ directory }),
         subdirectory: RelativePath.make(path.relative(destination.directory, directory).replaceAll("\\", "/")),
         timestamp: yield* DateTime.now,
-      })
+      }, { location: Location.Ref.make({ directory }) })
 
       if (patch) {
         const repository = yield* git.repo.discover(current.location.directory)
