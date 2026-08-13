@@ -1,6 +1,7 @@
 import { Context, Effect, Layer } from "effect"
 import { Database } from "../database/database"
 import { compressText } from "./json-codec"
+import { sql } from "drizzle-orm"
 
 /**
  * Fork-owned cold-row sealer for the OpenCode ChunkDB prototype (t6 slice:
@@ -92,24 +93,24 @@ const layer = Layer.effect(
         for (const candidate of candidates) {
           const frame = compressText(candidate.data)
           if (typeof frame === "string") continue
-          yield* db
-            .run(
-              `BEGIN IMMEDIATE;
-               UPDATE event SET data = ? WHERE id = ?;
-               INSERT INTO ocdb_seal (table_name, row_id, raw_bytes, stored_bytes, time_sealed)
-               VALUES ('event', ?, ?, ?, ?)
-               ON CONFLICT (table_name, row_id) DO UPDATE SET
-                 raw_bytes = excluded.raw_bytes,
-                 stored_bytes = excluded.stored_bytes,
-                 time_sealed = excluded.time_sealed;
-               COMMIT;`,
-              [frame, candidate.id, candidate.id, candidate.data.length, frame.byteLength, Date.now()],
+          yield* db.transaction((tx) =>
+            Effect.gen(function* () {
+              yield* tx.run(sql`UPDATE event SET data = ${frame} WHERE id = ${candidate.id}`)
+              yield* tx.run(sql`
+                INSERT INTO ocdb_seal (table_name, row_id, raw_bytes, stored_bytes, time_sealed)
+                VALUES ('event', ${candidate.id}, ${candidate.data.length}, ${frame.byteLength}, ${Date.now()})
+                ON CONFLICT (table_name, row_id) DO UPDATE SET
+                  raw_bytes = excluded.raw_bytes,
+                  stored_bytes = excluded.stored_bytes,
+                  time_sealed = excluded.time_sealed
+              `)
+            }),
             )
             .pipe(Effect.orDie)
           sealed += 1
           bytes += candidate.data.length
         }
-        yield* Effect.yieldNow()
+        yield* Effect.yieldNow
         if (sealed >= MAX_ROWS_PER_PASS) break
       }
 
@@ -120,5 +121,5 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = Layer.effect(Service, layer)
+export const node = layer
 export const defaultLayer = layer

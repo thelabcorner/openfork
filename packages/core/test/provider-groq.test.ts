@@ -1,7 +1,7 @@
 import { createGroq } from "@ai-sdk/groq"
 import { expect, test } from "bun:test"
 
-test("Groq passes through unknown reasoning effort", async () => {
+test("Groq passes through supported reasoning effort", async () => {
   let body: Record<string, unknown> | undefined
   const mockFetch = Object.assign(
     async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -21,8 +21,8 @@ test("Groq passes through unknown reasoning effort", async () => {
 
   await model.doGenerate({
     prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
-    providerOptions: { groq: { reasoningEffort: "custom" } },
+    providerOptions: { groq: { reasoningEffort: "high" } },
   })
 
-  expect(body?.reasoning_effort).toBe("custom")
+  expect(body?.reasoning_effort).toBe("high")
 })

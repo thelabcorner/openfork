@@ -31,7 +31,7 @@ test("xAI Responses sends promptCacheKey as prompt_cache_key", async () => {
   expect(body?.prompt_cache_key).toBe("session-123")
 })
 
-test("xAI Responses passes through xhigh reasoning effort", async () => {
+test("xAI Responses passes through supported reasoning effort", async () => {
   let body: Record<string, unknown> | undefined
   const mockFetch = Object.assign(
     async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -52,13 +52,13 @@ test("xAI Responses passes through xhigh reasoning effort", async () => {
 
   await model.doGenerate({
     prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
-    providerOptions: { xai: { reasoningEffort: "xhigh" } },
+    providerOptions: { xai: { reasoningEffort: "high" } },
   })
 
-  expect(body?.reasoning).toEqual({ effort: "xhigh" })
+  expect(body?.reasoning).toEqual({ effort: "high" })
 })
 
-test("xAI Chat passes through xhigh reasoning effort", async () => {
+test("xAI Chat passes through supported reasoning effort", async () => {
   let body: Record<string, unknown> | undefined
   const mockFetch = Object.assign(
     async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -78,8 +78,8 @@ test("xAI Chat passes through xhigh reasoning effort", async () => {
 
   await model.doGenerate({
     prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
-    providerOptions: { xai: { reasoningEffort: "xhigh" } },
+    providerOptions: { xai: { reasoningEffort: "high" } },
   })
 
-  expect(body?.reasoning_effort).toBe("xhigh")
+  expect(body?.reasoning_effort).toBe("high")
 })

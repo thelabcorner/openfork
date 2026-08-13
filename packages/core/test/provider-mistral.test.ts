@@ -27,7 +27,7 @@ test("Mistral sends promptCacheKey as prompt_cache_key", async () => {
   expect(body?.prompt_cache_key).toBe("session-123")
 })
 
-test("Mistral passes through unknown reasoning effort", async () => {
+test("Mistral passes through supported reasoning effort", async () => {
   let body: Record<string, unknown> | undefined
   const mockFetch = Object.assign(
     async (_input: Parameters<typeof fetch>[0], init?: RequestInit) => {
@@ -47,10 +47,10 @@ test("Mistral passes through unknown reasoning effort", async () => {
 
   await model.doGenerate({
     prompt: [{ role: "user", content: [{ type: "text", text: "Hello" }] }],
-    providerOptions: { mistral: { reasoningEffort: "custom" } },
+    providerOptions: { mistral: { reasoningEffort: "high" } },
   })
 
-  expect(body?.reasoning_effort).toBe("custom")
+  expect(body?.reasoning_effort).toBe("high")
 })
 
 test("Mistral round-trips native reasoning in assistant history", async () => {
