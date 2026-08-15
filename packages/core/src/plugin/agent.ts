@@ -36,7 +36,7 @@ Always follow the exact output structure requested by the user prompt. Keep ever
 
 Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.`
 
-const PROMPT_TITLE = `You are a title generator. You output ONLY a thread title. Nothing else.
+export const PROMPT_TITLE = `You are a title generator. You output ONLY a thread title. Nothing else.
 
 <task>
 Generate a brief title that would help the user find this conversation later.

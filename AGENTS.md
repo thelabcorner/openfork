@@ -3,6 +3,7 @@
 - Keep runtime dependencies directed from Schema to Core and Protocol, then from Core and Protocol to Server. Client runtime code may depend on Schema and Protocol but never Core or Server; `sdk-next` composes Client, Core, and Server.
 - The default branch in this repo is `dev`.
 - Local `main` ref may not exist; use `dev` or `origin/dev` for diffs.
+- When debugging or verifying a change in the desktop app, tell the user to run `bun run dev` from `packages/desktop` (not the packaged `.exe`) — it launches Electron directly against current source with renderer hot-reload and a live main-process/console log stream, so bugs and fixes can actually be observed instead of guessed at from source reading alone. A packaged/installed build reflects whatever commit it was built from, not the working tree — testing against one silently reproduces stale behavior and can make already-fixed bugs look unfixed. Renderer-only changes hot-reload; changes under `packages/desktop/src/main` need the dev process fully killed and relaunched (a window reload is not enough).
 
 ## Branch Names
 
@@ -147,6 +148,14 @@ const table = sqliteTable("session", {
 ## Type Checking
 
 - Always run `bun typecheck` from package directories (e.g., `packages/opencode`), never `tsc` directly.
+
+## API Architecture
+
+- Treat the V1 legacy API as the production app surface unless a task explicitly says it is for V2. Desktop, app workflows, tab actions, settings flows, and user-facing session behavior should be designed and verified against the V1 HTTP API and its SDK shape first.
+- V2 APIs and `SessionV2` are beta/incomplete infrastructure. Use them only for code paths that are already V2-owned or for explicitly scoped V2 work. Do not migrate V1 product behavior onto V2 endpoints just because a V2 type or client exists.
+- When adding user-facing session features, prefer V1 route groups and handlers under `packages/opencode/src/server/routes/instance/httpapi`, V1 session services such as `SessionPrompt`/`Session`, and the legacy JavaScript SDK regeneration path. Keep V2 additions separate unless the feature requires both surfaces.
+- If a feature is exposed through the app or desktop today, verify the packaged desktop build against the same V1 endpoint the UI calls. Local Vite success is not enough when the EXE bundles generated clients and server code.
+- Keep naming clear in comments and docs: "V1" means the current legacy production API; "V2" means the newer beta session/core API. Avoid referring to shared UI components as V2 API behavior just because their component names include `V2`.
 
 ## V2 Session Core
 

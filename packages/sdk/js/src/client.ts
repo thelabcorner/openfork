@@ -51,7 +51,10 @@ export function createOpencodeClient(config?: Config & { directory?: string }) {
   }
 
   const client = createClient(config)
-  client.interceptors.request.use((request) => rewrite(request, config?.directory))
+  client.interceptors.request.use((request) => {
+    if (!request) throw new Error("OpenCode SDK request interceptor received no Request")
+    return rewrite(request, config?.directory)
+  })
   client.interceptors.error.use(wrapClientError)
   return new OpencodeClient({ client })
 }

@@ -48,9 +48,10 @@ export class AccountTransportError extends Schema.TaggedErrorClass<AccountTransp
   cause: Schema.optional(Schema.Defect()),
 }) {
   static fromHttpClientError(error: HttpClientError.TransportError): AccountTransportError {
+    const request = error.request as { method?: unknown; url?: unknown } | undefined
     return new AccountTransportError({
-      method: error.request.method,
-      url: error.request.url,
+      method: typeof request?.method === "string" ? request.method : "?",
+      url: typeof request?.url === "string" ? request.url : "?",
       description: error.description,
       cause: error.cause,
     })

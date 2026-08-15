@@ -1,5 +1,6 @@
 # Desktop package notes
 
+- `bun run dev` (from this directory) is the fast, high-signal way to debug the desktop app: it builds and launches the real Electron shell against current source, streams main-process console output (IPC errors, engine logs, uncaught exceptions) directly to the terminal, and hot-reloads renderer changes. Prefer this over reasoning about behavior from source alone, and over testing a packaged/installed build — a packaged build only reflects whatever was true when it was built, so it can make an already-fixed bug look unfixed for no reason related to the fix itself. Main-process changes (anything under `src/main`) require killing and relaunching the process, not just reloading the window.
 - Renderer process should only call `window.api` from `src/preload`.
 - Main process should register IPC handlers in `src/main/ipc.ts`.
 - NEVER hardcode user-visible English strings in production code. ALWAYS use an i18n key for native menus, picker titles, dialogs, buttons, accessible labels, and displayed errors.

@@ -75,12 +75,13 @@ export function createOpencodeClient(config?: Config & { directory?: string; exp
   }
 
   const client = createClient(config)
-  client.interceptors.request.use((request) =>
-    rewrite(request, {
+  client.interceptors.request.use((request) => {
+    if (!request) throw new Error("OpenCode SDK request interceptor received no Request")
+    return rewrite(request, {
       directory: config?.directory,
       workspace: config?.experimental_workspaceID,
-    }),
-  )
+    })
+  })
   client.interceptors.response.use((response) => {
     const contentType = response.headers.get("content-type")
     if (contentType === "text/html")
