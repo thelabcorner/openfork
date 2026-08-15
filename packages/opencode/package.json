@@ -1,6 +1,6 @@
 {
   "$schema": "https://json.schemastore.org/package.json",
-"version": "1.18.18",
+  "version": "1.18.18",
   "name": "opencode",
   "type": "module",
   "license": "MIT",
@@ -137,6 +137,7 @@
     "opentui-spinner": "catalog:",
     "partial-json": "0.1.7",
     "remeda": "catalog:",
+    "seek-bzip": "2.0.0",
     "semver": "^7.6.3",
     "solid-js": "catalog:",
     "strip-ansi": "7.1.2",

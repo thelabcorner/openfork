@@ -1,0 +1,11 @@
+Inspect, extract, read, and create compressed archives in one step, so you don't have to run tar/unzip/7z commands yourself.
+
+Supported formats: ZIP, tar, tar.gz/.tgz, tar.bz2, tar.zst, plain gzip/brotli/bzip2/zstd streams, and (via a system tool such as 7-Zip or tar) 7z, rar, and xz. Format is detected automatically from file contents, not just the extension.
+
+Actions:
+- "list": Show the archive's contents WITHOUT extracting anything. Use this first to see what is inside and its sizes. The "entries" filter narrows the listing, e.g. entries: ["src/**", "*.md"].
+- "read": Print one file inside the archive without extracting the rest, e.g. entry: "src/main.ts". Accepts a glob pattern; offset/limit page through long text entries. Binary entries are rejected.
+- "extract": Unpack the archive. The default destination is a folder named after the archive (foo.zip -> ./foo, src.tar.gz -> ./src), or pass "destination". Existing files are skipped unless overwrite: true. "entries" extracts only matching paths. Path-traversal and absolute-path entries are blocked, and symlinks are never created, for safety.
+- "create": Build a new archive from "source" files/directories. The format is inferred from the "path" extension (.zip, .tar, .tar.gz, .gz, .br, .zst, .tar.zst, .7z). Directories are stored under their own name.
+
+Prefer this tool over shelling out to tar/unzip/7z: listing reads only the archive index (fast on huge archives), extraction is zip-slip safe with per-file size caps, and individual files can be read without extracting anything.
