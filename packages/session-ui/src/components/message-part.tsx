@@ -12,6 +12,7 @@ import {
   Index,
   type JSX,
   type ComponentProps,
+  type ValidComponent,
 } from "solid-js"
 import { createStore } from "solid-js/store"
 import stripAnsi from "strip-ansi"
@@ -65,6 +66,7 @@ import { partDefaultOpen } from "./part-default-open"
 import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
+import { SmartToolOutput } from "./tool-output"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 
 async function writeClipboard(text: string): Promise<boolean> {
@@ -852,6 +854,7 @@ function contextToolTrigger(part: ToolPart, i18n: ReturnType<typeof useI18n>) {
   const include = typeof input.include === "string" ? input.include : undefined
   const offset = typeof input.offset === "number" ? input.offset : undefined
   const limit = typeof input.limit === "number" ? input.limit : undefined
+  const icon = getToolInfo(part.tool, input, "metadata" in part.state ? part.state.metadata : undefined).icon
 
   switch (part.tool) {
     case "read": {
@@ -859,6 +862,7 @@ function contextToolTrigger(part: ToolPart, i18n: ReturnType<typeof useI18n>) {
       if (offset !== undefined) args.push("offset=" + offset)
       if (limit !== undefined) args.push("limit=" + limit)
       return {
+        icon,
         title: i18n.t("ui.tool.read"),
         subtitle: filePath ? getFilename(filePath) : "",
         args,
@@ -866,11 +870,13 @@ function contextToolTrigger(part: ToolPart, i18n: ReturnType<typeof useI18n>) {
     }
     case "list":
       return {
+        icon,
         title: i18n.t("ui.tool.list"),
         subtitle: getDirectory(path),
       }
     case "glob":
       return {
+        icon,
         title: i18n.t("ui.tool.glob"),
         subtitle: getDirectory(path),
         args: pattern ? ["pattern=" + pattern] : [],
@@ -880,6 +886,7 @@ function contextToolTrigger(part: ToolPart, i18n: ReturnType<typeof useI18n>) {
       if (pattern) args.push("pattern=" + pattern)
       if (include) args.push("include=" + include)
       return {
+        icon,
         title: i18n.t("ui.tool.grep"),
         subtitle: getDirectory(path),
         args,
@@ -888,6 +895,7 @@ function contextToolTrigger(part: ToolPart, i18n: ReturnType<typeof useI18n>) {
     default: {
       const info = getToolInfo(part.tool, input, "metadata" in part.state ? part.state.metadata : undefined)
       return {
+        icon,
         title: info.title,
         subtitle: info.subtitle || contextToolDetail(part),
         args: [],
@@ -1049,12 +1057,14 @@ export function ContextToolGroup(props: {
 }) {
   const i18n = useI18n()
   const [localOpen, setLocalOpen] = createSignal(false)
+  const [itemsOpen, setItemsOpen] = createStore<Record<string, boolean>>({})
   const open = () => props.open ?? localOpen()
   const pending = createMemo(
     () =>
       !!props.busy || props.parts.some((part) => part.state.status === "pending" || part.state.status === "running"),
   )
   const summary = createMemo(() => contextToolSummary(props.parts))
+  const fileComponent = useFileComponent()
   const handleOpenChange = (value: boolean) => {
     if (props.open === undefined) setLocalOpen(value)
     props.onOpenChange?.(value)
@@ -1071,6 +1081,9 @@ export function ContextToolGroup(props: {
     >
       <Collapsible.Trigger>
         <div data-component="context-tool-group-trigger">
+          <span data-slot="basic-tool-tool-icon" data-status={pending() ? "running" : undefined}>
+            <Icon name="magnifying-glass-menu" size="small" style={{ "stroke-width": 1.5 }} />
+          </span>
           <span
             data-slot="context-tool-group-title"
             class="min-w-0 flex items-center gap-2 text-14-medium text-text-strong"
@@ -1117,10 +1130,40 @@ export function ContextToolGroup(props: {
               const running = createMemo(
                 () => partAccessor().state.status === "pending" || partAccessor().state.status === "running",
               )
+              const output = createMemo(() => {
+                const part = partAccessor()
+                if (part.state.status !== "completed") return undefined
+                const value = (part.state as { output?: string }).output
+                return typeof value === "string" && value.trim() ? value : undefined
+              })
+              const itemOpen = () => itemsOpen[partAccessor().id] ?? false
+              const toggle = () => {
+                if (!output()) return
+                setItemsOpen(partAccessor().id, (value) => !value)
+              }
               return (
                 <div data-slot="context-tool-group-item">
-                  <div data-component="tool-trigger">
+                  <div
+                    data-component="tool-trigger"
+                    data-status={partAccessor().state.status}
+                    data-clickable={output() ? "true" : undefined}
+                    role={output() ? "button" : undefined}
+                    tabIndex={output() ? 0 : undefined}
+                    aria-expanded={output() ? itemOpen() : undefined}
+                    onClick={toggle}
+                    onKeyDown={(event) => {
+                      if (!output()) return
+                      if (event.key !== "Enter" && event.key !== " ") return
+                      event.preventDefault()
+                      toggle()
+                    }}
+                  >
                     <div data-slot="basic-tool-tool-trigger-content">
+                      <Show when={trigger().icon}>
+                        <span data-slot="basic-tool-tool-icon" data-status={partAccessor().state.status}>
+                          <Icon name={trigger().icon!} size="small" style={{ "stroke-width": 1.5 }} />
+                        </span>
+                      </Show>
                       <div data-slot="basic-tool-tool-info">
                         <div data-slot="basic-tool-tool-info-structured">
                           <div data-slot="basic-tool-tool-info-main">
@@ -1139,7 +1182,15 @@ export function ContextToolGroup(props: {
                         </div>
                       </div>
                     </div>
+                    <Show when={output()}>
+                      <span data-slot="context-tool-group-item-chevron" data-expanded={itemOpen() ? "" : undefined}>
+                        <Icon name="chevron-down" size="small" />
+                      </span>
+                    </Show>
                   </div>
+                  <Show when={output() && itemOpen()}>
+                    {contextItemBody(partAccessor(), output()!, fileComponent)}
+                  </Show>
                 </div>
               )
             }}
@@ -1148,6 +1199,45 @@ export function ContextToolGroup(props: {
       </Collapsible.Content>
     </Collapsible>
   )
+}
+
+function contextItemBody(part: ToolPart, output: string, fileComponent: ValidComponent) {
+  const input = (part.state.input ?? {}) as Record<string, unknown>
+  const metadata = ("metadata" in part.state ? part.state.metadata : undefined) as Record<string, unknown> | undefined
+
+  if (part.tool === "read") {
+    const display = metadata?.display as ReadDisplay | undefined
+    if (display?.type === "file") {
+      return (
+        <div data-component="read-content">
+          <Dynamic
+            component={fileComponent}
+            mode="text"
+            file={{
+              name: display.path,
+              contents: display.text,
+              cacheKey: checksum(display.text),
+            }}
+            overflow="scroll"
+          />
+        </div>
+      )
+    }
+    if (display?.type === "directory") return <DirectoryOutput entries={display.entries} />
+    return <SmartToolOutput output={output} />
+  }
+
+  if (part.tool === "grep") {
+    const parsed = parseGrepOutput(output)
+    if (parsed) return <GrepResults result={parsed} pattern={typeof input.pattern === "string" ? input.pattern : undefined} />
+    return <SmartToolOutput output={output} />
+  }
+
+  if (part.tool === "glob") {
+    return <GlobResults result={parseGlobOutput(output)} />
+  }
+
+  return <SmartToolOutput output={output} />
 }
 
 function UserMessageComments(props: { comments: UserMessageComment[]; bounded: boolean }) {
@@ -1773,11 +1863,182 @@ PART_MAPPING["reasoning"] = function ReasoningPartDisplay(props) {
   )
 }
 
+type ReadDisplay =
+  | {
+      type: "file"
+      path: string
+      text: string
+      lineStart: number
+      lineEnd: number
+      totalLines: number
+      truncated: boolean
+    }
+  | {
+      type: "directory"
+      path: string
+      entries: string[]
+      offset: number
+      totalEntries: number
+      truncated: boolean
+    }
+
+function DirectoryOutput(props: { entries: string[] }) {
+  return (
+    <div data-component="directory-output" data-scrollable tabIndex={0} role="region">
+      <For each={props.entries}>
+        {(entry) => {
+          const isDir = entry.endsWith("/")
+          const name = isDir ? entry.slice(0, -1) : entry
+          return (
+            <div data-slot="directory-entry">
+              <FileIcon node={{ path: name, type: isDir ? "directory" : "file" }} />
+              <span data-slot="directory-entry-name">{entry}</span>
+            </div>
+          )
+        }}
+      </For>
+    </div>
+  )
+}
+
+type GrepFileGroup = { path: string; matches: { line: number; text: string }[] }
+type GrepResult = { total: number; truncated: boolean; files: GrepFileGroup[] }
+
+function parseGrepOutput(output: string): GrepResult | undefined {
+  const lines = output.split("\n")
+  if (lines[0]?.trim() === "No files found") return { total: 0, truncated: false, files: [] }
+  const header = /^Found (\d+) matches/.exec(lines[0] ?? "")
+  if (!header) return undefined
+  const files: GrepFileGroup[] = []
+  let current: GrepFileGroup | undefined
+  for (const line of lines.slice(1)) {
+    if (!line || line.startsWith("(Results truncated")) continue
+    const lineMatch = /^ {2}Line (\d+): (.*)$/.exec(line)
+    if (lineMatch && current) {
+      current.matches.push({ line: Number(lineMatch[1]), text: lineMatch[2] ?? "" })
+      continue
+    }
+    const fileMatch = /^(.+):$/.exec(line)
+    if (fileMatch) {
+      current = { path: fileMatch[1]!, matches: [] }
+      files.push(current)
+    }
+  }
+  return { total: Number(header[1]), truncated: lines[0]!.includes("more matches available"), files }
+}
+
+function GrepMatchText(props: { text: string; term?: string }) {
+  const parts = createMemo(() => {
+    const term = props.term
+    if (!term) return [{ text: props.text, match: false }]
+    let re: RegExp
+    try {
+      re = new RegExp(`(${term})`, "gi")
+    } catch {
+      return [{ text: props.text, match: false }]
+    }
+    return props.text.split(re).map((chunk, i) => ({ text: chunk, match: i % 2 === 1 }))
+  })
+  return (
+    <For each={parts()}>{(part) => (part.match ? <mark data-slot="grep-match-mark">{part.text}</mark> : part.text)}</For>
+  )
+}
+
+function GrepResults(props: { result: GrepResult; pattern?: string }) {
+  const i18n = useI18n()
+  return (
+    <div
+      data-component="grep-results"
+      data-scrollable
+      tabIndex={0}
+      role="region"
+      aria-label={i18n.t("ui.scrollView.ariaLabel")}
+    >
+      <Show when={props.result.files.length === 0}>
+        <div data-slot="grep-empty">{i18n.t("ui.tool.grep.noMatches")}</div>
+      </Show>
+      <For each={props.result.files}>
+        {(group) => (
+          <div data-slot="grep-file-group">
+            <div data-slot="grep-file-header">
+              <FileIcon node={{ path: group.path, type: "file" }} />
+              <span data-slot="grep-file-name">{getFilename(group.path)}</span>
+              <span data-slot="grep-file-dir">{getDirectory(group.path)}</span>
+              <span data-slot="grep-match-count">{group.matches.length}</span>
+            </div>
+            <For each={group.matches}>
+              {(match) => (
+                <div data-slot="grep-match-row">
+                  <span data-slot="grep-match-line">{match.line}</span>
+                  <code data-slot="grep-match-text">
+                    <GrepMatchText text={match.text} term={props.pattern} />
+                  </code>
+                </div>
+              )}
+            </For>
+          </div>
+        )}
+      </For>
+      <Show when={props.result.truncated}>
+        <div data-slot="grep-truncated">{i18n.t("ui.tool.grep.truncated")}</div>
+      </Show>
+    </div>
+  )
+}
+
+type GlobResult = { files: string[]; truncated: boolean }
+
+function parseGlobOutput(output: string): GlobResult {
+  const lines = output.split("\n")
+  if (lines[0]?.trim() === "No files found") return { files: [], truncated: false }
+  const files: string[] = []
+  let truncated = false
+  for (const line of lines) {
+    if (!line) continue
+    if (line.startsWith("(Results are truncated")) {
+      truncated = true
+      continue
+    }
+    files.push(line)
+  }
+  return { files, truncated }
+}
+
+function GlobResults(props: { result: GlobResult }) {
+  const i18n = useI18n()
+  return (
+    <div
+      data-component="glob-results"
+      data-scrollable
+      tabIndex={0}
+      role="region"
+      aria-label={i18n.t("ui.scrollView.ariaLabel")}
+    >
+      <Show when={props.result.files.length === 0}>
+        <div data-slot="glob-empty">{i18n.t("ui.tool.glob.noMatches")}</div>
+      </Show>
+      <For each={props.result.files}>
+        {(file) => (
+          <div data-slot="glob-file-row">
+            <FileIcon node={{ path: file, type: "file" }} />
+            <span data-slot="glob-file-name">{getFilename(file)}</span>
+            <span data-slot="glob-file-dir">{getDirectory(file)}</span>
+          </div>
+        )}
+      </For>
+      <Show when={props.result.truncated}>
+        <div data-slot="glob-truncated">{i18n.t("ui.tool.glob.truncated")}</div>
+      </Show>
+    </div>
+  )
+}
+
 ToolRegistry.register({
   name: "read",
   render(props) {
     const data = useData()
     const i18n = useI18n()
+    const fileComponent = useFileComponent()
     const args: string[] = []
     if (props.input.offset) args.push("offset=" + props.input.offset)
     if (props.input.limit) args.push("limit=" + props.input.limit)
@@ -1787,6 +2048,7 @@ ToolRegistry.register({
       if (!value || !Array.isArray(value)) return []
       return value.filter((p): p is string => typeof p === "string")
     })
+    const display = createMemo(() => props.metadata.display as ReadDisplay | undefined)
     return (
       <>
         <BasicTool
@@ -1797,7 +2059,38 @@ ToolRegistry.register({
             subtitle: props.input.filePath ? getFilename(props.input.filePath) : "",
             args,
           }}
-        />
+        >
+          <Show
+            when={display()?.type === "file" && display()}
+            fallback={
+              <Show
+                when={display()?.type === "directory" && display()}
+                fallback={<SmartToolOutput output={props.output} />}
+              >
+                {(dir) => <DirectoryOutput entries={(dir() as ReadDisplay & { type: "directory" }).entries} />}
+              </Show>
+            }
+          >
+            {(file) => {
+              const info = () => file() as ReadDisplay & { type: "file" }
+              return (
+                <div data-component="read-content">
+                  <Dynamic
+                    component={fileComponent}
+                    mode="text"
+                    file={{
+                      name: info().path,
+                      contents: info().text,
+                      cacheKey: checksum(info().text),
+                    }}
+                    overflow="scroll"
+                    onRendered={props.onContentRendered}
+                  />
+                </div>
+              )
+            }}
+          </Show>
+        </BasicTool>
         <For each={loaded()}>
           {(filepath) => (
             <div data-component="tool-loaded-file">
@@ -1823,17 +2116,7 @@ ToolRegistry.register({
         icon="bullet-list"
         trigger={{ title: i18n.t("ui.tool.list"), subtitle: getDirectory(props.input.path || "/") }}
       >
-        <Show when={props.output}>
-          <div
-            data-component="tool-output"
-            data-scrollable
-            tabIndex={0}
-            role="region"
-            aria-label={i18n.t("ui.scrollView.ariaLabel")}
-          >
-            <Markdown text={props.output!} />
-          </div>
-        </Show>
+        <SmartToolOutput output={props.output} />
       </BasicTool>
     )
   },
@@ -1843,6 +2126,7 @@ ToolRegistry.register({
   name: "glob",
   render(props) {
     const i18n = useI18n()
+    const parsed = createMemo(() => (props.output ? parseGlobOutput(props.output) : undefined))
     return (
       <BasicTool
         {...props}
@@ -1853,16 +2137,8 @@ ToolRegistry.register({
           args: props.input.pattern ? ["pattern=" + props.input.pattern] : [],
         }}
       >
-        <Show when={props.output}>
-          <div
-            data-component="tool-output"
-            data-scrollable
-            tabIndex={0}
-            role="region"
-            aria-label={i18n.t("ui.scrollView.ariaLabel")}
-          >
-            <Markdown text={props.output!} />
-          </div>
+        <Show when={parsed()} fallback={<SmartToolOutput output={props.output} />}>
+          {(result) => <GlobResults result={result()} />}
         </Show>
       </BasicTool>
     )
@@ -1876,6 +2152,7 @@ ToolRegistry.register({
     const args: string[] = []
     if (props.input.pattern) args.push("pattern=" + props.input.pattern)
     if (props.input.include) args.push("include=" + props.input.include)
+    const parsed = createMemo(() => (props.output ? parseGrepOutput(props.output) : undefined))
     return (
       <BasicTool
         {...props}
@@ -1886,16 +2163,8 @@ ToolRegistry.register({
           args,
         }}
       >
-        <Show when={props.output}>
-          <div
-            data-component="tool-output"
-            data-scrollable
-            tabIndex={0}
-            role="region"
-            aria-label={i18n.t("ui.scrollView.ariaLabel")}
-          >
-            <Markdown text={props.output!} />
-          </div>
+        <Show when={parsed()} fallback={<SmartToolOutput output={props.output} />}>
+          {(result) => <GrepResults result={result()} pattern={props.input.pattern} />}
         </Show>
       </BasicTool>
     )
@@ -2088,11 +2357,9 @@ ToolRegistry.register({
     const i18n = useI18n()
     const pending = () => props.status === "pending" || props.status === "running"
     const sawPending = pending()
-    const text = createMemo(() => {
-      const cmd = props.input.command ?? props.metadata.command ?? ""
-      const out = stripAnsi(props.output || props.metadata.output || "").replace(/\r\n?/g, "\n")
-      return `$ ${cmd}${out ? "\n\n" + out : ""}`
-    })
+    const command = createMemo(() => props.input.command ?? props.metadata.command ?? "")
+    const output = createMemo(() => stripAnsi(props.output || props.metadata.output || "").replace(/\r\n?/g, "\n"))
+    const text = createMemo(() => `$ ${command()}${output() ? "\n\n" + output() : ""}`)
     const [copied, setCopied] = createSignal(false)
 
     const handleCopy = async () => {
@@ -2135,17 +2402,29 @@ ToolRegistry.register({
               />
             </TooltipV2>
           </div>
-          <div
-            data-slot="bash-scroll"
-            data-scrollable
-            tabIndex={0}
-            role="region"
-            aria-label={i18n.t("ui.scrollView.ariaLabel")}
-          >
-            <pre data-slot="bash-pre">
-              <code>{text()}</code>
-            </pre>
-          </div>
+          <Show when={command()}>
+            <div data-slot="bash-command">
+              <span data-slot="bash-prompt" aria-hidden="true">
+                $
+              </span>
+              <div data-slot="bash-command-code">
+                <Markdown text={"```bash\n" + command() + "\n```"} />
+              </div>
+            </div>
+          </Show>
+          <Show when={output()}>
+            <div
+              data-slot="bash-scroll"
+              data-scrollable
+              tabIndex={0}
+              role="region"
+              aria-label={i18n.t("ui.scrollView.ariaLabel")}
+            >
+              <pre data-slot="bash-pre">
+                <code>{output()}</code>
+              </pre>
+            </div>
+          </Show>
         </div>
       </BasicTool>
     )
@@ -2637,6 +2916,10 @@ ToolRegistry.register({
       </div>
     )
 
-    return <BasicTool icon="brain" status={props.status} trigger={trigger()} hideDetails />
+    return (
+      <BasicTool {...props} icon="brain" status={props.status} trigger={trigger()}>
+        <SmartToolOutput output={props.output} />
+      </BasicTool>
+    )
   },
 })

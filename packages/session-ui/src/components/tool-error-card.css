@@ -1,6 +1,52 @@
 [data-component="card"][data-kind="tool-error-card"] {
-  --card-pad-y: 8px;
+  --card-pad-y: 7px;
+  --card-pad-r: 10px;
+  --card-pad-l: 8px;
   --card-line-pad: 12px;
+
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+
+  &:hover,
+  &:focus-within {
+    background: var(--background-stronger);
+    border-color: var(--border-weak-base, rgba(255, 255, 255, 0.08));
+  }
+
+  /* the outer card matches the neutral tool-trigger chrome; reset the inner
+     trigger row so it doesn't double up on basic-tool.css's card chrome */
+  [data-component="tool-trigger"] {
+    padding: 0;
+    border-radius: 0;
+    border-color: transparent;
+    background: transparent;
+
+    &:hover {
+      background: transparent;
+      border-color: transparent;
+    }
+  }
+
+  &::before {
+    display: none;
+  }
+
+  [data-slot="basic-tool-tool-indicator"][data-component="tool-error-card-icon"] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    width: 22px;
+    height: 22px;
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--card-accent) 32%, transparent);
+    background: color-mix(in srgb, var(--card-accent) 12%, transparent);
+    color: var(--card-accent);
+  }
 
   [data-slot="basic-tool-tool-title"] {
     color: var(--v2-text-text-base);
@@ -29,38 +75,57 @@
 
   [data-slot="tool-error-card-content"] {
     position: relative;
-    padding-left: 24px;
-    margin-bottom: 8px;
+    padding-left: 30px;
+    margin-bottom: 2px;
+  }
+
+  [data-slot="tool-error-card-panel"] {
+    position: relative;
+    box-sizing: border-box;
+    border: 0.5px solid var(--v2-border-border-base);
+    border-radius: 6px;
+    background: var(--background-stronger, color-mix(in srgb, currentColor 3%, transparent));
+    box-shadow: 0 1px 2px color-mix(in srgb, var(--v2-alpha-dark-100, #000) 4%, transparent);
+    overflow: hidden;
     -webkit-user-select: text;
     user-select: text;
   }
 
-  > [data-component="collapsible"].tool-collapsible[data-open="true"] [data-slot="tool-error-card-content"] {
-    padding-right: 40px;
+  [data-slot="tool-error-card-panel-text"] {
+    display: block;
+    max-height: 260px;
+    margin: 0;
+    padding: 10px 34px 10px 12px;
+    overflow: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: var(--font-mono, ui-monospace, "SF Mono", Menlo, monospace);
+    font-size: 12px;
+    line-height: 1.55;
+    letter-spacing: -0.01px;
+    color: var(--v2-text-text-base);
   }
 
-  [data-slot="tool-error-card-copy"] {
+  [data-slot="tool-error-card-panel-copy"] {
     position: absolute;
-    top: 0;
-    right: 0;
-    opacity: 0;
-    pointer-events: none;
+    top: 6px;
+    right: 6px;
+    z-index: 1;
+    opacity: 0.7;
     transition: opacity 0.15s ease;
-    will-change: opacity;
   }
 
-  &:hover [data-slot="tool-error-card-copy"],
-  &:focus-within [data-slot="tool-error-card-copy"] {
+  [data-slot="tool-error-card-panel"]:hover [data-slot="tool-error-card-panel-copy"],
+  [data-slot="tool-error-card-panel-copy"]:focus-within {
     opacity: 1;
-    pointer-events: auto;
   }
 
-  [data-slot="tool-error-card-content"] :where(*)::selection {
+  [data-slot="tool-error-card-panel-text"] ::selection {
     background: var(--v2-state-bg-danger);
     color: var(--v2-text-text-base);
   }
 
-  [data-slot="tool-error-card-content"] :where(*)::-moz-selection {
+  [data-slot="tool-error-card-panel-text"] ::-moz-selection {
     background: var(--v2-state-bg-danger);
     color: var(--v2-text-text-base);
   }

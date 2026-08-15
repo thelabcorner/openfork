@@ -1,6 +1,6 @@
 import { type ComponentProps, createMemo, Show, splitProps } from "solid-js"
 import { createStore } from "solid-js/store"
-import { Card, CardDescription } from "@opencode-ai/ui/card"
+import { Card } from "@opencode-ai/ui/card"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
 import { Icon } from "@opencode-ai/ui/icon"
 import { IconButton } from "@opencode-ai/ui/icon-button"
@@ -101,7 +101,7 @@ export function ToolErrorCard(props: ToolErrorCardProps) {
           <div data-component="tool-trigger">
             <div data-slot="basic-tool-tool-trigger-content">
               <span data-slot="basic-tool-tool-indicator" data-component="tool-error-card-icon">
-                <Icon name="circle-ban-sign" size="small" style={{ "stroke-width": 1.5 }} />
+                <Icon name="close-small" size="small" style={{ "stroke-width": 1.5 }} />
               </span>
               <div data-slot="basic-tool-tool-info">
                 <div data-slot="basic-tool-tool-info-structured">
@@ -132,28 +132,34 @@ export function ToolErrorCard(props: ToolErrorCardProps) {
         </Collapsible.Trigger>
         <Collapsible.Content>
           <div data-slot="tool-error-card-content">
-            <Show when={open()}>
-              <div data-slot="tool-error-card-copy">
-                <Tooltip
-                  value={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.toolErrorCard.copyError")}
-                  placement="top"
-                  gutter={4}
-                >
-                  <IconButton
-                    icon={copied() ? "check" : "copy"}
-                    size="normal"
-                    variant="ghost"
-                    onMouseDown={(e) => e.preventDefault()}
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      void copy()
-                    }}
-                    aria-label={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.toolErrorCard.copyError")}
-                  />
-                </Tooltip>
-              </div>
+            <Show when={body()}>
+              {(value) => (
+                <div data-slot="tool-error-card-panel">
+                  <div data-slot="tool-error-card-panel-copy">
+                    <Tooltip
+                      value={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.toolErrorCard.copyError")}
+                      placement="top"
+                      gutter={4}
+                    >
+                      <IconButton
+                        icon={copied() ? "check" : "copy"}
+                        size="small"
+                        variant="ghost"
+                        onMouseDown={(e) => e.preventDefault()}
+                        onClick={(e) => {
+                          e.stopPropagation()
+                          void copy()
+                        }}
+                        aria-label={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.toolErrorCard.copyError")}
+                      />
+                    </Tooltip>
+                  </div>
+                  <pre data-slot="tool-error-card-panel-text">
+                    <code>{value()}</code>
+                  </pre>
+                </div>
+              )}
             </Show>
-            <Show when={body()}>{(value) => <CardDescription>{value()}</CardDescription>}</Show>
           </div>
         </Collapsible.Content>
       </Collapsible>

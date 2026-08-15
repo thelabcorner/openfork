@@ -13,10 +13,21 @@
   align-items: stretch;
   min-width: 0;
   width: 100%;
-  padding: 0 0 0 10px;
+  padding: 6px 8px;
   gap: 8px;
-  border-left: 2px solid var(--tec-border);
+  border: 0.5px solid color-mix(in srgb, var(--tec-border) 35%, transparent);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--tec-border) 6%, transparent);
   font-variant-numeric: tabular-nums;
+  transition:
+    border-color 0.15s ease,
+    background-color 0.15s ease;
+
+  &:hover,
+  &:focus-within {
+    border-color: color-mix(in srgb, var(--tec-border) 55%, transparent);
+    background: color-mix(in srgb, var(--tec-border) 9%, transparent);
+  }
 
   [data-slot="tool-error-card-trigger"] {
     box-sizing: border-box;
@@ -46,10 +57,13 @@
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    width: 16px;
-    height: 20px;
+    width: 22px;
+    height: 22px;
     box-sizing: border-box;
-    color: var(--tec-icon);
+    border-radius: 6px;
+    border: 1px solid color-mix(in srgb, var(--tec-border) 32%, transparent);
+    background: color-mix(in srgb, var(--tec-border) 12%, transparent);
+    color: var(--tec-border);
   }
 
   [data-slot="tool-error-card-ban"] {

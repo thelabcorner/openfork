@@ -1,10 +1,23 @@
-import { createEffect, For, Match, on, onCleanup, onMount, Show, Switch, type Accessor, type JSX } from "solid-js"
+import {
+  createEffect,
+  createMemo,
+  For,
+  Match,
+  on,
+  onCleanup,
+  onMount,
+  Show,
+  Switch,
+  type Accessor,
+  type JSX,
+} from "solid-js"
 import { animate, type AnimationPlaybackControls } from "motion"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
 import { createStore } from "solid-js/store"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
-import type { IconProps } from "@opencode-ai/ui/icon"
+import { Icon, type IconProps } from "@opencode-ai/ui/icon"
 import { TextShimmer } from "@opencode-ai/ui/text-shimmer"
+import { CodeView, SmartToolOutput, ToolSection } from "./tool-output"
 
 export type TriggerTitle = {
   title: string
@@ -187,8 +200,14 @@ export function BasicTool(props: BasicToolProps) {
       data-component="tool-trigger"
       data-clickable={props.clickable ? "true" : undefined}
       data-hide-details={props.hideDetails ? "true" : undefined}
+      data-status={props.status}
     >
       <div data-slot="basic-tool-tool-trigger-content">
+        <Show when={props.icon}>
+          <span data-slot="basic-tool-tool-icon" data-status={props.status}>
+            <Icon name={props.icon} size="small" style={{ "stroke-width": 1.5 }} />
+          </span>
+        </Show>
         <div data-slot="basic-tool-tool-info">
           <Switch>
             <Match when={dynamicTrigger !== undefined}>{dynamicTrigger}</Match>
@@ -325,12 +344,17 @@ export function GenericTool(props: {
   status?: string
   hideDetails?: boolean
   input?: Record<string, unknown>
+  output?: string
 }) {
   const i18n = useI18n()
+  const inputJson = createMemo(() => {
+    if (!props.input || Object.keys(props.input).length === 0) return undefined
+    return JSON.stringify(props.input, null, 2)
+  })
 
   return (
     <BasicTool
-      icon="mcp"
+      icon="brain"
       status={props.status}
       trigger={{
         title: i18n.t("ui.basicTool.called", { tool: props.tool }),
@@ -338,6 +362,19 @@ export function GenericTool(props: {
         args: args(props.input),
       }}
       hideDetails={props.hideDetails}
-    />
+    >
+      <Show when={inputJson()}>
+        {(json) => (
+          <ToolSection label={i18n.t("ui.basicTool.input")}>
+            <CodeView contents={json()} filename="input.json" />
+          </ToolSection>
+        )}
+      </Show>
+      <Show when={props.output}>
+        <ToolSection label={i18n.t("ui.basicTool.output")}>
+          <SmartToolOutput output={props.output} />
+        </ToolSection>
+      </Show>
+    </BasicTool>
   )
 }
