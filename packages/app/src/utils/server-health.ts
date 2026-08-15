@@ -145,19 +145,39 @@ export const useServerHealth = (servers: Accessor<ServerConnection.Any[]>, enabl
     }
     const list = servers()
     let dead = false
+    let refreshing = false
+    let pending = false
+    const failures = new Map<ServerConnection.Key, number>()
 
     const refresh = async () => {
+      if (refreshing) {
+        pending = true
+        return
+      }
+      refreshing = true
       const results: Record<string, ServerHealth> = {}
-      await Promise.all(
-        list.map(async (conn) => {
-          const key = ServerConnection.key(conn)
-          const result = await checkServerHealth(conn.http)
-          results[key] = result
-          if (!dead) setStatus(key, result)
-        }),
-      )
-      if (dead) return
-      setStatus(reconcile(results))
+      try {
+        await Promise.all(
+          list.map(async (conn) => {
+            const key = ServerConnection.key(conn)
+            const result = await checkServerHealth(conn.http)
+            const failed = result.healthy === false
+            const failureCount = failed ? (failures.get(key) ?? 0) + 1 : 0
+            if (failed) failures.set(key, failureCount)
+            else failures.delete(key)
+            const visible = failed && status[key]?.healthy === true && failureCount < 2 ? status[key]! : result
+            results[key] = visible
+            if (!dead) setStatus(key, visible)
+          }),
+        )
+        if (!dead) setStatus(reconcile(results))
+      } finally {
+        refreshing = false
+        if (pending && !dead) {
+          pending = false
+          void refresh()
+        }
+      }
     }
 
     void refresh()

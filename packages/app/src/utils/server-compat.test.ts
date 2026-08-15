@@ -47,6 +47,8 @@ function setup(
     protocol: typeof protocol === "string" ? Promise.resolve(protocol) : protocol,
     current: createApiForServer({ server, fetch: fetcher }),
     legacy: (directory) => createSdkForServer({ server, fetch: fetcher, directory, throwOnError: true }),
+    server,
+    fetch: fetcher,
     directory: "/repo",
   })
   return { api, requests }
@@ -162,6 +164,36 @@ describe("createCompatibleApi", () => {
     await api.session.list({ parentID: null, search: "session", limit: 50 })
 
     expect(new URL(requests[0]!.url).pathname).toBe("/experimental/session")
+  })
+
+  test("routes V1 tab control actions through raw session endpoints", async () => {
+    const { api, requests } = setup("v1")
+
+    await api.session.pause({ sessionID: "ses_1" })
+    await api.session.resume({ sessionID: "ses_1" })
+    await api.session.regenerateTitle({
+      sessionID: "ses_1",
+      model: { providerID: "provider", id: "model" },
+      prompt: "short title",
+    })
+
+    expect(requests.map((request) => [request.method, new URL(request.url).pathname])).toEqual([
+      ["POST", "/session/ses_1/pause"],
+      ["POST", "/session/ses_1/resume"],
+      ["POST", "/session/ses_1/title/regenerate"],
+    ])
+    expect(await requests[2]!.json()).toEqual({
+      model: { providerID: "provider", id: "model" },
+      prompt: "short title",
+    })
+  })
+
+  test("keeps tab control actions available on the current protocol shape", async () => {
+    const { api, requests } = setup("v2")
+
+    await api.session.pause({ sessionID: "ses_1" })
+
+    expect(new URL(requests[0]!.url).pathname).toBe("/session/ses_1/pause")
   })
 
   /*

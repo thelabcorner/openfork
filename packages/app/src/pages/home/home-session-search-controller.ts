@@ -23,7 +23,7 @@ const SEARCH_CACHE_TTL_MS = 60_000
 // Upper bound on a single search round-trip: a slow or blocked server (e.g.
 // the FTS backfill holding the DB semaphore) must surface the error card,
 // never an eternal skeleton. Within the 5-8s window the task allows.
-const SEARCH_TIMEOUT_MS = 6_000
+const SEARCH_TIMEOUT_MS = 15_000
 const MAX_SESSION_RESULTS = 8
 const MAX_MESSAGE_RESULTS = 24
 
@@ -209,24 +209,48 @@ export function createHomeSessionSearchController(home: HomeController, sessions
     abortInFlight()
     const controller = new AbortController()
     inFlight = controller
+    const startedAt = performance.now()
     try {
       const outcome = await searchWithDeadline(controller, SEARCH_TIMEOUT_MS, SEARCH_TIMEOUT_REASON, (signal) =>
         searchEndpoint(ctx?.sdk.client, value, signal, project),
       )
       if (outcome.kind === "user") return
       if (id !== requestID || !open()) return
+      const elapsedMs = Math.round(performance.now() - startedAt)
       if (outcome.kind === "timeout") {
         // Deadline hit on the current query: the user sees the error card,
         // not an eternal skeleton. Nothing is cached, so a later identical
         // query retries cleanly.
+        console.warn("[home-search] session search timed out", {
+          elapsedMs,
+          timeoutMs: SEARCH_TIMEOUT_MS,
+          queryLength: value.length,
+          scopedDirectory: project?.worktree,
+        })
         setState({ loading: false, error: `Timed out after ${Math.round(SEARCH_TIMEOUT_MS / 1_000)}s.` })
         return
+      }
+      if (elapsedMs > 1_000) {
+        console.info("[home-search] session search completed slowly", {
+          elapsedMs,
+          queryLength: value.length,
+          scopedDirectory: project?.worktree,
+          titleMatches: outcome.value.titleMatches.length,
+          messageMatches: outcome.value.messageMatches.length,
+        })
       }
       cache.set(cacheKey, { at: Date.now(), result: outcome.value })
       applyResult(outcome.value, id)
     } catch (cause) {
       if (id !== requestID || !open()) return
-      setState({ loading: false, error: describeSearchError(cause) })
+      const elapsedMs = Math.round(performance.now() - startedAt)
+      console.error("[home-search] session search failed", {
+        elapsedMs,
+        queryLength: value.length,
+        scopedDirectory: project?.worktree,
+        cause,
+      })
+      setState({ loading: false, error: `${describeSearchError(cause)} (${elapsedMs}ms)` })
     } finally {
       if (inFlight === controller) inFlight = undefined
     }

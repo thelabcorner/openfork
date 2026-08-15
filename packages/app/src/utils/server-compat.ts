@@ -1,5 +1,6 @@
-import type { ServerApi } from "./server"
+import { authTokenFromCredentials, type ServerApi } from "./server"
 import type { ServerProtocol } from "./server-protocol"
+import type { ServerConnection } from "@/context/server"
 import type { AgentPartInput, FilePartInput, OpencodeClient, Session, TextPartInput } from "@opencode-ai/sdk/v2/client"
 import type {
   Project,
@@ -29,6 +30,13 @@ type CompatibleSessionApi = Omit<
   rename: (input: Parameters<SessionApi["rename"]>[0] & LegacyLocation) => ReturnType<SessionApi["rename"]>
   // archive: (input: Parameters<SessionApi["archive"]>[0] & LegacyLocation) => ReturnType<SessionApi["archive"]>
   remove: (input: Parameters<SessionApi["remove"]>[0] & LegacyLocation) => ReturnType<SessionApi["remove"]>
+  pause: (input: { sessionID: string }) => Promise<void>
+  resume: (input: { sessionID: string }) => Promise<void>
+  regenerateTitle: (input: {
+    sessionID: string
+    model?: { id: string; providerID: string; variant?: string }
+    prompt?: string
+  }) => Promise<void>
 }
 type CompatiblePermissionApi = Omit<ServerApi["permission"], "reply"> & {
   reply: (
@@ -50,6 +58,8 @@ type CompatibleInput = {
   protocol: Promise<ServerProtocol>
   current: ServerApi
   legacy: LegacyFor
+  server: ServerConnection.HttpBase
+  fetch?: typeof globalThis.fetch
   directory?: string
 }
 
@@ -84,10 +94,11 @@ function sessionInfo(session: Session): SessionInfo {
 }
 
 export function createCompatibleApi(input: CompatibleInput): CompatibleApi {
+  const current = createCurrentApi(input)
   const v1 = createV1Api(input)
   return lazyApi(
-    input.protocol.then((protocol) => (protocol === "v1" ? v1 : input.current)),
-    input.current,
+    input.protocol.then((protocol) => (protocol === "v1" ? v1 : current)),
+    current,
   )
 }
 
@@ -120,6 +131,47 @@ function lazyApi<T extends object>(implementation: Promise<T>, shape: T): T {
       return nested
     },
   })
+}
+
+function createCurrentApi(input: CompatibleInput): CompatibleApi {
+  return {
+    ...input.current,
+    session: {
+      ...input.current.session,
+      async pause(value) {
+        await post(input, `/session/${encodeURIComponent(value.sessionID)}/pause`)
+      },
+      async resume(value) {
+        await post(input, `/session/${encodeURIComponent(value.sessionID)}/resume`)
+      },
+      async regenerateTitle(value) {
+        await post(input, `/session/${encodeURIComponent(value.sessionID)}/title/regenerate`, {
+          model: value.model,
+          prompt: value.prompt,
+        })
+      },
+    },
+  }
+}
+
+async function post(input: CompatibleInput, path: string, body?: unknown) {
+  const headers = new Headers()
+  if (body !== undefined) headers.set("content-type", "application/json")
+  if (input.server.password) {
+    headers.set(
+      "authorization",
+      `Basic ${authTokenFromCredentials({ username: input.server.username, password: input.server.password })}`,
+    )
+  }
+  const response = await (input.fetch ?? globalThis.fetch)(new URL(path, input.server.url), {
+    method: "POST",
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (!response.ok) throw new Error(`POST ${path} failed: ${response.status}`)
+  try {
+    await response.body?.cancel()
+  } catch {}
 }
 
 function createV1Api(input: CompatibleInput): CompatibleApi {
@@ -196,6 +248,18 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
       },
       async interrupt(value: Parameters<ServerApi["session"]["interrupt"]>[0]) {
         await legacy().session.abort(value)
+      },
+      async pause(value) {
+        await post(input, `/session/${encodeURIComponent(value.sessionID)}/pause`)
+      },
+      async resume(value) {
+        await post(input, `/session/${encodeURIComponent(value.sessionID)}/resume`)
+      },
+      async regenerateTitle(value) {
+        await post(input, `/session/${encodeURIComponent(value.sessionID)}/title/regenerate`, {
+          model: value.model,
+          prompt: value.prompt,
+        })
       },
       async prompt(value: SessionPromptInput & LegacyPrompt) {
         await legacy().session.promptAsync({
