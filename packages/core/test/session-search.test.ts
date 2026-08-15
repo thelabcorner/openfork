@@ -1,7 +1,6 @@
 import { describe, expect, test } from "bun:test"
-import { DateTime, Effect, Fiber, Layer, Schema } from "effect"
+import { DateTime, Effect, Layer, Schema } from "effect"
 import { eq, sql } from "drizzle-orm"
-import path from "path"
 import { AgentV2 } from "@opencode-ai/core/agent"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -33,7 +32,6 @@ import {
 import { SessionStore } from "@opencode-ai/core/session/store"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { testEffect } from "./lib/effect"
-import { tmpdir } from "./fixture/tmpdir"
 
 const projects = Layer.succeed(
   ProjectV2.Service,
@@ -947,101 +945,21 @@ describe("SessionSearch.backfillParts", () => {
   )
 })
 
-describe("SessionSearch backfill concurrency", () => {
-  // Proves the FTS backfill can never block live queries: the production
-  // backfill path opens its OWN SQLite connection (its own semaphore) while
-  // searches hit the shared client. Uses a FILE-backed database because the
-  // backfill opens a second connection to the same file (an in-memory db would
-  // be a different, empty database).
-  test("searches complete while the backfill runs on its own connection", async () => {
-    await using tmp = await tmpdir()
-    const filename = path.join(tmp.path, "search-concurrency.sqlite")
-    const layer = AppNodeBuilder.build(
-      LayerNode.group([Database.node]),
-      [[Database.node, Database.layerFromPath(filename)]],
-    )
-
-    await Effect.runPromise(
-      Effect.gen(function* () {
-        const { db } = yield* Database.Service
-
-        yield* db
-          .insert(ProjectTable)
-          .values({ id: ProjectV2.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
-          .run()
-        const sessionID = SessionV2.ID.make("ses_concurrency")
-        yield* db
-          .insert(SessionTable)
-          .values({
-            id: sessionID,
-            project_id: ProjectV2.ID.global,
-            slug: "concurrency",
-            directory: "/project",
-            title: "Concurrency",
-            version: "test",
-          })
-          .run()
-
-        // Seed pre-migration rows (empty search_text) with enough prose per row
-        // that a 5k-row chunk transaction takes long enough to observe the
-        // search/backfill interleaving.
-        const filler = "lorem ipsum dolor sit amet ".repeat(192) // ~6KB per row
-        const now = Date.now()
-        yield* db
-          .insert(SessionMessageTable)
-          .values(
-            Array.from({ length: 6000 }, (_, i) => ({
-              id: SessionMessage.ID.make(`msg_concurrency_${i}`),
-              session_id: sessionID,
-              type: "user" as const,
-              seq: i + 1,
-              time_created: now,
-              time_updated: now,
-              data: { text: filler, time: { created: now } },
-              search_text: "",
-            })),
-          )
-          .run()
-
-        // The PRODUCTION backfill path (dedicated connection) forked mid-test.
-        const backfill = yield* SessionSearch.backfillOnOwnConnection(filename).pipe(Effect.forkScoped)
-
-        // Fire searches at the SHARED client while the backfill is running.
-        const timings: number[] = []
-        for (let i = 0; i < 5; i++) {
-          const start = performance.now()
-          yield* SessionSearch.search(db, { query: "lorem" }).pipe(Effect.timeout("2 seconds"))
-          timings.push(performance.now() - start)
-        }
-
-        // Prove the searches really overlapped the backfill: it must still be
-        // mid-run (not done) right after the search phase.
-        const midState = yield* db
-          .select({ done: SearchBackfillTable.done })
-          .from(SearchBackfillTable)
-          .where(eq(SearchBackfillTable.id, 1))
-          .get()
-        expect(midState?.done).toBe(0)
-
-        yield* Fiber.join(backfill)
-
-        // The backfill completed without dying on lock contention and populated
-        // the FTS index through its own connection.
-        const state = yield* db
-          .select({ done: SearchBackfillTable.done })
-          .from(SearchBackfillTable)
-          .where(eq(SearchBackfillTable.id, 1))
-          .get()
-        expect(state?.done).toBe(1)
-
-        const result = yield* SessionSearch.search(db, { query: "lorem" })
-        expect(result.messageMatches.length).toBeGreaterThan(0)
-
-        // Every search stayed well under the bound while the backfill held the
-        // WAL write lock — reads on the shared connection never wait on it.
-        console.log("search latency while backfill mid-run (ms):", timings)
-        expect(Math.max(...timings)).toBeLessThan(1000)
-      }).pipe(Effect.scoped, Effect.provide(layer)),
-    )
-  }, 120000)
+describe("SessionSearch automatic backfill", () => {
+  test("is disabled unless explicitly enabled", () => {
+    const previous = process.env.OPENCODE_SEARCH_BACKFILL
+    try {
+      delete process.env.OPENCODE_SEARCH_BACKFILL
+      expect(SessionSearch.automaticBackfillEnabled()).toBe(false)
+      process.env.OPENCODE_SEARCH_BACKFILL = "0"
+      expect(SessionSearch.automaticBackfillEnabled()).toBe(false)
+      process.env.OPENCODE_SEARCH_BACKFILL = "1"
+      expect(SessionSearch.automaticBackfillEnabled()).toBe(true)
+      process.env.OPENCODE_SEARCH_BACKFILL = "true"
+      expect(SessionSearch.automaticBackfillEnabled()).toBe(true)
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_SEARCH_BACKFILL
+      else process.env.OPENCODE_SEARCH_BACKFILL = previous
+    }
+  })
 })

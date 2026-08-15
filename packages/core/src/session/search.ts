@@ -22,7 +22,8 @@ export const DefaultSearchLimit = 50
 export const MaxSearchLimit = 100
 const MaxQueryTerms = 8
 const MinTermLength = 2
-const BackfillChunk = 5000
+const BackfillChunk = 1000
+const AutomaticBackfillEnv = "OPENCODE_SEARCH_BACKFILL"
 
 export interface SearchInput {
   readonly query: string
@@ -54,6 +55,10 @@ export interface SearchResult {
 export class SearchError extends Schema.TaggedErrorClass<SearchError>()("Session.SearchError", {
   message: Schema.String,
 }) {}
+
+export function automaticBackfillEnabled() {
+  return ["1", "true"].includes(process.env[AutomaticBackfillEnv]?.toLowerCase() ?? "")
+}
 
 type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
 type MessageRow = {
@@ -303,16 +308,13 @@ const decodeTitleRow = (row: typeof SessionTable.$inferSelect) => {
 
 // --- resumable backfill -----------------------------------------------------
 
-// Chunked, resumable one-time backfill of search_text + FTS index for rows
+// Chunked, resumable maintenance backfill of search_text + FTS index for rows
 // written before the search migration. Each chunk commits in its own
-// transaction (5k rows), advances a rowid high-watermark, and yields so
-// startup and live queries are not blocked. The session_message FTS triggers
-// index each updated row atomically. Re-running is a no-op once done.
-//
-// The backfill must be given a DEDICATED connection (see
-// backfillOnOwnConnection / Database.withBackfillDb): a connection that shares
-// the live client's single-permit semaphore would block every query in the
-// process for the duration of a chunk transaction.
+// transaction, advances a rowid high-watermark, and yields between chunks.
+// The session_message FTS triggers index each updated row atomically.
+// Re-running is a no-op once done. This is intentionally opt-in for app
+// startup: even with a dedicated connection, writes still contend on the same
+// SQLite file and consume process time.
 export function backfill(db: Database): Effect.Effect<void> {
   return Effect.gen(function* () {
     const state = yield* retryOnLock(readBackfillState(db))
@@ -430,9 +432,9 @@ export function backfillParts(db: Database): Effect.Effect<void> {
   )
 }
 
-// Forked at SessionV2 init: run the resumable FTS backfill on a dedicated
-// SQLite connection (same file, its own semaphore) so the backfill can never
-// hold the shared client permit that live queries wait on.
+// Run the resumable FTS backfill on a dedicated SQLite connection so it does
+// not take the shared in-process client semaphore. This still writes to the
+// same database file, so automatic startup callers must gate it explicitly.
 export function backfillOnOwnConnection(filename: string): Effect.Effect<void> {
   return Database.withBackfillDb(filename, (db) => backfill(db)).pipe(
     Effect.catch((error) =>
