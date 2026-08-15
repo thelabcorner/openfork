@@ -215,6 +215,16 @@ function formatError(error: unknown, t: Translator): string {
   return formatErrorChain(error, t, 0)
 }
 
+function errorDetails(error: unknown) {
+  if (!(error instanceof Error)) return {}
+  return {
+    name: error.name,
+    message: error.message,
+    stack: error.stack,
+    cause: error.cause,
+  }
+}
+
 interface ErrorPageProps {
   error: unknown
 }
@@ -232,6 +242,7 @@ export const ErrorPage: Component<ErrorPageProps> = (props) => {
     recordedFatalError ??=
       platform.recordFatalRendererError?.({
         error: formattedError(),
+        ...errorDetails(props.error),
         url: location.href,
         version: platform.version,
         platform: platform.platform,

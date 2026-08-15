@@ -63,7 +63,7 @@ import LegacyLayout from "@/pages/layout"
 import NewLayout from "@/pages/layout-new"
 import { ErrorPage } from "./pages/error"
 import { useCheckServerHealth } from "./utils/server-health"
-import { legacySessionHref, legacySessionServer, requireServerKey, sessionHref } from "./utils/session-route"
+import { legacySessionHref, legacySessionServer, parseServerKey, requireServerKey, sessionHref } from "./utils/session-route"
 import { createSessionLineage } from "@/pages/session/session-lineage"
 
 import { SessionPage, SessionRouteErrorBoundary, TargetSessionRouteContent } from "@/pages/session"
@@ -111,8 +111,10 @@ const SessionRoute = () => {
 function TargetServerRoute(props: ParentProps) {
   const params = useParams<{ serverKey: string; id: string }>()
   const global = useGlobal()
+  const serverKey = createMemo(() => parseServerKey(params.serverKey))
   const conn = createMemo(() => {
-    const key = requireServerKey(params.serverKey)
+    const key = serverKey()
+    if (!key) return
     return global.servers.list().find((item) => ServerConnection.key(item) === key)
   })
 
@@ -120,7 +122,7 @@ function TargetServerRoute(props: ParentProps) {
     // Owns the server-identity remount. Session changes must NOT remount this
     // subtree (SessionRouteErrorBoundary resets and createSessionLineage
     // re-resolves reactively instead); both rely on this key for server changes.
-    <Show when={requireServerKey(params.serverKey)} keyed>
+    <Show when={serverKey()} keyed fallback={<ErrorPage error={new Error("Invalid server route")} />}>
       <ServerSDKProvider server={conn}>
         <ServerSyncProvider server={conn}>
           <ForkUsageProvider>{props.children}</ForkUsageProvider>
@@ -138,11 +140,16 @@ const TargetSessionRoute = () => (
 
 function LegacyTargetSessionRoute() {
   const params = useParams<{ serverKey: string; id: string }>()
+  const serverKey = createMemo(() => parseServerKey(params.serverKey))
   return (
     <TargetServerRoute>
-      <SessionRouteErrorBoundary sessionID={params.id} serverKey={requireServerKey(params.serverKey)}>
-        <LegacyTargetSessionRedirect />
-      </SessionRouteErrorBoundary>
+      <Show when={serverKey()} keyed fallback={<ErrorPage error={new Error("Invalid server route")} />}>
+        {(key) => (
+          <SessionRouteErrorBoundary sessionID={params.id} serverKey={key}>
+            <LegacyTargetSessionRedirect />
+          </SessionRouteErrorBoundary>
+        )}
+      </Show>
     </TargetServerRoute>
   )
 }

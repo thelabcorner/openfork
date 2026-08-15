@@ -99,7 +99,8 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
 
   const path = () => `${location.pathname}${location.search}${location.hash}`
   const creating = createMemo(() => {
-    const route = layout.route()
+    const route = layout.route() as LayoutRoute | undefined
+    if (!route) return false
     if (route.type === "draft" || route.type === "dir-new-sesssion") return true
     if (!params.dir) return false
     if (params.id) return false
@@ -197,9 +198,11 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
             const tabs = useTabs()
             const tabsStore = tabs.store
             const tabsStoreActions = tabs
+            const currentRoute = () => layout.route() as LayoutRoute | undefined
             const [session] = createResource(
               () => {
-                const route = layout.route()
+                const route = currentRoute()
+                if (!route) return undefined
                 if (route.type !== "session") return undefined
                 const conn = global.servers
                   .list()
@@ -213,7 +216,8 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                   .catch(() => {}),
             )
 
-            const matchRoute = (route: LayoutRoute) => {
+            const matchRoute = (route: LayoutRoute | undefined) => {
+              if (!route) return
               if (route.type === "home") return
               if (route.type === "draft") {
                 return tabsStore.find((item) => item.type === "draft" && item.draftID === route.draftID)
@@ -235,10 +239,11 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
               }
             }
 
-            const currentTab = () => matchRoute(layout.route())
+            const currentTab = () => matchRoute(currentRoute())
 
             createEffect(() => {
-              const route = layout.route()
+              const route = currentRoute()
+              if (!route) return
               if (!tabs.ready()) return
               const tab = currentTab()
               if (tab) {
@@ -262,9 +267,9 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
             })
 
             const openNewTab = () => {
-              const route = layout.route()
+              const route = currentRoute()
               const activeSession = session()
-              if (route.type === "session" && activeSession) {
+              if (route?.type === "session" && activeSession) {
                 const sessionTab = {
                   type: "session" as const,
                   server: route.server ?? server.key,
@@ -282,7 +287,7 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                 return
               }
 
-              if (route.type === "home") {
+              if (route?.type === "home") {
                 const selection = layout.home.selection()
                 const conn = global.servers.list().find((item) => ServerConnection.key(item) === selection.server)
                 const project = conn
@@ -311,7 +316,8 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
 
               tabs.newDraft({ server: fallback.server, directory: fallback.project.worktree }, "")
             }
-            const toggleHome = () => tabs.toggleHome({ home: layout.route().type === "home", current: currentTab() })
+            const homeActive = () => currentRoute()?.type === "home"
+            const toggleHome = () => tabs.toggleHome({ home: homeActive(), current: currentTab() })
 
             command.register("titlebar-home", () => [
               {
@@ -388,10 +394,10 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                     size="large"
                     class="!w-9 shrink-0"
                     icon={<IconV2 name="grid-plus" />}
-                    state={layout.route().type === "home" ? "pressed" : undefined}
+                    state={homeActive() ? "pressed" : undefined}
                     onClick={toggleHome}
                     aria-label={language.t("home.title")}
-                    aria-pressed={layout.route().type === "home"}
+                    aria-pressed={homeActive()}
                   />
                 </TooltipV2>
 

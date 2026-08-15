@@ -11,6 +11,8 @@ import { displayName, projectForSession } from "@/pages/layout/helpers"
 import { SessionTabAvatar } from "@/pages/layout/session-tab-avatar"
 import type { Session } from "@opencode-ai/sdk/v2"
 import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
+import { sessionApiOf } from "./titlebar-tab-actions"
+import { tabSessionState } from "./titlebar-tab-state"
 import { TabPreviewPopover } from "./titlebar-tab-popover"
 import "./titlebar-tab-nav.css"
 
@@ -46,16 +48,31 @@ export function TabNavItem(props: {
     props.onClose()
   }
   const global = useGlobal()
+  const language = useLanguage()
   const serverCtx = createMemo(() => {
     const conn = global.servers.list().find((item) => ServerConnection.key(item) === props.server)
     if (conn) return global.ensureServerCtx(conn)
   })
+  const sessionID = createMemo(() => props.session()?.id)
+  // Derivation lives in titlebar-tab-state: working from session_working(id),
+  // paused from the session_paused sidecar (never from !session_working — the
+  // interrupt-cleanup window would flicker paused -> working -> paused).
+  const sessionState = createMemo(() => tabSessionState(serverCtx(), sessionID()))
   const project = createMemo(() => {
     const session = props.session()
     if (!session) return
     return projectForSession(session, serverCtx()?.projects.list() ?? [])
   })
   const title = createMemo(() => props.session()?.title ?? props.fallbackTitle)
+
+  const runStateAction = () => {
+    const id = sessionID()
+    const api = sessionApiOf(serverCtx())
+    const state = sessionState()
+    if (!id || !api) return
+    if (state === "working") void api.interrupt({ sessionID: id })
+    else if (state === "paused") void api.resume({ sessionID: id })
+  }
 
   const projectName = createMemo(() => {
     const session = props.session()
@@ -181,6 +198,7 @@ export function TabNavItem(props: {
       data-slot="titlebar-tab-item"
       data-title-overflow={titleOverflowing()}
       data-editing={editing()}
+      data-session-state={sessionState()}
       class="group relative flex h-7 w-full min-w-0 select-none flex-row items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-[6px] px-1.5 [container-type:inline-size]"
       classList={{ invisible: props.hidden }}
       data-active={props.active}
@@ -222,9 +240,20 @@ export function TabNavItem(props: {
         }}
         class="flex h-full min-w-0 flex-1 flex-row items-center gap-1.5 text-[13px] font-medium text-v2-text-text-faint group-data-[active='true']:text-v2-text-text-base group-data-[editing='true']:text-v2-text-text-base [-webkit-user-drag:none]"
       >
-        <span data-slot="project-avatar-slot" class="flex size-4 shrink-0 items-center justify-center">
+        <span
+          data-slot="project-avatar-slot"
+          class="flex size-4 shrink-0 items-center justify-center"
+          classList={{ "text-v2-icon-icon-muted": sessionState() === "paused" }}
+          aria-label={
+            sessionState() === "paused"
+              ? language.t("tab.state.paused")
+              : sessionState() === "working"
+                ? language.t("tab.state.working")
+                : undefined
+          }
+        >
           <Show
-            when={props.session()}
+            when={sessionState() !== "paused" && props.session()}
             keyed
             fallback={
               <span class="block size-4 rounded-[3px] border border-v2-border-border-muted" aria-hidden="true" />
@@ -238,6 +267,9 @@ export function TabNavItem(props: {
                 server={props.server}
               />
             )}
+          </Show>
+          <Show when={sessionState() === "paused"}>
+            <IconV2 name="pause" class="size-4" aria-hidden="true" />
           </Show>
         </span>
         <span
@@ -278,6 +310,29 @@ export function TabNavItem(props: {
         />
       </a>
 
+      <Show when={sessionState() === "working" || sessionState() === "paused"}>
+        <div data-slot="tab-state">
+          <IconButtonV2
+            size="small"
+            variant="ghost-muted"
+            data-tab-action={sessionState() === "working" ? "stop" : "resume"}
+            class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100 group-data-[editing=true]:opacity-100"
+            onPointerDown={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+            }}
+            onClick={(event) => {
+              event.preventDefault()
+              event.stopPropagation()
+              runStateAction()
+            }}
+            icon={<IconV2 name={sessionState() === "working" ? "stop" : "play"} />}
+            aria-label={
+              sessionState() === "working" ? language.t("common.stopSession") : language.t("common.resumeSession")
+            }
+          />
+        </div>
+      </Show>
       <div data-slot="tab-close">
         <IconButtonV2
           size="small"
@@ -289,6 +344,7 @@ export function TabNavItem(props: {
           }}
           onClick={closeTab}
           icon={<IconV2 name="xmark-small" />}
+          aria-label={language.t("common.closeTab")}
         />
       </div>
     </div>

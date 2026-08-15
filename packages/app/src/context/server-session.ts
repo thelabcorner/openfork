@@ -204,8 +204,16 @@ export function createServerSession(
     session_message: {} as Record<string, SessionMessageInfo[]>,
     part: {} as Record<string, Part[]>,
     part_text_accum_delta: {} as Record<string, string>,
+    // Durable paused sidecar: derived from session.next.paused/resumed events (V2),
+    // info.pausedAt on session.updated/get (V1), and session.active seeding. Never
+    // derived from !session_working — a paused session is NOT working and must not
+    // flip through a spinner state.
+    paused: {} as Record<string, boolean>,
     session_working(id: string) {
-      return (this.session_status[id]?.type ?? "idle") !== "idle"
+      return ((this.session_status[id]?.type ?? "idle") !== "idle" && this.paused[id] !== true)
+    },
+    session_paused(id: string) {
+      return this.paused[id] === true
     },
   })
   const requests = new Map<string, Promise<Session>>()
@@ -259,6 +267,9 @@ export function createServerSession(
 
   const remember = (session: Session) => {
     setData("info", session.id, reconcile(session))
+    // V1 carries pausedAt in the full info payload (session.updated / session.get);
+    // the sidecar also seeds from session.active and V2 session.next.paused/resumed.
+    setData("paused", session.id, (session as Session & { pausedAt?: number }).pausedAt !== undefined)
     infoSeen.delete(session.id)
     infoSeen.add(session.id)
     if (infoSeen.size > sessionInfoLimit) {
@@ -944,6 +955,10 @@ export function createServerSession(
 
     const info = data.info[sessionID]
     if (event.type === "session.renamed" && info)
+      remember({ ...info, title: event.data.title, time: { ...info.time, updated: event.created } })
+    if (event.type === "session.next.paused") setData("paused", sessionID, true)
+    if (event.type === "session.next.resumed") setData("paused", sessionID, false)
+    if (event.type === "session.next.renamed" && info)
       remember({ ...info, title: event.data.title, time: { ...info.time, updated: event.created } })
     if (event.type === "session.moved" && info)
       remember({

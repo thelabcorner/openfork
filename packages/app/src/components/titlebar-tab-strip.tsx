@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createResource, createRoot, For, onCleanup, onMount, Show } from "solid-js"
+import { createEffect, createMemo, createResource, For, onCleanup, onMount, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { DragDropProvider, PointerSensor } from "@dnd-kit/solid"
@@ -18,7 +18,7 @@ import { useTabs } from "@/context/tabs"
 import { createTabPromptState } from "@/context/prompt"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { showToast } from "@/utils/toast"
-import { canStartTabDrag, isTabCloseTarget } from "./titlebar-tab-gesture"
+import { canStartTabDrag, isTabActionTarget } from "./titlebar-tab-gesture"
 import { adjacentTabKey, mergeVisibleTabOrder } from "./titlebar-tab-order"
 import type { Session } from "@opencode-ai/sdk/v2"
 
@@ -52,7 +52,7 @@ function SessionTabSlot(props: {
       data-active={props.active()}
       class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
     >
-      <TitlebarTabContextMenu id={props.id}>
+      <TitlebarTabContextMenu id={props.id} session={props.session} server={props.tab.server}>
         <TabNavItem
           ref={(el) => {
             ref = el
@@ -127,17 +127,12 @@ function SessionTabEntry(props: {
     const value = session()
     if (!ctx || !value || prefetched) return
     prefetched = true
-    createRoot((dispose) => {
-      try {
-        void ctx.sync
-          .ensureDirSyncContext(value.directory)
-          .session.sync(value.id)
-          .catch(() => {})
-          .finally(dispose)
-      } catch {
-        dispose()
-      }
-    })
+    // Runs in this component's own owner (disposed with the tab) instead of a
+    // throw-away createRoot: sync() can register cleanups after an async gap,
+    // which a root disposed eagerly on settle can't attach — that mismatch was
+    // logged as "cleanups created outside a createRoot or render will never be
+    // run" and leaked reactive state for every tab visited in a session.
+    void ctx.sync.ensureDirSyncContext(value.directory).session.sync(value.id).catch(() => {})
   })
 
   createEffect(() => {
@@ -302,7 +297,7 @@ export function TitlebarTabStrip(props: {
               activationConstraints: [new PointerActivationConstraints.Distance({ value: 4 })],
               preventActivation: (event) =>
                 !canStartTabDrag(event.pointerType) ||
-                isTabCloseTarget(event.target) ||
+                isTabActionTarget(event.target) ||
                 (event.target instanceof Element && !!event.target.closest('[contenteditable="true"]')),
             }),
           ]}

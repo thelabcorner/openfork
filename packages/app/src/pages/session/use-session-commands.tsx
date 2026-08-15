@@ -20,6 +20,7 @@ import { Message, Part, UserMessage } from "@opencode-ai/sdk/v2"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { createSessionOwnership } from "./session-ownership"
 import { useLocal } from "@/context/local"
+import { isTitleRegenerationPending, beginTitleRegeneration, endTitleRegeneration, type TabSessionApi } from "@/components/titlebar-tab-actions"
 
 export type SessionCommandContext = {
   navigateMessageByOffset: (offset: number) => void
@@ -79,6 +80,29 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     const id = params.id
     if (!id) return
     return sync().session.get(id)
+  }
+  // `session_paused` lands with the app-state sidecar (slice 2); read defensively
+  // and never derive paused from `!session_working` (swarm-tab-stop-pause §4.2, S4).
+  const tabSessionPaused = () => {
+    const id = params.id
+    if (!id) return false
+    return (sync().data as { session_paused?: (id: string) => boolean }).session_paused?.(id) ?? false
+  }
+  const regenerateTitle = () => {
+    const id = params.id
+    if (!id || isTitleRegenerationPending(id)) return
+    beginTitleRegeneration(id)
+    void (sdk().api.session as TabSessionApi)
+      .regenerateTitle({ sessionID: id })
+      .then(() => showToast({ title: language.t("toast.title.regenerated"), variant: "success" }))
+      .catch((err) =>
+        showToast({
+          title: language.t("toast.title.failed"),
+          description: err instanceof Error ? err.message : undefined,
+          variant: "error",
+        }),
+      )
+      .finally(() => endTitleRegeneration(id))
   }
   const hasReview = () => !!params.id
   const normalizeTab = (tab: string) => {
@@ -462,6 +486,52 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
         }
         navigate(`/${params.dir}/session`)
       },
+    }),
+    sessionCommand({
+      id: "session.stop",
+      title: language.t("command.session.stop"),
+      description: language.t("command.session.stop.description"),
+      slash: "stop",
+      disabled: !params.id || !sync().data.session_working(params.id),
+      onSelect: () => {
+        if (!params.id) return
+        void sdk().api.session.interrupt({ sessionID: params.id })
+      },
+    }),
+    sessionCommand({
+      id: "session.pause",
+      title: language.t("command.session.pause"),
+      description: language.t("command.session.pause.description"),
+      slash: "pause",
+      // Interim rule (cross-doc R6): no client-side pending-input count yet, so
+      // Pause stays disabled unless the session is actually working. Refine to
+      // `paused OR (idle AND no pending inputs)` when the queued-badge read lands.
+      disabled: !params.id || !sync().data.session_working(params.id),
+      onSelect: () => {
+        if (!params.id) return
+        void (sdk().api.session as TabSessionApi).pause({ sessionID: params.id })
+      },
+    }),
+    sessionCommand({
+      id: "session.resume",
+      title: language.t("command.session.resume"),
+      description: language.t("command.session.resume.description"),
+      slash: "resume",
+      disabled: !params.id || !tabSessionPaused(),
+      onSelect: () => {
+        if (!params.id) return
+        void (sdk().api.session as TabSessionApi).resume({ sessionID: params.id })
+      },
+    }),
+    sessionCommand({
+      id: "session.regenerateTitle",
+      title: isTitleRegenerationPending(params.id)
+        ? language.t("command.session.regenerateTitle.pending")
+        : language.t("command.session.regenerateTitle"),
+      description: language.t("command.session.regenerateTitle.description"),
+      slash: "retitle",
+      disabled: !params.id || isTitleRegenerationPending(params.id),
+      onSelect: regenerateTitle,
     }),
     sessionCommand({
       id: "session.undo",

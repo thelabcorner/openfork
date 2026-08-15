@@ -171,9 +171,16 @@ export function seedActiveSessionStatuses(
 ) {
   for (const sessionID of Object.keys(active)) {
     if (session.data.session_status[sessionID] !== undefined) continue
-    const status = active[sessionID]
-    session.set("session_status", sessionID, status?.type === "running" ? { type: "busy" } : status)
+    const status = normalizeActiveSessionStatus(active[sessionID])
+    if (status) session.set("session_status", sessionID, status)
   }
+}
+
+function normalizeActiveSessionStatus(status: SessionActiveOutput[string] | SessionStatus | undefined): SessionStatus | undefined {
+  const type = (status as { type?: string } | undefined)?.type
+  if (type === "running") return { type: "busy" }
+  if (type === "paused") return { type: "idle" }
+  return status as SessionStatus | undefined
 }
 
 function makeQueryOptionsApi(

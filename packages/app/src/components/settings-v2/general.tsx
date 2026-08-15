@@ -1,14 +1,22 @@
-import { Component, Show, createMemo, createResource } from "solid-js"
+import { Component, Show, createMemo, createResource, createSignal } from "solid-js"
 import { createMediaQuery } from "@solid-primitives/media"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
+import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitle } from "@opencode-ai/ui/v2/dialog-v2"
+import { DividerV2 } from "@opencode-ai/ui/v2/divider-v2"
+import { Icon } from "@opencode-ai/ui/v2/icon"
+import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { SelectV2 } from "@opencode-ai/ui/v2/select-v2"
 import { Switch } from "@opencode-ai/ui/v2/switch-v2"
+import { TextareaV2 } from "@opencode-ai/ui/v2/textarea-v2"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
+import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useUpdaterAction } from "../updater-action"
 import { useSettings } from "@/context/settings"
+import { useModels } from "@/context/models"
+import { useServerSync } from "@/context/server-sync"
 import { ExternalLink } from "../external-link"
 import { SettingsListV2 } from "./parts/list"
 import { SettingsRowV2 } from "./parts/row"
@@ -28,6 +36,14 @@ import {
 import "./settings-v2.css"
 
 const schemeOptions: ("system" | "light" | "dark")[] = ["system", "light", "dark"]
+const DEFAULT_TITLE_PROMPT = `Generate a brief title that would help the user find this conversation later.
+
+Follow all rules in <rules>
+Use the <examples> so you know what a good title looks like.
+Your output must be:
+- A single line
+- <=50 characters
+- No explanations`
 const fontSettings = {
   ui: {
     action: "settings-ui-font",
@@ -268,6 +284,194 @@ const LanguageSetting = () => {
         onSelect={(option) => option && language.setLocale(option.value)}
       />
     </SettingsRowV2>
+  )
+}
+
+const TitlePromptDialog: Component<{ onClose: () => void }> = (props) => {
+  const language = useLanguage()
+  const settings = useSettings()
+  const serverSync = useServerSync()
+  const savedPrompt = () => settings.general.titleGeneration()?.prompt?.trim()
+  const [prompt, setPrompt] = createSignal(savedPrompt() || DEFAULT_TITLE_PROMPT)
+  const usesDefaultPrompt = createMemo(() => prompt().trim() === DEFAULT_TITLE_PROMPT.trim())
+
+  const save = () => {
+    const next = settings.general.titleGeneration()
+    const value = prompt().trim()
+    settings.general.setTitleGeneration({
+      ...next,
+      prompt: value && value !== DEFAULT_TITLE_PROMPT.trim() ? value : undefined,
+    })
+    void serverSync().updateConfig({
+      title_prompt: value && value !== DEFAULT_TITLE_PROMPT.trim() ? value : undefined,
+    })
+    props.onClose()
+  }
+
+  return (
+    <Dialog
+      size="x-large"
+      containerClass="!w-[min(calc(100vw-40px),1040px)] !h-[min(calc(100vh-64px),760px)]"
+    >
+      <DialogHeader>
+        <div class="flex min-w-0 flex-1 flex-col gap-1">
+          <DialogTitle>{language.t("dialog.titlePrompt.title")}</DialogTitle>
+          <p data-slot="dialog-description" class="max-w-[720px]">
+            {language.t("dialog.titlePrompt.description")}
+          </p>
+        </div>
+      </DialogHeader>
+      <DividerV2 />
+      <DialogBody class="flex w-full flex-1 flex-col gap-4 overflow-hidden px-5 pt-5 pb-2">
+        <div class="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+          <div class="flex min-h-0 flex-col gap-3">
+            <div class="flex flex-wrap items-center gap-2">
+              <span
+                class="inline-flex h-6 select-none items-center rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-02 px-2 text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-muted"
+                data-current={usesDefaultPrompt() ? "" : undefined}
+              >
+                {language.t("dialog.titlePrompt.default")}
+              </span>
+              <span class="text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
+                {usesDefaultPrompt() ? language.t("settings.general.row.titleModel.default") : "Custom"}
+              </span>
+            </div>
+
+            <TextareaV2
+              autofocus
+              rows={18}
+              class="!min-h-0 !w-full !flex-1"
+              value={prompt()}
+              placeholder={language.t("dialog.titlePrompt.placeholder")}
+              spellcheck={false}
+              autocorrect="off"
+              autocomplete="off"
+              autocapitalize="off"
+              aria-label={language.t("dialog.titlePrompt.title")}
+              onInput={(event) => setPrompt(event.currentTarget.value)}
+            />
+          </div>
+
+          <aside class="flex min-h-0 flex-col gap-3 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 p-3">
+            <div class="flex flex-col gap-2">
+              <div class="select-none text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-base">
+                Tokens
+              </div>
+              <div class="flex flex-col gap-2 text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
+                <span class="flex items-start gap-2">
+                  <code class="mt-[-1px] rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">
+                    {"{previousTitle}"}
+                  </code>
+                  <span>{language.t("dialog.titlePrompt.token.previousTitle")}</span>
+                </span>
+                <span class="flex items-start gap-2">
+                  <code class="mt-[-1px] rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">
+                    {"{conversation}"}
+                  </code>
+                  <span>{language.t("dialog.titlePrompt.token.conversation")}</span>
+                </span>
+              </div>
+            </div>
+
+            <DividerV2 />
+
+            <div class="flex min-h-0 flex-1 flex-col gap-2">
+              <div class="select-none text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-base">
+                {language.t("dialog.titlePrompt.default")}
+              </div>
+              <pre
+                class="min-h-0 flex-1 overflow-auto whitespace-pre-wrap rounded-md border border-v2-border-border-muted bg-v2-background-bg-base p-3 font-mono text-[12px] leading-5 tracking-normal text-v2-text-text-muted select-none"
+                aria-label={language.t("dialog.titlePrompt.default")}
+              >
+                {DEFAULT_TITLE_PROMPT}
+              </pre>
+            </div>
+          </aside>
+        </div>
+      </DialogBody>
+      <DialogFooter>
+        <ButtonV2 type="button" variant="ghost" class="mr-auto" onClick={() => setPrompt(DEFAULT_TITLE_PROMPT)}>
+          {language.t("dialog.titlePrompt.reset")}
+        </ButtonV2>
+        <ButtonV2 type="button" variant="neutral" onClick={props.onClose}>
+          {language.t("common.cancel")}
+        </ButtonV2>
+        <ButtonV2 type="button" variant="contrast" onClick={save}>
+          {language.t("common.save")}
+        </ButtonV2>
+      </DialogFooter>
+    </Dialog>
+  )
+}
+
+const TitleGenerationSection: Component = () => {
+  const language = useLanguage()
+  const dialog = useDialog()
+  const settings = useSettings()
+  const serverSync = useServerSync()
+  const models = useModels()
+  const titleModels = createMemo(() =>
+    models
+      .list()
+      .filter((item) => models.visible({ modelID: item.id, providerID: item.provider.id }))
+      .map((item) => ({
+        id: `${item.provider.id}/${item.id}`,
+        label: `${item.provider.name} / ${item.name}`,
+        model: { providerID: item.provider.id, modelID: item.id },
+      })),
+  )
+  const titleModelOptions = createMemo(() => [
+    { id: "", label: language.t("settings.general.row.titleModel.default"), model: undefined },
+    ...titleModels().sort((a, b) => a.label.localeCompare(b.label)),
+  ])
+  const currentTitleModel = createMemo(() => {
+    const saved = settings.general.titleGeneration()?.model
+    if (!saved) return titleModelOptions()[0]
+    return titleModelOptions().find((item) => item.model?.providerID === saved.providerID && item.model.modelID === saved.modelID)
+  })
+  const selectTitleModel = (option: ReturnType<typeof titleModelOptions>[number] | null) => {
+    const next = settings.general.titleGeneration()
+    settings.general.setTitleGeneration({ ...next, model: option?.model })
+    void serverSync().updateConfig({
+      small_model: option?.model ? `${option.model.providerID}/${option.model.modelID}` : undefined,
+    })
+  }
+
+  return (
+    <div class="settings-v2-section">
+      <h3 class="settings-v2-section-title">{language.t("settings.general.section.titleGeneration")}</h3>
+      <SettingsListV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.titleModel.title")}
+          description={language.t("settings.general.row.titleModel.description")}
+        >
+          <div class="flex items-center gap-1.5">
+            <SelectV2
+              appearance="inline"
+              data-action="settings-title-model"
+              options={titleModelOptions()}
+              current={currentTitleModel()}
+              value={(option) => option.id}
+              label={(option) => option.label}
+              onSelect={selectTitleModel}
+              placement="bottom-end"
+              gutter={6}
+            />
+            <TooltipV2 placement="top" gutter={4} value={language.t("settings.general.row.titlePrompt.edit")}>
+              <IconButtonV2
+                type="button"
+                variant="ghost-muted"
+                size="small"
+                data-action="settings-title-prompt-edit"
+                icon={<Icon name="edit" />}
+                aria-label={language.t("settings.general.row.titlePrompt.edit")}
+                onClick={() => dialog.show(() => <TitlePromptDialog onClose={() => dialog.close()} />)}
+              />
+            </TooltipV2>
+          </div>
+        </SettingsRowV2>
+      </SettingsListV2>
+    </div>
   )
 }
 
@@ -551,6 +755,8 @@ export const SettingsGeneralV2: Component<{
         </Show>
 
         <GeneralSection />
+
+        <TitleGenerationSection />
 
         <AppearanceSection controller={appearance} />
 

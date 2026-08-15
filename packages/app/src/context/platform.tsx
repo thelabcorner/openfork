@@ -22,6 +22,10 @@ type DesktopOS = "macos" | "windows" | "linux"
 
 export type FatalRendererErrorLog = {
   error: string
+  name?: string
+  message?: string
+  stack?: string
+  cause?: unknown
   url: string
   version?: string
   platform: PlatformName

@@ -9,10 +9,37 @@
   justify-content: center;
 }
 
+/* Session-state action (stop / resume) sits inline-start of close in the same
+   absolute action group. Logical inset keeps the group mirrored for RTL. */
+[data-titlebar-tab] [data-slot="tab-state"] {
+  position: absolute;
+  top: 4px;
+  inset-inline-end: 26px;
+  display: flex;
+  height: 20px;
+  width: 20px;
+  align-items: center;
+  justify-content: center;
+}
+
 [data-titlebar-tab] {
   --tab-base: var(--v2-background-bg-deep);
   --tab-overlay: transparent;
+  /* Title fade mask must reserve room for the action group: close (20px) plus
+     the state button (20px + 2px gap) when a working/paused state is shown. */
+  --tab-action-group-width: 20px;
   background: linear-gradient(var(--tab-overlay), var(--tab-overlay)), var(--tab-base);
+}
+
+[data-titlebar-tab][data-session-state="working"]:not([data-editing="true"]),
+[data-titlebar-tab][data-session-state="paused"]:not([data-editing="true"]) {
+  --tab-action-group-width: 42px;
+}
+
+/* Paused tab gets a static neutral tint; the pause glyph in the avatar slot is
+   the persistent marker (no spinner, no flicker — never derived from !working). */
+[data-titlebar-tab][data-session-state="paused"] {
+  --tab-overlay: var(--v2-overlay-simple-overlay-hover);
 }
 
 [data-titlebar-tab]:is(:hover, :has(> [data-slot="tab-link"]:focus-visible)):not([data-state="pressed"]):not(
@@ -27,12 +54,26 @@
   --tab-overlay: var(--v2-overlay-simple-overlay-pressed);
 }
 
-[data-titlebar-tab]:is(:hover, [data-state="pressed"]) [data-slot="tab-close"] {
+[data-titlebar-tab]:is(:hover, [data-state="pressed"]) [data-slot="tab-close"],
+[data-titlebar-tab]:is(:hover, [data-state="pressed"]) [data-slot="tab-state"] {
   background: linear-gradient(var(--tab-overlay), var(--tab-overlay)), var(--tab-base);
 }
 
-[data-titlebar-tab][data-editing="true"] [data-slot="tab-close"] {
+[data-titlebar-tab][data-editing="true"] [data-slot="tab-close"],
+[data-titlebar-tab][data-editing="true"] [data-slot="tab-state"] {
   display: none;
+}
+
+/* The stop button carries a danger tint on hover/focus, the resume button stays
+   neutral — matching the composer's Stop affordance (prompt.action.stop). */
+[data-titlebar-tab] [data-slot="tab-state"] [data-tab-action="stop"]:is(:hover, :focus-visible, [data-state="hover"]) {
+  color: var(--v2-state-fg-danger);
+}
+
+/* Hover-reveal also reveals on keyboard focus so the action button is reachable
+   and visible when tabbing through the tab (link -> state -> close). */
+[data-titlebar-tab] [data-slot="tab-state"] button:focus-visible {
+  opacity: 1;
 }
 
 [data-titlebar-tab-list] {
@@ -105,7 +146,7 @@
 
 [data-titlebar-tab][data-title-overflow="true"]:is(:hover, [data-active="true"]):not([data-editing="true"])
   [data-slot="tab-link"] {
-  --tab-title-fade-offset: 24px;
+  --tab-title-fade-offset: calc(4px + var(--tab-action-group-width));
 }
 
 [data-titlebar-tab][data-title-overflow="true"]:not(:hover):not([data-active="true"]):not([data-editing="true"])
@@ -143,8 +184,16 @@
   }
 
   [data-slot="tab-close"] {
-    right: auto;
-    left: 50%;
+    inset-inline-end: auto;
+    inset-inline-start: 50%;
     transform: translateX(-50%);
+  }
+
+  /* When the title collapses the state button hugs the centered close button
+     (close left edge = 50% - 10px; state sits 20px + 2px gap further inline-start). */
+  [data-slot="tab-state"] {
+    inset-inline-end: auto;
+    inset-inline-start: calc(50% - 32px);
+    transform: none;
   }
 }

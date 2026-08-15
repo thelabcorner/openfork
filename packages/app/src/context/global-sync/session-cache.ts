@@ -20,13 +20,20 @@ export function dropSessionCaches(store: SessionCache, sessionIDs: Iterable<stri
   const stale = new Set(Array.from(sessionIDs).filter(Boolean))
   if (stale.size === 0) return
 
-  for (const key of Object.keys(store.part)) {
-    const parts = store.part[key]
-    if (!parts?.some((part) => stale.has(part?.sessionID ?? ""))) continue
-    for (const part of parts) {
-      delete store.part_text_accum_delta[part.id]
+  // Evict only the parts owned by the sessions being dropped, keyed via each
+  // session's own message list. Scanning every key in store.part here would be
+  // O(all cached messages across every session visited this run), which turned
+  // an occasional cache trim into a full-store sweep on every tab sync once
+  // SESSION_CACHE_LIMIT was exceeded.
+  for (const sessionID of stale) {
+    for (const message of store.message[sessionID] ?? []) {
+      const parts = store.part[message.id]
+      if (!parts) continue
+      for (const part of parts) {
+        delete store.part_text_accum_delta[part.id]
+      }
+      delete store.part[message.id]
     }
-    delete store.part[key]
   }
 
   for (const sessionID of stale) {

@@ -19,6 +19,11 @@ export interface SoundSettings {
   errors: string
 }
 
+export interface TitleGenerationSettings {
+  model?: { providerID: string; modelID: string }
+  prompt?: string
+}
+
 export interface Settings {
   general: {
     autoSave: boolean
@@ -39,6 +44,7 @@ export interface Settings {
     agentVisibilityInitialized?: boolean
     newInterfaceNoticeDismissed?: boolean
     shouldDisplayTabsToast?: boolean
+    titleGeneration?: TitleGenerationSettings
   }
   appearance: {
     fontSize: number
@@ -450,6 +456,10 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         shouldDisplayTabsToast: withFallback(() => store.general?.shouldDisplayTabsToast, false),
         dismissTabsToast() {
           setStore("general", "shouldDisplayTabsToast", false)
+        },
+        titleGeneration: withFallback(() => store.general?.titleGeneration, undefined),
+        setTitleGeneration(value: TitleGenerationSettings | undefined) {
+          setStore("general", "titleGeneration", value)
         },
       },
       visibility: {

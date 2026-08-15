@@ -104,7 +104,7 @@ import { diffs as list } from "@/utils/diffs"
 import { Persist, persisted } from "@/utils/persist"
 import { extractPromptFromParts } from "@/utils/prompt"
 import { formatServerError, isLocalSessionNotFoundError, isSessionNotFoundError } from "@/utils/server-errors"
-import { legacySessionHref, requireServerKey, sessionHref } from "@/utils/session-route"
+import { legacySessionHref, parseServerKey, requireServerKey, sessionHref } from "@/utils/session-route"
 import { useUsageExceededDialogs } from "./session/usage-exceeded-dialogs"
 import { createSessionOwnership } from "./session/session-ownership"
 import { createSessionLineage } from "./session/session-lineage"
@@ -166,14 +166,14 @@ export function TargetSessionRouteContent() {
   const serverSync = useServerSync()
   const directory = createMemo(() => serverSync().session.lineage.peek(params.id)?.session.directory)
   return (
-    // Settings must keep the target-server SDK, sync, and models context and remain registered
-    // when session content falls back to the route error boundary.
-    <TargetServerScopedProviders directory={directory} sessionID={() => params.id}>
-      <TargetSessionSettingsCommand />
-      <SessionRouteErrorBoundary sessionID={params.id} serverKey={requireServerKey(params.serverKey)} padded>
+    <SessionRouteErrorBoundary sessionID={params.id} serverKey={parseServerKey(params.serverKey)} padded>
+      {/* Settings must keep the target-server SDK, sync, and models context and remain registered
+          when session content falls back to the route error boundary. */}
+      <TargetServerScopedProviders directory={directory} sessionID={() => params.id}>
+        <TargetSessionSettingsCommand />
         <ResolvedTargetSessionRoute />
-      </SessionRouteErrorBoundary>
-    </TargetServerScopedProviders>
+      </TargetServerScopedProviders>
+    </SessionRouteErrorBoundary>
   )
 }
 
@@ -209,6 +209,7 @@ function SessionErrorFallback(props: { error: unknown; sessionID?: string; serve
   const language = useLanguage()
   const server = useServer()
   const tabs = useTabs()
+  const formatted = () => formatRouteError(props.error)
   const displayServer = createMemo(() => {
     const key = props.serverKey ?? server.key
     const conn = server.list.find((item) => ServerConnection.key(item) === key)
@@ -245,7 +246,33 @@ function SessionErrorFallback(props: { error: unknown; sessionID?: string; serve
       </div>
     )
   }
-  return <ErrorPage error={props.error} />
+  return (
+    <div class="flex-1 min-h-0 overflow-hidden">
+      <div class="h-full px-6 pb-42 -mt-4 flex flex-col items-center justify-center text-center gap-4">
+        <div class="flex flex-col items-center gap-2">
+          <div class="text-16-medium text-text max-w-md">{language.t("error.page.title")}</div>
+          <pre class="max-w-xl max-h-56 overflow-auto whitespace-pre-wrap rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 p-3 text-left font-mono text-[12px] leading-5 text-v2-text-text-muted">
+            {formatted()}
+          </pre>
+        </div>
+        <Show when={props.sessionID}>
+          <ButtonV2 variant="neutral" size="normal" icon="xmark-small" onClick={closeTab}>
+            {language.t("session.error.notFound.closeTab")}
+          </ButtonV2>
+        </Show>
+      </div>
+    </div>
+  )
+}
+
+function formatRouteError(error: unknown) {
+  if (error instanceof Error) return error.stack ?? `${error.name}: ${error.message}`
+  if (typeof error === "string") return error
+  try {
+    return JSON.stringify(error, null, 2)
+  } catch {
+    return String(error)
+  }
 }
 
 function ResolvedTargetSessionRoute() {
@@ -1336,11 +1363,17 @@ export default function Page() {
   // broadcast is the signal to surface the browser pane (auto-open).
   createEffect(() => {
     void browserHostClient.init()
-    const unsubscribe = browserHostClient.onTabRequest(() => {
+    const unsubscribeRequest = browserHostClient.onTabRequest(() => {
       if (view().browserPanel.opened()) return
       view().browserPanel.open()
     })
-    onCleanup(unsubscribe)
+    // Applies the local guest-list removal on close; without this the engine
+    // closes the tab but the panel keeps rendering a ghost entry for it.
+    const unsubscribeClose = browserHostClient.onTabClose(() => {})
+    onCleanup(() => {
+      unsubscribeRequest()
+      unsubscribeClose()
+    })
   })
 
   // Keep the engine's session context aligned with the open session so
