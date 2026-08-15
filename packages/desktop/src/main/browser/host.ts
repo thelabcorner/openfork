@@ -68,6 +68,9 @@ export class BrowserHost {
   private connected = false
   private readonly inFlight = new Map<string, InFlight>()
   private helloTimer: ReturnType<typeof setInterval> | null = null
+  private helloRetryTimer: ReturnType<typeof setTimeout> | null = null
+  private helloInFlight = false
+  private pendingHelloAttempt: number | undefined
   private stopping = false
   private readonly options: BrowserHostOptions
 
@@ -110,6 +113,9 @@ export class BrowserHost {
     this.stopping = true
     if (this.helloTimer) clearInterval(this.helloTimer)
     this.helloTimer = null
+    if (this.helloRetryTimer) clearTimeout(this.helloRetryTimer)
+    this.helloRetryTimer = null
+    this.pendingHelloAttempt = undefined
     for (const flight of this.inFlight.values()) {
       clearTimeout(flight.timer)
       flight.respond(
@@ -237,6 +243,10 @@ export class BrowserHost {
 
   private registerHello(attempt: number): void {
     if (this.stopping || this.server === null) return
+    if (this.helloInFlight) {
+      this.pendingHelloAttempt = Math.min(this.pendingHelloAttempt ?? attempt, attempt)
+      return
+    }
     const sidecar = this.options.sidecarProvider()
     if (!sidecar) {
       this.scheduleHelloRetry(attempt)
@@ -254,6 +264,7 @@ export class BrowserHost {
       callbackUrl: this.callbackUrl,
       callbackToken: this.callbackToken,
     }
+    this.helloInFlight = true
     this.postSidecar(sidecar, HELLO_PATH, registration)
       .then((reply) => {
         const parsed = reply as { data?: { accepted?: boolean; brokerProtocolVersion?: number; hostId?: string; replacement?: boolean } }
@@ -269,12 +280,23 @@ export class BrowserHost {
         this.logError("browser host hello failed", { attempt, error: String(error) })
         this.scheduleHelloRetry(attempt)
       })
+      .finally(() => {
+        this.helloInFlight = false
+        const pending = this.pendingHelloAttempt
+        this.pendingHelloAttempt = undefined
+        if (pending !== undefined) this.registerHello(pending)
+      })
   }
 
   private scheduleHelloRetry(attempt: number): void {
     if (this.stopping || this.server === null) return
     const delay = HELLO_BACKOFF_MS[Math.min(attempt, HELLO_BACKOFF_MS.length - 1)] ?? HELLO_BACKOFF_MS[0]!
-    setTimeout(() => this.registerHello(attempt + 1), delay).unref?.()
+    if (this.helloRetryTimer) clearTimeout(this.helloRetryTimer)
+    this.helloRetryTimer = setTimeout(() => {
+      this.helloRetryTimer = null
+      this.registerHello(attempt + 1)
+    }, delay)
+    this.helloRetryTimer.unref?.()
   }
 
   private async postSidecar(
@@ -292,7 +314,13 @@ export class BrowserHost {
       signal: AbortSignal.timeout(10_000),
     })
     if (!response.ok) throw new Error(`sidecar ${path} responded ${response.status}`)
-    return (await response.json()) as unknown
+    // Event acks can come back 200 with an empty body (emitHostEvent doesn't
+    // use the return value); unconditionally calling response.json() on an
+    // empty body throws "Unexpected end of JSON input" for every single
+    // event. Only hello's response is actually parsed.
+    const text = await response.text()
+    if (!text) return undefined
+    return JSON.parse(text) as unknown
   }
 
   private setConnected(connected: boolean): void {

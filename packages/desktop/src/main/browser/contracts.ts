@@ -24,6 +24,21 @@ export const BROKER_ABORT_PATH = "/v1/browser/request/:requestId/abort"
 export const BROWSER_PARTITION = "persist:opencode-browser-v1"
 export const HUMAN_INPUT_CHANNEL = "preview:human-input"
 
+// --- human-in-the-loop annotation channels (guest preload <-> main) -----------
+// Renderer-driven, NOT part of the agent broker/MCP protocol above — a person
+// toggles Annotate in the browser chrome; the guest preload runs its own
+// picker overlay and reports back over these channels.
+
+export const ANNOTATION_START_CHANNEL = "preview:start-pick"
+export const ANNOTATION_CANCEL_CHANNEL = "preview:cancel-pick"
+export const ANNOTATION_PICKED_CHANNEL = "preview:element-picked"
+export const ANNOTATION_CAPTURED_CHANNEL = "preview:annotation-captured"
+export const ANNOTATION_THEME_CHANNEL = "preview:annotation-theme"
+
+export const ANNOTATION_MARQUEE_MAX_ELEMENTS = 20
+export const ANNOTATION_CROP_PADDING_PX = 20
+export const ANNOTATION_MIN_MARQUEE_SIZE_PX = 3
+
 export const AGENT_CURSOR_MOVE_MS = 160
 export const AGENT_CURSOR_CLICK_LEAD_MS = 40
 export const HUMAN_PREEMPT_WINDOW_MS = 750
@@ -310,6 +325,94 @@ export interface GuestTabState {
   snapshotVersion: number
 }
 
+// --- human-in-the-loop annotation payload (guest preload -> main) -------------
+
+export interface AnnotationSourceFrame {
+  file: string
+  line?: number
+  column?: number
+}
+
+export interface AnnotationRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
+/** Structured, source-aware context for one selected element. No React/source
+ * metadata is available without a react-grab-equivalent bridge in this build
+ * — degrades to DOM selector/tagName/html/styles rather than failing the pick
+ * (matches the porting handoff's explicit guidance on missing metadata). */
+export interface AnnotationElementContext {
+  id: string
+  tagName: string
+  selector: string | null
+  htmlPreview: string
+  componentName: string | null
+  source: AnnotationSourceFrame | null
+  styles: string
+  rect: AnnotationRect
+}
+
+export interface AnnotationRegion {
+  id: string
+  rect: AnnotationRect
+}
+
+export interface AnnotationStroke {
+  id: string
+  color: string
+  width: number
+  points: Array<{ x: number; y: number }>
+  bounds: AnnotationRect
+}
+
+export interface AnnotationStyleChange {
+  targetId: string
+  selector: string | null
+  property: string
+  previousValue: string | null
+  value: string
+}
+
+export type AnnotationSubmission = "attach" | "send"
+
+/** What the guest preload sends over ANNOTATION_PICKED_CHANNEL. `screenshot`
+ * must always be null here — main owns the capture; a guest claiming to
+ * supply its own "trusted" screenshot bytes is a spoofing attempt and is
+ * rejected outright by the validator below. */
+export interface BrowserAnnotationPayload {
+  id: string
+  pageUrl: string
+  pageTitle: string | null
+  comment: string
+  elements: AnnotationElementContext[]
+  regions: AnnotationRegion[]
+  strokes: AnnotationStroke[]
+  styleChanges: AnnotationStyleChange[]
+  screenshot: null
+  cropRect: AnnotationRect | null
+  submission: AnnotationSubmission
+  createdAt: string
+}
+
+/** What main resolves back to the renderer once capture has settled (or
+ * failed — a failed screenshot must never discard the structured payload). */
+export interface BrowserAnnotationResult {
+  id: string
+  pageUrl: string
+  pageTitle: string | null
+  comment: string
+  elements: AnnotationElementContext[]
+  regions: AnnotationRegion[]
+  strokes: AnnotationStroke[]
+  styleChanges: AnnotationStyleChange[]
+  screenshot: { mime: "image/png"; dataUrl: string; width: number; height: number } | null
+  submission: AnnotationSubmission
+  createdAt: string
+}
+
 export interface BrowserPointerEvent {
   tabId: string
   phase: "move" | "click"
@@ -347,6 +450,7 @@ export type BrowserOperation =
   | { name: "query"; input: QueryInput }
   | { name: "profiler_start"; input: ProfilerStartInput }
   | { name: "profiler_stop"; input: ProfilerStopInput }
+  | { name: "react_inspect"; input: ReactInspectInput }
 
 export type BrowserOperationName = BrowserOperation["name"]
 
@@ -479,6 +583,10 @@ export interface ProfilerStartInput {
 }
 export interface ProfilerStopInput {
   component?: string
+  timeoutMs?: number
+}
+export interface ReactInspectInput {
+  target: ElementTarget
   timeoutMs?: number
 }
 
@@ -690,6 +798,20 @@ export interface ProfilerStopOutput {
     tabId: string
   }
 }
+export interface ReactComponentInfo {
+  name: string
+  source?: { file: string; line?: number; column?: number }
+  props?: unknown
+  hooks?: unknown[]
+}
+export interface ReactInspectOutput {
+  inspected: {
+    tabId: string
+    hasReact: boolean
+    component?: ReactComponentInfo
+    ancestors: ReactComponentInfo[]
+  }
+}
 
 // --- runtime guards (pure; unit-tested) ---------------------------------------
 
@@ -715,6 +837,7 @@ const OPERATION_NAMES: readonly BrowserOperationName[] = [
   "query",
   "profiler_start",
   "profiler_stop",
+  "react_inspect",
 ]
 
 const ERROR_TAGS: readonly BrowserErrorTag[] = [
@@ -797,6 +920,71 @@ export const isHumanInputSignal = (value: unknown): value is HumanInputSignal =>
     return typeof value.key === "string" && typeof value.code === "string"
   }
   return false
+}
+
+const isAnnotationRect = (value: unknown): value is AnnotationRect =>
+  isRecord(value) &&
+  typeof value.x === "number" &&
+  typeof value.y === "number" &&
+  typeof value.width === "number" &&
+  typeof value.height === "number"
+
+const isAnnotationSourceFrame = (value: unknown): value is AnnotationSourceFrame =>
+  isRecord(value) &&
+  typeof value.file === "string" &&
+  (value.line === undefined || typeof value.line === "number") &&
+  (value.column === undefined || typeof value.column === "number")
+
+const isAnnotationElementContext = (value: unknown): value is AnnotationElementContext =>
+  isRecord(value) &&
+  typeof value.id === "string" &&
+  typeof value.tagName === "string" &&
+  (value.selector === null || typeof value.selector === "string") &&
+  typeof value.htmlPreview === "string" &&
+  (value.componentName === null || typeof value.componentName === "string") &&
+  (value.source === null || isAnnotationSourceFrame(value.source)) &&
+  typeof value.styles === "string" &&
+  isAnnotationRect(value.rect)
+
+const isAnnotationRegion = (value: unknown): value is AnnotationRegion =>
+  isRecord(value) && typeof value.id === "string" && isAnnotationRect(value.rect)
+
+const isAnnotationStroke = (value: unknown): value is AnnotationStroke =>
+  isRecord(value) &&
+  typeof value.id === "string" &&
+  typeof value.color === "string" &&
+  typeof value.width === "number" &&
+  Array.isArray(value.points) &&
+  value.points.every((p) => isRecord(p) && typeof p.x === "number" && typeof p.y === "number") &&
+  isAnnotationRect(value.bounds)
+
+const isAnnotationStyleChange = (value: unknown): value is AnnotationStyleChange =>
+  isRecord(value) &&
+  typeof value.targetId === "string" &&
+  (value.selector === null || typeof value.selector === "string") &&
+  typeof value.property === "string" &&
+  (value.previousValue === null || typeof value.previousValue === "string") &&
+  typeof value.value === "string"
+
+/** Trust boundary: the main process does not accept the guest's JS object
+ * as-is. Every nested field is checked, and — critically — `screenshot` must
+ * be exactly `null`; main owns the capture, so a payload claiming to already
+ * carry screenshot bytes is rejected rather than trusted. */
+export const isBrowserAnnotationPayload = (value: unknown): value is BrowserAnnotationPayload => {
+  if (!isRecord(value)) return false
+  if (typeof value.id !== "string") return false
+  if (typeof value.pageUrl !== "string") return false
+  if (value.pageTitle !== null && typeof value.pageTitle !== "string") return false
+  if (typeof value.comment !== "string") return false
+  if (!Array.isArray(value.elements) || !value.elements.every(isAnnotationElementContext)) return false
+  if (!Array.isArray(value.regions) || !value.regions.every(isAnnotationRegion)) return false
+  if (!Array.isArray(value.strokes) || !value.strokes.every(isAnnotationStroke)) return false
+  if (!Array.isArray(value.styleChanges) || !value.styleChanges.every(isAnnotationStyleChange)) return false
+  if (value.screenshot !== null) return false
+  if (value.cropRect !== null && !isAnnotationRect(value.cropRect)) return false
+  if (value.submission !== "attach" && value.submission !== "send") return false
+  if (typeof value.createdAt !== "string") return false
+  return true
 }
 
 /** Guests may only load http(s) — blocks custom schemes/file. */

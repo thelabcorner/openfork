@@ -13,11 +13,28 @@ import { GuestRegistry } from "./guest"
 import { ControlArbiter } from "./arbitration"
 import { ControlSessionManager } from "./control-session"
 import { BrowserHost } from "./host"
+import { AnnotationController } from "./annotation"
 import {
+  type BrowserAnnotationResult,
   type BrowserState,
   type HostCapabilities,
   type HumanInputSignal,
+  type WireGuestTabState,
 } from "./contracts"
+
+const SESSION_CONTEXT_REGISTER_DEBOUNCE_MS = 150
+// wireGuest (guest.ts) calls sync() on every micro-transition of a
+// navigation (start-loading, title, navigate, stop-loading can all fire
+// within the same tick, and SPA pages firing did-navigate-in-page on every
+// history.pushState multiply this further). The renderer broadcast stays
+// immediate (cheap in-process IPC, and the UI should reflect it promptly);
+// only the outbound sidecar POST — a real network round-trip per call — is
+// coalesced, since "guest.stateChanged" carries the full current tab state
+// and downstream consumers only care about the latest value, not every
+// intermediate one.
+const GUEST_STATE_EVENT_DEBOUNCE_MS = 80
+
+type SessionContext = { sessionId: string; workspaceId?: string; directory?: string }
 
 export interface BrowserEngineOptions {
   windowId: string
@@ -36,9 +53,11 @@ export interface BrowserRenderApi {
   activateTab: (tabId: string) => BrowserState
   closeTab: (tabId: string) => { closed: boolean }
   registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) => { ok: true }
-  unregisterWebview: (runtimeTabId: string) => { ok: true }
+  unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) => { ok: true }
   humanInput: (runtimeTabId: string, signal: unknown) => void
   setSessionContext: (sessionId: string, opts?: { workspaceId?: string; directory?: string }) => void
+  startAnnotation: (tabId: string) => Promise<BrowserAnnotationResult | null>
+  cancelAnnotation: (tabId: string) => void
 }
 
 export class BrowserEngine {
@@ -47,11 +66,14 @@ export class BrowserEngine {
   readonly registry: GuestRegistry
   readonly operations: BrowserOperations
   readonly host: BrowserHost
+  readonly annotation = new AnnotationController()
   private readonly options: BrowserEngineOptions
   private readonly hostId = randomUUID()
   private readonly hostEpoch = 1
   private readonly pendingActivation = new Set<string>()
-  private sessionContext: { sessionId: string; workspaceId?: string; directory?: string } = { sessionId: "" }
+  private sessionContext: SessionContext = { sessionId: "" }
+  private sessionContextRegisterTimer: ReturnType<typeof setTimeout> | undefined
+  private readonly guestStateEventTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private started = false
 
   constructor(options: BrowserEngineOptions) {
@@ -71,7 +93,7 @@ export class BrowserEngine {
       onStateChange: (tab) => {
         if (!tab) return
         this.options.broadcast("browser-state", tab)
-        this.host.emitHostEvent({ type: "guest.stateChanged", tab, timestamp: new Date().toISOString() })
+        this.scheduleGuestStateEvent(tab)
       },
       onGuestGone: (runtimeTabId, webContentsId) => {
         this.arbiter.reset(runtimeTabId)
@@ -136,6 +158,11 @@ export class BrowserEngine {
   async stop(): Promise<void> {
     if (!this.started) return
     this.started = false
+    if (this.sessionContextRegisterTimer) clearTimeout(this.sessionContextRegisterTimer)
+    this.sessionContextRegisterTimer = undefined
+    for (const timer of this.guestStateEventTimers.values()) clearTimeout(timer)
+    this.guestStateEventTimers.clear()
+    for (const tab of this.registry.list()) this.annotation.cancel(tab.runtimeTabId)
     this.registry.teardown()
     await this.sessions.detachAll()
     await this.host.stop()
@@ -196,6 +223,7 @@ export class BrowserEngine {
       const tab = this.registry.get(tabId)
       if (!tab) return { closed: false }
       this.pendingActivation.delete(tabId)
+      this.annotation.cancel(tabId)
       this.registry.unregister(tabId)
       this.options.broadcast("browser-tab-close", { tabId })
       return { closed: true }
@@ -207,18 +235,52 @@ export class BrowserEngine {
       this.options.broadcast("browser-state", this.registry.tabState(record))
       return { ok: true }
     },
-    unregisterWebview: (runtimeTabId) => {
-      this.registry.unregister(runtimeTabId)
+    unregisterWebview: (runtimeTabId, webContentsId, generation) => {
+      this.registry.unregister(runtimeTabId, webContentsId, generation)
       return { ok: true }
     },
     humanInput: (runtimeTabId, signal) => {
       this.handleHumanInput(runtimeTabId, signal)
     },
     setSessionContext: (sessionId, opts) => {
-      this.sessionContext = { sessionId, workspaceId: opts?.workspaceId, directory: opts?.directory }
-      this.host.reRegister()
+      const next = { sessionId, workspaceId: opts?.workspaceId, directory: opts?.directory }
+      if (sameSessionContext(this.sessionContext, next)) return
+      this.sessionContext = next
+      this.scheduleSessionContextRegister()
+    },
+    startAnnotation: (tabId) => {
+      const tab = this.registry.get(tabId)
+      if (!tab) return Promise.resolve(null)
+      return this.annotation.start(tabId, tab.webContents, tab.colorScheme)
+    },
+    cancelAnnotation: (tabId) => {
+      this.annotation.cancel(tabId)
     },
   }
+
+  private scheduleGuestStateEvent(tab: WireGuestTabState): void {
+    const existing = this.guestStateEventTimers.get(tab.tabId)
+    if (existing) clearTimeout(existing)
+    const timer = setTimeout(() => {
+      this.guestStateEventTimers.delete(tab.tabId)
+      this.host.emitHostEvent({ type: "guest.stateChanged", tab, timestamp: new Date().toISOString() })
+    }, GUEST_STATE_EVENT_DEBOUNCE_MS)
+    timer.unref?.()
+    this.guestStateEventTimers.set(tab.tabId, timer)
+  }
+
+  private scheduleSessionContextRegister(): void {
+    if (this.sessionContextRegisterTimer) clearTimeout(this.sessionContextRegisterTimer)
+    this.sessionContextRegisterTimer = setTimeout(() => {
+      this.sessionContextRegisterTimer = undefined
+      this.host.reRegister()
+    }, SESSION_CONTEXT_REGISTER_DEBOUNCE_MS)
+    this.sessionContextRegisterTimer.unref?.()
+  }
+}
+
+function sameSessionContext(left: SessionContext, right: SessionContext) {
+  return left.sessionId === right.sessionId && left.workspaceId === right.workspaceId && left.directory === right.directory
 }
 
 /** Absolute path of the browser-guest preload bundle (electron-vite "preview" input). */

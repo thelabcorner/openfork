@@ -56,13 +56,66 @@ export interface BrowserTabRequest {
   newTab?: boolean
 }
 
+export interface BrowserAnnotationSourceFrame {
+  file: string
+  line?: number
+  column?: number
+}
+export interface BrowserAnnotationRect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+export interface BrowserAnnotationElementContext {
+  id: string
+  tagName: string
+  selector: string | null
+  htmlPreview: string
+  componentName: string | null
+  source: BrowserAnnotationSourceFrame | null
+  styles: string
+  rect: BrowserAnnotationRect
+}
+export interface BrowserAnnotationRegion {
+  id: string
+  rect: BrowserAnnotationRect
+}
+export interface BrowserAnnotationStroke {
+  id: string
+  color: string
+  width: number
+  points: Array<{ x: number; y: number }>
+  bounds: BrowserAnnotationRect
+}
+export interface BrowserAnnotationStyleChange {
+  targetId: string
+  selector: string | null
+  property: string
+  previousValue: string | null
+  value: string
+}
+export interface BrowserAnnotationResult {
+  id: string
+  pageUrl: string
+  pageTitle: string | null
+  comment: string
+  elements: BrowserAnnotationElementContext[]
+  regions: BrowserAnnotationRegion[]
+  strokes: BrowserAnnotationStroke[]
+  styleChanges: BrowserAnnotationStyleChange[]
+  screenshot: { mime: "image/png"; dataUrl: string; width: number; height: number } | null
+  submission: "attach" | "send"
+  createdAt: string
+}
+
 interface BrowserAPI {
   getState: () => Promise<BrowserState>
   openTab: (url: string, opts?: { activate?: boolean; newTab?: boolean }) => Promise<{ tabId: string }>
   activateTab: (tabId: string) => Promise<BrowserState>
   closeTab: (tabId: string) => Promise<{ closed: boolean }>
-  registerWebview: (runtimeTabId: string, webContentsId: number) => Promise<{ ok: true; tabId: string }>
-  unregisterWebview: (runtimeTabId: string) => Promise<{ ok: true }>
+  registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) => Promise<{ ok: true; tabId: string }>
+  unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) => Promise<{ ok: true }>
   getGuestPreloadPath: () => Promise<string>
   setSessionContext: (sessionId: string, opts?: { workspaceId?: string; directory?: string }) => Promise<void>
   onState: (cb: (tab: GuestTabState) => void) => () => void
@@ -70,6 +123,8 @@ interface BrowserAPI {
   onTabClose: (cb: (request: { tabId: string }) => void) => () => void
   onPointerEvent: (cb: (event: PreviewPointerEvent) => void) => () => void
   onHostState: (cb: (state: { connected: boolean }) => void) => () => void
+  startAnnotation: (tabId: string) => Promise<BrowserAnnotationResult | null>
+  cancelAnnotation: (tabId: string) => Promise<void>
 }
 
 const DISCONNECTED_STATE: BrowserHostState = {
@@ -106,15 +161,42 @@ function mapGuestTab(tab: GuestTabState): BrowserGuestState {
   }
 }
 
+/**
+ * Solid's <For> in browser-panel-v2.tsx reconciles by item reference, not by
+ * tabId — a "changed" guest object mounts/unmounts HostedBrowserWebview (a new
+ * <webview> DOM node, i.e. a visible reload). Reuse the previous object
+ * reference whenever the mapped fields are unchanged so unrelated state
+ * pushes don't remount a tab's webview.
+ */
+function sameGuest(a: BrowserGuestState, b: BrowserGuestState): boolean {
+  return (
+    a.tabId === b.tabId &&
+    a.url === b.url &&
+    a.title === b.title &&
+    a.loading === b.loading &&
+    a.canGoBack === b.canGoBack &&
+    a.canGoForward === b.canGoForward &&
+    a.zoomFactor === b.zoomFactor &&
+    a.controller === b.controller &&
+    a.crashed === b.crashed
+  )
+}
+
 /** Apply one full host state snapshot (getState). */
 function applyHostState(next: BrowserState) {
   const previous = hostState()
   const epochChanged = next.host.hostEpoch !== previous.hostEpoch
+  const previousByTabId = new Map(previous.guests.map((guest) => [guest.tabId, guest]))
+  const guests = next.tabs.map((tab) => {
+    const mapped = mapGuestTab(tab)
+    const existing = previousByTabId.get(tab.tabId)
+    return existing && sameGuest(existing, mapped) ? existing : mapped
+  })
   setHostState({
     connected: next.host.connected,
     hostEpoch: next.host.hostEpoch ?? 0,
     activeTabId: next.guest.activeTabId,
-    guests: next.tabs.map(mapGuestTab),
+    guests,
   })
 
   if (epochChanged) {
@@ -134,12 +216,25 @@ function applyHostState(next: BrowserState) {
 /** Apply one per-tab state push (onState). */
 function applyGuestTab(tab: GuestTabState) {
   const current = hostState()
-  const guests = current.guests.filter((guest) => guest.tabId !== tab.tabId)
-  setHostState({
-    ...current,
-    activeTabId: current.activeTabId ?? tab.tabId,
-    guests: [...guests, mapGuestTab(tab)],
-  })
+  const index = current.guests.findIndex((guest) => guest.tabId === tab.tabId)
+  const mapped = mapGuestTab(tab)
+
+  if (index === -1) {
+    setHostState({
+      ...current,
+      activeTabId: current.activeTabId ?? tab.tabId,
+      guests: [...current.guests, mapped],
+    })
+    return
+  }
+
+  // No-op pushes (e.g. duplicate readyState broadcasts) must not replace the
+  // guest's object reference — see sameGuest() above.
+  if (sameGuest(current.guests[index], mapped)) return
+
+  const guests = current.guests.slice()
+  guests[index] = mapped
+  setHostState({ ...current, guests })
 }
 
 /** Optimistically add a guest on tab request; the engine's browser-state push replaces it. */
@@ -267,14 +362,17 @@ export const browserHostClient = {
   setAppearance: (_appearance: BrowserAppearance) => Promise.resolve(),
   toggleDevtools: (_tabId: string) => Promise.resolve(),
 
-  registerWebview: (runtimeTabId: string, webContentsId: number) =>
-    rawBrowser()?.registerWebview(runtimeTabId, webContentsId) ??
+  registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) =>
+    rawBrowser()?.registerWebview(runtimeTabId, webContentsId, generation) ??
     Promise.resolve({ ok: true as const, tabId: runtimeTabId }),
-  unregisterWebview: (runtimeTabId: string) =>
-    rawBrowser()?.unregisterWebview(runtimeTabId) ?? Promise.resolve({ ok: true as const }),
+  unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) =>
+    rawBrowser()?.unregisterWebview(runtimeTabId, webContentsId, generation) ?? Promise.resolve({ ok: true as const }),
   getGuestPreloadPath: () => rawBrowser()?.getGuestPreloadPath() ?? Promise.resolve(""),
   setSessionContext: (sessionId: string, opts?: { workspaceId?: string; directory?: string }) =>
     rawBrowser()?.setSessionContext(sessionId, opts) ?? Promise.resolve(),
+
+  startAnnotation: (tabId: string) => rawBrowser()?.startAnnotation(tabId) ?? Promise.resolve(null),
+  cancelAnnotation: (tabId: string) => rawBrowser()?.cancelAnnotation(tabId) ?? Promise.resolve(),
 }
 
 export { noop }

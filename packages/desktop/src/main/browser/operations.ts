@@ -36,6 +36,7 @@ import {
   highlightScript,
   interactiveElementsScanScript,
   queryElementsScript,
+  reactInspectScript,
   resolveElementScript,
   toElementState,
 } from "./scripts-resolve"
@@ -71,6 +72,8 @@ import {
   type OpenInput,
   type OpenOutput,
   type QueryOutput,
+  type ReactComponentInfo,
+  type ReactInspectOutput,
   type RefTarget,
   type ResolvedElement,
   type ScreenshotInput,
@@ -166,6 +169,8 @@ export class BrowserOperations {
         return (await this.profilerStart(tabId)) as unknown as Record<string, unknown>
       case "profiler_stop":
         return (await this.profilerStop(tabId)) as unknown as Record<string, unknown>
+      case "react_inspect":
+        return (await this.reactInspect(tabId, operation.input)) as unknown as Record<string, unknown>
       default:
         throw new BrowserUnsupportedOperationError(`Unknown operation`)
     }
@@ -837,6 +842,32 @@ export class BrowserOperations {
         tabId: tab.runtimeTabId,
       },
     }
+  }
+
+  /** React-DevTools-equivalent component inspection for one target: name,
+   * dev-build source location, current props, readable hook state, and a
+   * bounded ancestor-component breadcrumb. Reads the Fiber tree directly
+   * (see reactInspectScript) — works without React DevTools installed and
+   * without weakening the guest's contextIsolation. */
+  private async reactInspect(tabId: string | undefined, input: { target: ElementTarget }): Promise<ReactInspectOutput> {
+    const tab = this.resolveTab(tabId)
+    return this.withControl(tab, "react_inspect", async (send) => {
+      const findExpr = await this.targetExpression(send, tab, input.target)
+      const result = (await this.evaluate(send, reactInspectScript(findExpr), true)) as
+        | { error: string }
+        | { hasReact: boolean; component?: ReactComponentInfo; ancestors?: ReactComponentInfo[] }
+        | null
+      if (result && "error" in result) throw new BrowserTargetNotFoundError(result.error)
+      if (!result) throw new BrowserTargetNotFoundError()
+      return {
+        inspected: {
+          tabId: tab.runtimeTabId,
+          hasReact: result.hasReact,
+          component: result.component,
+          ancestors: result.ancestors ?? [],
+        },
+      }
+    })
   }
 
   // --- helpers ----------------------------------------------------------------

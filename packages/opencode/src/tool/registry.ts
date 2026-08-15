@@ -16,6 +16,7 @@ import { WebFetchTool } from "./webfetch"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
+import { ArchiveTool } from "./archive"
 import * as Tool from "./tool"
 import { Config } from "@/config/config"
 import { type ToolContext as PluginToolContext, type ToolDefinition } from "@opencode-ai/plugin"
@@ -50,6 +51,7 @@ import { BrowserHighlightTool } from "./browser/highlight"
 import { BrowserAnnotateTool } from "./browser/annotate"
 import { BrowserProfilerStartTool } from "./browser/profiler-start"
 import { BrowserProfilerStopTool } from "./browser/profiler-stop"
+import { BrowserReactInspectTool } from "./browser/react-inspect"
 import { BrokerClient } from "@/browser/broker-client"
 import { Glob } from "@opencode-ai/core/util/glob"
 import path from "path"
@@ -131,6 +133,7 @@ const layer = Layer.effect(
     const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
+    const archivetool = yield* ArchiveTool
     const browserStatus = yield* BrowserStatusTool
     const browserOpen = yield* BrowserOpenTool
     const browserNavigate = yield* BrowserNavigateTool
@@ -152,6 +155,7 @@ const layer = Layer.effect(
     const browserAnnotate = yield* BrowserAnnotateTool
     const browserProfilerStart = yield* BrowserProfilerStartTool
     const browserProfilerStop = yield* BrowserProfilerStopTool
+    const browserReactInspect = yield* BrowserReactInspectTool
     const agent = yield* Agent.Service
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
@@ -257,6 +261,7 @@ const layer = Layer.effect(
           todo: Tool.init(todo),
           search: Tool.init(websearch),
           skill: Tool.init(skilltool),
+          archive: Tool.init(archivetool),
           patch: Tool.init(patchtool),
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
@@ -282,6 +287,7 @@ const layer = Layer.effect(
           browserAnnotate: Tool.init(browserAnnotate),
           browserProfilerStart: Tool.init(browserProfilerStart),
           browserProfilerStop: Tool.init(browserProfilerStop),
+          browserReactInspect: Tool.init(browserReactInspect),
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
 
@@ -301,6 +307,7 @@ const layer = Layer.effect(
             tool.todo,
             tool.search,
             tool.skill,
+            tool.archive,
             tool.patch,
             tool.browserStatus,
             tool.browserOpen,
@@ -323,6 +330,7 @@ const layer = Layer.effect(
             tool.browserAnnotate,
             tool.browserProfilerStart,
             tool.browserProfilerStop,
+            tool.browserReactInspect,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),

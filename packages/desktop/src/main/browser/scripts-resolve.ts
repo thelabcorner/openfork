@@ -342,6 +342,94 @@ export function highlightScript(resolveExpr: string, durationMs = 800) {
   })()`
 }
 
+// --- react inspect -----------------------------------------------------------
+
+/**
+ * Walk the target's React Fiber tree via DOM expando properties (React
+ * attaches `__reactFiber$<key>` to every node it manages) — no
+ * `contextIsolation=false` needed, no React DevTools protocol dependency.
+ * Only `_debugSource` is available on DEVELOPMENT builds of React (stripped
+ * in production), which is exactly the case this tool targets: a coding
+ * agent's local dev server. Bounded: props/hooks are recursively serialized
+ * to depth 3, ancestor chain capped at 12 components, hook list capped at 15.
+ */
+export function reactInspectScript(resolveExpr: string) {
+  return `(() => {
+    const find = ${resolveExpr};
+    let el;
+    try { el = find(); } catch (e) { return { error: e.message }; }
+    if (!el) return null;
+
+    const MAX_DEPTH = 3;
+    const safe = (value, depth) => {
+      if (depth > MAX_DEPTH) return '[Truncated]';
+      if (value === null || value === undefined) return value === undefined ? null : value;
+      if (typeof value === 'function') return '[Function ' + (value.name || 'anonymous') + ']';
+      if (typeof value === 'string') return value.length > 500 ? value.slice(0, 500) + '…' : value;
+      if (typeof value === 'number' || typeof value === 'boolean') return value;
+      if (typeof Element !== 'undefined' && value instanceof Element) return '[Element <' + value.tagName.toLowerCase() + '>]';
+      if (Array.isArray(value)) return value.slice(0, 20).map((v) => safe(v, depth + 1));
+      if (typeof value === 'object') {
+        const out = {};
+        let count = 0;
+        for (const key in value) {
+          if (key === 'children' || key.charAt(0) === '_') continue;
+          if (count++ >= 20) { out['…'] = 'truncated'; break; }
+          try { out[key] = safe(value[key], depth + 1); } catch { out[key] = '[Unserializable]'; }
+        }
+        return out;
+      }
+      return String(value);
+    };
+
+    const fiberKey = Object.keys(el).find((k) => k.indexOf('__reactFiber$') === 0 || k.indexOf('__reactInternalInstance$') === 0);
+    if (!fiberKey) return { hasReact: false, ancestors: [] };
+
+    const componentNameOfType = (type) => {
+      if (typeof type === 'string') return null;
+      if (typeof type === 'function') return type.displayName || type.name || null;
+      if (type && typeof type === 'object') return type.displayName || type.name || (type.render && (type.render.displayName || type.render.name)) || null;
+      return null;
+    };
+
+    const sourceOf = (fiber) => {
+      const s = fiber._debugSource;
+      if (!s) return undefined;
+      return { file: s.fileName, line: s.lineNumber, column: s.columnNumber };
+    };
+
+    const readHooks = (fiber) => {
+      const hooks = [];
+      let hook = fiber.memoizedState;
+      let guard = 0;
+      while (hook && guard++ < 25 && hooks.length < 15) {
+        if ('memoizedState' in hook) hooks.push(safe(hook.memoizedState, 0));
+        hook = hook.next;
+      }
+      return hooks;
+    };
+
+    let fiber = el[fiberKey];
+    let component;
+    const ancestors = [];
+    let guard = 0;
+    while (fiber && guard++ < 60) {
+      const name = componentNameOfType(fiber.type);
+      if (name) {
+        const entry = { name, source: sourceOf(fiber) };
+        if (!component) {
+          component = { name, source: entry.source, props: fiber.memoizedProps ? safe(fiber.memoizedProps, 0) : undefined, hooks: fiber.memoizedState ? readHooks(fiber) : undefined };
+        } else if (ancestors.length < 12) {
+          ancestors.push(entry);
+        }
+      }
+      fiber = fiber.return;
+    }
+
+    return { hasReact: true, component, ancestors };
+  })()`
+}
+
 // --- helpers ---------------------------------------------------------------
 
 export function isQueryMatch(value: unknown): value is QueryMatch {

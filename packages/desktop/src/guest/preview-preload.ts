@@ -11,6 +11,7 @@
 import { ipcRenderer } from "electron"
 
 import { HUMAN_INPUT_CHANNEL } from "../main/browser/contracts"
+import "./annotation-overlay"
 
 const send = (signal: unknown) => {
   ipcRenderer.send(HUMAN_INPUT_CHANNEL, signal)

@@ -2,7 +2,8 @@ import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
 import type { WslServersPlatform } from "@opencode-ai/app/wsl/types"
 import type { UpdaterState } from "@opencode-ai/app/updater"
 import type { DesktopNativeBundle } from "@opencode-ai/app/i18n/desktop-native"
-import type { BrowserPointerEvent, BrowserState, WireGuestTabState } from "../main/browser/contracts"
+import type { BrowserAnnotationResult, BrowserPointerEvent, BrowserState, WireGuestTabState } from "../main/browser/contracts"
+export type { BrowserAnnotationResult } from "../main/browser/contracts"
 export type {
   WslDistroProbe,
   WslInstalledDistro,
@@ -56,7 +57,7 @@ export type BrowserAPI = {
   activateTab: (tabId: string) => Promise<BrowserState>
   closeTab: (tabId: string) => Promise<{ closed: boolean }>
   registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) => Promise<{ ok: true }>
-  unregisterWebview: (runtimeTabId: string) => Promise<{ ok: true }>
+  unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) => Promise<{ ok: true }>
   getGuestPreloadPath: () => Promise<string>
   setSessionContext: (sessionId: string, opts?: { workspaceId?: string; directory?: string }) => Promise<void>
   onState: (cb: (tab: WireGuestTabState) => void) => () => void
@@ -64,6 +65,8 @@ export type BrowserAPI = {
   onTabClose: (cb: (request: { tabId: string }) => void) => () => void
   onPointerEvent: (cb: (event: BrowserPointerEvent) => void) => () => void
   onHostState: (cb: (state: { connected: boolean }) => void) => () => void
+  startAnnotation: (tabId: string) => Promise<BrowserAnnotationResult | null>
+  cancelAnnotation: (tabId: string) => Promise<void>
 }
 
 export type ElectronAPI = {

@@ -47,6 +47,9 @@ import {
   QueryInput,
   QueryOutput,
   QueryMatch,
+  ReactComponentInfo,
+  ReactInspectInput,
+  ReactInspectOutput,
   RecordingStartInput,
   RecordingStartOutput,
   RecordingStopInput,
@@ -133,6 +136,9 @@ export {
   QueryInput,
   QueryOutput,
   QueryMatch,
+  ReactComponentInfo,
+  ReactInspectInput,
+  ReactInspectOutput,
   RecordingStartInput,
   RecordingStartOutput,
   RecordingStopInput,
@@ -189,6 +195,7 @@ export const OperationInput = {
   annotate: AnnotateInput,
   profiler_start: ProfilerStartInput,
   profiler_stop: ProfilerStopInput,
+  react_inspect: ReactInspectInput,
 }
 
 /** Typed output schema per operation — validates the host's success object. */
@@ -214,6 +221,7 @@ export const OperationOutput = {
   annotate: AnnotateOutput,
   profiler_start: ProfilerStartOutput,
   profiler_stop: ProfilerStopOutput,
+  react_inspect: ReactInspectOutput,
 }
 
 export type OperationName = keyof typeof OperationInput
@@ -244,6 +252,7 @@ export const DEFAULT_TIMEOUT_MS: Record<OperationName, number> = {
   annotate: 15_000,
   profiler_start: 10_000,
   profiler_stop: 10_000,
+  react_inspect: 10_000,
 }
 
 /** Permission family per operation (design §5 + premium amendment). */
@@ -256,6 +265,7 @@ export const FAMILY: Record<OperationName, BrowserFamily> = {
   query: "browser.read",
   profiler_start: "browser.read",
   profiler_stop: "browser.read",
+  react_inspect: "browser.read",
   open: "browser.navigate",
   navigate: "browser.navigate",
   close: "browser.navigate",

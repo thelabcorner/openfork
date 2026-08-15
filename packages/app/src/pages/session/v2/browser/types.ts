@@ -122,7 +122,11 @@ export interface BrowserHostState {
   guests: BrowserGuestState[]
 }
 
-export const VIEWPORT_MIN_SIZE = 160
+// Hard bounds for a fixed (freeform/preset) viewport's logical CSS size —
+// mirrors Chrome DevTools' own device-toolbar limits.
+export const VIEWPORT_MIN_SIZE = 240
+export const VIEWPORT_MAX_SIZE = 3840
+export const VIEWPORT_MAX_AREA = VIEWPORT_MAX_SIZE * 2160
 export const VIEWPORT_PRESET_SIZE = 320
 
 /** Renderer key for a viewport setting (data attributes / store lookups). */

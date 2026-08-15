@@ -39,7 +39,13 @@ export function BrowserPanelV2(props: {
     if (!id) return null
     return browserHostClient.guest(id).title ?? browserHostClient.guest(id).url
   })
-  const tabs = createMemo(() => hostState().guests)
+  // Primitive tabId array, not the full guest objects: Solid's <For> reconciles
+  // by item identity, and guest objects get a new reference on every real
+  // field change (title while loading, url on navigation). Keying the mount
+  // loop off guest objects tore down and recreated HostedBrowserWebview (a
+  // fresh <webview>, i.e. a visible reload) on ordinary navigation — strings
+  // compare by value, so tabIds() stays stable across those pushes.
+  const tabIds = createMemo(() => hostState().guests.map((guest) => guest.tabId))
 
   const newTab = () => {
     void browserHostClient.open({ url: "about:blank", newTab: true, activate: true })
@@ -63,45 +69,22 @@ export function BrowserPanelV2(props: {
       <div class="flex h-8 shrink-0 items-center gap-1 border-b border-v2-border-border-base bg-v2-background-bg-base px-1.5">
         <div class="flex min-w-0 flex-1 items-center gap-1 overflow-hidden" data-browser-tabs>
           <Show
-            when={tabs().length > 0}
+            when={tabIds().length > 0}
             fallback={
               <div class="min-w-0 flex-1 truncate px-1 text-[11px] leading-none text-v2-text-text-muted" data-browser-panel-title>
                 {language.t("browser.panel.empty")}
               </div>
             }
           >
-            <For each={tabs()}>
-              {(tab) => (
-                <div
-                  data-active={activeTabId() === tab.tabId || undefined}
-                  class="group/tab flex h-6 min-w-0 max-w-[170px] flex-1 items-center rounded-[5px] text-v2-text-text-muted transition-colors duration-100 hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-base data-[active=true]:bg-v2-background-bg-layer-03 data-[active=true]:text-v2-text-text-base"
-                >
-                  <button
-                    type="button"
-                    class="flex h-full min-w-0 flex-1 items-center gap-1 rounded-l-[5px] px-2 text-left text-[11px] leading-none"
-                    title={tab.title || tab.url || language.t("browser.panel.empty")}
-                    aria-label={tab.title || tab.url || language.t("browser.panel.empty")}
-                    onClick={() => activateTab(tab.tabId)}
-                  >
-                    <span
-                      class="size-1.5 shrink-0 rounded-full bg-v2-icon-icon-muted data-[loading=true]:bg-v2-text-text-accent"
-                      data-loading={tab.loading || undefined}
-                    />
-                    <span class="min-w-0 flex-1 truncate">{tab.title || tab.url || activeTabTitle() || language.t("browser.panel.empty")}</span>
-                  </button>
-                  <button
-                    type="button"
-                    class="flex size-5 shrink-0 items-center justify-center rounded-[4px] opacity-0 transition-opacity duration-100 hover:bg-v2-background-bg-layer-01 group-hover/tab:opacity-100 data-[active=true]:opacity-100"
-                    data-active={activeTabId() === tab.tabId || undefined}
-                    aria-label={language.t("common.close")}
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      void browserHostClient.close(tab.tabId)
-                    }}
-                  >
-                    <CloseIcon />
-                  </button>
-                </div>
+            <For each={tabIds()}>
+              {(tabId) => (
+                <BrowserTabPill
+                  tabId={tabId}
+                  active={activeTabId() === tabId}
+                  fallbackTitle={activeTabTitle()}
+                  onActivate={() => activateTab(tabId)}
+                  onClose={() => void browserHostClient.close(tabId)}
+                />
               )}
             </For>
           </Show>
@@ -120,12 +103,12 @@ export function BrowserPanelV2(props: {
       </div>
 
       <div class="relative min-h-0 flex-1">
-        <Show when={tabs().length > 0} fallback={<BrowserPanelV2Empty onNewTab={newTab} />}>
-          <For each={tabs()}>
-            {(tab) => (
+        <Show when={tabIds().length > 0} fallback={<BrowserPanelV2Empty onNewTab={newTab} />}>
+          <For each={tabIds()}>
+            {(tabId) => (
               <HostedBrowserWebview
-                tabId={tab.tabId}
-                active={activeTabId() === tab.tabId}
+                tabId={tabId}
+                active={activeTabId() === tabId}
                 onClose={closeActiveTab}
                 onNewTab={newTab}
               />
@@ -142,6 +125,53 @@ export function BrowserPanelV2(props: {
         max={BROWSER_PANEL_V2_WIDTH_MAX}
         onResize={props.state.resizeSidebar}
       />
+    </div>
+  )
+}
+
+/** One tab-strip pill. Reads its own guest state so a title/loading update
+ * on one tab only re-renders that pill, not the whole strip. */
+function BrowserTabPill(props: {
+  tabId: string
+  active: boolean
+  fallbackTitle: string | null
+  onActivate: () => void
+  onClose: () => void
+}) {
+  const language = useLanguage()
+  const guest = createMemo(() => browserHostClient.guest(props.tabId))
+  const label = () => guest().title || guest().url || props.fallbackTitle || language.t("browser.panel.empty")
+
+  return (
+    <div
+      data-active={props.active || undefined}
+      class="group/tab flex h-6 min-w-0 max-w-[170px] flex-1 items-center rounded-[5px] text-v2-text-text-muted transition-colors duration-100 hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-base data-[active=true]:bg-v2-background-bg-layer-03 data-[active=true]:text-v2-text-text-base"
+    >
+      <button
+        type="button"
+        class="flex h-full min-w-0 flex-1 items-center gap-1 rounded-l-[5px] px-2 text-left text-[11px] leading-none"
+        title={label()}
+        aria-label={label()}
+        onClick={props.onActivate}
+      >
+        <span
+          class="size-1.5 shrink-0 rounded-full bg-v2-icon-icon-muted data-[loading=true]:bg-v2-text-text-accent"
+          data-loading={guest().loading || undefined}
+        />
+        <span class="min-w-0 flex-1 truncate">{label()}</span>
+      </button>
+      <button
+        type="button"
+        class="flex size-5 shrink-0 items-center justify-center rounded-[4px] opacity-0 transition-opacity duration-100 hover:bg-v2-background-bg-layer-01 group-hover/tab:opacity-100 data-[active=true]:opacity-100"
+        data-active={props.active || undefined}
+        aria-label={language.t("common.close")}
+        onClick={(event) => {
+          event.stopPropagation()
+          props.onClose()
+        }}
+      >
+        <CloseIcon />
+      </button>
     </div>
   )
 }

@@ -165,9 +165,11 @@ export class GuestRegistry {
   }
 
   /** Tear down a tab: clear arbitration, refs, and the partition lease. */
-  unregister(runtimeTabId: string): void {
+  unregister(runtimeTabId: string, webContentsId?: number, generation?: number): void {
     const record = this.tabs.get(runtimeTabId)
     if (!record) return
+    if (webContentsId !== undefined && record.webContentsId !== webContentsId) return
+    if (generation !== undefined && record.generation !== generation) return
     this.options.arbiter.reset(runtimeTabId)
     this.snapshotRefs.delete(runtimeTabId)
     this.tabs.delete(runtimeTabId)
@@ -260,55 +262,62 @@ export class GuestRegistry {
   }
 
   private wireGuest(record: GuestRecord, wc: WebContents) {
+    const runtimeTabId = record.runtimeTabId
+    const webContentsId = wc.id
+    const generation = record.generation
+    const current = () => {
+      const tab = this.tabs.get(runtimeTabId)
+      return tab?.webContentsId === webContentsId && tab.generation === generation && tab.webContents === wc
+    }
     wc.on("did-start-loading", () => {
-      if (!this.tabs.has(record.runtimeTabId)) return
+      if (!current()) return
       record.loading = true
       record.readyState = "loading"
-      this.sync(record.runtimeTabId)
+      this.sync(runtimeTabId)
     })
     wc.on("did-stop-loading", () => {
-      if (!this.tabs.has(record.runtimeTabId)) return
+      if (!current()) return
       record.loading = false
       record.readyState = "complete"
-      this.sync(record.runtimeTabId)
+      this.sync(runtimeTabId)
     })
     wc.on("did-finish-load", () => {
-      if (!this.tabs.has(record.runtimeTabId)) return
+      if (!current()) return
       record.readyState = "complete"
       record.url = wc.getURL()
-      this.sync(record.runtimeTabId)
+      this.sync(runtimeTabId)
     })
     wc.on("page-title-updated", (_event, title) => {
-      if (!this.tabs.has(record.runtimeTabId)) return
+      if (!current()) return
       record.title = title
-      this.sync(record.runtimeTabId)
+      this.sync(runtimeTabId)
     })
     wc.on("did-navigate", (_event, url) => {
-      if (!this.tabs.has(record.runtimeTabId)) return
+      if (!current()) return
       record.url = url
-      this.sync(record.runtimeTabId)
+      this.sync(runtimeTabId)
     })
     wc.on("did-navigate-in-page", (_event, url) => {
-      if (!this.tabs.has(record.runtimeTabId)) return
+      if (!current()) return
       record.url = url
-      this.sync(record.runtimeTabId)
+      this.sync(runtimeTabId)
     })
     wc.on("render-process-gone", () => {
-      if (!this.tabs.has(record.runtimeTabId)) return
+      if (!current()) return
       record.crashed = true
       record.attached = false
       this.options.logger?.error("browser guest render process gone", {
-        runtimeTabId: record.runtimeTabId,
+        runtimeTabId,
         webContentsId: wc.id,
         url: wc.getURL(),
       })
-      this.options.onGuestGone(record.runtimeTabId, wc.id)
-      this.sync(record.runtimeTabId)
+      this.options.onGuestGone(runtimeTabId, wc.id)
+      this.sync(runtimeTabId)
     })
     wc.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
-      if (!this.tabs.has(record.runtimeTabId)) return
+      if (!current()) return
       this.options.logger?.error("browser guest failed load", {
-        runtimeTabId: record.runtimeTabId,
+        runtimeTabId,
         errorCode,
         errorDescription,
         validatedURL,
@@ -316,10 +325,10 @@ export class GuestRegistry {
       })
     })
     wc.on("destroyed", () => {
-      if (!this.tabs.has(record.runtimeTabId)) return
+      if (!current()) return
       record.attached = false
-      this.options.onGuestGone(record.runtimeTabId, wc.id)
-      this.sync(record.runtimeTabId)
+      this.options.onGuestGone(runtimeTabId, wc.id)
+      this.sync(runtimeTabId)
     })
 
     // Guest-posted human input (from the sandboxed guest preload). The agent's
@@ -335,7 +344,7 @@ export class GuestRegistry {
     // Deny popups inside the hosted guest. Loading the popup target in-place
     // can cause consent/login retry loops on sites that expect a separate tab.
     wc.setWindowOpenHandler(({ url }) => {
-      this.options.logger?.log("browser guest blocked popup", { runtimeTabId: record.runtimeTabId, url })
+      this.options.logger?.log("browser guest blocked popup", { runtimeTabId, url })
       return { action: "deny" }
     })
     // Restrict guest navigation to http(s) only.

@@ -18,7 +18,9 @@ export const browserPointerStore = {
     return state.byTabId[tabId] ?? null
   },
   apply(event: BrowserPointerEvent) {
-    setState("byTabId", { ...state.byTabId, [event.tabId]: event })
+    // Pointer events fire at agent-move frequency — target the one tab's key
+    // directly rather than rebuilding the whole byTabId record every time.
+    setState("byTabId", event.tabId, event)
   },
   clear(tabId: string) {
     if (!(tabId in state.byTabId)) return

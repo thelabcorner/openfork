@@ -341,9 +341,9 @@ export function registerBrowserIpcHandlers(engine: BrowserEngine) {
     return engine.api.registerWebview(runtimeTabId, webContentsId, generation)
   })
 
-  ipcMain.handle("browser-unregister-webview", (event, runtimeTabId: string) => {
+  ipcMain.handle("browser-unregister-webview", (event, runtimeTabId: string, webContentsId?: number, generation?: number) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.unregisterWebview(runtimeTabId)
+    return engine.api.unregisterWebview(runtimeTabId, webContentsId, generation)
   })
 
   ipcMain.handle("browser-human-input", (event, runtimeTabId: string, signal: unknown) => {
@@ -362,5 +362,15 @@ export function registerBrowserIpcHandlers(engine: BrowserEngine) {
   ipcMain.handle("browser-get-guest-preload", (event) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return resolveGuestPreloadPath()
+  })
+
+  ipcMain.handle("browser-start-annotation", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.startAnnotation(tabId)
+  })
+
+  ipcMain.handle("browser-cancel-annotation", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    engine.api.cancelAnnotation(tabId)
   })
 }

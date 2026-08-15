@@ -4,11 +4,20 @@
 // viewport directly — it only edits the ViewportSetting, which the
 // presentation layer maps through zoomFactor * fit scale.
 
-import { Show, createMemo, createSignal, For } from "solid-js"
+import { Show, createEffect, createMemo, createSignal, For } from "solid-js"
 import { SelectV2 } from "@opencode-ai/ui/v2/select-v2"
 import { useLanguage } from "@/context/language"
 import { BROWSER_DEVICE_PRESETS, resolveBrowserDevicePreset, type BrowserDeviceNameKey } from "./browserPresets"
-import { browserViewportSettingKey, type DeviceOrientation, type ViewportSetting, type ViewportMode } from "./types"
+import { aspectRatioOf, resizeAtAspectRatio } from "./browserViewportLayout"
+import {
+  browserViewportSettingKey,
+  VIEWPORT_MAX_AREA,
+  VIEWPORT_MAX_SIZE,
+  VIEWPORT_MIN_SIZE,
+  type DeviceOrientation,
+  type ViewportSetting,
+  type ViewportMode,
+} from "./types"
 
 const MODES: readonly ViewportMode[] = ["fill", "freeform", "preset"]
 
@@ -34,13 +43,12 @@ export function BrowserDeviceToolbar(props: {
 }) {
   const language = useLanguage()
 
-  const preset = createMemo(() => resolveBrowserDevicePreset(props.setting.presetId))
   const presetOptions = createMemo(() => [...BROWSER_DEVICE_PRESETS])
 
   const switchMode = (mode: ViewportMode) => {
     const next: ViewportSetting = { ...props.setting, mode }
     if (mode === "preset") {
-      const fallback = resolveBrowserDevicePreset("laptop") ?? presetOptions()[0]
+      const fallback = resolveBrowserDevicePreset("ipad-air") ?? presetOptions()[0]
       next.presetId = props.setting.presetId ?? fallback.id
       next.width = fallback.width
       next.height = fallback.height
@@ -72,10 +80,62 @@ export function BrowserDeviceToolbar(props: {
     props.onChange({ ...props.setting, orientation, width, height })
   }
 
-  const readout = createMemo(() => {
-    if (props.setting.width == null || props.setting.height == null) return null
-    return `${props.setting.width} × ${props.setting.height}`
+  // Exact-dimension inputs: typed as strings so transient invalid states
+  // (empty, mid-edit) don't get clobbered by re-renders. Resynced from the
+  // authoritative setting whenever it changes externally (rotate, preset
+  // pick, mode switch, or our own committed edit) — never while the user is
+  // simply typing, since that doesn't touch props.setting.
+  const [draftWidth, setDraftWidth] = createSignal("")
+  const [draftHeight, setDraftHeight] = createSignal("")
+
+  createEffect(() => {
+    void browserViewportSettingKey(props.setting)
+    setDraftWidth(props.setting.width != null ? String(props.setting.width) : "")
+    setDraftHeight(props.setting.height != null ? String(props.setting.height) : "")
   })
+
+  function parseDimension(raw: string): number | null {
+    const trimmed = raw.trim()
+    if (!/^\d+$/.test(trimmed)) return null
+    const value = Number(trimmed)
+    if (value < VIEWPORT_MIN_SIZE || value > VIEWPORT_MAX_SIZE) return null
+    return value
+  }
+
+  // While aspect lock is on, the ratio comes from the last COMMITTED size
+  // (props.setting), not the live drafts — matches the resize-handle path:
+  // "aspect lock is local UI state that derives the current ratio from the
+  // latest fixed viewport," not a value that drifts as the drafts change.
+  const lockedRatio = createMemo(() =>
+    props.aspectRatioLocked ? aspectRatioOf(props.setting.width ?? 0, props.setting.height ?? 0) : null,
+  )
+
+  const onWidthInput = (value: string) => {
+    setDraftWidth(value)
+    const ratio = lockedRatio()
+    const width = parseDimension(value)
+    if (!ratio || width == null) return
+    setDraftHeight(String(resizeAtAspectRatio({ width, height: width / ratio }, "width", ratio).height))
+  }
+
+  const onHeightInput = (value: string) => {
+    setDraftHeight(value)
+    const ratio = lockedRatio()
+    const height = parseDimension(value)
+    if (!ratio || height == null) return
+    setDraftWidth(String(resizeAtAspectRatio({ width: height * ratio, height }, "height", ratio).width))
+  }
+
+  const submitDimensions = (event: SubmitEvent) => {
+    event.preventDefault()
+    const width = parseDimension(draftWidth())
+    const height = parseDimension(draftHeight())
+    if (width == null || height == null || width * height > VIEWPORT_MAX_AREA) return
+    // Typing an exact size is a manual override, same as dragging a rail —
+    // it converts a preset to freeform rather than silently keeping a preset
+    // identity that no longer matches the entered dimensions.
+    props.onChange({ ...props.setting, mode: "freeform", presetId: null, width, height })
+  }
 
   const segButton = (mode: ViewportMode) => (
     <button
@@ -95,11 +155,56 @@ export function BrowserDeviceToolbar(props: {
   return (
     <div
       data-browser-device-toolbar
-      class="pointer-events-auto absolute inset-x-0 top-0 z-30 flex h-7 items-center gap-1 border-b border-v2-border-border-base bg-v2-background-bg-base/90 px-1.5 backdrop-blur-sm"
+      class="flex h-7 shrink-0 items-center gap-1 border-b border-v2-border-border-base bg-v2-background-bg-base px-1.5"
     >
       <div class="flex items-center gap-0.5 rounded-[5px] bg-v2-background-bg-layer-01 p-0.5" role="group" aria-label={language.t("browser.viewportMode")}>
         <For each={MODES}>{(mode) => segButton(mode)}</For>
       </div>
+
+      {/* Dimensions live right next to the mode switch in every mode: an
+          editable W×H form for freeform/preset, a read-only live readout for
+          fill (its size is derived from the panel, not user-set). */}
+      <Show
+        when={props.setting.mode !== "fill"}
+        fallback={
+          <div
+            class="flex h-6 items-center rounded-[4px] bg-v2-background-bg-layer-01 px-1.5 text-[11px] leading-none tabular-nums text-v2-text-text-muted"
+            data-browser-viewport-readout
+          >
+            W {props.fillSize.width} × H {props.fillSize.height}
+          </div>
+        }
+      >
+        <form class="flex h-6 items-center gap-1" onSubmit={submitDimensions} data-browser-dimension-form>
+          <span class="text-[10px] text-v2-text-text-muted" aria-hidden="true">
+            W
+          </span>
+          <input
+            class="h-6 w-11 rounded-[4px] border border-transparent bg-v2-background-bg-layer-01 px-1 text-center text-[11px] leading-none tabular-nums text-v2-text-text-base outline-none transition-colors duration-100 focus:border-v2-border-border-strong aria-[invalid=true]:border-v2-text-text-warning"
+            value={draftWidth()}
+            onInput={(event) => onWidthInput(event.currentTarget.value)}
+            inputmode="numeric"
+            aria-label={language.t("browser.dimension.width")}
+            aria-invalid={parseDimension(draftWidth()) == null}
+            data-testid="browser-viewport-width"
+          />
+          <span class="text-[10px] text-v2-text-text-muted" aria-hidden="true">
+            ×
+          </span>
+          <span class="text-[10px] text-v2-text-text-muted" aria-hidden="true">
+            H
+          </span>
+          <input
+            class="h-6 w-11 rounded-[4px] border border-transparent bg-v2-background-bg-layer-01 px-1 text-center text-[11px] leading-none tabular-nums text-v2-text-text-base outline-none transition-colors duration-100 focus:border-v2-border-border-strong aria-[invalid=true]:border-v2-text-text-warning"
+            value={draftHeight()}
+            onInput={(event) => onHeightInput(event.currentTarget.value)}
+            inputmode="numeric"
+            aria-label={language.t("browser.dimension.height")}
+            aria-invalid={parseDimension(draftHeight()) == null}
+            data-testid="browser-viewport-height"
+          />
+        </form>
+      </Show>
 
       <Show when={props.setting.mode === "preset"}>
         <SelectV2<string>
@@ -107,7 +212,7 @@ export function BrowserDeviceToolbar(props: {
           class="h-6 w-[9.5rem] text-[11px]"
           options={presetOptions().map((p) => p.id)}
           value={(id) => id}
-          label={(id) => language.t((resolveBrowserDevicePreset(id)?.nameKey ?? "browser.device.laptop") as BrowserDeviceNameKey)}
+          label={(id) => language.t((resolveBrowserDevicePreset(id)?.nameKey ?? "browser.device.ipad-air") as BrowserDeviceNameKey)}
           current={props.setting.presetId ?? undefined}
           onSelect={(id) => selectPreset(id ?? null)}
         />
@@ -141,12 +246,6 @@ export function BrowserDeviceToolbar(props: {
       </Show>
 
       <div class="flex-1" />
-
-      <Show when={readout()}>
-        <div class="flex h-6 items-center rounded-[4px] px-1.5 text-[11px] leading-none tabular-nums text-v2-text-text-muted" data-browser-viewport-readout>
-          {readout()}
-        </div>
-      </Show>
 
       <button
         type="button"

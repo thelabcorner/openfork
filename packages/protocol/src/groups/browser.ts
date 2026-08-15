@@ -450,6 +450,11 @@ export const ProfilerStopInput = Schema.Struct({
   tabId: Schema.optional(Schema.String),
 })
 
+export const ReactInspectInput = Schema.Struct({
+  target: ElementTarget,
+  timeoutMs: Schema.optional(Schema.Number),
+})
+
 // --- per-operation outputs (explicit success objects, never void) ------------
 
 export const StatusOutput = Schema.Struct({
@@ -677,6 +682,29 @@ export const ProfilerStopOutput = Schema.Struct({
   profiled: ProfilerResult,
 })
 
+/** One fiber's worth of React DevTools-equivalent metadata — component
+ * name, dev-build source location, current props, and readable hook state
+ * (useState/useReducer values; skips refs/effects, which aren't meaningfully
+ * serializable). Reads React's Fiber tree directly, not the DevTools
+ * protocol — see reactInspectScript in packages/desktop for why this needs
+ * no `contextIsolation=false` relaxation. */
+export const ReactComponentInfo = Schema.Struct({
+  name: Schema.String,
+  source: Schema.optional(Schema.Struct({ file: Schema.String, line: Schema.optional(Schema.Number), column: Schema.optional(Schema.Number) })),
+  props: Schema.optional(Schema.Json),
+  hooks: Schema.optional(Schema.Array(Schema.Json)),
+})
+export type ReactComponentInfo = Schema.Schema.Type<typeof ReactComponentInfo>
+
+export const ReactInspectOutput = Schema.Struct({
+  inspected: Schema.Struct({
+    tabId: Schema.String,
+    hasReact: Schema.Boolean,
+    component: Schema.optional(ReactComponentInfo),
+    ancestors: Schema.Array(ReactComponentInfo),
+  }),
+})
+
 // --- operation tagged union --------------------------------------------------
 
 export const BrowserOperation = Schema.Union([
@@ -701,6 +729,7 @@ export const BrowserOperation = Schema.Union([
   Schema.Struct({ name: Schema.Literal("annotate"), input: AnnotateInput }),
   Schema.Struct({ name: Schema.Literal("profiler_start"), input: ProfilerStartInput }),
   Schema.Struct({ name: Schema.Literal("profiler_stop"), input: ProfilerStopInput }),
+  Schema.Struct({ name: Schema.Literal("react_inspect"), input: ReactInspectInput }),
 ])
 export type BrowserOperation = Schema.Schema.Type<typeof BrowserOperation>
 export type BrowserOperationName = BrowserOperation["name"]

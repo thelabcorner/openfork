@@ -15,9 +15,10 @@ const browserApi: BrowserAPI = {
   openTab: (url, opts) => ipcRenderer.invoke("browser-open-tab", url, opts),
   activateTab: (tabId) => ipcRenderer.invoke("browser-activate-tab", tabId),
   closeTab: (tabId) => ipcRenderer.invoke("browser-close-tab", tabId),
-  registerWebview: (runtimeTabId, webContentsId) =>
-    ipcRenderer.invoke("browser-register-webview", runtimeTabId, webContentsId),
-  unregisterWebview: (runtimeTabId) => ipcRenderer.invoke("browser-unregister-webview", runtimeTabId),
+  registerWebview: (runtimeTabId, webContentsId, generation) =>
+    ipcRenderer.invoke("browser-register-webview", runtimeTabId, webContentsId, generation),
+  unregisterWebview: (runtimeTabId, webContentsId, generation) =>
+    ipcRenderer.invoke("browser-unregister-webview", runtimeTabId, webContentsId, generation),
   getGuestPreloadPath: () => ipcRenderer.invoke("browser-get-guest-preload"),
   setSessionContext: (sessionId, opts) => ipcRenderer.invoke("browser-set-session-context", sessionId, opts),
   onState: (cb) => {
@@ -45,6 +46,8 @@ const browserApi: BrowserAPI = {
     ipcRenderer.on("browser-host-state", handler)
     return () => ipcRenderer.removeListener("browser-host-state", handler)
   },
+  startAnnotation: (tabId) => ipcRenderer.invoke("browser-start-annotation", tabId),
+  cancelAnnotation: (tabId) => ipcRenderer.invoke("browser-cancel-annotation", tabId),
 }
 
 const api: ElectronAPI = {

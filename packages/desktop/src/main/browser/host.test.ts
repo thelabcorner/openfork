@@ -1,4 +1,5 @@
 import { afterAll, beforeAll, expect, test } from "bun:test"
+import { createServer } from "node:http"
 import { BrowserHost } from "./host"
 import type { BrokerResponse, BrowserOperation, HostCapabilities } from "./contracts"
 
@@ -138,3 +139,68 @@ test("maps typed operation errors to tagged BrokerResponse errors", async () => 
     await failing.host.stop()
   }
 })
+
+test("coalesces overlapping host hello registrations", async () => {
+  const releases: VoidFunction[] = []
+  let requests = 0
+  const sidecar = createServer((req, res) => {
+    if (req.method !== "POST" || req.url !== "/api/browser/host/hello") {
+      res.writeHead(404).end()
+      return
+    }
+    req.resume()
+    requests++
+    releases.push(() => {
+      res.writeHead(200, { "content-type": "application/json" })
+      res.end(JSON.stringify({ data: { accepted: true, brokerProtocolVersion: 1, hostId: "test-host" } }))
+    })
+  })
+  await new Promise<void>((resolve, reject) => {
+    sidecar.once("error", reject)
+    sidecar.listen(0, "127.0.0.1", () => {
+      sidecar.off("error", reject)
+      resolve()
+    })
+  })
+  const address = sidecar.address()
+  const h = new BrowserHost({
+    hostId: "test-host",
+    hostEpoch: 1,
+    windowId: "test-window",
+    capabilities,
+    sidecarProvider: () => ({
+      url: `http://127.0.0.1:${typeof address === "object" && address !== null ? address.port : 0}`,
+      username: "user",
+      password: "pass",
+    }),
+    getSessionContext: () => ({ sessionId: "sess-test" }),
+    getGuestSnapshot: () => ({ attached: false, activeTabId: null, url: null }),
+    dispatch: async () => ({ status: { ok: true } }),
+  })
+  try {
+    await h.start()
+    await eventually(() => requests === 1)
+    h.reRegister()
+    h.reRegister()
+    h.reRegister()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(requests).toBe(1)
+    releases.shift()?.()
+    await eventually(() => requests === 2)
+    releases.shift()?.()
+    await new Promise((resolve) => setTimeout(resolve, 20))
+    expect(requests).toBe(2)
+  } finally {
+    await h.stop()
+    sidecar.closeAllConnections()
+    await new Promise<void>((resolve) => sidecar.close(() => resolve()))
+  }
+})
+
+async function eventually(predicate: () => boolean) {
+  for (let i = 0; i < 100; i++) {
+    if (predicate()) return
+    await new Promise((resolve) => setTimeout(resolve, 10))
+  }
+  expect(predicate()).toBe(true)
+}
