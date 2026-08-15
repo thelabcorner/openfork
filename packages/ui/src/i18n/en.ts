@@ -166,8 +166,14 @@ export const dict: Record<string, string> = {
   "ui.tool.agent": "{{type}} Agent",
   "ui.tool.agent.default": "Agent",
   "ui.tool.skill": "Skill",
+  "ui.tool.grep.noMatches": "No matches",
+  "ui.tool.grep.truncated": "Results truncated — refine the pattern or path",
+  "ui.tool.glob.noMatches": "No files found",
+  "ui.tool.glob.truncated": "Results truncated — refine the pattern or path",
 
   "ui.basicTool.called": "Called `{{tool}}`",
+  "ui.basicTool.input": "Input",
+  "ui.basicTool.output": "Output",
   "ui.toolErrorCard.failed": "Failed",
   "ui.toolErrorCard.copyError": "Copy error",
 
