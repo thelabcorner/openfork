@@ -420,7 +420,9 @@ export type SessionsCreateOutput = {
   }
 }["data"]
 
-export type SessionsActiveOutput = { readonly data: { readonly [x: string]: { readonly type: "running" } } }["data"]
+export type SessionsActiveOutput = {
+  readonly data: { readonly [x: string]: { readonly type: "running" | "paused" } }
+}["data"]
 
 export type SessionsGetInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
@@ -1687,6 +1689,28 @@ export type SessionsEventsOutput =
 export type SessionsInterruptInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
 export type SessionsInterruptOutput = void
+
+export type SessionsPauseInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
+
+export type SessionsPauseOutput = void
+
+export type SessionsResumeInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
+
+export type SessionsResumeOutput = void
+
+export type SessionsRegenerateTitleInput = {
+  readonly sessionID: { readonly sessionID: string }["sessionID"]
+  readonly model?: {
+    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly prompt?: string | null
+  }["model"]
+  readonly prompt?: {
+    readonly model?: { readonly id: string; readonly providerID: string; readonly variant?: string } | null
+    readonly prompt?: string | null
+  }["prompt"]
+}
+
+export type SessionsRegenerateTitleOutput = void
 
 export type SessionsMessageInput = {
   readonly sessionID: { readonly sessionID: string; readonly messageID: string }["sessionID"]

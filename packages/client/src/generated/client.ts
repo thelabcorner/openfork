@@ -37,6 +37,12 @@ import type {
   SessionsEventsOutput,
   SessionsInterruptInput,
   SessionsInterruptOutput,
+  SessionsPauseInput,
+  SessionsPauseOutput,
+  SessionsResumeInput,
+  SessionsResumeOutput,
+  SessionsRegenerateTitleInput,
+  SessionsRegenerateTitleOutput,
   SessionsMessageInput,
   SessionsMessageOutput,
   MessagesListInput,
@@ -500,6 +506,40 @@ export function make(options: ClientOptions) {
             path: `/api/session/${encodeURIComponent(input.sessionID)}/interrupt`,
             successStatus: 204,
             declaredStatuses: [404, 400, 401],
+            empty: true,
+          },
+          requestOptions,
+        ),
+      pause: (input: SessionsPauseInput, requestOptions?: RequestOptions) =>
+        request<SessionsPauseOutput>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/pause`,
+            successStatus: 204,
+            declaredStatuses: [404, 400, 401],
+            empty: true,
+          },
+          requestOptions,
+        ),
+      resume: (input: SessionsResumeInput, requestOptions?: RequestOptions) =>
+        request<SessionsResumeOutput>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/resume`,
+            successStatus: 204,
+            declaredStatuses: [404, 400, 401],
+            empty: true,
+          },
+          requestOptions,
+        ),
+      regenerateTitle: (input: SessionsRegenerateTitleInput, requestOptions?: RequestOptions) =>
+        request<SessionsRegenerateTitleOutput>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/title/regenerate`,
+            body: { model: input["model"], prompt: input["prompt"] },
+            successStatus: 204,
+            declaredStatuses: [404, 409, 503, 400, 401],
             empty: true,
           },
           requestOptions,
