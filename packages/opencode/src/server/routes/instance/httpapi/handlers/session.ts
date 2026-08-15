@@ -31,12 +31,13 @@ import {
   MessagesQuery,
   PermissionResponsePayload,
   PromptPayload,
+  RegenerateTitlePayload,
   RevertPayload,
   ShellPayload,
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError } from "../errors"
+import { PermissionNotFoundError, ServiceUnavailableError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -234,6 +235,113 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return true
     })
 
+    // V1 pause is stored on the legacy session row and propagated through the
+    // existing session.updated event. V1 runs bypass the V2 drain, so pause also
+    // cancels the in-flight V1 run and resume drains admitted-but-not-run input.
+    const pause = Effect.fn("SessionHttpApi.pause")(function* (ctx: { params: { sessionID: SessionID } }) {
+      yield* SessionError.mapStorageNotFoundSession(ctx.params.sessionID, session.get(ctx.params.sessionID))
+      yield* promptSvc.cancel(ctx.params.sessionID)
+      const current = yield* session.get(ctx.params.sessionID).pipe(Effect.orDie)
+      yield* session.setPaused({ sessionID: ctx.params.sessionID, pausedAt: current.pausedAt ?? Date.now() })
+      return HttpApiSchema.NoContent.make()
+    })
+
+    const resume = Effect.fn("SessionHttpApi.resume")(function* (ctx: { params: { sessionID: SessionID } }) {
+      yield* SessionError.mapStorageNotFoundSession(ctx.params.sessionID, session.get(ctx.params.sessionID))
+      yield* session.setPaused({ sessionID: ctx.params.sessionID, pausedAt: undefined })
+      // Drain messages admitted while paused (each loop invocation answers the
+      // latest pending user message; never auto-retries an interrupted turn).
+      yield* promptSvc.loop({ sessionID: ctx.params.sessionID }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logError("resume drain failed", { sessionID: ctx.params.sessionID, cause }),
+        ),
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
+      return HttpApiSchema.NoContent.make()
+    })
+
+    // Manual regeneration is synchronous from the API client's perspective:
+    // return success only after a new title was generated and applied. The
+    // caller's pending state stays visible during the model request, and a
+    // no-op can no longer show a false "updated" toast.
+    const regenerateTitle = Effect.fn("SessionHttpApi.regenerateTitle")(function* (ctx: {
+      params: { sessionID: SessionID }
+      payload: typeof RegenerateTitlePayload.Type
+    }) {
+      const baseline = yield* SessionError.mapStorageNotFoundSession(
+        ctx.params.sessionID,
+        session.get(ctx.params.sessionID),
+      )
+      yield* Effect.logInfo("regenerate title request", {
+        sessionID: ctx.params.sessionID,
+        baselineTitle: baseline.title,
+        explicitProviderID: ctx.payload.model?.providerID,
+        explicitModelID: ctx.payload.model?.id,
+        hasPrompt: ctx.payload.prompt !== undefined && ctx.payload.prompt.trim().length > 0,
+      })
+      const title = yield* promptSvc
+        .regenerateTitle({
+          sessionID: ctx.params.sessionID,
+          model: ctx.payload.model,
+          prompt: ctx.payload.prompt,
+        })
+        .pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              yield* Effect.logError("regenerate title failed", {
+                sessionID: ctx.params.sessionID,
+                error: String(Cause.squash(cause)),
+                cause: Cause.pretty(cause),
+              })
+              return yield* new ServiceUnavailableError({
+                message: "Failed to generate session title",
+                service: "session-title",
+              })
+            }),
+          ),
+        )
+      if (title === undefined) {
+        yield* Effect.logWarning("regenerate title produced no title", {
+          sessionID: ctx.params.sessionID,
+          baselineTitle: baseline.title,
+        })
+        return yield* new ServiceUnavailableError({
+          message: "Title generation produced no usable title",
+          service: "session-title",
+        })
+      }
+      const current = yield* SessionError.mapStorageNotFoundSession(
+        ctx.params.sessionID,
+        session.get(ctx.params.sessionID),
+      )
+      if (current.title !== baseline.title) {
+        yield* Effect.logInfo("regenerate title skipped because title changed", {
+          sessionID: ctx.params.sessionID,
+          baselineTitle: baseline.title,
+          currentTitle: current.title,
+          generatedTitle: title,
+        })
+        return HttpApiSchema.NoContent.make()
+      }
+      if (title === baseline.title) {
+        yield* Effect.logWarning("regenerate title produced unchanged title", {
+          sessionID: ctx.params.sessionID,
+          title,
+        })
+        return yield* new ServiceUnavailableError({
+          message: "Title generation produced the same title",
+          service: "session-title",
+        })
+      }
+      yield* session.setTitle({ sessionID: ctx.params.sessionID, title })
+      yield* Effect.logInfo("regenerate title applied", {
+        sessionID: ctx.params.sessionID,
+        previousTitle: baseline.title,
+        title,
+      })
+      return HttpApiSchema.NoContent.make()
+    })
+
     const init = Effect.fn("SessionHttpApi.init")(function* (ctx: {
       params: { sessionID: SessionID }
       payload: typeof InitPayload.Type
@@ -424,6 +532,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       .handle("update", update)
       .handleRaw("fork", forkRaw)
       .handle("abort", abort)
+      .handle("pause", pause)
+      .handle("resume", resume)
+      .handle("regenerateTitle", regenerateTitle)
       .handle("init", init)
       .handle("share", share)
       .handle("unshare", unshare)

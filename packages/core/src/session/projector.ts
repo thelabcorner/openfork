@@ -74,6 +74,7 @@ function sessionRow(info: SessionV1.SessionInfo): typeof SessionTable.$inferInse
     time_updated: info.time.updated,
     time_compacting: info.time.compacting,
     time_archived: info.time.archived,
+    paused_at: info.pausedAt ?? null,
   }
 }
 
@@ -215,13 +216,13 @@ const layer = Layer.effectDiscard(
   Effect.gen(function* () {
     const events = yield* EventV2.Service
     const { db, filename } = yield* Database.Service
-    // The projector is the write boundary for V1 message/part tables, so it
-    // constructs in v1-only desktop deployments where the lazy SessionV2 layer
-    // (which forks the V2 search backfill) may never run. Fork the resumable
-    // V1 part backfill here so the index is populated for pre-existing rows.
-    // It runs on a dedicated connection (same file, its own semaphore) so it
-    // never holds the shared client permit that live queries wait on.
-    yield* SessionSearch.backfillPartsOnOwnConnection(filename).pipe(Effect.forkScoped, Effect.andThen(Effect.void))
+    // Historical FTS backfill writes into the main SQLite file. Even on its
+    // own connection it can contend with live app writes and consume enough
+    // process time to make the server appear unhealthy, so keep it as an
+    // explicit maintenance task instead of automatic startup work.
+    if (SessionSearch.automaticBackfillEnabled()) {
+      yield* SessionSearch.backfillPartsOnOwnConnection(filename).pipe(Effect.forkScoped, Effect.andThen(Effect.void))
+    }
     yield* events.project(SessionV1.Event.Created, (event) =>
       Effect.gen(function* () {
         const stored = yield* db

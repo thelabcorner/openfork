@@ -83,36 +83,54 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         Effect.fn(function* (ctx) {
           const query = ctx.query.query.trim()
           if (query.length === 0) return yield* new InvalidRequestError({ message: "Search query must not be empty" })
-          return {
-            data: yield* session
-              .search({
-                query,
-                directory: ctx.query.directory,
-                workspaceID: ctx.query.workspace,
-                project: ctx.query.project,
-                limit: ctx.query.limit,
-              })
-              .pipe(
-                Effect.catchTag("Session.SearchError", (error) =>
-                  Effect.fail(
-                    new InvalidRequestError({
-                      message: `Search query is not valid: ${error.message}`,
-                      kind: "search",
-                    }),
-                  ),
+          const startedAt = Date.now()
+          const result = yield* session
+            .search({
+              query,
+              directory: ctx.query.directory,
+              workspaceID: ctx.query.workspace,
+              project: ctx.query.project,
+              limit: ctx.query.limit,
+            })
+            .pipe(
+              Effect.catchTag("Session.SearchError", (error) =>
+                Effect.fail(
+                  new InvalidRequestError({
+                    message: `Search query is not valid: ${error.message}`,
+                    kind: "search",
+                  }),
                 ),
               ),
+            )
+          const elapsedMs = Date.now() - startedAt
+          if (elapsedMs >= 1_000) {
+            yield* Effect.logInfo("session search completed slowly", {
+              elapsedMs,
+              queryLength: query.length,
+              limit: ctx.query.limit,
+              directory: ctx.query.directory,
+              workspace: ctx.query.workspace,
+              project: ctx.query.project,
+              titleMatches: result.titleMatches.length,
+              messageMatches: result.messageMatches.length,
+            })
+          }
+          return {
+            data: result,
           }
         }),
       )
       .handle(
         "session.active",
         Effect.fn(function* () {
-          return {
-            data: Object.fromEntries(
-              Array.from(yield* session.active, (sessionID) => [sessionID, { type: "running" as const }]),
-            ),
-          }
+          // A paused session has no drain, so union the durable-paused IDs with
+          // the live-drain set; paused wins in the transient overlap window.
+          const paused = yield* session.paused
+          const data = new Map<string, { type: "running" | "paused" }>(
+            Array.from(yield* session.active, (sessionID) => [sessionID, { type: "running" as const }]),
+          )
+          for (const sessionID of paused) data.set(sessionID, { type: "paused" as const })
+          return { data: Object.fromEntries(data) }
         }),
       )
       .handle(
@@ -394,6 +412,62 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
         "session.interrupt",
         Effect.fn(function* (ctx) {
           yield* session.interrupt(ctx.params.sessionID)
+          return HttpApiSchema.NoContent.make()
+        }),
+      )
+      .handle(
+        "session.pause",
+        Effect.fn(function* (ctx) {
+          yield* session.pause(ctx.params.sessionID).pipe(
+            Effect.catchTag("Session.NotFoundError", (error) =>
+              Effect.fail(
+                new SessionNotFoundError({
+                  sessionID: error.sessionID,
+                  message: `Session not found: ${error.sessionID}`,
+                }),
+              ),
+            ),
+          )
+          return HttpApiSchema.NoContent.make()
+        }),
+      )
+      .handle(
+        "session.resume",
+        Effect.fn(function* (ctx) {
+          yield* session.resume(ctx.params.sessionID).pipe(
+            Effect.catchTag("Session.NotFoundError", (error) =>
+              Effect.fail(
+                new SessionNotFoundError({
+                  sessionID: error.sessionID,
+                  message: `Session not found: ${error.sessionID}`,
+                }),
+              ),
+            ),
+          )
+          return HttpApiSchema.NoContent.make()
+        }),
+      )
+      .handle(
+        "session.regenerateTitle",
+        Effect.fn(function* (ctx) {
+          yield* session.regenerateTitle({ sessionID: ctx.params.sessionID, ...ctx.payload }).pipe(
+            Effect.catchTag("Session.NotFoundError", (error) =>
+              Effect.fail(
+                new SessionNotFoundError({
+                  sessionID: error.sessionID,
+                  message: `Session not found: ${error.sessionID}`,
+                }),
+              ),
+            ),
+            Effect.catchTag("SessionTitle.UnavailableError", (error) =>
+              Effect.fail(
+                new ServiceUnavailableError({
+                  message: `Title generation is not available: ${error.message}`,
+                  service: "session.title",
+                }),
+              ),
+            ),
+          )
           return HttpApiSchema.NoContent.make()
         }),
       )

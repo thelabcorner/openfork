@@ -55,6 +55,7 @@ export const SessionTable = sqliteTable(
       variant?: string
     }>(),
     ...Timestamps,
+    paused_at: integer(),
     time_compacting: integer(),
     time_archived: integer(),
   },

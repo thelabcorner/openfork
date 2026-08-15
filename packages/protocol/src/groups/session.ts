@@ -81,7 +81,7 @@ export const SessionsCursor = Schema.String.pipe(
 export type SessionsCursor = typeof SessionsCursor.Type
 
 const SessionActive = Schema.Struct({
-  type: Schema.Literal("running"),
+  type: Schema.Literals(["running", "paused"]),
 }).annotate({ identifier: "SessionActive" })
 
 const SessionHistoryLimit = PositiveInt.check(Schema.isLessThanOrEqualTo(100))
@@ -201,7 +201,7 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
           identifier: "v2.session.active",
           summary: "List active sessions",
           description:
-            "Retrieve foreground Session drains currently owned by this OpenCode process. Sessions absent from the result are inactive.",
+            "Retrieve active sessions: foreground drains currently owned by this OpenCode process (type: running) and durable-paused sessions (type: paused). Sessions absent from the result are inactive.",
         }),
       ),
     )
@@ -404,6 +404,58 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
             identifier: "v2.session.interrupt",
             summary: "Interrupt session execution",
             description: "Interrupt active execution owned by this OpenCode process. Idle interruption is a no-op.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.pause", "/api/session/:sessionID/pause", {
+        params: { sessionID: Session.ID },
+        success: HttpApiSchema.NoContent,
+        error: SessionNotFoundError,
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.pause",
+            summary: "Pause session",
+            description:
+              "Set the durable paused state and interrupt active execution. Idempotent: pausing an already paused session is a no-op. While paused, no drain provider turn may start; held inputs stay held and drain on resume.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.resume", "/api/session/:sessionID/resume", {
+        params: { sessionID: Session.ID },
+        success: HttpApiSchema.NoContent,
+        error: SessionNotFoundError,
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.resume",
+            summary: "Resume session",
+            description:
+              "Clear the durable paused state and wake the session so held inputs drain one at a time. The interrupted turn is never auto-retried.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.regenerateTitle", "/api/session/:sessionID/title/regenerate", {
+        params: { sessionID: Session.ID },
+        payload: Schema.Struct({
+          model: Model.Ref.pipe(Schema.optional),
+          prompt: Schema.String.pipe(Schema.optional),
+        }),
+        success: HttpApiSchema.NoContent,
+        error: [SessionNotFoundError, ConflictError, ServiceUnavailableError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.regenerateTitle",
+            summary: "Regenerate session title",
+            description:
+              "Accept a background title regeneration and return immediately. The generated title is applied only if the session title is unchanged since the request was accepted (a manual rename always wins); failures never overwrite an existing title.",
           }),
         ),
     )

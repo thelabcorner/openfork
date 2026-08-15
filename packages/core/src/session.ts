@@ -208,14 +208,16 @@ const layer = Layer.effect(
         ),
       )
 
-    // Resumable one-time backfill of the FTS index for pre-existing messages,
-    // forked so startup is not blocked on large databases. It runs on a
-    // dedicated SQLite connection (same file, its own semaphore) so it can
-    // never hold the shared client permit that live queries wait on.
-    yield* SessionSearch.backfillOnOwnConnection(database.filename).pipe(
-      Effect.forkScoped,
-      Effect.andThen(Effect.void),
-    )
+    // Historical FTS backfill writes into the main SQLite file. Even on its
+    // own connection it can contend with live app writes and consume enough
+    // process time to make the server appear unhealthy, so keep it as an
+    // explicit maintenance task instead of automatic startup work.
+    if (SessionSearch.automaticBackfillEnabled()) {
+      yield* SessionSearch.backfillOnOwnConnection(database.filename).pipe(
+        Effect.forkScoped,
+        Effect.andThen(Effect.void),
+      )
+    }
 
     const result = Service.of({
       create: Effect.fn("V2Session.create")(function* (input) {

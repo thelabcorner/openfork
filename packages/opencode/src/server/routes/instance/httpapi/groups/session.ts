@@ -20,7 +20,13 @@ import {
   WorkspaceRoutingQuery,
   WorkspaceRoutingQueryFields,
 } from "../middleware/workspace-routing"
-import { ApiNotFoundError, PermissionNotFoundError, SessionBusyError } from "../errors"
+import {
+  ApiNotFoundError,
+  PermissionNotFoundError,
+  ServiceUnavailableError,
+  SessionBusyError,
+  SessionNotFoundError,
+} from "../errors"
 import { described } from "./metadata"
 import { QueryBoolean } from "./query"
 import { ProviderV2 } from "@opencode-ai/core/provider"
@@ -71,6 +77,12 @@ export const PromptPayload = Schema.Struct(Struct.omit(SessionPrompt.PromptInput
 export const CommandPayload = Schema.Struct(Struct.omit(SessionPrompt.CommandInput.fields, ["sessionID"]))
 export const ShellPayload = Schema.Struct(Struct.omit(SessionPrompt.ShellInput.fields, ["sessionID"]))
 export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput.fields, ["sessionID"]))
+export const RegenerateTitlePayload = Schema.Struct({
+  // Explicit picker choice (settings "Title generation" model); omitted = cascade.
+  model: Schema.optional(ModelV2.Ref),
+  // Custom instruction for the title model; omitted = default prompt.
+  prompt: Schema.optional(Schema.String),
+})
 export const PermissionResponsePayload = Schema.Struct({
   response: PermissionV1.Reply,
 })
@@ -89,6 +101,9 @@ export const SessionPaths = {
   update: `${root}/:sessionID`,
   fork: `${root}/:sessionID/fork`,
   abort: `${root}/:sessionID/abort`,
+  pause: `${root}/:sessionID/pause`,
+  resume: `${root}/:sessionID/resume`,
+  regenerateTitle: `${root}/:sessionID/title/regenerate`,
   share: `${root}/:sessionID/share`,
   init: `${root}/:sessionID/init`,
   summarize: `${root}/:sessionID/summarize`,
@@ -260,6 +275,45 @@ export const SessionApi = HttpApi.make("session")
             identifier: "session.abort",
             summary: "Abort session",
             description: "Abort an active session and stop any ongoing AI processing or command execution.",
+          }),
+        ),
+        HttpApiEndpoint.post("pause", SessionPaths.pause, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          success: described(HttpApiSchema.NoContent, "Paused session"),
+          error: [HttpApiError.BadRequest, SessionNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.pause",
+            summary: "Pause session",
+            description:
+              "Pause a session: hold it durably so no new drain starts until resumed. Interrupts an in-flight run; idempotent.",
+          }),
+        ),
+        HttpApiEndpoint.post("resume", SessionPaths.resume, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          success: described(HttpApiSchema.NoContent, "Resumed session"),
+          error: [HttpApiError.BadRequest, SessionNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.resume",
+            summary: "Resume session",
+            description: "Resume a paused session: clear the pause and wake it so held inputs drain.",
+          }),
+        ),
+        HttpApiEndpoint.post("regenerateTitle", SessionPaths.regenerateTitle, {
+          params: { sessionID: SessionID },
+          query: WorkspaceRoutingQuery,
+          payload: RegenerateTitlePayload,
+          success: described(HttpApiSchema.NoContent, "Title regenerated"),
+          error: [HttpApiError.BadRequest, SessionNotFoundError, ServiceUnavailableError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session.regenerateTitle",
+            summary: "Regenerate session title",
+            description:
+              "Generate a new title from the session's conversation and update the session.",
           }),
         ),
         HttpApiEndpoint.post("init", SessionPaths.init, {

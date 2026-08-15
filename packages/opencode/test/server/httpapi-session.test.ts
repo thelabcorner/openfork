@@ -4,7 +4,7 @@ import { NodeHttpServer, NodeServices } from "@effect/platform-node"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { mkdir } from "node:fs/promises"
 import path from "node:path"
-import { Cause, Config, Effect, Exit, Layer } from "effect"
+import { Cause, Config, Effect, Exit, Fiber, Layer } from "effect"
 import { HttpClient, HttpClientRequest, HttpClientResponse, HttpRouter, HttpServer } from "effect/unstable/http"
 import { layerWebSocketConstructorGlobal } from "effect/unstable/socket/Socket"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -34,9 +34,9 @@ import * as DateTime from "effect/DateTime"
 import { eq } from "drizzle-orm"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideInstanceEffect, TestInstance, tmpdirScoped } from "../fixture/fixture"
-import { TestLLMServer } from "../lib/llm-server"
+import { TestLLMServer, reply } from "../lib/llm-server"
 import { testProviderConfig } from "../lib/test-provider"
-import { pollWithTimeout, testEffect } from "../lib/effect"
+import { pollWithTimeout, awaitWithTimeout, testEffect } from "../lib/effect"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
@@ -1086,5 +1086,256 @@ describe("session HttpApi", () => {
         })
       }),
     { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "pauses and resumes sessions durably",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory }
+        const session = yield* createSession({ title: "pause me" })
+
+        const pause = yield* request(pathFor(SessionPaths.pause, { sessionID: session.id }), {
+          method: "POST",
+          headers,
+        })
+        expect(pause.status).toBe(204)
+        expect(
+          (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), { headers }))
+            .pausedAt,
+        ).toBeTruthy()
+
+        // Idempotent — pause-while-paused is a no-op, not an error.
+        const again = yield* request(pathFor(SessionPaths.pause, { sessionID: session.id }), {
+          method: "POST",
+          headers,
+        })
+        expect(again.status).toBe(204)
+
+        const resume = yield* request(pathFor(SessionPaths.resume, { sessionID: session.id }), {
+          method: "POST",
+          headers,
+        })
+        expect(resume.status).toBe(204)
+        expect(
+          (yield* requestJson<Session.Info>(pathFor(SessionPaths.get, { sessionID: session.id }), { headers }))
+            .pausedAt,
+        ).toBeUndefined()
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "returns session not found errors for pause, resume and regenerateTitle on missing sessions",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const headers = { "x-opencode-directory": test.directory, "content-type": "application/json" }
+        const missing = SessionID.descending()
+        const expected = {
+          _tag: "SessionNotFoundError",
+          sessionID: missing,
+          message: `Session not found: ${missing}`,
+        }
+
+        for (const [name, body] of [
+          [SessionPaths.pause, undefined],
+          [SessionPaths.resume, undefined],
+          [SessionPaths.regenerateTitle, "{}"],
+        ] as const) {
+          const response = yield* request(pathFor(name, { sessionID: missing }), {
+            method: "POST",
+            headers: { ...headers, ...(body === undefined ? {} : { "content-type": "application/json" }) },
+            ...(body === undefined ? {} : { body }),
+          })
+          expect(response.status).toBe(404)
+          expect(yield* responseJson(response)).toEqual(expected)
+        }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "paused sessions admit prompts without running them, then drain on resume",
+    () =>
+      Effect.gen(function* () {
+        const llm = yield* TestLLMServer
+        yield* llm.text("ok", { usage: { input: 1, output: 1 } })
+
+        const config = testProviderConfig(llm.url)
+        const directory = yield* tmpdirScoped({ git: true, config })
+        const session = yield* createSession({ title: "paused drain" }).pipe(provideInstanceEffect(directory))
+        const headers = { "x-opencode-directory": directory }
+
+        yield* request(pathFor(SessionPaths.pause, { sessionID: session.id }), { method: "POST", headers })
+
+        // A prompt while paused is admitted (user message created) but never
+        // reaches the provider — no assistant message, no LLM hit.
+        const admitted = yield* request(
+          `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`,
+          {
+            method: "POST",
+            headers: { ...headers, "content-type": "application/json" },
+            body: JSON.stringify({
+              agent: "build",
+              model: { providerID: "test", modelID: "test-model" },
+              parts: [{ type: "text", text: "hello while paused" }],
+            }),
+          },
+        )
+        expect(admitted.status).toBe(200)
+        expect(yield* llm.calls).toBe(0)
+        expect(
+          (yield* Session.use.messages({ sessionID: session.id }).pipe(provideInstanceEffect(directory), Effect.orDie))
+            .filter((message) => message.info.role === "assistant"),
+        ).toHaveLength(0)
+
+        // Resume wakes the drain: the admitted message gets answered.
+        yield* request(pathFor(SessionPaths.resume, { sessionID: session.id }), { method: "POST", headers })
+
+        const assistant = yield* pollWithTimeout(
+          Effect.gen(function* () {
+            const messages = yield* Session.use
+              .messages({ sessionID: session.id })
+              .pipe(provideInstanceEffect(directory), Effect.orDie)
+            return messages.find((message) => message.info.role === "assistant")
+          }),
+          "resume did not drain the admitted prompt",
+          "10 seconds",
+        )
+        expect(assistant?.info.role).toBe("assistant")
+      }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.live("pause stops an in-flight V1 run", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      // The provider response never completes, so the run stays in flight.
+      yield* llm.hang
+
+      const config = testProviderConfig(llm.url)
+      const directory = yield* tmpdirScoped({ git: true, config })
+      const session = yield* createSession({ title: "in-flight pause" }).pipe(provideInstanceEffect(directory))
+      const headers = { "x-opencode-directory": directory }
+
+      // Fork the prompt request — a hung run would otherwise block the test.
+      const promptRequest = yield* request(
+        `${pathFor(SessionPaths.prompt, { sessionID: session.id })}?directory=${encodeURIComponent(directory)}`,
+        {
+          method: "POST",
+          headers: { ...headers, "content-type": "application/json" },
+          body: JSON.stringify({
+            agent: "build",
+            model: { providerID: "test", modelID: "test-model" },
+            parts: [{ type: "text", text: "long running task" }],
+          }),
+        },
+      ).pipe(Effect.forkChild)
+
+      // Wait until the run is actually streaming against the mock provider.
+      yield* llm.wait(1)
+
+      const pause = yield* request(pathFor(SessionPaths.pause, { sessionID: session.id }), {
+        method: "POST",
+        headers,
+      })
+      expect(pause.status).toBe(204)
+
+      // The in-flight run is cancelled: the prompt request resolves instead of
+      // hanging forever, and no further provider calls happen.
+      const response = yield* awaitWithTimeout(
+        Fiber.await(promptRequest).pipe(Effect.flatMap((exit) => Effect.succeed(exit))),
+        "in-flight V1 run was not stopped by pause",
+        "10 seconds",
+      )
+      expect(Exit.isSuccess(response)).toBe(true)
+      expect(yield* llm.calls).toBe(1)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
+  it.live("regenerates a session title in the background", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.text("Generated Title", { usage: { input: 1, output: 1 } })
+
+      const config = testProviderConfig(llm.url)
+      const directory = yield* tmpdirScoped({ git: true, config })
+      const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
+      const svc = yield* Session.Service
+      const message = yield* svc.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: session.id,
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+        time: { created: Date.now() },
+      })
+      yield* svc.updatePart({
+        id: PartID.ascending(),
+        sessionID: session.id,
+        messageID: message.id,
+        type: "text",
+        text: "hello",
+      })
+
+      const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+      expect(response.status).toBe(204)
+
+      const titled = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
+          return current.title === "Old Title" ? undefined : current.title
+        }),
+        "title was not regenerated",
+        "10 seconds",
+      )
+      expect(titled).toBe("Generated Title")
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
+  it.live("regenerateTitle leaves the title untouched when nothing usable is produced", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      // Empty model output → sanitizer yields nothing → no write.
+      yield* llm.push(reply().stop().item())
+
+      const config = testProviderConfig(llm.url)
+      const directory = yield* tmpdirScoped({ git: true, config })
+      const session = yield* createSession({ title: "Keep Me" }).pipe(provideInstanceEffect(directory))
+      const svc = yield* Session.Service
+      const message = yield* svc.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: session.id,
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+        time: { created: Date.now() },
+      })
+      yield* svc.updatePart({
+        id: PartID.ascending(),
+        sessionID: session.id,
+        messageID: message.id,
+        type: "text",
+        text: "hello",
+      })
+
+      const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+      expect(response.status).toBe(204)
+
+      // Give the background generation a moment to run, then confirm no write.
+      yield* llm.wait(1)
+      const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
+      expect(current.title).toBe("Keep Me")
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 })

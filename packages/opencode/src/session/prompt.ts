@@ -53,6 +53,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { eq } from "drizzle-orm"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionTitle } from "@opencode-ai/core/session/title"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
@@ -106,6 +107,12 @@ export interface Interface {
   readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
   readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
+  /** Generates a fresh title from the session's conversation; returns the title or undefined when nothing usable is produced. */
+  readonly regenerateTitle: (input: {
+    sessionID: SessionID
+    model?: ModelV2.Ref
+    prompt?: string
+  }) => Effect.Effect<string | undefined>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
@@ -190,6 +197,128 @@ const layer = Layer.effect(
       return parts
     })
 
+    // Shared title-generation body, used by auto-title (ensureTitle) and the V1
+    // regenerateTitle endpoint. Resolves the title model, streams the conversation,
+    // and sanitizes the result to a single line. Returns `undefined` when nothing
+    // usable is produced (empty/garbage output, no title agent, no anchor) — the
+    // caller keeps the existing title untouched.
+    const generateTitle = Effect.fn("SessionPrompt.generateTitle")(function* (input: {
+      sessionID: SessionID
+      firstUser: SessionV1.WithParts
+      context: SessionV1.WithParts[]
+      providerID: ProviderV2.ID
+      modelID: ModelV2.ID
+      model?: ModelV2.Ref
+      previousTitle: string
+      prompt: string
+    }) {
+      const firstInfo = input.firstUser.info
+      if (firstInfo.role !== "user") return
+      const subtasks = input.firstUser.parts.filter((p): p is SessionV1.SubtaskPart => p.type === "subtask")
+      const onlySubtasks = subtasks.length > 0 && input.firstUser.parts.every((p) => p.type === "subtask")
+
+      const ag = yield* agents.get("title")
+      if (!ag) return
+      // Candidate cascade: explicit picker choice → agent.title.model →
+      // config/plugin small model → session/default model. Runtime failures on
+      // one candidate should not make manual retitle fail while another usable
+      // model is available.
+      const resolve = (providerID: ProviderV2.ID, modelID: ModelV2.ID) =>
+        provider
+          .getModel(providerID, modelID)
+          .pipe(Effect.option, Effect.map(Option.getOrElse(() => undefined)))
+      const candidates = [
+        input.model ? yield* resolve(input.model.providerID, input.model.id) : undefined,
+        ag.model ? yield* resolve(ag.model.providerID, ag.model.modelID) : undefined,
+        yield* provider.getSmallModel(input.providerID),
+        yield* resolve(input.providerID, input.modelID),
+      ].filter((item): item is Provider.Model => item !== undefined)
+      const seen = new Set<string>()
+      const uniqueCandidates = candidates.filter((item) => {
+        const key = `${item.providerID}/${item.id}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return true
+      })
+      yield* Effect.logInfo("title generation candidates", {
+        sessionID: input.sessionID,
+        candidates: uniqueCandidates.map((item) => `${item.providerID}/${item.id}`),
+      })
+      for (const mdl of uniqueCandidates) {
+        const title = yield* Effect.gen(function* () {
+          yield* Effect.logInfo("title model candidate starting", {
+            sessionID: input.sessionID,
+            providerID: mdl.providerID,
+            modelID: mdl.id,
+          })
+          const msgs = onlySubtasks
+            ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
+            : yield* MessageV2.toModelMessagesEffect(input.context, mdl)
+          const text = yield* llm
+            .stream({
+              agent: ag,
+              user: firstInfo,
+              system: [],
+              small: true,
+              tools: {},
+              model: mdl,
+              sessionID: input.sessionID,
+              retries: 2,
+              // The caller resolves the task prompt (custom → default); the current
+              // title replaces the `{previousTitle}` token (retitle §3.5).
+              messages: [
+                { role: "user", content: input.prompt.replaceAll("{previousTitle}", input.previousTitle) },
+                ...msgs,
+              ],
+            })
+            .pipe(
+              Stream.filter(LLMEvent.is.textDelta),
+              Stream.map((e) => e.text),
+              Stream.mkString,
+              Effect.orDie,
+            )
+          // Shared sanitize (SessionTitle): strips think/fence/quote markers,
+          // first non-empty line, capped at 60 chars.
+          const title = SessionTitle.sanitizeTitle(text)
+          if (!title) {
+            yield* Effect.logWarning("title model candidate produced no usable title", {
+              sessionID: input.sessionID,
+              providerID: mdl.providerID,
+              modelID: mdl.id,
+              outputLength: text.length,
+              outputPreview: text.slice(0, 200),
+            })
+            return
+          }
+          yield* Effect.logInfo("title model candidate succeeded", {
+            sessionID: input.sessionID,
+            providerID: mdl.providerID,
+            modelID: mdl.id,
+            title,
+          })
+          return title
+        }).pipe(
+          Effect.catchCause((cause) =>
+            Effect.gen(function* () {
+              yield* Effect.logWarning("title model candidate failed", {
+                sessionID: input.sessionID,
+                providerID: mdl.providerID,
+                modelID: mdl.id,
+                error: String(Cause.squash(cause)),
+                cause: Cause.pretty(cause),
+              })
+              return undefined
+            }),
+          ),
+        )
+        if (title) return title
+      }
+      yield* Effect.logWarning("all title model candidates failed", {
+        sessionID: input.sessionID,
+        candidates: uniqueCandidates.map((item) => `${item.providerID}/${item.id}`),
+      })
+    })
+
     const title = Effect.fn("SessionPrompt.ensureTitle")(function* (input: {
       session: Session.Info
       history: SessionV1.WithParts[]
@@ -208,48 +337,98 @@ const layer = Layer.effect(
       const context = input.history.slice(0, idx + 1)
       const firstUser = context[idx]
       if (!firstUser || firstUser.info.role !== "user") return
-      const firstInfo = firstUser.info
 
-      const subtasks = firstUser.parts.filter((p): p is SessionV1.SubtaskPart => p.type === "subtask")
-      const onlySubtasks = subtasks.length > 0 && firstUser.parts.every((p) => p.type === "subtask")
-
-      const ag = yield* agents.get("title")
-      if (!ag) return
-      const mdl = ag.model
-        ? yield* provider.getModel(ag.model.providerID, ag.model.modelID)
-        : ((yield* provider.getSmallModel(input.providerID)) ??
-          (yield* provider.getModel(input.providerID, input.modelID)))
-      const msgs = onlySubtasks
-        ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
-        : yield* MessageV2.toModelMessagesEffect(context, mdl)
-      const text = yield* llm
-        .stream({
-          agent: ag,
-          user: firstInfo,
-          system: [],
-          small: true,
-          tools: {},
-          model: mdl,
-          sessionID: input.session.id,
-          retries: 2,
-          messages: [{ role: "user", content: "Generate a title for this conversation:\n" }, ...msgs],
-        })
-        .pipe(
-          Stream.filter(LLMEvent.is.textDelta),
-          Stream.map((e) => e.text),
-          Stream.mkString,
-          Effect.orDie,
-        )
-      const cleaned = text
-        .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-        .split("\n")
-        .map((line) => line.trim())
-        .find((line) => line.length > 0)
-      if (!cleaned) return
-      const t = cleaned.length > 100 ? cleaned.substring(0, 97) + "..." : cleaned
+      const t = yield* generateTitle({
+        sessionID: input.session.id,
+        firstUser,
+        context,
+        providerID: input.providerID,
+        modelID: input.modelID,
+        previousTitle: input.session.title,
+        prompt: "Generate a title for this conversation:\n",
+      })
+      if (!t) return
+      // Manual rename wins (retitle §6): only write when the title is still the
+      // baseline captured at loop start — a rename made while generation was in
+      // flight discards the generated title.
+      const current = yield* sessions.get(input.session.id).pipe(Effect.orDie)
+      if (current.title !== input.session.title) return
       yield* sessions
         .setTitle({ sessionID: input.session.id, title: t })
         .pipe(Effect.catchCause((cause) => Effect.logError("failed to generate title", { error: Cause.squash(cause) })))
+    })
+
+    // Manual regeneration (V1 httpapi `session.regenerateTitle`). Unlike
+    // ensureTitle this works for any conversation (custom titles, many user
+    // messages, forked sessions) and never admits a session_input row. The
+    // caller owns the guarded write (baseline compare + session.updated).
+    const regenerateTitle = Effect.fn("SessionPrompt.regenerateTitle")(function* (input: {
+      sessionID: SessionID
+      model?: ModelV2.Ref
+      prompt?: string
+    }) {
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+
+      const history = yield* sessions.messages({ sessionID: input.sessionID }).pipe(Effect.orDie)
+      const real = (m: SessionV1.WithParts) =>
+        m.info.role === "user" && !m.parts.every((p) => "synthetic" in p && p.synthetic)
+      const firstIdx = history.findIndex(real)
+      if (firstIdx === -1) return
+      const firstUser = history[firstIdx]
+      if (!firstUser || firstUser.info.role !== "user") return
+      // Prefer the opening message model, then the session row, then the
+      // configured/default model. Legacy V1 sessions can be missing either
+      // message or session model metadata; manual retitle should still work.
+      const fallbackModel = yield* provider.defaultModel().pipe(Effect.option)
+      const baseModel = firstUser.info.model ??
+        (session.model ? { providerID: session.model.providerID, modelID: session.model.id } : undefined) ??
+        Option.getOrUndefined(fallbackModel)
+      if (!baseModel) {
+        yield* Effect.logWarning("regenerate title has no model fallback", {
+          sessionID: input.sessionID,
+          hasMessageModel: firstUser.info.model !== undefined,
+          hasSessionModel: session.model !== undefined,
+        })
+        return
+      }
+      yield* Effect.logInfo("regenerate title starting", {
+        sessionID: input.sessionID,
+        messageCount: history.length,
+        firstUserIndex: firstIdx,
+        hasMessageModel: firstUser.info.model !== undefined,
+        hasSessionModel: session.model !== undefined,
+        baseProviderID: baseModel.providerID,
+        baseModelID: baseModel.modelID,
+        explicitProviderID: input.model?.providerID,
+        explicitModelID: input.model?.id,
+      })
+      // The first real user message stays pinned at the front of the context and
+      // everything newer follows chronologically, so the opening intent always
+      // reaches the title model (retitle §3.5).
+      const context = history.slice(firstIdx)
+      const cfg = yield* config.get()
+      // Custom prompt; empty/whitespace falls back to the configured title
+      // prompt, then the shared default (retitle edge #13).
+      const taskPromptBase =
+        input.prompt !== undefined && input.prompt.trim().length > 0
+          ? input.prompt
+          : (cfg.title_prompt ?? SessionTitle.DEFAULT_TITLE_PROMPT)
+      const taskPrompt = taskPromptBase.includes("{previousTitle}")
+        ? taskPromptBase
+        : `${taskPromptBase}
+
+Current title: {previousTitle}
+Generate a fresh title. Do not reuse the current title.`
+      return yield* generateTitle({
+        sessionID: input.sessionID,
+        firstUser,
+        context,
+        providerID: baseModel.providerID,
+        modelID: baseModel.modelID,
+        model: input.model,
+        previousTitle: session.title,
+        prompt: taskPrompt,
+      })
     })
 
     const handleSubtask = Effect.fn("SessionPrompt.handleSubtask")(function* (input: {
@@ -1067,6 +1246,9 @@ const layer = Layer.effect(
       }
 
       if (input.noReply === true) return message
+      // Paused: admit the message durably but do not run (mirror V2 admit-only;
+      // delivery is never overwritten). The admitted message drains on resume.
+      if (session.pausedAt !== undefined) return message
       return yield* loop({ sessionID: input.sessionID })
     })
 
@@ -1084,6 +1266,10 @@ const layer = Layer.effect(
         let structured: unknown
         let step = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+        // Hard pause gate (V1): a paused session must not start any provider
+        // work. Prompt admission already gates, but direct loop callers (resume,
+        // summarize, command) and in-flight wake races need the same check.
+        if (session.pausedAt !== undefined) return yield* lastAssistant(sessionID)
 
         while (true) {
           yield* status.set(sessionID, { type: "busy" })
@@ -1487,6 +1673,7 @@ const layer = Layer.effect(
       shell,
       command,
       resolvePromptParts,
+      regenerateTitle,
     })
   }),
 )

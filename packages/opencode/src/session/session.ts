@@ -108,6 +108,7 @@ export function fromRow(row: SessionRow): Info {
     metadata: row.metadata ?? undefined,
     revert,
     permission: row.permission ? [...row.permission] : undefined,
+    pausedAt: row.paused_at ?? undefined,
     time: {
       created: row.time_created,
       updated: row.time_updated,
@@ -151,6 +152,7 @@ export function toRow(info: Info) {
         }
       : null,
     permission: info.permission,
+    paused_at: info.pausedAt,
     time_created: info.time.created,
     time_updated: info.time.updated,
     time_compacting: info.time.compacting,
@@ -239,6 +241,7 @@ export const Info = Schema.Struct({
   version: Schema.String,
   metadata: optional(Metadata),
   time: Time,
+  pausedAt: optional(ArchivedTimestamp),
   permission: optional(PermissionV1.Ruleset),
   revert: optional(Revert),
 }).annotate({ identifier: "Session" })
@@ -428,6 +431,7 @@ export interface Interface {
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
   readonly get: (id: SessionID) => Effect.Effect<Info, NotFound>
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
+  readonly setPaused: (input: { sessionID: SessionID; pausedAt?: number }) => Effect.Effect<void>
   readonly setArchived: (input: { sessionID: SessionID; time?: number }) => Effect.Effect<void>
   readonly setMetadata: (input: typeof SetMetadataInput.Type) => Effect.Effect<void>
   readonly setAgentModel: (input: {
@@ -756,6 +760,13 @@ const layer: Layer.Layer<
       yield* patch(input.sessionID, { title: input.title }).pipe(Effect.orDie)
     })
 
+    // Pauses only notify through the legacy `session.updated` event (the V1
+    // SSE path); the authoritative `paused_at` column write is core's
+    // SessionV2.pause/resume. `pausedAt: undefined` clears the field.
+    const setPaused = Effect.fn("Session.setPaused")(function* (input: { sessionID: SessionID; pausedAt?: number }) {
+      yield* patch(input.sessionID, { pausedAt: input.pausedAt }).pipe(Effect.orDie)
+    })
+
     const setArchived = Effect.fn("Session.setArchived")(function* (input: { sessionID: SessionID; time?: number }) {
       yield* patch(input.sessionID, { time: { archived: input.time } }).pipe(Effect.orDie)
     })
@@ -913,6 +924,7 @@ const layer: Layer.Layer<
       touch,
       get,
       setTitle,
+      setPaused,
       setArchived,
       setMetadata,
       setAgentModel,
