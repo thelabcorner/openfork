@@ -1,0 +1,30 @@
+[data-slot="project-explorer-scrollbar"] {
+  position: absolute;
+  inset: 0;
+  z-index: 60;
+  pointer-events: none;
+  overflow: hidden;
+}
+
+[data-slot="project-explorer-scrollbar"] .scroll-view__thumb {
+  pointer-events: auto;
+}
+
+/* Horizontal thumb: mirrors the vertical .scroll-view__thumb pill geometry */
+[data-slot="project-explorer-scrollbar"] .scroll-view__thumb--horizontal {
+  inset-inline: 0;
+  inset-block-start: auto;
+  inset-block-end: 0;
+  width: auto;
+  height: 12px;
+}
+
+[data-slot="project-explorer-scrollbar"] .scroll-view__thumb--horizontal::after {
+  left: 0;
+  right: 0;
+  top: 50%;
+  bottom: auto;
+  width: auto;
+  height: 4px;
+  transform: translateY(-50%);
+}

@@ -1,0 +1,214 @@
+/* Ground-up JetBrains-caliber project tree. Deliberately denser and higher-
+   contrast than file-tree-v2.css: full-color icons always (not just on
+   select), colored filenames for git status instead of a letter badge,
+   tighter row height, no gap between rows. */
+
+[data-component="project-explorer-tree"] {
+  display: flex;
+  flex-direction: column;
+  font-variant-numeric: tabular-nums;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"] {
+  box-sizing: border-box;
+  width: 100%;
+  min-width: 0;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 6px;
+  padding-inline-end: 6px;
+  border: none;
+  border-radius: 4px;
+  background-color: transparent;
+  color: var(--v2-text-text-base);
+  text-align: start;
+  cursor: default;
+  font-size: 12.5px;
+  font-weight: 440;
+  letter-spacing: -0.03px;
+  transition: background-color 100ms ease;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"]:hover {
+  background-color: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"][data-selected] {
+  background-color: var(--v2-overlay-simple-overlay-pressed);
+  color: var(--v2-text-text-base);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"][data-focused] {
+  outline: 1px solid var(--v2-border-border-focus);
+  outline-offset: -1px;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"][data-ignored] {
+  color: var(--v2-text-text-faint);
+  opacity: 0.7;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-chevron"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  flex: none;
+  color: var(--v2-text-text-faint);
+  border-radius: 3px;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-chevron"]:hover {
+  background-color: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-chevron"] svg {
+  transition: transform 110ms ease;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-chevron"]:not([data-expanded]) svg {
+  transform: rotate(-90deg);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-icon"] {
+  flex: none;
+  width: 15px;
+  height: 15px;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-name"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* Git-status color drives the filename text directly — no letter badge. */
+[data-component="project-explorer-tree"] [data-slot="project-explorer-name"][data-status="add"] {
+  color: var(--v2-state-fg-success);
+}
+[data-component="project-explorer-tree"] [data-slot="project-explorer-name"][data-status="mix"] {
+  color: var(--v2-state-fg-info);
+}
+[data-component="project-explorer-tree"] [data-slot="project-explorer-name"][data-status="del"] {
+  color: var(--v2-state-fg-danger);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+  opacity: 0.75;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-favorite"] {
+  flex: none;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: 3px;
+  color: var(--v2-icon-icon-muted);
+  opacity: 0;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"]:hover [data-slot="project-explorer-favorite"],
+[data-component="project-explorer-tree"] [data-slot="project-explorer-favorite"][data-favorited] {
+  opacity: 1;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-favorite"][data-favorited] {
+  color: var(--v2-state-fg-warning);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-favorite"]:hover {
+  background-color: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-inline-input"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  height: 18px;
+  border-radius: 3px;
+  border: 1px solid var(--v2-border-border-focus);
+  background: var(--v2-background-bg-layer-01);
+  color: var(--v2-text-text-base);
+  font: inherit;
+  padding: 0 4px;
+  outline: none;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-confirm"] {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--v2-state-fg-danger);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-confirm-actions"] {
+  display: flex;
+  gap: 4px;
+  margin-inline-start: auto;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-confirm-actions"] button {
+  height: 16px;
+  padding: 0 6px;
+  border-radius: 3px;
+  font-size: 10.5px;
+  font-weight: 530;
+  border: none;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-confirm-actions"] button[data-variant="danger"] {
+  background: var(--v2-state-bg-danger);
+  color: var(--v2-state-fg-danger);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-confirm-actions"] button[data-variant="neutral"] {
+  background: var(--v2-background-bg-layer-03);
+  color: var(--v2-text-text-muted);
+}
+
+/* Search field + expand/collapse-all live in the panel header; the tree css
+   is the explorer's stylesheet, so the shared TextInputV2 is densified here
+   (scoped to the panel) instead of changing its default look everywhere. */
+[data-project-explorer-panel] [data-component="text-input-v2"] {
+  flex: 1 1 0%;
+  min-width: 0;
+  width: auto;
+  height: 22px;
+  align-self: center;
+  background: var(--v2-background-bg-layer-01);
+  box-shadow: none;
+}
+
+[data-project-explorer-panel]
+  [data-component="text-input-v2"]:where(:hover):not([data-disabled], [data-invalid]):not(:focus-within) {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-project-explorer-panel] [data-component="text-input-v2"] [data-slot="text-input-v2-input"] {
+  font-size: 11px;
+}
+
+[data-project-explorer-panel]
+  [data-component="text-input-v2"]
+  [data-slot="text-input-v2-icon-button"][data-variant="clear"] {
+  width: 18px;
+  height: 18px;
+  margin-inline-end: 0;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-search-empty"] {
+  display: flex;
+  align-items: center;
+  height: 32px;
+  padding-inline: 8px;
+  font-size: 11px;
+  color: var(--v2-text-text-faint);
+}

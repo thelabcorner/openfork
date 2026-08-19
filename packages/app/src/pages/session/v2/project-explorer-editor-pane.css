@@ -1,0 +1,177 @@
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-tab"] {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  height: 26px;
+  padding: 0 8px;
+  border-radius: 5px 5px 0 0;
+  background: transparent;
+  color: var(--v2-text-text-muted);
+  font-size: 11.5px;
+  max-width: 160px;
+  flex-shrink: 0;
+  border: none;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-tab"]:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-tab"][data-active] {
+  background: var(--v2-background-bg-layer-03);
+  color: var(--v2-text-text-base);
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-tab-dot"] {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-tab-dot"][data-dirty] {
+  background: var(--v2-state-fg-warning);
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-tab-close"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  border-radius: 3px;
+  flex-shrink: 0;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-tab-close"]:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-frame"] .cm-editor {
+  height: 100%;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-frame"] .cm-scroller {
+  scrollbar-width: none;
+}
+
+[data-component="project-explorer-editor-pane"]
+  [data-slot="project-explorer-editor-frame"]
+  .cm-scroller::-webkit-scrollbar {
+  display: none;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-tabbar"] {
+  scrollbar-width: none;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-tabbar"]::-webkit-scrollbar {
+  display: none;
+}
+
+/* Floating comment affordance: the wrapper anchors the absolutely positioned
+   square button to the selected line; the tooltip trigger sits where the
+   button is, so the tooltip anchors correctly. */
+[data-component="project-explorer-editor-pane"] .project-explorer-editor-comment-anchor {
+  position: absolute;
+  inset-inline-end: 18px;
+  z-index: 30;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-comment-button"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  border: none;
+  border-radius: 4px;
+  background: var(--v2-background-bg-accent);
+  color: var(--v2-text-text-contrast);
+  box-shadow: 0 1px 2px rgb(0 0 0 / 0.2), 0 1px 3px rgb(0 0 0 / 0.14);
+  transition:
+    transform 120ms ease,
+    box-shadow 120ms ease,
+    background 120ms ease;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-comment-button"]:hover {
+  background: var(--v2-text-text-accent-hover);
+  transform: translateY(-1px);
+  box-shadow: 0 3px 6px rgb(0 0 0 / 0.24), 0 2px 4px rgb(0 0 0 / 0.18);
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-viewer"] {
+  position: absolute;
+  inset: 0;
+  min-width: 0;
+  min-height: 0;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-view-toggle"] {
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  height: 20px;
+  padding: 2px;
+  border-radius: 4px;
+  background: var(--v2-background-bg-layer-02);
+  /* Clamp the inherited 24px line-height so the toggle box never grows taller
+     than h-8 (the tab bar is overflow-x-auto, which forces overflow-y: auto —
+     any content overflow makes the header Y-scroll). */
+  line-height: 16px;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-view-toggle"] button {
+  height: 16px;
+  padding: 0 8px;
+  border: none;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--v2-text-text-muted);
+  font-size: 10.5px;
+  font-weight: 560;
+  /* Keep button text within its 16px box regardless of inherited line-height. */
+  line-height: 16px;
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-view-toggle"] button:hover {
+  color: var(--v2-text-text-base);
+}
+
+[data-component="project-explorer-editor-pane"]
+  [data-slot="project-explorer-editor-view-toggle"]
+  button[data-active] {
+  background: var(--v2-background-bg-layer-03);
+  color: var(--v2-text-text-base);
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-comment"] {
+  position: absolute;
+  inset-inline-end: 18px;
+  z-index: 40;
+  width: min(360px, calc(100% - 36px));
+  box-shadow: var(--v2-elevation-raised);
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-conflict"] {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  font-size: 11.5px;
+  color: var(--v2-state-fg-warning);
+  background: var(--v2-state-bg-warning);
+  border-bottom: 1px solid var(--v2-border-border-base);
+}
+
+[data-component="project-explorer-editor-pane"] [data-slot="project-explorer-editor-conflict"] button {
+  margin-inline-start: auto;
+  height: 18px;
+  padding: 0 8px;
+  border-radius: 3px;
+  border: none;
+  background: var(--v2-background-bg-layer-03);
+  color: var(--v2-text-text-base);
+  font-size: 10.5px;
+}

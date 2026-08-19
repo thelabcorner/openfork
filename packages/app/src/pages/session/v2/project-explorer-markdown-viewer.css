@@ -1,0 +1,282 @@
+[data-component="project-explorer-markdown-viewer"] {
+  position: relative;
+  height: 100%;
+  min-width: 0;
+  background: var(--v2-background-bg-base);
+  color: var(--v2-text-text-base);
+  font-family: var(--font-family-sans, ui-sans-serif, system-ui, sans-serif);
+  font-size: 13px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+  user-select: text;
+  cursor: text;
+}
+
+[data-component="project-explorer-markdown-viewer"] [data-slot="project-explorer-markdown-viewer-scroller"] {
+  height: 100%;
+  overflow: auto;
+  scrollbar-width: none;
+}
+
+[data-component="project-explorer-markdown-viewer"]
+  [data-slot="project-explorer-markdown-viewer-scroller"]::-webkit-scrollbar {
+  display: none;
+}
+
+[data-component="project-explorer-markdown-viewer"] [data-slot="project-explorer-markdown-viewer-body"] {
+  max-width: 760px;
+  margin-inline: auto;
+  padding: 20px 24px 48px;
+  min-height: 100%;
+  overflow-wrap: break-word;
+}
+
+[data-component="project-explorer-markdown-viewer"] [data-slot="project-explorer-markdown-viewer-body"] > :first-child {
+  margin-top: 0;
+}
+
+[data-component="project-explorer-markdown-viewer"] [data-slot="project-explorer-markdown-viewer-body"] > :last-child {
+  margin-bottom: 0;
+}
+
+[data-component="project-explorer-markdown-viewer"] [data-slot="project-explorer-markdown-viewer-body"] > * {
+  unicode-bidi: plaintext;
+}
+
+/* Headings: sized by level, tight rhythm */
+[data-component="project-explorer-markdown-viewer"] h1 {
+  font-size: 18px;
+  font-weight: 650;
+  line-height: 1.35;
+  margin: 20px 0 10px;
+  color: var(--v2-text-text-base);
+}
+
+[data-component="project-explorer-markdown-viewer"] h2 {
+  font-size: 15.5px;
+  font-weight: 640;
+  line-height: 1.4;
+  margin: 18px 0 8px;
+  color: var(--v2-text-text-base);
+}
+
+[data-component="project-explorer-markdown-viewer"] h3 {
+  font-size: 14px;
+  font-weight: 620;
+  line-height: 1.45;
+  margin: 16px 0 8px;
+  color: var(--v2-text-text-base);
+}
+
+[data-component="project-explorer-markdown-viewer"] h4,
+[data-component="project-explorer-markdown-viewer"] h5,
+[data-component="project-explorer-markdown-viewer"] h6 {
+  font-size: 13px;
+  font-weight: 600;
+  line-height: 1.5;
+  margin: 14px 0 6px;
+  color: var(--v2-text-text-muted);
+}
+
+/* Paragraphs & emphasis */
+[data-component="project-explorer-markdown-viewer"] p {
+  margin: 8px 0;
+}
+
+[data-component="project-explorer-markdown-viewer"] strong,
+[data-component="project-explorer-markdown-viewer"] b {
+  color: var(--v2-text-text-base);
+  font-weight: 600;
+}
+
+/* Links */
+[data-component="project-explorer-markdown-viewer"] a {
+  color: var(--v2-text-text-accent);
+  text-decoration: none;
+}
+
+[data-component="project-explorer-markdown-viewer"] a:hover {
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+
+/* Lists */
+[data-component="project-explorer-markdown-viewer"] ul,
+[data-component="project-explorer-markdown-viewer"] ol {
+  margin: 8px 0;
+  padding-inline-start: 22px;
+}
+
+[data-component="project-explorer-markdown-viewer"] li {
+  margin: 3px 0;
+}
+
+[data-component="project-explorer-markdown-viewer"] li > ul,
+[data-component="project-explorer-markdown-viewer"] li > ol {
+  margin: 2px 0;
+}
+
+[data-component="project-explorer-markdown-viewer"] li::marker {
+  color: var(--v2-text-text-faint);
+}
+
+[data-component="project-explorer-markdown-viewer"] li:has(> input[type="checkbox"]) {
+  list-style: none;
+}
+
+[data-component="project-explorer-markdown-viewer"] input[type="checkbox"] {
+  accent-color: var(--v2-text-text-accent);
+}
+
+/* Blockquotes */
+[data-component="project-explorer-markdown-viewer"] blockquote {
+  margin: 10px 0;
+  padding-inline-start: 14px;
+  border-inline-start: 2px solid var(--v2-border-border-base);
+  color: var(--v2-text-text-muted);
+}
+
+[data-component="project-explorer-markdown-viewer"] blockquote > :first-child {
+  margin-top: 0;
+}
+
+[data-component="project-explorer-markdown-viewer"] blockquote > :last-child {
+  margin-bottom: 0;
+}
+
+/* Horizontal rule */
+[data-component="project-explorer-markdown-viewer"] hr {
+  margin: 20px 0;
+  border: none;
+  border-top: 1px solid var(--v2-border-border-muted);
+}
+
+/* Code blocks (Shiki) */
+[data-component="project-explorer-markdown-viewer"] pre {
+  margin: 10px 0;
+  direction: ltr;
+  unicode-bidi: isolate;
+}
+
+[data-component="project-explorer-markdown-viewer"] pre.shiki {
+  padding: 10px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--v2-border-border-muted);
+  overflow-x: auto;
+  font-family: var(--v2-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12.5px;
+  line-height: 1.6;
+  tab-size: 2;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-weak-base) transparent;
+}
+
+[data-component="project-explorer-markdown-viewer"] pre.shiki::-webkit-scrollbar,
+[data-component="project-explorer-markdown-viewer"] table::-webkit-scrollbar {
+  height: 6px;
+}
+
+[data-component="project-explorer-markdown-viewer"] pre.shiki::-webkit-scrollbar-track,
+[data-component="project-explorer-markdown-viewer"] table::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+[data-component="project-explorer-markdown-viewer"] pre.shiki::-webkit-scrollbar-thumb,
+[data-component="project-explorer-markdown-viewer"] table::-webkit-scrollbar-thumb {
+  background: var(--border-weak-base);
+  border-radius: 9999px;
+}
+
+[data-component="project-explorer-markdown-viewer"] pre.shiki::-webkit-scrollbar-thumb:hover,
+[data-component="project-explorer-markdown-viewer"] table::-webkit-scrollbar-thumb:hover {
+  background: var(--border-strong-base);
+}
+
+[data-component="project-explorer-markdown-viewer"] pre.shiki code {
+  font-family: inherit;
+  font-size: inherit;
+  background: none;
+  padding: 0;
+}
+
+/* Inline code */
+[data-component="project-explorer-markdown-viewer"] :not(pre) > code {
+  direction: ltr;
+  unicode-bidi: isolate;
+  font-family: var(--v2-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12px;
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: color-mix(in oklch, var(--v2-text-text-base) 7%, transparent);
+  color: var(--v2-text-text-base);
+}
+
+/* Tables */
+[data-component="project-explorer-markdown-viewer"] table {
+  display: block;
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  border-collapse: collapse;
+  font-size: 12.5px;
+  margin: 12px 0;
+  scrollbar-width: thin;
+  scrollbar-color: var(--border-weak-base) transparent;
+}
+
+[data-component="project-explorer-markdown-viewer"] th,
+[data-component="project-explorer-markdown-viewer"] td {
+  padding: 6px 10px;
+  border-bottom: 1px solid var(--v2-border-border-muted);
+  text-align: start;
+  vertical-align: top;
+}
+
+[data-component="project-explorer-markdown-viewer"] th {
+  font-weight: 600;
+  color: var(--v2-text-text-base);
+  border-bottom-color: var(--v2-border-border-base);
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+/* KaTeX */
+[data-component="project-explorer-markdown-viewer"] .katex-display {
+  margin: 10px 0;
+  padding: 2px 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+}
+
+[data-component="project-explorer-markdown-viewer"] .katex {
+  font-size: 1.05em;
+}
+
+/* Images */
+[data-component="project-explorer-markdown-viewer"] img {
+  display: block;
+  max-width: 100%;
+  height: auto;
+  margin: 12px 0;
+  border-radius: 6px;
+}
+
+/* Parse-error fallback: escaped raw source */
+[data-component="project-explorer-markdown-viewer"] [data-slot="project-explorer-markdown-viewer-fallback"] {
+  max-width: 760px;
+  margin-inline: auto;
+  padding: 20px 24px 48px;
+  font-family: var(--v2-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 12.5px;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  word-break: break-word;
+  color: var(--v2-text-text-base);
+}
+
+/* Loading-state placeholder: reserves the predicted content height so the
+   rendered document lands without a layout shift (flag-gated, advisory only) */
+[data-component="project-explorer-markdown-viewer"] [data-slot="project-explorer-markdown-viewer-placeholder"] {
+  max-width: 760px;
+  margin-inline: auto;
+  padding: 20px 24px 48px;
+}
