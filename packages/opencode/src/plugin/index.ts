@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { fileURLToPath } from "url"
 import type {
   Hooks,
   PluginInput,
@@ -9,6 +10,7 @@ import type {
 import { Config } from "@/config/config"
 import { createOpencodeClient } from "@opencode-ai/sdk"
 import { ServerAuth } from "@/server/auth"
+import { loadToolModule } from "@/tool/import"
 import { CodexAuthPlugin } from "./openai/codex"
 import { Session } from "@/session/session"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -119,6 +121,37 @@ async function applyPlugin(load: PluginLoader.Loaded, input: PluginInput, hooks:
 
   for (const server of getLegacyPlugins(load.mod)) {
     hooks.push(await server(input, load.options))
+  }
+}
+
+// Tool hot-reload P1 (plugin files): re-import a plugin entry from disk, bypassing Bun's
+// pathname-keyed module cache, and return the fresh module WITHOUT re-applying hooks. Callers
+// extract tool defs from the fresh `default` descriptor (readV1Plugin) and apply its server()
+// hook themselves; this helper never re-applies hooks.
+//
+// Mechanism: delegates to the registry's verified `loadToolModule` (src/tool/import.ts) — an
+// in-memory Bun.build bundle (inlines relative imports and bundled deps) imported via a
+// content-unique data:/blob: URL, so the result reflects the current disk state. A synchronous
+// transpile pre-check surfaces syntax errors BEFORE any import, because the file:// last-resort
+// fallback inside loadToolModule is module-cached by pathname and would otherwise serve a stale
+// module on a failed re-bundle (tool-hot-reload §3.3/Q9: never silently miss dependency changes).
+export async function reloadPluginEntry(
+  entry: PluginLoader.Resolved,
+): Promise<{ ok: true; mod: Record<string, unknown> } | { ok: false; error: string }> {
+  if (typeof Bun === "undefined") return { ok: false, error: "Plugin hot-reload requires Bun's transpiler" }
+  const file = entry.entry.startsWith("file://") ? fileURLToPath(entry.entry) : entry.entry
+  try {
+    // Loader must be on the CONSTRUCTOR: Bun 1.3.14 ignores the per-call `{ loader: "ts" }`
+    // option (always parses JSX, rejecting TS type annotations).
+    new Bun.Transpiler({ loader: "ts" }).transformSync(await Bun.file(file).text())
+  } catch (error) {
+    return { ok: false, error: `Failed to parse plugin entry ${entry.spec}: ${errorMessage(error)}` }
+  }
+  try {
+    const mod = await loadToolModule(file)
+    return { ok: true, mod }
+  } catch (error) {
+    return { ok: false, error: `Failed to reload plugin entry ${entry.spec}: ${errorMessage(error)}` }
   }
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@opencode-ai/app",
-"version": "1.18.18",
+  "version": "1.18.18",
   "description": "",
   "type": "module",
   "exports": {
@@ -48,12 +48,22 @@
     "vite-plugin-solid": "catalog:"
   },
   "dependencies": {
+    "@chenglou/pretext": "0.0.8",
+    "@codemirror/autocomplete": "6.20.3",
+    "@codemirror/commands": "6.10.4",
+    "@codemirror/language": "6.12.4",
+    "@codemirror/lang-xml": "6.1.0",
+    "@codemirror/language-data": "6.5.2",
+    "@codemirror/search": "6.7.1",
+    "@codemirror/state": "6.7.1",
+    "@codemirror/view": "6.43.8",
     "@corvu/drawer": "catalog:",
     "@dnd-kit/abstract": "0.5.0",
     "@dnd-kit/dom": "0.5.0",
     "@dnd-kit/helpers": "0.5.0",
     "@dnd-kit/solid": "0.5.0",
     "@kobalte/core": "catalog:",
+    "@lezer/highlight": "1.2.3",
     "@opencode-ai/client": "file:vendor/opencode-ai-client-1.17.13-v3.tgz",
     "@opencode-ai/core": "workspace:*",
     "@opencode-ai/schema": "workspace:*",
@@ -80,6 +90,7 @@
     "@tanstack/solid-query": "5.91.4",
     "@tanstack/solid-virtual": "catalog:",
     "@thisbeyond/solid-dnd": "0.7.5",
+    "codemirror": "6.0.2",
     "diff": "catalog:",
     "effect": "catalog:",
     "fuzzysort": "catalog:",

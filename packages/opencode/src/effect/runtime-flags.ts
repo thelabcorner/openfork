@@ -37,6 +37,26 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
     enabled: bool("OPENCODE_ENABLE_PARALLEL"),
     legacy: bool("OPENCODE_EXPERIMENTAL_PARALLEL"),
   }).pipe(Config.map((flags) => flags.enabled || flags.legacy)),
+  enableFirecrawl: Config.all({
+    enabled: bool("OPENCODE_ENABLE_FIRECRAWL"),
+    legacy: bool("OPENCODE_EXPERIMENTAL_FIRECRAWL"),
+  }).pipe(Config.map((flags) => flags.enabled || flags.legacy)),
+  enableDuckDuckGo: Config.all({
+    enabled: bool("OPENCODE_ENABLE_DUCKDUCKGO"),
+    legacy: bool("OPENCODE_EXPERIMENTAL_DUCKDUCKGO"),
+  }).pipe(Config.map((flags) => flags.enabled || flags.legacy)),
+  enableBrave: Config.all({
+    enabled: bool("OPENCODE_ENABLE_BRAVE"),
+    legacy: bool("OPENCODE_EXPERIMENTAL_BRAVE"),
+  }).pipe(Config.map((flags) => flags.enabled || flags.legacy)),
+  enableTavily: Config.all({
+    enabled: bool("OPENCODE_ENABLE_TAVILY"),
+    legacy: bool("OPENCODE_EXPERIMENTAL_TAVILY"),
+  }).pipe(Config.map((flags) => flags.enabled || flags.legacy)),
+  enableSearxng: Config.all({
+    enabled: bool("OPENCODE_ENABLE_SEARXNG"),
+    legacy: bool("OPENCODE_EXPERIMENTAL_SEARXNG"),
+  }).pipe(Config.map((flags) => flags.enabled || flags.legacy)),
   enableExperimentalModels: bool("OPENCODE_ENABLE_EXPERIMENTAL_MODELS"),
   enableQuestionTool: bool("OPENCODE_ENABLE_QUESTION_TOOL"),
   experimentalReferences: enabledByExperimental("OPENCODE_EXPERIMENTAL_REFERENCES"),
@@ -53,6 +73,11 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
   bashDefaultTimeoutMs: positiveInteger("OPENCODE_EXPERIMENTAL_BASH_DEFAULT_TIMEOUT_MS"),
   experimentalNativeLlm: bool("OPENCODE_EXPERIMENTAL_NATIVE_LLM"),
   experimentalWebSockets: bool("OPENCODE_EXPERIMENTAL_WEBSOCKETS"),
+  // Structural performance unlocks. All default-OFF; each requires the
+  // equivalence gate in docs/perf-structural-unlocks before enabling.
+  experimentalIncrementalTranscript: bool("OPENCODE_EXPERIMENTAL_INCREMENTAL_TRANSCRIPT"),
+  experimentalDbWriteBatch: bool("OPENCODE_EXPERIMENTAL_DB_WRITE_BATCH"),
+  experimentalDbReadWriteSplit: bool("OPENCODE_EXPERIMENTAL_DB_READ_WRITE_SPLIT"),
   client: Config.string("OPENCODE_CLIENT").pipe(Config.withDefault("cli")),
 }) {}
 

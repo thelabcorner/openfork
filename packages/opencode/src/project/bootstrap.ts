@@ -7,6 +7,7 @@ import * as Project from "./project"
 import * as Vcs from "./vcs"
 import { InstanceState } from "@/effect/instance-state"
 import { ShareNext } from "@/share/share-next"
+import { ToolReload } from "@/tool/reload"
 import { Effect, Layer } from "effect"
 import { Config } from "@/config/config"
 import { Service } from "./bootstrap-service"
@@ -28,6 +29,7 @@ const layer = Layer.effect(
     const shareNext = yield* ShareNext.Service
     const snapshot = yield* Snapshot.Service
     const vcs = yield* Vcs.Service
+    const toolReload = yield* ToolReload.Service
 
     const run = Effect.gen(function* () {
       const ctx = yield* InstanceState.context
@@ -36,6 +38,11 @@ const layer = Layer.effect(
       yield* config.get()
       // Plugin can mutate config so it has to be initialized before anything else.
       yield* plugin.init()
+      // ToolReload starts its watcher subscription + poll fallback for this instance;
+      // start() materializes the per-directory state and is non-blocking.
+      yield* toolReload
+        .start()
+        .pipe(Effect.catchCause((cause) => Effect.logWarning("tool reload init failed", { cause })))
       // Each service self-manages its own slow work via Effect.forkScoped against
       // its per-instance state scope. We just await materialization here.
       yield* Effect.forEach(
@@ -52,7 +59,7 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer: layer,
-  deps: [Config.node, Format.node, LSP.node, Plugin.node, Project.node, ShareNext.node, Snapshot.node, Vcs.node],
+  deps: [Config.node, Format.node, LSP.node, Plugin.node, Project.node, ShareNext.node, Snapshot.node, Vcs.node, ToolReload.node],
 })
 
 export * as InstanceBootstrap from "./bootstrap"

@@ -38,6 +38,7 @@ import { McpAuth } from "@/mcp/auth"
 import { Command } from "@/command"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
+import { ToolReload } from "@/tool/reload"
 import { Format } from "@/format"
 import { InstanceStore } from "@/project/instance-store"
 import { Project } from "@/project/project"
@@ -55,6 +56,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "./app-node-builder-v1"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 
 export const AppLayer = AppNodeBuilderV1.build(
   LayerNode.group([
@@ -98,6 +100,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     Command.node,
     Truncate.node,
     ToolRegistry.node,
+    ToolReload.node,
     Format.node,
     InstanceStore.node,
     Project.node,
@@ -107,6 +110,9 @@ export const AppLayer = AppNodeBuilderV1.build(
     Installation.node,
     ShareNext.node,
     SessionShare.node,
+    // Browser host broker: needed by the session-delete orphan path (CLI +
+    // httpapi) and transitively by the browser tools via BrokerClient.
+    BrowserHostBroker.node,
   ]),
 ).pipe(Layer.provideMerge(AppNodeBuilderV1.build(Ripgrep.node)), Layer.provideMerge(Observability.layer))
 

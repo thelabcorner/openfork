@@ -3,6 +3,7 @@ import { Effect } from "effect"
 import { cmd } from "./cmd"
 import { effectCmd, fail } from "../effect-cmd"
 import { Session } from "@/session/session"
+import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { SessionID } from "../../session/schema"
 import { UI } from "../ui"
 import { Locale } from "@/util/locale"
@@ -59,10 +60,13 @@ export const SessionDeleteCommand = effectCmd({
     }),
   handler: Effect.fn("Cli.session.delete")(function* (args) {
     const svc = yield* Session.Service
+    const broker = yield* BrowserHostBroker.Service
     const sessionID = SessionID.make(args.sessionID)
     yield* svc
       .remove(sessionID)
       .pipe(Effect.catchIf(NotFoundError.isInstance, () => fail(`Session not found: ${args.sessionID}`)))
+    // Browser lifecycle (D10): orphan the session's browser tabs to the user.
+    yield* Effect.ignore(broker.orphanSession(sessionID))
     UI.println(UI.Style.TEXT_SUCCESS_BOLD + `Session ${args.sessionID} deleted` + UI.Style.TEXT_NORMAL)
   }),
 })
