@@ -57,6 +57,8 @@ import { SessionTitle } from "@opencode-ai/core/session/title"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
+import { SpadSupervisor } from "./spad/supervisor"
+import { makeTurnPolicy } from "./spad/intent"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -843,6 +845,7 @@ Generate a fresh title. Do not reuse the current title.`
           providerID: model.providerID,
           modelID: model.modelID,
           variant,
+          ...(input.subProvider ? { subProvider: input.subProvider } : {}),
         },
         system: input.system,
         format: input.format,
@@ -1265,6 +1268,8 @@ Generate a fresh title. Do not reuse the current title.`
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
+        let spad: SpadSupervisor | undefined
+        let spadStarted = false
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         // Hard pause gate (V1): a paused session must not start any provider
         // work. Prompt admission already gates, but direct loop callers (resume,
@@ -1282,6 +1287,17 @@ Generate a fresh title. Do not reuse the current title.`
           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+          const lastUserMsg = msgs.findLast((msg) => msg.info.role === "user" && msg.info.id === lastUser.id)
+          if (!spadStarted && (yield* config.get()).experimental?.spad_recovery === true && lastUserMsg) {
+            const userText = lastUserMsg.parts
+              .filter((part): part is SessionV1.TextPart => part.type === "text" && part.synthetic !== true)
+              .map((part) => part.text)
+              .join("\n")
+            spad = new SpadSupervisor()
+            spad.beginTurn(makeTurnPolicy(userText, lastUser.format?.type === "json_schema"))
+            spadStarted = true
+          }
 
           const lastAssistantMsg = msgs.findLast(
             (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
@@ -1401,6 +1417,7 @@ Generate a fresh title. Do not reuse the current title.`
               assistantMessage: msg,
               sessionID,
               model,
+              spad,
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -1476,6 +1493,24 @@ Generate a fresh title. Do not reuse the current title.`
               handle.message.finish = handle.message.finish ?? "stop"
               yield* sessions.updateMessage(handle.message)
               return "break" as const
+            }
+
+            if (handle.recovery) {
+              const recoveryUser: SessionV1.User = {
+                ...lastUser,
+                id: MessageID.ascending(),
+                time: { created: Date.now() },
+              }
+              yield* sessions.updateMessage(recoveryUser)
+              yield* sessions.updatePart({
+                id: PartID.ascending(),
+                messageID: recoveryUser.id,
+                sessionID,
+                type: "text",
+                text: handle.recovery.prompt,
+                synthetic: true,
+              } satisfies SessionV1.TextPart)
+              return "continue" as const
             }
 
             const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
@@ -1696,6 +1731,7 @@ export const PromptInput = Schema.Struct({
   format: Schema.optional(SessionV1.Format),
   system: Schema.optional(Schema.String),
   variant: Schema.optional(Schema.String),
+  subProvider: Schema.optional(Schema.String),
   parts: Schema.Array(
     Schema.Union([
       SessionV1.TextPartInput,

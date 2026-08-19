@@ -89,6 +89,17 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
         providerOptions: input.provider.options,
       })
   const options = mergeOptions(mergeOptions(mergeOptions(base, input.model.options), input.agent.options), variant)
+  // OpenRouter sub-provider routing: pin the request to one upstream infra
+  // provider when the user chose one ("Auto" clears it, so nothing to merge).
+  const subProvider = input.user.model.subProvider
+  if (
+    input.model.providerID === "openrouter" &&
+    subProvider &&
+    subProvider !== "auto" &&
+    input.model.api.npm === "@openrouter/ai-sdk-provider"
+  ) {
+    options.provider = { only: [subProvider] }
+  }
   if (
     input.model.api.npm === "@ai-sdk/azure" &&
     (input.provider.options.useCompletionUrls || input.model.options.useCompletionUrls || options.useCompletionUrls)

@@ -781,6 +781,72 @@ it.instance("static loop returns assistant text through local provider", () =>
   }),
 )
 
+it.instance("SPAD recovery truncates a repetitive tail and continues with a hidden re-anchor", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      experimental: { spad_recovery: true },
+    }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "SPAD recovery",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const motif = "The implementation should continue from the last stable state. "
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Continue implementing the feature." }],
+    })
+    yield* llm.text(motif.repeat(12))
+    yield* llm.text("The recovery succeeded and the task can continue.")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const synthetic = messages.flatMap((message) => message.parts).find(
+      (part) => part.type === "text" && part.synthetic === true && part.text.includes("repetitive output loop"),
+    )
+    const repetitive = messages
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "text" && part.text.includes(motif))
+
+    expect(result.parts.some((part) => part.type === "text" && part.text.includes("recovery succeeded"))).toBe(true)
+    expect(synthetic).toBeDefined()
+    expect(repetitive?.type).toBe("text")
+    if (repetitive?.type === "text") expect(repetitive.text.length).toBeLessThan(motif.length * 12)
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+it.instance("SPAD disabled preserves repetitive output and avoids recovery", () =>
+  Effect.gen(function* () {
+    const { llm } = yield* useServerConfig(providerCfg)
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "SPAD disabled",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const motif = "The implementation should continue from the last stable state. "
+    const loop = motif.repeat(12)
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Continue implementing the feature." }],
+    })
+    yield* llm.text(loop)
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(result.parts.some((part) => part.type === "text" && part.text === loop)).toBe(true)
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
 it.instance("static loop consumes queued replies across turns", () =>
   Effect.gen(function* () {
     const { llm } = yield* useServerConfig(providerCfg)

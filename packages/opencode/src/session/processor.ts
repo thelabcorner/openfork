@@ -26,6 +26,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { ForkCredentials } from "@/fork/credentials"
+import { SpadSupervisor } from "./spad/supervisor"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -46,12 +47,14 @@ export interface Handle {
     },
   ) => Effect.Effect<void>
   readonly process: (streamInput: LLM.StreamInput) => Effect.Effect<Result>
+  readonly recovery?: { readonly prompt: string }
 }
 
 type Input = {
   assistantMessage: SessionV1.Assistant
   sessionID: SessionID
   model: Provider.Model
+  spad?: SpadSupervisor
 }
 
 export interface Interface {
@@ -71,8 +74,11 @@ interface ProcessorContext extends Input {
   snapshot: string | undefined
   blocked: boolean
   needsCompaction: boolean
+  needsRecovery: { readonly prompt: string } | undefined
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
+  /** Whether we have already recorded the first-token timestamp on the message. */
+  firstTokenRecorded: boolean
 }
 
 type StreamEvent = LLMEvent
@@ -106,13 +112,16 @@ const layer = Layer.effect(
         assistantMessage: input.assistantMessage,
         sessionID: input.sessionID,
         model: input.model,
+        spad: input.spad,
         toolcalls: {},
         shouldBreak: false,
         snapshot: initialSnapshot,
         blocked: false,
         needsCompaction: false,
+        needsRecovery: undefined,
         currentText: undefined,
         reasoningMap: {},
+        firstTokenRecorded: false,
       }
       let aborted = false
 
@@ -281,6 +290,17 @@ const layer = Layer.effect(
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
+            // Record first-token timestamp on the assistant message for upstream
+            // TTFT metrics. Only set once per message; reasoning-start that
+            // arrives after text-start is not the "first" token.
+            if (!ctx.firstTokenRecorded) {
+              ctx.firstTokenRecorded = true
+              ctx.assistantMessage.time.firstTokenAt = Date.now()
+              yield* session.updateMessage(ctx.assistantMessage)
+            }
+            // Reasoning may carry a provider signature that only arrives at block
+            // end. Observe it, but never truncate it until replay safety is proven.
+            ctx.spad?.startPart("reasoning", false, true)
             ctx.reasoningMap[value.id] = {
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -296,6 +316,7 @@ const layer = Layer.effect(
           case "reasoning-delta":
             // Match dev: silently drop orphan deltas (no preceding reasoning-start).
             if (!(value.id in ctx.reasoningMap)) return
+            ctx.spad?.push(value.text)
             ctx.reasoningMap[value.id].text += value.text
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
             yield* session.updatePartDelta({
@@ -445,6 +466,7 @@ const layer = Layer.effect(
             ctx.assistantMessage.finish = value.reason
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
+            if (value.servedModel) ctx.assistantMessage.servedModel = value.servedModel
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,
@@ -494,6 +516,14 @@ const layer = Layer.effect(
           }
 
           case "text-start":
+            // Record first-token timestamp on the assistant message for upstream
+            // TTFT metrics. Only set once per message.
+            if (!ctx.firstTokenRecorded) {
+              ctx.firstTokenRecorded = true
+              ctx.assistantMessage.time.firstTokenAt = Date.now()
+              yield* session.updateMessage(ctx.assistantMessage)
+            }
+            ctx.spad?.startPart("text")
             ctx.currentText = {
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -508,6 +538,16 @@ const layer = Layer.effect(
 
           case "text-delta":
             if (!ctx.currentText) return
+            const action = ctx.spad?.push(value.text)
+            if (action?.type === "abort") {
+              throw new Error(`Repetitive model output continued after recovery (${action.reason})`)
+            }
+            if (action?.type === "recover") {
+              ctx.currentText.text = ctx.currentText.text.slice(0, action.quarantineFrom)
+              yield* session.updatePart(ctx.currentText)
+              ctx.needsRecovery = { prompt: action.recoveryPrompt }
+              return
+            }
             ctx.currentText.text += value.text
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
             yield* session.updatePartDelta({
@@ -640,6 +680,7 @@ const layer = Layer.effect(
           messageID: input.assistantMessage.id,
         })
         ctx.needsCompaction = false
+        ctx.needsRecovery = undefined
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
         return yield* Effect.gen(function* () {
@@ -647,11 +688,20 @@ const layer = Layer.effect(
             ctx.currentText = undefined
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
+
+            // Record when the request is dispatched to the provider. The stream
+            // starts producing events only after the HTTP request is sent, so
+            // this timestamp is a close approximation of the actual wire send.
+            if (ctx.assistantMessage.time.requestSentAt === undefined) {
+              ctx.assistantMessage.time.requestSentAt = Date.now()
+              yield* session.updateMessage(ctx.assistantMessage)
+            }
+
             const stream = llm.stream(streamInput)
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),
-              Stream.takeUntil(() => ctx.needsCompaction),
+              Stream.takeUntil(() => ctx.needsCompaction || ctx.needsRecovery !== undefined),
               Stream.runDrain,
             )
           }).pipe(
@@ -699,6 +749,9 @@ const layer = Layer.effect(
         updateToolCall,
         completeToolCall,
         process,
+        get recovery() {
+          return ctx.needsRecovery
+        },
       } satisfies Handle
     })
 

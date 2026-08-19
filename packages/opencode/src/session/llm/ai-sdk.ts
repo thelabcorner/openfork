@@ -63,6 +63,27 @@ function usage(value: unknown) {
   return entries.length === 0 ? undefined : Object.fromEntries(entries)
 }
 
+// OpenRouter resolves router slugs (`free`, `auto`) to a concrete upstream
+// model + endpoint provider; both are reported on the response. The served
+// provider name (e.g. `DeepInfra`) is not a configured catalog entry.
+function servedModel(response: unknown, providerMetadata: unknown) {
+  if (!response || typeof response !== "object") return undefined
+  const modelID = (response as { modelId?: string }).modelId
+  if (!modelID) return undefined
+  const openrouter =
+    providerMetadata && typeof providerMetadata === "object"
+      ? (providerMetadata as Record<string, unknown>).openrouter
+      : undefined
+  const provider =
+    openrouter && typeof openrouter === "object"
+      ? (openrouter as Record<string, unknown>).provider
+      : undefined
+  return {
+    modelID,
+    providerID: typeof provider === "string" && provider.length > 0 ? provider : undefined,
+  }
+}
+
 function currentTextID(state: ReturnType<typeof adapterState>, id: string | undefined) {
   state.currentTextID = id ?? state.currentTextID ?? `text-${state.text++}`
   return state.currentTextID
@@ -104,6 +125,7 @@ export function toLLMEvents(
             reason: finishReason(event.finishReason),
             usage: usage(event.usage),
             providerMetadata: metadata,
+            servedModel: servedModel(event.response, event.providerMetadata),
           }),
         ]
       })

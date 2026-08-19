@@ -232,6 +232,11 @@ const layer = Layer.effect(
       const providerStream = llm.stream(request).pipe(
         Stream.runForEach((event) =>
           Effect.gen(function* () {
+            // Yield between provider events so one session's synchronous durable
+            // commits (node:sqlite blocks the single event loop) do not starve other
+            // sessions' LLM event processing, SSE delivery, or IPC. Scheduling-only;
+            // per-session publication order is preserved by the withPublication semaphore.
+            yield* Effect.yieldNow
             if (overflowFailure || publisher.hasProviderError()) return
             if (LLMEvent.is.providerError(event)) {
               if (isContextOverflowFailure(event) && !publisher.hasAssistantStarted()) {

@@ -58,12 +58,25 @@ export const SessionTable = sqliteTable(
     paused_at: integer(),
     time_compacting: integer(),
     time_archived: integer(),
+    group_id: text(),
   },
   (table) => [
     index("session_project_idx").on(table.project_id),
     index("session_workspace_idx").on(table.workspace_id),
     index("session_parent_idx").on(table.parent_id),
+    index("session_group_idx").on(table.group_id),
   ],
+)
+
+export const SessionGroupTable = sqliteTable(
+  "session_group",
+  {
+    id: text().primaryKey(),
+    name: text().notNull(),
+    position: integer().notNull().default(0),
+    ...Timestamps,
+  },
+  (table) => [index("session_group_position_idx").on(table.position)],
 )
 
 export const MessageTable = sqliteTable(

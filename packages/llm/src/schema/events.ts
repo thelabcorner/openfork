@@ -180,12 +180,27 @@ export const ToolError = Schema.Struct({
 }).annotate({ identifier: "LLM.Event.ToolError" })
 export type ToolError = Schema.Schema.Type<typeof ToolError>
 
+/**
+ * The model that actually served a request, when it differs from the
+ * configured/requested model. Router providers (e.g. OpenRouter's `free` /
+ * `auto`) resolve the requested router slug to a concrete upstream model and
+ * endpoint; `modelID` is the upstream model and `providerID` the upstream
+ * endpoint's provider name (e.g. `DeepInfra`), neither of which is a
+ * configured catalog entry.
+ */
+export const ServedModel = Schema.Struct({
+  modelID: Schema.String,
+  providerID: Schema.optional(Schema.String),
+}).annotate({ identifier: "LLM.ServedModel" })
+export type ServedModel = Schema.Schema.Type<typeof ServedModel>
+
 export const StepFinish = Schema.Struct({
   type: Schema.tag("step-finish"),
   index: Schema.Number,
   reason: FinishReason,
   usage: Schema.optional(Usage),
   providerMetadata: Schema.optional(ProviderMetadata),
+  servedModel: Schema.optional(ServedModel),
 }).annotate({ identifier: "LLM.Event.StepFinish" })
 export type StepFinish = Schema.Schema.Type<typeof StepFinish>
 
