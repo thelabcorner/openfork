@@ -11,6 +11,12 @@ describe("isLocalWorkspaceRoute", () => {
     expect(isLocalWorkspaceRoute("GET", "/session")).toBe(true)
   })
 
+  test("OpenRouter endpoint discovery stays on the control plane", () => {
+    expect(isLocalWorkspaceRoute("GET", "/experimental/openrouter-endpoints")).toBe(true)
+    expect(isLocalWorkspaceRoute("POST", "/experimental/openrouter-endpoints")).toBe(false)
+    expect(isLocalWorkspaceRoute("GET", "/experimental/openrouter-endpoints/extra")).toBe(false)
+  })
+
   test("GET /session/ses_abc is local (prefix match)", () => {
     expect(isLocalWorkspaceRoute("GET", "/session/ses_abc")).toBe(true)
   })

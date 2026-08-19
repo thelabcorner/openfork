@@ -92,6 +92,14 @@ import type {
   FilesListOutput,
   FilesFindInput,
   FilesFindOutput,
+  FilesWriteInput,
+  FilesWriteOutput,
+  FilesDeleteInput,
+  FilesDeleteOutput,
+  FilesRenameInput,
+  FilesRenameOutput,
+  FilesMkdirInput,
+  FilesMkdirOutput,
   CommandsListInput,
   CommandsListOutput,
   SkillsListInput,
@@ -857,6 +865,54 @@ export function make(options: ClientOptions) {
             query: { location: input["location"], query: input["query"], type: input["type"], limit: input["limit"] },
             successStatus: 200,
             declaredStatuses: [401, 400],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      write: (input: FilesWriteInput, requestOptions?: RequestOptions) =>
+        request<FilesWriteOutput>(
+          {
+            method: "POST",
+            path: `/api/fs/write`,
+            body: { path: input["path"], content: input["content"], expectedHash: input["expectedHash"] },
+            successStatus: 200,
+            declaredStatuses: [409, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      delete: (input: FilesDeleteInput, requestOptions?: RequestOptions) =>
+        request<FilesDeleteOutput>(
+          {
+            method: "POST",
+            path: `/api/fs/delete`,
+            body: { path: input["path"] },
+            successStatus: 200,
+            declaredStatuses: [409, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      rename: (input: FilesRenameInput, requestOptions?: RequestOptions) =>
+        request<FilesRenameOutput>(
+          {
+            method: "POST",
+            path: `/api/fs/rename`,
+            body: { from: input["from"], to: input["to"] },
+            successStatus: 200,
+            declaredStatuses: [409, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      mkdir: (input: FilesMkdirInput, requestOptions?: RequestOptions) =>
+        request<FilesMkdirOutput>(
+          {
+            method: "POST",
+            path: `/api/fs/mkdir`,
+            body: { path: input["path"], kind: input["kind"] },
+            successStatus: 200,
+            declaredStatuses: [409, 400, 401],
             empty: false,
           },
           requestOptions,

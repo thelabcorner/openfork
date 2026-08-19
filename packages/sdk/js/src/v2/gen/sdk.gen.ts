@@ -38,6 +38,8 @@ import type {
   ExperimentalConsoleSwitchOrgResponses,
   ExperimentalControlPlaneMoveSessionErrors,
   ExperimentalControlPlaneMoveSessionResponses,
+  ExperimentalOpenrouterEndpointsGetErrors,
+  ExperimentalOpenrouterEndpointsGetResponses,
   ExperimentalProjectCopyGenerateNameErrors,
   ExperimentalProjectCopyGenerateNameResponses,
   ExperimentalResourceListErrors,
@@ -60,14 +62,22 @@ import type {
   ExperimentalWorkspaceSyncListResponses,
   ExperimentalWorkspaceWarpErrors,
   ExperimentalWorkspaceWarpResponses,
+  FileDeleteErrors,
+  FileDeleteResponses,
   FileListErrors,
   FileListResponses,
+  FileMkdirErrors,
+  FileMkdirResponses,
   FilePartInput,
   FilePartSource,
   FileReadErrors,
   FileReadResponses,
+  FileRenameErrors,
+  FileRenameResponses,
   FileStatusErrors,
   FileStatusResponses,
+  FileWriteErrors,
+  FileWriteResponses,
   FindFilesErrors,
   FindFilesResponses,
   FindSymbolsErrors,
@@ -205,6 +215,22 @@ import type {
   SessionForkResponses,
   SessionGetErrors,
   SessionGetResponses,
+  SessionGroupAddSessionErrors,
+  SessionGroupAddSessionResponses,
+  SessionGroupCreateErrors,
+  SessionGroupCreateResponses,
+  SessionGroupGetErrors,
+  SessionGroupGetResponses,
+  SessionGroupListErrors,
+  SessionGroupListResponses,
+  SessionGroupRemoveErrors,
+  SessionGroupRemoveResponses,
+  SessionGroupRemoveSessionErrors,
+  SessionGroupRemoveSessionResponses,
+  SessionGroupRenameErrors,
+  SessionGroupRenameResponses,
+  SessionGroupReorderErrors,
+  SessionGroupReorderResponses,
   SessionInitErrors,
   SessionInitResponses,
   SessionListErrors,
@@ -255,6 +281,8 @@ import type {
   ToolIdsResponses,
   ToolListErrors,
   ToolListResponses,
+  ToolReloadErrors,
+  ToolReloadResponses,
   TuiAppendPromptErrors,
   TuiAppendPromptResponses,
   TuiClearPromptErrors,
@@ -281,8 +309,12 @@ import type {
   TuiShowToastResponses,
   TuiSubmitPromptErrors,
   TuiSubmitPromptResponses,
+  UsageSummaryErrors,
+  UsageSummaryResponses,
   V2AgentListErrors,
   V2AgentListResponses,
+  V2BrowserAssignErrors,
+  V2BrowserAssignResponses,
   V2BrowserEventErrors,
   V2BrowserEventResponses,
   V2BrowserHostHelloErrors,
@@ -299,12 +331,20 @@ import type {
   V2CredentialUpdateResponses,
   V2EventSubscribeErrors,
   V2EventSubscribeResponses,
+  V2FsDeleteErrors,
+  V2FsDeleteResponses,
   V2FsFindErrors,
   V2FsFindResponses,
   V2FsListErrors,
   V2FsListResponses,
+  V2FsMkdirErrors,
+  V2FsMkdirResponses,
   V2FsReadErrors,
   V2FsReadResponses,
+  V2FsRenameErrors,
+  V2FsRenameResponses,
+  V2FsWriteErrors,
+  V2FsWriteResponses,
   V2HealthGetErrors,
   V2HealthGetResponses,
   V2IntegrationAttemptCancelErrors,
@@ -381,6 +421,8 @@ import type {
   V2SessionMessageResponses,
   V2SessionMessagesErrors,
   V2SessionMessagesResponses,
+  V2SessionPauseErrors,
+  V2SessionPauseResponses,
   V2SessionPermissionCreateErrors,
   V2SessionPermissionCreateResponses,
   V2SessionPermissionGetErrors,
@@ -397,6 +439,10 @@ import type {
   V2SessionQuestionRejectResponses,
   V2SessionQuestionReplyErrors,
   V2SessionQuestionReplyResponses,
+  V2SessionRegenerateTitleErrors,
+  V2SessionRegenerateTitleResponses,
+  V2SessionResumeErrors,
+  V2SessionResumeResponses,
   V2SessionRevertClearErrors,
   V2SessionRevertClearResponses,
   V2SessionRevertCommitErrors,
@@ -952,6 +998,44 @@ export class Resource extends HeyApiClient {
   }
 }
 
+export class OpenrouterEndpoints extends HeyApiClient {
+  /**
+   * Get OpenRouter upstream providers
+   *
+   * Proxy OpenRouter's public /models/{id}/endpoints so the renderer avoids a cross-origin fetch. Returns the upstream infrastructure providers serving a model, or an empty list when a model has none.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      model: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "model" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      ExperimentalOpenrouterEndpointsGetResponses,
+      ExperimentalOpenrouterEndpointsGetErrors,
+      ThrowOnError
+    >({
+      url: "/experimental/openrouter-endpoints",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class ProjectCopy extends HeyApiClient {
   /**
    * Generate project copy name
@@ -1294,6 +1378,11 @@ export class Experimental extends HeyApiClient {
   private _resource?: Resource
   get resource(): Resource {
     return (this._resource ??= new Resource({ client: this.client }))
+  }
+
+  private _openrouterEndpoints?: OpenrouterEndpoints
+  get openrouterEndpoints(): OpenrouterEndpoints {
+    return (this._openrouterEndpoints ??= new OpenrouterEndpoints({ client: this.client }))
   }
 
   private _projectCopy?: ProjectCopy
@@ -1779,6 +1868,36 @@ export class Tool extends HeyApiClient {
       ...params,
     })
   }
+
+  /**
+   * Reload tools
+   *
+   * Trigger a manual reload of the instance's tool registry from tool files on disk.
+   */
+  public reload<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ToolReloadResponses, ToolReloadErrors, ThrowOnError>({
+      url: "/tool/reload",
+      ...options,
+      ...params,
+    })
+  }
 }
 
 export class Worktree extends HeyApiClient {
@@ -2090,6 +2209,162 @@ export class File extends HeyApiClient {
       url: "/file/content",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Write file
+   *
+   * Write the content of a specified file using optimistic concurrency.
+   */
+  public write<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      path?: string
+      content?: string
+      expectedHash?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "path" },
+            { in: "body", key: "content" },
+            { in: "body", key: "expectedHash" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<FileWriteResponses, FileWriteErrors, ThrowOnError>({
+      url: "/file/write",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Delete file
+   *
+   * Delete a specified file or directory.
+   */
+  public delete<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      path?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "path" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<FileDeleteResponses, FileDeleteErrors, ThrowOnError>({
+      url: "/file/delete",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Rename file
+   *
+   * Rename or move a specified file or directory.
+   */
+  public rename<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      from?: string
+      to?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "from" },
+            { in: "body", key: "to" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<FileRenameResponses, FileRenameErrors, ThrowOnError>({
+      url: "/file/rename",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Create file or directory
+   *
+   * Create an empty file or directory.
+   */
+  public mkdir<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      path?: string
+      kind?: "file" | "directory"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "path" },
+            { in: "body", key: "kind" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<FileMkdirResponses, FileMkdirErrors, ThrowOnError>({
+      url: "/file/mkdir",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 
@@ -3959,6 +4234,7 @@ export class Session2 extends HeyApiClient {
       format?: OutputFormat
       system?: string
       variant?: string
+      subProvider?: string
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
     options?: Options<never, ThrowOnError>,
@@ -3979,6 +4255,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "format" },
             { in: "body", key: "system" },
             { in: "body", key: "variant" },
+            { in: "body", key: "subProvider" },
             { in: "body", key: "parts" },
           ],
         },
@@ -4421,6 +4698,7 @@ export class Session2 extends HeyApiClient {
       format?: OutputFormat
       system?: string
       variant?: string
+      subProvider?: string
       parts?: Array<TextPartInput | FilePartInput | AgentPartInput | SubtaskPartInput>
     },
     options?: Options<never, ThrowOnError>,
@@ -4441,6 +4719,7 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "format" },
             { in: "body", key: "system" },
             { in: "body", key: "variant" },
+            { in: "body", key: "subProvider" },
             { in: "body", key: "parts" },
           ],
         },
@@ -4711,6 +4990,229 @@ export class Part extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+}
+
+export class SessionGroup extends HeyApiClient {
+  /**
+   * List session groups
+   *
+   * Get a list of all session groups, ordered by position.
+   */
+  public list<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<SessionGroupListResponses, SessionGroupListErrors, ThrowOnError>({
+      url: "/session-group",
+      ...options,
+    })
+  }
+
+  /**
+   * Create session group
+   *
+   * Create a new session group with a name.
+   */
+  public create<ThrowOnError extends boolean = false>(
+    parameters?: {
+      name?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "name" }] }])
+    return (options?.client ?? this.client).post<SessionGroupCreateResponses, SessionGroupCreateErrors, ThrowOnError>({
+      url: "/session-group",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Delete session group
+   *
+   * Delete a session group. Sessions in the group will be ungrouped.
+   */
+  public remove<ThrowOnError extends boolean = false>(
+    parameters: {
+      groupID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "groupID" }] }])
+    return (options?.client ?? this.client).delete<SessionGroupRemoveResponses, SessionGroupRemoveErrors, ThrowOnError>(
+      {
+        url: "/session-group/{groupID}",
+        ...options,
+        ...params,
+      },
+    )
+  }
+
+  /**
+   * Get session group
+   *
+   * Get a session group with its sessions.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      groupID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "groupID" }] }])
+    return (options?.client ?? this.client).get<SessionGroupGetResponses, SessionGroupGetErrors, ThrowOnError>({
+      url: "/session-group/{groupID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Rename session group
+   *
+   * Rename a session group.
+   */
+  public rename<ThrowOnError extends boolean = false>(
+    parameters: {
+      groupID: string
+      name?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "groupID" },
+            { in: "body", key: "name" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<SessionGroupRenameResponses, SessionGroupRenameErrors, ThrowOnError>({
+      url: "/session-group/{groupID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Reorder session group
+   *
+   * Change the position of a session group.
+   */
+  public reorder<ThrowOnError extends boolean = false>(
+    parameters: {
+      groupID: string
+      position?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "groupID" },
+            { in: "body", key: "position" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<SessionGroupReorderResponses, SessionGroupReorderErrors, ThrowOnError>(
+      {
+        url: "/session-group/{groupID}/reorder",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+
+  /**
+   * Add session to group
+   *
+   * Add a session to a group.
+   */
+  public addSession<ThrowOnError extends boolean = false>(
+    parameters: {
+      groupID: string
+      sessionId?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "groupID" },
+            { in: "body", key: "sessionId" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionGroupAddSessionResponses,
+      SessionGroupAddSessionErrors,
+      ThrowOnError
+    >({
+      url: "/session-group/{groupID}/session",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Remove session from group
+   *
+   * Remove a session from a group.
+   */
+  public removeSession<ThrowOnError extends boolean = false>(
+    parameters: {
+      groupID: string
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "groupID" },
+            { in: "path", key: "sessionID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).delete<
+      SessionGroupRemoveSessionResponses,
+      SessionGroupRemoveSessionErrors,
+      ThrowOnError
+    >({
+      url: "/session-group/{groupID}/session/{sessionID}",
+      ...options,
+      ...params,
     })
   }
 }
@@ -5332,6 +5834,42 @@ export class Tui extends HeyApiClient {
   }
 }
 
+export class Usage2 extends HeyApiClient {
+  /**
+   * Get global usage summary
+   *
+   * Aggregate token and cost usage across every session in the database, bucketed by provider, model, variant, project, and time.
+   */
+  public summary<ThrowOnError extends boolean = false>(
+    parameters: {
+      since: number
+      until: number
+      resolution: "hour" | "day"
+      projectID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "since" },
+            { in: "query", key: "until" },
+            { in: "query", key: "resolution" },
+            { in: "query", key: "projectID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<UsageSummaryResponses, UsageSummaryErrors, ThrowOnError>({
+      url: "/usage/summary",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Health extends HeyApiClient {
   /**
    * Check server health
@@ -5855,7 +6393,7 @@ export class Session3 extends HeyApiClient {
   /**
    * List active sessions
    *
-   * Retrieve foreground Session drains currently owned by this OpenCode process. Sessions absent from the result are inactive.
+   * Retrieve active sessions: foreground drains currently owned by this OpenCode process (type: running) and durable-paused sessions (type: paused). Sessions absent from the result are inactive.
    */
   public active<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).get<V2SessionActiveResponses, V2SessionActiveErrors, ThrowOnError>({
@@ -6137,6 +6675,85 @@ export class Session3 extends HeyApiClient {
       url: "/api/session/{sessionID}/interrupt",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Pause session
+   *
+   * Set the durable paused state and interrupt active execution. Idempotent: pausing an already paused session is a no-op. While paused, no drain provider turn may start; held inputs stay held and drain on resume.
+   */
+  public pause<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).post<V2SessionPauseResponses, V2SessionPauseErrors, ThrowOnError>({
+      url: "/api/session/{sessionID}/pause",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Resume session
+   *
+   * Clear the durable paused state and wake the session so held inputs drain one at a time. The interrupted turn is never auto-retried.
+   */
+  public resume<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).post<V2SessionResumeResponses, V2SessionResumeErrors, ThrowOnError>({
+      url: "/api/session/{sessionID}/resume",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Regenerate session title
+   *
+   * Accept a background title regeneration and return immediately. The generated title is applied only if the session title is unchanged since the request was accepted (a manual rename always wins); failures never overwrite an existing title.
+   */
+  public regenerateTitle<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      model?: ModelRef
+      prompt?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "model" },
+            { in: "body", key: "prompt" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      V2SessionRegenerateTitleResponses,
+      V2SessionRegenerateTitleErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/title/regenerate",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 
@@ -6696,7 +7313,7 @@ export class Credential2 extends HeyApiClient {
   }
 }
 
-export class Usage2 extends HeyApiClient {
+export class Usage3 extends HeyApiClient {
   /**
    * Get OpenCode Go usage
    *
@@ -6888,6 +7505,137 @@ export class Fs extends HeyApiClient {
       url: "/api/fs/find",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Write file
+   *
+   * Write one file relative to the requested location with optional hash concurrency.
+   */
+  public write<ThrowOnError extends boolean = false>(
+    parameters?: {
+      path?: string
+      content?: string
+      expectedHash?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "path" },
+            { in: "body", key: "content" },
+            { in: "body", key: "expectedHash" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<V2FsWriteResponses, V2FsWriteErrors, ThrowOnError>({
+      url: "/api/fs/write",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Delete path
+   *
+   * Delete one file or directory relative to the requested location.
+   */
+  public delete<ThrowOnError extends boolean = false>(
+    parameters?: {
+      path?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "path" }] }])
+    return (options?.client ?? this.client).post<V2FsDeleteResponses, V2FsDeleteErrors, ThrowOnError>({
+      url: "/api/fs/delete",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Rename path
+   *
+   * Rename or move one file or directory relative to the requested location.
+   */
+  public rename<ThrowOnError extends boolean = false>(
+    parameters?: {
+      from?: string
+      to?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "from" },
+            { in: "body", key: "to" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<V2FsRenameResponses, V2FsRenameErrors, ThrowOnError>({
+      url: "/api/fs/rename",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Create path
+   *
+   * Create one empty file or directory relative to the requested location.
+   */
+  public mkdir<ThrowOnError extends boolean = false>(
+    parameters?: {
+      path?: string
+      kind?: "file" | "directory"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "path" },
+            { in: "body", key: "kind" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<V2FsMkdirResponses, V2FsMkdirErrors, ThrowOnError>({
+      url: "/api/fs/mkdir",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 }
@@ -7385,7 +8133,7 @@ export class Host extends HeyApiClient {
   /**
    * Register a Desktop browser host
    *
-   * Register (or re-register) a Desktop browser host connection. Last hello wins per stickiness key; a new connectionId supersedes the old one and in-flight requests against the old connection fail with BrowserControlInterrupted.
+   * Register (or re-register) a Desktop browser host connection. Registration is session-agnostic and keyed by window: last hello wins per windowId; a new connectionId supersedes the old one and in-flight requests against the old connection fail with BrowserControlInterrupted.
    */
   public hello<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -7406,9 +8154,6 @@ export class Host extends HeyApiClient {
         activeTabId: string
         url: string
       }
-      sessionId?: string
-      workspaceId?: string
-      directory?: string
       callbackUrl?: string
       callbackToken?: string
     },
@@ -7426,9 +8171,6 @@ export class Host extends HeyApiClient {
             { in: "body", key: "windowId" },
             { in: "body", key: "capabilities" },
             { in: "body", key: "guest" },
-            { in: "body", key: "sessionId" },
-            { in: "body", key: "workspaceId" },
-            { in: "body", key: "directory" },
             { in: "body", key: "callbackUrl" },
             { in: "body", key: "callbackToken" },
           ],
@@ -7472,6 +8214,16 @@ export class Browser extends HeyApiClient {
               controller: "human" | "agent" | "none"
               zoomFactor: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
               attached: boolean
+              owner:
+                | {
+                    kind: "user"
+                  }
+                | {
+                    kind: "agent"
+                    sessionId: string
+                  }
+              active: boolean
+              muted: boolean
             }
             timestamp: string
           }
@@ -7482,6 +8234,11 @@ export class Browser extends HeyApiClient {
         | {
             type: "request.aborted"
             requestId: string
+            timestamp: string
+          }
+        | {
+            type: "tab.closed"
+            tabId: string
             timestamp: string
           }
     },
@@ -7509,6 +8266,48 @@ export class Browser extends HeyApiClient {
     return (options?.client ?? this.client).get<V2BrowserHostsResponses, V2BrowserHostsErrors, ThrowOnError>({
       url: "/api/browser/hosts",
       ...options,
+    })
+  }
+
+  /**
+   * Assign a tab to an owner
+   *
+   * User-initiated ownership change: assign a tab to a session, reassign from one session to another, or return it to the user (owner { kind: 'user' }). The user may set any owner — this is the user-authority channel, never an agent tool.
+   */
+  public assign<ThrowOnError extends boolean = false>(
+    parameters?: {
+      tabId?: string
+      owner?:
+        | {
+            kind: "user"
+          }
+        | {
+            kind: "agent"
+            sessionId: string
+          }
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "tabId" },
+            { in: "body", key: "owner" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<V2BrowserAssignResponses, V2BrowserAssignErrors, ThrowOnError>({
+      url: "/api/browser/assign",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 
@@ -7559,9 +8358,9 @@ export class V2 extends HeyApiClient {
     return (this._credential ??= new Credential2({ client: this.client }))
   }
 
-  private _usage?: Usage2
-  get usage(): Usage2 {
-    return (this._usage ??= new Usage2({ client: this.client }))
+  private _usage?: Usage3
+  get usage(): Usage3 {
+    return (this._usage ??= new Usage3({ client: this.client }))
   }
 
   private _permission?: Permission3
@@ -7748,6 +8547,11 @@ export class OpencodeClient extends HeyApiClient {
     return (this._part ??= new Part({ client: this.client }))
   }
 
+  private _sessionGroup?: SessionGroup
+  get sessionGroup(): SessionGroup {
+    return (this._sessionGroup ??= new SessionGroup({ client: this.client }))
+  }
+
   private _sync?: Sync
   get sync(): Sync {
     return (this._sync ??= new Sync({ client: this.client }))
@@ -7756,6 +8560,11 @@ export class OpencodeClient extends HeyApiClient {
   private _tui?: Tui
   get tui(): Tui {
     return (this._tui ??= new Tui({ client: this.client }))
+  }
+
+  private _usage?: Usage2
+  get usage(): Usage2 {
+    return (this._usage ??= new Usage2({ client: this.client }))
   }
 
   private _v2?: V2

@@ -23,8 +23,11 @@ import { ProviderApi } from "./groups/provider"
 import { PtyApi, PtyConnectApi } from "./groups/pty"
 import { QuestionApi } from "./groups/question"
 import { SessionApi } from "./groups/session"
+import { SessionGroupApi } from "./groups/session-group"
 import { SyncApi } from "./groups/sync"
+import { ToolApi } from "./groups/tool"
 import { TuiApi } from "./groups/tui"
+import { UsageApi } from "./groups/usage"
 import { WorkspaceApi } from "./groups/workspace"
 import { makeApi } from "@opencode-ai/protocol/api"
 import { LocationMiddleware } from "@opencode-ai/server/location"
@@ -73,8 +76,11 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
   .addHttpApi(PermissionApi)
   .addHttpApi(ProviderApi)
   .addHttpApi(SessionApi)
+  .addHttpApi(SessionGroupApi)
   .addHttpApi(SyncApi)
+  .addHttpApi(ToolApi)
   .addHttpApi(TuiApi)
+  .addHttpApi(UsageApi)
   .addHttpApi(WorkspaceApi)
   .middleware(SchemaErrorMiddleware)
 

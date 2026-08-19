@@ -13,14 +13,71 @@ import { ToolRegistry } from "@/tool/registry"
 import { Worktree } from "@/worktree"
 import { Effect, Option } from "effect"
 import * as HttpServerResponse from "effect/unstable/http/HttpServerResponse"
+import { HttpClient, HttpClientRequest } from "effect/unstable/http"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { ConsoleSwitchPayload, SessionListQuery, ToolListQuery, WorktreeApiError } from "../groups/experimental"
+import {
+  ConsoleSwitchPayload,
+  OpenRouterEndpointsQuery,
+  SessionListQuery,
+  ToolListQuery,
+  WorktreeApiError,
+} from "../groups/experimental"
 
 function mapWorktreeError<A, R>(self: Effect.Effect<A, Worktree.Error, R>) {
   return self.pipe(
     Effect.mapError((error) => new WorktreeApiError({ name: error._tag, data: { message: error.message } })),
   )
+}
+
+// Mirrors the renderer's parser in packages/app/src/utils/openrouter-endpoints.ts:
+// OpenRouter's `/api/v1/models/{id}/endpoints` returns `{ data: { endpoints: [] } }`
+// where each row carries `provider_name`, `tag` (e.g. "novita/fp8"), string
+// `pricing.{prompt,completion,input_cache_read}` and `uptime_last_30m`. Defensive:
+// unknown/malformed rows are skipped, pricing strings are coerced to numbers.
+function parseOpenRouterEndpoints(payload: unknown) {
+  const rows = (payload as { data?: { endpoints?: unknown } } | null)?.data?.endpoints
+  if (!Array.isArray(rows)) return []
+  const num = (value: unknown) => {
+    if (typeof value === "number") return value
+    if (typeof value === "string") {
+      const parsed = Number(value)
+      if (Number.isFinite(parsed)) return parsed
+    }
+    return undefined
+  }
+  const result: Array<{
+    providerName: string
+    tag: string
+    provider: string
+    pricing: { prompt: number; completion: number; cacheRead: number }
+    uptime?: number
+  }> = []
+  for (const row of rows) {
+    if (!row || typeof row !== "object") continue
+    const item = row as {
+      provider_name?: unknown
+      tag?: unknown
+      pricing?: { prompt?: unknown; completion?: unknown; input_cache_read?: unknown }
+      uptime_last_30m?: unknown
+    }
+    const tag = typeof item.tag === "string" ? item.tag : undefined
+    if (!tag) continue
+    const uptime = num(item.uptime_last_30m)
+    const perMillion = (value: unknown) => (num(value) ?? 0) * 1_000_000
+    result.push({
+      providerName: typeof item.provider_name === "string" ? item.provider_name : tag,
+      tag,
+      provider: tag.split("/")[0],
+      pricing: {
+        prompt: perMillion(item.pricing?.prompt),
+        completion: perMillion(item.pricing?.completion),
+        cacheRead: perMillion(item.pricing?.input_cache_read),
+      },
+      ...(uptime === undefined ? {} : { uptime }),
+    })
+  }
+  return result
 }
 
 export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "experimental", (handlers) =>
@@ -35,6 +92,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
     const sessions = yield* Session.Service
     const background = yield* BackgroundJob.Service
     const flags = yield* RuntimeFlags.Service
+    const http = yield* HttpClient.HttpClient
 
     const capabilities = Effect.fn("ExperimentalHttpApi.capabilities")(function* () {
       return { backgroundSubagents: flags.experimentalBackgroundSubagents }
@@ -175,6 +233,29 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       return yield* mcp.resources()
     })
 
+    const openrouterEndpoints = Effect.fn("ExperimentalHttpApi.openrouterEndpoints")(function* (ctx: {
+      query: typeof OpenRouterEndpointsQuery.Type
+    }) {
+      const request = HttpClientRequest.get(
+        `https://openrouter.ai/api/v1/models/${encodeURI(ctx.query.model)}/endpoints`,
+      ).pipe(HttpClientRequest.accept("application/json"))
+      const response = yield* HttpClient.filterStatusOk(http)
+        .execute(request)
+        .pipe(
+          Effect.timeoutOrElse({
+            duration: "15 seconds",
+            orElse: () => Effect.fail(new HttpApiError.InternalServerError({})),
+          }),
+          // Non-2xx or a transport failure surfaces as an internal error so the
+          // renderer can distinguish "couldn't load" from a model with no providers.
+          Effect.mapError(() => new HttpApiError.InternalServerError({})),
+        )
+      const body = yield* response.json.pipe(
+        Effect.mapError(() => new HttpApiError.InternalServerError({})),
+      )
+      return parseOpenRouterEndpoints(body)
+    })
+
     return handlers
       .handle("capabilities", capabilities)
       .handle("console", getConsole)
@@ -189,5 +270,6 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       .handle("session", session)
       .handle("sessionBackground", sessionBackground)
       .handle("resource", resource)
+      .handle("openrouterEndpoints", openrouterEndpoints)
   }),
 )

@@ -185,6 +185,10 @@ export const Assistant = Schema.Struct({
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
     completed: DateTimeUtcFromMillis.pipe(optional),
+    /** Timestamp when the provider HTTP request was dispatched. */
+    requestSentAt: DateTimeUtcFromMillis.pipe(optional),
+    /** Timestamp when the first visible text or reasoning token arrived. */
+    firstTokenAt: DateTimeUtcFromMillis.pipe(optional),
   }),
 }).annotate({ identifier: "Session.Message.Assistant" })
 

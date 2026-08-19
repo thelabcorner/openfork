@@ -559,7 +559,46 @@ const Endpoint11_1 = (raw: RawClient["server.fs"]) => (input: Endpoint11_1Input)
     query: { location: input["location"], query: input["query"], type: input["type"], limit: input["limit"] },
   }).pipe(Effect.mapError(mapClientError))
 
-const adaptGroup11 = (raw: RawClient["server.fs"]) => ({ list: Endpoint11_0(raw), find: Endpoint11_1(raw) })
+type Endpoint11_2Request = Parameters<RawClient["server.fs"]["fs.write"]>[0]
+type Endpoint11_2Input = {
+  readonly path: Endpoint11_2Request["payload"]["path"]
+  readonly content: Endpoint11_2Request["payload"]["content"]
+  readonly expectedHash?: Endpoint11_2Request["payload"]["expectedHash"]
+}
+const Endpoint11_2 = (raw: RawClient["server.fs"]) => (input: Endpoint11_2Input) =>
+  raw["fs.write"]({
+    payload: { path: input["path"], content: input["content"], expectedHash: input["expectedHash"] },
+  }).pipe(Effect.mapError(mapClientError))
+
+type Endpoint11_3Request = Parameters<RawClient["server.fs"]["fs.delete"]>[0]
+type Endpoint11_3Input = { readonly path: Endpoint11_3Request["payload"]["path"] }
+const Endpoint11_3 = (raw: RawClient["server.fs"]) => (input: Endpoint11_3Input) =>
+  raw["fs.delete"]({ payload: { path: input["path"] } }).pipe(Effect.mapError(mapClientError))
+
+type Endpoint11_4Request = Parameters<RawClient["server.fs"]["fs.rename"]>[0]
+type Endpoint11_4Input = {
+  readonly from: Endpoint11_4Request["payload"]["from"]
+  readonly to: Endpoint11_4Request["payload"]["to"]
+}
+const Endpoint11_4 = (raw: RawClient["server.fs"]) => (input: Endpoint11_4Input) =>
+  raw["fs.rename"]({ payload: { from: input["from"], to: input["to"] } }).pipe(Effect.mapError(mapClientError))
+
+type Endpoint11_5Request = Parameters<RawClient["server.fs"]["fs.mkdir"]>[0]
+type Endpoint11_5Input = {
+  readonly path: Endpoint11_5Request["payload"]["path"]
+  readonly kind: Endpoint11_5Request["payload"]["kind"]
+}
+const Endpoint11_5 = (raw: RawClient["server.fs"]) => (input: Endpoint11_5Input) =>
+  raw["fs.mkdir"]({ payload: { path: input["path"], kind: input["kind"] } }).pipe(Effect.mapError(mapClientError))
+
+const adaptGroup11 = (raw: RawClient["server.fs"]) => ({
+  list: Endpoint11_0(raw),
+  find: Endpoint11_1(raw),
+  write: Endpoint11_2(raw),
+  delete: Endpoint11_3(raw),
+  rename: Endpoint11_4(raw),
+  mkdir: Endpoint11_5(raw),
+})
 
 type Endpoint12_0Request = Parameters<RawClient["server.command"]["command.list"]>[0]
 type Endpoint12_0Input = { readonly location?: Endpoint12_0Request["query"]["location"] }

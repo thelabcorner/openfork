@@ -61,4 +61,5 @@ export const omitEndpoints = new Set([
   "browser.host.hello",
   "browser.event",
   "browser.hosts",
+  "browser.assign",
 ])

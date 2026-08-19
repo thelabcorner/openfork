@@ -62,6 +62,7 @@ export const LegacyEntry = Schema.Struct({
 export const LegacyContent = Schema.Struct({
   type: Schema.Literals(["text", "binary"]),
   content: Schema.String,
+  hash: Schema.String,
   diff: Schema.optional(Schema.String),
   patch: Schema.optional(
     Schema.Struct({
@@ -85,6 +86,44 @@ export const LegacyContent = Schema.Struct({
   mimeType: Schema.optional(Schema.String),
 }).annotate({ identifier: "FileContent" })
 
+export const FileWritePayload = Schema.Struct({
+  path: Schema.String,
+  content: Schema.String,
+  expectedHash: Schema.optional(Schema.String),
+})
+
+export const FileWriteResult = Schema.Struct({
+  hash: Schema.String,
+}).annotate({ identifier: "FileWriteResult" })
+
+export const FileDeletePayload = Schema.Struct({
+  path: Schema.String,
+})
+
+export const FileRenamePayload = Schema.Struct({
+  from: Schema.String,
+  to: Schema.String,
+})
+
+export const FileMkdirPayload = Schema.Struct({
+  path: Schema.String,
+  kind: Schema.Literals(["file", "directory"]),
+})
+
+export const FileMutationResult = Schema.Struct({}).annotate({ identifier: "FileMutationResult" })
+
+export class FileMutationError extends Schema.ErrorClass<FileMutationError>("FileMutationError")(
+  {
+    name: Schema.Literal("FileMutationError"),
+    data: Schema.Struct({
+      message: Schema.String,
+      path: Schema.optional(Schema.String),
+      code: Schema.Literals(["conflict", "invalid_path", "filesystem"]),
+    }),
+  },
+  { httpApiStatus: 409 },
+) {}
+
 export const LegacyStatus = Schema.Struct({
   path: Schema.String,
   added: NonNegativeInt,
@@ -98,6 +137,10 @@ export const FilePaths = {
   findSymbol: "/find/symbol",
   list: "/file",
   content: "/file/content",
+  write: "/file/write",
+  delete: "/file/delete",
+  rename: "/file/rename",
+  mkdir: "/file/mkdir",
   status: "/file/status",
 } as const
 
@@ -153,6 +196,54 @@ export const FileApi = HttpApi.make("file")
             identifier: "file.read",
             summary: "Read file",
             description: "Read the content of a specified file.",
+          }),
+        ),
+        HttpApiEndpoint.post("write", FilePaths.write, {
+          query: WorkspaceRoutingQuery,
+          payload: FileWritePayload,
+          success: described(FileWriteResult, "File write result"),
+          error: FileMutationError,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "file.write",
+            summary: "Write file",
+            description: "Write the content of a specified file using optimistic concurrency.",
+          }),
+        ),
+        HttpApiEndpoint.post("delete", FilePaths.delete, {
+          query: WorkspaceRoutingQuery,
+          payload: FileDeletePayload,
+          success: described(FileMutationResult, "File delete result"),
+          error: FileMutationError,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "file.delete",
+            summary: "Delete file",
+            description: "Delete a specified file or directory.",
+          }),
+        ),
+        HttpApiEndpoint.post("rename", FilePaths.rename, {
+          query: WorkspaceRoutingQuery,
+          payload: FileRenamePayload,
+          success: described(FileMutationResult, "File rename result"),
+          error: FileMutationError,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "file.rename",
+            summary: "Rename file",
+            description: "Rename or move a specified file or directory.",
+          }),
+        ),
+        HttpApiEndpoint.post("mkdir", FilePaths.mkdir, {
+          query: WorkspaceRoutingQuery,
+          payload: FileMkdirPayload,
+          success: described(FileMutationResult, "File create result"),
+          error: FileMutationError,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "file.mkdir",
+            summary: "Create file or directory",
+            description: "Create an empty file or directory.",
           }),
         ),
         HttpApiEndpoint.get("status", FilePaths.status, {

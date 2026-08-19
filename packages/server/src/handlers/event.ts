@@ -7,13 +7,14 @@ import * as Sse from "effect/unstable/encoding/Sse"
 import { Api } from "../api"
 
 const subscriberCapacity = 256
+const encodeOpenCodeEvent = Schema.encodeUnknownSync(OpenCodeEvent)
 
 function eventData(data: unknown): Sse.Event {
   return {
     _tag: "Event",
     event: "message",
     id: undefined,
-    data: JSON.stringify(Schema.encodeUnknownSync(OpenCodeEvent)(data)),
+    data: JSON.stringify(encodeOpenCodeEvent(data)),
   }
 }
 

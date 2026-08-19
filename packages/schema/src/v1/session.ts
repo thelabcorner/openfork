@@ -348,6 +348,7 @@ export const User = Schema.Struct({
     providerID: Provider.ID,
     modelID: Model.ID,
     variant: Schema.optional(Schema.String),
+    subProvider: Schema.optional(Schema.String),
   }),
   system: Schema.optional(Schema.String),
   tools: Schema.optional(Schema.Record(Schema.String, Schema.Boolean)),
@@ -456,6 +457,10 @@ export const Assistant = Schema.Struct({
   time: Schema.Struct({
     created: NonNegativeInt,
     completed: Schema.optional(NonNegativeInt),
+    /** Timestamp when the provider HTTP request was dispatched (monotonic-ish wall clock). */
+    requestSentAt: optional(NonNegativeInt),
+    /** Timestamp when the first visible text or reasoning token arrived from the provider. */
+    firstTokenAt: optional(NonNegativeInt),
   }),
   error: Schema.optional(AssistantErrorSchema),
   parentID: MessageID,
@@ -481,6 +486,19 @@ export const Assistant = Schema.Struct({
   }),
   structured: Schema.optional(Schema.Any),
   variant: Schema.optional(Schema.String),
+  /**
+   * The model that actually served this message when it differs from the
+   * configured/requested `modelID`. Router providers (e.g. OpenRouter `free` /
+   * `auto`) resolve the router slug to a concrete upstream model and endpoint;
+   * `modelID` is the upstream model id and `providerID` the upstream endpoint
+   * provider name (e.g. `DeepInfra`) — neither is a catalog entry.
+   */
+  servedModel: optional(
+    Schema.Struct({
+      modelID: Schema.String,
+      providerID: optional(Schema.String),
+    }),
+  ),
   finish: Schema.optional(Schema.String),
 }).annotate({ identifier: "AssistantMessage" })
 export type Assistant = Omit<Types.DeepMutable<Schema.Schema.Type<typeof Assistant>>, "error"> & {

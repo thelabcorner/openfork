@@ -532,6 +532,24 @@ const scenarios: Scenario[] = [
     }))
     .json(200, array, "status"),
   http.protected.get("/experimental/tool/ids", "tool.ids").json(200, array),
+  http.protected
+    .post("/tool/reload", "tool.reload")
+    .mutating()
+    .at((ctx) => ({ path: "/tool/reload", headers: ctx.headers() }))
+    .json(200, (body) => {
+      object(body)
+      check("ok" in body, "tool reload response should include ok")
+      if (body.ok === true) {
+        for (const key of ["added", "updated", "removed"]) {
+          check(key in body, `tool reload success should include ${key}`)
+          array(body[key])
+        }
+      } else if (body.ok === false) {
+        check(typeof body.error === "string", "tool reload failure should include error")
+      } else {
+        throw new Error("tool reload ok should be a boolean")
+      }
+    }),
   http.protected.get("/experimental/worktree", "worktree.list").json(200, array),
   http.protected
     .post("/experimental/worktree", "worktree.create")

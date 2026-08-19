@@ -678,7 +678,12 @@ export type SessionsContextOutput = {
     | {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
-        readonly time: { readonly created: number; readonly completed?: number }
+        readonly time: {
+          readonly created: number
+          readonly completed?: number
+          readonly requestSentAt?: number
+          readonly firstTokenAt?: number
+        }
         readonly type: "assistant"
         readonly agent: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
@@ -1778,7 +1783,12 @@ export type SessionsMessageOutput = {
     | {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
-        readonly time: { readonly created: number; readonly completed?: number }
+        readonly time: {
+          readonly created: number
+          readonly completed?: number
+          readonly requestSentAt?: number
+          readonly firstTokenAt?: number
+        }
         readonly type: "assistant"
         readonly agent: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
@@ -1950,7 +1960,12 @@ export type MessagesListOutput = {
     | {
         readonly id: string
         readonly metadata?: { readonly [x: string]: JsonValue }
-        readonly time: { readonly created: number; readonly completed?: number }
+        readonly time: {
+          readonly created: number
+          readonly completed?: number
+          readonly requestSentAt?: number
+          readonly firstTokenAt?: number
+        }
         readonly type: "assistant"
         readonly agent: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
@@ -2627,6 +2642,68 @@ export type FilesFindOutput = {
     readonly project: { readonly id: string; readonly directory: string }
   }
   readonly data: ReadonlyArray<{ readonly path: string; readonly type: "file" | "directory" }>
+}
+
+export type FilesWriteInput = {
+  readonly path: { readonly path: string; readonly content: string; readonly expectedHash?: string | undefined }["path"]
+  readonly content: {
+    readonly path: string
+    readonly content: string
+    readonly expectedHash?: string | undefined
+  }["content"]
+  readonly expectedHash?: {
+    readonly path: string
+    readonly content: string
+    readonly expectedHash?: string | undefined
+  }["expectedHash"]
+}
+
+export type FilesWriteOutput = {
+  readonly location: {
+    readonly directory: string
+    readonly workspaceID?: string
+    readonly project: { readonly id: string; readonly directory: string }
+  }
+  readonly data: { readonly hash: string }
+}
+
+export type FilesDeleteInput = { readonly path: { readonly path: string }["path"] }
+
+export type FilesDeleteOutput = {
+  readonly location: {
+    readonly directory: string
+    readonly workspaceID?: string
+    readonly project: { readonly id: string; readonly directory: string }
+  }
+  readonly data: {}
+}
+
+export type FilesRenameInput = {
+  readonly from: { readonly from: string; readonly to: string }["from"]
+  readonly to: { readonly from: string; readonly to: string }["to"]
+}
+
+export type FilesRenameOutput = {
+  readonly location: {
+    readonly directory: string
+    readonly workspaceID?: string
+    readonly project: { readonly id: string; readonly directory: string }
+  }
+  readonly data: {}
+}
+
+export type FilesMkdirInput = {
+  readonly path: { readonly path: string; readonly kind: "file" | "directory" }["path"]
+  readonly kind: { readonly path: string; readonly kind: "file" | "directory" }["kind"]
+}
+
+export type FilesMkdirOutput = {
+  readonly location: {
+    readonly directory: string
+    readonly workspaceID?: string
+    readonly project: { readonly id: string; readonly directory: string }
+  }
+  readonly data: {}
 }
 
 export type CommandsListInput = {

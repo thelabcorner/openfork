@@ -9,12 +9,30 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { EventApi } from "../groups/event"
 
+// Bounded cache of serialized event frames keyed by event id. The SSE handler
+// stringifies each event once and reuses the string across subscribers, so the
+// per-subscriber JSON.stringify fan-out (O(subscribers) per event) becomes O(1).
+// Events are immutable once published and ids are unique, so a cached string is
+// always correct; the cache is cleared when it exceeds the bound to stay bounded.
+const MAX_SERIALIZED_CACHE = 1024
+const serializedCache = new Map<string, string>()
+
+function serializeEventData(data: unknown): string {
+  if (typeof data === "string") return data
+  const id = (data as { id?: string })?.id
+  if (id) {
+    const cached = serializedCache.get(id)
+    if (cached !== undefined) return cached
+  }
+  return JSON.stringify(data)
+}
+
 function eventData(data: unknown): Sse.Event {
   return {
     _tag: "Event",
     event: "message",
     id: undefined,
-    data: JSON.stringify(data),
+    data: serializeEventData(data),
   }
 }
 
@@ -29,7 +47,17 @@ function eventResponse(events: EventV2.Interface) {
     // Listener registration is eager, so events published after this point cannot
     // be lost while the HTTP body fiber is starting or emitting server.connected.
     const queue = yield* Queue.unbounded<EventV2.Payload>()
-    const unsubscribe = yield* events.listen((event) => Effect.sync(() => Queue.offerUnsafe(queue, event)))
+    const unsubscribe = yield* events.listen((event) =>
+      Effect.sync(() => {
+        // Serialize once per event id; all subscribers reuse the cached string.
+        const key = event.id
+        if (!serializedCache.has(key)) {
+          serializedCache.set(key, JSON.stringify({ id: event.id, type: event.type, properties: event.data }))
+          if (serializedCache.size >= MAX_SERIALIZED_CACHE) serializedCache.clear()
+        }
+        Queue.offerUnsafe(queue, event)
+      }),
+    )
     yield* Effect.addFinalizer(() => unsubscribe)
     const stream = Stream.fromQueue(queue).pipe(
       Stream.filter(

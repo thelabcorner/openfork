@@ -87,6 +87,27 @@ export const SessionListQuery = Schema.Struct({
   archived: Schema.optional(QueryBoolean),
 })
 
+export const OpenRouterEndpointsQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  model: Schema.String,
+})
+
+export const OpenRouterEndpointSchema = Schema.Struct({
+  providerName: Schema.String,
+  tag: Schema.String,
+  provider: Schema.String,
+  pricing: Schema.Struct({
+    prompt: Schema.Number,
+    completion: Schema.Number,
+    cacheRead: Schema.Number,
+  }),
+  uptime: Schema.optional(Schema.Number),
+}).annotate({ identifier: "OpenRouterEndpoint" })
+
+export const OpenRouterEndpointsResponse = Schema.Array(OpenRouterEndpointSchema).annotate({
+  identifier: "OpenRouterEndpoints",
+})
+
 export const ExperimentalPaths = {
   capabilities: "/experimental/capabilities",
   console: "/experimental/console",
@@ -99,6 +120,7 @@ export const ExperimentalPaths = {
   session: "/experimental/session",
   sessionBackground: "/experimental/session/:sessionID/background",
   resource: "/experimental/resource",
+  openrouterEndpoints: "/experimental/openrouter-endpoints",
 } as const
 
 export const ExperimentalApi = HttpApi.make("experimental")
@@ -253,6 +275,18 @@ export const ExperimentalApi = HttpApi.make("experimental")
             identifier: "experimental.resource.list",
             summary: "Get MCP resources",
             description: "Get all available MCP resources from connected servers. Optionally filter by name.",
+          }),
+        ),
+        HttpApiEndpoint.get("openrouterEndpoints", ExperimentalPaths.openrouterEndpoints, {
+          query: OpenRouterEndpointsQuery,
+          success: described(OpenRouterEndpointsResponse, "OpenRouter upstream providers"),
+          error: HttpApiError.InternalServerError,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "experimental.openrouterEndpoints.get",
+            summary: "Get OpenRouter upstream providers",
+            description:
+              "Proxy OpenRouter's public /models/{id}/endpoints so the renderer avoids a cross-origin fetch. Returns the upstream infrastructure providers serving a model, or an empty list when a model has none.",
           }),
         ),
       )

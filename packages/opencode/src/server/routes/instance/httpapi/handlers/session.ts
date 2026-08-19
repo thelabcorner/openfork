@@ -1,6 +1,7 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { Agent } from "@/agent/agent"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
+import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
 import { Permission } from "@/permission"
@@ -58,6 +59,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const permissionSvc = yield* Permission.Service
     const statusSvc = yield* SessionStatus.Service
     const todoSvc = yield* Todo.Service
+    const broker = yield* BrowserHostBroker.Service
     const summary = yield* SessionSummary.Service
     const events = yield* EventV2Bridge.Service
     const scope = yield* Scope.Scope
@@ -178,6 +180,10 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const remove = Effect.fn("SessionHttpApi.remove")(function* (ctx: { params: { sessionID: SessionID } }) {
       yield* SessionError.mapStorageNotFound(session.remove(ctx.params.sessionID))
+      // Browser lifecycle (D10): the session's browser tabs are ORPHANED — owner
+      // flips to `user`, content kept for the human. Best-effort after the row
+      // is gone; the broker mints set_tab_owner control ops per tab.
+      yield* Effect.ignore(broker.orphanSession(ctx.params.sessionID))
       return true
     })
 

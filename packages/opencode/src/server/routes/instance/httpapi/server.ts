@@ -37,6 +37,7 @@ import { SessionPrompt } from "@/session/prompt"
 import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { Session } from "@/session/session"
+import { SessionGroup } from "@/session/group"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
@@ -47,6 +48,7 @@ import { Discovery } from "@/skill/discovery"
 import { Snapshot } from "@/snapshot"
 import { Storage } from "@/storage/storage"
 import { ToolRegistry } from "@/tool/registry"
+import { ToolReload } from "@/tool/reload"
 import { Truncate } from "@/tool/truncate"
 import { Worktree } from "@/worktree"
 import { RuntimeFlags } from "@/effect/runtime-flags"
@@ -69,6 +71,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
+import { Usage } from "@/usage/usage"
 import { lazy } from "@/util/lazy"
 import { CorsConfig, isAllowedCorsOrigin, type CorsOptions } from "@opencode-ai/server/cors"
 import { serveUIEffect } from "@/server/shared/ui"
@@ -101,8 +104,11 @@ import { providerHandlers } from "./handlers/provider"
 import { ptyConnectHandlers, ptyHandlers } from "./handlers/pty"
 import { questionHandlers } from "./handlers/question"
 import { sessionHandlers } from "./handlers/session"
+import { sessionGroupHandlers } from "./handlers/session-group"
 import { syncHandlers } from "./handlers/sync"
+import { toolHandlers } from "./handlers/tool"
 import { tuiHandlers } from "./handlers/tui"
+import { usageHandlers } from "./handlers/usage"
 import { handlers } from "@opencode-ai/server/handlers"
 import { buildLocationServiceMap, LocationServiceMap } from "@opencode-ai/core/location-services"
 import { layer as locationLayer } from "@opencode-ai/server/location"
@@ -169,8 +175,11 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     permissionHandlers,
     providerHandlers,
     sessionHandlers,
+    sessionGroupHandlers,
     syncHandlers,
+    toolHandlers,
     tuiHandlers,
+    usageHandlers,
     workspaceHandlers,
   ]),
 )
@@ -238,6 +247,7 @@ const app = LayerNode.group([
   PermissionSaved.node,
   Todo.node,
   Session.node,
+  SessionGroup.node,
   SessionProjector.node,
   SessionStatus.node,
   SessionUsage.node,
@@ -258,6 +268,7 @@ const app = LayerNode.group([
   Command.node,
   Truncate.node,
   ToolRegistry.node,
+  ToolReload.node,
   Format.node,
   Project.node,
   Vcs.node,
@@ -273,6 +284,7 @@ const app = LayerNode.group([
   ProjectCopy.node,
   PtyTicket.node,
   BrowserHostBroker.node,
+  Usage.node,
 ])
 
 export function createRoutes(
