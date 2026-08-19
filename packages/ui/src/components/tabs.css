@@ -135,7 +135,7 @@
     }
   }
 
-  #review-panel &[data-variant="normal"][data-orientation="horizontal"],
+  #session-side-panel &[data-variant="normal"][data-orientation="horizontal"],
   #terminal-panel &[data-variant="normal"][data-orientation="horizontal"] {
     background-color: var(--background-stronger);
 
@@ -685,9 +685,9 @@
   position: relative;
 }
 
-body[data-new-layout] #review-panel [data-component="tabs"],
+body[data-new-layout] #session-side-panel [data-component="tabs"],
 body[data-new-layout] #terminal-panel [data-component="tabs"],
-body[data-new-layout] #review-panel [data-component="tabs"][data-variant="normal"][data-orientation="horizontal"],
+body[data-new-layout] #session-side-panel [data-component="tabs"][data-variant="normal"][data-orientation="horizontal"],
 body[data-new-layout] #terminal-panel [data-component="tabs"][data-variant="normal"][data-orientation="horizontal"] {
   background-color: var(--v2-background-bg-base);
 
@@ -708,7 +708,7 @@ body[data-new-layout] #terminal-panel [data-component="tabs"][data-variant="norm
   }
 }
 
-body[data-new-layout] #review-panel [data-component="tabs"][data-variant="normal"][data-orientation="horizontal"] {
+body[data-new-layout] #session-side-panel [data-component="tabs"][data-variant="normal"][data-orientation="horizontal"] {
   [data-slot="tabs-list"] {
     height: 52px;
     padding-inline-end: 12px;
@@ -774,7 +774,7 @@ body[data-new-layout] #review-panel [data-component="tabs"][data-variant="normal
   }
 }
 
-body[data-new-layout] #review-panel [data-component="tabs"] .session-review-v2-tabs-bar {
+body[data-new-layout] #session-side-panel [data-component="tabs"] .session-changes-tabs-bar {
   width: 100%;
   min-width: 0;
   gap: 8px;
@@ -783,11 +783,11 @@ body[data-new-layout] #review-panel [data-component="tabs"] .session-review-v2-t
   background-color: var(--v2-background-bg-base);
 }
 
-body[data-new-layout] #review-panel [data-component="tabs"] .session-review-v2-tabs-bar [data-slot="tabs-list"],
+body[data-new-layout] #session-side-panel [data-component="tabs"] .session-changes-tabs-bar [data-slot="tabs-list"],
 body[data-new-layout]
-  #review-panel
+  #session-side-panel
   [data-component="tabs"][data-variant="normal"][data-orientation="horizontal"]
-  .session-review-v2-tabs-bar
+  .session-changes-tabs-bar
   [data-slot="tabs-list"] {
   flex: 1 1 0;
   min-width: 0;
@@ -796,9 +796,9 @@ body[data-new-layout]
 }
 
 body[data-new-layout]
-  #review-panel
+  #session-side-panel
   [data-component="tabs"]
-  .session-review-v2-tabs-bar
+  .session-changes-tabs-bar
   [data-slot="tabs-list"]
   > .sticky {
   padding-inline-end: 0;
@@ -821,22 +821,22 @@ body[data-new-layout]
 }
 
 body[data-new-layout]
-  #review-panel
+  #session-side-panel
   [data-component="tabs"]
-  .session-review-v2-tabs-bar
+  .session-changes-tabs-bar
   [data-slot="tabs-list"]
-  > .sticky:not(.session-review-v2-sidebar-toggle-slot) {
+  > .sticky:not(.session-changes-sidebar-toggle-slot) {
   left: auto;
   right: auto;
   inset-inline-end: 0;
 }
 
 body[data-new-layout]
-  #review-panel
+  #session-side-panel
   [data-component="tabs"]
-  .session-review-v2-tabs-bar
+  .session-changes-tabs-bar
   [data-slot="tabs-list"]
-  > .session-review-v2-sidebar-toggle-slot.sticky {
+  > .session-changes-sidebar-toggle-slot.sticky {
   left: auto;
   right: auto;
   inset-inline-start: 0;
@@ -879,11 +879,11 @@ body[data-new-layout]
   }
 }
 
-body[data-new-layout] #review-panel [data-component="tabs"] .session-review-v2-open-in-app-slot {
+body[data-new-layout] #session-side-panel [data-component="tabs"] .session-changes-open-in-app-slot {
   flex-shrink: 0;
   margin-inline-start: auto;
 }
 
-body[data-new-layout] #review-panel [data-component="tabs"] .session-review-v2-open-in-app {
+body[data-new-layout] #session-side-panel [data-component="tabs"] .session-changes-open-in-app {
   flex-shrink: 0;
 }

@@ -67,6 +67,11 @@ import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
 import { SmartToolOutput } from "./tool-output"
+import { ShellTimer } from "./shell-timer"
+import { GitOutput } from "./git-tool"
+import { TypecheckOutput } from "./typecheck-tool"
+import { SqliteOutput } from "./sqlite-tool"
+import { SympyOutput } from "./sympy-tool"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 
 async function writeClipboard(text: string): Promise<boolean> {
@@ -462,6 +467,19 @@ function newLayout() {
   return typeof document !== "undefined" && document.body.hasAttribute("data-new-layout")
 }
 
+function actionLabel(value: unknown) {
+  if (typeof value !== "string" || !value) return undefined
+  return value[0]!.toUpperCase() + value.slice(1)
+}
+
+function humanizeToolName(name: string) {
+  return name
+    .split("_")
+    .filter(Boolean)
+    .map((word) => word[0]!.toUpperCase() + word.slice(1))
+    .join(" ")
+}
+
 function webSearchProviderLabel(provider: unknown, i18n: ReturnType<typeof useI18n>) {
   const name = provider === "parallel" ? "Parallel" : provider === "exa" ? "Exa" : undefined
   if (name) return i18n.t("ui.tool.websearch.provider", { provider: name })
@@ -474,6 +492,13 @@ export function getToolInfo(
   metadata: Record<string, unknown> | undefined = {},
 ): ToolInfo {
   const i18n = useI18n()
+  if (tool.startsWith("browser_")) {
+    return {
+      icon: "window-cursor",
+      title: "Browser " + humanizeToolName(tool.slice("browser_".length)),
+      subtitle: typeof input.url === "string" ? input.url : typeof input.selector === "string" ? input.selector : undefined,
+    }
+  }
   switch (tool) {
     case "read":
       return {
@@ -564,6 +589,66 @@ export function getToolInfo(
       return {
         icon: "brain",
         title: input.name || i18n.t("ui.tool.skill"),
+      }
+    case "git":
+      return {
+        icon: "branch",
+        title: i18n.t("ui.tool.git"),
+        subtitle: actionLabel(input.mode ?? "status"),
+      }
+    case "test":
+      return {
+        icon: "circle-check",
+        title: i18n.t("ui.tool.test"),
+        subtitle: actionLabel(input.action ?? "run"),
+      }
+    case "typecheck":
+      return {
+        icon: "shield",
+        title: i18n.t("ui.tool.typecheck"),
+        subtitle: actionLabel(input.mode),
+      }
+    case "json":
+      return {
+        icon: "code",
+        title: i18n.t("ui.tool.json"),
+        subtitle: actionLabel(input.mode),
+      }
+    case "archive":
+      return {
+        icon: "archive",
+        title: i18n.t("ui.tool.archive"),
+        subtitle: actionLabel(input.action),
+      }
+    case "project":
+      return {
+        icon: "folder",
+        title: i18n.t("ui.tool.project"),
+        subtitle: actionLabel(input.action ?? "snapshot"),
+      }
+    case "sqlite":
+      return {
+        icon: "server",
+        title: i18n.t("ui.tool.sqlite"),
+        subtitle: actionLabel(input.action),
+      }
+    case "symbols":
+      return {
+        icon: "file-tree",
+        title: i18n.t("ui.tool.symbols"),
+        subtitle: actionLabel(input.action ?? "search"),
+      }
+    case "sympy":
+      return {
+        icon: "sliders",
+        title: i18n.t("ui.tool.sympy"),
+        subtitle: actionLabel(input.operation),
+      }
+    case "background":
+      return {
+        icon: "console",
+        title: i18n.t("ui.tool.background"),
+        subtitle: actionLabel(input.action),
       }
     default:
       return {
@@ -1585,7 +1670,7 @@ export const ToolRegistry = {
   render: getTool,
 }
 
-function ToolFileAccordion(props: { path: string; actions?: JSX.Element; children: JSX.Element }) {
+export function ToolFileAccordion(props: { path: string; actions?: JSX.Element; children: JSX.Element }) {
   const value = createMemo(() => props.path || "tool-file")
 
   return (
@@ -1755,7 +1840,10 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
     if (props.message.role !== "assistant") return ""
     const message = props.message as AssistantMessage
     const match = data.store.provider?.all?.get(message.providerID)
-    return match?.models?.[message.modelID]?.name ?? message.modelID
+    const name = match?.models?.[message.modelID]?.name ?? message.modelID
+    const served = message.servedModel
+    if (!served || served.modelID === message.modelID) return name
+    return `${name} → ${served.modelID}${served.providerID ? ` (${served.providerID})` : ""}`
   })
 
   const duration = createMemo(() => {
@@ -2361,6 +2449,14 @@ ToolRegistry.register({
     const output = createMemo(() => stripAnsi(props.output || props.metadata.output || "").replace(/\r\n?/g, "\n"))
     const text = createMemo(() => `$ ${command()}${output() ? "\n\n" + output() : ""}`)
     const [copied, setCopied] = createSignal(false)
+    const background = createMemo(() => props.metadata.background === true)
+    const startedAt = createMemo(() => (typeof props.metadata.startedAt === "number" ? props.metadata.startedAt : undefined))
+    const timeoutMs = createMemo(() => {
+      const value = background() ? props.metadata.timeoutMs : props.metadata.timeout
+      return typeof value === "number" ? value : undefined
+    })
+    const endedAt = createMemo(() => (typeof props.metadata.endedAt === "number" ? props.metadata.endedAt : undefined))
+    const timerRunning = createMemo(() => pending() || background())
 
     const handleCopy = async () => {
       const content = text()
@@ -2382,6 +2478,14 @@ ToolRegistry.register({
               <span data-slot="basic-tool-tool-title">
                 <TextShimmer text={i18n.t("ui.tool.shell")} active={pending()} />
               </span>
+              <Show when={startedAt()}>
+                <ShellTimer
+                  startedAt={startedAt()!}
+                  timeoutMs={timeoutMs()}
+                  running={timerRunning()}
+                  endedAt={endedAt()}
+                />
+              </Show>
               <Show when={!open() && props.input.command}>
                 <ShellSubmessage text={props.input.command} animate={sawPending} />
               </Show>
@@ -2410,6 +2514,15 @@ ToolRegistry.register({
               <div data-slot="bash-command-code">
                 <Markdown text={"```bash\n" + command() + "\n```"} />
               </div>
+            </div>
+          </Show>
+          <Show when={background()}>
+            <div data-slot="bash-background-banner">
+              <Icon name="arrow-right" size="small" />
+              <span>{i18n.t("ui.tool.shell.running")}</span>
+              <Show when={startedAt()}>
+                <ShellTimer startedAt={startedAt()!} timeoutMs={timeoutMs()} running />
+              </Show>
             </div>
           </Show>
           <Show when={output()}>
@@ -2923,3 +3036,173 @@ ToolRegistry.register({
     )
   },
 })
+
+const BROWSER_TOOLS = [
+  "browser_annotate",
+  "browser_claim",
+  "browser_click",
+  "browser_close",
+  "browser_evaluate",
+  "browser_highlight",
+  "browser_navigate",
+  "browser_open",
+  "browser_press",
+  "browser_profiler_start",
+  "browser_profiler_stop",
+  "browser_query",
+  "browser_react_inspect",
+  "browser_recording_start",
+  "browser_recording_stop",
+  "browser_resize",
+  "browser_screenshot",
+  "browser_scroll",
+  "browser_set_appearance",
+  "browser_snapshot",
+  "browser_status",
+  "browser_type",
+  "browser_wait_for",
+]
+
+ToolRegistry.register({
+  name: "background",
+  render(props) {
+    const i18n = useI18n()
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const status = createMemo(() => {
+      const value = props.metadata.status
+      return typeof value === "string" ? value : undefined
+    })
+    const running = createMemo(() => status() === "running")
+    const startedAt = createMemo(() =>
+      typeof props.metadata.startedAt === "number" ? props.metadata.startedAt : undefined,
+    )
+    const timeoutMs = createMemo(() =>
+      typeof props.metadata.timeoutMs === "number" ? props.metadata.timeoutMs : undefined,
+    )
+    const exit = createMemo(() => {
+      const value = props.metadata.exit
+      return typeof value === "number" ? value : undefined
+    })
+    const jobId = createMemo(() => {
+      const value = props.metadata.jobId
+      return typeof value === "string" ? value : undefined
+    })
+
+    return (
+      <BasicTool
+        {...props}
+        icon={info().icon}
+        trigger={{
+          title: info().title,
+          subtitle: info().subtitle,
+          args: jobId() ? [jobId()!] : [],
+        }}
+      >
+        <Show when={status()}>
+          <div data-component="background-status">
+            <span data-slot="background-status-badge" data-status={status()}>
+              {i18n.t(`ui.tool.background.status.${status()}` as never)}
+            </span>
+            <Show when={exit() !== undefined && exit() !== null}>
+              <span data-slot="background-status-exit">{i18n.t("ui.tool.background.exit", { code: exit()! })}</span>
+            </Show>
+            <Show when={startedAt()}>
+              <ShellTimer startedAt={startedAt()!} timeoutMs={timeoutMs()} running={running()} />
+            </Show>
+          </div>
+        </Show>
+        <SmartToolOutput output={props.output} />
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
+  name: "git",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const mode = createMemo(() => (typeof props.input.mode === "string" ? props.input.mode : "status"))
+    return (
+      <BasicTool
+        {...props}
+        icon={info().icon}
+        trigger={{ title: info().title, subtitle: info().subtitle }}
+      >
+        <Show when={props.output}>
+          <GitOutput mode={mode()} output={props.output!} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
+  name: "typecheck",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={{ title: info().title, subtitle: info().subtitle }}>
+        <Show when={props.output}>
+          <TypecheckOutput output={props.output!} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
+  name: "sqlite",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const action = createMemo(() => (typeof props.input.action === "string" ? props.input.action : "query"))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={{ title: info().title, subtitle: info().subtitle }}>
+        <Show when={props.output}>
+          <SqliteOutput action={action()} output={props.output!} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
+  name: "sympy",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={{ title: info().title, subtitle: info().subtitle }}>
+        <Show when={props.output}>
+          <SympyOutput output={props.output!} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+const STRUCTURED_TOOLS: Record<string, string | undefined> = {
+  test: "action",
+  json: "mode",
+  archive: "action",
+  project: "action",
+  symbols: "action",
+  ...Object.fromEntries(BROWSER_TOOLS.map((name) => [name, undefined])),
+}
+
+for (const [name, actionKey] of Object.entries(STRUCTURED_TOOLS)) {
+  ToolRegistry.register({
+    name,
+    render(props) {
+      const i18n = useI18n()
+      const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+      return (
+        <GenericTool
+          {...props}
+          icon={info().icon}
+          title={info().title}
+          subtitle={info().subtitle}
+          argsSkip={actionKey ? [actionKey] : []}
+        />
+      )
+    },
+  })
+}

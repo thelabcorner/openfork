@@ -19,38 +19,38 @@ export function FileSearchBar(props: {
   return (
     <Portal>
       <div
-        class="fixed z-50 flex h-8 items-center gap-2 rounded-md border border-border-base bg-background-base px-3 shadow-md"
+        class="session-find-bar"
         style={{
           top: `${props.pos().top}px`,
           ...(props.pos().left !== undefined ? { left: `${props.pos().left}px` } : { right: `${props.pos().right}px` }),
         }}
         onPointerDown={(e) => e.stopPropagation()}
       >
-        <Icon name="magnifying-glass" size="small" class="text-text-weak shrink-0" />
+        <Icon name="magnifying-glass" size="small" class="shrink-0 text-text-weak" />
         <input
           ref={props.setInput}
           placeholder={i18n.t("ui.fileSearch.placeholder")}
           value={props.query()}
-          class="w-40 bg-transparent outline-none text-14-regular text-text-strong placeholder:text-text-weak"
+          class="session-find-input"
           onInput={(e) => props.onInput(e.currentTarget.value)}
           onKeyDown={(e) => props.onKeyDown(e as KeyboardEvent)}
         />
-        <div class="shrink-0 text-12-regular text-text-weak tabular-nums text-right" style={{ width: "10ch" }}>
-          {props.count() ? `${props.index() + 1}/${props.count()}` : "0/0"}
+        <div class="session-find-count" classList={{ "session-find-count--active": props.count() > 0 }}>
+          {props.count() > 0 ? `${props.index() + 1}/${props.count()}` : "0/0"}
         </div>
-        <div class="flex items-center">
+        <div class="session-find-nav">
           <button
             type="button"
-            class="size-6 grid place-items-center rounded text-text-weak hover:bg-surface-base-hover hover:text-text-strong disabled:opacity-40 disabled:pointer-events-none"
+            class="session-find-btn"
             disabled={props.count() === 0}
             aria-label={i18n.t("ui.fileSearch.previousMatch")}
             onClick={props.onPrev}
           >
-            <Icon name="chevron-down" size="small" class="rotate-180" />
+            <Icon name="arrow-up" size="small" />
           </button>
           <button
             type="button"
-            class="size-6 grid place-items-center rounded text-text-weak hover:bg-surface-base-hover hover:text-text-strong disabled:opacity-40 disabled:pointer-events-none"
+            class="session-find-btn"
             disabled={props.count() === 0}
             aria-label={i18n.t("ui.fileSearch.nextMatch")}
             onClick={props.onNext}
@@ -58,9 +58,10 @@ export function FileSearchBar(props: {
             <Icon name="chevron-down" size="small" />
           </button>
         </div>
+        <div class="session-find-separator" />
         <button
           type="button"
-          class="size-6 grid place-items-center rounded text-text-weak hover:bg-surface-base-hover hover:text-text-strong"
+          class="session-find-btn"
           aria-label={i18n.t("ui.fileSearch.close")}
           onClick={props.onClose}
         >

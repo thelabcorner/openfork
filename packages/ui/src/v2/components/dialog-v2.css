@@ -121,6 +121,11 @@
           }
         }
 
+        [data-component="icon-button-v2"] {
+          margin-top: -2px;
+          margin-inline-end: 4px;
+        }
+
         &[data-hide-close] [data-slot="dialog-close-button"] {
           display: none;
         }
@@ -167,7 +172,7 @@
 
   &[data-size="large"] [data-slot="dialog-container"] {
     width: 640px;
-    height: 480px;
+    height: 560px;
   }
 
   &[data-size="x-large"] [data-slot="dialog-container"] {

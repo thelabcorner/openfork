@@ -325,9 +325,9 @@ function label(input: Record<string, unknown> | undefined) {
   return keys.map((key) => input?.[key]).find((value): value is string => typeof value === "string" && value.length > 0)
 }
 
-function args(input: Record<string, unknown> | undefined) {
+function args(input: Record<string, unknown> | undefined, extraSkip: string[] = []) {
   if (!input) return []
-  const skip = new Set(["description", "query", "url", "filePath", "path", "pattern", "name"])
+  const skip = new Set(["description", "query", "url", "filePath", "path", "pattern", "name", ...extraSkip])
   return Object.entries(input)
     .filter(([key]) => !skip.has(key))
     .flatMap(([key, value]) => {
@@ -345,6 +345,10 @@ export function GenericTool(props: {
   hideDetails?: boolean
   input?: Record<string, unknown>
   output?: string
+  icon?: IconProps["name"]
+  title?: string
+  subtitle?: string
+  argsSkip?: string[]
 }) {
   const i18n = useI18n()
   const inputJson = createMemo(() => {
@@ -354,12 +358,12 @@ export function GenericTool(props: {
 
   return (
     <BasicTool
-      icon="brain"
+      icon={props.icon ?? "brain"}
       status={props.status}
       trigger={{
-        title: i18n.t("ui.basicTool.called", { tool: props.tool }),
-        subtitle: label(props.input),
-        args: args(props.input),
+        title: props.title ?? i18n.t("ui.basicTool.called", { tool: props.tool }),
+        subtitle: props.subtitle ?? label(props.input),
+        args: args(props.input, props.argsSkip),
       }}
       hideDetails={props.hideDetails}
     >

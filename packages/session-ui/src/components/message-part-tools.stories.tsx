@@ -56,7 +56,12 @@ export const ShellCompleted = {
     <ToolCard
       tool="shell"
       input={{ command: "bun test packages/session-ui" }}
-      metadata={{ command: "bun test packages/session-ui" }}
+      metadata={{
+        command: "bun test packages/session-ui",
+        timeout: 120_000,
+        startedAt: Date.now() - 4_200,
+        endedAt: Date.now(),
+      }}
       output={"PASS  src/components/basic-tool.test.ts\n  ✓ renders icon chip\n  ✓ status coloring\n\n2 tests passed."}
       status="completed"
     />
@@ -65,7 +70,12 @@ export const ShellCompleted = {
 
 export const ShellRunning = {
   render: () => (
-    <ToolCard tool="shell" input={{ command: "bun run typecheck" }} metadata={{ command: "bun run typecheck" }} status="running" />
+    <ToolCard
+      tool="shell"
+      input={{ command: "bun run typecheck" }}
+      metadata={{ command: "bun run typecheck", timeout: 120_000, startedAt: Date.now() - 91_000 }}
+      status="running"
+    />
   ),
 }
 
@@ -233,4 +243,290 @@ export const ContextGroupReadGrepGlob = {
       </DataProvider>
     )
   },
+}
+
+export const GitStatus = {
+  render: () => (
+    <ToolCard
+      tool="git"
+      input={{ mode: "status" }}
+      output={[
+        '<status clean="false" entries="3">',
+        "  <entry> M src/components/shell-timer.tsx</entry>",
+        "  <entry>A  src/components/git-tool.tsx</entry>",
+        "  <entry>?? src/components/git-tool.stories.tsx</entry>",
+        "</status>",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const GitSummary = {
+  render: () => (
+    <ToolCard
+      tool="git"
+      input={{ mode: "summary" }}
+      output={[
+        '<summary branch="openfork">',
+        "  <entry> M src/components/shell-timer.tsx</entry>",
+        "  <entry>A  src/components/git-tool.tsx</entry>",
+        "</summary>",
+        "<recent>",
+        "  <commit>a1b2c3d (HEAD -> openfork) feat(session-ui): premium tool UI overhaul</commit>",
+        "  <commit>9f8e7d6 fix(session-ui): shell timer badge styling</commit>",
+        "</recent>",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const GitLog = {
+  render: () => (
+    <ToolCard
+      tool="git"
+      input={{ mode: "log" }}
+      output={[
+        "<log>",
+        "a1b2c3d (HEAD -> openfork, origin/openfork) feat(session-ui): premium tool UI overhaul",
+        "9f8e7d6 fix(session-ui): shell timer badge styling",
+        "1234567 chore: regenerate client and sdk-next generated types",
+        "</log>",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const GitDiff = {
+  render: () => (
+    <ToolCard
+      tool="git"
+      input={{ mode: "diff" }}
+      output={[
+        '<diff staged="false">',
+        "diff --git a/src/components/shell-timer.tsx b/src/components/shell-timer.tsx",
+        "index 1111111..2222222 100644",
+        "--- a/src/components/shell-timer.tsx",
+        "+++ b/src/components/shell-timer.tsx",
+        "@@ -70,7 +70,7 @@",
+        "-  return <span>old</span>",
+        "+  return <span>new hourglass badge</span>",
+        "</diff>",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const GitCommit = {
+  render: () => (
+    <ToolCard
+      tool="git"
+      input={{ mode: "commit", message: "feat: add premium tool UI" }}
+      output={[
+        '<commit applied="true">',
+        "  <commit>a1b2c3d feat: add premium tool UI</commit>",
+        '  <status clean="true" />',
+        "</commit>",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const TypecheckPassed = {
+  render: () => (
+    <ToolCard
+      tool="typecheck"
+      input={{ mode: "changed" }}
+      output={[
+        '<typecheck mode="changed" status="passed" errors="0" truncated="false">',
+        '<scope mode="changed" files="2">',
+        "  <file>packages/session-ui/src/components/shell-timer.tsx</file>",
+        "  <file>packages/session-ui/src/components/git-tool.tsx</file>",
+        "</scope>",
+        "<tsconfig>packages/session-ui/tsconfig.json</tsconfig>",
+        '<summary status="passed" errors="0" bin="tsgo" exit="0">',
+        "<triage>",
+        "  <p0>0</p0>",
+        "  <p1>0</p1>",
+        "  <p2>0</p2>",
+        "  <p3>0</p3>",
+        "</triage>",
+        "<clusters>",
+        "</clusters>",
+        "<next>",
+        "  No errors detected in the selected scope.",
+        "</next>",
+        "</typecheck>",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const TypecheckFailed = {
+  render: () => (
+    <ToolCard
+      tool="typecheck"
+      input={{ mode: "file", filePath: "packages/session-ui/src/components/git-tool.tsx" }}
+      output={[
+        '<typecheck mode="file" status="failed" errors="2" truncated="false">',
+        '<scope mode="file" files="1">',
+        "  <file>packages/session-ui/src/components/git-tool.tsx</file>",
+        "</scope>",
+        "<tsconfig>packages/session-ui/tsconfig.json</tsconfig>",
+        '<summary status="failed" errors="2" bin="tsgo" exit="1">',
+        "<triage>",
+        "  <p0>1</p0>",
+        "  <p1>1</p1>",
+        "  <p2>0</p2>",
+        "  <p3>0</p3>",
+        "</triage>",
+        "<clusters>",
+        '  <cluster code="TS2322" severity="P0" category="type" occurrences="1" files="1"/>',
+        "</clusters>",
+        "<diagnostics>",
+        '  <diagnostic file="packages/session-ui/src/components/git-tool.tsx" line="42" column="10" code="TS2322" severity="P0" category="type">',
+        "    <message>Type 'string | undefined' is not assignable to type 'string'.</message>",
+        "    <suggestion>Add a fallback value or narrow with a Show/when guard before use.</suggestion>",
+        "  </diagnostic>",
+        '  <diagnostic file="packages/session-ui/src/components/git-tool.tsx" line="88" column="3" code="TS6133" severity="P1" category="lint">',
+        "    <message>'unused' is declared but its value is never read.</message>",
+        "    <suggestion>Remove the unused declaration.</suggestion>",
+        "  </diagnostic>",
+        "</diagnostics>",
+        "<next>",
+        "  Fix in P0→P1 order first (1 P0, 1 P1).",
+        "</next>",
+        "</typecheck>",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const SqliteQuery = {
+  render: () => (
+    <ToolCard
+      tool="sqlite"
+      input={{ action: "query", db: "app.db", sql: "select id, name, created_at from users limit 3" }}
+      output={[
+        " id | name  | created_at          ",
+        "----+-------+---------------------",
+        "  1 | alice | 2026-01-01T10:00:00 ",
+        "  2 | bob   | 2026-01-02T11:15:00 ",
+        "  3 | carol | 2026-01-03T09:30:00 ",
+        "(3 rows, 1.2 ms)",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const SqliteSchema = {
+  render: () => (
+    <ToolCard
+      tool="sqlite"
+      input={{ action: "schema", db: "app.db" }}
+      output={[
+        "CREATE TABLE users (",
+        "  id INTEGER PRIMARY KEY,",
+        "  name TEXT NOT NULL,",
+        "  created_at TEXT NOT NULL",
+        ");",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const SympyOk = {
+  render: () => (
+    <ToolCard
+      tool="sympy"
+      input={{ expr: "sqrt(8)", operation: "simplify" }}
+      output={[
+        '<sympy status="ok" kind="expr" duration="12 ms">',
+        "  <call>simplify(sqrt(8))</call>",
+        "  <result>2*sqrt(2)</result>",
+        "</sympy>",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const SympyError = {
+  render: () => (
+    <ToolCard
+      tool="sympy"
+      input={{ expr: "1/(x-x)", operation: "simplify" }}
+      output={[
+        '<sympy status="error" kind="expr" duration="8 ms">',
+        "  <error>ZeroDivisionError: division by zero</error>",
+        "  <suggestion>Check for singularities before simplifying; consider limit() instead.</suggestion>",
+        "  <call>simplify(1/(x-x))</call>",
+        "</sympy>",
+      ].join("\n")}
+    />
+  ),
+}
+
+export const Test = {
+  render: () => (
+    <ToolCard
+      tool="test"
+      input={{ action: "run", path: "packages/session-ui" }}
+      output={"PASS  src/components/shell-timer.test.ts\n  ✓ formats elapsed time\n\n1 test passed."}
+    />
+  ),
+}
+
+export const Json = {
+  render: () => (
+    <ToolCard
+      tool="json"
+      input={{ mode: "query", path: "package.json", query: "$.dependencies" }}
+      output={JSON.stringify({ solid: "^1.9.0", effect: "^3.0.0" }, null, 2)}
+    />
+  ),
+}
+
+export const Archive = {
+  render: () => (
+    <ToolCard
+      tool="archive"
+      input={{ action: "list", path: "dist/release.zip" }}
+      output={["dist/index.js", "dist/index.js.map", "README.md"].join("\n")}
+    />
+  ),
+}
+
+export const Project = {
+  render: () => (
+    <ToolCard
+      tool="project"
+      input={{ action: "snapshot", tier: "summary" }}
+      output={"Workspace: opencode\nPackages: 24\nPrimary language: TypeScript"}
+    />
+  ),
+}
+
+export const Symbols = {
+  render: () => (
+    <ToolCard
+      tool="symbols"
+      input={{ action: "search", query: "ShellTimer" }}
+      output={"packages/session-ui/src/components/shell-timer.tsx:41: export function ShellTimer(props)"}
+    />
+  ),
+}
+
+export const BrowserClick = {
+  render: () => (
+    <ToolCard tool="browser_click" input={{ selector: "button.submit" }} output={"Clicked button.submit"} />
+  ),
+}
+
+export const BrowserNavigate = {
+  render: () => (
+    <ToolCard
+      tool="browser_navigate"
+      input={{ url: "https://opencode.ai" }}
+      output={"Navigated to https://opencode.ai"}
+    />
+  ),
 }

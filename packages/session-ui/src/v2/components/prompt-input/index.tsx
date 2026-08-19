@@ -13,6 +13,7 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { AttachmentCardV2 } from "../attachment-card-v2"
 import { CommentCardV2 } from "../comment-card-v2"
 import { typeLabel } from "../../../components/message-file"
+import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import type {
   PromptInputV2Attachment,
   PromptInputV2Comment,
@@ -42,6 +43,8 @@ export type PromptInputV2Props = {
   class?: string
   modelControl?: JSX.Element
   usageControl?: JSX.Element
+  autoAcceptControl?: JSX.Element
+  footerControl?: JSX.Element
   variantControlVisible?: boolean
   attachKeybind?: string[]
   attachShortcut?: string
@@ -135,12 +138,14 @@ export function PromptInputV2(props: PromptInputV2Props) {
           <PromptInputV2Attachments
             attachments={props.controller.attachments()}
             comments={props.controller.comments()}
+            files={props.controller.files()}
             activeCommentID={state.activeContextID}
             removeLabel={i18n.t("ui.promptInput.removeAttachment")}
             onAttachmentClick={props.controller.openAttachment}
             onAttachmentRemove={(attachment) => props.controller.removeAttachment(attachment.id)}
             onCommentClick={(comment) => props.controller.toggleContext(comment.key)}
             onCommentRemove={(comment) => props.controller.removeContext(comment.key)}
+            onFileRemove={(item) => props.controller.removeContext(item.key)}
           />
         </Show>
 
@@ -255,7 +260,11 @@ export function PromptInputV2(props: PromptInputV2Props) {
               )}
             </Show>
             <Show when={props.usageControl}>{props.usageControl}</Show>
+            <Show when={props.autoAcceptControl}>{props.autoAcceptControl}</Show>
           </div>
+          <Show when={props.footerControl}>
+            <div class="flex items-center pe-1">{props.footerControl}</div>
+          </Show>
           <PromptInputV2SubmitButton
             mode={state.mode}
             stopping={view.submit.stopping()}
@@ -380,21 +389,56 @@ function promptInputV2Cursor(editor: HTMLDivElement) {
 export function PromptInputV2Attachments(props: {
   attachments: PromptInputV2Attachment[]
   comments?: PromptInputV2Comment[]
+  files?: PromptInputV2Comment[]
   activeCommentID?: string
   removeLabel: string
   onAttachmentClick?: (attachment: PromptInputV2Attachment) => void
   onAttachmentRemove: (attachment: PromptInputV2Attachment) => void
   onCommentClick?: (comment: PromptInputV2Comment) => void
   onCommentRemove?: (comment: PromptInputV2Comment) => void
+  onFileRemove?: (item: PromptInputV2Comment) => void
 }) {
   const i18n = useI18n()
   return (
-    <Show when={props.attachments.length > 0 || (props.comments?.length ?? 0) > 0}>
+    <Show
+      when={
+        props.attachments.length > 0 ||
+        (props.comments?.length ?? 0) > 0 ||
+        (props.files?.length ?? 0) > 0
+      }
+    >
       <div data-component="prompt-input-v2-attachments" data-slot="prompt-attachments" class="relative">
         <div
           data-slot="prompt-attachments-scroll"
           class="flex flex-nowrap gap-2 overflow-x-auto no-scrollbar px-2 pt-2 pb-1"
         >
+          <For each={props.files ?? []}>
+            {(item) => (
+              <div class="relative group shrink-0">
+                <TooltipV2 value={item.path} placement="top" openDelay={800} contentClass="break-all">
+                  <AttachmentCardV2 title={getFilename(item.path)} hover={item.path}>
+                    <FileIcon node={{ path: item.path, type: "file" }} />
+                    <span class="truncate">{getDirectory(item.path)}</span>
+                    <Show when={item.selection}>
+                      {(sel) =>
+                        sel().startLine === sel().endLine
+                          ? `:${sel().startLine}`
+                          : `:${sel().startLine}-${sel().endLine}`
+                      }
+                    </Show>
+                  </AttachmentCardV2>
+                </TooltipV2>
+                <button
+                  type="button"
+                  onClick={() => props.onFileRemove?.(item)}
+                  class="absolute -top-1 -end-1 size-4 rounded-full bg-v2-icon-icon-muted outline-solid outline-1 outline-v2-icon-icon-contrast flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity"
+                  aria-label={props.removeLabel}
+                >
+                  <IconV2 name="outline-xmark" class="text-v2-icon-icon-contrast" />
+                </button>
+              </div>
+            )}
+          </For>
           <For each={props.comments ?? []}>
             {(comment) => (
               <div class="relative group shrink-0">

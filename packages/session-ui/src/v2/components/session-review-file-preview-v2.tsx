@@ -21,12 +21,12 @@ import type {
   SessionReviewFocus,
   SessionReviewLineComment,
 } from "../../components/session-review"
-import type { SessionReviewExpandMode } from "./session-review-v2"
+import type { SessionReviewExpandMode } from "./session-changes-v2"
 import { createLineCommentControllerV2 } from "./line-comment-annotations-v2"
 import { shouldVirtualizeReviewDiff } from "./session-review-file-preview-v2-virtualize"
 import { LineCommentV2OverflowIcon } from "@opencode-ai/ui/v2/line-comment-v2"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
-import "./session-review-v2.css"
+import "./session-changes-v2.css"
 
 type ReviewDiff = (SnapshotFileDiff & { file: string }) | FileDiffInfo | VcsFileDiff
 
@@ -253,18 +253,18 @@ export function SessionReviewFilePreviewV2(props: SessionReviewFilePreviewV2Prop
 
   return (
     <>
-      <div data-slot="session-review-v2-file-header">
-        <div data-slot="session-review-v2-file-title">
-          <div data-slot="session-review-v2-file-status" data-type={statusType(view().status)}>
+      <div data-slot="session-changes-v2-file-header">
+        <div data-slot="session-changes-v2-file-title">
+          <div data-slot="session-changes-v2-file-status" data-type={statusType(view().status)}>
             {statusLabel(view().status)}
           </div>
           <FileIcon node={{ path: props.file, type: "file" }} />
-          <span data-slot="session-review-v2-file-name">{getFilename(props.file)}</span>
+          <span data-slot="session-changes-v2-file-name">{getFilename(props.file)}</span>
           <Show when={props.file.includes("/")}>
-            <span data-slot="session-review-v2-file-path">{getDirectory(props.file)}</span>
+            <span data-slot="session-changes-v2-file-path">{getDirectory(props.file)}</span>
           </Show>
         </div>
-        <div data-slot="session-review-v2-file-diff">
+        <div data-slot="session-changes-v2-file-diff">
           <DiffChanges changes={view()} />
         </div>
       </div>
@@ -272,12 +272,12 @@ export function SessionReviewFilePreviewV2(props: SessionReviewFilePreviewV2Prop
         ref={(el) => {
           scrollRef = el
         }}
-        data-slot="session-review-v2-diff-scroll"
+        data-slot="session-changes-v2-diff-scroll"
       >
         <Show
           when={diffCanRender() || mediaKind()}
           fallback={
-            <div data-slot="session-review-v2-empty">
+            <div data-slot="session-changes-v2-empty">
               <span class="text-12-regular text-text-weak">{i18n.t("ui.fileMedia.binary.title")}</span>
             </div>
           }

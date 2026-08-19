@@ -9,7 +9,11 @@ export function index(list: Provider[] | undefined) {
   return new Map((list ?? []).map((item) => [item.id, item] as const))
 }
 
-export function get(list: Provider[] | ReadonlyMap<string, Provider> | undefined, providerID: string, modelID: string) {
+export function get(
+  list: readonly Provider[] | ReadonlyMap<string, Provider> | undefined,
+  providerID: string,
+  modelID: string,
+) {
   const provider =
     list instanceof Map
       ? list.get(providerID)
@@ -20,7 +24,7 @@ export function get(list: Provider[] | ReadonlyMap<string, Provider> | undefined
 }
 
 export function name(
-  list: Provider[] | ReadonlyMap<string, Provider> | undefined,
+  list: readonly Provider[] | ReadonlyMap<string, Provider> | undefined,
   providerID: string,
   modelID: string,
 ) {

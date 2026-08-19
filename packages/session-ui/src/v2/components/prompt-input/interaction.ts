@@ -308,6 +308,9 @@ export function createPromptInputV2Controller(input: {
     comments() {
       return draft.state.context.items.filter((item) => !!item.comment?.trim())
     },
+    files() {
+      return draft.state.context.items.filter((item) => !item.comment?.trim())
+    },
     attachments(): PromptInputV2Attachment[] {
       return draft.state.prompt.filter((part): part is PromptInputV2Attachment => part.type === "image")
     },

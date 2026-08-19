@@ -21,7 +21,7 @@ export const SESSION_REVIEW_V2_SIDEBAR_WIDTH_MAX = 480
 
 export type SessionReviewExpandMode = "expand" | "collapse"
 
-export type SessionReviewV2Props = {
+export type SessionChangesV2Props = {
   title?: JSX.Element
   stats?: JSX.Element
   empty?: JSX.Element
@@ -38,7 +38,7 @@ export type SessionReviewV2Props = {
   hasDiffs: boolean
 }
 
-export type SessionReviewV2SidebarProps = {
+export type SessionChangesV2SidebarProps = {
   open: boolean
   transition: boolean
   title?: JSX.Element
@@ -59,7 +59,7 @@ export type SessionReviewV2SidebarProps = {
   children?: JSX.Element
 }
 
-export function SessionReviewV2Sidebar(props: SessionReviewV2SidebarProps) {
+export function SessionChangesV2Sidebar(props: SessionChangesV2SidebarProps) {
   const i18n = useI18n()
   const [resizing, setResizing] = createSignal(false)
   const width = () => props.width ?? SESSION_REVIEW_V2_SIDEBAR_WIDTH_DEFAULT
@@ -74,19 +74,19 @@ export function SessionReviewV2Sidebar(props: SessionReviewV2SidebarProps) {
   })
 
   return (
-    <div data-component="session-review-v2-sidebar-root">
+    <div data-component="session-changes-v2-sidebar-root">
       <Show when={props.open}>
         <aside
-          data-slot="session-review-v2-sidebar"
+          data-slot="session-changes-v2-sidebar"
           data-transition={props.transition ? "" : undefined}
           data-resizing={resizing() ? "" : undefined}
           style={{ width: `${width()}px` }}
         >
-          <div data-slot="session-review-v2-sidebar-header">
-            <div data-slot="session-review-v2-sidebar-title">{props.title}</div>
+          <div data-slot="session-changes-v2-sidebar-header">
+            <div data-slot="session-changes-v2-sidebar-title">{props.title}</div>
             {props.stats}
           </div>
-          <div data-slot="session-review-v2-sidebar-filter">
+          <div data-slot="session-changes-v2-sidebar-filter">
             <TextInputV2
               type="search"
               value={props.filter}
@@ -102,8 +102,8 @@ export function SessionReviewV2Sidebar(props: SessionReviewV2SidebarProps) {
               showClearButton={props.filter.length > 0}
               clearLabel={i18n.t("ui.list.clearFilter")}
               onClearClick={() => props.onFilterChange("")}
-              placeholder={i18n.t("ui.sessionReviewV2.filterFiles")}
-              aria-label={i18n.t("ui.sessionReviewV2.filterFiles")}
+              placeholder={i18n.t("ui.SessionChangesV2.filterFiles")}
+              aria-label={i18n.t("ui.SessionChangesV2.filterFiles")}
               leadingIcon={
                 <svg
                   width="14"
@@ -123,7 +123,7 @@ export function SessionReviewV2Sidebar(props: SessionReviewV2SidebarProps) {
             />
           </div>
           <ScrollView
-            data-slot="session-review-v2-sidebar-tree"
+            data-slot="session-changes-v2-sidebar-tree"
             class="group/file-tree-v2"
             thumbVisibility="scroll"
             viewportRef={props.viewportRef}
@@ -133,7 +133,7 @@ export function SessionReviewV2Sidebar(props: SessionReviewV2SidebarProps) {
         </aside>
       </Show>
       <Show when={props.open && props.onWidthChange}>
-        <div data-slot="session-review-v2-sidebar-resize" onPointerDown={() => setResizing(true)}>
+        <div data-slot="session-changes-v2-sidebar-resize" onPointerDown={() => setResizing(true)}>
           <ResizeHandle
             direction="horizontal"
             size={width()}
@@ -148,7 +148,7 @@ export function SessionReviewV2Sidebar(props: SessionReviewV2SidebarProps) {
   )
 }
 
-export function SessionReviewV2(props: SessionReviewV2Props) {
+export function SessionChangesV2(props: SessionChangesV2Props) {
   const i18n = useI18n()
   const locale = useLocale()
 
@@ -206,13 +206,13 @@ export function SessionReviewV2(props: SessionReviewV2Props) {
   const toolbarStart = () => (
     <>
       <Show when={showCollapsedMeta()}>
-        <div data-slot="session-review-v2-toolbar-collapsed-meta">
+        <div data-slot="session-changes-v2-toolbar-collapsed-meta">
           <Show when={title()}>
-            <div data-slot="session-review-v2-toolbar-title">{title()}</div>
+            <div data-slot="session-changes-v2-toolbar-title">{title()}</div>
           </Show>
           {stats()}
           <Show when={canCycle()}>
-            <span data-slot="session-review-v2-file-position">
+            <span data-slot="session-changes-v2-file-position">
               {fileIndex() + 1}/{props.files.length}
             </span>
           </Show>
@@ -224,7 +224,7 @@ export function SessionReviewV2(props: SessionReviewV2Props) {
           inactive={!prev()}
           value={
             <>
-              {i18n.t("ui.sessionReviewV2.previousFile")}
+              {i18n.t("ui.SessionChangesV2.previousFile")}
               <KeybindV2 keys={[locale.direction() === "rtl" ? "→" : "←"]} variant="neutral" />
             </>
           }
@@ -233,10 +233,10 @@ export function SessionReviewV2(props: SessionReviewV2Props) {
             icon="arrow-left"
             variant="ghost"
             size="small"
-            class="session-review-v2-file-nav-button"
+            class="session-changes-v2-file-nav-button"
             disabled={!prev()}
             onClick={() => cycle(prev())}
-            aria-label={i18n.t("ui.sessionReviewV2.previousFile")}
+            aria-label={i18n.t("ui.SessionChangesV2.previousFile")}
           />
         </TooltipV2>
         <TooltipV2
@@ -244,7 +244,7 @@ export function SessionReviewV2(props: SessionReviewV2Props) {
           inactive={!next()}
           value={
             <>
-              {i18n.t("ui.sessionReviewV2.nextFile")}
+              {i18n.t("ui.SessionChangesV2.nextFile")}
               <KeybindV2 keys={[locale.direction() === "rtl" ? "←" : "→"]} variant="neutral" />
             </>
           }
@@ -253,10 +253,10 @@ export function SessionReviewV2(props: SessionReviewV2Props) {
             icon="arrow-right"
             variant="ghost"
             size="small"
-            class="session-review-v2-file-nav-button"
+            class="session-changes-v2-file-nav-button"
             disabled={!next()}
             onClick={() => cycle(next())}
-            aria-label={i18n.t("ui.sessionReviewV2.nextFile")}
+            aria-label={i18n.t("ui.SessionChangesV2.nextFile")}
           />
         </TooltipV2>
       </div>
@@ -271,16 +271,16 @@ export function SessionReviewV2(props: SessionReviewV2Props) {
           if (value !== "expand" && value !== "collapse") return
           props.onExpandModeChange(value)
         }}
-        class="session-review-v2-segmented-control session-review-v2-segmented-control--icon"
-        aria-label={i18n.t("ui.sessionReviewV2.expandMode")}
+        class="session-changes-v2-segmented-control session-changes-v2-segmented-control--icon"
+        aria-label={i18n.t("ui.SessionChangesV2.expandMode")}
       >
-        <TooltipV2 openDelay={2000} value={i18n.t("ui.sessionReviewV2.showAllLines")}>
-          <SegmentedControlItemV2 value="expand" aria-label={i18n.t("ui.sessionReviewV2.showAllLines")}>
+        <TooltipV2 openDelay={2000} value={i18n.t("ui.SessionChangesV2.showAllLines")}>
+          <SegmentedControlItemV2 value="expand" aria-label={i18n.t("ui.SessionChangesV2.showAllLines")}>
             <Icon name="expand" />
           </SegmentedControlItemV2>
         </TooltipV2>
-        <TooltipV2 openDelay={2000} value={i18n.t("ui.sessionReviewV2.hideNonDiffLines")}>
-          <SegmentedControlItemV2 value="collapse" aria-label={i18n.t("ui.sessionReviewV2.hideNonDiffLines")}>
+        <TooltipV2 openDelay={2000} value={i18n.t("ui.SessionChangesV2.hideNonDiffLines")}>
+          <SegmentedControlItemV2 value="collapse" aria-label={i18n.t("ui.SessionChangesV2.hideNonDiffLines")}>
             <Icon name="collapse" />
           </SegmentedControlItemV2>
         </TooltipV2>
@@ -292,16 +292,16 @@ export function SessionReviewV2(props: SessionReviewV2Props) {
             if (value !== "unified" && value !== "split") return
             props.onDiffStyleChange?.(value)
           }}
-          class="session-review-v2-segmented-control session-review-v2-segmented-control--icon"
-          aria-label={i18n.t("ui.sessionReviewV2.diffView")}
+          class="session-changes-v2-segmented-control session-changes-v2-segmented-control--icon"
+          aria-label={i18n.t("ui.SessionChangesV2.diffView")}
         >
-          <TooltipV2 openDelay={2000} value={i18n.t("ui.sessionReviewV2.unifiedDiff")}>
-            <SegmentedControlItemV2 value="unified" aria-label={i18n.t("ui.sessionReviewV2.unifiedDiff")}>
+          <TooltipV2 openDelay={2000} value={i18n.t("ui.SessionChangesV2.unifiedDiff")}>
+            <SegmentedControlItemV2 value="unified" aria-label={i18n.t("ui.SessionChangesV2.unifiedDiff")}>
               <Icon name="unified" />
             </SegmentedControlItemV2>
           </TooltipV2>
-          <TooltipV2 openDelay={2000} value={i18n.t("ui.sessionReviewV2.splitDiff")}>
-            <SegmentedControlItemV2 value="split" aria-label={i18n.t("ui.sessionReviewV2.splitDiff")}>
+          <TooltipV2 openDelay={2000} value={i18n.t("ui.SessionChangesV2.splitDiff")}>
+            <SegmentedControlItemV2 value="split" aria-label={i18n.t("ui.SessionChangesV2.splitDiff")}>
               <Icon name="split" />
             </SegmentedControlItemV2>
           </TooltipV2>
@@ -326,16 +326,16 @@ export function SessionReviewV2(props: SessionReviewV2Props) {
   )
 }
 
-export function SessionReviewV2SidebarToggle(props: { opened: boolean; disabled?: boolean; onToggle: () => void }) {
+export function SessionChangesV2SidebarToggle(props: { opened: boolean; disabled?: boolean; onToggle: () => void }) {
   const i18n = useI18n()
 
   return (
-    <TooltipV2 value={i18n.t("ui.sessionReviewV2.toggleSidebar")}>
+    <TooltipV2 value={i18n.t("ui.SessionChangesV2.toggleSidebar")}>
       <IconButtonV2
         variant="ghost"
         size="small"
-        class="session-review-v2-sidebar-toggle"
-        aria-label={i18n.t("ui.sessionReviewV2.toggleSidebar")}
+        class="session-changes-v2-sidebar-toggle"
+        aria-label={i18n.t("ui.SessionChangesV2.toggleSidebar")}
         aria-expanded={props.opened}
         data-expanded={props.opened ? "" : undefined}
         disabled={props.disabled}
