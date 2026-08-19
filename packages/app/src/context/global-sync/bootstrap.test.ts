@@ -239,13 +239,13 @@ describe("query keys", () => {
   test("loads the current provider and model catalog", async () => {
     const calls: unknown[] = []
     const api = {
-      provider: {
+      providers: {
         list: async (input: unknown) => {
           calls.push(["provider", input])
           return { location: {}, data: [{ id: "openai", name: "OpenAI", package: "@ai-sdk/openai" }] }
         },
       },
-      model: {
+      models: {
         list: async (input: unknown) => {
           calls.push(["model", input])
           return { location: {}, data: [] }
@@ -289,7 +289,7 @@ describe("query keys", () => {
         calls.push(input)
         return {
           location: {},
-          data: [{ name: "review", template: "Review files" /* source: "command" as const */ }],
+          data: [{ name: "shell", template: "Run a shell command" /* source: "command" as const */ }],
         }
       },
     } as unknown as CommandApi
@@ -297,7 +297,7 @@ describe("query keys", () => {
     const result = await loadCommands("/repo", api)
 
     expect(calls).toEqual([{ location: { directory: "/repo" } }])
-    expect(result).toEqual([{ name: "review", template: "Review files" /* source: "command" */ }])
+    expect(result).toEqual([{ name: "shell", template: "Run a shell command" /* source: "command" */ }])
   })
 
   test("loads projects from the current endpoint", async () => {

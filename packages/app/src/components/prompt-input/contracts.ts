@@ -32,10 +32,6 @@ export type PromptInputControls = {
       open: (tab: string) => void | Promise<void>
       setActive: (tab: string) => void
     }
-    reviewPanel: {
-      opened: () => boolean
-      open: () => void
-    }
   }
 }
 

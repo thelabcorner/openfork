@@ -4,7 +4,7 @@ import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useQuery } from "@tanstack/solid-query"
 import { DateTime } from "luxon"
 import { type Accessor, createEffect, createMemo, createRoot, type JSX, startTransition } from "solid-js"
-import { produce } from "solid-js/store"
+import { createStore, produce } from "solid-js/store"
 import { useCommand } from "@/context/command"
 import {
   loadHomeSessionIndex,
@@ -13,12 +13,14 @@ import {
 } from "@/context/global-sync/home-session-index"
 import type { LocalProject } from "@/context/layout"
 import { useLanguage } from "@/context/language"
+import { useSessionGroups } from "@/context/session-groups"
 import { ServerConnection } from "@/context/server"
 import { sessionHasOpenTab, useTabs } from "@/context/tabs"
 import { compareSessionTime, displayName, errorMessage, projectForSession } from "@/pages/layout/helpers"
 import { useSessionTabAvatarState } from "@/pages/layout/project-avatar-state"
 import { pathKey } from "@/utils/path-key"
 import { showToast } from "@/utils/toast"
+import { DialogSessionGroupName } from "@/components/dialog-session-group"
 import { Binary } from "@opencode-ai/core/util/binary"
 import { archiveHomeSession } from "../home-session-archive"
 import type { HomeController } from "./home-controller"
@@ -31,9 +33,10 @@ export type HomeSessionRecord = {
 }
 
 export type HomeSessionGroup = {
-  id: "today" | "yesterday" | "older"
+  id: string
   title: string
   sessions: HomeSessionRecord[]
+  isUserGroup: boolean
 }
 
 export type OpenSessionOptions = { background?: boolean }
@@ -43,6 +46,10 @@ export function createHomeSessionsController(home: HomeController) {
   const command = useCommand()
   const dialog = useDialog()
   const language = useLanguage()
+  const sessionGroups = useSessionGroups()
+  const [collapsed, setCollapsed] = createStore<Record<string, boolean>>({})
+  const [selected, setSelected] = createStore<Record<string, boolean>>({})
+  let selectionAnchor: string | undefined
   const projectDirectories = createMemo(() => {
     const project = home.project.selected()
     if (!project) return home.project.list().flatMap(directories)
@@ -95,7 +102,42 @@ export function createHomeSessionsController(home: HomeController) {
     }),
   )
   const records = createMemo(() => allRecords().slice(0, HOME_SESSION_LIMIT))
-  const groups = createMemo(() => groupSessions(records(), language))
+  const groups = createMemo(() => mergeGroupSessions(records(), language, sessionGroups))
+  const selectedIds = () => Object.keys(selected).filter((id) => selected[id])
+  const createGroup = async (name: string, sessionIds: string[] = []) => {
+    const group = await sessionGroups.createGroup(name)
+    await Promise.all(sessionIds.map((sessionId) => sessionGroups.addSessionToGroup({ groupId: group.id, sessionId })))
+    clearSelection()
+    return group.id
+  }
+  const toggleSelection = (sessionId: string, event: MouseEvent) => {
+    const ids = allRecords().map((record) => record.session.id)
+    const index = ids.indexOf(sessionId)
+    if (event.shiftKey && selectionAnchor) {
+      const anchor = ids.indexOf(selectionAnchor)
+      if (anchor !== -1 && index !== -1) {
+        const start = Math.min(anchor, index)
+        const end = Math.max(anchor, index)
+        setSelected(() => {
+          const next: Record<string, boolean> = {}
+          ids.slice(start, end + 1).forEach((id) => (next[id] = true))
+          return next
+        })
+      }
+    } else if (event.metaKey || event.ctrlKey) {
+      setSelected(sessionId, !selected[sessionId])
+      selectionAnchor = sessionId
+    } else {
+      setSelected(() => ({ [sessionId]: true }))
+      selectionAnchor = sessionId
+    }
+  }
+  const clearSelection = () => setSelected(() => ({}))
+  const groupSelected = () => {
+    const ids = selectedIds()
+    if (ids.length === 0) return
+    void dialog.show(() => <DialogSessionGroupName onSubmit={(name) => void createGroup(name, ids)} />)
+  }
   const prefetched = new Set<string>()
 
   createEffect(() => {
@@ -159,6 +201,28 @@ export function createHomeSessionsController(home: HomeController) {
             }}
           />
         ))
+      },
+    },
+  ])
+
+  command.register("home.group.shortcuts", () => [
+    {
+      id: "sessionGroup.group",
+      title: language.t("sessionGroup.addTo"),
+      description: language.t("sessionGroup.addTo.description"),
+      keybind: "mod+shift+g",
+      hidden: true,
+      onSelect: groupSelected,
+    },
+    {
+      id: "sessionGroup.rename",
+      title: language.t("sessionGroup.rename"),
+      description: language.t("sessionGroup.rename.description"),
+      keybind: "mod+shift+r",
+      hidden: true,
+      onSelect: () => {
+        // Rename group when group tab is active
+        // This is a placeholder - actual implementation depends on active tab
       },
     },
   ])
@@ -234,6 +298,56 @@ export function createHomeSessionsController(home: HomeController) {
         })
       },
     },
+    group: {
+      create: createGroup,
+      groupSelected,
+      rename: (id: string, name: string) => {
+        void sessionGroups.renameGroup({ id, name })
+      },
+      remove: (id: string) => {
+        void sessionGroups.deleteGroup(id)
+      },
+      addSession: (sessionId: string, groupId: string) => {
+        const ids = selected[sessionId] ? selectedIds() : [sessionId]
+        void Promise.all(ids.map((id) => sessionGroups.addSessionToGroup({ groupId, sessionId: id }))).then(clearSelection)
+      },
+      removeSession: (sessionId: string, groupId: string) => {
+        void sessionGroups.removeSessionFromGroup({ groupId, sessionId })
+      },
+      removeFromAll: (sessionId: string) => {
+        const ids = selected[sessionId] ? selectedIds() : [sessionId]
+        void Promise.all(
+          ids.flatMap((id) => {
+            const group = sessionGroups.groupForSession(id)
+            return group ? [sessionGroups.removeSessionFromGroup({ groupId: group.id, sessionId: id })] : []
+          }),
+        ).then(clearSelection)
+      },
+      toggleCollapsed: (id: string) => {
+        setCollapsed(id, (prev) => !prev)
+      },
+      isCollapsed: (id: string) => !!collapsed[id],
+      userGroups: () => sessionGroups.groups().map((g) => ({ id: g.id, name: g.name })),
+      groupForSession: (sessionId: string) => sessionGroups.groupForSession(sessionId)?.id,
+      openTab: (groupId: string) => {
+        const conn = home.server.focused()
+        if (!conn) return
+        const serverKey = ServerConnection.key(conn)
+        const existing = tabs.store.find((t) => t.type === "group" && t.groupId === groupId)
+        if (existing) {
+          tabs.select(existing)
+          return
+        }
+        const tab = tabs.addGroupTab({ server: serverKey, groupId })
+        tabs.select(tab)
+      },
+    },
+    selection: {
+      isSelected: (sessionId: string) => !!selected[sessionId],
+      count: () => selectedIds().length,
+      toggle: toggleSelection,
+      clear: clearSelection,
+    },
     tab: {
       isOpen: (record: HomeSessionRecord) =>
         sessionHasOpenTab(tabs.store, home.selection.value().server, record.session),
@@ -291,10 +405,35 @@ function groupSessions(records: HomeSessionRecord[], language: ReturnType<typeof
       ? language.t("sidebar.project.recentSessions")
       : language.t("home.sessions.group.older")
   return [
-    { id: "today" as const, title: language.t("home.sessions.group.today"), sessions: todaySessions },
-    { id: "yesterday" as const, title: language.t("home.sessions.group.yesterday"), sessions: yesterdaySessions },
-    { id: "older" as const, title: olderTitle, sessions: olderSessions },
+    { id: "today" as const, title: language.t("home.sessions.group.today"), sessions: todaySessions, isUserGroup: false },
+    { id: "yesterday" as const, title: language.t("home.sessions.group.yesterday"), sessions: yesterdaySessions, isUserGroup: false },
+    { id: "older" as const, title: olderTitle, sessions: olderSessions, isUserGroup: false },
   ].filter((group) => group.sessions.length > 0)
+}
+
+function mergeGroupSessions(
+  records: HomeSessionRecord[],
+  language: ReturnType<typeof useLanguage>,
+  sessionGroups: ReturnType<typeof useSessionGroups>,
+): HomeSessionGroup[] {
+  const userGroups = sessionGroups.groups()
+  const sessionByID = new Map(records.map((r) => [r.session.id, r]))
+  const groupedSessionIDs = new Set<string>()
+
+  const userGroupResults: HomeSessionGroup[] = userGroups
+    .map((entry) => {
+      const sessions = entry.sessionIds
+        .map((id) => sessionByID.get(id))
+        .filter((r): r is HomeSessionRecord => r !== undefined)
+      for (const session of sessions) groupedSessionIDs.add(session.session.id)
+      return { id: entry.id, title: entry.name, sessions, isUserGroup: true as const }
+    })
+    .filter((g) => g.sessions.length > 0 || userGroups.some((u) => u.id === g.id))
+
+  const remaining = records.filter((r) => !groupedSessionIDs.has(r.session.id))
+  const timeGroups = groupSessions(remaining, language)
+
+  return [...userGroupResults, ...timeGroups]
 }
 
 export type HomeSessionsController = ReturnType<typeof createHomeSessionsController>

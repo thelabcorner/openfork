@@ -9,11 +9,12 @@ import { Persist, persisted } from "@/utils/persist"
 export type ModelKey = { providerID: string; modelID: string }
 
 type Visibility = "show" | "hide"
-type User = ModelKey & { visibility: Visibility; favorite?: boolean }
+type User = ModelKey & { visibility?: Visibility; favorite?: boolean }
 type Store = {
   user: User[]
   recent: ModelKey[]
   variant?: Record<string, string | undefined>
+  subProvider?: Record<string, string | undefined>
 }
 
 const RECENT_LIMIT = 5
@@ -34,6 +35,7 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
         user: [],
         recent: [],
         variant: {},
+        subProvider: {},
       }),
     )
 
@@ -89,8 +91,14 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
 
     const visibility = createMemo(() => {
       const map = new Map<string, Visibility>()
-      for (const item of store.user) map.set(`${item.providerID}:${item.modelID}`, item.visibility)
+      for (const item of store.user) if (item.visibility) map.set(`${item.providerID}:${item.modelID}`, item.visibility)
       return map
+    })
+
+    const favorite = createMemo(() => {
+      const set = new Set<string>()
+      for (const item of store.user) if (item.favorite) set.add(modelKey(item))
+      return set
     })
 
     const list = createMemo(() =>
@@ -103,13 +111,13 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
 
     const find = (key: ModelKey) => list().find((m) => m.id === key.modelID && m.provider.id === key.providerID)
 
-    function update(model: ModelKey, state: Visibility) {
+    function updateUser(model: ModelKey, patch: Partial<Pick<User, "visibility" | "favorite">>) {
       const index = store.user.findIndex((x) => x.modelID === model.modelID && x.providerID === model.providerID)
       if (index >= 0) {
-        setStore("user", index, (current) => ({ ...current, visibility: state }))
+        setStore("user", index, (current) => ({ ...current, ...patch }))
         return
       }
-      setStore("user", store.user.length, { ...model, visibility: state })
+      setStore("user", store.user.length, { ...model, ...patch })
     }
 
     const visible = (model: ModelKey) => {
@@ -124,7 +132,13 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
     }
 
     const setVisibility = (model: ModelKey, state: boolean) => {
-      update(model, state ? "show" : "hide")
+      updateUser(model, { visibility: state ? "show" : "hide" })
+    }
+
+    const isFavorite = (model: ModelKey) => favorite().has(modelKey(model))
+
+    const toggleFavorite = (model: ModelKey) => {
+      updateUser(model, { favorite: !isFavorite(model) })
     }
 
     const push = (model: ModelKey) => {
@@ -145,6 +159,23 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       setStore("variant", key, value)
     }
 
+    // OpenRouter upstream-provider routing preference: the tag of the
+    // upstream infra provider a given model should be pinned to (or undefined
+    // for OpenRouter's own Auto routing). Persisted per model, exposed as a
+    // generic options bag alongside `variant` — deliberately separate from it,
+    // since variant is a closed set of per-model reasoning-effort presets.
+    const subProviderKey = (model: ModelKey) => `${model.providerID}:${model.modelID}`
+    const getSubProvider = (model: ModelKey) => store.subProvider?.[subProviderKey(model)]
+
+    const setSubProvider = (model: ModelKey, value: string | undefined) => {
+      const key = subProviderKey(model)
+      if (!store.subProvider) {
+        setStore("subProvider", { [key]: value })
+        return
+      }
+      setStore("subProvider", key, value)
+    }
+
     const [recentModels] = createResource(
       async () => {
         const recent = store.recent
@@ -160,6 +191,10 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       find,
       visible,
       setVisibility,
+      favorite: {
+        isFavorite,
+        toggle: toggleFavorite,
+      },
       recent: {
         list: () => recentModels()!,
         push,
@@ -167,6 +202,10 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       variant: {
         get: getVariant,
         set: setVariant,
+      },
+      subProvider: {
+        get: getSubProvider,
+        set: setSubProvider,
       },
     }
   },

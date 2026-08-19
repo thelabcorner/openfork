@@ -23,6 +23,14 @@ export namespace TimelineRow {
     userMessageID: string
     group: PartGroup
     previousAssistantPart: boolean
+    /**
+     * Advisory pre-mount height hint (px) for markdown text parts, derived
+     * from the pretext text-layout prior. PRETEXT PREDICTS, THE DOM DECIDES:
+     * the virtualizer may use this before mount, but measured height is
+     * authoritative. Always omitted when the OPENCODE_TEXT_LAYOUT flag is
+     * "off", so row equality is byte-identical to the un-flagged build.
+     */
+    heightHint?: number
   }> {}
   export class Thinking extends Data.TaggedClass("Thinking")<{
     userMessageID: string

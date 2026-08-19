@@ -1,4 +1,4 @@
-import { batch, createMemo, onCleanup, onMount, type Accessor } from "solid-js"
+import { createMemo, onCleanup, onMount, type Accessor } from "solid-js"
 import { createStore } from "solid-js/store"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { same } from "@/utils/same"
@@ -17,8 +17,6 @@ type TabsInput = {
   tabs: Accessor<Tabs>
   pathFromTab: (tab: string) => string | undefined
   normalizeTab: (tab: string) => string
-  review?: Accessor<boolean>
-  hasReview?: Accessor<boolean>
   fileBrowser?: Accessor<boolean>
 }
 
@@ -29,10 +27,7 @@ export function shouldShowFileTree(input: { visible: boolean; opened: boolean })
 }
 
 export const createSessionTabs = (input: TabsInput) => {
-  const review = input.review ?? (() => false)
-  const hasReview = input.hasReview ?? (() => false)
   const fileBrowser = input.fileBrowser ?? (() => false)
-  const contextOpen = createMemo(() => input.tabs().active() === "context" || input.tabs().all().includes("context"))
   const openFileOpen = createMemo(
     () =>
       fileBrowser() &&
@@ -45,7 +40,6 @@ export const createSessionTabs = (input: TabsInput) => {
         .tabs()
         .all()
         .flatMap((tab) => {
-          if (tab === "context" || tab === "review") return []
           if (tab === SESSION_OPEN_FILE_TAB && !fileBrowser()) return []
           const value = input.pathFromTab(tab) ? input.normalizeTab(tab) : tab
           if (seen.has(value)) return []
@@ -61,15 +55,11 @@ export const createSessionTabs = (input: TabsInput) => {
   })
   const activeTab = createMemo(() => {
     const active = input.tabs().active()
-    if (active === "context") return active
     if (active === SESSION_OPEN_FILE_TAB && openFileOpen()) return active
-    if (active === "review" && review()) return active
     if (active && input.pathFromTab(active)) return input.normalizeTab(active)
 
     const first = openedTabs()[0]
     if (first) return first
-    if (contextOpen()) return "context"
-    if (review() && hasReview()) return "review"
     return "empty"
   })
   const activeFileTab = createMemo(() => {
@@ -79,14 +69,12 @@ export const createSessionTabs = (input: TabsInput) => {
   })
   const closableTab = createMemo(() => {
     const active = activeTab()
-    if (active === "context") return active
     if (active === SESSION_OPEN_FILE_TAB && openFileOpen()) return active
     if (!openedTabs().includes(active)) return
     return active
   })
 
   return {
-    contextOpen,
     openFileOpen,
     panelTabs,
     openedTabs,
@@ -116,34 +104,11 @@ export const focusTerminalById = (id: string) => {
   return true
 }
 
-export const createOpenReviewFile = (input: {
-  showAllFiles: () => void
-  tabForPath: (path: string) => string
-  openTab: (tab: string) => void
-  setActive: (tab: string) => void
-  loadFile: (path: string) => any | Promise<void>
-}) => {
-  return (path: string) => {
-    batch(() => {
-      input.showAllFiles()
-      const maybePromise = input.loadFile(path)
-      const open = () => {
-        const tab = input.tabForPath(path)
-        input.openTab(tab)
-        input.setActive(tab)
-      }
-      if (maybePromise instanceof Promise) void maybePromise.then(open)
-      else open()
-    })
-  }
-}
-
 export const createOpenSessionFileTab = (input: {
   normalizeTab: (tab: string) => string
   openTab: (tab: string) => void
   pathFromTab: (tab: string) => string | undefined
   loadFile: (path: string) => void
-  openReviewPanel: () => void
   setActive: (tab: string) => void
 }) => {
   return (value: string) => {
@@ -154,7 +119,6 @@ export const createOpenSessionFileTab = (input: {
     if (!path) return
 
     input.loadFile(path)
-    input.openReviewPanel()
     input.setActive(next)
   }
 }

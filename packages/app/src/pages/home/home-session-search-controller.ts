@@ -17,6 +17,7 @@ import {
   type SessionSearchMessageMatch,
   type SessionSearchResult,
 } from "./home-session-search-response"
+import { useSessionGroups } from "@/context/session-groups"
 
 const SEARCH_DEBOUNCE_MS = 200
 const SEARCH_CACHE_TTL_MS = 60_000
@@ -52,6 +53,7 @@ export type HomeSearchHit =
       session: Session
       project: LocalProject
       projectName: string
+      groupName?: string
     }
   | {
       key: string
@@ -60,6 +62,7 @@ export type HomeSearchHit =
       session: Session
       project: LocalProject
       projectName: string
+      groupName?: string
       // Highlight segments precomputed once per result so render does zero work.
       segments: HighlightSegment[]
     }
@@ -69,6 +72,7 @@ type HomeSessionSearchSource = Pick<HomeSessionsController, "data" | "session">
 export function createHomeSessionSearchController(home: HomeController, sessions: HomeSessionSearchSource) {
   const command = useCommand()
   const language = useLanguage()
+  const sessionGroups = useSessionGroups()
   const [state, setState] = createStore({
     value: "",
     focused: false,
@@ -91,6 +95,17 @@ export function createHomeSessionSearchController(home: HomeController, sessions
     () => new Map(home.project.list().flatMap((project) => (project.id ? [[project.id, project] as const] : []))),
   )
 
+  // Build a map from session ID to group name for search result enrichment
+  const sessionGroupMap = createMemo(() => {
+    const map = new Map<string, string>()
+    for (const group of sessionGroups.list()) {
+      for (const sessionId of group.sessionIds) {
+        map.set(sessionId, group.name)
+      }
+    }
+    return map
+  })
+
   const hits = createMemo(() => {
     const sessionsHit: HomeSearchHit[] = state.sessions.map((session) => {
       const project = projectFor(session)
@@ -100,6 +115,7 @@ export function createHomeSessionSearchController(home: HomeController, sessions
         session,
         project,
         projectName: displayName(project),
+        groupName: sessionGroupMap().get(session.id),
       }
     })
     const messagesHit: HomeSearchHit[] = state.messages.map((message) => {
@@ -112,6 +128,7 @@ export function createHomeSessionSearchController(home: HomeController, sessions
         session,
         project,
         projectName: displayName(project),
+        groupName: sessionGroupMap().get(message.sessionID),
         segments: splitHighlight(message.snippet, message.matchedTerms),
       }
     })

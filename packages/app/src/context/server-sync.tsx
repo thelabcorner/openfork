@@ -205,6 +205,10 @@ function makeQueryOptionsApi(
       loadMcpResourcesQuery(scope, directory, serverAPI.mcp, sdkFor(directory), protocol),
     lsp: (directory: PathKey) => loadLspQuery(scope, directory, sdkFor(directory)),
     sessions: (directory: PathKey) => ({ queryKey: [scope, directory, "loadSessions"] as const }),
+    // No tool-def query is registered today (tool calls render from streamed ToolParts), but the
+    // query key is the contract `tool.reloaded` invalidates so a future /experimental/tool fetch
+    // returns fresh data (tool-hot-reload §3.4).
+    tools: (directory: PathKey) => ({ queryKey: [scope, directory, "loadTools"] as const }),
   }
 }
 export type QueryOptionsApi = ReturnType<typeof makeQueryOptionsApi>
@@ -550,6 +554,25 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     homeSessions.refresh(event.type)
     if (eventType === "integration.connection.updated") void refreshProviders()
 
+    const groupScope = `session-groups:${ServerConnection.key(serverSDK.server)}`
+    if (
+      eventType === "session_group.created" ||
+      eventType === "session_group.updated" ||
+      eventType === "session_group.deleted"
+    ) {
+      void queryClient.invalidateQueries({ queryKey: [groupScope, "session-groups"] })
+    }
+    if (
+      eventType === "session_group.session.added" ||
+      eventType === "session_group.session.removed"
+    ) {
+      void queryClient.invalidateQueries({ queryKey: [groupScope, "session-groups"] })
+      const groupId = (event.properties as { groupId?: string } | undefined)?.groupId
+      if (groupId) {
+        void queryClient.invalidateQueries({ queryKey: [groupScope, "session-group", groupId] })
+      }
+    }
+
     if (directory === "global") {
       if (eventType === "server.connected" && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
         void activeSessionsQuery.refetch()
@@ -603,6 +626,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       queue.push(key)
     if (eventType === "mcp.status.changed") void queryClient.invalidateQueries(queryOptionsApi.mcp(key))
     if (eventType === "mcp.resources.changed") void queryClient.invalidateQueries(queryOptionsApi.mcpResources(key))
+    if (eventType === "tool.reloaded") void queryClient.invalidateQueries(queryOptionsApi.tools(key))
     const [store, setStore] = existing
     applyDirectoryEvent({
       event,

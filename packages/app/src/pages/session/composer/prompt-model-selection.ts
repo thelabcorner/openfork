@@ -76,6 +76,23 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
     },
     visible: models.visible,
     setVisibility: models.setVisibility,
+    favorite: {
+      isFavorite: models.favorite.isFavorite,
+      toggle: models.favorite.toggle,
+    },
+    subProvider: {
+      current() {
+        const model = current()
+        if (!model) return
+        return models.subProvider.get({ providerID: model.provider.id, modelID: model.id })
+      },
+      get(item: ModelKey) {
+        return models.subProvider.get({ providerID: item.providerID, modelID: item.modelID })
+      },
+      set(item: ModelKey, value: string | undefined) {
+        models.subProvider.set({ providerID: item.providerID, modelID: item.modelID }, value)
+      },
+    },
     variant: {
       configured() {
         const item = input.agent()

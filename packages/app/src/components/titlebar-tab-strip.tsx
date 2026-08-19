@@ -7,9 +7,9 @@ import { Accessibility, AutoScroller, Feedback, PointerActivationConstraints } f
 import { RestrictToHorizontalAxis } from "@dnd-kit/abstract/modifiers"
 import { RestrictToElement } from "@dnd-kit/dom/modifiers"
 import { arrayMove } from "@dnd-kit/helpers"
-import { tabHref, tabKey, type SessionTab, type Tab } from "@/context/tabs"
+import { tabHref, tabKey, type GroupTab, type SessionTab, type Tab } from "@/context/tabs"
 import { ServerConnection } from "@/context/server"
-import { DraftTabItem, TabNavItem } from "@/components/titlebar-tab-nav"
+import { DraftTabItem, GroupTabNavItem, TabNavItem } from "@/components/titlebar-tab-nav"
 import { TitlebarTabContextMenu } from "@/components/titlebar-tab-context-menu"
 import { useGlobal, type ServerCtx } from "@/context/global"
 import { useLanguage } from "@/context/language"
@@ -31,6 +31,7 @@ function SessionTabSlot(props: {
   session: () => Session | undefined
   fallbackTitle?: string
   onRename: (title: string) => Promise<void>
+  onPrefetch: () => void
   onNavigate: (element: HTMLDivElement) => void
   onClose: () => void
 }) {
@@ -51,6 +52,7 @@ function SessionTabSlot(props: {
       data-tab-key={props.id}
       data-active={props.active()}
       class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
+      onPointerEnter={props.onPrefetch}
     >
       <TitlebarTabContextMenu id={props.id} session={props.session} server={props.tab.server}>
         <TabNavItem
@@ -91,6 +93,7 @@ function SessionTabEntry(props: {
   const persisted = createMemo(() => tabs.info[props.id])
   const [loadedSession] = createResource(
     () => {
+      if (!props.active()) return null
       const ctx = props.serverCtx()
       return ctx ? { id: props.tab.sessionId, ctx } : null
     },
@@ -100,6 +103,16 @@ function SessionTabEntry(props: {
   const missingSession = createMemo(() => !!props.serverCtx() && !loadedSession.loading && !session())
   const visible = createMemo(() => !!session() || missingSession() || !!persisted()?.title)
   let prefetched = false
+  let hoverPrefetchStarted = false
+
+  const prefetch = () => {
+    if (props.active() || hoverPrefetchStarted) return
+    const ctx = props.serverCtx()
+    const value = session()
+    if (!ctx || !value) return
+    hoverPrefetchStarted = true
+    void ctx.sync.ensureDirSyncContext(value.directory).session.prefetch(value.id, 20).catch(() => {})
+  }
 
   const rename = async (title: string) => {
     const value = session()
@@ -123,6 +136,7 @@ function SessionTabEntry(props: {
   createEffect(() => props.onVisibleChange(visible()))
 
   createEffect(() => {
+    if (!props.active()) return
     const ctx = props.serverCtx()
     const value = session()
     if (!ctx || !value || prefetched) return
@@ -158,6 +172,7 @@ function SessionTabEntry(props: {
         session={session}
         fallbackTitle={persisted()?.title ?? (missingSession() ? language.t("session.tab.unknown") : undefined)}
         onRename={rename}
+        onPrefetch={prefetch}
         onNavigate={props.onNavigate}
         onClose={props.onClose}
       />
@@ -206,6 +221,93 @@ function DraftTabSlot(props: {
         />
       </TitlebarTabContextMenu>
     </div>
+  )
+}
+
+function GroupTabSlot(props: {
+  tab: GroupTab
+  id: string
+  index: () => number
+  active: () => boolean
+  title: string
+  sessionCount: number
+  sessions?: { title: string; project?: string }[]
+  onNavigate: (element: HTMLDivElement) => void
+  onClose: () => void
+}) {
+  const sortable = useSortable({
+    get id() {
+      return props.id
+    },
+    get index() {
+      return props.index()
+    },
+  })
+  let ref!: HTMLDivElement
+
+  return (
+    <div
+      ref={sortable.ref}
+      data-titlebar-tab-slot
+      data-tab-key={props.id}
+      data-active={props.active()}
+      class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
+    >
+      <TitlebarTabContextMenu id={props.id} isGroup groupId={props.tab.groupId} server={props.tab.server}>
+        <GroupTabNavItem
+          ref={(el) => {
+            ref = el
+          }}
+          href={tabHref(props.tab)}
+          tab={props.tab}
+          title={props.title}
+          sessionCount={props.sessionCount}
+          sessions={props.sessions}
+          onNavigate={() => props.onNavigate(ref)}
+          onClose={props.onClose}
+          active={props.active()}
+          dragging={sortable.isDragSource()}
+        />
+      </TitlebarTabContextMenu>
+    </div>
+  )
+}
+
+function GroupTabEntry(props: {
+  tab: GroupTab
+  id: string
+  index: () => number
+  active: () => boolean
+  serverCtx: () => ServerCtx | undefined
+  onVisibleChange: (visible: boolean) => void
+  onNavigate: (element: HTMLDivElement) => void
+  onClose: () => void
+}) {
+  const tabs = useTabs()
+  const language = useLanguage()
+
+  const title = createMemo(() => {
+    const key = tabKey(props.tab)
+    return tabs.info[key]?.title ?? language.t("sessionGroup.name.placeholder")
+  })
+
+  const sessionCount = createMemo(() => 0)
+  const sessions = createMemo(() => undefined as { title: string; project?: string }[] | undefined)
+
+  createEffect(() => props.onVisibleChange(true))
+
+  return (
+    <GroupTabSlot
+      tab={props.tab}
+      id={props.id}
+      index={props.index}
+      active={props.active}
+      title={title()}
+      sessionCount={sessionCount()}
+      sessions={sessions()}
+      onNavigate={props.onNavigate}
+      onClose={props.onClose}
+    />
   )
 }
 
@@ -353,6 +455,24 @@ export function TitlebarTabStrip(props: {
                       index={visibleIndex}
                       active={() => props.currentTab() === tab}
                       forceTruncate={props.forceTruncate}
+                      serverCtx={serverCtx}
+                      onVisibleChange={(visible) => setVisibility(id, visible)}
+                      onNavigate={(element) => {
+                        ref = element
+                        props.onNavigate(tab, element)
+                      }}
+                      onClose={() => props.onClose(tab)}
+                    />
+                  )
+                }
+
+                if (tab.type === "group") {
+                  return (
+                    <GroupTabEntry
+                      tab={tab}
+                      id={id}
+                      index={visibleIndex}
+                      active={() => props.currentTab() === tab}
                       serverCtx={serverCtx}
                       onVisibleChange={(visible) => setVisibility(id, visible)}
                       onNavigate={(element) => {

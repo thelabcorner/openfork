@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, onCleanup, Show, type Ref } from "solid-js"
+import { createEffect, createMemo, createSignal, For, onCleanup, Show, type Ref } from "solid-js"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { createMutation } from "@tanstack/solid-query"
@@ -10,10 +10,11 @@ import { ServerConnection, serverName } from "@/context/server"
 import { displayName, projectForSession } from "@/pages/layout/helpers"
 import { SessionTabAvatar } from "@/pages/layout/session-tab-avatar"
 import type { Session } from "@opencode-ai/sdk/v2"
+import type { GroupTab } from "@/context/tabs"
 import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
 import { sessionApiOf } from "./titlebar-tab-actions"
 import { tabSessionState } from "./titlebar-tab-state"
-import { TabPreviewPopover } from "./titlebar-tab-popover"
+import { TabPreviewPopover, type TabPreviewData } from "./titlebar-tab-popover"
 import "./titlebar-tab-nav.css"
 
 // MouseEvent.button uses 1 for the middle/wheel button.
@@ -459,5 +460,121 @@ export function DraftTabItem(props: {
         />
       </div>
     </div>
+  )
+}
+
+export function GroupTabNavItem(props: {
+  ref?: Ref<HTMLDivElement>
+  href: string
+  tab: GroupTab
+  title: string
+  sessionCount: number
+  sessions?: { title: string; project?: string }[]
+  onClose: () => void
+  onNavigate: () => void
+  active?: boolean
+  suppressNavigation?: () => boolean
+  dragging?: boolean
+  pressed?: boolean
+  hidden?: boolean
+}) {
+  const language = useLanguage()
+  const closeTab = (event: MouseEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    props.onClose()
+  }
+  const [popoverOpen, setPopoverOpen] = createSignal(false)
+  const previewBlocked = () => !!props.dragging || !!props.pressed
+
+  const tab = (
+    <div
+      ref={(el) => forwardTabRef(props.ref, el)}
+      data-titlebar-tab
+      data-slot="titlebar-tab-item"
+      data-active={props.active}
+      data-dragging={props.dragging}
+      data-state={props.active || props.pressed ? "pressed" : undefined}
+      class="group relative flex h-7 w-full min-w-0 flex-row items-center gap-1.5 overflow-hidden rounded-[6px] px-1.5 [container-type:inline-size] whitespace-nowrap"
+      classList={{ invisible: props.hidden }}
+      onMouseDown={(event) => {
+        if (event.button !== MIDDLE_MOUSE_BUTTON) return
+        event.preventDefault()
+        event.stopPropagation()
+      }}
+      onAuxClick={(event) => {
+        if (event.button !== MIDDLE_MOUSE_BUTTON) return
+        closeTab(event)
+      }}
+    >
+      <a
+        data-slot="tab-link"
+        data-titlebar-tab-link
+        href={props.href}
+        draggable={false}
+        onDragStart={(event) => {
+          event.preventDefault()
+          event.stopPropagation()
+        }}
+        onMouseDown={(event) => {
+          if (event.button !== 0) return
+          if (props.suppressNavigation?.()) return
+          props.onNavigate()
+        }}
+        onClick={(event) => {
+          event.preventDefault()
+          if (event.detail > 0) return
+          if (props.suppressNavigation?.()) return
+          props.onNavigate()
+        }}
+        class="flex h-full min-w-0 flex-1 flex-row items-center gap-1.5 text-[13px] font-medium text-v2-text-text-faint group-data-[active='true']:text-v2-text-text-base [-webkit-user-drag:none]"
+      >
+        <span class="flex size-4 shrink-0 items-center justify-center">
+          <IconV2 name="layers" class="text-v2-icon-icon-muted" />
+        </span>
+        <span
+          data-titlebar-tab-title
+          class="min-w-0 flex-1 overflow-hidden text-clip whitespace-nowrap outline-none leading-4"
+        >
+          {props.title}
+        </span>
+        <span class="rounded-full bg-v2-background-bg-layer-03 px-1.5 py-px text-[10px] text-v2-text-text-faint">
+          {props.sessionCount}
+        </span>
+      </a>
+      <div data-slot="tab-close">
+        <IconButtonV2
+          size="small"
+          variant="ghost-muted"
+          onPointerDown={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+          }}
+          onMouseDown={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+          }}
+          class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100 group-data-[editing=true]:opacity-100"
+          onClick={closeTab}
+          icon={<IconV2 name="xmark-small" />}
+          aria-label={language.t("common.closeTab")}
+        />
+      </div>
+    </div>
+  )
+
+  return (
+    <TabPreviewPopover
+      trigger={tab}
+      open={popoverOpen() && !previewBlocked()}
+      onOpenChange={(value) => {
+        if (value && previewBlocked()) return
+        setPopoverOpen(value)
+      }}
+      data={{
+        title: props.title,
+        groupSessions: props.sessions,
+      }}
+    />
   )
 }

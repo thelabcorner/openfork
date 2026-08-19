@@ -296,6 +296,20 @@ describe("tab batch close", () => {
     expect(navigateCalls.length).toBe(before)
   })
 
+  test("close-all with a large batch empties the store in a single update", async () => {
+    const many = Array.from({ length: 60 }, (_, i) => sessionTab(String(i)))
+    mount({ tabs: many })
+    tabs.select(sessionTab("30"))
+    const before = navigateCalls.length
+    tabs.closeAllTabs()
+    await flush()
+
+    expect(tabs.store).toHaveLength(0)
+    // exactly one navigation for the whole batch, not one per closed tab
+    expect(navigateCalls.length).toBe(before + 1)
+    expect(navigateCalls.at(-1)).toBe("/")
+  })
+
   test("close-others with the anchor tab active keeps the anchor", async () => {
     mount({ tabs: [sessionTab("a"), sessionTab("b"), sessionTab("c")] })
     const before = navigateCalls.length

@@ -136,11 +136,12 @@ export const DialogManageModelsV2: Component = () => {
   const setModelVisibility = (item: ModelItem, checked: boolean) => {
     local.model.setVisibility({ modelID: item.id, providerID: item.provider.id }, checked)
   }
+  const modelCost = (item: ModelItem) => item.cost.input + item.cost.output
   const list = useFilteredList<ModelItem>({
     items: () => local.model.list(),
     key: (x) => `${x.provider.id}:${x.id}`,
     filterKeys: ["provider.name", "name", "id"],
-    sortBy: (a, b) => a.name.localeCompare(b.name),
+    sortBy: (a, b) => modelCost(a) - modelCost(b) || a.name.localeCompare(b.name),
     groupBy: (x) => x.provider.id,
     sortGroupsBy: (a, b) => {
       const aRank = popularProviders.indexOf(a.category)
@@ -165,7 +166,7 @@ export const DialogManageModelsV2: Component = () => {
         </ButtonV2>
       </DialogHeader>
       <DialogBody class="flex min-h-0 flex-1 flex-col">
-        <div class="px-4 pt-px pb-3">
+        <div class="px-4 pt-px pb-2">
           <div class="relative">
             <TextInputV2
               type="search"
@@ -195,7 +196,7 @@ export const DialogManageModelsV2: Component = () => {
           </div>
         </div>
         <div data-slot="manage-models-scroll" class="relative min-h-0 flex-1">
-          <div class="settings-v2-panel settings-v2-models h-full px-4 pt-4 pb-4">
+          <div class="settings-v2-panel settings-v2-models h-full px-4 pt-2 pb-3">
             <Show
               when={!list.grouped.loading}
               fallback={
@@ -221,7 +222,7 @@ export const DialogManageModelsV2: Component = () => {
                     <div class="settings-v2-section" data-component="settings-models-provider">
                       <div class="settings-v2-models-group-header justify-between">
                         <div class="flex min-w-0 items-center gap-2">
-                          <ProviderIcon id={group.category} width={16} height={16} class="ml-4 shrink-0" />
+                          <ProviderIcon id={group.category} width={14} height={14} class="ml-3 shrink-0" />
                           <h3 class="settings-v2-section-title">{group.items[0].provider.name}</h3>
                         </div>
                         <div>

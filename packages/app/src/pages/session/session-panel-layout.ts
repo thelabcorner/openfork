@@ -1,11 +1,12 @@
 export function sessionPanelLayout(input: {
-  review: boolean
   terminal: boolean
   files: boolean
-  browser: boolean
+  context: boolean
+  usage?: boolean
+  models?: boolean
 }) {
   return {
-    visible: input.review || input.terminal || input.files || input.browser,
-    stacked: input.review && input.terminal,
+    visible: input.terminal || input.files || input.context || input.usage === true || input.models === true,
+    stacked: false,
   }
 }

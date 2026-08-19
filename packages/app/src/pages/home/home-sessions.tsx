@@ -45,6 +45,21 @@ export function HomeSessions(props: {
       onSearchSelectActive={props.search.result.selectActive}
       onSearchHighlight={props.search.result.highlight}
       onSearchSelect={props.search.result.select}
+      onCreateGroup={props.sessions.group.create}
+      onAddToGroup={props.sessions.group.addSession}
+      onRemoveFromGroup={props.sessions.group.removeFromAll}
+      onRenameGroup={props.sessions.group.rename}
+      onDeleteGroup={props.sessions.group.remove}
+       onOpenGroupTab={props.sessions.group.openTab}
+       onGroupSelected={props.sessions.group.groupSelected}
+       selectedCount={props.sessions.selection.count}
+       isSelected={props.sessions.selection.isSelected}
+       onToggleSelection={props.sessions.selection.toggle}
+       onClearSelection={props.sessions.selection.clear}
+       onToggleGroupCollapsed={props.sessions.group.toggleCollapsed}
+      isGroupCollapsed={props.sessions.group.isCollapsed}
+      groupForSession={props.sessions.group.groupForSession}
+      userGroups={props.sessions.group.userGroups}
     />
   )
 }

@@ -321,6 +321,27 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
       setVisibility(item: ModelKey, visible: boolean) {
         models.setVisibility(item, visible)
       },
+      favorite: {
+        isFavorite(item: ModelKey) {
+          return models.favorite.isFavorite(item)
+        },
+        toggle(item: ModelKey) {
+          models.favorite.toggle(item)
+        },
+      },
+      subProvider: {
+        current() {
+          const model = current()
+          if (!model) return
+          return models.subProvider.get({ providerID: model.provider.id, modelID: model.id })
+        },
+        get(item: ModelKey) {
+          return models.subProvider.get({ providerID: item.providerID, modelID: item.modelID })
+        },
+        set(item: ModelKey, value: string | undefined) {
+          models.subProvider.set({ providerID: item.providerID, modelID: item.modelID }, value)
+        },
+      },
       variant: {
         configured,
         selected,

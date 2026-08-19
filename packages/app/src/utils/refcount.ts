@@ -1,4 +1,4 @@
-import { onCleanup } from "solid-js"
+import { getOwner, onCleanup } from "solid-js"
 
 export function createRefCountMap<T>(
   create: (key: string) => T,
@@ -10,14 +10,16 @@ export function createRefCountMap<T>(
 
   return (key: string) => {
     const id = identity(key)
-    onCleanup(() => {
-      refCounts.set(id, (refCounts.get(id) ?? 0) - 1)
-      if (refCounts.get(id) === 0) {
-        remove?.(id)
-        items.delete(id)
-        refCounts.delete(id)
-      }
-    })
+    if (getOwner()) {
+      onCleanup(() => {
+        refCounts.set(id, (refCounts.get(id) ?? 0) - 1)
+        if (refCounts.get(id) === 0) {
+          remove?.(id)
+          items.delete(id)
+          refCounts.delete(id)
+        }
+      })
+    }
 
     const cached = items.get(id)
     if (cached) {

@@ -191,6 +191,10 @@ export const DESKTOP_MENU: DesktopMenu[] = [
         accelerator: { macos: "Ctrl+`" },
       },
       { type: "item", labelKey: "desktop.menu.toggleFileTree", command: "fileTree.toggle" },
+      { type: "item", labelKey: "desktop.menu.toggleProjectExplorer", command: "projectExplorer.toggle" },
+      { type: "item", labelKey: "desktop.menu.toggleContext", command: "context.toggle" },
+      { type: "item", labelKey: "desktop.menu.toggleUsage", command: "usage.toggle" },
+      { type: "item", labelKey: "desktop.menu.toggleModelList", command: "models.toggle" },
       { type: "separator" },
       { type: "item", labelKey: "desktop.menu.reload", action: "view.reload", role: "reload" },
       {

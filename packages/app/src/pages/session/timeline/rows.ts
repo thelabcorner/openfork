@@ -2,6 +2,7 @@ import { parseCommentNote, readCommentMetadata } from "@/utils/comment-note"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
 import { AssistantMessage, Part, SessionStatus, UserMessage } from "@opencode-ai/sdk/v2"
 import { groupParts, renderable, type PartGroup } from "@opencode-ai/session-ui/message-part"
+import { estimateMarkdownHeight, MARKDOWN_WIDTH_FALLBACK } from "@/pages/session/v2/project-explorer-markdown-height"
 import { TimelineRow, type SummaryDiff } from "./timeline-row"
 import { uniqueSummaryDiffs } from "./summary-diffs"
 import { compareMessages } from "@/utils/session-message"
@@ -25,6 +26,7 @@ export type TimelineRowMap = {
     userMessageID: string
     group: PartGroup
     previousAssistantPart: boolean
+    heightHint?: number
   }
   Thinking: { userMessageID: string; reasoningHeading?: string }
   Retry: { userMessageID: string }
@@ -33,6 +35,8 @@ export type TimelineRowMap = {
 }
 
 export namespace Timeline {
+  export type TurnGroup = { user: UserMessage; assistants: AssistantMessage[] }
+
   export function constructSessionMessageRows(
     messages: SessionMessageInfo[],
     getMessage: (messageID: string) => UserMessage | AssistantMessage | undefined,
@@ -42,7 +46,34 @@ export namespace Timeline {
     inlineComments: boolean,
     projectedUserMessages: UserMessage[],
   ) {
-    const turns: { user: UserMessage; assistants: AssistantMessage[] }[] = []
+    const { activeMessageID, turns } = groupTurns(messages, getMessage, projectedUserMessages)
+    return {
+      activeMessageID,
+      rows: turns.flatMap((turn, index) =>
+        constructMessageRows(
+          turn.user,
+          getMessageParts,
+          turn.assistants,
+          index,
+          showReasoning,
+          status,
+          turn.user.id === activeMessageID,
+          inlineComments,
+        ),
+      ),
+    }
+  }
+
+  // Pure grouping pass: which assistant messages belong to which user-message turn, and
+  // in what order. Deliberately excludes row CONSTRUCTION (groupParts/markdown estimation/
+  // comment parsing) so callers that only need turn membership (e.g. a per-turn reactive
+  // cache) don't pay for reprocessing every turn's content on every message-list change.
+  export function groupTurns(
+    messages: SessionMessageInfo[],
+    getMessage: (messageID: string) => UserMessage | AssistantMessage | undefined,
+    projectedUserMessages: UserMessage[],
+  ) {
+    const turns: TurnGroup[] = []
     const turnByUserID = new Map<string, (typeof turns)[number]>()
     messages.forEach((message) => {
       const projected = getMessage(message.id)
@@ -72,30 +103,34 @@ export namespace Timeline {
       turns.push(turn)
       turnByUserID.set(user.id, turn)
     })
+    const missingTurns: typeof turns = []
     projectedUserMessages.forEach((user) => {
       if (turnByUserID.has(user.id)) return
       const turn = { user, assistants: [] }
-      const index = turns.findIndex((item) => compareMessages(user, item.user) < 0)
-      if (index < 0) turns.push(turn)
-      if (index >= 0) turns.splice(index, 0, turn)
+      missingTurns.push(turn)
       turnByUserID.set(user.id, turn)
     })
-    const activeMessageID = turns.at(-1)?.user.id
-    return {
-      activeMessageID,
-      rows: turns.flatMap((turn, index) =>
-        constructMessageRows(
-          turn.user,
-          getMessageParts,
-          turn.assistants,
-          index,
-          showReasoning,
-          status,
-          turn.user.id === activeMessageID,
-          inlineComments,
-        ),
-      ),
+    if (missingTurns.length > 0) {
+      // Merge separately loaded projected messages in linear time. Repeated
+      // findIndex/splice made large history hydration quadratic.
+      missingTurns.sort((left, right) => compareMessages(left.user, right.user))
+      const merged: typeof turns = []
+      let existingIndex = 0
+      let missingIndex = 0
+      while (existingIndex < turns.length || missingIndex < missingTurns.length) {
+        const existing = turns[existingIndex]
+        const missing = missingTurns[missingIndex]
+        if (!existing || (missing && compareMessages(missing.user, existing.user) < 0)) {
+          merged.push(missingTurns[missingIndex++]!)
+          continue
+        }
+        merged.push(existing)
+        existingIndex += 1
+      }
+      turns.splice(0, turns.length, ...merged)
     }
+    const activeMessageID = turns.at(-1)?.user.id
+    return { activeMessageID, turns }
   }
 
   export function constructMessageRows(
@@ -125,6 +160,7 @@ export namespace Timeline {
         .filter((part) => renderable(part, showReasoning))
         .map((part) => ({ messageID: message.id, messageIndex, part })),
     )
+    const partByRef = new Map(assistantPartRefs.map((ref) => [`${ref.messageID}:${ref.part.id}` as const, ref.part]))
     const assistantItems =
       interrupted && !compaction
         ? [
@@ -169,6 +205,12 @@ export namespace Timeline {
     }
 
     let assistantGroupIndex = 0
+    // The hint is a PRE-MOUNT prior. A streaming turn's part text grows with
+    // every delta; attaching the changing hint to its rows would break row
+    // equality (the hint is the only text-derived field) and replace/remount
+    // the markdown element mid-stream. Same workingTurn predicate as
+    // message-timeline: skip the hint while the active turn is not idle.
+    const workingTurn = isActive && status !== "idle"
     assistantItems.forEach((item) => {
       if (item.type === "interrupted") {
         rows.push(
@@ -180,11 +222,15 @@ export namespace Timeline {
         return
       }
 
+      const heightHint = workingTurn ? undefined : markdownRowHeightHint(item.group, partByRef)
       rows.push(
         new TimelineRow.AssistantPart({
           userMessageID: userMessage.id,
           group: item.group,
           previousAssistantPart: assistantGroupIndex > 0,
+          // Omit the hint when absent so row equality is byte-identical to the
+          // un-flagged build (flag "off" / working turn / non-markdown parts).
+          ...(heightHint === undefined ? {} : { heightHint }),
         }),
       )
       assistantGroupIndex += 1
@@ -315,6 +361,13 @@ export namespace Timeline {
 
   function record(value: unknown): value is Record<string, unknown> {
     return !!value && typeof value === "object" && !Array.isArray(value)
+  }
+
+  function markdownRowHeightHint(group: PartGroup, partByRef: Map<string, Part>) {
+    if (group.type !== "part") return
+    const part = partByRef.get(`${group.ref.messageID}:${group.ref.partID}`)
+    if (part?.type !== "text") return
+    return estimateMarkdownHeight(part.text, MARKDOWN_WIDTH_FALLBACK)
   }
 }
 

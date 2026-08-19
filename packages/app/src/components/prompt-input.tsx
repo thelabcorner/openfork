@@ -217,17 +217,8 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       schedule(attempts)
     }
 
-    const wantsReview = item.commentOrigin === "review" || (item.commentOrigin !== "file" && commentInReview(item.path))
-    if (wantsReview) {
-      if (!props.controls.session.reviewPanel.opened()) props.controls.session.reviewPanel.open()
-      layout.fileTree.setTab("changes")
-      tabs().setActive("review")
-      queueCommentFocus()
-      return
-    }
-
-    if (!props.controls.session.reviewPanel.opened()) props.controls.session.reviewPanel.open()
-    layout.fileTree.setTab("all")
+    const wantsChanges = item.commentOrigin === "review" || (item.commentOrigin !== "file" && commentInReview(item.path))
+    layout.fileTree.setTab(wantsChanges ? "changes" : "all")
     const tab = files.tab(item.path)
     void tabs().open(tab)
     tabs().setActive(tab)
@@ -1192,11 +1183,22 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const variants = createMemo(() => ["default", ...props.controls.model.selection.variant.list()])
   // Check provider variants directly: `variants` also includes the UI-only default option.
   const showVariantControl = createMemo(() => props.controls.model.selection.variant.list().length > 0)
+  // See prompt-input-v2.tsx's identical draft-scoped flag for why the
+  // no-session case doesn't bind to permission.isAutoAcceptingDirectory.
+  const [draftAutoAccept, setDraftAutoAccept] = createSignal(false)
   const accepting = createMemo(() => {
     const id = props.controls.session.id
-    if (!id) return permission.isAutoAcceptingDirectory(sdk().directory)
+    if (!id) return draftAutoAccept()
     return permission.isAutoAccepting(id, sdk().directory)
   })
+  const toggleAutoAccept = () => {
+    const id = props.controls.session.id
+    if (!id) {
+      setDraftAutoAccept((value) => !value)
+      return
+    }
+    permission.toggleAutoAccept(id, sdk().directory)
+  }
 
   const { abort, handleSubmit } =
     props.submission ??
@@ -1781,6 +1783,31 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                         </TooltipKeybind>
                       </div>
                     </Show>
+                    <TooltipV2
+                      placement="top"
+                      gutter={4}
+                      value={
+                        accepting()
+                          ? language.t("command.permissions.autoaccept.disable")
+                          : language.t("command.permissions.autoaccept.enable")
+                      }
+                    >
+                      <IconButtonV2
+                        type="button"
+                        data-action="prompt-permissions-autoaccept"
+                        variant="ghost-muted"
+                        size="large"
+                        aria-pressed={accepting()}
+                        aria-label={
+                          accepting()
+                            ? language.t("command.permissions.autoaccept.disable")
+                            : language.t("command.permissions.autoaccept.enable")
+                        }
+                        classList={{ "!text-v2-state-fg-warning": accepting() }}
+                        icon={<IconV2 name={accepting() ? "shield-check" : "shield"} />}
+                        onClick={toggleAutoAccept}
+                      />
+                    </TooltipV2>
                   </Show>
                 </Show>
               </div>

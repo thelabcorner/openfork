@@ -87,6 +87,10 @@ const openExternal: Platform["openExternal"] = (value) => {
   window.open(url.href, "_blank", "noopener,noreferrer")
 }
 
+const refresh: Platform["refresh"] = async () => {
+  window.location.reload()
+}
+
 const restart: Platform["restart"] = async () => {
   window.location.reload()
 }
@@ -121,6 +125,7 @@ const platform: Platform = {
   draftStore: createBrowserDraftStore(),
   version: pkg.version,
   openExternal,
+  refresh,
   restart,
   notify,
   getDefaultServer: async () => {

@@ -1,5 +1,5 @@
 import type { Message, UserMessage } from "@opencode-ai/sdk/v2"
-import { createMemo, createResource, onCleanup, untrack, type Accessor } from "solid-js"
+import { createEffect, createMemo, createResource, on, onCleanup, untrack, type Accessor } from "solid-js"
 import { useServerSync } from "@/context/server-sync"
 import { useSync } from "@/context/sync"
 import { same } from "@/utils/same"
@@ -15,6 +15,16 @@ export function createTimelineModel(input: {
   const sync = useSync()
   let refreshFrame: number | undefined
   let refreshTimer: number | undefined
+
+  createEffect(
+    on(input.sessionID, (id, previous) => {
+      if (previous && previous !== id) sync().session.release(previous)
+    }),
+  )
+  onCleanup(() => {
+    const id = input.sessionID()
+    if (id) sync().session.release(id)
+  })
 
   const [resource] = createResource(
     () => input.sessionID(),
@@ -33,7 +43,7 @@ export function createTimelineModel(input: {
           untrack(() => {
             if (stale) void sync().session.sync(id, { force: true })
           })
-        }, 0)
+        }, 500)
       })
 
       return sync().session.sync(id)

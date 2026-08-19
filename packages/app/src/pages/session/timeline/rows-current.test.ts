@@ -1,6 +1,7 @@
 import { describe, expect, mock, test } from "bun:test"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
 import { normalizeSessionMessages } from "@/utils/session-message"
+import type { TimelineRow as TimelineRowNS } from "./rows"
 
 mock.module("@opencode-ai/session-ui/message-part", () => ({
   renderable: () => true,
@@ -10,6 +11,17 @@ mock.module("@opencode-ai/session-ui/message-part", () => ({
       key: ref.part.id,
       ref: { messageID: ref.messageID, partID: ref.part.id },
     })),
+}))
+
+// rows.ts now imports the markdown-height predictor, which imports the shared
+// text-layout lib (pretext-timeline workstream). Stub the lib so this suite
+// runs before it lands; the flag defaults to "off" (no hint computed), and the
+// gating test below flips it to "pretext" to observe the hint.
+let textLayoutModeValue: "off" | "prior" | "pretext" = "off"
+mock.module("@/lib/text-layout", () => ({
+  estimateTextHeight: (text: string) => (text ? 100 : undefined),
+  prepareTextLayout: () => undefined,
+  textLayoutMode: () => textLayoutModeValue,
 }))
 
 const { Timeline, TimelineRow } = await import("./rows")
@@ -203,5 +215,55 @@ describe("current session timeline rows", () => {
     )
 
     expect(result.rows.map((row) => row._tag)).toEqual(["UserMessage", "AssistantPart"])
+  })
+
+  test("gates the markdown height hint on the working turn during streaming", () => {
+    const source = [
+      { id: "msg_user_1", type: "user", text: "first question", time: { created: 1 } },
+      {
+        id: "msg_assistant_1",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "first answer" }],
+        time: { created: 2, completed: 3 },
+      },
+      { id: "msg_user_2", type: "user", text: "second question", time: { created: 4 } },
+      {
+        id: "msg_assistant_2",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "second answer" }],
+        time: { created: 5 },
+      },
+    ] satisfies SessionMessageInfo[]
+    const normalized = normalizeSessionMessages("ses_1", source)
+    const messages = new Map(normalized.messages.map((message) => [message.id, message]))
+
+    textLayoutModeValue = "pretext"
+    try {
+      const result = Timeline.constructSessionMessageRows(
+        source,
+        (messageID) => messages.get(messageID),
+        (messageID) => normalized.parts.get(messageID) ?? [],
+        true,
+        "busy",
+        true,
+        normalized.messages.filter((message) => message.role === "user"),
+      )
+      const parts = result.rows.filter(
+        (row): row is Extract<TimelineRowNS.TimelineRow, { _tag: "AssistantPart" }> => row._tag === "AssistantPart",
+      )
+      expect(parts).toHaveLength(2)
+      // Completed (non-active) turn keeps the advisory pre-mount hint...
+      expect(parts[0]?.heightHint).toBeTypeOf("number")
+      // ...while the streaming (active + busy) turn omits it so row equality
+      // stays stable across part deltas — no markdown remount mid-stream
+      // (the pretext-timeline benchmark regression this gate fixes).
+      expect(parts[1]?.heightHint).toBeUndefined()
+    } finally {
+      textLayoutModeValue = "off"
+    }
   })
 })

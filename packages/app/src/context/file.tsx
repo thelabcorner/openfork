@@ -1,4 +1,4 @@
-import { batch, createEffect, createMemo, onCleanup } from "solid-js"
+import { createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { showToast } from "@/utils/toast"
@@ -26,6 +26,8 @@ import { useServerSDK } from "./server-sdk"
 import { SessionRouteKey, SessionStateKey } from "@/utils/server-scope"
 import { createFileTreeStore } from "./file/tree-store"
 import { invalidateFromWatcher } from "./file/watcher"
+import { createGitStatusStore } from "./file/git-status"
+import { normalizeFileTreeV2Path } from "@/components/file-tree-v2-model"
 import {
   selectionFromLines,
   type FileState,
@@ -45,6 +47,8 @@ export {
   setFileContentBytes,
   touchFileContent,
 }
+
+const WATCHER_TREE_REFRESH_DELAY_MS = 120
 
 function errorMessage(error: unknown, fallback: string) {
   if (error instanceof Error && error.message) return error.message
@@ -75,6 +79,13 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     }>({
       file: {},
     })
+    const watcherRefresh = {
+      disposed: false,
+      running: false,
+      timer: undefined as ReturnType<typeof setTimeout> | undefined,
+      queue: new Set<string>(),
+      stale: new Set<string>(),
+    }
 
     const tree = createFileTreeStore({
       scope,
@@ -82,6 +93,22 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       list: (dir) =>
         sdk()
           .client.file.list({ path: dir })
+          .then((x) => x.data ?? []),
+      onError: (message) => {
+        showToast({
+          variant: "error",
+          title: language.t("toast.file.listFailed.title"),
+          description: message,
+        })
+      },
+    })
+
+    const gitStatus = createGitStatusStore({
+      scope,
+      normalize: normalizeFileTreeV2Path,
+      fetchStatus: () =>
+        sdk()
+          .client.file.status()
           .then((x) => x.data ?? []),
       onError: (message) => {
         showToast({
@@ -108,12 +135,10 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
 
     createEffect(() => {
       scope()
+      tree.switchScope()
       inflight.clear()
       resetFileContentLru()
-      batch(() => {
-        setStore("file", reconcile({}))
-        tree.reset()
-      })
+      setStore("file", reconcile({}))
     })
 
     const viewCache = createFileViewCache(serverSDK().scope)
@@ -209,7 +234,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           {
             location: { directory: sdk().directory },
             query,
-            type: dirs === "true" ? "directory" : "file",
+            type: dirs === "true" ? undefined : "file",
             limit: options?.limit,
           },
           { signal: options?.signal },
@@ -222,19 +247,68 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           },
         )
 
+    const treeConsumerVisible = () => layout.fileTree.opened() || layout.projectExplorer.opened()
+
+    const drainWatcherRefreshQueue = () => {
+      if (watcherRefresh.disposed || watcherRefresh.running || watcherRefresh.timer) return
+      if (watcherRefresh.queue.size === 0) return
+
+      watcherRefresh.timer = setTimeout(() => {
+        watcherRefresh.timer = undefined
+        if (watcherRefresh.disposed) return
+
+        const next = watcherRefresh.queue.values().next().value
+        if (typeof next !== "string") return
+        watcherRefresh.queue.delete(next)
+
+        if (!treeConsumerVisible()) {
+          watcherRefresh.stale.add(next)
+          watcherRefresh.queue.forEach((dir) => watcherRefresh.stale.add(dir))
+          watcherRefresh.queue.clear()
+          return
+        }
+
+        watcherRefresh.running = true
+        void tree.listDir(next, { force: true }).finally(() => {
+          watcherRefresh.running = false
+          drainWatcherRefreshQueue()
+        })
+      }, WATCHER_TREE_REFRESH_DELAY_MS)
+    }
+
+    const refreshTreeDirFromWatcher = (dir: string) => {
+      if (!treeConsumerVisible()) {
+        watcherRefresh.stale.add(dir)
+        return
+      }
+      watcherRefresh.queue.add(dir)
+      drainWatcherRefreshQueue()
+    }
+
+    createEffect(() => {
+      if (!treeConsumerVisible()) return
+      // Only refresh dirs still loaded in the tree. Events that landed while the
+      // tree was hidden may reference dirs that were reset on a project switch;
+      // refreshing those would be wasted work and a burst of listDir calls.
+      for (const dir of watcherRefresh.stale) {
+        if (tree.isLoaded(dir)) watcherRefresh.queue.add(dir)
+      }
+      watcherRefresh.stale.clear()
+      drainWatcherRefreshQueue()
+    })
+
     const stop = sdk().event.listen((e) => {
       invalidateFromWatcher(e.details, {
         normalize: path.normalize,
-        hasFile: (file) => Boolean(store.file[file]),
+        hasFile: (file) => treeConsumerVisible() && Boolean(store.file[file]),
         isOpen: (file) => tabs.all().some((tab) => path.pathFromTab(tab) === file),
         loadFile: (file) => {
           void load(file, { force: true })
         },
         node: tree.node,
         isDirLoaded: tree.isLoaded,
-        refreshDir: (dir) => {
-          void tree.listDir(dir, { force: true })
-        },
+        refreshDir: refreshTreeDirFromWatcher,
+        onInvalidate: (file) => gitStatus.invalidate(file),
       })
     })
 
@@ -263,6 +337,16 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       withPath(input, (file) => view().setSelectedLines(file, range))
 
     onCleanup(() => {
+      watcherRefresh.disposed = true
+      if (watcherRefresh.timer) clearTimeout(watcherRefresh.timer)
+      watcherRefresh.queue.clear()
+      watcherRefresh.stale.clear()
+      gitStatus.dispose()
+      // FileProvider fully remounts on every navigation away from a session and back
+      // (e.g. via Home or a draft tab -- those routes don't share this provider tree).
+      // Save the current scope's tree into the module-level cache so the next mount for
+      // the same directory seeds warm instead of paying a full uncached re-list.
+      tree.persist()
       stop()
       viewCache.clear()
     })
@@ -277,8 +361,12 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         refresh: (input: string) => tree.listDir(input, { force: true }),
         state: tree.dirState,
         children: tree.children,
+        allNodes: tree.allNodes,
         expand: tree.expandDir,
         collapse: tree.collapseDir,
+        expandAll: tree.expandAll,
+        collapseAll: tree.collapseAll,
+        prewarm: tree.prewarm,
         toggle(input: string) {
           if (tree.dirState(input)?.expanded) {
             tree.collapseDir(input)
@@ -289,6 +377,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       },
       get,
       load,
+      gitStatus: gitStatus.status,
       scrollTop,
       scrollLeft,
       setScrollTop,

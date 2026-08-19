@@ -1,4 +1,4 @@
-import { type Accessor, type Component, createSignal, For, onCleanup, Show } from "solid-js"
+import { type Accessor, type Component, createSignal, For, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Dialog as DialogV2, DialogBody, DialogHeader, DialogTitleGroup } from "@opencode-ai/ui/v2/dialog-v2"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
@@ -10,6 +10,7 @@ import { useLanguage } from "@/context/language"
 import { useForkUsage } from "@/context/fork-usage"
 import { useServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
+import { useNow } from "@/hooks/use-now"
 import { showToast } from "@/utils/toast"
 import { ForkClient, type ForkServer } from "@/utils/fork-client"
 import { UsageBreakdownV2 } from "./usage-gauge-v2"
@@ -24,9 +25,7 @@ export const DialogCredentialSwitcherV2: Component<{
   const server = (): ForkServer => serverSDK().server.http
   const directory = () => props.directory?.()
 
-  const [now, setNow] = createSignal(Date.now())
-  const interval = window.setInterval(() => setNow(Date.now()), 30_000)
-  onCleanup(() => window.clearInterval(interval))
+  const now = useNow()
 
   const credentials = forkUsage.credentials
   const usage = forkUsage.usage
@@ -35,6 +34,19 @@ export const DialogCredentialSwitcherV2: Component<{
   const [confirmingRemove, setConfirmingRemove] = createSignal<string | undefined>()
   const [renameStore, setRenameStore] = createStore({ value: "" })
   const [addStore, setAddStore] = createStore({ open: false, key: "", label: "", error: undefined as string | undefined })
+
+  const COOLDOWN_MS = 30_000
+  const [lastRefreshedAt, setLastRefreshedAt] = createSignal(0)
+  const cooldownRemaining = () => Math.max(0, COOLDOWN_MS - (now() - lastRefreshedAt()))
+  const isCoolingDown = () => cooldownRemaining() > 0
+  const isRefreshing = () => usage.loading
+  const canRefresh = () => !isCoolingDown() && !isRefreshing()
+
+  const refreshUsage = () => {
+    if (!canRefresh()) return
+    setLastRefreshedAt(now())
+    forkUsage.refreshUsage()
+  }
 
   const refreshAll = async () => {
     forkUsage.refreshAll()
@@ -99,6 +111,46 @@ export const DialogCredentialSwitcherV2: Component<{
         <DialogTitleGroup
           title={language.t("dialog.credential.title")}
           description={language.t("dialog.credential.description")}
+        />
+        <IconButtonV2
+          type="button"
+          size="small"
+          variant="ghost-muted"
+          aria-label={language.t("browser.tab.refresh")}
+          title={language.t("browser.tab.refresh")}
+          disabled={!canRefresh()}
+          onClick={() => refreshUsage()}
+          icon={
+            <Show
+              when={isRefreshing()}
+              fallback={
+                <Show when={isCoolingDown()} fallback={
+                  <svg
+                    data-slot="icon-svg"
+                    width="14"
+                    height="14"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    xmlns="http://www.w3.org/2000/svg"
+                    aria-hidden="true"
+                  >
+                    <path d="M21 12a9 9 0 0 0-9-9 9.75 9.75 0 0 0-6.74 2.74L3 8" />
+                    <path d="M3 3v5h5" />
+                    <path d="M3 12a9 9 0 0 0 9 9 9.75 9.75 0 0 0 6.74-2.74L21 16" />
+                    <path d="M16 16h5v5" />
+                  </svg>
+                }>
+                  <span class="text-[10px] font-[560] leading-none tabular-nums">{Math.ceil(cooldownRemaining() / 1000)}</span>
+                </Show>
+              }
+            >
+              <Spinner class="size-3.5 shrink-0" />
+            </Show>
+          }
         />
       </DialogHeader>
       <DialogBody class="!flex-none !overflow-visible">

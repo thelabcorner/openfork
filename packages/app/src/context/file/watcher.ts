@@ -13,6 +13,9 @@ type WatcherOps = {
   node: (path: string) => FileNode | undefined
   isDirLoaded: (path: string) => boolean
   refreshDir: (path: string) => void
+  /** Called with the normalized changed path so consumers (e.g. git status)
+   * can invalidate just that path instead of rescanning. */
+  onInvalidate?: (path: string) => void
 }
 
 export function invalidateFromWatcher(event: WatcherEvent, ops: WatcherOps) {
@@ -27,6 +30,8 @@ export function invalidateFromWatcher(event: WatcherEvent, ops: WatcherOps) {
   const path = ops.normalize(rawPath)
   if (!path) return
   if (path.startsWith(".git/")) return
+
+  ops.onInvalidate?.(path)
 
   if (ops.hasFile(path) || ops.isOpen?.(path)) {
     ops.loadFile(path)

@@ -3,7 +3,6 @@ import { createMemo, createRoot } from "solid-js"
 import { createStore } from "solid-js/store"
 import {
   SESSION_OPEN_FILE_TAB,
-  createOpenReviewFile,
   createOpenSessionFileTab,
   createSessionTabs,
   focusTerminalById,
@@ -15,26 +14,6 @@ describe("shouldShowFileTree", () => {
   test("does not reserve space for a disabled file tree", () => {
     expect(shouldShowFileTree({ visible: false, opened: true })).toBe(false)
     expect(shouldShowFileTree({ visible: true, opened: true })).toBe(true)
-  })
-})
-
-describe("createOpenReviewFile", () => {
-  test("opens and loads selected review file", () => {
-    const calls: string[] = []
-    const openReviewFile = createOpenReviewFile({
-      showAllFiles: () => calls.push("show"),
-      tabForPath: (path) => {
-        calls.push(`tab:${path}`)
-        return `file://${path}`
-      },
-      openTab: (tab) => calls.push(`open:${tab}`),
-      setActive: (tab) => calls.push(`active:${tab}`),
-      loadFile: (path) => calls.push(`load:${path}`),
-    })
-
-    openReviewFile("src/a.ts")
-
-    expect(calls).toEqual(["show", "load:src/a.ts", "tab:src/a.ts", "open:file://src/a.ts", "active:file://src/a.ts"])
   })
 })
 
@@ -52,7 +31,6 @@ describe("createOpenSessionFileTab", () => {
         return tab.slice("file://".length)
       },
       loadFile: (path) => calls.push(`load:${path}`),
-      openReviewPanel: () => calls.push("review"),
       setActive: (tab) => calls.push(`active:${tab}`),
     })
 
@@ -63,7 +41,6 @@ describe("createOpenSessionFileTab", () => {
       "open:file://src/a.ts",
       "path:file://src/a.ts",
       "load:src/a.ts",
-      "review",
       "active:file://src/a.ts",
     ])
   })
@@ -126,7 +103,7 @@ describe("createSessionTabs", () => {
     })
   })
 
-  test("prefers context and review fallbacks when no file tab is active", () => {
+  test("prefers context fallback when no file tab is active", () => {
     createRoot((dispose) => {
       const [state] = createStore({
         active: undefined as string | undefined,
@@ -137,8 +114,6 @@ describe("createSessionTabs", () => {
         tabs,
         pathFromTab: () => undefined,
         normalizeTab: (tab) => tab,
-        review: () => true,
-        hasReview: () => true,
       })
 
       expect(result.activeTab()).toBe("context")
@@ -156,11 +131,9 @@ describe("createSessionTabs", () => {
         tabs,
         pathFromTab: () => undefined,
         normalizeTab: (tab) => tab,
-        review: () => true,
-        hasReview: () => true,
       })
 
-      expect(result.activeTab()).toBe("review")
+      expect(result.activeTab()).toBe("empty")
       expect(result.activeFileTab()).toBeUndefined()
       expect(result.closableTab()).toBeUndefined()
       dispose()

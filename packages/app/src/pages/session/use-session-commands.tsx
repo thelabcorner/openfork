@@ -1,4 +1,5 @@
 import { useNavigate } from "@solidjs/router"
+import { startTransition } from "solid-js"
 import { useCommand, type CommandOption } from "@/context/command"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { previewSelectedLines } from "@opencode-ai/session-ui/pierre/selection-bridge"
@@ -26,7 +27,6 @@ export type SessionCommandContext = {
   navigateMessageByOffset: (offset: number) => void
   setActiveMessage: (message: UserMessage | undefined) => void
   focusInput: () => void
-  review?: () => boolean
   fileBrowser?: () => boolean
   find?: {
     open: () => void
@@ -104,7 +104,6 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       )
       .finally(() => endTitleRegeneration(id))
   }
-  const hasReview = () => !!params.id
   const normalizeTab = (tab: string) => {
     if (!tab.startsWith("file://")) return tab
     return file.tab(tab)
@@ -113,8 +112,6 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     tabs,
     pathFromTab: file.pathFromTab,
     normalizeTab,
-    review: actions.review,
-    hasReview,
     fileBrowser: actions.fileBrowser,
   })
   const activeFileTab = tabState.activeFileTab
@@ -624,16 +621,20 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       },
     }),
     viewCommand({
-      id: "review.toggle",
-      title: language.t("command.review.toggle"),
-      keybind: "mod+shift+r",
-      onSelect: () => view().reviewPanel.toggle(),
+      id: "context.toggle",
+      title: language.t("command.context.toggle"),
+      keybind: "mod+shift+l",
+      onSelect: () => layout.sessionContext.toggle(),
     }),
     viewCommand({
-      id: "browser.toggle",
-      title: language.t("command.browser.toggle"),
-      keybind: "mod+shift+b",
-      onSelect: () => view().browserPanel.toggle(),
+      id: "usage.toggle",
+      title: language.t("command.usage.toggle"),
+      onSelect: () => void startTransition(() => layout.usage.toggle()),
+    }),
+    viewCommand({
+      id: "models.toggle",
+      title: language.t("command.models.toggle"),
+      onSelect: () => layout.models.toggle(),
     }),
     ...(shown()
       ? [

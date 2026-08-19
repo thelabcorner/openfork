@@ -70,10 +70,6 @@ function PromptInputExample() {
         open: (tab: string) => setControls("tabs", (tabs) => (tabs.includes(tab) ? tabs : [...tabs, tab])),
         setActive: (tab: string) => setControls("activeTab", tab),
       },
-      reviewPanel: {
-        opened: () => controls.reviewOpen,
-        open: () => setControls("reviewOpen", true),
-      },
     },
   }
   const addReviewComment = () => {
@@ -151,7 +147,6 @@ function PromptInputWithOpenDock() {
         open: () => {},
         setActive: (tab: string) => setControls("activeTab", tab),
       },
-      reviewPanel: { opened: () => false, open: () => {} },
     },
   }
   const state = {

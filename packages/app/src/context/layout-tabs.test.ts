@@ -57,9 +57,9 @@ describe("openSessionTab", () => {
     )
   })
 
-  test("keeps the preview when switching to Review", () => {
-    expect(openSessionTab(state(["file://a.ts"], "file://a.ts", "file://a.ts"), "review")).toEqual(
-      state(["file://a.ts"], "review", "file://a.ts"),
+  test("keeps the preview when switching to Changes", () => {
+    expect(openSessionTab(state(["file://a.ts"], "file://a.ts", "file://a.ts"), "changes")).toEqual(
+      state(["file://a.ts"], "changes", "file://a.ts"),
     )
   })
 

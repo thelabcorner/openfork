@@ -35,6 +35,7 @@ import {
   onCleanup,
   type ParentProps,
   Show,
+  Suspense,
 } from "solid-js"
 import { Dynamic } from "solid-js/web"
 import { makeEventListener } from "@solid-primitives/event-listener"
@@ -42,6 +43,7 @@ import { CommandProvider, useCommand, type CommandOption } from "@/context/comma
 import { CommentsProvider } from "@/context/comments"
 import { FileProvider } from "@/context/file"
 import { ForkUsageProvider } from "@/context/fork-usage"
+import { SessionGroupsProvider } from "@/context/session-groups"
 import { ServerSDKProvider } from "@/context/server-sdk"
 import { ServerSyncProvider, useServerSync } from "@/context/server-sync"
 import { GlobalProvider, useGlobal } from "@/context/global"
@@ -71,6 +73,7 @@ import { NewHome } from "@/pages/home"
 import { LegacyHome } from "@/pages/home/legacy-home"
 
 const NewSession = lazy(() => import("@/pages/new-session"))
+const GroupTabPage = lazy(() => import("@/pages/group-tab"))
 
 const SessionRoute = () => {
   const settings = useSettings()
@@ -179,7 +182,9 @@ function SelectedServerProviders(props: ParentProps) {
     <ServerKey>
       <ServerSDKProvider>
         <ServerSyncProvider>
-          <ForkUsageProvider>{props.children}</ForkUsageProvider>
+          <SessionGroupsProvider>
+            <ForkUsageProvider>{props.children}</ForkUsageProvider>
+          </SessionGroupsProvider>
         </ServerSyncProvider>
       </ServerSDKProvider>
     </ServerKey>
@@ -653,9 +658,36 @@ function Routes(props: { serverScoped?: JSX.Element }) {
         <Route path="/" component={NewHome} />
         <Route path="/:dir/session/:id" component={NewLayoutLegacySessionRedirect} />
         <Route path="/server/:serverKey/session/:id" component={TargetSessionRoute} />
+        <Route path="/server/:serverKey/group/:groupId/session/:sessionId" component={GroupTabRoute} />
+        <Route path="/server/:serverKey/group/:groupId" component={GroupTabRoute} />
       </Show>
       <Route path="/new-session" component={DraftRoute} />
     </>
+  )
+}
+
+function GroupTabRoute() {
+  const params = useParams<{ serverKey: string; groupId: string; sessionId?: string }>()
+  const global = useGlobal()
+  const serverKey = createMemo(() => parseServerKey(params.serverKey))
+  const conn = createMemo(() => {
+    const key = serverKey()
+    if (!key) return
+    return global.servers.list().find((item) => ServerConnection.key(item) === key)
+  })
+
+  return (
+    <Show when={serverKey()} keyed fallback={<ErrorPage error={new Error("Invalid group route")} />}>
+      <ServerSDKProvider server={conn}>
+        <ServerSyncProvider server={conn}>
+          <ForkUsageProvider>
+            <Suspense>
+              <GroupTabPage />
+            </Suspense>
+          </ForkUsageProvider>
+        </ServerSyncProvider>
+      </ServerSDKProvider>
+    </Show>
   )
 }
 

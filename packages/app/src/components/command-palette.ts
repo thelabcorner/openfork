@@ -40,7 +40,7 @@ const COMMON_COMMAND_IDS = [
   "session.previous",
   "session.next",
   "terminal.toggle",
-  "review.toggle",
+  "context.toggle",
 ] as const
 
 export function uniqueCommandPaletteEntries(items: CommandPaletteEntry[]) {
@@ -65,13 +65,12 @@ export function createCommandPaletteFileEntry(path: string, category: string): C
 export function createCommandPaletteFileOpener(onOpenFile?: (path: string) => void) {
   const file = useFile()
   const layout = useLayout()
-  const { tabs, view } = useSessionLayout()
+  const { tabs } = useSessionLayout()
 
   return (path: string) => {
     const value = file.tab(path)
     void tabs().open(value)
     void file.load(path)
-    if (!view().reviewPanel.opened()) view().reviewPanel.open()
     layout.fileTree.setTab("all")
     onOpenFile?.(path)
     tabs().setActive(value)

@@ -7,7 +7,7 @@ import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
-import { createEffect, createMemo, on, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, on, onCleanup, Show } from "solid-js"
 import { ModelSelectorPopoverV2 } from "@/components/dialog-select-model"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
 import type { PromptInputProps } from "@/components/prompt-input/contracts"
@@ -15,6 +15,7 @@ import { normalizePromptHistoryEntry, promptLength, type PromptHistoryComment } 
 import { createPersistedPromptInputHistory } from "@/components/prompt-input/history-store"
 import { promptDesignPlaceholder, promptPlaceholder } from "@/components/prompt-input/placeholder"
 import { createPromptSubmit } from "@/components/prompt-input/submit"
+import { createLiveGenerationRate, type LiveGenerationRateState } from "@/components/prompt-input/live-generation-rate"
 import { selectionFromLines, type SelectedLineRange, useFile } from "@/context/file"
 import { useComments } from "@/context/comments"
 import { useCommand } from "@/context/command"
@@ -26,6 +27,7 @@ import { usePlatform } from "@/context/platform"
 import { useSDK } from "@/context/sdk"
 import { useForkUsage } from "@/context/fork-usage"
 import { useSync } from "@/context/sync"
+import { SessionUsageWarningBanner } from "@/components/session-usage-warning-banner"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { showToast } from "@/utils/toast"
 import type { ForkWindowUsage } from "@/utils/fork-client"
@@ -45,6 +47,8 @@ export type PromptInputV2ComposerProps = {
 export type PromptInputV2ControllerProps = Omit<PromptInputProps, "class" | "submission">
 export type PromptInputV2ComposerController = PromptInputV2Interaction & {
   readonly model: PromptInputProps["controls"]["model"]
+  readonly autoAccept: { active: () => boolean; toggle: () => void }
+  readonly liveRate: () => LiveGenerationRateState
 }
 
 export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
@@ -54,6 +58,7 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
 
   return (
     <div class="flex flex-col gap-3">
+      <SessionUsageWarningBanner providerID={props.controller.model.selection.current()?.provider?.id} />
       <PromptInputV2
         controller={props.controller}
         borderUnderlay={props.borderUnderlay}
@@ -62,6 +67,13 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
         attachKeybind={command.keybindParts("file.attach")}
         attachShortcut={command.keybind("file.attach")}
         usageControl={<PromptInputV2UsageArc />}
+        autoAcceptControl={
+          <PromptInputV2AutoAcceptToggle
+            active={props.controller.autoAccept.active()}
+            onToggle={props.controller.autoAccept.toggle}
+          />
+        }
+        footerControl={<PromptInputV2LiveRate value={props.controller.liveRate()} />}
         modelControl={
           <PromptInputV2ModelControl
             loading={props.controller.model.loading}
@@ -79,6 +91,97 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
         }
       />
     </div>
+  )
+}
+
+function PromptInputV2LiveRate(props: { value: LiveGenerationRateState }) {
+  const language = useLanguage()
+  const [display, setDisplay] = createSignal(0)
+  let raf: number | undefined
+  let current = 0
+
+  const target = () => {
+    const { current: rate, last } = props.value
+    if (typeof rate === "number") return rate
+    if (last !== null) return last
+    return 0
+  }
+
+  const isLive = () => typeof props.value.current === "number"
+  const isWaiting = () => props.value.current === "paused"
+  const hasRate = () => isLive() || props.value.last !== null
+  const isMeasured = () => props.value.source === "measured"
+
+  const tick = () => {
+    const t = target()
+    const diff = t - current
+    if (Math.abs(diff) < 0.5) {
+      current = t
+      setDisplay(Math.round(t))
+      return
+    }
+    current += diff * 0.15
+    setDisplay(Math.round(current))
+    raf = requestAnimationFrame(tick)
+  }
+
+  createEffect(() => {
+    void target()
+    if (raf !== undefined) cancelAnimationFrame(raf)
+    raf = requestAnimationFrame(tick)
+  })
+
+  onCleanup(() => {
+    if (raf !== undefined) cancelAnimationFrame(raf)
+  })
+
+  return (
+    <div class="flex items-center gap-1.5 px-1 text-[11px] leading-4 text-text-weaker tabular-nums select-none">
+      <Show when={hasRate()}>
+        <Show
+          when={isLive()}
+          fallback={<span class="size-1.5 rounded-full bg-current" />}
+        >
+          <span class="relative flex size-1.5 shrink-0">
+            <span class="absolute inline-flex size-full animate-ping rounded-full bg-current opacity-60" />
+            <span class="relative inline-flex size-1.5 rounded-full bg-current" />
+          </span>
+        </Show>
+        <span class={isWaiting() ? "opacity-60" : ""}>
+          {isMeasured()
+            ? language.t("prompt.liveRate.measured", { value: display().toLocaleString(language.intl()) })
+            : language.t("prompt.liveRate.value", { value: display().toLocaleString(language.intl()) })}
+        </span>
+      </Show>
+      <Show when={isWaiting() && !hasRate()}>
+        <span class="size-1.5 rounded-full bg-current" />
+        <span>{language.t("prompt.liveRate.waiting")}</span>
+      </Show>
+    </div>
+  )
+}
+
+export function PromptInputV2AutoAcceptToggle(props: { active: boolean; onToggle: () => void }) {
+  const language = useLanguage()
+  const label = () =>
+    props.active
+      ? language.t("command.permissions.autoaccept.disable")
+      : language.t("command.permissions.autoaccept.enable")
+
+  return (
+    <TooltipV2 placement="top" gutter={4} value={label()}>
+      <IconButtonV2
+        type="button"
+        data-action="prompt-permissions-autoaccept"
+        variant="ghost-muted"
+        size="large"
+        aria-pressed={props.active}
+        aria-label={label()}
+        classList={{ "!text-v2-state-fg-warning": props.active }}
+        icon={<Icon name={props.active ? "shield-check" : "shield"} />}
+        onClick={props.onToggle}
+      />
+    </TooltipV2>
   )
 }
 
@@ -126,9 +229,22 @@ function TripartiteArc(props: { rolling: number; weekly: number; monthly: number
     const finish = start + span * (bounded / 100)
     return (
       <g>
-        <path d={arcPath(12, 12, 7.5, start, end)} fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" opacity="0.22" />
+        <path
+          d={arcPath(12, 12, 7.5, start, end)}
+          fill="none"
+          stroke="currentColor"
+          stroke-width="2.2"
+          stroke-linecap="round"
+          opacity="0.22"
+        />
         <Show when={bounded > 0}>
-          <path d={arcPath(12, 12, 7.5, start, finish)} fill="none" stroke={color} stroke-width="2.2" stroke-linecap="round" />
+          <path
+            d={arcPath(12, 12, 7.5, start, finish)}
+            fill="none"
+            stroke={color}
+            stroke-width="2.2"
+            stroke-linecap="round"
+          />
         </Show>
       </g>
     )
@@ -152,7 +268,7 @@ function remainingColor(remaining: number, base: number) {
 }
 
 function usedPercent(window: ForkWindowUsage) {
-  if (window.estimatedPercent !== undefined) return Math.max(0, Math.min(100, window.estimatedPercent))
+  if (typeof window.estimatedPercent === "number") return Math.max(0, Math.min(100, window.estimatedPercent))
   if (window.limitUSD <= 0) return 0
   return Math.max(0, Math.min(100, (window.spentUSD / window.limitUSD) * 100))
 }
@@ -207,6 +323,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   })
   const info = createMemo(() => (props.controls.session.id ? sync().session.get(props.controls.session.id) : undefined))
   const working = createMemo(() => sync().data.session_working(props.controls.session.id ?? ""))
+  const liveRate = createLiveGenerationRate({ sessionID: () => props.controls.session.id, working })
   const attachments = createMemo(() =>
     prompt.current().filter((part): part is ImageAttachmentPart => part.type === "image"),
   )
@@ -284,11 +401,25 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     )
   }
 
+  // Not-yet-created ("draft") sessions get their own local flag rather than
+  // binding to permission.isAutoAcceptingDirectory: that would enable
+  // auto-accept for every future chat in this directory, not just the one
+  // being composed. On submit, createPromptSubmit promotes this onto the
+  // freshly created session only (see submit.ts's shouldAutoAccept).
+  const [draftAutoAccept, setDraftAutoAccept] = createSignal(false)
   const accepting = createMemo(() => {
     const id = props.controls.session.id
-    if (!id) return permission.isAutoAcceptingDirectory(sdk().directory)
+    if (!id) return draftAutoAccept()
     return permission.isAutoAccepting(id, sdk().directory)
   })
+  const toggleAutoAccept = () => {
+    const id = props.controls.session.id
+    if (!id) {
+      setDraftAutoAccept((value) => !value)
+      return
+    }
+    permission.toggleAutoAccept(id, sdk().directory)
+  }
   const submission = createPromptSubmit({
     prompt,
     info,
@@ -503,6 +634,10 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     },
   })
   Object.defineProperty(controller, "model", { get: () => props.controls.model })
+  Object.defineProperty(controller, "autoAccept", {
+    get: () => ({ active: accepting, toggle: toggleAutoAccept }),
+  })
+  Object.defineProperty(controller, "liveRate", { get: () => liveRate })
 
   command.register("prompt-input", () => [
     {
@@ -666,16 +801,9 @@ function openComment(
     })
   }
   const diffs = props.controls.session.id ? sync().data.session_diff[props.controls.session.id] : undefined
-  const review =
+  const wantsChanges =
     item.commentOrigin === "review" || (item.commentOrigin !== "file" && diffs?.some((diff) => diff.file === item.path))
-  if (!props.controls.session.reviewPanel.opened()) props.controls.session.reviewPanel.open()
-  if (review) {
-    layout.fileTree.setTab("changes")
-    props.controls.session.tabs.setActive("review")
-    queueFocus()
-    return
-  }
-  layout.fileTree.setTab("all")
+  layout.fileTree.setTab(wantsChanges ? "changes" : "all")
   const tab = files.tab(item.path)
   void props.controls.session.tabs.open(tab)
   props.controls.session.tabs.setActive(tab)

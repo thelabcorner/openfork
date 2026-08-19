@@ -3,7 +3,7 @@ import "@opencode-ai/ui/v2/file-tree-v2.css"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { kindChange, kindLabel, type Kind } from "@/components/file-tree-v2"
-import { normalizePath } from "@/pages/session/v2/review-diff-kinds"
+import { normalizeFileTreeV2Path } from "@/components/file-tree-v2-model"
 import { createVirtualizer, defaultRangeExtractor } from "@tanstack/solid-virtual"
 import { virtualScrollElement } from "@/components/virtual-scroll-element"
 
@@ -49,9 +49,9 @@ export function SessionFileListV2(props: {
   onFileClick: (path: string) => void
   onFileDoubleClick?: (path: string) => void
 }) {
-  const active = () => normalizePath(props.active ?? "")
-  const highlighted = () => normalizePath(props.highlighted ?? "")
-  const normalized = createMemo(() => props.files.map(normalizePath))
+  const active = () => normalizeFileTreeV2Path(props.active ?? "")
+  const highlighted = () => normalizeFileTreeV2Path(props.highlighted ?? "")
+  const normalized = createMemo(() => props.files.map(normalizeFileTreeV2Path))
   const [root, setRoot] = createSignal<HTMLDivElement>()
   const [focused, setFocused] = createSignal<string>()
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
@@ -101,7 +101,7 @@ export function SessionFileListV2(props: {
       <For each={virtualRowKeys()}>
         {(key) => {
           const path = key as string
-          const value = normalizePath(path)
+          const value = normalizeFileTreeV2Path(path)
           const selected = () => (highlighted() ? highlighted() === value : active() === value)
           const highlightedRow = () => highlighted() === value
           const kind = () => props.kinds?.get(value)

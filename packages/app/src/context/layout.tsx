@@ -31,8 +31,11 @@ const DEFAULT_SIDEBAR_WIDTH = 344
 const DEFAULT_FILE_TREE_WIDTH = 200
 const DEFAULT_SESSION_WIDTH = 600
 const DEFAULT_TERMINAL_HEIGHT = 280
-const DEFAULT_REVIEW_PANEL_OPENED = false
 const DEFAULT_BROWSER_PANEL_OPENED = false
+const DEFAULT_PROJECT_EXPLORER_PANEL_OPENED = false
+const DEFAULT_SESSION_CONTEXT_PANEL_OPENED = false
+const DEFAULT_USAGE_PANEL_OPENED = false
+const DEFAULT_MODELS_PANEL_OPENED = false
 export type AvatarColorKey = (typeof AVATAR_COLOR_KEYS)[number]
 
 export function getAvatarColors(key?: string) {
@@ -68,9 +71,6 @@ export function getProjectAvatarVariant(key?: string): ProjectAvatarVariant {
 
 type SessionView = {
   scroll: Record<string, SessionScroll>
-  reviewOpen?: string[]
-  reviewMode?: ReviewChangeMode
-  reviewFile?: string
   pendingMessage?: string
   pendingMessageAt?: number
   todoCollapsed?: boolean
@@ -86,15 +86,12 @@ type TabHandoff = {
 export type LocalProject = Partial<Project> & { worktree: string; expanded: boolean }
 export type HomeProjectSelection = { server: ServerConnection.Key; directory?: string }
 
-export type ReviewDiffStyle = "unified" | "split"
-export type ReviewChangeMode = "git" | "branch" | "turn"
-export type ReviewPanelSource = "context-button" | "other"
-
 export type LayoutRoute =
   | { type: "home" }
   | { type: "draft"; draftID: string; server?: ServerConnection.Key }
   | { type: "dir-new-sesssion"; dir: string; dirBase64: string; server?: ServerConnection.Key }
   | { type: "session"; sessionId: string; server?: ServerConnection.Key }
+  | { type: "group"; groupId: string; server?: ServerConnection.Key }
 
 const sessionPath = (key: string) => {
   const dir = SessionStateKey.route(key).split("/")[0]
@@ -142,6 +139,14 @@ export const currentRoute = (pathname: string, search: string): LayoutRoute => {
     return {
       type: "session",
       sessionId: parts[3],
+      server: requireServerKey(parts[1]),
+    }
+  }
+
+  if (parts[0] === "server" && parts[2] === "group" && parts[3]) {
+    return {
+      type: "group",
+      groupId: parts[3],
       server: requireServerKey(parts[1]),
     }
   }
@@ -195,7 +200,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         }
       })()
 
-      const review = value.review
       const fileTree = value.fileTree
       const migratedFileTree = (() => {
         if (!isRecord(fileTree)) return fileTree
@@ -207,18 +211,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           opened: true,
           width: width === 260 ? DEFAULT_FILE_TREE_WIDTH : width,
           tab: "changes",
-        }
-      })()
-
-      const migratedReview = (() => {
-        if (!isRecord(review)) return review
-        if (typeof review.panelOpened === "boolean") return review
-
-        const opened =
-          isRecord(fileTree) && typeof fileTree.opened === "boolean" ? fileTree.opened : DEFAULT_REVIEW_PANEL_OPENED
-        return {
-          ...review,
-          panelOpened: opened,
         }
       })()
 
@@ -250,7 +242,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
 
       if (
         migratedSidebar === sidebar &&
-        migratedReview === review &&
         migratedFileTree === fileTree &&
         migratedSessionTabs === value.sessionTabs &&
         sessionView === value.sessionView
@@ -261,14 +252,13 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       return {
         ...value,
         sidebar: migratedSidebar,
-        review: migratedReview,
         fileTree: migratedFileTree,
         sessionTabs: migratedSessionTabs,
         sessionView,
       }
     }
 
-    const target = Persist.serverGlobal(serverSdk().scope, "layout", ["layout.v6"])
+    const target = Persist.serverGlobal(serverSdk().scope, "layout", ["layout.v7"])
     const [store, setStore, _, ready] = persisted(
       { ...target, migrate },
       createStore({
@@ -282,12 +272,20 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           height: DEFAULT_TERMINAL_HEIGHT,
           opened: false,
         },
-        review: {
-          diffStyle: "split" as ReviewDiffStyle,
-          panelOpened: DEFAULT_REVIEW_PANEL_OPENED,
-        },
         browser: {
           panelOpened: DEFAULT_BROWSER_PANEL_OPENED,
+        },
+        projectExplorer: {
+          panelOpened: DEFAULT_PROJECT_EXPLORER_PANEL_OPENED,
+        },
+        sessionContext: {
+          panelOpened: DEFAULT_SESSION_CONTEXT_PANEL_OPENED,
+        },
+        usage: {
+          panelOpened: DEFAULT_USAGE_PANEL_OPENED,
+        },
+        models: {
+          panelOpened: DEFAULT_MODELS_PANEL_OPENED,
         },
         fileTree: {
           opened: false,
@@ -311,7 +309,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       }),
     )
     const [ephemeral, setEphemeral] = createStore({
-      reviewPanelSource: "other" as ReviewPanelSource,
       sessionTabPreview: {} as Record<string, string | undefined>,
     })
 
@@ -695,16 +692,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           setStore("terminal", "height", height)
         },
       },
-      review: {
-        diffStyle: createMemo(() => store.review?.diffStyle ?? "split"),
-        setDiffStyle(diffStyle: ReviewDiffStyle) {
-          if (!store.review) {
-            setStore("review", { diffStyle, panelOpened: DEFAULT_REVIEW_PANEL_OPENED })
-            return
-          }
-          setStore("review", "diffStyle", diffStyle)
-        },
-      },
       fileTree: {
         opened: createMemo(() => store.fileTree?.opened ?? true),
         width: createMemo(() => store.fileTree?.width ?? DEFAULT_FILE_TREE_WIDTH),
@@ -743,6 +730,131 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
             return
           }
           setStore("fileTree", "width", width)
+        },
+      },
+      browser: {
+        opened: createMemo(() => store.browser?.panelOpened ?? DEFAULT_BROWSER_PANEL_OPENED),
+        open() {
+          if (!store.browser) {
+            setStore("browser", { panelOpened: true })
+            return
+          }
+          setStore("browser", "panelOpened", true)
+        },
+        close() {
+          if (!store.browser) {
+            setStore("browser", { panelOpened: false })
+            return
+          }
+          setStore("browser", "panelOpened", false)
+        },
+        toggle() {
+          const current = store.browser?.panelOpened ?? DEFAULT_BROWSER_PANEL_OPENED
+          if (!store.browser) {
+            setStore("browser", { panelOpened: !current })
+            return
+          }
+          setStore("browser", "panelOpened", !current)
+        },
+      },
+      projectExplorer: {
+        opened: createMemo(() => store.projectExplorer?.panelOpened ?? DEFAULT_PROJECT_EXPLORER_PANEL_OPENED),
+        open() {
+          if (!store.projectExplorer) {
+            setStore("projectExplorer", { panelOpened: true })
+            return
+          }
+          setStore("projectExplorer", "panelOpened", true)
+        },
+        close() {
+          if (!store.projectExplorer) {
+            setStore("projectExplorer", { panelOpened: false })
+            return
+          }
+          setStore("projectExplorer", "panelOpened", false)
+        },
+        toggle() {
+          const current = store.projectExplorer?.panelOpened ?? DEFAULT_PROJECT_EXPLORER_PANEL_OPENED
+          if (!store.projectExplorer) {
+            setStore("projectExplorer", { panelOpened: !current })
+            return
+          }
+          setStore("projectExplorer", "panelOpened", !current)
+        },
+      },
+      sessionContext: {
+        opened: createMemo(() => store.sessionContext?.panelOpened ?? DEFAULT_SESSION_CONTEXT_PANEL_OPENED),
+        open() {
+          if (!store.sessionContext) {
+            setStore("sessionContext", { panelOpened: true })
+            return
+          }
+          setStore("sessionContext", "panelOpened", true)
+        },
+        close() {
+          if (!store.sessionContext) {
+            setStore("sessionContext", { panelOpened: false })
+            return
+          }
+          setStore("sessionContext", "panelOpened", false)
+        },
+        toggle() {
+          const current = store.sessionContext?.panelOpened ?? DEFAULT_SESSION_CONTEXT_PANEL_OPENED
+          if (!store.sessionContext) {
+            setStore("sessionContext", { panelOpened: !current })
+            return
+          }
+          setStore("sessionContext", "panelOpened", !current)
+        },
+      },
+      usage: {
+        opened: createMemo(() => store.usage?.panelOpened ?? DEFAULT_USAGE_PANEL_OPENED),
+        open() {
+          if (!store.usage) {
+            setStore("usage", { panelOpened: true })
+            return
+          }
+          setStore("usage", "panelOpened", true)
+        },
+        close() {
+          if (!store.usage) {
+            setStore("usage", { panelOpened: false })
+            return
+          }
+          setStore("usage", "panelOpened", false)
+        },
+        toggle() {
+          const current = store.usage?.panelOpened ?? DEFAULT_USAGE_PANEL_OPENED
+          if (!store.usage) {
+            setStore("usage", { panelOpened: !current })
+            return
+          }
+          setStore("usage", "panelOpened", !current)
+        },
+      },
+      models: {
+        opened: createMemo(() => store.models?.panelOpened ?? DEFAULT_MODELS_PANEL_OPENED),
+        open() {
+          if (!store.models) {
+            setStore("models", { panelOpened: true })
+            return
+          }
+          setStore("models", "panelOpened", true)
+        },
+        close() {
+          if (!store.models) {
+            setStore("models", { panelOpened: false })
+            return
+          }
+          setStore("models", "panelOpened", false)
+        },
+        toggle() {
+          const current = store.models?.panelOpened ?? DEFAULT_MODELS_PANEL_OPENED
+          if (!store.models) {
+            setStore("models", { panelOpened: !current })
+            return
+          }
+          setStore("models", "panelOpened", !current)
         },
       },
       session: {
@@ -813,18 +925,8 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       view(sessionKey: string | Accessor<string>) {
         const key = createSessionKeyReader(sessionKey, ensureKey)
         const s = createMemo(() => store.sessionView[key()] ?? { scroll: {} })
-        const reviewMode = createMemo(() => {
-          const mode = s().reviewMode
-          if (mode === "git" || mode === "branch" || mode === "turn") return mode
-        })
-        const reviewFile = createMemo(() => {
-          const file = s().reviewFile
-          if (typeof file === "string") return file
-        })
         const terminalOpened = createMemo(() => store.terminal?.opened ?? false)
-        const reviewPanelOpened = createMemo(() => store.review?.panelOpened ?? DEFAULT_REVIEW_PANEL_OPENED)
         const browserPanelOpened = createMemo(() => store.browser?.panelOpened ?? DEFAULT_BROWSER_PANEL_OPENED)
-        const reviewPanelSource = createMemo(() => (reviewPanelOpened() ? ephemeral.reviewPanelSource : "other"))
 
         function setTerminalOpened(next: boolean) {
           const current = store.terminal
@@ -836,28 +938,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           const value = current.opened ?? false
           if (value === next) return
           setStore("terminal", "opened", next)
-        }
-
-        function setReviewPanelOpened(next: boolean, source: ReviewPanelSource) {
-          const nextSource = next ? source : "other"
-          const current = store.review
-          if (!current) {
-            batch(() => {
-              setStore("review", { diffStyle: "split" as ReviewDiffStyle, panelOpened: next })
-              setEphemeral("reviewPanelSource", nextSource)
-            })
-            return
-          }
-
-          const value = current.panelOpened ?? DEFAULT_REVIEW_PANEL_OPENED
-          if (value === next) {
-            if (ephemeral.reviewPanelSource !== nextSource) setEphemeral("reviewPanelSource", nextSource)
-            return
-          }
-          batch(() => {
-            setStore("review", "panelOpened", next)
-            setEphemeral("reviewPanelSource", nextSource)
-          })
         }
 
         return {
@@ -891,19 +971,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
               setTerminalOpened(!terminalOpened())
             },
           },
-          reviewPanel: {
-            opened: reviewPanelOpened,
-            source: reviewPanelSource,
-            open(source: ReviewPanelSource = "other") {
-              setReviewPanelOpened(true, source)
-            },
-            close() {
-              setReviewPanelOpened(false, "other")
-            },
-            toggle() {
-              setReviewPanelOpened(!reviewPanelOpened(), "other")
-            },
-          },
           browserPanel: {
             opened: browserPanelOpened,
             open() {
@@ -929,96 +996,6 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
               setStore("browser", "panelOpened", !current)
             },
           },
-          review: {
-            mode: reviewMode,
-            setMode(mode: ReviewChangeMode) {
-              const session = key()
-              const current = store.sessionView[session]
-              if (!current) {
-                setStore("sessionView", session, { scroll: {}, reviewMode: mode })
-                prune(session)
-                return
-              }
-              if (current.reviewMode === mode) return
-              setStore("sessionView", session, "reviewMode", mode)
-              prune(session)
-            },
-            file: reviewFile,
-            setFile(file: string) {
-              const session = key()
-              const current = store.sessionView[session]
-              if (!current) {
-                setStore("sessionView", session, { scroll: {}, reviewFile: file })
-                prune(session)
-                return
-              }
-              if (current.reviewFile === file) return
-              setStore("sessionView", session, "reviewFile", file)
-              prune(session)
-            },
-            open: createMemo(() => s().reviewOpen ?? []),
-            setOpen(open: string[]) {
-              const session = key()
-              const next = Array.from(new Set(open))
-              const current = store.sessionView[session]
-              if (!current) {
-                setStore("sessionView", session, {
-                  scroll: {},
-                  reviewOpen: next,
-                })
-                return
-              }
-
-              if (same(current.reviewOpen, next)) return
-              setStore("sessionView", session, "reviewOpen", next)
-            },
-            openPath(path: string) {
-              const session = key()
-              const current = store.sessionView[session]
-              if (!current) {
-                setStore("sessionView", session, {
-                  scroll: {},
-                  reviewOpen: [path],
-                })
-                return
-              }
-
-              if (!current.reviewOpen) {
-                setStore("sessionView", session, "reviewOpen", [path])
-                return
-              }
-
-              if (current.reviewOpen.includes(path)) return
-              setStore("sessionView", session, "reviewOpen", current.reviewOpen.length, path)
-            },
-            closePath(path: string) {
-              const session = key()
-              const current = store.sessionView[session]?.reviewOpen
-              if (!current) return
-
-              const index = current.indexOf(path)
-              if (index === -1) return
-              setStore(
-                "sessionView",
-                session,
-                "reviewOpen",
-                produce((draft) => {
-                  if (!draft) return
-                  draft.splice(index, 1)
-                }),
-              )
-            },
-            togglePath(path: string) {
-              const session = key()
-              const current = store.sessionView[session]?.reviewOpen
-              if (!current || !current.includes(path)) {
-                this.openPath(path)
-                return
-              }
-
-              this.closePath(path)
-            },
-          },
         }
       },
       tabs(sessionKey: string | Accessor<string>) {
@@ -1036,7 +1013,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         return {
           tabs,
           active: createMemo(() => tabs().active),
-          all: createMemo(() => tabs().all.filter((tab) => tab !== "review")),
+          all: createMemo(() => tabs().all),
           preview: createMemo(() => ephemeral.sessionTabPreview[key()]),
           setActive(tab: string | undefined) {
             const session = key()
@@ -1049,7 +1026,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           },
           setAll(all: string[]) {
             const session = key()
-            const next = normalizeAll(all).filter((tab) => tab !== "review")
+            const next = normalizeAll(all)
             batch(() => {
               if (!store.sessionTabs[session]) {
                 setStore("sessionTabs", session, { all: next, active: undefined })

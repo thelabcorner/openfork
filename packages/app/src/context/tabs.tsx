@@ -1,4 +1,5 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
+import { base64Encode } from "@opencode-ai/core/util/encode"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createStore, produce } from "solid-js/store"
 import { Persist, persisted, removePersisted, draftPersistedKeys } from "@/utils/persist"
@@ -28,7 +29,13 @@ export type DraftTab = {
   worktree?: string
 }
 
-export type Tab = SessionTab | DraftTab
+export type GroupTab = {
+  type: "group"
+  server: ServerConnection.Key
+  groupId: string
+}
+
+export type Tab = SessionTab | DraftTab | GroupTab
 
 export type TabInfo = {
   title?: string
@@ -41,10 +48,19 @@ type RecentTab = {
 
 export const draftHref = (draftID: string) => `/new-session?draftId=${encodeURIComponent(draftID)}`
 
-export const tabHref = (tab: Tab) =>
-  tab.type === "draft" ? draftHref(tab.draftID) : sessionHref(tab.server, tab.sessionId)
+export const groupHref = (server: ServerConnection.Key, groupId: string) =>
+  `/server/${base64Encode(server)}/group/${groupId}`
 
-export const tabKey = (tab: Tab) => (tab.type === "draft" ? `draft:${tab.draftID}` : `${tab.server}\n${tabHref(tab)}`)
+export const tabHref = (tab: Tab) => {
+  if (tab.type === "draft") return draftHref(tab.draftID)
+  if (tab.type === "group") return groupHref(tab.server, tab.groupId)
+  return sessionHref(tab.server, tab.sessionId)
+}
+
+export const tabKey = (tab: Tab) => {
+  if (tab.type === "draft") return `draft:${tab.draftID}`
+  return `${tab.server}\n${tabHref(tab)}`
+}
 
 export function sessionHasOpenTab(tabs: Tab[], server: ServerConnection.Key, session: Session) {
   return tabs.some((tab) => tab.type === "session" && tab.server === server && tab.sessionId === session.id)
@@ -176,28 +192,38 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       if (draftID) removeDraftPersisted(draftID)
     }
 
-    // Shared by the batch close actions: closes the given store indices in
-    // descending order via closeTab (single-source semantics), then fixes up
-    // navigation when the previously-active tab is inside the closed range.
-    // closeTab computes its post-close neighbour against the array as it is at
-    // call time, which mid-batch can point at a tab a later close removes —
-    // after the splices land, navigate to the nearest surviving tab (right
-    // first, then left, mirroring nextTabAfterClose) or home.
+    // Shared by the batch close actions: closes the given store indices in a
+    // single atomic update (one setStore + one startTransition), then fixes up
+    // navigation when the previously-active tab is inside the closed range,
+    // landing on the nearest surviving tab (right first, then left, mirroring
+    // nextTabAfterClose) or home. Closing each index via its own closeTab call
+    // used to fire one startTransition per tab, which for large batches (e.g.
+    // "close all tabs") queued many overlapping concurrent transitions and
+    // stalled the app.
     const closeBatch = (indices: number[]) => {
       const original = [...store]
       const activeBefore = recentKey()
       const onActive = activeBefore !== undefined && location.pathname !== "/"
       const closed = new Set<string>()
-      for (const index of indices) {
-        const tab = original[index]
-        if (!tab) continue
+      const targets = indices
+        .map((index) => ({ index, tab: original[index] }))
+        .filter((entry): entry is { index: number; tab: Tab } => !!entry.tab)
+
+      for (const { index, tab } of targets) {
         closed.add(tabKey(tab))
-        actions.closeTab(index)
+        if (tab.type === "session") updateClosed((stack) => pushClosedTab(stack, tab, index))
       }
-      if (!onActive || !closed.has(activeBefore)) return
-      void Promise.resolve().then(() => {
-        const survivors = store
-        if (survivors.length === 0) {
+
+      void startTransition(() => {
+        setStore(
+          produce((tabs) => {
+            for (const { index } of [...targets].sort((a, b) => b.index - a.index)) {
+              tabs.splice(index, 1)
+            }
+          }),
+        )
+        if (!onActive || !closed.has(activeBefore)) return
+        if (store.length === 0) {
           setRecentKey(undefined)
           navigate("/")
           return
@@ -212,11 +238,33 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
           navigate("/")
         }
       })
+
+      for (const { tab } of targets) {
+        const key = tabKey(tab)
+        const draftID = tab.type === "draft" ? tab.draftID : undefined
+        memory.remove(key)
+        removeInfo(key)
+        if (draftID) removeDraftPersisted(draftID)
+      }
     }
 
     const actions = {
       addSessionTab: (tab: Omit<SessionTab, "type">) => {
         const next = { type: "session" as const, ...tab }
+        const existing = store.find((item) => tabKey(item) === tabKey(next))
+        if (existing) return existing
+        void startTransition(() => {
+          setStore(
+            produce((tabs) => {
+              if (tabs.some((item) => tabKey(item) === tabKey(next))) return
+              tabs.push(next)
+            }),
+          )
+        })
+        return next
+      },
+      addGroupTab: (tab: Omit<GroupTab, "type">) => {
+        const next = { type: "group" as const, ...tab }
         const existing = store.find((item) => tabKey(item) === tabKey(next))
         if (existing) return existing
         void startTransition(() => {
@@ -343,6 +391,12 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
         updateClosed((stack) => removeClosedTabs(stack, input.server, [input.sessionId]))
         const index = store.findIndex(
           (tab) => tab.type === "session" && tab.server === input.server && tab.sessionId === input.sessionId,
+        )
+        if (index !== -1) removeTab(index)
+      },
+      removeGroupTab(input: Omit<GroupTab, "type">) {
+        const index = store.findIndex(
+          (tab) => tab.type === "group" && tab.server === input.server && tab.groupId === input.groupId,
         )
         if (index !== -1) removeTab(index)
       },

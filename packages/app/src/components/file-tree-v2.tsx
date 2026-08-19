@@ -8,6 +8,7 @@ import {
   For,
   Show,
   splitProps,
+  untrack,
   type ComponentProps,
   type ParentProps,
 } from "solid-js"
@@ -167,7 +168,9 @@ export default function FileTreeV2(props: {
 
   createEffect(() => {
     if (!live()) return
-    void file.tree.list("")
+    const state = file.tree.state("")
+    if (state?.loaded || state?.loading) return
+    untrack(() => void file.tree.list(""))
   })
 
   // Only scroll when the active path changes (or first appears in the tree).

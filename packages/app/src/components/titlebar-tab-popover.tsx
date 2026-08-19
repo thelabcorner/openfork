@@ -1,5 +1,5 @@
 import { HoverCard as Kobalte } from "@kobalte/core/hover-card"
-import { createSignal, Show, type JSXElement } from "solid-js"
+import { createSignal, For, Show, type JSXElement } from "solid-js"
 import "./titlebar-tab-popover.css"
 
 // Initial hover delay before the preview appears, per design.
@@ -17,6 +17,7 @@ export interface TabPreviewData {
   title?: string
   path?: string
   serverName?: string
+  groupSessions?: { title: string; project?: string }[]
 }
 
 export function TabPreviewPopover(props: {
@@ -84,6 +85,21 @@ export function TabPreviewPopover(props: {
 
           <Show when={props.data.serverName}>
             <div data-slot="server">{props.data.serverName}</div>
+          </Show>
+
+          <Show when={props.data.groupSessions}>
+            <div data-slot="group-sessions" class="flex flex-col gap-1">
+              <For each={props.data.groupSessions}>
+                {(session) => (
+                  <div class="flex items-center gap-2">
+                    <span class="text-[12px] text-v2-text-text-base [font-weight:530]">{session.title}</span>
+                    <Show when={session.project}>
+                      <span class="text-[11px] text-v2-text-text-muted">{session.project}</span>
+                    </Show>
+                  </div>
+                )}
+              </For>
+            </div>
           </Show>
         </Kobalte.Content>
       </Kobalte.Portal>

@@ -69,7 +69,6 @@ const controls = {
   session: {
     id: "story-session",
     tabs: { active: () => undefined, all: () => [], open: () => {}, setActive: () => {} },
-    reviewPanel: { opened: () => false, open: () => {} },
   },
 }
 

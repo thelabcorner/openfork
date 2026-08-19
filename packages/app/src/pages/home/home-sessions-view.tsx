@@ -1,10 +1,12 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
-import { type Accessor, createMemo, For, Show, Suspense } from "solid-js"
+import { type Accessor, createMemo, createSignal, For, Show, Suspense } from "solid-js"
+import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
+import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useLanguage } from "@/context/language"
 import { ServerConnection } from "@/context/server"
@@ -20,6 +22,7 @@ import {
 } from "./home-sessions-controller"
 import type { HomeSearchHit } from "./home-session-search-controller"
 import type { SessionSearchMessageMatch } from "./home-session-search-response"
+import { DialogSessionGroupName } from "@/components/dialog-session-group"
 
 const SHOW_HOME_SESSION_ARCHIVE = false
 const HOME_SECTION_LABEL = "text-v2-text-text-muted [font-weight:440]"
@@ -74,6 +77,21 @@ export type HomeSessionsViewProps = {
   onSearchSelectActive: () => void
   onSearchHighlight: (hit: HomeSearchHit) => void
   onSearchSelect: (hit: HomeSearchHit, options?: OpenSessionOptions) => void
+  onCreateGroup: (name: string, sessionIds?: string[]) => Promise<string>
+  onAddToGroup: (sessionId: string, groupId: string) => void
+  onRemoveFromGroup: (sessionId: string) => void
+  onRenameGroup: (groupId: string, name: string) => void
+  onDeleteGroup: (groupId: string) => void
+  onOpenGroupTab: (groupId: string) => void
+  onGroupSelected: () => void
+  selectedCount: Accessor<number>
+  isSelected: (sessionId: string) => boolean
+  onToggleSelection: (sessionId: string, event: MouseEvent) => void
+  onClearSelection: () => void
+  onToggleGroupCollapsed: (groupId: string) => void
+  isGroupCollapsed: (groupId: string) => boolean
+  groupForSession: (sessionId: string) => string | undefined
+  userGroups: () => Array<{ id: string; name: string }>
 }
 
 export function HomeSessionsView(props: HomeSessionsViewProps) {
@@ -85,6 +103,28 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
     >
       <div class="sticky top-0 z-30 shrink-0 bg-v2-background-bg-base pb-3 pt-6 lg:pt-12" onWheel={props.onWheel}>
         <HomeSessionSearch {...props} />
+        <Show when={props.selectedCount() > 0}>
+          <div class="mt-2 flex items-center gap-2 rounded-[8px] bg-v2-background-bg-layer-02 px-2 py-1.5">
+            <span class="px-1 text-12-medium text-v2-text-text-base">
+              {props.selectedCount()}
+            </span>
+            <ButtonV2
+              variant="neutral"
+              size="small"
+              icon="layers"
+              onClick={props.onGroupSelected}
+            >
+              {props.language.t("sessionGroup.addTo")}
+            </ButtonV2>
+            <IconButtonV2
+              variant="ghost-muted"
+              size="small"
+              icon={<IconV2 name="close" />}
+              aria-label={props.language.t("common.cancel")}
+              onClick={props.onClearSelection}
+            />
+          </div>
+        </Show>
         <Suspense>
           <Show when={props.groups().length > 0 && props.canCreateSession()}>
             <div class="pointer-events-none absolute right-0 top-[84px] z-20 flex lg:top-[108px]">
@@ -130,16 +170,46 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
               <For each={props.groups()}>
                 {(group, index) => (
                   <>
-                    <HomeSessionGroupHeader
-                      title={group.title}
-                      titleOpacity={props.titleOpacity(group.id)}
-                      onSetRef={(element) => props.onSetHeader(group.id, element)}
-                      elevated={index() === 0}
-                    />
+                    <Show
+                      when={group.isUserGroup}
+                      fallback={
+                        <HomeSessionGroupHeader
+                          title={group.title}
+                          titleOpacity={props.titleOpacity(group.id)}
+                          onSetRef={(element) => props.onSetHeader(group.id, element)}
+                          elevated={index() === 0}
+                        />
+                      }
+                    >
+                      <HomeSessionGroupHeaderRow
+                        group={group}
+                        titleOpacity={props.titleOpacity(group.id)}
+                        onSetRef={(element) => props.onSetHeader(group.id, element)}
+                        elevated={index() === 0}
+                        language={props.language}
+                        isCollapsed={props.isGroupCollapsed(group.id)}
+                        onToggleCollapse={() => props.onToggleGroupCollapsed(group.id)}
+                        onOpenTab={() => props.onOpenGroupTab(group.id)}
+                        onRename={(name) => props.onRenameGroup(group.id, name)}
+                        onDelete={() => props.onDeleteGroup(group.id)}
+                      />
+                    </Show>
                     <div
                       class={`flex min-w-0 flex-col gap-px pt-4 ${index() === props.groups().length - 1 ? "" : "mb-6"}`}
                     >
-                      <For each={group.sessions}>{(record) => <HomeSessionRow {...props} record={record} />}</For>
+                      <Show
+                        when={!group.isUserGroup || !props.isGroupCollapsed(group.id)}
+                      >
+                        <For each={group.sessions}>
+                          {(record) => (
+                            <HomeSessionRow
+                              {...props}
+                              record={record}
+                              inGroupId={group.isUserGroup ? group.id : undefined}
+                            />
+                          )}
+                        </For>
+                      </Show>
                     </div>
                   </>
                 )}
@@ -503,6 +573,11 @@ function HomeSessionSearchRow(
         <Show when={showProjectName()}>
           <HomeSessionProjectName name={props.hit.projectName} search />
         </Show>
+        <Show when={props.hit.groupName}>
+          <span class="shrink-0 rounded-[4px] bg-v2-background-bg-layer-02 px-1.5 py-px text-[11px] text-v2-text-text-faint transition-[background-color] duration-[120ms] ease-in-out">
+            {props.hit.groupName}
+          </span>
+        </Show>
       </div>
     </button>
   )
@@ -568,6 +643,11 @@ function HomeSessionSearchMessageRow(
           <Show when={showProjectName()}>
             <HomeSessionProjectName name={props.hit.projectName} search />
           </Show>
+          <Show when={props.hit.groupName}>
+            <span class="shrink-0 rounded-[4px] bg-v2-background-bg-layer-02 px-1.5 py-px text-[11px] text-v2-text-text-faint transition-[background-color] duration-[120ms] ease-in-out">
+              {props.hit.groupName}
+            </span>
+          </Show>
           <span class="ml-auto shrink-0 pl-2 text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440]">
             {time()}
           </span>
@@ -614,69 +694,246 @@ function HomeSessionGroupHeader(props: {
   )
 }
 
-function HomeSessionRow(props: HomeSessionsViewProps & { record: HomeSessionRecord }) {
-  const title = createMemo(() => sessionTitle(props.record.session.title) || props.record.session.id)
-  const showProjectName = () => props.showProjectName() && props.record.projectName
+function HomeSessionGroupHeaderRow(props: {
+  group: HomeSessionGroup
+  titleOpacity: number
+  onSetRef: (element: HTMLDivElement) => void
+  elevated?: boolean
+  language: ReturnType<typeof useLanguage>
+  isCollapsed: boolean
+  onToggleCollapse: () => void
+  onOpenTab: () => void
+  onRename: (name: string) => void
+  onDelete: () => void
+}) {
+  const dialog = useDialog()
+  const [editing, setEditing] = createSignal(false)
+  const sessionCountLabel = () =>
+    props.language.plural("sessionGroup.sessions", props.group.sessions.length)
 
   return (
     <div
-      class="group/session relative flex h-10 min-w-0 items-center rounded-[6px]"
-      classList={{ group: !!showProjectName() }}
+      ref={props.onSetRef}
+      class={`
+        group/session-group sticky top-[84px] flex h-10 min-w-0 items-center gap-2
+        rounded-[6px] px-3 bg-v2-background-bg-base
+        transition-[background-color] duration-[120ms] ease-in-out
+        hover:bg-v2-overlay-simple-overlay-hover
+        lg:top-[108px]
+      `}
+      classList={{ "home-session-group-header z-[5]": !!props.elevated, "z-10": !props.elevated }}
     >
-      <button
-        type="button"
-        data-component="home-session-row"
-        class={`
-          flex h-10 min-w-0 w-full flex-1 shrink-0 cursor-default items-center gap-2 rounded-[6px] border-0
-          bg-transparent py-3 pl-3 pr-10 text-left text-v2-text-text-muted [font-weight:530]
-          transition-[background-color,color,box-shadow] duration-[120ms] ease-in-out
-          hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none
-        `}
-        onMouseDown={(event) => {
-          if (event.button === 1) event.preventDefault()
-        }}
-        onClick={(event) => props.onOpenSession(props.record.session, { background: isBackgroundOpen(event) })}
-        onAuxClick={(event) => {
-          if (!isBackgroundOpen(event)) return
+      <IconButtonV2
+        data-action="home-session-group-collapse"
+        variant="ghost-muted"
+        size="small"
+        icon={
+          <IconV2
+            name="chevron-down"
+            size="small"
+            class="transition-transform duration-150 ease-in-out"
+            style={{ transform: `rotate(${props.isCollapsed ? -90 : 0}deg)` }}
+          />
+        }
+        aria-label={props.isCollapsed ? props.language.t("home.server.expand") : props.language.t("home.server.collapse")}
+        onClick={(event) => {
           event.preventDefault()
-          props.onOpenSession(props.record.session, { background: true })
+          event.stopPropagation()
+          props.onToggleCollapse()
         }}
+      />
+      <span
+        class="min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap text-[13px] text-v2-text-text-base [font-weight:530]"
+        style={{ opacity: props.titleOpacity }}
       >
-        <HomeSessionLeadingController
-          server={props.server}
-          isOpenTab={props.isOpenTab}
-          record={props.record}
-          revealProjectOnHover={!!showProjectName()}
-        />
-        <HomeSessionTitle title={title()} showProjectName={!!showProjectName()} />
-        <Show when={showProjectName()}>
-          <HomeSessionProjectName name={props.record.projectName} />
-        </Show>
-      </button>
-      <Show when={SHOW_HOME_SESSION_ARCHIVE}>
-        <div
-          class={`
-            hover-reveal absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-1
-            group-hover/session:opacity-100 focus-within:opacity-100
-          `}
-        >
-          <TooltipV2 class="flex shrink-0 items-center" placement="bottom" value={props.language.t("common.archive")}>
-            <IconButtonV2
-              data-action="home-session-archive"
-              variant="ghost-muted"
-              size="large"
-              icon={<IconV2 name="archive" />}
-              aria-label={props.language.t("common.archive")}
-              onClick={(event) => {
-                event.preventDefault()
-                event.stopPropagation()
-                void props.onArchiveSession(props.record.session)
-              }}
-            />
-          </TooltipV2>
-        </div>
-      </Show>
+        {props.group.title}
+      </span>
+      <span
+        aria-hidden="true"
+        class="shrink-0 rounded-[4px] px-1.5 py-px text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440] bg-v2-background-bg-layer-02"
+      >
+        {sessionCountLabel()}
+      </span>
+      <div
+        class={`
+          shrink-0 group-hover/session-group:opacity-100
+          focus-within:opacity-100 data-[menu=true]:opacity-100
+        `}
+      >
+        <MenuV2 gutter={6} modal={false} placement="bottom-end">
+          <MenuV2.Trigger
+            as={IconButtonV2}
+            data-action="home-session-group-menu"
+            variant="ghost-muted"
+            size="small"
+            icon={<IconV2 name="outline-dots" />}
+            aria-label={props.language.t("common.moreOptions")}
+          />
+          <MenuV2.Portal>
+            <MenuV2.Content>
+              <MenuV2.Item onSelect={props.onOpenTab}>
+                {props.language.t("sessionGroup.openGroup")}
+              </MenuV2.Item>
+              <MenuV2.Separator />
+               <MenuV2.Item
+                 onSelect={() => {
+                   void dialog.show(() => (
+                     <DialogSessionGroupName initial={props.group.title} onSubmit={props.onRename} />
+                   ))
+                 }}
+              >
+                {props.language.t("common.rename")}
+              </MenuV2.Item>
+               <MenuV2.Item
+                 onSelect={props.onDelete}
+              >
+                <span class="text-v2-state-text-danger">{props.language.t("common.delete")}</span>
+              </MenuV2.Item>
+            </MenuV2.Content>
+          </MenuV2.Portal>
+        </MenuV2>
+      </div>
     </div>
+  )
+}
+
+function HomeSessionRow(
+  props: HomeSessionsViewProps & { record: HomeSessionRecord; inGroupId?: string },
+) {
+  const dialog = useDialog()
+  const title = createMemo(() => sessionTitle(props.record.session.title) || props.record.session.id)
+  const showProjectName = () => props.showProjectName() && props.record.projectName
+  const inGroup = () => !!props.inGroupId
+
+  return (
+    <MenuV2.Context>
+      <MenuV2.Context.Trigger class="block h-full w-full">
+        <div
+          class="group/session relative flex h-10 min-w-0 items-center rounded-[6px]"
+          classList={{ group: !!showProjectName() }}
+        >
+          <button
+            type="button"
+             data-component="home-session-row"
+             data-selected={props.isSelected(props.record.session.id) ? "" : undefined}
+             aria-pressed={props.isSelected(props.record.session.id)}
+            class={`
+              flex h-10 min-w-0 w-full flex-1 shrink-0 cursor-default items-center gap-2 rounded-[6px] border-0
+              bg-transparent py-3 pl-3 pr-10 text-left text-v2-text-text-muted [font-weight:530]
+              transition-[background-color,color,box-shadow] duration-[120ms] ease-in-out
+              hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none
+            `}
+            classList={{ "bg-v2-background-bg-layer-03": props.isSelected(props.record.session.id) }}
+            onMouseDown={(event) => {
+              if (event.button === 1) event.preventDefault()
+            }}
+            onClick={(event) => {
+              if (event.shiftKey || event.metaKey || event.ctrlKey) {
+                event.preventDefault()
+                props.onToggleSelection(props.record.session.id, event)
+                return
+              }
+              props.onOpenSession(props.record.session, { background: isBackgroundOpen(event) })
+            }}
+            onAuxClick={(event) => {
+              if (!isBackgroundOpen(event)) return
+              event.preventDefault()
+              props.onOpenSession(props.record.session, { background: true })
+            }}
+          >
+            <HomeSessionLeadingController
+              server={props.server}
+              isOpenTab={props.isOpenTab}
+              record={props.record}
+              revealProjectOnHover={!!showProjectName()}
+            />
+            <HomeSessionTitle title={title()} showProjectName={!!showProjectName()} />
+            <Show when={showProjectName()}>
+              <HomeSessionProjectName name={props.record.projectName} />
+            </Show>
+          </button>
+          <Show when={SHOW_HOME_SESSION_ARCHIVE}>
+            <div
+              class={`
+                hover-reveal absolute right-1.5 top-1/2 flex -translate-y-1/2 items-center gap-1
+                group-hover/session:opacity-100 focus-within:opacity-100
+              `}
+            >
+              <TooltipV2 class="flex shrink-0 items-center" placement="bottom" value={props.language.t("common.archive")}>
+                <IconButtonV2
+                  data-action="home-session-archive"
+                  variant="ghost-muted"
+                  size="large"
+                  icon={<IconV2 name="archive" />}
+                  aria-label={props.language.t("common.archive")}
+                  onClick={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    void props.onArchiveSession(props.record.session)
+                  }}
+                />
+              </TooltipV2>
+            </div>
+          </Show>
+        </div>
+      </MenuV2.Context.Trigger>
+      <MenuV2.Context.Portal>
+        <MenuV2.Context.Content>
+          <MenuV2.Item
+            onSelect={() =>
+              props.onOpenSession(props.record.session, { background: false })
+            }
+          >
+            {props.language.t("common.open")}
+          </MenuV2.Item>
+          <MenuV2.Item
+            onSelect={() =>
+              props.onOpenSession(props.record.session, { background: true })
+            }
+          >
+            {props.language.t("home.sessions.contextMenu.addToGroup")}
+          </MenuV2.Item>
+          <MenuV2.Separator />
+          <MenuV2.Sub gutter={0} overlap overflowPadding={8}>
+            <MenuV2.SubTrigger>
+              {props.language.t("home.sessions.contextMenu.addToGroup")}
+            </MenuV2.SubTrigger>
+            <MenuV2.Portal>
+              <MenuV2.SubContent class="max-w-[200px]">
+                <For each={props.userGroups()}>
+                  {(group) => (
+                    <MenuV2.Item onSelect={() => props.onAddToGroup(props.record.session.id, group.id)}>
+                      {group.name}
+                    </MenuV2.Item>
+                  )}
+                </For>
+                <MenuV2.Separator />
+                 <MenuV2.Item
+                   onSelect={() => {
+                     void dialog.show(() => (
+                       <DialogSessionGroupName
+                         onSubmit={(name) => void props.onCreateGroup(name, [props.record.session.id])}
+                       />
+                     ))
+                   }}
+                >
+                  {props.language.t("home.sessions.contextMenu.newGroup")}
+                </MenuV2.Item>
+              </MenuV2.SubContent>
+            </MenuV2.Portal>
+          </MenuV2.Sub>
+          <Show when={inGroup()}>
+            <MenuV2.Item onSelect={() => props.onRemoveFromGroup(props.record.session.id)}>
+              {props.language.t("home.sessions.contextMenu.removeFromGroup")}
+            </MenuV2.Item>
+          </Show>
+          <MenuV2.Separator />
+          <MenuV2.Item onSelect={() => void props.onArchiveSession(props.record.session)}>
+            {props.language.t("common.archive")}
+          </MenuV2.Item>
+        </MenuV2.Context.Content>
+      </MenuV2.Context.Portal>
+    </MenuV2.Context>
   )
 }
 
@@ -703,6 +960,30 @@ function HomeSessionProjectName(props: { name: string; search?: boolean }) {
     >
       {props.name}
     </span>
+  )
+}
+
+function HomeGroupEmptyState(props: {
+  language: ReturnType<typeof useLanguage>
+  onAddSessions?: () => void
+}) {
+  return (
+    <div class="flex flex-col items-center gap-2 py-6">
+      <IconV2 name="layers" size="large" class="text-v2-icon-icon-muted" />
+      <span class="text-[13px] text-v2-text-text-muted [font-weight:440]">
+        {props.language.t("sessionGroup.empty")}
+      </span>
+      <span class="text-[12px] text-v2-text-text-faint [font-weight:440]">
+        {props.language.t("sessionGroup.empty.description")}
+      </span>
+      <Show when={props.onAddSessions}>
+        {(addSessions) => (
+          <ButtonV2 variant="ghost-muted" size="small" onClick={addSessions()}>
+            {props.language.t("sessionGroup.addSessions")}
+          </ButtonV2>
+        )}
+      </Show>
+    </div>
   )
 }
 

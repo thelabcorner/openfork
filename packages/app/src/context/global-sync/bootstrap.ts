@@ -12,13 +12,17 @@ import type {
 import type {
   AgentListInput,
   AgentListOutput,
-  CatalogApi,
   CommandInfo,
   CommandListInput,
   CommandListOutput,
+  ModelDefaultOutput,
+  ModelListInput,
+  ModelListOutput,
   ProjectCurrentInput,
   ProjectCurrentOutput,
   ProjectListOutput,
+  ProviderListInput,
+  ProviderListOutput,
   ReferenceListInput,
   ReferenceListOutput,
   SessionApi,
@@ -117,6 +121,23 @@ export const loadGlobalConfigQuery = (scope: ServerScope, sdk: OpencodeClient, p
 type ProjectApi = {
   readonly list: () => Promise<ProjectListOutput>
   readonly current: (input?: ProjectCurrentInput) => Promise<ProjectCurrentOutput>
+}
+
+type CatalogApi = {
+  readonly providers?: {
+    readonly list: (input?: ProviderListInput) => Promise<ProviderListOutput>
+  }
+  readonly provider?: {
+    readonly list: (input?: ProviderListInput) => Promise<ProviderListOutput>
+  }
+  readonly models?: {
+    readonly list: (input?: ModelListInput) => Promise<ModelListOutput>
+    readonly default?: (input?: ModelListInput) => Promise<ModelDefaultOutput>
+  }
+  readonly model?: {
+    readonly list: (input?: ModelListInput) => Promise<ModelListOutput>
+    readonly default?: (input?: ModelListInput) => Promise<ModelDefaultOutput>
+  }
 }
 
 type McpApi = ServerApi["mcp"]
@@ -234,10 +255,13 @@ export const loadProvidersQuery = (
           return normalizeProviderList(result.data!)
         }
         const location = directory ? { location: { directory } } : undefined
+        const providerApi = sdk.providers ?? sdk.provider
+        const modelApi = sdk.models ?? sdk.model
+        if (!providerApi || !modelApi) throw new Error("Provider/model catalog API unavailable")
         const [providers, models, defaultModel] = await Promise.all([
-          sdk.provider.list(location),
-          sdk.model.list(location),
-          sdk.model.default(location),
+          providerApi.list(location),
+          modelApi.list(location),
+          modelApi.default?.(location) ?? Promise.resolve({ location: location?.location ?? {}, data: null }),
         ])
         return normalizeProviderList(providers.data, models.data, defaultModel.data)
       }),

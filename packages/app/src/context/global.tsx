@@ -45,7 +45,11 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
     const ensureServerCtx = (conn: ServerConnection.Any) => {
       const key = ServerConnection.key(conn)
       const existing = serverCtxs.get(key)
-      if (existing) return existing.serverCtx
+      if (existing && existing.serverCtx.sdk.url === conn.http.url) return existing.serverCtx
+      if (existing) {
+        existing.dispose()
+        serverCtxs.delete(key)
+      }
       const root = createRoot((dispose) => {
         const serverCtx = createServerCtx(conn, server.scope(key), server.projects.forServer(key))
         return { dispose, serverCtx }

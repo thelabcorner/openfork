@@ -1,0 +1,11 @@
+@layer components {
+  ::highlight(opencode-session-find) {
+    background-color: rgb(from var(--v2-yellow-300) r g b / 0.3);
+    border-radius: 2px;
+  }
+
+  ::highlight(opencode-session-find-current) {
+    background-color: rgb(from var(--v2-yellow-500) r g b / 0.5);
+    border-radius: 2px;
+  }
+}

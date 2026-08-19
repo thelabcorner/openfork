@@ -78,6 +78,13 @@ export function enqueueServerEvent(queue: QueuedServerEvent[], event: QueuedServ
 
 export function coalesceServerEvents(events: QueuedServerEvent[]) {
   const output: QueuedServerEvent[] = []
+  // Pending V1 message.part.delta merges keyed by (directory, messageID, partID, field).
+  // Unlike the previous adjacent-only merge, deltas for the SAME part/field may be
+  // concatenated even when interleaved with deltas for OTHER parts/sessions — the
+  // final store state is identical because each part's field is an independent
+  // append-only string. Any non-delta event is a barrier (a snapshot/removal/status
+  // can change a part's base), so pending merges never cross one.
+  const pending = new Map<string, number>()
   events.forEach((event) => {
     const current = currentDelta(event.payload.current)
     if (current) {
@@ -108,32 +115,30 @@ export function coalesceServerEvents(events: QueuedServerEvent[]) {
       return
     }
     if (event.payload.type !== "message.part.delta") {
+      // Any non-delta event is a barrier: no delta may merge across it.
+      pending.clear()
       output.push(event)
       return
     }
     const props = event.payload.properties
-    const previous = output[output.length - 1]
-    if (
-      !previous ||
-      previous.payload.type !== "message.part.delta" ||
-      previous.directory !== event.directory ||
-      previous.payload.properties.messageID !== props.messageID ||
-      previous.payload.properties.partID !== props.partID ||
-      previous.payload.properties.field !== props.field
-    ) {
-      output.push({
+    const key = `${event.directory}:${props.messageID}:${props.partID}:${props.field}`
+    const existingIndex = pending.get(key)
+    if (existingIndex !== undefined) {
+      const previousProps = output[existingIndex].payload.properties as { delta: string }
+      output[existingIndex] = {
         directory: event.directory,
-        payload: { ...event.payload, properties: { ...props } },
-      })
+        payload: {
+          ...event.payload,
+          properties: { ...props, delta: previousProps.delta + props.delta },
+        },
+      }
       return
     }
-    output[output.length - 1] = {
+    output.push({
       directory: event.directory,
-      payload: {
-        ...event.payload,
-        properties: { ...props, delta: previous.payload.properties.delta + props.delta },
-      },
-    }
+      payload: { ...event.payload, properties: { ...props } },
+    })
+    pending.set(key, output.length - 1)
   })
   return output
 }

@@ -1,4 +1,5 @@
 import type { AssistantMessage, Message } from "@opencode-ai/sdk/v2/client"
+import { effectiveModel } from "./session-context-model-metrics"
 
 type Provider = {
   id: string
@@ -43,16 +44,18 @@ const build = (messages: Message[] = [], providers: Provider[] = []): Context | 
   if (!message) return undefined
 
   const provider = providers.find((item) => item.id === message.providerID)
-  const model = provider?.models[message.modelID]
-  const limit = model?.limit.context
+  const served = effectiveModel(message)
+  const model = served ? provider?.models[served.modelID] : undefined
+  const resolved = model ?? provider?.models[message.modelID]
+  const limit = resolved?.limit.context
   const total = tokenTotal(message)
 
   return {
     message,
     provider,
-    model,
-    providerLabel: provider?.name ?? message.providerID,
-    modelLabel: model?.name ?? message.modelID,
+    model: resolved,
+    providerLabel: served?.providerID ?? provider?.name ?? message.providerID,
+    modelLabel: resolved?.name ?? served?.modelID ?? message.modelID,
     limit,
     input: message.tokens.input,
     total,

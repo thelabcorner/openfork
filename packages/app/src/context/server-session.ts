@@ -226,6 +226,8 @@ export function createServerSession(
   const orphanParts = new Map<string, Set<string>>()
   const removedMessages = new Map<string, Set<string>>()
   const deltaBases = new Map<string, { base: string; sessionID: string }>()
+  const suspended = new Set<string>()
+  const stale = new Set<string>()
   const deleteMessageParts = (
     cache: { part: Record<string, Part[] | undefined>; part_text_accum_delta: Record<string, string | undefined> },
     messageID: string,
@@ -689,8 +691,9 @@ export function createServerSession(
   ) => {
     const source = page.source
       ? (() => {
-          const incoming = new Map(page.source.map((message) => [message.id, message]))
           const existing = data.session_message[sessionID] ?? []
+          if (page.projectSource && existing.length === 0 && !load?.touchedSource.size) return page.source
+          const incoming = new Map(page.source.map((message) => [message.id, message]))
           const current = existing.filter((message) => !incoming.has(message.id))
           const live = new Map(existing.map((message) => [message.id, message]))
           return (page.sourceMode === "older" ? [...page.source, ...current] : [...current, ...page.source]).map(
@@ -700,7 +703,9 @@ export function createServerSession(
       : undefined
     const projected =
       page.projectSource && source
-        ? (() => {
+        ? source === page.source
+          ? page
+          : (() => {
             const normalized = normalizeSessionMessages(sessionID, source)
             return {
               ...page,
@@ -709,7 +714,7 @@ export function createServerSession(
                 .map(([id, part]) => ({ id, part: part.sort((a, b) => cmp(a.id, b.id)) }))
                 .sort((a, b) => cmp(a.id, b.id)),
             }
-          })()
+            })()
         : page
     const merged = mergeOptimisticPage(projected, [...(optimistic.get(sessionID)?.values() ?? [])])
     merged.observed.forEach((item) => {
@@ -787,20 +792,23 @@ export function createServerSession(
             ),
           ),
         ]
-        for (const parentID of parentIDs) {
-          if (generations.get(sessionID) !== active) break
-          const parent = await fetchMessage(sessionID, parentID, () =>
-            resetMessageLoad(sessionID, load, messageLoadBaseline(load, parentID)),
-          ).catch((error) => {
-            const cause = error instanceof Error && typeof error.cause === "object" ? error.cause : undefined
-            if (cause && "status" in cause && cause.status === 404) {
-              load.removedMessages.add(parentID)
-              return
-            }
-            throw error
-          })
+        const fetchedParents = await Promise.all(
+          parentIDs.map((parentID) =>
+            fetchMessage(sessionID, parentID, () =>
+              resetMessageLoad(sessionID, load, messageLoadBaseline(load, parentID)),
+            ).catch((error) => {
+              const cause = error instanceof Error && typeof error.cause === "object" ? error.cause : undefined
+              if (cause && "status" in cause && cause.status === 404) {
+                load.removedMessages.add(parentID)
+                return undefined
+              }
+              throw error
+            }),
+          ),
+        )
+        for (const parent of fetchedParents) {
           if (!parent) continue
-          if (parent.message.role !== "user") throw new Error(`Assistant parent is not a user message: ${parentID}`)
+          if (parent.message.role !== "user") throw new Error(`Assistant parent is not a user message: ${parent.message.id}`)
           parents.push(parent)
         }
       }
@@ -846,6 +854,7 @@ export function createServerSession(
 
   const sync = (sessionID: string, options?: { force?: boolean; messageLimit?: number }) => {
     touch(sessionID)
+    suspended.delete(sessionID)
     return runInflight(inflight, sessionID, async () => {
       const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
       if (cached && data.info[sessionID] && !options?.force) return
@@ -855,7 +864,12 @@ export function createServerSession(
           ? Promise.resolve()
           : loadMessages(sessionID, options?.messageLimit ?? meta.limit[sessionID] ?? initialMessagePageSize),
       ])
+      stale.delete(sessionID)
     })
+  }
+
+  const release = (sessionID: string) => {
+    suspended.add(sessionID)
   }
 
   const prefetch = async (sessionID: string, limit: number) => {
@@ -947,10 +961,35 @@ export function createServerSession(
   const applyV2 = (event: OpenCodeEvent) => {
     if (!("data" in event) || !("sessionID" in event.data) || typeof event.data.sessionID !== "string") return
     const sessionID = event.data.sessionID
-    const reduction = v2.reduce(data.session_message[sessionID] ?? [], event)
-    if (reduction) {
-      projectV2(reduction)
-      if (reduction.missing) hydrateV2Message(sessionID, reduction.missing)
+    // Keep inactive streaming sessions lightweight. Their status and metadata
+    // are still handled below, while message projection waits for session.sync
+    // on activation. Reducing every delta for every open session makes the
+    // shared store do O(streams * deltas) work even when the timeline is hidden.
+    const loaded = data.session_message[sessionID] !== undefined || data.message[sessionID] !== undefined
+    const contentEvent =
+      event.type.startsWith("session.input.") ||
+      event.type.startsWith("session.text.") ||
+      event.type.startsWith("session.reasoning.") ||
+      event.type.startsWith("session.tool.") ||
+      event.type.startsWith("session.shell.") ||
+      event.type === "session.agent.selected" ||
+      event.type === "session.model.selected" ||
+      event.type === "session.synthetic" ||
+      event.type === "session.skill.activated" ||
+      event.type === "session.step.started" ||
+      event.type === "session.step.ended" ||
+      event.type === "session.step.failed"
+    if (suspended.has(sessionID) && contentEvent) {
+      stale.add(sessionID)
+      return
+    }
+    if (!loaded && contentEvent) return
+    if (loaded || messageLoads.has(sessionID)) {
+      const reduction = v2.reduce(data.session_message[sessionID] ?? [], event)
+      if (reduction) {
+        projectV2(reduction)
+        if (reduction.missing) hydrateV2Message(sessionID, reduction.missing)
+      }
     }
 
     const info = data.info[sessionID]
@@ -1323,6 +1362,7 @@ export function createServerSession(
       },
     },
     sync,
+    release,
     prefetch,
     shouldPrefetch(sessionID: string, limit: number) {
       if (data.message[sessionID] === undefined) return true
@@ -1331,7 +1371,7 @@ export function createServerSession(
       return (meta.limit[sessionID] ?? 0) <= limit
     },
     fresh(sessionID: string, ttl: number) {
-      return Date.now() - (meta.at[sessionID] ?? 0) <= ttl
+      return !stale.has(sessionID) && Date.now() - (meta.at[sessionID] ?? 0) <= ttl
     },
     optimistic: {
       add(input: { sessionID: string; message: Message; parts: Part[] }) {

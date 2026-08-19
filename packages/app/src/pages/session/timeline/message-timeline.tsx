@@ -77,6 +77,8 @@ import { observeElementOffsetReconnectAware } from "./observe-element-offset"
 import { createTimelineProjection } from "./projection"
 import { MessageComment, SummaryDiff, TimelineRow, TimelineRowMap } from "./rows"
 import { filterVirtualIndexes } from "./virtual-items"
+import { textLayoutMode } from "@/lib/text-layout"
+import { TIMELINE_FALLBACK_SIZE, TimelineRowEstimator, type RowEstimateInput } from "./estimation"
 
 const emptyMessages: MessageType[] = []
 const emptyParts: PartType[] = []
@@ -87,8 +89,12 @@ const idle = { type: "idle" as const }
 type FramedTimelineRow = Exclude<TimelineRow.TimelineRow, { _tag: "TurnGap" }>
 type TimelineRowByTag<T extends TimelineRow.TimelineRow["_tag"]> = Extract<TimelineRow.TimelineRow, { _tag: T }>
 
-const timelineFallbackItemSize = 60
+const timelineFallbackItemSize = TIMELINE_FALLBACK_SIZE
 const timelineCache = new Map<string, { measurements: VirtualItem[]; toolOpen: Record<string, boolean | undefined> }>()
+
+// Process-global estimator: priors/history learning persists across sessions;
+// per-row measurements are keyed by row key (session-scoped) and never leak.
+const rowEstimator = new TimelineRowEstimator({ mode: textLayoutMode() })
 
 const taskDescription = (part: PartType, sessionID: string) => {
   if (part.type !== "tool" || part.tool !== "task") return
@@ -252,7 +258,8 @@ export function MessageTimeline(props: {
   setContentRef: (el: HTMLDivElement) => void
   userMessages: UserMessage[]
   anchor: (id: string) => string
-  setRevealMessage?: (fn: (id: string) => void) => void
+  setRevealMessage?: (fn: (id: string, rowIndex?: number) => void) => void
+  setRevealRow?: (fn: (rowIndex: number) => void) => void
   setScrollToEnd?: (fn: () => void) => void
   setHistoryAnchor?: (handlers: { capture: () => void; restore: (done: boolean) => void }) => void
   findMatches?: { matched: () => Set<string>; active: () => string | undefined }
@@ -346,8 +353,48 @@ export function MessageTimeline(props: {
   const messageByID = projection.messageByID
   const messageLastRowIndex = projection.messageLastRowIndex
   const messageRowIndex = projection.messageRowIndex
+  const messageRowIndices = projection.messageRowIndices
   const timelineRowByKey = projection.rowByKey
   const timelineRows = projection.rows
+  const safeTimelineRows = createMemo(() => timelineRows() ?? [])
+  let estimateInputCache = new WeakMap<
+    TimelineRow.TimelineRow,
+    { key: string; text?: string; heightHint?: number }
+  >()
+
+  const estimateInput = (row: TimelineRow.TimelineRow): RowEstimateInput => {
+    let cached = estimateInputCache.get(row)
+    if (!cached) {
+      let text: string | undefined
+      if (row._tag === "UserMessage") {
+        const parts = getMsgParts(row.userMessageID)
+        text = parts
+          .filter((part): part is Extract<PartType, { type: "text" }> => part.type === "text" && !!part.text)
+          .map((part) => part.text)
+          .join("\n") || undefined
+      } else if (row._tag === "AssistantPart" && row.group.type === "part") {
+        const part = getMsgPart(row.group.ref.messageID, row.group.ref.partID)
+        if (part?.type === "text" && part.text) text = part.text
+      } else if (row._tag === "Error") {
+        text = row.text || undefined
+      } else if (row._tag === "Thinking") {
+        text = row.reasoningHeading || undefined
+      }
+      cached = { key: TimelineRow.key(row), text, heightHint: row._tag === "AssistantPart" ? row.heightHint : undefined }
+      estimateInputCache.set(row, cached)
+    }
+    const streaming = sessionStatus().type !== "idle" && activeMessageID() === row.userMessageID
+    return {
+      ...cached,
+      row,
+      streaming,
+    }
+  }
+  createEffect(() => {
+    sessionMessages()
+    sessionStatus().type
+    estimateInputCache = new WeakMap()
+  })
 
   let prependAnchor: { key: string; offset: number } | undefined
   let prependAnchorFrame: number | undefined
@@ -416,20 +463,24 @@ export function MessageTimeline(props: {
   let virtualContent: HTMLDivElement | undefined
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
     get count() {
-      return timelineRows().length
+      return safeTimelineRows().length
     },
     getScrollElement: () => listRoot() ?? null,
     observeElementOffset: observeElementOffsetReconnectAware,
     initialOffset: () => (props.shouldAnchorBottom() ? Number.MAX_SAFE_INTEGER : 0),
     initialMeasurementsCache: initialMeasurements,
-    estimateSize: () => timelineFallbackItemSize,
+    estimateSize: (index) => {
+      const row = safeTimelineRows()[index]
+      if (!row) return timelineFallbackItemSize
+      return rowEstimator.estimateSize(estimateInput(row))
+    },
     scrollToFn: (offset, options, instance) => {
       // Expose the computed range before core writes an anchor correction so the browser does not clamp it to the old height.
       if (virtualContent) virtualContent.style.height = `${instance.getTotalSize()}px`
       elementScroll(offset, options, instance)
     },
     get getItemKey() {
-      const rows = timelineRows()
+      const rows = safeTimelineRows()
       return (index: number) => {
         const row = rows[index]
         // ResizeObserver can report a removed element after its row has left the projection.
@@ -449,10 +500,27 @@ export function MessageTimeline(props: {
       const id = activeMessageID()
       const active = id ? (messageLastRowIndex().get(id) ?? -1) : -1
       const indexes = defaultRangeExtractor({ ...range, overscan: renderOverscan() })
-      return filterVirtualIndexes(
-        [...new Set([...resizePinnedIndexes, ...indexes, ...(active < 0 ? [] : [active])])].sort((a, b) => a - b),
-        range.count,
-      )
+      const extras =
+        active < 0 || active >= (resizePinnedIndexes.at(-1) ?? -1)
+          ? active < 0
+            ? resizePinnedIndexes
+            : [...resizePinnedIndexes, active]
+          : [...resizePinnedIndexes, active].sort((left, right) => left - right)
+      const merged: number[] = []
+      let extraIndex = 0
+      let index = 0
+      while (extraIndex < extras.length || index < indexes.length) {
+        const extra = extras[extraIndex]
+        const current = indexes[index]
+        if (current === undefined || (extra !== undefined && extra < current)) {
+          if (extra !== merged[merged.length - 1]) merged.push(extra)
+          extraIndex += 1
+          continue
+        }
+        if (current !== merged[merged.length - 1]) merged.push(current)
+        index += 1
+      }
+      return filterVirtualIndexes(merged, range.count)
     },
   })
   const resizeItem = virtualizer.resizeItem
@@ -499,10 +567,19 @@ export function MessageTimeline(props: {
   )
   const virtualRowKeys = createMemo(() => virtualizer.getVirtualItems().map((item) => item.key as string))
   createEffect(() => {
-    props.setRevealMessage?.((id) => {
+    props.setRevealMessage?.((id, rowIndex) => {
+      // If a specific row index is provided, scroll to that exact row
+      // (used by session find to scroll to the match, not just the turn start)
+      if (rowIndex !== undefined) {
+        virtualizer.scrollToIndex(rowIndex, { align: "center" })
+        return
+      }
       const index = messageRowIndex().get(id)
       if (index === undefined) return
       virtualizer.scrollToIndex(index, { align: "center" })
+    })
+    props.setRevealRow?.((rowIndex) => {
+      virtualizer.scrollToIndex(rowIndex, { align: "center" })
     })
     props.setScrollToEnd?.(() => virtualizer.scrollToEnd())
     props.setHistoryAnchor?.({ capture: capturePrependAnchor, restore: restorePrependAnchor })
@@ -521,7 +598,7 @@ export function MessageTimeline(props: {
   })
 
   const maybeAnchorBottom = () => {
-    if (timelineRows().length === 0) return
+    if (safeTimelineRows().length === 0) return
     if (!props.shouldAnchorBottom() || props.hasScrollGesture()) return
     if (resizePinFrame !== undefined) cancelAnimationFrame(resizePinFrame)
     clearPrependAnchor()
@@ -532,7 +609,7 @@ export function MessageTimeline(props: {
   let measuredSessionKey = sessionKey()
   createEffect(() => {
     const key = sessionKey()
-    timelineRows().length
+    safeTimelineRows().length
     if (measuredSessionKey !== key) {
       measuredSessionKey = key
       virtualizer.measure()
@@ -548,6 +625,7 @@ export function MessageTimeline(props: {
     if (resizePinFrame !== undefined) cancelAnimationFrame(resizePinFrame)
     if (overscanFrame !== undefined) cancelAnimationFrame(overscanFrame)
     props.setRevealMessage?.(() => {})
+    props.setRevealRow?.(() => {})
     props.setScrollToEnd?.(() => {})
     props.setHistoryAnchor?.({ capture: () => {}, restore: () => {} })
   })
@@ -572,6 +650,19 @@ export function MessageTimeline(props: {
     setListRoot(root)
     props.setScrollRef(root)
   }
+
+  // Track the timeline content width ONCE; the estimator reuses the same
+  // prepared text across width changes (no per-row measurement reads).
+  createEffect(() => {
+    const root = listRoot()
+    if (!root) return
+    const resizeObserver = new ResizeObserver(([entry]) => {
+      rowEstimator.setWidth(entry?.contentRect.width ?? root.clientWidth)
+    })
+    resizeObserver.observe(root)
+    rowEstimator.setWidth(root.clientWidth)
+    onCleanup(() => resizeObserver.disconnect())
+  })
 
   const handleListWheel = (event: WheelEvent & { currentTarget: HTMLDivElement }) => {
     if (!prependLoading) clearPrependAnchor()
@@ -987,39 +1078,36 @@ export function MessageTimeline(props: {
 
   const workingTurn = (userMessageID: string) => sessionStatus().type !== "idle" && activeMessageID() === userMessageID
 
-  const turnDurationMs = (userMessageID: string) => {
-    const message = messageByID().get(userMessageID)
-    if (!message || message.role !== "user") return
-    const end = (assistantMessagesByParent().get(userMessageID) ?? emptyAssistantMessages).reduce<number | undefined>(
-      (max, item) => {
+  const turnDurationByMessage = createMemo(() => {
+    const result = new Map<string, number>()
+    for (const [userMessageID, messages] of assistantMessagesByParent()) {
+      const message = messageByID().get(userMessageID)
+      if (!message || message.role !== "user") continue
+      const end = messages.reduce<number | undefined>((max, item) => {
         const completed = item.time.completed
-        if (typeof completed !== "number") return max
-        if (max === undefined) return completed
-        return Math.max(max, completed)
-      },
-      undefined,
-    )
-    if (typeof end !== "number") return
-    if (end < message.time.created) return
-    return end - message.time.created
-  }
+        return typeof completed === "number" && (max === undefined || completed > max) ? completed : max
+      }, undefined)
+      if (end !== undefined && end >= message.time.created) result.set(userMessageID, end - message.time.created)
+    }
+    return result
+  })
+  const turnDurationMs = (userMessageID: string) => turnDurationByMessage().get(userMessageID)
 
-  const assistantCopyPartID = (userMessageID: string) => {
-    if (workingTurn(userMessageID)) return null
-    const messages = assistantMessagesByParent().get(userMessageID) ?? emptyAssistantMessages
-
-    for (let i = messages.length - 1; i >= 0; i--) {
-      const message = messages[i]
-      if (!message) continue
-
-      const parts = getMsgParts(message.id)
-      for (let j = parts.length - 1; j >= 0; j--) {
-        const part = parts[j]
-        if (!part || part.type !== "text" || !part.text?.trim()) continue
-        return part.id
+  const assistantCopyPartByMessage = createMemo(() => {
+    const result = new Map<string, string>()
+    for (const [userMessageID, messages] of assistantMessagesByParent()) {
+      for (let i = messages.length - 1; i >= 0; i -= 1) {
+        const part = getMsgParts(messages[i]!.id).findLast((item) => item.type === "text" && !!item.text?.trim())
+        if (part?.type === "text") {
+          result.set(userMessageID, part.id)
+          break
+        }
       }
     }
-  }
+    return result
+  })
+  const assistantCopyPartID = (userMessageID: string) =>
+    workingTurn(userMessageID) ? null : (assistantCopyPartByMessage().get(userMessageID) ?? undefined)
 
   const renderAssistantPartGroup = (row: Accessor<TimelineRowMap["AssistantPart"]>, onSizeChange?: () => void) => {
     if (row().group.type === "context") {
@@ -1109,9 +1197,6 @@ export function MessageTimeline(props: {
           "md:max-w-200 2xl:max-w-[1000px]": props.centered,
           "md:mx-auto": props.centered,
           "pt-3": previousAssistantPart(),
-          "bg-v2-background-bg-accent/8": props.findMatches?.matched().has(input.row().userMessageID) ?? false,
-          "bg-v2-background-bg-accent/14 outline outline-1 -outline-offset-1 outline-v2-border-border-focus/60":
-            props.findMatches?.active() === input.row().userMessageID,
         }}
       >
         <div data-component="session-turn" class="min-w-0 w-full relative" style={{ height: "auto" }}>
@@ -1298,13 +1383,20 @@ export function MessageTimeline(props: {
     const [ready, setReady] = createSignal(initialItem.size <= timelineFallbackItemSize || !asyncFile())
     let contentMeasureFrame: number | undefined
 
-    onMount(() => virtualizer.measureElement(element))
+    const measureElementAndObserve = (element: HTMLDivElement) => {
+      virtualizer.measureElement(element)
+      const current = row()
+      const height = virtualizer.itemSizeCache.get(TimelineRow.key(current))
+      if (height !== undefined) rowEstimator.observe({ ...estimateInput(current), height })
+    }
+
+    onMount(() => measureElementAndObserve(element))
 
     createEffect(
       on(
         () => item().index,
         () => {
-          virtualizer.measureElement(element)
+          measureElementAndObserve(element)
         },
         { defer: true },
       ),
@@ -1340,7 +1432,7 @@ export function MessageTimeline(props: {
             onSizeChange={() => {
               setReady(true)
               if (contentMeasureFrame !== undefined) cancelAnimationFrame(contentMeasureFrame)
-              contentMeasureFrame = scheduleConnectedMeasure(element, virtualizer.measureElement)
+              contentMeasureFrame = scheduleConnectedMeasure(element, measureElementAndObserve)
             }}
           />
         </div>
@@ -1883,7 +1975,7 @@ export function MessageTimeline(props: {
           }}
         >
           <For each={virtualRowKeys()}>{(rowKey) => <VirtualTimelineRow rowKey={rowKey} />}</For>
-          <Show when={timelineRows().length > 0}>
+          <Show when={safeTimelineRows().length > 0}>
             <div
               data-timeline-row="bottom-spacer"
               aria-hidden="true"

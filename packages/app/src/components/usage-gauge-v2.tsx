@@ -5,26 +5,26 @@ import type { ForkWindowUsage } from "@/utils/fork-client"
 
 const usd = new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", maximumFractionDigits: 2 })
 
-const percent = (window: ForkWindowUsage) => {
-  if (window.estimatedPercent !== undefined) return Math.max(0, Math.min(100, window.estimatedPercent))
+export const percent = (window: ForkWindowUsage) => {
+  if (typeof window.estimatedPercent === "number") return Math.max(0, Math.min(100, window.estimatedPercent))
   if (window.limitUSD <= 0) return 0
   return Math.round(Math.max(0, Math.min(100, (window.spentUSD / window.limitUSD) * 100)) * 10) / 10
 }
 
-const toneFor = (pct: number) => {
+export const toneFor = (pct: number) => {
   if (pct >= 100) return "danger"
   if (pct >= 75) return "warning"
   return "success"
 }
 
-const colorFor = (tone: "danger" | "warning" | "success") => {
+export const colorFor = (tone: "danger" | "warning" | "success") => {
   if (tone === "danger") return "var(--v2-state-fg-danger)"
   if (tone === "warning") return "var(--v2-state-fg-warning)"
   return "var(--v2-state-fg-success)"
 }
 
 const formatPercent = (window: ForkWindowUsage, pct: number) =>
-  window.estimatedPercent !== undefined && pct % 1 !== 0
+  typeof window.estimatedPercent === "number" && pct % 1 !== 0
     ? pct.toFixed(2)
     : pct.toFixed(pct % 1 === 0 ? 0 : 1)
 
@@ -33,13 +33,16 @@ const formatCountdown = (
   ms: number,
 ) => {
   if (ms <= 0) return language.t("usage.duration.zero")
-  const totalMinutes = Math.ceil(ms / 60000)
-  const day = Math.floor(totalMinutes / 1440)
-  const hour = Math.floor((totalMinutes % 1440) / 60)
-  const minute = totalMinutes % 60
-  if (day > 0) return language.t("usage.duration.daysHours", { days: day, hours: hour })
-  if (hour > 0) return language.t("usage.duration.hoursMinutes", { hours: hour, minutes: minute })
-  return language.t("usage.duration.minutes", { minutes: minute })
+  const totalSeconds = Math.floor(ms / 1000)
+  const seconds = totalSeconds % 60
+  const totalMinutes = Math.floor(totalSeconds / 60)
+  const minutes = totalMinutes % 60
+  const totalHours = Math.floor(totalMinutes / 60)
+  const hours = totalHours % 24
+  const days = Math.floor(totalHours / 24)
+  if (days > 0) return language.t("usage.duration.daysHoursSeconds", { days, hours, seconds })
+  if (totalHours > 0) return language.t("usage.duration.hoursMinutesSeconds", { hours, minutes, seconds })
+  return language.t("usage.duration.minutesSeconds", { minutes, seconds })
 }
 
 const formatResetDate = (ms: number) =>

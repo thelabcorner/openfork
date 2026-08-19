@@ -116,6 +116,12 @@ export const createDirSyncContext = (
         await serverSync.session.sync(sessionID, options)
         index(sessionID)
       },
+      prefetch(sessionID: string, limit = 20) {
+        return serverSync.session.prefetch(sessionID, limit)
+      },
+      release(sessionID: string) {
+        serverSync.session.release(sessionID)
+      },
       todo: serverSync.session.todo,
       history: serverSync.session.history,
       evict(sessionID: string) {

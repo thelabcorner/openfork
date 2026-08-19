@@ -7,7 +7,7 @@ describe("createScrollPersistence", () => {
     try {
       const snapshot = {
         session: {
-          review: { x: 0, y: 0 },
+          changes: { x: 0, y: 0 },
         },
       } as Record<string, Record<string, { x: number; y: number }>>
       const writes: Array<Record<string, { x: number; y: number }>> = []
@@ -21,7 +21,7 @@ describe("createScrollPersistence", () => {
       })
 
       for (const i of Array.from({ length: 30 }, (_, n) => n + 1)) {
-        scroll.setScroll("session", "review", { x: 0, y: i })
+        scroll.setScroll("session", "changes", { x: 0, y: i })
       }
 
       vi.advanceTimersByTime(9)
@@ -30,9 +30,9 @@ describe("createScrollPersistence", () => {
       vi.advanceTimersByTime(1)
 
       expect(writes).toHaveLength(1)
-      expect(writes[0]?.review).toEqual({ x: 0, y: 30 })
+      expect(writes[0]?.changes).toEqual({ x: 0, y: 30 })
 
-      scroll.setScroll("session", "review", { x: 0, y: 30 })
+      scroll.setScroll("session", "changes", { x: 0, y: 30 })
       vi.advanceTimersByTime(20)
 
       expect(writes).toHaveLength(1)
@@ -52,13 +52,13 @@ describe("createScrollPersistence", () => {
       onFlush: () => {},
     })
 
-    expect(scroll.scroll("session", "review")).toBeUndefined()
+    expect(scroll.scroll("session", "changes")).toBeUndefined()
 
     snapshot.session = {
-      review: { x: 12, y: 34 },
+      changes: { x: 12, y: 34 },
     }
 
-    expect(scroll.scroll("session", "review")).toEqual({ x: 12, y: 34 })
+    expect(scroll.scroll("session", "changes")).toEqual({ x: 12, y: 34 })
     scroll.dispose()
   })
 })

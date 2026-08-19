@@ -85,7 +85,7 @@ describe("coalesceServerEvents", () => {
     ])
   })
 
-  test("preserves event ID order across interleaved deltas", () => {
+  test("merges interleaved deltas for the same part across other-part deltas", () => {
     const first = delta("a")
     const other = delta("b", "text", "other")
     const last = delta("c")
@@ -95,7 +95,48 @@ describe("coalesceServerEvents", () => {
 
     const result = coalesceServerEvents([first, other, last])
 
-    expect(result.map((event) => event.payload.id)).toEqual(["1", "2", "3"])
+    // "a" and "c" target the same part/field and are separated only by a delta for
+    // a DIFFERENT part, so they concatenate into one event (kept at the first
+    // occurrence, carrying the last id). The other-part delta stays separate.
+    expect(result).toHaveLength(2)
+    expect(result[0]?.payload).toMatchObject({ id: "3", properties: { partID: "part", delta: "ac" } })
+    expect(result[1]?.payload).toMatchObject({ id: "2", properties: { partID: "other", delta: "b" } })
+  })
+
+  test("does not merge deltas across a non-delta barrier", () => {
+    const status = {
+      directory: "/repo",
+      payload: { type: "session.status", properties: { sessionID: "ses", status: { type: "idle" } } } as Event,
+    }
+    const result = coalesceServerEvents([delta("a"), status, delta("c")])
+
+    expect(result.map((event) => event.payload.type)).toEqual([
+      "message.part.delta",
+      "session.status",
+      "message.part.delta",
+    ])
+    expect(result[0]?.payload).toMatchObject({ properties: { delta: "a" } })
+    expect(result[2]?.payload).toMatchObject({ properties: { delta: "c" } })
+  })
+
+  test("does not merge deltas across a part snapshot barrier", () => {
+    const snapshot = {
+      directory: "/repo",
+      payload: {
+        type: "message.part.updated",
+        properties: {
+          sessionID: "ses",
+          part: { id: "part", sessionID: "ses", messageID: "msg", type: "text", text: "snapshot" },
+        },
+      } as Event,
+    }
+    const result = coalesceServerEvents([delta("a"), snapshot, delta("c")])
+
+    expect(result.map((event) => event.payload.type)).toEqual([
+      "message.part.delta",
+      "message.part.updated",
+      "message.part.delta",
+    ])
   })
 })
 

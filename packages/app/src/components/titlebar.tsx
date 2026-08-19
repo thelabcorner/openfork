@@ -169,6 +169,26 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
     },
   ])
 
+  command.register("browser-toggle", () => [
+    {
+      id: "browser.toggle",
+      title: language.t("command.browser.toggle"),
+      category: language.t("command.category.view"),
+      keybind: "mod+shift+b",
+      onSelect: () => layout.browser.toggle(),
+    },
+  ])
+
+  command.register("project-explorer-toggle", () => [
+    {
+      id: "projectExplorer.toggle",
+      title: language.t("command.projectExplorer.toggle"),
+      category: language.t("command.category.view"),
+      keybind: "mod+shift+p",
+      onSelect: () => layout.projectExplorer.toggle(),
+    },
+  ])
+
   return (
     <header
       data-slot={useV2Titlebar() ? "titlebar-v2" : undefined}
@@ -237,6 +257,12 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                   if (parent) return parent
                 }
               }
+              if (route.type === "group") {
+                return tabsStore.find(
+                  (item) =>
+                    item.type === "group" && item.server === route.server && item.groupId === route.groupId,
+                )
+              }
             }
 
             const currentTab = () => matchRoute(currentRoute())
@@ -257,6 +283,11 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                 const sessionId = s.parentID ?? s.id
                 const next = { server: route.server ?? server.key, sessionId }
                 tabsStoreActions.addSessionTab(next)
+              }
+
+              if (route.type === "group") {
+                const next = { server: route.server ?? server.key, groupId: route.groupId }
+                tabsStoreActions.addGroupTab(next)
               }
             })
 
@@ -401,21 +432,29 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                   />
                 </TooltipV2>
 
-                <TitlebarTabStrip
-                  tabs={tabsStore}
-                  currentTab={currentTab}
-                  forceTruncate={tabsAreOverflowing()}
-                  onOverflowChange={setTabsAreOverflowing}
-                  onNavigate={(tab, el) => {
-                    tabs.select(tab)
-                    el?.scrollIntoView({ behavior: "instant" })
-                  }}
-                  onClose={(tab) => {
-                    const index = tabsStore.findIndex((item) => tabKey(item) === tabKey(tab))
-                    if (index !== -1) tabsStoreActions.closeTab(index)
-                  }}
-                  onReorder={(keys) => tabsStoreActions.reorder(keys)}
-                />
+                {/* tabsStore starts at its default ([]) until the persisted read resolves --
+                    rendering it unconditionally shows a confidently-empty tab strip that then
+                    pops to the real tab list, which reads as a flash on cold app start.
+                    tabs.ready() is already the signal the auto-add-tab effect above waits on
+                    for the same reason; gate the visible strip on it too instead of making the
+                    read itself faster (see packages/app/src/context/tabs.tsx). */}
+                <Show when={tabs.ready()}>
+                  <TitlebarTabStrip
+                    tabs={tabsStore}
+                    currentTab={currentTab}
+                    forceTruncate={tabsAreOverflowing()}
+                    onOverflowChange={setTabsAreOverflowing}
+                    onNavigate={(tab, el) => {
+                      tabs.select(tab)
+                      el?.scrollIntoView({ behavior: "instant" })
+                    }}
+                    onClose={(tab) => {
+                      const index = tabsStore.findIndex((item) => tabKey(item) === tabKey(tab))
+                      if (index !== -1) tabsStoreActions.closeTab(index)
+                    }}
+                    onReorder={(keys) => tabsStoreActions.reorder(keys)}
+                  />
+                </Show>
                 <TooltipV2
                   placement="bottom"
                   value={
@@ -612,10 +651,60 @@ type TitlebarV2RightState = {
 }
 
 function TitlebarV2Right(props: { state: TitlebarV2RightState }) {
+  const layout = useLayout()
+  const command = useCommand()
+  const language = useLanguage()
+  const desktop = createMediaQuery("(min-width: 768px)")
   return (
     <div class="relative z-20 flex shrink-0 items-center justify-end gap-0 overflow-visible">
       <Show when={props.state.update.visible}>
         <TitlebarUpdateIconButton state={props.state.update} />
+      </Show>
+      <Show when={desktop()}>
+        <TooltipV2
+          placement="bottom"
+          value={
+            <>
+              {language.t("command.projectExplorer.toggle")}
+              <KeybindV2 keys={command.keybindParts("projectExplorer.toggle")} variant="neutral" />
+            </>
+          }
+        >
+          <IconButtonV2
+            type="button"
+            variant="ghost-muted"
+            size="large"
+            class="!w-9 shrink-0"
+            state={layout.projectExplorer.opened() ? "pressed" : undefined}
+            onClick={layout.projectExplorer.toggle}
+            aria-label={language.t("command.projectExplorer.toggle")}
+            aria-expanded={layout.projectExplorer.opened()}
+            aria-controls="project-explorer-panel"
+            icon={<IconV2 name="filetree" />}
+          />
+        </TooltipV2>
+        <TooltipV2
+          placement="bottom"
+          value={
+            <>
+              {language.t("command.browser.toggle")}
+              <KeybindV2 keys={command.keybindParts("browser.toggle")} variant="neutral" />
+            </>
+          }
+        >
+          <IconButtonV2
+            type="button"
+            variant="ghost-muted"
+            size="large"
+            class="!w-9 shrink-0"
+            state={layout.browser.opened() ? "pressed" : undefined}
+            onClick={layout.browser.toggle}
+            aria-label={language.t("command.browser.toggle")}
+            aria-expanded={layout.browser.opened()}
+            aria-controls="browser-panel"
+            icon={<IconV2 name="globe" />}
+          />
+        </TooltipV2>
       </Show>
       <div id="opencode-titlebar-right" class="flex shrink-0 items-center justify-end gap-0" />
     </div>

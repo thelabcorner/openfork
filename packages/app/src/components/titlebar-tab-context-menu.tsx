@@ -21,6 +21,8 @@ import {
 //   ────────── separator ──────────
 //   [Regenerate title]                                <- retitle group
 //   ────────── separator ──────────
+//   [Rename group / Add sessions]                     <- group actions (group tabs only)
+//   ────────── separator ──────────
 //   [project actions]                                 <- pathfinder group (future)
 //   ────────── separator ──────────
 //   [Close tab … Close all tabs]                      <- existing Close group, last
@@ -29,7 +31,14 @@ import {
 // store index is derived at open and at select time so "left"/"right" follow full
 // store order, not the visible/overflow-filtered order the strip renders.
 export function TitlebarTabContextMenu(
-  props: ParentProps<{ id: string; session?: () => Session | undefined; server?: ServerConnection.Key }>,
+  props: ParentProps<{
+    id: string
+    session?: () => Session | undefined
+    server?: ServerConnection.Key
+    isGroup?: boolean
+    groupId?: string
+    groupName?: string
+  }>,
 ) {
   const tabs = useTabs()
   const language = useLanguage()
@@ -88,6 +97,14 @@ export function TitlebarTabContextMenu(
       .finally(() => endTitleRegeneration(id))
   }
 
+  const renameGroup = () => {
+    showToast({ title: language.t("sessionGroup.rename") })
+  }
+
+  const addSessions = () => {
+    showToast({ title: language.t("sessionGroup.addSessions") })
+  }
+
   return (
     <MenuV2.Context>
       <MenuV2.Context.Trigger class="block h-full w-full min-w-0" as="div">
@@ -119,6 +136,15 @@ export function TitlebarTabContextMenu(
                 TODO(tab-project-actions): insert the P1/P2/P3 project-action group
                 here with a separator, per the binding menu layout contract in
                 docs/swarm-cross-doc-review.md §4. Nothing renders until that lands. */}
+            <MenuV2.Separator />
+          </Show>
+          <Show when={props.isGroup}>
+            <MenuV2.Item onSelect={renameGroup}>
+              {language.t("sessionGroup.rename")}
+            </MenuV2.Item>
+            <MenuV2.Item onSelect={addSessions}>
+              {language.t("sessionGroup.addSessions")}
+            </MenuV2.Item>
             <MenuV2.Separator />
           </Show>
           {/* Group 4 — existing Close group, unchanged, last. */}
