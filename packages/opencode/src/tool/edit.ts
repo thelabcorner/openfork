@@ -4,20 +4,25 @@
 // https://github.com/cline/cline/blob/main/evals/diff-edits/diff-apply/diff-06-26-25.ts
 
 import * as path from "path"
-import { Effect, Schema, Semaphore } from "effect"
+import { Effect, Option, Schema, Semaphore } from "effect"
 import * as Tool from "./tool"
 import { LSP } from "@/lsp/lsp"
+import * as LSPClient from "@/lsp/client"
 import { createTwoFilesPatch, diffLines } from "diff"
 import DESCRIPTION from "./edit.txt"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { EventV2Bridge } from "@/event-v2-bridge"
+import { EventV2 } from "@opencode-ai/core/event"
 import { Format } from "../format"
 import { InstanceState } from "@/effect/instance-state"
 import { Snapshot } from "@/snapshot"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Bom from "@/util/bom"
+import { optional, PositiveInt } from "@opencode-ai/schema"
+import { AppProcess } from "@opencode-ai/core/process"
+import { TypecheckScope } from "./typecheck-scope"
 
 function normalizeLineEndings(text: string): string {
   return text.replaceAll("\r\n", "\n")
@@ -44,18 +49,305 @@ function lock(filePath: string) {
   return next
 }
 
+// Batch edit op. Two shapes (union — the JSON-schema "anyOf" equivalent):
+// a line-targeted op (optionally verified by oldText) or an exact replace op.
+const BatchOp = Schema.Union([
+  Schema.Struct({
+    line: PositiveInt.annotate({
+      description: "1-based line to replace",
+    }),
+    newText: Schema.String.annotate({ description: "Replacement text for the line" }),
+    oldText: optional(Schema.String).annotate({
+      description: "Optional verification: line must contain this text",
+    }),
+  }),
+  Schema.Struct({
+    oldString: Schema.String.annotate({ description: "The exact text to replace (must be unique)" }),
+    newString: Schema.String.annotate({ description: "The replacement text" }),
+  }),
+])
+
 export const Parameters = Schema.Struct({
   filePath: Schema.String.annotate({ description: "The absolute path to the file to modify" }),
-  oldString: Schema.String.annotate({ description: "The text to replace" }),
-  newString: Schema.String.annotate({
+  oldString: Schema.optional(Schema.String).annotate({ description: "The text to replace" }),
+  newString: Schema.optional(Schema.String).annotate({
     description: "The text to replace it with (must be different from oldString)",
+  }),
+  newText: Schema.optional(Schema.String).annotate({
+    description: "Replacement text for the line/range/insertAfter/appendFile/nearText strategies",
   }),
   replaceAll: Schema.optional(Schema.Boolean).annotate({
     description: "Replace all occurrences of oldString (default false)",
   }),
+  line: Schema.optional(PositiveInt).annotate({
+    description: "1-based line to replace with newText (line strategy)",
+  }),
+  oldText: Schema.optional(Schema.String).annotate({
+    description: "Verification for line/range/nearText strategies: target must contain this text",
+  }),
+  startLine: Schema.optional(PositiveInt).annotate({
+    description: "Range replace start (1-based, inclusive). Ranges over 5 lines require oldText or startAnchor.",
+  }),
+  endLine: Schema.optional(PositiveInt).annotate({
+    description: "Range replace end (1-based, inclusive)",
+  }),
+  insertAfter: Schema.optional(PositiveInt).annotate({
+    description: "Insert newText after this 1-based line (insertAfter strategy)",
+  }),
+  appendFile: Schema.optional(Schema.Boolean).annotate({
+    description: "Append newText at the end of the file (appendFile strategy)",
+  }),
+  nearText: Schema.optional(Schema.String).annotate({
+    description: "Context anchor for the nearText strategy: find oldText within ±5 lines of this text and replace it",
+  }),
+  edits: Schema.optional(Schema.Array(BatchOp)).annotate({
+    description:
+      "Batch of edits applied atomically: [{line,newText,oldText?}] or [{oldString,newString}]. Fully validated before any write.",
+  }),
+  runTypecheck: Schema.optional(Schema.Boolean).annotate({
+    description: "After applying, run a scoped tsgo/tsc check on this file and append the result (default false)",
+  }),
 })
 
-export const EditTool = Tool.define(
+export type BatchOpType = Schema.Schema.Type<typeof BatchOp>
+
+type EditMetadata = {
+  diagnostics: Record<string, LSPClient.Diagnostic[]>
+  diff: string
+  filediff: Snapshot.FileDiff
+  applied?: number
+  strategy?: string
+  oldPreview?: string
+  output?: string
+}
+
+// ---------------------------------------------------------------------------
+// Cheap (token-efficient) edit strategies — rails R1-R9.
+//
+// These are pure helpers (unit-testable like `replace()`). The exact
+// oldString/newString path keeps priority and is untouched; strategies only
+// run when oldString is absent. Every strategy operates on LF-normalized
+// content; the execute normalizes line endings at the boundary.
+// ---------------------------------------------------------------------------
+
+export type StrategyResult = {
+  content: string
+  applied: number
+  oldPreview?: string
+}
+
+const linesOf = (content: string) => content.split("\n")
+
+// R4 Line verify: bounds-checked; oldText (if given) must be contained in the
+// line, else reject with the actual snippet. A bare line replace is allowed
+// (whole-line replace is inherently bounded) but surfaces oldPreview.
+export function replaceLine(content: string, line: number, newText: string, oldText?: string): StrategyResult {
+  const lines = linesOf(content)
+  if (line < 1 || line > lines.length) {
+    throw new Error(`Line ${line} is out of range (file has ${lines.length} lines)`)
+  }
+  const current = lines[line - 1]!
+  if (oldText !== undefined && !current.includes(oldText)) {
+    throw new Error(`Line ${line} does not contain the expected text.\nActual line: ${current.slice(0, 80)}`)
+  }
+  if (current === newText) return { content, applied: 0, oldPreview: current }
+  const next = [...lines]
+  next[line - 1] = newText
+  return { content: next.join("\n"), applied: 1, oldPreview: current }
+}
+
+// R5 Range verify: bounds-checked, startLine <= endLine. Ranges spanning more
+// than 5 lines require oldText (contained in the joined range) — a wide
+// unanchored replace is a code-mangling vector.
+export function replaceLines(
+  content: string,
+  startLine: number,
+  endLine: number,
+  newText: string,
+  oldText?: string,
+): StrategyResult {
+  const lines = linesOf(content)
+  if (startLine < 1 || endLine < startLine || endLine > lines.length) {
+    throw new Error(`Invalid range ${startLine}..${endLine} (file has ${lines.length} lines)`)
+  }
+  const span = endLine - startLine + 1
+  if (span > 5 && oldText === undefined) {
+    throw new Error(
+      `Range ${startLine}..${endLine} spans ${span} lines (>5) and requires oldText verification. Provide the text contained in the range, or use the exact oldString/newString path.`,
+    )
+  }
+  const joined = lines.slice(startLine - 1, endLine).join("\n")
+  if (oldText !== undefined && !joined.includes(oldText)) {
+    throw new Error(
+      `Range ${startLine}..${endLine} does not contain the expected text.\nFirst line: ${lines[startLine - 1]?.slice(0, 80)}`,
+    )
+  }
+  if (joined === newText) return { content, applied: 0, oldPreview: joined }
+  const next = [...lines.slice(0, startLine - 1), newText, ...lines.slice(endLine)]
+  return { content: next.join("\n"), applied: 1, oldPreview: joined }
+}
+
+export function insertAfterLine(content: string, after: number, newText: string): StrategyResult {
+  const lines = linesOf(content)
+  if (after < 1 || after > lines.length) {
+    throw new Error(`insertAfter line ${after} is out of range (file has ${lines.length} lines)`)
+  }
+  const next = [...lines.slice(0, after), newText, ...lines.slice(after)]
+  return { content: next.join("\n"), applied: 1 }
+}
+
+// R7 Append: appends at EOF (fixes the presGEN prepend bug). Never requires
+// verification — it is inherently a whole-file-tail operation.
+export function appendToFile(content: string, newText: string): StrategyResult {
+  if (content.length === 0) return { content: newText, applied: newText === "" ? 0 : 1 }
+  const sep = content.endsWith("\n") ? "" : "\n"
+  const next = content + sep + newText
+  return { content: next, applied: next === content ? 0 : 1 }
+}
+
+// R3/R6 Anchor verify: nearText must match exactly one line (a multi-anchor is
+// ambiguous — the tool never guesses a location); oldText must occur in
+// exactly one line within the ±5 window, else reject listing the candidates.
+export function replaceNear(
+  content: string,
+  nearText: string,
+  oldText: string,
+  newText: string,
+): StrategyResult {
+  const lines = linesOf(content)
+  const anchors: number[] = []
+  for (let i = 0; i < lines.length; i++) {
+    if (lines[i]!.includes(nearText)) anchors.push(i)
+  }
+  if (anchors.length === 0) {
+    throw new Error(`nearText anchor not found: "${nearText.slice(0, 80)}" does not appear in the file. Provide the exact anchor text from the current file content.`)
+  }
+  if (anchors.length > 1) {
+    throw new Error(
+      `nearText matches multiple lines (${anchors.map((i) => i + 1).join(", ")}). Provide a more specific anchor or use the exact oldString/newString path.`,
+    )
+  }
+  const anchor = anchors[0]!
+  const start = Math.max(0, anchor - 5)
+  const end = Math.min(lines.length - 1, anchor + 5)
+  const candidates: number[] = []
+  for (let i = start; i <= end; i++) {
+    if (lines[i]!.includes(oldText)) candidates.push(i)
+  }
+  if (candidates.length === 0) {
+    throw new Error(
+      `oldText not found within ±5 lines of the nearText anchor (line ${anchor + 1}). Provide the exact text to replace.`,
+    )
+  }
+  if (candidates.length > 1) {
+    throw new Error(
+      `oldText appears on multiple lines near the anchor (lines ${candidates.map((i) => i + 1).join(", ")}). Provide a more specific nearText or use the exact oldString/newString path.`,
+    )
+  }
+  const target = candidates[0]!
+  const current = lines[target]!
+  const replaced = current.split(oldText).join(newText)
+  if (replaced === current) return { content, applied: 0, oldPreview: current }
+  const next = [...lines]
+  next[target] = replaced
+  return { content: next.join("\n"), applied: 1, oldPreview: current }
+}
+
+// R9 Atomic batch: every op is applied in memory; any validation failure
+// rejects the whole batch and nothing is written (the single write under the
+// lock makes the batch atomic). Exact ops reuse `replace()` (unique-match
+// semantics); line ops reuse `replaceLine` (R4 verify per op).
+export function applyBatch(content: string, edits: readonly BatchOpType[]): StrategyResult {
+  let current = content
+  let applied = 0
+  let oldPreview: string | undefined
+  for (const edit of edits) {
+    if ("line" in edit) {
+      const next = replaceLine(current, edit.line, normalizeLineEndings(edit.newText), edit.oldText === undefined ? undefined : normalizeLineEndings(edit.oldText))
+      current = next.content
+      applied += next.applied
+      oldPreview = oldPreview ?? next.oldPreview
+      continue
+    }
+    const next = replace(current, normalizeLineEndings(edit.oldString), normalizeLineEndings(edit.newString))
+    if (next !== current) applied++
+    current = next
+  }
+  return { content: current, applied, oldPreview }
+}
+
+// Strategy dispatch (rails: ambiguity guard — never guess). Exact path wins
+// when oldString is present; otherwise exactly one strategy group may be set.
+export function applyEditStrategy(
+  content: string,
+  params: {
+    edits?: readonly BatchOpType[]
+    line?: number
+    startLine?: number
+    endLine?: number
+    insertAfter?: number
+    appendFile?: boolean
+    nearText?: string
+    oldText?: string
+    newText?: string
+  },
+): StrategyResult & { strategy: string } {
+  const groups: string[] = []
+  if (params.edits?.length) groups.push("edits")
+  if (params.line !== undefined) groups.push("line")
+  if (params.startLine !== undefined || params.endLine !== undefined) groups.push("startLine/endLine")
+  if (params.insertAfter !== undefined) groups.push("insertAfter")
+  if (params.appendFile) groups.push("appendFile")
+  if (params.nearText !== undefined) groups.push("nearText")
+
+  if (groups.length === 0) {
+    throw new Error(
+      "No edit strategy detected. Provide oldString/newString (exact path), or one of: edits, line, startLine+endLine, insertAfter, appendFile, nearText.",
+    )
+  }
+  if (groups.length > 1) {
+    throw new Error(`Ambiguous edit: multiple strategies present (${groups.join(", ")}). Provide exactly one.`)
+  }
+
+  const strategy = groups[0]!
+  const newText = params.newText === undefined ? undefined : normalizeLineEndings(params.newText)
+  const oldText = params.oldText === undefined ? undefined : normalizeLineEndings(params.oldText)
+
+  if (strategy === "edits") {
+    return { ...applyBatch(content, params.edits!), strategy }
+  }
+  if (strategy === "line") {
+    if (newText === undefined) throw new Error("line strategy requires newText (the replacement text)")
+    return { ...replaceLine(content, params.line!, newText, oldText), strategy }
+  }
+  if (strategy === "startLine/endLine") {
+    if (params.startLine === undefined || params.endLine === undefined) {
+      throw new Error("startLine/endLine strategy requires both startLine and endLine")
+    }
+    if (newText === undefined) throw new Error("startLine/endLine strategy requires newText (the replacement text)")
+    return { ...replaceLines(content, params.startLine, params.endLine, newText, oldText), strategy }
+  }
+  if (strategy === "insertAfter") {
+    if (newText === undefined) throw new Error("insertAfter strategy requires newText (the text to insert)")
+    return { ...insertAfterLine(content, params.insertAfter!, newText), strategy }
+  }
+  if (strategy === "appendFile") {
+    if (newText === undefined) throw new Error("appendFile strategy requires newText (the text to append)")
+    return { ...appendToFile(content, newText), strategy }
+  }
+  if (strategy === "nearText") {
+    if (newText === undefined) throw new Error("nearText strategy requires newText (the replacement text)")
+    if (oldText === undefined || oldText === "") throw new Error("nearText strategy requires oldText (the exact text to replace)")
+    return { ...replaceNear(content, normalizeLineEndings(params.nearText!), oldText, newText), strategy }
+  }
+  throw new Error(`Unsupported strategy: ${strategy}`)
+}
+
+export const EditTool = Tool.define<
+  typeof Parameters,
+  EditMetadata,
+  LSP.Service | FSUtil.Service | Format.Service | EventV2Bridge.Service
+>(
   "edit",
   Effect.gen(function* () {
     const lsp = yield* LSP.Service
@@ -66,14 +358,10 @@ export const EditTool = Tool.define(
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
+      execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<EditMetadata>) =>
         Effect.gen(function* () {
           if (!params.filePath) {
             throw new Error("filePath is required")
-          }
-
-          if (params.oldString === params.newString) {
-            throw new Error("No changes to apply: oldString and newString are identical.")
           }
 
           const instance = yield* InstanceState.context
@@ -82,137 +370,334 @@ export const EditTool = Tool.define(
             : path.join(instance.directory, params.filePath)
           yield* assertExternalDirectoryEffect(ctx, filePath)
 
-          let diff = ""
-          let contentOld = ""
-          let contentNew = ""
-          yield* lock(filePath).withPermits(1)(
-            Effect.gen(function* () {
-              if (params.oldString === "") {
-                const existed = yield* afs.existsSafe(filePath)
-                if (existed) {
-                  throw new Error(
-                    "oldString cannot be empty when editing an existing file. Provide the exact text to replace, or use write for an intentional full-file replacement.",
-                  )
-                }
-                const next = Bom.split(params.newString)
-                const desiredBom = next.bom
-                contentOld = ""
-                contentNew = next.text
-                diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
-                yield* ctx.ask({
-                  permission: "edit",
-                  patterns: [path.relative(instance.worktree, filePath)],
-                  always: ["*"],
-                  metadata: {
-                    filepath: filePath,
-                    diff,
-                  },
-                })
-                yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
-                if (yield* format.file(filePath)) {
-                  contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
-                }
-                yield* events.publish(FileSystem.Event.Edited, { file: filePath })
-                yield* events.publish(Watcher.Event.Updated, {
-                  file: filePath,
-                  event: "add",
-                })
-                return
-              }
-
-              const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
-              if (!info) throw new Error(`File ${filePath} not found`)
-              if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
-              const source = yield* Bom.readFile(afs, filePath)
-              contentOld = source.text
-
-              const ending = detectLineEnding(contentOld)
-              const old = convertToLineEnding(normalizeLineEndings(params.oldString), ending)
-              const replacement = convertToLineEnding(normalizeLineEndings(params.newString), ending)
-
-              const next = Bom.split(replace(contentOld, old, replacement, params.replaceAll))
-              const desiredBom = source.bom || next.bom
-              contentNew = next.text
-
-              diff = trimDiff(
-                createTwoFilesPatch(
-                  filePath,
-                  filePath,
-                  normalizeLineEndings(contentOld),
-                  normalizeLineEndings(contentNew),
-                ),
-              )
-              yield* ctx.ask({
-                permission: "edit",
-                patterns: [path.relative(instance.worktree, filePath)],
-                always: ["*"],
-                metadata: {
-                  filepath: filePath,
-                  diff,
-                },
-              })
-
-              yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
-              if (yield* format.file(filePath)) {
-                contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
-              }
-              yield* events.publish(FileSystem.Event.Edited, { file: filePath })
-              yield* events.publish(Watcher.Event.Updated, {
-                file: filePath,
-                event: "change",
-              })
-              diff = trimDiff(
-                createTwoFilesPatch(
-                  filePath,
-                  filePath,
-                  normalizeLineEndings(contentOld),
-                  normalizeLineEndings(contentNew),
-                ),
-              )
-            }).pipe(Effect.orDie),
-          )
-
-          let additions = 0
-          let deletions = 0
-          for (const change of diffLines(contentOld, contentNew)) {
-            if (change.added) additions += change.count || 0
-            if (change.removed) deletions += change.count || 0
-          }
-          const filediff: Snapshot.FileDiff = {
-            file: filePath,
-            patch: diff,
-            additions,
-            deletions,
+          // Exact path has priority (back-compat; cheap params are ignored
+          // when oldString is present). This branch is byte-for-byte the
+          // pre-upgrade behavior.
+          if (params.oldString !== undefined) {
+            if (params.newString === undefined) {
+              throw new Error("newString is required when oldString is provided.")
+            }
+            if (params.oldString === params.newString) {
+              throw new Error("No changes to apply: oldString and newString are identical.")
+            }
+            const oldString = params.oldString
+            const newString = params.newString
+            return yield* exactExecute({ lsp, afs, format, events, params, oldString, newString, ctx, filePath, instance })
           }
 
-          yield* ctx.metadata({
-            metadata: {
-              diff,
-              filediff,
-              diagnostics: {},
-            },
-          })
-
-          let output = "Edit applied successfully."
-          yield* lsp.touchFile(filePath, "document")
-          const diagnostics = yield* lsp.diagnostics()
-          const normalizedFilePath = FSUtil.normalizePath(filePath)
-          const block = LSP.Diagnostic.report(filePath, diagnostics[normalizedFilePath] ?? [])
-          if (block) output += `\n\nLSP errors detected in this file, please fix:\n${block}`
-
-          return {
-            metadata: {
-              diagnostics,
-              diff,
-              filediff,
-            },
-            title: `${path.relative(instance.worktree, filePath)}`,
-            output,
-          }
+          return yield* strategyExecute({ lsp, afs, format, events, params, ctx, filePath, instance })
         }),
     }
   }),
 )
+
+// The pre-upgrade exact edit path, kept byte-for-byte (rails already present:
+// empty-oldString reject, multi-match reject, disproportionate-match guard).
+const exactExecute = Effect.fn("EditTool.exact")(function* (input: {
+  lsp: LSP.Interface
+  afs: FSUtil.Interface
+  format: Format.Interface
+  events: EventV2.Interface
+  params: Schema.Schema.Type<typeof Parameters>
+  oldString: string
+  newString: string
+  ctx: Tool.Context
+  filePath: string
+  instance: { directory: string; worktree: string }
+}) {
+  const { params, oldString, newString, ctx, filePath, instance, lsp, afs, format, events } = input
+
+  let diff = ""
+  let contentOld = ""
+  let contentNew = ""
+  yield* lock(filePath).withPermits(1)(
+    Effect.gen(function* () {
+      if (oldString === "") {
+        const existed = yield* afs.existsSafe(filePath)
+        if (existed) {
+          throw new Error(
+            "oldString cannot be empty when editing an existing file. Provide the exact text to replace, or use write for an intentional full-file replacement.",
+          )
+        }
+        const next = Bom.split(newString)
+        const desiredBom = next.bom
+        contentOld = ""
+        contentNew = next.text
+        diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, contentNew))
+        yield* ctx.ask({
+          permission: "edit",
+          patterns: [path.relative(instance.worktree, filePath)],
+          always: ["*"],
+          metadata: {
+            filepath: filePath,
+            diff,
+          },
+        })
+        yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
+        if (yield* format.file(filePath)) {
+          contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
+        }
+        yield* events.publish(FileSystem.Event.Edited, { file: filePath })
+        yield* events.publish(Watcher.Event.Updated, {
+          file: filePath,
+          event: "add",
+        })
+        return
+      }
+
+      const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (!info) throw new Error(`File ${filePath} not found`)
+      if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
+      const source = yield* Bom.readFile(afs, filePath)
+      contentOld = source.text
+
+      const ending = detectLineEnding(contentOld)
+      const old = convertToLineEnding(normalizeLineEndings(oldString), ending)
+      const replacement = convertToLineEnding(normalizeLineEndings(newString), ending)
+
+      const next = Bom.split(replace(contentOld, old, replacement, params.replaceAll))
+      const desiredBom = source.bom || next.bom
+      contentNew = next.text
+
+      diff = trimDiff(
+        createTwoFilesPatch(
+          filePath,
+          filePath,
+          normalizeLineEndings(contentOld),
+          normalizeLineEndings(contentNew),
+        ),
+      )
+      yield* ctx.ask({
+        permission: "edit",
+        patterns: [path.relative(instance.worktree, filePath)],
+        always: ["*"],
+        metadata: {
+          filepath: filePath,
+          diff,
+        },
+      })
+
+      yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
+      if (yield* format.file(filePath)) {
+        contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
+      }
+      yield* events.publish(FileSystem.Event.Edited, { file: filePath })
+      yield* events.publish(Watcher.Event.Updated, {
+        file: filePath,
+        event: "change",
+      })
+      diff = trimDiff(
+        createTwoFilesPatch(
+          filePath,
+          filePath,
+          normalizeLineEndings(contentOld),
+          normalizeLineEndings(contentNew),
+        ),
+      )
+    }).pipe(Effect.orDie),
+  )
+
+  const result = yield* finishEdit({ ctx, filePath, instance, contentOld, contentNew, diff, lsp, strategy: "exact" })
+
+  if (params.runTypecheck) {
+    const block = yield* runTypecheckAfterEdit(filePath, instance, ctx)
+    if (block) result.output += block
+  }
+  return result
+})
+
+// Cheap-strategy edit path (rails R1-R9). Dispatch + validation happen in
+// memory before any write; the single write under the lock is atomic (R9).
+const strategyExecute = Effect.fn("EditTool.strategy")(function* (input: {
+  lsp: LSP.Interface
+  afs: FSUtil.Interface
+  format: Format.Interface
+  events: EventV2.Interface
+  params: Schema.Schema.Type<typeof Parameters>
+  ctx: Tool.Context
+  filePath: string
+  instance: { directory: string; worktree: string }
+}) {
+  const { lsp, afs, format, events, params, ctx, filePath, instance } = input
+
+  let diff = ""
+  let contentOld = ""
+  let contentNew = ""
+  let applied = 1
+  let oldPreview: string | undefined
+  let strategy = ""
+
+  yield* lock(filePath).withPermits(1)(
+    Effect.gen(function* () {
+      const info = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      if (!info) throw new Error(`File ${filePath} not found`)
+      if (info.type === "Directory") throw new Error(`Path is a directory, not a file: ${filePath}`)
+      const source = yield* Bom.readFile(afs, filePath)
+      contentOld = normalizeLineEndings(source.text)
+
+      const result = applyEditStrategy(contentOld, params)
+      strategy = result.strategy
+      applied = result.applied
+      oldPreview = result.oldPreview
+
+      // R1 no-op detection: nothing to do, never write, never ask.
+      if (applied === 0) {
+        contentNew = contentOld
+        return
+      }
+
+      const ending = detectLineEnding(source.text)
+      const next = Bom.split(convertToLineEnding(result.content, ending))
+      const desiredBom = source.bom || next.bom
+      contentNew = next.text
+
+      diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, normalizeLineEndings(contentNew)))
+      yield* ctx.ask({
+        permission: "edit",
+        patterns: [path.relative(instance.worktree, filePath)],
+        always: ["*"],
+        metadata: {
+          filepath: filePath,
+          diff,
+        },
+      })
+
+      yield* afs.writeWithDirs(filePath, Bom.join(contentNew, desiredBom))
+      if (yield* format.file(filePath)) {
+        contentNew = yield* Bom.syncFile(afs, filePath, desiredBom)
+      }
+      yield* events.publish(FileSystem.Event.Edited, { file: filePath })
+      yield* events.publish(Watcher.Event.Updated, {
+        file: filePath,
+        event: "change",
+      })
+      diff = trimDiff(createTwoFilesPatch(filePath, filePath, contentOld, normalizeLineEndings(contentNew)))
+    }).pipe(Effect.orDie),
+  )
+
+  if (applied === 0) {
+    const title = path.relative(instance.worktree, filePath)
+    const message = `No changes to apply: the target content already matches (strategy=${strategy}). applied=0.`
+    yield* ctx.metadata({
+      metadata: {
+        diff: "",
+        filediff: { file: filePath, patch: "", additions: 0, deletions: 0 },
+        diagnostics: {},
+        applied: 0,
+        strategy,
+      },
+    })
+    return {
+      title,
+      metadata: {
+        diff: "",
+        filediff: { file: filePath, patch: "", additions: 0, deletions: 0 },
+        diagnostics: {},
+        applied: 0,
+        strategy,
+        ...(oldPreview !== undefined ? { oldPreview } : {}),
+      },
+      output: message,
+    }
+  }
+
+  const result = yield* finishEdit({ ctx, filePath, instance, contentOld, contentNew, diff, lsp, strategy, oldPreview })
+
+  if (params.runTypecheck) {
+    const block = yield* runTypecheckAfterEdit(filePath, instance, ctx)
+    if (block) result.output += block
+  }
+  return result
+})
+
+// Shared post-write tail: diff stats, metadata, LSP diagnostics.
+const finishEdit = Effect.fn("EditTool.finish")(function* (input: {
+  ctx: Tool.Context
+  filePath: string
+  instance: { directory: string; worktree: string }
+  contentOld: string
+  contentNew: string
+  diff: string
+  lsp: LSP.Interface
+  strategy: string
+  oldPreview?: string
+}) {
+  const { ctx, filePath, instance, contentOld, contentNew, diff, lsp, strategy, oldPreview } = input
+
+  let additions = 0
+  let deletions = 0
+  for (const change of diffLines(contentOld, contentNew)) {
+    if (change.added) additions += change.count || 0
+    if (change.removed) deletions += change.count || 0
+  }
+  const filediff: Snapshot.FileDiff = {
+    file: filePath,
+    patch: diff,
+    additions,
+    deletions,
+  }
+
+  yield* ctx.metadata({
+    metadata: {
+      diff,
+      filediff,
+      diagnostics: {},
+      applied: 1,
+      strategy,
+      ...(oldPreview !== undefined ? { oldPreview } : {}),
+    },
+  })
+
+  let output = `Edit applied successfully (strategy=${strategy}, +${additions}/-${deletions} lines).`
+  yield* lsp.touchFile(filePath, "document")
+  const diagnostics = yield* lsp.diagnostics()
+  const normalizedFilePath = FSUtil.normalizePath(filePath)
+  const block = LSP.Diagnostic.report(filePath, diagnostics[normalizedFilePath] ?? [])
+  if (block) output += `\n\nLSP errors detected in this file, please fix:\n${block}`
+
+  return {
+    metadata: {
+      diagnostics,
+      diff,
+      filediff,
+      applied: 1,
+      strategy,
+      ...(oldPreview !== undefined ? { oldPreview } : {}),
+    },
+    title: `${path.relative(instance.worktree, filePath)}`,
+    output,
+  }
+})
+
+// R10 opt-in scoped typecheck after edit (default OFF; LSP diagnostics are the
+// primary signal). Returns an output block to append, or undefined when the
+// file is not TypeScript or the check is unavailable.
+const runTypecheckAfterEdit = Effect.fn("EditTool.runTypecheck")(function* (
+  filePath: string,
+  instance: { directory: string; worktree: string },
+  ctx: Tool.Context,
+) {
+  if (!TypecheckScope.isTsFile(filePath)) return undefined
+  const app = yield* Effect.serviceOption(AppProcess.Service)
+  if (Option.isNone(app)) return undefined
+  const dir = path.dirname(filePath)
+  const tsconfigDir = yield* Effect.promise(() => TypecheckScope.findNearestTsconfig(dir, instance.worktree))
+  if (!tsconfigDir) return undefined
+  const outcome = yield* TypecheckScope.runScopedTypecheck({
+    app: app.value,
+    worktree: instance.worktree,
+    tsconfigDir,
+    files: [filePath],
+    maxErrors: 30,
+    timeoutMs: 30_000,
+    signal: ctx.abort,
+  })
+  const status = outcome.exitCode === 0 ? "passed" : "failed"
+  return `\n\n<typecheck status="${status}" errors="${outcome.diagnostics.length}">\nScoped tsgo check of ${path.relative(instance.worktree, filePath)}: ${status}.\n${outcome.diagnostics
+    .slice(0, 10)
+    .map((d) => `  - ${d.file}(${d.line},${d.column}): TS${d.code} [${d.severity}] ${d.message.split("\n")[0]}`)
+    .join("\n")}\n</typecheck>`
+})
 
 export type Replacer = (content: string, find: string) => Generator<string, void, unknown>
 

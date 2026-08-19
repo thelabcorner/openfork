@@ -8,6 +8,7 @@ import { evaluate } from "@/permission/evaluate"
 import { Config } from "@/config/config"
 import { ToolID } from "./schema"
 import { TRUNCATION_DIR } from "./truncation-dir"
+import { heldJobStems } from "@/background/shell-jobs"
 
 const RETENTION = Duration.days(7)
 
@@ -22,6 +23,16 @@ export interface Options {
   maxLines?: number
   maxBytes?: number
   direction?: "head" | "tail"
+}
+
+const JOB_PREFIX = "job_"
+
+// Extract the job file stem from a `job_<stem>.log`/`job_<stem>.json` name.
+function jobStemFromFile(name: string): string | undefined {
+  if (!name.startsWith(JOB_PREFIX)) return undefined
+  const base = name.slice(JOB_PREFIX.length)
+  if (!base.endsWith(".log") && !base.endsWith(".json")) return undefined
+  return base.slice(0, base.length - (base.endsWith(".log") ? 4 : 5))
 }
 
 function hasTaskTool(agent?: Agent.Info) {
@@ -52,11 +63,16 @@ const layer = Layer.effect(
 
     const cleanup = Effect.fn("Truncate.cleanup")(function* () {
       const cutoff = Date.now() - Duration.toMillis(RETENTION)
+      const held = heldJobStems()
       const entries = yield* fs.readDirectory(TRUNCATION_DIR).pipe(
-        Effect.map((all) => all.filter((name) => name.startsWith("tool_"))),
+        Effect.map((all) => all.filter((name) => name.startsWith("tool_") || name.startsWith("job_"))),
         Effect.catch(() => Effect.succeed([])),
       )
       for (const entry of entries) {
+        // Never sweep a live job's log/meta: a quiet long-running job could
+        // exceed the mtime cutoff without writing new output.
+        const stem = jobStemFromFile(entry)
+        if (stem !== undefined && held.has(stem)) continue
         const file = path.join(TRUNCATION_DIR, entry)
         const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.succeed(undefined)))
         const mtime = info && Option.getOrUndefined(info.mtime)

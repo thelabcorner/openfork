@@ -20,9 +20,21 @@ exports[`tool parameters JSON Schema (wire shape) bash 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "background": {
+      "description": "Run the command in the background. Returns immediately with a job id. Use the \`background\` tool to manage it. DO NOT sleep, poll, or block on background work.",
+      "type": "boolean",
+    },
     "command": {
       "description": "The command to execute",
       "type": "string",
+    },
+    "id": {
+      "description": "Optional short job id, e.g. 'bg1'. Must match ^[A-Za-z0-9_-]+$. Auto-generated if omitted. Rejected if the id is already in use or its log still exists on disk.",
+      "type": "string",
+    },
+    "notify": {
+      "description": "When background=true, notify the agent automatically when the command finishes (default true). Set false for a long-running managed job (e.g. a dev server) you will control via the \`background\` tool. Ignored when background is false.",
+      "type": "boolean",
     },
     "timeout": {
       "description": "Optional timeout in milliseconds",
@@ -47,27 +59,121 @@ exports[`tool parameters JSON Schema (wire shape) edit 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "appendFile": {
+      "description": "Append newText at the end of the file (appendFile strategy)",
+      "type": "boolean",
+    },
+    "edits": {
+      "description": "Batch of edits applied atomically: [{line,newText,oldText?}] or [{oldString,newString}]. Fully validated before any write.",
+      "items": {
+        "anyOf": [
+          {
+            "properties": {
+              "line": {
+                "description": "1-based line to replace",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer",
+              },
+              "newText": {
+                "description": "Replacement text for the line",
+                "type": "string",
+              },
+              "oldText": {
+                "type": "string",
+              },
+            },
+            "required": [
+              "line",
+              "newText",
+            ],
+            "type": "object",
+          },
+          {
+            "properties": {
+              "newString": {
+                "description": "The replacement text",
+                "type": "string",
+              },
+              "oldString": {
+                "description": "The exact text to replace (must be unique)",
+                "type": "string",
+              },
+            },
+            "required": [
+              "oldString",
+              "newString",
+            ],
+            "type": "object",
+          },
+        ],
+      },
+      "type": "array",
+    },
+    "endLine": {
+      "description": "Range replace end (1-based, inclusive)",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991,
+      "minimum": -9007199254740991,
+      "type": "integer",
+    },
     "filePath": {
       "description": "The absolute path to the file to modify",
+      "type": "string",
+    },
+    "insertAfter": {
+      "description": "Insert newText after this 1-based line (insertAfter strategy)",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991,
+      "minimum": -9007199254740991,
+      "type": "integer",
+    },
+    "line": {
+      "description": "1-based line to replace with newText (line strategy)",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991,
+      "minimum": -9007199254740991,
+      "type": "integer",
+    },
+    "nearText": {
+      "description": "Context anchor for the nearText strategy: find oldText within ±5 lines of this text and replace it",
       "type": "string",
     },
     "newString": {
       "description": "The text to replace it with (must be different from oldString)",
       "type": "string",
     },
+    "newText": {
+      "description": "Replacement text for the line/range/insertAfter/appendFile/nearText strategies",
+      "type": "string",
+    },
     "oldString": {
       "description": "The text to replace",
+      "type": "string",
+    },
+    "oldText": {
+      "description": "Verification for line/range/nearText strategies: target must contain this text",
       "type": "string",
     },
     "replaceAll": {
       "description": "Replace all occurrences of oldString (default false)",
       "type": "boolean",
     },
+    "runTypecheck": {
+      "description": "After applying, run a scoped tsgo/tsc check on this file and append the result (default false)",
+      "type": "boolean",
+    },
+    "startLine": {
+      "description": "Range replace start (1-based, inclusive). Ranges over 5 lines require oldText or startAnchor.",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991,
+      "minimum": -9007199254740991,
+      "type": "integer",
+    },
   },
   "required": [
     "filePath",
-    "oldString",
-    "newString",
   ],
   "type": "object",
 }
@@ -261,6 +367,13 @@ exports[`tool parameters JSON Schema (wire shape) read 1`] = `
       "description": "The absolute path to the file or directory to read",
       "type": "string",
     },
+    "filePaths": {
+      "description": "Bulk read: up to 8 files in one call, each rendered as its own <file> block. Mutually exclusive with filePath.",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
+    },
     "limit": {
       "description": "The maximum number of lines to read (defaults to 2000)",
       "maximum": 9007199254740991,
@@ -274,9 +387,6 @@ exports[`tool parameters JSON Schema (wire shape) read 1`] = `
       "type": "integer",
     },
   },
-  "required": [
-    "filePath",
-  ],
   "type": "object",
 }
 `;
@@ -285,14 +395,38 @@ exports[`tool parameters JSON Schema (wire shape) skill 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "mode": {
+      "description": "What to do (default: load by name)",
+      "enum": [
+        "load",
+        "list",
+        "search",
+      ],
+      "type": "string",
+    },
     "name": {
       "description": "The name of the skill from available_skills",
       "type": "string",
     },
+    "names": {
+      "description": "Load several registered skills in one call",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
+    },
+    "query": {
+      "description": "search mode: substring filter across skill names and descriptions",
+      "type": "string",
+    },
+    "tags": {
+      "description": "Filter registered skills by tag keywords matched against name/description",
+      "items": {
+        "type": "string",
+      },
+      "type": "array",
+    },
   },
-  "required": [
-    "name",
-  ],
   "type": "object",
 }
 `;
@@ -407,6 +541,14 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "action": {
+      "description": "Action: 'search' (default) runs a query and returns results; 'providers' lists the available search providers, their config status (keyless-ready | needs <ENV_VAR>), and how to enable each.",
+      "enum": [
+        "search",
+        "providers",
+      ],
+      "type": "string",
+    },
     "contextMaxCharacters": {
       "description": "Maximum characters for context string optimized for LLMs (default: 10000)",
       "type": "number",
@@ -423,8 +565,21 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
       "description": "Number of search results to return (default: 8)",
       "type": "number",
     },
+    "provider": {
+      "description": "Explicitly pin a search provider: exa | parallel | firecrawl | duckduckgo | brave | tavily | searxng. Overrides automatic selection (env override, feature flags, session checksum). Run action:'providers' to see which are usable.",
+      "enum": [
+        "exa",
+        "parallel",
+        "firecrawl",
+        "duckduckgo",
+        "brave",
+        "tavily",
+        "searxng",
+      ],
+      "type": "string",
+    },
     "query": {
-      "description": "Websearch query",
+      "description": "Websearch query (required for action 'search')",
       "type": "string",
     },
     "type": {
@@ -437,9 +592,6 @@ exports[`tool parameters JSON Schema (wire shape) websearch 1`] = `
       "type": "string",
     },
   },
-  "required": [
-    "query",
-  ],
   "type": "object",
 }
 `;
@@ -455,6 +607,10 @@ exports[`tool parameters JSON Schema (wire shape) write 1`] = `
     "filePath": {
       "description": "The absolute path to the file to write (must be absolute, not relative)",
       "type": "string",
+    },
+    "runTypecheck": {
+      "description": "After writing, run a scoped tsgo/tsc check on this file and append the result (default false)",
+      "type": "boolean",
     },
   },
   "required": [

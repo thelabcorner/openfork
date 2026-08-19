@@ -4,11 +4,36 @@
 - Use this tool for accessing information beyond knowledge cutoff
 - Searches are performed automatically within a single API call
 
+Providers (7): exa | parallel | firecrawl | duckduckgo | brave | tavily | searxng
+
+Keyless out of the box (no API key required):
+  - DuckDuckGo — keyless
+  - Exa Web Search (mcp.exa.ai) — keyless; EXA_API_KEY optional to raise limits
+  - Parallel Web Search (search.parallel.ai) — keyless; PARALLEL_API_KEY optional
+  - Firecrawl Web Search (api.firecrawl.dev) — keyless; FIRECRAWL_API_KEY optional
+
+Key-based (free tiers) and self-hosted:
+  - Brave Search — needs BRAVE_API_KEY (free tier: https://brave.com/search/api/)
+  - Tavily Search — needs TAVILY_API_KEY (free tier: https://tavily.com)
+  - SearXNG — self-hosted; needs SEARXNG_URL (https://docs.searxng.org)
+
+Introspection:
+  - Run websearch({ action: "providers" }) to list every provider with its config status
+    (keyless-ready | ready | needs <ENV_VAR>) and how to enable each — no query, no network.
+
+Provider selection (highest precedence first):
+  1. The explicit `provider` parameter (exa | parallel | firecrawl | duckduckgo | brave | tavily | searxng) — use this to pin a specific provider or fall back when one fails.
+  2. The OPENCODE_WEBSEARCH_PROVIDER environment variable (same values).
+  3. Feature flags (OPENCODE_ENABLE_EXA / OPENCODE_ENABLE_PARALLEL / OPENCODE_ENABLE_FIRECRAWL / OPENCODE_ENABLE_DUCKDUCKGO / OPENCODE_ENABLE_BRAVE / OPENCODE_ENABLE_TAVILY / OPENCODE_ENABLE_SEARXNG).
+  4. A deterministic per-session checksum spread across the AVAILABLE providers (keyless-first: when no keys are set, only the keyless providers participate).
+
 Usage notes:
   - Supports live crawling modes when available: 'fallback' (backup if cached unavailable) or 'preferred' (prioritize live crawling)
   - Search types when available: 'auto' (balanced), 'fast' (quick results), 'deep' (comprehensive search)
   - Configurable context length for optimal LLM integration
   - Domain filtering and advanced search options available
+  - The resolved provider is always named in the permission prompt and tool output
+  - Per-provider params: numResults applies to all; livecrawl/type/contextMaxCharacters are Exa-specific
 
 The current year is {{year}}. You MUST use this year when searching for recent information or current events
 - Example: If the current year is 2026 and the user asks for "latest AI news", search for "AI news 2026", NOT "AI news 2025"

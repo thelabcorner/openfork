@@ -19,6 +19,18 @@ export function parameterSchema() {
     workdir: Schema.optional(Schema.String).annotate({
       description: `The working directory to run the command in. Defaults to the current directory. Use this instead of 'cd' commands.`,
     }),
+    background: Schema.optional(Schema.Boolean).annotate({
+      description:
+        "Run the command in the background. Returns immediately with a job id. Use the `background` tool to manage it. DO NOT sleep, poll, or block on background work.",
+    }),
+    notify: Schema.optional(Schema.Boolean).annotate({
+      description:
+        "When background=true, notify the agent automatically when the command finishes (default true). Set false for a long-running managed job (e.g. a dev server) you will control via the `background` tool. Ignored when background is false.",
+    }),
+    id: Schema.optional(Schema.String).annotate({
+      description:
+        "Optional short job id, e.g. 'bg1'. Must match ^[A-Za-z0-9_-]+$. Auto-generated if omitted. Rejected if the id is already in use or its log still exists on disk.",
+    }),
   })
 }
 
@@ -270,6 +282,16 @@ function profile(name: string, platform: NodeJS.Platform, limits: Limits, defaul
   }
 }
 
+const BACKGROUND_SECTION = [
+  "# Background commands",
+  "- Set `background: true` to run a long-lived command (a dev server, a build, a watch) without blocking. The tool returns immediately with a job id like `job_abc`.",
+  "- With the default `notify: true` you are notified automatically when the command finishes (or times out).",
+  "- Set `notify: false` for managed jobs you control yourself (e.g. a dev server that should keep running). You will NOT be notified — you must check it explicitly.",
+  "- Use the `background` tool to manage any background job: `background list`, `background status {id}`, `background read {id}` (live output), `background wait {id}`, `background send {id}`, `background kill {id}`.",
+  "- Full output streams to a per-job log file reported at launch; read it with `background read {id}`.",
+  "- Background jobs ignore the default timeout; pass an explicit `timeout` to kill the job after that many milliseconds.",
+].join("\n")
+
 export function render(name: string, platform: NodeJS.Platform, limits: Limits, defaultTimeoutMs: number) {
   const selected = profile(name, platform, limits, defaultTimeoutMs)
   return {
@@ -280,6 +302,7 @@ export function render(name: string, platform: NodeJS.Platform, limits: Limits, 
       tmp: Global.Path.tmp,
       workdirSection: selected.workdirSection,
       commandSection: selected.commandSection,
+      backgroundSection: BACKGROUND_SECTION,
       gitCommands: selected.gitCommands,
       toolName: ShellID.ToolID,
       gitCommandRestriction: selected.gitCommandRestriction,

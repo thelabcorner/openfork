@@ -154,9 +154,18 @@ describe("tool.archive", () => {
       expect(list.metadata.format).toBe("gzip (tar)")
       expect(list.output).toContain("docs/readme.md")
 
-      yield* tool.execute({ action: "extract", path: path.join(test.directory, "docs.tar.gz") }, ctx)
-      const content = yield* readText(path.join(test.directory, "docs", "readme.md"))
+      // Extract into a fresh destination so the assertion can't accidentally
+      // read the original source file.
+      yield* tool.execute(
+        { action: "extract", path: path.join(test.directory, "docs.tar.gz"), destination: path.join(test.directory, "out-tgz") },
+        ctx,
+      )
+      const content = yield* readText(path.join(test.directory, "out-tgz", "docs", "readme.md"))
       expect(content).toBe("# Docs\n")
+      // Regular files must not be misclassified as symlinks.
+      const again = yield* tool.execute({ action: "extract", path: path.join(test.directory, "docs.tar.gz"), destination: path.join(test.directory, "out-tgz2") }, ctx)
+      expect(again.output).not.toContain("symlinks skipped")
+      expect(again.output).toContain("Extracted 1 files")
     }),
   )
 

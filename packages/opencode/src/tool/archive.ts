@@ -454,7 +454,7 @@ function renderExtract(filepath: string, dest: string, result: Awaited<ReturnTyp
     lines.push(`${result.errors.length} entries could not be extracted:`)
     lines.push(...result.errors.slice(0, 5).map((e) => `  - ${e}`))
   }
-  if (result.errors.length === 0 && result.extracted === 0 && result.skipped === 0 && result.blocked === 0) {
+  if (result.errors.length === 0 && result.extracted === 0 && result.skipped === 0 && result.blocked === 0 && result.links === 0) {
     lines.push("Nothing matched. Check the entries filter against the archive's listing.")
   }
   return lines.join("\n")

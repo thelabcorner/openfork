@@ -229,8 +229,13 @@ describe("tool parameters", () => {
     test("accepts name", () => {
       expect(parse(Skill, { name: "foo" }).name).toBe("foo")
     })
-    test("rejects missing name", () => {
-      expect(accepts(Skill, {})).toBe(false)
+    test("accepts mode list / search without name (soft-fail at runtime)", () => {
+      expect(parse(Skill, { mode: "list" }).mode).toBe("list")
+      expect(parse(Skill, { mode: "search", query: "x" }).query).toBe("x")
+      expect(parse(Skill, { names: ["a", "b"] }).names).toEqual(["a", "b"])
+    })
+    test("empty object is accepted (tool soft-fails with suggestions)", () => {
+      expect(accepts(Skill, {})).toBe(true)
     })
   })
 

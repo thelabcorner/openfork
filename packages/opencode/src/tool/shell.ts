@@ -1,4 +1,5 @@
 import { Effect, Stream } from "effect"
+import { Duration } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
 import * as Tool from "./tool"
@@ -16,11 +17,18 @@ import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "./shell/id"
 
 import * as Truncate from "./truncate"
+import { TRUNCATION_DIR } from "./truncation-dir"
 import { Plugin } from "@/plugin"
 import { ChildProcess } from "effect/unstable/process"
+import type { CommandInput, StdinConfig } from "effect/unstable/process/ChildProcess"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
+import { BackgroundJob } from "@/background/job"
+import { ShellJobs, jobLogPath, jobMetaPath } from "@/background/shell-jobs"
+import { Identifier } from "@/id/id"
+import type { TaskPromptOps } from "./task"
+import { Scope } from "effect"
 
 export { Parameters } from "./shell/prompt"
 
@@ -260,6 +268,71 @@ const parse = Effect.fn("ShellTool.parse")(function* (command: string, ps: boole
   return tree
 })
 
+const escapeXML = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+
+type BackgroundMeta = {
+  jobId: string
+  command: string
+  logPath: string
+  notify: boolean
+  timeoutMs?: number
+}
+
+function renderRunning(meta: BackgroundMeta) {
+  return [
+    `<background_shell job="${meta.jobId}" state="running">`,
+    `<summary>Background command started: ${escapeXML(meta.command)}</summary>`,
+    `<command>${escapeXML(meta.command)}</command>`,
+    meta.notify
+      ? "You will be notified when it finishes."
+      : "Notify is off; check on it with the `background` tool.",
+    `Use the \`background\` tool with id \`${meta.jobId}\` to: status, read, wait, send, kill.`,
+    `Full output streams to: ${meta.logPath}`,
+    "</background_shell>",
+  ].join("\n")
+}
+
+function renderCompleted(meta: BackgroundMeta, preview: string, exit: number | null) {
+  return [
+    `<background_shell job="${meta.jobId}" state="completed" exit="${exit ?? 0}">`,
+    `<summary>Background command completed: ${escapeXML(meta.command)}</summary>`,
+    `<command>${escapeXML(meta.command)}</command>`,
+    "<preview>",
+    preview || "(no output)",
+    "</preview>",
+    `Full output: ${meta.logPath}`,
+    "</background_shell>",
+  ].join("\n")
+}
+
+function renderError(meta: BackgroundMeta, error: string, preview: string, exit: number | null) {
+  return [
+    `<background_shell job="${meta.jobId}" state="error" exit="${exit ?? 1}">`,
+    `<summary>Background command failed: ${escapeXML(meta.command)}</summary>`,
+    `<command>${escapeXML(meta.command)}</command>`,
+    `<error>${error}</error>`,
+    "<preview>",
+    preview || "(no output)",
+    "</preview>",
+    `Full output: ${meta.logPath}`,
+    "</background_shell>",
+  ].join("\n")
+}
+
+function renderTimeout(meta: BackgroundMeta, preview: string) {
+  return [
+    `<background_shell job="${meta.jobId}" state="cancelled" reason="timeout">`,
+    `<summary>Background command timed out after ${meta.timeoutMs} ms: ${escapeXML(meta.command)}</summary>`,
+    `<command>${escapeXML(meta.command)}</command>`,
+    `<error>Killed after exceeding the explicit timeout of ${meta.timeoutMs} ms.</error>`,
+    "<preview>",
+    preview || "(no output)",
+    "</preview>",
+    `Full output: ${meta.logPath}`,
+    "</background_shell>",
+  ].join("\n")
+}
+
 const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan, input: { command: string }) {
   if (scan.dirs.size > 0) {
     const directories = Array.from(scan.dirs)
@@ -290,13 +363,21 @@ const ask = Effect.fn("ShellTool.ask")(function* (ctx: Tool.Context, scan: Scan,
   })
 })
 
-function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv) {
+function cmd(
+  shell: string,
+  command: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  stdin: CommandInput | StdinConfig = "ignore",
+  options: { forceKillAfter?: Duration.Input } = {},
+) {
   if (process.platform === "win32" && Shell.ps(shell)) {
     return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
       cwd,
       env,
-      stdin: "ignore",
+      stdin,
       detached: false,
+      ...options,
     })
   }
 
@@ -304,8 +385,9 @@ function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv
     shell,
     cwd,
     env,
-    stdin: "ignore",
+    stdin,
     detached: process.platform !== "win32",
+    ...options,
   })
 }
 const parser = lazy(async () => {
@@ -344,6 +426,9 @@ export const ShellTool = Tool.define(
     const trunc = yield* Truncate.Service
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
+    const background = yield* BackgroundJob.Service
+    const jobs = yield* ShellJobs.Service
+    const scope = yield* Scope.Scope
     const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
 
     const cygpath = Effect.fn("ShellTool.cygpath")(function* (shell: string, text: string) {
@@ -446,6 +531,7 @@ export const ShellTool = Tool.define(
       let cut = false
       let expired = false
       let aborted = false
+      const startedAt = Date.now()
 
       const closeSink = Effect.fnUntraced(function* () {
         const stream = sink
@@ -475,6 +561,8 @@ export const ShellTool = Tool.define(
       yield* ctx.metadata({
         metadata: {
           output: "",
+          timeout: input.timeout,
+          startedAt,
         },
       })
 
@@ -515,6 +603,8 @@ export const ShellTool = Tool.define(
                       ctx.metadata({
                         metadata: {
                           output: last,
+                          timeout: input.timeout,
+                          startedAt,
                         },
                       }),
                     ),
@@ -525,6 +615,8 @@ export const ShellTool = Tool.define(
               return ctx.metadata({
                 metadata: {
                   output: last,
+                  timeout: input.timeout,
+                  startedAt,
                 },
               })
             }),
@@ -588,10 +680,205 @@ export const ShellTool = Tool.define(
           output: last || preview(output),
           exit: code,
           truncated: cut,
+          timeout: input.timeout,
+          startedAt,
+          endedAt: Date.now(),
           ...(cut && file ? { outputPath: file } : {}),
         },
         output,
       }
+    })
+
+    const inject = Effect.fn("ShellTool.injectBackgroundResult")(function* (ctx: Tool.Context, text: string) {
+      const ops = ctx.extra?.promptOps as TaskPromptOps | undefined
+      if (!ops) return
+      yield* ops
+        .prompt({
+          sessionID: ctx.sessionID,
+          agent: ctx.agent,
+          parts: [{ type: "text", synthetic: true, text }],
+        })
+        .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
+    })
+
+    const readLogTail = Effect.fn("ShellTool.readLogTail")(function* (logPath: string) {
+      const limits = yield* trunc.limits()
+      const text = yield* fs.readFileStringSafe(logPath)
+      if (!text) return "(no output)"
+      return tail(text, limits.maxLines, limits.maxBytes).text || "(no output)"
+    })
+
+    const runBackground = Effect.fn("ShellTool.runBackground")(function* (
+      input: {
+        shell: string
+        command: string
+        cwd: string
+        env: NodeJS.ProcessEnv
+        jobId: string
+        logPath: string
+        metaPath: string
+        notify: boolean
+        timeoutMs?: number
+      },
+      ctx: Tool.Context,
+    ) {
+      const limits = yield* trunc.limits()
+      const keep = limits.maxBytes * 2
+      const list: Chunk[] = []
+      let used = 0
+      let last = ""
+      let sink: ReturnType<typeof createWriteStream> | undefined
+      let timedOut = false
+
+      const closeSink = Effect.fnUntraced(function* () {
+        const stream = sink
+        if (!stream) return
+        sink = undefined
+        if (stream.destroyed || stream.closed) return
+        yield* Effect.promise(
+          () =>
+            new Promise<void>((resolve) => {
+              let settled = false
+              const done = () => {
+                if (settled) return
+                settled = true
+                stream.off("close", done)
+                stream.off("error", done)
+                stream.off("finish", done)
+                resolve()
+              }
+              stream.once("close", done)
+              stream.once("error", done)
+              stream.once("finish", done)
+              stream.end(done)
+            }),
+        ).pipe(Effect.catch(() => Effect.void))
+      })
+
+      const meta: BackgroundMeta = {
+        jobId: input.jobId,
+        command: input.command,
+        logPath: input.logPath,
+        notify: input.notify,
+        timeoutMs: input.timeoutMs,
+      }
+
+      const previewText = Effect.fnUntraced(function* () {
+        const raw = list.map((item) => item.text).join("")
+        const end = tail(raw, limits.maxLines, limits.maxBytes)
+        return end.text || "(no output)"
+      })
+
+      const code: number | null = yield* Effect.scoped(
+        Effect.gen(function* () {
+          yield* Effect.addFinalizer(closeSink)
+          sink = createWriteStream(input.logPath, { flags: "a" })
+          const handle = yield* spawner.spawn(
+            cmd(input.shell, input.command, input.cwd, input.env, { stream: "pipe", endOnDone: false }, {
+              forceKillAfter: "3 seconds",
+            }),
+          )
+          yield* jobs.register({
+            id: input.jobId,
+            handle,
+            command: input.command,
+            shell: input.shell,
+            cwd: input.cwd,
+            env: input.env,
+            logPath: input.logPath,
+            metaPath: input.metaPath,
+            notify: input.notify,
+            timeoutMs: input.timeoutMs,
+          })
+          yield* Effect.addFinalizer(() => jobs.remove(input.jobId).pipe(Effect.ignore))
+
+          yield* Effect.forkScoped(
+            Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
+              const size = Buffer.byteLength(chunk, "utf-8")
+              list.push({ text: chunk, size })
+              used += size
+              while (used > keep && list.length > 1) {
+                const item = list.shift()
+                if (!item) break
+                used -= item.size
+              }
+              last = preview(last + chunk)
+              sink?.write(chunk)
+              return Effect.void
+            }),
+          )
+
+          const exit = yield* input.timeoutMs !== undefined
+            ? Effect.raceAll([
+                handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+                Effect.sleep(`${input.timeoutMs + 100} millis`).pipe(
+                  Effect.map(() => ({ kind: "timeout" as const, code: null })),
+                ),
+              ])
+            : handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code })))
+
+          if (exit.kind === "timeout") {
+            timedOut = true
+            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            if (input.notify) {
+              yield* inject(ctx, renderTimeout(meta, yield* previewText()))
+            }
+            yield* background.cancel(input.jobId).pipe(Effect.ignore)
+          }
+          return exit.code
+        }),
+      ).pipe(Effect.orDie)
+
+      if (!timedOut && code !== 0) {
+        return yield* Effect.fail(new Error(`Command exited with code ${code}`))
+      }
+      return yield* previewText()
+    })
+
+    const pollUntilRegistered = Effect.fn("ShellTool.pollUntilRegistered")(function* (jobId: string) {
+      let waited = 0
+      while (waited < 2000) {
+        const entry = yield* jobs.get(jobId)
+        if (entry) return
+        const info = yield* background.get(jobId)
+        if (info && info.status !== "running") return
+        yield* Effect.sleep("10 millis")
+        waited += 10
+      }
+    })
+
+    const notify = Effect.fn("ShellTool.notifyBackgroundResult")(function* (
+      input: {
+        jobId: string
+        command: string
+        logPath: string
+        notify: boolean
+      },
+      ctx: Tool.Context,
+    ) {
+      if (!ctx.extra?.promptOps) return
+      const meta: BackgroundMeta = {
+        jobId: input.jobId,
+        command: input.command,
+        logPath: input.logPath,
+        notify: input.notify,
+      }
+      yield* background.wait({ id: input.jobId }).pipe(
+        Effect.flatMap((result) => {
+          if (result.info?.status === "completed") {
+            return inject(ctx, renderCompleted(meta, result.info.output ?? "", 0))
+          }
+          if (result.info?.status === "error") {
+            return readLogTail(input.logPath).pipe(
+              Effect.flatMap((preview) =>
+                inject(ctx, renderError(meta, result.info?.error ?? "Command failed", preview, null)),
+              ),
+            )
+          }
+          return Effect.void
+        }),
+        Effect.forkIn(scope, { startImmediately: true }),
+      )
     })
 
     return () =>
@@ -603,43 +890,116 @@ export const ShellTool = Tool.define(
         const prompt = ShellPrompt.render(name, process.platform, limits, defaultTimeoutMs)
         yield* Effect.logInfo("shell tool using shell", { shell })
 
-        return {
-          description: prompt.description,
-          parameters: prompt.parameters,
-          execute: (params: Parameters, ctx: Tool.Context) =>
-            Effect.gen(function* () {
-              const instanceCtx = yield* InstanceState.context
-              const cwd = params.workdir
-                ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
-                : instanceCtx.directory
-              if (params.timeout !== undefined && params.timeout < 0) {
-                throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
-              }
-              const timeout = params.timeout ?? defaultTimeoutMs
-              const ps = Shell.ps(shell)
-              yield* Effect.scoped(
-                Effect.gen(function* () {
-                  const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
-                    Effect.sync(() => tree.delete()),
-                  )
-                  const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
-                  if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
-                  yield* ask(ctx, scan, params)
-                }),
-              )
+          return {
+            description: prompt.description,
+            parameters: prompt.parameters,
+            execute: (params: Parameters, ctx: Tool.Context) =>
+              Effect.gen(function* () {
+                const instanceCtx = yield* InstanceState.context
+                const cwd = params.workdir
+                  ? yield* resolvePath(params.workdir, instanceCtx.directory, shell)
+                  : instanceCtx.directory
+                if (params.timeout !== undefined && params.timeout < 0) {
+                  throw new Error(`Invalid timeout value: ${params.timeout}. Timeout must be a positive number.`)
+                }
+                const timeout = params.timeout ?? defaultTimeoutMs
+                const ps = Shell.ps(shell)
+                yield* Effect.scoped(
+                  Effect.gen(function* () {
+                    const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
+                      Effect.sync(() => tree.delete()),
+                    )
+                    const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
+                    if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
+                    yield* ask(ctx, scan, params)
+                  }),
+                )
 
-              return yield* run(
-                {
-                  shell,
-                  command: params.command,
-                  cwd,
-                  env: yield* shellEnv(ctx, cwd),
-                  timeout,
-                },
-                ctx,
-              )
-            }),
-        }
-      })
+                const env = yield* shellEnv(ctx, cwd)
+
+                if (params.background === true) {
+                  const jobId = params.id ?? Identifier.ascending("job")
+                  if (params.id) {
+                    if (!/^[A-Za-z0-9_-]+$/.test(params.id)) {
+                      throw new Error(
+                        `Invalid job id: ${params.id}. Must match ^[A-Za-z0-9_-]+$ (letters, digits, _ and -).`,
+                      )
+                    }
+                    const registered = yield* background.get(params.id)
+                    if (registered) {
+                      throw new Error(`job id "${params.id}" is already in use`)
+                    }
+                    const logExists = yield* fs.existsSafe(jobLogPath(params.id))
+                    const metaExists = yield* fs.existsSafe(jobMetaPath(params.id))
+                    if (logExists || metaExists) {
+                      throw new Error(
+                        `job id "${params.id}" is already in use (a stale log exists on disk; pick a new id)`,
+                      )
+                    }
+                  }
+
+                  const logPath = jobLogPath(jobId)
+                  const metaPath = jobMetaPath(jobId)
+                  const wantsNotify = params.notify ?? true
+                  const timeoutMs = params.timeout
+                  const startedAt = Date.now()
+                  const metadata: Record<string, unknown> = {
+                    background: true,
+                    jobId,
+                    logPath,
+                    notify: wantsNotify,
+                    startedAt,
+                    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                  }
+
+                  yield* fs.ensureDir(TRUNCATION_DIR)
+                  yield* fs.writeFileString(logPath, "")
+                  yield* fs.writeJson(metaPath, {
+                    id: jobId,
+                    command: params.command,
+                    shell,
+                    cwd,
+                    startedAt,
+                    notify: wantsNotify,
+                    ...(timeoutMs !== undefined ? { timeoutMs } : {}),
+                  })
+
+                  yield* background.start({
+                    id: jobId,
+                    type: "shell",
+                    title: params.command,
+                    metadata,
+                    run: runBackground(
+                      { shell, command: params.command, cwd, env, jobId, logPath, metaPath, notify: wantsNotify, timeoutMs },
+                      ctx,
+                    ),
+                  })
+                  // The run effect (forked by start) registers the handle in
+                  // ShellJobs; wait briefly so the manager tool's kill/send can
+                  // resolve the handle without racing the launch. If the process
+                  // dies before registration (spawn failure), settle quickly.
+                  yield* pollUntilRegistered(jobId)
+                  if (wantsNotify) yield* notify({ jobId, command: params.command, logPath, notify: wantsNotify }, ctx)
+
+                  return {
+                    title: params.command,
+                    metadata,
+                    output: renderRunning({ jobId, command: params.command, logPath, notify: wantsNotify, timeoutMs }),
+                  }
+                }
+
+                return yield* run(
+                  {
+                    shell,
+                    command: params.command,
+                    cwd,
+                    env,
+                    timeout,
+                  },
+                  ctx,
+                )
+              }).pipe(Effect.orDie),
+          }
+        })
   }),
 )

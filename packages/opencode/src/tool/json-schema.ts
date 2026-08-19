@@ -3,6 +3,10 @@ import { JsonSchema, Schema } from "effect"
 import type * as Tool from "./tool"
 
 type JsonObject = Record<string, unknown>
+// Keyed by Schema instance. Stale-safe across tool reloads: custom/plugin tools
+// get a FRESH `Schema.declare` instance per `fromPlugin` conversion (custom.ts),
+// so a reload never reuses the same Schema with a changed def — the old entry
+// is simply unreachable. Builtins are built once and never reloaded (P0).
 const cache = new WeakMap<Schema.Top, JSONSchema7>()
 
 export function fromSchema(schema: Schema.Top): JSONSchema7 {

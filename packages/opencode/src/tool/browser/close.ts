@@ -11,7 +11,7 @@ export const BrowserCloseTool = Tool.define(
     const broker = yield* BrokerClient.Service
     return {
       description:
-        "Close a browser tab (default the active tab) and optionally the whole guest window. Returns whether the closed tab was the active one and how many guests remain for the session. Re-open with browser_open when needed.",
+        "Close a browser tab owned by this session (default the session's active owned tab; an explicit tabId must be this session's own tab). The user can always close any tab from the UI. Re-open with browser_open when needed.",
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {

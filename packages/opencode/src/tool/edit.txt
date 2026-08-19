@@ -8,3 +8,13 @@ Usage:
 - The edit will FAIL if `oldString` is not found in the file with an error "oldString not found in content".
 - The edit will FAIL if `oldString` is found multiple times in the file with an error "Found multiple matches for oldString. Provide more surrounding lines in oldString to identify the correct match." Either provide a larger string with more surrounding context to make it unique or use `replaceAll` to change every instance of `oldString`. 
 - Use `replaceAll` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
+
+Token-efficient strategies (use when repeating the full old text is wasteful; exact oldString/newString still has priority and is always the safest):
+- line + newText: replace one 1-based line. Optional oldText verifies the line contains it; the old line is echoed back in the output.
+- startLine + endLine + newText: replace a line range. Ranges over 5 lines require oldText verification.
+- insertAfter + newText: insert newText after a 1-based line.
+- appendFile:true + newText: append newText at the end of the file.
+- nearText + oldText + newText: find oldText within ±5 lines of a unique anchor line and replace it.
+- edits: [{line,newText,oldText?}] or [{oldString,newString}] — apply a batch atomically; fully validated before any write.
+
+Safety rails: empty/ambiguous targets are rejected (never guessed); a no-op edit returns applied=0 without writing; the unified diff is always surfaced. Optional runTypecheck:true runs a scoped tsgo/tsc check on the file after applying.

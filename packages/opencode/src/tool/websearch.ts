@@ -2,13 +2,37 @@ import { Effect, Schema } from "effect"
 import { HttpClient } from "effect/unstable/http"
 import * as Tool from "./tool"
 import * as McpWebSearch from "./mcp-websearch"
+import * as FirecrawlWebSearch from "./firecrawl-websearch"
+import * as DuckDuckGoWebSearch from "./duckduckgo-websearch"
+import * as BraveWebSearch from "./brave-websearch"
+import * as TavilyWebSearch from "./tavily-websearch"
+import * as SearxngWebSearch from "./searxng-websearch"
 import DESCRIPTION from "./websearch.txt"
 import { checksum } from "@opencode-ai/core/util/encode"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 
+export const WEBSEARCH_PROVIDERS = [
+  "exa",
+  "parallel",
+  "firecrawl",
+  "duckduckgo",
+  "brave",
+  "tavily",
+  "searxng",
+] as const
+export type WebSearchProvider = (typeof WEBSEARCH_PROVIDERS)[number]
+
+const WebSearchProviderSchema = Schema.Literals(WEBSEARCH_PROVIDERS)
+
 export const Parameters = Schema.Struct({
-  query: Schema.String.annotate({ description: "Websearch query" }),
+  action: Schema.optional(Schema.Literals(["search", "providers"])).annotate({
+    description:
+      "Action: 'search' (default) runs a query and returns results; 'providers' lists the available search providers, their config status (keyless-ready | needs <ENV_VAR>), and how to enable each.",
+  }),
+  query: Schema.optional(Schema.String).annotate({
+    description: "Websearch query (required for action 'search')",
+  }),
   numResults: Schema.optional(Schema.Number).annotate({
     description: "Number of search results to return (default: 8)",
   }),
@@ -22,23 +46,92 @@ export const Parameters = Schema.Struct({
   contextMaxCharacters: Schema.optional(Schema.Number).annotate({
     description: "Maximum characters for context string optimized for LLMs (default: 10000)",
   }),
+  provider: Schema.optional(WebSearchProviderSchema).annotate({
+    description:
+      "Explicitly pin a search provider: exa | parallel | firecrawl | duckduckgo | brave | tavily | searxng. Overrides automatic selection (env override, feature flags, session checksum). Run action:'providers' to see which are usable.",
+  }),
 })
 
-const WebSearchProviderSchema = Schema.Literals(["exa", "parallel"])
-export type WebSearchProvider = Schema.Schema.Type<typeof WebSearchProviderSchema>
+export type WebSearchFlags = Partial<Record<WebSearchProvider, boolean>>
 
-export function selectWebSearchProvider(sessionID: string, flags = { exa: false, parallel: false }): WebSearchProvider {
+// Keyless-ready providers work with no configuration; key/config providers
+// become available when their env var is set (or their flag is enabled).
+const KEYLESS_PROVIDERS: ReadonlySet<WebSearchProvider> = new Set([
+  "exa",
+  "parallel",
+  "firecrawl",
+  "duckduckgo",
+])
+
+const PROVIDER_ENV: Partial<Record<WebSearchProvider, string>> = {
+  brave: "BRAVE_API_KEY",
+  tavily: "TAVILY_API_KEY",
+  searxng: "SEARXNG_URL",
+}
+
+// Flag precedence when multiple flags are set (parallel-first preserved, then
+// exa/firecrawl, then the free providers in insertion order).
+export const PROVIDER_FLAG_ORDER: readonly WebSearchProvider[] = [
+  "parallel",
+  "exa",
+  "firecrawl",
+  "duckduckgo",
+  "brave",
+  "tavily",
+  "searxng",
+]
+
+export function isWebSearchProvider(value: string | undefined): value is WebSearchProvider {
+  return value !== undefined && (WEBSEARCH_PROVIDERS as readonly string[]).includes(value)
+}
+
+export function isProviderAvailable(p: WebSearchProvider, flags: WebSearchFlags = {}): boolean {
+  if (flags[p]) return true
+  if (KEYLESS_PROVIDERS.has(p)) return true
+  const env = PROVIDER_ENV[p]
+  return env !== undefined && Boolean(process.env[env])
+}
+
+/** Per-provider config status for the `providers` action. */
+export function providerStatus(p: WebSearchProvider, flags: WebSearchFlags = {}): string {
+  if (flags[p]) return "enabled via flag"
+  if (KEYLESS_PROVIDERS.has(p)) return "keyless-ready"
+  const env = PROVIDER_ENV[p]
+  if (env && process.env[env]) return "ready"
+  return `needs ${env}`
+}
+
+export function selectWebSearchProvider(
+  sessionID: string,
+  flags: WebSearchFlags = {},
+  pin?: WebSearchProvider,
+): WebSearchProvider {
+  // Explicit in-call pin wins (the agent/user deliberately chose a provider).
+  if (pin && isWebSearchProvider(pin)) return pin
   const override = process.env.OPENCODE_WEBSEARCH_PROVIDER
-  if (override === "exa" || override === "parallel") return override
-  if (flags.parallel) return "parallel"
-  if (flags.exa) return "exa"
+  if (isWebSearchProvider(override)) return override
+  for (const p of PROVIDER_FLAG_ORDER) {
+    if (flags[p]) return p
+  }
 
-  return Number.parseInt(checksum(sessionID) ?? "0", 36) % 2 === 0 ? "exa" : "parallel"
+  // Deterministic per-session spread over the AVAILABLE providers only —
+  // keyless-first when no keys are configured.
+  const available = WEBSEARCH_PROVIDERS.filter((p) => isProviderAvailable(p, flags))
+  const mod = Number.parseInt(checksum(sessionID) ?? "0", 36) % available.length
+  return available[mod]
 }
 
 export function webSearchProviderLabel(provider: unknown) {
-  if (provider === "parallel") return "Parallel Web Search"
-  if (provider === "exa") return "Exa Web Search"
+  const labels: Record<string, string> = {
+    parallel: "Parallel Web Search",
+    exa: "Exa Web Search",
+    firecrawl: "Firecrawl Web Search",
+    duckduckgo: "DuckDuckGo",
+    brave: "Brave Search",
+    tavily: "Tavily Search",
+    searxng: "SearXNG",
+  }
+  if (typeof provider === "string" && provider in labels) return labels[provider]
   return "Web Search"
 }
 
@@ -70,8 +163,8 @@ function callProvider(
       "web_search",
       McpWebSearch.ParallelSearchArgs,
       {
-        objective: params.query,
-        search_queries: [params.query],
+        objective: params.query!,
+        search_queries: [params.query!],
         session_id: ctx.sessionID,
         model_name: webSearchModelName(ctx.extra),
       },
@@ -80,13 +173,37 @@ function callProvider(
     )
   }
 
+  if (provider === "firecrawl") {
+    return FirecrawlWebSearch.call(
+      http,
+      params.query!,
+      Math.min(Math.max(Math.trunc(params.numResults || 8), 1), 100),
+    )
+  }
+
+  if (provider === "duckduckgo") {
+    return DuckDuckGoWebSearch.call(http, params.query!)
+  }
+
+  if (provider === "brave") {
+    return BraveWebSearch.call(http, params.query!, Math.min(Math.max(Math.trunc(params.numResults || 8), 1), 20))
+  }
+
+  if (provider === "tavily") {
+    return TavilyWebSearch.call(http, params.query!, Math.min(Math.max(Math.trunc(params.numResults || 8), 1), 20))
+  }
+
+  if (provider === "searxng") {
+    return SearxngWebSearch.call(http, params.query!)
+  }
+
   return McpWebSearch.call(
     http,
     McpWebSearch.EXA_URL,
     "web_search_exa",
     McpWebSearch.SearchArgs,
     {
-      query: params.query,
+      query: params.query!,
       type: params.type || "auto",
       numResults: params.numResults || 8,
       livecrawl: params.livecrawl || "fallback",
@@ -96,7 +213,33 @@ function callProvider(
   )
 }
 
-export const WebSearchTool = Tool.define(
+function providersOutput(flags: Record<string, boolean>): string {
+  const keyless = WEBSEARCH_PROVIDERS.filter((p) => KEYLESS_PROVIDERS.has(p)).length
+  const lines = [
+    `websearch providers (${WEBSEARCH_PROVIDERS.length}, ${keyless} keyless-ready):`,
+  ]
+  for (const p of WEBSEARCH_PROVIDERS) {
+    const status = providerStatus(p, flags)
+    const note =
+      p === "brave" ? "  (free tier: https://brave.com/search/api/)"
+      : p === "tavily" ? "  (free tier: https://tavily.com)"
+      : p === "searxng" ? "  (self-hosted: https://docs.searxng.org)"
+      : ""
+    lines.push(`  ${p.padEnd(11)} ${status}${note}`)
+  }
+  lines.push("")
+  lines.push("Enable a key-based provider by setting its env var (e.g. BRAVE_API_KEY=...).")
+  lines.push('Pin a provider with provider: "brave", or set OPENCODE_WEBSEARCH_PROVIDER=brave.')
+  return lines.join("\n")
+}
+
+type WebSearchMeta = { action: "search" | "providers"; provider: WebSearchProvider | undefined }
+
+export const WebSearchTool = Tool.define<
+  typeof Parameters,
+  WebSearchMeta,
+  HttpClient.HttpClient | RuntimeFlags.Service
+>(
   "websearch",
   Effect.gen(function* () {
     const http = yield* HttpClient.HttpClient
@@ -109,10 +252,31 @@ export const WebSearchTool = Tool.define(
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
-          const provider = selectWebSearchProvider(ctx.sessionID, {
+          const flagMap = {
             exa: flags.enableExa,
             parallel: flags.enableParallel,
-          })
+            firecrawl: flags.enableFirecrawl,
+            duckduckgo: flags.enableDuckDuckGo,
+            brave: flags.enableBrave,
+            tavily: flags.enableTavily,
+            searxng: flags.enableSearxng,
+          }
+
+          // ── Introspection: no query, no network, no permission ask ──
+          if (params.action === "providers") {
+            const output = providersOutput(flagMap)
+            return {
+              title: "websearch providers",
+              output,
+              metadata: { action: "providers" as const, provider: undefined },
+            }
+          }
+
+          if (!params.query) {
+            return yield* Effect.fail(new Error("query is required for action 'search'"))
+          }
+
+          const provider = selectWebSearchProvider(ctx.sessionID, flagMap, params.provider)
           const title = webSearchProviderLabel(provider)
           yield* ctx.metadata({ title: `${title} "${params.query}"`, metadata: { provider } })
 
@@ -135,7 +299,7 @@ export const WebSearchTool = Tool.define(
           return {
             output: result ?? "No search results found. Please try a different query.",
             title: `${title}: ${params.query}`,
-            metadata: { provider },
+            metadata: { provider, action: "search" as const },
           }
         }).pipe(Effect.orDie),
     }

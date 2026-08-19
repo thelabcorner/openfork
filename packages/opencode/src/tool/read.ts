@@ -26,7 +26,13 @@ class ReadStop extends Schema.TaggedErrorClass<ReadStop>()("ReadStop", {}) {}
 // Schema output is identical (`type: "number"`), so the LLM view is
 // unchanged; purely CLI-facing uses must now send numbers rather than strings.
 export const Parameters = Schema.Struct({
-  filePath: Schema.String.annotate({ description: "The absolute path to the file or directory to read" }),
+  filePath: Schema.optional(Schema.String).annotate({
+    description: "The absolute path to the file or directory to read",
+  }),
+  filePaths: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description:
+      "Bulk read: up to 8 files in one call, each rendered as its own <file> block. Mutually exclusive with filePath.",
+  }),
   offset: Schema.optional(NonNegativeInt).annotate({
     description: "The line number to start reading from (1-indexed)",
   }),
@@ -34,6 +40,8 @@ export const Parameters = Schema.Struct({
     description: "The maximum number of lines to read (defaults to 2000)",
   }),
 })
+
+const MAX_BULK_FILES = 8
 
 type Display =
   | {
@@ -231,7 +239,67 @@ export const ReadTool = Tool.define<
       ctx: Tool.Context<Metadata>,
     ) {
       const instance = yield* InstanceState.context
+
+      // Bulk read (filePaths[]): each file rendered compactly, joined with
+      // blank lines. Purely additive — single-path behavior is unchanged.
+      if (params.filePaths?.length) {
+        if (params.filePaths.length > MAX_BULK_FILES) {
+          throw new Error(`filePaths[] supports at most ${MAX_BULK_FILES} files (got ${params.filePaths.length}).`)
+        }
+        const blocks: string[] = []
+        let truncated = false
+        let bytes = 0
+        for (const input of params.filePaths) {
+          let filepath = input
+          if (!path.isAbsolute(filepath)) filepath = path.resolve(instance.directory, filepath)
+          if (process.platform === "win32") filepath = FSUtil.normalizePath(filepath)
+          yield* ctx.ask({
+            permission: "read",
+            patterns: [path.relative(instance.worktree, filepath)],
+            always: ["*"],
+            metadata: {},
+          })
+          yield* assertExternalDirectoryEffect(ctx, filepath, { kind: "file" })
+          const stat = yield* fs.stat(filepath).pipe(
+            Effect.catchIf(
+              (err) => "reason" in err && err.reason._tag === "NotFound",
+              () => Effect.succeed(undefined),
+            ),
+          )
+          if (!stat) {
+            blocks.push(`<file path="${filepath}">\n<missing />\n</file>`)
+            continue
+          }
+          const file = yield* lines(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
+          const block = [
+            `<file path="${filepath}">`,
+            "<content>",
+            file.raw.map((line, i) => `${i + file.offset}: ${line}`).join("\n"),
+            file.more || file.cut ? `\n(Showing lines ${file.offset}-${file.offset + file.raw.length - 1} of ${file.count}. Use offset=${file.offset + file.raw.length} to continue.)` : "",
+            "</content>",
+            "</file>",
+          ]
+            .filter((line) => line !== "")
+            .join("\n")
+          blocks.push(block)
+          truncated = truncated || file.more || file.cut
+          bytes += Buffer.byteLength(block, "utf8")
+        }
+        return {
+          title: `read ${params.filePaths.length} files`,
+          output: blocks.join("\n\n"),
+          metadata: {
+            preview: blocks[0]?.slice(0, 20) ?? "",
+            truncated,
+            loaded: [] as string[],
+          },
+        }
+      }
+
       let filepath = params.filePath
+      if (!filepath) {
+        throw new Error("Provide filePath or filePaths[] to read.")
+      }
       if (!path.isAbsolute(filepath)) {
         filepath = path.resolve(instance.directory, filepath)
       }

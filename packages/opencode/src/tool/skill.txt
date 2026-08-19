@@ -2,4 +2,10 @@ Load a specialized skill when the task at hand matches one of the skills listed 
 
 Use this tool to inject the skill's instructions and resources into current conversation. The output may contain detailed workflow guidance as well as references to scripts, files, etc in the same directory as the skill.
 
+Modes:
+- load (default): load one skill by name, or several with names: ["a", "b"].
+- list: enumerate all registered skills with their descriptions.
+- search: filter registered skills by query substring across name/description, and optionally tags: [...] keyword filters.
+- Unknown names fail softly with the available-skill list and suggestions.
+
 The skill name must match one of the skills listed in your system prompt.

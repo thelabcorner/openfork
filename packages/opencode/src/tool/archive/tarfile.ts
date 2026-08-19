@@ -64,7 +64,7 @@ export function readTar(buf: Uint8Array): TarEntry[] {
     }
 
     const name = pendingName ?? pax.path ?? rawName
-    const linkTo = pendingLink ?? pax.linkpath ?? rawLink
+    const linkTo = pendingLink ?? pax.linkpath ?? (rawLink !== "" ? rawLink : undefined)
     const finalSize = pax.size !== undefined ? pax.size : size
     const finalMtime = pax.mtime !== undefined ? pax.mtime : mtime
     const finalMode = pax.mode !== undefined ? pax.mode : mode

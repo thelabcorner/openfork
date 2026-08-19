@@ -1,6 +1,5 @@
-import { Schema } from "effect"
+import { Effect, Option, Schema } from "effect"
 import * as path from "path"
-import { Effect } from "effect"
 import * as Tool from "./tool"
 import { LSP } from "@/lsp/lsp"
 import { createTwoFilesPatch } from "diff"
@@ -14,6 +13,8 @@ import { InstanceState } from "@/effect/instance-state"
 import { trimDiff } from "./edit"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import * as Bom from "@/util/bom"
+import { AppProcess } from "@opencode-ai/core/process"
+import { TypecheckScope } from "./typecheck-scope"
 
 const MAX_PROJECT_DIAGNOSTICS_FILES = 5
 
@@ -21,6 +22,9 @@ export const Parameters = Schema.Struct({
   content: Schema.String.annotate({ description: "The content to write to the file" }),
   filePath: Schema.String.annotate({
     description: "The absolute path to the file to write (must be absolute, not relative)",
+  }),
+  runTypecheck: Schema.optional(Schema.Boolean).annotate({
+    description: "After writing, run a scoped tsgo/tsc check on this file and append the result (default false)",
   }),
 })
 
@@ -35,7 +39,7 @@ export const WriteTool = Tool.define(
     return {
       description: DESCRIPTION,
       parameters: Parameters,
-      execute: (params: { content: string; filePath: string }, ctx: Tool.Context) =>
+      execute: (params: { content: string; filePath: string; runTypecheck?: boolean }, ctx: Tool.Context) =>
         Effect.gen(function* () {
           const instance = yield* InstanceState.context
           const filepath = path.isAbsolute(params.filePath)
@@ -72,6 +76,29 @@ export const WriteTool = Tool.define(
           })
 
           let output = "Wrote file successfully."
+          if (params.runTypecheck && TypecheckScope.isTsFile(filepath)) {
+            const app = yield* Effect.serviceOption(AppProcess.Service)
+            if (Option.isSome(app)) {
+              const dir = path.dirname(filepath)
+              const tsconfigDir = yield* Effect.promise(() => TypecheckScope.findNearestTsconfig(dir, instance.worktree))
+              if (tsconfigDir) {
+                const outcome = yield* TypecheckScope.runScopedTypecheck({
+                  app: app.value,
+                  worktree: instance.worktree,
+                  tsconfigDir,
+                  files: [filepath],
+                  maxErrors: 30,
+                  timeoutMs: 30_000,
+                  signal: ctx.abort,
+                })
+                const status = outcome.exitCode === 0 ? "passed" : "failed"
+                output += `\n\n<typecheck status="${status}" errors="${outcome.diagnostics.length}">\nScoped tsgo check of ${path.relative(instance.worktree, filepath)}: ${status}.\n${outcome.diagnostics
+                  .slice(0, 10)
+                  .map((d) => `  - ${d.file}(${d.line},${d.column}): TS${d.code} [${d.severity}] ${d.message.split("\n")[0]}`)
+                  .join("\n")}\n</typecheck>`
+              }
+            }
+          }
           yield* lsp.touchFile(filepath, "document")
           const diagnostics = yield* lsp.diagnostics()
           const normalizedFilepath = FSUtil.normalizePath(filepath)

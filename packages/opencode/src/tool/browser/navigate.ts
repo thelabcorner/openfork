@@ -11,7 +11,7 @@ export const BrowserNavigateTool = Tool.define(
     const broker = yield* BrokerClient.Service
     return {
       description:
-        "Navigate the active browser tab to a new URL (or reload). waitUntil controls how long to wait for the page: commit (immediately), domcontentloaded, load (default), or networkidle. After navigating, call browser_snapshot to re-establish element refs — the previous snapshot's refs are stale and will be rejected with BrowserStaleRefError.",
+        "Navigate this session's active owned browser tab to a new URL (or reload). waitUntil controls how long to wait for the page: commit (immediately), domcontentloaded, load (default), or networkidle. After navigating, call browser_snapshot to re-establish element refs — the previous snapshot's refs are stale and will be rejected with BrowserStaleRefError.",
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
