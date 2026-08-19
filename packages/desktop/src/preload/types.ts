@@ -2,7 +2,7 @@ import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
 import type { WslServersPlatform } from "@opencode-ai/app/wsl/types"
 import type { UpdaterState } from "@opencode-ai/app/updater"
 import type { DesktopNativeBundle } from "@opencode-ai/app/i18n/desktop-native"
-import type { BrowserAnnotationResult, BrowserPointerEvent, BrowserState, WireGuestTabState } from "../main/browser/contracts"
+import type { BrowserAnnotationResult, BrowserPointerEvent, BrowserState, HostOwner, WireGuestTabState } from "../main/browser/contracts"
 export type { BrowserAnnotationResult } from "../main/browser/contracts"
 export type {
   WslDistroProbe,
@@ -59,7 +59,18 @@ export type BrowserAPI = {
   registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) => Promise<{ ok: true }>
   unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) => Promise<{ ok: true }>
   getGuestPreloadPath: () => Promise<string>
-  setSessionContext: (sessionId: string, opts?: { workspaceId?: string; directory?: string }) => Promise<void>
+  assignTab: (tabId: string, owner: HostOwner) => Promise<{ tabId: string; owner: HostOwner }>
+  closeRange: (tabId: string, mode: "left" | "right" | "others" | "all") => Promise<{ closed: string[] }>
+  refreshTab: (tabId: string) => Promise<void>
+  duplicateTab: (tabId: string) => Promise<{ tabId: string; url: string }>
+  setTabMuted: (tabId: string, muted: boolean) => Promise<void>
+  openDevtools: (tabId: string) => Promise<void>
+  hardReload: (tabId: string) => Promise<void>
+  clearCookies: (tabId: string) => Promise<void>
+  clearCache: (tabId: string) => Promise<void>
+  setAppearance: (appearance: "system" | "light" | "dark") => Promise<void>
+  listExtensions: (tabId: string) => Promise<Array<{ id: string; name: string; version: string; enabled: boolean }>>
+  setExtensionEnabled: (tabId: string, extensionId: string, enabled: boolean) => Promise<void>
   onState: (cb: (tab: WireGuestTabState) => void) => () => void
   onTabRequest: (cb: (request: BrowserTabRequest) => void) => () => void
   onTabClose: (cb: (request: { tabId: string }) => void) => () => void
@@ -86,6 +97,7 @@ export type ElectronAPI = {
   checkAppExists: (appName: string) => Promise<boolean>
   resolveAppPath: (appName: string) => Promise<string | null>
   storeGet: (name: string, key: string) => Promise<string | null>
+  storeGetAll: (name: string) => Promise<Record<string, string>>
   storeSet: (name: string, key: string, value: string) => Promise<void>
   storeDelete: (name: string, key: string) => Promise<void>
   storeClear: (name: string) => Promise<void>

@@ -5,6 +5,10 @@
 
 export type BrowserController = "human" | "agent" | "none"
 
+/** A tab's owner — user-owned or owned by one agent session (two agents never
+ * share a tab; the user may always reassign via the context menu). */
+export type HostOwner = { kind: "user" } | { kind: "agent"; sessionId: string }
+
 /** Agent pointer event pushed from the main process (cursor overlay feed). */
 export interface BrowserPointerEvent {
   tabId: string
@@ -66,6 +70,8 @@ export interface BrowserGuestState {
   zoomFactor: number
   controller: BrowserController
   crashed: boolean
+  owner: HostOwner
+  muted: boolean
 }
 
 /** Snapshot badge for one interactive element (frozen per snapshotVersion). */
@@ -119,6 +125,7 @@ export interface BrowserHostState {
   connected: boolean
   hostEpoch: number
   activeTabId: string | null
+  appearance: "light" | "dark" | "system"
   guests: BrowserGuestState[]
 }
 

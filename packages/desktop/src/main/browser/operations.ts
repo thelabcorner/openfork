@@ -24,6 +24,7 @@ import {
   BrowserNotAReactAppError,
   BrowserNotAttachedError,
   BrowserOperationFailedError,
+  BrowserPermissionDeniedError,
   BrowserStaleRefError,
   BrowserTabNotFoundError,
   BrowserTargetNotFoundError,
@@ -41,6 +42,7 @@ import {
   toElementState,
 } from "./scripts-resolve"
 import {
+  BROWSER_PROTOCOL_VERSION,
   AGENT_CURSOR_CLICK_LEAD_MS,
   AGENT_CURSOR_MOVE_MS,
   MAX_EVALUATION_BYTES,
@@ -62,39 +64,60 @@ import {
   type AnnotationTarget,
   type BrowserOperation,
   type BrowserPointerEvent,
+  type ClaimInput,
+  type ClaimOutput,
   type ClickInput,
   type ClickOutput,
   type Coords,
+  type ElementSelector,
+  type DuplicateTabInput,
   type ElementState,
   type ElementTarget,
+  type ExtensionInfo,
+  type ExtensionToggleInput,
   type HighlightOutput,
   type Locator,
   type OpenInput,
   type OpenOutput,
+  type ProfilerResult,
+  type ProfilerStartOutput,
+  type ProfilerStopOutput,
+  type QueryMatch,
   type QueryOutput,
   type ReactComponentInfo,
   type ReactInspectOutput,
   type RefTarget,
+  type RefreshTabInput,
   type ResolvedElement,
+  type ResolvedTarget,
   type ScreenshotInput,
   type ScreenshotOutput,
+  type SetMutedInput,
+  type SetTabOwnerInput,
+  type SetTabOwnerOutput,
   type SnapshotElement,
   type SnapshotOutput,
   type StatusOutput,
+  type Viewport,
   type WaitForOutput,
+  type WireBrowserState,
   type WireGuestTabState,
 } from "./contracts"
-import { isCoords, isLocator, isRefTarget } from "./contracts"
+import { canClaimTab, canDispatchTab, isCoords, isLocator, isRefTarget } from "./contracts"
 
 export interface BrowserOperationsOptions {
   registry: GuestRegistry
   sessions: ControlSessionManager
   recordingDirectory: string
   maxResultBytes: number
+  /** Broker-wire host state for the status op (connected + host identity). */
+  getHostState?: () => { connected: boolean; hostId: string; hostEpoch: number; protocolVersion: number; windowId: string }
   /** Renderer must mount a <webview> for the tab and register it. */
   onTabRequest: (request: { tabId: string; url: string; activate?: boolean }) => void
   /** Renderer must remove the <webview> DOM for the tab. */
   onTabClose: (tabId: string) => void
+  /** Any destroy path must emit `tab.closed` so the broker mirror drops the row. */
+  onTabClosed: (tabId: string) => void
   /** Cursor choreography broadcast (browser-pointer-event). */
   onPointerEvent: (event: BrowserPointerEvent) => void
 }
@@ -109,9 +132,20 @@ type AnnotationScriptItem = Pick<AnnotationTarget, "label" | "tone"> & {
   expression: string
 }
 
+interface PendingOpen {
+  resolve: (tab: GuestRecord) => void
+  timer: ReturnType<typeof setTimeout>
+  /** Broker-open path: attribute the created tab to this session (agent owner). */
+  sessionId?: string
+  /** Duplicate path: the new tab inherits this source tab's owner (D8). */
+  inheritOwnerFrom?: string
+}
+
 export class BrowserOperations {
-  private readonly pendingOpens = new Map<string, { resolve: (tab: GuestRecord) => void; timer: ReturnType<typeof setTimeout> }>()
+  private readonly pendingOpens = new Map<string, PendingOpen>()
   private readonly activeRecordings = new Map<string, ActiveRecording>()
+  /** Removed-but-known extensions (id -> load info) so the UI can re-enable. */
+  private readonly disabledExtensions = new Map<string, { path: string; name: string; version: string }>()
   private pointerSequence = 0
 
   constructor(private readonly deps: BrowserOperationsOptions) {}
@@ -122,15 +156,26 @@ export class BrowserOperations {
     if (!pending) return
     clearTimeout(pending.timer)
     this.pendingOpens.delete(runtimeTabId)
+    if (pending.sessionId) {
+      this.deps.registry.setOwner(runtimeTabId, { kind: "agent", sessionId: pending.sessionId })
+    } else if (pending.inheritOwnerFrom) {
+      const source = this.deps.registry.get(pending.inheritOwnerFrom)
+      if (source) this.deps.registry.setOwner(runtimeTabId, source.owner)
+    }
+    if (pending.sessionId || pending.inheritOwnerFrom) this.deps.registry.activate(runtimeTabId)
     pending.resolve(tab)
   }
 
-  async dispatch(tabId: string | undefined, operation: BrowserOperation): Promise<Record<string, unknown>> {
+  async dispatch(tabId: string | undefined, operation: BrowserOperation, sessionId: string): Promise<Record<string, unknown>> {
     switch (operation.name) {
       case "status":
         return (await this.status(tabId)) as unknown as Record<string, unknown>
       case "open":
-        return (await this.open(operation.input)) as unknown as Record<string, unknown>
+        return (await this.open(operation.input, sessionId)) as unknown as Record<string, unknown>
+      case "claim":
+        return (await this.claim(operation.input, sessionId)) as unknown as Record<string, unknown>
+      case "set_tab_owner":
+        return (await this.setTabOwner(operation.input)) as unknown as Record<string, unknown>
       case "navigate":
         return (await this.navigate(tabId, operation.input)) as unknown as Record<string, unknown>
       case "resize":
@@ -158,7 +203,7 @@ export class BrowserOperations {
       case "recording_stop":
         return (await this.recordingStop(tabId, operation.input)) as unknown as Record<string, unknown>
       case "close":
-        return (await this.close(tabId, operation.input)) as unknown as Record<string, unknown>
+        return (await this.close(tabId, operation.input, sessionId)) as unknown as Record<string, unknown>
       case "highlight":
         return (await this.highlight(tabId, operation.input)) as unknown as Record<string, unknown>
       case "annotate":
@@ -171,6 +216,24 @@ export class BrowserOperations {
         return (await this.profilerStop(tabId)) as unknown as Record<string, unknown>
       case "react_inspect":
         return (await this.reactInspect(tabId, operation.input)) as unknown as Record<string, unknown>
+      case "refresh":
+        return (await this.refresh(operation.input)) as unknown as Record<string, unknown>
+      case "duplicate":
+        return (await this.duplicate(operation.input)) as unknown as Record<string, unknown>
+      case "set_muted":
+        return (await this.setMuted(operation.input)) as unknown as Record<string, unknown>
+      case "open_devtools":
+        return (await this.openDevtools(operation.input)) as unknown as Record<string, unknown>
+      case "hard_reload":
+        return (await this.hardReload(operation.input)) as unknown as Record<string, unknown>
+      case "clear_cookies":
+        return (await this.clearCookies(operation.input)) as unknown as Record<string, unknown>
+      case "clear_cache":
+        return (await this.clearCache(operation.input)) as unknown as Record<string, unknown>
+      case "extensions_list":
+        return (await this.extensionsList(operation.input)) as unknown as Record<string, unknown>
+      case "extension_set_enabled":
+        return (await this.extensionSetEnabled(operation.input)) as unknown as Record<string, unknown>
       default:
         throw new BrowserUnsupportedOperationError(`Unknown operation`)
     }
@@ -179,46 +242,83 @@ export class BrowserOperations {
   // --- status -----------------------------------------------------------------
 
   private async status(tabId: string | undefined): Promise<StatusOutput> {
+    const hostState = this.deps.getHostState?.() ?? {
+      connected: true,
+      hostId: "",
+      hostEpoch: 0,
+      protocolVersion: BROWSER_PROTOCOL_VERSION,
+      windowId: this.deps.registry.list()[0]?.windowId ?? "",
+    }
     const active = this.activeTab(tabId)
-    const tabs: WireGuestTabState[] = this.deps.registry.list().map((record) => this.deps.registry.tabState(record))
+    const guest: WireBrowserState["guest"] = {
+      windowId: hostState.windowId,
+      state: active ? (active.crashed ? "crashed" : "attached") : "detached",
+      ...(active
+        ? {
+            activeTab: {
+              tabId: active.runtimeTabId,
+              url: active.url,
+              title: active.title,
+              readyState: active.crashed
+                ? "LoadFailed"
+                : active.loading || active.readyState !== "complete"
+                  ? "Loading"
+                  : "Success",
+              viewport: active.viewport ?? { width: 0, height: 0, dpr: 1, scrollX: 0, scrollY: 0 },
+            },
+          }
+        : {}),
+    }
     return {
       status: {
-        host: {
-          connected: false,
-          hostId: null,
-          hostEpoch: null,
-          connectionId: null,
-          windowId: this.deps.registry.list()[0]?.windowId ?? "",
-          capabilities: {
-            maxSnapshotBytes: MAX_EVALUATION_BYTES,
-            maxResultBytes: this.deps.maxResultBytes,
-            supportedAppearances: ["system", "light", "dark"],
-            supportsRecording: true,
-            cdp: true,
-          },
-        },
-        guest: {
-          attached: this.deps.registry.size > 0,
-          activeTabId: active?.runtimeTabId ?? null,
-          url: active?.url ?? null,
-          controller: active ? this.deps.registry.controller(active.runtimeTabId) : "none",
-          zoomFactor: active?.zoomFactor ?? 1,
-        },
-        tabs,
+        connected: hostState.connected,
+        host: { hostId: hostState.hostId, protocolVersion: hostState.protocolVersion, hostEpoch: hostState.hostEpoch },
+        guest,
+        appearance: this.deps.registry.getAppearance(),
+        recording: this.deps.registry.getRecording(),
       },
+      tabs: this.deps.registry.list().map((record) => this.deps.registry.tabState(record)),
     }
   }
 
   // --- open / navigate / close ------------------------------------------------
 
-  private async open(input: OpenInput): Promise<OpenOutput> {
+  private async open(input: OpenInput, sessionId: string): Promise<OpenOutput> {
+    // Named tab: claim-and-navigate (D6) or navigate the session's own tab.
+    if (input.tabId !== undefined) {
+      const tab = this.resolveTab(input.tabId)
+      // Broker is authoritative; the host double-checks (defense in depth).
+      const gate = canDispatchTab(tab.owner, sessionId)
+      if (gate === "other-agent") throw new BrowserPermissionDeniedError()
+      if (gate === "user-owned" && input.claim !== true) throw new BrowserPermissionDeniedError()
+      if (input.claim === true && gate === "user-owned") {
+        this.deps.registry.setOwner(tab.runtimeTabId, { kind: "agent", sessionId })
+      }
+      const from = tab.url
+      await this.withControl(tab, "navigate", async (send) => {
+        await send("Page.navigate", { url: input.url })
+        await this.waitForNavigation(tab.runtimeTabId)
+      })
+      const viewport = await this.readViewport(tab)
+      return {
+        opened: {
+          tabId: tab.runtimeTabId,
+          url: tab.url || input.url,
+          title: tab.title,
+          readyState: "Success",
+          viewport,
+          owner: { kind: "agent", sessionId },
+        },
+      }
+    }
+    // Fresh tab: the created tab is owned by the requesting session (D2/D6).
     const runtimeTabId = randomUUID()
     const pending = new Promise<GuestRecord>((resolve, reject) => {
       const timer = setTimeout(() => {
         this.pendingOpens.delete(runtimeTabId)
         reject(new BrowserTimeoutError("open", OPEN_ATTACH_TIMEOUT_MS))
       }, OPEN_ATTACH_TIMEOUT_MS)
-      this.pendingOpens.set(runtimeTabId, { resolve, timer })
+      this.pendingOpens.set(runtimeTabId, { resolve, timer, sessionId })
     })
     this.deps.onTabRequest({ tabId: runtimeTabId, url: input.url, activate: input.activate ?? true })
     const attached = await pending
@@ -230,8 +330,29 @@ export class BrowserOperations {
         title: attached.title,
         readyState: "Success",
         viewport,
+        owner: { kind: "agent", sessionId },
       },
     }
+  }
+
+  /** Explicit claim (D6): flip a user tab to this session — first-come-wins. */
+  private async claim(input: ClaimInput, sessionId: string): Promise<ClaimOutput> {
+    const tab = this.resolveTab(input.tabId)
+    const gate = canClaimTab(tab.owner, sessionId)
+    if (gate === "denied") throw new BrowserPermissionDeniedError()
+    if (gate === "ok") {
+      this.deps.registry.setOwner(tab.runtimeTabId, { kind: "agent", sessionId })
+    }
+    // Idempotent for the session's own tab.
+    return { claimed: { tabId: tab.runtimeTabId, owner: { kind: "agent", sessionId } } }
+  }
+
+  /** Broker-minted control op (D7): set the tab's owner to ANY value the user
+   * chose. An agent tool can never invoke this — only `assign` mints it. */
+  private async setTabOwner(input: SetTabOwnerInput): Promise<SetTabOwnerOutput> {
+    const tab = this.resolveTab(input.tabId)
+    this.deps.registry.setOwner(tab.runtimeTabId, input.owner)
+    return { assigned: { tabId: tab.runtimeTabId, owner: input.owner } }
   }
 
   private async navigate(
@@ -257,13 +378,16 @@ export class BrowserOperations {
     }
   }
 
-  private async close(tabId: string | undefined, input: { tabId?: string }): Promise<Record<string, unknown>> {
+  private async close(tabId: string | undefined, input: { tabId?: string }, sessionId: string): Promise<Record<string, unknown>> {
     const target = input.tabId ?? tabId
-    const tab = target ? this.deps.registry.get(target) : this.deps.registry.list()[0]
+    const tab = target ? this.deps.registry.get(target) : this.deps.registry.activeTab
     if (!tab) throw new BrowserTabNotFoundError(target)
-    const wasActive = this.deps.registry.list()[0]?.runtimeTabId === tab.runtimeTabId
+    // Broker is authoritative; the host double-checks ownership (own tab only).
+    if (canDispatchTab(tab.owner, sessionId) !== "ok") throw new BrowserPermissionDeniedError()
+    const wasActive = this.deps.registry.activeTab?.runtimeTabId === tab.runtimeTabId
     this.deps.registry.unregister(tab.runtimeTabId)
     this.deps.onTabClose(tab.runtimeTabId)
+    this.deps.onTabClosed(tab.runtimeTabId)
     return {
       closed: {
         tabId: tab.runtimeTabId,
@@ -271,6 +395,101 @@ export class BrowserOperations {
         guestsRemaining: this.deps.registry.size,
       },
     }
+  }
+
+  // --- host-internal context-menu ops (D8/D8a/D8b; never on the broker wire) ---
+
+  private async refresh(input: RefreshTabInput): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId)
+    tab.webContents.reload()
+    return { refreshed: { tabId: tab.runtimeTabId } }
+  }
+
+  private async duplicate(input: DuplicateTabInput): Promise<Record<string, unknown>> {
+    const source = this.resolveTab(input.tabId)
+    const runtimeTabId = randomUUID()
+    const pending = new Promise<GuestRecord>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.pendingOpens.delete(runtimeTabId)
+        reject(new BrowserTimeoutError("duplicate", OPEN_ATTACH_TIMEOUT_MS))
+      }, OPEN_ATTACH_TIMEOUT_MS)
+      this.pendingOpens.set(runtimeTabId, { resolve, timer, inheritOwnerFrom: source.runtimeTabId })
+    })
+    this.deps.onTabRequest({ tabId: runtimeTabId, url: source.url, activate: true })
+    const attached = await pending
+    return { duplicated: { tabId: attached.runtimeTabId, url: attached.url || source.url } }
+  }
+
+  private async setMuted(input: SetMutedInput): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId)
+    tab.webContents.setAudioMuted(input.muted)
+    this.deps.registry.setMuted(tab.runtimeTabId, input.muted)
+    return { muted: { tabId: tab.runtimeTabId, muted: input.muted } }
+  }
+
+  // --- host-internal browser chrome ops (D10) ----------------------------------
+
+  private async openDevtools(input: RefreshTabInput): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId)
+    tab.webContents.openDevTools({ mode: "detach" })
+    return { devtools: { tabId: tab.runtimeTabId, open: true } }
+  }
+
+  private async hardReload(input: RefreshTabInput): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId)
+    tab.webContents.reloadIgnoringCache()
+    return { reloaded: { tabId: tab.runtimeTabId, hard: true } }
+  }
+
+  private async clearCookies(input: RefreshTabInput): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId)
+    await tab.webContents.session.clearStorageData({ storages: ["cookies"] })
+    return { cleared: { tabId: tab.runtimeTabId, scope: "cookies" } }
+  }
+
+  private async clearCache(input: RefreshTabInput): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId)
+    await tab.webContents.session.clearCache()
+    return { cleared: { tabId: tab.runtimeTabId, scope: "cache" } }
+  }
+
+  private async extensionsList(input: RefreshTabInput): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId)
+    const extensions = tab.webContents.session.extensions.getAllExtensions().map((extension) => ({
+      id: extension.id,
+      name: extension.name,
+      version: extension.version,
+      enabled: true,
+    }))
+    const byId = new Map(extensions.map((extension) => [extension.id, extension]))
+    // Removed-but-known extensions (toggled off in this host session) stay
+    // listed so the menu can re-enable them from their stashed path.
+    for (const [id, known] of this.disabledExtensions) {
+      if (!byId.has(id)) byId.set(id, { id, name: known.name, version: known.version, enabled: false })
+    }
+    return { extensions: [...byId.values()] }
+  }
+
+  private async extensionSetEnabled(input: ExtensionToggleInput): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId)
+    const session = tab.webContents.session
+    if (input.enabled) {
+      const known = this.disabledExtensions.get(input.extensionId)
+      if (!known) throw new BrowserOperationFailedError(`Extension "${input.extensionId}" is not known; it must be loaded from its path`)
+      await session.extensions.loadExtension(known.path)
+      this.disabledExtensions.delete(input.extensionId)
+      return { extension: { id: input.extensionId, enabled: true } }
+    }
+    const existing = session.extensions.getExtension(input.extensionId)
+    if (existing) {
+      this.disabledExtensions.set(input.extensionId, {
+        path: existing.path,
+        name: existing.name,
+        version: existing.version,
+      })
+      session.extensions.removeExtension(input.extensionId)
+    }
+    return { extension: { id: input.extensionId, enabled: false } }
   }
 
   // --- resize / appearance ----------------------------------------------------
@@ -303,7 +522,7 @@ export class BrowserOperations {
     const effective: "light" | "dark" =
       input.appearance === "system" ? (nativeTheme.shouldUseDarkColors ? "dark" : "light") : input.appearance
     this.deps.registry.setAppearance(input.appearance)
-    const tab = this.deps.registry.list()[0]
+    const tab = this.deps.registry.activeTab
     if (tab) {
       await this.withControl(tab, "set_appearance", async (send) => {
         await send("Emulation.setEmulatedMedia", {
@@ -345,23 +564,19 @@ export class BrowserOperations {
       for (const raw of scan.elements) {
         const ref = typeof raw["ref"] === "string" ? raw["ref"] : `e${elements.length + 1}`
         const rect = asRect(raw["rect"])
-        const center = asPoint(raw["center"]) ?? { x: rect.x + rect.width / 2, y: rect.y + rect.height / 2 }
+        const center = asPoint(raw["center"]) ?? { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) }
         const selector = asSelector(raw["selector"])
         const locator = raw["locator"] && isLocator(raw["locator"]) ? (raw["locator"] as Locator) : undefined
         refs.set(ref, { x: center.x, y: center.y, locator })
         elements.push({
           ref,
-          tagName: typeof raw["tagName"] === "string" ? raw["tagName"] : typeof raw["role"] === "string" ? String(raw["role"]) : "element",
-          text: typeof raw["text"] === "string" ? raw["text"] : null,
-          selector: selector?.value ?? "",
-          confidence: selector?.confidence ?? "low",
+          role: typeof raw["role"] === "string" ? raw["role"] : "generic",
+          name: typeof raw["name"] === "string" ? raw["name"] : "",
+          selector: selector ?? { kind: "structural", value: "", confidence: "low" },
           rect,
-          role: typeof raw["role"] === "string" ? raw["role"] : null,
-          name: typeof raw["name"] === "string" ? raw["name"] : null,
+          center,
           state: toElementState(raw["state"]),
-          display: typeof raw["display"] === "string" ? raw["display"] : null,
-          position: typeof raw["position"] === "string" ? raw["position"] : null,
-          zIndex: typeof raw["zIndex"] === "number" ? raw["zIndex"] : null,
+          ...(locator ? { locator } : {}),
         })
       }
     }
@@ -440,7 +655,7 @@ export class BrowserOperations {
       const after = this.deps.registry.get(tab.runtimeTabId)
       return {
         clicked: {
-          target: resolved,
+          target: toResolvedTarget(input.target, coords, resolved),
           coords,
           clickCount,
           afterUrl: after?.url || undefined,
@@ -465,7 +680,7 @@ export class BrowserOperations {
       const center = result?.center ?? { x: 0, y: 0 }
       return {
         highlighted: {
-          target: {
+          target: toResolvedTarget(input.target, center, {
             selector: "",
             confidence: "low",
             rect: { x: center.x, y: center.y, width: 0, height: 0 },
@@ -475,8 +690,8 @@ export class BrowserOperations {
             display: null,
             position: null,
             zIndex: null,
-          },
-          coords: center,
+          }),
+          at: { time: Date.now() },
         },
       }
     })
@@ -534,9 +749,10 @@ export class BrowserOperations {
           if (setter) setter.call(control, ${encoded});
           control.dispatchEvent(new Event('input', { bubbles: true }));
           control.dispatchEvent(new Event('change', { bubbles: true }));
-          const caret = control.selectionStart ?? (control.textContent ?? '').length;
+          const selectionStart = control.selectionStart ?? 0;
+          const selectionEnd = control.selectionEnd ?? (control.textContent ?? '').length;
           ${input.submit ? "control.closest('form')?.requestSubmit();" : ""}
-          return { ok: true, caret, submitted: ${input.submit ? "true" : "false"} };
+          return { ok: true, selectionStart, selectionEnd, submitted: ${input.submit ? "true" : "false"} };
         } catch (error) { return { error: String(error) }; }
       })()`
       const result = (await this.evaluate(send, expression, true)) as Record<string, unknown>
@@ -544,7 +760,10 @@ export class BrowserOperations {
       return {
         typed: {
           value: input.text,
-          caret: typeof result["caret"] === "number" ? result["caret"] : input.text.length,
+          caret: {
+            selectionStart: typeof result["selectionStart"] === "number" ? result["selectionStart"] : 0,
+            selectionEnd: typeof result["selectionEnd"] === "number" ? result["selectionEnd"] : input.text.length,
+          },
           submitted: result["submitted"] === true,
         },
       }
@@ -635,7 +854,7 @@ export class BrowserOperations {
     }
     return {
       evaluated: {
-        result: value,
+        result: value === undefined ? null : value,
         type: Array.isArray(value) ? "array" : typeof value,
         truncated: false,
       },
@@ -678,9 +897,9 @@ export class BrowserOperations {
     if (!satisfied) throw new BrowserTimeoutError("wait_for", input.timeoutMs ?? 10_000)
     return {
       waited: {
-        condition: input.condition as WaitForOutput["waited"]["condition"],
+        condition: input.condition as unknown as WaitForOutput["waited"]["condition"],
         satisfied: true,
-        at: { time: new Date().toISOString(), url: tab.url, title: tab.title },
+        at: { time: Date.now(), url: tab.url, title: tab.title },
       },
     }
   }
@@ -695,7 +914,7 @@ export class BrowserOperations {
     const recordingId = randomUUID()
     const maxBytes = input.maxBytes ?? RECORDING_DEFAULT_MAX_BYTES
     const maxDurationMs = input.maxDurationMs ?? RECORDING_DEFAULT_MAX_DURATION_MS
-    const startedAt = new Date().toISOString()
+    const startedAt = Date.now()
     const frames: string[] = []
     let budget = maxBytes
 
@@ -716,6 +935,7 @@ export class BrowserOperations {
     }, maxDurationMs)
     const record: ActiveRecording = { recordingId, tabId: tab.runtimeTabId, startedAt, frames, timer, unsubscribe }
     this.activeRecordings.set(recordingId, record)
+    this.deps.registry.setRecording({ active: true, recordingId })
 
     try {
       await this.withControl(tab, "recording_start", async (send) => {
@@ -730,6 +950,7 @@ export class BrowserOperations {
       clearTimeout(timer)
       unsubscribe()
       this.activeRecordings.delete(recordingId)
+      this.deps.registry.setRecording({ active: false })
       throw error
     }
     return {
@@ -747,6 +968,7 @@ export class BrowserOperations {
     if (!record) throw new BrowserUnsupportedOperationError("No active recording to stop")
     const stoppedAt = Date.now()
     clearTimeout(record.timer)
+    this.deps.registry.setRecording({ active: false })
     const tab = this.deps.registry.get(record.tabId)
     if (tab) {
       try {
@@ -766,8 +988,8 @@ export class BrowserOperations {
     return {
       recording: {
         recordingId,
-        stoppedAt: new Date(stoppedAt).toISOString(),
-        durationMs: Math.max(0, stoppedAt - Date.parse(record.startedAt)),
+          stoppedAt,
+          durationMs: Math.max(0, stoppedAt - record.startedAt),
         sizeBytes,
         artifact: {
           type: "file",
@@ -797,25 +1019,40 @@ export class BrowserOperations {
     const result = await this.withControl(tab, "query", async (send) =>
       this.evaluate(send, queryElementsScript(locator, maxResults), true),
     )
-    const parsed = result as { matches?: Array<Record<string, unknown>>; truncated?: boolean } | null
-    const matches: ResolvedElement[] = (parsed?.matches ?? []).map((raw) => ({
-      selector: asSelector(raw["selector"])?.value ?? "",
-      confidence: asSelector(raw["selector"])?.confidence ?? "low",
-      rect: asRect(raw["rect"]),
-      role: typeof raw["role"] === "string" ? raw["role"] : null,
-      name: typeof raw["name"] === "string" ? raw["name"] : null,
-      state: {
-        visible: raw["visibility"] !== "hidden",
-        enabled: true,
-        checked: false,
-        focused: false,
-        readonly: false,
+    const parsed = result as { matches?: Array<Record<string, unknown>>; count?: number; truncated?: boolean } | null
+    const matches: QueryMatch[] = (parsed?.matches ?? []).map((raw) => {
+      const rect = asRect(raw["rect"])
+      const center = asPoint(raw["center"]) ?? { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) }
+      const selector = asSelector(raw["selector"])
+      const position: QueryMatch["position"] =
+        raw["position"] === "static" ||
+        raw["position"] === "relative" ||
+        raw["position"] === "absolute" ||
+        raw["position"] === "fixed" ||
+        raw["position"] === "sticky"
+          ? (raw["position"] as QueryMatch["position"])
+          : "static"
+      return {
+        ...(typeof raw["role"] === "string" ? { role: raw["role"] } : {}),
+        ...(typeof raw["name"] === "string" ? { name: raw["name"] } : {}),
+        ...(selector ? { selector } : {}),
+        rect,
+        center,
+        visibility: raw["visibility"] === "hidden" ? "hidden" : "visible",
+        display: typeof raw["display"] === "string" ? raw["display"] : "",
+        position,
+        ...(typeof raw["text"] === "string" ? { text: raw["text"] } : {}),
+      }
+    })
+    return {
+      queried: {
+        tabId: tab.runtimeTabId,
+        url: tab.url,
+        matches,
+        count: typeof parsed?.count === "number" ? parsed.count : matches.length,
+        truncated: parsed?.truncated ?? false,
       },
-      display: typeof raw["display"] === "string" ? raw["display"] : null,
-      position: typeof raw["position"] === "string" ? raw["position"] : null,
-      zIndex: typeof raw["zIndex"] === "number" ? raw["zIndex"] : null,
-    }))
-    return { queried: { matches, truncated: parsed?.truncated ?? false } }
+    }
   }
 
   private async profilerStart(tabId: string | undefined): Promise<Record<string, unknown>> {
@@ -824,7 +1061,7 @@ export class BrowserOperations {
       this.evaluate(send, PROFILER_INSTALL_SCRIPT, true),
     )
     if (detected === false) throw new BrowserNotAReactAppError()
-    return { profiler: { started: true, tabId: tab.runtimeTabId } }
+    return { started: { snapshotVersion: this.deps.registry.get(tab.runtimeTabId)?.snapshotVersion ?? 0 } }
   }
 
   private async profilerStop(tabId: string | undefined): Promise<Record<string, unknown>> {
@@ -833,13 +1070,14 @@ export class BrowserOperations {
       this.evaluate(send, PROFILER_COLLECT_SCRIPT, true),
     )
     const parsed = (result ?? {}) as { commitCount?: number; windowMs?: number; components?: Array<{ name: string; renders: number }>; propsDiff?: unknown }
+    const components = (parsed.components ?? []).slice(0, PROFILER_MAX_COMPONENTS)
     return {
-      profiler: {
-        commitCount: parsed.commitCount ?? 0,
+      profiled: {
+        commits: parsed.commitCount ?? 0,
         windowMs: parsed.windowMs ?? 0,
-        components: (parsed.components ?? []).slice(0, PROFILER_MAX_COMPONENTS),
+        topRenders: components.map((component) => ({ name: component.name, count: component.renders })),
         propsDiff: parsed.propsDiff,
-        tabId: tab.runtimeTabId,
+        truncated: (parsed.components ?? []).length > PROFILER_MAX_COMPONENTS,
       },
     }
   }
@@ -875,13 +1113,13 @@ export class BrowserOperations {
   private resolveTab(tabId?: string): GuestRecord {
     const tab = this.deps.registry.requireTab(tabId)
     if (tab) return tab
-    const first = this.deps.registry.list()[0]
-    if (first) return first
+    const active = this.deps.registry.activeTab
+    if (active) return active
     throw new BrowserTabNotFoundError(tabId)
   }
 
   private activeTab(tabId?: string): GuestRecord | undefined {
-    return this.deps.registry.requireTab(tabId) ?? this.deps.registry.list()[0]
+    return this.deps.registry.requireTab(tabId) ?? this.deps.registry.activeTab
   }
 
   private async withControl<T>(
@@ -1031,20 +1269,22 @@ export class BrowserOperations {
     this.deps.onPointerEvent(event)
   }
 
-  private async readViewport(tab: GuestRecord): Promise<{ width: number; height: number; dpr: number; scrollX: number; scrollY: number }> {
+  private async readViewport(tab: GuestRecord): Promise<Viewport> {
     if (tab.crashed) return { width: 0, height: 0, dpr: 1, scrollX: 0, scrollY: 0 }
     try {
       const result = await this.withControl(tab, "readViewport", async (send) =>
         this.evaluate(send, "({ width: window.innerWidth, height: window.innerHeight, dpr: window.devicePixelRatio, scrollX: window.scrollX, scrollY: window.scrollY })", true),
       )
       const parsed = (result ?? {}) as Record<string, unknown>
-      return {
+      const viewport: Viewport = {
         width: Math.max(0, Math.round(Number(parsed["width"] ?? 0))),
         height: Math.max(0, Math.round(Number(parsed["height"] ?? 0))),
         dpr: Number(parsed["dpr"] ?? 1) || 1,
         scrollX: Math.round(Number(parsed["scrollX"] ?? 0)),
         scrollY: Math.round(Number(parsed["scrollY"] ?? 0)),
       }
+      tab.viewport = viewport
+      return viewport
     } catch {
       return { width: 0, height: 0, dpr: 1, scrollX: 0, scrollY: 0 }
     }
@@ -1081,7 +1321,7 @@ export class BrowserOperations {
 interface ActiveRecording {
   recordingId: string
   tabId: string
-  startedAt: string
+  startedAt: number
   frames: string[]
   timer: ReturnType<typeof setTimeout>
   unsubscribe: () => void
@@ -1109,11 +1349,39 @@ const asPoint = (value: unknown): { x: number; y: number } | undefined => {
   return { x: Math.round(record["x"]), y: Math.round(record["y"]) }
 }
 
-const asSelector = (value: unknown): { kind: string; value: string; confidence: "high" | "med" | "low" } | undefined => {
+const asSelector = (value: unknown): ElementSelector | undefined => {
   const record = (typeof value === "object" && value !== null ? value : {}) as Record<string, unknown>
   if (typeof record["value"] !== "string") return undefined
   const confidence = record["confidence"] === "high" || record["confidence"] === "med" ? record["confidence"] : "low"
-  return { kind: typeof record["kind"] === "string" ? record["kind"] : "structural", value: record["value"], confidence }
+  const kind =
+    record["kind"] === "testid" || record["kind"] === "id" || record["kind"] === "aria" || record["kind"] === "role-name"
+      ? record["kind"]
+      : "structural"
+  return { kind, value: record["value"], confidence }
+}
+
+/** Map a resolved internal element onto the wire ResolvedTarget echo. */
+const toResolvedTarget = (target: ElementTarget, coords: Coords, resolved: ResolvedElement): ResolvedTarget => {
+  if (isRefTarget(target)) {
+    return {
+      kind: "ref",
+      ref: target.ref,
+      snapshotVersion: target.snapshotVersion,
+      center: coords,
+      ...(resolved.role ? { role: resolved.role } : {}),
+      ...(resolved.name ? { name: resolved.name } : {}),
+    }
+  }
+  if (isCoords(target)) return { kind: "coords", center: coords }
+  return {
+    kind: "locator",
+    locator: target,
+    center: coords,
+    rect: resolved.rect,
+    ...(resolved.role ? { role: resolved.role } : {}),
+    ...(resolved.name ? { name: resolved.name } : {}),
+    state: resolved.state,
+  }
 }
 
 const annotationScript = (items: AnnotationScriptItem[], clear: boolean, durationMs: number | undefined): string => {
@@ -1291,13 +1559,13 @@ const buildA11yTree = (axTree: unknown, maxDepth: number): A11yNode[] => {
       typeof node["value"] === "object" && node["value"] !== null
         ? String((node["value"] as Record<string, unknown>)["value"] ?? undefined)
         : undefined
-    const states: Record<string, boolean> = {}
+    const states: string[] = []
     if (Array.isArray(node["states"])) {
       for (const state of node["states"]) {
         if (typeof state === "object" && state !== null) {
           const record = state as Record<string, unknown>
           const key = String(record["name"] ?? "")
-          if (key) states[key] = record["value"] !== false
+          if (key && record["value"] !== false) states.push(key)
         }
       }
     }
@@ -1315,7 +1583,7 @@ const buildA11yTree = (axTree: unknown, maxDepth: number): A11yNode[] => {
       w > 0 && h > 0
         ? {
             locator: { type: "role" as const, value: name ? `${role}: "${name}"` : role },
-            coords: { x: Math.round(Number(box["x"] ?? 0) + w / 2), y: Math.round(Number(box["y"] ?? 0) + h / 2) },
+            rect: { x: Math.round(Number(box["x"] ?? 0)), y: Math.round(Number(box["y"] ?? 0)), width: Math.round(w), height: Math.round(h) },
           }
         : undefined
     return { role, name, value, states, ...(target ? { target } : {}), children }

@@ -20,7 +20,19 @@ const browserApi: BrowserAPI = {
   unregisterWebview: (runtimeTabId, webContentsId, generation) =>
     ipcRenderer.invoke("browser-unregister-webview", runtimeTabId, webContentsId, generation),
   getGuestPreloadPath: () => ipcRenderer.invoke("browser-get-guest-preload"),
-  setSessionContext: (sessionId, opts) => ipcRenderer.invoke("browser-set-session-context", sessionId, opts),
+  assignTab: (tabId, owner) => ipcRenderer.invoke("browser-assign-tab", tabId, owner),
+  closeRange: (tabId, mode) => ipcRenderer.invoke("browser-close-range", tabId, mode),
+  refreshTab: (tabId) => ipcRenderer.invoke("browser-refresh-tab", tabId),
+  duplicateTab: (tabId) => ipcRenderer.invoke("browser-duplicate-tab", tabId),
+  setTabMuted: (tabId, muted) => ipcRenderer.invoke("browser-set-tab-muted", tabId, muted),
+  openDevtools: (tabId) => ipcRenderer.invoke("browser-open-devtools", tabId),
+  hardReload: (tabId) => ipcRenderer.invoke("browser-hard-reload", tabId),
+  clearCookies: (tabId) => ipcRenderer.invoke("browser-clear-cookies", tabId),
+  clearCache: (tabId) => ipcRenderer.invoke("browser-clear-cache", tabId),
+  setAppearance: (appearance) => ipcRenderer.invoke("browser-set-appearance", appearance),
+  listExtensions: (tabId) => ipcRenderer.invoke("browser-list-extensions", tabId),
+  setExtensionEnabled: (tabId, extensionId, enabled) =>
+    ipcRenderer.invoke("browser-set-extension-enabled", tabId, extensionId, enabled),
   onState: (cb) => {
     const handler = (_: unknown, tab: Parameters<typeof cb>[0]) => cb(tab)
     ipcRenderer.on("browser-state", handler)
@@ -108,6 +120,7 @@ const api: ElectronAPI = {
   checkAppExists: (appName) => ipcRenderer.invoke("check-app-exists", appName),
   resolveAppPath: (appName) => ipcRenderer.invoke("resolve-app-path", appName),
   storeGet: (name, key) => ipcRenderer.invoke("store-get", name, key),
+  storeGetAll: (name) => ipcRenderer.invoke("store-get-all", name),
   storeSet: (name, key, value) => ipcRenderer.invoke("store-set", name, key, value),
   storeDelete: (name, key) => ipcRenderer.invoke("store-delete", name, key),
   storeClear: (name) => ipcRenderer.invoke("store-clear", name),

@@ -29,6 +29,9 @@ export interface RunInput<Name extends OperationName = OperationName> {
   readonly sessionID: SessionID
   readonly messageID: MessageID
   readonly toolCallID?: string
+  /** Optional: the broker is authoritative for tab defaulting — when omitted it
+   * resolves the session's most-recently-active owned tab (or fast-fails with
+   * BrowserTabNotFound), and fills `tabId` on the forwarded envelope. */
   readonly tabId?: string
   readonly operation: Name
   readonly input: OperationInputOf<Name>
@@ -90,7 +93,7 @@ const layer = Layer.effect(
         Effect.mapError(
           (cause) =>
             new BrowserOperationFailedError({
-              message: `The browser host returned a malformed result for ${input.operation}.`,
+              message: `The browser host returned a result for ${input.operation} that does not match the expected schema: ${String(cause)}`,
               retryable: true,
               details: String(cause),
             }),

@@ -13,6 +13,8 @@ import {
   BrokerError,
   BrokerRequest,
   BrokerResponse,
+  ClaimInput,
+  ClaimOutput,
   ClickInput,
   ClickOutput,
   CloseInput,
@@ -30,6 +32,7 @@ import {
   HostGuestState,
   HostHello,
   HostHelloReply,
+  HostOwner,
   HostRegistration,
   HostRegistrationInfo,
   Locator,
@@ -62,6 +65,7 @@ import {
   ScrollInput,
   ScrollOutput,
   SelectorConfidence,
+  SessionTabInfo,
   SetAppearanceInput,
   SetAppearanceOutput,
   ScreenshotInput,
@@ -102,6 +106,8 @@ export {
   BrokerError,
   BrokerRequest,
   BrokerResponse,
+  ClaimInput,
+  ClaimOutput,
   ClickInput,
   ClickOutput,
   CloseInput,
@@ -119,6 +125,7 @@ export {
   HostGuestState,
   HostHello,
   HostHelloReply,
+  HostOwner,
   HostRegistration,
   HostRegistrationInfo,
   Locator,
@@ -151,6 +158,7 @@ export {
   ScrollInput,
   ScrollOutput,
   SelectorConfidence,
+  SessionTabInfo,
   SetAppearanceInput,
   SetAppearanceOutput,
   ScreenshotInput,
@@ -176,6 +184,7 @@ export type { BrowserErrorClass }
 export const OperationInput = {
   status: StatusInput,
   open: OpenInput,
+  claim: ClaimInput,
   navigate: NavigateInput,
   resize: ResizeInput,
   set_appearance: SetAppearanceInput,
@@ -202,6 +211,7 @@ export const OperationInput = {
 export const OperationOutput = {
   status: StatusOutput,
   open: OpenOutput,
+  claim: ClaimOutput,
   navigate: NavigateOutput,
   resize: ResizeOutput,
   set_appearance: SetAppearanceOutput,
@@ -235,6 +245,7 @@ export const DEFAULT_TIMEOUT_MS: Record<OperationName, number> = {
   snapshot: 30_000,
   screenshot: 30_000,
   open: 30_000,
+  claim: 10_000,
   navigate: 30_000,
   resize: 10_000,
   set_appearance: 10_000,
@@ -267,6 +278,7 @@ export const FAMILY: Record<OperationName, BrowserFamily> = {
   profiler_stop: "browser.read",
   react_inspect: "browser.read",
   open: "browser.navigate",
+  claim: "browser.navigate",
   navigate: "browser.navigate",
   close: "browser.navigate",
   resize: "browser.interact",
@@ -286,11 +298,11 @@ export const FAMILY: Record<OperationName, BrowserFamily> = {
 /** Model-facing prose for each broker error tag (tool `output` on failure). */
 export const ERROR_MESSAGE: Record<Schema.Schema.Type<typeof BrowserErrorTag>, string> = {
   BrowserHostUnavailable:
-    "No live Desktop browser host is registered for this session. The browser panel may be closed, or the app reconnected. Call browser_status to check, and browser_open to (re)create the guest.",
+    "No live Desktop browser host is registered. Call browser_open to re-establish the browser.",
   BrowserProtocolMismatch:
     "The Desktop host speaks a different broker protocol version. The host must re-register; ask the user to restart the browser panel.",
   BrowserTabNotFound:
-    "The requested tab does not exist (or the guest has no active tab). Call browser_open to create a tab first.",
+    "This session has no browser tab. Call browser_open to create a tab for this session.",
   BrowserGuestCrashed: "The browser guest crashed. Call browser_open to recreate it.",
   BrowserControlInterrupted:
     "Browser control was interrupted (the user took over, a newer host connection superseded this one, or the operation was aborted). Re-snapshot and retry.",
@@ -304,7 +316,8 @@ export const ERROR_MESSAGE: Record<Schema.Schema.Type<typeof BrowserErrorTag>, s
   BrowserDebuggerConflict:
     "The CDP debugger is unavailable (guest is being inspected or the debugger is attached elsewhere).",
   BrowserUnsupportedOperation: "This Desktop host does not support the operation (missing capability).",
-  BrowserPermissionDenied: "Permission to perform this browser action was denied. The action was not executed.",
+  BrowserPermissionDenied:
+    "This tab belongs to another session or to the user; you may not control it. Claim a user tab with browser_claim, or open your own tab.",
   BrowserNotAttached: "The guest exists but no page is attached. Call browser_open to attach a page.",
   BrowserOperationFailed: "The browser operation failed. See the error details; retry may help.",
   BrowserStaleRefError:
@@ -339,6 +352,10 @@ export function permissionPattern(operation: OperationName, url?: string): strin
 
 export function formatViewport(viewport: Schema.Schema.Type<typeof Viewport>): string {
   return `${viewport.width}x${viewport.height}@${viewport.dpr}x scroll(${viewport.scrollX},${viewport.scrollY})`
+}
+
+export function formatOwner(owner: Schema.Schema.Type<typeof HostOwner>): string {
+  return owner.kind === "user" ? "user" : `agent(${owner.sessionId})`
 }
 
 export function formatTarget(target: Schema.Schema.Type<typeof ResolvedTarget>): string {

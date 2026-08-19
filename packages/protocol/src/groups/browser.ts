@@ -28,7 +28,7 @@ import { InvalidRequestError } from "../errors"
  */
 
 /** Broker wire version. The host's hello is rejected when it mismatches. */
-export const BROWSER_PROTOCOL_VERSION = 1
+export const BROWSER_PROTOCOL_VERSION = 2
 
 export const BROKER_REQUEST_PATH = "/v1/browser/request"
 export const BROKER_ABORT_PATH = "/v1/browser/request/:requestId/abort"
@@ -81,6 +81,17 @@ export const HostGuestState = Schema.Struct({
 })
 export type HostGuestState = Schema.Schema.Type<typeof HostGuestState>
 
+/**
+ * A tab's owner — exactly one of `user` (human-opened / orphaned / unassigned)
+ * or `agent(<sessionId>)` (a chat session owns the tab). A tab is never owned by
+ * two owners; two agents never share a tab (single-agent exclusivity).
+ */
+export const HostOwner = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("user") }),
+  Schema.Struct({ kind: Schema.Literal("agent"), sessionId: Session.ID }),
+])
+export type HostOwner = Schema.Schema.Type<typeof HostOwner>
+
 export const HostHello = Schema.Struct({
   protocolVersion: Schema.Number,
   hostId: Schema.String,
@@ -93,16 +104,14 @@ export const HostHello = Schema.Struct({
 export type HostHello = Schema.Schema.Type<typeof HostHello>
 
 /**
- * Payload the host POSTs to the sidecar hello endpoint. The stickiness key is
- * `${sessionID}@${workspaceID ?? sha1(directory)}#${windowID}`, so the
- * registration must carry the session identity plus the host's callback
- * reachability.
+ * Payload the host POSTs to the sidecar hello endpoint. Registration is
+ * session-agnostic: the browser is ONE shared instance owned by the app window,
+ * never by a session. The registry is keyed by window/hostId only, so the
+ * registration carries no session identity — just the host's callback
+ * reachability. Sessions own TABS (see `HostOwner`/`GuestTabState`), not hosts.
  */
 export const HostRegistration = Schema.Struct({
   ...HostHello.fields,
-  sessionId: Session.ID,
-  workspaceId: Schema.optional(Workspace.ID),
-  directory: Schema.optional(AbsolutePath),
   callbackUrl: Schema.String,
   callbackToken: Schema.String,
 })
@@ -110,10 +119,6 @@ export type HostRegistration = Schema.Schema.Type<typeof HostRegistration>
 
 /** Debug listing row — registration minus the callback bearer token. */
 export const HostRegistrationInfo = Schema.Struct({
-  sessionId: Session.ID,
-  workspaceId: Schema.optional(Workspace.ID),
-  directory: Schema.optional(AbsolutePath),
-  callbackUrl: Schema.String,
   protocolVersion: Schema.Number,
   hostId: Schema.String,
   hostEpoch: Schema.Number,
@@ -121,6 +126,7 @@ export const HostRegistrationInfo = Schema.Struct({
   windowId: Schema.String,
   capabilities: HostCapabilities,
   guest: HostGuestState,
+  callbackUrl: Schema.String,
   status: Schema.Literals(["live", "superseded", "dead"]),
   registeredAt: Schema.Number,
   lastSeenAt: Schema.Number,
@@ -145,6 +151,9 @@ export const GuestTabState = Schema.Struct({
   controller: Schema.Literals(["human", "agent", "none"]),
   zoomFactor: Schema.Number,
   attached: Schema.Boolean,
+  owner: HostOwner,
+  active: Schema.Boolean,
+  muted: Schema.Boolean,
 })
 export type GuestTabState = Schema.Schema.Type<typeof GuestTabState>
 
@@ -153,6 +162,7 @@ export const HostEvent = Schema.Union([
   Schema.Struct({ type: Schema.Literal("guest.stateChanged"), tab: GuestTabState, timestamp: Schema.String }),
   Schema.Struct({ type: Schema.Literal("host.stopping"), timestamp: Schema.String }),
   Schema.Struct({ type: Schema.Literal("request.aborted"), requestId: Schema.String, timestamp: Schema.String }),
+  Schema.Struct({ type: Schema.Literal("tab.closed"), tabId: Schema.String, timestamp: Schema.String }),
 ])
 export type HostEvent = Schema.Schema.Type<typeof HostEvent>
 
@@ -304,6 +314,8 @@ export const StatusInput = Schema.Struct({
 
 export const OpenInput = Schema.Struct({
   url: Schema.String,
+  tabId: Schema.optional(Schema.String),
+  claim: Schema.optional(Schema.Boolean),
   newTab: Schema.optional(Schema.Boolean),
   activate: Schema.optional(Schema.Boolean),
   appearance: Schema.optional(Schema.Literals(["system", "light", "dark"])),
@@ -457,8 +469,22 @@ export const ReactInspectInput = Schema.Struct({
 
 // --- per-operation outputs (explicit success objects, never void) ------------
 
+/** One tab row of the FULL shared-host tab list (D5/D12). `status` returns every
+ * tab — user-owned and every session's — so agents can see the shared browser.
+ * Read is broad; CONTROL stays ownership-scoped. */
+export const SessionTabInfo = Schema.Struct({
+  tabId: Schema.String,
+  url: Schema.String,
+  title: Schema.String,
+  active: Schema.Boolean,
+  owner: HostOwner,
+  muted: Schema.Boolean,
+})
+export type SessionTabInfo = Schema.Schema.Type<typeof SessionTabInfo>
+
 export const StatusOutput = Schema.Struct({
   status: BrowserState,
+  tabs: Schema.Array(SessionTabInfo),
 })
 
 export const OpenOutput = Schema.Struct({
@@ -468,8 +494,38 @@ export const OpenOutput = Schema.Struct({
     title: Schema.String,
     readyState: Schema.String,
     viewport: Viewport,
+    owner: HostOwner,
   }),
 })
+
+export const ClaimInput = Schema.Struct({
+  tabId: Schema.String,
+  timeoutMs: Schema.optional(Schema.Number),
+})
+export type ClaimInput = Schema.Schema.Type<typeof ClaimInput>
+
+export const ClaimOutput = Schema.Struct({
+  claimed: Schema.Struct({
+    tabId: Schema.String,
+    owner: HostOwner,
+  }),
+})
+export type ClaimOutput = Schema.Schema.Type<typeof ClaimOutput>
+
+/** Broker-minted control op (from user-initiated `assign`); never an agent tool. */
+export const SetTabOwnerInput = Schema.Struct({
+  tabId: Schema.String,
+  owner: HostOwner,
+})
+export type SetTabOwnerInput = Schema.Schema.Type<typeof SetTabOwnerInput>
+
+export const SetTabOwnerOutput = Schema.Struct({
+  assigned: Schema.Struct({
+    tabId: Schema.String,
+    owner: HostOwner,
+  }),
+})
+export type SetTabOwnerOutput = Schema.Schema.Type<typeof SetTabOwnerOutput>
 
 export const NavigateOutput = Schema.Struct({
   navigated: Schema.Struct({
@@ -597,7 +653,7 @@ export const RecordingStopOutput = Schema.Struct({
     sizeBytes: Schema.Number,
     artifact: Schema.Struct({
       type: Schema.Literal("file"),
-      mime: Schema.Literals(["video/webm", "image/gif"]),
+      mime: Schema.Literals(["video/webm", "image/gif", "text/html"]),
       url: Schema.String,
       path: Schema.optional(Schema.String),
     }),
@@ -710,6 +766,8 @@ export const ReactInspectOutput = Schema.Struct({
 export const BrowserOperation = Schema.Union([
   Schema.Struct({ name: Schema.Literal("status"), input: Schema.Unknown }),
   Schema.Struct({ name: Schema.Literal("open"), input: OpenInput }),
+  Schema.Struct({ name: Schema.Literal("claim"), input: ClaimInput }),
+  Schema.Struct({ name: Schema.Literal("set_tab_owner"), input: SetTabOwnerInput }),
   Schema.Struct({ name: Schema.Literal("navigate"), input: NavigateInput }),
   Schema.Struct({ name: Schema.Literal("resize"), input: ResizeInput }),
   Schema.Struct({ name: Schema.Literal("set_appearance"), input: SetAppearanceInput }),
@@ -777,6 +835,24 @@ export type BrokerResponse = Schema.Schema.Type<typeof BrokerResponse>
 
 // --- group -------------------------------------------------------------------
 
+/** User-initiated ownership change (D7) — fully general: `owner` may be `user`
+ * ("Return to me") or `agent(<sessionId>)` (assign to a session, or REASSIGN
+ * from one session to another). Invoked from the UI/main via `POST
+ * /api/browser/assign` — never from an agent tool (agents only `claim`). */
+export const AssignRequest = Schema.Struct({
+  tabId: Schema.String,
+  owner: HostOwner,
+})
+export type AssignRequest = Schema.Schema.Type<typeof AssignRequest>
+
+export const AssignResponse = Schema.Struct({
+  data: Schema.Struct({
+    tabId: Schema.String,
+    owner: HostOwner,
+  }),
+})
+export type AssignResponse = Schema.Schema.Type<typeof AssignResponse>
+
 export const BrowserHostGroup = HttpApiGroup.make("server.browser")
   .add(
     HttpApiEndpoint.post("browser.host.hello", "/api/browser/host/hello", {
@@ -788,7 +864,7 @@ export const BrowserHostGroup = HttpApiGroup.make("server.browser")
         identifier: "v2.browser.host.hello",
         summary: "Register a Desktop browser host",
         description:
-          "Register (or re-register) a Desktop browser host connection. Last hello wins per stickiness key; a new connectionId supersedes the old one and in-flight requests against the old connection fail with BrowserControlInterrupted.",
+          "Register (or re-register) a Desktop browser host connection. Registration is session-agnostic and keyed by window: last hello wins per windowId; a new connectionId supersedes the old one and in-flight requests against the old connection fail with BrowserControlInterrupted.",
       }),
     ),
   )
@@ -814,6 +890,20 @@ export const BrowserHostGroup = HttpApiGroup.make("server.browser")
         identifier: "v2.browser.hosts",
         summary: "List registered browser hosts",
         description: "Debug listing of the currently registered Desktop browser host connections.",
+      }),
+    ),
+  )
+  .add(
+    HttpApiEndpoint.post("browser.assign", "/api/browser/assign", {
+      payload: AssignRequest,
+      success: AssignResponse,
+      error: InvalidRequestError,
+    }).annotateMerge(
+      OpenApi.annotations({
+        identifier: "v2.browser.assign",
+        summary: "Assign a tab to an owner",
+        description:
+          "User-initiated ownership change: assign a tab to a session, reassign from one session to another, or return it to the user (owner { kind: 'user' }). The user may set any owner — this is the user-authority channel, never an agent tool.",
       }),
     ),
   )

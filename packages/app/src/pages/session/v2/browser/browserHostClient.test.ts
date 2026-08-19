@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { browserHostClient, type GuestTabState } from "./browserHostClient"
+import { browserHostClient, type GuestTabState, type HostOwner } from "./browserHostClient"
 
 // Regression coverage for the "tabs reload in a loop" bug: Solid's <For> in
 // browser-panel-v2.tsx reconciles guests by object reference, so any state
@@ -15,6 +15,9 @@ function tab(overrides: Partial<GuestTabState> & { tabId: string }): GuestTabSta
     controller: "none",
     zoomFactor: 1,
     attached: true,
+    owner: { kind: "user" },
+    active: false,
+    muted: false,
     ...overrides,
   }
 }
@@ -40,7 +43,11 @@ describe("browserHostClient state identity", () => {
         registerWebview: async () => ({ ok: true as const, tabId: "" }),
         unregisterWebview: async () => ({ ok: true as const }),
         getGuestPreloadPath: async () => "",
-        setSessionContext: async () => {},
+        assignTab: async (tabId: string, owner: HostOwner) => ({ tabId, owner }),
+        closeRange: async () => ({ closed: [] }),
+        refreshTab: async () => {},
+        duplicateTab: async (tabId: string) => ({ tabId, url: "" }),
+        setTabMuted: async () => {},
         onState: (cb: (tab: GuestTabState) => void) => {
           onStateCb = cb
           return () => {}

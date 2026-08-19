@@ -4,9 +4,8 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useLanguage } from "@/context/language"
 
 /**
- * Browser panel sidebar toggle — mirrors SessionReviewV2SidebarToggle's
- * signature ({opened, disabled?, onToggle}) so the browser pane can be
- * collapsed/expanded from the session header next to the review toggle.
+ * Browser panel sidebar toggle — compact icon button that collapses/expands
+ * the browser pane from the session header.
  */
 export function BrowserPanelV2SidebarToggle(props: {
   opened: boolean

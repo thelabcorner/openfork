@@ -4,8 +4,10 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { useLanguage } from "@/context/language"
+import { useServerSync } from "@/context/server-sync"
 import { browserHostClient } from "./browser/browserHostClient"
 import { HostedBrowserWebview } from "./browser/HostedBrowserWebview"
+import { BrowserTabContextMenu } from "./browser/browser-tab-context-menu"
 import { BrowserPanelV2SidebarToggle } from "./browser-panel-v2-sidebar-toggle"
 import {
   BROWSER_PANEL_V2_WIDTH_MAX,
@@ -25,6 +27,16 @@ export function BrowserPanelV2(props: {
 }) {
   const language = useLanguage()
   const hostState = browserHostClient.state
+  const serverSync = useServerSync()
+
+  // Open/visited chat sessions for the "Assign to session…" submenu (D7 user
+  // authority). Sourced from the in-memory session store the page maintains;
+  // the exact list hook is an implementation detail (flagged in the design).
+  const assignSessions = createMemo(() =>
+    Object.values(serverSync().session.data.info)
+      .filter((info): info is NonNullable<typeof info> => info !== undefined)
+      .map((session) => ({ id: session.id, title: session.title ?? session.id })),
+  )
 
   const activeTabId = createMemo(() => {
     const state = hostState()
@@ -63,7 +75,8 @@ export function BrowserPanelV2(props: {
   return (
     <div
       id="browser-panel"
-      class="flex h-full min-h-0 flex-col overflow-hidden bg-v2-background-bg-base contain-strict"
+      class="my-2 me-2 flex min-h-0 shrink-0 self-stretch flex-col overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)] contain-strict"
+      style={{ width: `${props.state.sidebarWidth()}px` }}
       data-browser-panel
     >
       <div class="flex h-8 shrink-0 items-center gap-1 border-b border-v2-border-border-base bg-v2-background-bg-base px-1.5">
@@ -82,6 +95,7 @@ export function BrowserPanelV2(props: {
                   tabId={tabId}
                   active={activeTabId() === tabId}
                   fallbackTitle={activeTabTitle()}
+                  sessions={assignSessions}
                   onActivate={() => activateTab(tabId)}
                   onClose={() => void browserHostClient.close(tabId)}
                 />
@@ -130,19 +144,23 @@ export function BrowserPanelV2(props: {
 }
 
 /** One tab-strip pill. Reads its own guest state so a title/loading update
- * on one tab only re-renders that pill, not the whole strip. */
+ * on one tab only re-renders that pill, not the whole strip. Right-click opens
+ * the tab context menu (D8). */
 function BrowserTabPill(props: {
   tabId: string
   active: boolean
   fallbackTitle: string | null
+  sessions: () => Array<{ id: string; title: string }>
   onActivate: () => void
   onClose: () => void
 }) {
   const language = useLanguage()
   const guest = createMemo(() => browserHostClient.guest(props.tabId))
   const label = () => guest().title || guest().url || props.fallbackTitle || language.t("browser.panel.empty")
+  const ownerLabel = () =>
+    guest().owner.kind === "user" ? language.t("browser.tab.owner.user") : language.t("browser.tab.owner.agent")
 
-  return (
+  const pill = (
     <div
       data-active={props.active || undefined}
       class="group/tab flex h-6 min-w-0 max-w-[170px] flex-1 items-center rounded-[5px] text-v2-text-text-muted transition-colors duration-100 hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-base data-[active=true]:bg-v2-background-bg-layer-03 data-[active=true]:text-v2-text-text-base"
@@ -150,7 +168,7 @@ function BrowserTabPill(props: {
       <button
         type="button"
         class="flex h-full min-w-0 flex-1 items-center gap-1 rounded-l-[5px] px-2 text-left text-[11px] leading-none"
-        title={label()}
+        title={`${label()} · ${ownerLabel()}${guest().muted ? ` · ${language.t("browser.tab.owner.muted")}` : ""}`}
         aria-label={label()}
         onClick={props.onActivate}
       >
@@ -159,6 +177,9 @@ function BrowserTabPill(props: {
           data-loading={guest().loading || undefined}
         />
         <span class="min-w-0 flex-1 truncate">{label()}</span>
+        <span class="shrink-0 text-[9px] leading-none uppercase text-v2-text-text-muted">
+          {guest().muted ? language.t("browser.tab.owner.muted") : ownerLabel()}
+        </span>
       </button>
       <button
         type="button"
@@ -173,6 +194,12 @@ function BrowserTabPill(props: {
         <CloseIcon />
       </button>
     </div>
+  )
+
+  return (
+    <BrowserTabContextMenu tabId={props.tabId} guest={guest} sessions={props.sessions} onClose={props.onClose}>
+      {pill}
+    </BrowserTabContextMenu>
   )
 }
 

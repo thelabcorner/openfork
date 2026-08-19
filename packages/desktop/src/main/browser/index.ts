@@ -15,14 +15,18 @@ import { ControlSessionManager } from "./control-session"
 import { BrowserHost } from "./host"
 import { AnnotationController } from "./annotation"
 import {
+  BROWSER_PROTOCOL_VERSION,
+  type Appearance,
   type BrowserAnnotationResult,
   type BrowserState,
+  type ExtensionInfo,
   type HostCapabilities,
+  type HostOwner,
   type HumanInputSignal,
   type WireGuestTabState,
+  rangeTargets,
 } from "./contracts"
 
-const SESSION_CONTEXT_REGISTER_DEBOUNCE_MS = 150
 // wireGuest (guest.ts) calls sync() on every micro-transition of a
 // navigation (start-loading, title, navigate, stop-loading can all fire
 // within the same tick, and SPA pages firing did-navigate-in-page on every
@@ -33,8 +37,6 @@ const SESSION_CONTEXT_REGISTER_DEBOUNCE_MS = 150
 // and downstream consumers only care about the latest value, not every
 // intermediate one.
 const GUEST_STATE_EVENT_DEBOUNCE_MS = 80
-
-type SessionContext = { sessionId: string; workspaceId?: string; directory?: string }
 
 export interface BrowserEngineOptions {
   windowId: string
@@ -55,7 +57,24 @@ export interface BrowserRenderApi {
   registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) => { ok: true }
   unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) => { ok: true }
   humanInput: (runtimeTabId: string, signal: unknown) => void
-  setSessionContext: (sessionId: string, opts?: { workspaceId?: string; directory?: string }) => void
+  /** User-initiated ownership change (D7) — assign/reassign/unassign to ANY owner. */
+  assignTab: (tabId: string, owner: HostOwner) => Promise<{ tabId: string; owner: HostOwner }>
+  /** User close-range (D8): close tabs left/right/others/all of `tabId`. */
+  closeRange: (tabId: string, mode: "left" | "right" | "others" | "all") => { closed: string[] }
+  /** Host-level webview reload (D8a). */
+  refreshTab: (tabId: string) => Promise<void>
+  /** Clone the tab with the same URL; the duplicate INHERITS the source owner (D8). */
+  duplicateTab: (tabId: string) => Promise<{ tabId: string; url: string }>
+  /** Per-tab audio mute toggle (D8b). */
+  setTabMuted: (tabId: string, muted: boolean) => Promise<void>
+  /** Chrome chrome ops (D10): detached devtools, cache-bypassing reload, storage clears. */
+  openDevtools: (tabId: string) => Promise<void>
+  hardReload: (tabId: string) => Promise<void>
+  clearCookies: (tabId: string) => Promise<void>
+  clearCache: (tabId: string) => Promise<void>
+  setAppearance: (appearance: Appearance) => Promise<void>
+  listExtensions: (tabId: string) => Promise<ExtensionInfo[]>
+  setExtensionEnabled: (tabId: string, extensionId: string, enabled: boolean) => Promise<void>
   startAnnotation: (tabId: string) => Promise<BrowserAnnotationResult | null>
   cancelAnnotation: (tabId: string) => void
 }
@@ -71,8 +90,6 @@ export class BrowserEngine {
   private readonly hostId = randomUUID()
   private readonly hostEpoch = 1
   private readonly pendingActivation = new Set<string>()
-  private sessionContext: SessionContext = { sessionId: "" }
-  private sessionContextRegisterTimer: ReturnType<typeof setTimeout> | undefined
   private readonly guestStateEventTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private started = false
 
@@ -110,8 +127,16 @@ export class BrowserEngine {
       sessions: this.sessions,
       recordingDirectory: options.recordingDirectory,
       maxResultBytes: capabilities.maxResultBytes,
+      getHostState: () => ({
+        connected: this.host.isConnected,
+        hostId: this.hostId,
+        hostEpoch: this.hostEpoch,
+        protocolVersion: BROWSER_PROTOCOL_VERSION,
+        windowId: options.windowId,
+      }),
       onTabRequest: (request) => this.options.broadcast("browser-tab-request", request),
       onTabClose: (tabId) => this.options.broadcast("browser-tab-close", { tabId }),
+      onTabClosed: (tabId) => this.host.emitHostEvent({ type: "tab.closed", tabId, timestamp: new Date().toISOString() }),
       onPointerEvent: (event) => this.options.broadcast("browser-pointer-event", event),
     })
     this.host = new BrowserHost({
@@ -120,7 +145,6 @@ export class BrowserEngine {
       windowId: options.windowId,
       capabilities,
       sidecarProvider: options.sidecarProvider,
-      getSessionContext: () => this.sessionContext,
       getGuestSnapshot: () => {
         const active = this.registry.activeTab
         return {
@@ -129,7 +153,7 @@ export class BrowserEngine {
           url: active?.url ?? null,
         }
       },
-      dispatch: (tabId, operation) => this.operations.dispatch(tabId, operation),
+      dispatch: (tabId, operation, sessionId) => this.operations.dispatch(tabId, operation, sessionId),
       onConnectedChange: (connected) => {
         this.options.broadcast("browser-host-state", { connected })
         this.options.logger?.log("browser host connected", { connected })
@@ -158,8 +182,6 @@ export class BrowserEngine {
   async stop(): Promise<void> {
     if (!this.started) return
     this.started = false
-    if (this.sessionContextRegisterTimer) clearTimeout(this.sessionContextRegisterTimer)
-    this.sessionContextRegisterTimer = undefined
     for (const timer of this.guestStateEventTimers.values()) clearTimeout(timer)
     this.guestStateEventTimers.clear()
     for (const tab of this.registry.list()) this.annotation.cancel(tab.runtimeTabId)
@@ -190,6 +212,7 @@ export class BrowserEngine {
           cdp: true,
         },
       },
+      appearance: this.registry.getAppearance(),
       guest: {
         attached: this.registry.size > 0,
         activeTabId: active?.runtimeTabId ?? null,
@@ -205,6 +228,7 @@ export class BrowserEngine {
   readonly api: BrowserRenderApi = {
     getState: () => this.getState(),
     openTab: (url, opts) => {
+      // Human-opened tabs are owner `user` (registry default; D2).
       const tabId = randomUUID()
       if (opts?.activate ?? true) this.pendingActivation.add(tabId)
       this.options.broadcast("browser-tab-request", {
@@ -219,15 +243,7 @@ export class BrowserEngine {
       this.registry.activate(tabId)
       return this.getState()
     },
-    closeTab: (tabId) => {
-      const tab = this.registry.get(tabId)
-      if (!tab) return { closed: false }
-      this.pendingActivation.delete(tabId)
-      this.annotation.cancel(tabId)
-      this.registry.unregister(tabId)
-      this.options.broadcast("browser-tab-close", { tabId })
-      return { closed: true }
-    },
+    closeTab: (tabId) => this.closeTabInternal(tabId).length === 1 ? { closed: true } : { closed: false },
     registerWebview: (runtimeTabId, webContentsId, generation = 0) => {
       const record = this.registry.register(runtimeTabId, webContentsId, generation)
       if (this.pendingActivation.delete(runtimeTabId)) this.registry.activate(runtimeTabId)
@@ -242,11 +258,65 @@ export class BrowserEngine {
     humanInput: (runtimeTabId, signal) => {
       this.handleHumanInput(runtimeTabId, signal)
     },
-    setSessionContext: (sessionId, opts) => {
-      const next = { sessionId, workspaceId: opts?.workspaceId, directory: opts?.directory }
-      if (sameSessionContext(this.sessionContext, next)) return
-      this.sessionContext = next
-      this.scheduleSessionContextRegister()
+    assignTab: async (tabId, owner) => {
+      // User-initiated ownership change (D7): fully general — assign/reassign/unassign.
+      const sidecar = this.options.sidecarProvider()
+      if (!sidecar) throw new Error("No sidecar connection available")
+      const response = await fetch(`${sidecar.url}/api/browser/assign`, {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Basic ${Buffer.from(`${sidecar.username}:${sidecar.password}`).toString("base64")}`,
+        },
+        body: JSON.stringify({ tabId, owner }),
+      })
+      if (!response.ok) throw new Error(`browser assign responded ${response.status}`)
+      const body = (await response.json()) as { data?: { tabId?: string; owner?: HostOwner } }
+      return { tabId: body.data?.tabId ?? tabId, owner: body.data?.owner ?? owner }
+    },
+    closeRange: (tabId, mode) => {
+      const ordered = this.registry.list().map((record) => record.runtimeTabId)
+      return { closed: this.closeTabs(rangeTargets(ordered, tabId, mode)) }
+    },
+    refreshTab: async (tabId) => {
+      await this.operations.dispatch(tabId, { name: "refresh", input: { tabId } }, "")
+    },
+    duplicateTab: async (tabId) => {
+      const result = (await this.operations.dispatch(tabId, { name: "duplicate", input: { tabId } }, "")) as {
+        duplicated?: { tabId?: string; url?: string }
+      }
+      return { tabId: result.duplicated?.tabId ?? tabId, url: result.duplicated?.url ?? "" }
+    },
+    setTabMuted: async (tabId, muted) => {
+      await this.operations.dispatch(tabId, { name: "set_muted", input: { tabId, muted } }, "")
+    },
+    openDevtools: async (tabId) => {
+      await this.operations.dispatch(tabId, { name: "open_devtools", input: { tabId } }, "")
+    },
+    hardReload: async (tabId) => {
+      await this.operations.dispatch(tabId, { name: "hard_reload", input: { tabId } }, "")
+    },
+    clearCookies: async (tabId) => {
+      await this.operations.dispatch(tabId, { name: "clear_cookies", input: { tabId } }, "")
+    },
+    clearCache: async (tabId) => {
+      await this.operations.dispatch(tabId, { name: "clear_cache", input: { tabId } }, "")
+    },
+    setAppearance: async (appearance) => {
+      await this.operations.dispatch(undefined, { name: "set_appearance", input: { appearance } }, "")
+    },
+    listExtensions: async (tabId) => {
+      const result = (await this.operations.dispatch(tabId, { name: "extensions_list", input: { tabId } }, "")) as {
+        extensions?: ExtensionInfo[]
+      }
+      return result.extensions ?? []
+    },
+    setExtensionEnabled: async (tabId, extensionId, enabled) => {
+      await this.operations.dispatch(
+        tabId,
+        { name: "extension_set_enabled", input: { tabId, extensionId, enabled } },
+        "",
+      )
     },
     startAnnotation: (tabId) => {
       const tab = this.registry.get(tabId)
@@ -256,6 +326,27 @@ export class BrowserEngine {
     cancelAnnotation: (tabId) => {
       this.annotation.cancel(tabId)
     },
+  }
+
+  /** User-authority close (D9): preempt the arbiter + detach the CDP session so
+   * an in-flight agent op aborts (never hangs), then destroy and emit tab.closed. */
+  private closeTabInternal(tabId: string): string[] {
+    const tab = this.registry.get(tabId)
+    if (!tab) return []
+    this.arbiter.preempt(tabId)
+    this.sessions.detach(tab.webContentsId ?? -1).catch(() => undefined)
+    this.pendingActivation.delete(tabId)
+    this.annotation.cancel(tabId)
+    this.registry.unregister(tabId)
+    this.host.emitHostEvent({ type: "tab.closed", tabId, timestamp: new Date().toISOString() })
+    this.options.broadcast("browser-tab-close", { tabId })
+    return [tabId]
+  }
+
+  private closeTabs(tabIds: readonly string[]): string[] {
+    const closed: string[] = []
+    for (const tabId of tabIds) closed.push(...this.closeTabInternal(tabId))
+    return closed
   }
 
   private scheduleGuestStateEvent(tab: WireGuestTabState): void {
@@ -268,19 +359,6 @@ export class BrowserEngine {
     timer.unref?.()
     this.guestStateEventTimers.set(tab.tabId, timer)
   }
-
-  private scheduleSessionContextRegister(): void {
-    if (this.sessionContextRegisterTimer) clearTimeout(this.sessionContextRegisterTimer)
-    this.sessionContextRegisterTimer = setTimeout(() => {
-      this.sessionContextRegisterTimer = undefined
-      this.host.reRegister()
-    }, SESSION_CONTEXT_REGISTER_DEBOUNCE_MS)
-    this.sessionContextRegisterTimer.unref?.()
-  }
-}
-
-function sameSessionContext(left: SessionContext, right: SessionContext) {
-  return left.sessionId === right.sessionId && left.workspaceId === right.workspaceId && left.directory === right.directory
 }
 
 /** Absolute path of the browser-guest preload bundle (electron-vite "preview" input). */

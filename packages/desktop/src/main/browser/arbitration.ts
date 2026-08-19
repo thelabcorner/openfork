@@ -244,4 +244,13 @@ export class ControlArbiter {
     this.controllers.delete(tabId)
     this.queue.clear()
   }
+
+  /** Close-driven preemption (D9): the user is closing the tab, so any in-flight
+   * agent action must fail with BrowserControlInterrupted — bump the epoch (kills
+   * guarded `send` mid-command) and clear controller/queue state. */
+  preempt(tabId: string) {
+    this.epoch.bump(tabId)
+    this.controllers.delete(tabId)
+    this.queue.clear()
+  }
 }

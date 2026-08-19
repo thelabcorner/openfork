@@ -15,7 +15,7 @@
 
 // --- wire constants (must stay in sync with the protocol group) ---------------
 
-export const BROWSER_PROTOCOL_VERSION = 1
+export const BROWSER_PROTOCOL_VERSION = 2
 export const BROKER_REQUEST_PATH = "/v1/browser/request"
 export const BROKER_ABORT_PATH = "/v1/browser/request/:requestId/abort"
 
@@ -110,6 +110,10 @@ export interface HostGuestState {
   url: string | null
 }
 
+/** A tab's owner — exactly one of `user` or `agent(<sessionId>)`. Two agents
+ * never share a tab; the user may always reassign via the context menu. */
+export type HostOwner = { kind: "user" } | { kind: "agent"; sessionId: string }
+
 export interface HostHello {
   protocolVersion: number
   hostId: string
@@ -120,11 +124,9 @@ export interface HostHello {
   guest: HostGuestState
 }
 
-/** Payload the host POSTs to the sidecar hello endpoint (HostHello + stickiness context + reachability). */
+/** Payload the host POSTs to the sidecar hello endpoint (session-agnostic: the
+ * browser is ONE shared instance owned by the app window, never by a session). */
 export interface HostRegistration extends HostHello {
-  sessionId: string
-  workspaceId?: string
-  directory?: string
   callbackUrl: string
   callbackToken: string
 }
@@ -147,6 +149,19 @@ export interface WireGuestTabState {
   controller: BrowserController
   zoomFactor: number
   attached: boolean
+  owner: HostOwner
+  active: boolean
+  muted: boolean
+}
+
+/** One row of the FULL shared-host tab list (browser_status / broker mirror). */
+export interface SessionTabInfo {
+  tabId: string
+  url: string
+  title: string
+  active: boolean
+  owner: HostOwner
+  muted: boolean
 }
 
 export type HostEvent =
@@ -154,19 +169,20 @@ export type HostEvent =
   | { type: "guest.stateChanged"; tab: WireGuestTabState; timestamp: string }
   | { type: "host.stopping"; timestamp: string }
   | { type: "request.aborted"; requestId: string; timestamp: string }
+  | { type: "tab.closed"; tabId: string; timestamp: string }
 
 // --- wire: broker envelope ----------------------------------------------------
 
 export interface BrokerRequest {
   requestId: string
   sessionId: string
+  windowId: string
   workspaceId?: string
   directory?: string
   messageId: string
   toolCallId?: string
   tabId?: string
   operation: BrowserOperation
-  input: unknown
   timeoutMs: number
 }
 
@@ -212,6 +228,13 @@ export interface Coords {
   y: number
 }
 
+export interface Rect {
+  x: number
+  y: number
+  width: number
+  height: number
+}
+
 export interface RefTarget {
   ref: string
   snapshotVersion: number
@@ -244,19 +267,6 @@ export interface ElementSelector {
   confidence: SelectorConfidence
 }
 
-/** Bounded DOM-query match (browser_query output; engine-internal shape). */
-export interface QueryMatch {
-  role?: string
-  name?: string
-  selector: ElementSelector
-  rect: { x: number; y: number; width: number; height: number }
-  center: { x: number; y: number }
-  visibility: "visible" | "hidden"
-  display: string
-  position: string
-  text?: string
-}
-
 export interface ResolvedElement {
   selector: string
   confidence: SelectorConfidence
@@ -269,10 +279,31 @@ export interface ResolvedElement {
   zIndex: number | null
 }
 
-export interface SnapshotElement extends ResolvedElement {
+export interface SnapshotElement {
   ref: string
-  tagName: string
-  text: string | null
+  role: string
+  name: string
+  selector: ElementSelector
+  rect: Rect
+  center: Coords
+  state: ElementState
+  locator?: Locator
+}
+
+/** What an interact operation ACTUALLY resolved — the wire ResolvedTarget echo. */
+export interface ResolvedTarget {
+  kind: "ref" | "locator" | "coords"
+  ref?: string
+  snapshotVersion?: number
+  selector?: ElementSelector
+  locator?: Locator
+  rect?: Rect
+  center?: Coords
+  role?: string
+  name?: string
+  tagName?: string
+  state?: ElementState
+  nodeId?: number
 }
 
 export interface Viewport {
@@ -283,20 +314,12 @@ export interface Viewport {
   scrollY: number
 }
 
-export interface ResolvedTarget {
-  locator: Locator
-  coords: Coords
-  tagName: string
-  role?: string
-  text?: string
-}
-
 export interface A11yNode {
   role: string
   name: string
   value?: string
-  states: Record<string, boolean>
-  target?: { locator: Locator; coords: Coords }
+  states: string[]
+  target?: { locator?: Locator; rect: Rect }
   children: A11yNode[]
 }
 
@@ -307,7 +330,7 @@ export type GuestReadyState = "loading" | "interactive" | "complete"
 export interface GuestTabState {
   runtimeTabId: string
   windowId: string
-  sessionId: string
+  owner: HostOwner
   workspaceId?: string
   webContentsId: number | null
   url: string
@@ -322,6 +345,8 @@ export interface GuestTabState {
   generation: number
   crashed: boolean
   attached: boolean
+  muted: boolean
+  viewport?: Viewport
   snapshotVersion: number
 }
 
@@ -431,6 +456,8 @@ export type HumanInputSignal =
 export type BrowserOperation =
   | { name: "status"; input: StatusInput }
   | { name: "open"; input: OpenInput }
+  | { name: "claim"; input: ClaimInput }
+  | { name: "set_tab_owner"; input: SetTabOwnerInput }
   | { name: "navigate"; input: NavigateInput }
   | { name: "resize"; input: ResizeInput }
   | { name: "set_appearance"; input: SetAppearanceInput }
@@ -451,6 +478,17 @@ export type BrowserOperation =
   | { name: "profiler_start"; input: ProfilerStartInput }
   | { name: "profiler_stop"; input: ProfilerStopInput }
   | { name: "react_inspect"; input: ReactInspectInput }
+  // Host-internal context-menu ops (D8/D8a/D8b) — engine dispatch only, never on the broker wire.
+  | { name: "refresh"; input: RefreshTabInput }
+  | { name: "duplicate"; input: DuplicateTabInput }
+  | { name: "set_muted"; input: SetMutedInput }
+  // Host-internal browser chrome ops (D10) — engine dispatch only.
+  | { name: "open_devtools"; input: RefreshTabInput }
+  | { name: "hard_reload"; input: RefreshTabInput }
+  | { name: "clear_cookies"; input: RefreshTabInput }
+  | { name: "clear_cache"; input: RefreshTabInput }
+  | { name: "extensions_list"; input: RefreshTabInput }
+  | { name: "extension_set_enabled"; input: ExtensionToggleInput }
 
 export type BrowserOperationName = BrowserOperation["name"]
 
@@ -460,10 +498,56 @@ export interface StatusInput {
 }
 export interface OpenInput {
   url: string
+  tabId?: string
+  claim?: boolean
   newTab?: boolean
   activate?: boolean
   appearance?: Appearance
   timeoutMs?: number
+}
+export interface ClaimInput {
+  tabId: string
+  timeoutMs?: number
+}
+export interface ClaimOutput {
+  claimed: {
+    tabId: string
+    owner: HostOwner
+  }
+}
+/** Broker-minted control op (from user-initiated assign); never an agent tool. */
+export interface SetTabOwnerInput {
+  tabId: string
+  owner: HostOwner
+}
+export interface SetTabOwnerOutput {
+  assigned: {
+    tabId: string
+    owner: HostOwner
+  }
+}
+/** Host-internal context-menu ops (D8/D8a/D8b) — engine dispatch only, never on the wire. */
+export interface RefreshTabInput {
+  tabId: string
+}
+export interface DuplicateTabInput {
+  tabId: string
+}
+export interface SetMutedInput {
+  tabId: string
+  muted: boolean
+}
+/** Chrome-style browser chrome ops (D10) — tabId-scoped. */
+export interface ExtensionToggleInput {
+  tabId: string
+  extensionId: string
+  enabled: boolean
+}
+export interface ExtensionInfo {
+  id: string
+  name: string
+  version: string
+  enabled: boolean
 }
 export interface NavigateInput {
   url: string
@@ -528,12 +612,15 @@ export interface EvaluateInput {
   timeoutMs?: number
   maxResultBytes?: number
 }
+export type WaitForCondition =
+  | { type: "selector"; selector: Locator }
+  | { type: "text"; text: string; visible?: boolean }
+  | { type: "url"; pattern: string }
+  | { type: "expression"; script: string }
+
 export interface WaitForInput {
-  condition:
-    | { type: "selector"; selector: Locator }
-    | { type: "text"; text: string; visible?: boolean }
-    | { type: "url"; pattern: string }
-    | { type: "expression"; script: string }
+  condition: WaitForCondition
+  target?: ElementTarget
   state?: "visible" | "hidden" | "attached" | "detached"
   timeoutMs?: number
 }
@@ -590,25 +677,22 @@ export interface ReactInspectInput {
   timeoutMs?: number
 }
 
-export interface StatusOutput {
-  status: {
-    host: {
-      connected: boolean
-      hostId: string | null
-      hostEpoch: number | null
-      connectionId: string | null
-      windowId: string
-      capabilities: HostCapabilities
-    }
-    guest: {
-      attached: boolean
-      activeTabId: string | null
-      url: string | null
-      controller: BrowserController
-      zoomFactor: number
-    }
-    tabs: WireGuestTabState[]
+/** Wire BrowserState (status op) — NOT the renderer BrowserState above. */
+export interface WireBrowserState {
+  connected: boolean
+  host?: { hostId: string; protocolVersion: number; hostEpoch: number }
+  guest?: {
+    windowId: string
+    state: "attached" | "detached" | "crashed" | "unavailable"
+    activeTab?: { tabId: string; url: string; title: string; readyState: string; viewport: Viewport }
   }
+  appearance: Appearance
+  recording: { active: boolean; recordingId?: string }
+}
+
+export interface StatusOutput {
+  status: WireBrowserState
+  tabs: SessionTabInfo[]
 }
 
 /** Renderer-facing aggregate state (window.api.browser.getState). */
@@ -628,6 +712,7 @@ export interface BrowserState {
     controller: BrowserController
     zoomFactor: number
   }
+  appearance: Appearance
   tabs: WireGuestTabState[]
 }
 export interface OpenOutput {
@@ -637,6 +722,7 @@ export interface OpenOutput {
     title: string
     readyState: WireGuestTabState["readyState"]
     viewport: Viewport
+    owner: HostOwner
   }
 }
 export interface NavigateOutput {
@@ -691,7 +777,7 @@ export interface ScreenshotOutput {
 }
 export interface ClickOutput {
   clicked: {
-    target: ResolvedElement
+    target: ResolvedTarget
     coords: Coords
     clickCount: number
     afterUrl?: string
@@ -700,23 +786,23 @@ export interface ClickOutput {
 }
 export interface TypeOutput {
   typed: {
-    target?: ResolvedElement
+    target?: ResolvedTarget
     value: string
-    caret: number
+    caret: { selectionStart: number; selectionEnd: number }
     submitted: boolean
   }
 }
 export interface PressOutput {
   pressed: {
     key: string
-    target?: ResolvedElement
+    target?: ResolvedTarget
     repeat: boolean
     modifiers: string[]
   }
 }
 export interface ScrollOutput {
   scrolled: {
-    target?: ResolvedElement
+    target?: ResolvedTarget
     viewport: Viewport
     scrollX: number
     scrollY: number
@@ -732,27 +818,28 @@ export interface EvaluateOutput {
 }
 export interface WaitForOutput {
   waited: {
-    condition: WaitForInput["condition"]
+    condition?: WaitForCondition
+    target?: ResolvedTarget
     satisfied: true
-    at: { time: string; url: string; title: string }
-    element?: ResolvedElement
+    at: { time: number; url: string; title: string }
+    element?: ResolvedTarget
   }
 }
 export interface RecordingStartOutput {
   recording: {
     recordingId: string
     format: string
-    startedAt: string
+    startedAt: number
     tabId: string
   }
 }
 export interface RecordingStopOutput {
   recording: {
     recordingId: string
-    stoppedAt: string
+    stoppedAt: number
     durationMs: number
     sizeBytes: number
-    artifact: { type: "file"; mime: string; url: string; path?: string }
+    artifact: { type: "file"; mime: "video/webm" | "image/gif" | "text/html"; url: string; path?: string }
   }
 }
 export interface CloseOutput {
@@ -764,8 +851,8 @@ export interface CloseOutput {
 }
 export interface HighlightOutput {
   highlighted: {
-    target: ResolvedElement
-    coords: Coords
+    target: ResolvedTarget
+    at: { time: number }
   }
 }
 export interface AnnotateOutput {
@@ -776,27 +863,41 @@ export interface AnnotateOutput {
     at: { time: number }
   }
 }
+export interface QueryMatch {
+  ref?: string
+  role?: string
+  name?: string
+  selector?: ElementSelector
+  rect: Rect
+  center: Coords
+  visibility: "visible" | "hidden"
+  display: string
+  position: "static" | "relative" | "absolute" | "fixed" | "sticky"
+  text?: string
+}
+
 export interface QueryOutput {
   queried: {
-    matches: ResolvedElement[]
+    tabId: string
+    url: string
+    matches: QueryMatch[]
+    count: number
     truncated: boolean
   }
 }
 export interface ProfilerStartOutput {
-  profiler: {
-    started: true
-    component?: string
-    tabId: string
-  }
+  started: { snapshotVersion: number }
 }
+export interface ProfilerResult {
+  commits: number
+  windowMs: number
+  topRenders: Array<{ name: string; count: number }>
+  propsDiff?: unknown
+  truncated: boolean
+}
+
 export interface ProfilerStopOutput {
-  profiler: {
-    commitCount: number
-    windowMs: number
-    components: Array<{ name: string; renders: number }>
-    propsDiff?: unknown
-    tabId: string
-  }
+  profiled: ProfilerResult
 }
 export interface ReactComponentInfo {
   name: string
@@ -818,6 +919,8 @@ export interface ReactInspectOutput {
 const OPERATION_NAMES: readonly BrowserOperationName[] = [
   "status",
   "open",
+  "claim",
+  "set_tab_owner",
   "navigate",
   "resize",
   "set_appearance",
@@ -838,6 +941,15 @@ const OPERATION_NAMES: readonly BrowserOperationName[] = [
   "profiler_start",
   "profiler_stop",
   "react_inspect",
+  "refresh",
+  "duplicate",
+  "set_muted",
+  "open_devtools",
+  "hard_reload",
+  "clear_cookies",
+  "clear_cache",
+  "extensions_list",
+  "extension_set_enabled",
 ]
 
 const ERROR_TAGS: readonly BrowserErrorTag[] = [
@@ -902,7 +1014,7 @@ export const isBrokerRequest = (value: unknown): value is BrokerRequest => {
   if (typeof value.timeoutMs !== "number") return false
   if (!isRecord(value.operation)) return false
   if (!isBrowserOperationName(value.operation.name)) return false
-  if (!("input" in value)) return false
+  if (!("input" in value.operation)) return false
   if (value.tabId !== undefined && typeof value.tabId !== "string") return false
   return true
 }
@@ -994,7 +1106,7 @@ export const isBrowserGuestUrl = (value: string): boolean => {
   return url.protocol === "http:" || url.protocol === "https:"
 }
 
-export const toWireGuestTabState = (tab: GuestTabState): WireGuestTabState => ({
+export const toWireGuestTabState = (tab: GuestTabState, active: boolean): WireGuestTabState => ({
   tabId: tab.runtimeTabId,
   url: tab.url,
   title: tab.title,
@@ -1002,4 +1114,36 @@ export const toWireGuestTabState = (tab: GuestTabState): WireGuestTabState => ({
   controller: tab.controller,
   zoomFactor: tab.zoomFactor,
   attached: tab.attached,
+  owner: tab.owner,
+  active,
+  muted: tab.muted,
 })
+
+/** Close-range computation (D8): which tab ids to close for a mode, relative to
+ * the tab at `tabId`, in registry order. Pure + unit-tested. */
+export const rangeTargets = (tabIds: readonly string[], tabId: string, mode: "left" | "right" | "others" | "all"): string[] => {
+  const index = tabIds.indexOf(tabId)
+  switch (mode) {
+    case "left":
+      return index <= 0 ? [] : tabIds.slice(0, index)
+    case "right":
+      return index < 0 ? [] : tabIds.slice(index + 1)
+    case "others":
+      return tabIds.filter((id) => id !== tabId)
+    case "all":
+      return [...tabIds]
+  }
+}
+
+/** Can this session dispatch to a tab with this owner? (O1/O2/O3 — mirror of the
+ * core broker helper; desktop cannot import core, so it is mirrored here.) */
+export const canDispatchTab = (owner: HostOwner, sessionId: string): "ok" | "other-agent" | "user-owned" => {
+  if (owner.kind === "user") return "user-owned"
+  return owner.sessionId === sessionId ? "ok" : "other-agent"
+}
+
+/** Can this session claim a tab with this owner? (O4/O5/O6) */
+export const canClaimTab = (owner: HostOwner, sessionId: string): "ok" | "idempotent" | "denied" => {
+  if (owner.kind === "user") return "ok"
+  return owner.sessionId === sessionId ? "idempotent" : "denied"
+}

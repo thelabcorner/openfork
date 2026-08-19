@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test"
 import {
+  ControlArbiter,
   ControlEpoch,
   ControllerState,
   ExpectedAgentInputQueue,
@@ -82,4 +83,20 @@ test("ControllerState: agent marker, human window expiry, none default", () => {
   expect(state.get("tab1", 2_000)).toBe("none")
   state.delete("tab1")
   expect(state.get("tab1")).toBe("none")
+})
+
+test("ControlArbiter.preempt: bumps the epoch (kills in-flight send) and clears controller/queue", async () => {
+  const arbiter = new ControlArbiter()
+  arbiter.setAgent("tab1")
+  arbiter.expectAgentInput("tab1", pointer(50, 50))
+  expect(arbiter.controller("tab1")).toBe("agent")
+  expect(arbiter.getExpectedInputs().size).toBe(1)
+
+  const { send } = createEpochGuardedSender(arbiter.getEpoch(), async () => ({ ok: true }))
+  const inFlight = send("tab1", "Input.dispatchMouseEvent")
+  arbiter.preempt("tab1")
+  await expect(inFlight).rejects.toBeInstanceOf(BrowserControlInterruptedError)
+
+  expect(arbiter.controller("tab1")).toBe("none")
+  expect(arbiter.getExpectedInputs().size).toBe(0)
 })

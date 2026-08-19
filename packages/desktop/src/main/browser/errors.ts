@@ -43,7 +43,24 @@ export class BrowserNotAReactAppError extends BrowserError {
 
 export class BrowserTabNotFoundError extends BrowserError {
   constructor(tabId?: string) {
-    super("BrowserTabNotFound", tabId ? `No browser tab "${tabId}"` : "No active browser tab — call browser_open first", true)
+    super(
+      "BrowserTabNotFound",
+      tabId
+        ? `No browser tab "${tabId}" for this session. Call browser_open to create a tab for this session.`
+        : "This session has no browser tab. Call browser_open to create a tab for this session.",
+      true,
+      tabId ? { tabId } : undefined,
+    )
+  }
+}
+
+/** Ownership violation (O1/O3/O5): cross-session tab, user tab without claim,
+ * or a claim on another session's tab. Never retryable — the action is denied. */
+export class BrowserPermissionDeniedError extends BrowserError {
+  constructor(
+    message = "This browser tab belongs to another session (or to the user). You may not control it. Claim a user tab with browser_claim, or open your own.",
+  ) {
+    super("BrowserPermissionDenied", message, false)
   }
 }
 

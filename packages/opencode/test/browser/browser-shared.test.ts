@@ -1,7 +1,17 @@
 import { describe, expect, it } from "bun:test"
 import { Schema } from "effect"
+import { Session } from "@opencode-ai/schema/session"
 import { BrowserError } from "@opencode-ai/core/browser/host-broker"
-import { ERROR_MESSAGE, FAMILY, OperationInput, permissionPattern, toBrowserError } from "../../src/browser/shared"
+import {
+  DEFAULT_TIMEOUT_MS,
+  ERROR_MESSAGE,
+  FAMILY,
+  OperationInput,
+  OperationOutput,
+  formatOwner,
+  permissionPattern,
+  toBrowserError,
+} from "../../src/browser/shared"
 
 const decode = <A>(schema: Schema.Schema<A>, input: unknown): A => {
   const option = Schema.decodeUnknownOption(schema as unknown as Schema.Decoder<unknown>)(input)
@@ -20,6 +30,7 @@ describe("BrowserShared permission families", () => {
     expect(FAMILY.profiler_stop).toBe("browser.read")
     expect(FAMILY.open).toBe("browser.navigate")
     expect(FAMILY.navigate).toBe("browser.navigate")
+    expect(FAMILY.claim).toBe("browser.navigate")
     expect(FAMILY.close).toBe("browser.navigate")
     expect(FAMILY.click).toBe("browser.interact")
     expect(FAMILY.type).toBe("browser.interact")
@@ -96,5 +107,36 @@ describe("BrowserShared per-operation input schemas (premium targeting)", () => 
 
   it("rejects click without any target", () => {
     expect(() => decode(OperationInput.click, {})).toThrow()
+  })
+})
+
+describe("BrowserShared ownership + claim surface", () => {
+  it("maps claim in OperationInput/Output with a default timeout", () => {
+    expect(OperationInput.claim).toBeDefined()
+    expect(OperationOutput.claim).toBeDefined()
+    expect(DEFAULT_TIMEOUT_MS.claim).toBe(10_000)
+  })
+
+  it("browser_open accepts tabId + claim (claim-and-navigate, D6)", () => {
+    const decoded = decode(OperationInput.open, { url: "https://example.com", tabId: "tab_1", claim: true })
+    expect(decoded.tabId).toBe("tab_1")
+    expect(decoded.claim).toBe(true)
+  })
+
+  it("SetTabOwnerInput/Output are NOT agent-facing (no tool mapping)", () => {
+    expect("set_tab_owner" in OperationInput).toBe(false)
+    expect("set_tab_owner" in OperationOutput).toBe(false)
+  })
+
+  it("formatOwner renders user vs agent(sessionId)", () => {
+    expect(formatOwner({ kind: "user" })).toBe("user")
+    expect(formatOwner({ kind: "agent", sessionId: Session.ID.make("ses_1") })).toBe("agent(ses_1)")
+  })
+
+  it("ownership prose: TabNotFound/PermissionDenied/HostUnavailable", () => {
+    expect(ERROR_MESSAGE.BrowserTabNotFound).toContain("browser_open")
+    expect(ERROR_MESSAGE.BrowserTabNotFound).toContain("for this session")
+    expect(ERROR_MESSAGE.BrowserPermissionDenied).toContain("browser_claim")
+    expect(ERROR_MESSAGE.BrowserHostUnavailable).not.toContain("for this session")
   })
 })

@@ -25,6 +25,7 @@ import { createUpdaterSubscriptions } from "./updater-subscriptions"
 import { createDesktopDraftStore } from "./draft-store"
 import { nativeT } from "./native-translations"
 import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
+import type { HostOwner } from "./browser/contracts"
 
 const pickerFilters = (ext?: string[]) => {
   if (!ext || ext.length === 0) return undefined
@@ -132,6 +133,18 @@ export function registerIpcHandlers(deps: Deps) {
   ipcMain.handle("store-clear", (_event: IpcMainInvokeEvent, name: string) => {
     getStore(name).clear()
     void removeStoreFileIfEmpty(name)
+  })
+  ipcMain.handle("store-get-all", (_event: IpcMainInvokeEvent, name: string) => {
+    try {
+      const store = getStore(name)
+      const entries: Record<string, string> = {}
+      for (const [key, value] of Object.entries(store.store)) {
+        entries[key] = typeof value === "string" ? value : JSON.stringify(value)
+      }
+      return entries
+    } catch {
+      return {}
+    }
   })
   ipcMain.handle("store-keys", (_event: IpcMainInvokeEvent, name: string) => {
     const store = getStore(name)
@@ -351,13 +364,65 @@ export function registerBrowserIpcHandlers(engine: BrowserEngine) {
     engine.api.humanInput(runtimeTabId, signal)
   })
 
-  ipcMain.handle(
-    "browser-set-session-context",
-    (event, sessionId: string, opts?: { workspaceId?: string; directory?: string }) => {
-      if (!trusted(event)) throw new Error("Untrusted browser sender")
-      engine.api.setSessionContext(sessionId, opts)
-    },
-  )
+  ipcMain.handle("browser-assign-tab", (event, tabId: string, owner: HostOwner) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.assignTab(tabId, owner)
+  })
+
+  ipcMain.handle("browser-close-range", (event, tabId: string, mode: "left" | "right" | "others" | "all") => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.closeRange(tabId, mode)
+  })
+
+  ipcMain.handle("browser-refresh-tab", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.refreshTab(tabId)
+  })
+
+  ipcMain.handle("browser-duplicate-tab", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.duplicateTab(tabId)
+  })
+
+  ipcMain.handle("browser-set-tab-muted", (event, tabId: string, muted: boolean) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.setTabMuted(tabId, muted)
+  })
+
+  ipcMain.handle("browser-open-devtools", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.openDevtools(tabId)
+  })
+
+  ipcMain.handle("browser-hard-reload", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.hardReload(tabId)
+  })
+
+  ipcMain.handle("browser-clear-cookies", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.clearCookies(tabId)
+  })
+
+  ipcMain.handle("browser-clear-cache", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.clearCache(tabId)
+  })
+
+  ipcMain.handle("browser-set-appearance", (event, appearance: "system" | "light" | "dark") => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.setAppearance(appearance)
+  })
+
+  ipcMain.handle("browser-list-extensions", (event, tabId: string) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.listExtensions(tabId)
+  })
+
+  ipcMain.handle("browser-set-extension-enabled", (event, tabId: string, extensionId: string, enabled: boolean) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.setExtensionEnabled(tabId, extensionId, enabled)
+  })
 
   ipcMain.handle("browser-get-guest-preload", (event) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")

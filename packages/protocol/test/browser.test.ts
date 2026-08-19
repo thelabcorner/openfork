@@ -5,6 +5,7 @@ import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { Workspace } from "@opencode-ai/schema/workspace"
 import {
   A11yNode,
+  AssignRequest,
   BrokerError,
   BrokerRequest,
   BrokerResponse,
@@ -12,10 +13,12 @@ import {
   BrowserOperation,
   ClickInput,
   ElementTarget,
+  GuestTabState,
   HostRegistration,
   HostHelloReply,
   QueryInput,
   SnapshotOutput,
+  StatusOutput,
 } from "../src/groups/browser"
 
 // Suspended schemas (A11yNode, and anything containing it) have a non-statically-
@@ -29,9 +32,9 @@ const decodeFails = async (schema: Schema.Schema<unknown>, input: unknown) => {
 }
 
 describe("browser wire: HostRegistration", () => {
-  test("accepts a valid registration with session identity and callback reachability", async () => {
+  test("accepts a session-agnostic registration (window-keyed, no session identity)", async () => {
     const registration = {
-      protocolVersion: 1,
+      protocolVersion: 2,
       hostId: "host-1",
       hostEpoch: 3,
       connectionId: "conn-1",
@@ -44,42 +47,81 @@ describe("browser wire: HostRegistration", () => {
         cdp: true,
       },
       guest: { attached: true, activeTabId: "tab_1", url: "https://example.com" },
-      sessionId: Session.ID.make("ses_test"),
-      workspaceId: Workspace.ID.make("wrk_1"),
       callbackUrl: "http://127.0.0.1:54123",
       callbackToken: "secret",
     }
     const decoded = await decode(HostRegistration, registration)
-    expect(decoded.sessionId).toBe(Session.ID.make("ses_test"))
-    expect(decoded.protocolVersion).toBe(1)
+    expect(decoded.windowId).toBe("win-1")
+    expect(decoded.protocolVersion).toBe(2)
     expect(decoded.callbackToken).toBe("secret")
+    expect("sessionId" in decoded).toBe(false)
+    expect("workspaceId" in decoded).toBe(false)
+    expect("directory" in decoded).toBe(false)
+  })
+})
+
+describe("browser wire: tab ownership + full tab list", () => {
+  test("GuestTabState carries owner (user or agent) + active + muted", async () => {
+    const userTab = {
+      tabId: "tab_1",
+      url: "https://example.com",
+      title: "Example",
+      readyState: "Success",
+      controller: "human",
+      zoomFactor: 1,
+      attached: true,
+      owner: { kind: "user" },
+      active: true,
+      muted: false,
+    } as const
+    expect(await decode(GuestTabState, userTab)).toEqual(userTab)
+    const agentTab = {
+      ...userTab,
+      owner: { kind: "agent", sessionId: Session.ID.make("ses_test") },
+    }
+    const decoded = await decode(GuestTabState, agentTab)
+    expect(decoded.owner).toEqual({ kind: "agent", sessionId: Session.ID.make("ses_test") })
   })
 
-  test("rejects a registration missing session identity", async () => {
-    const missing = {
-      protocolVersion: 1,
-      hostId: "host-1",
-      hostEpoch: 0,
-      connectionId: "conn-1",
-      windowId: "win-1",
-      capabilities: {
-        maxSnapshotBytes: 1_000_000,
-        maxResultBytes: 256_000,
-        supportedAppearances: ["system", "light", "dark"],
-        supportsRecording: false,
-        cdp: true,
-      },
-      guest: { attached: false, activeTabId: null, url: null },
-      callbackUrl: "http://127.0.0.1:54123",
-      callbackToken: "secret",
+  test("StatusOutput carries the full tab list (SessionTabInfo rows)", async () => {
+    const output = {
+      status: { connected: true, appearance: "system", recording: { active: false } },
+      tabs: [
+        {
+          tabId: "tab_1",
+          url: "https://example.com",
+          title: "Example",
+          active: true,
+          owner: { kind: "user" },
+          muted: false,
+        },
+        {
+          tabId: "tab_2",
+          url: "https://other.example",
+          title: "Other",
+          active: false,
+          owner: { kind: "agent", sessionId: Session.ID.make("ses_test") },
+          muted: true,
+        },
+      ],
     }
-    await decodeFails(HostRegistration, missing)
+    const decoded = await decode(StatusOutput, output)
+    expect(decoded.tabs).toHaveLength(2)
+    expect(decoded.tabs[1]?.owner).toEqual({ kind: "agent", sessionId: Session.ID.make("ses_test") })
+    expect(decoded.tabs[1]?.muted).toBe(true)
+  })
+
+  test("AssignRequest accepts any owner — user (Return to me) or agent(sessionId)", async () => {
+    const toUser = { tabId: "tab_1", owner: { kind: "user" } } as const
+    expect(await decode(AssignRequest, toUser)).toEqual(toUser)
+    const toSession = { tabId: "tab_1", owner: { kind: "agent", sessionId: Session.ID.make("ses_test") } } as const
+    expect(await decode(AssignRequest, toSession)).toEqual(toSession)
   })
 })
 
 describe("browser wire: HostHelloReply", () => {
   test("round trips the accepted reply", async () => {
-    const reply = { data: { accepted: true, brokerProtocolVersion: 1, hostId: "host-1", replacement: true } }
+    const reply = { data: { accepted: true, brokerProtocolVersion: 2, hostId: "host-1", replacement: true } }
     const decoded = await decode(HostHelloReply, reply)
     expect(decoded).toEqual(reply)
   })

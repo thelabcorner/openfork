@@ -23,20 +23,17 @@ import {
   type JSX,
   type Ref,
 } from "solid-js"
-import { useParams } from "@solidjs/router"
 import { useLanguage } from "@/context/language"
-import { usePrompt, type ImageAttachmentPart, type TextPart } from "@/context/prompt"
 import { usePlatform } from "@/context/platform"
-import { useSDK } from "@/context/sdk"
 import { useServerSync } from "@/context/server-sync"
-import { useSync } from "@/context/sync"
-import { useLocal } from "@/context/local"
+import type { ImageAttachmentPart, TextPart } from "@/context/prompt"
 import { sendFollowupDraft, type FollowupDraft } from "@/components/prompt-input/submit"
 import { createBlobReference } from "@/utils/draft-store"
 import { uuid } from "@/utils/uuid"
 import { showToast } from "@/utils/toast"
 import { browserHostClient, type BrowserAnnotationResult } from "./browserHostClient"
 import { buildBrowserAnnotationPrompt } from "./browserAnnotationPrompt"
+import { BrowserChromeMenu } from "./BrowserChromeMenu"
 import { browserSurfaceStore } from "./browserSurfaceStore"
 import {
   resolveBrowserDeviceViewportArea,
@@ -97,13 +94,9 @@ export function HostedBrowserWebview(props: {
   onNewTab: () => void
 }) {
   const language = useLanguage()
-  const prompt = usePrompt()
   const platform = usePlatform()
-  const params = useParams<{ id?: string }>()
-  const sdk = useSDK()
   const serverSync = useServerSync()
-  const sync = useSync()
-  const local = useLocal()
+  const canAnnotate = () => !!browserHostClient.annotationTarget()
   const [webviewEl, setWebviewEl] = createSignal<WebviewElement>()
   const [annotating, setAnnotating] = createSignal(false)
   const [preloadPath, setPreloadPath] = createSignal("")
@@ -122,8 +115,10 @@ export function HostedBrowserWebview(props: {
   let stageRef: HTMLDivElement | undefined
   let raf = 0
   let registeredWebview: { webContentsId: number; generation: number } | undefined
+  let loadingStuckTimer = 0
 
   const guest = createMemo(() => browserHostClient.guest(props.tabId))
+  const [loadingOverride, setLoadingOverride] = createSignal(false)
   const hostState = browserHostClient.state
   const surface = createMemo(() => browserSurfaceStore.get(props.tabId))
   /** Authoritative viewport — persisted, read by every consumer except the
@@ -175,8 +170,15 @@ export function HostedBrowserWebview(props: {
     setWebviewEl(el)
     el.addEventListener("did-start-loading", () => {
       setCrashed(false)
+      setLoadingOverride(false)
+      clearTimeout(loadingStuckTimer)
+      loadingStuckTimer = window.setTimeout(() => {
+        setLoadingOverride(true)
+      }, 5_000)
     })
     el.addEventListener("did-stop-loading", () => {
+      clearTimeout(loadingStuckTimer)
+      setLoadingOverride(false)
       setCanGoBack(el.canGoBack())
       setCanGoForward(el.canGoForward())
       setDraftUrl(el.getURL())
@@ -229,6 +231,7 @@ export function HostedBrowserWebview(props: {
   })
 
   onCleanup(() => {
+    clearTimeout(loadingStuckTimer)
     if (raf) cancelAnimationFrame(raf)
     if (registeredWebview) {
       void browserHostClient.unregisterWebview(
@@ -486,8 +489,10 @@ export function HostedBrowserWebview(props: {
   }
 
   function attachAnnotation(parts: Array<TextPart | ImageAttachmentPart>) {
-    const target = prompt.capture()
-    target.set([...target.current(), ...parts], target.cursor())
+    const target = browserHostClient.annotationTarget()
+    if (!target) return
+    const capture = target.capture()
+    capture.set([...capture.current(), ...parts], capture.cursor())
   }
 
   /** True send (not just attach-to-draft): builds a minimal FollowupDraft and
@@ -501,25 +506,24 @@ export function HostedBrowserWebview(props: {
    * session or no model/agent selected, rather than silently dropping the
    * annotation. */
   async function sendAnnotation(parts: Array<TextPart | ImageAttachmentPart>) {
-    const sessionID = params.id
-    const currentModel = local.model.current()
-    const currentAgent = local.agent.current()
-    if (!sessionID || !currentModel || !currentAgent) {
+    const target = browserHostClient.annotationTarget()
+    if (!target) return
+    if (!target.agent || !target.model.providerID) {
       attachAnnotation(parts)
       showToast({ title: language.t("browser.annotate.toast.attached.title") })
       return
     }
     const draft: FollowupDraft = {
-      sessionID,
-      sessionDirectory: sdk().directory,
+      sessionID: target.sessionID,
+      sessionDirectory: target.directory,
       prompt: parts,
       context: [],
-      agent: currentAgent.name,
-      model: { providerID: currentModel.provider.id, modelID: currentModel.id },
-      variant: local.model.variant.current() ?? undefined,
+      agent: target.agent,
+      model: { providerID: target.model.providerID, modelID: target.model.modelID },
+      variant: target.model.variant ?? undefined,
     }
     try {
-      await sendFollowupDraft({ api: sdk().api.session, serverSync: serverSync(), sync: sync(), draft })
+      await sendFollowupDraft({ api: target.api, serverSync: serverSync(), sync: target.sync, draft })
     } catch {
       // sendFollowupDraft already toasts its own failure; nothing further to
       // do here — the structured content was never silently discarded since
@@ -531,6 +535,10 @@ export function HostedBrowserWebview(props: {
     if (annotating()) {
       setAnnotating(false)
       void browserHostClient.cancelAnnotation(props.tabId)
+      return
+    }
+    if (!canAnnotate()) {
+      showToast({ title: language.t("browser.annotate.toast.unavailable") })
       return
     }
     setAnnotating(true)
@@ -557,7 +565,9 @@ export function HostedBrowserWebview(props: {
   }
 
   const reloadPage = () => {
-    webviewEl()?.reload()
+    // Host-level reload (D8a): the engine owns the webview reload so the broker
+    // stays authoritative; falls back to the DOM call when the host is gone.
+    void browserHostClient.refreshTab(guest().tabId)
   }
 
   const stopLoading = () => {
@@ -572,7 +582,7 @@ export function HostedBrowserWebview(props: {
     webviewEl()?.goForward()
   }
 
-  const loading = () => guest().loading
+  const loading = () => guest().loading && !loadingOverride()
   const controller = () => guest().controller
   const url = () => guest().url
   const title = () => guest().title
@@ -654,15 +664,17 @@ export function HostedBrowserWebview(props: {
           />
         </form>
 
-        <IconButton
-          label={annotating() ? language.t("browser.nav.cancelAnnotate") : language.t("browser.nav.annotate")}
-          onClick={() => void toggleAnnotate()}
-          title={annotating() ? language.t("browser.nav.cancelAnnotate") : language.t("browser.nav.annotate")}
-          active={annotating()}
-          data-testid="browser-annotate"
-        >
-          <AnnotateIcon />
-        </IconButton>
+        <Show when={canAnnotate()}>
+          <IconButton
+            label={annotating() ? language.t("browser.nav.cancelAnnotate") : language.t("browser.nav.annotate")}
+            onClick={() => void toggleAnnotate()}
+            title={annotating() ? language.t("browser.nav.cancelAnnotate") : language.t("browser.nav.annotate")}
+            active={annotating()}
+            data-testid="browser-annotate"
+          >
+            <AnnotateIcon />
+          </IconButton>
+        </Show>
         <IconButton
           label={language.t("browser.nav.newTab")}
           onClick={props.onNewTab}
@@ -679,6 +691,7 @@ export function HostedBrowserWebview(props: {
         >
           <NavIcon d="M5 5L11 11M11 5L5 11" />
         </IconButton>
+        <BrowserChromeMenu tabId={props.tabId} />
       </div>
 
       {/* ── device/viewport toolbar: part of the chrome flow (not an overlay),

@@ -8,6 +8,7 @@ import {
   type Appearance,
   type Controller,
   type GuestTabState,
+  type HostOwner,
   type HumanInputSignal,
   isHumanInputSignal,
   toWireGuestTabState,
@@ -58,10 +59,18 @@ export class GuestRegistry {
   private readonly wired = new WeakSet<WebContents>()
   private appearance: Appearance = "system"
   private recording: { active: boolean; recordingId?: string } = { active: false }
+  /** Explicitly activated tab. Falls back to the first tab so a tab is always
+   * active while any exist (and Map ORDER stays insertion order — activation
+   * must not reorder the strip the way the session tabs UI keeps positions). */
+  private activeTabId: string | null = null
 
   constructor(private readonly options: GuestRegistryOptions) {}
 
   get activeTab(): GuestRecord | undefined {
+    if (this.activeTabId !== null) {
+      const tracked = this.tabs.get(this.activeTabId)
+      if (tracked) return tracked
+    }
     return this.tabs.values().next().value
   }
 
@@ -80,22 +89,19 @@ export class GuestRegistry {
   activate(runtimeTabId: string): GuestRecord | undefined {
     const record = this.tabs.get(runtimeTabId)
     if (!record) return undefined
-    const rest = [...this.tabs.entries()].filter(([tabId]) => tabId !== runtimeTabId)
-    this.tabs.clear()
-    this.tabs.set(runtimeTabId, record)
-    rest.forEach(([tabId, existing]) => this.tabs.set(tabId, existing))
+    this.activeTabId = runtimeTabId
     return record
   }
 
   /** Map an engine record to the wire tab state broadcast to the renderer. */
   tabState(record: GuestRecord): WireGuestTabState {
-    return toWireGuestTabState(record)
+    return toWireGuestTabState(record, record === this.activeTab)
   }
 
   /** Push the current wire state for a tab to the onStateChange consumer. */
   sync(runtimeTabId: string): void {
     const record = this.tabs.get(runtimeTabId)
-    if (record) this.options.onStateChange(toWireGuestTabState(record))
+    if (record) this.options.onStateChange(this.tabState(record))
   }
 
   /** Resolve a tab for an operation; undefined when unknown or crashed. */
@@ -129,7 +135,7 @@ export class GuestRegistry {
       (({
         runtimeTabId,
         windowId: this.options.windowId,
-        sessionId: "",
+        owner: { kind: "user" },
         webContentsId: null,
         url: "",
         title: "",
@@ -143,6 +149,7 @@ export class GuestRegistry {
         generation,
         crashed: false,
         attached: false,
+        muted: false,
         snapshotVersion: 0,
       } satisfies GuestTabState) as GuestRecord)
     record.webContents = wc
@@ -154,6 +161,7 @@ export class GuestRegistry {
     record.loading = wc.isLoading()
     if (!this.tabs.has(runtimeTabId)) {
       this.tabs.set(runtimeTabId, record)
+      if (this.activeTabId === null) this.activeTabId = runtimeTabId
       this.touchPartition(BROWSER_PARTITION)
     }
     if (!this.wired.has(wc)) {
@@ -173,6 +181,7 @@ export class GuestRegistry {
     this.options.arbiter.reset(runtimeTabId)
     this.snapshotRefs.delete(runtimeTabId)
     this.tabs.delete(runtimeTabId)
+    if (this.activeTabId === runtimeTabId) this.activeTabId = this.tabs.keys().next().value ?? null
     this.releasePartition(BROWSER_PARTITION)
   }
 
@@ -191,6 +200,21 @@ export class GuestRegistry {
     this.sync(runtimeTabId)
   }
 
+  /** Flip a tab's owner (claim, assign, orphan) and push the wire state out. */
+  setOwner(runtimeTabId: string, owner: HostOwner): void {
+    const record = this.tabs.get(runtimeTabId)
+    if (!record) return
+    record.owner = owner
+    this.sync(runtimeTabId)
+  }
+
+  setMuted(runtimeTabId: string, muted: boolean): void {
+    const record = this.tabs.get(runtimeTabId)
+    if (!record) return
+    record.muted = muted
+    this.sync(runtimeTabId)
+  }
+
   controller(runtimeTabId: string): Controller {
     return this.options.arbiter.controller(runtimeTabId)
   }
@@ -198,7 +222,7 @@ export class GuestRegistry {
   setAppearance(next: Appearance): void {
     this.appearance = next
     for (const record of this.tabs.values()) record.colorScheme = this.resolveColorScheme()
-    this.options.onStateChange(this.activeTab ? toWireGuestTabState(this.activeTab) : null)
+    this.options.onStateChange(this.activeTab ? this.tabState(this.activeTab) : null)
   }
 
   getAppearance(): Appearance {
@@ -207,7 +231,7 @@ export class GuestRegistry {
 
   setRecording(next: { active: boolean; recordingId?: string }): void {
     this.recording = next
-    this.options.onStateChange(this.activeTab ? toWireGuestTabState(this.activeTab) : null)
+    this.options.onStateChange(this.activeTab ? this.tabState(this.activeTab) : null)
   }
 
   getRecording(): { active: boolean; recordingId?: string } {
@@ -323,6 +347,11 @@ export class GuestRegistry {
         validatedURL,
         isMainFrame,
       })
+      if (isMainFrame) {
+        record.loading = false
+        record.readyState = "complete"
+        this.sync(runtimeTabId)
+      }
     })
     wc.on("destroyed", () => {
       if (!current()) return

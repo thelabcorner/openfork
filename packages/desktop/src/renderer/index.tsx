@@ -17,7 +17,6 @@ import {
 } from "@opencode-ai/app"
 import type { UpdaterState } from "@opencode-ai/app/updater"
 import * as Sentry from "@sentry/solid"
-import type { AsyncStorage } from "@solid-primitives/storage"
 import { createMemoryHistory, MemoryRouter, type BaseRouterProps } from "@solidjs/router"
 import { createEffect, createMemo, createResource, createSignal, onCleanup, Show } from "solid-js"
 import { render } from "solid-js/web"
@@ -28,9 +27,20 @@ import { DesktopFirstLaunchOnboarding } from "./onboarding"
 import { resetZoom, setPinchZoomEnabled, webviewZoom, zoomIn, zoomOut } from "./webview-zoom"
 import { windowFullscreen } from "./window-fullscreen"
 import { availableStartupServer, readyWslConnections } from "./wsl/connections"
+import { createDesktopStorage } from "./storage"
 import "./styles.css"
 import { Splash } from "@opencode-ai/ui/logo"
 import { useTheme } from "@opencode-ai/ui/theme/context"
+
+window.addEventListener(
+  "error",
+  (event) => {
+    if (event.message === "ResizeObserver loop completed with undelivered notifications.") {
+      event.preventDefault()
+    }
+  },
+  true,
+)
 
 const root = document.getElementById("root")
 if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
@@ -136,32 +146,7 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
     return window.api.runDesktopMenuAction(action)
   }
 
-  const storage = (() => {
-    const cache = new Map<string, AsyncStorage>()
-
-    const createStorage = (name: string) => {
-      const api: AsyncStorage = {
-        getItem: (key: string) => window.api.storeGet(name, key),
-        setItem: (key: string, value: string) => window.api.storeSet(name, key, value),
-        removeItem: (key: string) => window.api.storeDelete(name, key),
-        clear: () => window.api.storeClear(name),
-        key: async (index: number) => (await window.api.storeKeys(name))[index],
-        getLength: () => window.api.storeLength(name),
-        get length() {
-          return api.getLength()
-        },
-      }
-      return api
-    }
-
-    return (name = "default.dat") => {
-      const cached = cache.get(name)
-      if (cached) return cached
-      const api = createStorage(name)
-      cache.set(name, api)
-      return api
-    }
-  })()
+  const storage = createDesktopStorage(window.api)
 
   const wslServersApi = os === "windows" ? window.api.wslServers : undefined
 
@@ -245,6 +230,10 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
     setForceFocus: (enabled) => window.api.setForceFocus(enabled),
 
     recordFatalRendererError: (error) => window.api.recordFatalRendererError(error),
+
+    refresh: async () => {
+      await window.api.runDesktopMenuAction("view.reload")
+    },
 
     restart: async () => {
       await window.api.killSidecar().catch(() => undefined)
