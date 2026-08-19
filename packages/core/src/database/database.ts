@@ -2,7 +2,7 @@ export * as Database from "./database"
 
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "#sqlite"
-import { Context, Effect, Layer } from "effect"
+import { Context, Duration, Effect, Layer, Schedule } from "effect"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
 import { isAbsolute, join } from "path"
@@ -34,6 +34,17 @@ const layer = (filename: string) =>
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
       yield* DatabaseMigration.apply(db)
+
+      // Periodically checkpoint the WAL so it doesn't grow unbounded during
+      // long runs. TRUNCATE actually truncates the WAL file (PASSIVE only
+      // checkpoints what it can without blocking). Runs on the shared
+      // connection, so it is serialized with live queries; a bounded WAL keeps
+      // startup replay cheap. Failures are swallowed so the loop keeps going.
+      yield* Effect.forkScoped(
+        db
+          .run("PRAGMA wal_checkpoint(TRUNCATE)")
+          .pipe(Effect.ignore, Effect.repeat(Schedule.spaced(Duration.minutes(5)))),
+      )
 
       return { db, filename }
     }).pipe(Effect.orDie),

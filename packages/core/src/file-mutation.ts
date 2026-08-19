@@ -27,6 +27,16 @@ export interface ConditionalWriteInput extends WriteInput {
 
 export interface RemoveInput {
   readonly target: Target
+  readonly recursive?: boolean
+}
+
+export interface RenameInput {
+  readonly from: Target
+  readonly to: Target
+}
+
+export interface MkdirInput {
+  readonly target: Target
 }
 
 export class StaleContentError extends Schema.TaggedErrorClass<StaleContentError>()("FileMutation.StaleContentError", {
@@ -51,6 +61,20 @@ export interface RemoveResult {
   readonly existed: boolean
 }
 
+export interface RenameResult {
+  readonly operation: "rename"
+  readonly from: string
+  readonly to: string
+  readonly fromResource: string
+  readonly toResource: string
+}
+
+export interface MkdirResult {
+  readonly operation: "mkdir"
+  readonly target: string
+  readonly resource: string
+}
+
 export interface Interface {
   /** Create without replacing an existing target. */
   readonly create: (input: WriteInput) => Effect.Effect<WriteResult, TargetExistsError | FSUtil.Error>
@@ -62,6 +86,8 @@ export interface Interface {
     input: ConditionalWriteInput,
   ) => Effect.Effect<WriteResult, StaleContentError | FSUtil.Error>
   readonly remove: (input: RemoveInput) => Effect.Effect<RemoveResult, FSUtil.Error>
+  readonly rename: (input: RenameInput) => Effect.Effect<RenameResult, TargetExistsError | FSUtil.Error>
+  readonly mkdir: (input: MkdirInput) => Effect.Effect<MkdirResult, TargetExistsError | FSUtil.Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/FileMutation") {}
@@ -80,6 +106,14 @@ const layer = Layer.effect(
       (target: Target) =>
       <A, E, R>(effect: Effect.Effect<A, E, R>) =>
         locks.withLock(target.canonical)(Effect.uninterruptible(effect))
+    const withTargetLocks =
+      (targets: readonly Target[]) =>
+      <A, E, R>(effect: Effect.Effect<A, E, R>) =>
+        targets
+          .map((target) => target.canonical)
+          .filter((target, index, list) => list.indexOf(target) === index)
+          .toSorted()
+          .reduceRight((current, target) => locks.withLock(target)(current), Effect.uninterruptible(effect))
 
     const writeResult = (target: Target, existed: boolean): WriteResult => ({
       operation: "write",
@@ -93,6 +127,20 @@ const layer = Layer.effect(
       target: target.canonical,
       resource: target.resource,
       existed,
+    })
+
+    const renameResult = (input: RenameInput): RenameResult => ({
+      operation: "rename",
+      from: input.from.canonical,
+      to: input.to.canonical,
+      fromResource: input.from.resource,
+      toResource: input.to.resource,
+    })
+
+    const mkdirResult = (target: Target): MkdirResult => ({
+      operation: "mkdir",
+      target: target.canonical,
+      resource: target.resource,
     })
 
     const write = Effect.fn("FileMutation.write")((input: WriteInput) =>
@@ -159,7 +207,7 @@ const layer = Layer.effect(
     const remove = Effect.fn("FileMutation.remove")((input: RemoveInput) =>
       withTargetLock(input.target)(
         Effect.gen(function* () {
-          const existed = yield* fs.remove(input.target.canonical).pipe(
+          const existed = yield* fs.remove(input.target.canonical, { recursive: input.recursive }).pipe(
             Effect.as(true),
             Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(false)),
           )
@@ -168,7 +216,32 @@ const layer = Layer.effect(
       ),
     )
 
-    return Service.of({ create, write, writeTextPreservingBom, writeIfUnchanged, remove })
+    const rename = Effect.fn("FileMutation.rename")((input: RenameInput) =>
+      withTargetLocks([input.from, input.to])(
+        Effect.gen(function* () {
+          if (yield* fs.exists(input.to.canonical)) {
+            return yield* new TargetExistsError({ path: input.to.canonical })
+          }
+          yield* fs.ensureDir(dirname(input.to.canonical))
+          yield* fs.rename(input.from.canonical, input.to.canonical)
+          return renameResult(input)
+        }),
+      ),
+    )
+
+    const mkdir = Effect.fn("FileMutation.mkdir")((input: MkdirInput) =>
+      withTargetLock(input.target)(
+        Effect.gen(function* () {
+          if (yield* fs.exists(input.target.canonical)) {
+            return yield* new TargetExistsError({ path: input.target.canonical })
+          }
+          yield* fs.makeDirectory(input.target.canonical, { recursive: true })
+          return mkdirResult(input.target)
+        }),
+      ),
+    )
+
+    return Service.of({ create, write, writeTextPreservingBom, writeIfUnchanged, remove, rename, mkdir })
   }),
 )
 

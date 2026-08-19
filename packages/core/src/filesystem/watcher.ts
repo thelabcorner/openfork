@@ -84,11 +84,25 @@ const layer = Layer.effect(
     )
 
     const callback: ParcelWatcher.SubscribeCallback = (_error, updates) => {
-      for (const update of updates) {
-        if (update.type === "create") runFork(events.publish(Event.Updated, { file: update.path, event: "add" }))
-        if (update.type === "update") runFork(events.publish(Event.Updated, { file: update.path, event: "change" }))
-        if (update.type === "delete") runFork(events.publish(Event.Updated, { file: update.path, event: "unlink" }))
-      }
+      if (updates.length === 0) return
+      // Parcel already batches native notifications. Publish the batch from a
+      // single fiber instead of scheduling one fiber per changed path.
+      runFork(
+        Effect.forEach(
+          updates,
+          (update) =>
+            events.publish(Event.Updated, {
+              file: update.path,
+              event:
+                update.type === "create"
+                  ? "add"
+                  : update.type === "update"
+                    ? "change"
+                    : "unlink",
+            }),
+          { discard: true },
+        ),
+      )
     }
 
     const subscribe = (directory: string, ignore: string[]) => {
@@ -106,16 +120,23 @@ const layer = Layer.effect(
     const config = (yield* (yield* Config.Service).entries())
       .filter((entry): entry is Config.Document => entry.type === "document")
       .flatMap((item) => item.info.watcher?.ignore ?? [])
-    if (location.vcs && (yield* Flag.OPENCODE_EXPERIMENTAL_FILEWATCHER)) {
+    const configIgnore = new Set(config)
+    // Watch any project root, git or not (operator decision: the old `location.vcs &&` guard
+    // from f95f877e5f deliberately skipped non-git roots; do not re-add it). Ignore patterns
+    // (Ignore.PATTERNS + config `watcher.ignore` + protected paths) bound event volume.
+    if (yield* Flag.OPENCODE_EXPERIMENTAL_FILEWATCHER) {
       yield* Effect.forkScoped(
-        subscribe(location.directory, [...Ignore.PATTERNS, ...config, ...protecteds(location.directory)]),
+        subscribe(
+          location.directory,
+          [...new Set([...Ignore.PATTERNS, ...configIgnore, ...protecteds(location.directory)])],
+        ),
       )
     }
 
     if (location.vcs?.type === "git") {
       const resolved = (yield* git.repo.discover(location.directory))?.gitDirectory
       const vcs = resolved ? yield* fs.realPath(resolved).pipe(Effect.catch(() => Effect.succeed(resolved))) : undefined
-      if (vcs && !config.includes(".git") && !config.includes(vcs) && (!resolved || !config.includes(resolved))) {
+      if (vcs && !configIgnore.has(".git") && !configIgnore.has(vcs) && (!resolved || !configIgnore.has(resolved))) {
         const ignore = (yield* fs.readDirectoryEntries(vcs).pipe(Effect.catch(() => Effect.succeed([])))).flatMap(
           (entry) => (entry.name === "HEAD" ? [] : [entry.name]),
         )

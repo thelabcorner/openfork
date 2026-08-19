@@ -43,5 +43,6 @@ export const migrations = (
     import("./migration/20260812000000_session_search_fts"),
     import("./migration/20260812000001_session_search_v1_fts"),
     import("./migration/20260814000116_public_trish_tilby"),
+    import("./migration/20260816000000_add_session_groups"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

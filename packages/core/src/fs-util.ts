@@ -129,15 +129,16 @@ export namespace FSUtil {
         content: string | Uint8Array,
         mode?: number,
       ) {
-        const write = typeof content === "string" ? fs.writeFileString(path, content) : fs.writeFile(path, content)
+        const write = () => (typeof content === "string" ? fs.writeFileString(path, content) : fs.writeFile(path, content))
 
-        yield* write.pipe(
+        yield* write().pipe(
           Effect.catchIf(
-            (e) => e.reason._tag === "NotFound",
+            // Bun on Windows can surface a missing parent as Unknown.
+            (e) => e.reason._tag === "NotFound" || e.reason._tag === "Unknown",
             () =>
               Effect.gen(function* () {
                 yield* fs.makeDirectory(dirname(path), { recursive: true })
-                yield* write
+                yield* write()
               }),
           ),
         )

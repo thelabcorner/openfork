@@ -151,6 +151,51 @@ describe("FileMutation", () => {
     ),
   )
 
+  it.live("renames an internal file without replacing an existing target", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        yield* Effect.promise(() => fs.writeFile(path.join(directory, "before.txt"), "content"))
+        yield* Effect.promise(() => fs.writeFile(path.join(directory, "exists.txt"), "winner"))
+        const mutation = yield* LocationMutation.Service
+        const files = yield* FileMutation.Service
+        const from = yield* mutation.resolve({ path: "before.txt" })
+        const to = yield* mutation.resolve({ path: "nested/after.txt" })
+
+        expect(yield* files.rename({ from, to })).toEqual({
+          operation: "rename",
+          from: from.canonical,
+          to: to.canonical,
+          fromResource: "before.txt",
+          toResource: "nested/after.txt",
+        })
+        expect(yield* Effect.promise(() => fs.readFile(path.join(directory, "nested", "after.txt"), "utf8"))).toBe(
+          "content",
+        )
+
+        const existing = yield* mutation.resolve({ path: "exists.txt" })
+        expect(yield* files.rename({ from: to, to: existing }).pipe(Effect.flip)).toMatchObject({
+          _tag: "FileMutation.TargetExistsError",
+          path: existing.canonical,
+        })
+      }).pipe(provide(directory)),
+    ),
+  )
+
+  it.live("creates an internal directory", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const target = yield* (yield* LocationMutation.Service).resolve({ path: "nested/created", kind: "directory" })
+
+        expect(yield* (yield* FileMutation.Service).mkdir({ target })).toEqual({
+          operation: "mkdir",
+          target: target.canonical,
+          resource: "nested/created",
+        })
+        expect((yield* Effect.promise(() => fs.stat(path.join(directory, "nested", "created")))).isDirectory()).toBe(true)
+      }).pipe(provide(directory)),
+    ),
+  )
+
   it.live("writes an explicitly resolved external target", () =>
     withTmp((directory) =>
       withTmp((outside) =>
