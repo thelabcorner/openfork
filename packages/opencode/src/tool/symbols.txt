@@ -1,0 +1,18 @@
+Code intelligence for TS/TSX/JS: find definitions, outline a file, and find
+usages (JetBrains Find Symbol + Find Usages). Use when you need to know where
+a symbol is DECLARED (search), what a file contains (outline), or everywhere a
+symbol is REFERENCED including cross-file imports (usages).
+
+Actions:
+  search  — find definitions of a name, ranked exact > prefix > substring >
+            fuzzy; optional kind=/path=/lang= filters; one-line results.
+  outline — all symbols in one file, grouped by kind (classes show members).
+  usages  — all references to a symbol (by name, or by file+line). Defs first,
+            grouped by file with counts; references in files that import the
+            symbol are attributed; same-name-different-binding files land in
+            an honest 'unattributed' bucket — never pretended usages.
+
+Tree-sitter based (comments/strings excluded); grep-anchored candidate search
+keeps it fast on large repos. For plain-text search across files use grep; for
+whole-file reading use read; prefer usages over grepping a name when you need
+references rather than raw matches.

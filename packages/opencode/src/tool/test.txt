@@ -1,0 +1,16 @@
+Engine-aware test runner: run or enumerate the repo's tests with the right
+harness and a parseable reporter. Use when the agent needs to run tests, check
+whether a change broke something, or discover what tests exist.
+
+Actions:
+  run  (default) — run tests; reports 'N passed / N failed / N skipped (dur)',
+        a capped failing list (file:line — name — first assertion line), a
+        bounded output tail, and a full-output file path.
+  list — enumerate test files (and names when the harness supports it
+        cheaply). Never executes tests.
+
+Harnesses: bun test, vitest, jest, node:test (first-class); mocha, ava,
+playwright (best-effort). runtime=auto|bun|node; path and testNamePattern
+filters mapped per harness. Runs in a child process with a hard timeout
+(default 120s) and kills on expiry. Every run is gated by a dedicated 'test'
+permission whose rule pattern is the exact resolved command.

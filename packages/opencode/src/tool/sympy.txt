@@ -1,0 +1,24 @@
+Symbolic math calculator backed by Python + SymPy. Gives the agent algebra,
+calculus, linear-algebra, and number-theory answers without shelling out to a
+raw python REPL.
+
+Two input surfaces:
+- Structured (safe, no code injection): `expr` (a sympy expression string, e.g.
+  `sqrt(8)`, `sin(pi/4)`, `x**2 - 4`) + optional `operation` enum
+  (simplify|expand|factor|solve|diff|integrate|limit|series|evalf|nroots|...).
+  The tool constructs the sympy call. Optional `symbols` ("x y") — auto-detected
+  from the expression when omitted. `variable`/`point`/`direction`/`order`/
+  `precision` refine the operation.
+- Advanced (arbitrary sympy statements): `code` — `from sympy import *` is
+  preloaded and any `symbols` are declared; the last expression's value is
+  captured and returned.
+
+Timeouts: a HARD timeout kills the python child (sympy integrate/expand can
+hang). Availability: if python or sympy is missing, the tool says exactly how
+to install it instead of failing cryptically.
+
+Safety: executes Python — gated behind the `sympy` permission. Compute-only;
+no file IO.
+
+Result format: compact sympy str() (not pretty math). The effective sympy call,
+elapsed ms, and clean error prose (first error line + suggestion) are included.

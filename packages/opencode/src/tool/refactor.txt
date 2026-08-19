@@ -1,0 +1,28 @@
+Semantic, symbol-aware, multi-file TypeScript refactoring using the TypeScript
+Language Service. Never a textual grep-replace engine (rail R3).
+
+Modes:
+  resolveSymbol          — quick info + rename info + references count at filePath:line:column
+  findReferences         — semantic references grouped by file
+  renameSymbol           — TS findRenameLocations across the project (strings/comments opt-in)
+  organizeImports        — TS organizeImports per file in scope
+  updateImportSource     — AST-only rewrite of import/export module specifiers + dynamic import()
+  moveFileUpdateImports  — move a file, rewrite its relative imports, rewrite importers
+  preview                — re-render a saved plan by previewId
+
+PLAN-FIRST SAFETY (dry-run by default):
+- Every write-capable mode first produces a plan (previewId) and saves it to
+  .opencode/cache/refactor-preview/<id>.json (TTL 6h). No files change.
+- Applying requires the saved plan id + confirm:"REFACTOR"; args alone are
+  never enough to write.
+- Before applying, every touched file is re-fingerprinted — if any changed
+  since preview, apply is rejected (stale) and a fresh dry-run is required.
+- All touched files are backed up in memory; any exception during apply
+  restores them. If diagnostics increase after apply (and rollbackOnFailure),
+  the change is rolled back and reported as status="rolled-back".
+- Path safety: worktree-bound; refuses .git/node_modules/dist/build/coverage/
+  .next and generated patterns unless allowGenerated; never writes .d.ts;
+  never targets the repo root.
+
+Permission model: read-only modes ask permission:"read" on the target files;
+apply asks permission:"edit" once per touched file (diff in metadata).

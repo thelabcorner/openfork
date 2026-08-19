@@ -1,0 +1,65 @@
+Use `patch` for BULK, coordinated, multi-file changes in ONE call: creating files, deleting files, renaming files, or editing several files at once. It understands BOTH the opencode patch format and git-style unified diffs, and validates everything before writing.
+
+When to use what:
+- Single targeted change to one file -> use `edit` (cheaper, line-anchored).
+- Writing a brand-new file whole -> use `write`.
+- Several coordinated changes across files (a refactor, a rename, adding/deleting multiple files) -> use `patch`. Prefer this over a read+edit loop for bulk work: one call, one permission prompt, one summary.
+
+DRY-RUN BY DEFAULT. Calling `patch` with just `patchText` VALIDATES the patch and returns a compact per-file plan WITHOUT writing anything: op + path + +/- line counts + a clean/conflict verdict per file. Review the plan, fix any conflicted hunks, then re-run with `apply: true` to commit. Mistakes are cheap; retries are deterministic; nothing is written until you say apply.
+
+TWO SUPPORTED FORMATS (auto-detected; pass `format` to force):
+
+1) Opencode format — token-efficient, only changed lines:
+
+*** Begin Patch
+*** Add File: src/config.ts
++export const port = 8080
+*** Update File: src/server.ts
+@@
+-const port = 3000
++const port = config.port
+*** Move to: src/app.ts
+@@
+-startServer()
++startApp()
+*** Delete File: obsolete.txt
+*** End Patch
+
+   Rules: `*** Begin Patch` ... `*** End Patch` envelope; each operation starts with
+   `*** Add File: <path>` (every content line prefixed with `+`), `*** Update File: <path>`
+   (optional `*** Move to: <path>` immediately after the header renames the file; `@@`
+   hunks below with `-` removed lines, `+` added lines, ` ` context lines), or
+   `*** Delete File: <path>` (nothing follows).
+
+2) Git-style unified diff — paste `git diff` output directly:
+
+diff --git a/src/server.ts b/src/server.ts
+--- a/src/server.ts
++++ b/src/server.ts
+@@ -1,2 +1,2 @@
+-const port = 3000
++const port = config.port
+diff --git a/new.txt b/new.txt
+new file mode 100644
+--- /dev/null
++++ b/new.txt
+@@ -0,0 +1,1 @@
++hello
+
+   New files (--- /dev/null), deletions (+++ /dev/null), and renames
+   (--- a/old, +++ b/new) are translated automatically.
+
+OUTPUT SEMANTICS:
+- Dry-run plan lines: `A path (+N/-0)` add, `M path (+N/-M)` modify, `R old -> new` rename,
+  `D path (+0/-N)` delete, each followed by `clean` or `CONFLICT: <reason>`.
+- Conflicts name the file and why (e.g. expected lines not found) so you can fix the exact hunk.
+- Pass `showDiff: true` to include the full diffs in the plan.
+- On apply, the output is the same lean A/M/D/R summary plus any LSP diagnostics per file.
+
+ERROR HANDLING & RECOVERY:
+- "patch rejected: empty patch" — you sent the envelope with no operations. Add Add/Update/Delete sections.
+- "Invalid patch: ..." — could not parse. The error shows the expected format, a one-file example, and the first 80 chars received. Re-read the format example and resubmit; do NOT blind-retry the same text.
+- "patch verification failed for N file(s): <file>: ..." (apply only) — some hunks did not match the current file contents. NOTHING was applied. Re-read the affected files and regenerate those hunks from the current content.
+- "no changes to apply" — every hunk matched but produced no diff (the change is already present). Nothing was written.
+
+Path resolution is relative to the project directory; paths that escape the worktree require explicit user approval. All hunks are validated BEFORE any file is written — a bad hunk means nothing is applied, never a partial write.

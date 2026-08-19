@@ -1,0 +1,16 @@
+Premium JSON manipulation and analysis tool for agents.
+
+Use scaffold first when you need to understand a JSON file's structure without reading the whole thing.
+
+Writes are dry-run by default: format/patch only preview the result. Re-run with dryRun:false to apply the change; a write permission prompt will appear.
+
+Modes:
+  validate  — parse JSON and report syntax errors with line/column/excerpt
+  scaffold  — JSON layout tree with JSONPath, JSON Pointer, node counts, array shapes
+  query     — read one JSONPath like $.users[0].name
+  search    — search keys, values, or type
+  schema    — infer JSON Schema-like structure
+  format    — pretty/minify/sort keys; dry-run default
+  patch     — apply RFC6902-style patch ops; dry-run default
+  diff      — structural diff between file/jsonText and compareFilePath/compareJsonText
+  stats     — compact parse/scaffold metrics

@@ -1,0 +1,21 @@
+Git operations bound to the current worktree. Read-only by default; writes require
+an explicit in-tool confirm token in addition to the permission prompt.
+
+Modes:
+  help       — usage summary
+  status     — porcelain status (default)
+  summary    — short status + branch + recent commits
+  diff       — unified diff (staged:true for --cached), contextLines, paths filter
+  log        — recent commits (maxCount)
+  show       — show a ref/path (ref required)
+  stage      — stage paths (or all with confirm:"STAGE_ALL")
+  unstage    — unstage paths (or all with confirm:"UNSTAGE_ALL")
+  restore    — discard worktree changes to paths (confirm:"RESTORE_WORKTREE"/"RESTORE_BOTH"; all → "RESTORE_ALL")
+  commit     — commit staged changes (dry-run by default; confirm:"COMMIT" to apply)
+  shell      — restricted read-only git command fallback (allowlisted subcommands only)
+
+Safety:
+- All paths are resolved inside the worktree; absolute/escaping/`-`-leading paths are rejected.
+- Commands are argv arrays, never shell strings; GIT_TERMINAL_PROMPT=0, no pager, no optional locks.
+- Every write echoes a fresh `status` afterwards; commit echoes `git log -1`.
+- `-C`/`--git-dir`/`--work-tree` are blocked in shell mode.

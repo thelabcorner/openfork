@@ -1,0 +1,23 @@
+Fast scoped typechecking for TypeScript/TSX files. Reuses the repo's own compiler
+invocation (tsgo / tsc) against a temporary tsconfig whose `include` is narrowed
+to the target files, so scoped modes are fast and full runs are explicit.
+
+Modes (default: file|files|folder|changed — resolved from the params):
+  file       — typecheck one file (filePath)
+  files      — typecheck a list of files (files[])
+  folder     — typecheck every TS file under folder (skips node_modules/dist/build/.next/.turbo/coverage/.git/__pycache__)
+  changed    — typecheck files changed vs HEAD (staged + unstaged, optional untracked)
+  bottomUp   — seed files + their local-import dependency closure to `depth`
+  full       — run the repo's own `typecheck` script (slow; requires `reason`)
+  explain    — describe a single error code (TS<code>) with a suggestion
+
+Every call prompts with the `typecheck` permission (patterns ["*"], always ["*"])
+— read-only analysis; no writes happen.
+
+Output is XML-ish: <scope>, <tsconfig>, <summary>, per-diagnostic triage
+(file/line/column/code/severity/category/suggestion), <clusters> grouped by
+error class ordered P0→P3, and <next> guidance. Scoped modes never fall back to
+a full-project compile (rail R7).
+
+Set `reason` for `full` mode — it is slow (runs the package's own typecheck
+script) and requires an explicit justification.

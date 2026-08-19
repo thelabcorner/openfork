@@ -1,0 +1,26 @@
+Codebase orientation snapshot — a token-lean map of what a project is and where
+things live. Use BEFORE reading code: to identify stack/framework, entry points,
+scripts, CI, and rough stats for an unfamiliar repo (e.g. at session start, when
+landing in a new checkout, or when deciding which package to work in).
+
+Actions:
+  snapshot  (default) — tier-based project snapshot (below)
+  recent    — the N most recently modified files (newest first, grouped by
+            directory, relative timestamps) — what is being worked on here?
+  toolchain — installed runtimes + versions (bun/node/npm/pnpm/yarn/python/
+            go/rustc), PATH resolution, and key env vars — answers "what is
+            installed and available to run?"
+
+Snapshot tiers:
+  summary   (default) — stack, lockfile, monorepo flag, git/worktree state,
+            init summary (manifest/git/lockfile/deps/dev scripts), key scripts,
+            entry points, CI presence, stats one-liner (~40 lines)
+  structure — summary + .gitignore-aware bounded tree with directory sizes
+  full      — stack detail + annotated package.json scripts + tree + entry/
+            config/CI lists + detailed stats
+
+It NEVER reads source bodies: only manifests/config (capped), ripgrep file
+lists/line counts, and file sizes — so it is always cheap and safe. Prefer it
+over grep/glob/read when the question is "what kind of repo is this and what
+can I run in it?" For precise structure use glob; for content use grep; for
+files use read.

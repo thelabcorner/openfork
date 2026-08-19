@@ -1,0 +1,15 @@
+Read and modify SQLite databases in one step, without shelling out to the sqlite3 CLI.
+
+Actions:
+- "tables": List the tables and views in the database (no per-table row counts in v1).
+- "schema": Show the CREATE statement and column info for one table (schema {table}), or the whole database's DDL (schema without a table).
+- "query": Run a read-only SELECT and show psql-style aligned results. Rows are capped (default 200, max 5000; 50 KB rendered text) — use "export" to spill the full result to a file, or add LIMIT.
+- "run": Execute one write/DDL statement (INSERT/UPDATE/DELETE/CREATE/ALTER/DROP/...) inside a transaction. dryRun (default true) executes then rolls back; dryRun:false commits after an edit permission prompt. Reports changes/lastInsertRowid. Destructive statements (DROP, DELETE/UPDATE without WHERE, ALTER ... DROP) are flagged in the permission prompt.
+- "explain": Run EXPLAIN QUERY PLAN for a statement and show the id/parent/notused/detail plan — read the detail column.
+- "export": Run a query and write the full result to a CSV (default) or JSON file at outputPath (required). Refuses to overwrite unless overwrite:true. Caps: maxRows (default 1M), maxBytes (default 50 MB) — truncated:true when a cap is hit.
+
+Every call is stateless: pass the "db" file path (relative to the working directory or absolute) on each call. Optionally pass "attach" (array of paths, max 8) to open extra databases for cross-db queries — they are aliased attach0, attach1, ... (reference them as attachN.<table>; main stays main). Read actions open the connection read-only (query_only when attached) and require the file to exist; "run" may create a missing file (parents created).
+
+One statement per call: reject interior ';' — issue separate statements as separate calls. Values for '?' placeholders go in "params" (strings bind as TEXT; use X'...' literals for BLOB data). Non-SQLite files are refused on every action (run never clobbers).
+
+Prefer this tool over the sqlite3 CLI or bash when you need to inspect or modify a SQLite database: reads never write, writes are transactional with dry-run rollback by default, destructive statements are flagged in the permission prompt, and results come back as aligned tables instead of raw CLI text.
