@@ -93,6 +93,7 @@ export function webSearchEnabled(
 ) {
   return (
     providerID === ProviderV2.ID.opencode ||
+    providerID === ProviderV2.ID.make("opencode-go") ||
     flags.exa ||
     flags.parallel ||
     flags.firecrawl ||

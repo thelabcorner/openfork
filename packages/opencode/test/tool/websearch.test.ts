@@ -149,9 +149,10 @@ describe("websearch provider", () => {
     expect(selectWebSearchProvider(SESSION_ID, { searxng: true })).toBe("searxng")
   })
 
-  test("is only enabled for opencode or explicit websearch provider flags", () => {
+  test("is enabled for OpenCode providers or explicit websearch provider flags", () => {
     const none = { exa: false, parallel: false, firecrawl: false, duckduckgo: false, brave: false, tavily: false, searxng: false }
     expect(webSearchEnabled(ProviderV2.ID.opencode, none)).toBe(true)
+    expect(webSearchEnabled(ProviderV2.ID.make("opencode-go"), none)).toBe(true)
     expect(webSearchEnabled(ProviderV2.ID.openai, none)).toBe(false)
     expect(webSearchEnabled(ProviderV2.ID.openai, { ...none, exa: true })).toBe(true)
     expect(webSearchEnabled(ProviderV2.ID.openai, { ...none, parallel: true })).toBe(true)

@@ -12,7 +12,6 @@ import { SessionMessage } from "./message"
 import { SessionMessageUpdater } from "./message-updater"
 import { SessionInput } from "./input"
 import { WorkspaceV2 } from "../workspace"
-import { SessionContextEpoch } from "./context-epoch"
 import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
 import { SessionSearch } from "./search"
 import { searchText, partSearchText } from "./search-text"
@@ -264,7 +263,6 @@ const layer = Layer.effectDiscard(
           .where(eq(SessionTable.id, event.data.sessionID))
           .run()
           .pipe(Effect.orDie)
-        yield* SessionContextEpoch.reset(db, event.data.sessionID)
       }),
     )
     yield* events.project(SessionV1.Event.Deleted, (event) =>
@@ -471,7 +469,6 @@ const layer = Layer.effectDiscard(
           .where(eq(SessionTable.id, event.data.sessionID))
           .run()
           .pipe(Effect.orDie)
-        yield* SessionContextEpoch.reset(db, event.data.sessionID)
       }),
     )
   }),
