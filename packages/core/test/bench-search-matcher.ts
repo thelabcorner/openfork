@@ -371,11 +371,26 @@ async function main() {
   const symResultKey = (page: Matcher.QueryPage): string[] =>
     page.results.map((r) => (r.kind === "symbol" ? `${r.name}\u0000${r.path}` : r.path ?? ""))
 
+  // Name-level intent: the labeled PRIMARY (basename stem / symbol name)
+  // appearing among top-10 rows. Duplicate names across many paths are
+  // user-equivalent, so row-level rank on duplicated targets measures
+  // id-order luck, not ranking quality.
+  const primaryOf = (target: string): string => {
+    const [tPath, tName] = target.split("\u0000")
+    if (tName !== undefined) return tName.toLowerCase()
+    const p = tPath!
+    const core = p.endsWith("/") ? p.slice(0, -1) : p
+    return core.slice(core.lastIndexOf("/") + 1).toLowerCase().replace(/\.[a-z]+$/i, "")
+  }
+
+  let n1 = 0
+  let n10 = 0
+
   let r1 = 0
   let r5 = 0
   let r10 = 0
   let mrrSum = 0
-  const byForm = new Map<string, { hits: number; n: number; mrr: number }>()
+  const byForm = new Map<string, { hits: number; n: number; mrr: number; nameHits: number }>()
   for (const l of labeled) {
     const page = session.query(l.query, { limit: 30 })
     const results = symResultKey(page)
@@ -384,18 +399,29 @@ async function main() {
     if (rank <= 5) r5++
     if (rank <= 10) r10++
     mrrSum += rank === Infinity ? 0 : 1 / rank
-    const agg = byForm.get(l.form) ?? { hits: 0, n: 0, mrr: 0 }
+    const targetPrimary = primaryOf(l.target)
+    const topPrimaries = new Set(
+      page.results.slice(0, 10).map((r) =>
+        r.kind === "symbol" ? (r.name ?? "").toLowerCase() : basenameOf(r.path ?? "").replace(/\.[a-z]+$/i, ""),
+      ),
+    )
+    const nameHit = topPrimaries.has(targetPrimary)
+    if (nameHit) n10++
+    if (nameHit && rank === 1) n1++
+    const agg = byForm.get(l.form) ?? { hits: 0, n: 0, mrr: 0, nameHits: 0 }
     agg.n++
     if (rank <= 10) agg.hits++
+    if (nameHit) agg.nameHits++
     agg.mrr += rank === Infinity ? 0 : 1 / rank
     byForm.set(l.form, agg)
   }
   console.log("  [mark] labeled loop done")
   const N = labeled.length
   console.log(`  labeled queries: ${N} (path+symbol intents)`)
-  console.log(`  recall@1 ${(100 * (r1 / N)).toFixed(1)}% | recall@5 ${(100 * (r5 / N)).toFixed(1)}% | recall@10 ${(100 * (r10 / N)).toFixed(1)}% | MRR ${(mrrSum / N).toFixed(3)}`)
+  console.log(`  ROW-LEVEL   recall@1 ${(100 * (r1 / N)).toFixed(1)}% | recall@5 ${(100 * (r5 / N)).toFixed(1)}% | recall@10 ${(100 * (r10 / N)).toFixed(1)}% | MRR ${(mrrSum / N).toFixed(3)}`)
+  console.log(`  NAME-LEVEL  intent-recall@1 ${(100 * (n1 / N)).toFixed(1)}% | intent-recall@10 ${(100 * (n10 / N)).toFixed(1)}%  <- GATE METRIC`)
   for (const [form, agg] of [...byForm.entries()].sort()) {
-    console.log(`    ${form.padEnd(9)} recall@10 ${((100 * agg.hits) / agg.n).toFixed(1).padStart(6)}% MRR ${(agg.mrr / agg.n).toFixed(3)}`)
+    console.log(`    ${form.padEnd(9)} row@10 ${((100 * agg.hits) / agg.n).toFixed(1).padStart(6)}% name@10 ${((100 * agg.nameHits) / agg.n).toFixed(1).padStart(6)}% MRR ${(agg.mrr / agg.n).toFixed(3)}`)
   }
 
   console.log("  [mark] churn start")

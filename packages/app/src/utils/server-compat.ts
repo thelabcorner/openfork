@@ -50,9 +50,24 @@ type CompatiblePermissionApi = Omit<ServerApi["permission"], "reply"> & {
     input: Parameters<ServerApi["permission"]["reply"]>[0] & { location?: { directory?: string } },
   ) => ReturnType<ServerApi["permission"]["reply"]>
 }
+type CompatibleFindSearchInput = {
+  query: string
+  limit?: number
+  offset?: number
+  symbols?: boolean
+  signal?: AbortSignal
+  location?: { directory?: string }
+}
+type CompatibleFindApi = {
+  search: (input: CompatibleFindSearchInput) => Promise<{
+    location: { directory: string; project: { id: string; directory: string } }
+    data: MentionSearchPage
+  }>
+}
 export type CompatibleApi = Omit<ServerApi, "session" | "permission"> & {
   readonly session: CompatibleSessionApi
   readonly permission: CompatiblePermissionApi
+  readonly find: CompatibleFindApi
 }
 type LegacyPrompt = {
   agent?: string
@@ -157,6 +172,11 @@ function createCurrentApi(input: CompatibleInput): CompatibleApi {
           model: value.model,
           prompt: value.prompt,
         })
+      },
+    },
+    find: {
+      search() {
+        return Promise.reject(new Error("find.search requires a v1 protocol server"))
       },
     },
   }
@@ -446,6 +466,20 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           (result.data ?? []).map((path) => ({ path, type: value.type ?? "file" })),
           value.location,
         )
+      },
+    },
+    find: {
+      async search(value: CompatibleFindSearchInput) {
+        const result = await legacy(value.location).find.search(
+          {
+            query: value.query,
+            limit: value.limit !== undefined ? String(value.limit) : undefined,
+            offset: value.offset !== undefined ? String(value.offset) : undefined,
+            symbols: value.symbols === undefined ? undefined : value.symbols ? "true" : "false",
+          },
+          { signal: value.signal },
+        )
+        return located(result.data ?? { results: [], hasMore: false, total: 0 }, value.location)
       },
     },
     integration: {

@@ -34,15 +34,14 @@ const corpus = loadCorpus()
 const rawBytes = corpus.reduce((n, p) => n + Buffer.byteLength(p) + 1, 0)
 console.log(`corpus: ${corpus.length.toLocaleString()} paths, ${((rawBytes / 1048576)).toFixed(2)} MiB raw`)
 
-await Effect.runPromise(
-  Effect.scoped(
+await Effect.runPromise(((Effect.scoped(
     Effect.gen(function* () {
-      const ctx = yield* Layer.build(ChunkStore.layerFromPath(dbFile))
+      const ctx = yield* Layer.build(ChunkStore.layerFromPath(dbFile) as Layer.Layer<ChunkStore.Service>)
       const store = Context.get(ctx as any, ChunkStore.Service)
 
     // --- seal: chunk + append the whole corpus ---
     const sorted = corpus.map((p) => new TextEncoder().encode(p)).sort(compareBytes)
-    const chunks = []
+    const chunks: { kind: number; entries: Uint8Array[] }[] = []
     for (let i = 0; i < sorted.length; i += 8192) chunks.push({ kind: ChunkStore.KIND_FILE, entries: sorted.slice(i, i + 8192) })
     const sealAllMs = yield* Effect.promise(async () => {
       const t0 = performance.now()
@@ -72,7 +71,7 @@ await Effect.runPromise(
         const samples: number[] = []
         for (let run = 0; run < 5; run++) {
           const t0 = performance.now()
-          const raw = await Effect.runPromise(store.readRaw(ChunkStore.KIND_FILE) as any)
+          const raw = (await Effect.runPromise(store.readRaw(ChunkStore.KIND_FILE) as any)) as ChunkStore.RawChunk[]
           let total = 0
           for (const chunk of raw) total += chunk.count
           samples.push(performance.now() - t0 + (total === 0 ? 1 : 0))
@@ -130,7 +129,7 @@ await Effect.runPromise(
     // --- gate: storage ratio (clean DB: corpus chunks only) ---
     const ratioDb = path.join(dir, "ratio.db")
     yield* Effect.gen(function* () {
-      const ctx = yield* Layer.build(ChunkStore.layerFromPath(ratioDb))
+      const ctx = yield* Layer.build(ChunkStore.layerFromPath(ratioDb) as Layer.Layer<ChunkStore.Service>)
       const s = Context.get(ctx as any, ChunkStore.Service)
       yield* s.append(chunks)
     })
@@ -154,8 +153,7 @@ await Effect.runPromise(
     const exit = yield* Effect.exit(store.readAll(ChunkStore.KIND_FILE) as any)
     console.log(`GATE corrupt-CRC fail-closed: ${Effect.isFailure(exit) ? "PASS" : "FAIL"}`)
     }),
-  ),
-)
+  ))) as unknown as Effect.Effect<void, never>)
 
 fs.rmSync(dir, { recursive: true, force: true })
 

@@ -90,7 +90,7 @@ describe("matcher golden relevance", () => {
     }
     // exact prefix hit highlights the basename start
     const pkg = res.find((r) => r.item.path === "packages/x.ts")
-    if (pkg?.positions) expect(pkg.positions[0]).toBe(pkg.baseOffset)
+    if (pkg?.positions && pkg.baseOffset !== undefined) expect(pkg.positions[0]!).toBe(pkg.baseOffset)
   })
 
   test("empty and whitespace queries return nothing", () => {

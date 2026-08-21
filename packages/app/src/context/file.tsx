@@ -10,6 +10,7 @@ import { useSync } from "./sync"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
 import { createPathHelpers } from "./file/path"
+import { normalizeMentionPage } from "@/components/prompt-input/at-mention-search"
 import {
   approxBytes,
   evictContentLru,
@@ -39,7 +40,7 @@ import {
 export type { FileSelection, SelectedLineRange, FileViewState, FileState }
 export { selectionFromLines }
 
-export type MentionSymbolKind = "fn" | "method" | "class" | "interface" | "type" | "enum" | "const"
+export type MentionSymbolKind = "fn" | "method" | "class" | "interface" | "type" | "enum" | "const" | (string & {})
 
 export type MentionResult =
   | { kind: "file"; path: string; type?: "file" | "directory"; positions?: number[] }
@@ -315,9 +316,12 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           },
         )
 
-    // Falls back to the legacy file find until /find/search ships in the generated
-    // client; swap the body to that call when it lands.
-    const searchMentions = (
+    // /find/search (index-backed mention search) with graceful degradation to the
+    // legacy file find for older servers; the unavailable flag sticks so a 404
+    // server doesn't take the probe on every keystroke.
+    let mentionsIndexUnavailable = false
+
+    const searchMentionsFallback = (
       query: string,
       options?: { limit?: number; offset?: number; signal?: AbortSignal },
     ): Promise<MentionSearchPage> =>
@@ -328,6 +332,29 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         }),
         hasMore: false,
       }))
+
+    const searchMentions = (
+      query: string,
+      options?: { limit?: number; offset?: number; signal?: AbortSignal },
+    ): Promise<MentionSearchPage> => {
+      if (mentionsIndexUnavailable) return searchMentionsFallback(query, options)
+      return serverSDK()
+        .api.find.search({
+          location: { directory: sdk().directory },
+          query,
+          limit: options?.limit,
+          offset: options?.offset,
+          signal: options?.signal,
+        })
+        .then(
+          (x) => normalizeMentionPage(x.data),
+          (error) => {
+            if (options?.signal?.aborted) throw error
+            mentionsIndexUnavailable = true
+            return searchMentionsFallback(query, options)
+          },
+        )
+    }
 
     const treeConsumerVisible = () => layout.fileTree.opened() || layout.projectExplorer.opened()
 

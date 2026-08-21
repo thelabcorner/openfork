@@ -11,7 +11,7 @@
 
 import fuzzysort from "fuzzysort"
 import { buildAtRows, splitHighlightSegments } from "../src/components/prompt-input/at-rows"
-import { toMentionOptions } from "../src/components/prompt-input/at-mention-search"
+import { normalizeMentionPage, toMentionOptions } from "../src/components/prompt-input/at-mention-search"
 import { resolveAtToken } from "../src/components/prompt-input/at-token"
 import type { MentionResult } from "../src/context/file"
 import type { AtGroup } from "../src/components/prompt-input/at-rows"
@@ -96,6 +96,37 @@ for (const n of [200, 1000, 5000]) {
   const results = makeResults(n)
   const recents = Array.from({ length: 20 }, (_, i) => `packages/app/src/pages/session/view-${i}/component-${i}.tsx`)
   time(`toMentionOptions n=${n}`, n >= 5000 ? 200 : 1000, () => toMentionOptions(results, recents))
+}
+
+console.log("\n— real /find/search wire path (compat normalize: sentinels + baseOffset projection) —")
+function makeWirePage(count: number) {
+  return {
+    results: makeResults(count).map((entry) => {
+      if (entry.kind === "symbol") {
+        return {
+          kind: "symbol" as const,
+          name: entry.name,
+          path: entry.path,
+          line: `${entry.line}` as number | string,
+          symbolKind: entry.symbolKind,
+          positions: entry.positions?.map((p) => `${p}` as number | string),
+        }
+      }
+      const baseOffset = entry.path.length - (entry.path.split("/").pop() ?? "").length
+      return {
+        kind: "file" as const,
+        path: entry.path,
+        type: entry.type,
+        positions: entry.positions?.map((p) => p + baseOffset) as number[] | undefined,
+        baseOffset: `${baseOffset}` as number | string,
+      }
+    }),
+    hasMore: false,
+  }
+}
+for (const n of [200, 1000, 5000]) {
+  const page = makeWirePage(n)
+  time(`normalizeMentionPage n=${n}`, n >= 5000 ? 200 : 1000, () => normalizeMentionPage(page))
 }
 for (const n of [1000, 5000]) {
   const groups = makeGroups(n)

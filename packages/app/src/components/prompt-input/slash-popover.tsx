@@ -7,7 +7,7 @@ import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { buildAtRows, groupTitleKey, splitHighlightSegments, type AtGroup, type AtRow } from "./at-rows"
 
-export type AtSymbolKind = "fn" | "method" | "class" | "interface" | "type" | "enum" | "const"
+export type AtSymbolKind = "fn" | "method" | "class" | "interface" | "type" | "enum" | "const" | (string & {})
 
 export type AtOption =
   | { type: "agent"; name: string; display: string }

@@ -43,6 +43,56 @@ export function toMentionOptions(results: MentionResult[], recentPaths: readonly
   })
 }
 
+type WireNumber = number | string
+
+interface WireMentionPage {
+  results: Array<
+    | {
+        kind: "symbol"
+        name: string
+        path: string
+        line: WireNumber
+        symbolKind: string
+        positions?: WireNumber[]
+      }
+    | {
+        kind: "file"
+        path: string
+        type?: "file" | "directory"
+        positions?: WireNumber[]
+        baseOffset?: WireNumber
+      }
+  >
+  hasMore: boolean
+}
+
+// Normalizes a /find/search page into the app-internal contract: OpenAPI numeric
+// string-sentinels coerced, and file-row match positions projected from
+// full-path coordinates onto the basename the row renders.
+export function normalizeMentionPage(page: WireMentionPage): { results: MentionResult[]; hasMore: boolean } {
+  return {
+    results: page.results.map((entry): MentionResult => {
+      if (entry.kind === "symbol") {
+        return {
+          kind: "symbol",
+          name: entry.name,
+          path: entry.path,
+          line: Number(entry.line),
+          symbolKind: entry.symbolKind,
+          positions: entry.positions?.map(Number),
+        }
+      }
+      const baseOffset = entry.baseOffset === undefined ? undefined : Number(entry.baseOffset)
+      const positions =
+        entry.positions && baseOffset !== undefined && baseOffset > 0
+          ? entry.positions.map(Number).filter((p) => p >= baseOffset).map((p) => p - baseOffset)
+          : entry.positions?.map(Number)
+      return { kind: "file", path: entry.path, type: entry.type, positions }
+    }),
+    hasMore: page.hasMore,
+  }
+}
+
 export function createAtMentionSearch<T>(
   search: (query: string, options: { signal: AbortSignal; limit: number; offset: number }) => Promise<MentionSearchPageOf<T>>,
 ) {
