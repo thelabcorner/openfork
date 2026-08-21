@@ -87,6 +87,18 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`event_value\` (
+          \`aggregate_id\` text NOT NULL,
+          \`value_id\` text NOT NULL,
+          \`sha256\` text NOT NULL,
+          \`raw_len\` integer NOT NULL,
+          \`bytes\` blob NOT NULL,
+          \`refs\` integer DEFAULT 1 NOT NULL,
+          \`time_promoted\` integer NOT NULL,
+          CONSTRAINT \`event_value_pk\` PRIMARY KEY(\`aggregate_id\`, \`value_id\`)
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`permission\` (
           \`id\` text PRIMARY KEY,
           \`project_id\` text NOT NULL,
@@ -135,6 +147,13 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`part_search_backfill\` (
+          \`id\` integer PRIMARY KEY,
+          \`watermark_rowid\` integer DEFAULT -1 NOT NULL,
+          \`done\` integer DEFAULT 0 NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`part\` (
           \`id\` text PRIMARY KEY,
           \`message_id\` text NOT NULL,
@@ -147,12 +166,52 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`search_backfill\` (
+          \`id\` integer PRIMARY KEY,
+          \`watermark_rowid\` integer DEFAULT -1 NOT NULL,
+          \`done\` integer DEFAULT 0 NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_checkpoint\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`ordinal\` integer NOT NULL,
+          \`kind\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`before_snapshot\` text,
+          \`after_snapshot\` text,
+          \`user_message_id\` text,
+          \`assistant_message_id\` text,
+          \`diff\` text,
+          \`additions\` integer DEFAULT 0 NOT NULL,
+          \`deletions\` integer DEFAULT 0 NOT NULL,
+          \`files\` integer DEFAULT 0 NOT NULL,
+          \`excluded\` text,
+          \`error\` text,
+          \`epoch\` text NOT NULL,
+          \`epoch_mismatch\` integer DEFAULT 0 NOT NULL,
+          \`created_at\` integer NOT NULL,
+          \`finalized_at\` integer,
+          CONSTRAINT \`fk_session_checkpoint_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_context_epoch\` (
           \`session_id\` text PRIMARY KEY,
           \`baseline\` text NOT NULL,
           \`snapshot\` text NOT NULL,
           \`baseline_seq\` integer NOT NULL,
           CONSTRAINT \`fk_session_context_epoch_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_group\` (
+          \`id\` text PRIMARY KEY,
+          \`name\` text NOT NULL,
+          \`position\` integer DEFAULT 0 NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
         );
       `)
       yield* tx.run(`
@@ -212,6 +271,7 @@ export default {
           \`paused_at\` integer,
           \`time_compacting\` integer,
           \`time_archived\` integer,
+          \`group_id\` text,
           CONSTRAINT \`fk_session_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
         );
       `)
@@ -241,6 +301,7 @@ export default {
       `)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
+      yield* tx.run(`CREATE UNIQUE INDEX \`event_value_agg_sha_idx\` ON \`event_value\` (\`aggregate_id\`,\`sha256\`);`)
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )
@@ -249,6 +310,17 @@ export default {
       )
       yield* tx.run(`CREATE INDEX \`part_message_id_id_idx\` ON \`part\` (\`message_id\`,\`id\`);`)
       yield* tx.run(`CREATE INDEX \`part_session_idx\` ON \`part\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_checkpoint_session_ordinal_idx\` ON \`session_checkpoint\` (\`session_id\`,\`ordinal\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`session_checkpoint_session_idx\` ON \`session_checkpoint\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_checkpoint_session_user_idx\` ON \`session_checkpoint\` (\`session_id\`,\`user_message_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_checkpoint_session_assistant_idx\` ON \`session_checkpoint\` (\`session_id\`,\`assistant_message_id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`session_group_position_idx\` ON \`session_group\` (\`position\`);`)
       yield* tx.run(
         `CREATE INDEX \`session_input_session_pending_delivery_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`,\`delivery\`,\`admitted_seq\`);`,
       )
@@ -271,75 +343,7 @@ export default {
       yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
-      yield* tx.run(`CREATE INDEX \`session_directory_idx\` ON \`session\` (\`directory\`);`)
-      yield* tx.run(`
-        CREATE VIRTUAL TABLE \`session_message_fts\` USING fts5(
-          search_text,
-          content='session_message',
-          content_rowid='rowid',
-          tokenize='unicode61'
-        );
-      `)
-      yield* tx.run(`
-        CREATE TRIGGER \`session_message_fts_ai\` AFTER INSERT ON \`session_message\` BEGIN
-          INSERT INTO \`session_message_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
-        END;
-      `)
-      yield* tx.run(`
-        CREATE TRIGGER \`session_message_fts_ad\` AFTER DELETE ON \`session_message\` BEGIN
-          INSERT INTO \`session_message_fts\`(\`session_message_fts\`, rowid, search_text)
-          VALUES ('delete', old.rowid, old.search_text);
-        END;
-      `)
-      yield* tx.run(`
-        CREATE TRIGGER \`session_message_fts_au\` AFTER UPDATE ON \`session_message\` BEGIN
-          INSERT INTO \`session_message_fts\`(\`session_message_fts\`, rowid, search_text)
-          VALUES ('delete', old.rowid, old.search_text);
-          INSERT INTO \`session_message_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
-        END;
-      `)
-      yield* tx.run(`
-        CREATE TABLE \`search_backfill\` (
-          \`id\` integer PRIMARY KEY,
-          \`watermark_rowid\` integer NOT NULL DEFAULT -1,
-          \`done\` integer NOT NULL DEFAULT 0
-        );
-      `)
-      yield* tx.run(`INSERT INTO \`search_backfill\` (\`id\`, \`watermark_rowid\`, \`done\`) VALUES (1, -1, 0);`)
-      yield* tx.run(`
-        CREATE VIRTUAL TABLE \`part_fts\` USING fts5(
-          search_text,
-          content='part',
-          content_rowid='rowid',
-          tokenize='unicode61'
-        );
-      `)
-      yield* tx.run(`
-        CREATE TRIGGER \`part_fts_ai\` AFTER INSERT ON \`part\` BEGIN
-          INSERT INTO \`part_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
-        END;
-      `)
-      yield* tx.run(`
-        CREATE TRIGGER \`part_fts_ad\` AFTER DELETE ON \`part\` BEGIN
-          INSERT INTO \`part_fts\`(\`part_fts\`, rowid, search_text)
-          VALUES ('delete', old.rowid, old.search_text);
-        END;
-      `)
-      yield* tx.run(`
-        CREATE TRIGGER \`part_fts_au\` AFTER UPDATE ON \`part\` BEGIN
-          INSERT INTO \`part_fts\`(\`part_fts\`, rowid, search_text)
-          VALUES ('delete', old.rowid, old.search_text);
-          INSERT INTO \`part_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
-        END;
-      `)
-      yield* tx.run(`
-        CREATE TABLE \`part_search_backfill\` (
-          \`id\` integer PRIMARY KEY,
-          \`watermark_rowid\` integer NOT NULL DEFAULT -1,
-          \`done\` integer NOT NULL DEFAULT 0
-        );
-      `)
-      yield* tx.run(`INSERT INTO \`part_search_backfill\` (\`id\`, \`watermark_rowid\`, \`done\`) VALUES (1, -1, 0);`)
+      yield* tx.run(`CREATE INDEX \`session_group_idx\` ON \`session\` (\`group_id\`);`)
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
     })
   },

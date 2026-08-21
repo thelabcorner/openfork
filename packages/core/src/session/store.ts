@@ -10,6 +10,7 @@ import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
 import { SessionMessageTable, SessionTable } from "./sql"
 import { fromRow } from "./info"
+import { resolveProjectionRef } from "../event"
 
 export interface Interface {
   readonly get: (sessionID: SessionSchema.ID) => Effect.Effect<SessionSchema.Info | undefined>
@@ -34,7 +35,9 @@ const layer = Layer.effect(
     return Service.of({
       get: Effect.fn("SessionStore.get")(function* (sessionID) {
         const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get().pipe(Effect.orDie)
-        return row ? fromRow(row) : undefined
+        if (!row) return undefined
+        const summaryDiffs = yield* resolveProjectionRef(db, sessionID, "session.summary_diffs", row.summary_diffs)
+        return fromRow({ ...row, summary_diffs: summaryDiffs })
       }),
       context: Effect.fn("SessionStore.context")(function* (sessionID) {
         return yield* SessionHistory.load(db, sessionID)
@@ -49,12 +52,12 @@ const layer = Layer.effect(
           .where(eq(SessionMessageTable.id, messageID))
           .get()
           .pipe(Effect.orDie)
-        return row
-          ? {
-              sessionID: SessionSchema.ID.make(row.session_id),
-              message: yield* decodeMessage({ ...row.data, id: row.id, type: row.type }).pipe(Effect.orDie),
-            }
-          : undefined
+        if (!row) return undefined
+        const data = yield* resolveProjectionRef(db, row.session_id, "session_message.data", row.data)
+        return {
+          sessionID: SessionSchema.ID.make(row.session_id),
+          message: yield* decodeMessage({ ...data, id: row.id, type: row.type }).pipe(Effect.orDie),
+        }
       }),
     })
   }),

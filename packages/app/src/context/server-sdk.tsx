@@ -13,6 +13,8 @@ import { useGlobal } from "./global"
 import { ServerScope } from "@/utils/server-scope"
 import { detectServerProtocol, type ServerProtocol } from "@/utils/server-protocol"
 import { createCompatibleApi, type CompatibleApi } from "@/utils/server-compat"
+import { markServerStreamDead, markServerStreamLive } from "@/utils/server-liveness"
+import { perf } from "./perf"
 
 const isAbortError = (error: unknown) =>
   error !== null && typeof error === "object" && "name" in error && error.name === "AbortError"
@@ -224,36 +226,230 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   const FLUSH_FRAME_MS = 16
   const STREAM_YIELD_MS = 8
   const RECONNECT_DELAY_MS = 250
+  // Delta accumulator tuning. Deltas that arrive for the same (session, message,
+  // part, field) are folded in place and emitted as ONE event per flush instead of
+  // one per delta, so the downstream reducer does a single large append rather than
+  // many tiny ones (the dominant per-event cost is the string copy). A key flushes
+  // early once its accumulated delta is large (burst coalescing) or has been pending
+  // past MAX_AGE (keeps streaming responsive even for slow trickles); barriers and
+  // the final flush always drain everything.
+  const ACCUMULATOR_BURST_BYTES = 2048
+  const ACCUMULATOR_MAX_AGE_MS = 100
 
-  let queue: Queued[] = []
-  let buffer: Queued[] = []
+  interface AccEntry {
+    ev: Queued
+    dirtySince: number
+  }
+
+  const v2 = new Map<string, Map<string, Map<string, Map<string, AccEntry>>>>()
+  const v1 = new Map<string, Map<string, Map<string, Map<string, Map<string, AccEntry>>>>>()
+  const dirtyV2 = new Set<AccEntry>()
+  const dirtyV1 = new Set<AccEntry>()
+  let singletons: Queued[] = []
+
+  const nowMs = () => Date.now()
+
+  function appendV2(existing: AccEntry, incoming: Queued) {
+    const cur = existing.ev.payload.current as CurrentDelta
+    const inc = incoming.payload.current as CurrentDelta
+    const fragment = currentDeltaFragment(cur) + currentDeltaFragment(inc)
+    if (cur.type === "session.compaction.delta") (cur.data as { text: string }).text = fragment
+    else (cur.data as { delta: string }).delta = fragment
+  }
+
+  function v2Coords(cur: CurrentDelta): [string, string, string] {
+    if (cur.type === "session.tool.input.delta")
+      return [cur.data.sessionID, cur.data.assistantMessageID, cur.data.callID]
+    if (cur.type === "session.compaction.delta") return [cur.data.sessionID, "", ""]
+    return [cur.data.sessionID, cur.data.assistantMessageID, String(cur.data.ordinal)]
+  }
+
+  function removeV2(ev: Queued) {
+    const cur = ev.payload.current as CurrentDelta
+    const [s, m, o] = v2Coords(cur)
+    const a = v2.get(ev.directory)
+    const b = a?.get(s)
+    const mm = b?.get(m)
+    if (mm) {
+      mm.delete(o)
+      if (mm.size === 0) b?.delete(m)
+      if (b && b.size === 0) a?.delete(s)
+    }
+  }
+
+  function removeV1(ev: Queued) {
+    const p = ev.payload.properties as { sessionID: string; messageID: string; partID: string; field: string }
+    const a = v1.get(ev.directory)
+    const b = a?.get(p.sessionID)
+    const mm = b?.get(p.messageID)
+    const pt = mm?.get(p.partID)
+    if (pt) {
+      pt.delete(p.field)
+      if (pt.size === 0) mm?.delete(p.partID)
+      if (mm && mm.size === 0) b?.delete(p.messageID)
+      if (b && b.size === 0) a?.delete(p.sessionID)
+    }
+  }
+
+  function dropSession(directory: string, sessionID: string) {
+    const a = v2.get(directory)
+    if (a) {
+      const b = a.get(sessionID)
+      if (b) {
+        for (const mm of b.values()) for (const e of mm.values()) dirtyV2.delete(e)
+        a.delete(sessionID)
+      }
+    }
+    const va = v1.get(directory)
+    if (va) {
+      const vb = va.get(sessionID)
+      if (vb) {
+        for (const mm of vb.values()) for (const pt of mm.values()) for (const e of pt.values()) dirtyV1.delete(e)
+        va.delete(sessionID)
+      }
+    }
+  }
+
+  const messagePartUpdatedProps = (ev: Queued) =>
+    ev.payload.properties as unknown as { sessionID: string; messageID: string; part: { id: string } }
+  const removedProps = (ev: Queued) => ev.payload.properties as unknown as { sessionID: string }
+
+  function flushV2(directory: string, sessionID: string, messageID: string, ordinal: string) {
+    const mm = v2.get(directory)?.get(sessionID)?.get(messageID)
+    const entry = mm?.get(ordinal)
+    if (entry) {
+      singletons.push(entry.ev)
+      mm!.delete(ordinal)
+      dirtyV2.delete(entry)
+    }
+  }
+
+  function flushV1(directory: string, sessionID: string, messageID: string, partID: string) {
+    const mm = v1.get(directory)?.get(sessionID)?.get(messageID)
+    const pt = mm?.get(partID)
+    if (!pt) return
+    for (const [field, entry] of pt) {
+      singletons.push(entry.ev)
+      dirtyV1.delete(entry)
+      pt.delete(field)
+    }
+    if (pt.size === 0) mm!.delete(partID)
+  }
+
+  function handleBarrier(ev: Queued) {
+    const type = ev.payload.type as string
+    if (type === "message.part.updated") {
+      const p = messagePartUpdatedProps(ev)
+      flushV1(ev.directory, p.sessionID, p.messageID, p.part.id)
+      singletons.push(ev)
+      return
+    }
+    if (
+      type === "session.text.ended" ||
+      type === "session.reasoning.ended" ||
+      type === "session.tool.input.ended" ||
+      type === "session.compaction.ended"
+    ) {
+      const cur = ev.payload.current as CurrentDelta | undefined
+      if (cur) {
+        const [s, m, o] = v2Coords(cur)
+        flushV2(ev.directory, s, m, o)
+      }
+      singletons.push(ev)
+      return
+    }
+    if (type === "message.removed" || type === "session.deleted") {
+      dropSession(ev.directory, removedProps(ev).sessionID)
+      singletons.push(ev)
+      return
+    }
+    singletons.push(ev)
+  }
+
+  function receive(ev: Queued) {
+    const cur = currentDelta(ev.payload.current)
+    if (cur) {
+      const [s, m, o] = v2Coords(cur)
+      let a = v2.get(ev.directory)
+      if (!a) { a = new Map(); v2.set(ev.directory, a) }
+      let b = a.get(s)
+      if (!b) { b = new Map(); a.set(s, b) }
+      let mm = b.get(m)
+      if (!mm) { mm = new Map(); b.set(m, mm) }
+      const ex = mm.get(o)
+      if (ex) appendV2(ex, ev)
+      else {
+        const entry: AccEntry = { ev, dirtySince: nowMs() }
+        mm.set(o, entry)
+        dirtyV2.add(entry)
+      }
+      return
+    }
+    if (ev.payload.type === "message.part.delta") {
+      const p = ev.payload.properties as { sessionID: string; messageID: string; partID: string; field: string; delta: string }
+      let a = v1.get(ev.directory)
+      if (!a) { a = new Map(); v1.set(ev.directory, a) }
+      let b = a.get(p.sessionID)
+      if (!b) { b = new Map(); a.set(p.sessionID, b) }
+      let mm = b.get(p.messageID)
+      if (!mm) { mm = new Map(); b.set(p.messageID, mm) }
+      let pt = mm.get(p.partID)
+      if (!pt) { pt = new Map(); mm.set(p.partID, pt) }
+      const ex = pt.get(p.field)
+      if (ex) (ex.ev.payload.properties as { delta: string }).delta += p.delta
+      else {
+        const entry: AccEntry = { ev, dirtySince: nowMs() }
+        pt.set(p.field, entry)
+        dirtyV1.add(entry)
+      }
+      return
+    }
+    handleBarrier(ev)
+  }
+
   let timer: ReturnType<typeof setTimeout> | undefined
   let last = 0
 
-  const flush = () => {
-    if (timer) clearTimeout(timer)
-    timer = undefined
+  const flush = (final = false) => {
+    if (timer) { clearTimeout(timer); timer = undefined }
+    if (dirtyV2.size === 0 && dirtyV1.size === 0 && singletons.length === 0) return
 
-    if (queue.length === 0) return
-
-    const events = queue
-    queue = buffer
-    buffer = events
-    queue.length = 0
-
-    last = Date.now()
-    const output = coalesceServerEvents(events)
+    const t = nowMs()
     batch(() => {
-      output.forEach((event) => emitter.emit(event.directory, event.payload))
+      for (const entry of [...dirtyV2]) {
+        const cur = entry.ev.payload.current as CurrentDelta
+        const bytes = cur.type === "session.compaction.delta"
+          ? String((cur.data as { text: string }).text).length
+          : String((cur.data as { delta: string }).delta).length
+        if (final || bytes >= ACCUMULATOR_BURST_BYTES || t - entry.dirtySince >= ACCUMULATOR_MAX_AGE_MS) {
+          emitter.emit(entry.ev.directory, entry.ev.payload)
+          removeV2(entry.ev)
+          dirtyV2.delete(entry)
+        }
+      }
+      for (const entry of [...dirtyV1]) {
+        const delta = (entry.ev.payload.properties as { delta: string }).delta
+        if (final || delta.length >= ACCUMULATOR_BURST_BYTES || t - entry.dirtySince >= ACCUMULATOR_MAX_AGE_MS) {
+          emitter.emit(entry.ev.directory, entry.ev.payload)
+          removeV1(entry.ev)
+          dirtyV1.delete(entry)
+        }
+      }
+      for (const ev of singletons) emitter.emit(ev.directory, ev.payload)
     })
-
-    buffer.length = 0
+    singletons = []
+    last = t
+    if (perf.enabled) perf.frame()
+    // Pending deltas that haven't reached the burst/age threshold stay retained
+    // for the next window; keep the flush cadence alive so they drain within
+    // MAX_AGE even when the stream is momentarily idle (no new receive()).
+    if (dirtyV2.size > 0 || dirtyV1.size > 0) schedule()
   }
 
   const schedule = () => {
     if (timer) return
-    const elapsed = Date.now() - last
-    timer = setTimeout(flush, Math.max(0, FLUSH_FRAME_MS - elapsed))
+    const elapsed = nowMs() - last
+    timer = setTimeout(() => flush(false), Math.max(0, FLUSH_FRAME_MS - elapsed))
   }
 
   let streamErrorLogged = false
@@ -270,6 +466,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     const previous = run
     const current = (async () => {
       if (previous) await previous
+      const streamKey = ServerConnection.key(server)
       // oxlint-disable-next-line no-unmodified-loop-condition -- `started` is set to false by stop() which also aborts; both flags are checked to allow graceful exit
       while (!abort.signal.aborted && started && generation === active) {
         attempt = new AbortController()
@@ -285,12 +482,16 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
               : eventApi.event.subscribe({ signal: attempt.signal })
           let yielded = Date.now()
           for await (const event of events) {
+            // Any delivered event (including the 10s server heartbeat) proves the
+            // server is up; the health poll reads this to skip its own request.
+            markServerStreamLive(streamKey)
             streamErrorLogged = false
             const legacy = "payload" in event
             if (legacy && event.payload.type === "sync") continue
             const directory = legacy ? (event.directory ?? "global") : (event.location?.directory ?? "global")
             const payload = legacy ? (event.payload as Event) : adaptServerEvent(event)
-            if (enqueueServerEvent(queue, { directory, payload })) schedule()
+            receive({ directory, payload })
+            schedule()
 
             if (Date.now() - yielded < STREAM_YIELD_MS) continue
             yielded = Date.now()
@@ -305,6 +506,9 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
               error,
             })
           }
+          // A genuine failure (not an intentional stop/abort) means the server is
+          // unreachable: drop liveness so the health poll resumes its checks.
+          if (!isStreamClosed(error, attempt?.signal)) markServerStreamDead(streamKey)
         } finally {
           abort.signal.removeEventListener("abort", onAbort)
           attempt = undefined
@@ -316,7 +520,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     })().finally(() => {
       if (run !== current) return
       run = undefined
-      flush()
+      flush(true)
     })
     run = current
     return run
@@ -336,7 +540,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   onCleanup(() => {
     stop()
     abort.abort()
-    flush()
+    flush(true)
   })
 
   const sdk = createSdkForServer({

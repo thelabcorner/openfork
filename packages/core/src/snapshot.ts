@@ -3,12 +3,14 @@ export * as Snapshot from "./snapshot"
 import { makeLocationNode } from "./effect/app-node"
 import path from "path"
 import { Context, Effect, Layer, Schema } from "effect"
+import { ChildProcess } from "effect/unstable/process"
 import { Config } from "./config"
 import { File } from "./file"
 import { FSUtil } from "./fs-util"
 import { Git } from "./git"
 import { Global } from "./global"
 import { Location } from "./location"
+import { AppProcess } from "./process"
 import { AbsolutePath, RelativePath } from "./schema"
 import { Hash } from "./util/hash"
 
@@ -79,6 +81,41 @@ export interface Interface {
    * only known paths should change.
    */
   readonly checkout: (snapshot: ID) => Effect.Effect<void, Error>
+
+  /**
+   * Pin a captured tree object inside the shadow repository so it survives
+   * `Snapshot.cleanup()` GC pruning (which runs `git gc --prune=7.days`). A
+   * detached commit is created from the tree and referenced under
+   * `refs/opencode/retained/<hash>`; the ref keeps the object reachable. Idempotent.
+   */
+  readonly retain: (hash: ID) => Effect.Effect<void, any>
+
+  /**
+   * Drop the pin created by `retain` for a tree object. Safe to call when no pin
+   * exists.
+   */
+  readonly release: (hash: ID) => Effect.Effect<void, any>
+
+  /**
+   * Stable identity of the snapshot store for the current project + worktree.
+   * Checkpoints captured against a different epoch (e.g. worktree recreated,
+   * path reused, repository replaced) must not be diffed or restored.
+   */
+  readonly epoch: () => Effect.Effect<string, any>
+
+  /**
+   * Best-effort list of files that were excluded from the `to` snapshot because
+   * they exceeded the snapshot size limit (new untracked files larger than 2 MiB).
+   * Used to surface `partial` checkpoint status. Detection is worktree-based and
+   * approximate: it reports oversized worktree files absent from the `to` tree.
+   */
+  readonly excludedFiles: (input: CompareInput) => Effect.Effect<readonly ExcludedFile[], any>
+}
+
+export interface ExcludedFile {
+  readonly path: RelativePath
+  readonly reason: string
+  readonly size?: number
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Snapshot") {}
@@ -91,6 +128,7 @@ const layer = Layer.effect(
     const git = yield* Git.Service
     const global = yield* Global.Service
     const location = yield* Location.Service
+    const appProcess = yield* AppProcess.Service
     const source = yield* git.repo.discover(location.project.directory)
     const worktree = source
       ? AbsolutePath.make(yield* fs.realPath(source.worktree).pipe(Effect.orDie))
@@ -223,7 +261,83 @@ const layer = Layer.effect(
         .pipe(Effect.mapError((cause) => failure("restore", cause)))
     })
 
-    return Service.of({ capture, files, diff, preview, restore, checkout })
+    const epoch = Effect.fnUntraced(function* () {
+      return Hash.fast(`${location.project.id}:${worktree}`)
+    })
+
+    const retain = Effect.fn("Snapshot.retain")(function* (hash: ID) {
+      if (!(yield* enabled())) return
+      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("capture", cause)))
+      const ref = `refs/opencode/retained/${hash}`
+      const commit = yield* appProcess
+        .run(
+          ChildProcess.make("git", ["--git-dir", repo.gitDirectory, "--work-tree", repo.worktree, "commit-tree", hash, "-m", `opencode retain ${hash}`]),
+          { stdin: "ignore" },
+        )
+        .pipe(Effect.mapError((cause) => new Error({ operation: "capture", message: `failed to retain ${hash}`, cause })))
+      if (commit.exitCode !== 0)
+        return yield* new Error({
+          operation: "capture",
+          message: `commit-tree failed for ${hash}: ${commit.stderr.toString("utf8").trim()}`,
+        })
+      const update = yield* appProcess
+        .run(
+          ChildProcess.make("git", ["--git-dir", repo.gitDirectory, "update-ref", ref, commit.stdout.toString("utf8").trim()]),
+          { stdin: "ignore" },
+        )
+        .pipe(Effect.mapError((cause) => new Error({ operation: "capture", message: `failed to pin ${ref}`, cause })))
+      if (update.exitCode !== 0)
+        return yield* new Error({
+          operation: "capture",
+          message: `update-ref failed for ${ref}: ${update.stderr.toString("utf8").trim()}`,
+        })
+    })
+
+    const release = Effect.fn("Snapshot.release")(function* (hash: ID) {
+      if (!(yield* enabled())) return
+      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("capture", cause)))
+      const ref = `refs/opencode/retained/${hash}`
+      yield* appProcess
+        .run(ChildProcess.make("git", ["--git-dir", repo.gitDirectory, "update-ref", "-d", ref]), { stdin: "ignore" })
+        .pipe(Effect.catch(() => Effect.void))
+    })
+
+    const excludedFiles = Effect.fn("Snapshot.excludedFiles")(function* (input: CompareInput) {
+      if (!(yield* enabled())) return []
+      const repo = yield* repository().pipe(Effect.mapError((cause) => failure("files", cause)))
+      const toTree = Git.TreeID.make(input.to)
+      const inTo = new Set(yield* git.tree.files({ repository: repo, from: toTree, to: toTree }))
+      const list = (args: string[]) =>
+        appProcess.run(
+          ChildProcess.make("git", ["--git-dir", repo.gitDirectory, "--work-tree", repo.worktree, ...args]),
+          { stdin: "ignore" },
+        )
+      const [untracked, modified] = yield* Effect.all(
+        [
+          list(["ls-files", "--others", "--exclude-standard", "-z"]).pipe(Effect.map((r) => r.stdout.toString("utf8"))),
+          list(["diff-files", "--name-only", "-z"]).pipe(Effect.map((r) => r.stdout.toString("utf8"))),
+        ],
+        { concurrency: 2 },
+      )
+      const candidates = Array.from(new Set([...untracked, ...modified].join("\0").split("\0").filter(Boolean)))
+      if (!candidates.length) return []
+      const excluded = yield* Effect.forEach(
+        candidates,
+        (file): Effect.Effect<ExcludedFile | undefined> =>
+          Effect.gen(function* () {
+            if (inTo.has(RelativePath.make(file))) return undefined
+            const info = yield* fs.stat(path.resolve(repo.worktree, file)).pipe(Effect.catch(() => Effect.succeed(undefined)))
+            if (!info || info.type !== "File") return undefined
+            const size = typeof info.size === "bigint" ? Number(info.size) : info.size
+            if (size > 2 * 1024 * 1024) return { path: RelativePath.make(file), reason: "new-file-too-large", size }
+            return undefined
+          }),
+        { concurrency: 8 },
+      )
+      return excluded.filter((item) => item !== undefined) as unknown as readonly ExcludedFile[]
+    })
+
+    return Service.of({ capture, files, diff, preview, restore, checkout, retain, release, epoch, excludedFiles })
   }),
 )
 
@@ -232,7 +346,7 @@ export const locationLayer = layer.pipe(Layer.provideMerge(Config.locationLayer)
 export const node = makeLocationNode({
   service: Service,
   layer,
-  deps: [Config.node, FSUtil.node, Git.node, Global.node, Location.node],
+  deps: [Config.node, FSUtil.node, Git.node, Global.node, Location.node, AppProcess.node],
 })
 
 export const noopLayer = Layer.succeed(
@@ -244,6 +358,10 @@ export const noopLayer = Layer.succeed(
     preview: () => Effect.succeed([]),
     restore: () => Effect.void,
     checkout: () => Effect.void,
+    retain: () => Effect.void as any,
+    release: () => Effect.void as any,
+    epoch: () => Effect.succeed("noop") as any,
+    excludedFiles: () => Effect.succeed([]) as any,
   }),
 )
 

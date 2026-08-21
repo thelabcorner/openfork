@@ -1,0 +1,12 @@
+{
+  "tripped": false,
+  "level": null,
+  "trippedAt": null,
+  "trippedBy": "",
+  "tripwires": {
+    "maxSpawnsPerMin": 500,
+    "maxMessagesPerMin": 1000,
+    "maxMembers": 1000,
+    "maxTasksPerMin": 500
+  }
+}

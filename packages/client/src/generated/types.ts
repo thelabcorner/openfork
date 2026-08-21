@@ -66,6 +66,35 @@ export type UnknownError = {
 export const isUnknownError = (value: unknown): value is UnknownError =>
   typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "UnknownError"
 
+export type CheckpointUnsupportedError = {
+  readonly _tag: "CheckpointUnsupportedError"
+  readonly sessionID: string
+  readonly reason: string
+  readonly message: string
+}
+export const isCheckpointUnsupportedError = (value: unknown): value is CheckpointUnsupportedError =>
+  typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "CheckpointUnsupportedError"
+
+export type CheckpointNotFoundError = {
+  readonly _tag: "CheckpointNotFoundError"
+  readonly sessionID: string
+  readonly checkpointID: string
+  readonly message: string
+}
+export const isCheckpointNotFoundError = (value: unknown): value is CheckpointNotFoundError =>
+  typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "CheckpointNotFoundError"
+
+export type CheckpointEpochError = {
+  readonly _tag: "CheckpointEpochError"
+  readonly sessionID: string
+  readonly checkpointID: string
+  readonly expected: string
+  readonly actual: string
+  readonly message: string
+}
+export const isCheckpointEpochError = (value: unknown): value is CheckpointEpochError =>
+  typeof value === "object" && value !== null && "_tag" in value && value["_tag"] === "CheckpointEpochError"
+
 export type ProviderNotFoundError = {
   readonly _tag: "ProviderNotFoundError"
   readonly providerID: string
@@ -1879,6 +1908,151 @@ export type SessionsMessageOutput = {
         readonly time: { readonly created: number }
       }
 }["data"]
+
+export type SessionsListCheckpointsInput = {
+  readonly sessionID: { readonly sessionID: string }["sessionID"]
+  readonly limit?: {
+    readonly limit?: number | undefined
+    readonly status?: "capturing" | "ready" | "partial" | "error" | undefined
+    readonly kind?: "baseline" | "turn" | "manual" | "pre-revert" | undefined
+  }["limit"]
+  readonly status?: {
+    readonly limit?: number | undefined
+    readonly status?: "capturing" | "ready" | "partial" | "error" | undefined
+    readonly kind?: "baseline" | "turn" | "manual" | "pre-revert" | undefined
+  }["status"]
+  readonly kind?: {
+    readonly limit?: number | undefined
+    readonly status?: "capturing" | "ready" | "partial" | "error" | undefined
+    readonly kind?: "baseline" | "turn" | "manual" | "pre-revert" | undefined
+  }["kind"]
+}
+
+export type SessionsListCheckpointsOutput = {
+  readonly data: ReadonlyArray<{
+    readonly id: string
+    readonly sessionID: string
+    readonly ordinal: number
+    readonly kind: "baseline" | "turn" | "manual" | "pre-revert"
+    readonly status: "capturing" | "ready" | "partial" | "error"
+    readonly userMessageID?: string | undefined
+    readonly assistantMessageID?: string | undefined
+    readonly beforeSnapshot: string
+    readonly afterSnapshot?: string | undefined
+    readonly createdAt: number
+    readonly finalizedAt?: number | undefined
+    readonly summary: { readonly files: number; readonly additions: number; readonly deletions: number }
+    readonly excluded?:
+      | ReadonlyArray<{ readonly path: string; readonly reason: string; readonly size?: number | undefined }>
+      | undefined
+    readonly epochMismatch?: boolean | undefined
+  }>
+}["data"]
+
+export type SessionsGetCheckpointInput = {
+  readonly sessionID: { readonly sessionID: string; readonly checkpointID: string }["sessionID"]
+  readonly checkpointID: { readonly sessionID: string; readonly checkpointID: string }["checkpointID"]
+}
+
+export type SessionsGetCheckpointOutput = {
+  readonly id: string
+  readonly sessionID: string
+  readonly ordinal: number
+  readonly kind: "baseline" | "turn" | "manual" | "pre-revert"
+  readonly status: "capturing" | "ready" | "partial" | "error"
+  readonly userMessageID?: string | undefined
+  readonly assistantMessageID?: string | undefined
+  readonly beforeSnapshot: string
+  readonly afterSnapshot?: string | undefined
+  readonly createdAt: number
+  readonly finalizedAt?: number | undefined
+  readonly summary: { readonly files: number; readonly additions: number; readonly deletions: number }
+  readonly excluded?:
+    | ReadonlyArray<{ readonly path: string; readonly reason: string; readonly size?: number | undefined }>
+    | undefined
+  readonly epochMismatch?: boolean | undefined
+}
+
+export type SessionsDiffCheckpointInput = {
+  readonly sessionID: { readonly sessionID: string; readonly checkpointID: string }["sessionID"]
+  readonly checkpointID: { readonly sessionID: string; readonly checkpointID: string }["checkpointID"]
+  readonly mode?: { readonly mode?: "turn" | "session" | undefined }["mode"]
+}
+
+export type SessionsDiffCheckpointOutput = {
+  readonly from: string
+  readonly to: string
+  readonly mode: "turn" | "session"
+  readonly files: ReadonlyArray<{
+    readonly path: string
+    readonly status: "added" | "modified" | "deleted"
+    readonly additions: number
+    readonly deletions: number
+    readonly patch: string
+  }>
+  readonly excluded?:
+    | ReadonlyArray<{ readonly path: string; readonly reason: string; readonly size?: number | undefined }>
+    | undefined
+  readonly partial?: boolean | undefined
+}
+
+export type SessionsDiffCheckpointRawInput = {
+  readonly sessionID: { readonly sessionID: string; readonly checkpointID: string }["sessionID"]
+  readonly checkpointID: { readonly sessionID: string; readonly checkpointID: string }["checkpointID"]
+  readonly mode?: { readonly mode?: "turn" | "session" | undefined }["mode"]
+}
+
+export type SessionsDiffCheckpointRawOutput = string
+
+export type SessionsRevertCheckpointInput = {
+  readonly sessionID: { readonly sessionID: string; readonly checkpointID: string }["sessionID"]
+  readonly checkpointID: { readonly sessionID: string; readonly checkpointID: string }["checkpointID"]
+  readonly mode?: { readonly mode?: "discard-current" | "preserve-current" | undefined }["mode"]
+}
+
+export type SessionsRevertCheckpointOutput = {
+  readonly id: string
+  readonly sessionID: string
+  readonly ordinal: number
+  readonly kind: "baseline" | "turn" | "manual" | "pre-revert"
+  readonly status: "capturing" | "ready" | "partial" | "error"
+  readonly userMessageID?: string | undefined
+  readonly assistantMessageID?: string | undefined
+  readonly beforeSnapshot: string
+  readonly afterSnapshot?: string | undefined
+  readonly createdAt: number
+  readonly finalizedAt?: number | undefined
+  readonly summary: { readonly files: number; readonly additions: number; readonly deletions: number }
+  readonly excluded?:
+    | ReadonlyArray<{ readonly path: string; readonly reason: string; readonly size?: number | undefined }>
+    | undefined
+  readonly epochMismatch?: boolean | undefined
+}
+
+export type SessionsCreateCheckpointInput = {
+  readonly sessionID: { readonly sessionID: string }["sessionID"]
+  readonly kind: { readonly kind: "manual"; readonly label?: string | undefined }["kind"]
+  readonly label?: { readonly kind: "manual"; readonly label?: string | undefined }["label"]
+}
+
+export type SessionsCreateCheckpointOutput = {
+  readonly id: string
+  readonly sessionID: string
+  readonly ordinal: number
+  readonly kind: "baseline" | "turn" | "manual" | "pre-revert"
+  readonly status: "capturing" | "ready" | "partial" | "error"
+  readonly userMessageID?: string | undefined
+  readonly assistantMessageID?: string | undefined
+  readonly beforeSnapshot: string
+  readonly afterSnapshot?: string | undefined
+  readonly createdAt: number
+  readonly finalizedAt?: number | undefined
+  readonly summary: { readonly files: number; readonly additions: number; readonly deletions: number }
+  readonly excluded?:
+    | ReadonlyArray<{ readonly path: string; readonly reason: string; readonly size?: number | undefined }>
+    | undefined
+  readonly epochMismatch?: boolean | undefined
+}
 
 export type MessagesListInput = {
   readonly sessionID: { readonly sessionID: string }["sessionID"]

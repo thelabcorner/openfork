@@ -1,7 +1,36 @@
 import { Formatter, Logger, type LogLevel } from "effect"
 import path from "path"
+import fs from "node:fs"
+import zlib from "node:zlib"
 import { Global } from "../global"
 import { runID } from "./shared"
+
+const MAX_LOG_SIZE = 5 * 1024 * 1024
+const MAX_LOG_AGE_DAYS = 7
+
+function rotateLogs(dir: string, base: string) {
+  try {
+    const file = path.join(dir, base)
+    try {
+      const info = fs.statSync(file)
+      if (info.size >= MAX_LOG_SIZE) {
+        const stamp = new Date().toISOString().replace(/[-:]/g, "").replace(/\.\d+Z$/, "")
+        const gzPath = `${file}.${stamp}.gz`
+        const data = fs.readFileSync(file)
+        fs.writeFileSync(gzPath, zlib.gzipSync(data))
+        fs.truncateSync(file, 0)
+      }
+    } catch {}
+    const cutoff = Date.now() - MAX_LOG_AGE_DAYS * 24 * 60 * 60 * 1000
+    for (const entry of fs.readdirSync(dir)) {
+      if (!entry.startsWith(`${base}.`) || !entry.endsWith(".gz")) continue
+      const p = path.join(dir, entry)
+      try {
+        if (fs.statSync(p).mtimeMs < cutoff) fs.rmSync(p, { force: true })
+      } catch {}
+    }
+  } catch {}
+}
 
 function formatter(id: string = runID) {
   return Logger.map(Logger.formatStructured, (output) => {
@@ -48,6 +77,10 @@ function format(input: unknown) {
 
 export function fileLogger(file = path.join(Global.Path.log, "opencode.log"), id: string = runID) {
   // Do not set batchWindow to 0; it causes high idle CPU usage.
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true })
+  } catch {}
+  rotateLogs(path.dirname(file), path.basename(file))
   return Logger.toFile(formatter(id), file, { flag: "a" })
 }
 

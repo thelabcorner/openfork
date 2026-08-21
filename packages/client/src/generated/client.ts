@@ -45,6 +45,18 @@ import type {
   SessionsRegenerateTitleOutput,
   SessionsMessageInput,
   SessionsMessageOutput,
+  SessionsListCheckpointsInput,
+  SessionsListCheckpointsOutput,
+  SessionsGetCheckpointInput,
+  SessionsGetCheckpointOutput,
+  SessionsDiffCheckpointInput,
+  SessionsDiffCheckpointOutput,
+  SessionsDiffCheckpointRawInput,
+  SessionsDiffCheckpointRawOutput,
+  SessionsRevertCheckpointInput,
+  SessionsRevertCheckpointOutput,
+  SessionsCreateCheckpointInput,
+  SessionsCreateCheckpointOutput,
   MessagesListInput,
   MessagesListOutput,
   ModelsListInput,
@@ -563,6 +575,77 @@ export function make(options: ClientOptions) {
           },
           requestOptions,
         ).then((value) => value.data),
+      listCheckpoints: (input: SessionsListCheckpointsInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: SessionsListCheckpointsOutput }>(
+          {
+            method: "GET",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/checkpoint`,
+            query: { limit: input["limit"], status: input["status"], kind: input["kind"] },
+            successStatus: 200,
+            declaredStatuses: [404, 422, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      getCheckpoint: (input: SessionsGetCheckpointInput, requestOptions?: RequestOptions) =>
+        request<SessionsGetCheckpointOutput>(
+          {
+            method: "GET",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/checkpoint/${encodeURIComponent(input.checkpointID)}`,
+            successStatus: 200,
+            declaredStatuses: [404, 409, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      diffCheckpoint: (input: SessionsDiffCheckpointInput, requestOptions?: RequestOptions) =>
+        request<SessionsDiffCheckpointOutput>(
+          {
+            method: "GET",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/checkpoint/${encodeURIComponent(input.checkpointID)}/diff`,
+            query: { mode: input["mode"] },
+            successStatus: 200,
+            declaredStatuses: [404, 409, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      diffCheckpointRaw: (input: SessionsDiffCheckpointRawInput, requestOptions?: RequestOptions) =>
+        request<SessionsDiffCheckpointRawOutput>(
+          {
+            method: "GET",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/checkpoint/${encodeURIComponent(input.checkpointID)}/diff/raw`,
+            query: { mode: input["mode"] },
+            successStatus: 200,
+            declaredStatuses: [404, 409, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      revertCheckpoint: (input: SessionsRevertCheckpointInput, requestOptions?: RequestOptions) =>
+        request<SessionsRevertCheckpointOutput>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/checkpoint/${encodeURIComponent(input.checkpointID)}/revert`,
+            body: { mode: input["mode"] },
+            successStatus: 200,
+            declaredStatuses: [404, 409, 422, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ),
+      createCheckpoint: (input: SessionsCreateCheckpointInput, requestOptions?: RequestOptions) =>
+        request<SessionsCreateCheckpointOutput>(
+          {
+            method: "POST",
+            path: `/api/session/${encodeURIComponent(input.sessionID)}/checkpoint`,
+            body: { kind: input["kind"], label: input["label"] },
+            successStatus: 200,
+            declaredStatuses: [404, 422, 409, 400, 401],
+            empty: false,
+          },
+          requestOptions,
+        ),
     },
     messages: {
       list: (input: MessagesListInput, requestOptions?: RequestOptions) =>

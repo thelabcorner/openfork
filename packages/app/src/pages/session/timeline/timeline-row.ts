@@ -59,7 +59,22 @@ export namespace TimelineRow {
     | Error
     | Retry
 
+  // Rows are immutable after construction (constructMessageRows creates fresh
+  // instances; reuseTimelineRows copies rather than mutating), so the key is a
+  // pure function of the row object and can be memoized once per row. key() is
+  // on the hot path of every rows-list change (reconciliation, index maps,
+  // virtualizer re-keying, estimateInput), where the string concat showed up
+  // as measurable overhead -- the cache turns it into a WeakMap get.
+  const keyCache = new WeakMap<TimelineRow, string>()
   export const key = (row: TimelineRow) => {
+    const cached = keyCache.get(row)
+    if (cached !== undefined) return cached
+    const computed = computeKey(row)
+    keyCache.set(row, computed)
+    return computed
+  }
+
+  function computeKey(row: TimelineRow) {
     switch (row._tag) {
       case "TurnGap":
         return `turn-gap:${row.userMessageID}`

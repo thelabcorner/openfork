@@ -12,6 +12,7 @@ const Handlers = Runtime.handlers(Commands, {
   api: () => import("./commands/handlers/api"),
   debug: {
     agents: () => import("./commands/handlers/debug/agents"),
+    checkpoints: () => import("./commands/handlers/debug/checkpoints"),
   },
   migrate: () => import("./commands/handlers/migrate"),
   service: {

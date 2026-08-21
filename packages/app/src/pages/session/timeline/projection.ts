@@ -97,41 +97,36 @@ export function createTimelineProjection(input: {
   const rows = createMemo((previous: TimelineRow.TimelineRow[] | undefined) =>
     reuseTimelineRows(previous, perTurnRows().flatMap((turnRows) => turnRows())),
   )
-  const rowByKey = createMemo(() => new Map(rows().map((row) => [TimelineRow.key(row), row] as const)))
-  const messageRowIndex = createMemo(() => {
-    const result = new Map<string, number>()
+  // All per-row index maps are built in ONE pass over rows() (five separate
+  // memos each iterated the list; a rows-list change happens on every message
+  // append, so this is a per-append O(rows) hot path).
+  // - messageRowIndex: first row index per message (turn start)
+  // - messageRowIndices: all row indices per message (session find scrolls to
+  //   the exact row containing a match, not just the turn start)
+  const rowIndexMaps = createMemo(() => {
+    const rowByKey = new Map<string, TimelineRow.TimelineRow>()
+    const messageRowIndex = new Map<string, number>()
+    const messageRowIndices = new Map<string, number[]>()
+    const messageLastRowIndex = new Map<string, number>()
+    const lastAssistantGroupKey = new Map<string, string>()
     rows().forEach((row, index) => {
-      if (!("userMessageID" in row) || result.has(row.userMessageID)) return
-      result.set(row.userMessageID, index)
-    })
-    return result
-  })
-  // All row indices per message (not just first). Used by session find to
-  // scroll to the exact row containing a match, not just the turn start.
-  const messageRowIndices = createMemo(() => {
-    const result = new Map<string, number[]>()
-    rows().forEach((row, index) => {
+      rowByKey.set(TimelineRow.key(row), row)
       if (!("userMessageID" in row)) return
-      const list = result.get(row.userMessageID)
+      const id = row.userMessageID
+      if (!messageRowIndex.has(id)) messageRowIndex.set(id, index)
+      const list = messageRowIndices.get(id)
       if (list) list.push(index)
-      else result.set(row.userMessageID, [index])
+      else messageRowIndices.set(id, [index])
+      messageLastRowIndex.set(id, index)
+      if (row._tag === "AssistantPart") lastAssistantGroupKey.set(id, row.group.key)
     })
-    return result
+    return { rowByKey, messageRowIndex, messageRowIndices, messageLastRowIndex, lastAssistantGroupKey }
   })
-  const messageLastRowIndex = createMemo(() => {
-    const result = new Map<string, number>()
-    rows().forEach((row, index) => {
-      if ("userMessageID" in row) result.set(row.userMessageID, index)
-    })
-    return result
-  })
-  const lastAssistantGroupKey = createMemo(() => {
-    const result = new Map<string, string>()
-    rows().forEach((row) => {
-      if (row._tag === "AssistantPart") result.set(row.userMessageID, row.group.key)
-    })
-    return result
-  })
+  const rowByKey = createMemo(() => rowIndexMaps().rowByKey)
+  const messageRowIndex = createMemo(() => rowIndexMaps().messageRowIndex)
+  const messageRowIndices = createMemo(() => rowIndexMaps().messageRowIndices)
+  const messageLastRowIndex = createMemo(() => rowIndexMaps().messageLastRowIndex)
+  const lastAssistantGroupKey = createMemo(() => rowIndexMaps().lastAssistantGroupKey)
 
   return {
     activeMessageID,

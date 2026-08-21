@@ -6,6 +6,7 @@ import os from "os"
 import { SessionID, MessageID, PartID } from "./schema"
 import { MessageV2 } from "./message-v2"
 import { SessionRevert } from "./revert"
+import { TurnCheckpoint } from "./checkpoint"
 import { Session } from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
@@ -142,7 +143,8 @@ const layer = Layer.effect(
     const scope = yield* Scope.Scope
     const instruction = yield* Instruction.Service
     const state = yield* SessionRunState.Service
-    const revert = yield* SessionRevert.Service
+     const revert = yield* SessionRevert.Service
+     const turnCheckpoint = yield* TurnCheckpoint.Service
     const summary = yield* SessionSummary.Service
     const sys = yield* SystemPrompt.Service
     const llm = yield* LLM.Service
@@ -1270,26 +1272,41 @@ Generate a fresh title. Do not reuse the current title.`
         let step = 0
         let spad: SpadSupervisor | undefined
         let spadStarted = false
+        let turn: TurnCheckpoint.Turn | undefined
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         // Hard pause gate (V1): a paused session must not start any provider
         // work. Prompt admission already gates, but direct loop callers (resume,
         // summarize, command) and in-flight wake races need the same check.
         if (session.pausedAt !== undefined) return yield* lastAssistant(sessionID)
 
-        while (true) {
-          yield* status.set(sessionID, { type: "busy" })
-          yield* Effect.logInfo("loop", { "session.id": sessionID, step })
+         while (true) {
+           yield* status.set(sessionID, { type: "busy" })
+           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-          let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-            Effect.provideService(Database.Service, database),
-          )
+           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+             Effect.provideService(Database.Service, database),
+           )
 
-          const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
-          if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+           // Per-turn checkpoint: capture a pre-turn tree and insert a `capturing`
+           // row on the first step of this runLoop invocation (one logical turn).
+           // On resume of an interrupted turn, begin() reconciles the existing row.
+           if (step === 0) {
+             turn = yield* turnCheckpoint.begin({ sessionID, userMessageID: lastUser.id }).pipe(
+               Effect.catch((err) =>
+                 Effect.logWarning("turn checkpoint begin failed", {
+                   "session.id": sessionID,
+                   error: String(err),
+                 }).pipe(Effect.as(undefined)),
+               ),
+             )
+           }
 
           const lastUserMsg = msgs.findLast((msg) => msg.info.role === "user" && msg.info.id === lastUser.id)
-          if (!spadStarted && (yield* config.get()).experimental?.spad_recovery === true && lastUserMsg) {
+          if (!spadStarted && (yield* config.get()).experimental?.spad_recovery !== false && lastUserMsg) {
             const userText = lastUserMsg.parts
               .filter((part): part is SessionV1.TextPart => part.type === "text" && part.synthetic !== true)
               .map((part) => part.text)
@@ -1556,6 +1573,12 @@ Generate a fresh title. Do not reuse the current title.`
           continue
         }
 
+        // Quiescence: the turn reached a terminal assistant completion. Capture
+        // the post-turn tree, diff against the pre-turn tree, and finalize the
+        // checkpoint row (best-effort; never breaks the turn result).
+        yield* turnCheckpoint.finish(turn)
+        turn = undefined
+
         yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
@@ -1564,7 +1587,14 @@ Generate a fresh title. Do not reuse the current title.`
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      return yield* state.ensureRunning(input.sessionID, lastAssistant(input.sessionID), runLoop(input.sessionID))
+      // Hard interruption of the runLoop fiber (crash-level abort, not the
+      // graceful step-level path) still finalizes the turn checkpoint with
+      // status `aborted` and a captured after-state (t3 §47).
+      return yield* state.ensureRunning(
+        input.sessionID,
+        lastAssistant(input.sessionID),
+        runLoop(input.sessionID).pipe(Effect.onError(() => turnCheckpoint.finishAborted(input.sessionID))),
+      )
     })
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
@@ -1840,8 +1870,9 @@ export const node = LayerNode.make({
     Image.node,
     CrossSpawnSpawner.node,
     Instruction.node,
-    SessionRunState.node,
-    SessionRevert.node,
+     SessionRunState.node,
+     SessionRevert.node,
+     TurnCheckpoint.node,
     SessionSummary.node,
     SystemPrompt.node,
     LLM.node,

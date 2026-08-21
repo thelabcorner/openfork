@@ -1,6 +1,7 @@
 export * as ToolOutputStore from "./tool-output-store"
 
 import path from "path"
+import { brotliCompressSync, constants } from "node:zlib"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { Config } from "./config"
 import { FSUtil } from "./fs-util"
@@ -127,10 +128,20 @@ const layer = Layer.effect(
     })
 
     const write = Effect.fn("ToolOutputStore.write")(function* (content: string) {
-      const file = path.join(directory, `tool_${Identifier.ascending()}`)
+      const file = path.join(directory, `tool_${Identifier.ascending()}.br`)
       yield* fs.ensureDir(directory).pipe(Effect.mapError((cause) => new StorageError({ operation: "write", cause })))
+      const compressed = yield* Effect.try({
+        try: () =>
+          brotliCompressSync(Buffer.from(content, "utf-8"), {
+            params: {
+              [constants.BROTLI_PARAM_MODE]: constants.BROTLI_MODE_TEXT,
+              [constants.BROTLI_PARAM_QUALITY]: 4,
+            },
+          }),
+        catch: (cause) => new StorageError({ operation: "write", cause }),
+      })
       yield* fs
-        .writeFileString(file, content, { flag: "wx" })
+        .writeFile(file, compressed, { flag: "wx" })
         .pipe(Effect.mapError((cause) => new StorageError({ operation: "write", cause })))
       return file
     })
@@ -156,7 +167,7 @@ const layer = Layer.effect(
         }
 
       const outputPath = yield* write(contextual)
-      const marker = `... output truncated; full content saved to ${outputPath} ...`
+      const marker = `... output truncated; full content saved to ${outputPath} (brotli compressed). Use the archive tool to view it: archive({action:"read", path:"${outputPath}"}) ...`
 
       return {
         output: {

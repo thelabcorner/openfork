@@ -386,3 +386,137 @@ export function ScrollView(props: ScrollViewProps) {
     </div>
   )
 }
+
+/** ScrollView-style overlay thumb for a scroll container this component does not
+ * own (e.g. a contenteditable that must stay the scroller). Renders the same
+ * pill as ScrollView, revealed on hover/scroll and draggable. The overlay takes
+ * no layout space and is pointer-events-transparent except on the thumb; the
+ * parent of `viewport` provides the positioning context. */
+export function ScrollViewOverlayScrollbar(props: {
+  viewport: () => HTMLElement | undefined
+  hoverTarget?: () => HTMLElement | undefined
+}) {
+  const [state, setState] = createStore({
+    hovered: false,
+    dragging: false,
+    scrolling: false,
+    show: false,
+    size: 0,
+    top: 0,
+  })
+  let idleTimer: ReturnType<typeof setTimeout> | undefined
+  let thumbRef!: HTMLDivElement
+
+  const update = () => {
+    const viewport = props.viewport()
+    if (!viewport) return
+    const { scrollTop, scrollHeight, clientHeight } = viewport
+    if (scrollHeight <= clientHeight || scrollHeight === 0) {
+      setState("show", false)
+      return
+    }
+    const trackPadding = 8
+    const trackHeight = clientHeight - trackPadding * 2
+    const height = Math.max(32, (clientHeight / scrollHeight) * trackHeight)
+    const maxScrollTop = scrollHeight - clientHeight
+    const maxThumbTop = trackHeight - height
+    setState({
+      show: true,
+      size: height,
+      top: trackPadding + (maxScrollTop > 0 ? (scrollTop / maxScrollTop) * maxThumbTop : 0),
+    })
+  }
+
+  const markScrolling = () => {
+    setState("scrolling", true)
+    if (idleTimer !== undefined) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => setState("scrolling", false), 800)
+  }
+
+  onCleanup(() => {
+    if (idleTimer !== undefined) clearTimeout(idleTimer)
+  })
+
+  createEffect(() => {
+    const viewport = props.viewport()
+    if (!viewport) return
+    const onScroll = () => {
+      update()
+      markScrolling()
+    }
+    viewport.addEventListener("scroll", onScroll, { passive: true })
+    createResizeObserver(
+      () =>
+        [viewport, viewport.firstElementChild].filter(
+          (element): element is HTMLElement => element instanceof HTMLElement,
+        ),
+      update,
+    )
+    update()
+    onCleanup(() => viewport.removeEventListener("scroll", onScroll))
+  })
+
+  createEffect(() => {
+    const target = props.hoverTarget?.() ?? props.viewport()
+    if (!target) return
+    const enter = () => setState("hovered", true)
+    const leave = () => setState("hovered", false)
+    target.addEventListener("pointerenter", enter)
+    target.addEventListener("pointerleave", leave)
+    onCleanup(() => {
+      target.removeEventListener("pointerenter", enter)
+      target.removeEventListener("pointerleave", leave)
+      setState("hovered", false)
+    })
+  })
+
+  const onThumbPointerDown = (event: PointerEvent) => {
+    const viewport = props.viewport()
+    if (!viewport) return
+    event.preventDefault()
+    event.stopPropagation()
+    setState("dragging", true)
+    const grabOffset = event.clientY - thumbRef.getBoundingClientRect().top
+    thumbRef.setPointerCapture(event.pointerId)
+
+    const onPointerMove = (move: PointerEvent) => {
+      viewport.scrollTop = scrollTopFromThumbPointer({
+        pointer: move.clientY,
+        viewportTop: viewport.getBoundingClientRect().top,
+        grabOffset,
+        clientHeight: viewport.clientHeight,
+        scrollHeight: viewport.scrollHeight,
+        thumbHeight: state.size,
+      })
+    }
+    const done = (up: PointerEvent) => {
+      setState("dragging", false)
+      thumbRef.releasePointerCapture(up.pointerId)
+      thumbRef.removeEventListener("pointermove", onPointerMove)
+      thumbRef.removeEventListener("pointerup", done)
+      thumbRef.removeEventListener("pointercancel", done)
+    }
+    thumbRef.addEventListener("pointermove", onPointerMove)
+    thumbRef.addEventListener("pointerup", done)
+    thumbRef.addEventListener("pointercancel", done)
+  }
+
+  return (
+    <div class="pointer-events-none absolute inset-0 z-20 overflow-hidden">
+      <Show when={state.show}>
+        <div
+          ref={(el) => (thumbRef = el)}
+          class="scroll-view__thumb"
+          data-visible={state.hovered || state.dragging || state.scrolling}
+          data-dragging={state.dragging}
+          style={{
+            height: `${state.size}px`,
+            transform: `translateY(${state.top}px)`,
+            "z-index": 100,
+          }}
+          onPointerDown={onThumbPointerDown}
+        />
+      </Show>
+    </div>
+  )
+}

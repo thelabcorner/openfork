@@ -168,6 +168,8 @@ const stubSearch = makeLocationNode({
       find: () => Effect.succeed([]),
       glob: () => Effect.succeed([]),
       grep: () => Effect.succeed([]),
+      searchMentions: () =>
+        Effect.succeed({ files: [], symbols: [], results: [], hasMore: false, total: 0 }),
     }),
   ),
   deps: [],

@@ -38,6 +38,14 @@ interface Config {
   readonly spanAttributes?: Record<string, unknown>
   readonly transformResultNames?: (str: string) => string
   readonly transformQueryNames?: (str: string) => string
+  /**
+   * CREATE-TIME-ONLY pragmas applied BEFORE `journal_mode = WAL` on a fresh
+   * connection. `page_size` and `auto_vacuum` can only be set before any table
+   * exists and before WAL is enabled, so they MUST run here (setting them after
+   * WAL is a silent no-op). On an existing DB they are harmless no-ops. Populated
+   * by the storage layer (ChunkDB) when its feature flag is on.
+   */
+  readonly createTimePragmas?: { readonly page_size: number; readonly auto_vacuum: number }
 }
 
 interface SqliteConnection extends Connection {
@@ -155,7 +163,27 @@ const nativeLayer = (config: Config) =>
         enableForeignKeyConstraints: true,
         open: true,
       })
-      yield* Effect.addFinalizer(() => Effect.sync(() => native.close()))
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          try {
+            native.exec("PRAGMA wal_checkpoint(TRUNCATE)")
+          } catch {}
+          try {
+            native.close()
+          } catch {}
+          try {
+            const maybeGc = (globalThis as unknown as { gc?: () => void }).gc
+            maybeGc?.()
+          } catch {}
+        }),
+      )
+      // Create-time-only pragmas MUST precede WAL: page_size/auto_vacuum are
+      // silent no-ops once WAL is enabled or any table exists. On existing DBs
+      // they are harmless no-ops, so applying unconditionally is safe.
+      if (config.createTimePragmas) {
+        native.exec(`PRAGMA page_size = ${config.createTimePragmas.page_size}`)
+        native.exec(`PRAGMA auto_vacuum = ${config.createTimePragmas.auto_vacuum}`)
+      }
       if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
       return native
     }),

@@ -114,12 +114,22 @@ function createServerCtx(
   const sdk = createServerSdkContext(conn, scope)
   const sync = createServerSyncContext(sdk)
 
+  const projectMeta = createMemo(() => {
+    const byId = new Map<string, (typeof sync.data.project)[number]>()
+    const byWorktree = new Map<string, (typeof sync.data.project)[number]>()
+    for (const project of sync.data.project) {
+      byId.set(project.id, project)
+      byWorktree.set(pathKey(project.worktree), project)
+    }
+    return { byId, byWorktree }
+  })
+
   function enrich(project: { worktree: string; expanded: boolean }) {
     const [childStore] = sync.child(project.worktree, { bootstrap: false })
     const projectID = childStore.project
     const metadata = projectID
-      ? sync.data.project.find((x) => x.id === projectID)
-      : sync.data.project.find((x) => x.worktree === project.worktree)
+      ? projectMeta().byId.get(projectID)
+      : projectMeta().byWorktree.get(pathKey(project.worktree))
 
     // Preserve local icon override from per-workspace localStorage cache (childStore.icon).
     // Without this, different subdirectories of the same git repo would share the same
@@ -133,7 +143,7 @@ function createServerCtx(
 
   const projectsList = createMemo(() => projects.list().map(enrich))
   const recentlyClosedList = createMemo(() => {
-    const known = new Set(sync.data.project.map((project) => pathKey(project.worktree)))
+    const known = projectMeta().byWorktree
     return projects
       .recentlyClosed()
       .filter((worktree) => known.has(pathKey(worktree)))

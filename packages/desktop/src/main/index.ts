@@ -351,6 +351,26 @@ const main = Effect.gen(function* () {
     ),
   )
 
+  // Show a window as soon as we can instead of blocking on the sidecar (backend
+  // process spawn + up-to-30s health-check poll below). The renderer's own
+  // LoadingSplash already awaits `serverReady` via the `awaitInitialization` IPC
+  // handler registered above, so it correctly waits for the backend itself --
+  // there's no correctness reason to *also* keep the window from appearing at
+  // all until that finishes. Previously this ran after `Fiber.await(loadingTask)`,
+  // meaning the app showed nothing (no splash, no window) for the entire backend
+  // startup, which is most of what makes cold start feel "extremely slow."
+  app.on("window-all-closed", () => {
+    if (process.platform === "darwin") return
+    app.quit()
+  })
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length > 0) return
+    restoreMainWindows()
+  })
+
+  const windows = restoreMainWindows()
+  if (windows.length) createMenu(menuDeps)
+
   const loadingTask = yield* Effect.gen(function* () {
     logger.log("sidecar connection started", { version: SIDECAR_VERSION })
 
@@ -428,18 +448,6 @@ const main = Effect.gen(function* () {
   }).pipe(forwardInitializationFailure(serverReady), Effect.forkChild)
 
   yield* Fiber.await(loadingTask)
-
-  app.on("window-all-closed", () => {
-    if (process.platform === "darwin") return
-    app.quit()
-  })
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length > 0) return
-    restoreMainWindows()
-  })
-
-  const windows = restoreMainWindows()
-  if (windows.length) createMenu(menuDeps)
 
   // Sidecar is up (serverReady settled by the loadingTask above): start the
   // browser host bridge (loopback listener + sidecar hello registration).

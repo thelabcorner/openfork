@@ -173,7 +173,7 @@ export const Info = Schema.Struct({
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),
       spad_recovery: Schema.optional(Schema.Boolean).annotate({
-        description: "Enable experimental text-channel repetitive-output recovery",
+        description: "Enable repetitive-output recovery (SPAD-R). Enabled by default; set false to disable",
       }),
       batch_tool: Schema.optional(Schema.Boolean).annotate({ description: "Enable the batch tool" }),
       openTelemetry: Schema.optional(Schema.Boolean).annotate({

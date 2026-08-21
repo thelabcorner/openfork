@@ -27,6 +27,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { ForkCredentials } from "@/fork/credentials"
 import { SpadSupervisor } from "./spad/supervisor"
+import { toolResourceKey } from "./spad/thrash"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -286,6 +287,16 @@ const layer = Layer.effect(
         }
       }
 
+      const isSignedReasoningMetadata = (metadata: unknown): boolean => {
+        if (!isRecord(metadata)) return false
+        const rec = metadata as Record<string, unknown>
+        const anthropic = rec.anthropic
+        if (isRecord(anthropic) && "signature" in anthropic) return true
+        const bedrock = rec.bedrock
+        if (isRecord(bedrock) && "signature" in bedrock) return true
+        return false
+      }
+
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
         switch (value.type) {
           case "reasoning-start":
@@ -298,9 +309,7 @@ const layer = Layer.effect(
               ctx.assistantMessage.time.firstTokenAt = Date.now()
               yield* session.updateMessage(ctx.assistantMessage)
             }
-            // Reasoning may carry a provider signature that only arrives at block
-            // end. Observe it, but never truncate it until replay safety is proven.
-            ctx.spad?.startPart("reasoning", false, true)
+            ctx.spad?.startPart("reasoning", false, false)
             ctx.reasoningMap[value.id] = {
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -316,7 +325,25 @@ const layer = Layer.effect(
           case "reasoning-delta":
             // Match dev: silently drop orphan deltas (no preceding reasoning-start).
             if (!(value.id in ctx.reasoningMap)) return
-            ctx.spad?.push(value.text)
+            {
+              const action = ctx.spad?.push(value.text)
+              if (action?.type === "abort") throw new Error(`Repetitive reasoning continued after recovery (${action.reason})`)
+              if (action?.type === "recover") {
+                const signed =
+                  isSignedReasoningMetadata(ctx.reasoningMap[value.id].metadata) ||
+                  isSignedReasoningMetadata(value.providerMetadata)
+                if (signed) {
+                  // Signed thinking must remain observe-only for replay safety.
+                } else {
+                  const full = ctx.reasoningMap[value.id].text + value.text
+                  const cut = action.noTruncate ? full.length : Math.max(0, Math.min(full.length, action.quarantineFrom))
+                  ctx.reasoningMap[value.id].text = full.slice(0, cut)
+                  yield* session.updatePart(ctx.reasoningMap[value.id])
+                  ctx.needsRecovery = { prompt: action.recoveryPrompt }
+                  return
+                }
+              }
+            }
             ctx.reasoningMap[value.id].text += value.text
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
             yield* session.updatePartDelta({
@@ -379,8 +406,8 @@ const layer = Layer.effect(
             const recentParts = parts.slice(-DOOM_LOOP_THRESHOLD)
 
             if (
-              recentParts.length !== DOOM_LOOP_THRESHOLD ||
-              !recentParts.every(
+              recentParts.length === DOOM_LOOP_THRESHOLD &&
+              recentParts.every(
                 (part) =>
                   part.type === "tool" &&
                   part.tool === value.name &&
@@ -388,18 +415,27 @@ const layer = Layer.effect(
                   JSON.stringify(part.state.input) === JSON.stringify(input),
               )
             ) {
-              return
+              const agent = yield* agents.get(ctx.assistantMessage.agent)
+              yield* permission.ask({
+                permission: "doom_loop",
+                patterns: [value.name],
+                sessionID: ctx.assistantMessage.sessionID,
+                metadata: { tool: value.name, input },
+                always: [value.name],
+                ruleset: agent.permission,
+              })
             }
 
-            const agent = yield* agents.get(ctx.assistantMessage.agent)
-            yield* permission.ask({
-              permission: "doom_loop",
-              patterns: [value.name],
-              sessionID: ctx.assistantMessage.sessionID,
-              metadata: { tool: value.name, input },
-              always: [value.name],
-              ruleset: agent.permission,
-            })
+            {
+              const isMutating = value.name === "write" || value.name === "edit" || value.name === "patch"
+              const resource = toolResourceKey(value.name, input)
+              const toolAction = ctx.spad?.pushTool(value.name, isMutating, resource)
+              if (toolAction?.type === "abort") throw new Error(`Repetitive tool calls continued after recovery (${toolAction.reason})`)
+              if (toolAction?.type === "recover") {
+                ctx.needsRecovery = { prompt: toolAction.recoveryPrompt }
+                return
+              }
+            }
             return
           }
 
@@ -543,7 +579,8 @@ const layer = Layer.effect(
               throw new Error(`Repetitive model output continued after recovery (${action.reason})`)
             }
             if (action?.type === "recover") {
-              ctx.currentText.text = ctx.currentText.text.slice(0, action.quarantineFrom)
+              const cut = action.noTruncate ? ctx.currentText.text.length : action.quarantineFrom
+              ctx.currentText.text = ctx.currentText.text.slice(0, cut)
               yield* session.updatePart(ctx.currentText)
               ctx.needsRecovery = { prompt: action.recoveryPrompt }
               return
@@ -681,6 +718,7 @@ const layer = Layer.effect(
         })
         ctx.needsCompaction = false
         ctx.needsRecovery = undefined
+        ctx.spad?.markGeneration()
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
         return yield* Effect.gen(function* () {

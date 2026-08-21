@@ -1,0 +1,26 @@
+{
+  "generatedBy": "bench-frontcode.ts",
+  "runtime": "bun 1.3.14 (Windows x64)",
+  "corpus": { "events": 2000, "aggregates": 50, "chunkEvents": 64, "rawBytes": 8062911, "uniqueValues": 1450 },
+  "storage": {
+    "frontCodedZstd3Bytes": 63177,
+    "currentEventValueApproxBytes": 388667,
+    "frontVsCurrent": 6.152033176630736,
+    "rawVsFront": 127.62415119426373
+  },
+  "timingsMsMedian3": {
+    "fullLoadFront": 14.365999999999985,
+    "fullLoadCurrent": 72.457,
+    "partialLoadFront": 1.0125000000000455,
+    "partialLoadCurrent": 1.2051999999999907,
+    "append100Front": 23.77150000000006,
+    "append100Current": 3.9452,
+    "updateOneFrontRewriteChunk": 13.032100000000014,
+    "updateOneCurrentValue": 0.030300000000011096
+  },
+  "interpretation": {
+    "viableFor": ["sealed append-only history", "bulk/full-load replay", "highly repetitive payloads"],
+    "risks": ["single-record appends pay zstd overhead", "one update rewrites a full 64-record chunk", "prototype has no crash-safe locator/index publication"],
+    "notProductionEvidence": "Synthetic corpus and in-memory bytes; current event_value size includes approximate reference overhead and excludes SQLite page/index overhead."
+  }
+}

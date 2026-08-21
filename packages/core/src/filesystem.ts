@@ -7,6 +7,7 @@ import { FSUtil } from "./fs-util"
 import { Location } from "./location"
 import { PositiveInt, RelativePath } from "./schema"
 import { FileSystemSearch } from "./filesystem/search"
+import type { Matcher } from "./search/matcher"
 import { Entry, FileSystem, FindInput, Match } from "@opencode-ai/schema/filesystem"
 export { Entry, Match, Submatch } from "@opencode-ai/schema/filesystem"
 
@@ -52,6 +53,12 @@ export interface Interface {
   readonly find: (input: FindInput) => Effect.Effect<Entry[]>
   readonly glob: (input: GlobInput) => Effect.Effect<readonly Entry[]>
   readonly grep: (input: GrepInput) => Effect.Effect<readonly Match[]>
+  readonly searchMentions: (input: {
+    query: string
+    limit: number
+    offset: number
+    symbols: boolean
+  }) => Effect.Effect<Matcher.QueryPage>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/FileSystem") {}
@@ -75,6 +82,7 @@ const baseLayer = Layer.effect(
       find: search.find,
       glob: search.glob,
       grep: search.grep,
+      searchMentions: search.searchMentions,
       read: Effect.fn("FileSystem.read")(function* (input) {
         const target = yield* resolve(input.path)
         const info = yield* fs.stat(target.real).pipe(Effect.orDie)

@@ -11,6 +11,7 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useLanguage } from "@/context/language"
 import { ServerConnection } from "@/context/server"
 import { SessionTabAvatarView } from "@/pages/layout/session-tab-avatar"
+import { type ProjectAvatarStatus } from "@opencode-ai/ui/v2/project-avatar-v2"
 import { sessionTitle } from "@/utils/session-title"
 import { getRelativeTime } from "@/utils/time"
 import { shouldOpenSessionInBackground } from "../home-session-open"
@@ -238,7 +239,7 @@ function HomeSessionLeadingController(props: {
           record={props.record}
           revealProjectOnHover={props.revealProjectOnHover}
           open={state.open()}
-          unread={state.unread()}
+          status={state.status()}
           loading={state.loading()}
         />
       )}
@@ -250,7 +251,7 @@ function HomeSessionLeading(props: {
   record: HomeSessionRecord
   revealProjectOnHover: boolean
   open: boolean
-  unread: boolean
+  status: ProjectAvatarStatus | undefined
   loading: boolean
 }) {
   return (
@@ -269,7 +270,7 @@ function HomeSessionLeading(props: {
         project={props.record.project}
         directory={props.record.session.directory}
         revealProjectOnHover={props.revealProjectOnHover}
-        unread={props.unread}
+        status={props.status}
         loading={props.loading}
       />
     </div>

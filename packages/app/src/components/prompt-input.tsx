@@ -14,6 +14,8 @@ import {
   type JSX,
 } from "solid-js"
 import { selectionFromLines, type SelectedLineRange, useFile } from "@/context/file"
+import { useServer } from "@/context/server"
+import { authTokenFromCredentials } from "@/utils/server"
 import {
   ContentPart,
   DEFAULT_PROMPT,
@@ -23,6 +25,7 @@ import {
   usePrompt,
   ImageAttachmentPart,
   AgentPart,
+  ExternalPathPart,
   FileAttachmentPart,
 } from "@/context/prompt"
 import { useLayout } from "@/context/layout"
@@ -53,6 +56,15 @@ import { usePlatform } from "@/context/platform"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { createTextFragment, getCursorPosition, setCursorPosition, setRangeEdge } from "./prompt-input/editor-dom"
 import { createPromptAttachments } from "./prompt-input/attachments"
+import { createAtMentionSearch, toMentionOptions } from "./prompt-input/at-mention-search"
+import { resolveAtToken } from "./prompt-input/at-token"
+import {
+  createExternalPathFetch,
+  createExternalPathMentionSearch,
+  ensureExternalPathPermission,
+  splitExternalToken,
+  type ExternalPathFetch,
+} from "./prompt-input/external-path-search"
 import { ACCEPTED_FILE_TYPES, pickAttachmentFiles } from "./prompt-input/files"
 import {
   canNavigateHistoryAtCursor,
@@ -460,7 +472,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     },
   ])
 
-  const closePopover = () => setStore({ popover: null, slashMenu: false, slashMenuQuery: "" })
+  const closePopover = () => {
+    setStore({ popover: null, slashMenu: false, slashMenuQuery: "" })
+    atSearch.onInput("")
+    externalSearch.onInput("")
+  }
 
   const resetHistoryNavigation = (force = false) => {
     if (!force && (store.historyIndex < 0 || store.applyingHistory)) return
@@ -627,6 +643,43 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       })
       return
     }
+    if (option.type === "symbol") {
+      addPart({
+        type: "file",
+        path: option.path,
+        content: "@" + option.name,
+        start: 0,
+        end: 0,
+        filename: option.name,
+        line: option.line,
+      })
+      return
+    }
+    if (option.type === "external") {
+      addPart({
+        type: "external-path",
+        path: option.path,
+        isDir: option.isDir,
+        content: "@" + option.path,
+        start: 0,
+        end: 0,
+        ...(option.status === "denied" ? { status: "denied" as const } : {}),
+      })
+      void ensureExternalPathPermission(externalFetch, option.path).catch(() => undefined)
+      return
+    }
+    if (option.type === "file" && option.isDir) {
+      addPart({
+        type: "file",
+        path: option.path,
+        content: "@" + option.path,
+        start: 0,
+        end: 0,
+        mime: "application/x-directory",
+        filename: option.display,
+      })
+      return
+    }
     addPart({ type: "file", path: option.path, content: "@" + option.path, start: 0, end: 0 })
   }
 
@@ -635,37 +688,85 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     if (x.type === "agent") return `agent:${x.name}`
     if (x.type === "reference") return `reference:${x.name}`
     if (x.type === "resource") return `resource:${x.client}:${x.uri}`
+    if (x.type === "symbol") return `symbol:${x.path}:${x.line}:${x.name}`
+    if (x.type === "external") return `external:${x.path}`
     return `file:${x.path}`
+  }
+
+  const atSearch = createAtMentionSearch((query, options) => files.searchMentions(query, options))
+
+  const serverConn = useServer()
+  const externalFetch: ExternalPathFetch = (input) => {
+    const conn = serverConn.current
+    if (!conn) return Promise.resolve({ status: "denied" })
+    return createExternalPathFetch({
+      url: conn.http.url,
+      authorization: conn.http.password
+        ? `Basic ${authTokenFromCredentials({ username: conn.http.username, password: conn.http.password })}`
+        : undefined,
+      sessionID: () => props.controls.session.id,
+    })(input)
+  }
+  const externalSearch = createExternalPathMentionSearch(externalFetch)
+
+  const routeAtSearch = (token: string) => {
+    if (splitExternalToken(token)) {
+      atSearch.onInput("")
+      externalSearch.onInput(token)
+      return
+    }
+    externalSearch.onInput("")
+    atSearch.onInput(token)
   }
 
   const {
     flat: atFlat,
+    grouped: atGrouped,
+    filter: atFilter,
     active: atActive,
     setActive: setAtActive,
     onInput: atOnInput,
     onKeyDown: atOnKeyDown,
   } = useFilteredList<AtOption>({
-    items: async (query) => {
+    items: (query) => {
       const references = referenceList()
       const agents = agentList()
       const mcpResources = mcpResourceList()
       const open = recent()
-      const seen = new Set(open)
       const pinned: AtOption[] = open.map((path) => ({ type: "file", path, display: path, recent: true }))
       if (!query.trim()) return [...references, ...agents, ...mcpResources, ...pinned]
-      const paths = await files.searchFilesAndDirectories(query)
-      const fileOptions: AtOption[] = paths
-        .filter((path) => !seen.has(path))
-        .map((path) => ({ type: "file", path, display: path }))
-      return [...references, ...agents, ...mcpResources, ...pinned, ...fileOptions]
+      if (splitExternalToken(query)) {
+        return [
+          ...references,
+          ...agents,
+          ...mcpResources,
+          ...pinned,
+          ...externalSearch.results().map((row): AtOption => ({
+            type: "external",
+            name: row.name,
+            path: row.path,
+            base: row.base,
+            isDir: row.isDir,
+            status: row.status,
+            display: row.name,
+          })),
+        ]
+      }
+      // Server results arrive pre-ranked (files, folders, symbols interleaved);
+      // skipFilter keeps them in server order instead of re-running fuzzysort.
+      const remote = toMentionOptions(atSearch.results(), open)
+      return [...references, ...agents, ...mcpResources, ...pinned, ...remote]
     },
     key: atKey,
     filterKeys: ["display"],
-    skipFilter: (item) => item.type === "file" && !item.recent,
+    skipFilter: (item) =>
+      (item.type === "file" && !item.recent) || item.type === "symbol" || item.type === "external",
     groupBy: (item) => {
       if (item.type === "reference") return "reference"
       if (item.type === "agent") return "agent"
       if (item.type === "resource") return "resource"
+      if (item.type === "symbol") return "symbol"
+      if (item.type === "external") return "external"
       if (item.recent) return "recent"
       return "file"
     },
@@ -675,12 +776,16 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         if (category === "agent") return 1
         if (category === "resource") return 2
         if (category === "recent") return 3
-        return 4
+        if (category === "file") return 4
+        if (category === "symbol") return 5
+        return 6
       }
       return rank(a.category) - rank(b.category)
     },
     onSelect: handleAtSelect,
   })
+
+  const atExternalMode = createMemo(() => !!splitExternalToken(atFilter()))
 
   const slashCommands = createMemo<SlashCommand[]>(() => {
     const builtin = command.options
@@ -750,7 +855,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     onSelect: handleSlashSelect,
   })
 
-  const createPill = (part: FileAttachmentPart | AgentPart) => {
+  const createPill = (part: FileAttachmentPart | AgentPart | ExternalPathPart) => {
     const pill = document.createElement("span")
     pill.textContent = part.content
     pill.setAttribute("data-type", part.type)
@@ -759,11 +864,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (part.mime) pill.setAttribute("data-mime", part.mime)
       if (part.filename) pill.setAttribute("data-filename", part.filename)
       if (part.url) pill.setAttribute("data-url", part.url)
+      if (part.line !== undefined) pill.setAttribute("data-line", String(part.line))
       if (part.source?.type === "resource") {
         pill.setAttribute("data-source-type", part.source.type)
         pill.setAttribute("data-source-client-name", part.source.clientName)
         pill.setAttribute("data-source-uri", part.source.uri)
       }
+    }
+    if (part.type === "external-path") {
+      pill.setAttribute("data-path", part.path)
+      pill.setAttribute("data-is-dir", String(part.isDir))
+      if (part.status) pill.setAttribute("data-status", part.status)
     }
     if (part.type === "agent") pill.setAttribute("data-name", part.name)
     pill.setAttribute("contenteditable", "false")
@@ -788,6 +899,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       const el = node as HTMLElement
       if (el.dataset.type === "file") return true
       if (el.dataset.type === "agent") return true
+      if (el.dataset.type === "external-path") return true
       return el.tagName === "BR"
     })
 
@@ -798,7 +910,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         editorRef.appendChild(createTextFragment(part.content))
         continue
       }
-      if (part.type === "file" || part.type === "agent") {
+      if (part.type === "file" || part.type === "agent" || part.type === "external-path") {
         editorRef.appendChild(createPill(part))
       }
     }
@@ -835,6 +947,45 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       const item = items.find((entry) => entry.id === active) ?? items[0]
       handleSlashSelect(item)
     }
+  }
+
+  const replaceAtToken = (token: string) => {
+    const selection = window.getSelection()
+    if (!selection || selection.rangeCount === 0 || !editorRef.contains(selection.anchorNode)) return false
+    const cursorPosition = getCursorPosition(editorRef)
+    const rawText = prompt
+      .current()
+      .map((part) => ("content" in part ? part.content : ""))
+      .join("")
+    const atToken = resolveAtToken(rawText.substring(0, cursorPosition))
+    if (!atToken) return false
+    const range = selection.getRangeAt(0)
+    setRangeEdge(editorRef, range, "start", atToken.start)
+    setRangeEdge(editorRef, range, "end", cursorPosition)
+    range.deleteContents()
+    if (token) {
+      range.insertNode(document.createTextNode(token))
+      range.collapse(false)
+    } else {
+      range.collapse(true)
+    }
+    selection.removeAllRanges()
+    selection.addRange(range)
+    handleInput()
+    return true
+  }
+
+  const completeAtInline = () => {
+    const top = atFlat()[0]
+    if (!top) return false
+    const completion = top.type === "file" || top.type === "external" ? top.path : top.name
+    const cursorPosition = getCursorPosition(editorRef)
+    const rawText = prompt
+      .current()
+      .map((part) => ("content" in part ? part.content : ""))
+      .join("")
+    if (resolveAtToken(rawText.substring(0, cursorPosition))?.token === completion) return false
+    return replaceAtToken("@" + completion)
   }
 
   const reconcile = (input: Prompt) => {
@@ -901,6 +1052,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         ...(file.dataset.mime ? { mime: file.dataset.mime } : {}),
         ...(file.dataset.filename ? { filename: file.dataset.filename } : {}),
         ...(file.dataset.url ? { url: file.dataset.url } : {}),
+        ...(file.dataset.line ? { line: Number(file.dataset.line) } : {}),
         ...(source ? { source } : {}),
       })
       position += content.length
@@ -914,6 +1066,20 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         content,
         start: position,
         end: position + content.length,
+      })
+      position += content.length
+    }
+
+    const pushExternalPath = (pill: HTMLElement) => {
+      const content = pill.textContent ?? ""
+      parts.push({
+        type: "external-path",
+        path: pill.dataset.path!,
+        isDir: pill.dataset.isDir === "true",
+        content,
+        start: position,
+        end: position + content.length,
+        ...(pill.dataset.status ? { status: pill.dataset.status as ExternalPathPart["status"] } : {}),
       })
       position += content.length
     }
@@ -934,6 +1100,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
       if (el.dataset.type === "agent") {
         flushText()
         pushAgent(el)
+        return
+      }
+      if (el.dataset.type === "external-path") {
+        flushText()
+        pushExternalPath(el)
         return
       }
       if (el.tagName === "BR") {
@@ -988,11 +1159,12 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const shellMode = store.mode === "shell"
 
     if (!shellMode) {
-      const atMatch = rawText.substring(0, cursorPosition).match(/@(\S*)$/)
+      const atToken = resolveAtToken(rawText.substring(0, cursorPosition))
       const slashMatch = rawText.match(/^\/(\S*)$/)
 
-      if (atMatch) {
-        atOnInput(atMatch[1])
+      if (atToken) {
+        atOnInput(atToken.token)
+        routeAtSearch(atToken.token)
         setStore({ popover: "at", slashMenu: false, slashMenuQuery: "" })
       } else if (slashMatch) {
         slashOnInput(slashMatch[1])
@@ -1027,20 +1199,19 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
     const range = selection.getRangeAt(0)
     if (!editorRef.contains(range.startContainer)) return false
 
-    if (part.type === "file" || part.type === "agent") {
+    if (part.type === "file" || part.type === "agent" || part.type === "external-path") {
       const cursorPosition = getCursorPosition(editorRef)
       const rawText = prompt
         .current()
         .map((p) => ("content" in p ? p.content : ""))
         .join("")
       const textBeforeCursor = rawText.substring(0, cursorPosition)
-      const atMatch = textBeforeCursor.match(/@(\S*)$/)
+      const atToken = resolveAtToken(textBeforeCursor)
       const pill = createPill(part)
       const gap = document.createTextNode(" ")
 
-      if (atMatch) {
-        const start = atMatch.index ?? cursorPosition - atMatch[0].length
-        setRangeEdge(editorRef, range, "start", start)
+      if (atToken) {
+        setRangeEdge(editorRef, range, "start", atToken.start)
         setRangeEdge(editorRef, range, "end", cursorPosition)
       }
 
@@ -1269,6 +1440,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
     if (event.key === "Escape") {
       if (store.popover) {
+        if (store.popover === "at") replaceAtToken("")
         closePopover()
         event.preventDefault()
         event.stopPropagation()
@@ -1322,6 +1494,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
 
     if (store.popover) {
       if (event.key === "Tab") {
+        if (store.popover === "at" && completeAtInline()) {
+          event.preventDefault()
+          return
+        }
         selectPopoverActive()
         event.preventDefault()
         return
@@ -1441,6 +1617,10 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
         popover={store.popover}
         setSlashPopoverRef={(el) => (slashPopoverRef = el)}
         atFlat={atFlat()}
+        atGroups={atGrouped.latest ?? []}
+        atSearching={atExternalMode() ? externalSearch.searching() : atSearch.searching()}
+        atLoadingMore={atExternalMode() ? externalSearch.loadingMore() : atSearch.loadingMore()}
+        onAtLoadMore={atExternalMode() ? externalSearch.loadMore : atSearch.loadMore}
         atActive={atActive() ?? undefined}
         atKey={atKey}
         setAtActive={setAtActive}
@@ -1538,6 +1718,7 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                 "select-text": true,
                 "w-full pl-3 pr-2 pt-2 text-14-regular text-text-strong focus:outline-none whitespace-pre-wrap": true,
                 "[&_[data-type=file]]:text-syntax-property": true,
+                "[&_[data-type=external-path]]:text-syntax-property": true,
                 "[&_[data-type=agent]]:text-syntax-type": true,
                 "font-mono!": store.mode === "shell",
               }}

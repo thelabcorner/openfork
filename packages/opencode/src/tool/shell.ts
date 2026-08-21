@@ -556,6 +556,36 @@ export const ShellTool = Tool.define(
               stream.end(done)
             }),
         ).pipe(Effect.catch(() => Effect.void))
+        const sidecar = (stream as unknown as Record<string, unknown>).__brSidecar as string | undefined
+        const target = (stream as unknown as Record<string, unknown>).__brTarget as string | undefined
+        if (sidecar && target) {
+          yield* Effect.tryPromise({
+            try: async () => {
+              const fs = await import("node:fs/promises")
+              const zlib = await import("node:zlib")
+              let sidecarData = ""
+              try {
+                sidecarData = await fs.readFile(sidecar, "utf-8")
+              } catch {}
+              if (!sidecarData) {
+                await fs.rm(sidecar, { force: true }).catch(() => {})
+                return
+              }
+              let base = ""
+              try {
+                const brData = await fs.readFile(target)
+                base = zlib.brotliDecompressSync(brData as unknown as Buffer).toString("utf-8")
+              } catch {}
+              const combined = base + sidecarData
+              const compressed = zlib.brotliCompressSync(Buffer.from(combined, "utf-8"), {
+                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4, [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_TEXT },
+              })
+              await fs.writeFile(target, compressed)
+              await fs.rm(sidecar, { force: true }).catch(() => {})
+            },
+            catch: () => undefined,
+          }).pipe(Effect.catch(() => Effect.void))
+        }
       })
 
       yield* ctx.metadata({
@@ -595,7 +625,18 @@ export const ShellTool = Tool.define(
                       Effect.sync(() => {
                         file = next
                         cut = true
-                        sink = createWriteStream(next, { flags: "a" })
+                        // ToolOutputStore now returns .br (brotli) — streaming append to .br would corrupt it.
+                        // Keep the sink as plain text during the run and compress on close; the final .br is created by ToolOutputStore on first write, subsequent chunks go to a plain sidecar that will be merged and compressed on close.
+                        if (next.endsWith(".br")) {
+                          const plainSidecar = next.slice(0, -3)
+                          // Seed the plain sidecar with the already-compressed content's decompressed form is not needed — the .br already contains `full`. New chunks go to plain sidecar and will be appended and recompressed on close.
+                          sink = createWriteStream(plainSidecar, { flags: "a" })
+                          // Remember the sidecar path for close
+                          ;(sink as unknown as Record<string, unknown>).__brSidecar = plainSidecar
+                          ;(sink as unknown as Record<string, unknown>).__brTarget = next
+                        } else {
+                          sink = createWriteStream(next, { flags: "a" })
+                        }
                         full = ""
                       }),
                     ),

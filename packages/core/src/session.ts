@@ -11,7 +11,7 @@ import { Location } from "./location"
 import { SessionMessage } from "./session/message"
 import { Prompt } from "./session/prompt"
 import { PromptInput } from "@opencode-ai/schema/prompt-input"
-import { EventV2 } from "./event"
+import { EventV2, resolveProjectionRef } from "./event"
 import { Database } from "./database/database"
 import { SessionProjector } from "./session/projector"
 import { SessionMessageTable, SessionTable } from "./session/sql"
@@ -349,7 +349,12 @@ const layer = Layer.effect(
         const rows = yield* (input.limit === undefined ? query.all() : query.limit(input.limit).all()).pipe(
           Effect.orDie,
         )
-        return yield* Effect.forEach(direction === "previous" ? rows.toReversed() : rows, decode)
+        return yield* Effect.forEach(direction === "previous" ? rows.toReversed() : rows, (row) =>
+          Effect.gen(function* () {
+            const data = yield* resolveProjectionRef(db, input.sessionID, "session_message.data", row.data)
+            return yield* decode({ ...row, data })
+          }),
+        )
       }),
       message: Effect.fn("V2Session.message")(function* (input) {
         const stored = yield* store.message(input.messageID)

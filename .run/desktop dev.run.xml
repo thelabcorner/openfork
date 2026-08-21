@@ -1,0 +1,27 @@
+<component name="ProjectRunConfigurationManager">
+  <configuration default="false" name="desktop dev" type="js.build_tools.npm">
+    <package-json value="$PROJECT_DIR$/packages/desktop/package.json" />
+    <command value="run" />
+    <scripts>
+      <script value="dev" />
+    </scripts>
+    <node-interpreter value="project" />
+    <envs>
+      <!-- TEMPORARY: opencode-openfork.db and opencode.db are both corrupted
+           ("database disk image is malformed") and currently locked by something
+           unidentified, blocking a fresh start. Point at a new file to unblock
+           immediately; revert once the lock is resolved and the old files can be
+           inspected/cleaned up. -->
+      <env name="OPENCODE_DB" value="C:\Users\slooshied\.local\share\opencode\opencode-openfork-recovered.db" />
+      <!-- ChunkDB epoch-1 background sealer: brotli-compresses cold (48h+ write-idle),
+           large (>=4KB) event rows in place. Fully tested read-path round-trip
+           (packages/core/test/database/chunkdb.test.ts), fail-closed on corruption.
+           Do NOT set OPENCODE_SEAL_DEDUP -- epoch-2 (cross-row dedup via $cdbRef)
+           has no implemented read-side rehydration; the epoch gate (chunkdb.ts)
+           would make an epoch-1 binary refuse to open a DB touched by it, but it's
+           simplest to just never turn it on. -->
+      <env name="OPENCODE_SEAL_ENABLED" value="true" />
+    </envs>
+    <method v="2" />
+  </configuration>
+</component>

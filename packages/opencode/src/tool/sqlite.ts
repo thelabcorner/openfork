@@ -8,13 +8,36 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import * as Core from "./sqlite/core"
-import { runRemoteAction } from "./sqlite/subprocess"
 import DESCRIPTION from "./sqlite.txt"
 
-const isBun = typeof process.versions?.bun !== "undefined"
+// Runtime detection: Bun reports process.versions.bun even though
+// process.release.name is "node". Electron's Node sidecar must not be
+// mistaken for Bun.
+const isBun =
+  typeof process === "object" &&
+  typeof process.versions?.electron !== "string" &&
+  typeof process.versions?.bun === "string"
 
-type Database = import("bun:sqlite").Database
-type Statement = import("bun:sqlite").Statement
+type UnifiedStatement = {
+  readonly columnNames: string[]
+  readonly columnTypes: Array<string | null | undefined>
+  iterate(...params: Array<string | number | boolean | null>): Iterable<Record<string, unknown>>
+  all(...params: Array<string | number | boolean | null>): Array<Record<string, unknown>>
+  get(...params: Array<string | number | boolean | null>): Record<string, unknown> | undefined
+  run(...params: Array<string | number | boolean | null>): { changes: number; lastInsertRowid: number | bigint }
+}
+type UnifiedDatabase = {
+  exec(sql: string): void
+  prepare(sql: string): UnifiedStatement
+  query(sql: string): {
+    get(...params: Array<string | number | boolean | null>): Record<string, unknown> | undefined
+    all(...params: Array<string | number | boolean | null>): Array<Record<string, unknown>>
+  }
+  close(): void
+}
+// Keep old names as aliases so the rest of the file needs no churn
+type Database = UnifiedDatabase
+type Statement = UnifiedStatement
 
 const DEFAULT_LIMIT = 200
 const MAX_LIMIT = 5000
@@ -142,28 +165,126 @@ const readAsk = Effect.fn("SqliteTool.readAsk")(function* (ctx: Tool.Context, re
   yield* assertExternalDirectoryEffect(ctx, resolved.abs, { kind: "file" })
 })
 
+const wrapBunStatement = (stmt: import("bun:sqlite").Statement): UnifiedStatement => {
+  const getColumnNames = () => stmt.columnNames as string[]
+  const getColumnTypes = (): Array<string | null | undefined> => {
+    try {
+      return stmt.columnTypes as Array<string | null | undefined>
+    } catch {
+      return getColumnNames().map(() => null)
+    }
+  }
+  return {
+    get columnNames() {
+      return getColumnNames()
+    },
+    get columnTypes() {
+      return getColumnTypes()
+    },
+    iterate: (...params: Array<string | number | boolean | null>) => stmt.iterate(...params) as Iterable<Record<string, unknown>>,
+    all: (...params: Array<string | number | boolean | null>) => stmt.all(...params) as Array<Record<string, unknown>>,
+    get: (...params: Array<string | number | boolean | null>) => stmt.get(...params) as Record<string, unknown> | undefined,
+    run: (...params: Array<string | number | boolean | null>) => {
+      const r = stmt.run(...params) as { changes: number; lastInsertRowid: number | bigint }
+      return { changes: r.changes, lastInsertRowid: r.lastInsertRowid }
+    },
+  }
+}
+
+const wrapBunDatabase = (db: import("bun:sqlite").Database): UnifiedDatabase => ({
+  exec: (sql: string) => db.exec(sql),
+  prepare: (sql: string) => wrapBunStatement(db.prepare(sql)),
+  query: (sql: string) => {
+    const q = db.query(sql) as { get(...p: unknown[]): unknown; all(...p: unknown[]): unknown[] }
+    return {
+      get: (...params: Array<string | number | boolean | null>) => q.get(...params) as Record<string, unknown> | undefined,
+      all: (...params: Array<string | number | boolean | null>) => q.all(...params) as Array<Record<string, unknown>>,
+    }
+  },
+  close: () => db.close(),
+})
+
+type NodeStatement = {
+  columns(): Array<{ column: string; name: string; type: string | null }>
+  iterate(...params: unknown[]): Iterable<Record<string, unknown>>
+  all(...params: unknown[]): Array<Record<string, unknown>>
+  get(...params: unknown[]): Record<string, unknown> | undefined
+  run(...params: unknown[]): { changes: number; lastInsertRowid: number | bigint }
+}
+type NodeDatabaseSync = {
+  exec(sql: string): void
+  prepare(sql: string): NodeStatement
+  close(): void
+}
+
+const wrapNodeStatement = (stmt: NodeStatement): UnifiedStatement => ({
+  get columnNames() {
+    return stmt.columns().map((c) => c.name)
+  },
+  get columnTypes() {
+    return stmt.columns().map((c) => c.type as string | null | undefined)
+  },
+  iterate: (...params: Array<string | number | boolean | null>) => stmt.iterate(...(params as unknown[])) as Iterable<Record<string, unknown>>,
+  all: (...params: Array<string | number | boolean | null>) => stmt.all(...(params as unknown[])) as Array<Record<string, unknown>>,
+  get: (...params: Array<string | number | boolean | null>) => stmt.get(...(params as unknown[])) as Record<string, unknown> | undefined,
+  run: (...params: Array<string | number | boolean | null>) => {
+    const r = stmt.run(...(params as unknown[])) as { changes: number; lastInsertRowid: number | bigint }
+    return { changes: r.changes, lastInsertRowid: r.lastInsertRowid }
+  },
+})
+
+const wrapNodeDatabase = (db: NodeDatabaseSync): UnifiedDatabase => ({
+  exec: (sql: string) => db.exec(sql),
+  prepare: (sql: string) => wrapNodeStatement(db.prepare(sql)),
+  query: (sql: string) => {
+    const stmt = db.prepare(sql)
+    return {
+      get: (...params: Array<string | number | boolean | null>) => stmt.get(...(params as unknown[])) as Record<string, unknown> | undefined,
+      all: (...params: Array<string | number | boolean | null>) => stmt.all(...(params as unknown[])) as Array<Record<string, unknown>>,
+    }
+  },
+  close: () => db.close(),
+})
+
 const openConnection = (abs: string, mode: ConnectionMode, attaches: Resolved[]) =>
   Effect.acquireRelease(
     Effect.promise(async () => {
-      // Bun reports process.release.name === "node"; the bun version field is
-      // the reliable runtime check. Under Node/Electron the lazy import keeps
-      // the module graph safe (bun:sqlite is unavailable there).
-      if (typeof process.versions?.bun === "undefined") {
-        throw new Error("SQLite tool requires Bun's runtime")
+      if (isBun) {
+        const bunSqliteSpecifier = "bun:" + "sqlite"
+        const { Database } = await import(bunSqliteSpecifier)
+        const opts =
+          mode === "readonly"
+            ? { readonly: true as const }
+            : { readwrite: true as const, create: mode === "readwrite" }
+        const db = new Database(abs, opts)
+        db.exec("PRAGMA busy_timeout = 5000")
+        for (let i = 0; i < attaches.length; i++) {
+          db.prepare("ATTACH DATABASE ? AS " + Core.attachAlias(i)).run(attaches[i].abs)
+        }
+        if (mode === "query_only") db.exec("PRAGMA query_only = ON")
+        return wrapBunDatabase(db)
       }
-      const bunSqliteSpecifier = "bun:" + "sqlite"
-      const { Database } = await import(bunSqliteSpecifier)
-      const opts =
-        mode === "readonly"
-          ? { readonly: true as const }
-          : { readwrite: true as const, create: mode === "readwrite" }
-      const db = new Database(abs, opts)
+      // Node 22+ fallback: `node:sqlite` (DatabaseSync)
+      let NodeDatabaseSync: new (path: string, opts?: unknown) => NodeDatabaseSync
+      try {
+        const mod = await import("node:sqlite")
+        NodeDatabaseSync = (mod as { DatabaseSync: new (path: string, opts?: unknown) => NodeDatabaseSync }).DatabaseSync
+      } catch (e) {
+        throw new Error(
+          `SQLite tool: no suitable driver found (tried bun:sqlite and node:sqlite). Under Node, requires Node 22+ with --experimental-vm-modules or install Bun (https://bun.sh). Cause: ${e instanceof Error ? e.message : String(e)}`,
+        )
+      }
+      const opts = mode === "readonly" ? { readOnly: true } : { readOnly: false }
+      // `node:sqlite` will create the file if readOnly is false; for
+      // readonly/query_only the file must already exist (checked by requireDbFile
+      // or the run-path mkdir logic).
+      const db = new NodeDatabaseSync(abs, opts)
       db.exec("PRAGMA busy_timeout = 5000")
       for (let i = 0; i < attaches.length; i++) {
         db.prepare("ATTACH DATABASE ? AS " + Core.attachAlias(i)).run(attaches[i].abs)
       }
       if (mode === "query_only") db.exec("PRAGMA query_only = ON")
-      return db
+      return wrapNodeDatabase(db)
     }),
     (db) => Effect.sync(() => db.close()),
   )

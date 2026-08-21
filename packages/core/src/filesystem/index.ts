@@ -10,6 +10,7 @@ import { Global } from "../global"
 import { Location } from "../location"
 import { RelativePath } from "../schema"
 import { Hash } from "../util/hash"
+import { IndexFrontcode } from "./index-frontcode"
 
 /**
  * Server-side persisted, incrementally-invalidated project file index.
@@ -101,11 +102,13 @@ export const layer = Layer.effect(
 
     const root = yield* fs.realPath(location.directory).pipe(Effect.orDie)
     const cachePath = path.join(global.data, "file-index", `${Hash.sha256(root)}.json`)
+    const frontManifestPath = `${cachePath}.front.manifest`
 
     const subtrees = new Map<string, Subtree>()
     let builtAt = 0
     let rootStat: RootStat | undefined
     let loaded = false
+    let persistRevision = 0
     const dirty = yield* Ref.make(false)
     const flushQueue = yield* Queue.dropping<number>(1)
 
@@ -121,24 +124,68 @@ export const layer = Layer.effect(
 
     const persist = (): Effect.Effect<void> =>
       Effect.gen(function* () {
+        const revision = persistRevision
+        const snapshotSubtrees = Object.fromEntries(Array.from(subtrees.entries(), ([dir, sub]) => [dir, { at: sub.at, entries: [...sub.entries] }]))
+        const snapshotRootStat = rootStat ?? (yield* currentRootStat())
         const state: IndexState = {
           schemaVersion: SCHEMA_VERSION,
           builtAt,
           root,
-          rootStat: rootStat ?? (yield* currentRootStat()),
-          subtrees: Object.fromEntries(subtrees),
+          rootStat: snapshotRootStat,
+          subtrees: snapshotSubtrees,
         }
         const bytes = IndexSerialization.encode(state)
         yield* fs.ensureDir(path.dirname(cachePath))
         const tmp = `${cachePath}.${Math.random().toString(36).slice(2)}.tmp`
         yield* fs.writeFile(tmp, bytes)
         yield* fs.rename(tmp, cachePath)
+
+        // Cold snapshots are immutable generations. Chunks are published first;
+        // the manifest rename is the commit point, so an interrupted write keeps
+        // the previous generation readable. Mutable watcher updates remain in the
+        // in-memory map and are coalesced by the existing debounce queue.
+        const generation = `${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`
+        const entries = Object.entries(snapshotSubtrees).flatMap(([dir, sub]) =>
+          sub.entries.map((entry) => ({ dir, path: String(entry.path), type: entry.type } as IndexFrontcode.FrontEntry)),
+        ).toSorted((a, b) => a.dir.localeCompare(b.dir) || a.path.localeCompare(b.path) || a.type.localeCompare(b.type))
+        const chunks: IndexFrontcode.FrontChunk[] = []
+        for (let first = 0; first < entries.length; first += 128) {
+          const frame = IndexFrontcode.encodeChunk(entries.slice(first, first + 128))
+          const name = `${path.basename(cachePath)}.${generation}.${chunks.length}.chunk`
+          yield* fs.writeFile(path.join(path.dirname(cachePath), name), frame)
+          chunks.push({ name, first, count: Math.min(128, entries.length - first), rawBytes: IndexFrontcode.chunkRawBytes(frame), storedBytes: frame.byteLength, sha256: IndexFrontcode.chunkDigest(frame) })
+        }
+        const manifest: IndexFrontcode.FrontManifest = {
+          format: "file-index-frontcode",
+          version: 1,
+          generation,
+          builtAt,
+          root,
+          rootStat: snapshotRootStat,
+          chunks,
+        }
+        const frontTmp = `${frontManifestPath}.${generation}.tmp`
+        yield* fs.writeFile(frontTmp, new TextEncoder().encode(JSON.stringify(manifest)))
+        if (revision !== persistRevision) return
+        yield* fs.rename(frontTmp, frontManifestPath)
+        // Best-effort reachability GC: only generation chunk files for this
+        // index are considered, and the just-published manifest's names are
+        // retained. Orphans from interrupted publication cannot affect loads.
+        yield* Effect.gen(function* () {
+          const names = new Set(manifest.chunks.map((chunk) => chunk.name))
+          for (const entry of yield* fs.readDirectoryEntries(path.dirname(cachePath))) {
+            if (entry.name.startsWith(`${path.basename(cachePath)}.`) && entry.name.endsWith(".chunk") && !names.has(entry.name)) {
+              yield* fs.remove(path.join(path.dirname(cachePath), entry.name), { force: true }).pipe(Effect.ignore)
+            }
+          }
+        }).pipe(Effect.catch(() => Effect.void))
       }).pipe(
         Effect.catch((error) => Effect.logWarning("file index persist failed", { error }).pipe(Effect.asVoid)),
       )
 
     const markDirty = (): Effect.Effect<void> =>
       Effect.gen(function* () {
+        persistRevision++
         yield* Ref.set(dirty, true)
         yield* Queue.offer(flushQueue, 1).pipe(Effect.ignore)
       })
@@ -159,6 +206,45 @@ export const layer = Layer.effect(
       Effect.gen(function* () {
         if (loaded) return
         loaded = true
+        const frontLoaded = yield* Effect.gen(function* () {
+          const manifestBytes = yield* fs.readFile(frontManifestPath)
+          const manifest = JSON.parse(new TextDecoder().decode(manifestBytes)) as IndexFrontcode.FrontManifest
+          if (
+            manifest.format !== "file-index-frontcode" ||
+            manifest.version !== 1 ||
+            manifest.root !== root ||
+            !Number.isFinite(manifest.builtAt) ||
+            !manifest.rootStat ||
+            !Number.isFinite(manifest.rootStat.mtimeMs) ||
+            !Number.isFinite(manifest.rootStat.size) ||
+            !Number.isFinite(manifest.rootStat.ino) ||
+            !Array.isArray(manifest.chunks) ||
+            manifest.chunks.length > 100_000
+          ) return false
+          const decoded = new Map<string, Subtree>()
+          let expectedFirst = 0
+          let previousKey = ""
+          for (const chunk of manifest.chunks) {
+            if (chunk.first !== expectedFirst || chunk.count < 1 || chunk.count > 128 || chunk.rawBytes < 0 || path.basename(chunk.name) !== chunk.name || chunk.storedBytes < 13 || chunk.storedBytes > 32 * 1024 * 1024) return false
+            const frame = yield* fs.readFile(path.join(path.dirname(frontManifestPath), chunk.name))
+            if (frame.byteLength !== chunk.storedBytes || IndexFrontcode.chunkDigest(frame) !== chunk.sha256) return false
+            if (IndexFrontcode.chunkRawBytes(frame) !== chunk.rawBytes) return false
+            for (const entry of IndexFrontcode.decodeChunk(frame)) {
+              const key = `${entry.dir}\u0000${entry.path}\u0000${entry.type}`
+              if (key <= previousKey || entry.path.includes("\\") || entry.path === "" || entry.path.split("/").includes("..")) return false
+              previousKey = key
+              const current = decoded.get(entry.dir)
+              const entries = [...(current?.entries ?? []), { path: RelativePath.make(entry.path), type: entry.type }]
+              decoded.set(entry.dir, { at: current?.at ?? manifest.builtAt, entries })
+            }
+            expectedFirst += chunk.count
+          }
+          builtAt = manifest.builtAt
+          rootStat = manifest.rootStat
+          for (const [dir, sub] of decoded) subtrees.set(dir, { at: sub.at, entries: [...sub.entries].sort(compareEntries) })
+          return true
+        }).pipe(Effect.catch(() => Effect.succeed(false)))
+        if (frontLoaded) return
         const bytes = yield* fs.readFile(cachePath).pipe(Effect.catch(() => Effect.succeed(undefined as Uint8Array | undefined)))
         if (bytes === undefined) return
         const blob = yield* IndexSerialization.decode(bytes).pipe(

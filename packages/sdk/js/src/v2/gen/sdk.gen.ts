@@ -80,6 +80,8 @@ import type {
   FileWriteResponses,
   FindFilesErrors,
   FindFilesResponses,
+  FindSearchErrors,
+  FindSearchResponses,
   FindSymbolsErrors,
   FindSymbolsResponses,
   FindTextErrors,
@@ -98,6 +100,8 @@ import type {
   ForkUsageGetResponses,
   FormatterStatusErrors,
   FormatterStatusResponses,
+  FsExternalListErrors,
+  FsExternalListResponses,
   GlobalConfigGetErrors,
   GlobalConfigGetResponses,
   GlobalConfigUpdateErrors,
@@ -401,6 +405,18 @@ import type {
   V2ReferenceListResponses,
   V2SessionActiveErrors,
   V2SessionActiveResponses,
+  V2SessionCheckpointCreateErrors,
+  V2SessionCheckpointCreateResponses,
+  V2SessionCheckpointDiffErrors,
+  V2SessionCheckpointDiffRawErrors,
+  V2SessionCheckpointDiffRawResponses,
+  V2SessionCheckpointDiffResponses,
+  V2SessionCheckpointGetErrors,
+  V2SessionCheckpointGetResponses,
+  V2SessionCheckpointListErrors,
+  V2SessionCheckpointListResponses,
+  V2SessionCheckpointRevertErrors,
+  V2SessionCheckpointRevertResponses,
   V2SessionCompactErrors,
   V2SessionCompactResponses,
   V2SessionContextErrors,
@@ -2115,6 +2131,44 @@ export class Find extends HeyApiClient {
   }
 
   /**
+   * Fuzzy mention search
+   *
+   * Fuzzy-search files, directories, and symbols for @mention typeahead. Returns one merged score-ranked list with match highlight positions and offset pagination.
+   */
+  public search<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      query: string
+      limit?: string
+      offset?: string
+      symbols?: "true" | "false"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "query" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "offset" },
+            { in: "query", key: "symbols" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<FindSearchResponses, FindSearchErrors, ThrowOnError>({
+      url: "/find/search",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
    * Find symbols
    *
    * Search for workspace symbols like functions, classes, and variables using LSP.
@@ -2396,6 +2450,53 @@ export class File extends HeyApiClient {
       ...options,
       ...params,
     })
+  }
+}
+
+export class External extends HeyApiClient {
+  /**
+   * List external directory
+   *
+   * List entries of an arbitrary local directory outside the project for @mention typeahead. Gated by the external_directory permission; first access to a subtree prompts the user.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      path: string
+      sessionID: string
+      query?: string
+      limit?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "path" },
+            { in: "query", key: "sessionID" },
+            { in: "query", key: "query" },
+            { in: "query", key: "limit" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<FsExternalListResponses, FsExternalListErrors, ThrowOnError>({
+      url: "/fs/external-list",
+      ...options,
+      ...params,
+    })
+  }
+}
+
+export class Fs extends HeyApiClient {
+  private _external?: External
+  get external(): External {
+    return (this._external ??= new External({ client: this.client }))
   }
 }
 
@@ -6017,6 +6118,234 @@ export class Revert extends HeyApiClient {
   }
 }
 
+export class Checkpoint extends HeyApiClient {
+  /**
+   * List checkpoints
+   *
+   * List durable per-turn checkpoints for a session, ordered by ordinal. Returns 422 when the project is not Git or snapshots are disabled.
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      limit?: string
+      status?: "capturing" | "ready" | "partial" | "error"
+      kind?: "baseline" | "turn" | "manual" | "pre-revert"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "status" },
+            { in: "query", key: "kind" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      V2SessionCheckpointListResponses,
+      V2SessionCheckpointListErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/checkpoint",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Create manual checkpoint
+   *
+   * Create a manual checkpoint capturing the current worktree state.
+   */
+  public create<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      kind?: "manual"
+      label?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "kind" },
+            { in: "body", key: "label" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      V2SessionCheckpointCreateResponses,
+      V2SessionCheckpointCreateErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/checkpoint",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get checkpoint
+   *
+   * Retrieve a single checkpoint by ID. Rejects cross-epoch targets.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      checkpointID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "checkpointID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      V2SessionCheckpointGetResponses,
+      V2SessionCheckpointGetErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/checkpoint/{checkpointID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Checkpoint diff
+   *
+   * Structured FileDiff[] for a checkpoint. mode=turn (default) diffs before→after of the checkpoint; mode=session diffs baseline→target.
+   */
+  public diff<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      checkpointID: string
+      mode?: "turn" | "session"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "checkpointID" },
+            { in: "query", key: "mode" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      V2SessionCheckpointDiffResponses,
+      V2SessionCheckpointDiffErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/checkpoint/{checkpointID}/diff",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Checkpoint raw diff
+   *
+   * Joined unified patch text for a checkpoint diff. Bounded by Snapshot size controls.
+   */
+  public diffRaw<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      checkpointID: string
+      mode?: "turn" | "session"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "checkpointID" },
+            { in: "query", key: "mode" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      V2SessionCheckpointDiffRawResponses,
+      V2SessionCheckpointDiffRawErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/checkpoint/{checkpointID}/diff/raw",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Revert to checkpoint
+   *
+   * Restore the filesystem to the checkpoint's after-snapshot and truncate later turns. Captures a pre-revert undo point. mode=discard-current overwrites uncommitted working-tree changes.
+   */
+  public revert<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      checkpointID: string
+      mode?: "discard-current" | "preserve-current"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "path", key: "checkpointID" },
+            { in: "body", key: "mode" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      V2SessionCheckpointRevertResponses,
+      V2SessionCheckpointRevertErrors,
+      ThrowOnError
+    >({
+      url: "/api/session/{sessionID}/checkpoint/{checkpointID}/revert",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
 export class Permission2 extends HeyApiClient {
   /**
    * List session permission requests
@@ -6826,6 +7155,11 @@ export class Session3 extends HeyApiClient {
     return (this._revert ??= new Revert({ client: this.client }))
   }
 
+  private _checkpoint?: Checkpoint
+  get checkpoint(): Checkpoint {
+    return (this._checkpoint ??= new Checkpoint({ client: this.client }))
+  }
+
   private _permission?: Permission2
   get permission(): Permission2 {
     return (this._permission ??= new Permission2({ client: this.client }))
@@ -7415,7 +7749,7 @@ export class Permission3 extends HeyApiClient {
   }
 }
 
-export class Fs extends HeyApiClient {
+export class Fs2 extends HeyApiClient {
   /**
    * Read file
    *
@@ -8368,9 +8702,9 @@ export class V2 extends HeyApiClient {
     return (this._permission ??= new Permission3({ client: this.client }))
   }
 
-  private _fs?: Fs
-  get fs(): Fs {
-    return (this._fs ??= new Fs({ client: this.client }))
+  private _fs?: Fs2
+  get fs(): Fs2 {
+    return (this._fs ??= new Fs2({ client: this.client }))
   }
 
   private _command?: Command2
@@ -8475,6 +8809,11 @@ export class OpencodeClient extends HeyApiClient {
   private _file?: File
   get file(): File {
     return (this._file ??= new File({ client: this.client }))
+  }
+
+  private _fs?: Fs
+  get fs(): Fs {
+    return (this._fs ??= new Fs({ client: this.client }))
   }
 
   private _instance?: Instance

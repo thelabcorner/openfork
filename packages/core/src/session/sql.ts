@@ -5,6 +5,7 @@ import type { SessionMessage } from "./message"
 import type { Prompt } from "./prompt"
 import type { SessionInput } from "./input"
 import type { Snapshot } from "../snapshot"
+import type { Checkpoint } from "../checkpoint"
 import { PermissionV1 } from "../v1/permission"
 import { ProjectV2 } from "../project"
 import type { SessionSchema } from "./schema"
@@ -14,6 +15,7 @@ import { Timestamps } from "../database/schema.sql"
 import type { SystemContext } from "../system-context/index"
 import { AgentV2 } from "../agent"
 import type { Revert } from "@opencode-ai/schema/revert"
+import { File } from "../file"
 
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
@@ -212,3 +214,53 @@ export const PartSearchBackfillTable = sqliteTable("part_search_backfill", {
   watermark_rowid: integer().notNull().default(-1),
   done: integer().notNull().default(0),
 })
+
+// Durable per-turn checkpoint metadata layered on top of the Snapshot shadow
+// Git engine. Each row records the explicit before/after filesystem trees for
+// one logical turn (or a manual/pre-revert point) so the turn diff and
+// cumulative diff can be recomputed and the checkpoint can be reverted without
+// re-deriving causal state. Tree objects are pinned inside the shadow repo via
+// `Snapshot.retain` so `Snapshot.cleanup()` GC pruning cannot drop them.
+export const SessionCheckpointTable = sqliteTable(
+  "session_checkpoint",
+  {
+    id: text().$type<Checkpoint.ID>().primaryKey(),
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    // Monotonic within a session; never reused even across retries/forks.
+    ordinal: integer().notNull(),
+    kind: text().$type<Checkpoint.Kind>().notNull(),
+    status: text().$type<Checkpoint.Status>().notNull(),
+    // Explicit pre-turn filesystem tree (captured at the turn boundary, NOT
+    // derived from the previous checkpoint's after-snapshot).
+    before_snapshot: text(),
+    // Post-quiescence filesystem tree. Null while status === "capturing".
+    after_snapshot: text(),
+    user_message_id: text(),
+    assistant_message_id: text(),
+    // Structured per-file diff, persisted for cheap list/timeline rendering.
+    // Recomputable via Snapshot.diff(before, after); this is a cache.
+    diff: text({ mode: "json" }).$type<File.Diff[]>(),
+    additions: integer().notNull().default(0),
+    deletions: integer().notNull().default(0),
+    files: integer().notNull().default(0),
+    // Files excluded from the snapshot (e.g. >2 MiB new untracked files).
+    excluded: text({ mode: "json" }).$type<Checkpoint.Excluded[]>(),
+    // Last error for a checkpoint in `error` status.
+    error: text({ mode: "json" }).$type<Checkpoint.CheckpointError>(),
+    // Snapshot-store epoch (project + worktree identity) at creation time.
+    epoch: text().notNull(),
+    // Set when a read/diff detects the current store epoch no longer matches.
+    epoch_mismatch: integer().notNull().default(0),
+    created_at: integer().notNull(),
+    finalized_at: integer(),
+  },
+  (table) => [
+    uniqueIndex("session_checkpoint_session_ordinal_idx").on(table.session_id, table.ordinal),
+    index("session_checkpoint_session_idx").on(table.session_id),
+    index("session_checkpoint_session_user_idx").on(table.session_id, table.user_message_id),
+    index("session_checkpoint_session_assistant_idx").on(table.session_id, table.assistant_message_id),
+  ],
+)

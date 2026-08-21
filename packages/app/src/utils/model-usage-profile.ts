@@ -105,6 +105,40 @@ function parsePricingTable(markdown: string): PricingEntry[] {
   return entries
 }
 
+export type UsageTables = { profile: ProfileEntry[]; pricing: PricingEntry[] }
+
+let tablesInflight: Promise<UsageTables | undefined> | undefined
+
+// Fetches and parses the source doc once, returning both tables. Replaces the
+// previous two independent fetches of the same URL (profile + pricing) so the
+// model selector opens with a single network round-trip and parse pass.
+export async function getUsageTables(): Promise<UsageTables> {
+  const cachedProfile = readCache()
+  const cachedPricing = pricingCache
+  const profileFresh = cachedProfile && Date.now() - cachedProfile.fetchedAt < CACHE_TTL_MS
+  const pricingFresh = cachedPricing && Date.now() - cachedPricing.fetchedAt < CACHE_TTL_MS
+  if (profileFresh && pricingFresh) {
+    return { profile: cachedProfile!.entries, pricing: cachedPricing!.entries }
+  }
+  if (!tablesInflight) {
+    tablesInflight = fetch(SOURCE_URL)
+      .then((res) => (res.ok ? res.text() : Promise.reject(new Error(`status ${res.status}`))))
+      .then((markdown) => {
+        const profile = parseProfileTable(markdown)
+        const pricing = parsePricingTable(markdown)
+        if (profile.length > 0) writeCache({ fetchedAt: Date.now(), entries: profile })
+        if (pricing.length > 0) pricingCache = { fetchedAt: Date.now(), entries: pricing }
+        return { profile, pricing }
+      })
+      .catch(() => ({ profile: cachedProfile?.entries ?? [], pricing: cachedPricing?.entries ?? [] }))
+      .finally(() => {
+        tablesInflight = undefined
+      })
+  }
+  const result = await tablesInflight
+  return result ?? { profile: cachedProfile?.entries ?? [], pricing: cachedPricing?.entries ?? [] }
+}
+
 export async function getUsageProfileTable(): Promise<ProfileEntry[]> {
   const cached = readCache()
   if (cached && Date.now() - cached.fetchedAt < CACHE_TTL_MS) return cached.entries

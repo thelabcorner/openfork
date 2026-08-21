@@ -8,6 +8,9 @@ import { Workspace } from "@opencode-ai/schema/workspace"
 import { Context, Effect, Encoding, Result, Schema, Struct } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, HttpApiMiddleware, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import {
+  CheckpointEpochError,
+  CheckpointNotFoundError,
+  CheckpointUnsupportedError,
   ConflictError,
   InvalidCursorError,
   InvalidRequestError,
@@ -21,6 +24,64 @@ import { Model } from "@opencode-ai/schema/model"
 import { Location } from "@opencode-ai/schema/location"
 import { Revert } from "@opencode-ai/schema/revert"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
+
+const CheckpointKind = Schema.Literals(["baseline", "turn", "manual", "pre-revert"])
+const CheckpointStatus = Schema.Literals(["capturing", "ready", "partial", "error"])
+
+const CheckpointExcluded = Schema.Struct({
+  path: Schema.String,
+  reason: Schema.String,
+  size: Schema.optional(Schema.Number),
+})
+
+const CheckpointInfo = Schema.Struct({
+  id: Schema.String,
+  sessionID: Session.ID,
+  ordinal: Schema.Number,
+  kind: CheckpointKind,
+  status: CheckpointStatus,
+  userMessageID: Schema.optional(Schema.String),
+  assistantMessageID: Schema.optional(Schema.String),
+  beforeSnapshot: Schema.String,
+  afterSnapshot: Schema.optional(Schema.String),
+  createdAt: Schema.Number,
+  finalizedAt: Schema.optional(Schema.Number),
+  summary: Schema.Struct({
+    files: Schema.Number,
+    additions: Schema.Number,
+    deletions: Schema.Number,
+  }),
+  excluded: Schema.optional(Schema.Array(CheckpointExcluded)),
+  epochMismatch: Schema.optional(Schema.Boolean),
+}).annotate({ identifier: "CheckpointInfo" })
+
+const CheckpointListQuery = Schema.Struct({
+  limit: Schema.optional(Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))),
+  status: Schema.optional(CheckpointStatus),
+  kind: Schema.optional(CheckpointKind),
+})
+
+const CheckpointDiffQuery = Schema.Struct({
+  mode: Schema.optional(Schema.Literals(["turn", "session"])),
+})
+
+const CheckpointRevertPayload = Schema.Struct({
+  mode: Schema.optional(Schema.Literals(["discard-current", "preserve-current"])),
+})
+
+const CheckpointCreatePayload = Schema.Struct({
+  kind: Schema.Literals(["manual"]),
+  label: Schema.optional(Schema.String),
+})
+
+const CheckpointDiffResponse = Schema.Struct({
+  from: Schema.String,
+  to: Schema.String,
+  mode: Schema.Literals(["turn", "session"]),
+  files: Schema.Array(Revert.FileDiff),
+  excluded: Schema.optional(Schema.Array(CheckpointExcluded)),
+  partial: Schema.optional(Schema.Boolean),
+}).annotate({ identifier: "CheckpointDiff" })
 
 const SessionsQueryFields = {
   workspace: Workspace.ID.pipe(Schema.optional),
@@ -466,11 +527,109 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
         error: [SessionNotFoundError, MessageNotFoundError],
       })
         .middleware(sessionLocationMiddleware)
+      .annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.session.message",
+          summary: "Get session message",
+          description: "Retrieve one projected message owned by the Session.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.checkpoint.list", "/api/session/:sessionID/checkpoint", {
+        params: { sessionID: Session.ID },
+        query: CheckpointListQuery,
+        success: Schema.Struct({ data: Schema.Array(CheckpointInfo) }),
+        error: [SessionNotFoundError, CheckpointUnsupportedError],
+      })
+        .middleware(sessionLocationMiddleware)
         .annotateMerge(
           OpenApi.annotations({
-            identifier: "v2.session.message",
-            summary: "Get session message",
-            description: "Retrieve one projected message owned by the Session.",
+            identifier: "v2.session.checkpoint.list",
+            summary: "List checkpoints",
+            description:
+              "List durable per-turn checkpoints for a session, ordered by ordinal. Returns 422 when the project is not Git or snapshots are disabled.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.checkpoint.get", "/api/session/:sessionID/checkpoint/:checkpointID", {
+        params: { sessionID: Session.ID, checkpointID: Schema.String },
+        success: CheckpointInfo,
+        error: [SessionNotFoundError, CheckpointNotFoundError, CheckpointEpochError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.checkpoint.get",
+            summary: "Get checkpoint",
+            description: "Retrieve a single checkpoint by ID. Rejects cross-epoch targets.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.checkpoint.diff", "/api/session/:sessionID/checkpoint/:checkpointID/diff", {
+        params: { sessionID: Session.ID, checkpointID: Schema.String },
+        query: CheckpointDiffQuery,
+        success: CheckpointDiffResponse,
+        error: [SessionNotFoundError, CheckpointNotFoundError, CheckpointEpochError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.checkpoint.diff",
+            summary: "Checkpoint diff",
+            description:
+              "Structured FileDiff[] for a checkpoint. mode=turn (default) diffs before→after of the checkpoint; mode=session diffs baseline→target.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.get("session.checkpoint.diffRaw", "/api/session/:sessionID/checkpoint/:checkpointID/diff/raw", {
+        params: { sessionID: Session.ID, checkpointID: Schema.String },
+        query: CheckpointDiffQuery,
+        success: Schema.String,
+        error: [SessionNotFoundError, CheckpointNotFoundError, CheckpointEpochError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.checkpoint.diffRaw",
+            summary: "Checkpoint raw diff",
+            description: "Joined unified patch text for a checkpoint diff. Bounded by Snapshot size controls.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.checkpoint.revert", "/api/session/:sessionID/checkpoint/:checkpointID/revert", {
+        params: { sessionID: Session.ID, checkpointID: Schema.String },
+        payload: CheckpointRevertPayload,
+        success: CheckpointInfo,
+        error: [SessionNotFoundError, CheckpointNotFoundError, CheckpointEpochError, ConflictError, CheckpointUnsupportedError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.checkpoint.revert",
+            summary: "Revert to checkpoint",
+            description:
+              "Restore the filesystem to the checkpoint's after-snapshot and truncate later turns. Captures a pre-revert undo point. mode=discard-current overwrites uncommitted working-tree changes.",
+          }),
+        ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.checkpoint.create", "/api/session/:sessionID/checkpoint", {
+        params: { sessionID: Session.ID },
+        payload: CheckpointCreatePayload,
+        success: CheckpointInfo,
+        error: [SessionNotFoundError, CheckpointUnsupportedError, ConflictError],
+      })
+        .middleware(sessionLocationMiddleware)
+        .annotateMerge(
+          OpenApi.annotations({
+            identifier: "v2.session.checkpoint.create",
+            summary: "Create manual checkpoint",
+            description: "Create a manual checkpoint capturing the current worktree state.",
           }),
         ),
     )

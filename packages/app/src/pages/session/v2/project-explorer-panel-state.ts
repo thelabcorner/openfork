@@ -1,5 +1,6 @@
 import { createStore } from "solid-js/store"
 import { Persist, persisted } from "@/utils/persist"
+import { clampSize } from "@/utils/resizable-size"
 
 export const PROJECT_EXPLORER_TREE_WIDTH_DEFAULT = 280
 export const PROJECT_EXPLORER_TREE_WIDTH_MIN = 200
@@ -32,20 +33,14 @@ export function createProjectExplorerPanelState() {
     panelWidth: () => store.treeWidth + (store.editorOpened ? store.editorWidth : 0),
     treeWidth: () => store.treeWidth,
     resizeTree: (width: number) =>
-      setStore(
-        "treeWidth",
-        Math.min(PROJECT_EXPLORER_TREE_WIDTH_MAX, Math.max(PROJECT_EXPLORER_TREE_WIDTH_MIN, width)),
-      ),
+      setStore("treeWidth", clampSize(width, PROJECT_EXPLORER_TREE_WIDTH_MIN, PROJECT_EXPLORER_TREE_WIDTH_MAX)),
 
     editorOpened: () => store.editorOpened,
     openEditor: () => setStore("editorOpened", true),
     closeEditor: () => setStore("editorOpened", false),
     editorWidth: () => store.editorWidth,
     resizeEditor: (width: number) =>
-      setStore(
-        "editorWidth",
-        Math.min(PROJECT_EXPLORER_EDITOR_WIDTH_MAX, Math.max(PROJECT_EXPLORER_EDITOR_WIDTH_MIN, width)),
-      ),
+      setStore("editorWidth", clampSize(width, PROJECT_EXPLORER_EDITOR_WIDTH_MIN, PROJECT_EXPLORER_EDITOR_WIDTH_MAX)),
   }
 }
 

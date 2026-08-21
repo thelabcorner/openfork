@@ -12,11 +12,16 @@ import { decode64 } from "@/utils/base64"
 import { EventSessionError } from "@opencode-ai/sdk/v2"
 import { Persist, persisted } from "@/utils/persist"
 import { playSoundById } from "@/utils/sound"
+import { showToast } from "@/utils/toast"
 import { useGlobal } from "./global"
 import { ServerConnection, useServer } from "./server"
 import { type DraftTab, useTabs } from "./tabs"
 import { requireServerKey } from "@/utils/session-route"
 import type { ServerScope } from "@/utils/server-scope"
+
+const ERROR_SOUND_DEBOUNCE_MS = 5_000
+let lastErrorSoundTime = 0
+let lastErrorToastTime = 0
 
 type NotificationBase = {
   directory?: string
@@ -374,14 +379,18 @@ function createServerNotificationState(input: {
       if (session?.parentID) return
 
       if (settings.sounds.errorsEnabled()) {
-        void playSoundById(settings.sounds.errors())
+        const now = Date.now()
+        if (now - lastErrorSoundTime > ERROR_SOUND_DEBOUNCE_MS) {
+          lastErrorSoundTime = now
+          void playSoundById(settings.sounds.errors())
+        }
       }
 
       const error = "error" in event.properties ? event.properties.error : undefined
       append({
         directory,
         time,
-        viewed: viewedInCurrentSession(directory, sessionID),
+        viewed: false,
         type: "error",
         session: sessionID ?? "global",
         error,
@@ -392,6 +401,16 @@ function createServerNotificationState(input: {
       const href = sessionID ? `/${base64Encode(directory)}/session/${sessionID}` : `/${base64Encode(directory)}`
       if (settings.notifications.errors()) {
         void platform.notify(language.t("notification.session.error.title"), description, () => input.navigate(href))
+      }
+
+      const now = Date.now()
+      if (now - lastErrorToastTime > ERROR_SOUND_DEBOUNCE_MS) {
+        lastErrorToastTime = now
+        showToast({
+          variant: "error",
+          title: language.t("notification.session.error.title"),
+          description,
+        })
       }
     })
   }

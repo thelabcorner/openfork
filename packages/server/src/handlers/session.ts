@@ -1,9 +1,15 @@
 import { SessionV2 } from "@opencode-ai/core/session"
-import { DateTime, Effect, Stream } from "effect"
+import { Checkpoint } from "@opencode-ai/core/checkpoint"
+import { Snapshot } from "@opencode-ai/core/snapshot"
+import { EventV2 } from "@opencode-ai/core/event"
+import { DateTime, Effect, Schema, Stream } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
 import { SessionsCursor } from "@opencode-ai/protocol/groups/session"
 import {
+  CheckpointEpochError,
+  CheckpointNotFoundError,
+  CheckpointUnsupportedError,
   ConflictError,
   InvalidCursorError,
   InvalidRequestError,
@@ -14,12 +20,49 @@ import {
 } from "@opencode-ai/protocol/errors"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 
+const CheckpointReverted = EventV2.define({
+  type: "session.checkpoint.reverted",
+  durable: { version: 1, aggregate: "sessionID" },
+  schema: {
+    sessionID: Schema.String,
+    checkpointID: Schema.String,
+    ordinal: Schema.Number,
+    afterSnapshot: Schema.optional(Schema.String),
+  },
+})
+
 const DefaultSessionsLimit = 50
 const DefaultSessionHistoryLimit = 50
+
+function toCheckpointInfo(cp: Checkpoint.SessionCheckpoint) {
+  return {
+    id: cp.id,
+    sessionID: cp.sessionID,
+    ordinal: cp.ordinal,
+    kind: cp.kind,
+    status: cp.status,
+    userMessageID: cp.userMessageID ?? undefined,
+    assistantMessageID: cp.assistantMessageID ?? undefined,
+    beforeSnapshot: cp.beforeSnapshot ?? "",
+    afterSnapshot: cp.afterSnapshot ?? undefined,
+    createdAt: cp.createdAt,
+    finalizedAt: cp.finalizedAt ?? undefined,
+    summary: { files: cp.files, additions: cp.additions, deletions: cp.deletions },
+    excluded: cp.excluded.length > 0 ? cp.excluded : undefined,
+    epochMismatch: cp.epochMismatch,
+  }
+}
 
 export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handlers) =>
   Effect.gen(function* () {
     const session = yield* SessionV2.Service
+    const events = yield* EventV2.Service
+    // Checkpoint/Snapshot are Location-scoped: they are provided per-request by
+    // SessionLocationMiddleware (LocationServices), never at group-construction
+    // time — requesting them here crashes the server at startup.
+    const locationDeps = Effect.gen(function* () {
+      return { checkpoint: yield* Checkpoint.Service, snapshot: yield* Snapshot.Service }
+    })
 
     return handlers
       .handle(
@@ -481,6 +524,243 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
             messageID: ctx.params.messageID,
             message: `Message not found: ${ctx.params.messageID}`,
           })
+        }),
+      )
+      .handle(
+        "session.checkpoint.list",
+        Effect.fn(function* (ctx) {
+          const { checkpoint } = yield* locationDeps
+          const checkpoints = yield* checkpoint.list({ sessionID: ctx.params.sessionID })
+          let result = checkpoints
+          if (ctx.query.status) result = result.filter((c) => c.status === ctx.query.status)
+          if (ctx.query.kind) result = result.filter((c) => c.kind === ctx.query.kind)
+          if (ctx.query.limit !== undefined) result = result.slice(0, ctx.query.limit)
+          return { data: result.map(toCheckpointInfo) }
+        }),
+      )
+      .handle(
+        "session.checkpoint.get",
+        Effect.fn(function* (ctx) {
+          const { checkpoint, snapshot } = yield* locationDeps
+          const cp = yield* checkpoint.get({
+            sessionID: ctx.params.sessionID,
+            checkpointID: Checkpoint.ID.make(ctx.params.checkpointID),
+          })
+          if (!cp)
+            return yield* new CheckpointNotFoundError({
+              sessionID: ctx.params.sessionID,
+              checkpointID: ctx.params.checkpointID,
+              message: `Checkpoint not found: ${ctx.params.checkpointID}`,
+            })
+          if (cp.epochMismatch)
+            return yield* new CheckpointEpochError({
+              sessionID: ctx.params.sessionID,
+              checkpointID: ctx.params.checkpointID,
+              expected: cp.epoch,
+              actual: yield* snapshot.epoch(),
+              message: `Checkpoint epoch mismatch: expected ${cp.epoch}, got current snapshot epoch`,
+            })
+          return toCheckpointInfo(cp)
+        }),
+      )
+      .handle(
+        "session.checkpoint.diff",
+        Effect.fn(function* (ctx) {
+          const { checkpoint, snapshot } = yield* locationDeps
+          const cp = yield* checkpoint.get({
+            sessionID: ctx.params.sessionID,
+            checkpointID: Checkpoint.ID.make(ctx.params.checkpointID),
+          })
+          if (!cp)
+            return yield* new CheckpointNotFoundError({
+              sessionID: ctx.params.sessionID,
+              checkpointID: ctx.params.checkpointID,
+              message: `Checkpoint not found: ${ctx.params.checkpointID}`,
+            })
+          if (cp.epochMismatch)
+            return yield* new CheckpointEpochError({
+              sessionID: ctx.params.sessionID,
+              checkpointID: ctx.params.checkpointID,
+              expected: cp.epoch,
+              actual: yield* snapshot.epoch(),
+              message: `Checkpoint epoch mismatch: expected ${cp.epoch}, got current snapshot epoch`,
+            })
+          const mode = ctx.query.mode ?? "turn"
+          const files = yield* checkpoint
+            .diff({ sessionID: ctx.params.sessionID, checkpointID: cp.id, mode })
+            .pipe(
+              Effect.catchTag(["SessionCheckpoint.EpochMismatch"], (error) =>
+                Effect.fail(
+                  new CheckpointEpochError({
+                    sessionID: ctx.params.sessionID,
+                    checkpointID: ctx.params.checkpointID,
+                    expected: error.expected,
+                    actual: error.actual,
+                    message: `Checkpoint epoch mismatch: expected ${error.expected}, got ${error.actual}`,
+                  }),
+                ),
+              ),
+            )
+          const excluded = cp.excluded.length > 0 ? cp.excluded : undefined
+          return {
+            from: cp.beforeSnapshot ?? "",
+            to: cp.afterSnapshot ?? "",
+            mode,
+            files,
+            excluded,
+            partial: cp.status === "partial" ? true : undefined,
+          }
+        }),
+      )
+      .handle(
+        "session.checkpoint.diffRaw",
+        Effect.fn(function* (ctx) {
+          const { checkpoint, snapshot } = yield* locationDeps
+          const cp = yield* checkpoint.get({
+            sessionID: ctx.params.sessionID,
+            checkpointID: Checkpoint.ID.make(ctx.params.checkpointID),
+          })
+          if (!cp)
+            return yield* new CheckpointNotFoundError({
+              sessionID: ctx.params.sessionID,
+              checkpointID: ctx.params.checkpointID,
+              message: `Checkpoint not found: ${ctx.params.checkpointID}`,
+            })
+          if (cp.epochMismatch)
+            return yield* new CheckpointEpochError({
+              sessionID: ctx.params.sessionID,
+              checkpointID: ctx.params.checkpointID,
+              expected: cp.epoch,
+              actual: yield* snapshot.epoch(),
+              message: `Checkpoint epoch mismatch: expected ${cp.epoch}, got current snapshot epoch`,
+            })
+          const mode = ctx.query.mode ?? "turn"
+          const files = yield* checkpoint
+            .diff({ sessionID: ctx.params.sessionID, checkpointID: cp.id, mode })
+            .pipe(
+              Effect.catchTag(["SessionCheckpoint.EpochMismatch"], (error) =>
+                Effect.fail(
+                  new CheckpointEpochError({
+                    sessionID: ctx.params.sessionID,
+                    checkpointID: ctx.params.checkpointID,
+                    expected: error.expected,
+                    actual: error.actual,
+                    message: `Checkpoint epoch mismatch: expected ${error.expected}, got ${error.actual}`,
+                  }),
+                ),
+              ),
+            )
+          return files.map((f) => f.patch ?? "").join("\n")
+        }),
+      )
+      .handle(
+        "session.checkpoint.revert",
+        Effect.fn(function* (ctx) {
+          const { checkpoint, snapshot } = yield* locationDeps
+          const cp = yield* checkpoint.get({
+            sessionID: ctx.params.sessionID,
+            checkpointID: Checkpoint.ID.make(ctx.params.checkpointID),
+          })
+          if (!cp)
+            return yield* new CheckpointNotFoundError({
+              sessionID: ctx.params.sessionID,
+              checkpointID: ctx.params.checkpointID,
+              message: `Checkpoint not found: ${ctx.params.checkpointID}`,
+            })
+          if (cp.epochMismatch)
+            return yield* new CheckpointEpochError({
+              sessionID: ctx.params.sessionID,
+              checkpointID: ctx.params.checkpointID,
+              expected: cp.epoch,
+              actual: yield* snapshot.epoch(),
+              message: `Checkpoint epoch mismatch: expected ${cp.epoch}, got current snapshot epoch`,
+            })
+          if (!cp.afterSnapshot)
+            return yield* new CheckpointUnsupportedError({
+              sessionID: ctx.params.sessionID,
+              reason: "checkpoint has no after-snapshot",
+              message: `Checkpoint ${ctx.params.checkpointID} has no after-snapshot to revert to`,
+            })
+          // Capture a pre-revert undo point so the revert itself is reversible.
+          const preRevertSnapshot = yield* snapshot.capture()
+          const targetSnapshot = Snapshot.ID.make(cp.afterSnapshot)
+          // The pre-revert row must not collide with the target's ordinal
+          // (UNIQUE(session_id, ordinal)); place it past the current maximum so
+          // the following removeAfter(ordinal: cp.ordinal) keeps it.
+          const existing = yield* checkpoint.list({ sessionID: ctx.params.sessionID })
+          const preRevertOrdinal = existing.length > 0 ? Math.max(...existing.map((c) => c.ordinal)) + 1 : 1
+          yield* checkpoint.create({
+            sessionID: ctx.params.sessionID,
+            ordinal: preRevertOrdinal,
+            kind: "pre-revert",
+            beforeSnapshot: targetSnapshot,
+            afterSnapshot: preRevertSnapshot ?? undefined,
+          })
+          // TODO: acquire per-worktree capture lock (CheckpointLifecycle.withCaptureLock) once available.
+          yield* snapshot.checkout(targetSnapshot)
+          yield* checkpoint.removeAfter({ sessionID: ctx.params.sessionID, ordinal: cp.ordinal })
+          const info = yield* session.get(ctx.params.sessionID).pipe(
+            Effect.catchTag("Session.NotFoundError", () =>
+              Effect.fail(
+                new SessionNotFoundError({
+                  sessionID: ctx.params.sessionID,
+                  message: `Session not found: ${ctx.params.sessionID}`,
+                }),
+              ),
+            ),
+          )
+          yield* events.publish(
+            CheckpointReverted,
+            {
+              sessionID: ctx.params.sessionID,
+              checkpointID: ctx.params.checkpointID,
+              ordinal: cp.ordinal,
+              afterSnapshot: preRevertSnapshot ?? undefined,
+            },
+            { location: { directory: info.location.directory } },
+          )
+          const updated = yield* checkpoint.get({
+            sessionID: ctx.params.sessionID,
+            checkpointID: cp.id,
+          })
+          return updated ? toCheckpointInfo(updated) : toCheckpointInfo(cp)
+        }),
+      )
+      .handle(
+        "session.checkpoint.create",
+        Effect.fn(function* (ctx) {
+          const { checkpoint, snapshot } = yield* locationDeps
+          const info = yield* session.get(ctx.params.sessionID).pipe(
+            Effect.catchTag("Session.NotFoundError", () =>
+              Effect.fail(
+                new SessionNotFoundError({
+                  sessionID: ctx.params.sessionID,
+                  message: `Session not found: ${ctx.params.sessionID}`,
+                }),
+              ),
+            ),
+          )
+          const beforeSnapshot = yield* snapshot.capture()
+          const existing = yield* checkpoint.list({ sessionID: ctx.params.sessionID })
+          const ordinal = existing.length > 0 ? Math.max(...existing.map((c) => c.ordinal)) + 1 : 1
+          const epoch = yield* snapshot.epoch().pipe(Effect.orDie)
+          const cp = yield* checkpoint.create({
+            sessionID: ctx.params.sessionID,
+            ordinal,
+            kind: "manual",
+            beforeSnapshot: beforeSnapshot ?? null,
+            afterSnapshot: beforeSnapshot ?? undefined,
+            epoch,
+          }).pipe(
+            Effect.mapError((error) =>
+              new CheckpointUnsupportedError({
+                sessionID: ctx.params.sessionID,
+                reason: "checkpoint creation failed",
+                message: error.message,
+              }),
+            ),
+          )
+          return toCheckpointInfo(cp)
         }),
       )
   }),

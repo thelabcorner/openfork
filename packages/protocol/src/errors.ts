@@ -109,3 +109,35 @@ export class PtyNotFoundError extends Schema.TaggedErrorClass<PtyNotFoundError>(
   },
   { httpApiStatus: 404 },
 ) {}
+
+export class CheckpointNotFoundError extends Schema.TaggedErrorClass<CheckpointNotFoundError>()(
+  "CheckpointNotFoundError",
+  {
+    sessionID: Schema.String,
+    checkpointID: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 404 },
+) {}
+
+export class CheckpointEpochError extends Schema.TaggedErrorClass<CheckpointEpochError>()(
+  "CheckpointEpochError",
+  {
+    sessionID: Schema.String,
+    checkpointID: Schema.String,
+    expected: Schema.String,
+    actual: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 409 },
+) {}
+
+export class CheckpointUnsupportedError extends Schema.TaggedErrorClass<CheckpointUnsupportedError>()(
+  "CheckpointUnsupportedError",
+  {
+    sessionID: Schema.String,
+    reason: Schema.String,
+    message: Schema.String,
+  },
+  { httpApiStatus: 422 },
+) {}

@@ -2290,6 +2290,31 @@ export type OpenRouterEndpoint = {
 
 export type OpenRouterEndpoints = Array<OpenRouterEndpoint>
 
+export type MentionResult =
+  | {
+      kind: "file"
+      path: string
+      type?: "file" | "directory"
+      score: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      positions?: Array<number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN">
+      baseOffset?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+  | {
+      kind: "symbol"
+      name: string
+      path: string
+      line: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      symbolKind: string
+      score: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      positions?: Array<number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN">
+    }
+
+export type MentionSearchPage = {
+  results: Array<MentionResult>
+  hasMore: boolean
+  total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
 export type Symbol = {
   name: string
   kind: number
@@ -2352,6 +2377,30 @@ export type File = {
   added: number
   removed: number
   status: "added" | "deleted" | "modified"
+}
+
+export type ExternalPathError = {
+  name: "ExternalPathError"
+  data: {
+    message: string
+    code: "invalid_path" | "not_found" | "filesystem"
+  }
+}
+
+export type ExternalPermissionPendingError = {
+  name: "ExternalPermissionPendingError"
+  data: {
+    message: string
+    glob: string
+  }
+}
+
+export type ExternalPermissionDeniedError = {
+  name: "ExternalPermissionDeniedError"
+  data: {
+    message: string
+    glob: string
+  }
 }
 
 export type Path = {
@@ -2857,6 +2906,67 @@ export type SessionHistory = {
 }
 
 export type SessionDurableEventStream = string
+
+export type CheckpointInfo = {
+  id: string
+  sessionID: string
+  ordinal: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  kind: "baseline" | "turn" | "manual" | "pre-revert"
+  status: "capturing" | "ready" | "partial" | "error"
+  userMessageID?: string
+  assistantMessageID?: string
+  beforeSnapshot: string
+  afterSnapshot?: string
+  createdAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  finalizedAt?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  summary: {
+    files: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    additions: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    deletions: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  excluded?: Array<{
+    path: string
+    reason: string
+    size?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }>
+  epochMismatch?: boolean
+}
+
+export type CheckpointUnsupportedError = {
+  _tag: "CheckpointUnsupportedError"
+  sessionID: string
+  reason: string
+  message: string
+}
+
+export type CheckpointNotFoundError = {
+  _tag: "CheckpointNotFoundError"
+  sessionID: string
+  checkpointID: string
+  message: string
+}
+
+export type CheckpointEpochError = {
+  _tag: "CheckpointEpochError"
+  sessionID: string
+  checkpointID: string
+  expected: string
+  actual: string
+  message: string
+}
+
+export type CheckpointDiff = {
+  from: string
+  to: string
+  mode: "turn" | "session"
+  files: Array<FileDiff>
+  excluded?: Array<{
+    path: string
+    reason: string
+    size?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }>
+  partial?: boolean
+}
 
 export type SessionMessagesResponse = {
   data: Array<SessionMessage>
@@ -3928,6 +4038,17 @@ export type ConfigV2ExperimentalPolicy = {
   action: "provider.use"
   effect: PolicyEffect
   resource: string
+}
+
+export type ExternalPathEntry = {
+  name: string
+  absolute: string
+  type: "file" | "directory" | "symlink" | "other"
+}
+
+export type ExternalPathListResult = {
+  base: string
+  entries: Array<ExternalPathEntry>
 }
 
 export type ProjectDirectories = Array<{
@@ -8349,6 +8470,38 @@ export type FindFilesResponses = {
 
 export type FindFilesResponse = FindFilesResponses[keyof FindFilesResponses]
 
+export type FindSearchData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    query: string
+    limit?: string
+    offset?: string
+    symbols?: "true" | "false"
+  }
+  url: "/find/search"
+}
+
+export type FindSearchErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type FindSearchError = FindSearchErrors[keyof FindSearchErrors]
+
+export type FindSearchResponses = {
+  /**
+   * Mention search page
+   */
+  200: MentionSearchPage
+}
+
+export type FindSearchResponse = FindSearchResponses[keyof FindSearchResponses]
+
 export type FindSymbolsData = {
   body?: never
   path?: never
@@ -8603,6 +8756,46 @@ export type FileStatusResponses = {
 }
 
 export type FileStatusResponse = FileStatusResponses[keyof FileStatusResponses]
+
+export type FsExternalListData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    path: string
+    sessionID: string
+    query?: string
+    limit?: string
+  }
+  url: "/fs/external-list"
+}
+
+export type FsExternalListErrors = {
+  /**
+   * ExternalPathError | InvalidRequestError
+   */
+  400: ExternalPathError | InvalidRequestError
+  /**
+   * ExternalPermissionDeniedError
+   */
+  403: ExternalPermissionDeniedError
+  /**
+   * ExternalPermissionPendingError
+   */
+  409: ExternalPermissionPendingError
+}
+
+export type FsExternalListError = FsExternalListErrors[keyof FsExternalListErrors]
+
+export type FsExternalListResponses = {
+  /**
+   * External directory listing
+   */
+  200: ExternalPathListResult
+}
+
+export type FsExternalListResponse = FsExternalListResponses[keyof FsExternalListResponses]
 
 export type InstanceDisposeData = {
   body?: never
@@ -13345,6 +13538,270 @@ export type V2SessionMessageResponses = {
 }
 
 export type V2SessionMessageResponse = V2SessionMessageResponses[keyof V2SessionMessageResponses]
+
+export type V2SessionCheckpointListData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    limit?: string
+    status?: "capturing" | "ready" | "partial" | "error"
+    kind?: "baseline" | "turn" | "manual" | "pre-revert"
+  }
+  url: "/api/session/{sessionID}/checkpoint"
+}
+
+export type V2SessionCheckpointListErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * CheckpointUnsupportedError
+   */
+  422: CheckpointUnsupportedError
+}
+
+export type V2SessionCheckpointListError = V2SessionCheckpointListErrors[keyof V2SessionCheckpointListErrors]
+
+export type V2SessionCheckpointListResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: Array<CheckpointInfo>
+  }
+}
+
+export type V2SessionCheckpointListResponse = V2SessionCheckpointListResponses[keyof V2SessionCheckpointListResponses]
+
+export type V2SessionCheckpointCreateData = {
+  body: {
+    kind: "manual"
+    label?: string
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/checkpoint"
+}
+
+export type V2SessionCheckpointCreateErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError
+   */
+  404: SessionNotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+  /**
+   * CheckpointUnsupportedError
+   */
+  422: CheckpointUnsupportedError
+}
+
+export type V2SessionCheckpointCreateError = V2SessionCheckpointCreateErrors[keyof V2SessionCheckpointCreateErrors]
+
+export type V2SessionCheckpointCreateResponses = {
+  /**
+   * CheckpointInfo
+   */
+  200: CheckpointInfo
+}
+
+export type V2SessionCheckpointCreateResponse =
+  V2SessionCheckpointCreateResponses[keyof V2SessionCheckpointCreateResponses]
+
+export type V2SessionCheckpointGetData = {
+  body?: never
+  path: {
+    sessionID: string
+    checkpointID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/checkpoint/{checkpointID}"
+}
+
+export type V2SessionCheckpointGetErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError | CheckpointNotFoundError
+   */
+  404: CheckpointNotFoundError | SessionNotFoundError
+  /**
+   * CheckpointEpochError
+   */
+  409: CheckpointEpochError
+}
+
+export type V2SessionCheckpointGetError = V2SessionCheckpointGetErrors[keyof V2SessionCheckpointGetErrors]
+
+export type V2SessionCheckpointGetResponses = {
+  /**
+   * CheckpointInfo
+   */
+  200: CheckpointInfo
+}
+
+export type V2SessionCheckpointGetResponse = V2SessionCheckpointGetResponses[keyof V2SessionCheckpointGetResponses]
+
+export type V2SessionCheckpointDiffData = {
+  body?: never
+  path: {
+    sessionID: string
+    checkpointID: string
+  }
+  query?: {
+    mode?: "turn" | "session"
+  }
+  url: "/api/session/{sessionID}/checkpoint/{checkpointID}/diff"
+}
+
+export type V2SessionCheckpointDiffErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError | CheckpointNotFoundError
+   */
+  404: CheckpointNotFoundError | SessionNotFoundError
+  /**
+   * CheckpointEpochError
+   */
+  409: CheckpointEpochError
+}
+
+export type V2SessionCheckpointDiffError = V2SessionCheckpointDiffErrors[keyof V2SessionCheckpointDiffErrors]
+
+export type V2SessionCheckpointDiffResponses = {
+  /**
+   * CheckpointDiff
+   */
+  200: CheckpointDiff
+}
+
+export type V2SessionCheckpointDiffResponse = V2SessionCheckpointDiffResponses[keyof V2SessionCheckpointDiffResponses]
+
+export type V2SessionCheckpointDiffRawData = {
+  body?: never
+  path: {
+    sessionID: string
+    checkpointID: string
+  }
+  query?: {
+    mode?: "turn" | "session"
+  }
+  url: "/api/session/{sessionID}/checkpoint/{checkpointID}/diff/raw"
+}
+
+export type V2SessionCheckpointDiffRawErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError | CheckpointNotFoundError
+   */
+  404: CheckpointNotFoundError | SessionNotFoundError
+  /**
+   * CheckpointEpochError
+   */
+  409: CheckpointEpochError
+}
+
+export type V2SessionCheckpointDiffRawError = V2SessionCheckpointDiffRawErrors[keyof V2SessionCheckpointDiffRawErrors]
+
+export type V2SessionCheckpointDiffRawResponses = {
+  /**
+   * Success
+   */
+  200: string
+}
+
+export type V2SessionCheckpointDiffRawResponse =
+  V2SessionCheckpointDiffRawResponses[keyof V2SessionCheckpointDiffRawResponses]
+
+export type V2SessionCheckpointRevertData = {
+  body: {
+    mode?: "discard-current" | "preserve-current"
+  }
+  path: {
+    sessionID: string
+    checkpointID: string
+  }
+  query?: never
+  url: "/api/session/{sessionID}/checkpoint/{checkpointID}/revert"
+}
+
+export type V2SessionCheckpointRevertErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+  /**
+   * SessionNotFoundError | CheckpointNotFoundError
+   */
+  404: CheckpointNotFoundError | SessionNotFoundError
+  /**
+   * CheckpointEpochError | ConflictError
+   */
+  409: CheckpointEpochError | ConflictError
+  /**
+   * CheckpointUnsupportedError
+   */
+  422: CheckpointUnsupportedError
+}
+
+export type V2SessionCheckpointRevertError = V2SessionCheckpointRevertErrors[keyof V2SessionCheckpointRevertErrors]
+
+export type V2SessionCheckpointRevertResponses = {
+  /**
+   * CheckpointInfo
+   */
+  200: CheckpointInfo
+}
+
+export type V2SessionCheckpointRevertResponse =
+  V2SessionCheckpointRevertResponses[keyof V2SessionCheckpointRevertResponses]
 
 export type V2SessionMessagesData = {
   body?: never

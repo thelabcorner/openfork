@@ -1,6 +1,10 @@
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Vcs } from "@/project/vcs"
+import { containsPath } from "@/project/instance-context"
+import { Config } from "@/config/config"
+import { Permission } from "@/permission"
+import { SessionID } from "@/session/schema"
 import { FileMutation } from "@opencode-ai/core/file-mutation"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { FileIndex } from "@opencode-ai/core/filesystem/index"
@@ -11,13 +15,18 @@ import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
+import { ExternalPath } from "@opencode-ai/schema/external-path"
 import { Hash } from "@opencode-ai/core/util/hash"
 import { Effect, Layer, Option } from "effect"
 import ignore from "ignore"
+import os from "os"
 import path from "path"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
 import {
+  ExternalPathError,
+  ExternalPermissionDeniedError,
+  ExternalPermissionPendingError,
   FileDeletePayload,
   FileMkdirPayload,
   FileMutationError,
@@ -27,6 +36,10 @@ import {
 
 const IGNORE_CACHE_TTL_MS = 2_000
 type IgnoreMatcher = ReturnType<typeof ignore>
+
+// Reused across requests: constructing collation options per compare call made
+// large-directory sorts the dominant cost of external-list.
+const entryCollator = new Intl.Collator(undefined, { sensitivity: "base", numeric: true })
 
 export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handlers) =>
   Effect.gen(function* () {
@@ -135,6 +148,31 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
         duration: Math.round(performance.now() - started),
       })
       return found.map((item) => item.path)
+    })
+
+    const findSearch = Effect.fn("FileHttpApi.findSearch")(function* (ctx: {
+      query: { query: string; limit?: number; offset?: number; symbols?: "true" | "false" }
+    }) {
+      const started = performance.now()
+      const page = yield* filesystem(
+        FileSystem.Service.use((fs) =>
+          fs.searchMentions({
+            query: ctx.query.query,
+            limit: ctx.query.limit ?? 30,
+            offset: ctx.query.offset ?? 0,
+            symbols: ctx.query.symbols !== "false",
+          }),
+        ),
+      ).pipe(Effect.orDie)
+      yield* Effect.logInfo("find search", {
+        query: ctx.query.query,
+        limit: ctx.query.limit ?? 30,
+        offset: ctx.query.offset ?? 0,
+        results: page.results.length,
+        total: page.total,
+        duration: Math.round(performance.now() - started),
+      })
+      return { results: page.results as never[], hasMore: page.hasMore, total: page.total }
     })
 
     const findSymbol = Effect.fn("FileHttpApi.findSymbol")(function* () {
@@ -270,9 +308,131 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       }))
     })
 
+    const externalGlob = (dir: string) =>
+      process.platform === "win32"
+        ? FSUtil.normalizePathPattern(path.join(dir, "*"))
+        : path.join(dir, "*").replaceAll("\\", "/")
+
+    const deepestExistingAncestor = Effect.fn("FileHttpApi.deepestExistingAncestor")(function* (target: string) {
+      const fs = yield* FSUtil.Service
+      let current = target
+      while (true) {
+        if (yield* fs.existsSafe(current)) return current
+        const parent = path.dirname(current)
+        if (parent === current) return yield* new ExternalPathError({
+          name: "ExternalPathError",
+          data: { message: `No existing ancestor directory for path: ${target}`, code: "not_found" as const },
+        })
+        current = parent
+      }
+    })
+
+    const externalList = Effect.fn("FileHttpApi.externalList")(function* (ctx: {
+      query: { path: string; sessionID: string; query?: string; limit?: number }
+    }) {
+      const raw = ctx.query.path
+      if (
+        !ExternalPath.isExternalPathToken(raw) ||
+        raw.startsWith("\\\\?\\") ||
+        raw.startsWith("\\\\.\\") ||
+        raw.startsWith("//?/") ||
+        raw.startsWith("//./")
+      ) {
+        return yield* new ExternalPathError({
+          name: "ExternalPathError",
+          data: { message: `Path is not an absolute external path: ${raw}`, code: "invalid_path" as const },
+        })
+      }
+
+      const ins = yield* InstanceState.context
+      const target = ExternalPath.normalizeExternalPathToken(raw, { home: os.homedir() })
+      const base = FSUtil.normalizePath(target)
+
+      // Workspace-internal absolute paths need no external_directory grant, matching tool behavior.
+      if (!containsPath(base, ins)) {
+        const permissionSvc = yield* Permission.Service
+        const glob = externalGlob(base)
+        const pending = yield* permissionSvc.list()
+        if (pending.some((item) => item.permission === "external_directory" && item.patterns.includes(glob))) {
+          return yield* new ExternalPermissionPendingError({
+            name: "ExternalPermissionPendingError",
+            data: { message: "Approval for this directory is already pending", glob },
+          })
+        }
+        const config = yield* Config.Service
+        const cfg = yield* config.get()
+        const ruleset = Permission.merge(
+          Permission.fromConfig({ external_directory: { "*": "ask" } }),
+          Permission.fromConfig(cfg.permission ?? {}),
+        )
+        yield* permissionSvc.ask({
+          sessionID: SessionID.make(ctx.query.sessionID),
+          permission: "external_directory",
+          patterns: [glob],
+          always: [glob],
+          metadata: { filepath: base, parentDir: base },
+          ruleset,
+        }).pipe(
+          Effect.catchTag("PermissionDeniedError", () =>
+            Effect.fail(
+              new ExternalPermissionDeniedError({
+                name: "ExternalPermissionDeniedError",
+                data: { message: `Access denied to ${base}`, glob },
+              }),
+            ),
+          ),
+          Effect.catchTag("PermissionRejectedError", () =>
+            Effect.fail(
+              new ExternalPermissionDeniedError({
+                name: "ExternalPermissionDeniedError",
+                data: { message: `Access rejected for ${base}`, glob },
+              }),
+            ),
+          ),
+          Effect.catchTag("PermissionCorrectedError", () =>
+            Effect.fail(
+              new ExternalPermissionDeniedError({
+                name: "ExternalPermissionDeniedError",
+                data: { message: `Access rejected for ${base}`, glob },
+              }),
+            ),
+          ),
+        )
+      }
+
+      const ancestor = yield* deepestExistingAncestor(base)
+      const fs = yield* FSUtil.Service
+      const entries = yield* fs.readDirectoryEntries(ancestor).pipe(
+        Effect.mapError(
+          (error): ExternalPathError =>
+            new ExternalPathError({
+              name: "ExternalPathError",
+              data: { message: error.message || "Failed to read directory", code: "filesystem" as const },
+            }),
+        ),
+      )
+      const needle = ctx.query.query?.toLowerCase() ?? ""
+      const filtered = needle ? entries.filter((entry) => entry.name.toLowerCase().includes(needle)) : entries
+      // Partition before sorting so the comparator only pays for collation.
+      const dirs: typeof entries = []
+      const rest: typeof entries = []
+      for (const entry of filtered) (entry.type === "directory" ? dirs : rest).push(entry)
+      dirs.sort((a, b) => entryCollator.compare(a.name, b.name))
+      rest.sort((a, b) => entryCollator.compare(a.name, b.name))
+      return {
+        base: ancestor,
+        entries: [...dirs, ...rest].slice(0, ctx.query.limit ?? 50).map((entry) => ({
+          name: entry.name,
+          absolute: path.join(ancestor, entry.name),
+          type: entry.type,
+        })),
+      }
+    })
+
     return handlers
       .handle("findText", findText)
       .handle("findFile", findFile)
+      .handle("findSearch", findSearch)
       .handle("findSymbol", findSymbol)
       .handle("list", list)
       .handle("content", content)
@@ -281,5 +441,6 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       .handle("rename", rename)
       .handle("mkdir", mkdir)
       .handle("status", status)
+      .handle("externalList", externalList)
   }),
 ).pipe(Layer.provide(locationServiceMapLayer))

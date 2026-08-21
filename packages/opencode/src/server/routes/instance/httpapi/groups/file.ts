@@ -32,10 +32,104 @@ export const FindFileQuery = Schema.Struct({
   ),
 })
 
+export const FindSearchQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  query: Schema.String,
+  limit: Schema.optional(
+    Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(1000)),
+  ),
+  offset: Schema.optional(Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))),
+  symbols: Schema.optional(Schema.Literals(["true", "false"])),
+})
+
+export const MentionResult = Schema.Union([
+  Schema.Struct({
+    kind: Schema.Literal("file"),
+    path: Schema.String,
+    type: Schema.optional(Schema.Literals(["file", "directory"])),
+    score: Schema.Number,
+    positions: Schema.optional(Schema.Array(Schema.Number)),
+    baseOffset: Schema.optional(Schema.Number),
+  }),
+  Schema.Struct({
+    kind: Schema.Literal("symbol"),
+    name: Schema.String,
+    path: Schema.String,
+    line: Schema.Number,
+    symbolKind: Schema.String,
+    score: Schema.Number,
+    positions: Schema.optional(Schema.Array(Schema.Number)),
+  }),
+]).annotate({ identifier: "MentionResult" })
+
+export const FindSearchResponse = Schema.Struct({
+  results: Schema.Array(MentionResult),
+  hasMore: Schema.Boolean,
+  total: Schema.Number,
+}).annotate({ identifier: "MentionSearchPage" })
+
 export const FindSymbolQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   query: Schema.String,
 })
+
+export const ExternalListQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  path: Schema.String,
+  sessionID: Schema.String,
+  query: Schema.optional(Schema.String),
+  limit: Schema.optional(
+    Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(200)),
+  ),
+})
+
+export const ExternalEntry = Schema.Struct({
+  name: Schema.String,
+  absolute: Schema.String,
+  type: Schema.Literals(["file", "directory", "symlink", "other"]),
+}).annotate({ identifier: "ExternalPath.Entry" })
+
+export const ExternalListResult = Schema.Struct({
+  base: Schema.String,
+  entries: Schema.Array(ExternalEntry),
+}).annotate({ identifier: "ExternalPath.ListResult" })
+
+export class ExternalPathError extends Schema.ErrorClass<ExternalPathError>("ExternalPathError")(
+  {
+    name: Schema.Literal("ExternalPathError"),
+    data: Schema.Struct({
+      message: Schema.String,
+      code: Schema.Literals(["invalid_path", "not_found", "filesystem"]),
+    }),
+  },
+  { httpApiStatus: 400 },
+) {}
+
+export class ExternalPermissionPendingError extends Schema.ErrorClass<ExternalPermissionPendingError>(
+  "ExternalPermissionPendingError",
+)(
+  {
+    name: Schema.Literal("ExternalPermissionPendingError"),
+    data: Schema.Struct({
+      message: Schema.String,
+      glob: Schema.String,
+    }),
+  },
+  { httpApiStatus: 409 },
+) {}
+
+export class ExternalPermissionDeniedError extends Schema.ErrorClass<ExternalPermissionDeniedError>(
+  "ExternalPermissionDeniedError",
+)(
+  {
+    name: Schema.Literal("ExternalPermissionDeniedError"),
+    data: Schema.Struct({
+      message: Schema.String,
+      glob: Schema.String,
+    }),
+  },
+  { httpApiStatus: 403 },
+) {}
 
 export const LegacyMatch = Schema.Struct({
   path: Schema.Struct({ text: Schema.String }),
@@ -134,7 +228,9 @@ export const LegacyStatus = Schema.Struct({
 export const FilePaths = {
   findText: "/find",
   findFile: "/find/file",
+  findSearch: "/find/search",
   findSymbol: "/find/symbol",
+  externalList: "/fs/external-list",
   list: "/file",
   content: "/file/content",
   write: "/file/write",
@@ -166,6 +262,17 @@ export const FileApi = HttpApi.make("file")
             identifier: "find.files",
             summary: "Find files",
             description: "Search for files or directories by name or pattern in the project directory.",
+          }),
+        ),
+        HttpApiEndpoint.get("findSearch", FilePaths.findSearch, {
+          query: FindSearchQuery,
+          success: described(FindSearchResponse, "Mention search page"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "find.search",
+            summary: "Fuzzy mention search",
+            description:
+              "Fuzzy-search files, directories, and symbols for @mention typeahead. Returns one merged score-ranked list with match highlight positions and offset pagination.",
           }),
         ),
         HttpApiEndpoint.get("findSymbol", FilePaths.findSymbol, {
@@ -254,6 +361,18 @@ export const FileApi = HttpApi.make("file")
             identifier: "file.status",
             summary: "Get file status",
             description: "Get the git status of all files in the project.",
+          }),
+        ),
+        HttpApiEndpoint.get("externalList", FilePaths.externalList, {
+          query: ExternalListQuery,
+          success: described(ExternalListResult, "External directory listing"),
+          error: [ExternalPathError, ExternalPermissionPendingError, ExternalPermissionDeniedError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "fs.external.list",
+            summary: "List external directory",
+            description:
+              "List entries of an arbitrary local directory outside the project for @mention typeahead. Gated by the external_directory permission; first access to a subtree prompts the user.",
           }),
         ),
       )

@@ -3,6 +3,7 @@ import { createVirtualizer, defaultRangeExtractor } from "@tanstack/solid-virtua
 import type { FileNode } from "@opencode-ai/sdk/v2"
 import { FileIcon } from "@opencode-ai/ui/file-icon"
 import { Icon } from "@opencode-ai/ui/v2/icon"
+import { Spinner } from "@opencode-ai/ui/spinner"
 import { useFile } from "@/context/file"
 import { useLanguage } from "@/context/language"
 import { virtualScrollElement } from "@/components/virtual-scroll-element"
@@ -44,6 +45,17 @@ export function ProjectExplorerTree(props: {
 }) {
   const file = useFile()
   const language = useLanguage()
+
+  // While the root is loading (or errored without any loaded node at all) the
+  // tree has no rows — without this the panel opens as a blank slab. Surface a
+  // spinner so the user gets immediate idle feedback while the first directory
+  // listing round-trips, then it swaps to the virtualizer as soon as any node
+  // lands.
+  const loading = createMemo(() => {
+    const state = file.tree.state("")
+    if (!state) return false
+    return !state.loaded && state.loading !== false
+  })
 
   const [root, setRoot] = createSignal<HTMLDivElement>()
   const [focused, setFocused] = createSignal<string>()
@@ -151,6 +163,21 @@ export function ProjectExplorerTree(props: {
     return out
   })
 
+  // Declared after visibleRows: createMemo evaluates eagerly, so an earlier
+  // declaration would read visibleRows in its temporal dead zone and throw.
+  const empty = createMemo(() => visibleRows().length === 0)
+
+  // path -> flat-row index, computed once per rows() revision. Replaces the
+  // repeated O(n) findIndex calls used by the virtualizer range extractor and
+  // keyboard navigation — those ran on every scroll frame / keypress, turning
+  // large trees into a per-event linear scan.
+  const visibleIndex = createMemo(() => {
+    const index = new Map<string, number>()
+    let i = 0
+    for (const row of visibleRows()) index.set(row.node.path, i++)
+    return index
+  })
+
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
     get count() {
       return visibleRows().length
@@ -166,7 +193,7 @@ export function ProjectExplorerTree(props: {
     rangeExtractor: (range) => {
       const indexes = defaultRangeExtractor(range)
       const path = focused()
-      const index = path ? visibleRows().findIndex((row) => row.node.path === path) : -1
+      const index = path ? visibleIndex().get(path) ?? -1 : -1
       if (index < 0 || indexes.includes(index)) return indexes
       return [...indexes, index].sort((a, b) => a - b)
     },
@@ -213,7 +240,7 @@ export function ProjectExplorerTree(props: {
   const moveSelection = (delta: number) => {
     const list = visibleRows()
     if (list.length === 0) return
-    const index = list.findIndex((row) => row.node.path === selected())
+    const index = visibleIndex().get(selected()) ?? -1
     const next = Math.min(list.length - 1, Math.max(0, (index === -1 ? 0 : index) + delta))
     const path = list[next]!.node.path
     setSelected(path)
@@ -234,7 +261,7 @@ export function ProjectExplorerTree(props: {
     if (!path) return
     const scroller = virtualScrollElement(root())
     if (!scroller) return
-    const index = visibleRows().findIndex((row) => row.node.path === path)
+    const index = visibleIndex().get(path) ?? -1
     if (index < 0) return
     setRevealTarget(undefined)
     // Rows are fixed-height (estimateSize 22); use the rendered item's start
@@ -316,15 +343,26 @@ export function ProjectExplorerTree(props: {
       onKeyDown={onKeyDown}
       style={{
         position: "relative",
-        height: `${Math.max(virtualizer.getTotalSize(), searching() ? 36 : 0)}px`,
+        height: `${Math.max(virtualizer.getTotalSize(), searching() ? 36 : loading() && empty() && !searching() ? 120 : 0)}px`,
       }}
     >
       <Show
-        when={!searching() || visibleRows().length > 0}
+        when={!loading() || !empty() || searching()}
         fallback={
-          <div data-slot="project-explorer-search-empty">{language.t("projectExplorer.search.noResults")}</div>
+          <div
+            data-slot="project-explorer-loading"
+            class="absolute inset-0 flex items-center justify-center"
+          >
+            <Spinner class="size-4 shrink-0 text-v2-icon-icon-muted" />
+          </div>
         }
       >
+        <Show
+          when={!searching() || visibleRows().length > 0}
+          fallback={
+            <div data-slot="project-explorer-search-empty">{language.t("projectExplorer.search.noResults")}</div>
+          }
+        >
         <For each={virtualRowKeys()}>
         {(key) => (
           <Show when={virtualItemByKey().get(key)}>
@@ -406,6 +444,7 @@ export function ProjectExplorerTree(props: {
           </Show>
         )}
         </For>
+        </Show>
       </Show>
     </div>
   )

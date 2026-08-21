@@ -38,6 +38,24 @@ import {
 
 export type { FileSelection, SelectedLineRange, FileViewState, FileState }
 export { selectionFromLines }
+
+export type MentionSymbolKind = "fn" | "method" | "class" | "interface" | "type" | "enum" | "const"
+
+export type MentionResult =
+  | { kind: "file"; path: string; type?: "file" | "directory"; positions?: number[] }
+  | {
+      kind: "symbol"
+      name: string
+      path: string
+      line: number
+      symbolKind: MentionSymbolKind
+      positions?: number[]
+    }
+
+export interface MentionSearchPage {
+  results: MentionResult[]
+  hasMore: boolean
+}
 export {
   evictContentLru,
   getFileContentBytesTotal,
@@ -49,6 +67,31 @@ export {
 }
 
 const WATCHER_TREE_REFRESH_DELAY_MS = 120
+const DEFAULT_MAX_CONTENT_SCOPES = 5
+
+// Module-level (not per-store), mirroring tree-store's scopeCache: keeps a project's
+// loaded file *content* across a scope switch and across a FileProvider remount, not
+// just within one provider's lifetime. Previously every scope change unconditionally
+// wiped store.file (see the old `setStore("file", reconcile({}))` here), so revisiting
+// a project always re-fetched every open file's content even seconds later -- unlike
+// the directory tree, which already had this cache. Bounded by the same maxScopes as
+// tree-store so a long session doesn't grow this unbounded.
+const contentScopeCache = new Map<string, Record<string, FileState>>()
+
+function touchContentScope(key: string) {
+  const snap = contentScopeCache.get(key)
+  if (!snap) return
+  contentScopeCache.delete(key)
+  contentScopeCache.set(key, snap)
+}
+
+function evictContentScopes(maxScopes: number) {
+  while (contentScopeCache.size > maxScopes) {
+    const oldest = contentScopeCache.keys().next().value
+    if (oldest === undefined) break
+    contentScopeCache.delete(oldest)
+  }
+}
 
 function errorMessage(error: unknown, fallback: string) {
   if (error instanceof Error && error.message) return error.message
@@ -74,11 +117,20 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     )
 
     const inflight = new Map<string, Promise<void>>()
+    let currentContentScope = scope()
+    const initialContentSnapshot = contentScopeCache.get(currentContentScope)
     const [store, setStore] = createStore<{
       file: Record<string, FileState>
     }>({
-      file: {},
+      file: initialContentSnapshot ? { ...initialContentSnapshot } : {},
     })
+    if (initialContentSnapshot) {
+      touchContentScope(currentContentScope)
+      for (const file of Object.values(initialContentSnapshot)) {
+        if (!file.content) continue
+        touchFileContent(file.path, approxBytes(file.content))
+      }
+    }
     const watcherRefresh = {
       disposed: false,
       running: false,
@@ -134,11 +186,27 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     }
 
     createEffect(() => {
-      scope()
+      const next = scope()
       tree.switchScope()
+      if (next === currentContentScope) return
+
+      contentScopeCache.set(currentContentScope, { ...store.file })
+      evictContentScopes(DEFAULT_MAX_CONTENT_SCOPES)
+      currentContentScope = next
       inflight.clear()
       resetFileContentLru()
-      setStore("file", reconcile({}))
+
+      const cached = contentScopeCache.get(next)
+      if (!cached) {
+        setStore("file", reconcile({}))
+        return
+      }
+      touchContentScope(next)
+      setStore("file", reconcile(cached))
+      for (const file of Object.values(cached)) {
+        if (!file.content) continue
+        touchFileContent(file.path, approxBytes(file.content))
+      }
     })
 
     const viewCache = createFileViewCache(serverSDK().scope)
@@ -247,6 +315,20 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           },
         )
 
+    // Falls back to the legacy file find until /find/search ships in the generated
+    // client; swap the body to that call when it lands.
+    const searchMentions = (
+      query: string,
+      options?: { limit?: number; offset?: number; signal?: AbortSignal },
+    ): Promise<MentionSearchPage> =>
+      search(query, "true", options).then((paths) => ({
+        results: paths.map((path): MentionResult => {
+          if (!path.endsWith("/")) return { kind: "file", path }
+          return { kind: "file", path: path.replace(/\/+$/, ""), type: "directory" }
+        }),
+        hasMore: false,
+      }))
+
     const treeConsumerVisible = () => layout.fileTree.opened() || layout.projectExplorer.opened()
 
     const drainWatcherRefreshQueue = () => {
@@ -347,6 +429,9 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       // Save the current scope's tree into the module-level cache so the next mount for
       // the same directory seeds warm instead of paying a full uncached re-list.
       tree.persist()
+      contentScopeCache.set(currentContentScope, { ...store.file })
+      touchContentScope(currentContentScope)
+      evictContentScopes(DEFAULT_MAX_CONTENT_SCOPES)
       stop()
       viewCache.clear()
     })
@@ -386,7 +471,9 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       setSelectedLines,
       searchFiles: (query: string, options?: { limit?: number; signal?: AbortSignal }) =>
         search(query, "false", options),
-      searchFilesAndDirectories: (query: string) => search(query, "true"),
+      searchFilesAndDirectories: (query: string, options?: { limit?: number; signal?: AbortSignal }) =>
+        search(query, "true", options),
+      searchMentions,
     }
   },
 })

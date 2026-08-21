@@ -23,6 +23,7 @@
 //     defs are extracted and swapped, and a "plugin hooks require restart" warning is
 //     attached (P1 scope, tool-hot-reload §3.3).
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { Ignore } from "@opencode-ai/core/filesystem/ignore"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { EventV2 } from "@opencode-ai/core/event"
 import { ToolEvent } from "@opencode-ai/schema/tool-event"
@@ -311,6 +312,11 @@ const layer = Layer.effect(
         if (nativeWatcher) {
           const bridge = yield* EffectBridge.make()
           const backend = watcherBackend()
+          yield* Effect.logInfo("tool reload watcher: subscribing to config dirs", {
+            dirs: dirs.length,
+            backend,
+            ignoreCount: Ignore.PATTERNS.length,
+          })
           const callback = bridge.bind((_error: Error | null, updates: ParcelWatcher.Event[]) => {
             for (const update of updates) {
               if (!isWatchedFile(dirs, update.path)) continue
@@ -328,7 +334,7 @@ const layer = Layer.effect(
             Effect.promise(() => Promise.allSettled(subscriptions.map((subscription) => subscription.unsubscribe()))),
           )
           for (const dir of dirs) {
-            const pending = nativeWatcher.subscribe(dir, callback, { backend })
+            const pending = nativeWatcher.subscribe(dir, callback, { ignore: Ignore.PATTERNS, backend })
             yield* Effect.promise(() => pending).pipe(
               Effect.tap((subscription) => Effect.sync(() => subscriptions.push(subscription))),
               Effect.catch((error) =>
@@ -336,6 +342,14 @@ const layer = Layer.effect(
               ),
             )
           }
+          yield* Effect.logInfo("tool reload watcher: subscribed", {
+            subscribed: subscriptions.length,
+            attempted: dirs.length,
+          })
+        } else {
+          yield* Effect.logWarning("tool reload watcher: native binding unavailable, falling back to poll", {
+            dirs: dirs.length,
+          })
         }
 
         // Poll detection: fingerprint every watched file across all config dirs. Catches

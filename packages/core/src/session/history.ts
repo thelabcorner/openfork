@@ -5,6 +5,7 @@ import { MessageDecodeError } from "./error"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
 import { SessionContextEpochTable, SessionMessageTable } from "./sql"
+import { resolveProjectionRef } from "../event"
 
 type DatabaseService = Database.Interface["db"]
 
@@ -52,16 +53,19 @@ const messageRows = Effect.fnUntraced(function* (
   return rows
 })
 
-const decodeMessageRow = (row: typeof SessionMessageTable.$inferSelect) =>
-  decode({ ...row.data, id: row.id, type: row.type }).pipe(
-    Effect.mapError(
-      () =>
-        new MessageDecodeError({
-          sessionID: SessionSchema.ID.make(row.session_id),
-          messageID: SessionMessage.ID.make(row.id),
-        }),
-    ),
-  )
+const decodeMessageRow = (db: DatabaseService, row: typeof SessionMessageTable.$inferSelect) =>
+  Effect.gen(function* () {
+    const data = yield* resolveProjectionRef(db, row.session_id, "session_message.data", row.data)
+    return yield* decode({ ...data, id: row.id, type: row.type }).pipe(
+      Effect.mapError(
+        () =>
+          new MessageDecodeError({
+            sessionID: SessionSchema.ID.make(row.session_id),
+            messageID: SessionMessage.ID.make(row.id),
+          }),
+      ),
+    )
+  })
 
 export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
   const [epoch, compaction] = yield* Effect.all(
@@ -76,7 +80,7 @@ export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseServ
     ],
     { concurrency: "unbounded" },
   )
-  return yield* Effect.forEach(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq), decodeMessageRow)
+  return yield* Effect.forEach(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq), (row) => decodeMessageRow(db, row))
 })
 
 export const loadForRunner = Effect.fn("SessionHistory.loadForRunner")(function* (
@@ -94,7 +98,7 @@ export const entriesForRunner = Effect.fn("SessionHistory.entriesForRunner")(fun
 ) {
   const rows = yield* messageRows(db, sessionID, yield* latestCompaction(db, sessionID), baselineSeq)
   return yield* Effect.forEach(rows, (row) =>
-    decodeMessageRow(row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
+    decodeMessageRow(db, row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
   )
 })
 

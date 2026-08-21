@@ -461,6 +461,14 @@ export function MessageTimeline(props: {
   let resizePinnedIndexes: number[] = []
   let resizePinFrame: number | undefined
   let virtualContent: HTMLDivElement | undefined
+  // Cached from the width/height ResizeObserver below instead of read live in
+  // resizeItem. resizeItem runs once per row on every measurement and the
+  // virtualizer is writing row-position styles in the same batch, so a live
+  // `root.clientHeight` read there forces a synchronous layout flush on
+  // nearly every row -- classic read-after-write thrashing that gets worse
+  // the more rows/messages a session has. The container's own height only
+  // changes when it's actually resized, which the observer already tracks.
+  let containerHeight = 0
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
     get count() {
       return safeTimelineRows().length
@@ -538,7 +546,7 @@ export function MessageTimeline(props: {
     const item = virtualizer.measurementsCache[index]
     const previous = item ? (virtualizer.itemSizeCache.get(item.key) ?? item.size) : undefined
     const root = listRoot()
-    if (root && previous !== undefined && Math.abs(size - previous) > root.clientHeight) {
+    if (root && previous !== undefined && Math.abs(size - previous) > containerHeight) {
       const view = root.getBoundingClientRect()
       resizePinnedIndexes = [...root.querySelectorAll<HTMLElement>("[data-index]")]
         .filter((element) => {
@@ -562,10 +570,21 @@ export function MessageTimeline(props: {
     const first = virtualizer.range?.startIndex
     return first !== undefined && item.index < first
   }
-  const virtualItemByKey = createMemo(
-    () => new Map(virtualizer.getVirtualItems().map((item) => [item.key, item] as const)),
-  )
-  const virtualRowKeys = createMemo(() => virtualizer.getVirtualItems().map((item) => item.key as string))
+  // One pass over the virtual items for both lookups: the map (per row key)
+  // and the key list for <For> (per virtualizer update, i.e. per scroll frame).
+  const virtualItemsMemo = createMemo(() => {
+    const items = virtualizer.getVirtualItems()
+    const byKey = new Map<string, VirtualItem>()
+    const keys: string[] = new Array(items.length)
+    for (let i = 0; i < items.length; i++) {
+      const item = items[i]!
+      byKey.set(item.key as string, item)
+      keys[i] = item.key as string
+    }
+    return { byKey, keys }
+  })
+  const virtualItemByKey = () => virtualItemsMemo().byKey
+  const virtualRowKeys = () => virtualItemsMemo().keys
   createEffect(() => {
     props.setRevealMessage?.((id, rowIndex) => {
       // If a specific row index is provided, scroll to that exact row
@@ -606,14 +625,21 @@ export function MessageTimeline(props: {
     virtualizer.scrollToEnd()
   }
 
-  let measuredSessionKey = sessionKey()
+  // NOTE: this component instance is shared across session tabs (only remounts
+  // on server/directory change, not on tab switch -- see TargetSessionPage's
+  // Show key), so this effect fires on every tab switch. It intentionally does
+  // NOT call virtualizer.measure() here: TimelineRow.key() is globally unique
+  // per row (not scoped to a session), so the virtualizer's itemSizeCache is
+  // effectively a cross-session cache -- calling measure() would wipe it and
+  // force every visible row of the newly-active session to synchronously
+  // remeasure from scratch on every single switch, which is exactly the "many
+  // small sync ops, no single long task" stall previously reported on tab
+  // switches. Rows the virtualizer hasn't seen before just miss the cache and
+  // fall back to estimateSize/measureElement on mount, same as scrolling to
+  // reveal new content -- no special-casing needed.
   createEffect(() => {
-    const key = sessionKey()
+    sessionKey()
     safeTimelineRows().length
-    if (measuredSessionKey !== key) {
-      measuredSessionKey = key
-      virtualizer.measure()
-    }
     maybeAnchorBottom()
   })
 
@@ -658,9 +684,11 @@ export function MessageTimeline(props: {
     if (!root) return
     const resizeObserver = new ResizeObserver(([entry]) => {
       rowEstimator.setWidth(entry?.contentRect.width ?? root.clientWidth)
+      containerHeight = entry?.contentRect.height ?? root.clientHeight
     })
     resizeObserver.observe(root)
     rowEstimator.setWidth(root.clientWidth)
+    containerHeight = root.clientHeight
     onCleanup(() => resizeObserver.disconnect())
   })
 

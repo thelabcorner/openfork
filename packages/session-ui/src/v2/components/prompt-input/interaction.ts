@@ -1,4 +1,4 @@
-import { createEffect, on, type Accessor } from "solid-js"
+import { createEffect, on, onCleanup, type Accessor } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useFilteredList } from "@opencode-ai/ui/hooks"
 import { createPromptInputV2Attachments, type PromptInputV2AttachmentConfig } from "./attachments"
@@ -53,6 +53,40 @@ export function createPromptInputV2State() {
   return createStore(createPromptInputV2InteractionState())
 }
 
+const CONTEXT_SEARCH_DEBOUNCE_MS = 70
+
+function createDeferredContextSearch(
+  search: (query: string, options?: { signal?: AbortSignal; limit?: number }) => PromptInputV2Suggestion[] | Promise<PromptInputV2Suggestion[]>,
+) {
+  let controller: AbortController | undefined
+  let timer: ReturnType<typeof setTimeout> | undefined
+  let generation = 0
+
+  const run = (query: string) =>
+    new Promise<PromptInputV2Suggestion[]>((resolve) => {
+      const token = ++generation
+      if (timer) clearTimeout(timer)
+      timer = setTimeout(() => {
+        controller?.abort()
+        const next = new AbortController()
+        controller = next
+        Promise.resolve(search(query, { signal: next.signal, limit: 200 }))
+          .then((results) => resolve(token === generation && !next.signal.aborted ? results : []))
+          .catch(() => resolve([]))
+      }, CONTEXT_SEARCH_DEBOUNCE_MS)
+    })
+
+  const cancel = () => {
+    generation++
+    if (timer) clearTimeout(timer)
+    controller?.abort()
+  }
+
+  onCleanup(cancel)
+
+  return { run }
+}
+
 export function createPromptInputV2Controller(input: {
   store: PromptInputV2StoreInput
   state?: ReturnType<typeof createPromptInputV2State>
@@ -60,7 +94,10 @@ export function createPromptInputV2Controller(input: {
   history?: PromptInputV2History
   commands: Accessor<PromptInputV2Suggestion[]>
   context: Accessor<PromptInputV2Suggestion[]>
-  searchContextFiles: (query: string) => PromptInputV2Suggestion[] | Promise<PromptInputV2Suggestion[]>
+  searchContextFiles: (
+    query: string,
+    options?: { signal?: AbortSignal; limit?: number },
+  ) => PromptInputV2Suggestion[] | Promise<PromptInputV2Suggestion[]>
   openAttachment?: (attachment: PromptInputV2Attachment) => void
   openContext?: (key: string) => void
   onContextRemove?: (item: PromptInputV2Comment) => void
@@ -106,13 +143,14 @@ export function createPromptInputV2Controller(input: {
     }
     attachments.pick(() => fileInput?.click())
   }
+  const contextSearch = createDeferredContextSearch(input.searchContextFiles)
   const contextList = useFilteredList<PromptInputV2Suggestion>({
     items: async (query) => {
       const fixed = input.context().filter((item) => item.kind !== "file")
       const recent = input.context().filter((item) => item.kind === "file" && item.recent)
       if (!query.trim()) return [...fixed, ...recent]
       const seen = new Set(recent.map((item) => item.id))
-      const files = (await input.searchContextFiles(query)).filter((item) => !seen.has(item.id))
+      const files = (await contextSearch.run(query)).filter((item) => !seen.has(item.id))
       return [...fixed, ...recent, ...files]
     },
     key: (item) => item.id,

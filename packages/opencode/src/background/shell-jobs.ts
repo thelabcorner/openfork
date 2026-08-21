@@ -34,8 +34,12 @@ export function jobFileStem(id: string): string {
   return id.startsWith("job_") ? id.slice("job_".length) : id
 }
 
-export const jobLogPath = (id: string) => path.join(TRUNCATION_DIR, `job_${jobFileStem(id)}.log`)
-export const jobMetaPath = (id: string) => path.join(TRUNCATION_DIR, `job_${jobFileStem(id)}.json`)
+export const JOB_SUBDIR = "job-output"
+export const jobLogPath = (id: string) => path.join(TRUNCATION_DIR, JOB_SUBDIR, `job_${jobFileStem(id)}.log`)
+export const jobMetaPath = (id: string) => path.join(TRUNCATION_DIR, JOB_SUBDIR, `job_${jobFileStem(id)}.json`)
+// Legacy paths (pre-subdir) — for reading old jobs that haven't been migrated
+export const jobLogPathLegacy = (id: string) => path.join(TRUNCATION_DIR, `job_${jobFileStem(id)}.log`)
+export const jobMetaPathLegacy = (id: string) => path.join(TRUNCATION_DIR, `job_${jobFileStem(id)}.json`)
 
 // Process-global set of live job file stems. Truncate.cleanup (which runs in a
 // global context without an instance) reads this to never delete a running

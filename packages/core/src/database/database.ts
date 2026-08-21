@@ -7,12 +7,16 @@ import { Global } from "../global"
 import { Flag } from "../flag/flag"
 import { isAbsolute, join } from "path"
 import { DatabaseMigration } from "./migration"
+import { ensureChunkDB, CHUNKDB_PAGE_SIZE, CHUNKDB_AUTO_VACUUM } from "./chunkdb"
+import { runSealerLoop } from "./chunk-sealer"
+import { compactDatabase } from "./chunk-compact"
+import { rebuildDatabase } from "./chunk-rebuild"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
-type DatabaseShape = Effect.Success<typeof makeDatabase>
+export type DatabaseShape = Effect.Success<typeof makeDatabase>
 
 export interface Interface {
   db: DatabaseShape
@@ -25,6 +29,25 @@ const layer = (filename: string) =>
   Layer.effect(
     Service,
     Effect.gen(function* () {
+      // Epoch-3 (#9): opt-in shrink of EXISTING databases (auto_vacuum=0 files
+      // never reclaim space on their own). Must run BEFORE the main connection
+      // is acquired — on Windows the main Native handle keeps the file locked
+      // (WAL mode) and the compact swap (rename original -> .bak) would fail
+      // with EBUSY if the main handle is open. Gated on OPENCODE_SEAL_COMPACT.
+      // Uses raw SQLite connections with deterministic close(), so it is safe
+      // to run here with no main db yet; errors are logged and do not block startup.
+      // Epoch-3 (#8): one-shot REBUILD that extends the #9 file-swap to also
+      // collapse projections (session_message.data / message.data /
+      // session.summary_diffs / event message.updated+session.updated) into
+      // event_value $cdbRef indexes (same table, no second scan). R2/Q1/Q4.
+      // Flag-gated OPENCODE_SEAL_REBUILD (default-off); takes precedence over
+      // COMPACT because the rebuild already does VACUUM + dedup.
+      if (Flag.OPENCODE_SEAL_REBUILD) {
+        yield* rebuildDatabase(filename).pipe(Effect.logError)
+      } else if (Flag.OPENCODE_SEAL_COMPACT) {
+        yield* compactDatabase(filename).pipe(Effect.logError)
+      }
+
       const db = yield* makeDatabase
 
       yield* db.run("PRAGMA journal_mode = WAL")
@@ -34,6 +57,10 @@ const layer = (filename: string) =>
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
       yield* DatabaseMigration.apply(db)
+      yield* ensureChunkDB(db)
+      if (Flag.OPENCODE_SEAL_ENABLED) {
+        yield* Effect.forkScoped(runSealerLoop(filename).pipe(Effect.ignore))
+      }
 
       // Periodically checkpoint the WAL so it doesn't grow unbounded during
       // long runs. TRUNCATE actually truncates the WAL file (PASSIVE only
@@ -51,7 +78,13 @@ const layer = (filename: string) =>
   )
 
 export function layerFromPath(filename: string) {
-  return layer(filename).pipe(Layer.provide(sqliteLayer({ filename })))
+  // Create-time storage tuning (page_size + auto_vacuum=INCREMENTAL) for NEW
+  // DBs. Applied by the native layer BEFORE `journal_mode = WAL` so it actually
+  // takes effect; harmless no-op on existing DBs. Gated on the ChunkDB feature.
+  const createTimePragmas = Flag.OPENCODE_SEAL_ENABLED
+    ? { page_size: CHUNKDB_PAGE_SIZE, auto_vacuum: CHUNKDB_AUTO_VACUUM }
+    : undefined
+  return layer(filename).pipe(Layer.provide(sqliteLayer({ filename, createTimePragmas })))
 }
 
 // Runs `body` with a dedicated second SQLite connection to the same database

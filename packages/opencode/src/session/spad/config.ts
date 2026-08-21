@@ -23,9 +23,17 @@ export const DEFAULT_SPAD_CONFIG: SpadConfig = Object.freeze({
   maxRecoveryAttempts: 2,
   relapseMatchChars: 96,
   recoveryWatchChars: 1536,
-  autoRecoverCanonical: false,
+  autoRecoverCanonical: true,
+  canonicalMinDuplicate4GramRatio: 0.65,
   lowLexicalDistinctLetters: 4,
   lowLexicalMinCoverage: 1024,
+  autoRecoverThrash: true,
+  thrashMinGenerations: 3,
+  thrashMinToolCalls: 8,
+  thrashNoMutationGens: 3,
+  thrashReaccessRatio: 0.5,
+  thrashNarrationOverlap: 0.35,
+  thrashNarrationStreak: 3,
 })
 
 export function validateConfig(config: SpadConfig): void {

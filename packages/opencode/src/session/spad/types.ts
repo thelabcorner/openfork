@@ -1,4 +1,4 @@
-export type SpadLane = "raw" | "canonical"
+export type SpadLane = "raw" | "canonical" | "thrash"
 export type SpadChannel = "text" | "reasoning"
 
 export interface PeriodThresholdBand {
@@ -22,8 +22,16 @@ export interface SpadConfig {
   readonly relapseMatchChars: number
   readonly recoveryWatchChars: number
   readonly autoRecoverCanonical: boolean
+  readonly canonicalMinDuplicate4GramRatio: number
   readonly lowLexicalDistinctLetters: number
   readonly lowLexicalMinCoverage: number
+  readonly autoRecoverThrash: boolean
+  readonly thrashMinGenerations: number
+  readonly thrashMinToolCalls: number
+  readonly thrashNoMutationGens: number
+  readonly thrashReaccessRatio: number
+  readonly thrashNarrationOverlap: number
+  readonly thrashNarrationStreak: number
 }
 
 export interface PeriodDetection {
@@ -55,6 +63,7 @@ export type SpadAction =
       readonly detection: PeriodDetection
       readonly quarantineFrom: number
       readonly recoveryPrompt: string
+      readonly noTruncate?: boolean
     }
   | {
       readonly type: "abort"

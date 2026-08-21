@@ -823,7 +823,7 @@ it.instance("SPAD recovery truncates a repetitive tail and continues with a hidd
 
 it.instance("SPAD disabled preserves repetitive output and avoids recovery", () =>
   Effect.gen(function* () {
-    const { llm } = yield* useServerConfig(providerCfg)
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), experimental: { spad_recovery: false } }))
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const session = yield* sessions.create({

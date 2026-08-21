@@ -25,6 +25,13 @@ export type PromptInputV2AgentPart = PromptInputV2PartBase & {
   name: string
 }
 
+export type PromptInputV2ExternalPathPart = PromptInputV2PartBase & {
+  type: "external-path"
+  path: string
+  isDir: boolean
+  status?: "granted" | "denied"
+}
+
 export type PromptInputV2Attachment = {
   type: "image"
   id: string
@@ -38,6 +45,7 @@ export type PromptInputV2Prompt = (
   | PromptInputV2TextPart
   | PromptInputV2FilePart
   | PromptInputV2AgentPart
+  | PromptInputV2ExternalPathPart
   | PromptInputV2Attachment
 )[]
 

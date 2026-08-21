@@ -3,7 +3,7 @@ export * as SessionProjector from "./projector"
 import { and, desc, eq, gt, or, sql } from "drizzle-orm"
 import { DateTime, Effect, Layer, Schema } from "effect"
 import { Database } from "../database/database"
-import { EventV2 } from "../event"
+import { EventV2, resolveProjectionRef } from "../event"
 import { makeGlobalNode } from "../effect/app-node"
 import { SessionEvent } from "./event"
 import { SessionV1 } from "../v1/session"
@@ -293,7 +293,8 @@ const layer = Layer.effectDiscard(
           .all()
           .pipe(Effect.orDie)
         for (const row of rows) {
-          const previous = usage(row.data)
+          const data = yield* resolveProjectionRef(db, event.data.sessionID, "part.data", row.data)
+          const previous = usage(data)
           if (previous) yield* applyUsage(db, event.data.sessionID, previous, -1)
         }
         yield* db
@@ -311,7 +312,7 @@ const layer = Layer.effectDiscard(
           .where(and(eq(PartTable.id, event.data.partID), eq(PartTable.session_id, event.data.sessionID)))
           .get()
           .pipe(Effect.orDie)
-        const previous = row && usage(row.data)
+        const previous = row && usage(yield* resolveProjectionRef(db, event.data.sessionID, "part.data", row.data))
         if (previous) yield* applyUsage(db, event.data.sessionID, previous, -1)
         yield* db
           .delete(PartTable)

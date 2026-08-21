@@ -24,7 +24,17 @@ export const Commands = Spec.make(typeof OPENCODE_CLI_NAME === "string" ? OPENCO
     }),
     Spec.make("debug", {
       description: "Debugging and troubleshooting tools",
-      commands: [Spec.make("agents", { description: "List all agents" })],
+      commands: [
+        Spec.make("agents", { description: "List all agents" }),
+        Spec.make("checkpoints", {
+          description: "List checkpoints for a session",
+          params: {
+            sessionID: Argument.string("sessionID").pipe(
+              Argument.withDescription("Session ID to inspect checkpoints for"),
+            ),
+          },
+        }),
+      ],
     }),
     Spec.make("migrate", { description: "Migrate v1 data to v2" }),
     Spec.make("service", {

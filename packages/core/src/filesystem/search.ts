@@ -13,11 +13,53 @@ import { Ripgrep } from "../ripgrep"
 import { RelativePath } from "../schema"
 import { Flag } from "../flag/flag"
 import { Watcher } from "./watcher"
+import { Matcher } from "../search/matcher"
+import { SearchIndex } from "../search/index-service"
+import { ChunkStore } from "../search/chunk-store"
+import { Global } from "../global"
+
+// Mention-search session cache shared by backends that can enumerate paths:
+// the prepared index is keyed by a cheap revision stamp so watcher deltas
+// trigger a rebuild only when the candidate set actually changed.
+const MENTION_BUILD_LIMIT = 100_000
+
+function mentionSessionKey(paths: readonly { path: string }[], symbols: readonly unknown[]): string {
+  return `${paths.length}:${symbols.length}:${paths.length > 0 ? (paths[0]!.path + "|" + paths[paths.length - 1]!.path) : ""}`
+}
+
+const mentionsState = new WeakMap<object, { key: string; session: Matcher.QuerySession }>()
+
+function mentionsFromEntries(
+  owner: object,
+  paths: readonly Matcher.PathEntry[],
+  symbols: readonly Matcher.SymbolEntry[],
+  input: { query: string; limit: number; offset: number; symbols: boolean },
+): Matcher.QueryPage {
+  const key = mentionSessionKey(paths, symbols)
+  let state = mentionsState.get(owner)
+  if (!state || state.key !== key) {
+    if (paths.length > MENTION_BUILD_LIMIT) {
+      // oversized corpus without the byte-first store seam: fall back to
+      // caller-provided ranking by returning an empty page (handler degrades)
+      return { files: [], symbols: [], results: [], hasMore: false, total: 0 }
+    }
+    state = { key, session: Matcher.createSession(Matcher.prepare({ paths, symbols })) }
+    mentionsState.set(owner, state)
+  }
+  return state.session.query(input.query, { limit: input.limit, offset: input.offset, symbols: input.symbols })
+}
 
 export interface Interface {
   readonly find: (input: FileSystem.FindInput) => Effect.Effect<FileSystem.Entry[]>
   readonly glob: (input: FileSystem.GlobInput) => Effect.Effect<readonly FileSystem.Entry[]>
   readonly grep: (input: FileSystem.GrepInput) => Effect.Effect<readonly FileSystem.Match[]>
+  /** Fuzzy mention search over paths (+symbols where the backend provides them). */
+  readonly searchMentions: (input: {
+    query: string
+    limit: number
+    offset: number
+    symbols: boolean
+  }) => Effect.Effect<Matcher.QueryPage>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/FileSystem/Search") {}
@@ -199,6 +241,15 @@ export const ripgrepLayer = Layer.effect(
             })
           })
         }),
+      searchMentions: (input) =>
+        Effect.sync(() => {
+          const paths: Matcher.PathEntry[] = state.files.map((p) => ({ path: p, isDir: false }))
+          for (const d of state.directories) {
+            const trimmed = d.endsWith(path.sep) ? d.slice(0, -path.sep.length) : d
+            paths.push({ path: trimmed, isDir: true })
+          }
+          return mentionsFromEntries(state, paths, [], input)
+        }),
     })
   }),
 )
@@ -225,6 +276,7 @@ export const fffLayer = Layer.effect(
         find: () => Effect.succeed([]),
         glob: () => Effect.succeed([]),
         grep: () => Effect.succeed([]),
+        searchMentions: () => Effect.succeed({ files: [], symbols: [], results: [], hasMore: false, total: 0 }),
       })
     }
     yield* Effect.addFinalizer(() => Effect.sync(() => result.value.destroy()).pipe(Effect.ignore))
@@ -312,12 +364,125 @@ export const fffLayer = Layer.effect(
               })
             })
         }),
+      searchMentions: (input) =>
+        Effect.sync(() => {
+          const options = { pageIndex: 0, pageSize: input.limit + input.offset }
+          const found = result.value.mixedSearch(input.query.trim(), options)
+          if (!found.ok) throw found.error
+          const items = found.value.items
+            .map((item, index) => ({
+              path: item.item.relativePath.replaceAll("\\", "/").replace(/\/$/, "") + (item.type === "directory" ? "/" : ""),
+              type: item.type,
+              score: found.value.scores[index]?.total ?? 0,
+            }))
+            .sort((a, b) => b.score - a.score || a.path.length - b.path.length)
+          const page = Math.max(0, input.offset)
+          const window = items.slice(page, page + input.limit)
+          const results: Matcher.UnifiedResult[] = window.map((item) => ({
+            kind: "file" as const,
+            path: item.path,
+            type: item.type,
+            score: item.score,
+            positions: mentionPositions(item.path, input.query),
+            baseOffset: item.path.lastIndexOf("/", item.path.length - 2) + 1,
+          }))
+          return {
+            files: [],
+            symbols: [],
+            results,
+            hasMore: page + window.length < items.length,
+            total: items.length,
+          }
+        }),
     })
   }),
 )
 
-const layer = Layer.unwrap(Effect.sync(() => (Flag.OPENCODE_DISABLE_FFF || !Fff.available() ? ripgrepLayer : fffLayer)))
+// highlight indices of the (single-token lowercased) query inside text,
+// computed post-hoc for backends that rank without exposing positions
+function mentionPositions(text: string, query: string): number[] | undefined {
+  const tokens = query.trim().toLowerCase().split(/\s+/).filter((t) => t.length > 0)
+  if (tokens.length === 0) return undefined
+  const lower = text.toLowerCase()
+  const out: number[] = []
+  for (const tok of tokens) {
+    let from = 0
+    for (const ch of tok) {
+      const idx = lower.indexOf(ch, from)
+      if (idx < 0) break
+      out.push(idx)
+      from = idx + 1
+    }
+  }
+  if (out.length === 0) return undefined
+  out.sort((a, b) => a - b)
+  return [...new Set(out)]
+}
+
+const indexLayer = Layer.effect(
+  Service,
+  Effect.gen(function* () {
+    const index = yield* SearchIndex.Service
+    const location = yield* Location.Service
+    const fs = yield* FSUtil.Service
+    const ripgrep = yield* Ripgrep.Service
+    return Service.of({
+      glob: (input) =>
+        Effect.gen(function* () {
+          const target = path.resolve(location.directory, input.path ?? ".")
+          const info = yield* fs.stat(target).pipe(Effect.orDie)
+          const cwd = info.type === "File" ? path.dirname(target) : target
+          return yield* ripgrep.glob({ cwd, pattern: input.pattern, limit: input.limit ?? Number.MAX_SAFE_INTEGER }).pipe(
+            Effect.map((result) => result.map((entry) => FileSystem.Entry.make({ path: RelativePath.make(path.relative(location.directory, path.resolve(cwd, entry.path))), type: entry.type }))),
+            Effect.orDie,
+          ) as Effect.Effect<FileSystem.Entry[]>
+        }),
+      grep: (input) =>
+        Effect.gen(function* () {
+          const target = path.resolve(location.directory, input.path ?? ".")
+          const info = yield* fs.stat(target).pipe(Effect.orDie)
+          const cwd = info.type === "File" ? path.dirname(target) : target
+          return yield* ripgrep.grep({ cwd, pattern: input.pattern, file: info.type === "File" ? path.basename(target) : undefined, include: input.include, limit: input.limit ?? Number.MAX_SAFE_INTEGER }).pipe(Effect.orDie)
+        }),
+      find: (input) =>
+        Effect.gen(function* () {
+          const snapshot = yield* (index.loadAll().pipe(Effect.orDie) as Effect.Effect<{ paths: SearchIndex.PathEntry[]; symbols: never[] }>)
+          const targets = snapshot.paths
+            .filter((entry) => input.type === undefined || (input.type === "directory") === entry.isDir)
+            .map((entry) => (entry.isDir ? entry.path + path.sep : entry.path))
+          return fuzzysort.go(input.query, targets, { limit: input.limit ?? 50 }).map((item) => {
+            const relative = item.target
+            const isDir = relative.endsWith(path.sep)
+            return FileSystem.Entry.make({ path: RelativePath.make(relative), type: isDir ? "directory" : "file" })
+          })
+        }),
+      searchMentions: (input) =>
+        Effect.gen(function* () {
+          const snapshot = yield* (index.loadAll().pipe(Effect.orDie) as Effect.Effect<{
+            paths: SearchIndex.PathEntry[]
+            symbols: Matcher.SymbolEntry[]
+          }>)
+          return mentionsFromEntries(index, snapshot.paths, snapshot.symbols, input)
+        }),
+    })
+  }),
+)
+
+// Path-derived store wiring: layerWith composes the chunk-store statically so
+// its connection finalizer attaches to the consumer scope (unwrap here only
+// defers the path derivation until Location is available).
+const indexComposite = Layer.unwrap(
+  Effect.gen(function* () {
+    const location = yield* Location.Service
+    const fs = yield* FSUtil.Service
+    const global = yield* Global.Service
+    const root = yield* fs.realPath(location.directory).pipe(Effect.orDie)
+    return indexLayer.pipe(Layer.provideMerge(SearchIndex.layerWith(ChunkStore.dbPathFor(root, global.data))))
+  }),
+)
+const baseLayer = Layer.unwrap(Effect.sync(() => (Flag.OPENCODE_DISABLE_FFF || !Fff.available() ? ripgrepLayer : fffLayer)))
+const layer = Layer.unwrap(Effect.sync(() => (Flag.OPENCODE_SEARCH_INDEX ? indexComposite : baseLayer)))
 
 export const locationLayer = layer
 
-export const node = makeLocationNode({ service: Service, layer, deps: [FSUtil.node, Location.node, Ripgrep.node, EventV2.node] })
+export const node = makeLocationNode({ service: Service, layer, deps: [FSUtil.node, Location.node, Ripgrep.node, EventV2.node, Global.node] })

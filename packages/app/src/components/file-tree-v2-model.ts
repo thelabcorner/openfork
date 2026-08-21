@@ -99,9 +99,21 @@ export function flattenLiveFileTreeV2(
 }
 
 function toLiveNode(node: FileNode): FileTreeV2Node {
-  return {
+  const cached = liveNodeCache.get(node)
+  if (cached) return cached
+  const live = {
     ...node,
     path: normalizeFileTreeV2Path(node.path),
     originalPath: node.path,
   }
+  liveNodeCache.set(node, live)
+  return live
 }
+
+// Derived live nodes are a pure function of the *source* FileNode identity.
+// Solid's store hands us proxy objects that keep a stable reference until the
+// backing data is actually replaced (produce/set/reconcile), so caching by
+// source identity turns the per-row O(n) spread allocation during every tree
+// re-flatten (triggered by any watcher refresh or expand) into an O(changed)
+// pass. WeakMap so evicted store nodes don't pin memory.
+const liveNodeCache = new WeakMap<FileNode, FileTreeV2Node>()

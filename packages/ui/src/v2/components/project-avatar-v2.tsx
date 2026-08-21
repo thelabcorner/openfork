@@ -29,20 +29,33 @@ export type ProjectAvatarVariant = (typeof PROJECT_AVATAR_VARIANTS)[number]
 // "outline" is a neutral, muted style (e.g. recently closed projects) and is not part of the color rotation.
 export type ProjectAvatarStyle = ProjectAvatarVariant | "outline"
 
+export type ProjectAvatarStatus = "unread" | "question" | "permission" | "error" | "complete"
+
 export interface ProjectAvatarProps extends ComponentProps<"div"> {
   fallback: string
   src?: string
   variant?: ProjectAvatarStyle
   unread?: boolean
+  status?: ProjectAvatarStatus
 }
 
 export function ProjectAvatar(props: ProjectAvatarProps) {
-  const [split, rest] = splitProps(props, ["fallback", "src", "variant", "unread", "class", "classList", "style"])
+  const [split, rest] = splitProps(props, [
+    "fallback",
+    "src",
+    "variant",
+    "unread",
+    "status",
+    "class",
+    "classList",
+    "style",
+  ])
+  const dot = () => split.status ?? (split.unread ? "unread" : undefined)
   return (
     <div
       {...rest}
       data-component="project-avatar-v2"
-      data-unread={split.unread ? "" : undefined}
+      data-unread={dot() ? "" : undefined}
       classList={{
         ...split.classList,
         [split.class ?? ""]: !!split.class,
@@ -58,8 +71,8 @@ export function ProjectAvatar(props: ProjectAvatarProps) {
           {(value) => <img src={value()} draggable={false} data-slot="project-avatar-image" />}
         </Show>
       </div>
-      <Show when={split.unread}>
-        <span data-slot="project-avatar-unread-dot" aria-hidden="true" />
+      <Show when={dot()}>
+        <span data-slot="project-avatar-unread-dot" data-status={dot()} aria-hidden="true" />
       </Show>
     </div>
   )

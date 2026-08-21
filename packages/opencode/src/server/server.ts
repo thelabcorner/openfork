@@ -196,8 +196,56 @@ function forceClose(state: ListenerState) {
   return Effect.all([state.http.closeAll, state.websockets.closeAll], { concurrency: "unbounded", discard: true })
 }
 
+// SSE connections write a heartbeat every 10s (see the event handler), which keeps
+// resetting Node's own idle/write timers even when the peer is long gone (laptop
+// sleep, wifi drop, VPN blip -- no FIN/RST ever arrives). Without OS-level TCP
+// keepalive, a dead SSE connection's socket -- and the GlobalBus listener + queue
+// tied to it via the request fiber -- can live forever, accumulating over a long
+// session until GlobalBus.emit() (called on every published event) is slow enough
+// to make even the health check miss its window. keepalive probes independently of
+// application read/write activity, so the OS actually notices a half-open peer and
+// closes the socket, which triggers the fiber's cleanup and drops the listener.
+// Kept short: this is the window during which a half-open SSE connection's
+// listener sits in event.ts's global `listeners` array before the OS notices
+// the peer is gone and closes the socket, triggering cleanup. notify() runs
+// that array on every published event, so a longer delay directly extends how
+// long each dead connection adds overhead to every request server-wide.
+const SOCKET_KEEPALIVE_DELAY_MS = 5_000
+
+// Node's http.Server tears down an idle keep-alive socket after 5s
+// (server.keepAliveTimeout default) with no new request on it. The
+// renderer's own fetch keep-alive pool is willing to hold a loopback
+// connection open much longer than that, so every request burst separated
+// by more than ~5s of idle time (e.g. switch tabs, pause, switch again) was
+// forced to pay a fresh TCP handshake -- the server closed the socket before
+// the client ever tried to reuse it. On Windows especially, high-churn
+// localhost connection setup/teardown accumulates TIME_WAIT sockets, adding
+// yet another source of tab-switch stutter under heavy use. Raising this
+// lets the server hold sockets open as long as the client is willing to.
+const KEEP_ALIVE_TIMEOUT_MS = 60_000
+// Must exceed keepAliveTimeout: Node times out waiting for the next
+// request's headers using the same per-socket clock, and a headersTimeout
+// at or below keepAliveTimeout could cut a connection off right as we've
+// told it to stay alive.
+const HEADERS_TIMEOUT_MS = KEEP_ALIVE_TIMEOUT_MS + 5_000
+
 function serverLayer(opts: { port: number; hostname: string }) {
   const server = createServer()
+  server.on("connection", (socket) => socket.setKeepAlive(true, SOCKET_KEEPALIVE_DELAY_MS))
+  server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS
+  server.headersTimeout = HEADERS_TIMEOUT_MS
+  // Node's server.requestTimeout (default 300_000ms since Node 18) is meant to
+  // protect an internet-facing server from slow-loris-style clients that never
+  // finish sending a request. In practice it's also a well-known footgun for
+  // long-lived streaming responses: Node does not reset it once the response
+  // starts, so an SSE connection that's actively receiving heartbeats every
+  // 10s can still get killed by the server ~5 minutes after it opened, for no
+  // reason visible to the client or to our own heartbeat/keepalive logic --
+  // it just looks like a random disconnect, with no correlation to load or
+  // chat activity, because the timer runs regardless of either. This server
+  // only ever accepts loopback connections from our own trusted Electron
+  // renderer, so the DoS protection this exists for doesn't apply here.
+  server.requestTimeout = 0
   const serverRef = { closeStarted: false, forceStop: false }
   const close = server.close.bind(server)
   // Keep shutdown owned by NodeHttpServer, but honor listener.stop(true) by

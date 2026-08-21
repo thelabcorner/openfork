@@ -3,8 +3,8 @@ export * as SessionSearch from "./search"
 import { eq, sql, type SQL } from "drizzle-orm"
 import { Cause, Effect, Option, Schedule, Schema } from "effect"
 import { ProjectV2 } from "../project"
-import type { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { Database } from "../database/database"
+import { resolveProjectionRef } from "../event"
 import { fromRow } from "./info"
 import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
@@ -60,7 +60,7 @@ export function automaticBackfillEnabled() {
   return ["1", "true"].includes(process.env[AutomaticBackfillEnv]?.toLowerCase() ?? "")
 }
 
-type Database = EffectDrizzleSqlite.EffectSQLiteDatabase
+type Database = Database.Interface["db"]
 type MessageRow = {
   readonly id: string
   readonly session_id: string
@@ -326,6 +326,7 @@ export function backfill(db: Database): Effect.Effect<void> {
         db
           .select({
             id: SessionMessageTable.id,
+            session_id: SessionMessageTable.session_id,
             type: SessionMessageTable.type,
             data: SessionMessageTable.data,
             rowid: sql<number>`rowid`,
@@ -345,7 +346,8 @@ export function backfill(db: Database): Effect.Effect<void> {
         db.transaction((tx) =>
           Effect.gen(function* () {
             for (const row of rows) {
-              const message = decodeMessage({ ...row.data, id: row.id, type: row.type })
+              const data = yield* resolveProjectionRef(db, row.session_id, "session_message.data", row.data)
+              const message = decodeMessage({ ...data, id: row.id, type: row.type })
               if (Option.isSome(message)) {
                 yield* tx
                   .update(SessionMessageTable)
@@ -406,7 +408,8 @@ export function backfillParts(db: Database): Effect.Effect<void> {
         db.transaction((tx) =>
           Effect.gen(function* () {
             for (const row of rows) {
-              const part = decodePart({ ...row.data, id: row.id, sessionID: row.session_id, messageID: row.message_id })
+              const data = yield* resolveProjectionRef(db, row.session_id, "part.data", row.data)
+              const part = decodePart({ ...data, id: row.id, sessionID: row.session_id, messageID: row.message_id })
               if (Option.isSome(part)) {
                 yield* tx
                   .update(PartTable)

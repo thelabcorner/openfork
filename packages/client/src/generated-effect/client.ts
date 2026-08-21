@@ -251,6 +251,80 @@ const Endpoint3_20 = (raw: RawClient["server.session"]) => (input: Endpoint3_20I
     Effect.map((value) => value.data),
   )
 
+type Endpoint3_21Request = Parameters<RawClient["server.session"]["session.checkpoint.list"]>[0]
+type Endpoint3_21Input = {
+  readonly sessionID: Endpoint3_21Request["params"]["sessionID"]
+  readonly limit?: Endpoint3_21Request["query"]["limit"]
+  readonly status?: Endpoint3_21Request["query"]["status"]
+  readonly kind?: Endpoint3_21Request["query"]["kind"]
+}
+const Endpoint3_21 = (raw: RawClient["server.session"]) => (input: Endpoint3_21Input) =>
+  raw["session.checkpoint.list"]({
+    params: { sessionID: input["sessionID"] },
+    query: { limit: input["limit"], status: input["status"], kind: input["kind"] },
+  }).pipe(
+    Effect.mapError(mapClientError),
+    Effect.map((value) => value.data),
+  )
+
+type Endpoint3_22Request = Parameters<RawClient["server.session"]["session.checkpoint.get"]>[0]
+type Endpoint3_22Input = {
+  readonly sessionID: Endpoint3_22Request["params"]["sessionID"]
+  readonly checkpointID: Endpoint3_22Request["params"]["checkpointID"]
+}
+const Endpoint3_22 = (raw: RawClient["server.session"]) => (input: Endpoint3_22Input) =>
+  raw["session.checkpoint.get"]({
+    params: { sessionID: input["sessionID"], checkpointID: input["checkpointID"] },
+  }).pipe(Effect.mapError(mapClientError))
+
+type Endpoint3_23Request = Parameters<RawClient["server.session"]["session.checkpoint.diff"]>[0]
+type Endpoint3_23Input = {
+  readonly sessionID: Endpoint3_23Request["params"]["sessionID"]
+  readonly checkpointID: Endpoint3_23Request["params"]["checkpointID"]
+  readonly mode?: Endpoint3_23Request["query"]["mode"]
+}
+const Endpoint3_23 = (raw: RawClient["server.session"]) => (input: Endpoint3_23Input) =>
+  raw["session.checkpoint.diff"]({
+    params: { sessionID: input["sessionID"], checkpointID: input["checkpointID"] },
+    query: { mode: input["mode"] },
+  }).pipe(Effect.mapError(mapClientError))
+
+type Endpoint3_24Request = Parameters<RawClient["server.session"]["session.checkpoint.diffRaw"]>[0]
+type Endpoint3_24Input = {
+  readonly sessionID: Endpoint3_24Request["params"]["sessionID"]
+  readonly checkpointID: Endpoint3_24Request["params"]["checkpointID"]
+  readonly mode?: Endpoint3_24Request["query"]["mode"]
+}
+const Endpoint3_24 = (raw: RawClient["server.session"]) => (input: Endpoint3_24Input) =>
+  raw["session.checkpoint.diffRaw"]({
+    params: { sessionID: input["sessionID"], checkpointID: input["checkpointID"] },
+    query: { mode: input["mode"] },
+  }).pipe(Effect.mapError(mapClientError))
+
+type Endpoint3_25Request = Parameters<RawClient["server.session"]["session.checkpoint.revert"]>[0]
+type Endpoint3_25Input = {
+  readonly sessionID: Endpoint3_25Request["params"]["sessionID"]
+  readonly checkpointID: Endpoint3_25Request["params"]["checkpointID"]
+  readonly mode?: Endpoint3_25Request["payload"]["mode"]
+}
+const Endpoint3_25 = (raw: RawClient["server.session"]) => (input: Endpoint3_25Input) =>
+  raw["session.checkpoint.revert"]({
+    params: { sessionID: input["sessionID"], checkpointID: input["checkpointID"] },
+    payload: { mode: input["mode"] },
+  }).pipe(Effect.mapError(mapClientError))
+
+type Endpoint3_26Request = Parameters<RawClient["server.session"]["session.checkpoint.create"]>[0]
+type Endpoint3_26Input = {
+  readonly sessionID: Endpoint3_26Request["params"]["sessionID"]
+  readonly kind: Endpoint3_26Request["payload"]["kind"]
+  readonly label?: Endpoint3_26Request["payload"]["label"]
+}
+const Endpoint3_26 = (raw: RawClient["server.session"]) => (input: Endpoint3_26Input) =>
+  raw["session.checkpoint.create"]({
+    params: { sessionID: input["sessionID"] },
+    payload: { kind: input["kind"], label: input["label"] },
+  }).pipe(Effect.mapError(mapClientError))
+
 const adaptGroup3 = (raw: RawClient["server.session"]) => ({
   list: Endpoint3_0(raw),
   search: Endpoint3_1(raw),
@@ -273,6 +347,12 @@ const adaptGroup3 = (raw: RawClient["server.session"]) => ({
   resume: Endpoint3_18(raw),
   regenerateTitle: Endpoint3_19(raw),
   message: Endpoint3_20(raw),
+  listCheckpoints: Endpoint3_21(raw),
+  getCheckpoint: Endpoint3_22(raw),
+  diffCheckpoint: Endpoint3_23(raw),
+  diffCheckpointRaw: Endpoint3_24(raw),
+  revertCheckpoint: Endpoint3_25(raw),
+  createCheckpoint: Endpoint3_26(raw),
 })
 
 type Endpoint4_0Request = Parameters<RawClient["server.message"]["session.messages"]>[0]

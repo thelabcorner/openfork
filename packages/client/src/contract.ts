@@ -40,6 +40,12 @@ export const groupNames = {
 
 export const endpointNames = {
   "session.messages": "list",
+  "session.checkpoint.list": "listCheckpoints",
+  "session.checkpoint.get": "getCheckpoint",
+  "session.checkpoint.diff": "diffCheckpoint",
+  "session.checkpoint.diffRaw": "diffCheckpointRaw",
+  "session.checkpoint.revert": "revertCheckpoint",
+  "session.checkpoint.create": "createCheckpoint",
   "integration.connect.key": "connectKey",
   "integration.connect.oauth": "connectOauth",
   "integration.attempt.status": "attemptStatus",

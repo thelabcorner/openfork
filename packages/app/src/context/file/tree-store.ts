@@ -328,6 +328,14 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     evict()
   }
 
+  // On a cold mount (no cached snapshot), eagerly seed the root and its
+  // top-level directories in the background so the tree renders with data on
+  // first paint and the first expand of any top-level dir is instant. This
+  // previously only happened on scope *switches* — a fresh FileProvider mount
+  // left the cold path un-pre-warmed, so the panel opened empty and every
+  // first expand paid a round trip.
+  if (!initialSnapshot) schedulePrewarm()
+
   return {
     listDir,
     expandDir,

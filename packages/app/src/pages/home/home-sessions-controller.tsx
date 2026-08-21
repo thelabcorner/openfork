@@ -18,6 +18,7 @@ import { ServerConnection } from "@/context/server"
 import { sessionHasOpenTab, useTabs } from "@/context/tabs"
 import { compareSessionTime, displayName, errorMessage, projectForSession } from "@/pages/layout/helpers"
 import { useSessionTabAvatarState } from "@/pages/layout/project-avatar-state"
+import { type ProjectAvatarStatus } from "@opencode-ai/ui/v2/project-avatar-v2"
 import { pathKey } from "@/utils/path-key"
 import { showToast } from "@/utils/toast"
 import { DialogSessionGroupName } from "@/components/dialog-session-group"
@@ -442,7 +443,12 @@ export function HomeSessionStatusController(props: {
   server: Accessor<ServerConnection.Key>
   record: HomeSessionRecord
   isOpenTab: (record: HomeSessionRecord) => boolean
-  render: (state: { unread: Accessor<boolean>; loading: Accessor<boolean>; open: Accessor<boolean> }) => JSX.Element
+  render: (state: {
+    unread: Accessor<boolean>
+    status: Accessor<ProjectAvatarStatus | undefined>
+    loading: Accessor<boolean>
+    open: Accessor<boolean>
+  }) => JSX.Element
 }) {
   const avatar = useSessionTabAvatarState(
     props.server,
@@ -451,6 +457,7 @@ export function HomeSessionStatusController(props: {
   )
   return props.render({
     unread: avatar.unread,
+    status: avatar.status,
     loading: avatar.loading,
     open: () => props.isOpenTab(props.record),
   })

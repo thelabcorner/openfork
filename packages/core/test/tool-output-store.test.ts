@@ -1,5 +1,6 @@
 import { describe, expect } from "bun:test"
 import path from "path"
+import { brotliDecompressSync } from "node:zlib"
 import { Cause, Effect, Exit, Fiber, Layer, Option } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -11,6 +12,13 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { ToolOutputStore } from "@opencode-ai/core/tool-output-store"
 import { testEffect } from "./lib/effect"
 import { tmpdir } from "./fixture/tmpdir"
+
+const readSpilled = (fs: FSUtil.Interface, file: string) =>
+  Effect.gen(function* () {
+    const data = yield* fs.readFile(file)
+    const buf = file.endsWith(".br") ? brotliDecompressSync(data as unknown as Buffer) : data
+    return new TextDecoder().decode(buf as unknown as Uint8Array)
+  })
 
 const sessionID = SessionV2.ID.make("ses_tool_output_store")
 
@@ -63,7 +71,8 @@ describe("ToolOutputStore", () => {
         })
         expect(result.output.structured).toEqual({ kind: "report" })
         expect(result.outputPaths).toHaveLength(1)
-        expect(yield* fs.readFileString(result.outputPaths[0])).toBe(first + second)
+        expect(result.outputPaths[0].endsWith(".br")).toBe(true)
+        expect(yield* readSpilled(fs, result.outputPaths[0])).toBe(first + second)
         if (result.output.content[0]?.type !== "text") throw new Error("expected text preview")
         expect(Buffer.byteLength(result.output.content[0].text)).toBeLessThanOrEqual(ToolOutputStore.MAX_BYTES)
       }),
@@ -77,7 +86,7 @@ describe("ToolOutputStore", () => {
         const result = yield* store.bound({ sessionID, toolCallID: "call-json", output: { structured, content: [] } })
         expect(result.output.structured).toEqual(structured)
         expect(result.outputPaths).toHaveLength(1)
-        expect(JSON.parse(yield* fs.readFileString(result.outputPaths[0]))).toEqual(structured)
+        expect(JSON.parse(yield* readSpilled(fs, result.outputPaths[0]))).toEqual(structured)
         expect(result.output.content).toHaveLength(1)
       }),
     ),
@@ -126,7 +135,7 @@ describe("ToolOutputStore", () => {
 
         expect(result.output.structured).toEqual({ caption: "pixel" })
         expect(result.output.content[1]).toEqual(media)
-        expect(yield* fs.readFileString(result.outputPaths[0])).toBe(text)
+        expect(yield* readSpilled(fs, result.outputPaths[0])).toBe(text)
       }),
     ),
   )

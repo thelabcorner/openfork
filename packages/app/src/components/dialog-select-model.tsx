@@ -1,5 +1,17 @@
 import { Popover as Kobalte } from "@kobalte/core/popover"
-import { Component, ComponentProps, createEffect, createMemo, createResource, createSignal, For, JSX, Show } from "solid-js"
+import {
+  Component,
+  ComponentProps,
+  createEffect,
+  createMemo,
+  createResource,
+  createSignal,
+  For,
+  JSX,
+  onCleanup,
+  onMount,
+  Show,
+} from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLocal } from "@/context/local"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
@@ -32,7 +44,7 @@ import { useSDK } from "@/context/sdk"
 import type { ForkWindowUsage } from "@/utils/fork-client"
 import { percent as usagePercent, colorFor } from "./usage-gauge-v2"
 import { estimateRequestsRemaining, estimateRequestsRemainingFromCost, isUsageTrackedProvider } from "@/utils/model-usage-estimate"
-import { getUsagePricingTable, getUsageProfileTable, matchUsagePricing, matchUsageProfile } from "@/utils/model-usage-profile"
+import { getUsageTables, matchUsagePricing, matchUsageProfile } from "@/utils/model-usage-profile"
 import { averageCostPerRequest, buildModelCostIndex } from "@/utils/model-usage-history"
 import { deepSeekRatePeriod, isDeepSeekPeakPricedModel } from "@/utils/model-peak-pricing"
 
@@ -51,6 +63,15 @@ const manageKey = "action:manage"
 // request (`request.ts` additionally guards against it defensively).
 const OPENROUTER_AUTO = "auto"
 const favoritesRailKey = "favorites"
+
+// Row streaming: render enough rows to fill the ~320px viewport several times
+// over on the first paint, then append the remainder during idle frames. A
+// 1000-model catalog otherwise mounts synchronously at open (~70ms block).
+const INITIAL_RENDER_ROWS = 48
+const RENDER_CHUNK = 96
+// The highlighted row must always exist in the DOM; keep this much company
+// rendered past it so arrowing into unrendered territory never misses.
+const ACTIVE_RENDER_BUFFER = 24
 
 // Representative $/token price (input + output) — cheapest first within a
 // provider group and within favorites, name as tiebreaker for equal-cost models.
@@ -766,8 +787,9 @@ function ModelSelectorPopoverV2View(props: {
   const language = useLanguage()
   const forkUsage = useForkUsage()
   const sync = useSync()
-  const [profileTable] = createResource(() => getUsageProfileTable())
-  const [pricingTable] = createResource(() => getUsagePricingTable())
+  const [tables] = createResource(() => getUsageTables())
+  const profileTable = () => tables()?.profile ?? []
+  const pricingTable = () => tables()?.pricing ?? []
   const [store, setStore] = createStore({ open: false, search: "", active: "", rail: "", submenu: "" })
   let searchRef: HTMLInputElement | undefined
   let contentRef: HTMLDivElement | undefined
@@ -829,10 +851,32 @@ function ModelSelectorPopoverV2View(props: {
       personalized: personalCost !== undefined,
     }
   }
+  // Compute usage once per model and reuse it for the max-requests scaling and
+  // every rendered row, instead of running the profile/pricing match loops
+  // twice per model (once here, once per row) on every open.
+  // Deferred until after first paint so opening the selector paints the model
+  // list immediately; the usage bars (and the cost-index scan they can trigger)
+  // fill in on the next idle frame instead of blocking the open.
+  const [usageReady, setUsageReady] = createSignal(false)
+  onMount(() => {
+    const schedule = (cb: () => void) =>
+      typeof requestIdleCallback === "function"
+        ? requestIdleCallback(cb, { timeout: 200 })
+        : setTimeout(cb, 0)
+    schedule(() => setUsageReady(true))
+  })
+  const usageMap = createMemo(() => {
+    const map = new Map<string, ReturnType<typeof usageFor>>()
+    if (!usageReady()) return map
+    for (const item of models()) {
+      map.set(modelKey(item), usageFor(item))
+    }
+    return map
+  })
   const maxRequests = createMemo(() => {
     let max = 0
     for (const item of models()) {
-      const requests = usageFor(item)?.estimatedRequests
+      const requests = usageMap().get(modelKey(item))?.estimatedRequests
       if (requests !== undefined && requests > max) max = requests
     }
     return max
@@ -843,6 +887,51 @@ function ModelSelectorPopoverV2View(props: {
     ...groups().flatMap((group) => group.items.map((item) => ({ navKey: modelKey(item), item }))),
     { navKey: manageKey },
   ])
+  // Streamed rendering slices. Selection, search-first-key, and keyboard nav
+  // all operate on the full logical list (rows()/navKeys()); only the DOM is
+  // deferred. Slices keep item identity so <For> appends without remounting.
+  const [renderLimit, setRenderLimit] = createSignal(INITIAL_RENDER_ROWS)
+  const favoriteSlice = createMemo(() => (showFavorites() ? favorites().slice(0, renderLimit()) : []))
+  // Per-group visible counts start where favorites left off; groups themselves
+  // stay keyed by category so the outer <For> keeps stable identities while
+  // slices grow.
+  const groupVisibleCounts = createMemo(() => {
+    let budget = Math.max(0, renderLimit() - favorites().length)
+    const counts = new Map<string, number>()
+    for (const group of groups()) {
+      const count = Math.min(group.items.length, budget)
+      counts.set(group.category, count)
+      budget -= count
+    }
+    return counts
+  })
+  const renderedCount = createMemo(
+    () =>
+      (showFavorites() ? favorites().length : 0) +
+      (showProviderGroups() ? groups().reduce((total, group) => total + group.items.length, 0) : 0),
+  )
+  createEffect(() => {
+    const total = renderedCount()
+    if (renderLimit() >= total) return
+    const grow = () => setRenderLimit((limit) => Math.min(total, limit + RENDER_CHUNK))
+    const handle =
+      typeof requestIdleCallback === "function"
+        ? requestIdleCallback(grow, { timeout: 120 })
+        : setTimeout(grow, 0)
+    onCleanup(() => {
+      if (typeof cancelIdleCallback === "function") cancelIdleCallback(handle as number)
+      else clearTimeout(handle as number)
+    })
+  })
+  createEffect(() => {
+    const active = store.active
+    if (!active || active === manageKey) return
+    const index = rows().findIndex((row) => row.navKey === active)
+    if (index < 0) return
+    if (index + ACTIVE_RENDER_BUFFER > renderLimit()) {
+      setRenderLimit(Math.min(renderedCount(), index + ACTIVE_RENDER_BUFFER))
+    }
+  })
   const navKeys = () => rows().map((row) => row.navKey)
   const initialActive = () => {
     const selected = props.current()
@@ -855,6 +944,7 @@ function ModelSelectorPopoverV2View(props: {
   const setOpen = (open: boolean) => {
     if (open) {
       dismiss.allowTriggerRestore()
+      setRenderLimit(INITIAL_RENDER_ROWS)
       setStore({ open: true, active: initialActive(), submenu: "" })
       setTimeout(() =>
         requestAnimationFrame(() => {
@@ -916,9 +1006,9 @@ function ModelSelectorPopoverV2View(props: {
   })
 
   const renderRow = (item: ModelItem, navKey: string) => {
-    // Computed once per row (not once per consumer): shared by the tooltip
-    // and the meta bar below instead of each calling usageFor(item) itself.
-    const usage = createMemo(() => usageFor(item))
+    // Read the per-model usage computed once in usageMap rather than
+    // re-running the profile/pricing match loops for every rendered row.
+    const usage = createMemo(() => usageMap().get(modelKey(item)))
     if (item.provider.id === "openrouter") {
       return (
         <OpenRouterRow
@@ -1151,14 +1241,15 @@ function ModelSelectorPopoverV2View(props: {
                       <Icon name="star-filled" size="small" class="shrink-0 text-v2-state-fg-warning" />
                       <span class="min-w-0 flex-1 truncate">{language.t("dialog.model.favorites")}</span>
                     </MenuV2.GroupLabel>
-                    {rowList(favorites(), favoriteKey)}
+                    {rowList(favoriteSlice(), favoriteKey)}
                   </MenuV2.Group>
                   <MenuV2.Separator class="my-0.5" />
                 </Show>
                 <Show when={showProviderGroups()}>
                   <For each={groups()}>
                     {(group) => (
-                      <MenuV2.Group>
+                      <Show when={(groupVisibleCounts().get(group.category) ?? 0) > 0}>
+                        <MenuV2.Group>
                         <MenuV2.GroupLabel class="gap-2 px-3">
                           <ProviderIcon id={group.category} class="size-3.5 shrink-0 opacity-70" />
                           <span class="min-w-0 flex-1 truncate">{group.items[0].provider.name}</span>
@@ -1177,8 +1268,9 @@ function ModelSelectorPopoverV2View(props: {
                             </button>
                           </Show>
                         </MenuV2.GroupLabel>
-                        {rowList(group.items, modelKey)}
-                      </MenuV2.Group>
+                        {rowList(group.items.slice(0, groupVisibleCounts().get(group.category) ?? 0), modelKey)}
+                        </MenuV2.Group>
+                      </Show>
                     )}
                   </For>
                 </Show>

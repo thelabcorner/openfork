@@ -59,6 +59,7 @@ import type {
 } from "@opencode-ai/client/promise"
 import { toggleMcp } from "./global-sync/mcp"
 import { createServerSession, type ServerSession } from "./server-session"
+import { perf } from "./perf"
 
 type GlobalStore = {
   ready: boolean
@@ -311,6 +312,16 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   let eventFrame: number | undefined
   let eventTimer: ReturnType<typeof setTimeout> | undefined
 
+  const time = (name: "applyV2" | "apply" | "dir" | "home" | "invalid", fn: () => void) => {
+    if (!perf.enabled) {
+      fn()
+      return
+    }
+    const t = performance.now()
+    fn()
+    perf.span(name, performance.now() - t)
+  }
+
   onCleanup(() => {
     if (eventFrame !== undefined) cancelAnimationFrame(eventFrame)
     if (eventTimer !== undefined) clearTimeout(eventTimer)
@@ -545,13 +556,17 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     const event = e.details
     const eventType: string = event.type
     const recent = bootingRoot || Date.now() - bootedAt < 1500
+    perf.event()
 
-    if (event.current) session.applyV2(event.current)
-    session.apply(event)
-    if (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") {
-      homeSessions.apply(event)
+    if (event.current) {
+      const current = event.current
+      time("applyV2", () => session.applyV2(current))
     }
-    homeSessions.refresh(event.type)
+    time("apply", () => session.apply(event))
+    if (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") {
+      time("home", () => homeSessions.apply(event))
+    }
+    time("home", () => homeSessions.refresh(event.type))
     if (eventType === "integration.connection.updated") void refreshProviders()
 
     const groupScope = `session-groups:${ServerConnection.key(serverSDK.server)}`
@@ -624,37 +639,47 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       eventType === "agent.updated"
     )
       queue.push(key)
-    if (eventType === "mcp.status.changed") void queryClient.invalidateQueries(queryOptionsApi.mcp(key))
-    if (eventType === "mcp.resources.changed") void queryClient.invalidateQueries(queryOptionsApi.mcpResources(key))
-    if (eventType === "tool.reloaded") void queryClient.invalidateQueries(queryOptionsApi.tools(key))
+    if (eventType === "mcp.status.changed")
+      time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.mcp(key)))
+    if (eventType === "mcp.resources.changed")
+      time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.mcpResources(key)))
+    if (eventType === "tool.reloaded")
+      time("invalid", () => void queryClient.invalidateQueries(queryOptionsApi.tools(key)))
     const [store, setStore] = existing
-    applyDirectoryEvent({
-      event,
-      directory,
-      store,
-      setStore,
-      push: (directory) => {
-        if (children.active(directory)) queue.push(directory)
-      },
-      retainedLimit: sessionMeta.get(key)?.limit,
-      sessionContent: false,
-      permission: session.data.permission,
-      vcsCache: children.vcsCache.get(key),
-      loadLsp: () => {
-        if (!children.active(key)) return
-        void queryClient.fetchQuery(queryOptionsApi.lsp(key))
-      },
-      loadReferences: () => {
-        if (!children.active(key)) return
-        void queryClient.fetchQuery(queryOptionsApi.references(key))
-      },
-    })
+    time("dir", () =>
+      applyDirectoryEvent({
+        event,
+        directory,
+        store,
+        setStore,
+        push: (directory) => {
+          if (children.active(directory)) queue.push(directory)
+        },
+        retainedLimit: sessionMeta.get(key)?.limit,
+        sessionContent: false,
+        permission: session.data.permission,
+        vcsCache: children.vcsCache.get(key),
+        loadLsp: () => {
+          if (!children.active(key)) return
+          void queryClient.fetchQuery(queryOptionsApi.lsp(key))
+        },
+        loadReferences: () => {
+          if (!children.active(key)) return
+          void queryClient.fetchQuery(queryOptionsApi.references(key))
+        },
+      }),
+    )
   })
 
   onCleanup(unsub)
   onCleanup(() => {
     queue.dispose()
   })
+  if (perf.enabled) {
+    const id = setInterval(() => perf.tick(), 250)
+    onCleanup(() => clearInterval(id))
+    perf.startFrameMonitor()
+  }
   onCleanup(() => {
     for (const directory of Object.keys(children.children)) {
       children.disposeDirectory(directoryKey(directory))

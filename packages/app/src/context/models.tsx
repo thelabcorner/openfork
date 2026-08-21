@@ -5,6 +5,7 @@ import { filter, firstBy, flat, groupBy, mapValues, pipe, uniqueBy, values } fro
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { useProviders } from "@/hooks/use-providers"
 import { Persist, persisted } from "@/utils/persist"
+import { getUsageTables } from "@/utils/model-usage-profile"
 
 export type ModelKey = { providerID: string; modelID: string }
 
@@ -28,6 +29,12 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
   gate: false,
   init: (props: { directory?: Accessor<string | undefined> } = {}) => {
     const providers = useProviders(() => props.directory?.())
+
+    // Warm the model usage profile/pricing tables in the background as soon as
+    // the app is up, so opening the model selector never waits on (or re-fires)
+    // the network fetch. The data is global (not per-directory) and the fetch
+    // is deduped + cached, so this is a single best-effort fetch at most.
+    void getUsageTables()
 
     const [store, setStore, _, ready] = persisted(
       Persist.global("model", ["model.v1"]),

@@ -83,18 +83,27 @@ export class TimelineRowEstimator {
   /**
    * Feed a real measured height back (from measureElement / ResizeObserver).
    * Measurement is the strongest evidence and is never downgraded.
+   *
+   * Streaming rows only update the per-row measurement map: their text (and
+   * height) changes on every part delta, so feeding priors/history with
+   * in-flight heights pollutes the learned state, and hashing the growing
+   * text per delta is O(text) per token -- quadratic over a stream. The
+   * measurement map entry is still refreshed so overscan re-entry and
+   * restored scroll position use the latest height.
    */
   observe(input: {
     key: string
     row: TimelineRow.TimelineRow
     text?: string
     height: number
+    streaming?: boolean
   }) {
     if (!Number.isFinite(input.height) || input.height <= 0) return
     this.measurements.set(input.key, input.height)
     if (this.measurements.size > this.maxMeasurements) {
       this.measurements.delete(this.measurements.keys().next().value!)
     }
+    if (input.streaming) return
     this.priors.observe(input.row._tag, input.height)
     this.history.observe(input.row._tag, input.text, this.widthPx, input.height)
   }

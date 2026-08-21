@@ -121,6 +121,26 @@
   pointer-events: none;
 }
 
+[data-slot="project-avatar-unread-dot"][data-status="unread"] {
+  background: var(--v2-background-bg-accent);
+}
+
+[data-slot="project-avatar-unread-dot"][data-status="question"] {
+  background: var(--v2-blue-400);
+}
+
+[data-slot="project-avatar-unread-dot"][data-status="permission"] {
+  background: var(--v2-avatar-bg-yellow);
+}
+
+[data-slot="project-avatar-unread-dot"][data-status="error"] {
+  background: var(--v2-avatar-bg-red);
+}
+
+[data-slot="project-avatar-unread-dot"][data-status="complete"] {
+  background: var(--v2-green-500);
+}
+
 [data-slot="project-avatar-slot"] {
   display: flex;
   flex-shrink: 0;

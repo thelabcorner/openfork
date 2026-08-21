@@ -8,6 +8,7 @@ import { useServerSDK } from "./server-sdk"
 import { RECENTLY_CLOSED_DISPLAY_LIMIT, ServerConnection, useServer } from "./server"
 import { usePlatform } from "./platform"
 import { Project } from "@opencode-ai/sdk/v2"
+import type { Project as ProjectInfo } from "@opencode-ai/sdk/v2/client"
 import { normalizeProjectInfo } from "./global-sync/utils"
 import { Persist, persisted, removePersisted } from "@/utils/persist"
 import { pathKey } from "@/utils/path-key"
@@ -443,12 +444,22 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       return available[Math.floor(Math.random() * available.length)]
     }
 
+    const projectMeta = createMemo(() => {
+      const byId = new Map<string, ProjectInfo>()
+      const byWorktree = new Map<string, ProjectInfo>()
+      for (const project of serverSync().data.project) {
+        byId.set(project.id, project)
+        byWorktree.set(pathKey(project.worktree), project)
+      }
+      return { byId, byWorktree }
+    })
+
     function enrich(project: { worktree: string; expanded: boolean }) {
       const [childStore] = serverSync().child(project.worktree, { bootstrap: false })
       const projectID = childStore.project
       const metadata = projectID
-        ? serverSync().data.project.find((x) => x.id === projectID)
-        : serverSync().data.project.find((x) => x.worktree === project.worktree)
+        ? projectMeta().byId.get(projectID)
+        : projectMeta().byWorktree.get(pathKey(project.worktree))
 
       // Preserve local icon override from per-workspace localStorage cache (childStore.icon).
       // Without this, different subdirectories of the same git repo would share the same
@@ -634,7 +645,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       projects: {
         list,
         recentlyClosed: createMemo(() => {
-          const known = new Set(serverSync().data.project.map((project) => pathKey(project.worktree)))
+          const known = projectMeta().byWorktree
           return server.projects
             .recentlyClosed()
             .filter((worktree) => known.has(pathKey(worktree)))

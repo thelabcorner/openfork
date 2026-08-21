@@ -228,6 +228,13 @@ export function createServerSession(
   const deltaBases = new Map<string, { base: string; sessionID: string }>()
   const suspended = new Set<string>()
   const stale = new Set<string>()
+  const v1ContentEvents = new Set([
+    "message.updated",
+    "message.removed",
+    "message.part.updated",
+    "message.part.removed",
+    "message.part.delta",
+  ])
   const deleteMessageParts = (
     cache: { part: Record<string, Part[] | undefined>; part_text_accum_delta: Record<string, string | undefined> },
     messageID: string,
@@ -1048,6 +1055,13 @@ export function createServerSession(
         event.type !== "session.deleted"
       )
         void resolve(eventID).catch(() => {})
+      // Mirror applyV2's suspended-session gate: a released/background tab shouldn't
+      // pay per-delta Binary.search + reconcile cost. It resyncs from session.sync
+      // when reactivated (see `fresh`), same as the V2 protocol path.
+      if (suspended.has(eventID) && v1ContentEvents.has(event.type)) {
+        stale.add(eventID)
+        return
+      }
     }
     switch (event.type) {
       case "session.created":

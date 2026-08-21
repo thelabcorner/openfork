@@ -283,6 +283,7 @@ function formatRouteError(error: unknown) {
 
 function ResolvedTargetSessionRoute() {
   const params = useParams<{ serverKey: string; id: string }>()
+  const language = useLanguage()
   const tabs = useTabs()
   const sync = useServerSync()
   const serverKey = createMemo(() => requireServerKey(params.serverKey))
@@ -307,13 +308,29 @@ function ResolvedTargetSessionRoute() {
     // lineage mid-resolution), which tears down the workspace subtree including
     // the terminal. Same-workspace tab switches keep it open because warm
     // targets resolve synchronously from the sync cache.
-    <Show when={directory()}>
+    <Show when={directory()} fallback={<SessionLoadingFallback language={language} sessionID={params.id} />}>
       <SDKProvider directory={targetDirectory}>
         <DirectoryDataProvider directory={targetDirectory} server={serverKey}>
           <TargetSessionPage />
         </DirectoryDataProvider>
       </SDKProvider>
     </Show>
+  )
+}
+
+function SessionLoadingFallback(props: { language: ReturnType<typeof useLanguage>; sessionID?: string }) {
+  return (
+    <div class="relative size-full overflow-hidden flex flex-col" style={{ height: "calc(100% - 1px)" }}>
+      <div class="flex-1 min-h-0 flex flex-col items-center justify-center text-center gap-4 p-6">
+        <Spinner class="size-8" style={{ color: "var(--icon-weak)" }} />
+        <div class="flex flex-col items-center gap-1 max-w-md">
+          <div class="text-14-medium text-text-weak">{props.language.t("session.loading")}</div>
+          <div class="text-12-regular text-text-faint">
+            {props.language.t("session.loading.description")}
+          </div>
+        </div>
+      </div>
+    </div>
   )
 }
 
@@ -324,7 +341,11 @@ function TargetSessionPage() {
   const sdk = useSDK()
   const serverSDK = useServerSDK()
   return (
-    <Show when={`${serverSDK().scope}\0${sdk().directory}`} keyed>
+    <Show when={`${serverSDK().scope}\0${sdk().directory}`} keyed fallback={
+      <div class="flex-1 min-h-0 overflow-hidden flex items-center justify-center p-6">
+        <Spinner class="size-6" style={{ color: "var(--icon-weak)" }} />
+      </div>
+    }>
       <SessionPage />
     </Show>
   )
