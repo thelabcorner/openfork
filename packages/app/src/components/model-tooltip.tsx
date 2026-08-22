@@ -1,6 +1,7 @@
 import { Show, type Component, type JSX } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { DEEPSEEK_PEAK_RATES, deepSeekRatePeriod, isDeepSeekPeakPricedModel, type DeepSeekRate } from "@/utils/model-peak-pricing"
+import { stripUnlimitedSuffix } from "@/utils/model-badges"
 
 type InputKey = "text" | "image" | "audio" | "video" | "pdf"
 type InputMap = Record<InputKey, boolean>
@@ -81,10 +82,14 @@ function ModelTooltipRow(props: { name: JSX.Element; value: JSX.Element }) {
 // this picks ONE extra dimension per model: peak/off-peak for the two
 // DeepSeek models that actually have it (more actionable — there's already a
 // per-row badge for "which period is it right now"), 1M/1B for everyone else.
-function ModelTooltipCostTable(props: { model: ModelInfo; cost: NonNullable<ModelInfo["cost"]> }) {
+function ModelTooltipCostTable(props: {
+  model: ModelInfo
+  cost: NonNullable<ModelInfo["cost"]>
+  period?: ReturnType<typeof deepSeekRatePeriod>
+}) {
   const language = useLanguage()
   const peakRates = () => (isDeepSeekPeakPricedModel({ id: props.model.id, provider: { id: props.model.provider.id ?? "" } }) ? DEEPSEEK_PEAK_RATES[props.model.id] : undefined)
-  const currentPeriod = () => deepSeekRatePeriod(new Date())
+  const currentPeriod = () => props.period ?? deepSeekRatePeriod(new Date())
 
   const row = (label: string, value: number) => (
     <>
@@ -158,8 +163,10 @@ export const ModelTooltip: Component<{
   model: ModelInfo
   latest?: boolean
   free?: boolean
+  unlimited?: boolean
   v2?: boolean
   usage?: { percent: number; estimatedRequests?: number; personalized?: boolean }
+  period?: ReturnType<typeof deepSeekRatePeriod>
 }> = (props) => {
   const language = useLanguage()
   const sourceName = (model: ModelInfo) => {
@@ -184,16 +191,18 @@ export const ModelTooltip: Component<{
   const title = () => {
     const tags: Array<string> = []
     if (props.latest) tags.push(language.t("model.tag.latest"))
+    if (props.unlimited) tags.push(language.t("model.tag.unlimited"))
     if (props.free) tags.push(language.t("model.tag.free"))
     const suffix = tags.length ? ` (${tags.join(", ")})` : ""
-    return `${sourceName(props.model)} ${props.model.name}${suffix}`
+    return `${sourceName(props.model)} ${stripUnlimitedSuffix(props.model.name)}${suffix}`
   }
   const name = () => {
     const tags: Array<string> = []
     if (props.latest) tags.push(language.t("model.tag.latest"))
+    if (props.unlimited) tags.push(language.t("model.tag.unlimited"))
     if (props.free) tags.push(language.t("model.tag.free"))
     const suffix = tags.length ? ` (${tags.join(", ")})` : ""
-    return `${props.model.name}${suffix}`
+    return `${stripUnlimitedSuffix(props.model.name)}${suffix}`
   }
   const inputs = () => {
     if (props.model.capabilities) {
@@ -231,7 +240,7 @@ export const ModelTooltip: Component<{
         <ModelTooltipRow name={language.t("model.tooltip.context.label")} value={contextLimit()} />
         <Show when={props.model.cost && (props.model.cost.input > 0 || props.model.cost.output > 0 || props.model.cost.cache.read > 0)}>
           <div class="h-px bg-v2-border-border-muted" />
-          <ModelTooltipCostTable model={props.model} cost={props.model.cost!} />
+          <ModelTooltipCostTable model={props.model} cost={props.model.cost!} period={props.period} />
         </Show>
         <Show when={props.usage?.estimatedRequests !== undefined}>
           <div class="h-px bg-v2-border-border-muted" />

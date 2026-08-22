@@ -111,4 +111,12 @@ export type PromptInputV2Suggestion = {
   keybind?: string[]
   recent?: boolean
   mention?: PromptInputV2FilePart | PromptInputV2AgentPart
+  /** Character offsets into `label` matched by the server-side query, when known (file search results). */
+  positions?: number[]
+  /** File size in bytes, when known (file search results). */
+  size?: number
+  /** Last-modified time in epoch ms, when known (file search results). */
+  mtime?: number
+  /** Line count, when known (text files). */
+  lineCount?: number
 }

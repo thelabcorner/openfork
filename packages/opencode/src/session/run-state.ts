@@ -36,6 +36,13 @@ const layer = Layer.effect(
       Effect.fn("SessionRunState.state")(function* () {
         const scope = yield* Scope.Scope
         const runners = new Map<SessionID, Runner.Runner<SessionV1.WithParts>>()
+        // Sessions whose current run was cancelled via an explicit cancel()
+        // (operator stop). The runner's onIdle callback consults this so the
+        // resulting idle transition is published with reason "aborted" —
+        // consumers (e.g. swarm supervisors) can tell an operator stop from a
+        // natural turn end. Added before existing.cancel and removed after it
+        // settles, since onIdle fires synchronously inside cancel.
+        const cancelled = new Set<SessionID>()
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
@@ -45,7 +52,7 @@ const layer = Layer.effect(
             runners.clear()
           }),
         )
-        return { runners, scope }
+        return { runners, scope, cancelled }
       }),
     )
 
@@ -59,7 +66,7 @@ const layer = Layer.effect(
       const next = Runner.make<SessionV1.WithParts>(data.scope, {
         onIdle: Effect.gen(function* () {
           data.runners.delete(sessionID)
-          yield* status.set(sessionID, { type: "idle" })
+          yield* status.set(sessionID, { type: "idle" }, data.cancelled.has(sessionID) ? "aborted" : undefined)
         }),
         onBusy: status.set(sessionID, { type: "busy" }),
         onInterrupt,
@@ -79,10 +86,15 @@ const layer = Layer.effect(
       const data = yield* InstanceState.get(state)
       const existing = data.runners.get(sessionID)
       if (!existing) {
-        yield* status.set(sessionID, { type: "idle" })
+        yield* status.set(sessionID, { type: "idle" }, "aborted")
         return
       }
-      yield* existing.cancel
+      data.cancelled.add(sessionID)
+      try {
+        yield* existing.cancel
+      } finally {
+        data.cancelled.delete(sessionID)
+      }
     })
 
     const ensureRunning = Effect.fn("SessionRunState.ensureRunning")(function* (

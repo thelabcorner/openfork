@@ -290,6 +290,17 @@ export function SessionContextTab() {
   const formatter = createMemo(() => createSessionContextFormatter(language.intl()))
   const [rawOpen, setRawOpen] = createSignal<string[]>([])
 
+  // Reset accordion open state + gate live timer on session/tab switch (prevents
+  // stale teardown and effect churn for inactive tabs after keep-mounted shell).
+  createEffect(
+    on(
+      () => params.id,
+      (current, previous) => {
+        if (current !== previous) setRawOpen([])
+      },
+    ),
+  )
+
   // The turn currently streaming (if any) — last assistant message without
   // `time.completed`. Drives the faux-realtime timing ticker below; a stable
   // primitive id (not the message object) is what the effect tracks, so a
@@ -306,12 +317,14 @@ export function SessionContextTab() {
   const liveMessageID = createMemo(() => liveMessage()?.id)
 
   const [now, setNow] = createSignal(Date.now())
-  createEffect(() => {
-    if (!liveMessageID()) return
-    setNow(Date.now())
-    const interval = setInterval(() => setNow(Date.now()), 1000)
-    onCleanup(() => clearInterval(interval))
-  })
+  createEffect(
+    on(liveMessageID, (id) => {
+      if (!id) return
+      setNow(Date.now())
+      const interval = setInterval(() => setNow(Date.now()), 1000)
+      onCleanup(() => clearInterval(interval))
+    }),
+  )
 
   const liveDelta = createMemo<LiveGenerationProgress>(() => {
     const msg = liveMessage()

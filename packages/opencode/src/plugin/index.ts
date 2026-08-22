@@ -12,8 +12,6 @@ import { createOpencodeClient } from "@opencode-ai/sdk"
 import { ServerAuth } from "@/server/auth"
 import { loadToolModule } from "@/tool/import"
 import { CodexAuthPlugin } from "./openai/codex"
-import { Session } from "@/session/session"
-import { NamedError } from "@opencode-ai/core/util/error"
 import { CopilotAuthPlugin } from "./github-copilot/copilot"
 import { ModalPlugin } from "./modal/modal"
 import { gitlabAuthPlugin as GitlabAuthPlugin } from "opencode-gitlab-auth"
@@ -170,7 +168,7 @@ const layer = Layer.effect(
         const bridge = yield* EffectBridge.make()
 
         function publishPluginError(message: string) {
-          bridge.fork(events.publish(Session.Event.Error, { error: new NamedError.Unknown({ message }).toObject() }))
+          bridge.fork(Effect.logError("failed to load plugin", { message }))
         }
 
         const { Server } = yield* Effect.promise(() => import("../server/server"))

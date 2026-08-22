@@ -85,6 +85,12 @@ IMPORTANT:
 
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
 
+// Injected (request-only) when a generation is an automatic continuation of
+// one that ended with finish "unknown" — the provider stream dropped before a
+// stop reason. Without this the model is asked to produce another assistant
+// turn with no new input, which it experiences as a blank/phantom user message.
+const UNKNOWN_FINISH_CONTINUATION_PROMPT = `[AUTOMATIC CONTINUATION — system, not the user] Your previous response was cut off mid-stream: the provider connection dropped before a completion signal arrived (finish reason "unknown"). Nothing new was asked and there is no new user request. Resume exactly where you stopped: continue the same task or sentence WITHOUT repeating output you already produced, without apologizing, and without asking the user anything. If you genuinely cannot continue, state in one short line what you were doing, then immediately proceed with the next concrete step.`
+
 function mcpResourceBase64Size(value: string) {
   const trimmed = value.replace(/\s/g, "")
   const padding = trimmed.endsWith("==") ? 2 : trimmed.endsWith("=") ? 1 : 0
@@ -1438,6 +1444,11 @@ Generate a fresh title. Do not reuse the current title.`
             })
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
+          // True when THIS generation is an automatic continuation of a
+          // previous one that ended with finish "unknown" — the #43892 case.
+          const continuingAfterUnknown =
+            lastAssistant?.finish === "unknown" && lastAssistant.parentID === lastUser.id
+
           const outcome: "break" | "continue" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
@@ -1498,6 +1509,16 @@ Generate a fresh title. Do not reuse the current title.`
               system,
               messages: [
                 ...modelMsgs,
+                // #43892 continuation context: when the previous generation
+                // ended with finish "unknown" (provider stream dropped before
+                // a stop reason), the loop starts ANOTHER generation with no
+                // new user input. Left unexplained, models experience this as
+                // a blank prompt / phantom user turn and may restart, ask the
+                // user what happened, or freeze. Tell it why — REQUEST-ONLY,
+                // never persisted into the session.
+                ...(continuingAfterUnknown
+                  ? [{ role: "user" as const, content: UNKNOWN_FINISH_CONTINUATION_PROMPT }]
+                  : []),
                 ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
               ],
               tools,

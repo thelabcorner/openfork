@@ -252,6 +252,7 @@ export const DESKTOP_NATIVE_ENGLISH = {
   "desktop.menu.toggleContext": "Toggle Context",
   "desktop.menu.toggleUsage": "Toggle Usage",
   "desktop.menu.toggleModelList": "Toggle Model List",
+  "desktop.menu.toggleLimits": "Toggle Limits",
   "desktop.menu.reload": "Reload",
   "desktop.menu.toggleDeveloperTools": "Toggle Developer Tools",
   "desktop.menu.actualSize": "Actual Size",

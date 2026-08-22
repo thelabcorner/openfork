@@ -3,7 +3,7 @@ import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { useLanguage } from "@/context/language"
 import { showToast } from "@/utils/toast"
-import { bundledLanguages, createHighlighter, type BundledLanguage, type Highlighter } from "shiki"
+import type { BundledLanguage, Highlighter } from "shiki"
 import { checksum } from "@opencode-ai/core/util/encode"
 import { createMarkdownParser } from "@opencode-ai/ui/context/marked-parser"
 import { OpenCodeTheme } from "@opencode-ai/ui/context/marked-theme"
@@ -26,7 +26,9 @@ import "./project-explorer-markdown-viewer.css"
 let highlighter: Promise<Highlighter> | undefined
 
 function getHighlighter() {
-  return (highlighter ??= createHighlighter({ themes: [OpenCodeTheme], langs: [] }))
+  return (highlighter ??= import("shiki").then(({ createHighlighter }) =>
+    createHighlighter({ themes: [OpenCodeTheme], langs: [] }),
+  ))
 }
 
 // Module-level singleton parser: the Marked instance (with KaTeX + Shiki) is
@@ -34,6 +36,7 @@ function getHighlighter() {
 // timeline's highlight machinery (createHighlighter + OpenCode theme).
 const parser = createMarkdownParser(async (code, language) => {
   const instance = await getHighlighter()
+  const { bundledLanguages } = await import("shiki")
   const name = language in bundledLanguages ? language : "text"
   if (!instance.getLoadedLanguages().includes(name))
     await instance.loadLanguage(bundledLanguages[name as BundledLanguage])

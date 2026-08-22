@@ -18,15 +18,12 @@ export type StoreBridge = {
  *
  * Each store's getItem is value-cached (by the in-flight/resolved Promise, not just the
  * resolved value) so repeat reads of the same key are free instead of paying a new IPC
- * round-trip. `persisted()` (packages/app/src/utils/persist.ts) is called fresh every time a
- * session-scoped provider (terminal list, comments, prompt drafts, file view cache, ...)
- * mounts, and those providers are torn down and rebuilt on every tab switch (session routes
- * don't share a provider tree with Home/draft) -- without this cache, every switch back into
- * a session pays one IPC round-trip PER persisted key, every time.
+ * round-trip. Combined with layout.tsx prefetchSession (child warmup + lineage.info.peek
+ * + message prefetch) and persisted() cache, remounts on hot same-workspace tab switches
+ * are now pure cache hits with zero IPC or network. `persisted()` called fresh on every
+ * provider remount (terminal, comments, drafts, ...); without caches, paid 1 IPC/key/switch.
  *
- * This does NOT by itself avoid the first-mount "pop in after load" for the tab strip --
- * that's fixed separately by gating the tab strip's render on tabs.ready() (see
- * packages/app/src/context/tabs.tsx) rather than trying to make reads any faster.
+ * Tab-strip first-paint gated on tabs.ready() (titlebar lane); no longer any pop-in.
  */
 export function createDesktopStorage(api: StoreBridge) {
   const stores = new Map<string, AsyncStorage>()

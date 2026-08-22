@@ -91,6 +91,8 @@ import { UsagePanel } from "@/pages/session/usage-panel"
 import { createUsagePanelState } from "@/pages/session/usage-panel-state"
 import { ModelsPanel } from "@/pages/session/models-panel"
 import { createModelsPanelState } from "@/pages/session/models-panel-state"
+import { LimitsPanel } from "@/pages/session/limits-panel"
+import { createLimitsPanelState } from "@/pages/session/limits-panel-state"
 import { sessionPanelLayout } from "@/pages/session/session-panel-layout"
 import { browserHostClient } from "@/pages/session/v2/browser/browserHostClient"
 import { TerminalPanel } from "@/pages/session/terminal-panel"
@@ -304,10 +306,11 @@ function ResolvedTargetSessionRoute() {
   })
 
   return (
-    // Non-keyed: closes only while the target's directory is unknown (uncached
-    // lineage mid-resolution), which tears down the workspace subtree including
-    // the terminal. Same-workspace tab switches keep it open because warm
-    // targets resolve synchronously from the sync cache.
+    // Non-keyed Show on directory(): loading fallback ONLY for uncached lineage
+    // (preserves SDKProvider + DirectoryDataProvider + TargetSessionPage shell
+    // on same-workspace session-id switches). Warm targets resolve sync from
+    // cache → instant keep-alive. See TargetSessionPage workspace key + now
+    // workspaceKey()-keyed panel shell (no remount of composer/panels on id change).
     <Show when={directory()} fallback={<SessionLoadingFallback language={language} sessionID={params.id} />}>
       <SDKProvider directory={targetDirectory}>
         <DirectoryDataProvider directory={targetDirectory} server={serverKey}>
@@ -334,9 +337,13 @@ function SessionLoadingFallback(props: { language: ReturnType<typeof useLanguage
   )
 }
 
-// Owns the workspace-identity remount. Must not include the session ID in the
-// key: SessionPage handles session changes reactively, and remounting here
-// destroys workspace-scoped state (terminal PTYs, file/prompt providers).
+// Owns the workspace-identity remount (scope+directory key). Session ID changes
+// within same workspace DO NOT remount here (or SDKProvider/DirectoryDataProvider
+// above it, or SessionProviders below). See ResolvedTargetSessionRoute:310
+// non-keyed dir Show + sessionPanelKey now workspaceKey() (line ~475). Provider
+// teardown only on Home↔session (higher serverKey in app.tsx) or dir change.
+// SessionPage handles id changes reactively; avoids destroying terminal PTYs,
+// file/prompt providers, persisted trees, composer controller.
 function TargetSessionPage() {
   const sdk = useSDK()
   const serverSDK = useServerSDK()
@@ -469,7 +476,13 @@ export default function Page() {
   })
 
   const workspaceTabs = createMemo(() => layout.tabs(workspaceKey))
-  const sessionPanelKey = createMemo(() => (params.id ? `${serverSDK().scope}\0${params.id}` : undefined))
+  // workspace-keyed (not per-session-id): keeps panel shell + ErrorBoundary + composer
+  // controller creation across same-workspace tab switches. Inner reactivity (sessionKey,
+  // params.id, timeline out-of-lane) updates without remount. Matches TargetSessionPage
+  // dir-keyed Show and non-keyed dir Show in ResolvedTargetSessionRoute (preserves
+  // SDKProvider/DirectoryDataProvider/SessionProviders). Only remounts on dir/server change
+  // or uncached lineage fallback.
+  const sessionPanelKey = createMemo(() => (params.id ? workspaceKey() : undefined))
 
   createEffect(
     on(
@@ -524,9 +537,11 @@ export default function Page() {
   const desktopContextPanelOpen = createMemo(() => isDesktop() && layout.sessionContext.opened())
   const desktopUsagePanelOpen = createMemo(() => isDesktop() && layout.usage.opened())
   const desktopModelsPanelOpen = createMemo(() => isDesktop() && layout.models.opened())
+  const desktopLimitsPanelOpen = createMemo(() => isDesktop() && layout.limits.opened())
   const contextPanelState = createContextPanelState()
   const usagePanelState = createUsagePanelState()
   const modelsPanelState = createModelsPanelState()
+  const limitsPanelState = createLimitsPanelState()
   const desktopSessionResizeOpen = createMemo(() => newSessionDesign() && desktopTerminalOpen())
   const desktopSidePanelOpen = createMemo(() => desktopSessionResizeOpen() || desktopFileTreeOpen())
   const desktopSessionSiblingOpen = createMemo(
@@ -535,7 +550,8 @@ export default function Page() {
       desktopProjectExplorerOpen() ||
       desktopContextPanelOpen() ||
       desktopUsagePanelOpen() ||
-      desktopModelsPanelOpen(),
+      desktopModelsPanelOpen() ||
+      desktopLimitsPanelOpen(),
   )
   const sessionPanelGapCount = createMemo(
     () =>
@@ -543,7 +559,8 @@ export default function Page() {
       Number(desktopSidePanelOpen()) +
       Number(desktopContextPanelOpen()) +
       Number(desktopUsagePanelOpen()) +
-      Number(desktopModelsPanelOpen()),
+      Number(desktopModelsPanelOpen()) +
+      Number(desktopLimitsPanelOpen()),
   )
   const sessionPanelReservedWidth = createMemo(
     () =>
@@ -551,7 +568,8 @@ export default function Page() {
       (desktopFileTreeOpen() && !desktopSessionResizeOpen() ? layout.fileTree.width() : 0) +
       (desktopContextPanelOpen() ? contextPanelState.sidebarWidth() : 0) +
       (desktopUsagePanelOpen() ? usagePanelState.sidebarWidth() : 0) +
-      (desktopModelsPanelOpen() ? modelsPanelState.sidebarWidth() : 0),
+      (desktopModelsPanelOpen() ? modelsPanelState.sidebarWidth() : 0) +
+      (desktopLimitsPanelOpen() ? limitsPanelState.sidebarWidth() : 0),
   )
   const sessionPanelReservedGap = createMemo(() =>
     settings.general.newLayoutDesigns() ? sessionPanelGapCount() * 8 : 0,
@@ -596,6 +614,7 @@ export default function Page() {
       context: desktopContextPanelOpen(),
       usage: desktopUsagePanelOpen(),
       models: desktopModelsPanelOpen(),
+      limits: desktopLimitsPanelOpen(),
     }),
   )
 
@@ -2170,6 +2189,13 @@ export default function Page() {
             onClose={() => layout.models.close()}
           />
         </Show>
+        <Show when={!newSessionDesign() && desktopLimitsPanelOpen()}>
+          <LimitsPanel
+            state={limitsPanelState}
+            opened={desktopLimitsPanelOpen()}
+            onClose={() => layout.limits.close()}
+          />
+        </Show>
         <Show when={!newSessionDesign() && desktopContextPanelOpen()}>
           <ContextPanel
             state={contextPanelState}
@@ -2182,7 +2208,11 @@ export default function Page() {
             <Show
               when={
                 (isDesktop() &&
-                  (desktopFileTreeOpen() || desktopContextPanelOpen() || desktopUsagePanelOpen() || desktopModelsPanelOpen())) ||
+                  (desktopFileTreeOpen() ||
+                    desktopContextPanelOpen() ||
+                    desktopUsagePanelOpen() ||
+                    desktopModelsPanelOpen() ||
+                    desktopLimitsPanelOpen())) ||
                 terminalOpen()
               }
             >
@@ -2190,46 +2220,57 @@ export default function Page() {
                 <Show
                   when={
                     isDesktop() &&
-                    (desktopFileTreeOpen() || desktopContextPanelOpen() || desktopUsagePanelOpen() || desktopModelsPanelOpen())
+                    (desktopFileTreeOpen() ||
+                      desktopContextPanelOpen() ||
+                      desktopUsagePanelOpen() ||
+                      desktopModelsPanelOpen() ||
+                      desktopLimitsPanelOpen())
                   }
                 >
-                  <div class="min-h-0 flex-1 flex flex-row gap-2">
-                    <Show when={desktopFileTreeOpen()}>
-                      <Suspense>
-                        <SessionSidePanel
-                          diffs={vcsDiffs}
-                          diffsReady={vcsReady}
-                          empty={() => ""}
-                          hasChanges={hasVcsChanges}
-                          changeCount={vcsCount}
-                          activeDiff={undefined}
-                          focusChangeDiff={() => {}}
-                          size={size}
-                        />
-                      </Suspense>
-                    </Show>
-                    <Show when={desktopUsagePanelOpen()}>
-                      <UsagePanel
-                        state={usagePanelState}
-                        opened={desktopUsagePanelOpen()}
-                        onClose={() => layout.usage.close()}
-                      />
-                    </Show>
-                    <Show when={desktopModelsPanelOpen()}>
-                      <ModelsPanel
-                        state={modelsPanelState}
-                        opened={desktopModelsPanelOpen()}
-                        onClose={() => layout.models.close()}
-                      />
-                    </Show>
-                    <Show when={desktopContextPanelOpen()}>
-                      <ContextPanel
-                        state={contextPanelState}
-                        opened={desktopContextPanelOpen()}
-                        onClose={() => layout.sessionContext.close()}
-                      />
-                    </Show>
-                  </div>
+              <div class="min-h-0 flex-1 flex flex-row gap-2">
+                <Show when={desktopFileTreeOpen()}>
+                  <Suspense>
+                    <SessionSidePanel
+                      diffs={vcsDiffs}
+                      diffsReady={vcsReady}
+                      empty={() => ""}
+                      hasChanges={hasVcsChanges}
+                      changeCount={vcsCount}
+                      activeDiff={undefined}
+                      focusChangeDiff={() => {}}
+                      size={size}
+                    />
+                  </Suspense>
+                </Show>
+                <Show when={desktopUsagePanelOpen()}>
+                  <UsagePanel
+                    state={usagePanelState}
+                    opened={desktopUsagePanelOpen()}
+                    onClose={() => layout.usage.close()}
+                  />
+                </Show>
+                <Show when={desktopModelsPanelOpen()}>
+                  <ModelsPanel
+                    state={modelsPanelState}
+                    opened={desktopModelsPanelOpen()}
+                    onClose={() => layout.models.close()}
+                  />
+                </Show>
+                <Show when={desktopLimitsPanelOpen()}>
+                  <LimitsPanel
+                    state={limitsPanelState}
+                    opened={desktopLimitsPanelOpen()}
+                    onClose={() => layout.limits.close()}
+                  />
+                </Show>
+                <Show when={desktopContextPanelOpen()}>
+                  <ContextPanel
+                    state={contextPanelState}
+                    opened={desktopContextPanelOpen()}
+                    onClose={() => layout.sessionContext.close()}
+                  />
+                </Show>
+              </div>
                 </Show>
                 <Show when={desktopV2PanelLayout().stacked}>
                   <div class="relative h-2 shrink-0" onPointerDown={() => size.start()}>

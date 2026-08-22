@@ -1352,6 +1352,11 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   )
 
   const variants = createMemo(() => ["default", ...props.controls.model.selection.variant.list()])
+  const variantIcon = (value: string | undefined) => {
+    const icons = ["brain", "dash", "glasses", "task", "subagent", "code", "mcp", "prompt", "selector", "sliders"] as const
+    const icon = icons[Math.max(0, variants().indexOf(value ?? "default")) % icons.length]
+    return <Icon name={icon} size="small" class="shrink-0 text-icon-info-active" />
+  }
   // Check provider variants directly: `variants` also includes the UI-only default option.
   const showVariantControl = createMemo(() => props.controls.model.selection.variant.list().length > 0)
   // See prompt-input-v2.tsx's identical draft-scoped flag for why the
@@ -1951,6 +1956,13 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
                             options={variants()}
                             current={props.controls.model.selection.variant.current() ?? "default"}
                             label={(x) => (x === "default" ? language.t("common.default") : x)}
+                            icon={variantIcon}
+                            children={(x) => (
+                              <span class="flex items-center gap-2">
+                                {variantIcon(x)}
+                                {x === "default" ? language.t("common.default") : x}
+                              </span>
+                            )}
                             onSelect={(value) => {
                               props.controls.model.selection.variant.set(value === "default" ? undefined : value)
                               restoreFocus()

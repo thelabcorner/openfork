@@ -92,6 +92,24 @@ export const OpenRouterEndpointsQuery = Schema.Struct({
   model: Schema.String,
 })
 
+export const OpenRouterTelemetryQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  model: Schema.String,
+  timeRange: Schema.optional(Schema.Literal("1w", "3d")),
+})
+
+export const OpenRouterTelemetryItemSchema = Schema.Struct({
+  endpointId: Schema.String,
+  providerName: Schema.String,
+  providerSlug: Schema.String,
+  cacheHitPercent: Schema.Number,
+  throughputTps: Schema.optional(Schema.Number),
+}).annotate({ identifier: "OpenRouterTelemetryItem" })
+
+export const OpenRouterTelemetryResponse = Schema.Array(OpenRouterTelemetryItemSchema).annotate({
+  identifier: "OpenRouterTelemetry",
+})
+
 export const OpenRouterEndpointSchema = Schema.Struct({
   providerName: Schema.String,
   tag: Schema.String,
@@ -121,6 +139,7 @@ export const ExperimentalPaths = {
   sessionBackground: "/experimental/session/:sessionID/background",
   resource: "/experimental/resource",
   openrouterEndpoints: "/experimental/openrouter-endpoints",
+  openrouterTelemetry: "/experimental/openrouter-telemetry",
 } as const
 
 export const ExperimentalApi = HttpApi.make("experimental")
@@ -275,6 +294,18 @@ export const ExperimentalApi = HttpApi.make("experimental")
             identifier: "experimental.resource.list",
             summary: "Get MCP resources",
             description: "Get all available MCP resources from connected servers. Optionally filter by name.",
+          }),
+        ),
+        HttpApiEndpoint.get("openrouterTelemetry", ExperimentalPaths.openrouterTelemetry, {
+          query: OpenRouterTelemetryQuery,
+          success: described(OpenRouterTelemetryResponse, "OpenRouter telemetry"),
+          error: HttpApiError.InternalServerError,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "experimental.openrouterTelemetry.get",
+            summary: "Get OpenRouter telemetry",
+            description:
+              "Proxy OpenRouter's frontend telemetry APIs (effective-pricing, throughput-comparison) so the renderer avoids cross-origin fetches.",
           }),
         ),
         HttpApiEndpoint.get("openrouterEndpoints", ExperimentalPaths.openrouterEndpoints, {

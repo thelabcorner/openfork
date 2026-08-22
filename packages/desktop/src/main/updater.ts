@@ -1,5 +1,4 @@
 import { app, dialog } from "electron"
-import pkg from "electron-updater"
 import { UPDATER_ENABLED } from "./constants"
 import { createUpdaterController, type UpdaterReadyRecord } from "./updater-controller"
 import { getLogger } from "./logging"
@@ -7,11 +6,31 @@ import { getStore } from "./store"
 import { setAppQuitting } from "./windows"
 import { nativeT } from "./native-translations"
 
-const { autoUpdater } = pkg
 const key = "ready"
 
-export function setupAutoUpdater(stop: () => Promise<void>) {
+export async function setupAutoUpdater(stop: () => Promise<void>) {
   const logger = getLogger()
+  if (!UPDATER_ENABLED) {
+    return createUpdaterController({
+      enabled: false,
+      currentVersion: app.getVersion(),
+      backend: {
+        checkForUpdates: async () => null,
+        downloadUpdate: async () => undefined,
+        quitAndInstall: () => undefined,
+      },
+      persistence: {
+        get: () => undefined,
+        set: () => undefined,
+        clear: () => undefined,
+      },
+      stop,
+      log: (message, data) => logger.log(message, data),
+    })
+  }
+
+  const imported = await import("electron-updater")
+  const autoUpdater = imported.autoUpdater ?? imported.default.autoUpdater
   autoUpdater.logger = logger
   autoUpdater.channel = "latest"
   autoUpdater.allowPrerelease = false
@@ -60,7 +79,10 @@ export function setupAutoUpdater(stop: () => Promise<void>) {
   })
 }
 
-export async function showUpdaterDialog(controller: ReturnType<typeof setupAutoUpdater>, alertOnFail: boolean) {
+export async function showUpdaterDialog(
+  controller: Awaited<ReturnType<typeof setupAutoUpdater>>,
+  alertOnFail: boolean,
+) {
   const state = await controller.check()
   if (state.status === "error") {
     if (!alertOnFail) return

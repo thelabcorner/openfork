@@ -26,6 +26,9 @@ export function toMentionOptions(results: MentionResult[], recentPaths: readonly
           display: entry.path,
           isDir: entry.type === "directory",
           positions: entry.positions,
+          size: entry.size,
+          mtime: entry.mtime,
+          lineCount: entry.lineCount,
         },
       ]
     }
@@ -61,6 +64,9 @@ interface WireMentionPage {
         type?: "file" | "directory"
         positions?: WireNumber[]
         baseOffset?: WireNumber
+        size?: WireNumber
+        mtime?: WireNumber
+        lineCount?: WireNumber
       }
   >
   hasMore: boolean
@@ -87,7 +93,18 @@ export function normalizeMentionPage(page: WireMentionPage): { results: MentionR
         entry.positions && baseOffset !== undefined && baseOffset > 0
           ? entry.positions.map(Number).filter((p) => p >= baseOffset).map((p) => p - baseOffset)
           : entry.positions?.map(Number)
-      return { kind: "file", path: entry.path, type: entry.type, positions }
+      return {
+        kind: "file",
+        path: entry.path,
+        type: entry.type,
+        positions,
+        // Preserved so consumers rendering the FULL path as label can re-project
+        // basename-relative positions back into label space (see prompt-input-v2).
+        baseOffset,
+        size: entry.size === undefined ? undefined : Number(entry.size),
+        mtime: entry.mtime === undefined ? undefined : Number(entry.mtime),
+        lineCount: entry.lineCount === undefined ? undefined : Number(entry.lineCount),
+      }
     }),
     hasMore: page.hasMore,
   }

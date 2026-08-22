@@ -201,6 +201,10 @@ import type {
   QuestionReplyErrors,
   QuestionReplyResponses,
   QuestionV2Reply,
+  QuotaGetErrors,
+  QuotaGetResponses,
+  QuotaProvidersErrors,
+  QuotaProvidersResponses,
   SessionAbortErrors,
   SessionAbortResponses,
   SessionChildrenErrors,
@@ -3934,6 +3938,39 @@ export class Provider extends HeyApiClient {
   private _oauth?: Oauth
   get oauth(): Oauth {
     return (this._oauth ??= new Oauth({ client: this.client }))
+  }
+}
+
+export class Quota extends HeyApiClient {
+  /**
+   * List quota providers
+   *
+   * Lists every registered provider-account quota source and whether credentials are present. Purely informational; never blocks inference.
+   */
+  public providers<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<QuotaProvidersResponses, QuotaProvidersErrors, ThrowOnError>({
+      url: "/quota/providers",
+      ...options,
+    })
+  }
+
+  /**
+   * Get provider quota
+   *
+   * Fetches the provider's account usage/balance endpoint and normalizes it into quota windows. Failures are reported inside the result envelope (ok=false), not as HTTP errors.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      providerID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "providerID" }] }])
+    return (options?.client ?? this.client).get<QuotaGetResponses, QuotaGetErrors, ThrowOnError>({
+      url: "/quota/{providerID}",
+      ...options,
+      ...params,
+    })
   }
 }
 
@@ -8874,6 +8911,11 @@ export class OpencodeClient extends HeyApiClient {
   private _provider?: Provider
   get provider(): Provider {
     return (this._provider ??= new Provider({ client: this.client }))
+  }
+
+  private _quota?: Quota
+  get quota(): Quota {
+    return (this._quota ??= new Quota({ client: this.client }))
   }
 
   private _session?: Session2

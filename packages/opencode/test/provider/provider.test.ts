@@ -747,6 +747,68 @@ it.instance(
 )
 
 it.instance(
+  "getSmallModel prefers a free variant over a newer paid model in the same family",
+  Effect.gen(function* () {
+    const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("test-provider"))
+    expect(model?.id).toBe(ModelV2.ID.make("free-flash"))
+  }),
+  {
+    config: {
+      provider: {
+        "test-provider": {
+          name: "Test Provider",
+          npm: "@ai-sdk/openai-compatible",
+          models: {
+            "paid-flash": {
+              family: "gemini-flash",
+              release_date: "2026-08-01",
+              cost: { input: 0.15, output: 0.6, cache_read: 0, cache_write: 0 },
+            },
+            "free-flash": {
+              family: "gemini-flash",
+              release_date: "2025-06-01",
+              cost: { input: 0, output: 0, cache_read: 0, cache_write: 0 },
+            },
+          },
+          options: { apiKey: "test-key" },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "getSmallModel still picks the newest model when the family has no free variant",
+  Effect.gen(function* () {
+    const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("test-provider"))
+    expect(model?.id).toBe(ModelV2.ID.make("paid-new"))
+  }),
+  {
+    config: {
+      provider: {
+        "test-provider": {
+          name: "Test Provider",
+          npm: "@ai-sdk/openai-compatible",
+          models: {
+            "paid-old": {
+              family: "gemini-flash",
+              release_date: "2026-01-01",
+              cost: { input: 0.15, output: 0.6, cache_read: 0, cache_write: 0 },
+            },
+            "paid-new": {
+              family: "gemini-flash",
+              release_date: "2026-06-01",
+              cost: { input: 0.3, output: 1.2, cache_read: 0, cache_write: 0 },
+            },
+          },
+          options: { apiKey: "test-key" },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
   "getSmallModel matches exact model families",
   Effect.gen(function* () {
     const model = yield* Provider.use.getSmallModel(ProviderV2.ID.make("test-provider"))

@@ -76,6 +76,56 @@ function cacheGet(key: string) {
   return entry.value
 }
 
+const DRAFT_DEBOUNCE_MS = 500
+const pendingDraftWrites = new Map<string, { timer: ReturnType<typeof setTimeout>; value: string }>()
+let draftFlushListenersInstalled = false
+
+function flushPendingDraftWrites(draft: AsyncStorage) {
+  for (const [key, pending] of pendingDraftWrites) {
+    clearTimeout(pending.timer)
+    pendingDraftWrites.delete(key)
+    void draft.setItem(key, pending.value)
+  }
+}
+
+function ensureDraftFlushListeners(draft: AsyncStorage) {
+  if (draftFlushListenersInstalled) return
+  draftFlushListenersInstalled = true
+  const flush = () => flushPendingDraftWrites(draft)
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flush()
+  })
+  window.addEventListener("pagehide", flush)
+  window.addEventListener("beforeunload", flush)
+}
+
+function createDebouncedDraftStorage(draft: AsyncStorage, prefix: string): AsyncStorage {
+  ensureDraftFlushListeners(draft)
+  return {
+    getItem: (key) => draft.getItem(prefix + key),
+    setItem: (key, value) => {
+      const fullKey = prefix + key
+      const existing = pendingDraftWrites.get(fullKey)
+      if (existing) clearTimeout(existing.timer)
+      const timer = setTimeout(() => {
+        pendingDraftWrites.delete(fullKey)
+        void draft.setItem(fullKey, value)
+      }, DRAFT_DEBOUNCE_MS)
+      pendingDraftWrites.set(fullKey, { timer, value })
+      return Promise.resolve()
+    },
+    removeItem: (key) => {
+      const fullKey = prefix + key
+      const existing = pendingDraftWrites.get(fullKey)
+      if (existing) {
+        clearTimeout(existing.timer)
+        pendingDraftWrites.delete(fullKey)
+      }
+      return draft.removeItem(fullKey)
+    },
+  }
+}
+
 function fallbackDisabled(scope: string) {
   return fallback.get(scope) === true
 }
@@ -542,7 +592,13 @@ export function removePersisted(
   platform?: Platform,
 ) {
   if (target.draft && platform?.draftStore) {
-    void platform.draftStore.removeItem(`${target.storage ?? "default"}:${target.key}`)
+    const fullKey = `${target.storage ?? "default"}:${target.key}`
+    const pending = pendingDraftWrites.get(fullKey)
+    if (pending) {
+      clearTimeout(pending.timer)
+      pendingDraftWrites.delete(fullKey)
+    }
+    void platform.draftStore.removeItem(fullKey)
   }
   const isDesktop = platform?.platform === "desktop" && !!platform.storage
 
@@ -582,11 +638,7 @@ export function persisted<T>(
   const currentStorage = (() => {
     if (draft) {
       const prefix = `${config.storage ?? "default"}:`
-      return {
-        getItem: (key: string) => draft.getItem(prefix + key),
-        setItem: (key: string, value: string) => draft.setItem(prefix + key, value),
-        removeItem: (key: string) => draft.removeItem(prefix + key),
-      } satisfies AsyncStorage
+      return createDebouncedDraftStorage(draft, prefix)
     }
     if (isDesktop) return platform.storage?.(config.storage)
     if (!config.storage) return localStorageDirect()

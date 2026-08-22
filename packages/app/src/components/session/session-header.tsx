@@ -511,6 +511,26 @@ export function SessionHeader() {
                           />
                         </Button>
                       </Tooltip>
+
+                      <Tooltip placement="bottom" value={language.t("command.limits.toggle")}>
+                        <Button
+                          variant="ghost"
+                          class="titlebar-icon w-8 h-6 p-0 box-border"
+                          aria-label={language.t("command.limits.toggle")}
+                          aria-expanded={layout.limits.opened()}
+                          aria-controls="limits-panel"
+                          onClick={() => void startTransition(() => layout.limits.toggle())}
+                        >
+                          <Icon
+                            size="small"
+                            name="providers"
+                            classList={{
+                              "text-icon-strong": layout.limits.opened(),
+                              "text-icon-weak": !layout.limits.opened(),
+                            }}
+                          />
+                        </Button>
+                      </Tooltip>
                     </div>
                   </div>
                 </div>

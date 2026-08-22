@@ -19,6 +19,7 @@ import { InstanceHttpApi } from "../api"
 import {
   ConsoleSwitchPayload,
   OpenRouterEndpointsQuery,
+  OpenRouterTelemetryQuery,
   SessionListQuery,
   ToolListQuery,
   WorktreeApiError,
@@ -233,6 +234,71 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       return yield* mcp.resources()
     })
 
+    const openrouterTelemetry = Effect.fn("ExperimentalHttpApi.openrouterTelemetry")(function* (ctx: {
+      query: typeof import("../groups/experimental").OpenRouterTelemetryQuery.Type
+    }) {
+      // Best-effort proxy for the undocumented frontend telemetry endpoints.
+      const modelId = ctx.query.model
+      const timeRange = ctx.query.timeRange ?? "1w"
+      // Resolve permaslug via author-models proxy
+      const author = modelId.slice(0, modelId.indexOf("/"))
+      const permaslugRes = yield* HttpClient.filterStatusOk(http).execute(
+        HttpClientRequest.get(
+          `https://openrouter.ai/api/frontend/v1/author-models?authorSlug=${encodeURIComponent(author)}`,
+        ).pipe(HttpClientRequest.accept("application/json")),
+      ).pipe(Effect.timeoutOrElse({ duration: "10 seconds", orElse: () => Effect.fail(new HttpApiError.InternalServerError({})) }), Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      const permaslugBody = yield* permaslugRes.json.pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      const permaslug = (permaslugBody as { data?: { models?: Array<{ slug?: string; permaslug?: string; endpoint?: { variant?: string } }> } })?.data?.models?.find((m) => m.slug === modelId && m.endpoint?.variant === "standard")?.permaslug ?? (permaslugBody as { data?: { models?: Array<{ slug?: string; permaslug?: string }> } })?.data?.models?.find((m) => m.slug === modelId)?.permaslug
+      if (!permaslug) return []
+
+      // Effective pricing for identity + cache ratio
+      const pricingRes = yield* HttpClient.filterStatusOk(http).execute(
+        HttpClientRequest.get(
+          `https://openrouter.ai/api/frontend/v1/stats/effective-pricing?permaslug=${encodeURIComponent(permaslug)}&shape=v7&variant=standard`,
+        ).pipe(HttpClientRequest.accept("application/json")),
+      ).pipe(Effect.timeoutOrElse({ duration: "10 seconds", orElse: () => Effect.fail(new HttpApiError.InternalServerError({})) }), Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      const pricingBody = yield* pricingRes.json.pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      const summaries = (pricingBody as { data?: { providerSummaries?: Array<{ endpointId?: string; providerName?: string; providerSlug?: string; cacheHitRate?: number }> } })?.data?.providerSummaries ?? []
+      const allowedIds = new Set(summaries.map((s) => s.endpointId).filter((id): id is string => !!id))
+
+      // Throughput series
+      let throughputLatest = new Map<string, number>()
+      try {
+        const throughputRes = yield* HttpClient.filterStatusOk(http).execute(
+          HttpClientRequest.get(
+            `https://openrouter.ai/api/frontend/v1/stats/throughput-comparison?permaslug=${encodeURIComponent(permaslug)}&timeRange=${encodeURIComponent(timeRange)}&variant=standard`,
+          ).pipe(HttpClientRequest.accept("application/json")),
+        ).pipe(Effect.timeoutOrElse({ duration: "10 seconds", orElse: () => Effect.fail(new HttpApiError.InternalServerError({})) }), Effect.mapError(() => new HttpApiError.InternalServerError({})))
+        const throughputBody = yield* throughputRes.json.pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+        const todayStr = new Date().toISOString().slice(0, 10)
+        for (const point of ((throughputBody as { data?: Array<{ x?: string; y?: Record<string, number> }> })?.data ?? [])) {
+          const bucket = point.x?.slice(0, 10)
+          if (bucket && bucket >= todayStr) continue
+          for (const [rawKey, value] of Object.entries(point.y ?? {})) {
+            const endpointId = rawKey.split("::", 1)[0]
+            if (allowedIds.has(endpointId) && typeof value === "number") {
+              throughputLatest.set(endpointId, value)
+            }
+          }
+        }
+      } catch {
+        // Best-effort: throughput failure shouldn't kill telemetry.
+      }
+
+      return summaries.map((summary) => {
+        const endpointId = summary.endpointId!
+        const providerName = summary.providerName ?? endpointId
+        const providerSlug = summary.providerSlug ?? endpointId
+        return {
+          endpointId,
+          providerName,
+          providerSlug,
+          cacheHitPercent: Math.round((summary.cacheHitRate ?? 0) * 10000) / 100,
+          throughputTps: throughputLatest.has(endpointId) ? Math.round(throughputLatest.get(endpointId)! * 100) / 100 : undefined,
+        }
+      })
+    })
+
     const openrouterEndpoints = Effect.fn("ExperimentalHttpApi.openrouterEndpoints")(function* (ctx: {
       query: typeof OpenRouterEndpointsQuery.Type
     }) {
@@ -270,6 +336,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       .handle("session", session)
       .handle("sessionBackground", sessionBackground)
       .handle("resource", resource)
+      .handle("openrouterTelemetry", openrouterTelemetry)
       .handle("openrouterEndpoints", openrouterEndpoints)
   }),
 )

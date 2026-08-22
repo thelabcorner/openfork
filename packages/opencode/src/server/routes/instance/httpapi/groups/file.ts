@@ -50,6 +50,9 @@ export const MentionResult = Schema.Union([
     score: Schema.Number,
     positions: Schema.optional(Schema.Array(Schema.Number)),
     baseOffset: Schema.optional(Schema.Number),
+    size: Schema.optional(Schema.Number),
+    mtime: Schema.optional(Schema.Number),
+    lineCount: Schema.optional(Schema.Number),
   }),
   Schema.Struct({
     kind: Schema.Literal("symbol"),

@@ -37,6 +37,7 @@ const DEFAULT_PROJECT_EXPLORER_PANEL_OPENED = false
 const DEFAULT_SESSION_CONTEXT_PANEL_OPENED = false
 const DEFAULT_USAGE_PANEL_OPENED = false
 const DEFAULT_MODELS_PANEL_OPENED = false
+const DEFAULT_LIMITS_PANEL_OPENED = false
 export type AvatarColorKey = (typeof AVATAR_COLOR_KEYS)[number]
 
 export function getAvatarColors(key?: string) {
@@ -287,6 +288,9 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         },
         models: {
           panelOpened: DEFAULT_MODELS_PANEL_OPENED,
+        },
+        limits: {
+          panelOpened: DEFAULT_LIMITS_PANEL_OPENED,
         },
         fileTree: {
           opened: false,
@@ -866,6 +870,31 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
             return
           }
           setStore("models", "panelOpened", !current)
+        },
+      },
+      limits: {
+        opened: createMemo(() => store.limits?.panelOpened ?? DEFAULT_LIMITS_PANEL_OPENED),
+        open() {
+          if (!store.limits) {
+            setStore("limits", { panelOpened: true })
+            return
+          }
+          setStore("limits", "panelOpened", true)
+        },
+        close() {
+          if (!store.limits) {
+            setStore("limits", { panelOpened: false })
+            return
+          }
+          setStore("limits", "panelOpened", false)
+        },
+        toggle() {
+          const current = store.limits?.panelOpened ?? DEFAULT_LIMITS_PANEL_OPENED
+          if (!store.limits) {
+            setStore("limits", { panelOpened: !current })
+            return
+          }
+          setStore("limits", "panelOpened", !current)
         },
       },
       session: {

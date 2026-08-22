@@ -8,11 +8,13 @@ import {
   createSignal,
   For,
   JSX,
+  on,
   onCleanup,
   onMount,
   Show,
 } from "solid-js"
 import { createStore } from "solid-js/store"
+import { createVirtualizer, defaultRangeExtractor } from "@tanstack/solid-virtual"
 import { useLocal } from "@/context/local"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { popularProviders } from "@/hooks/use-providers"
@@ -30,13 +32,14 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { ModelTooltip, formatCostPerMillion } from "./model-tooltip"
 import { getOpenRouterEndpoints, type OpenRouterEndpoint } from "@/utils/openrouter-endpoints"
+import { fetchTelemetry, type OpenRouterTelemetry } from "@/utils/openrouter-telemetry"
 import { useLanguage } from "@/context/language"
 import { decode64 } from "@/utils/base64"
 import { handleDocumentSearchKeydown } from "@/utils/search-keydown"
 import { createMenuDismissController } from "@/utils/menu-dismiss-controller"
 import { createEventListener } from "@solid-primitives/event-listener"
 import { createPolled } from "@solid-primitives/timer"
-import { matchesModelSearch } from "./dialog-select-model-search"
+import { createModelSearchMatcher, prepareModelSearchFields } from "./dialog-select-model-search"
 import { useForkUsage } from "@/context/fork-usage"
 import { useSync } from "@/context/sync"
 import { useLayout } from "@/context/layout"
@@ -47,6 +50,7 @@ import { estimateRequestsRemaining, estimateRequestsRemainingFromCost, isUsageTr
 import { getUsageTables, matchUsagePricing, matchUsageProfile } from "@/utils/model-usage-profile"
 import { averageCostPerRequest, buildModelCostIndex } from "@/utils/model-usage-history"
 import { deepSeekRatePeriod, isDeepSeekPeakPricedModel } from "@/utils/model-peak-pricing"
+import { isUnlimitedModel, stripUnlimitedSuffix, hasPublishedPricing } from "@/utils/model-badges"
 
 const isFree = (provider: string, cost: { input: number } | undefined) =>
   provider === "opencode" && (!cost || cost.input === 0)
@@ -56,22 +60,13 @@ type ModelItem = ReturnType<ModelState["list"]>[number]
 
 const modelKey = (model: ModelItem) => `${model.provider.id}:${model.id}`
 const manageKey = "action:manage"
+let persistedModelSearch = ""
 
 // Sentinel for "let OpenRouter pick the upstream provider" — the first,
 // default-selected entry of the sub-provider picker. Storing it is never
 // persisted; choosing it clears the pinned preference so nothing reaches the
 // request (`request.ts` additionally guards against it defensively).
-const OPENROUTER_AUTO = "auto"
 const favoritesRailKey = "favorites"
-
-// Row streaming: render enough rows to fill the ~320px viewport several times
-// over on the first paint, then append the remainder during idle frames. A
-// 1000-model catalog otherwise mounts synchronously at open (~70ms block).
-const INITIAL_RENDER_ROWS = 48
-const RENDER_CHUNK = 96
-// The highlighted row must always exist in the DOM; keep this much company
-// rendered past it so arrowing into unrendered territory never misses.
-const ACTIVE_RENDER_BUFFER = 24
 
 // Representative $/token price (input + output) — cheapest first within a
 // provider group and within favorites, name as tiebreaker for equal-cost models.
@@ -111,6 +106,10 @@ const ModelList: Component<{
     <List
       class={`flex-1 px-3 min-h-0 [&_[data-slot=list-scroll]]:flex-1 [&_[data-slot=list-scroll]]:min-h-0 ${props.class ?? ""}`}
       search={{ placeholder: language.t("dialog.model.search.placeholder"), autofocus: true, action: props.action }}
+      filter={persistedModelSearch}
+      onFilter={(value) => {
+        persistedModelSearch = value
+      }}
       emptyMessage={language.t("dialog.model.empty")}
       key={(x) => `${x.provider.id}:${x.id}`}
       items={models}
@@ -131,7 +130,14 @@ const ModelList: Component<{
           placement="right-start"
           gutter={12}
           openDelay={0}
-          value={<ModelTooltip model={item} latest={item.latest} free={isFree(item.provider.id, item.cost)} />}
+          value={
+            <ModelTooltip
+              model={item}
+              latest={item.latest}
+              free={isFree(item.provider.id, item.cost)}
+              unlimited={isUnlimitedModel(item)}
+            />
+          }
         >
           {node}
         </Tooltip>
@@ -145,8 +151,11 @@ const ModelList: Component<{
     >
       {(i) => (
         <div class="w-full flex items-center gap-x-2 text-13-regular">
-          <span class="truncate">{i.name}</span>
+          <span class="truncate">{stripUnlimitedSuffix(i.name)}</span>
           <DeepSeekRateBadge model={i} />
+          <Show when={isUnlimitedModel(i)}>
+            <Tag>{language.t("model.tag.unlimited")}</Tag>
+          </Show>
           <Show when={isFree(i.provider.id, i.cost)}>
             <Tag>{language.t("model.tag.free")}</Tag>
           </Show>
@@ -251,6 +260,112 @@ const providerIconId = (provider: string, providerName: string) => {
   return "synthetic"
 }
 
+function OpenRouterEndpointList(props: {
+  endpoints: OpenRouterEndpoint[]
+  pinned: string | undefined
+  onPickProvider: (tag: string | undefined) => void
+}) {
+  const language = useLanguage()
+  const [scrollRoot, setScrollRoot] = createSignal<HTMLDivElement>()
+  const [focusedIndex, setFocusedIndex] = createSignal(-1)
+  const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
+    get count() {
+      return props.endpoints.length
+    },
+    getScrollElement: () => scrollRoot() ?? null,
+    initialRect: { width: 256, height: 336 },
+    estimateSize: () => 28,
+    overscan: 4,
+    getItemKey: (index) => props.endpoints[index]?.tag ?? index,
+    rangeExtractor: (range) => {
+      const indexes = defaultRangeExtractor(range)
+      const focused = focusedIndex()
+      if (focused < 0 || indexes.includes(focused)) return indexes
+      return [...indexes, focused].sort((a, b) => a - b)
+    },
+  })
+  const focusIndex = (index: number) => {
+    if (index < 0 || index >= props.endpoints.length) return
+    setFocusedIndex(index)
+    virtualizer.scrollToIndex(index, { align: "auto" })
+    requestAnimationFrame(() => {
+      scrollRoot()?.querySelector<HTMLElement>(`[data-endpoint-index="${index}"]`)?.focus()
+    })
+  }
+
+  return (
+    <ScrollView
+      class="max-h-[336px] w-full [&_.scroll-view__viewport]:overscroll-contain"
+      viewportRef={setScrollRoot}
+    >
+      <div class="relative" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+        <For each={virtualizer.getVirtualItems()}>
+          {(virtualRow) => {
+            const entry = props.endpoints[virtualRow.index]
+            if (!entry) return null
+            const price = formatPricePerM(entry.pricing.prompt + entry.pricing.completion)
+            return (
+              <div
+                class="absolute inset-x-0 top-0"
+                style={{ transform: `translateY(${virtualRow.start}px)` }}
+              >
+                <MenuV2.Item
+                  data-endpoint-index={virtualRow.index}
+                  class="w-full"
+                  data-selected={props.pinned === entry.provider ? true : undefined}
+                  tabIndex={focusedIndex() === virtualRow.index || (focusedIndex() < 0 && virtualRow.index === 0) ? 0 : -1}
+                  onFocus={() => setFocusedIndex(virtualRow.index)}
+                  onKeyDown={(event) => {
+                    if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return
+                    event.preventDefault()
+                    event.stopPropagation()
+                    focusIndex(virtualRow.index + (event.key === "ArrowDown" ? 1 : -1))
+                  }}
+                  onSelect={() => props.onPickProvider(entry.provider)}
+                >
+                  <ProviderIcon
+                    id={providerIconId(entry.provider, entry.providerName)}
+                    class="size-3.5 shrink-0 opacity-70"
+                  />
+                  <span class="min-w-0 flex-1 truncate">{entry.providerName}</span>
+                  <span class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-faint">
+                    {price}
+                  </span>
+                  <Show when={entry.uptime !== undefined}>
+                    <span
+                      class="shrink-0 rounded-sm px-1 text-[9px] font-[600] uppercase leading-4"
+                      title={language.t("dialog.model.subprovider.uptime")}
+                      style={{ color: colorFor(uptimeTone(entry.uptime!)) }}
+                    >
+                      {entry.uptime!.toFixed(1)}%
+                    </span>
+                  </Show>
+                  <Show when={entry.telemetry?.cacheHitPercent !== undefined}>
+                    <span
+                      class="shrink-0 rounded-sm px-1 text-[9px] font-[520] tabular-nums text-v2-text-text-faint"
+                      title="Cache hit rate"
+                    >
+                      ~{entry.telemetry!.cacheHitPercent}%
+                    </span>
+                  </Show>
+                  <Show when={entry.telemetry?.throughputTps !== undefined}>
+                    <span
+                      class="shrink-0 rounded-sm px-1 text-[9px] font-[520] tabular-nums text-v2-text-text-faint"
+                      title="Throughput (tokens/s)"
+                    >
+                      {entry.telemetry!.throughputTps} tok/s
+                    </span>
+                  </Show>
+                </MenuV2.Item>
+              </div>
+            )
+          }}
+        </For>
+      </div>
+    </ScrollView>
+  )
+}
+
 // An OpenRouter model row is a `Menu.Sub` trigger: hovering opens a submenu
 // whose header shows the model's full `ModelTooltip` (so the tooltip is part
 // of the submenu, not a separate floating element competing with its hover-
@@ -260,12 +375,16 @@ const providerIconId = (provider: string, providerName: string) => {
 function OpenRouterRow(props: {
   item: ModelItem
   navKey: string
-  active: boolean
   current: boolean
   favorited: boolean
   pinned: string | undefined
   usage?: { percent: number; estimatedRequests?: number; personalized?: boolean }
   maxRequests: number
+  priceLabel: string
+  rowRef: (element: HTMLElement | undefined) => void
+  endpoints: OpenRouterEndpoint[] | undefined
+  loading: boolean
+  period?: ReturnType<typeof deepSeekRatePeriod>
   onActivate: () => void
   onToggleFavorite: () => void
   onPickProvider: (tag: string | undefined) => void
@@ -273,53 +392,10 @@ function OpenRouterRow(props: {
   onSubmenuChange: (open: boolean) => void
 }) {
   const language = useLanguage()
-  const sdk = useSDK()
-  // Fetch the upstream-provider table lazily, only once the user actually
-  // approaches this row (hover) to open the picker — never on mount. Opening
-  // the selector with a connected OpenRouter account lists dozens of models,
-  // and firing one endpoints fetch (+ sync localStorage parse) per row up
-  // front causes a janky/paint-blocking burst right at popover open.
-  const [endpoints, setEndpoints] = createSignal<OpenRouterEndpoint[] | undefined>()
-  const [loading, setLoading] = createSignal(false)
-  let requested: string | undefined
-  const fetchEndpoints = async (model: string) => {
-    const response = await sdk().client.experimental.openrouterEndpoints.get({ model }, { throwOnError: true })
-    // The server proxy normalizes OpenRouter's per-token prices to USD/1M (its
-    // canonical boundary). No real per-million rate is below $0.0001, so any
-    // smaller magnitude is a per-token price leaked by a stale proxy or cached
-    // response — rescale it here rather than ever rendering a "$0.0000004/M".
-    const perMillion = (value: number) =>
-      Math.abs(value) > 0 && Math.abs(value) < 1e-4 ? value * 1_000_000 : value
-    return response.data.map((entry) => ({
-      providerName: entry.providerName,
-      tag: entry.tag,
-      provider: entry.provider,
-      pricing: {
-        prompt: perMillion(Number(entry.pricing.prompt)),
-        completion: perMillion(Number(entry.pricing.completion)),
-        cacheRead: perMillion(Number(entry.pricing.cacheRead)),
-      },
-      uptime: entry.uptime === undefined ? undefined : Number(entry.uptime),
-    }))
-  }
-  const loadEndpoints = () => {
-    const model = props.item.id
-    if (requested === model) return
-    requested = model
-    setLoading(true)
-    void getOpenRouterEndpoints(model, fetchEndpoints).then((result) => {
-      setEndpoints(result)
-      setLoading(false)
-    })
-  }
-  // Stable catalog price (USD/1M), identical to the other rows. Deriving it from
-  // the lazily-fetched upstream table made the number jump the moment endpoints
-  // loaded on hover; the submenu carries the per-provider rates instead.
-  const price = () => formatPricePerM(modelCost(props.item))
   const pinnedName = () => {
     const tag = props.pinned
     if (!tag) return undefined
-    return endpoints()?.find((entry) => entry.provider === tag)?.providerName
+    return props.endpoints?.find((entry) => entry.provider === tag)?.providerName
   }
 
   return (
@@ -330,41 +406,39 @@ function OpenRouterRow(props: {
       open={props.submenuOpen}
       onOpenChange={(open) => {
         props.onSubmenuChange(open)
-        if (open) {
-          loadEndpoints()
-          return
-        }
-        // Reset so reopening after a failed load re-fetches instead of
-        // short-circuiting on `requested`; successful loads are served from the
-        // module cache so a reopen here is cheap.
-        requested = undefined
       }}
     >
       <MenuV2.SubTrigger
+        ref={props.rowRef}
         data-option-key={props.navKey}
         data-selected-model={props.current ? true : undefined}
         title={pinnedName()}
         class="scroll-my-6 w-full"
-        classList={{ "!bg-v2-overlay-simple-overlay-hover": props.active || props.current }}
-        onPointerMove={() => {
+        classList={{ "!bg-v2-overlay-simple-overlay-hover": props.current }}
+        onMouseEnter={() => {
           props.onActivate()
+          props.onSubmenuChange(true)
         }}
       >
         <ProviderIcon id={props.item.provider.id} class="size-3.5 shrink-0 opacity-60" />
-        <span class="min-w-0 flex-1 truncate leading-5">{props.item.name}</span>
+        <span class="min-w-0 flex-1 truncate leading-5">{stripUnlimitedSuffix(props.item.name)}</span>
         <Show when={props.item.latest}>
           <TagV2 class="shrink-0">{language.t("model.tag.latest")}</TagV2>
+        </Show>
+        <Show when={isUnlimitedModel(props.item)}>
+          <TagV2 class="shrink-0">{language.t("model.tag.unlimited")}</TagV2>
         </Show>
         <ModelRowMeta
           item={props.item}
           usage={props.usage}
           maxRequests={props.maxRequests}
-          price={<span class="text-[10px] font-[520] leading-5">{price()}</span>}
+          price={<span class="text-[10px] font-[520] leading-5">{props.priceLabel}</span>}
         />
         <ModelFavoriteToggle favorited={props.favorited} onToggle={props.onToggleFavorite} />
       </MenuV2.SubTrigger>
-      <MenuV2.Portal>
-        <MenuV2.SubContent class="w-64 rounded-md border-0 bg-v2-background-bg-layer-01 p-1 shadow-[var(--v2-elevation-floating)] focus:outline-none">
+      <Show when={props.submenuOpen}>
+        <MenuV2.Portal>
+          <MenuV2.SubContent class="w-64 rounded-md border-0 bg-v2-background-bg-layer-01 p-1 shadow-[var(--v2-elevation-floating)] focus:outline-none">
           <div
             class="mb-1 border-b border-v2-border-border-muted px-3 pb-1.5"
             style={{ "font-size": "11px", "line-height": "12px", "font-weight": 530 }}
@@ -373,7 +447,9 @@ function OpenRouterRow(props: {
               model={props.item}
               latest={props.item.latest}
               free={isFree(props.item.provider.id, props.item.cost)}
+              unlimited={isUnlimitedModel(props.item)}
               usage={props.usage}
+              period={props.period}
               v2
             />
           </div>
@@ -388,61 +464,25 @@ function OpenRouterRow(props: {
           </MenuV2.Item>
           <MenuV2.Separator class="my-0.5" />
           <Show
-            when={loading()}
+            when={props.loading}
             fallback={
               <Show
-                when={endpoints() && endpoints()!.length > 0}
+                when={props.endpoints && props.endpoints.length > 0}
                 fallback={
                   <MenuV2.Item disabled>
                     <span class="min-w-0 flex-1 truncate">
-                      {endpoints() === undefined
+                      {props.endpoints === undefined
                         ? language.t("dialog.model.subprovider.error")
                         : language.t("dialog.model.subprovider.empty")}
                     </span>
                   </MenuV2.Item>
                 }
               >
-                <For each={endpoints()}>
-                  {(entry) => (
-                    <TooltipV2
-                      class="w-full"
-                      placement="right-start"
-                      gutter={6}
-                      openDelay={0}
-                      value={
-                        <OpenRouterProviderTooltip
-                          model={props.item}
-                          endpoint={entry}
-                          pinned={props.pinned === entry.provider}
-                        />
-                      }
-                    >
-                      <MenuV2.Item
-                        class="w-full"
-                        data-selected={props.pinned === entry.provider ? true : undefined}
-                        onSelect={() => props.onPickProvider(entry.provider)}
-                      >
-                        <ProviderIcon
-                          id={providerIconId(entry.provider, entry.providerName)}
-                          class="size-3.5 shrink-0 opacity-70"
-                        />
-                        <span class="min-w-0 flex-1 truncate">{entry.providerName}</span>
-                        <span class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-faint">
-                          {formatPricePerM(entry.pricing.prompt + entry.pricing.completion)}
-                        </span>
-                        <Show when={entry.uptime !== undefined}>
-                          <span
-                            class="shrink-0 rounded-sm px-1 text-[9px] font-[600] uppercase leading-4"
-                            title={language.t("dialog.model.subprovider.uptime")}
-                            style={{ color: colorFor(uptimeTone(entry.uptime!)) }}
-                          >
-                            {entry.uptime!.toFixed(1)}%
-                          </span>
-                        </Show>
-                      </MenuV2.Item>
-                    </TooltipV2>
-                  )}
-                </For>
+                <OpenRouterEndpointList
+                  endpoints={props.endpoints!}
+                  pinned={props.pinned}
+                  onPickProvider={props.onPickProvider}
+                />
               </Show>
             }
           >
@@ -450,63 +490,10 @@ function OpenRouterRow(props: {
               <span class="min-w-0 flex-1 truncate">{language.t("common.loading")}</span>
             </MenuV2.Item>
           </Show>
-        </MenuV2.SubContent>
-      </MenuV2.Portal>
+          </MenuV2.SubContent>
+        </MenuV2.Portal>
+      </Show>
     </MenuV2.Sub>
-  )
-}
-
-// Specialized tooltip for an OpenRouter upstream-provider entry in the picker:
-// who serves the model, at what price, with what uptime, and whether it's the
-// currently pinned routing target.
-function OpenRouterProviderTooltip(props: {
-  model: ModelItem
-  endpoint: OpenRouterEndpoint
-  pinned: boolean
-}) {
-  const language = useLanguage()
-  const row = (name: string, value: JSX.Element) => (
-    <div class="flex min-w-0 items-center gap-4">
-      <span class="shrink-0 text-v2-text-text-muted">{name}</span>
-      <span class="ml-auto min-w-0 truncate text-right text-v2-text-text-base">{value}</span>
-    </div>
-  )
-  return (
-    <div class="flex w-[224px] flex-col gap-2">
-      {row(
-        language.t("model.tooltip.provider"),
-        <span class="font-[520]">{props.endpoint.providerName}</span>,
-      )}
-      {row(language.t("model.tooltip.model"), props.model.name)}
-      {row(
-        language.t("model.tooltip.cost.input"),
-        <span class="tabular-nums">{formatPricePerM(props.endpoint.pricing.prompt)}</span>,
-      )}
-      {row(
-        language.t("model.tooltip.cost.output"),
-        <span class="tabular-nums">{formatPricePerM(props.endpoint.pricing.completion)}</span>,
-      )}
-      <Show when={props.endpoint.pricing.cacheRead > 0}>
-        {row(
-          language.t("model.tooltip.cost.cached"),
-          <span class="tabular-nums">{formatPricePerM(props.endpoint.pricing.cacheRead)}</span>,
-        )}
-      </Show>
-      <Show when={props.endpoint.uptime !== undefined}>
-        {row(
-          language.t("dialog.model.subprovider.uptime"),
-          <span class="tabular-nums" style={{ color: colorFor(uptimeTone(props.endpoint.uptime!)) }}>
-            {props.endpoint.uptime!.toFixed(1)}%
-          </span>,
-        )}
-      </Show>
-      <Show when={props.pinned}>
-        <div class="h-px bg-v2-border-border-muted" />
-        <span class="text-[10px] font-[520] text-v2-text-text-accent">
-          {language.t("dialog.model.subprovider.pinned")}
-        </span>
-      </Show>
-    </div>
   )
 }
 
@@ -540,11 +527,21 @@ function ModelFavoriteToggle(props: { favorited: boolean; onToggle: () => void }
 // DeepSeek V4 Flash / Pro (OpenCode Zen) are priced by time-of-day rate
 // period. Show whether it is peak or off-peak right now, refreshed on a
 // minute boundary so the badge tracks the current UTC hour without a build.
-function DeepSeekRateBadge(props: { model: ModelItem; v2?: boolean }) {
+// The timer is owned once by ModelSelectorPopoverV2View (not per-row) to avoid
+// N intervals for N rows; this component receives the shared period via props
+// and degrades to a live read when used outside that view (legacy dialog).
+function DeepSeekRateBadge(props: { model: ModelItem; v2?: boolean; period?: ReturnType<typeof deepSeekRatePeriod> }) {
   const language = useLanguage()
-  const now = createPolled(() => new Date(), 60_000)
-  const label = () =>
-    deepSeekRatePeriod(now()) === "peak" ? language.t("model.tag.peak") : language.t("model.tag.offpeak")
+  // Only create a fallback timer when the caller didn't provide a shared period
+  // and this row is actually a DeepSeek peak-priced model — avoids N timers for
+  // N rows (previously every row created a 60s interval unconditionally).
+  let fallbackNow: (() => Date) | undefined
+  if (props.period === undefined && isDeepSeekPeakPricedModel(props.model)) {
+    const now = createPolled(() => new Date(), 60_000)
+    fallbackNow = now
+  }
+  const period = () => props.period ?? (fallbackNow ? deepSeekRatePeriod(fallbackNow()) : deepSeekRatePeriod(new Date()))
+  const label = () => (period() === "peak" ? language.t("model.tag.peak") : language.t("model.tag.offpeak"))
   const badge = () =>
     props.v2 ? (
       <TagV2 class="shrink-0" title={language.t("model.peak.hours")}>
@@ -725,36 +722,46 @@ function createModelSelectorController(input: {
     model
       .list()
       .filter((item) => model.visible({ modelID: item.id, providerID: item.provider.id }))
-      .filter((item) => (input.provider() ? item.provider.id === input.provider() : true)),
+      .filter((item) => (input.provider() ? item.provider.id === input.provider() : true))
+      .sort(byCost),
+  )
+  const searchableFields = createMemo(
+    () =>
+      new Map(
+        allModels().map((item) => [
+          item,
+          prepareModelSearchFields([item.name, item.id, item.provider.name]),
+        ] as const),
+      ),
   )
 
   const key = (item: ModelItem) => ({ modelID: item.id, providerID: item.provider.id })
+  const current = createMemo(() => {
+    const value = model.current()
+    return value ? modelKey(value) : undefined
+  })
 
   return {
     models: (search: string) => {
       const query = search.trim()
-      const filtered = query
-        ? allModels().filter((item) => matchesModelSearch(query, [item.name, item.id, item.provider.name]))
-        : allModels()
-      return [...filtered].sort(byCost)
+      if (!query) return allModels()
+      const matches = createModelSearchMatcher(query)
+      const fields = searchableFields()
+      return allModels().filter((item) => matches(fields.get(item)!))
     },
     groups: (models: ModelItem[]) => {
       const byProvider = new Map<string, ModelItem[]>()
       for (const item of models) {
-        byProvider.set(item.provider.id, [...(byProvider.get(item.provider.id) ?? []), item])
+        const group = byProvider.get(item.provider.id)
+        if (group) group.push(item)
+        else byProvider.set(item.provider.id, [item])
       }
-      return Array.from(byProvider, ([category, items]) => ({ category, items: [...items].sort(byCost) })).sort(
-        sortModelGroups,
-      )
+      return Array.from(byProvider, ([category, items]) => ({ category, items })).sort(sortModelGroups)
     },
-    favorites: (models: ModelItem[]) =>
-      models.filter((item) => model.favorite.isFavorite(key(item))).sort(byCost),
+    favorites: (models: ModelItem[]) => models.filter((item) => model.favorite.isFavorite(key(item))),
     isFavorite: (item: ModelItem) => model.favorite.isFavorite(key(item)),
     toggleFavorite: (item: ModelItem) => model.favorite.toggle(key(item)),
-    current: () => {
-      const value = model.current()
-      return value ? modelKey(value) : undefined
-    },
+    current,
     select: (item: ModelItem) => {
       model.set({ modelID: item.id, providerID: item.provider.id }, { recent: true })
       input.onSelect()
@@ -767,6 +774,10 @@ function createModelSelectorController(input: {
 }
 
 type NavRow = { navKey: string; item?: ModelItem }
+type SelectorRenderRow =
+  | { kind: "header"; key: string; provider?: string; title: string }
+  | { kind: "separator"; key: string }
+  | { kind: "item"; key: string; navKey: string; item: ModelItem }
 
 function ModelSelectorPopoverV2View(props: {
   trigger: ModelSelectorTrigger
@@ -790,10 +801,134 @@ function ModelSelectorPopoverV2View(props: {
   const [tables] = createResource(() => getUsageTables())
   const profileTable = () => tables()?.profile ?? []
   const pricingTable = () => tables()?.pricing ?? []
-  const [store, setStore] = createStore({ open: false, search: "", active: "", rail: "", submenu: "" })
+  const sdk = useSDK()
+  const [store, setStore] = createStore({ open: false, search: persistedModelSearch, active: "", rail: "", submenu: "" })
   let searchRef: HTMLInputElement | undefined
   let contentRef: HTMLDivElement | undefined
   const dismiss = createMenuDismissController(() => contentRef)
+  let submenuTimer: ReturnType<typeof setTimeout> | undefined
+  let pendingSubmenu: string | undefined
+
+  // Centralized DeepSeek period: one timer for the whole selector, not one per row.
+  const deepSeekNow = createPolled(() => new Date(), 60_000)
+  const deepSeekPeriod = createMemo(() => deepSeekRatePeriod(deepSeekNow()))
+
+  // Centralized OpenRouter endpoint cache: one store + ring prefetcher instead of
+  // per-row signals + per-hover fetches that each hit localStorage + network.
+  const [openRouterStore, setOpenRouterStore] = createStore<
+    Record<string, { loading: boolean; endpoints: OpenRouterEndpoint[] | undefined }>
+  >({})
+  const openRouterPrefetched = new Set<string>()
+  const fetchOpenRouterEndpoints = async (model: string): Promise<OpenRouterEndpoint[]> => {
+    const [endpointsResponse, telemetryResponseRaw] = await Promise.all([
+      sdk().client.experimental.openrouterEndpoints.get({ model }, { throwOnError: true }),
+      sdk().client.experimental.openrouterTelemetry.get({ model, timeRange: "1w" }, { throwOnError: false }).catch(() => undefined),
+    ])
+    const telemetryResponse = telemetryResponseRaw?.data ?? telemetryResponseRaw
+    const perMillion = (value: number) => (Math.abs(value) > 0 && Math.abs(value) < 1e-4 ? value * 1_000_000 : value)
+    const endpoints = endpointsResponse.data.map((entry) => {
+      const entryTelemetry = telemetryResponse?.find(
+        (t) => t.providerName === entry.providerName || t.providerSlug === entry.provider,
+      )
+      return {
+        providerName: entry.providerName,
+        tag: entry.tag,
+        provider: entry.provider,
+        pricing: {
+          prompt: perMillion(Number(entry.pricing.prompt)),
+          completion: perMillion(Number(entry.pricing.completion)),
+          cacheRead: perMillion(Number(entry.pricing.cacheRead)),
+        },
+        uptime: entry.uptime === undefined ? undefined : Number(entry.uptime),
+        telemetry: entryTelemetry
+          ? {
+              cacheHitPercent: entryTelemetry.cacheHitPercent,
+              throughputTps: entryTelemetry.throughputTps,
+            }
+          : undefined,
+      }
+    })
+    return endpoints
+  }
+  const ensureOpenRouter = (modelID: string) => {
+    const existing = openRouterStore[modelID]
+    if (existing?.loading || existing?.endpoints !== undefined) return
+    openRouterPrefetched.add(modelID)
+    setOpenRouterStore(modelID, { loading: true, endpoints: undefined })
+    void getOpenRouterEndpoints(modelID, fetchOpenRouterEndpoints).then((result) => {
+      setOpenRouterStore(modelID, { loading: false, endpoints: result })
+    })
+  }
+
+  // Hover is intentionally treated as an intent, not an immediate state change.
+  // Scanning across rows should stay entirely CSS-only; only a row that remains
+  // hovered long enough gets a tooltip/submenu and the associated reactive work.
+  const TOOLTIP_INTENT_DELAY = 64
+  const SUBMENU_INTENT_DELAY = 80
+  let hoverRaf = 0
+  let hoverTimer: ReturnType<typeof setTimeout> | undefined
+  let pendingActive: string | null = null
+  const flushPendingActive = () => {
+    hoverRaf = 0
+    const next = pendingActive
+    pendingActive = null
+    if (next !== null && store.active !== next) setStore("active", next)
+  }
+  const cancelHoverIntent = () => {
+    pendingActive = null
+    if (hoverRaf) {
+      cancelAnimationFrame(hoverRaf)
+      hoverRaf = 0
+    }
+    if (hoverTimer !== undefined) {
+      clearTimeout(hoverTimer)
+      hoverTimer = undefined
+    }
+  }
+  const setSubmenu = (navKey: string, open: boolean, modelID: string) => {
+    if (!open) {
+      if (pendingSubmenu === navKey) {
+        pendingSubmenu = undefined
+        if (submenuTimer !== undefined) clearTimeout(submenuTimer)
+        submenuTimer = undefined
+      }
+      if (store.submenu === navKey) setStore("submenu", "")
+      return
+    }
+    if (pendingSubmenu === navKey || store.submenu === navKey) return
+    if (submenuTimer !== undefined) clearTimeout(submenuTimer)
+    pendingSubmenu = navKey
+    submenuTimer = setTimeout(() => {
+      submenuTimer = undefined
+      pendingSubmenu = undefined
+      setStore("submenu", navKey)
+      ensureOpenRouter(modelID)
+    }, SUBMENU_INTENT_DELAY)
+  }
+  const activate = (navKey: string) => {
+    if (store.submenu && store.submenu !== navKey) setStore("submenu", "")
+    if (pendingSubmenu && pendingSubmenu !== navKey) {
+      pendingSubmenu = undefined
+      if (submenuTimer !== undefined) clearTimeout(submenuTimer)
+      submenuTimer = undefined
+    }
+    if (store.active === navKey) {
+      cancelHoverIntent()
+      return
+    }
+    pendingActive = navKey
+    if (hoverTimer !== undefined) clearTimeout(hoverTimer)
+    hoverTimer = setTimeout(() => {
+      hoverTimer = undefined
+      if (hoverRaf) cancelAnimationFrame(hoverRaf)
+      hoverRaf = requestAnimationFrame(flushPendingActive)
+    }, TOOLTIP_INTENT_DELAY)
+  }
+  onCleanup(() => {
+    cancelHoverIntent()
+    if (submenuTimer !== undefined) clearTimeout(submenuTimer)
+    pendingSubmenu = undefined
+  })
 
   const models = createMemo(() => props.models(store.search))
   // The provider rail is derived from the full (search-filtered) model list so
@@ -817,6 +952,21 @@ function ModelSelectorPopoverV2View(props: {
   const hasContent = () => (store.rail === favoritesRailKey ? favorites().length > 0 : railModels().length > 0)
   const favoriteKey = (item: ModelItem) => `fav:${modelKey(item)}`
 
+  // O(1) lookups for hover: avoid linear `models().find` per hover and
+  // `querySelector` DOM scans (forced layout). Refs are populated as rows mount.
+  const rowRefs = new Map<string, HTMLElement>()
+  const setRowRef = (key: string) => (element: HTMLElement | undefined) => {
+    if (element) rowRefs.set(key, element)
+    else rowRefs.delete(key)
+  }
+  const modelByKey = createMemo(() => {
+    const map = new Map<string, ModelItem>()
+    for (const item of models()) {
+      map.set(modelKey(item), item)
+      map.set(`fav:${modelKey(item)}`, item)
+    }
+    return map
+  })
   // Deliberately does NOT fall back to `usage.latest.aggregate`: that figure
   // spans every credential the account has ever used (including long-since
   // reset/exhausted ones), which is why an earlier version of this pinned at
@@ -851,35 +1001,157 @@ function ModelSelectorPopoverV2View(props: {
       personalized: personalCost !== undefined,
     }
   }
-  // Compute usage once per model and reuse it for the max-requests scaling and
-  // every rendered row, instead of running the profile/pricing match loops
-  // twice per model (once here, once per row) on every open.
-  // Deferred until after first paint so opening the selector paints the model
-  // list immediately; the usage bars (and the cost-index scan they can trigger)
-  // fill in on the next idle frame instead of blocking the open.
-  const [usageReady, setUsageReady] = createSignal(false)
-  onMount(() => {
-    const schedule = (cb: () => void) =>
-      typeof requestIdleCallback === "function"
-        ? requestIdleCallback(cb, { timeout: 200 })
-        : setTimeout(cb, 0)
-    schedule(() => setUsageReady(true))
-  })
-  const usageMap = createMemo(() => {
-    const map = new Map<string, ReturnType<typeof usageFor>>()
-    if (!usageReady()) return map
-    for (const item of models()) {
-      map.set(modelKey(item), usageFor(item))
+  // Ring prefetcher for OpenRouter: after open, warm endpoint data on idle, 3 at
+  // a time. This effect deliberately never reads openRouterStore: reading a
+  // reactive cache while writing it would restart the ring after every result.
+  createEffect(() => {
+    if (!store.open) return
+    // Capture the current filtered model list; re-runs when search/rail changes.
+    const ids = [...new Set(models().filter((item) => item.provider.id === "openrouter").map((item) => item.id))]
+    if (ids.length === 0) return
+    let cancelled = false
+    const MAX_CONCURRENT = 3
+    let inFlight = 0
+    let index = 0
+    const pump = () => {
+      if (cancelled) return
+      while (inFlight < MAX_CONCURRENT && index < ids.length) {
+        const id = ids[index++]
+        if (openRouterPrefetched.has(id)) continue
+        openRouterPrefetched.add(id)
+        inFlight++
+        setOpenRouterStore(id, { loading: true, endpoints: undefined })
+        void getOpenRouterEndpoints(id, fetchOpenRouterEndpoints)
+          .then((result) => {
+            if (!cancelled) setOpenRouterStore(id, { loading: false, endpoints: result })
+          })
+          .finally(() => {
+            inFlight--
+            if (index < ids.length) {
+              const schedule =
+                typeof requestIdleCallback === "function"
+                  ? () => requestIdleCallback(pump, { timeout: 400 })
+                  : () => setTimeout(pump, 32)
+              schedule()
+            }
+          })
+      }
     }
-    return map
+    let idleHandle: number | undefined
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+    if (typeof requestIdleCallback === "function") idleHandle = requestIdleCallback(pump, { timeout: 600 })
+    else timeoutHandle = setTimeout(pump, 64)
+    onCleanup(() => {
+      cancelled = true
+      if (idleHandle !== undefined && typeof cancelIdleCallback === "function") cancelIdleCallback(idleHandle)
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle)
+    })
   })
-  const maxRequests = createMemo(() => {
-    let max = 0
-    for (const item of models()) {
-      const requests = usageMap().get(modelKey(item))?.estimatedRequests
-      if (requests !== undefined && requests > max) max = requests
+
+  // Shared tooltip: single floating card driven by active row, instead of N
+  // Kobalte Tooltip instances each with MutationObserver + floating-ui overhead
+  // and openDelay=0 mount on every hover. This cuts ~50 Tooltip managers to 1.
+  const [tooltipPos, setTooltipPos] = createSignal<{ x: number; y: number } | null>(null)
+  let tooltipPositionFrame = 0
+  let tooltipSuppressedFor: string | undefined
+  onCleanup(() => {
+    if (tooltipPositionFrame) cancelAnimationFrame(tooltipPositionFrame)
+  })
+  const setTooltipPosition = (position: { x: number; y: number } | null) => {
+    const current = tooltipPos()
+    if (!position) {
+      if (current) setTooltipPos(null)
+      return
     }
-    return max
+    if (current?.x === position.x && current.y === position.y) return
+    setTooltipPos(position)
+  }
+  const tooltipModel = createMemo<ModelItem | undefined>(() => {
+    const active = store.active
+    if (!active || active === manageKey) return undefined
+    const candidate = modelByKey().get(active) ?? modelByKey().get(active.startsWith("fav:") ? active.slice(4) : active)
+    if (!candidate || candidate.provider.id === "openrouter") return undefined
+    if (store.rail !== "" && store.rail !== favoritesRailKey && candidate.provider.id !== store.rail) return undefined
+    if (store.rail === favoritesRailKey && !props.isFavorite(candidate)) return undefined
+    if (!store.open) return undefined
+    return candidate
+  })
+  const tooltipUsage = createMemo(() => {
+    const item = tooltipModel()
+    return item ? usageMap().get(modelKey(item)) : undefined
+  })
+  const updateTooltipPosition = () => {
+    const active = store.active
+    if (tooltipSuppressedFor === active) {
+      setTooltipPosition(null)
+      return
+    }
+    const item = tooltipModel()
+    if (!item) {
+      setTooltipPosition(null)
+      return
+    }
+    const element = rowRefs.get(store.active)
+    const viewport = scrollRoot()
+    if (!viewport) {
+      setTooltipPosition(null)
+      return
+    }
+    if (!element || !element.isConnected || !contentRef?.contains(element)) {
+      tooltipSuppressedFor = active
+      setTooltipPosition(null)
+      return
+    }
+    const rect = element.getBoundingClientRect()
+    const viewportRect = viewport.getBoundingClientRect()
+    if (rect.bottom <= viewportRect.top || rect.top >= viewportRect.bottom || rect.height === 0) {
+      tooltipSuppressedFor = active
+      setTooltipPosition(null)
+      return
+    }
+    const width = 236
+    const height = 280
+    let x = rect.right + 6
+    let y = rect.top
+    if (x + width > window.innerWidth) x = rect.left - width - 6
+    if (x < 8) x = 8
+    if (y + height > window.innerHeight) y = Math.max(8, window.innerHeight - height - 8)
+    if (y < 8) y = 8
+    setTooltipPosition({ x, y })
+  }
+  createEffect(() => {
+    void tooltipModel()
+    void store.open
+    void scrollRoot()
+    if (tooltipSuppressedFor !== store.active) tooltipSuppressedFor = undefined
+    if (!store.open) {
+      setTooltipPos(null)
+      return
+    }
+    if (tooltipPositionFrame) cancelAnimationFrame(tooltipPositionFrame)
+    tooltipPositionFrame = requestAnimationFrame(() => {
+      tooltipPositionFrame = 0
+      updateTooltipPosition()
+    })
+  })
+  createEffect(() => {
+    if (!store.open || !tooltipModel()) return
+    const viewport = scrollRoot()
+    if (!viewport) return
+    const onScroll = () => {
+      if (tooltipSuppressedFor === store.active) return
+      if (tooltipPositionFrame) return
+      tooltipPositionFrame = requestAnimationFrame(() => {
+        tooltipPositionFrame = 0
+        updateTooltipPosition()
+      })
+    }
+    viewport.addEventListener("scroll", onScroll)
+    window.addEventListener("resize", onScroll)
+    onCleanup(() => {
+      viewport.removeEventListener("scroll", onScroll)
+      window.removeEventListener("resize", onScroll)
+    })
   })
 
   const rows = createMemo<NavRow[]>(() => [
@@ -887,50 +1159,104 @@ function ModelSelectorPopoverV2View(props: {
     ...groups().flatMap((group) => group.items.map((item) => ({ navKey: modelKey(item), item }))),
     { navKey: manageKey },
   ])
-  // Streamed rendering slices. Selection, search-first-key, and keyboard nav
-  // all operate on the full logical list (rows()/navKeys()); only the DOM is
-  // deferred. Slices keep item identity so <For> appends without remounting.
-  const [renderLimit, setRenderLimit] = createSignal(INITIAL_RENDER_ROWS)
-  const favoriteSlice = createMemo(() => (showFavorites() ? favorites().slice(0, renderLimit()) : []))
-  // Per-group visible counts start where favorites left off; groups themselves
-  // stay keyed by category so the outer <For> keeps stable identities while
-  // slices grow.
-  const groupVisibleCounts = createMemo(() => {
-    let budget = Math.max(0, renderLimit() - favorites().length)
-    const counts = new Map<string, number>()
-    for (const group of groups()) {
-      const count = Math.min(group.items.length, budget)
-      counts.set(group.category, count)
-      budget -= count
+  const renderRows = createMemo<SelectorRenderRow[]>(() => {
+    const result: SelectorRenderRow[] = []
+    if (showFavorites()) {
+      result.push({ kind: "header", key: "header:favorites", title: language.t("dialog.model.favorites") })
+      result.push(...favorites().map((item) => ({ kind: "item" as const, key: favoriteKey(item), navKey: favoriteKey(item), item })))
+      result.push({ kind: "separator", key: "separator:favorites" })
     }
-    return counts
+    if (showProviderGroups()) {
+      for (const group of groups()) {
+        result.push({
+          kind: "header",
+          key: `header:${group.category}`,
+          provider: group.category,
+          title: group.items[0].provider.name,
+        })
+        result.push(
+          ...group.items.map((item) => ({ kind: "item" as const, key: modelKey(item), navKey: modelKey(item), item })),
+        )
+      }
+    }
+    return result
   })
-  const renderedCount = createMemo(
-    () =>
-      (showFavorites() ? favorites().length : 0) +
-      (showProviderGroups() ? groups().reduce((total, group) => total + group.items.length, 0) : 0),
+  const [scrollRoot, setScrollRoot] = createSignal<HTMLDivElement>()
+  const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
+    get count() {
+      return renderRows().length
+    },
+    getScrollElement: () => scrollRoot() ?? null,
+    initialRect: { width: 316, height: 320 },
+    estimateSize: (index) => (renderRows()[index]?.kind === "header" ? 28 : renderRows()[index]?.kind === "separator" ? 5 : 28),
+    overscan: 8,
+    getItemKey: (index) => renderRows()[index]?.key ?? index,
+    rangeExtractor: (range) => {
+      const indexes = defaultRangeExtractor(range)
+      const active = store.active
+      const activeIndex = renderRows().findIndex((row) => row.kind === "item" && row.navKey === active)
+      if (activeIndex < 0 || indexes.includes(activeIndex)) return indexes
+      return [...indexes, activeIndex].sort((a, b) => a - b)
+    },
+  })
+  createEffect(
+    on(
+      () => store.rail,
+      () => setTooltipPos(null),
+      { defer: true },
+    ),
+  )
+  // TanStack may reuse VirtualItem objects when indexes stay stable. Solid's
+  // <For> keys by object identity, so snapshot the row alongside each virtual
+  // item to force an intentional replacement when search changes the model at
+  // the same index.
+  const virtualRows = createMemo(() =>
+    virtualizer.getVirtualItems().map((virtualRow) => ({
+      virtualRow,
+      row: renderRows()[virtualRow.index],
+    })),
   )
   createEffect(() => {
-    const total = renderedCount()
-    if (renderLimit() >= total) return
-    const grow = () => setRenderLimit((limit) => Math.min(total, limit + RENDER_CHUNK))
-    const handle =
-      typeof requestIdleCallback === "function"
-        ? requestIdleCallback(grow, { timeout: 120 })
-        : setTimeout(grow, 0)
-    onCleanup(() => {
-      if (typeof cancelIdleCallback === "function") cancelIdleCallback(handle as number)
-      else clearTimeout(handle as number)
+    if (!store.open || !store.active) return
+    const active = store.active
+    const index = renderRows().findIndex((row) => row.kind === "item" && row.navKey === active)
+    if (index < 0 || !scrollRoot()) return
+    const range = virtualizer.range
+    if (range && index >= range.startIndex && index <= range.endIndex) return
+    queueMicrotask(() => {
+      const next = renderRows().findIndex((row) => row.kind === "item" && row.navKey === active)
+      if (next >= 0) virtualizer.scrollToIndex(next, { align: "auto" })
     })
   })
-  createEffect(() => {
-    const active = store.active
-    if (!active || active === manageKey) return
-    const index = rows().findIndex((row) => row.navKey === active)
-    if (index < 0) return
-    if (index + ACTIVE_RENDER_BUFFER > renderLimit()) {
-      setRenderLimit(Math.min(renderedCount(), index + ACTIVE_RENDER_BUFFER))
+  // Usage bars are presentation metadata, not navigation data. Calculate them
+  // only for mounted virtual rows; the full catalog must never be scanned just
+  // because the selector opened.
+  const [usageReady, setUsageReady] = createSignal(false)
+  onMount(() => {
+    const schedule = (cb: () => void) =>
+      typeof requestIdleCallback === "function" ? requestIdleCallback(cb, { timeout: 200 }) : setTimeout(cb, 0)
+    schedule(() => setUsageReady(true))
+  })
+  const visibleUsageItems = createMemo(() =>
+    virtualizer
+      .getVirtualItems()
+      .map((virtualRow) => renderRows()[virtualRow.index])
+      .filter((row): row is Extract<SelectorRenderRow, { kind: "item" }> => row?.kind === "item")
+      .map((row) => row.item),
+  )
+  const usageMap = createMemo(() => {
+    const map = new Map<string, ReturnType<typeof usageFor>>()
+    if (!usageReady() || !store.open) return map
+    for (const item of visibleUsageItems()) map.set(modelKey(item), usageFor(item))
+    return map
+  })
+  const maxRequests = createMemo(() => {
+    let max = 0
+    for (const item of visibleUsageItems()) {
+      const requests = usageMap().get(modelKey(item))?.estimatedRequests
+      if (requests !== undefined && requests > max) max = requests
     }
+    return max
   })
   const navKeys = () => rows().map((row) => row.navKey)
   const initialActive = () => {
@@ -939,22 +1265,28 @@ function ModelSelectorPopoverV2View(props: {
     if (selected && options.includes(selected)) return selected
     return options[0] ?? ""
   }
-  const activeItem = () =>
-    store.active ? contentRef?.querySelector<HTMLElement>(`[data-option-key="${CSS.escape(store.active)}"]`) : undefined
   const setOpen = (open: boolean) => {
     if (open) {
+      if (submenuTimer !== undefined) clearTimeout(submenuTimer)
+      submenuTimer = undefined
+      pendingSubmenu = undefined
+      cancelHoverIntent()
       dismiss.allowTriggerRestore()
-      setRenderLimit(INITIAL_RENDER_ROWS)
       setStore({ open: true, active: initialActive(), submenu: "" })
       setTimeout(() =>
         requestAnimationFrame(() => {
           searchRef?.focus()
-          activeItem()?.scrollIntoView({ block: "nearest" })
         }),
       )
       return
     }
-    setStore({ open: false, search: "", active: "", submenu: "" })
+    cancelHoverIntent()
+    if (submenuTimer !== undefined) clearTimeout(submenuTimer)
+    submenuTimer = undefined
+    pendingSubmenu = undefined
+    // Keep the query for the next open; the explicit clear control remains the
+    // user's way to reset it. This makes repeated model switching much faster.
+    setStore({ open: false, active: "", submenu: "" })
   }
   const selectModel = (item: ModelItem) => {
     dismiss.preventTriggerRestore()
@@ -985,15 +1317,40 @@ function ModelSelectorPopoverV2View(props: {
     if (options.length === 0) return
     const index = options.indexOf(store.active)
     const start = index === -1 ? 0 : index
-    setStore("active", options[(start + delta + options.length) % options.length])
-    queueMicrotask(() => activeItem()?.scrollIntoView({ block: "nearest" }))
+    const next = options[(start + delta + options.length) % options.length]
+    setStore("active", next)
+    queueMicrotask(() => {
+      const index = renderRows().findIndex((row) => row.kind === "item" && row.navKey === next)
+      const range = virtualizer.range
+      if (index >= 0 && (!range || index < range.startIndex || index > range.endIndex)) {
+        virtualizer.scrollToIndex(index, { align: "auto" })
+      }
+    })
   }
   const setSearch = (value: string) => {
-    const filtered = props.models(value)
-    const fav = props.favorites(filtered)
-    const firstKey = fav[0] ? favoriteKey(fav[0]) : filtered[0] ? modelKey(filtered[0]) : manageKey
-    setStore({ search: value, active: firstKey })
+    persistedModelSearch = value
+    setStore("search", value)
   }
+
+  // Wait for the search memo to settle before choosing the first result. Reading
+  // models() immediately after setStore("search", ...) observes the old list
+  // during Solid's event batch and leaves the UI stale until the next reopen.
+  createEffect(
+    on(
+      () => store.search,
+      () => {
+        const filtered = models()
+        const fav = favorites()
+        const firstKey = fav[0] ? favoriteKey(fav[0]) : filtered[0] ? modelKey(filtered[0]) : manageKey
+        if (store.active !== firstKey) setStore("active", firstKey)
+        if (scrollRoot()) {
+          virtualizer.measure()
+          virtualizer.scrollToOffset(0)
+        }
+      },
+      { defer: true },
+    ),
+  )
 
   createEffect(() => {
     if (!store.open) return
@@ -1006,30 +1363,32 @@ function ModelSelectorPopoverV2View(props: {
   })
 
   const renderRow = (item: ModelItem, navKey: string) => {
-    // Read the per-model usage computed once in usageMap rather than
-    // re-running the profile/pricing match loops for every rendered row.
-    const usage = createMemo(() => usageMap().get(modelKey(item)))
+    const itemKey = modelKey(item)
+    const current = props.current() === itemKey
+    const usage = usageMap().get(itemKey)
+    const price = hasPublishedPricing(item.cost) ? formatPricePerM(modelCost(item)) : "—"
     if (item.provider.id === "openrouter") {
+      const cached = openRouterStore[item.id]
       return (
         <OpenRouterRow
           item={item}
           navKey={navKey}
-          active={store.active === navKey}
-          current={props.current() === modelKey(item)}
+          current={current}
           favorited={props.isFavorite(item)}
           pinned={props.subProviderGet(item)}
-          usage={usage()}
+          usage={usage}
           maxRequests={maxRequests()}
-          onActivate={() => setStore("active", navKey)}
+          priceLabel={price}
+          rowRef={setRowRef(navKey)}
+          endpoints={cached?.endpoints}
+          loading={cached?.loading ?? false}
+          period={deepSeekPeriod()}
+          onActivate={() => {
+            activate(navKey)
+          }}
           onToggleFavorite={() => props.onToggleFavorite(item)}
           submenuOpen={store.submenu === navKey}
-          onSubmenuChange={(open) => {
-            if (open) {
-              setStore("submenu", navKey)
-              return
-            }
-            if (store.submenu === navKey) setStore("submenu", "")
-          }}
+          onSubmenuChange={(open) => setSubmenu(navKey, open, item.id)}
           onPickProvider={(tag) => {
             props.subProviderSet(item, tag)
             selectModel(item)
@@ -1038,66 +1397,38 @@ function ModelSelectorPopoverV2View(props: {
       )
     }
     return (
-      <TooltipV2
-        class="w-full"
-        placement="right-start"
-        gutter={6}
-        openDelay={0}
-        value={
-          <ModelTooltip model={item} latest={item.latest} free={isFree(item.provider.id, item.cost)} usage={usage()} v2 />
-        }
+      <MenuV2.Item
+        ref={setRowRef(navKey)}
+        data-option-key={navKey}
+        data-selected-model={current ? true : undefined}
+        classList={{ "!bg-v2-overlay-simple-overlay-hover": current }}
+        class="scroll-my-6 w-full hover:bg-v2-overlay-simple-overlay-hover"
+        onMouseEnter={() => activate(navKey)}
+        onSelect={() => selectModel(item)}
       >
-        <MenuV2.RadioItem
-          value={modelKey(item)}
-          data-option-key={navKey}
-          data-selected-model={props.current() === modelKey(item) ? true : undefined}
-          class="scroll-my-6 w-full"
-          classList={{ "!bg-v2-overlay-simple-overlay-hover": store.active === navKey }}
-          onMouseEnter={() => {
-            setStore("active", navKey)
-            setTimeout(() => searchRef?.focus())
-          }}
-          onSelect={() => selectModel(item)}
-        >
-          <ProviderIcon id={item.provider.id} class="size-3.5 shrink-0 opacity-60" />
-          <span class="min-w-0 flex-1 truncate leading-5">{item.name}</span>
-          <DeepSeekRateBadge model={item} v2 />
-          <Show when={isFree(item.provider.id, item.cost)}>
-            <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
-          </Show>
-          <Show when={item.latest}>
-            <TagV2 class="shrink-0">{language.t("model.tag.latest")}</TagV2>
-          </Show>
-          <ModelRowMeta
-            item={item}
-            usage={usage()}
-            maxRequests={maxRequests()}
-            price={<span class="text-[10px] font-[520] leading-5">{formatPricePerM(modelCost(item))}</span>}
-          />
-          <ModelFavoriteToggle favorited={props.isFavorite(item)} onToggle={() => props.onToggleFavorite(item)} />
-        </MenuV2.RadioItem>
-      </TooltipV2>
-    )
-  }
-
-  // Renders a group's model rows. Standard models are RadioItems and need a
-  // RadioGroup to track the active selection; OpenRouter rows are nested
-  // `Menu.Sub`s, which Kobalte registers in the parent menu's selection
-  // manager — mixing them into the same RadioGroup corrupts selection and
-  // dismissal (models stop selecting, the menu stops closing). So standard
-  // rows stay in a RadioGroup and OpenRouter Subs are rendered beside it.
-  const rowList = (items: ModelItem[], keyFor: (item: ModelItem) => string) => {
-    const standard = items.filter((item) => item.provider.id !== "openrouter")
-    const openrouter = items.filter((item) => item.provider.id === "openrouter")
-    return (
-      <>
-        <Show when={standard.length > 0}>
-          <MenuV2.RadioGroup value={props.current()}>
-            <For each={standard}>{(item) => renderRow(item, keyFor(item))}</For>
-          </MenuV2.RadioGroup>
+        <ProviderIcon id={item.provider.id} class="size-3.5 shrink-0 opacity-60" />
+        <span class="min-w-0 flex-1 truncate leading-5">{stripUnlimitedSuffix(item.name)}</span>
+        <DeepSeekRateBadge model={item} v2 period={deepSeekPeriod()} />
+        <Show when={isUnlimitedModel(item)}>
+          <TagV2 class="shrink-0">{language.t("model.tag.unlimited")}</TagV2>
         </Show>
-        <For each={openrouter}>{(item) => renderRow(item, keyFor(item))}</For>
-      </>
+        <Show when={isFree(item.provider.id, item.cost)}>
+          <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
+        </Show>
+        <Show when={item.latest}>
+          <TagV2 class="shrink-0">{language.t("model.tag.latest")}</TagV2>
+        </Show>
+        <ModelRowMeta
+          item={item}
+          usage={usage}
+          maxRequests={maxRequests()}
+          price={<span class="text-[10px] font-[520] leading-5">{price}</span>}
+        />
+        <Show when={current}>
+          <Icon name="check" size="small" class="shrink-0 text-v2-text-text-accent" />
+        </Show>
+        <ModelFavoriteToggle favorited={props.isFavorite(item)} onToggle={() => props.onToggleFavorite(item)} />
+      </MenuV2.Item>
     )
   }
 
@@ -1192,7 +1523,11 @@ function ModelSelectorPopoverV2View(props: {
                   classList={{ "!text-v2-state-fg-warning": store.rail === favoritesRailKey }}
                   aria-label={language.t("dialog.model.favorites")}
                   title={language.t("dialog.model.favorites")}
-                  onClick={() => setStore("rail", store.rail === favoritesRailKey ? "" : favoritesRailKey)}
+                  onClick={() => {
+                    tooltipSuppressedFor = store.active
+                    setTooltipPos(null)
+                    setStore("rail", store.rail === favoritesRailKey ? "" : favoritesRailKey)
+                  }}
                 >
                   <Show when={store.rail === favoritesRailKey}>
                     <span class="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-v2-state-fg-warning" />
@@ -1214,7 +1549,11 @@ function ModelSelectorPopoverV2View(props: {
                       classList={{ "!text-v2-text-text-accent": store.rail === provider.id }}
                       aria-label={provider.name}
                       title={provider.name}
-                      onClick={() => setStore("rail", store.rail === provider.id ? "" : provider.id)}
+                      onClick={() => {
+                        tooltipSuppressedFor = store.active
+                        setTooltipPos(null)
+                        setStore("rail", store.rail === provider.id ? "" : provider.id)
+                      }}
                     >
                       <Show when={store.rail === provider.id}>
                         <span class="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-v2-text-text-accent" />
@@ -1225,68 +1564,84 @@ function ModelSelectorPopoverV2View(props: {
                 )}
               </For>
             </div>
-            <ScrollView data-slot="model-selector-scroll" class="min-h-0 flex-1">
-              <div class="flex flex-col p-0.5 pt-0">
-                <Show
-                  when={hasContent()}
-                  fallback={
-                    <div class="flex h-12 items-center px-3 text-[13px] font-[440] leading-5 tracking-[-0.04px] text-v2-text-text-faint">
-                      {language.t("dialog.model.empty")}
-                    </div>
-                  }
-                >
-                  <Show when={showFavorites()}>
-                  <MenuV2.Group>
-                    <MenuV2.GroupLabel class="gap-2 px-3">
-                      <Icon name="star-filled" size="small" class="shrink-0 text-v2-state-fg-warning" />
-                      <span class="min-w-0 flex-1 truncate">{language.t("dialog.model.favorites")}</span>
-                    </MenuV2.GroupLabel>
-                    {rowList(favoriteSlice(), favoriteKey)}
-                  </MenuV2.Group>
-                  <MenuV2.Separator class="my-0.5" />
-                </Show>
-                <Show when={showProviderGroups()}>
-                  <For each={groups()}>
-                    {(group) => (
-                      <Show when={(groupVisibleCounts().get(group.category) ?? 0) > 0}>
-                        <MenuV2.Group>
-                        <MenuV2.GroupLabel class="gap-2 px-3">
-                          <ProviderIcon id={group.category} class="size-3.5 shrink-0 opacity-70" />
-                          <span class="min-w-0 flex-1 truncate">{group.items[0].provider.name}</span>
-                          <Show when={group.category === "opencode"}>
-                            <button
-                              type="button"
-                              class="flex size-5 shrink-0 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"
-                              aria-label={language.t("dialog.credential.manageKeys")}
-                              onPointerDown={(event) => event.preventDefault()}
-                              onClick={(event) => {
-                                event.stopPropagation()
-                                props.onManageCredentials()
-                              }}
+            <ScrollView
+              data-slot="model-selector-scroll"
+              class="min-h-0 flex-1"
+              viewportRef={setScrollRoot}
+            >
+              <Show
+                when={hasContent()}
+                fallback={
+                  <div class="flex h-12 items-center px-3 text-[13px] font-[440] leading-5 tracking-[-0.04px] text-v2-text-text-faint">
+                    {language.t("dialog.model.empty")}
+                  </div>
+                }
+              >
+                <div class="relative p-0.5 pt-0" style={{ height: `${virtualizer.getTotalSize()}px` }}>
+                  <For each={virtualRows()}>
+                    {(entry) => {
+                      const virtualRow = entry.virtualRow
+                      const row = entry.row
+                      if (!row) return null
+                      if (row.kind === "separator") {
+                        return (
+                          <div
+                            class="absolute inset-x-0 top-0 h-px bg-v2-border-border-muted"
+                            style={{ transform: `translateY(${virtualRow.start}px)` }}
+                          />
+                        )
+                      }
+                      if (row.kind === "header") {
+                        return (
+                          <div
+                            data-slot="menu-v2-group-label"
+                            class="absolute inset-x-0 top-0 box-border flex h-7 items-center gap-2 px-3 text-[11px] font-[530] leading-none tracking-[0.05px] text-v2-text-text-faint"
+                            style={{ transform: `translateY(${virtualRow.start}px)` }}
+                          >
+                            <Show
+                              when={row.provider}
+                              fallback={<Icon name="star-filled" size="small" class="shrink-0 text-v2-state-fg-warning" />}
                             >
-                              <Icon name="outline-sliders" size="small" />
-                            </button>
-                          </Show>
-                        </MenuV2.GroupLabel>
-                        {rowList(group.items.slice(0, groupVisibleCounts().get(group.category) ?? 0), modelKey)}
-                        </MenuV2.Group>
-                      </Show>
-                    )}
+                              <ProviderIcon id={row.provider!} class="size-3.5 shrink-0 opacity-70" />
+                            </Show>
+                            <span class="min-w-0 flex-1 truncate">{row.title}</span>
+                            <Show when={row.provider === "opencode"}>
+                              <button
+                                type="button"
+                                class="flex size-5 shrink-0 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"
+                                aria-label={language.t("dialog.credential.manageKeys")}
+                                onPointerDown={(event) => event.preventDefault()}
+                                onClick={(event) => {
+                                  event.stopPropagation()
+                                  props.onManageCredentials()
+                                }}
+                              >
+                                <Icon name="outline-sliders" size="small" />
+                              </button>
+                            </Show>
+                          </div>
+                        )
+                      }
+                      return (
+                        <div
+                          class="absolute inset-x-0 top-0"
+                          style={{ transform: `translateY(${virtualRow.start}px)` }}
+                        >
+                          {renderRow(row.item, row.navKey)}
+                        </div>
+                      )
+                    }}
                   </For>
-                </Show>
+                </div>
               </Show>
-            </div>
-          </ScrollView>
+            </ScrollView>
           </div>
           <div class="h-px bg-v2-border-border-muted" />
           <div class="flex flex-col p-0.5">
             <MenuV2.Item
               data-option-key={manageKey}
-              classList={{ "!bg-v2-overlay-simple-overlay-hover": store.active === manageKey }}
-              onMouseEnter={() => {
-                setStore("active", manageKey)
-                setTimeout(() => searchRef?.focus())
-              }}
+              class="hover:bg-v2-overlay-simple-overlay-hover"
+              onMouseEnter={() => activate(manageKey)}
               onSelect={manage}
             >
               <Icon name="outline-sliders" size="small" />
@@ -1294,6 +1649,34 @@ function ModelSelectorPopoverV2View(props: {
             </MenuV2.Item>
           </div>
         </MenuV2.Content>
+        <Show when={tooltipModel()}>
+          {(item) => (
+            <Show when={tooltipPos()}>
+              {(position) => (
+                <div
+                  data-component="tooltip-v2"
+                  style={{
+                    position: "fixed",
+                    left: `${position().x}px`,
+                    top: `${position().y}px`,
+                    "pointer-events": "none",
+                    "z-index": 1000,
+                  }}
+                >
+                  <ModelTooltip
+                    model={item()}
+                    latest={item().latest}
+                    free={isFree(item().provider.id, item().cost)}
+                    unlimited={isUnlimitedModel(item())}
+                    usage={tooltipUsage()}
+                    period={deepSeekPeriod()}
+                    v2
+                  />
+                </div>
+              )}
+            </Show>
+          )}
+        </Show>
       </MenuV2.Portal>
     </MenuV2>
   )

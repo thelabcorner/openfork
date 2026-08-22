@@ -195,6 +195,7 @@ export const DESKTOP_MENU: DesktopMenu[] = [
       { type: "item", labelKey: "desktop.menu.toggleContext", command: "context.toggle" },
       { type: "item", labelKey: "desktop.menu.toggleUsage", command: "usage.toggle" },
       { type: "item", labelKey: "desktop.menu.toggleModelList", command: "models.toggle" },
+      { type: "item", labelKey: "desktop.menu.toggleLimits", command: "limits.toggle" },
       { type: "separator" },
       { type: "item", labelKey: "desktop.menu.reload", action: "view.reload", role: "reload" },
       {

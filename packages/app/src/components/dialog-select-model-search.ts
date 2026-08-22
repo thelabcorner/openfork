@@ -1,5 +1,7 @@
 export const normalizeModelSearch = (value: string) =>
   value
+    .normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
     .replace(/[^\p{Letter}\p{Number}]+/gu, " ")
     .trim()
@@ -7,12 +9,22 @@ export const normalizeModelSearch = (value: string) =>
 
 export const compactModelSearch = (value: string) => normalizeModelSearch(value).replaceAll(" ", "")
 
-export const matchesModelSearch = (query: string, values: string[]) => {
-  const search = normalizeModelSearch(query)
-  if (!search) return true
+const searchTokens = (value: string) => normalizeModelSearch(value).split(" ").filter(Boolean)
 
-  const compactSearch = compactModelSearch(query)
-  return values.some(
-    (value) => normalizeModelSearch(value).includes(search) || compactModelSearch(value).includes(compactSearch),
-  )
+export const prepareModelSearchFields = (values: string[]) =>
+  values.map((value) => {
+    const normalized = normalizeModelSearch(value)
+    return { normalized, compact: normalized.replaceAll(" ", "") }
+  })
+
+export const createModelSearchMatcher = (query: string) => {
+  const tokens = searchTokens(query)
+  if (tokens.length === 0) return () => true
+  const compactTokens = tokens.map((token) => token.replaceAll(" ", ""))
+
+  return (fields: ReturnType<typeof prepareModelSearchFields>) =>
+    tokens.every((token, index) => fields.some((field) => field.normalized.includes(token) || field.compact.includes(compactTokens[index])))
 }
+
+export const matchesModelSearch = (query: string, values: string[]) =>
+  createModelSearchMatcher(query)(prepareModelSearchFields(values))

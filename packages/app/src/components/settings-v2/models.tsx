@@ -10,6 +10,7 @@ import { useLanguage } from "@/context/language"
 import { useModels } from "@/context/models"
 import { useServerSDK } from "@/context/server-sdk"
 import { popularProviders } from "@/hooks/use-providers"
+import { stripUnlimitedSuffix } from "@/utils/model-badges"
 import { Persist, persisted } from "@/utils/persist"
 import { SettingsListV2 } from "./parts/list"
 import { SettingsRowV2 } from "./parts/row"
@@ -157,7 +158,7 @@ export const SettingsModelsV2: Component = () => {
                           {(item) => {
                             const key = { providerID: item.provider.id, modelID: item.id }
                             return (
-                              <SettingsRowV2 title={item.name} description="">
+                              <SettingsRowV2 title={stripUnlimitedSuffix(item.name)} description="">
                                 <div>
                                   <Switch
                                     checked={models.visible(key)}
@@ -166,7 +167,7 @@ export const SettingsModelsV2: Component = () => {
                                     }}
                                     hideLabel
                                   >
-                                    {item.name}
+                                    {stripUnlimitedSuffix(item.name)}
                                   </Switch>
                                 </div>
                               </SettingsRowV2>

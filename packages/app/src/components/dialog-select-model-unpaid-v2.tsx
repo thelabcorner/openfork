@@ -11,10 +11,11 @@ import { useProviders } from "@/hooks/use-providers"
 import { decode64 } from "@/utils/base64"
 import { useLanguage } from "@/context/language"
 import { ModelTooltip } from "./model-tooltip"
+import { isUnlimitedModel } from "@/utils/model-badges"
 
 type ModelState = ReturnType<typeof useLocal>["model"]
 const featuredProviders = ["opencode", "opencode-go", "openai", "anthropic", "google", "github-copilot"]
-const displayModelName = (name: string) => name.replace(/\s+(?:\(free\)|free)$/i, "")
+const displayModelName = (name: string) => name.replace(/\s+(?:\((?:free|unlimited)\)|free|unlimited)$/i, "")
 
 export const DialogSelectModelUnpaidV2: Component<{ model?: ModelState }> = (props) => {
   const local = useLocal()
@@ -95,6 +96,7 @@ export const DialogSelectModelUnpaidV2: Component<{ model?: ModelState }> = (pro
                       model={{ ...item, name: displayModelName(item.name) }}
                       latest={item.latest}
                       free={isFree(item)}
+                      unlimited={isUnlimitedModel(item)}
                       v2
                     />
                   }
@@ -106,6 +108,9 @@ export const DialogSelectModelUnpaidV2: Component<{ model?: ModelState }> = (pro
                   >
                     <span class="min-w-0 truncate">{displayModelName(item.name)}</span>
                     <Tag class="shrink-0">{language.t("model.tag.free")}</Tag>
+                    <Show when={isUnlimitedModel(item)}>
+                      <Tag class="shrink-0">{language.t("model.tag.unlimited")}</Tag>
+                    </Show>
                     <Show when={item.latest}>
                       <Tag class="shrink-0">{language.t("model.tag.latest")}</Tag>
                     </Show>

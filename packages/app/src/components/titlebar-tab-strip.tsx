@@ -329,6 +329,11 @@ export function TitlebarTabStrip(props: {
   const [visibility, setVisibility] = createStore<Record<string, boolean>>({})
   const visibleTabs = createMemo(() => props.tabs.filter((tab) => tab.type === "draft" || visibility[tabKey(tab)]))
   const visibleTabIds = () => visibleTabs().map(tabKey)
+  const visibleIndexMap = createMemo(() => {
+    const map = new Map<string, number>()
+    visibleTabs().forEach((tab, i) => map.set(tabKey(tab), i))
+    return map
+  })
 
   command.register("titlebar-tab-cycle", () => [
     {
@@ -348,6 +353,23 @@ export function TitlebarTabStrip(props: {
       onSelect: () => selectAdjacentTab(1),
     },
   ])
+
+  // Consolidated single registration for mod+1..9 (was per-tab useTabShortcut + repeated findIndex).
+  // Reduces Solid subscriptions, command churn, and work on strip re-renders/inactive tabs.
+  command.register("titlebar-tab-numbers", () => {
+    const vtabs = visibleTabs()
+    return vtabs.slice(0, 9).map((tab, i) => {
+      const number = i + 1
+      return {
+        id: `tab.${number}`,
+        category: "tab",
+        title: "",
+        keybind: `mod+${number}`,
+        hidden: true,
+        onSelect: () => props.onNavigate(tab),
+      }
+    })
+  })
 
   function selectAdjacentTab(offset: -1 | 1) {
     const current = props.currentTab()
@@ -439,8 +461,7 @@ export function TitlebarTabStrip(props: {
               {(tab) => {
                 const id = tabKey(tab)
                 let ref!: HTMLDivElement
-                const visibleIndex = () => visibleTabs().findIndex((item) => tabKey(item) === id)
-                useTabShortcut(visibleIndex, () => props.onNavigate(tab, ref))
+                const visibleIndex = () => visibleIndexMap().get(id) ?? -1
                 const serverCtx = createMemo(() => {
                   if (tab.type !== "session") return
                   const conn = global.servers.list().find((item) => ServerConnection.key(item) === tab.server)
@@ -465,6 +486,7 @@ export function TitlebarTabStrip(props: {
                     />
                   )
                 }
+
 
                 if (tab.type === "group") {
                   return (
@@ -515,23 +537,4 @@ export function TitlebarTabStrip(props: {
       />
     </div>
   )
-}
-
-function useTabShortcut(index: () => number, onSelect: () => void) {
-  const command = useCommand()
-
-  command.register(() => {
-    const number = index() + 1
-    if (number < 1 || number > 9) return []
-    return [
-      {
-        id: `tab.${number}`,
-        category: "tab",
-        title: "",
-        keybind: `mod+${number}`,
-        hidden: true,
-        onSelect,
-      },
-    ]
-  })
 }

@@ -10,8 +10,14 @@ type Driver = {
   getBlob(id: string): Promise<Blob | null>
 }
 
-export type DraftStore = AsyncStorage & { putBlob(blob: Blob): Promise<BlobReference> }
+export type DraftStore = AsyncStorage & {
+  putBlob(blob: Blob): Promise<BlobReference>
+  /** Commit pending debounced writes immediately (unload, tests). */
+  flush(): Promise<void>
+}
 const urls = new Map<string, string>()
+
+const DRAFT_WRITE_DEBOUNCE_MS = 500
 
 function blobUrl(id: string, blob: Blob) {
   const existing = urls.get(id)
@@ -35,9 +41,37 @@ export async function createBlobReference(blob: Blob): Promise<BlobReference> {
 
 export function createDraftStore(driver: Driver): DraftStore {
   const versions = new Map<string, number>()
+  const pending = new Map<string, { value: string; timer: ReturnType<typeof setTimeout> }>()
   const putBlob = async (blob: Blob) => {
     const id = await driver.putBlob(blob)
     return { id, url: blobUrl(id, blob) }
+  }
+  // Draft prompts can be hundreds of KB; encoding is a full JSON round-trip, so
+  // keystroke-driven writes are coalesced and only the latest value ever commits.
+  const commit = async (key: string, value: string) => {
+    const version = (versions.get(key) ?? 0) + 1
+    versions.set(key, version)
+    const encoded = JSON.stringify(await encode(JSON.parse(value)))
+    if (versions.get(key) === version) await driver.set(key, encoded)
+  }
+  const schedule = (key: string, value: string) => {
+    const queued = pending.get(key)
+    if (queued) clearTimeout(queued.timer)
+    const timer = setTimeout(() => {
+      pending.delete(key)
+      void commit(key, value).catch(() => undefined)
+    }, DRAFT_WRITE_DEBOUNCE_MS)
+    pending.set(key, { value, timer })
+  }
+  const flush = async () => {
+    const entries = [...pending]
+    pending.clear()
+    await Promise.all(
+      entries.map(async ([key, entry]) => {
+        clearTimeout(entry.timer)
+        await commit(key, entry.value).catch(() => undefined)
+      }),
+    )
   }
   const encode = async (value: unknown): Promise<unknown> => {
     if (Array.isArray(value)) return Promise.all(value.map(encode))
@@ -77,20 +111,25 @@ export function createDraftStore(driver: Driver): DraftStore {
   }
   return {
     getItem: async (key) => {
+      const queued = pending.get(key)?.value
+      if (queued !== undefined) return queued
       const value = await driver.get(key)
       return value === null ? null : JSON.stringify(await decode(JSON.parse(value)))
     },
     setItem: async (key, value) => {
-      const version = (versions.get(key) ?? 0) + 1
-      versions.set(key, version)
-      const encoded = JSON.stringify(await encode(JSON.parse(value)))
-      if (versions.get(key) === version) await driver.set(key, encoded)
+      schedule(key, value)
     },
     removeItem: async (key) => {
+      const queued = pending.get(key)
+      if (queued) {
+        clearTimeout(queued.timer)
+        pending.delete(key)
+      }
       versions.set(key, (versions.get(key) ?? 0) + 1)
       await driver.remove(key)
     },
     putBlob,
+    flush,
   }
 }
 
@@ -140,7 +179,7 @@ export function createBrowserDraftStore(): DraftStore {
       transaction.addEventListener("error", () => reject(transaction.error))
     })
   }
-  return createDraftStore({
+  const store = createDraftStore({
     get: async (key) => ((await get("documents", key)) as string | undefined) ?? null,
     set: (key, value) => write("documents", key, value),
     remove: (key) => write("documents", key),
@@ -151,6 +190,17 @@ export function createBrowserDraftStore(): DraftStore {
     },
     getBlob: async (id) => ((await get("blobs", id)) as Blob | undefined) ?? null,
   })
+  attachDraftFlush(store)
+  return store
+}
+
+export function attachDraftFlush(store: DraftStore) {
+  const flush = () => void store.flush()
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flush()
+  })
+  globalThis.addEventListener("pagehide", flush)
+  globalThis.addEventListener("beforeunload", flush)
 }
 
 export async function blobDataUrl(blob: BlobReference, mime: string) {

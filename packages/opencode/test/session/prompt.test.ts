@@ -941,6 +941,20 @@ it.instance("loop continues when finish is unknown", () =>
       expect(result.parts.some((part) => part.type === "text" && part.text === "second")).toBe(true)
       expect(result.info.finish).toBe("stop")
     }
+
+    // Continuation context (#43892): the N+1 generation must be TOLD why it
+    // is running (previous response ended "unknown"), instead of appearing
+    // as a blank/phantom user turn. Request-only — gen 1 has no notice.
+    const hits = yield* llm.hits
+    const firstBody = JSON.stringify(hits[0]?.body)
+    expect(firstBody).not.toContain("AUTOMATIC CONTINUATION")
+    const secondMessages = ((hits[1]?.body as { messages?: Array<{ role: string; content: unknown }> })
+      ?.messages ?? []) as Array<{ role: string; content: unknown }>
+    const lastUserTurn = secondMessages.findLast((m) => m.role === "user")
+    expect(JSON.stringify(lastUserTurn?.content)).toContain("AUTOMATIC CONTINUATION")
+    // The persisted session must NOT contain it (request-only injection).
+    const finalMsgs = yield* sessions.messages({ sessionID: session.id })
+    expect(JSON.stringify(finalMsgs)).not.toContain("AUTOMATIC CONTINUATION")
   }),
 )
 

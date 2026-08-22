@@ -45,6 +45,13 @@ export const Idle = Event.define({
   type: "session.idle",
   schema: {
     sessionID: SessionID,
+    /**
+     * Why the session went idle. "aborted" means the transition was caused by
+     * an operator cancel (user pressed stop / run was cancelled), not a natural
+     * turn end — consumers that auto-resume work MUST treat it as an explicit
+     * stop and not re-prompt the session.
+     */
+    reason: optional(Schema.Literal("aborted")),
   },
 })
 

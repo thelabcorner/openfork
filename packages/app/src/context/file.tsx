@@ -43,7 +43,17 @@ export { selectionFromLines }
 export type MentionSymbolKind = "fn" | "method" | "class" | "interface" | "type" | "enum" | "const" | (string & {})
 
 export type MentionResult =
-  | { kind: "file"; path: string; type?: "file" | "directory"; positions?: number[] }
+  | {
+      kind: "file"
+      path: string
+      type?: "file" | "directory"
+      positions?: number[]
+      /** Basename start offset in the full path; positions are basename-relative when > 0. */
+      baseOffset?: number
+      size?: number
+      mtime?: number
+      lineCount?: number
+    }
   | {
       kind: "symbol"
       name: string

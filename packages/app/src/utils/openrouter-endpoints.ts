@@ -13,11 +13,13 @@
 export type OpenRouterEndpoint = {
   providerName: string
   tag: string
-  // OpenRouter's provider.only pins by provider slug, not the quantization
-  // tag — derive it by stripping any "/quantization" suffix from `tag`.
   provider: string
   pricing: { prompt: number; completion: number; cacheRead: number }
   uptime: number | undefined
+  telemetry?: {
+    cacheHitPercent: number
+    throughputTps?: number
+  }
 }
 
 type CacheEntry = { version: number; fetchedAt: number; endpoints: OpenRouterEndpoint[] }
@@ -31,6 +33,8 @@ const CACHE_VERSION = 1
 
 const memoryCache = new Map<string, CacheEntry>()
 const inflight = new Map<string, Promise<OpenRouterEndpoint[] | undefined>>()
+const pendingWrites = new Map<string, CacheEntry>()
+let persistHandle: number | ReturnType<typeof setTimeout> | undefined
 
 const cacheKey = (id: string) => `opencode.openrouter-endpoints.v4.${id}`
 
@@ -53,11 +57,31 @@ function readCache(id: string): CacheEntry | undefined {
 function writeCache(id: string, entry: CacheEntry) {
   memoryCache.set(id, entry)
   if (typeof localStorage === "undefined") return
-  try {
-    localStorage.setItem(cacheKey(id), JSON.stringify(entry))
-  } catch {
-    // best-effort cache only
+  pendingWrites.set(cacheKey(id), entry)
+  schedulePersist()
+}
+
+// localStorage serialization and writes are synchronous. Keep them out of the
+// request completion path and commit at most one model per idle slice so a ring
+// of OpenRouter responses cannot interrupt hover/scroll frames.
+function schedulePersist() {
+  if (persistHandle !== undefined || pendingWrites.size === 0) return
+  const flush = () => {
+    persistHandle = undefined
+    const next = pendingWrites.entries().next()
+    if (next.done) return
+    pendingWrites.delete(next.value[0])
+    try {
+      localStorage.setItem(next.value[0], JSON.stringify(next.value[1]))
+    } catch {
+      // best-effort cache only
+    }
+    schedulePersist()
   }
+  persistHandle =
+    typeof requestIdleCallback === "function"
+      ? requestIdleCallback(flush, { timeout: 1_000 })
+      : setTimeout(flush, 100)
 }
 
 // Returns the endpoint list for a model, `[]` when the model has no upstream

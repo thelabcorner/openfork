@@ -1,3 +1,4 @@
+import { autopsyMark } from "./autopsy-timing" // STARTUP-AUTOPSY: temporary probe, see 02-main-process.md
 import { randomUUID } from "node:crypto"
 import { mkdirSync, rmSync } from "node:fs"
 import * as http from "node:http"
@@ -118,6 +119,7 @@ function ensureLoopbackNoProxy() {
 }
 
 const main = Effect.gen(function* () {
+  autopsyMark("main-body-start") // STARTUP-AUTOPSY
   contextMenu({ showSaveImageAs: true, showLookUpSelection: false, showSearchWithGoogle: false })
 
   // on macOS apps run in `/` which can cause issues with ripgrep
@@ -257,9 +259,12 @@ const main = Effect.gen(function* () {
 
   const serverReady = Deferred.makeUnsafe<ServerReadyData, unknown>()
 
+  autopsyMark("whenReady-wait-start") // STARTUP-AUTOPSY
   yield* Effect.promise(() => app.whenReady())
+  autopsyMark("whenReady-done") // STARTUP-AUTOPSY
 
   if (!TEST_ONBOARDING) migrate()
+  autopsyMark("migrate-done") // STARTUP-AUTOPSY
   yield* Effect.promise(() => cleanupStoreFiles(app.getPath("userData"))).pipe(
     Effect.tap((result) =>
       Effect.sync(() => {
@@ -273,11 +278,13 @@ const main = Effect.gen(function* () {
       }),
     ),
   )
+  autopsyMark("store-cleanup-done") // STARTUP-AUTOPSY
   app.setAsDefaultProtocolClient("opencode")
   registerRendererProtocol()
   wireWebviewHardening(resolveGuestPreloadPath())
   setDockIcon()
-  const updater = setupAutoUpdater(stopSidecars)
+  const updater = yield* Effect.promise(() => setupAutoUpdater(stopSidecars))
+  autopsyMark("updater-configured") // STARTUP-AUTOPSY
   const menuDeps = {
     trigger: (id: string) => {
       const win = getLastFocusedWindow()
@@ -318,6 +325,7 @@ const main = Effect.gen(function* () {
     },
   })
   registerWslIpcHandlers(wslServers)
+  autopsyMark("ipc-registered") // STARTUP-AUTOPSY (includes draft-store sqlite open + orphan scan)
 
   // Browser engine: guest registry + CDP control + arbitration + host bridge.
   // Constructed once; start() (host hello) happens after the sidecar is up.
@@ -340,6 +348,7 @@ const main = Effect.gen(function* () {
   })
   registerBrowserIpcHandlers(browserEngine)
   void updater.start()
+  autopsyMark("updater-start-fired") // STARTUP-AUTOPSY (async network check kicked off pre-window)
   const updateTimer = setInterval(() => void updater.check(), 10 * 60 * 1000)
   updateTimer.unref()
   app.once("will-quit", () => clearInterval(updateTimer))
@@ -368,7 +377,9 @@ const main = Effect.gen(function* () {
     restoreMainWindows()
   })
 
+  autopsyMark("windows-restore-start") // STARTUP-AUTOPSY
   const windows = restoreMainWindows()
+  autopsyMark("windows-created", { count: windows.length }) // STARTUP-AUTOPSY
   if (windows.length) createMenu(menuDeps)
 
   const loadingTask = yield* Effect.gen(function* () {
@@ -419,6 +430,7 @@ const main = Effect.gen(function* () {
     const password = randomUUID()
 
     logger.log("spawning sidecar", { url })
+    autopsyMark("sidecar-spawn-start") // STARTUP-AUTOPSY
     const { listener, health } = yield* Effect.promise(() =>
       spawnLocalServer(hostname, port, password, {
         userDataPath: app.getPath("userData"),
@@ -427,6 +439,7 @@ const main = Effect.gen(function* () {
         onExit: (code) => writeLog("utility", "sidecar exited", { code }, "warn"),
       }),
     )
+    autopsyMark("sidecar-ready-msg") // STARTUP-AUTOPSY (utility process sent {type:"ready"})
     server = listener
     readyData = { url, username: "opencode", password }
     yield* Deferred.succeed(serverReady, readyData)
@@ -443,11 +456,13 @@ const main = Effect.gen(function* () {
         }),
       ),
     )
+    autopsyMark("sidecar-health-done") // STARTUP-AUTOPSY
 
     logger.log("loading task finished")
   }).pipe(forwardInitializationFailure(serverReady), Effect.forkChild)
 
   yield* Fiber.await(loadingTask)
+  autopsyMark("loading-task-done") // STARTUP-AUTOPSY
 
   // Sidecar is up (serverReady settled by the loadingTask above): start the
   // browser host bridge (loopback listener + sidecar hello registration).

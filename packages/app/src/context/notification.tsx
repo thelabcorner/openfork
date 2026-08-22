@@ -23,6 +23,16 @@ const ERROR_SOUND_DEBOUNCE_MS = 5_000
 let lastErrorSoundTime = 0
 let lastErrorToastTime = 0
 
+function sessionErrorDescription(error: unknown, fallback: string) {
+  if (typeof error === "string") return error
+  if (error && typeof error === "object" && "data" in error) {
+    const data = (error as { data?: { message?: string } }).data
+    if (data?.message) return data.message
+  }
+  if (error instanceof Error) return error.message
+  return fallback
+}
+
 type NotificationBase = {
   directory?: string
   session?: string
@@ -374,6 +384,11 @@ function createServerNotificationState(input: {
     time: number,
   ) => {
     const sessionID = event.properties.sessionID
+    const error = "error" in event.properties ? event.properties.error : undefined
+    console.error("[session.error]", { directory, sessionID, error })
+    if (!sessionID) return
+    if (error && typeof error === "object" && "name" in error && error.name === "MessageAbortedError") return
+
     void lookup(directory, sessionID).then((session) => {
       if (meta.disposed) return
       if (session?.parentID) return
@@ -386,19 +401,19 @@ function createServerNotificationState(input: {
         }
       }
 
-      const error = "error" in event.properties ? event.properties.error : undefined
       append({
         directory,
         time,
         viewed: false,
         type: "error",
-        session: sessionID ?? "global",
+        session: sessionID,
         error,
       })
-      const description =
-        session?.title ??
-        (typeof error === "string" ? error : language.t("notification.session.error.fallbackDescription"))
-      const href = sessionID ? `/${base64Encode(directory)}/session/${sessionID}` : `/${base64Encode(directory)}`
+      const description = sessionErrorDescription(
+        error,
+        language.t("notification.session.error.fallbackDescription"),
+      )
+      const href = `/${base64Encode(directory)}/session/${sessionID}`
       if (settings.notifications.errors()) {
         void platform.notify(language.t("notification.session.error.title"), description, () => input.navigate(href))
       }

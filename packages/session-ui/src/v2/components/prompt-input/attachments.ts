@@ -98,6 +98,22 @@ export function createPromptInputV2Attachments(
   }
   const add = async (file: File, toast = true, target = capture(), clipboard = false) => {
     if (!target) return false
+    const archiveKind = detectArchiveKind(file.name)
+    if (archiveKind) {
+      const sourcePath = input.getPathForFile?.(file) || undefined
+      if (!sourcePath) {
+        if (toast) input.warn()
+        return false
+      }
+      input.focusEditor()
+      input.addPart({
+        type: "text",
+        content: archiveInstructions(sourcePath, archiveKind, file.size),
+        start: 0,
+        end: 0,
+      })
+      return true
+    }
     const mime = await attachmentMime(file)
     if (!mime) {
       if (toast) input.warn()
@@ -187,7 +203,19 @@ export function createPromptInputV2Attachments(
       return
     }
     const files = event.dataTransfer?.files
-    if (files) await addAttachments(Array.from(files))
+    if (files && files.length > 0) {
+      await addAttachments(Array.from(files))
+      return
+    }
+    if (!plainText) return
+    const text = plainText.includes("\r") ? plainText.replace(/\r\n?/g, "\n") : plainText
+    if (largePaste(text)) {
+      const file = new File([text], pasteFilename(), { type: "text/markdown" })
+      await add(file, true)
+      return
+    }
+    input.focusEditor()
+    input.addPart({ type: "text", content: text, start: 0, end: 0 })
   }
 
   onMount(() => {
@@ -272,7 +300,63 @@ function cursorPosition(editor: HTMLElement) {
   return before.toString().replace(/\u200B/g, "").length
 }
 
-function largePaste(text: string) {
+export function largePaste(text: string) {
   if (text.length >= 8000) return true
   return text.split("\n").length - 1 >= 120
+}
+
+export function pasteFilename() {
+  return `pasted-${new Date().toISOString().replace(/[:.]/g, "-")}.md`
+}
+
+// Compound suffixes (tar containers) must be matched before their bare single-file
+// counterpart, or "data.tar.gz" would be misdetected as a plain "gz" stream.
+const ARCHIVE_TAR_SUFFIXES = [
+  ".tar.gz",
+  ".tgz",
+  ".tar.bz2",
+  ".tbz2",
+  ".tar.xz",
+  ".txz",
+  ".tar.zst",
+  ".tzst",
+  ".tar.lz4",
+  ".tar.lzma",
+  ".tar",
+]
+const ARCHIVE_SINGLE_SUFFIXES = [".gz", ".bz2", ".xz", ".zst", ".br", ".lz4", ".lzma"]
+
+export function detectArchiveKind(filename: string): string | undefined {
+  const lower = filename.toLowerCase()
+  for (const suffix of ARCHIVE_TAR_SUFFIXES) {
+    if (lower.endsWith(suffix)) return suffix.slice(1)
+  }
+  if (lower.endsWith(".zip")) return "zip"
+  if (lower.endsWith(".7z")) return "7z"
+  if (lower.endsWith(".rar")) return "rar"
+  for (const suffix of ARCHIVE_SINGLE_SUFFIXES) {
+    if (lower.endsWith(suffix)) return suffix.slice(1)
+  }
+  return undefined
+}
+
+function humanFileSize(bytes: number): string {
+  if (bytes < 1024) return `${bytes} B`
+  const units = ["KB", "MB", "GB", "TB"]
+  let value = bytes / 1024
+  let unit = 0
+  while (value >= 1024 && unit < units.length - 1) {
+    value /= 1024
+    unit++
+  }
+  const rounded = value >= 100 ? Math.round(value) : value >= 10 ? Math.round(value * 10) / 10 : Math.round(value * 100) / 100
+  return `${rounded} ${units[unit]}`
+}
+
+export function archiveInstructions(path: string, kind: string, size: number): string {
+  return [
+    `[Archive attached: ${path} (${kind}, ${humanFileSize(size)})]`,
+    `Use the archive tool on this path — do not read the raw archive bytes or load the whole file into context.`,
+    `List its contents first, then read or extract only the entries you actually need.`,
+  ].join("\n")
 }

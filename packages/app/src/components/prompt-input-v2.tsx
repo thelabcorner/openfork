@@ -332,11 +332,8 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     return prompt.context.items().filter((item) => !!item.comment?.trim()).length
   })
   const blank = createMemo(() => {
-    const text = prompt
-      .current()
-      .map((part) => ("content" in part ? part.content : ""))
-      .join("")
-    return text.trim().length === 0 && attachments().length === 0 && commentCount() === 0
+    if (attachments().length > 0 || commentCount() > 0) return false
+    return prompt.current().every((part) => !("content" in part) || part.content.trim().length === 0)
   })
   const stopping = createMemo(() => working() && blank())
   const placeholder = createMemo(() =>
@@ -563,12 +560,19 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     searchContextFiles: async (query, options) =>
       (await files.searchMentions(query, options)).results.flatMap((entry) => {
         if (entry.kind !== "file") return []
+        // normalizeMentionPage projects positions onto the basename; this label
+        // is the FULL path, so shift them back into label space.
+        const dirOffset = entry.baseOffset !== undefined && entry.baseOffset > 0 ? entry.baseOffset : 0
         return [
           {
             id: `file:${entry.path}`,
             kind: "file" as const,
             label: entry.path,
             path: entry.path,
+            positions: entry.positions?.map((p) => p + dirOffset),
+            size: entry.size,
+            mtime: entry.mtime,
+            lineCount: entry.lineCount,
             mention: { type: "file", path: entry.path, content: `@${entry.path}`, start: 0, end: 0 },
           },
         ]

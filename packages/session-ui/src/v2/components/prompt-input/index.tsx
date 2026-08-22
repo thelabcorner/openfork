@@ -98,6 +98,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
           emptyLabel={i18n.t("ui.promptInput.noMatchingItems")}
           items={props.controller.suggestions()}
           activeID={state.popover.type === "closed" ? undefined : state.popover.activeID}
+          query={state.popover.type === "closed" ? "" : state.popover.query}
           search={
             state.popover.type === "command-menu"
               ? {
@@ -172,10 +173,10 @@ export function PromptInputV2(props: PromptInputV2Props) {
             classList={{ "font-mono!": state.mode === "shell", "opacity-50": props.disabled }}
             onInput={(event) => {
               const cursor = promptInputV2Cursor(event.currentTarget)
-              const prompt = parsePromptInputV2Editor(event.currentTarget)
+              const { parts: prompt, text } = parsePromptInputV2Editor(event.currentTarget)
               const images = props.controller.parts().filter((part) => part.type === "image")
               localInput = true
-              props.controller.onInput(prompt.map((part) => part.content).join(""), [...prompt, ...images], cursor)
+              props.controller.onInput(text, [...prompt, ...images], cursor)
             }}
             onKeyDown={(event) => {
               if (props.controller.onKeyDown(event)) return
@@ -316,16 +317,19 @@ function parsePromptInputV2Editor(editor: HTMLDivElement) {
   const parts: Exclude<PromptInputV2Prompt[number], PromptInputV2Attachment>[] = []
   let buffer = ""
   let position = 0
+  let text = ""
 
   const flush = () => {
     if (!buffer) return
     parts.push({ type: "text", content: buffer, start: position, end: position + buffer.length })
     position += buffer.length
+    text += buffer
     buffer = ""
   }
   const mention = (element: HTMLElement) => {
     flush()
     const content = element.textContent ?? ""
+    text += content
     if (element.dataset.mention === "agent") {
       parts.push({
         type: "agent",
@@ -374,10 +378,10 @@ function parsePromptInputV2Editor(editor: HTMLDivElement) {
     parts.every((part) => part.type === "text") &&
     parts.every((part) => part.content.replace(/[\n\u200B]/g, "") === "")
   ) {
-    return [{ type: "text" as const, content: "", start: 0, end: 0 }]
+    return { parts: [{ type: "text" as const, content: "", start: 0, end: 0 }], text: "" }
   }
-  if (parts.length > 0) return parts
-  return [{ type: "text" as const, content: "", start: 0, end: 0 }]
+  if (parts.length > 0) return { parts, text }
+  return { parts: [{ type: "text" as const, content: "", start: 0, end: 0 }], text: "" }
 }
 
 function promptInputV2Cursor(editor: HTMLDivElement) {
@@ -587,10 +591,13 @@ function PromptInputV2ConfiguredSelect(props: {
       keybind={props.control.keybind?.() ?? props.keybind}
       options={props.control.options()}
       current={current()}
+      variant={!props.model}
       currentIcon={
-        <Show when={props.model && providerID()}>
-          <ProviderIcon id={providerID()!} class="size-4 shrink-0 opacity-60" />
-        </Show>
+        <>
+          <Show when={props.model && providerID()} fallback={props.model ? undefined : <PromptInputV2VariantIcon value={current()} index={props.control.options().findIndex((option) => option.id === current())} />}>
+            <ProviderIcon id={providerID()!} class="size-4 shrink-0 opacity-60" />
+          </Show>
+        </>
       }
       onSelect={props.control.onSelect}
     />
@@ -603,6 +610,7 @@ export function PromptInputV2Select(props: {
   options: PromptInputV2Option[]
   current: string
   currentIcon?: JSX.Element
+  variant?: boolean
   class?: string
   onOpenChange?: (open: boolean) => void
   onSelect: (id: string) => void
@@ -639,7 +647,12 @@ export function PromptInputV2Select(props: {
               <For each={props.options}>
                 {(option) => (
                   <MenuV2.RadioItem value={option.id} class="capitalize" closeOnSelect>
-                    {option.label}
+                    <span class="flex items-center gap-2">
+                      <Show when={props.variant}>
+                        <PromptInputV2VariantIcon value={option.id} index={props.options.indexOf(option)} />
+                      </Show>
+                      {option.label}
+                    </span>
                   </MenuV2.RadioItem>
                 )}
               </For>
@@ -651,10 +664,18 @@ export function PromptInputV2Select(props: {
   )
 }
 
+function PromptInputV2VariantIcon(props: { value: string; index: number }) {
+  const icons = ["brain", "dash", "glasses", "task", "subagent", "code", "mcp", "prompt", "selector", "sliders"] as const
+  const name = icons[props.index % icons.length]
+  return <Icon name={name} size="small" class="shrink-0 text-icon-info-active" />
+}
+
 export function PromptInputV2Popover(props: {
   emptyLabel: string
   items: PromptInputV2Suggestion[]
   activeID?: string
+  /** Current typed query, used for pragmatic substring highlighting when an item has no server-computed `positions`. */
+  query?: string
   search?: {
     value: string
     label: string
@@ -702,11 +723,16 @@ export function PromptInputV2Popover(props: {
             >
               <div class="flex min-w-0 flex-1 items-center gap-2">
                 <PromptInputV2SuggestionIcon item={item} />
-                <span class="shrink-0 text-v2-text-text-base">{item.label}</span>
+                <span class="shrink-0 text-v2-text-text-base">
+                  <PromptInputV2SuggestionLabel item={item} query={props.query} />
+                </span>
                 <Show when={item.description}>
                   <span class="min-w-0 truncate text-v2-text-text-muted">{item.description}</span>
                 </Show>
               </div>
+              <Show when={promptInputV2SuggestionMeta(item)}>
+                {(meta) => <span class="shrink-0 text-[11px] tabular-nums text-v2-text-text-faint">{meta()}</span>}
+              </Show>
               <Show when={item.keybind?.length}>
                 <span class="shrink-0 text-v2-text-text-muted">{item.keybind?.join("+")}</span>
               </Show>
@@ -716,6 +742,124 @@ export function PromptInputV2Popover(props: {
       </Show>
     </div>
   )
+}
+
+// Right-aligned, muted metadata (file size / modified time / line count), when available.
+// Only file-search results currently carry size/mtime/lineCount end-to-end — see
+// searchContextFiles's mapping in prompt-input-v2.tsx.
+function promptInputV2SuggestionMeta(item: PromptInputV2Suggestion): string | undefined {
+  if (item.kind !== "file") return undefined
+  // Epoch-0 / negative timestamps are coerced-absent metadata, never real:
+  // a size is only shown when the mtime pair is trustworthy.
+  const mtime = item.mtime
+  const hasTime = typeof mtime === "number" && Number.isFinite(mtime) && mtime > 0
+  const parts: string[] = []
+  if (hasTime && typeof item.size === "number" && Number.isFinite(item.size) && item.size >= 0)
+    parts.push(formatPromptInputV2FileSize(item.size))
+  if (hasTime && mtime !== undefined) parts.push(formatPromptInputV2RelativeTime(mtime))
+  if (
+    hasTime &&
+    typeof item.lineCount === "number" &&
+    Number.isFinite(item.lineCount) &&
+    item.lineCount >= 0
+  )
+    parts.push(formatPromptInputV2LineCount(item.lineCount))
+  return parts.length > 0 ? parts.join(" · ") : undefined
+}
+
+function formatPromptInputV2LineCount(lines: number): string {
+  if (!Number.isFinite(lines) || lines < 0) return ""
+  if (lines === 1) return "1 line"
+  if (lines < 1000) return `${lines} lines`
+  if (lines < 10000) return `${(lines / 1000).toFixed(1)}k lines`
+  return `${Math.round(lines / 1000)}k lines`
+}
+
+function formatPromptInputV2FileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return ""
+  if (bytes < 1000) return `${bytes} B`
+  const units = ["KB", "MB", "GB", "TB"]
+  let value = bytes / 1000
+  let unitIndex = 0
+  while (value >= 1000 && unitIndex < units.length - 1) {
+    value /= 1000
+    unitIndex++
+  }
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`
+}
+
+function formatPromptInputV2RelativeTime(mtimeMs: number, now: number = Date.now()): string {
+  // Non-positive timestamps are coerced-absent metadata (epoch 0 = 1970), never real.
+  if (!Number.isFinite(mtimeMs) || mtimeMs <= 0) return ""
+  const deltaMs = now - mtimeMs
+  if (!Number.isFinite(deltaMs)) return ""
+  if (deltaMs < 0) return "just now"
+  const seconds = Math.floor(deltaMs / 1000)
+  if (seconds < 45) return "just now"
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days < 30) return `${days}d ago`
+  const months = Math.floor(days / 30)
+  if (months < 12) return `${months}mo ago`
+  const years = Math.floor(months / 12)
+  return `${years}y ago`
+}
+
+// Highlights matched characters in a suggestion's label. Prefers server-
+// computed `positions` (character offsets into `label`, only present on
+// file-search results today — see MentionResult in packages/app/src/context/file.tsx).
+// Falls back to a plain case-insensitive substring match against the typed
+// query for everything else (agents/references/resources/recent files/
+// commands), since useFilteredList's client-side fuzzysort filtering doesn't
+// expose match indices. This is a deliberate pragmatic choice, not a
+// fabricated positions array.
+function PromptInputV2SuggestionLabel(props: { item: PromptInputV2Suggestion; query?: string }) {
+  const segments = createMemo(() => highlightPromptInputV2Label(props.item.label, props.item.positions, props.query))
+  return (
+    <For each={segments()}>
+      {(segment) =>
+        segment.matched ? (
+          <span class="rounded-[2px] bg-v2-overlay-simple-overlay-hover text-v2-text-text-accent">{segment.text}</span>
+        ) : (
+          <>{segment.text}</>
+        )
+      }
+    </For>
+  )
+}
+
+type PromptInputV2LabelSegment = { text: string; matched: boolean }
+
+function highlightPromptInputV2Label(label: string, positions: number[] | undefined, query: string | undefined): PromptInputV2LabelSegment[] {
+  if (positions && positions.length > 0) {
+    const matched = new Set(positions)
+    const segments: PromptInputV2LabelSegment[] = []
+    let buffer = ""
+    let bufferMatched = false
+    for (let index = 0; index < label.length; index++) {
+      const isMatched = matched.has(index)
+      if (buffer && isMatched !== bufferMatched) {
+        segments.push({ text: buffer, matched: bufferMatched })
+        buffer = ""
+      }
+      buffer += label[index]
+      bufferMatched = isMatched
+    }
+    if (buffer) segments.push({ text: buffer, matched: bufferMatched })
+    return segments
+  }
+  const needle = query?.trim()
+  if (!needle) return [{ text: label, matched: false }]
+  const index = label.toLowerCase().indexOf(needle.toLowerCase())
+  if (index === -1) return [{ text: label, matched: false }]
+  const segments: PromptInputV2LabelSegment[] = []
+  if (index > 0) segments.push({ text: label.slice(0, index), matched: false })
+  segments.push({ text: label.slice(index, index + needle.length), matched: true })
+  if (index + needle.length < label.length) segments.push({ text: label.slice(index + needle.length), matched: false })
+  return segments
 }
 
 export function PromptInputV2SubmitButton(props: {
@@ -762,7 +906,8 @@ export function PromptInputV2SubmitButton(props: {
 
 function PromptInputV2SuggestionIcon(props: { item: PromptInputV2Suggestion }) {
   if (props.item.kind === "agent") return <Icon name="brain" size="small" class="shrink-0 text-icon-info-active" />
-  if (props.item.kind === "command") return null
+  if (props.item.kind === "command") return <Icon name="terminal" size="small" class="shrink-0 text-icon-info-active" />
+  if (props.item.kind === "resource") return <Icon name="mcp" size="small" class="shrink-0 text-icon-info-active" />
   return (
     <FileIcon
       node={{ path: props.item.path ?? props.item.label, type: props.item.kind === "reference" ? "directory" : "file" }}

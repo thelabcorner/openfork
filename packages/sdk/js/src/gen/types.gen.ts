@@ -476,6 +476,11 @@ export type EventSessionIdle = {
   type: "session.idle"
   properties: {
     sessionID: string
+    /**
+     * Why the session went idle. "aborted" = operator cancel (user pressed
+     * stop), not a natural turn end.
+     */
+    reason?: "aborted"
   }
 }
 

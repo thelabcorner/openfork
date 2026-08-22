@@ -15,10 +15,23 @@ import type { SymbolEntry } from "./symbols"
 export interface PathEntry {
   readonly path: string
   readonly isDir: boolean
+  /** Seal-time capture only (Tier-2 metadata); undefined until sealed & stat succeeds. */
+  readonly size?: number
+  readonly mtime?: number
+  readonly lineCount?: number
 }
 
 const DEBOUNCE_MS = 150
 const CHUNK_SIZE = 8192
+const LINE_COUNT_MAX_BYTES = 512 * 1024
+const BINARY_EXT_RE =
+  /\.(png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|pdf|zip|tar|gz|tgz|bz2|xz|7z|rar|mp4|mp3|mov|avi|mkv|wasm|pyc|class|o|so|dll|exe|bin|dat|lock)$/i
+
+const shouldCountLines = (p: string, size: number): boolean => {
+  if (!Number.isFinite(size) || size <= 0 || size > LINE_COUNT_MAX_BYTES) return false
+  if (BINARY_EXT_RE.test(p)) return false
+  return true
+}
 
 export interface Interface {
   /** Full snapshot: persisted base + watcher deltas. Strings materialize lazily. */
@@ -65,6 +78,13 @@ const serviceLayer = Layer.effect(
     const tombstones = new Set<string>()
     const pending = new Map<string, PathEntry | undefined>()
     const sealed = new Map<string, PathEntry>()
+    // Tier-2 metadata (size/mtime) captured at seal time, kept as a SEPARATE
+    // key-value blob in the meta table (like `tombstones`) rather than inside
+    // the front-coded path-byte chunks. Front-coding compresses sorted path
+    // bytes only — there is no per-entry slot for auxiliary fields, so this
+    // side-map is the safe extension point. Best-effort: a stat failure just
+    // omits size/mtime for that path.
+    const fileMeta = new Map<string, { size: number; mtime: number; lineCount?: number }>()
     const symbols = new Map<string, SymbolEntry[]>()
     const listeners = new Set<(updates: readonly PathEntry[]) => void>()
 
@@ -87,18 +107,25 @@ const serviceLayer = Layer.effect(
       sealed.delete(entryPath)
       tombstones.add(entryPath)
       symbols.delete(entryPath)
+      fileMeta.delete(entryPath)
     }
 
     const loadRaw = Effect.gen(function* () {
-      const [fileChunks, dirChunks, storedTombstones] = yield* Effect.all([
+      const [fileChunks, dirChunks, storedTombstones, storedFileMeta] = yield* Effect.all([
         store.readRaw(KIND_FILE).pipe(Effect.catch(() => Effect.succeed<ChunkStore.RawChunk[]>([]))),
         store.readRaw(KIND_DIR).pipe(Effect.catch(() => Effect.succeed<ChunkStore.RawChunk[]>([]))),
         store.getMeta("tombstones").pipe(Effect.catch(() => Effect.succeed<string | undefined>(undefined))),
+        store.getMeta("fileMeta").pipe(Effect.catch(() => Effect.succeed<string | undefined>(undefined))),
       ])
       rawFileChunks = fileChunks
       rawDirChunks = dirChunks
       tombstones.clear()
       if (storedTombstones) for (const entryPath of JSON.parse(storedTombstones) as string[]) tombstones.add(entryPath)
+      fileMeta.clear()
+      if (storedFileMeta) {
+        const parsed = JSON.parse(storedFileMeta) as Array<[string, { size: number; mtime: number; lineCount?: number }]>
+        for (const [entryPath, meta] of parsed) fileMeta.set(entryPath, meta)
+      }
     })
     yield* loadRaw
 
@@ -123,7 +150,10 @@ const serviceLayer = Layer.effect(
       const push = (entry: PathEntry) => {
         if (seen.has(entry.path) || tombstones.has(entry.path)) return
         seen.add(entry.path)
-        out.push(entry)
+        const meta = !entry.isDir ? fileMeta.get(entry.path) : undefined
+        out.push(
+          meta ? { ...entry, size: meta.size, mtime: meta.mtime, lineCount: meta.lineCount } : entry,
+        )
       }
       // Base rows with a pending record are stale: deleted or superseded by
       // the overlay copies below.
@@ -158,7 +188,92 @@ const serviceLayer = Layer.effect(
         if (entry !== undefined) sealed.set(entryPath, entry)
       }
       yield* store.putMeta("tombstones", JSON.stringify([...tombstones])).pipe(Effect.ignore)
+      // Tier-2: best-effort stat capture for newly sealed files, alongside
+      // (not inside) the front-coded stream. One extra stat (+ optional line
+      // count for text files) per newly sealed file per debounced seal — bounded
+      // by watcher churn, not query volume.
+      const statTargets = adds.filter((entry) => !entry.isDir)
+      if (statTargets.length > 0) {
+        yield* Effect.forEach(
+          statTargets,
+          (entry) =>
+            fs.stat(path.join(root, entry.path)).pipe(
+              Effect.flatMap((info) => {
+                const size = Number(info.size)
+                const mtime = info.mtime._tag === "Some" ? info.mtime.value.getTime() : Date.now()
+                if (!shouldCountLines(entry.path, size)) {
+                  fileMeta.set(entry.path, { size, mtime })
+                  return Effect.void
+                }
+                return fs.readFileStringSafe(path.join(root, entry.path)).pipe(
+                  Effect.map((text) => {
+                    const lineCount = text === undefined ? undefined : text.split("\n").length
+                    fileMeta.set(entry.path, { size, mtime, lineCount })
+                  }),
+                  Effect.catch(() => {
+                    fileMeta.set(entry.path, { size, mtime })
+                    return Effect.void
+                  }),
+                )
+              }),
+              Effect.catch(() => Effect.void),
+            ),
+          { concurrency: 8 },
+        )
+        yield* store.putMeta("fileMeta", JSON.stringify([...fileMeta])).pipe(Effect.ignore)
+      }
     })
+
+    // If this was a fresh cache the ripgrep seed above left the full file set in
+    // `pending`. Flush it immediately so Tier-2 metadata (size/mtime/lineCount)
+    // is persisted without waiting for the next watcher event.
+    if (pending.size > 0) {
+      yield* seal.pipe(Effect.ignore)
+    }
+
+    // Backfill Tier-2 metadata for existing persisted chunks that were created
+    // before size/mtime/lineCount capture existed (or before the immediate-seal
+    // flush above). Runs in the background so startup stays fast.
+    yield* Effect.forkIn(
+      Effect.gen(function* () {
+        const missing = snapshot().filter((p) => !p.isDir && !fileMeta.has(p.path))
+        if (missing.length === 0) return
+        // Cap background work on enormous repos; prioritize visible files later
+        // via query-time enrichment if needed.
+        const batchSize = 1000
+        for (let i = 0; i < missing.length; i += batchSize) {
+          const batch = missing.slice(i, i + batchSize)
+          yield* Effect.forEach(
+            batch,
+            (entry) =>
+              fs.stat(path.join(root, entry.path)).pipe(
+                Effect.flatMap((info) => {
+                  const size = Number(info.size)
+                  const mtime = info.mtime._tag === "Some" ? info.mtime.value.getTime() : Date.now()
+                  if (!shouldCountLines(entry.path, size)) {
+                    fileMeta.set(entry.path, { size, mtime })
+                    return Effect.void
+                  }
+                  return fs.readFileStringSafe(path.join(root, entry.path)).pipe(
+                    Effect.map((text) => {
+                      const lineCount = text === undefined ? undefined : text.split("\n").length
+                      fileMeta.set(entry.path, { size, mtime, lineCount })
+                    }),
+                    Effect.catch(() => {
+                      fileMeta.set(entry.path, { size, mtime })
+                      return Effect.void
+                    }),
+                  )
+                }),
+                Effect.catch(() => Effect.void),
+              ),
+            { concurrency: 8 },
+          )
+          yield* store.putMeta("fileMeta", JSON.stringify([...fileMeta])).pipe(Effect.ignore)
+        }
+      }),
+      scope,
+    )
 
     const queue = yield* Queue.dropping<void>(256)
     yield* events.listen((event) =>
@@ -223,6 +338,8 @@ const serviceLayer = Layer.effect(
           yield* store.clear()
           tombstones.clear()
           yield* store.putMeta("tombstones", "[]").pipe(Effect.ignore)
+          // fileMeta entries survive compaction (paths unchanged); re-persist as-is.
+          yield* store.putMeta("fileMeta", JSON.stringify([...fileMeta])).pipe(Effect.ignore)
           const chunks: ChunkStore.ChunkInput[] = []
           for (const [kind, entries] of [
             [KIND_FILE, files],

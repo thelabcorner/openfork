@@ -1988,6 +1988,11 @@ const layer = Layer.effect(
           if (unprefixed) return unprefixed
           continue
         }
+        // Housekeeping calls (titles, summaries) run without user consent per-request, so
+        // prefer a zero-cost variant of the same family over a newer paid one; fall back
+        // to the newest paid model only when the family has no free option.
+        const free = candidates.find((model) => model.cost.input === 0 && model.cost.output === 0)
+        if (free) return free
         if (candidates[0]) return candidates[0]
       }
 

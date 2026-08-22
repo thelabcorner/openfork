@@ -1,3 +1,4 @@
+import { autopsyMark } from "./autopsy-timing" // STARTUP-AUTOPSY: temporary probe, see 02-main-process.md
 import windowState from "electron-window-state"
 import { resolveThemeVariant } from "@opencode-ai/ui/theme/resolve"
 import type { DesktopTheme } from "@opencode-ai/ui/theme/types"
@@ -263,7 +264,9 @@ export function createMainWindow(id: string = randomUUID()) {
   wireZoom(win)
 
   win.once("ready-to-show", () => {
+    autopsyMark("window-ready-to-show") // STARTUP-AUTOPSY
     win.show()
+    autopsyMark("window-shown") // STARTUP-AUTOPSY (entry-chain window-visible endpoint)
   })
 
   return win

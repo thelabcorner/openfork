@@ -32,3 +32,6 @@ UPCOMING_CHANGELOG.md
 logs/
 *.bun-build
 tsconfig.tsbuildinfo
+
+# Agent swarm databases (local-only, never commit)
+.opencode/swarms/*.chunkdb*

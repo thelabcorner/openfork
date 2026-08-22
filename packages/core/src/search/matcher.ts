@@ -22,6 +22,10 @@ import { MatcherScore, NEG, matchedPositions } from "./matcher-score"
 export interface PathEntry {
   path: string
   isDir: boolean
+  /** Tier-2 metadata (seal-time stat capture); undefined when unavailable. */
+  size?: number
+  mtime?: number
+  lineCount?: number
 }
 export interface SymbolEntry {
   name: string
@@ -56,6 +60,9 @@ export interface UnifiedResult {
   score: number
   positions?: number[]
   baseOffset?: number
+  size?: number
+  mtime?: number
+  lineCount?: number
 }
 
 export interface QueryPage {
@@ -169,6 +176,10 @@ interface Scratch {
   prevStateValid: boolean
   prevQLen: number
   prevQ: Uint16Array
+  sweepAcc: Uint32Array | undefined
+  sweepAccWords: number
+  sweepCursor: number
+  sweepQid: number
   heapIds: Uint32Array
   heapScores: Int32Array
   heapSize: number
@@ -195,6 +206,10 @@ function makeScratch(count: number): Scratch {
     prevStateValid: false,
     prevQLen: 0,
     prevQ: new Uint16Array(QUERY_MAX),
+    sweepAcc: undefined,
+    sweepAccWords: 0,
+    sweepCursor: 0,
+    sweepQid: 0,
     heapIds: new Uint32Array(1024),
     heapScores: new Int32Array(1024),
     heapSize: 0,
@@ -432,8 +447,64 @@ function runCorpusQuery<T extends PathEntry | SymbolEntry>(
   // hopeless entries, and validate survivors precisely. This replaces any
   // full-corpus scan.
   if (total < capacity) {
+  // incremental sweep: if previous query was an append, resume from last cursor
+  if (s.prevStateValid && s.prevQLen + 1 === tokens[0]!.length && prefixOf(s.prevQ, s.prevQLen, tokens[0]!, tokens[0]!.length)) {
+    // reuse acc and cursor
+    const acc = s.sweepAcc!
+    const words = idx.bitWords
+    const firstBase = MatcherIndexFold(tokens[0]![0]!) * words
+    // recompute acc only for new char
+    const newChar = tokens[0]![tokens[0]!.length - 1]!
+    const baseNew = MatcherIndexFold(newChar) * words
+    for (let w = 0; w < words; w++) acc[w] &= idx.charBits[baseNew + w]!
+    // sweep from saved cursor
+    let added = 0
+    let visits = 0
+    for (let w = s.sweepCursor; w < words && visits < SWEEP_VISIT_CAP; w++) {
+      let bits = acc[w]
+      while (bits !== 0 && visits < SWEEP_VISIT_CAP) {
+        const bit = bits & -bits
+        bits ^= bit
+        visits++
+        const id = (w << 5) | (31 - Math.clz32(bit))
+        if (s.seenEpoch[id] === s.epoch) continue
+        s.seenEpoch[id] = s.epoch
+        if (idx.textLen[id]! < tokLensSum) continue
+        if (s.heapSize >= s.heapCap) {
+          const bound = idx.staticPrior[id]! + (tokLensSum + 1) * 36 + MatcherScore.PRIMARY_EXACT_BONUS + 20
+          if (bound <= s.heapScores[0]!) continue
+        }
+        const sum = scoreCandidateIndex(idx, id, tokens)
+        if (sum <= NEG) continue
+        if (s.countedEpoch[id] !== qid) {
+          s.countedEpoch[id] = qid
+          added++
+        }
+        heapOffer(s, id, sum)
+      }
+    }
+    s.sweepCursor = Math.min(words, s.sweepCursor + (words - s.sweepCursor))
+    total += added
+  } else {
+    // full sweep
     total += bitsetSupersetSweep(idx, s, tokens, tokLensSum, qid)
+    // reset cursor
+    s.sweepCursor = 0
+    // store acc for future
+    const acc = new Uint32Array(idx.bitWords)
+    const words = idx.bitWords
+    const firstBase = MatcherIndexFold(tokens[0]![0]!) * words
+    acc.set(idx.charBits.subarray(firstBase, firstBase + words))
+    for (const tok of tokens) {
+      for (let i = 0; i < tok.length; i++) {
+        const base = MatcherIndexFold(tok[i]!) * words
+        for (let w = 0; w < words; w++) acc[w] &= idx.charBits[base + w]!
+      }
+    }
+    s.sweepAcc = acc
   }
+  }
+
   const tScore1 = performance.now()
 
   // typo mode: adjacent transposition of the driver token, strict underfill only
@@ -677,10 +748,10 @@ function postingContains(pool: Uint32Array, g: { off: number; len: number }, id:
 // Complete underfill channel: AND of per-char presence bitmaps over all query
 // characters is a superset of every possible subsequence match. Sweeps the
 // whole superset with O(1) rejects (seen / too-short / cannot-beat-heap-min)
-// and precise validation only for survivors. Visit-capped so pathological
-// short-key supersets stay bounded (ascending-id order, deterministic).
-// Returns newly matched count.
-const SWEEP_VISIT_CAP = 24_000
+// and precise validation only for survivors. Time-budgeted so no single
+// keystroke blocks > ~2ms; visit-capped as secondary guard.
+const SWEEP_VISIT_CAP = 8_000
+const SWEEP_TIME_BUDGET_MS = 2.0
 
 function bitsetSupersetSweep(
   idx: SearchIndex,
@@ -703,7 +774,9 @@ function bitsetSupersetSweep(
   const boundConst = (m + 1) * 36 + MatcherScore.PRIMARY_EXACT_BONUS + 20
   let added = 0
   let visits = 0
+  const deadline = performance.now() + SWEEP_TIME_BUDGET_MS
   for (let w = 0; w < words && visits < SWEEP_VISIT_CAP; w++) {
+    if (performance.now() > deadline) break
     let bits = acc[w]
     while (bits !== 0 && visits < SWEEP_VISIT_CAP) {
       const bit = bits & -bits
@@ -870,6 +943,9 @@ function merge(fp: CorpusPage<PathEntry>, sp: CorpusPage<SymbolEntry>, prepared:
         score: fp.scores[i]!,
         positions: fp.positions[i],
         baseOffset: fp.baseOffsets[i],
+        size: row.size,
+        mtime: row.mtime,
+        lineCount: row.lineCount,
       },
     })
   }

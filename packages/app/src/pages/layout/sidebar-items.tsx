@@ -210,8 +210,8 @@ export const SessionItem = (props: SessionItemProps): JSX.Element => {
       unseenCount={unseenCount}
       clearHoverProjectSoon={props.clearHoverProjectSoon}
       sidebarOpened={layout.sidebar.opened}
-      warmPress={() => warm(2, "high")}
-      warmFocus={() => warm(2, "high")}
+      warmPress={() => warm(1, "high")} // tighter hover prefetch (self + immediate; layout warm + child/info covers rest)
+      warmFocus={() => warm(1, "high")}
     />
   )
 

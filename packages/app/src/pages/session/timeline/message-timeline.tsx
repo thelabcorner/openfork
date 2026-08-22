@@ -276,6 +276,14 @@ export function MessageTimeline(props: {
   const language = useLanguage()
   const { params, sessionKey } = useSessionKey()
   const ownerSessionKey = sessionKey()
+  // The instance persists across same-workspace tab switches, so the cleanup
+  // snapshot must be stored under the LAST ACTIVE session, not whichever
+  // session happened to be mounted first (ownerSessionKey).
+  let activeSessionKey = ownerSessionKey
+  createEffect(() => {
+    if (!params.id) return
+    activeSessionKey = sessionKey()
+  })
   const cached = timelineCache.get(ownerSessionKey)
   const initialMeasurements = cached?.measurements
   const coldBottomMount = !initialMeasurements?.length && props.shouldAnchorBottom()
@@ -645,8 +653,8 @@ export function MessageTimeline(props: {
 
   onCleanup(() => {
     clearPrependAnchor()
-    timelineCache.delete(ownerSessionKey)
-    timelineCache.set(ownerSessionKey, { measurements: virtualizer.takeSnapshot(), toolOpen: { ...toolOpen } })
+    timelineCache.delete(activeSessionKey)
+    timelineCache.set(activeSessionKey, { measurements: virtualizer.takeSnapshot(), toolOpen: { ...toolOpen } })
     while (timelineCache.size > 16) timelineCache.delete(timelineCache.keys().next().value!)
     if (resizePinFrame !== undefined) cancelAnimationFrame(resizePinFrame)
     if (overscanFrame !== undefined) cancelAnimationFrame(overscanFrame)
@@ -1369,7 +1377,20 @@ export function MessageTimeline(props: {
       if (height !== undefined) rowEstimator.observe({ ...estimateInput(current), height })
     }
 
-    onMount(() => measureElementAndObserve(element))
+    onMount(() => {
+      // Visible rows must measure synchronously so the first painted frame of a
+      // hot switch is exact. Offscreen overscan rows defer one frame: their
+      // measureElement read would otherwise interleave with the virtualizer's
+      // row-position style writes in the same commit -- the same read-after-write
+      // layout thrash removed from resizeItem (see containerHeight). The deferred
+      // call still reads fresh height at observe time, so no drift is missed.
+      const range = virtualizer.range
+      if (range && initialItem.index >= range.startIndex && initialItem.index <= range.endIndex) {
+        measureElementAndObserve(element)
+        return
+      }
+      contentMeasureFrame = scheduleConnectedMeasure(element, measureElementAndObserve)
+    })
 
     createEffect(
       on(

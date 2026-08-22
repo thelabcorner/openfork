@@ -81,13 +81,60 @@ test("moves legacy image data URLs into blobs and hydrates object URLs", async (
   })
 
   await store.setItem("prompt", JSON.stringify({ prompt: [{ type: "image", dataUrl: "data:image/png;base64,YQ==" }] }))
+  await store.flush()
   expect(documents.get("prompt")).not.toContain("dataUrl")
   const value = JSON.parse((await store.getItem("prompt"))!)
   expect(value.prompt[0].blob.id).toBe("1")
   expect(value.prompt[0].blob.url).toStartWith("blob:")
 })
 
-test("does not let delayed blob migration overwrite a newer draft", async () => {
+test("coalesces rapid draft writes into a single write of the latest value", async () => {
+  const documents = new Map<string, string>()
+  let writes = 0
+  const store = createDraftStore({
+    get: async () => null,
+    set: async (key, value) => {
+      writes++
+      documents.set(key, value)
+    },
+    remove: async () => undefined,
+    putBlob: async () => "blob",
+    getBlob: async () => null,
+  })
+
+  await store.setItem("prompt", JSON.stringify({ prompt: [{ type: "text", content: "first" }] }))
+  await store.setItem("prompt", JSON.stringify({ prompt: [{ type: "text", content: "second" }] }))
+  expect(documents.has("prompt")).toBe(false)
+  expect(await store.getItem("prompt")).toContain("second")
+
+  await store.flush()
+  expect(writes).toBe(1)
+  expect(documents.get("prompt")).toContain("second")
+})
+
+test("removeItem cancels a pending debounced write instead of resurrecting the draft", async () => {
+  const documents = new Map<string, string>()
+  let writes = 0
+  const store = createDraftStore({
+    get: async () => null,
+    set: async (key, value) => {
+      writes++
+      documents.set(key, value)
+    },
+    remove: async (key) => void documents.delete(key),
+    putBlob: async () => "blob",
+    getBlob: async () => null,
+  })
+
+  await store.setItem("prompt", JSON.stringify({ prompt: [{ type: "text", content: "draft" }] }))
+  await store.removeItem("prompt")
+  await store.flush()
+
+  expect(writes).toBe(0)
+  expect(documents.has("prompt")).toBe(false)
+})
+
+test("does not let an in-flight older commit overwrite a newer draft", async () => {
   const documents = new Map<string, string>()
   const migration = Promise.withResolvers<void>()
   const store = createDraftStore({
@@ -100,13 +147,14 @@ test("does not let delayed blob migration overwrite a newer draft", async () => 
     },
     getBlob: async () => null,
   })
-  const older = store.setItem(
-    "prompt",
-    JSON.stringify({ prompt: [{ type: "image", dataUrl: "data:image/png;base64,YQ==" }] }),
-  )
-  await Bun.sleep(0)
+  const older = store.setItem("prompt", JSON.stringify({ prompt: [{ type: "image", dataUrl: "data:image/png;base64,YQ==" }] }))
+  const firstCommit = store.flush()
   await store.setItem("prompt", JSON.stringify({ prompt: [{ type: "text", content: "latest" }] }))
+
+  await store.flush()
+  expect(documents.get("prompt")).toContain("latest")
   migration.resolve()
+  await firstCommit
   await older
 
   expect(documents.get("prompt")).toContain("latest")

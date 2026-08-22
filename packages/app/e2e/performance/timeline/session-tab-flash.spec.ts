@@ -48,11 +48,16 @@ benchmark("samples cached session repaint after the click", async ({ page, repor
   expect(result.samples.length).toBeGreaterThan(0)
 })
 
-benchmark("prefetches every open session tab", async ({ page, report }) => {
-  const prefetched = new Set<string>()
+benchmark("serves cached timeline when switching to an open session tab", async ({ page, report }) => {
+  // Warming is zero-network by design (bulk cache / child store / lineage peek),
+  // so load-time HTTP cannot observe it. The observable contract: after the
+  // initial session settles, switching to another open tab must paint its
+  // timeline WITHOUT any further messages fetch -- whatever served the cache.
+  const messageStarts: { sessionID: string; before?: string }[] = []
   await mockStressTimeline(page, {
     onMessages: (input) => {
-      if (!input.before && input.phase === "start") prefetched.add(input.sessionID)
+      if (input.phase !== "start") return
+      messageStarts.push({ sessionID: input.sessionID, before: input.before })
     },
   })
   await installStressSessionTabs(page, {
@@ -61,7 +66,22 @@ benchmark("prefetches every open session tab", async ({ page, report }) => {
   await installTimelineSettings(page)
   await page.goto(stressSessionHref(fixture.sourceID))
   await expectSessionTitle(page, fixture.expected.sourceTitle)
+  await waitForStableTimeline(page, fixture.expected.sourceMessageIDs.at(-1)!)
 
-  await expect.poll(() => prefetched.has(fixture.childID)).toBe(true)
-  report({ prefetched: [...prefetched] })
+  const warmCalls = messageStarts.length
+  await page
+    .locator(`[data-slot="titlebar-tabs"] a[href="${stressSessionHref(fixture.childID)}"]`)
+    .first()
+    .click()
+  await Promise.all([
+    expectSessionTitle(page, fixture.expected.childTitle),
+    waitForStableTimeline(page, fixture.expected.childMessageIDs.at(-1)!),
+  ])
+
+  const switchFetches = messageStarts.slice(warmCalls)
+  report({
+    warmSessions: [...new Set(messageStarts.slice(0, warmCalls).map((call) => call.sessionID))],
+    switchFetches,
+  })
+  expect(switchFetches.filter((call) => call.sessionID === fixture.childID)).toEqual([])
 })

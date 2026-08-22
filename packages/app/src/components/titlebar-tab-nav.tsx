@@ -280,6 +280,7 @@ export function TabNavItem(props: {
           }}
           data-slot="tab-title"
           data-titlebar-tab-title
+          dir="auto"
           class="min-w-0 flex-1 outline-none leading-4"
           classList={{
             "overflow-hidden text-clip whitespace-nowrap": !editing(),
@@ -436,6 +437,7 @@ export function DraftTabItem(props: {
         </span>
         <span
           data-titlebar-tab-title
+          dir="auto"
           class="min-w-0 flex-1 overflow-hidden text-clip whitespace-nowrap outline-none leading-4"
         >
           {props.title}
@@ -534,6 +536,7 @@ export function GroupTabNavItem(props: {
         </span>
         <span
           data-titlebar-tab-title
+          dir="auto"
           class="min-w-0 flex-1 overflow-hidden text-clip whitespace-nowrap outline-none leading-4"
         >
           {props.title}

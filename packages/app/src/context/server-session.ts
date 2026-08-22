@@ -18,6 +18,7 @@ import { message as cleanMessage } from "@/utils/diffs"
 import { sessionNotFoundError } from "@/utils/server-errors"
 import { rootSession } from "@/utils/session-route"
 import { normalizeSessionInfo } from "@/utils/session"
+import { createRequestGate } from "@/utils/request-gate"
 import { compareMessages, messageKey, normalizeSessionMessages } from "@/utils/session-message"
 import { dropSessionCaches, pickSessionCacheEvictions, SESSION_CACHE_LIMIT } from "./global-sync/session-cache"
 import { createV2SessionReducer, type V2SessionReduction } from "./server-session-v2-reducer"
@@ -218,6 +219,10 @@ export function createServerSession(
   })
   const requests = new Map<string, Promise<Session>>()
   const inflight = new Map<string, Promise<void>>()
+  // Bounds how many distinct sessions' sync() can be actually fetching at
+  // once, so spam-switching through many tabs doesn't fire an unbounded
+  // burst of concurrent request pairs at the server. See request-gate.ts.
+  const gated = createRequestGate(4)
   const inflightTodo = new Map<string, Promise<void>>()
   const optimistic = new Map<string, Map<string, OptimisticItem>>()
   const v2 = createV2SessionReducer()
@@ -862,17 +867,19 @@ export function createServerSession(
   const sync = (sessionID: string, options?: { force?: boolean; messageLimit?: number }) => {
     touch(sessionID)
     suspended.delete(sessionID)
-    return runInflight(inflight, sessionID, async () => {
-      const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
-      if (cached && data.info[sessionID] && !options?.force) return
-      await Promise.all([
-        resolve(sessionID, options),
-        cached && !options?.force
-          ? Promise.resolve()
-          : loadMessages(sessionID, options?.messageLimit ?? meta.limit[sessionID] ?? initialMessagePageSize),
-      ])
-      stale.delete(sessionID)
-    })
+    return runInflight(inflight, sessionID, () =>
+      gated(async () => {
+        const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
+        if (cached && data.info[sessionID] && !options?.force) return
+        await Promise.all([
+          resolve(sessionID, options),
+          cached && !options?.force
+            ? Promise.resolve()
+            : loadMessages(sessionID, options?.messageLimit ?? meta.limit[sessionID] ?? initialMessagePageSize),
+        ])
+        stale.delete(sessionID)
+      }),
+    )
   }
 
   const release = (sessionID: string) => {

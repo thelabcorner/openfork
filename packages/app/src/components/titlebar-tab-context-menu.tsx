@@ -43,8 +43,9 @@ export function TitlebarTabContextMenu(
   const tabs = useTabs()
   const language = useLanguage()
   const global = useGlobal()
-  const index = () => tabs.store.findIndex((item) => tabKey(item) === props.id)
-  const count = () => tabs.store.length
+  // Memoized to avoid O(n) findIndex + length on every render/hover (was firing all tabs on store changes).
+  const index = createMemo(() => tabs.store.findIndex((item) => tabKey(item) === props.id))
+  const count = createMemo(() => tabs.store.length)
   const sessionID = createMemo(() => props.session?.()?.id)
   const serverCtx = createMemo<ServerCtx | undefined>(() => {
     if (!props.server) return

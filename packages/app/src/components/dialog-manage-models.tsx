@@ -10,6 +10,7 @@ import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { Switch as SwitchV2 } from "@opencode-ai/ui/v2/switch-v2"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
+import { stripUnlimitedSuffix } from "@/utils/model-badges"
 import { useFilteredList } from "@opencode-ai/ui/hooks"
 import { For, Show, type Component } from "solid-js"
 import { useLocal } from "@/context/local"
@@ -100,7 +101,7 @@ export const DialogManageModels: Component = () => {
       >
         {(i) => (
           <div class="w-full flex items-center justify-between gap-x-3">
-            <span>{i.name}</span>
+            <span>{stripUnlimitedSuffix(i.name)}</span>
             <div onClick={(e) => e.stopPropagation()}>
               <Switch
                 checked={!!local.model.visible({ modelID: i.id, providerID: i.provider.id })}

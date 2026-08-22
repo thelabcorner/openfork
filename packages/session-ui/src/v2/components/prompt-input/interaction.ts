@@ -1,7 +1,7 @@
 import { createEffect, on, onCleanup, type Accessor } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useFilteredList } from "@opencode-ai/ui/hooks"
-import { createPromptInputV2Attachments, type PromptInputV2AttachmentConfig } from "./attachments"
+import { createPromptInputV2Attachments, largePaste, pasteFilename, type PromptInputV2AttachmentConfig } from "./attachments"
 import { createPromptInputV2Store, type PromptInputV2StoreInput } from "./store"
 import type {
   PromptInputV2Attachment,
@@ -240,7 +240,7 @@ export function createPromptInputV2Controller(input: {
       key: event.key,
       ctrl: event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey,
       composing: event.isComposing,
-      ids: suggestions().map((item) => item.id),
+      ids: state.popover.type !== "closed" ? suggestions().map((item) => item.id) : [],
       empty: draft.state.prompt.every((part) => !("content" in part) || part.content.length === 0),
     })
     if (handled) event.preventDefault()
@@ -426,6 +426,11 @@ export function createPromptInputV2Controller(input: {
       const text = clipboard?.getData("text/plain")
       if (!text) return
       event.preventDefault()
+      if (attachments && largePaste(text)) {
+        const file = new File([text], pasteFilename(), { type: "text/markdown" })
+        void attachments.addAttachments([file])
+        return
+      }
       if (typeof document.execCommand === "function" && document.execCommand("insertText", false, text)) return
       const target = event.currentTarget
       const selection = window.getSelection()

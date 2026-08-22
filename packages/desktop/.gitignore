@@ -23,6 +23,7 @@ dist-ssr
 *.sln
 *.sw?
 out/
+electron.vite.config.*.mjs
 
 resources/opencode-cli*
 resources/icons

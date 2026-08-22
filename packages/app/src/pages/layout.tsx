@@ -40,6 +40,8 @@ import { clearWorkspaceTerminals } from "@/context/terminal"
 import { pickSessionCacheEvictions } from "@/context/global-sync/session-cache"
 import { useNotification } from "@/context/notification"
 import { usePermission } from "@/context/permission"
+import { useTabs } from "@/context/tabs"
+import type { SessionTab } from "@/context/tabs"
 import { Binary } from "@opencode-ai/core/util/binary"
 import { retry } from "@opencode-ai/core/util/retry"
 import { playSoundById } from "@/utils/sound"
@@ -115,6 +117,7 @@ export default function LegacyLayout(props: ParentProps) {
   const server = useServer()
   const notification = useNotification()
   const permission = usePermission()
+  const tabs = useTabs()
   const navigate = useNavigate()
   const providers = useProviders(() => undefined)
   const dialog = useDialog()
@@ -144,6 +147,11 @@ export default function LegacyLayout(props: ParentProps) {
   }
   const colorSchemeLabel = (scheme: ColorScheme) => language.t(colorSchemeKey[scheme])
   const currentDir = createMemo(() => route().dir)
+  const activeDirectory = createMemo(() => {
+    const id = params.id
+    if (!id) return currentDir()
+    return serverSync().session.lineage.peek(id)?.session.directory ?? currentDir()
+  })
 
   const [state, setState] = createStore({
     autoselect: !initialDirectory,
@@ -637,7 +645,7 @@ export default function LegacyLayout(props: ParentProps) {
   const prefetchChunk = 200
   const prefetchConcurrency = 2
   const prefetchPendingLimit = 10
-  const span = 4
+  const span = 2 // tighter warm (last-N via list order + hover; avoids over-prefetch on large lists)
   const prefetchToken = { value: 0 }
   const prefetchQueues = new Map<string, PrefetchQueue>()
 
@@ -734,7 +742,19 @@ export default function LegacyLayout(props: ParentProps) {
     const directory = session.directory
     if (!directory) return
 
-    const cached = untrack(() => !serverSync().session.shouldPrefetch(session.id, prefetchChunk))
+    const sync = serverSync()
+    // Warm child store (used for projects) + full lineage (peek + resolve warms parent
+    // chain via rootSession; fixes child-session loading fallback/teardown). Keep span=2.
+    sync.child(directory, { bootstrap: false })
+    const cached = untrack(() => {
+      if (!sync.session.peek(session.id)) {
+        void sync.session.resolve(session.id).catch(() => {})
+      }
+      if (!sync.session.lineage.peek(session.id)) {
+        void sync.session.lineage.resolve(session.id).catch(() => {})
+      }
+      return !sync.session.shouldPrefetch(session.id, prefetchChunk)
+    })
     if (cached) return
 
     const q = queueFor(directory)
@@ -767,6 +787,9 @@ export default function LegacyLayout(props: ParentProps) {
   }
 
   const warm = (sessions: Session[], index: number) => {
+    // Tighter neighbor warm + last-N via currentSessions list order. High for immediate
+    // neighbors (priority promotion in queue). Combined with child/info warm in
+    // prefetchSession eliminates remaining network/IPC on hot same-workspace switches.
     for (let offset = 1; offset <= span; offset++) {
       const next = sessions[index + offset]
       if (next) prefetchSession(next, offset === 1 ? "high" : "low")
@@ -790,6 +813,17 @@ export default function LegacyLayout(props: ParentProps) {
 
     warm(sessions, index)
   })
+
+  createEffect(() => {
+    if (!tabs.ready()) return
+    for (const tab of tabs.store) {
+      if (tab.type !== "session") continue
+      const directory = serverSync().session.peek(tab.sessionId)?.directory ?? activeDirectory()
+      if (!directory) continue
+      prefetchSession({ id: tab.sessionId, directory } as Session, "high")
+    }
+  })
+
 
   function navigateSessionByOffset(offset: number) {
     const sessions = currentSessions()

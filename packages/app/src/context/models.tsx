@@ -6,6 +6,7 @@ import { createSimpleContext } from "@opencode-ai/ui/context"
 import { useProviders } from "@/hooks/use-providers"
 import { Persist, persisted } from "@/utils/persist"
 import { getUsageTables } from "@/utils/model-usage-profile"
+import { isRecentModelRelease, withinRecentWindow } from "@/utils/model-recency"
 
 export type ModelKey = { providerID: string; modelID: string }
 
@@ -68,13 +69,10 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
     const latest = createMemo(() =>
       pipe(
         available(),
-        filter(
-          (x) =>
-            Math.abs(
-              (release().get(modelKey({ providerID: x.provider.id, modelID: x.id })) ?? DateTime.invalid("invalid"))
-                .diffNow()
-                .as("months"),
-            ) < 6,
+        filter((x) =>
+          withinRecentWindow(
+            release().get(modelKey({ providerID: x.provider.id, modelID: x.id })) ?? DateTime.invalid("invalid"),
+          ),
         ),
         groupBy((x) => x.provider.id),
         mapValues((models) =>
@@ -133,9 +131,9 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       if (state === "hide") return false
       if (state === "show") return true
       if (latestSet().has(key)) return true
-      const date = release().get(key)
-      if (!date?.isValid) return true
-      return false
+      // Newly-added models default ON (no matter what); only releases that
+      // aged out of the recent window default to off.
+      return isRecentModelRelease(release().get(key))
     }
 
     const setVisibility = (model: ModelKey, state: boolean) => {

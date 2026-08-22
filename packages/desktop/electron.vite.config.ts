@@ -2,8 +2,10 @@ import { sentryVitePlugin } from "@sentry/vite-plugin"
 import { defineConfig } from "electron-vite"
 import appPlugin from "@opencode-ai/app/vite"
 import * as fs from "node:fs/promises"
+import { fileURLToPath, pathToFileURL } from "node:url"
 
-const OPENCODE_SERVER_DIST = "../opencode/dist/node"
+const OPENCODE_SERVER_DIST = fileURLToPath(new URL("../opencode/dist/node", import.meta.url))
+const OPENCODE_SERVER_FILE = fileURLToPath(new URL("../opencode/dist/node/node.js", import.meta.url))
 
 const channel = (() => {
   const raw = process.env.OPENCODE_CHANNEL
@@ -31,7 +33,7 @@ const sentry =
       })
     : false
 
-export default defineConfig({
+export default defineConfig(({ command }) => ({
   main: {
     define: {
       "import.meta.env.OPENCODE_CHANNEL": JSON.stringify(channel),
@@ -65,12 +67,15 @@ const require = __cjs_mod__.createRequire(import.meta.url);
         name: "opencode:virtual-server-module",
         enforce: "pre",
         resolveId(id) {
-          if (id === "virtual:opencode-server") return this.resolve(`${OPENCODE_SERVER_DIST}/node.js`)
+          if (id !== "virtual:opencode-server") return
+          if (command === "serve") return { id: pathToFileURL(OPENCODE_SERVER_FILE).href, external: true }
+          return this.resolve(OPENCODE_SERVER_FILE)
         },
       },
       {
         name: "opencode:copy-server-assets",
         async writeBundle() {
+          if (command === "serve") return
           for (const l of await fs.readdir(OPENCODE_SERVER_DIST)) {
             if (!l.endsWith(".wasm")) continue
             await fs.writeFile(`./out/main/chunks/${l}`, await fs.readFile(`${OPENCODE_SERVER_DIST}/${l}`))
@@ -109,4 +114,4 @@ const require = __cjs_mod__.createRequire(import.meta.url);
       },
     },
   },
-})
+}))

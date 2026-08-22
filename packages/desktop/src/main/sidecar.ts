@@ -1,5 +1,20 @@
+import { createRequire, enableCompileCache, registerHooks } from "node:module"
 import * as http from "node:http"
 import * as tls from "node:tls"
+import { pathToFileURL } from "node:url"
+import { autopsyMark } from "./autopsy-timing" // STARTUP-AUTOPSY: temporary probe, see 02-main-process.md
+
+enableCompileCache()
+
+const nodePtyUrl = pathToFileURL(
+  createRequire(import.meta.url).resolve(`@lydell/node-pty-${process.platform}-${process.arch}`),
+).href
+registerHooks({
+  resolve(specifier, context, nextResolve) {
+    if (specifier === "@lydell/node-pty") return { url: nodePtyUrl, shortCircuit: true }
+    return nextResolve(specifier, context)
+  },
+})
 
 type NodeHttpWithEnvProxy = typeof http & {
   setGlobalProxyFromEnv: () => void
@@ -38,6 +53,8 @@ type Listener = {
 const parentPort = getParentPort()
 let listener: Listener | undefined
 
+autopsyMark("sidecar-module-eval") // STARTUP-AUTOPSY (utility process module graph loaded)
+
 parentPort.on("message", (event) => {
   const command = parseCommand(event.data)
   if (!command) return
@@ -50,11 +67,13 @@ parentPort.on("message", (event) => {
 
 async function start(command: StartCommand) {
   try {
+    autopsyMark("sidecar-start-cmd") // STARTUP-AUTOPSY
     prepareSidecarEnv(command.password, command.userDataPath)
     ensureLoopbackNoProxy()
     useSystemCertificates()
     useEnvProxy()
     const { Server } = await import("virtual:opencode-server")
+    autopsyMark("sidecar-server-imported") // STARTUP-AUTOPSY (33 MB server bundle parsed+evaluated)
 
     listener = await Server.listen({
       port: command.port,
@@ -63,6 +82,7 @@ async function start(command: StartCommand) {
       password: command.password,
       cors: ["oc://renderer"],
     })
+    autopsyMark("sidecar-listening") // STARTUP-AUTOPSY
     parentPort.postMessage({ type: "ready" })
   } catch (error) {
     parentPort.postMessage({ type: "error", error: serializeError(error) })

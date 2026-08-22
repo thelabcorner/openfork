@@ -23,6 +23,7 @@ import { McpAuth } from "@/mcp/auth"
 import { Permission } from "@/permission"
 import { Plugin } from "@/plugin"
 import { PluginPtyEnvironment } from "@/plugin/pty-environment"
+import { Quota } from "@/quota/quota"
 import { InstanceStore } from "@/project/instance-store"
 import { Project } from "@/project/project"
 import { Vcs } from "@/project/vcs"
@@ -103,6 +104,7 @@ import { projectCopyHandlers } from "./handlers/project-copy"
 import { providerHandlers } from "./handlers/provider"
 import { ptyConnectHandlers, ptyHandlers } from "./handlers/pty"
 import { questionHandlers } from "./handlers/question"
+import { quotaHandlers } from "./handlers/quota"
 import { sessionHandlers } from "./handlers/session"
 import { sessionGroupHandlers } from "./handlers/session-group"
 import { syncHandlers } from "./handlers/sync"
@@ -174,6 +176,7 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     questionHandlers,
     permissionHandlers,
     providerHandlers,
+    quotaHandlers,
     sessionHandlers,
     sessionGroupHandlers,
     syncHandlers,
@@ -285,6 +288,7 @@ const app = LayerNode.group([
   PtyTicket.node,
   BrowserHostBroker.node,
   Usage.node,
+  Quota.node,
 ])
 
 export function createRoutes(

@@ -71,8 +71,14 @@ export function getCurrentCli(target = RUST_TARGET ?? nativeTarget()) {
 
 export async function downloadCliToResources() {
   const cli = getCurrentCli()
-  const directory = await mkdtemp(join(tmpdir(), "opencode-cli-"))
   const dest = windowsify("resources/opencode-cli")
+  const stamp = "resources/opencode-cli.version"
+  const stampFile = Bun.file(stamp)
+  if ((await Bun.file(dest).exists()) && (await stampFile.exists()) && (await stampFile.text()) === CLI_VERSION) {
+    console.log(`Reusing ${cli.package} at ${dest}`)
+    return
+  }
+  const directory = await mkdtemp(join(tmpdir(), "opencode-cli-"))
   try {
     await writeFile(
       join(directory, "package.json"),
@@ -91,6 +97,7 @@ export async function downloadCliToResources() {
     await $`pwsh -NoLogo -NoProfile -ExecutionPolicy Bypass -File ../../script/sign-windows.ps1 ${dest}`
   }
   if (process.platform === "darwin") await $`codesign --force --sign - ${dest}`
+  await Bun.write(stamp, CLI_VERSION)
 
   console.log(`Copied ${cli.package} to ${dest}`)
 }

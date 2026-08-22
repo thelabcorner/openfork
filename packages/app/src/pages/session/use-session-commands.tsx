@@ -648,6 +648,11 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       title: language.t("command.models.toggle"),
       onSelect: () => layout.models.toggle(),
     }),
+    viewCommand({
+      id: "limits.toggle",
+      title: language.t("command.limits.toggle"),
+      onSelect: () => void startTransition(() => layout.limits.toggle()),
+    }),
     ...(shown()
       ? [
           viewCommand({

@@ -1522,6 +1522,7 @@ export type GlobalEvent = {
         type: "session.idle"
         properties: {
           sessionID: string
+          reason?: "aborted"
         }
       }
     | {
@@ -2298,6 +2299,9 @@ export type MentionResult =
       score: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
       positions?: Array<number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN">
       baseOffset?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      size?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      mtime?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      lineCount?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
     }
   | {
       kind: "symbol"
@@ -6172,6 +6176,7 @@ export type SessionIdle = {
   location?: LocationRef
   data: {
     sessionID: string
+    reason?: "aborted"
   }
 }
 
@@ -7201,6 +7206,7 @@ export type EventSessionIdle = {
   type: "session.idle"
   properties: {
     sessionID: string
+    reason?: "aborted"
   }
 }
 
@@ -10151,6 +10157,102 @@ export type ProviderOauthCallbackResponses = {
 }
 
 export type ProviderOauthCallbackResponse = ProviderOauthCallbackResponses[keyof ProviderOauthCallbackResponses]
+
+export type QuotaProvidersData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/quota/providers"
+}
+
+export type QuotaProvidersErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type QuotaProvidersError = QuotaProvidersErrors[keyof QuotaProvidersErrors]
+
+export type QuotaProvidersResponses = {
+  /**
+   * Registered quota providers with configured state
+   */
+  200: {
+    providers: Array<{
+      providerId: string
+      providerName: string
+      configured: boolean
+    }>
+  }
+}
+
+export type QuotaProvidersResponse = QuotaProvidersResponses[keyof QuotaProvidersResponses]
+
+export type QuotaGetData = {
+  body?: never
+  path: {
+    providerID: string
+  }
+  query?: never
+  url: "/quota/{providerID}"
+}
+
+export type QuotaGetErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type QuotaGetError = QuotaGetErrors[keyof QuotaGetErrors]
+
+export type QuotaGetResponses = {
+  /**
+   * Normalized provider quota result
+   */
+  200: {
+    providerId: string
+    providerName: string
+    ok: boolean
+    configured: boolean
+    error?: string
+    planLabel?: string
+    usage: {
+      windows: {
+        [key: string]: {
+          usedPercent: number
+          remainingPercent: number
+          windowSeconds: number
+          resetAt: number
+          resetAfterSeconds: number
+          valueLabel: string
+        }
+      }
+      models?: {
+        [key: string]: {
+          windows: {
+            [key: string]: {
+              usedPercent: number
+              remainingPercent: number
+              windowSeconds: number
+              resetAt: number
+              resetAfterSeconds: number
+              valueLabel: string
+            }
+          }
+        }
+      }
+    }
+    fetchedAt: number
+  }
+}
+
+export type QuotaGetResponse = QuotaGetResponses[keyof QuotaGetResponses]
 
 export type SessionListData = {
   body?: never
