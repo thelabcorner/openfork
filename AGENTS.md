@@ -1,23 +1,51 @@
-- To regenerate the legacy JavaScript SDK, run `./packages/sdk/js/script/build.ts`.
-- After changing the public Protocol or Server `HttpApi`, run `bun run generate` from `packages/client`. Do not edit `src/generated` or `src/generated-effect` directly.
-- Keep runtime dependencies directed from Schema to Core and Protocol, then from Core and Protocol to Server. Client runtime code may depend on Schema and Protocol but never Core or Server; `sdk-next` composes Client, Core, and Server.
-- The default branch in this repo is `dev`.
-- Local `main` ref may not exist; use `dev` or `origin/dev` for diffs.
-- When debugging or verifying a change in the desktop app, tell the user to run `bun run dev` from `packages/desktop` (not the packaged `.exe`) — it launches Electron directly against current source with renderer hot-reload and a live main-process/console log stream, so bugs and fixes can actually be observed instead of guessed at from source reading alone. A packaged/installed build reflects whatever commit it was built from, not the working tree — testing against one silently reproduces stale behavior and can make already-fixed bugs look unfixed. Renderer-only changes hot-reload; changes under `packages/desktop/src/main` need the dev process fully killed and relaunched (a window reload is not enough).
+# OpenFork
 
-## Branch Names
+This repository is **OpenFork**: a branch-fork of [OpenCode](https://github.com/anomalyco/opencode) Desktop. It is not an independent product and it is not OpenChamber.
 
-Use a short branch name of at most three words, separated by hyphens. Do not use slashes or type prefixes such as `feat/` or `fix/`.
+- Default branch: `main`
+- Upstream: `upstream` → `https://github.com/anomalyco/opencode.git`
+- Sync source: **release tags** (`v1.18.x`), not a floating `upstream/dev`
+- Ownership map: `FORK.md`
 
-Examples: `session-recovery`, `fix-scroll-state`, `regenerate-sdk`.
+This tree is desktop + sidecar only. Ignore and prune: console, stats, enterprise, slack, web, infra, TUI. Those paths are **not on `main`**. If a merge puts them back, `bun run fork:prune` — do not keep them. Do not maintain `packages/opencode/src/cli/tui`; take upstream there.
 
-## Commits and PR Titles
+## Instruction order
 
-Use conventional commit-style messages and PR titles: `type(scope): summary`.
+1. This file.
+2. `FORK.md` for remotes, KEEP/DROP, or conflict ownership.
+3. Every matching skill under `.opencode/skills/`.
+4. Nearest package `AGENTS.md`.
+5. Local code precedent.
 
-Valid types are `feat`, `fix`, `docs`, `chore`, `refactor`, and `test`. Scopes are optional; use the affected package or area when helpful, e.g. `core`, `opencode`, `tui`, `app`, `desktop`, `sdk`, or `plugin`.
+If these conflict, stop. Do not silently pick one.
 
-Examples: `fix(tui): simplify thinking toggle styling`, `docs: update contributing guide`, `chore(sdk): regenerate types`.
+## Skills
+
+| Trigger | Skill |
+|---|---|
+| Merge, cherry-pick, or rebase involving `upstream`, a `v*.*.*` tag, or an anomalyco PR | `upstream-sync` |
+| Effect v4 / effect-smol | `effect` |
+| RTL/LTR, desktop chrome, mixed-direction text | `rtl-aware-development` |
+
+Load `upstream-sync` before any git operation that brings upstream code in. Do not use `-X ours` / `-X theirs`. Do not `filter-repo`. Do not rebase `main` onto `upstream/dev`.
+
+## Desktop
+
+When debugging or verifying the desktop app, tell the user to run `bun run dev` from `packages/desktop` (not the packaged `.exe`). It launches Electron against current source with renderer hot-reload and a live main-process log stream. A packaged build reflects whatever commit it was built from. Renderer-only changes hot-reload; changes under `packages/desktop/src/main` need the dev process killed and relaunched.
+
+## Workspace
+
+Runtime dependencies stay directed from Schema to Core and Protocol, then from Core and Protocol to Server. Client runtime code may depend on Schema and Protocol but never Core or Server; `sdk-next` is out of the desktop workspace.
+
+After changing the public Protocol or Server `HttpApi`, run `bun run generate` from `packages/client`. Do not edit `src/generated` or `src/generated-effect` directly. To regenerate the legacy JavaScript SDK, run `./packages/sdk/js/script/build.ts`.
+
+## Branch names
+
+Short, at most three words, hyphens, no `feat/` prefixes. Examples: `session-recovery`, `fix-scroll-state`.
+
+## Commits and PR titles
+
+`type(scope): summary`. Types: `feat`, `fix`, `docs`, `chore`, `refactor`, `test`.
 
 ## Style Guide
 
