@@ -68,6 +68,12 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 
 Worked example: `git show a747d51764` (v1.18.21).
 
+### Case-by-case — read both sides
+
+These KEEP-path files had real conflicts in v1.18.21 but follow no blanket rule: keep fork feature hunks, take upstream bugfixes, and let `git show a747d51764` decide.
+
+`packages/app/src/pages/session/timeline/message-timeline.tsx`, `packages/app/src/pages/session/use-session-commands.tsx`, `packages/app/src/pages/session/v2/session-file-browser-tab.tsx`, `packages/app/e2e/utils/mock-server.ts`, `packages/core/src/session/projector.ts`, `packages/core/src/session/runner/llm.ts`, `packages/opencode/src/session/llm/ai-sdk.ts`, `packages/opencode/src/session/session.ts`
+
 ### Generated — do not hand-merge
 
 `packages/client/src/generated/**`, `packages/client/src/generated-effect/**`, `packages/sdk/js/src/gen/**`, `packages/sdk/js/src/v2/gen/**`.
@@ -83,6 +89,8 @@ Take either side, then regenerate.
 ### Tests that assume deleted fork UI
 
 Keep the fork stub. Do not restore `#review-panel` because an upstream e2e wants it.
+
+Unit tests carrying both fork and upstream assertions (`test/tool/websearch.test.ts`, `test/session/prompt.test.ts`, `test/session/compaction.test.ts`, `test/provider/provider.test.ts`): union the suites — fold upstream renames and new cases into the expanded fork test instead of dropping either side.
 
 ## Semantic checklist (every tag merge)
 
