@@ -4,10 +4,9 @@
   "version": "1.18.21",
   "type": "module",
   "license": "MIT",
-  "homepage": "https://opencode.ai",
+  "homepage": "https://github.com/thelabcorner/openfork",
   "author": {
-    "name": "OpenCode",
-    "email": "hello@opencode.ai"
+    "name": "thelabcorner"
   },
   "scripts": {
     "typecheck": "tsgo -b",

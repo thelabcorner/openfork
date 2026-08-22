@@ -89,3 +89,19 @@ for (const channel of ["beta", "prod"] as const) {
     })
   })
 }
+
+// OpenFork: a publish feed would generate app-update.yml inside packaged builds;
+// while it points at anomalyco, electron-updater can install official OpenCode
+// over this fork. No channel may carry any publish target until it is retargeted.
+for (const channel of ["dev", "beta", "prod"] as const) {
+  test(`carries no upstream publish feed in ${channel} builds`, async () => {
+    const previous = process.env.OPENCODE_CHANNEL
+    process.env.OPENCODE_CHANNEL = channel
+    const module = await import(`./electron-builder.config.ts?no-publish=${channel}`)
+    const config = module.default as Configuration
+    if (previous === undefined) delete process.env.OPENCODE_CHANNEL
+    else process.env.OPENCODE_CHANNEL = previous
+
+    expect(config.publish).toBeUndefined()
+  })
+}

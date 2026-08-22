@@ -17,8 +17,8 @@ const xml = `<?xml version="1.0" encoding="UTF-8"?>
   <name>${productName}</name>
   <summary>${summary}</summary>
 
-  <developer id="ly.anoma">
-    <name>Anomaly Innovations Inc.</name>
+  <developer id="thelabcorner">
+    <name>thelabcorner</name>
   </developer>
 
   <description>
@@ -31,9 +31,10 @@ const xml = `<?xml version="1.0" encoding="UTF-8"?>
 
   <content_rating type="oars-1.1" />
 
-  <url type="bugtracker">https://github.com/anomalyco/opencode/issues</url>
-  <url type="homepage">https://opencode.ai</url>
-  <url type="vcs-browser">https://github.com/anomalyco/opencode</url>
+  <!-- OpenFork: identity URLs point at this fork, not upstream anomalyco/opencode. -->
+  <url type="bugtracker">https://github.com/thelabcorner/openfork/issues</url>
+  <url type="homepage">https://github.com/thelabcorner/openfork</url>
+  <url type="vcs-browser">https://github.com/thelabcorner/openfork</url>
 
   <screenshots>
     <screenshot type="default">
