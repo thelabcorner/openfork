@@ -44,7 +44,7 @@ If the PR is a stack, wait for the tag. Skip console/stats/web-only PRs.
 
 ## Conflicts
 
-1. List conflicted files. Classify each with `FORK.md` (fork-owned / union / generated / SaaS / meta).
+1. List conflicted files. Classify each with `FORK.md` (fork-owned / union / case-by-case / generated / SaaS / meta).
 2. **Generated:** pick either side, then regenerate (`bun run generate` in `packages/client`; `./packages/sdk/js/script/build.ts` if V1 SDK moved).
 3. **package.json:** take **upstream version numbers**. Union fork-added deps. Then `bun install` to rebuild `bun.lock`. Never hand-edit the lock.
 4. **Fork-owned:** keep fork behavior. Apply upstream hunks only when they are unrelated bugfixes.
