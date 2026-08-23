@@ -1,4 +1,15 @@
-# opencode database guide
+# opencode package guide
+
+## HttpApi Surfaces and Client Generation — read before editing routes
+
+This package defines the **unified** `OpenCodeHttpApi` (`packages/opencode/src/server/routes/instance/httpapi/api.ts` = `ServerApi` from `@opencode-ai/protocol` + `InstanceHttpApi` + `RootHttpApi` + `EventApi` + `PtyConnect`). That is what the desktop/app actually calls.
+
+- **Protocol-only** (`packages/protocol` → `packages/client`): `ServerApi` alone (health/session/message/model/provider/etc.). Run `bun run generate` from `packages/client` after changing `packages/protocol`. Do not edit `src/generated`.
+- **Unified** (`packages/opencode` → `packages/sdk/js`): the full `OpenCodeHttpApi`. This is the **only** client that has `experimental/*`, `instance/*`, `control/*`, `workspace/*`, `pty/*`, `quota/*`, `sync/*`, `tool/*` (e.g. `experimental.openrouterEndpoints`, `experimental.openrouterTelemetry`). After changing ANY `packages/opencode/src/server/routes/**`, run `bun run build` from `packages/sdk/js` (which runs `bun dev generate > openapi.json` + hey-api codegen). Do not edit `src/v2/gen`.
+
+If you touched both layers, run BOTH generators. To verify, grep the generated output: `rg -n "openrouterTelemetry" packages/sdk/js/src/v2/gen/sdk.gen.ts` (unified) vs `rg -n "health" packages/client/src/generated/client.ts` (protocol). `experimental.*` will **never** appear in `packages/client` — that is expected, not a generation failure.
+
+See root `AGENTS.md` § API Surfaces for the hybrid decision tree and verification steps.
 
 ## Database
 

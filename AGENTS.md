@@ -37,7 +37,12 @@ When debugging or verifying the desktop app, tell the user to run `bun run dev` 
 
 Runtime dependencies stay directed from Schema to Core and Protocol, then from Core and Protocol to Server. Client runtime code may depend on Schema and Protocol but never Core or Server; `sdk-next` is out of the desktop workspace.
 
-After changing the public Protocol or Server `HttpApi`, run `bun run generate` from `packages/client`. Do not edit `src/generated` or `src/generated-effect` directly. To regenerate the legacy JavaScript SDK, run `./packages/sdk/js/script/build.ts`.
+There are two generated clients — both are HttpApi-based, but they cover different surfaces:
+
+- **Protocol client** (`packages/client` → `@opencode-ai/client`): generated from `packages/protocol` (`makeDefaultApi` / `makeApi`). Covers `ServerApi` only (health, session, message, model, provider, integration, credential, usage, permission, fs, command, skill, event, pty, question, reference, projectCopy). Run `bun run generate` from `packages/client` after changing `packages/protocol`. Do not edit `src/generated` or `src/generated-effect` directly.
+- **Unified SDK** (`packages/sdk/js` → `@opencode-ai/sdk/v2/client` → `createOpencodeClient`): generated from `packages/opencode` `OpenCodeHttpApi` (composes `ServerApi` + `InstanceHttpApi` + `RootHttpApi` + `EventApi` + `PtyConnect`). This is the ONLY client that sees `experimental/*`, `instance/*`, `control/*`, `workspace/*`, `quota/*`, etc. (e.g. `experimental.openrouterEndpoints`, `experimental.openrouterTelemetry`). After changing ANY `packages/opencode/src/server/routes/**` HttpApi, run `bun run build` from `packages/sdk/js` (runs `bun dev generate > openapi.json` + hey-api codegen). Do not edit `src/v2/gen`.
+
+If you changed both layers, run BOTH. Desktop `packages/app` imports the unified SDK via `useSDK()` (`@/context/sdk` → `createOpencodeClient` from `@opencode-ai/sdk/v2/client`) — not `@opencode-ai/client` — for any `sdk().client.experimental.*` call. The old doc label "legacy JavaScript SDK" for `packages/sdk/js` is misleading: it is now the canonical unified SDK.
 
 ## Branch names
 
@@ -177,13 +182,28 @@ const table = sqliteTable("session", {
 
 - Always run `bun typecheck` from package directories (e.g., `packages/opencode`), never `tsc` directly.
 
-## API Architecture
+## API Surfaces — Hybrid (mid-migration, read before choosing a client)
 
-- Treat the V1 legacy API as the production app surface unless a task explicitly says it is for V2. Desktop, app workflows, tab actions, settings flows, and user-facing session behavior should be designed and verified against the V1 HTTP API and its SDK shape first.
-- V2 APIs and `SessionV2` are beta/incomplete infrastructure. Use them only for code paths that are already V2-owned or for explicitly scoped V2 work. Do not migrate V1 product behavior onto V2 endpoints just because a V2 type or client exists.
-- When adding user-facing session features, prefer V1 route groups and handlers under `packages/opencode/src/server/routes/instance/httpapi`, V1 session services such as `SessionPrompt`/`Session`, and the legacy JavaScript SDK regeneration path. Keep V2 additions separate unless the feature requires both surfaces.
-- If a feature is exposed through the app or desktop today, verify the packaged desktop build against the same V1 endpoint the UI calls. Local Vite success is not enough when the EXE bundles generated clients and server code.
-- Keep naming clear in comments and docs: "V1" means the current legacy production API; "V2" means the newer beta session/core API. Avoid referring to shared UI components as V2 API behavior just because their component names include `V2`.
+This repo is mid-migration. Desktop/app is a **hodgepodge**, not pure V1 or pure V2. The blanket "V1 is production, V2 is beta" framing is stale and was actively misleading agents (e.g. an `experimental.openrouterTelemetry` call was wired to `packages/client` and failed at runtime as `Cannot read properties of undefined (reading 'get')` because that surface only exists in the unified SDK).
+
+Current reality:
+
+- **New UI is mostly unified/V2**: `packages/app/src` `prompt-input-v2`, session v2, file explorer v2, terminal v2, permission/question v2, and all `experimental/*` routes (`openrouterEndpoints`, `openrouterTelemetry`, etc.) are unified HttpApi and are accessed ONLY via `@opencode-ai/sdk/v2/client` (`useSDK().client` via `@/context/sdk`). Types come from `@opencode-ai/sdk/v2` (`Session`, `Message`, `Part`, `FileNode`, etc.).
+- **Legacy flows still use promise/client**: older session lists, `server-session`, `global-sync` shims, and some `FileDiffInfo`/`SessionInfo` flows still import from `@opencode-ai/client/promise` (`OpenCode` / `OpenCodeClient`). These correspond to the "V1" `Session` / `SessionPrompt` services under `packages/opencode/src/server/routes/instance/httpapi` and `packages/protocol`.
+- **Overlap is real**: many files import BOTH clients in the same module (`global-sync/bootstrap.ts`, `diffs.ts`, `server-sdk.tsx`, `server-compat.ts`). Do not assume one client covers the other.
+
+Decision tree for agents:
+
+1. Does the endpoint live under `experimental/*`, `instance/*`, `control/*`, `workspace/*`, `pty/*`, `quota/*`, `sync/*`, `tool/*` under `packages/opencode/src/server/routes/instance/httpapi`? → **Unified SDK** (`packages/sdk/js` → `sdk().client.experimental.*` / `sdk().client.instance.*` etc.). Regenerate there with `bun run build` from `packages/sdk/js`.
+2. Does it live under `server/session`, `server/message`, `server/model`, `server/provider`, etc. defined in `packages/protocol`? → EITHER client works (unified also covers it via `OpenCodeHttpApi` composition), but prefer unified for new code unless the file already uses the `OpenCode` promise client consistently.
+3. Adding a new `HttpApi` group under `packages/opencode/src/server/routes/instance/httpapi`? → it will ONLY appear in the unified SDK; `packages/client` will NOT see it. If you also touched `packages/protocol`, run BOTH generators.
+
+Verification (do not trust HMR alone):
+
+- After any HttpApi change, grep the **actual generated output** before assuming the client exists: `rg -n "openrouterTelemetry|openrouterEndpoints" packages/sdk/js/src/v2/gen/sdk.gen.ts` and `rg -n "health|session" packages/client/src/generated/client.ts`. Local Vite HMR success does NOT imply the packaged desktop EXE sees the same shape — the EXE bundles whatever was last generated.
+- If `sdk().client.experimental.*` is `undefined` at runtime, you regenerated the wrong package. `experimental.*` lives ONLY in the unified SDK.
+
+Naming: "V1" in old comments means the legacy promise-client / `Session`/`SessionPrompt` services; "V2" in old comments means the protocol/unified HttpApi + `SessionV2` durability. "V2" in a component name (`ModelSelectorPopoverV2`, `FileTreeV2`) is a UI iteration label, not an API version — do not infer the API surface from it.
 
 ## V2 Session Core
 

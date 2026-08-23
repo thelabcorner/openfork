@@ -15,6 +15,21 @@
 - App (from `packages/app`): `bun dev -- --port 4444`
 - Open `http://localhost:4444` to verify UI changes (it targets the backend at `http://localhost:4096`).
 
+## API Clients — Which SDK to Use (app is hybrid)
+
+`packages/app` is **mid-migration**: it imports BOTH clients in the same files. Do not pick by habit.
+
+- **Unified SDK** (`@opencode-ai/sdk/v2/client` via `useSDK()` → `sdk().client`): covers `ServerApi` (health/session/message/provider/etc.) **PLUS** `InstanceHttpApi`/`RootHttpApi`/`EventApi` (`experimental/*`, `instance/*`, `control/*`, `workspace/*`, `pty/*`, `quota/*`, `sync/*`). This is the **only** client that has `sdk().client.experimental.openrouterEndpoints` / `.openrouterTelemetry`, `sdk().client.instance`, etc. New UI — `prompt-input-v2`, session v2, file explorer v2, terminal v2, permission/question v2 — uses this.
+- **Protocol client** (`@opencode-ai/client/promise` → `OpenCode` / `OpenCodeClient`): covers `ServerApi` only (the `packages/protocol` surface). Still used by legacy shims: `server-session`, `global-sync` bootstraps, some `FileDiffInfo`/`SessionInfo` flows, and tests. It will **never** have `experimental.*` — if `sdk().client.experimental.*` is `undefined` at runtime (`Cannot read properties of undefined (reading 'get')`), you looked at / regenerated the wrong package.
+
+Rules:
+
+- Adding or touching `experimental/*`, `instance/*`, `control/*`, `workspace/*`, `quota/*`, `pte/*`, `sync/*`, `tool/*` under `packages/opencode/src/server/routes/instance/httpapi` → unified SDK. After change, run `bun run build` from `packages/sdk/js` (not `packages/client`), then verify with `rg -n "openrouterTelemetry" packages/sdk/js/src/v2/gen/sdk.gen.ts`.
+- Touching `packages/protocol` ( `server/session`, `server/message`, `server/model`, etc.) → run `bun run generate` from `packages/client` **and** `bun run build` from `packages/sdk/js` if the same endpoint is also exposed via the unified `OpenCodeHttpApi`.
+- Do not edit `packages/client/src/generated/**` or `packages/sdk/js/src/v2/gen/**` by hand.
+
+See root `AGENTS.md` § Workspace / § API Surfaces for the full decision tree and verification steps. "V2" in a component name (`FileTreeV2`, `ModelSelectorPopoverV2`) is a UI iteration label, not an API version.
+
 ## SolidJS
 
 - Always prefer `createStore` over multiple `createSignal` calls
