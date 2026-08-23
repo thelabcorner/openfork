@@ -67,6 +67,7 @@ function fromRow(row: typeof SessionGroupTable.$inferSelect): Info {
 
 export interface Interface {
   readonly list: () => Effect.Effect<Info[]>
+  readonly listWithSessions: () => Effect.Effect<Array<{ group: Info; sessions: Array<{ id: string; title: string }> }>>
   readonly create: (input: { name: string }) => Effect.Effect<Info>
   readonly rename: (input: { id: ID; name: string }) => Effect.Effect<void, NotFoundError>
   readonly remove: (id: ID) => Effect.Effect<void, NotFoundError>
@@ -94,6 +95,32 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         .all()
         .pipe(Effect.orDie)
       return rows.map(fromRow)
+    })
+
+    // Batched variant of `getWithSessions` for clients that need every group's
+    // membership: two total queries (groups + memberships bucketed in memory)
+    // instead of one round-trip per group.
+    const listWithSessions = Effect.fn("SessionGroup.listWithSessions")(function* () {
+      const rows = yield* db
+        .select()
+        .from(SessionGroupTable)
+        .orderBy(asc(SessionGroupTable.position))
+        .all()
+        .pipe(Effect.orDie)
+      const memberships = yield* db
+        .select({ id: SessionTable.id, title: SessionTable.title, group_id: SessionTable.group_id })
+        .from(SessionTable)
+        .where(sql`"group_id" IS NOT NULL`)
+        .all()
+        .pipe(Effect.orDie)
+      const byGroup = new Map<string, Array<{ id: string; title: string }>>()
+      for (const row of memberships) {
+        if (!row.group_id) continue
+        const bucket = byGroup.get(row.group_id)
+        if (bucket) bucket.push({ id: row.id, title: row.title })
+        else byGroup.set(row.group_id, [{ id: row.id, title: row.title }])
+      }
+      return rows.map((row) => ({ group: fromRow(row), sessions: byGroup.get(row.id) ?? [] }))
     })
 
     const create = Effect.fn("SessionGroup.create")(function* (input: { name: string }) {
@@ -226,6 +253,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
 
     return Service.of({
       list,
+      listWithSessions,
       create,
       rename,
       remove,

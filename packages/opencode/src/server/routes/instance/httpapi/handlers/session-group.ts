@@ -13,6 +13,10 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
       return yield* svc.list()
     })
 
+    const listDetails = Effect.fn("SessionGroupHttpApi.listDetails")(function* () {
+      return yield* svc.listWithSessions()
+    })
+
     const create = Effect.fn("SessionGroupHttpApi.create")(function* (ctx: {
       payload: typeof CreatePayload.Type
     }) {
@@ -71,6 +75,7 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
 
     return handlers
       .handle("list", list)
+      .handle("listDetails", listDetails)
       .handle("create", create)
       .handle("get", get)
       .handle("rename", rename)

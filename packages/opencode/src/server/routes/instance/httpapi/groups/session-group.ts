@@ -10,6 +10,7 @@ const root = "/session-group"
 export const SessionGroupPaths = {
   list: root,
   create: root,
+  details: `${root}/details`,
   get: `${root}/:groupID`,
   rename: `${root}/:groupID`,
   remove: `${root}/:groupID`,
@@ -32,6 +33,11 @@ export const ReorderPayload = Schema.Struct({
 
 export const AddSessionPayload = Schema.Struct({
   sessionId: Schema.String,
+})
+
+const Detail = Schema.Struct({
+  group: SessionGroup.Info,
+  sessions: Schema.Array(Schema.Struct({ id: Schema.String, title: Schema.String })),
 })
 
 export const SessionGroupApi = HttpApi.make("session-group")
@@ -60,19 +66,22 @@ export const SessionGroupApi = HttpApi.make("session-group")
         ),
         HttpApiEndpoint.get("get", SessionGroupPaths.get, {
           params: { groupID: SessionGroup.ID },
-          success: described(
-            Schema.Struct({
-              group: SessionGroup.Info,
-              sessions: Schema.Array(Schema.Struct({ id: Schema.String, title: Schema.String })),
-            }),
-            "Session group with sessions",
-          ),
+          success: described(Detail, "Session group with sessions"),
           error: [HttpApiError.BadRequest, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.get",
             summary: "Get session group",
             description: "Get a session group with its sessions.",
+          }),
+        ),
+        HttpApiEndpoint.get("listDetails", SessionGroupPaths.details, {
+          success: described(Schema.Array(Detail), "All session groups with their sessions"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session-group.listDetails",
+            summary: "List session groups with sessions",
+            description: "Get every session group together with its member sessions in one response.",
           }),
         ),
         HttpApiEndpoint.patch("rename", SessionGroupPaths.rename, {
