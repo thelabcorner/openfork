@@ -158,6 +158,20 @@ export const dict: Record<string, string> = {
   "ui.tool.websearch": "Web Search",
   "ui.tool.websearch.provider": "{{provider}} Web Search",
   "ui.tool.shell": "Shell",
+
+  "ui.tool.shell.stop.label": "Stop command",
+
+  "ui.tool.shell.stop.stopping": "Stopping…",
+
+  "ui.tool.shell.stop.notRunning.title": "Command not running",
+
+  "ui.tool.shell.stop.notRunning.description": "It already finished or was stopped.",
+
+  "ui.tool.shell.stop.notRunning.descriptionJob": "The background job already finished or was stopped.",
+
+  "ui.tool.shell.stop.failed.title": "Could not stop command",
+
+  "ui.tool.shell.stop.failed.description": "The request to stop the command failed.",
   "ui.tool.patch": "Patch",
   "ui.tool.todos": "To-dos",
   "ui.tool.todos.read": "Read to-dos",
