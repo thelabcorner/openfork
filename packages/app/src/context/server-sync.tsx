@@ -413,7 +413,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     },
   })
 
-  async function loadSessions(directory: string, options?: { limit?: number }) {
+  async function loadSessions(directory: string, options?: { limit?: number; shrinkTo?: number }) {
     const key = directoryKey(directory)
     const pending = sessionLoads.get(key)
     if (pending) {
@@ -423,6 +423,25 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
     children.pin(key)
     const [store, setStore] = children.child(directory, { bootstrap: false })
+    // Explicit user-intended shrink (e.g. a "show less" control): trim the
+    // retained list to the requested cap and lower the meta high-water mark to
+    // match. Without the meta update, the floor below would keep every later
+    // loadSessions at the old larger size — and a plain store.limit decrement
+    // alone would no-op entirely against it.
+    if (options?.shrinkTo !== undefined) {
+      const target = Math.max(0, options.shrinkTo)
+      const next = trimSessions(store.session, {
+        limit: target,
+        permission: session.data.permission,
+      })
+      batch(() => {
+        setStore("limit", target)
+        setStore("session", reconcile(next, { key: "id" }))
+      })
+      sessionMeta.set(key, { limit: target })
+      children.unpin(key)
+      return
+    }
     const meta = sessionMeta.get(key)
     const retainedLimit = Math.max(store.limit, options?.limit ?? 0, meta?.limit ?? 0)
     if (meta && meta.limit >= retainedLimit) {

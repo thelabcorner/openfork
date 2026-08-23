@@ -126,6 +126,7 @@ export const dict = {
   "chats.search.noResults": "No matching chats",
   "chats.group.recent": "Recent",
   "chats.showMore": "Show more chats",
+  "chats.showLess": "Show fewer chats",
   "chats.empty": "No chats yet",
   "chats.badge.permission": "Waiting on permission",
   "chats.badge.question": "Waiting on a question",

@@ -35,7 +35,7 @@ import { aggregateSessionContextByModel, liveGenerationProgress } from "@/compon
 import { getSessionContext } from "@/components/session/session-context-metrics"
 import { computeMeasuredRate } from "@/components/prompt-input/live-generation-rate-math"
 import { SessionContextMenu } from "@/components/session-menu/session-context-menu"
-import type { ChatSidebarPaneState } from "./chat-sidebar-pane-state"
+import { CHAT_SIDEBAR_RECENT_LIMIT_MIN, type ChatSidebarPaneState } from "./chat-sidebar-pane-state"
 import type { AssistantMessage, Session } from "@opencode-ai/sdk/v2/client"
 
 type ProviderList = ReturnType<ReturnType<typeof useProviders>["all"]> extends Map<string, infer P>
@@ -754,6 +754,30 @@ export function ChatSidebarPane(props: {
                           }}
                         >
                           {language.t("chats.showMore")}
+                        </button>
+                      </Show>
+                      <Show
+                        when={
+                          group.directory
+                            ? (serverSync().child(group.directory, { bootstrap: false })[0].limit ?? 5) > 5
+                            : props.state.recentLimit() > CHAT_SIDEBAR_RECENT_LIMIT_MIN
+                        }
+                      >
+                        <button
+                          type="button"
+                          class="ms-[26px] flex h-6 items-center rounded-md pe-2 text-start text-[10px] leading-none text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-muted focus-visible:outline-none"
+                          onClick={() => {
+                            if (!group.directory) {
+                              props.state.showLessRecent()
+                              return
+                            }
+                            const [store] = serverSync().child(group.directory, { bootstrap: false })
+                            void serverSync().project.loadSessions(group.directory, {
+                              shrinkTo: Math.max(5, (store.limit ?? 5) - 5),
+                            })
+                          }}
+                        >
+                          {language.t("chats.showLess")}
                         </button>
                       </Show>
                     </nav>
