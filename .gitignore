@@ -44,3 +44,4 @@ startup-investigation/raw/harness/cpu/
 startup-investigation/raw/models-dev-api.json
 startup-investigation/raw/trials.jsonl
 startup-investigation/raw/backend-link-desktop-logs-mined.txt
+startup-investigation/raw/*cpuprofile-summary.txt
