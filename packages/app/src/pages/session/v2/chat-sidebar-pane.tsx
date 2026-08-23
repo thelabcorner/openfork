@@ -152,13 +152,14 @@ export function ChatSidebarPane(props: {
   const workingArrival = new Map<string, number>()
   let arrivalSeq = 0
 
+  // Reads the global session store directly: the dir-context proxy routes
+  // session_working to this exact store regardless of directory
+  // (context/directory-sync.ts), so routing through ensureDirSyncContext here
+  // only added refcount churn per row per recompute — plus a dispose-thrash
+  // hazard when this pane was the context's sole holder.
   const isWorking = (session: Session) => {
-    if (!session.id || !session.directory) return false
-    try {
-      return serverSync().ensureDirSyncContext(session.directory).data.session_working(session.id)
-    } catch {
-      return false
-    }
+    if (!session.id) return false
+    return serverSync().session.data.session_working(session.id)
   }
 
   const pinWorkingFirst = (rows: Session[]) => {
@@ -178,26 +179,51 @@ export function ChatSidebarPane(props: {
     return [...pinned.sort((a, b) => a.seq - b.seq).map((item) => item.session), ...rest]
   }
 
+  // Stage 1 — pure grouping. Deliberately reads NO working-state signals: a
+  // working flip must re-run only the cheap pinning pass in `groups` below,
+  // never the filters and sorts here. Each directory's root slice is also
+  // computed once per run and shared by both the recent merge and the project
+  // group — previously the worktree slice was filtered + sorted a second time.
+  const baseGroups = createMemo(() => {
+    const projects = layout.projects.list()
+    const now = Date.now()
+    const slices = new Map<string, Session[]>()
+    const sliceOf = (dir: string) => {
+      const cached = slices.get(dir)
+      if (cached) return cached
+      // searchsmith seam: pre-filter roots here (before sortedRootSessions
+      // sorts) when search needs to scope the pane's listing.
+      const rows = sortedRootSessions(
+        {
+          session: (serverSync().child(dir, { bootstrap: false })[0].session ?? []).map((session) =>
+            withDirectory(session, dir),
+          ),
+          path: { directory: dir },
+        },
+        now,
+      )
+      slices.set(dir, rows)
+      return rows
+    }
+    const recentPool: Session[] = []
+    for (const project of projects) {
+      for (const dir of [project.worktree, ...(project.sandboxes ?? [])]) recentPool.push(...sliceOf(dir))
+    }
+    const projectRows = new Map<string, Session[]>()
+    for (const project of projects) projectRows.set(project.worktree, sliceOf(project.worktree))
+    return { projects, recentPool: [...recentPool].sort(compareSessionTime), projectRows }
+  })
+
+  // Stage 2 — pinning + assembly. The only stage that reads working state, so
+  // a flip storm re-runs just this (~pin cost) while stage 1's sorts stay
+  // cached; stableGroups below then finds nothing visibly changed and keeps
+  // every row component alive.
   const groups = createMemo<ChatSessionGroup[]>(() => {
+    const { projects, recentPool, projectRows } = baseGroups()
     const result: ChatSessionGroup[] = []
 
-    const now = Date.now()
-    const allSessions: Session[] = []
-    const storeSessions = (dir: string) =>
-      (serverSync().child(dir, { bootstrap: false })[0].session ?? []).map((session) =>
-        withDirectory(session, dir),
-      )
-    for (const project of layout.projects.list()) {
-      const dirs = [project.worktree, ...(project.sandboxes ?? [])]
-      for (const dir of dirs) {
-        for (const s of sortedRootSessions({ session: storeSessions(dir), path: { directory: dir } }, now)) {
-          allSessions.push(s)
-        }
-      }
-    }
-
-    const recentOrdered = pinWorkingFirst([...allSessions].sort(compareSessionTime))
-    if (recentOrdered.length > 0) {
+    if (recentPool.length > 0) {
+      const recentOrdered = pinWorkingFirst(recentPool)
       result.push({
         key: "recent",
         label: language.t("chats.group.recent"),
@@ -207,13 +233,11 @@ export function ChatSidebarPane(props: {
       })
     }
 
-    for (const project of layout.projects.list()) {
-      const [store] = serverSync().child(project.worktree, { bootstrap: false })
-      const rows = pinWorkingFirst(
-        sortedRootSessions({ session: storeSessions(project.worktree), path: { directory: project.worktree } }, now),
-      )
+    for (const project of projects) {
+      const rows = pinWorkingFirst(projectRows.get(project.worktree) ?? [])
       if (rows.length === 0) continue
-      const meta = projectForSession(rows[0], layout.projects.list()) ?? project
+      const [store] = serverSync().child(project.worktree, { bootstrap: false })
+      const meta = projectForSession(rows[0], projects) ?? project
       result.push({
         key: pathKey(project.worktree),
         label: displayName(project),
