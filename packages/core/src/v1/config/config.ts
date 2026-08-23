@@ -175,6 +175,9 @@ export const Info = Schema.Struct({
       spad_recovery: Schema.optional(Schema.Boolean).annotate({
         description: "Enable repetitive-output recovery (SPAD-R). Enabled by default; set false to disable",
       }),
+      spad_observe_only: Schema.optional(Schema.Boolean).annotate({
+        description: "Run SPAD-R detection in observe-only mode: log detections but never truncate or recover",
+      }),
       batch_tool: Schema.optional(Schema.Boolean).annotate({ description: "Enable the batch tool" }),
       openTelemetry: Schema.optional(Schema.Boolean).annotate({
         description: "Enable OpenTelemetry spans for AI SDK calls (using the 'experimental_telemetry' flag)",

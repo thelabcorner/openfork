@@ -51,4 +51,37 @@ export default {
       yield* tx.run(`INSERT INTO \`part_search_backfill\` (\`id\`, \`watermark_rowid\`, \`done\`) VALUES (1, -1, 0);`)
     })
   },
+  // See the session_message_fts migration: drizzle-kit cannot express the FTS
+  // objects, so reconcile creates them on fresh databases and repairs
+  // databases whose journal already claims this migration.
+  reconcile(tx) {
+    return Effect.gen(function* () {
+      yield* tx.run(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS \`part_fts\` USING fts5(
+          search_text,
+          content='part',
+          content_rowid='rowid',
+          tokenize='unicode61'
+        );
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER IF NOT EXISTS \`part_fts_ai\` AFTER INSERT ON \`part\` BEGIN
+          INSERT INTO \`part_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER IF NOT EXISTS \`part_fts_ad\` AFTER DELETE ON \`part\` BEGIN
+          INSERT INTO \`part_fts\`(\`part_fts\`, rowid, search_text)
+          VALUES ('delete', old.rowid, old.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER IF NOT EXISTS \`part_fts_au\` AFTER UPDATE ON \`part\` BEGIN
+          INSERT INTO \`part_fts\`(\`part_fts\`, rowid, search_text)
+          VALUES ('delete', old.rowid, old.search_text);
+          INSERT INTO \`part_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END;
+      `)
+    })
+  },
 } satisfies DatabaseMigration.Migration

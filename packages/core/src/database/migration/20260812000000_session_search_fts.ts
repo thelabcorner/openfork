@@ -50,4 +50,38 @@ export default {
       yield* tx.run(`INSERT INTO \`search_backfill\` (\`id\`, \`watermark_rowid\`, \`done\`) VALUES (1, -1, 0);`)
     })
   },
+  // The FTS objects are invisible to drizzle-kit, so the generated full schema
+  // cannot create them; reconcile covers fresh databases and repairs databases
+  // whose journal already claims this migration.
+  reconcile(tx) {
+    return Effect.gen(function* () {
+      yield* tx.run(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS \`session_message_fts\` USING fts5(
+          search_text,
+          content='session_message',
+          content_rowid='rowid',
+          tokenize='unicode61'
+        );
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER IF NOT EXISTS \`session_message_fts_ai\` AFTER INSERT ON \`session_message\` BEGIN
+          INSERT INTO \`session_message_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER IF NOT EXISTS \`session_message_fts_ad\` AFTER DELETE ON \`session_message\` BEGIN
+          INSERT INTO \`session_message_fts\`(\`session_message_fts\`, rowid, search_text)
+          VALUES ('delete', old.rowid, old.search_text);
+        END;
+      `)
+      yield* tx.run(`
+        CREATE TRIGGER IF NOT EXISTS \`session_message_fts_au\` AFTER UPDATE ON \`session_message\` BEGIN
+          INSERT INTO \`session_message_fts\`(\`session_message_fts\`, rowid, search_text)
+          VALUES ('delete', old.rowid, old.search_text);
+          INSERT INTO \`session_message_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
+        END;
+      `)
+      yield* tx.run(`CREATE INDEX IF NOT EXISTS \`session_directory_idx\` ON \`session\` (\`directory\`);`)
+    })
+  },
 } satisfies DatabaseMigration.Migration

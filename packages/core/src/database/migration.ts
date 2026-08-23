@@ -13,6 +13,13 @@ const lock = Semaphore.makeUnsafe(1)
 export type Migration = {
   id: string
   up: (tx: Transaction) => Effect.Effect<void, unknown>
+  // Idempotent DDL for objects drizzle-kit cannot express (FTS5 virtual tables,
+  // triggers). Fresh databases are built from the generated full schema and
+  // pre-journal every migration id WITHOUT executing it, so anything that only
+  // lives in up() never gets created there; reconcile runs on every open so
+  // those objects exist (or are repaired) regardless of how the database was
+  // born.
+  reconcile?: (tx: Transaction) => Effect.Effect<void, unknown>
 }
 
 export function apply(db: Database) {
@@ -26,6 +33,7 @@ export function apply(db: Database) {
       yield* db.transaction((tx) =>
         Effect.gen(function* () {
           yield* schema.up(tx)
+          yield* reconcileSupplements(tx, migrations)
           yield* tx.run(
             sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
           )
@@ -77,5 +85,21 @@ export function applyOnly(db: Database, input: Migration[]) {
         }),
       )
     }
+
+    // Self-heal: databases whose journal already claims a reconcile migration
+    // (e.g. created from the generated full schema before the objects existed)
+    // get their supplements created here. All statements are IF NOT EXISTS, so
+    // this is a cheap no-op for healthy databases.
+    if (input.some(hasReconcile)) {
+      yield* db.transaction((tx) => reconcileSupplements(tx, input))
+    }
   })
+}
+
+function hasReconcile(migration: Migration): migration is Migration & Required<Pick<Migration, "reconcile">> {
+  return migration.reconcile !== undefined
+}
+
+function reconcileSupplements(tx: Transaction, input: Migration[]) {
+  return Effect.forEach(input.filter(hasReconcile), (migration) => migration.reconcile(tx)).pipe(Effect.asVoid)
 }

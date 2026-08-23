@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "796658a2-5a8b-4bde-b6c0-6615be4f0ead",
+  "id": "5475787e-5da2-46ec-aece-653343330ff1",
   "prevIds": [
-    "f14a9b18-8207-487e-a3d3-227e629ba9ad"
+    "796658a2-5a8b-4bde-b6c0-6615be4f0ead"
   ],
   "ddl": [
     {
@@ -28,6 +28,10 @@
     },
     {
       "name": "credential",
+      "entityType": "tables"
+    },
+    {
+      "name": "device",
       "entityType": "tables"
     },
     {
@@ -481,6 +485,76 @@
       "name": "time_updated",
       "entityType": "columns",
       "table": "credential"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "device"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "name",
+      "entityType": "columns",
+      "table": "device"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "token_hash",
+      "entityType": "columns",
+      "table": "device"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "token_prefix",
+      "entityType": "columns",
+      "table": "device"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "device"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_seen_at",
+      "entityType": "columns",
+      "table": "device"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "revoked_at",
+      "entityType": "columns",
+      "table": "device"
     },
     {
       "type": "text",
@@ -2209,6 +2283,15 @@
     },
     {
       "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "device_pk",
+      "table": "device",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "aggregate_id"
       ],
       "nameExplicit": false,
@@ -2765,6 +2848,15 @@
       "name": "todo_session_idx",
       "entityType": "indexes",
       "table": "todo"
+    },
+    {
+      "columns": [
+        "token_hash"
+      ],
+      "nameExplicit": false,
+      "name": "device_token_hash_unique",
+      "entityType": "uniques",
+      "table": "device"
     }
   ],
   "renames": []

@@ -70,6 +70,17 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`device\` (
+          \`id\` text PRIMARY KEY,
+          \`name\` text NOT NULL,
+          \`token_hash\` text NOT NULL UNIQUE,
+          \`token_prefix\` text NOT NULL,
+          \`created_at\` integer NOT NULL,
+          \`last_seen_at\` integer,
+          \`revoked_at\` integer
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`event_sequence\` (
           \`aggregate_id\` text PRIMARY KEY,
           \`seq\` integer NOT NULL,
