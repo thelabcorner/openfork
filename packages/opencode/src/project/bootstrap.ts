@@ -8,7 +8,7 @@ import * as Vcs from "./vcs"
 import { InstanceState } from "@/effect/instance-state"
 import { ShareNext } from "@/share/share-next"
 import { ToolReload } from "@/tool/reload"
-import { Effect, Layer, Clock } from "effect"
+import { Effect, Layer } from "effect"
 import { Config } from "@/config/config"
 import { Service } from "./bootstrap-service"
 
@@ -45,7 +45,9 @@ const layer = Layer.effect(
     const vcs = yield* Vcs.Service
     const toolReload = yield* ToolReload.Service
 
-    const run = Effect.gen(function* () {
+    // Request-gating half: InstanceStore unblocks queued requests as soon as
+    // this completes. Keep it fast — nothing speculative belongs here.
+    const gate = Effect.gen(function* () {
       const ctx = yield* InstanceState.context
       yield* Effect.logInfo("bootstrapping", { directory: ctx.directory })
       // everything depends on config so eager load it for nice traces
@@ -57,8 +59,13 @@ const layer = Layer.effect(
       yield* timed(ctx.directory, "toolReload", toolReload.start()).pipe(
         Effect.catchCause((cause) => Effect.logWarning("tool reload init failed", { cause })),
       )
-      // Each service self-manages its own slow work via Effect.forkScoped against
-      // its per-instance state scope. We just await materialization here.
+    }).pipe(Effect.withSpan("InstanceBootstrap.gate"))
+
+    // Non-gating half: eager per-service materialization. Services also
+    // materialize lazily via InstanceState.get on first use (single-flighted by
+    // ScopedCache), so a slow init here delays warm caches, never requests.
+    const warmup = Effect.gen(function* () {
+      const ctx = yield* InstanceState.context
       yield* Effect.forEach(
         [
           ["lsp", lsp],
@@ -73,10 +80,10 @@ const layer = Layer.effect(
             Effect.catchCause((cause) => Effect.logWarning("init failed", { cause })),
           ),
         { concurrency: "unbounded", discard: true },
-      ).pipe(Effect.withSpan("InstanceBootstrap.init"))
-    }).pipe(Effect.withSpan("InstanceBootstrap"))
+      ).pipe(Effect.withSpan("InstanceBootstrap.warmup"))
+    })
 
-    return Service.of({ run })
+    return Service.of({ gate, warmup })
   }),
 )
 

@@ -47,8 +47,23 @@ export function createTimelineModel(input: {
         }, 500)
       })
 
-      const done = trackPending(`session.sync:${id}`)
-      return Promise.resolve(sync().session.sync(id)).finally(done)
+      const label = `session.sync:${id}`
+      const done = trackPending(label)
+      // Perf marks so DevTools/perf traces attribute route-paint waits to the
+      // actual sync round-trip instead of an unlabelled Suspense gap.
+      const markStart = `${label}.start`
+      const markEnd = `${label}.end`
+      performance.mark(markStart)
+      return Promise.resolve(sync().session.sync(id))
+        .finally(() => {
+          performance.mark(markEnd)
+          try {
+            performance.measure(label, markStart, markEnd)
+          } catch {
+            // Mark already gone (buffer eviction) — the measure is best-effort.
+          }
+          done()
+        })
     },
   )
   const messages = createMemo(() => {

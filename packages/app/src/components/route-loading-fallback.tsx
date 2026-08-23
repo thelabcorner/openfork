@@ -17,6 +17,20 @@ function queryLabel(query: { queryKey: readonly unknown[] }) {
     .join(" · ")
 }
 
+/**
+ * Why a query is (or isn't) contributing to the wait. TanStack reports
+ * DISABLED queries as status "pending" — counting them as load time conflates
+ * enablement-gating (e.g. vcsQuery waiting on project info) with real fetch
+ * latency, which made cold-start traces read as uniformly slow.
+ */
+type QueryPhase = "fetching" | "refetching" | "disabled" | "idle"
+
+function queryPhase(query: { state: { fetchStatus: string; status: string; data?: unknown } }): QueryPhase {
+  if (query.state.fetchStatus === "fetching") return query.state.data === undefined ? "fetching" : "refetching"
+  if (query.state.status === "pending") return "disabled"
+  return "idle"
+}
+
 export function RouteLoadingFallback() {
   const language = useLanguage()
   const location = useLocation()
@@ -25,7 +39,9 @@ export function RouteLoadingFallback() {
   const [now, setNow] = createSignal(started)
   const [copied, setCopied] = createSignal(false)
   const [tick, setTick] = createSignal(0)
-  const [seenQueries, setSeenQueries] = createStore({ items: [] as { key: string; started: number; done: boolean }[] })
+  const [seenQueries, setSeenQueries] = createStore({
+    items: [] as { key: string; started: number; done: boolean; phase: QueryPhase }[],
+  })
 
   onMount(() => {
     const clock = window.setInterval(() => setNow(Date.now()), 250)
@@ -42,20 +58,25 @@ export function RouteLoadingFallback() {
     return queryClient
       .getQueryCache()
       .getAll()
-      .filter((query) => query.state.fetchStatus === "fetching" || query.state.status === "pending")
+      .map((query) => ({ key: queryLabel(query), phase: queryPhase(query) }))
   })
   const waits = createMemo(() => pendingWork())
   const waitMs = (item: { started: number; done: boolean }) => (item.done ? 0 : now() - item.started)
 
   createEffect(() => {
-    const active = new Set(queries().map(queryLabel))
-    for (const key of active) {
-      if (seenQueries.items.some((item) => item.key === key)) continue
-      setSeenQueries("items", (items) => [...items, { key, started: Date.now(), done: false }])
+    const active = new Set(queries().filter((item) => item.phase !== "idle").map((item) => item.key))
+    for (const item of queries()) {
+      if (item.phase === "idle") continue
+      const existing = seenQueries.items.find((row) => row.key === item.key)
+      if (!existing) {
+        setSeenQueries("items", (items) => [...items, { key: item.key, started: Date.now(), done: false, phase: item.phase }])
+        continue
+      }
+      if (existing.phase !== item.phase) setSeenQueries("items", (row) => row.key === item.key, "phase", item.phase)
     }
-    for (const item of seenQueries.items) {
-      const done = !active.has(item.key)
-      if (item.done !== done) setSeenQueries("items", (row) => row.key === item.key, "done", done)
+    for (const row of seenQueries.items) {
+      const done = !active.has(row.key)
+      if (row.done !== done) setSeenQueries("items", (item) => item.key === row.key, "done", done)
     }
   })
 
@@ -66,7 +87,9 @@ export function RouteLoadingFallback() {
       "queries:",
       ...(seenQueries.items.length === 0
         ? ["  (none)"]
-        : seenQueries.items.map((item) => `  ${item.key} (${item.done ? 0 : now() - item.started}ms)`)),
+        : seenQueries.items.map(
+            (item) => `  ${item.key} [${item.phase}] (${item.done ? 0 : now() - item.started}ms)`,
+          )),
       "pending:",
       ...(waits().length === 0
         ? ["  (none — Solid Suspense is holding this view)"]
@@ -110,7 +133,7 @@ export function RouteLoadingFallback() {
             <For each={seenQueries.items}>
               {(item) => (
                 <li class="break-all">
-                  {item.key} · {item.done ? 0 : now() - item.started}ms
+                  {item.key} · [{item.phase}] {item.done ? 0 : now() - item.started}ms
                 </li>
               )}
             </For>
