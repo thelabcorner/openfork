@@ -27,6 +27,11 @@ export function createChatSidebarPaneState() {
     recentLimit: () => Math.max(CHAT_SIDEBAR_RECENT_LIMIT_MIN, store.recentLimit),
     showMoreRecent: () =>
       setStore("recentLimit", (value) => Math.max(CHAT_SIDEBAR_RECENT_LIMIT_MIN, value) + CHAT_SIDEBAR_RECENT_LIMIT_STEP),
+    showLessRecent: () =>
+      setStore(
+        "recentLimit",
+        (value) => Math.max(CHAT_SIDEBAR_RECENT_LIMIT_MIN, Math.max(CHAT_SIDEBAR_RECENT_LIMIT_MIN, value) - CHAT_SIDEBAR_RECENT_LIMIT_STEP),
+      ),
     isGroupCollapsed: (key: string) => store.collapsedGroups[key] === true,
     toggleGroup: (key: string) => setStore("collapsedGroups", key, (prev) => !prev),
     revealGroup: (key: string) => setStore("collapsedGroups", key, false),
