@@ -5,6 +5,7 @@ import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Command } from "@/command"
 import { Permission } from "@/permission"
+import { Project } from "@/project/project"
 import { SessionShare } from "@/share/session"
 import { Session } from "@/session/session"
 import { SessionCompaction } from "@/session/compaction"
@@ -62,6 +63,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const broker = yield* BrowserHostBroker.Service
     const summary = yield* SessionSummary.Service
     const events = yield* EventV2Bridge.Service
+    const project = yield* Project.Service
     const scope = yield* Scope.Scope
 
     const list = Effect.fn("SessionHttpApi.list")(function* (ctx: { query: typeof ListQuery.Type }) {
@@ -353,6 +355,13 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       payload: typeof InitPayload.Type
     }) {
       yield* requireSession(ctx.params.sessionID)
+      // Project marks the worktree initialized by listening for the INIT
+      // command's Executed event — a subscription registered inside lazy
+      // instance state. Since F1 split bootstrap, requests can run before
+      // warmup registers it, so materialize it here: this is the only dispatch
+      // site of Command.Default.INIT, and after the first call this is a
+      // cached no-op.
+      yield* project.init()
       yield* promptSvc
         .command({
           sessionID: ctx.params.sessionID,
