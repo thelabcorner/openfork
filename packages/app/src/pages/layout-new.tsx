@@ -1,4 +1,5 @@
-import { createEffect, onCleanup, Show, Suspense, type ParentProps } from "solid-js"
+import { createEffect, lazy, onCleanup, Show, Suspense, type ParentProps } from "solid-js"
+import { RouteLoadingFallback } from "@/components/route-loading-fallback"
 import { createStore } from "solid-js/store"
 import { createMediaQuery } from "@solid-primitives/media"
 import { DebugBar } from "@/components/debug-bar"
@@ -8,8 +9,15 @@ import { useLayout } from "@/context/layout"
 import { usePlatform } from "@/context/platform"
 import { setV2Toast, ToastRegion } from "@/utils/toast"
 import { createBrowserPanelV2State } from "@/pages/session/v2/browser-panel-v2-state"
-import { BrowserPanelV2 } from "@/pages/session/v2/browser-panel-v2"
-import { browserHostClient } from "@/pages/session/v2/browser/browserHostClient"
+import { createChatSidebarPaneState } from "@/pages/session/v2/chat-sidebar-pane-state"
+
+const BrowserPanelV2 = lazy(() =>
+  import("@/pages/session/v2/browser-panel-v2").then((m) => ({ default: m.BrowserPanelV2 })),
+)
+
+const ChatSidebarPane = lazy(() =>
+  import("@/pages/session/v2/chat-sidebar-pane").then((m) => ({ default: m.ChatSidebarPane })),
+)
 
 export default function NewLayout(props: ParentProps) {
   const platform = usePlatform()
@@ -22,8 +30,11 @@ export default function NewLayout(props: ParentProps) {
   // stays mounted (and its webviews alive) across every route — home, new
   // session, and chat sessions alike. The engine's tab-request broadcast is
   // the signal to auto-open it.
-  const browserV2State = createBrowserPanelV2State()
   const isDesktop = createMediaQuery("(min-width: 768px)")
+  const chatSidebarState = createChatSidebarPaneState()
+  const chatOpen = () => layout.chats.opened()
+  const chatVisible = () => isDesktop() && chatOpen()
+  const browserV2State = createBrowserPanelV2State()
   const browserOpen = () => layout.browser.opened()
   const browserVisible = () => isDesktop() && browserOpen()
 
@@ -37,16 +48,23 @@ export default function NewLayout(props: ParentProps) {
   // instead; layout.projectExplorer's open/close state (below) still lives
   // here in the shared context so the titlebar toggle works regardless.
 
+  // The browser host client module is loaded lazily (it drags the whole
+  // browser pane graph with it); the subscription is torn down via a
+  // synchronous onCleanup because the async body runs outside any owner.
   createEffect(() => {
-    void browserHostClient.init()
-    const unsubscribeRequest = browserHostClient.onTabRequest(() => {
-      if (layout.browser.opened()) return
-      layout.browser.open()
-    })
-    const unsubscribeClose = browserHostClient.onTabClose(() => {})
-    onCleanup(() => {
-      unsubscribeRequest()
-      unsubscribeClose()
+    let disposeHostClient = () => {}
+    onCleanup(() => disposeHostClient())
+    void import("@/pages/session/v2/browser/browserHostClient").then(({ browserHostClient }) => {
+      void browserHostClient.init()
+      const unsubscribeRequest = browserHostClient.onTabRequest(() => {
+        if (layout.browser.opened()) return
+        layout.browser.open()
+      })
+      const unsubscribeClose = browserHostClient.onTabClose(() => {})
+      disposeHostClient = () => {
+        unsubscribeRequest()
+        unsubscribeClose()
+      }
     })
   })
 
@@ -77,15 +95,28 @@ export default function NewLayout(props: ParentProps) {
         }
       />
       <div class="flex min-h-0 min-w-0 flex-1 flex-row items-stretch">
+        <Show when={chatVisible()}>
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <ChatSidebarPane
+              state={chatSidebarState}
+              opened={chatOpen()}
+              onClose={() => layout.chats.close()}
+            />
+          </Suspense>
+        </Show>
         <main class="min-h-0 min-w-0 flex-1 overflow-x-hidden flex flex-col items-start contain-strict">
-          <Suspense>{props.children}</Suspense>
+          <Suspense fallback={<RouteLoadingFallback />}>
+            {props.children}
+          </Suspense>
         </main>
         <Show when={browserVisible()}>
-          <BrowserPanelV2
-            state={browserV2State}
-            opened={browserOpen()}
-            onClose={() => layout.browser.close()}
-          />
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <BrowserPanelV2
+              state={browserV2State}
+              opened={browserOpen()}
+              onClose={() => layout.browser.close()}
+            />
+          </Suspense>
         </Show>
       </div>
       {import.meta.env.DEV && state.debugTools && <DebugBar inline />}

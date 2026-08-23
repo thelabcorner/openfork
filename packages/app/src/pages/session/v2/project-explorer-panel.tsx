@@ -1,7 +1,7 @@
 import { Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { debounce } from "@solid-primitives/scheduled"
-import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
+import { ResizeHandle, type ResizeHandlePairSide } from "@opencode-ai/ui/resize-handle"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
@@ -40,6 +40,13 @@ export function ProjectExplorerPanel(props: {
   onAddToChat?: (path: string) => void
   fileOps?: FileOpsPort
   gitStatus?: ReadonlyMap<string, Kind>
+  /**
+   * Dividers owned by this panel, supplied by the session row so the whole row
+   * is described by one ordered pane list. `treePair` is tree|editor when the
+   * editor is open and tree|session otherwise; `editorPair` is editor|session.
+   */
+  treePair?: { left: ResizeHandlePairSide; right: ResizeHandlePairSide }
+  editorPair?: { left: ResizeHandlePairSide; right: ResizeHandlePairSide }
 }) {
   const language = useLanguage()
   const favorites = createProjectExplorerFavorites()
@@ -86,11 +93,17 @@ export function ProjectExplorerPanel(props: {
   return (
     <div
       id="project-explorer-panel"
-      class="relative flex h-full min-h-0 shrink-0 flex-row overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)] contain-strict"
-      style={{ width: `${props.state.panelWidth()}px` }}
+      // Width is the sum of the tree + editor panes, so it is left to `auto`:
+      // a stored width here would be a second, lagging source of truth during
+      // a drag. (`contain: strict` would zero out an auto width.)
+      class="relative flex h-full min-h-0 w-auto shrink-0 flex-row overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)]"
       data-project-explorer-panel
     >
-      <div class="relative flex h-full min-h-0 shrink-0 flex-col" style={{ width: `${props.state.treeWidth()}px` }}>
+      <div
+        id="project-explorer-tree-pane"
+        class="relative flex h-full min-h-0 shrink-0 flex-col"
+        style={{ width: `${props.state.treeWidth()}px` }}
+      >
         <div class="flex h-8 shrink-0 items-center gap-1 border-b border-v2-border-border-base px-2">
           <span class="min-w-0 max-w-24 truncate text-[11px] font-[560] uppercase tracking-[0.04px] text-v2-text-text-muted">
             {language.t("projectExplorer.title")}
@@ -179,18 +192,28 @@ export function ProjectExplorerPanel(props: {
             onCreate={(path, kind) => void fileOps().mkdir({ path, kind }).catch(notImplementedToast)}
           />
         </ScrollView>
-        <ResizeHandle
-          direction="horizontal"
-          edge="end"
-          size={props.state.treeWidth()}
-          min={PROJECT_EXPLORER_TREE_WIDTH_MIN}
-          max={PROJECT_EXPLORER_TREE_WIDTH_MAX}
-          onResize={props.state.resizeTree}
-        />
+        {/* Divider on the tree's right edge: tree|editor, or tree|session. */}
+        <Show when={props.treePair}>
+          {(pair) => (
+            <ResizeHandle
+              direction="horizontal"
+              edge="end"
+              size={props.state.treeWidth()}
+              min={PROJECT_EXPLORER_TREE_WIDTH_MIN}
+              max={PROJECT_EXPLORER_TREE_WIDTH_MAX}
+              onResize={props.state.resizeTree}
+              pair={pair()}
+            />
+          )}
+        </Show>
       </div>
 
       <Show when={props.state.editorOpened()}>
-        <div class="relative flex h-full min-h-0 shrink-0 flex-row" style={{ width: `${props.state.editorWidth()}px` }}>
+        <div
+          id="project-explorer-editor-pane"
+          class="relative flex h-full min-h-0 shrink-0 flex-row"
+          style={{ width: `${props.state.editorWidth()}px` }}
+        >
           <ProjectExplorerEditorPane
             fileOps={fileOps()}
             onCloseAll={props.state.closeEditor}
@@ -205,14 +228,20 @@ export function ProjectExplorerPanel(props: {
             onToggleFavorite={(path) => favorites.toggle(path)}
             ref={(handle) => (editorHandle = handle)}
           />
-          <ResizeHandle
-            direction="horizontal"
-            edge="end"
-            size={props.state.editorWidth()}
-            min={PROJECT_EXPLORER_EDITOR_WIDTH_MIN}
-            max={PROJECT_EXPLORER_EDITOR_WIDTH_MAX}
-            onResize={props.state.resizeEditor}
-          />
+          {/* Divider on the editor's right edge: editor|session. */}
+          <Show when={props.editorPair}>
+            {(pair) => (
+              <ResizeHandle
+                direction="horizontal"
+                edge="end"
+                size={props.state.editorWidth()}
+                min={PROJECT_EXPLORER_EDITOR_WIDTH_MIN}
+                max={PROJECT_EXPLORER_EDITOR_WIDTH_MAX}
+                onResize={props.state.resizeEditor}
+                pair={pair()}
+              />
+            )}
+          </Show>
         </div>
       </Show>
     </div>

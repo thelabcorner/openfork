@@ -28,6 +28,7 @@ function SessionTabSlot(props: {
   index: () => number
   active: () => boolean
   forceTruncate: boolean
+  pending: boolean
   session: () => Session | undefined
   fallbackTitle?: string
   onRename: (title: string) => Promise<void>
@@ -68,6 +69,7 @@ function SessionTabSlot(props: {
           onClose={props.onClose}
           active={props.active()}
           forceTruncate={props.forceTruncate}
+          pending={props.pending}
           dragging={sortable.isDragSource()}
         />
       </TitlebarTabContextMenu>
@@ -81,6 +83,7 @@ function SessionTabEntry(props: {
   index: () => number
   active: () => boolean
   forceTruncate: boolean
+  pending: boolean
   serverCtx: () => ServerCtx | undefined
   onVisibleChange: (visible: boolean) => void
   onNavigate: (element: HTMLDivElement) => void
@@ -169,6 +172,7 @@ function SessionTabEntry(props: {
         index={props.index}
         active={props.active}
         forceTruncate={props.forceTruncate}
+        pending={props.pending}
         session={session}
         fallbackTitle={persisted()?.title ?? (missingSession() ? language.t("session.tab.unknown") : undefined)}
         onRename={rename}
@@ -185,6 +189,7 @@ function DraftTabSlot(props: {
   id: string
   index: () => number
   active: () => boolean
+  pending: boolean
   title: string
   onNavigate: (element: HTMLDivElement) => void
   onClose: () => void
@@ -217,6 +222,7 @@ function DraftTabSlot(props: {
           onNavigate={() => props.onNavigate(ref)}
           onClose={props.onClose}
           active={props.active()}
+          pending={props.pending}
           dragging={sortable.isDragSource()}
         />
       </TitlebarTabContextMenu>
@@ -229,6 +235,7 @@ function GroupTabSlot(props: {
   id: string
   index: () => number
   active: () => boolean
+  pending: boolean
   title: string
   sessionCount: number
   sessions?: { title: string; project?: string }[]
@@ -266,6 +273,7 @@ function GroupTabSlot(props: {
           onNavigate={() => props.onNavigate(ref)}
           onClose={props.onClose}
           active={props.active()}
+          pending={props.pending}
           dragging={sortable.isDragSource()}
         />
       </TitlebarTabContextMenu>
@@ -278,6 +286,7 @@ function GroupTabEntry(props: {
   id: string
   index: () => number
   active: () => boolean
+  pending: boolean
   serverCtx: () => ServerCtx | undefined
   onVisibleChange: (visible: boolean) => void
   onNavigate: (element: HTMLDivElement) => void
@@ -302,6 +311,7 @@ function GroupTabEntry(props: {
       id={props.id}
       index={props.index}
       active={props.active}
+      pending={props.pending}
       title={title()}
       sessionCount={sessionCount()}
       sessions={sessions()}
@@ -315,6 +325,7 @@ export function TitlebarTabStrip(props: {
   tabs: Tab[]
   currentTab: () => Tab | undefined
   forceTruncate: boolean
+  pendingTabKey?: () => string | null
   onNavigate: (tab: Tab, el?: HTMLDivElement) => void
   onClose: (tab: Tab) => void
   onReorder: (keys: string[]) => void
@@ -462,6 +473,7 @@ export function TitlebarTabStrip(props: {
                 const id = tabKey(tab)
                 let ref!: HTMLDivElement
                 const visibleIndex = () => visibleIndexMap().get(id) ?? -1
+                const pending = () => props.pendingTabKey?.() === id
                 const serverCtx = createMemo(() => {
                   if (tab.type !== "session") return
                   const conn = global.servers.list().find((item) => ServerConnection.key(item) === tab.server)
@@ -476,6 +488,7 @@ export function TitlebarTabStrip(props: {
                       index={visibleIndex}
                       active={() => props.currentTab() === tab}
                       forceTruncate={props.forceTruncate}
+                      pending={pending()}
                       serverCtx={serverCtx}
                       onVisibleChange={(visible) => setVisibility(id, visible)}
                       onNavigate={(element) => {
@@ -495,6 +508,7 @@ export function TitlebarTabStrip(props: {
                       id={id}
                       index={visibleIndex}
                       active={() => props.currentTab() === tab}
+                      pending={pending()}
                       serverCtx={serverCtx}
                       onVisibleChange={(visible) => setVisibility(id, visible)}
                       onNavigate={(element) => {
@@ -512,6 +526,7 @@ export function TitlebarTabStrip(props: {
                     id={id}
                     index={visibleIndex}
                     active={() => props.currentTab() === tab}
+                    pending={pending()}
                     title={language.t("command.session.new")}
                     onNavigate={(element) => {
                       ref = element

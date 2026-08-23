@@ -5,6 +5,7 @@ import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { useLanguage } from "@/context/language"
 import { useServerSync } from "@/context/server-sync"
+import { useLayout } from "@/context/layout"
 import { browserHostClient } from "./browser/browserHostClient"
 import { HostedBrowserWebview } from "./browser/HostedBrowserWebview"
 import { BrowserTabContextMenu } from "./browser/browser-tab-context-menu"
@@ -28,6 +29,28 @@ export function BrowserPanelV2(props: {
   const language = useLanguage()
   const hostState = browserHostClient.state
   const serverSync = useServerSync()
+  const layout = useLayout()
+
+  // When a session route is mounted, share the resize delta proportionally
+  // across its row (session pane + open right panels) instead of only
+  // shrinking whatever the outer flex layout happens to absorb. Outside a
+  // session route there's no row to share with, so this is `undefined` and
+  // the handle falls back to resizing only the browser panel itself.
+  const resizePair = createMemo(() => {
+    const group = layout.sessionRow.group()?.()
+    if (!group || group.length === 0) return undefined
+    return {
+      left: group,
+      groupMode: "weighted" as const,
+      right: {
+        size: props.state.sidebarWidth(),
+        min: BROWSER_PANEL_V2_WIDTH_MIN,
+        max: BROWSER_PANEL_V2_WIDTH_MAX,
+        onResize: props.state.resizeSidebar,
+        el: () => document.getElementById("browser-panel"),
+      },
+    }
+  })
 
   // Open/visited chat sessions for the "Assign to session…" submenu (D7 user
   // authority). Sourced from the in-memory session store the page maintains;
@@ -138,6 +161,7 @@ export function BrowserPanelV2(props: {
         min={BROWSER_PANEL_V2_WIDTH_MIN}
         max={BROWSER_PANEL_V2_WIDTH_MAX}
         onResize={props.state.resizeSidebar}
+        pair={resizePair()}
       />
     </div>
   )

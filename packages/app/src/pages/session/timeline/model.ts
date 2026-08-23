@@ -3,6 +3,7 @@ import { createEffect, createMemo, createResource, on, onCleanup, untrack, type 
 import { useServerSync } from "@/context/server-sync"
 import { useSync } from "@/context/sync"
 import { same } from "@/utils/same"
+import { trackPending } from "@/utils/pending-work"
 
 const emptyUserMessages: UserMessage[] = []
 const sessionFreshness = 15_000
@@ -46,7 +47,8 @@ export function createTimelineModel(input: {
         }, 500)
       })
 
-      return sync().session.sync(id)
+      const done = trackPending(`session.sync:${id}`)
+      return Promise.resolve(sync().session.sync(id)).finally(done)
     },
   )
   const messages = createMemo(() => {

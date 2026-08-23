@@ -25,6 +25,22 @@ function tr(translator: Translator | undefined, key: string, text: string, vars?
   return out
 }
 
+export function isCancelledRequestError(error: unknown) {
+  if (!error) return false
+  if (typeof error === "object") {
+    if ("name" in error && (error.name === "AbortError" || error.name === "TimeoutError")) return true
+    const status =
+      "cause" in error && typeof error.cause === "object" && error.cause && "status" in error.cause
+        ? error.cause.status
+        : "status" in error
+          ? error.status
+          : undefined
+    if (status === 499) return true
+  }
+  const message = error instanceof Error ? error.message : String(error)
+  return /\b499\b/.test(message)
+}
+
 export function formatServerError(error: unknown, translate?: Translator, fallback?: string) {
   const unwrapped = unwrapNamedError(error)
   if (isConfigInvalidErrorLike(unwrapped)) return parseReadableConfigInvalidError(unwrapped, translate)

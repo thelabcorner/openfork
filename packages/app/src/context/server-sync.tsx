@@ -31,7 +31,8 @@ import { estimateRootSessionTotal, loadRootSessions, loadRootSessionsV1 } from "
 import { trimSessions } from "./global-sync/session-trim"
 import type { ProjectMeta } from "./global-sync/types"
 import { SESSION_RECENT_LIMIT } from "./global-sync/types"
-import { formatServerError } from "@/utils/server-errors"
+import { formatServerError, isCancelledRequestError } from "@/utils/server-errors"
+import { safeQueryData } from "@/utils/safe-query-data"
 import { queryOptions, useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/solid-query"
 import type { SolidQueryOptions } from "@tanstack/solid-query"
 import { createRefreshQueue } from "./global-sync/queue"
@@ -281,19 +282,21 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     },
     project: [],
     provider_auth: {},
+    // JSDOC: Suspension-safe query getters (route-level black-screen fix).
+    // `@tanstack/solid-query` uses an internal `createResource()` per query.
+    // Reading `.data` while the resource is unresolved (isPending true)
+    // parks the Suspense boundary. Check `isPending` first; only then
+    // access `.data`, with a safe default (`?? EMPTY` / `?? {}`).
     get path() {
       const EMPTY = { state: "", config: "", worktree: "", directory: "", home: "" }
-      if (pathQuery.isLoading) return EMPTY
-      return pathQuery.data ?? EMPTY
+      return safeQueryData(pathQuery, EMPTY)
     },
     get provider() {
       const EMPTY = { all: new Map(), connected: [], default: {} }
-      if (providerQuery.isLoading) return EMPTY
-      return providerQuery.data ?? EMPTY
+      return safeQueryData(providerQuery, EMPTY)
     },
     get config() {
-      if (configQuery.isLoading) return {}
-      return configQuery.data ?? {}
+      return safeQueryData(configQuery, {})
     },
     get reload() {
       return updateConfigMutation.isPending ? "pending" : undefined
@@ -388,6 +391,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       void loadCommands(directory, serverSDK.api.command, sdkFor(directory), serverSDK.protocol)
         .then((commands) => setStore("command", commands))
         .catch((err) => {
+          if (isCancelledRequestError(err)) return
           showToast({
             variant: "error",
             title: language.t("toast.project.reloadFailed.title", { project: getFilename(directory) }),
@@ -470,6 +474,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
               sessionMeta.set(key, { limit })
             })
             .catch((err) => {
+              if (isCancelledRequestError(err)) return
               console.error("Failed to load sessions", err)
               const project = getFilename(directory)
               showToast({
@@ -588,8 +593,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       }
     }
 
+    // JSDOC: Read `.data` only after confirming `!isPending`, else the
+    // internal `createResource()` suspends and the route hangs.
     if (directory === "global") {
-      if (eventType === "server.connected" && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
+      if (eventType === "server.connected" && !activeSessionsQuery.isPending && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
         void activeSessionsQuery.refetch()
       applyGlobalEvent({
         event,

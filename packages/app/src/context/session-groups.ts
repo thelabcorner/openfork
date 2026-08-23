@@ -4,6 +4,7 @@ import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/s
 import { createEffect, createMemo } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useGlobal } from "./global"
+import { safeQueryData } from "@/utils/safe-query-data"
 import { useServer } from "./server"
 
 export type SessionGroupEntry = {
@@ -99,18 +100,37 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
     })
     const client = createMemo(() => transportOf(serverSDK()))
 
-    // Server-backed group list (TanStack Query)
+    // Server-backed group list (TanStack Query) — global, no InstanceStore dep after backend fix.
     const groupsQuery = useQuery(() =>
       queryOptions({
         queryKey: groupListQueryKey(scope()),
         queryFn: () => groupCall<SessionGroupResponse[]>(client(), "GET", "/api/session-group"),
         enabled: !!server.current,
+        staleTime: 30_000,
+        gcTime: 5 * 60_000,
+        retry: 1,
       }),
     )
 
+    /**
+     * JSDOC: Avoid `groupsQuery.data` read when `isPending` is true.
+     *
+     * `@tanstack/solid-query` creates an internal `createResource()` per
+     * query. Accessing `.data` while the resource is unresolved (cache empty,
+     * `isPending` true) causes Solid's Suspense mechanism to park the read.
+     * Inside `<Suspense>` routes this produces the multi-second blank screen.
+     *
+     * Pattern: gate on `isPending` first, fall back to `.data ?? []` only after.
+     */
     const [details, setDetails] = createStore<Record<string, SessionGroupDetailResponse>>({})
+    const groupList = () => {
+      const data = safeQueryData(groupsQuery, [] as SessionGroupResponse[])
+      // Servers older than the session-group feature answer unknown API paths
+      // with an empty JSON object; treat any non-array payload as no groups.
+      return Array.isArray(data) ? data : []
+    }
     createEffect(() => {
-      for (const group of (groupsQuery.data ?? []) as SessionGroupResponse[]) {
+      for (const group of groupList()) {
         if (details[group.id]) continue
         void groupCall<SessionGroupDetailResponse>(client(), "GET", `/api/session-group/${group.id}`).then((detail) =>
           setDetails(group.id, detail),
@@ -119,9 +139,10 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
     })
 
     // Build SessionGroupEntry list by merging group metadata with detail session IDs
+    // Same suspension-guard: never read `groupsQuery.data` unless `isPending`
+    // is false, otherwise the internal `createResource()` stays unresolved.
     const list = createMemo(() => {
-      const groups: SessionGroupResponse[] = groupsQuery.data ?? []
-      return groups.map((group) => {
+      return groupList().map((group) => {
         const detail = details[group.id]
         return {
           id: group.id,

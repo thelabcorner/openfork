@@ -17,7 +17,9 @@ type OpenAttachmentPickerOptions = {
   defaultPath?: string
 }
 type SaveFilePickerOptions = { title?: string; defaultPath?: string }
-type PlatformName = "web" | "desktop"
+type SharePayload = { title?: string; text?: string; url?: string }
+type HapticStyle = "light" | "medium" | "heavy" | "success" | "warning" | "error"
+type PlatformName = "web" | "desktop" | "pwa"
 type DesktopOS = "macos" | "windows" | "linux"
 
 export type FatalRendererErrorLog = {
@@ -128,11 +130,25 @@ type PlatformBase = {
 
   /** Record a fatal renderer error in platform logs (desktop only) */
   recordFatalRendererError?(error: FatalRendererErrorLog): Promise<void>
+
+  /** Share content via the platform share sheet; resolves "unsupported" where absent (web/pwa) */
+  share?(payload: SharePayload): Promise<"shared" | "cancelled" | "unsupported">
+
+  /** Install-state and install prompt for installed-web-app contexts (pwa) */
+  installPrompt?: {
+    available(): boolean
+    isStandalone(): boolean
+    promptInstall(): Promise<"accepted" | "dismissed" | "unavailable">
+  }
+
+  /** Haptic feedback where the platform supports it; silent no-op elsewhere (pwa) */
+  haptics?(style: HapticStyle): void
 }
 
 export type Platform = PlatformBase &
   (
     | { platform: "web"; os?: never }
+    | { platform: "pwa"; os?: never }
     | {
         platform: "desktop"
         os?: DesktopOS

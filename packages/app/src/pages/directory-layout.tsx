@@ -5,7 +5,7 @@ import { useLocation, useNavigate, useParams } from "@solidjs/router"
 import { type Accessor, createEffect, createMemo, createResource, onCleanup, type ParentProps, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { LocalProvider } from "@/context/local"
-import { SDKProvider } from "@/context/sdk"
+import { SDKProvider, useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { decode64 } from "@/utils/base64"
 import { Schema } from "effect"
@@ -25,12 +25,46 @@ export function DirectoryDataProvider(
   const params = useParams()
   const sync = useSync()
   const serverSync = useServerSync()
+  const sdk = useSDK()
+  const language = useLanguage()
   const directory = () => (typeof props.directory === "function" ? props.directory() : props.directory)
   const slug = createMemo(() => base64Encode(directory()))
   const href = (sessionID: string) => {
     const server = props.server?.()
     if (server) return sessionHref(server, sessionID)
     return `/${slug()}/session/${sessionID}`
+  }
+
+  const killShell = async (input: { sessionID: string; callID?: string; jobId?: string }) => {
+    try {
+      const response = await sdk().client.tool.kill({ toolKillPayload: input }, { throwOnError: true })
+      if (!response.data.killed) {
+        showToast({
+          title: language.t("ui.tool.shell.stop.notRunning.title"),
+          description:
+            input.jobId ?
+              language.t("ui.tool.shell.stop.notRunning.descriptionJob")
+            : language.t("ui.tool.shell.stop.notRunning.description"),
+        })
+      }
+      return response.data
+    } catch (error) {
+      showToast({
+        variant: "error",
+        title: language.t("ui.tool.shell.stop.failed.title"),
+        description: errorMessage(error),
+      })
+      return { killed: false }
+    }
+  }
+
+  const errorMessage = (err: unknown) => {
+    if (err && typeof err === "object" && "message" in err) {
+      const value = (err as { message?: unknown }).message
+      if (typeof value === "string") return value
+    }
+    if (err instanceof Error) return err.message
+    return language.t("ui.tool.shell.stop.failed.description")
   }
 
   createEffect(() => {
@@ -66,6 +100,7 @@ export function DirectoryDataProvider(
           sessionID={params.id}
           onNavigateToSession={(sessionID: string) => navigate(href(sessionID))}
           onSessionHref={href}
+          onKillShell={killShell}
         >
           <LocalProvider>{props.children}</LocalProvider>
         </DataProvider>

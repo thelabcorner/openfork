@@ -1,4 +1,5 @@
 import { sentryVitePlugin } from "@sentry/vite-plugin"
+import { fileURLToPath } from "node:url"
 import { defineConfig } from "vite"
 import desktopPlugin from "./vite"
 
@@ -29,5 +30,11 @@ export default defineConfig({
   build: {
     target: "esnext",
     sourcemap: true,
+    rollupOptions: {
+      input: {
+        main: fileURLToPath(new URL("./index.html", import.meta.url)),
+        pwa: fileURLToPath(new URL("./pwa.html", import.meta.url)),
+      },
+    },
   },
 })

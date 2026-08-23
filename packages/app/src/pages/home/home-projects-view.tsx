@@ -1,4 +1,4 @@
-import { type Accessor, createMemo, For, type JSX, onCleanup, Show, splitProps } from "solid-js"
+import { type Accessor, createMemo, For, onCleanup, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { DragDropProvider, PointerSensor } from "@dnd-kit/solid"
 import { isSortable, useSortable } from "@dnd-kit/solid/sortable"
@@ -6,22 +6,20 @@ import { AutoScroller, Feedback, PointerActivationConstraints } from "@dnd-kit/d
 import { RestrictToVerticalAxis } from "@dnd-kit/abstract/modifiers"
 import { RestrictToElement } from "@dnd-kit/dom/modifiers"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
-import { ProjectAvatar } from "@opencode-ai/ui/v2/project-avatar-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
-import { getProjectAvatarVariant, type HomeProjectSelection, type LocalProject } from "@/context/layout"
+import { type HomeProjectSelection, type LocalProject } from "@/context/layout"
 import { ServerConnection } from "@/context/server"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
-import { displayName, getProjectAvatarSource } from "@/pages/layout/helpers"
+import { displayName } from "@/pages/layout/helpers"
 import { ServerRowMenuView, serverMenuLabels } from "@/components/server/server-row-menu"
 import { ServerHealthIndicator } from "@/components/server/server-row"
 import { type ServerHealth } from "@/utils/server-health"
 import { fileManagerApp } from "@/utils/file-manager"
-
-const HOME_PROJECT_NAV_LABEL = "min-w-0 flex-1 overflow-hidden text-ellipsis whitespace-nowrap"
+import { HOME_PROJECT_NAV_LABEL, HomeProjectAvatar, HomeProjectNavButton } from "./home-rows"
 
 const serverContextMenuID = (server: ServerConnection.Any) => `server:${ServerConnection.key(server)}`
 const projectContextMenuID = (server: ServerConnection.Any, directory: string) =>
@@ -585,35 +583,3 @@ function HomeProjectRow(
   )
 }
 
-function HomeProjectNavButton(props: JSX.ButtonHTMLAttributes<HTMLButtonElement>) {
-  const [local, rest] = splitProps(props, ["class", "classList", "children"])
-  return (
-    <button
-      {...rest}
-      class={`
-        flex h-7 min-w-0 w-full shrink-0 cursor-default items-center gap-2 rounded-[6px] bg-transparent px-1.5 text-left
-        text-v2-text-text-muted [font-weight:440] transition-[background-color,color,box-shadow] duration-[120ms] ease-in-out
-        hover:bg-v2-background-bg-layer-01 hover:text-v2-text-text-base
-        data-[selected]:bg-v2-background-bg-layer-03 data-[selected]:text-v2-text-text-base
-        data-[selected]:hover:bg-v2-background-bg-layer-03
-        focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-base focus-visible:outline-none
-        focus-visible:[box-shadow:inset_0_0_0_0.5px_var(--v2-border-border-muted)]
-        ${local.class ?? ""}
-      `}
-      classList={local.classList}
-    >
-      {local.children}
-    </button>
-  )
-}
-
-function HomeProjectAvatar(props: { project: LocalProject; outline?: boolean }) {
-  const name = createMemo(() => displayName(props.project))
-  return (
-    <ProjectAvatar
-      fallback={name()}
-      src={props.outline ? undefined : getProjectAvatarSource(props.project.id, props.project.icon)}
-      variant={props.outline ? "outline" : getProjectAvatarVariant(props.project.icon?.color)}
-    />
-  )
-}

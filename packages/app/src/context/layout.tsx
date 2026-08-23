@@ -1,7 +1,8 @@
 import { createStore, produce, reconcile } from "solid-js/store"
-import { batch, createEffect, createMemo, onCleanup, onMount, type Accessor } from "solid-js"
+import { batch, createEffect, createMemo, createSignal, onCleanup, onMount, type Accessor } from "solid-js"
 import { useLocation } from "@solidjs/router"
 import { createSimpleContext } from "@opencode-ai/ui/context"
+import type { ResizeHandlePairSide } from "@opencode-ai/ui/resize-handle"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { useServerSync } from "./server-sync"
 import { useServerSDK } from "./server-sdk"
@@ -38,6 +39,7 @@ const DEFAULT_SESSION_CONTEXT_PANEL_OPENED = false
 const DEFAULT_USAGE_PANEL_OPENED = false
 const DEFAULT_MODELS_PANEL_OPENED = false
 const DEFAULT_LIMITS_PANEL_OPENED = false
+const DEFAULT_CHATS_PANEL_OPENED = false
 export type AvatarColorKey = (typeof AVATAR_COLOR_KEYS)[number]
 
 export function getAvatarColors(key?: string) {
@@ -291,6 +293,9 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         },
         limits: {
           panelOpened: DEFAULT_LIMITS_PANEL_OPENED,
+        },
+        chats: {
+          panelOpened: DEFAULT_CHATS_PANEL_OPENED,
         },
         fileTree: {
           opened: false,
@@ -627,9 +632,23 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       if (sessionTimer !== undefined) window.clearTimeout(sessionTimer)
     })
 
+    // Cross-tree resize coordination: the hosted browser panel lives outside
+    // session.tsx's own component tree (it's app-shell scoped so it survives
+    // route changes), but resizing it should still share its delta evenly
+    // across every pane in session.tsx's inner row (session pane + open right
+    // panels), not just whichever one happens to be flex's sole absorber.
+    // session.tsx registers its current row group here while mounted; when no
+    // session route is mounted this is `undefined` and the browser panel
+    // falls back to resizing only itself.
+    const [sessionRowGroup, setSessionRowGroup] = createSignal<(() => ResizeHandlePairSide[]) | undefined>(undefined)
+
     return {
       route,
       ready,
+      sessionRow: {
+        group: sessionRowGroup,
+        setGroup: setSessionRowGroup,
+      },
       home: {
         selection: createMemo(() => store.home.selection),
         setSelection(selection: HomeProjectSelection) {
@@ -872,31 +891,56 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
           setStore("models", "panelOpened", !current)
         },
       },
-      limits: {
-        opened: createMemo(() => store.limits?.panelOpened ?? DEFAULT_LIMITS_PANEL_OPENED),
-        open() {
-          if (!store.limits) {
-            setStore("limits", { panelOpened: true })
-            return
-          }
-          setStore("limits", "panelOpened", true)
+        limits: {
+          opened: createMemo(() => store.limits?.panelOpened ?? DEFAULT_LIMITS_PANEL_OPENED),
+          open() {
+            if (!store.limits) {
+              setStore("limits", { panelOpened: true })
+              return
+            }
+            setStore("limits", "panelOpened", true)
+          },
+          close() {
+            if (!store.limits) {
+              setStore("limits", { panelOpened: false })
+              return
+            }
+            setStore("limits", "panelOpened", false)
+          },
+          toggle() {
+            const current = store.limits?.panelOpened ?? DEFAULT_LIMITS_PANEL_OPENED
+            if (!store.limits) {
+              setStore("limits", { panelOpened: !current })
+              return
+            }
+            setStore("limits", "panelOpened", !current)
+          },
         },
-        close() {
-          if (!store.limits) {
-            setStore("limits", { panelOpened: false })
-            return
-          }
-          setStore("limits", "panelOpened", false)
+        chats: {
+          opened: createMemo(() => store.chats?.panelOpened ?? DEFAULT_CHATS_PANEL_OPENED),
+          open() {
+            if (!store.chats) {
+              setStore("chats", { panelOpened: true })
+              return
+            }
+            setStore("chats", "panelOpened", true)
+          },
+          close() {
+            if (!store.chats) {
+              setStore("chats", { panelOpened: false })
+              return
+            }
+            setStore("chats", "panelOpened", false)
+          },
+          toggle() {
+            const current = store.chats?.panelOpened ?? DEFAULT_CHATS_PANEL_OPENED
+            if (!store.chats) {
+              setStore("chats", { panelOpened: !current })
+              return
+            }
+            setStore("chats", "panelOpened", !current)
+          },
         },
-        toggle() {
-          const current = store.limits?.panelOpened ?? DEFAULT_LIMITS_PANEL_OPENED
-          if (!store.limits) {
-            setStore("limits", { panelOpened: !current })
-            return
-          }
-          setStore("limits", "panelOpened", !current)
-        },
-      },
       session: {
         width: createMemo(() => store.session?.width ?? DEFAULT_SESSION_WIDTH),
         resize(width: number) {

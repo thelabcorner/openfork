@@ -133,7 +133,7 @@ export function createSessionComposerRegionController(input: {
     child: () => !!parentID(),
     showComposer: () => !input.state.blocked() || !!parentID(),
     handoffPrompt: () => getSessionHandoff(input.sessionKey())?.prompt,
-    promptReady: () => input.prompt.ready() || promptReady(),
+    promptReady: () => input.prompt.ready() || promptReady.latest === true,
     dock: () => (store.ready && input.state.dock()) || value() > 0.001,
     dockProgress: value,
     dockHeight: () => Math.max(78, store.height),

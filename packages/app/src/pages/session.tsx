@@ -5,6 +5,7 @@ import { createQuery, useMutation, useQueryClient } from "@tanstack/solid-query"
 import {
   batch,
   ErrorBoundary,
+  lazy,
   onCleanup,
   Suspense,
   Show,
@@ -28,7 +29,11 @@ import { FileProvider, selectionFromLines, useFile, type FileSelection, type Sel
 import { createStore } from "solid-js/store"
 import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
 import { Spinner } from "@opencode-ai/ui/spinner"
-import { ProjectExplorerPanel } from "@/pages/session/v2/project-explorer-panel"
+import { RouteLoadingFallback } from "@/components/route-loading-fallback"
+
+const ProjectExplorerPanel = lazy(() =>
+  import("@/pages/session/v2/project-explorer-panel").then((m) => ({ default: m.ProjectExplorerPanel })),
+)
 import { createProjectExplorerPanelState } from "@/pages/session/v2/project-explorer-panel-state"
 import { isScrollKeyTarget, scrollKey, scrollKeyOwner } from "@opencode-ai/ui/scroll-view"
 import { Tabs } from "@opencode-ai/ui/tabs"
@@ -38,7 +43,7 @@ import { previewSelectedLines } from "@opencode-ai/session-ui/pierre/selection-b
 import { FileSearchBar } from "@opencode-ai/session-ui/file-search"
 import { showToast } from "@/utils/toast"
 import { base64Encode } from "@opencode-ai/core/util/encode"
-import { useLocation, useNavigate, useParams, useSearchParams } from "@solidjs/router"
+import { useLocation, useNavigate, useParams, useSearchParams, type RouteSectionProps } from "@solidjs/router"
 import { NewSessionView, SessionHeader } from "@/components/session"
 import { ErrorPage } from "@/pages/error"
 import { CommentsProvider, useComments } from "@/context/comments"
@@ -71,7 +76,8 @@ import {
   createSessionComposerRegionController,
   SessionComposerRegion,
 } from "@/pages/session/composer"
-import { createSessionTabs, createSizing, shouldShowFileTree } from "@/pages/session/helpers"
+import { createSessionTabs, createSizing, shouldShowFileTree, createSwitchGate } from "@/pages/session/helpers"
+import { safeQueryData } from "@/utils/safe-query-data"
 import { MessageTimeline } from "@/pages/session/timeline/message-timeline"
 import { createTimelineModel } from "@/pages/session/timeline/model"
 import { createSessionFindBarPosition, createSessionFindMatcher } from "@/pages/session/session-find"
@@ -84,6 +90,16 @@ import {
   SESSION_PANEL_WIDTH_MIN,
   sessionPanelWidthMax,
 } from "@/pages/session/session-panel-width"
+import { USAGE_PANEL_WIDTH_MIN } from "@/pages/session/usage-panel-state"
+import { MODELS_PANEL_WIDTH_MIN } from "@/pages/session/models-panel-state"
+import { LIMITS_PANEL_WIDTH_MIN } from "@/pages/session/limits-panel-state"
+import { CONTEXT_PANEL_WIDTH_MIN } from "@/pages/session/context-panel-state"
+import {
+  PROJECT_EXPLORER_TREE_WIDTH_MIN,
+  PROJECT_EXPLORER_TREE_WIDTH_MAX,
+  PROJECT_EXPLORER_EDITOR_WIDTH_MIN,
+  PROJECT_EXPLORER_EDITOR_WIDTH_MAX,
+} from "@/pages/session/v2/project-explorer-panel-state"
 import { SessionSidePanel } from "@/pages/session/session-side-panel"
 import { ContextPanel } from "@/pages/session/context-panel"
 import { createContextPanelState } from "@/pages/session/context-panel-state"
@@ -94,7 +110,20 @@ import { createModelsPanelState } from "@/pages/session/models-panel-state"
 import { LimitsPanel } from "@/pages/session/limits-panel"
 import { createLimitsPanelState } from "@/pages/session/limits-panel-state"
 import { sessionPanelLayout } from "@/pages/session/session-panel-layout"
-import { browserHostClient } from "@/pages/session/v2/browser/browserHostClient"
+
+/**
+ * One pane in the horizontal session row. `absorb` marks the single `flex: 1`
+ * pane whose width is layout-derived rather than stored -- see `orderedPanes`.
+ */
+interface RowPane {
+  id: string
+  size: () => number
+  min: number
+  max?: number
+  resize: (width: number) => void
+  el: () => HTMLElement | null
+  absorb?: boolean
+}
 import { TerminalPanel } from "@/pages/session/terminal-panel"
 import { TerminalPanelV2 } from "@/pages/session/terminal-panel-v2"
 import { useComposerCommands } from "@/pages/session/use-composer-commands"
@@ -147,10 +176,29 @@ async function runPromptRollbackMutation<T, R>(input: {
     })
 }
 
-export function SessionPage() {
+/**
+ * "pane" renders the full desktop session page (header + pane row + side
+ * panels). "center" renders only the center column (timeline + composer
+ * mount) for shells that supply their own chrome — see SessionCenterColumn.
+ */
+type SessionPageVariant = "pane" | "center"
+
+export function SessionPage(props: { variant?: SessionPageVariant; suppressMobileTabs?: boolean }) {
   return (
     <SessionProviders>
-      <Page />
+      <Page variant={props.variant} suppressMobileTabs={props.suppressMobileTabs} />
+    </SessionProviders>
+  )
+}
+
+// Mobile-shell entry point (F2 extraction): the session center column without
+// the desktop pane scaffold. Requires the same provider subtree as SessionPage.
+// suppressMobileTabs hides the in-column session/changes tab strips (both
+// placements) when the shell supplies its own bottom chrome.
+export function SessionCenterColumn(props: { suppressMobileTabs?: boolean }) {
+  return (
+    <SessionProviders>
+      <Page variant="center" suppressMobileTabs={props.suppressMobileTabs} />
     </SessionProviders>
   )
 }
@@ -159,7 +207,7 @@ export function SessionPage() {
 // remount around the server-scoped providers. Nothing here may key on the
 // session ID: session tabs on the same server share this route instance, and
 // workspace-scoped state (terminal, directory providers) lives below.
-export function TargetSessionRouteContent() {
+export function TargetSessionRouteContent(props: { variant?: SessionPageVariant; suppressMobileTabs?: boolean }) {
   const params = useParams<{ serverKey: string; id: string }>()
   const serverSync = useServerSync()
   const directory = createMemo(() => serverSync().session.lineage.peek(params.id)?.session.directory)
@@ -169,10 +217,19 @@ export function TargetSessionRouteContent() {
           when session content falls back to the route error boundary. */}
       <TargetServerScopedProviders directory={directory} sessionID={() => params.id}>
         <TargetSessionSettingsCommand />
-        <ResolvedTargetSessionRoute />
+        <ResolvedTargetSessionRoute variant={props.variant} suppressMobileTabs={props.suppressMobileTabs} />
       </TargetServerScopedProviders>
     </SessionRouteErrorBoundary>
   )
+}
+
+// Route-ready center-column mount (lineage resolution, error boundary, and
+// target-server providers included) for mobile shells. Partial RouteSectionProps
+// keeps it usable both as a router `component` and as a plain JSX element.
+export function TargetSessionCenterRoute(
+  props: Partial<RouteSectionProps<unknown>> & { suppressMobileTabs?: boolean },
+) {
+  return <TargetSessionRouteContent variant="center" suppressMobileTabs={props.suppressMobileTabs} />
 }
 
 function TargetSessionSettingsCommand() {
@@ -283,7 +340,7 @@ function formatRouteError(error: unknown) {
   }
 }
 
-function ResolvedTargetSessionRoute() {
+function ResolvedTargetSessionRoute(props: { variant?: SessionPageVariant; suppressMobileTabs?: boolean }) {
   const params = useParams<{ serverKey: string; id: string }>()
   const language = useLanguage()
   const tabs = useTabs()
@@ -314,7 +371,7 @@ function ResolvedTargetSessionRoute() {
     <Show when={directory()} fallback={<SessionLoadingFallback language={language} sessionID={params.id} />}>
       <SDKProvider directory={targetDirectory}>
         <DirectoryDataProvider directory={targetDirectory} server={serverKey}>
-          <TargetSessionPage />
+          <TargetSessionPage variant={props.variant} suppressMobileTabs={props.suppressMobileTabs} />
         </DirectoryDataProvider>
       </SDKProvider>
     </Show>
@@ -344,7 +401,7 @@ function SessionLoadingFallback(props: { language: ReturnType<typeof useLanguage
 // teardown only on Home↔session (higher serverKey in app.tsx) or dir change.
 // SessionPage handles id changes reactively; avoids destroying terminal PTYs,
 // file/prompt providers, persisted trees, composer controller.
-function TargetSessionPage() {
+function TargetSessionPage(props: { variant?: SessionPageVariant; suppressMobileTabs?: boolean }) {
   const sdk = useSDK()
   const serverSDK = useServerSDK()
   return (
@@ -353,7 +410,7 @@ function TargetSessionPage() {
         <Spinner class="size-6" style={{ color: "var(--icon-weak)" }} />
       </div>
     }>
-      <SessionPage />
+      <SessionPage variant={props.variant} suppressMobileTabs={props.suppressMobileTabs} />
     </Show>
   )
 }
@@ -416,7 +473,7 @@ function SessionPanelFrame(props: ParentProps<{ newLayout: boolean; raised?: boo
   )
 }
 
-export default function Page() {
+export default function Page(props: { variant?: SessionPageVariant; suppressMobileTabs?: boolean }) {
   const serverSync = useServerSync()
   const layout = useLayout()
   const local = useLocal()
@@ -601,11 +658,72 @@ export default function Page() {
       split: false,
     }),
   )
+  const byId = (id: string) => () => document.getElementById(id)
+  const FILE_TREE_PANE_WIDTH_MIN = 240
+
+  const orderedRightPanes = createMemo(() => {
+    const list: RowPane[] = []
+    if (desktopFileTreeOpen())
+      list.push({
+        id: "fileTree",
+        size: () => layout.fileTree.width(),
+        resize: (v) => layout.fileTree.resize(v),
+        min: FILE_TREE_PANE_WIDTH_MIN,
+        el: byId("session-side-panel"),
+      })
+    if (desktopUsagePanelOpen())
+      list.push({
+        id: "usage",
+        size: () => usagePanelState.sidebarWidth(),
+        resize: (v) => usagePanelState.resizeSidebar(v),
+        min: USAGE_PANEL_WIDTH_MIN,
+        el: byId("usage-panel"),
+      })
+    if (desktopModelsPanelOpen())
+      list.push({
+        id: "models",
+        size: () => modelsPanelState.sidebarWidth(),
+        resize: (v) => modelsPanelState.resizeSidebar(v),
+        min: MODELS_PANEL_WIDTH_MIN,
+        el: byId("models-panel"),
+      })
+    if (desktopLimitsPanelOpen())
+      list.push({
+        id: "limits",
+        size: () => limitsPanelState.sidebarWidth(),
+        resize: (v) => limitsPanelState.resizeSidebar(v),
+        min: LIMITS_PANEL_WIDTH_MIN,
+        el: byId("limits-panel"),
+      })
+    if (desktopContextPanelOpen())
+      list.push({
+        id: "context",
+        size: () => contextPanelState.sidebarWidth(),
+        resize: (v) => contextPanelState.resizeSidebar(v),
+        min: CONTEXT_PANEL_WIDTH_MIN,
+        el: byId("context-panel"),
+      })
+    return list
+  })
+
+  // The terminal is a horizontal pane only when it is the session's SOLE
+  // right-hand neighbour. Otherwise it is stacked below the right-pane row
+  // inside a content-sized wrapper and takes no part in the horizontal model.
+  const terminalAbsorbs = createMemo(() => desktopSessionResizeOpen() && orderedRightPanes().length === 0)
+
+  // The session pane is either the full row, an explicitly sized pane (when the
+  // terminal absorbs), or the absorber itself -- in which case it carries no
+  // width at all and `flex: 1` derives it. Never `calc()`: a derived width
+  // cannot be moved by a divider, and would clobber transient drag styles.
   const sessionPanelWidth = createMemo(() => {
     if (!desktopSessionSiblingOpen()) return "100%"
-    if (desktopSessionResizeOpen()) return `${sessionPanelResizedWidth()}px`
-    return `calc(100% - ${sessionPanelReservedWidth() + sessionPanelReservedGap()}px)`
+    if (terminalAbsorbs()) return `${sessionPanelResizedWidth()}px`
+    return undefined
   })
+  // Per-session view state (e.g. terminal open) can change sessionPanelWidth() in
+  // the same commit as a tab switch; suppress the width transition while a keyed
+  // swap settles so switching tabs never animates panel width.
+  const switching = createSwitchGate(sessionKey)
   const centered = createMemo(() => isDesktop() && newSessionDesign())
   const desktopV2PanelLayout = createMemo(() =>
     sessionPanelLayout({
@@ -617,6 +735,132 @@ export default function Page() {
       limits: desktopLimitsPanelOpen(),
     }),
   )
+
+  /**
+   * Anchor-invariant pane row (see the Anchor-Invariant Pane Resizing doc).
+   *
+   * The row is modelled as ONE ordered list of visible panes with exactly
+   * `N - 1` internal dividers between them. Every pane carries an explicit
+   * pixel width except a single "absorber" -- the pane that is `flex: 1` and
+   * therefore takes whatever width the others do not. Because the absorber's
+   * width is layout-derived, a divider touching it only needs to write its
+   * *other* participant: flexbox transfers exactly the complementary amount,
+   * which conserves the pair sum and leaves every other boundary fixed.
+   *
+   * The absorber is the session pane, except when the terminal is the only
+   * thing to the session's right (then the session is explicitly sized and the
+   * terminal group absorbs).
+   */
+  const sessionRowPane = createMemo<RowPane>(() => ({
+    id: "session",
+    size: () => sessionPanelResizedWidth(),
+    min: SESSION_PANEL_WIDTH_MIN,
+    resize: (v: number) => {
+      size.touch()
+      layout.session.resize(v)
+    },
+    el: () => document.querySelector<HTMLElement>("[data-session-panel]"),
+    absorb: !terminalAbsorbs(),
+  }))
+
+  /**
+   * The complete ordered pane row. `N` panes => `N - 1` dividers; each divider
+   * is owned by the pane on its right (an `edge="start"` handle) except the
+   * explorer's, which is owned by the pane on its left.
+   */
+  const orderedPanes = createMemo<RowPane[]>(() => {
+    const list: RowPane[] = []
+    if (desktopProjectExplorerOpen()) {
+      list.push({
+        id: "explorerTree",
+        size: () => projectExplorerState.treeWidth(),
+        resize: projectExplorerState.resizeTree,
+        min: PROJECT_EXPLORER_TREE_WIDTH_MIN,
+        max: PROJECT_EXPLORER_TREE_WIDTH_MAX,
+        el: byId("project-explorer-tree-pane"),
+      })
+      if (projectExplorerState.editorOpened())
+        list.push({
+          id: "explorerEditor",
+          size: () => projectExplorerState.editorWidth(),
+          resize: projectExplorerState.resizeEditor,
+          min: PROJECT_EXPLORER_EDITOR_WIDTH_MIN,
+          max: PROJECT_EXPLORER_EDITOR_WIDTH_MAX,
+          el: byId("project-explorer-editor-pane"),
+        })
+    }
+    list.push(sessionRowPane())
+    list.push(...orderedRightPanes())
+    if (terminalAbsorbs())
+      list.push({
+        id: "terminal",
+        size: () => 0,
+        resize: () => {},
+        min: 200,
+        el: byId("terminal-panel"),
+        absorb: true,
+      })
+    return list
+  })
+
+  const toPairSide = (pane: RowPane) => ({
+    size: pane.size(),
+    min: pane.min,
+    max: pane.max,
+    onResize: pane.resize,
+    el: pane.el,
+    absorb: pane.absorb,
+  })
+
+  /**
+   * The divider immediately to the LEFT of `paneId` (owned by an `edge="start"`
+   * handle). For the first right-side pane this is a plain pair with whatever
+   * precedes it (the session pane). For every later right-side pane, "left" is
+   * the whole group of right-side panes before it: dragging pane 4's edge in a
+   * `session | 2 | 3 | 4` row shares the delta across panes 2 and 3
+   * evenly, delta/n across the n panes in the group, rather than only shrinking pane 3, so
+   * pane 1 (session) and every other unrelated pane never move.
+   */
+  const dividerBefore = (paneId: string) => {
+    const rightPanes = orderedRightPanes()
+    const rightIdx = rightPanes.findIndex((p) => p.id === paneId)
+    if (rightIdx > 0) {
+      return {
+        left: rightPanes.slice(0, rightIdx).map(toPairSide),
+        right: toPairSide(rightPanes[rightIdx]),
+        // Proportional to current size: a pane that's already big keeps its
+        // relative size (it gives up more px but a similar %), and a pane
+        // that's already small isn't crushed disproportionately the way an
+        // even split would crush it.
+        groupMode: "weighted",
+      }
+    }
+    const list = orderedPanes()
+    const idx = list.findIndex((p) => p.id === paneId)
+    if (idx <= 0) return undefined
+    return { left: toPairSide(list[idx - 1]), right: toPairSide(list[idx]) }
+  }
+
+  // The hosted browser panel is mounted outside this component (app-shell
+  // scoped, see layout-new.tsx) but its resize divider should still share
+  // its delta evenly across every pane in this row -- session pane plus
+  // every open right panel -- instead of only whatever happens to be the
+  // sole flex absorber at that outer level. Publish the current row's
+  // resizable sides through the shared layout context so the browser panel
+  // can build the same n-way-split group pair used for `dividerBefore`.
+  createEffect(() => {
+    const group = [sessionRowPane(), ...orderedRightPanes()].map(toPairSide)
+    layout.sessionRow.setGroup(() => () => group)
+  })
+  onCleanup(() => layout.sessionRow.setGroup(undefined))
+
+  /** The divider immediately to the RIGHT of `paneId` (owned by an `edge="end"` handle). */
+  const dividerAfter = (paneId: string) => {
+    const list = orderedPanes()
+    const idx = list.findIndex((p) => p.id === paneId)
+    if (idx < 0 || idx >= list.length - 1) return undefined
+    return { left: toPairSide(list[idx]), right: toPairSide(list[idx + 1]) }
+  }
 
   function normalizeTab(tab: string) {
     if (!tab.startsWith("file://")) return tab
@@ -736,9 +980,15 @@ export default function Page() {
     }),
   )
 
+  // deferRender's only reader is the composer-region ready latch below, which
+  // latches true on first ready and never resets across same-workspace switches.
+  // Once that latch is held, pulsing deferRender on every sessionKey change is
+  // unobservable work (two store writes + a rAF/setTimeout hop per switch), so
+  // only pulse on mount or when the target timeline isn't already readable
+  // (cold switch).
   createComputed((prev) => {
     const key = sessionKey()
-    if (key !== prev) {
+    if (key !== prev && (prev === undefined || !messagesReady())) {
       setStore("deferRender", true)
       const owner = sessionOwnership.capture()
       requestAnimationFrame(() => {
@@ -770,7 +1020,16 @@ export default function Page() {
         }),
   }))
   const refreshVcs = debounce(() => void queryClient.invalidateQueries({ queryKey: vcsKey() }), 100)
-  const vcsDiffs = () => vcsQuery.data ?? []
+  /**
+   * JSDOC: TanStack Solid-Query suspension guard for VCS diffs.
+   *
+   * `vcsQuery.data` accesses the internal `createResource()` backing the
+   * query. Reading it while `isPending` is true would park the route under
+   * `<Suspense>` (black screen until `/vcs` resolves). Gate with
+   * `isPending` first; only read `.data` once the query has a cached result.
+   */
+  // D.R.Y: uses the shared suspension-safe query reader (see safe-query-data.ts).
+  const vcsDiffs = () => safeQueryData(vcsQuery, [])
   const vcsCount = () => vcsDiffs().length
   const hasVcsChanges = () => vcsCount() > 0
   const vcsReady = () => !vcsQuery.isPending
@@ -1865,8 +2124,12 @@ export default function Page() {
 
   const sessionPanelContent = () => (
     <>
-      {sessionSync() ?? ""}
-      <Show when={!isDesktop() && !!params.id && settings.general.newLayoutDesigns() && !mobileTabsBottom()}>
+      {sessionSync.latest ?? ""}
+      <Show
+        when={
+          !isDesktop() && !!params.id && settings.general.newLayoutDesigns() && !mobileTabsBottom() && !props.suppressMobileTabs
+        }
+      >
         {mobileTabs(true)}
       </Show>
       <div class="flex-1 min-h-0 overflow-hidden">
@@ -2093,9 +2356,34 @@ export default function Page() {
           )
         }}
       </Show>
-      <Show when={!!params.id && mobileTabsBottom()}>{mobileTabs(true, true)}</Show>
+      <Show when={!!params.id && mobileTabsBottom() && !props.suppressMobileTabs}>
+        {mobileTabs(true, true)}
+      </Show>
     </>
   )
+
+  // Center-column variant: timeline + composer mount only, no desktop pane
+  // scaffold (no header, explorer, side panels, terminal, or pane-row width
+  // model). Same provider subtree and remount semantics as the pane variant.
+  if (props.variant === "center") {
+    return (
+      <div data-session-panel class="@container relative flex w-full min-w-0 flex-col min-h-0 h-full flex-1">
+        {settings.general.newLayoutDesigns() ? (
+          <Show when={sessionPanelKey()} keyed>
+            {(_) => (
+              <SessionPanelFrame newLayout raised={!!params.id}>
+                <ErrorBoundary fallback={sessionErrorFallback}>{sessionPanelContent()}</ErrorBoundary>
+              </SessionPanelFrame>
+            )}
+          </Show>
+        ) : (
+          <SessionPanelFrame newLayout={false} raised={!!params.id}>
+            {sessionPanelContent()}
+          </SessionPanelFrame>
+        )}
+      </div>
+    )
+  }
 
   return (
     <SessionRouteFrame>
@@ -2108,21 +2396,29 @@ export default function Page() {
         }}
       >
         <Show when={isDesktop() && layout.projectExplorer.opened()}>
-          <ProjectExplorerPanel
-            state={projectExplorerState}
-            onClose={layout.projectExplorer.close}
-            onAddToChat={(path) => prompt.context.add({ type: "file", path })}
-            fileOps={fileOps()}
-            gitStatus={file.gitStatus()}
-          />
+          <Suspense fallback={<RouteLoadingFallback />}>
+            <ProjectExplorerPanel
+              state={projectExplorerState}
+              onClose={layout.projectExplorer.close}
+              onAddToChat={(path) => prompt.context.add({ type: "file", path })}
+              fileOps={fileOps()}
+              gitStatus={file.gitStatus()}
+              treePair={dividerAfter("explorerTree")}
+              editorPair={dividerAfter("explorerEditor")}
+            />
+          </Suspense>
         </Show>
         <Show when={!isDesktop() && !!params.id && !settings.general.newLayoutDesigns()}>{mobileTabs()}</Show>
 
         <div
+          data-session-panel
           classList={{
-            "@container relative shrink-0 flex flex-col min-h-0 h-full flex-1 md:flex-none transition-[width]": true,
-            "duration-[240ms] ease-[cubic-bezier(0.22,1,0.36,1)] will-change-[width] motion-reduce:transition-none":
-              !size.active(),
+            "@container relative flex flex-col min-h-0 h-full flex-1": true,
+            // Absorber: no stored width, `flex: 1` derives it from the row.
+            "md:min-w-0": !sessionPanelWidth(),
+            "shrink-0 md:flex-none": !!sessionPanelWidth(),
+            "transition-[width] duration-[240ms] ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none":
+              !size.active() && !switching() && !!sessionPanelWidth(),
           }}
           style={{
             width: sessionPanelWidth(),
@@ -2142,7 +2438,8 @@ export default function Page() {
             </SessionPanelFrame>
           )}
 
-          <Show when={desktopSessionResizeOpen()}>
+          {/* Divider on the session's right edge: session|terminal. */}
+          <Show when={terminalAbsorbs()}>
             <div onPointerDown={() => size.start()}>
               <ResizeHandle
                 classList={{
@@ -2156,13 +2453,14 @@ export default function Page() {
                   size.touch()
                   layout.session.resize(width)
                 }}
+                pair={dividerAfter("session")}
               />
             </div>
           </Show>
         </div>
 
         <Show when={!newSessionDesign() && desktopSidePanelOpen()}>
-          <Suspense>
+          <Suspense fallback={<RouteLoadingFallback />}>
             <SessionSidePanel
               diffs={vcsDiffs}
               diffsReady={vcsReady}
@@ -2216,7 +2514,19 @@ export default function Page() {
                 terminalOpen()
               }
             >
-              <div class="min-w-0 h-full flex flex-1 flex-col">
+              {/*
+                The right group is content-sized (its panes carry explicit px
+                widths) so the session pane absorbs the row. It only becomes
+                the absorber itself when the terminal is the session's sole
+                right-hand neighbour.
+              */}
+              <div
+                classList={{
+                  "h-full flex flex-col": true,
+                  "min-w-0 flex-1": terminalAbsorbs(),
+                  "shrink-0": !terminalAbsorbs(),
+                }}
+              >
                 <Show
                   when={
                     isDesktop() &&
@@ -2229,7 +2539,7 @@ export default function Page() {
                 >
               <div class="min-h-0 flex-1 flex flex-row gap-2">
                 <Show when={desktopFileTreeOpen()}>
-                  <Suspense>
+                  <Suspense fallback={<RouteLoadingFallback />}>
                     <SessionSidePanel
                       diffs={vcsDiffs}
                       diffsReady={vcsReady}
@@ -2239,6 +2549,7 @@ export default function Page() {
                       activeDiff={undefined}
                       focusChangeDiff={() => {}}
                       size={size}
+                      pair={dividerBefore("fileTree")}
                     />
                   </Suspense>
                 </Show>
@@ -2247,6 +2558,7 @@ export default function Page() {
                     state={usagePanelState}
                     opened={desktopUsagePanelOpen()}
                     onClose={() => layout.usage.close()}
+                    pair={dividerBefore("usage")}
                   />
                 </Show>
                 <Show when={desktopModelsPanelOpen()}>
@@ -2254,6 +2566,7 @@ export default function Page() {
                     state={modelsPanelState}
                     opened={desktopModelsPanelOpen()}
                     onClose={() => layout.models.close()}
+                    pair={dividerBefore("models")}
                   />
                 </Show>
                 <Show when={desktopLimitsPanelOpen()}>
@@ -2261,6 +2574,7 @@ export default function Page() {
                     state={limitsPanelState}
                     opened={desktopLimitsPanelOpen()}
                     onClose={() => layout.limits.close()}
+                    pair={dividerBefore("limits")}
                   />
                 </Show>
                 <Show when={desktopContextPanelOpen()}>
@@ -2268,6 +2582,7 @@ export default function Page() {
                     state={contextPanelState}
                     opened={desktopContextPanelOpen()}
                     onClose={() => layout.sessionContext.close()}
+                    pair={dividerBefore("context")}
                   />
                 </Show>
               </div>

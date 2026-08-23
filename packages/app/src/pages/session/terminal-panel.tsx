@@ -18,7 +18,7 @@ import { useSettings } from "@/context/settings"
 import { useTerminal } from "@/context/terminal"
 import { useSDK } from "@/context/sdk"
 import { terminalTabLabel } from "@/pages/session/terminal-label"
-import { createSizing, focusTerminalById } from "@/pages/session/helpers"
+import { createSizing, createSwitchGate, focusTerminalById } from "@/pages/session/helpers"
 import { getTerminalHandoff, setTerminalHandoff } from "@/pages/session/handoff"
 import { useSessionLayout } from "@/pages/session/session-layout"
 
@@ -30,10 +30,13 @@ export function TerminalPanel() {
   const language = useLanguage()
   const command = useCommand()
   const settings = useSettings()
-  const { workspaceKey, view } = useSessionLayout()
+  const { sessionKey, workspaceKey, view } = useSessionLayout()
 
   const opened = createMemo(() => view().terminal.opened())
   const size = createSizing()
+  // view() is session-scoped, so terminal open state can flip in the same
+  // commit as a session switch — gate on sessionKey, not workspaceKey.
+  const switching = createSwitchGate(() => sessionKey())
   const height = createMemo(() => layout.terminal.height())
   const close = () => view().terminal.close()
   let root: HTMLDivElement | undefined
@@ -206,8 +209,8 @@ export function TerminalPanel() {
       inert={!opened()}
       class="relative w-full shrink-0 bg-background-stronger"
       classList={{
-        "transition-[height] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] will-change-[height] motion-reduce:transition-none":
-          !size.active(),
+        "transition-[height] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none":
+          !size.active() && !switching(),
       }}
       style={{ height: opened() ? `${pane()}px` : "0px" }}
     >

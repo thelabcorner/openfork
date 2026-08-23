@@ -1,4 +1,4 @@
-import { createMemo, onCleanup, onMount, type Accessor } from "solid-js"
+import { createComputed, createMemo, createSignal, on, onCleanup, onMount, type Accessor } from "solid-js"
 import { createStore } from "solid-js/store"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { same } from "@/utils/same"
@@ -171,3 +171,35 @@ export const createSizing = () => {
 }
 
 export type Sizing = ReturnType<typeof createSizing>
+
+// True while a keyed swap (session/workspace change) settles, so size
+// transitions never animate across a switch — only user-driven toggles do.
+// createComputed (not createEffect) so the class drops in the same DOM commit
+// as any width/height input that flips with the key.
+export const createSwitchGate = (key: Accessor<unknown>) => {
+  const [active, setActive] = createSignal(false)
+  let outer: number | undefined
+  let inner: number | undefined
+
+  createComputed(
+    on(key, () => {
+      setActive(true)
+      if (outer !== undefined) cancelAnimationFrame(outer)
+      if (inner !== undefined) cancelAnimationFrame(inner)
+      outer = requestAnimationFrame(() => {
+        outer = undefined
+        inner = requestAnimationFrame(() => {
+          inner = undefined
+          setActive(false)
+        })
+      })
+    }),
+  )
+
+  onCleanup(() => {
+    if (outer !== undefined) cancelAnimationFrame(outer)
+    if (inner !== undefined) cancelAnimationFrame(inner)
+  })
+
+  return active
+}

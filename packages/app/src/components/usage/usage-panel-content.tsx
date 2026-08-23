@@ -21,6 +21,8 @@ import {
 import { UsageAreaChart, UsageBarRow, UsageDOWChart, UsageHeatmap, UsageHourChart, UsageTooltipContent } from "./usage-chart"
 import { groupModelsByName, modelsForProvider, type ModelGroup } from "./usage-model-groups"
 import { UsageModelTable, UsageProviderModelTable } from "./usage-model-table"
+import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
+import { FreeUsageBar, FreeUsageModelsTable } from "@/components/openrouter-free-usage-bar"
 
 type Metric = "cost" | "tokens"
 type Page = "overview" | "models" | "providers"
@@ -89,6 +91,7 @@ export function UsagePanelContent() {
   const windowDef = createMemo(() => USAGE_WINDOWS.find((w) => w.key === windowKey()) ?? USAGE_WINDOWS[4])
 
   const summary = createUsageSummary({ windowDef, projectID, refreshTick })
+  const freeUsage = useOpenRouterFreeUsage({ includeValue: true })
 
   // Usage is global, so avoid fetching the full provider/model catalog just to
   // decorate aggregate rows. Provider ids are stable, compact, and already the
@@ -184,6 +187,17 @@ export function UsagePanelContent() {
               )}
             </For>
           </div>
+
+          <Show when={freeUsage.data()}>
+            {(report) => (
+              <div class="flex flex-col gap-2">
+                <FreeUsageBar report={report()} />
+                <Show when={report().free.models.length > 0}>
+                  <FreeUsageModelsTable report={report()} />
+                </Show>
+              </div>
+            )}
+          </Show>
 
           <div class="flex items-center gap-1">
             <div class="flex min-w-0 flex-1 items-center gap-1">

@@ -1377,16 +1377,36 @@ export function MessageTimeline(props: {
       if (height !== undefined) rowEstimator.observe({ ...estimateInput(current), height })
     }
 
+    const measureOrDefer = () => {
+      // Row keys are globally unique (message-ID derived), so an itemSizeCache
+      // hit is the exact height this same row had last time it was on screen --
+      // including from before a session switch. Taking the synchronous
+      // getBoundingClientRect anyway would force a layout flush per row right
+      // after the virtualizer wrote sibling position styles in the same commit;
+      // across a viewport of remounted rows that read-after-write thrash is the
+      // dominant sync cost of the switch frame. Trust the cached size for this
+      // frame and take the fresh read one frame later: a stale cache (content
+      // changed while the session was backgrounded) self-corrects there instead
+      // of stalling paint.
+      if (virtualizer.itemSizeCache.has(props.rowKey)) {
+        if (contentMeasureFrame !== undefined) cancelAnimationFrame(contentMeasureFrame)
+        contentMeasureFrame = scheduleConnectedMeasure(element, measureElementAndObserve)
+        return
+      }
+      measureElementAndObserve(element)
+    }
+
     onMount(() => {
-      // Visible rows must measure synchronously so the first painted frame of a
-      // hot switch is exact. Offscreen overscan rows defer one frame: their
-      // measureElement read would otherwise interleave with the virtualizer's
-      // row-position style writes in the same commit -- the same read-after-write
-      // layout thrash removed from resizeItem (see containerHeight). The deferred
-      // call still reads fresh height at observe time, so no drift is missed.
+      // Rows with no cached size that are visible right now must measure
+      // synchronously so the first painted frame of a cold mount is exact.
+      // Offscreen overscan rows defer one frame: their measureElement read
+      // would otherwise interleave with the virtualizer's row-position style
+      // writes in the same commit -- the same read-after-write layout thrash
+      // removed from resizeItem (see containerHeight). The deferred call still
+      // reads fresh height at observe time, so no drift is missed.
       const range = virtualizer.range
       if (range && initialItem.index >= range.startIndex && initialItem.index <= range.endIndex) {
-        measureElementAndObserve(element)
+        measureOrDefer()
         return
       }
       contentMeasureFrame = scheduleConnectedMeasure(element, measureElementAndObserve)
@@ -1395,9 +1415,7 @@ export function MessageTimeline(props: {
     createEffect(
       on(
         () => item().index,
-        () => {
-          measureElementAndObserve(element)
-        },
+        measureOrDefer,
         { defer: true },
       ),
     )

@@ -318,7 +318,8 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
     })
 
     createEffect(() => {
-      if (!ready() || !launchState.classified || platform.platform !== "web") return
+      if (!ready() || !launchState.classified) return
+      if (platform.platform !== "web" && platform.platform !== "pwa") return
       const existing = hasExistingWebState(settingsInit, launchState.previous)
       if (!layoutTransitionClassified()) setStore("general", "layoutTransitionEligible", existing)
       initializeAgentVisibility(existing)

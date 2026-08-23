@@ -13,10 +13,24 @@ export const nextTabListScrollLeft = (input: Input) => {
 export const createFileTabListSync = (input: { el: HTMLDivElement }) => {
   let frame: number | undefined
   let prevScrollWidth = input.el.scrollWidth
+  // The first observed burst is the list materializing (mount or session
+  // restore), not a user-opened tab — prime the baseline instead of scrolling.
+  let primed = false
+  // Only a pure append (tab opened, nothing removed) reveals the new tab.
+  // Session switches replace the whole child set and must not smooth-scroll.
+  let appendOnly = false
 
   const update = () => {
     const scrollWidth = input.el.scrollWidth
     const clientWidth = input.el.clientWidth
+
+    if (!primed || !appendOnly) {
+      primed = true
+      appendOnly = false
+      prevScrollWidth = scrollWidth
+      return
+    }
+
     const left = nextTabListScrollLeft({
       prevScrollWidth,
       scrollWidth,
@@ -48,7 +62,16 @@ export const createFileTabListSync = (input: { el: HTMLDivElement }) => {
   }
 
   input.el.addEventListener("wheel", onWheel, { passive: false })
-  const observer = new MutationObserver(schedule)
+  const observer = new MutationObserver((records) => {
+    let added = 0
+    let removed = 0
+    for (const record of records) {
+      added += record.addedNodes.length
+      removed += record.removedNodes.length
+    }
+    appendOnly = removed === 0 && added > 0
+    schedule()
+  })
   observer.observe(input.el, { childList: true })
 
   return () => {

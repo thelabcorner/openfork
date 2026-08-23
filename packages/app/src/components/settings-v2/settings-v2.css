@@ -737,3 +737,179 @@
   line-height: 1;
   color: var(--v2-state-fg-danger);
 }
+
+.settings-v2-tab-body.settings-v2-devices {
+  gap: 0;
+}
+
+.settings-v2-tab-header.settings-v2-devices-header {
+  padding-bottom: 24px;
+}
+
+.settings-v2-devices-header .settings-v2-tab-header-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-v2-devices [data-component="settings-v2-list"] {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  padding: 20px;
+  border-radius: 6px;
+}
+
+.settings-v2-devices-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.settings-v2-devices-row:not(:last-child) {
+  padding-bottom: 16px;
+  margin-bottom: 16px;
+  border-bottom: 0.5px solid var(--v2-border-border-base);
+}
+
+.settings-v2-devices-actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.settings-v2-devices-lead {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 10px;
+}
+
+.settings-v2-devices-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.settings-v2-devices-name {
+  font-size: 13px;
+  font-weight: 530;
+  line-height: 1;
+  color: var(--v2-text-text-base);
+}
+
+.settings-v2-devices-meta {
+  font-size: 11px;
+  font-weight: 440;
+  line-height: 1;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-v2-devices-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  padding-block: 48px;
+  font-size: 13px;
+  font-weight: 440;
+  line-height: 1;
+  color: var(--v2-text-text-muted);
+  text-align: center;
+}
+
+.settings-v2-devices-status-description {
+  max-width: 320px;
+  line-height: 18px;
+}
+
+[data-component="dialog-v2"].settings-v2-pair-dialog [data-slot="dialog-container"] {
+  width: 360px;
+  max-width: calc(100vw - 32px);
+  height: auto;
+  border-radius: 8px;
+  align-items: stretch;
+}
+
+.settings-v2-pair-qr {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 14px;
+  border-radius: 8px;
+  /* Literal white keeps the code scannable in dark theme — themed surfaces
+     invert and many phone scanners fail on inverted QRs. */
+  background: #ffffff;
+  box-shadow: var(--v2-elevation-raised);
+}
+
+.settings-v2-pair-qr svg {
+  width: 176px;
+  height: 176px;
+}
+
+.settings-v2-pair-code-block {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  margin-top: 20px;
+}
+
+.settings-v2-pair-code-label {
+  font-size: 11px;
+  font-weight: 440;
+  line-height: 1;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-v2-pair-code {
+  font-size: 22px;
+  font-weight: 590;
+  line-height: 1;
+  letter-spacing: 0.06em;
+  font-variant-numeric: tabular-nums;
+  font-feature-settings:
+    "tnum" on,
+    "lnum" on;
+  color: var(--v2-text-text-base);
+}
+
+.settings-v2-pair-countdown {
+  margin-top: 16px;
+  font-size: 11px;
+  font-weight: 440;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  color: var(--v2-text-text-faint);
+}
+
+.settings-v2-pair-countdown--expired {
+  color: var(--v2-state-fg-danger);
+}
+
+.settings-v2-pair-status {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  padding-block: 48px;
+  font-size: 13px;
+  font-weight: 440;
+  line-height: 1;
+  color: var(--v2-text-text-muted);
+  text-align: center;
+}
+
+.settings-v2-pair-error {
+  color: var(--v2-state-fg-danger);
+}

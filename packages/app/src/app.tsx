@@ -54,6 +54,7 @@ import { ModelsProvider } from "@/context/models"
 import { NotificationProvider } from "@/context/notification"
 import { PermissionProvider } from "@/context/permission"
 import { usePlatform } from "@/context/platform"
+import { PwaPairEntry } from "@/components/pwa/pair-entry"
 import { PromptProvider } from "@/context/prompt"
 import { ServerConnection, ServerProvider, serverName, useServer } from "@/context/server"
 import { SettingsProvider, useSettings } from "@/context/settings"
@@ -68,11 +69,12 @@ import { useCheckServerHealth } from "./utils/server-health"
 import { legacySessionHref, legacySessionServer, parseServerKey, requireServerKey, sessionHref } from "./utils/session-route"
 import { createSessionLineage } from "@/pages/session/session-lineage"
 
-import { SessionPage, SessionRouteErrorBoundary, TargetSessionRouteContent } from "@/pages/session"
+import { SessionPage, SessionRouteErrorBoundary, TargetSessionCenterRoute, TargetSessionRouteContent } from "@/pages/session"
 import { NewHome } from "@/pages/home"
 import { LegacyHome } from "@/pages/home/legacy-home"
+import MobileLayout from "@/pages/layout-mobile"
 
-const NewSession = lazy(() => import("@/pages/new-session"))
+import NewSession from "@/pages/new-session"
 const GroupTabPage = lazy(() => import("@/pages/group-tab"))
 
 const SessionRoute = () => {
@@ -397,6 +399,18 @@ function NewAppLayout(props: ParentProps<{ serverScoped?: JSX.Element }>) {
   )
 }
 
+// Third layout arm (docs/pwa-mobile/03 §1.4): same provider stack as the new
+// shell, mobile chrome instead of desktop titlebar/panes.
+function MobileAppLayout(props: ParentProps<{ serverScoped?: JSX.Element }>) {
+  return (
+    <SelectedServerProviders>
+      <ServerScopedProviders serverScoped={props.serverScoped}>
+        <MobileLayout>{props.children}</MobileLayout>
+      </ServerScopedProviders>
+    </SelectedServerProviders>
+  )
+}
+
 // The draft page only renders the prompt composer, so it drops TerminalProvider.
 // FileProvider and CommentsProvider stay because PromptInput uses file search and comment context.
 function DraftProviders(props: ParentProps) {
@@ -520,6 +534,7 @@ function ConnectionGate(props: ParentProps<{ disableHealthCheck?: boolean; start
 function ConnectionError(props: { onRetry?: () => void; onServerSelected?: (key: ServerConnection.Key) => void }) {
   const language = useLanguage()
   const server = useServer()
+  const pwa = usePlatform().platform === "pwa"
   const others = () => server.list.filter((s) => ServerConnection.key(s) !== server.key)
   const name = createMemo(() => server.name || server.key)
   const serverToken = "\u0000server\u0000"
@@ -539,6 +554,11 @@ function ConnectionError(props: { onRetry?: () => void; onServerSelected?: (key:
         </p>
         <p class="mt-1 text-12-regular text-text-weak">{language.t("app.server.retrying")}</p>
       </div>
+      {/* PWA pairing fallback: manual 6-char code entry on the connect surface (task p3). */}
+      <Show when={pwa}>
+        <PwaPairEntry />
+      </Show>
+
       <Show when={others().length > 0}>
         <div class="flex flex-col gap-2 w-full max-w-sm">
           <span class="text-12-regular text-text-base text-center">{language.t("app.server.otherServers")}</span>
@@ -583,6 +603,7 @@ export function AppInterface(props: {
   startup?: Promise<void>
   serverScoped?: JSX.Element
 }) {
+  const pwa = usePlatform().platform === "pwa"
   // The visual new layout lives in the router root so it remains mounted across
   // route changes. Draft and session routes override only their server-bound data
   // providers beneath it.
@@ -612,9 +633,22 @@ export function AppInterface(props: {
                     <PermissionProvider>
                       <NotificationProvider>
                         <ServerShell>
-                          <Show when={useSettings().general.newLayoutDesigns()} fallback={routerProps.children}>
-                            <NewAppLayout serverScoped={props.serverScoped}>{routerProps.children}</NewAppLayout>
-                          </Show>
+                          {/* PWA renders the mobile arm regardless of the layout flag;
+                              web/desktop keep the legacy/new arms byte-identical. */}
+                          {pwa ? (
+                            <MobileAppLayout serverScoped={props.serverScoped}>
+                              {routerProps.children}
+                            </MobileAppLayout>
+                          ) : (
+                            <Show
+                              when={useSettings().general.newLayoutDesigns()}
+                              fallback={routerProps.children}
+                            >
+                              <NewAppLayout serverScoped={props.serverScoped}>
+                                {routerProps.children}
+                              </NewAppLayout>
+                            </Show>
+                          )}
                         </ServerShell>
                       </NotificationProvider>
                     </PermissionProvider>
@@ -633,6 +667,7 @@ export function AppInterface(props: {
 
 function Routes(props: { serverScoped?: JSX.Element }) {
   const settings = useSettings()
+  const pwa = usePlatform().platform === "pwa"
 
   return (
     <>
@@ -657,7 +692,14 @@ function Routes(props: { serverScoped?: JSX.Element }) {
       <Show when={settings.general.newLayoutDesigns()}>
         <Route path="/" component={NewHome} />
         <Route path="/:dir/session/:id" component={NewLayoutLegacySessionRedirect} />
-        <Route path="/server/:serverKey/session/:id" component={TargetSessionRoute} />
+        <Route
+          path="/server/:serverKey/session/:id"
+          component={
+            pwa
+              ? () => <TargetSessionCenterRoute suppressMobileTabs />
+              : TargetSessionRoute
+          }
+        />
         <Route path="/server/:serverKey/group/:groupId/session/:sessionId" component={GroupTabRoute} />
         <Route path="/server/:serverKey/group/:groupId" component={GroupTabRoute} />
       </Show>

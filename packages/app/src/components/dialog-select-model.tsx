@@ -32,7 +32,7 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { ModelTooltip, formatCostPerMillion } from "./model-tooltip"
 import { getOpenRouterEndpoints, type OpenRouterEndpoint } from "@/utils/openrouter-endpoints"
-import { fetchTelemetry, type OpenRouterTelemetry } from "@/utils/openrouter-telemetry"
+import { showToast } from "@/utils/toast"
 import { useLanguage } from "@/context/language"
 import { decode64 } from "@/utils/base64"
 import { handleDocumentSearchKeydown } from "@/utils/search-keydown"
@@ -46,6 +46,8 @@ import { useLayout } from "@/context/layout"
 import { useSDK } from "@/context/sdk"
 import type { ForkWindowUsage } from "@/utils/fork-client"
 import { percent as usagePercent, colorFor } from "./usage-gauge-v2"
+import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
+import { FreeUsageBar } from "./openrouter-free-usage-bar"
 import { estimateRequestsRemaining, estimateRequestsRemainingFromCost, isUsageTrackedProvider } from "@/utils/model-usage-estimate"
 import { getUsageTables, matchUsagePricing, matchUsageProfile } from "@/utils/model-usage-profile"
 import { averageCostPerRequest, buildModelCostIndex } from "@/utils/model-usage-history"
@@ -422,6 +424,9 @@ function OpenRouterRow(props: {
       >
         <ProviderIcon id={props.item.provider.id} class="size-3.5 shrink-0 opacity-60" />
         <span class="min-w-0 flex-1 truncate leading-5">{stripUnlimitedSuffix(props.item.name)}</span>
+        <Show when={props.item.id.endsWith(":free") || props.item.id === "openrouter/free"}>
+          <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
+        </Show>
         <Show when={props.item.latest}>
           <TagV2 class="shrink-0">{language.t("model.tag.latest")}</TagV2>
         </Show>
@@ -799,9 +804,20 @@ function ModelSelectorPopoverV2View(props: {
   const forkUsage = useForkUsage()
   const sync = useSync()
   const [tables] = createResource(() => getUsageTables())
-  const profileTable = () => tables()?.profile ?? []
-  const pricingTable = () => tables()?.pricing ?? []
+  const profileTable = () => tables.latest?.profile ?? []
+  const pricingTable = () => tables.latest?.pricing ?? []
   const sdk = useSDK()
+  const freeUsage = useOpenRouterFreeUsage({ includeValue: false })
+  const freeModelRequests = createMemo(() => {
+    const report = freeUsage.data()
+    if (!report) return new Map<string, number>()
+    const map = new Map<string, number>()
+    for (const m of report.free.models) {
+      map.set(m.model, m.requests)
+      map.set(`openrouter:${m.model}`, m.requests)
+    }
+    return map
+  })
   const [store, setStore] = createStore({ open: false, search: persistedModelSearch, active: "", rail: "", submenu: "" })
   let searchRef: HTMLInputElement | undefined
   let contentRef: HTMLDivElement | undefined
@@ -820,16 +836,9 @@ function ModelSelectorPopoverV2View(props: {
   >({})
   const openRouterPrefetched = new Set<string>()
   const fetchOpenRouterEndpoints = async (model: string): Promise<OpenRouterEndpoint[]> => {
-    const [endpointsResponse, telemetryResponseRaw] = await Promise.all([
-      sdk().client.experimental.openrouterEndpoints.get({ model }, { throwOnError: true }),
-      sdk().client.experimental.openrouterTelemetry.get({ model, timeRange: "1w" }, { throwOnError: false }).catch(() => undefined),
-    ])
-    const telemetryResponse = telemetryResponseRaw?.data ?? telemetryResponseRaw
+    const endpointsResponse = await sdk().client.experimental.openrouterEndpoints.get({ model }, { throwOnError: true })
     const perMillion = (value: number) => (Math.abs(value) > 0 && Math.abs(value) < 1e-4 ? value * 1_000_000 : value)
     const endpoints = endpointsResponse.data.map((entry) => {
-      const entryTelemetry = telemetryResponse?.find(
-        (t) => t.providerName === entry.providerName || t.providerSlug === entry.provider,
-      )
       return {
         providerName: entry.providerName,
         tag: entry.tag,
@@ -840,23 +849,44 @@ function ModelSelectorPopoverV2View(props: {
           cacheRead: perMillion(Number(entry.pricing.cacheRead)),
         },
         uptime: entry.uptime === undefined ? undefined : Number(entry.uptime),
-        telemetry: entryTelemetry
-          ? {
-              cacheHitPercent: entryTelemetry.cacheHitPercent,
-              throughputTps: entryTelemetry.throughputTps,
-            }
-          : undefined,
       }
     })
     return endpoints
+  }
+  const addOpenRouterTelemetry = async (model: string, endpoints: OpenRouterEndpoint[]) => {
+    // Best-effort: telemetry augments uptime/price but must never break the submenu.
+    // The server now never 500s (returns [] on no telemetry), so this is silent.
+    try {
+      const response = await sdk().client.experimental.openrouterTelemetry.get({ model, timeRange: "1w" }, { throwOnError: true })
+      const telemetry = response.data ?? []
+      if (telemetry.length === 0) return endpoints
+      return endpoints.map((entry) => {
+        const value = telemetry.find((item) => item.providerName === entry.providerName || item.providerSlug === entry.provider)
+        const cacheHitPercent = value && Number.isFinite(Number(value.cacheHitPercent)) ? Number(value.cacheHitPercent) : undefined
+        const throughputTps = value && Number.isFinite(Number(value.throughputTps)) ? Number(value.throughputTps) : undefined
+        return value && cacheHitPercent !== undefined
+          ? {
+              ...entry,
+              telemetry: {
+                cacheHitPercent,
+                ...(throughputTps === undefined ? {} : { throughputTps }),
+              },
+            }
+          : entry
+      })
+    } catch (error) {
+      // Silent best-effort — log for diagnostics, do not toast (would spam for ~ models).
+      console.warn("[openrouter-telemetry] best-effort fetch failed", { model, error: String(error) })
+      return endpoints
+    }
   }
   const ensureOpenRouter = (modelID: string) => {
     const existing = openRouterStore[modelID]
     if (existing?.loading || existing?.endpoints !== undefined) return
     openRouterPrefetched.add(modelID)
     setOpenRouterStore(modelID, { loading: true, endpoints: undefined })
-    void getOpenRouterEndpoints(modelID, fetchOpenRouterEndpoints).then((result) => {
-      setOpenRouterStore(modelID, { loading: false, endpoints: result })
+    void getOpenRouterEndpoints(modelID, fetchOpenRouterEndpoints).then(async (result) => {
+      setOpenRouterStore(modelID, { loading: false, endpoints: result ? await addOpenRouterTelemetry(modelID, result) : result })
     })
   }
 
@@ -1022,8 +1052,8 @@ function ModelSelectorPopoverV2View(props: {
         inFlight++
         setOpenRouterStore(id, { loading: true, endpoints: undefined })
         void getOpenRouterEndpoints(id, fetchOpenRouterEndpoints)
-          .then((result) => {
-            if (!cancelled) setOpenRouterStore(id, { loading: false, endpoints: result })
+          .then(async (result) => {
+            if (!cancelled) setOpenRouterStore(id, { loading: false, endpoints: result ? await addOpenRouterTelemetry(id, result) : result })
           })
           .finally(() => {
             inFlight--
@@ -1412,8 +1442,13 @@ function ModelSelectorPopoverV2View(props: {
         <Show when={isUnlimitedModel(item)}>
           <TagV2 class="shrink-0">{language.t("model.tag.unlimited")}</TagV2>
         </Show>
-        <Show when={isFree(item.provider.id, item.cost)}>
+        <Show when={isFree(item.provider.id, item.cost) || item.id.endsWith(":free") || item.id === "openrouter/free"}>
           <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
+        </Show>
+        <Show when={freeModelRequests().get(item.id) !== undefined || freeModelRequests().get(modelKey(item)) !== undefined}>
+          <span class="shrink-0 rounded-sm bg-v2-background-bg-layer-03 px-1 text-[10px] font-[520] tabular-nums text-v2-text-text-faint">
+            {freeModelRequests().get(item.id) ?? freeModelRequests().get(modelKey(item))} req
+          </span>
         </Show>
         <Show when={item.latest}>
           <TagV2 class="shrink-0">{language.t("model.tag.latest")}</TagV2>
@@ -1508,6 +1543,13 @@ function ModelSelectorPopoverV2View(props: {
               </button>
             </div>
           </div>
+          <Show when={freeUsage.data()}>
+            {(report) => (
+              <div class="border-b border-v2-border-border-muted p-1.5">
+                <FreeUsageBar report={report()} compact />
+              </div>
+            )}
+          </Show>
           <div class="h-px bg-v2-border-border-muted" />
           <div class="flex min-h-0 max-h-[320px]">
             <div class="flex w-8 shrink-0 flex-col items-stretch gap-0.5 border-r border-v2-border-border-muted p-0.5 py-1">

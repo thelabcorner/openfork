@@ -14,6 +14,8 @@ import { ServerScope } from "@/utils/server-scope"
 import { detectServerProtocol, type ServerProtocol } from "@/utils/server-protocol"
 import { createCompatibleApi, type CompatibleApi } from "@/utils/server-compat"
 import { markServerStreamDead, markServerStreamLive } from "@/utils/server-liveness"
+import { eventStreamFetch } from "@/utils/event-stream-auth"
+import { trackPending } from "@/utils/pending-work"
 import { perf } from "./perf"
 
 const isAbortError = (error: unknown) =>
@@ -207,17 +209,25 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     }
   })()
 
-  const eventApi = createApiForServer({ server: server.http, fetch: eventFetch })
+  // Both clients below are dedicated to the event stream (eventApi →
+  // event.subscribe, eventSdk → global.event), so wrapping their fetch puts
+  // the auth_token query param on SSE requests only — EventSource-style
+  // contexts cannot rely on headers alone (utils/event-stream-auth.ts).
+  const sseFetch = eventStreamFetch(eventFetch ?? globalThis.fetch, server.http)
+  const eventApi = createApiForServer({ server: server.http, fetch: sseFetch })
   const eventSdk = createSdkForServer({
     signal: abort.signal,
-    fetch: eventFetch,
+    fetch: sseFetch,
     server: server.http,
   })
   const protocol = detectServerProtocol(server.http, platform.fetch ?? globalThis.fetch)
-  const [protocolKind] = createResource(
+  const [protocolKindResource] = createResource(
     () => protocol,
     (value) => value,
   )
+  const protocolPending = trackPending("server.protocol")
+  void protocol.finally(protocolPending)
+  const protocolKind = () => protocolKindResource.latest
   const emitter = createGlobalEmitter<{
     [key: string]: ServerEvent
   }>()

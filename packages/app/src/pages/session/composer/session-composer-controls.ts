@@ -45,10 +45,23 @@ export function createPromptInputController(input: {
       model: {
         selection: input.model ?? local.model,
         paid: providers.paid().length > 0,
+        /**
+         * JSDOC: TanStack Solid-Query suspension trap (route-level black screen).
+         *
+         * `query.data` (even with `?? []`) reads the internal `createResource()`
+         * that `@tanstack/solid-query` uses. When the cache is empty and the
+         * query is `isPending`, that resource has not resolved yet — calling
+         * the accessor inside a route covered by `<Suspense>` parks the entire
+         * route until the query finishes (multi-second black screen on new
+         * session or tab switch). The same applies to `isLoading` + `.data`.
+         *
+         * Safe pattern: check `isPending` ONLY. Never read `.data` while
+         * `isPending` is true inside Suspense-covered render paths.
+         */
         loading:
-          (local.agent.visible() && agentsQuery.isLoading) ||
-          providersQuery.isLoading ||
-          globalProvidersQuery.isLoading,
+          (local.agent.visible() && agentsQuery.isPending) ||
+          providersQuery.isPending ||
+          globalProvidersQuery.isPending,
       },
       session: {
         id: input.sessionID(),

@@ -1,5 +1,5 @@
 import { Show } from "solid-js"
-import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
+import { ResizeHandle, type ResizeHandlePairSide } from "@opencode-ai/ui/resize-handle"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
@@ -21,6 +21,7 @@ export function ContextPanel(props: {
   state: ContextPanelState
   opened: boolean
   onClose: () => void
+  pair?: { left: ResizeHandlePairSide | ResizeHandlePairSide[]; right: ResizeHandlePairSide }
 }) {
   const language = useLanguage()
 
@@ -60,6 +61,7 @@ export function ContextPanel(props: {
         min={CONTEXT_PANEL_WIDTH_MIN}
         max={CONTEXT_PANEL_WIDTH_MAX}
         onResize={props.state.resizeSidebar}
+        pair={props.pair}
       />
     </div>
   )

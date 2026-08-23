@@ -18,7 +18,7 @@ import { Tabs } from "@opencode-ai/ui/tabs"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Icon } from "@opencode-ai/ui/icon"
 import { TooltipKeybind } from "@opencode-ai/ui/tooltip"
-import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
+import { ResizeHandle, type ResizeHandlePairSide } from "@opencode-ai/ui/resize-handle"
 import { Mark } from "@opencode-ai/ui/logo"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
@@ -46,6 +46,7 @@ import {
   SESSION_OPEN_FILE_TAB,
   createOpenSessionFileTab,
   createSessionTabs,
+  createSwitchGate,
   getTabReorderIndex,
   shouldShowFileTree,
   type Sizing,
@@ -73,6 +74,7 @@ export function SessionSidePanel(props: {
   focusChangeDiff: (path: string) => void
   size: Sizing
   stacked?: boolean
+  pair?: { left: ResizeHandlePairSide | ResizeHandlePairSide[]; right: ResizeHandlePairSide }
 }) {
   const layout = useLayout()
   const settings = useSettings()
@@ -86,6 +88,7 @@ export function SessionSidePanel(props: {
 
   const isDesktop = createMediaQuery("(min-width: 768px)")
   const shown = settings.visibility.fileTree
+  const switching = createSwitchGate(() => sessionKey())
 
   const fileOpen = createMemo(
     () =>
@@ -97,10 +100,10 @@ export function SessionSidePanel(props: {
   )
   const open = createMemo(() => fileOpen())
   const fileTreeWidth = createMemo(() => Math.max(FILE_TREE_WIDTH_MIN, layout.fileTree.width()))
-  const panelWidth = createMemo(() => {
-    if (!open()) return "0px"
-    return `${fileTreeWidth()}px`
-  })
+  // The outer <aside> IS the file-tree pane: it is the single element the
+  // divider sizes. `#file-tree-panel` used to carry a second copy of the same
+  // width, which meant a transient drag write to one left the other stale;
+  // it now simply fills the aside.
   const treeWidth = createMemo(() => (fileOpen() ? `${fileTreeWidth()}px` : "0px"))
 
   const diffs = createMemo(() => props.diffs().filter(renderDiff))
@@ -260,11 +263,11 @@ export function SessionSidePanel(props: {
           "h-full shrink-0": !props.stacked,
           "h-full min-h-0": props.stacked,
           "pointer-events-none": !open(),
-          "transition-[width] duration-[240ms] ease-[cubic-bezier(0.22,1,0.36,1)] will-change-[width] motion-reduce:transition-none":
-            !props.size.active(),
+          "transition-[width] duration-[240ms] ease-[cubic-bezier(0.22,1,0.36,1)] motion-reduce:transition-none":
+            !props.size.active() && !switching(),
           "rounded-[10px] shadow-[var(--v2-elevation-raised)] overflow-hidden": settings.general.newLayoutDesigns(),
         }}
-        style={{ width: panelWidth() }}
+        style={{ width: treeWidth() }}
       >
             <Show when={open()}>
           <div
@@ -274,8 +277,12 @@ export function SessionSidePanel(props: {
             }}
           >
               <div
-                class="relative min-w-0 h-full flex-1 overflow-hidden"
+                class="relative min-w-0 h-full overflow-hidden"
                 classList={{
+                  // Collapsed whenever the file tree owns the pane -- the tree
+                  // is the flex filler in that case.
+                  "w-0 shrink-0": fileOpen(),
+                  "flex-1": !fileOpen(),
                   "bg-v2-background-bg-base": settings.general.newLayoutDesigns(),
                   "bg-background-base": !settings.general.newLayoutDesigns(),
                 }}
@@ -574,12 +581,7 @@ export function SessionSidePanel(props: {
             <Show when={fileOpen()}>
               <div
                 id="file-tree-panel"
-                class="relative min-w-0 h-full shrink-0 overflow-hidden"
-                classList={{
-                  "transition-[width] duration-200 ease-[cubic-bezier(0.22,1,0.36,1)] will-change-[width] motion-reduce:transition-none":
-                    !props.size.active(),
-                }}
-                style={{ width: treeWidth() }}
+                class="relative min-w-0 h-full flex-1 overflow-hidden"
               >
                 <div
                   class="h-full flex flex-col overflow-hidden group/filetree"
@@ -668,6 +670,7 @@ export function SessionSidePanel(props: {
                         props.size.touch()
                         layout.fileTree.resize(width)
                       }}
+                      pair={props.pair}
                     />
                   </div>
                 </Show>

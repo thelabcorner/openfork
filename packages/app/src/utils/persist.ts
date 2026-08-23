@@ -2,6 +2,7 @@ import { Platform, usePlatform } from "@/context/platform"
 import { makePersisted, type AsyncStorage, type SyncStorage } from "@solid-primitives/storage"
 import { checksum } from "@opencode-ai/core/util/encode"
 import { createResource, type Accessor } from "solid-js"
+import { trackPending } from "@/utils/pending-work"
 import type { SetStoreFunction, Store } from "solid-js/store"
 import { pathKey } from "@/utils/path-key"
 import { ScopedKey, ServerScope, type ServerScope as ServerScopeValue } from "@/utils/server-scope"
@@ -736,6 +737,10 @@ export function persisted<T>(
   const [state, setState, init] = makePersisted(store, { name: config.key, storage })
 
   const isAsync = init instanceof Promise
+  if (isAsync) {
+    const done = trackPending(`persist:${config.key}`)
+    void (init as Promise<unknown>).finally(done)
+  }
   const [ready] = createResource(
     () => init,
     async (initValue) => {

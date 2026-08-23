@@ -10,7 +10,7 @@ type SessionStore = {
 }
 
 export function compareSessionTime(a: Session, b: Session) {
-  const updated = (b.time.updated ?? b.time.created) - (a.time.updated ?? a.time.created)
+  const updated = (b.time?.updated ?? b.time?.created ?? 0) - (a.time?.updated ?? a.time?.created ?? 0)
   if (updated !== 0) return updated
   return a.id < b.id ? -1 : a.id > b.id ? 1 : 0
 }

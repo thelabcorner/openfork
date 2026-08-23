@@ -1,7 +1,12 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionNotFoundError } from "@opencode-ai/sdk/v2/client"
 import type { ConfigInvalidError, ProviderModelNotFoundError } from "./server-errors"
-import { formatServerError, isSessionNotFoundError, parseReadableConfigInvalidError } from "./server-errors"
+import {
+  formatServerError,
+  isCancelledRequestError,
+  isSessionNotFoundError,
+  parseReadableConfigInvalidError,
+} from "./server-errors"
 
 function fill(text: string, vars?: Record<string, string | number>) {
   if (!vars) return text
@@ -141,6 +146,29 @@ describe("formatServerError", () => {
     const wrapped = new Error("ConfigInvalidError", { cause: { body, status: 400 } })
 
     expect(formatServerError(wrapped, language.t)).toBe("Arquivo de config em config invalido: Missing host")
+  })
+})
+
+describe("isCancelledRequestError", () => {
+  test("matches AbortError and TimeoutError", () => {
+    expect(isCancelledRequestError(new DOMException("Aborted", "AbortError"))).toBe(true)
+    expect(isCancelledRequestError(Object.assign(new Error("timed out"), { name: "TimeoutError" }))).toBe(true)
+  })
+
+  test("matches 499 client-closed responses", () => {
+    expect(
+      isCancelledRequestError(
+        new Error("opencode server GET http://127.0.0.1:17494/agent/ → 499: (empty response body)", {
+          cause: { body: undefined, status: 499 },
+        }),
+      ),
+    ).toBe(true)
+    expect(isCancelledRequestError({ status: 499 })).toBe(true)
+  })
+
+  test("does not match real server failures", () => {
+    expect(isCancelledRequestError(new Error("Request failed with status 503"))).toBe(false)
+    expect(isCancelledRequestError(new Error("opencode server GET /agent/ → 500"))).toBe(false)
   })
 })
 

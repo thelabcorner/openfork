@@ -1,9 +1,11 @@
-import { type ParentProps, Show } from "solid-js"
+import { createMemo, type ParentProps } from "solid-js"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { showToast } from "@/utils/toast"
 import type { FileTreeV2Node } from "@/components/file-tree-v2-model"
+import { createFileMenuModel } from "./session-menu/file-menu-model"
+import { MenuSectionsRenderer } from "./session-menu/menu-renderer"
 
 export type ProjectExplorerNodeActions = {
   favorited: boolean
@@ -41,6 +43,19 @@ export function ProjectExplorerTreeContextMenu(props: ParentProps<{ node: FileTr
     if (!ok) showToast({ variant: "error", title: language.t("projectExplorer.contextMenu.revealFailed") })
   }
 
+  const sections = createMemo(() =>
+    createFileMenuModel({
+      language,
+      node: props.node,
+      actions: props.actions,
+      system: {
+        reveal: () => void reveal(),
+        copyPath: (relative) => void copyPath(relative),
+        hasReveal: !!platform.revealPath,
+      },
+    }),
+  )
+
   return (
     <MenuV2.Context>
       <MenuV2.Context.Trigger class="block w-full min-w-0" as="div">
@@ -48,25 +63,7 @@ export function ProjectExplorerTreeContextMenu(props: ParentProps<{ node: FileTr
       </MenuV2.Context.Trigger>
       <MenuV2.Context.Portal>
         <MenuV2.Context.Content>
-          <Show when={props.node.type === "file"}>
-            <MenuV2.Item onSelect={props.actions.onOpen}>{language.t("projectExplorer.contextMenu.open")}</MenuV2.Item>
-            <MenuV2.Item onSelect={props.actions.onMention}>{language.t("projectExplorer.contextMenu.addToChat")}</MenuV2.Item>
-            <MenuV2.Separator />
-          </Show>
-          <MenuV2.Item onSelect={props.actions.onFavoriteToggle}>
-            {props.actions.favorited
-              ? language.t("model.favorite.remove")
-              : language.t("model.favorite.add")}
-          </MenuV2.Item>
-          <MenuV2.Separator />
-          <MenuV2.Item onSelect={props.actions.onNewFile}>{language.t("projectExplorer.contextMenu.newFile")}</MenuV2.Item>
-          <MenuV2.Item onSelect={props.actions.onNewFolder}>{language.t("projectExplorer.contextMenu.newFolder")}</MenuV2.Item>
-          <MenuV2.Item onSelect={props.actions.onRename}>{language.t("projectExplorer.contextMenu.rename")}</MenuV2.Item>
-          <MenuV2.Item onSelect={props.actions.onDelete}>{language.t("projectExplorer.contextMenu.delete")}</MenuV2.Item>
-          <MenuV2.Separator />
-          <MenuV2.Item onSelect={reveal}>{language.t("projectExplorer.contextMenu.reveal")}</MenuV2.Item>
-          <MenuV2.Item onSelect={() => void copyPath(true)}>{language.t("projectExplorer.contextMenu.copyPath")}</MenuV2.Item>
-          <MenuV2.Item onSelect={() => void copyPath(false)}>{language.t("projectExplorer.contextMenu.copyAbsolutePath")}</MenuV2.Item>
+          <MenuSectionsRenderer sections={sections()} />
         </MenuV2.Context.Content>
       </MenuV2.Context.Portal>
     </MenuV2.Context>

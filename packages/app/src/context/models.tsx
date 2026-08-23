@@ -201,7 +201,7 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
         toggle: toggleFavorite,
       },
       recent: {
-        list: () => recentModels()!,
+        list: () => recentModels.latest ?? [],
         push,
       },
       variant: {

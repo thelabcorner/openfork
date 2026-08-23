@@ -67,9 +67,23 @@ export type HomeSearchHit =
       segments: HighlightSegment[]
     }
 
-type HomeSessionSearchSource = Pick<HomeSessionsController, "data" | "session">
+// Structural surface the search controller actually reads from its host, so
+// callers outside home/ can supply a focused adapter instead of a full
+// HomeController. HomeController satisfies this as-is.
+export type HomeSessionSearchHost = {
+  project: Pick<HomeController["project"], "list" | "selected">
+  server: Pick<HomeController["server"], "list" | "focused" | "focusedContext">
+}
 
-export function createHomeSessionSearchController(home: HomeController, sessions: HomeSessionSearchSource) {
+type HomeSessionSearchSource = {
+  session: Pick<HomeSessionsController["session"], "open">
+}
+
+export function createHomeSessionSearchController(
+  home: HomeSessionSearchHost,
+  sessions: HomeSessionSearchSource,
+  options?: { registerFocusCommand?: boolean },
+) {
   const command = useCommand()
   const language = useLanguage()
   const sessionGroups = useSessionGroups()
@@ -203,15 +217,19 @@ export function createHomeSessionSearchController(home: HomeController, sessions
     }),
   )
 
-  command.register("home.search", () => [
-    {
-      id: "home.sessions.search.focus",
-      title: placeholder(),
-      keybind: "mod+f",
-      hidden: true,
-      onSelect: focus,
-    },
-  ])
+  // Off for non-home hosts: the hidden mod+f focus command would collide with
+  // whichever command owns mod+f on that surface (e.g. session.find).
+  if (options?.registerFocusCommand !== false) {
+    command.register("home.search", () => [
+      {
+        id: "home.sessions.search.focus",
+        title: placeholder(),
+        keybind: "mod+f",
+        hidden: true,
+        onSelect: focus,
+      },
+    ])
+  }
 
   async function runSearch(value: string, id: number) {
     const ctx = home.server.focusedContext()

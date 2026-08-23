@@ -15,7 +15,10 @@ const trimTrailingSlashes = (value: string) => {
 
 const isWindowsPath = (value: string) => value[1] === ":" || value.startsWith("\\\\")
 
-export const pathKey = (path: string) => {
+export const pathKey = (path: string | undefined) => {
+  // Sync-store sessions can lack `directory`; callers compare keys rather than
+  // consume them, so missing input maps to "" instead of crashing on .length.
+  if (!path) return "" as PathKey
   const value = isWindowsPath(path) ? path.replaceAll("\\", "/") : path
   const trimmed = trimTrailingSlashes(value)
   if (!trimmed && value.startsWith("/")) return "/" as PathKey

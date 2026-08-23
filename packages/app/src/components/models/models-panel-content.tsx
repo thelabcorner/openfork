@@ -6,6 +6,9 @@ import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { useLocal } from "@/context/local"
 import { useLanguage } from "@/context/language"
 import { matchesModelSearch } from "../dialog-select-model-search"
+import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
+import { FreeUsageBar, FreeUsageModelsTable } from "@/components/openrouter-free-usage-bar"
+import { useSDK } from "@/context/sdk"
 import "../settings-v2/settings-v2.css"
 
 type ModelItem = ReturnType<ReturnType<typeof useLocal>["model"]["list"]>[number]
@@ -65,6 +68,8 @@ export function ModelsPanelContent() {
   const language = useLanguage()
   const local = useLocal()
   const model = local.model
+  const sdk = useSDK()
+  const freeUsage = useOpenRouterFreeUsage({ includeValue: true })
   const [search, setSearch] = createSignal("")
   const [sortKey, setSortKey] = createSignal<SortKey>("cost")
   const [selected, setSelected] = createSignal<ModelItem | undefined>()
@@ -104,15 +109,15 @@ export function ModelsPanelContent() {
     () => {
       const item = activeModel()
       if (!item) return undefined
-      return `${item.provider.id}/${item.id}`
+      return item.id
     },
-    async (key) => {
-      const [author, slug] = key.split("/")
+    async (modelID) => {
       try {
-        const response = await fetch(`https://openrouter.ai/api/v1/models/${author}/${slug}/endpoints`)
-        if (!response.ok) return null
-        const json = (await response.json()) as { data?: { endpoints?: EndpointTelemetry[] } }
-        return json.data?.endpoints ?? []
+        const response = await sdk().client.experimental.openrouterEndpoints.get({ model: modelID }, { throwOnError: true })
+        return response.data.map((entry) => ({
+          provider_name: entry.providerName,
+          uptime_last_30m: entry.uptime,
+        })) as EndpointTelemetry[]
       } catch {
         return null
       }
@@ -198,6 +203,16 @@ export function ModelsPanelContent() {
           )}
         >
           <div class="flex flex-col gap-4 p-3">
+          <Show when={freeUsage.data()}>
+            {(report) => (
+              <div class="flex flex-col gap-2">
+                <FreeUsageBar report={report()} />
+                <Show when={report().free.models.length > 0}>
+                  <FreeUsageModelsTable report={report()} />
+                </Show>
+              </div>
+            )}
+          </Show>
           <Show when={cheapestByModel().length > 0} fallback={<EmptyState />}>
             <Section title={language.t("models.compare.cheapest.title")}>
               <div class="grid grid-cols-2 gap-1.5">

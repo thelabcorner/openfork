@@ -41,7 +41,7 @@ import {
   normalizeProjectInfo,
   normalizeProviderList,
 } from "./utils"
-import { formatServerError } from "@/utils/server-errors"
+import { formatServerError, isCancelledRequestError } from "@/utils/server-errors"
 import { QueryClient, queryOptions } from "@tanstack/solid-query"
 import { loadMcpQuery, loadMcpResourcesQuery } from "../server-sync"
 import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
@@ -80,7 +80,10 @@ function waitForPaint() {
 }
 
 function errors(list: PromiseSettledResult<unknown>[]) {
-  return list.filter((item): item is PromiseRejectedResult => item.status === "rejected").map((item) => item.reason)
+  return list
+    .filter((item): item is PromiseRejectedResult => item.status === "rejected")
+    .map((item) => item.reason)
+    .filter((reason) => !isCancelledRequestError(reason))
 }
 
 const providerRev = new Map<string, number>()
@@ -552,6 +555,7 @@ export async function bootstrapDirectory(input: {
         input.queryClient
           .fetchQuery(loadProvidersQuery(input.scope, input.directory, input.api, input.sdk, input.protocol))
           .catch((err) => {
+            if (isCancelledRequestError(err)) return
             const project = getFilename(input.directory)
             showToast({
               variant: "error",

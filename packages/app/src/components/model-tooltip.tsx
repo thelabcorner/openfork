@@ -124,7 +124,7 @@ function ModelTooltipCostTable(props: {
             {language.t("model.tooltip.cost.perBillion")}
           </span>
           {row(language.t("model.tooltip.cost.input"), props.cost.input)}
-          {row(language.t("model.tooltip.cost.cached"), props.cost.cache.read)}
+          {row(language.t("model.tooltip.cost.cached"), props.cost.cache?.read ?? 0)}
           {row(language.t("model.tooltip.cost.output"), props.cost.output)}
         </div>
       }
@@ -238,7 +238,7 @@ export const ModelTooltip: Component<{
         </Show>
         <ModelTooltipRow name={language.t("model.tooltip.reasoning")} value={reasoning()} />
         <ModelTooltipRow name={language.t("model.tooltip.context.label")} value={contextLimit()} />
-        <Show when={props.model.cost && (props.model.cost.input > 0 || props.model.cost.output > 0 || props.model.cost.cache.read > 0)}>
+        <Show when={props.model.cost && (props.model.cost.input > 0 || props.model.cost.output > 0 || (props.model.cost.cache?.read ?? 0) > 0)}>
           <div class="h-px bg-v2-border-border-muted" />
           <ModelTooltipCostTable model={props.model} cost={props.model.cost!} period={props.period} />
         </Show>
@@ -273,11 +273,11 @@ export const ModelTooltip: Component<{
       </Show>
       <div class="text-12-regular text-text-invert-base">{reasoning()}</div>
       <div class="text-12-regular text-text-invert-base">{context()}</div>
-      <Show when={props.model.cost && (props.model.cost.input > 0 || props.model.cost.output > 0 || props.model.cost.cache.read > 0)}>
+      <Show when={props.model.cost && (props.model.cost.input > 0 || props.model.cost.output > 0 || (props.model.cost.cache?.read ?? 0) > 0)}>
         <div class="text-12-regular text-text-invert-base">
           {language.t("model.tooltip.cost", {
             input: formatCostPerMillion(props.model.cost!.input),
-            cached: formatCostPerMillion(props.model.cost!.cache.read),
+            cached: formatCostPerMillion(props.model.cost!.cache?.read ?? 0),
             output: formatCostPerMillion(props.model.cost!.output),
           })}
         </div>

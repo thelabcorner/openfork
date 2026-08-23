@@ -4,6 +4,7 @@ import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { createMutation } from "@tanstack/solid-query"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
+import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
 import { useGlobal } from "@/context/global"
 import { useLanguage } from "@/context/language"
 import { ServerConnection, serverName } from "@/context/server"
@@ -31,6 +32,7 @@ export function TabNavItem(props: {
   onNavigate: () => void
   active?: boolean
   forceTruncate?: boolean
+  pending?: boolean
   suppressNavigation?: () => boolean
   dragging?: boolean
   pressed?: boolean
@@ -244,33 +246,44 @@ export function TabNavItem(props: {
         <span
           data-slot="project-avatar-slot"
           class="flex size-4 shrink-0 items-center justify-center"
-          classList={{ "text-v2-icon-icon-muted": sessionState() === "paused" }}
+          classList={{ "text-v2-icon-icon-muted": !props.pending && sessionState() === "paused" }}
           aria-label={
-            sessionState() === "paused"
-              ? language.t("tab.state.paused")
-              : sessionState() === "working"
-                ? language.t("tab.state.working")
-                : undefined
+            props.pending
+              ? language.t("common.loading")
+              : sessionState() === "paused"
+                ? language.t("tab.state.paused")
+                : sessionState() === "working"
+                  ? language.t("tab.state.working")
+                  : undefined
           }
         >
           <Show
-            when={sessionState() !== "paused" && props.session()}
-            keyed
+            when={props.pending}
             fallback={
-              <span class="block size-4 rounded-[3px] border border-v2-border-border-muted" aria-hidden="true" />
+              <>
+                <Show
+                  when={sessionState() !== "paused" && props.session()}
+                  keyed
+                  fallback={
+                    <span class="block size-4 rounded-[3px] border border-v2-border-border-muted" aria-hidden="true" />
+                  }
+                >
+                  {(session) => (
+                    <SessionTabAvatar
+                      project={project()}
+                      directory={session.directory}
+                      sessionId={session.id}
+                      server={props.server}
+                    />
+                  )}
+                </Show>
+                <Show when={sessionState() === "paused"}>
+                  <IconV2 name="pause" class="size-4" aria-hidden="true" />
+                </Show>
+              </>
             }
           >
-            {(session) => (
-              <SessionTabAvatar
-                project={project()}
-                directory={session.directory}
-                sessionId={session.id}
-                server={props.server}
-              />
-            )}
-          </Show>
-          <Show when={sessionState() === "paused"}>
-            <IconV2 name="pause" class="size-4" aria-hidden="true" />
+            <LoaderV2 class="size-4" aria-hidden="true" />
           </Show>
         </span>
         <span
@@ -375,6 +388,7 @@ export function DraftTabItem(props: {
   href: string
   title: string
   active?: boolean
+  pending?: boolean
   onNavigate: () => void
   onClose: () => void
   suppressNavigation?: () => boolean
@@ -433,7 +447,9 @@ export function DraftTabItem(props: {
         class="flex h-full min-w-0 flex-1 flex-row items-center gap-1.5 text-[13px] font-medium text-v2-text-text-faint group-data-[active='true']:text-v2-text-text-base [-webkit-user-drag:none]"
       >
         <span class="flex size-4 shrink-0 items-center justify-center">
-          <IconV2 name="edit" />
+          <Show when={props.pending} fallback={<IconV2 name="edit" />}>
+            <LoaderV2 class="size-4" aria-hidden="true" />
+          </Show>
         </span>
         <span
           data-titlebar-tab-title
@@ -475,6 +491,7 @@ export function GroupTabNavItem(props: {
   onClose: () => void
   onNavigate: () => void
   active?: boolean
+  pending?: boolean
   suppressNavigation?: () => boolean
   dragging?: boolean
   pressed?: boolean
@@ -532,7 +549,9 @@ export function GroupTabNavItem(props: {
         class="flex h-full min-w-0 flex-1 flex-row items-center gap-1.5 text-[13px] font-medium text-v2-text-text-faint group-data-[active='true']:text-v2-text-text-base [-webkit-user-drag:none]"
       >
         <span class="flex size-4 shrink-0 items-center justify-center">
-          <IconV2 name="layers" class="text-v2-icon-icon-muted" />
+          <Show when={props.pending} fallback={<IconV2 name="layers" class="text-v2-icon-icon-muted" />}>
+            <LoaderV2 class="size-4" aria-hidden="true" />
+          </Show>
         </span>
         <span
           data-titlebar-tab-title

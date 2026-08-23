@@ -5,13 +5,14 @@ import {
   createSignal,
   Match,
   on,
+  onCleanup,
   onMount,
   Show,
   Switch,
   untrack,
 } from "solid-js"
 import { createStore } from "solid-js/store"
-import { useLocation, useNavigate, useParams } from "@solidjs/router"
+import { useIsRouting, useLocation, useNavigate, useParams } from "@solidjs/router"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Icon } from "@opencode-ai/ui/icon"
 import { Button } from "@opencode-ai/ui/button"
@@ -78,7 +79,7 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
   const mac = createMemo(() => platform.platform === "desktop" && platform.os === "macos")
   const windows = createMemo(() => platform.platform === "desktop" && platform.os === "windows")
   const linux = createMemo(() => platform.platform === "desktop" && platform.os === "linux")
-  const web = createMemo(() => platform.platform === "web")
+  const web = createMemo(() => platform.platform === "web" || platform.platform === "pwa")
   const macTrafficLights = createMemo(() => mac() && !platform.windowFullscreen?.())
   const zoom = () => platform.webviewZoom?.() ?? 1
   const titlebarZoom = () => (windows() ? Math.max(zoom(), minTitlebarZoom) : zoom())
@@ -186,6 +187,16 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
       category: language.t("command.category.view"),
       keybind: "mod+shift+p",
       onSelect: () => layout.projectExplorer.toggle(),
+    },
+  ])
+
+  command.register("chats-toggle", () => [
+    {
+      id: "chats.toggle",
+      title: language.t("command.chats.toggle"),
+      category: language.t("command.category.view"),
+      keybind: "mod+shift+c",
+      onSelect: () => layout.chats.toggle(),
     },
   ])
 
@@ -394,6 +405,42 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
             })
 
             const [tabsAreOverflowing, setTabsAreOverflowing] = createSignal(false)
+            const routing = useIsRouting()
+            const [pendingTabKey, setPendingTabKey] = createSignal<string | null>(null)
+            let pendingSince = 0
+            createEffect(() => {
+              const pending = pendingTabKey()
+              if (!pending) return
+              pendingSince = Date.now()
+            })
+
+            createEffect(() => {
+              const pending = pendingTabKey()
+              if (!pending) return
+              const current = currentTab()
+              if (!current || tabKey(current) !== pending) return
+              if (routing()) return
+              if (current.type === "session" && session.loading) return
+              const elapsed = Date.now() - pendingSince
+              const minVisible = 550
+              if (elapsed < minVisible) {
+                const id = setTimeout(
+                  () => setPendingTabKey((key) => (key === pending ? null : key)),
+                  minVisible - elapsed,
+                )
+                onCleanup(() => clearTimeout(id))
+                return
+              }
+              setPendingTabKey(null)
+            })
+
+            // Safety: never hold a pending spinner forever (e.g. failed load)
+            createEffect(() => {
+              const pending = pendingTabKey()
+              if (!pending) return
+              const id = setTimeout(() => setPendingTabKey((key) => (key === pending ? null : key)), 4000)
+              onCleanup(() => clearTimeout(id))
+            })
 
             return (
               <div
@@ -443,10 +490,17 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                     tabs={tabsStore}
                     currentTab={currentTab}
                     forceTruncate={tabsAreOverflowing()}
+                    pendingTabKey={pendingTabKey}
                     onOverflowChange={setTabsAreOverflowing}
                     onNavigate={(tab, el) => {
+                      const key = tabKey(tab)
+                      const current = currentTab()
+                      if (!current || tabKey(current) !== key) setPendingTabKey(key)
                       tabs.select(tab)
-                      el?.scrollIntoView({ behavior: "instant" })
+                      // Defer past the router's transition microtask so the scroll
+                      // lands on the post-commit strip instead of forcing a layout
+                      // on stale DOM inside the click handler.
+                      queueMicrotask(() => el?.scrollIntoView({ behavior: "instant" }))
                     }}
                     onClose={(tab) => {
                       const index = tabsStore.findIndex((item) => tabKey(item) === tabKey(tab))
@@ -703,6 +757,28 @@ function TitlebarV2Right(props: { state: TitlebarV2RightState }) {
             aria-expanded={layout.browser.opened()}
             aria-controls="browser-panel"
             icon={<IconV2 name="globe" />}
+          />
+        </TooltipV2>
+        <TooltipV2
+          placement="bottom"
+          value={
+            <>
+              {language.t("command.chats.toggle")}
+              <KeybindV2 keys={command.keybindParts("chats.toggle")} variant="neutral" />
+            </>
+          }
+        >
+          <IconButtonV2
+            type="button"
+            variant="ghost-muted"
+            size="large"
+            class="!w-9 shrink-0"
+            state={layout.chats.opened() ? "pressed" : undefined}
+            onClick={layout.chats.toggle}
+            aria-label={language.t("command.chats.toggle")}
+            aria-expanded={layout.chats.opened()}
+            aria-controls="chat-sidebar-pane"
+            icon={<IconV2 name="chats" />}
           />
         </TooltipV2>
       </Show>
