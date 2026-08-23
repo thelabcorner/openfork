@@ -47,6 +47,15 @@ export function createTimelineModel(input: {
         }, 500)
       })
 
+      // Cache-first paint: when messages for this session are already in the
+      // store, resolve immediately so the route paints from cache instead of
+      // parking on sync(). Awaiting sync here can block on a joined in-flight
+      // prefetch (sidebar hydration) or a full refetch even though paintable
+      // data exists; staleness is handled out-of-band by the scheduled
+      // force-refresh above, and any joined fetch keeps filling the same
+      // reactive store while the timeline is already visible.
+      if (cached) return
+
       const label = `session.sync:${id}`
       const done = trackPending(label)
       // Perf marks so DevTools/perf traces attribute route-paint waits to the
