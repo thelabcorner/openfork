@@ -1,6 +1,6 @@
 import type { Page, Route } from "@playwright/test"
 
-const emptyList = new Set(["/skill", "/command", "/lsp", "/formatter", "/vcs/status", "/vcs/diff", "/fork/credential"])
+const emptyList = new Set(["/skill", "/command", "/lsp", "/formatter", "/vcs/status", "/vcs/diff", "/fork/credential", "/api/session-group", "/session-group"])
 const emptyObject = new Set(["/global/config", "/config", "/provider/auth", "/mcp", "/experimental/resource"])
 
 export interface MockServerConfig {
@@ -45,7 +45,13 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     "/project/current": config.project,
     "/agent": [{ name: "build", mode: "primary" }],
     "/vcs": { branch: "main", default_branch: "main" },
-    "/session": config.sessions,
+    // Flat v2 Session rows: this surface feeds the compat layer's
+    // sessionInfo(), which reads top-level directory/workspaceID (unlike
+    // /api/session, whose location-shaped rows go through
+    // normalizeSessionInfo). A directory-less row poisons the server-session
+    // cache and leaves lineage resolution settled-but-unusable (center column
+    // hangs on its loading fallback forever).
+    "/session": config.sessions.map((session) => flatSession(session, config.directory)),
   }
 
   await page.route("**/*", async (route) => {
@@ -257,7 +263,10 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     const sessionMatch = path.match(/^\/session\/([^/]+)$/)
     if (sessionMatch) {
       const session = config.sessions.find((s) => s.id === sessionMatch[1])
-      return json(route, session ?? {})
+      // Flat v2 Session shape — see the /session note above. The compat
+      // layer's session.get maps flat .directory; a location-shaped or bare
+      // row here makes the session cache entry directory-less.
+      return json(route, session ? flatSession(session, config.directory) : {})
     }
 
     const projectMatch = path.match(/^\/project\/([^/]+)$/)
@@ -363,6 +372,29 @@ export function currentSession(session: { id: string } & Record<string, unknown>
     },
     subpath: session.path,
     revert: session.revert,
+  }
+}
+
+// Flat v2 Session shape (directory at top level, no location wrapper) for the
+// unprefixed /session surfaces consumed through the compat layer's
+// sessionInfo(), which reads flat fields directly.
+export function flatSession(session: { id: string } & Record<string, unknown>, fallbackDirectory?: string) {
+  const base = currentSession(session, fallbackDirectory)
+  return {
+    id: base.id,
+    slug: base.id,
+    projectID: base.projectID,
+    workspaceID: base.location.workspaceID,
+    directory: base.location.directory,
+    path: base.subpath,
+    parentID: base.parentID,
+    cost: base.cost,
+    tokens: base.tokens,
+    time: base.time,
+    title: base.title,
+    agent: base.agent,
+    model: base.model,
+    revert: base.revert,
   }
 }
 

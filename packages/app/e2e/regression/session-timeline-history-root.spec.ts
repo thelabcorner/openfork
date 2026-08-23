@@ -176,7 +176,7 @@ for (const scenario of scenarios) {
     history.resolve()
     await expect(page.locator('[data-timeline-part-id^="prt_history_root_"]')).toHaveCount(assistants.length)
     await expect.poll(() => requests.filter((request) => request.phase === "end").length).toBe(2)
-    await expect(page.getByRole("button", { name: "Stop" })).toBeVisible()
+    await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible()
     await waitForProbeSamples(page, beforeHistory)
     expect(pages).toEqual([
       { before: undefined, limit: initialPageSize },
@@ -189,7 +189,7 @@ for (const scenario of scenarios) {
     for (const event of scenario.idleFirst ? [idle, message] : [message, idle]) {
       const beforeEvent = await probeSamples(page)
       await transport.send(event)
-      if (event === idle) await expect(page.getByRole("button", { name: "Stop" })).toHaveCount(0)
+      if (event === idle) await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0)
       if (event === message && scenario.interrupted)
         await expect(page.getByText("Interrupted", { exact: true })).toBeVisible()
       await waitForProbeSamples(page, beforeEvent)
@@ -200,7 +200,7 @@ for (const scenario of scenarios) {
 
     expect(requests[0]).toEqual({ before: undefined, phase: "start", sessionID })
     expect(requests[1]).toEqual({ before: undefined, phase: "end", sessionID })
-    await expect(page.getByRole("button", { name: "Stop" })).toHaveCount(0)
+    await expect(page.getByRole("button", { name: "Stop", exact: true })).toHaveCount(0)
     await expect(page.locator('[data-timeline-row="bottom-spacer"]')).toBeVisible()
     if (scenario.interrupted) await expect(page.getByText("Interrupted", { exact: true })).toBeVisible()
     expect(

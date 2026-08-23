@@ -343,7 +343,7 @@ test.describe("smoke: session timeline", () => {
     const shellTrigger = shell.locator('[data-slot="collapsible-trigger"]')
     const shellSubtitle = shell.locator('[data-slot="basic-tool-tool-subtitle"]')
     await expect(shellSubtitle).toHaveCount(0)
-    await expect(shell.locator('[data-slot="bash-pre"]')).toContainText("$ bun typecheck")
+    await expect(shell.locator('[data-slot="bash-command-code"]')).toContainText("bun typecheck")
     await shellTrigger.click()
     await expect(shellTrigger).toHaveAttribute("aria-expanded", "false")
     await expect(shellSubtitle).toHaveText("bun typecheck")

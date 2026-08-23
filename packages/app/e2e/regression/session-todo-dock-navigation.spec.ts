@@ -73,7 +73,7 @@ test("animates todo lifecycle without replaying it across session tabs", async (
 
   sessionStatus[sourceID] = { type: "busy" }
   events.push(statusEvent(sourceID, "busy"))
-  await expect(page.getByRole("button", { name: "Stop" })).toBeVisible()
+  await expect(page.getByRole("button", { name: "Stop", exact: true })).toBeVisible()
 
   await page.waitForTimeout(700)
   const opening = sampleDock(page, 1_000)

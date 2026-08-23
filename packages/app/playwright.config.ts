@@ -41,5 +41,17 @@ export default defineConfig({
       name: "chromium",
       use: { ...devices["Desktop Chrome"] },
     },
+    // Mobile device project (docs/pwa-mobile/06 §7.5). Env-gated until its
+    // flake budget is known (06 §7.6); scoped to the pwa specs so enabling it
+    // does not run the whole desktop suite under phone emulation.
+    ...(process.env.PLAYWRIGHT_MOBILE === "1"
+      ? [
+          {
+            name: "webkit-mobile",
+            testMatch: /pwa-.*\.spec\.ts/,
+            use: { ...devices["iPhone 13"] },
+          },
+        ]
+      : []),
   ],
 })
