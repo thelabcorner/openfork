@@ -1,0 +1,109 @@
+/* PWA large-title collapsing header — docs/pwa-mobile/01 §2 nav model, 02 §5.5.
+   The bar is sticky INSIDE the scroller owned by PwaLargeTitle; only
+   opacity/transform animate (compositor-safe, docs/pwa-mobile/06 §2.5). */
+
+.pwa-large-title {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+}
+
+.pwa-large-title__scroller {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.pwa-large-title__bar {
+  position: sticky;
+  top: 0;
+  z-index: 10;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
+  align-items: center;
+  flex-shrink: 0;
+  height: 44px;
+  padding: 0 8px;
+  background: var(--v2-background-bg-base);
+}
+
+.pwa-large-title__bar[data-collapsed] {
+  border-bottom: 1px solid var(--v2-border-border-muted);
+}
+
+.pwa-large-title__back {
+  justify-self: start;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 44px;
+  padding: 0 8px;
+  border: none;
+  background: none;
+  color: var(--text-interactive-base);
+  font-size: var(--font-size-base);
+  touch-action: manipulation;
+  transition: transform 80ms ease-out;
+}
+
+.pwa-large-title__back:active {
+  transform: scale(0.97);
+}
+
+.pwa-large-title__bar-title {
+  grid-column: 2;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--font-size-base);
+  font-weight: var(--font-weight-medium);
+  letter-spacing: var(--letter-spacing-tight);
+  color: var(--text-strong);
+  opacity: 0;
+  transform: translateY(6px);
+  pointer-events: none;
+}
+
+.pwa-large-title__bar-title[data-visible] {
+  opacity: 1;
+  transform: translateY(0);
+  transition:
+    opacity 160ms ease-out,
+    transform 160ms ease-out;
+}
+
+.pwa-large-title__actions {
+  justify-self: end;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 44px;
+}
+
+.pwa-large-title__title {
+  flex-shrink: 0;
+  margin: 0;
+  padding: 2px 16px 8px;
+  font-size: 1.75rem;
+  font-weight: var(--font-weight-medium);
+  line-height: 1.2;
+  letter-spacing: var(--letter-spacing-tightest);
+  color: var(--text-strong);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .pwa-large-title__back,
+  .pwa-large-title__bar-title[data-visible] {
+    transition: none;
+  }
+  .pwa-large-title__back:active {
+    transform: none;
+  }
+}
