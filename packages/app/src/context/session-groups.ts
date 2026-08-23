@@ -2,7 +2,7 @@ import type { Session } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/solid-query"
 import { createEffect, createMemo } from "solid-js"
-import { createStore } from "solid-js/store"
+import { createStore, reconcile } from "solid-js/store"
 import { useGlobal } from "./global"
 import { safeQueryData } from "@/utils/safe-query-data"
 import { useServer } from "./server"
@@ -43,10 +43,6 @@ type GroupClient = {
 
 function groupListQueryKey(scope: string) {
   return [scope, "session-groups"] as const
-}
-
-function groupDetailQueryKey(scope: string, groupId: string) {
-  return [scope, "session-group", groupId] as const
 }
 
 // Delegates to the configured SDK transport (baseUrl + auth + response
@@ -129,13 +125,46 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
       // with an empty JSON object; treat any non-array payload as no groups.
       return Array.isArray(data) ? data : []
     }
+
+    // One batched round-trip populates every group's membership (the server
+    // buckets memberships in two total queries). If the backend predates the
+    // batched route, fall back to per-group fetches — deduped so concurrent
+    // list changes never duplicate an in-flight request.
+    const inflightDetails = new Map<string, Promise<void>>()
+    const fetchDetailDeduped = (groupId: string) => {
+      if (inflightDetails.has(groupId)) return
+      const promise = groupCall<SessionGroupDetailResponse>(client(), "GET", `/api/session-group/${groupId}`)
+        .then((detail) => {
+          setDetails(groupId, detail)
+        })
+        .catch(() => {
+          // Leave the group without membership rather than failing the pane;
+          // the next invalidate() retries it.
+        })
+        .finally(() => {
+          inflightDetails.delete(groupId)
+        })
+      inflightDetails.set(groupId, promise)
+    }
+    const applyDetailBatch = (payload: SessionGroupDetailResponse[]) => {
+      const next: Record<string, SessionGroupDetailResponse> = {}
+      for (const detail of payload) next[detail.group.id] = detail
+      // reconcile keeps object identity for unchanged groups so downstream
+      // memos don't churn when only one group's membership moved.
+      setDetails(reconcile(next))
+    }
+    const refreshDetails = (groupIds: string[]) => {
+      if (groupIds.length === 0) return
+      void groupCall<SessionGroupDetailResponse[]>(client(), "GET", "/api/session-group/details").then((payload) => {
+        if (!Array.isArray(payload)) throw new Error("unexpected session-group details payload")
+        applyDetailBatch(payload)
+      }).catch(() => {
+        for (const groupId of groupIds) fetchDetailDeduped(groupId)
+      })
+    }
+
     createEffect(() => {
-      for (const group of groupList()) {
-        if (details[group.id]) continue
-        void groupCall<SessionGroupDetailResponse>(client(), "GET", `/api/session-group/${group.id}`).then((detail) =>
-          setDetails(group.id, detail),
-        )
-      }
+      refreshDetails(groupList().map((group) => group.id).filter((id) => !details[id]))
     })
 
     // Build SessionGroupEntry list by merging group metadata with detail session IDs
@@ -162,25 +191,18 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
       return list().find((g) => g.sessionIds.includes(sessionId))
     }
 
+    // `groupId` is accepted for call-site compatibility but no longer scopes
+    // the refresh: the batched details fetch costs one round-trip regardless,
+    // so refreshing every group's membership is both simpler and fresher.
     const invalidate = (groupId?: string) => {
       queryClient.invalidateQueries({ queryKey: groupListQueryKey(scope()) })
-      if (!groupId) return
-      queryClient.invalidateQueries({ queryKey: groupDetailQueryKey(scope(), groupId) })
-      void groupCall<SessionGroupDetailResponse>(client(), "GET", `/api/session-group/${groupId}`).then((detail) =>
-        setDetails(groupId, detail),
-      )
+      refreshDetails(groupList().map((group) => group.id))
     }
 
     const fetchDetail = (groupId: string) => {
-      const existing = queryClient.getQueryData<SessionGroupDetailResponse>(groupDetailQueryKey(scope(), groupId))
+      const existing = details[groupId]
       if (existing) return existing
-      void queryClient.prefetchQuery(
-        queryOptions({
-          queryKey: groupDetailQueryKey(scope(), groupId),
-          queryFn: () => groupCall<SessionGroupDetailResponse>(client(), "GET", `/api/session-group/${groupId}`),
-          staleTime: 30_000,
-        }),
-      )
+      fetchDetailDeduped(groupId)
       return undefined
     }
 

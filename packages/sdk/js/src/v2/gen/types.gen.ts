@@ -11873,6 +11873,37 @@ export type SessionGroupRenameResponses = {
 
 export type SessionGroupRenameResponse = SessionGroupRenameResponses[keyof SessionGroupRenameResponses]
 
+export type SessionGroupListDetailsData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/session-group/details"
+}
+
+export type SessionGroupListDetailsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type SessionGroupListDetailsError = SessionGroupListDetailsErrors[keyof SessionGroupListDetailsErrors]
+
+export type SessionGroupListDetailsResponses = {
+  /**
+   * All session groups with their sessions
+   */
+  200: Array<{
+    group: SessionGroupInfo
+    sessions: Array<{
+      id: string
+      title: string
+    }>
+  }>
+}
+
+export type SessionGroupListDetailsResponse = SessionGroupListDetailsResponses[keyof SessionGroupListDetailsResponses]
+
 export type SessionGroupReorderData = {
   body?: {
     position: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"

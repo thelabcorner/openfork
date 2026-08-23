@@ -238,6 +238,8 @@ import type {
   SessionGroupCreateResponses,
   SessionGroupGetErrors,
   SessionGroupGetResponses,
+  SessionGroupListDetailsErrors,
+  SessionGroupListDetailsResponses,
   SessionGroupListErrors,
   SessionGroupListResponses,
   SessionGroupRemoveErrors,
@@ -5463,6 +5465,19 @@ export class SessionGroup extends HeyApiClient {
         ...params.headers,
       },
     })
+  }
+
+  /**
+   * List session groups with sessions
+   *
+   * Get every session group together with its member sessions in one response.
+   */
+  public listDetails<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      SessionGroupListDetailsResponses,
+      SessionGroupListDetailsErrors,
+      ThrowOnError
+    >({ url: "/session-group/details", ...options })
   }
 
   /**
