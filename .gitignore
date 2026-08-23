@@ -35,3 +35,12 @@ tsconfig.tsbuildinfo
 
 # Agent swarm databases (local-only, never commit)
 .opencode/swarms/*.chunkdb*
+
+# Local run artifacts (probe/e2e/profiling output)
+*.log
+*.cpuprofile
+packages/app/cdp-screenshot.png
+startup-investigation/raw/harness/cpu/
+startup-investigation/raw/models-dev-api.json
+startup-investigation/raw/trials.jsonl
+startup-investigation/raw/backend-link-desktop-logs-mined.txt
