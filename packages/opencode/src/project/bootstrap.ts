@@ -8,12 +8,26 @@ import * as Vcs from "./vcs"
 import { InstanceState } from "@/effect/instance-state"
 import { ShareNext } from "@/share/share-next"
 import { ToolReload } from "@/tool/reload"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Clock } from "effect"
 import { Config } from "@/config/config"
 import { Service } from "./bootstrap-service"
 
 export { Service } from "./bootstrap-service"
 export type { Interface } from "./bootstrap-service"
+
+/**
+ * Logs how long one bootstrap step took for this directory. Cold-start
+ * attribution: every directory-scoped HTTP request queues behind the full
+ * InstanceBootstrap.run (see InstanceStore.boot), so these lines identify
+ * which init is the tail latency without attaching a profiler.
+ */
+const timed = <A, E, R>(directory: string, label: string, effect: Effect.Effect<A, E, R>) =>
+  Effect.gen(function* () {
+    const startedAt = Date.now()
+    const value = yield* effect
+    yield* Effect.logInfo("instance init complete", { directory, service: label, ms: Date.now() - startedAt })
+    return value
+  })
 
 const layer = Layer.effect(
   Service,
@@ -35,19 +49,29 @@ const layer = Layer.effect(
       const ctx = yield* InstanceState.context
       yield* Effect.logInfo("bootstrapping", { directory: ctx.directory })
       // everything depends on config so eager load it for nice traces
-      yield* config.get()
+      yield* timed(ctx.directory, "config", config.get())
       // Plugin can mutate config so it has to be initialized before anything else.
-      yield* plugin.init()
+      yield* timed(ctx.directory, "plugin", plugin.init())
       // ToolReload starts its watcher subscription + poll fallback for this instance;
       // start() materializes the per-directory state and is non-blocking.
-      yield* toolReload
-        .start()
-        .pipe(Effect.catchCause((cause) => Effect.logWarning("tool reload init failed", { cause })))
+      yield* timed(ctx.directory, "toolReload", toolReload.start()).pipe(
+        Effect.catchCause((cause) => Effect.logWarning("tool reload init failed", { cause })),
+      )
       // Each service self-manages its own slow work via Effect.forkScoped against
       // its per-instance state scope. We just await materialization here.
       yield* Effect.forEach(
-        [lsp, shareNext, format, vcs, snapshot, project],
-        (s) => s.init().pipe(Effect.catchCause((cause) => Effect.logWarning("init failed", { cause }))),
+        [
+          ["lsp", lsp],
+          ["shareNext", shareNext],
+          ["format", format],
+          ["vcs", vcs],
+          ["snapshot", snapshot],
+          ["project", project],
+        ] as const,
+        ([name, service]) =>
+          timed(ctx.directory, name, service.init()).pipe(
+            Effect.catchCause((cause) => Effect.logWarning("init failed", { cause })),
+          ),
         { concurrency: "unbounded", discard: true },
       ).pipe(Effect.withSpan("InstanceBootstrap.init"))
     }).pipe(Effect.withSpan("InstanceBootstrap"))

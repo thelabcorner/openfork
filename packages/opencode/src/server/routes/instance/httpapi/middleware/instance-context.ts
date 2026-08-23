@@ -26,7 +26,14 @@ function provideInstanceContext<E>(
 ): Effect.Effect<HttpServerResponse.HttpServerResponse, E, WorkspaceRouteContext> {
   return Effect.gen(function* () {
     const route = yield* WorkspaceRouteContext
+    const startedAt = Date.now()
     const ctx = yield* store.load({ directory: decode(route.directory) })
+    const waitedMs = Date.now() - startedAt
+    // Diagnostics: requests queue behind cold instance bootstraps (see
+    // InstanceStore.boot); surface any meaningful wait so slow first paints
+    // on a directory can be attributed without attaching a profiler.
+    if (waitedMs > 200)
+      yield* Effect.logWarning("instance load delayed request", { directory: route.directory, ms: waitedMs })
     return yield* effect.pipe(
       Effect.provideService(InstanceRef, ctx),
       Effect.provideService(WorkspaceRef, route.workspaceID),
