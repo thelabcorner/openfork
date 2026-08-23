@@ -14,7 +14,10 @@ import { MessageID, SessionID } from "../../src/session/schema"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 
-const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+const noopBootstrap = Layer.succeed(
+  InstanceBootstrap.Service,
+  InstanceBootstrap.Service.of({ gate: Effect.void, warmup: Effect.void }),
+)
 const env = AppNodeBuilder.build(
   LayerNode.group([Permission.node, EventV2Bridge.node, CrossSpawnSpawner.node, InstanceStore.node]),
   [[InstanceStore.bootstrapNode, noopBootstrap]],

@@ -31,7 +31,10 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { Database } from "@opencode-ai/core/database/database"
 import { httpApiLayer } from "./httpapi-layer"
 
-const noopBootstrapLayer = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+const noopBootstrapLayer = Layer.succeed(
+  InstanceBootstrap.Service,
+  InstanceBootstrap.Service.of({ gate: Effect.void, warmup: Effect.void }),
+)
 const appLayer = AppNodeBuilder.build(
   LayerNode.group([FSUtil.node, CrossSpawnSpawner.node, InstanceStore.node, Database.node, SessionNs.node]),
   [[InstanceStore.bootstrapNode, noopBootstrapLayer]],

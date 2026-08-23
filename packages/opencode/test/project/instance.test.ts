@@ -12,7 +12,7 @@ import { testEffect } from "../lib/effect"
 let bootstrapRun: Effect.Effect<void> = Effect.void
 const noopBootstrap = Layer.succeed(
   InstanceBootstrap.Service,
-  InstanceBootstrap.Service.of({ run: Effect.suspend(() => bootstrapRun) }),
+  InstanceBootstrap.Service.of({ gate: Effect.suspend(() => bootstrapRun), warmup: Effect.void }),
 )
 
 const it = testEffect(

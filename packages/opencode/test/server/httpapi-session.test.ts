@@ -41,7 +41,7 @@ import { pollWithTimeout, awaitWithTimeout, testEffect } from "../lib/effect"
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const noopBootstrapLayer = Layer.succeed(
   InstanceBootstrapService.Service,
-  InstanceBootstrapService.Service.of({ run: Effect.void }),
+  InstanceBootstrapService.Service.of({ gate: Effect.void, warmup: Effect.void }),
 )
 const appLayer = AppNodeBuilder.build(
   LayerNode.group([InstanceStore.node, Project.node, Session.node, Workspace.node, Database.node, Ripgrep.node]),

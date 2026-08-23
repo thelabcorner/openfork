@@ -20,7 +20,10 @@ afterEach(async () => {
   await resetDatabase()
 })
 
-const noopBootstrap = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+const noopBootstrap = Layer.succeed(
+  InstanceBootstrap.Service,
+  InstanceBootstrap.Service.of({ gate: Effect.void, warmup: Effect.void }),
+)
 const testInstanceStore = AppNodeBuilder.build(InstanceStore.node, [[InstanceStore.bootstrapNode, noopBootstrap]])
 
 const it = testEffect(

@@ -20,7 +20,10 @@ import { NpmTest } from "../fake/npm"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 
-const noopBootstrapLayer = Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void }))
+const noopBootstrapLayer = Layer.succeed(
+  InstanceBootstrap.Service,
+  InstanceBootstrap.Service.of({ gate: Effect.void, warmup: Effect.void }),
+)
 const it = testEffect(
   AppNodeBuilder.build(LayerNode.group([Plugin.node, Workspace.node, InstanceStore.node, Ripgrep.node]), [
     [Auth.node, AuthTest.empty],

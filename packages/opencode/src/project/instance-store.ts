@@ -58,7 +58,7 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
                   project: result.project,
                 })),
               )
-        yield* bootstrap.run.pipe(Effect.provideService(InstanceRef, ctx))
+        yield* bootstrap.gate.pipe(Effect.provideService(InstanceRef, ctx))
         return ctx
       }).pipe(Effect.withSpan("InstanceStore.boot"))
 
@@ -72,8 +72,19 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const completeLoad = (directory: string, input: LoadInput, entry: Entry) =>
       Effect.gen(function* () {
         const exit = yield* Effect.exit(boot({ ...input, directory }))
-        if (Exit.isFailure(exit)) yield* removeEntry(directory, entry)
+        if (Exit.isFailure(exit)) {
+          yield* removeEntry(directory, entry)
+          yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
+          return
+        }
+        // Requests stop waiting here: eager service warmup keeps running on this
+        // fiber after the Deferred resolves, so first paint no longer queues
+        // behind it. Services also materialize lazily via InstanceState.get on
+        // first use, so nothing functional depends on warmup having run.
         yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
+        yield* bootstrap.warmup.pipe(Effect.provideService(InstanceRef, exit.value)).pipe(
+          Effect.catchCause((cause) => Effect.logWarning("instance warmup failed", { cause })),
+        )
       })
 
     const emitDisposed = (input: { directory: string; project?: string }) =>

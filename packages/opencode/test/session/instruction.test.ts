@@ -25,7 +25,7 @@ const it = testEffect(
   AppNodeBuilder.build(LayerNode.group([CrossSpawnSpawner.node, LayerNodePlatform.filesystem, InstanceStore.node]), [
     [
       InstanceBootstrap.node,
-      Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void })),
+      Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ gate: Effect.void, warmup: Effect.void })),
     ],
   ]),
 )

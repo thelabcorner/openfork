@@ -30,7 +30,7 @@ const it = testEffect(
       [RuntimeFlags.node, RuntimeFlags.layer({ experimentalWorkspaces: false })],
       [
         InstanceBootstrap.node,
-        Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ run: Effect.void })),
+        Layer.succeed(InstanceBootstrap.Service, InstanceBootstrap.Service.of({ gate: Effect.void, warmup: Effect.void })),
       ],
     ],
   ),
