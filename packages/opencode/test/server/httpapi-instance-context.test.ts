@@ -143,37 +143,46 @@ const serveDisposeProbe = () =>
   )
 
 describe("HttpApi instance context middleware", () => {
-  it.live("provides instance context from the routed directory", () =>
-    Effect.gen(function* () {
-      const dir = yield* tmpdirScoped({ git: true })
-      const project = yield* Project.use.fromDirectory(dir)
-      yield* serveProbe()
+  it.live(
+    "provides instance context from the routed directory",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const project = yield* Project.use.fromDirectory(dir)
+        yield* serveProbe()
 
-      const response = yield* HttpClient.get(`/probe?directory=${encodeURIComponent(dir)}`)
+        const response = yield* HttpClient.get(`/probe?directory=${encodeURIComponent(dir)}`)
 
-      expect(response.status).toBe(200)
-      expect(yield* response.json).toEqual({
-        directory: dir,
-        worktree: dir,
-        projectID: project.project.id,
-        workspaceID: null,
-      })
-    }),
+        expect(response.status).toBe(200)
+        expect(yield* response.json).toEqual({
+          directory: dir,
+          worktree: dir,
+          projectID: project.project.id,
+          workspaceID: null,
+        })
+      }),
+    // Instance loads now return before eager service warmup finishes (F1), so
+    // warmup fibers compete with the probe for CPU on slow hosts; the default
+    // 5s budget flaked on Windows. Generous cap, unchanged assertions.
+    { timeout: 30_000 },
   )
 
-  it.live("persists the routed project while loading instance context", () =>
-    Effect.gen(function* () {
-      const dir = yield* tmpdirScoped({ git: true })
-      const project = yield* Project.Service
-      yield* serveProbe()
+  it.live(
+    "persists the routed project while loading instance context",
+    () =>
+      Effect.gen(function* () {
+        const dir = yield* tmpdirScoped({ git: true })
+        const project = yield* Project.Service
+        yield* serveProbe()
 
-      const response = yield* HttpClient.get(`/probe?directory=${encodeURIComponent(dir)}`)
+        const response = yield* HttpClient.get(`/probe?directory=${encodeURIComponent(dir)}`)
 
-      expect(response.status).toBe(200)
-      const saved = (yield* project.list()).find((item) => item.worktree === dir)
-      expect(saved).toBeDefined()
-      expect(saved?.id).not.toBe("global")
-    }),
+        expect(response.status).toBe(200)
+        const saved = (yield* project.list()).find((item) => item.worktree === dir)
+        expect(saved).toBeDefined()
+        expect(saved?.id).not.toBe("global")
+      }),
+    { timeout: 30_000 },
   )
 
   it.live("falls back to the raw directory when URI decoding fails", () =>

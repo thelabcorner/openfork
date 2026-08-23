@@ -6,7 +6,7 @@ import { WorkspaceContext } from "@/control-plane/workspace-context"
 import { InstanceRef } from "@/effect/instance-ref"
 import { disposeInstance as runDisposers } from "@/effect/instance-registry"
 import { FSUtil } from "@opencode-ai/core/fs-util"
-import { Context, Deferred, Duration, Effect, Exit, Layer, Scope } from "effect"
+import { Context, Deferred, Duration, Effect, Exit, Fiber, Layer, Scope } from "effect"
 import { type InstanceContext } from "./instance-context"
 import { InstanceBootstrap } from "./bootstrap-service"
 import * as Project from "./project"
@@ -41,6 +41,11 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
     const bootstrap = yield* InstanceBootstrap.Service
     const scope = yield* Scope.Scope
     const cache = new Map<string, Entry>()
+    // Warmup fibers per directory. Disposal must interrupt these BEFORE
+    // invalidating service caches: ScopedCache.invalidate closes the entry
+    // scope, which joins any in-flight lookup fiber — without this interrupt,
+    // disposing a still-warming instance stalls until its slowest init lands.
+    const warmups = new Map<string, Fiber.Fiber<void>>()
 
     const boot = (input: LoadInput & { directory: string }) =>
       Effect.gen(function* () {
@@ -69,6 +74,24 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
         return true
       })
 
+    const startWarmup = (directory: string, ctx: InstanceContext) =>
+      Effect.gen(function* () {
+        const fiber = yield* bootstrap.warmup.pipe(
+          Effect.provideService(InstanceRef, ctx),
+          Effect.catchCause((cause) => Effect.logWarning("instance warmup failed", { cause })),
+          Effect.forkIn(scope),
+        )
+        warmups.set(directory, fiber)
+      })
+
+    const stopWarmup = (directory: string) =>
+      Effect.gen(function* () {
+        const fiber = warmups.get(directory)
+        if (!fiber) return
+        warmups.delete(directory)
+        yield* Fiber.interrupt(fiber)
+      })
+
     const completeLoad = (directory: string, input: LoadInput, entry: Entry) =>
       Effect.gen(function* () {
         const exit = yield* Effect.exit(boot({ ...input, directory }))
@@ -77,14 +100,14 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
           return
         }
-        // Requests stop waiting here: eager service warmup keeps running on this
-        // fiber after the Deferred resolves, so first paint no longer queues
-        // behind it. Services also materialize lazily via InstanceState.get on
-        // first use, so nothing functional depends on warmup having run.
+        // Requests stop waiting here: eager service warmup keeps running on a
+        // detached fiber after the Deferred resolves, so first paint no longer
+        // queues behind it. Services also materialize lazily via
+        // InstanceState.get on first use, so nothing functional depends on
+        // warmup having run. Disposal interrupts the fiber (stopWarmup) before
+        // invalidating caches so teardown never waits out a slow init.
         yield* Deferred.done(entry.deferred, exit).pipe(Effect.asVoid)
-        yield* bootstrap.warmup.pipe(Effect.provideService(InstanceRef, exit.value)).pipe(
-          Effect.catchCause((cause) => Effect.logWarning("instance warmup failed", { cause })),
-        )
+        yield* startWarmup(directory, exit.value)
       })
 
     const emitDisposed = (input: { directory: string; project?: string }) =>
@@ -104,6 +127,10 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
 
     const disposeContext = Effect.fn("InstanceStore.disposeContext")(function* (ctx: InstanceContext) {
       yield* Effect.logInfo("disposing instance", { directory: ctx.directory })
+      // Kill warmup first — ScopedCache.invalidate joins in-flight lookups, so
+      // invalidating while warmup is still materializing would stall teardown
+      // for as long as the slowest init takes.
+      yield* stopWarmup(ctx.directory)
       yield* Effect.promise(() => runDisposers(ctx.directory))
       yield* emitDisposed({ directory: ctx.directory, project: ctx.project.id })
     })
@@ -143,11 +170,12 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
           cache.set(directory, entry)
           yield* Effect.gen(function* () {
             yield* Effect.logInfo("reloading instance", { directory: directory })
-            if (previous) {
-              yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
-              yield* Effect.promise(() => runDisposers(directory))
-              yield* emitDisposed({ directory, project: input.project?.id })
-            }
+          if (previous) {
+            yield* Deferred.await(previous.deferred).pipe(Effect.ignore)
+            yield* stopWarmup(directory)
+            yield* Effect.promise(() => runDisposers(directory))
+            yield* emitDisposed({ directory, project: input.project?.id })
+          }
             yield* completeLoad(directory, input, entry)
           }).pipe(Effect.forkIn(scope, { startImmediately: true }))
           return yield* restore(Deferred.await(entry.deferred))

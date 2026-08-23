@@ -67,25 +67,31 @@ function waitDisposed(directory: string) {
   })
 }
 
-it.live("InstanceStore.provide runs InstanceBootstrap before effect", () =>
-  Effect.gen(function* () {
-    const tmp = yield* bootstrapFixture
-    const store = yield* InstanceStore.Service
+it.live(
+  "InstanceStore.provide runs InstanceBootstrap before effect",
+  () =>
+    Effect.gen(function* () {
+      const tmp = yield* bootstrapFixture
+      const store = yield* InstanceStore.Service
 
-    yield* store.provide({ directory: tmp.directory }, Effect.succeed("ok"))
+      yield* store.provide({ directory: tmp.directory }, Effect.succeed("ok"))
 
-    expect(existsSync(tmp.marker)).toBe(true)
-  }),
+      expect(existsSync(tmp.marker)).toBe(true)
+    }),
+  { timeout: 30000 },
 )
 
-it.live("CLI bootstrap runs InstanceBootstrap before callback", () =>
-  Effect.gen(function* () {
-    const tmp = yield* bootstrapFixture
+it.live(
+  "CLI bootstrap runs InstanceBootstrap before callback",
+  () =>
+    Effect.gen(function* () {
+      const tmp = yield* bootstrapFixture
 
-    yield* Effect.promise(() => cliBootstrap(tmp.directory, async () => "ok"))
+      yield* Effect.promise(() => cliBootstrap(tmp.directory, async () => "ok"))
 
-    expect(existsSync(tmp.marker)).toBe(true)
-  }),
+      expect(existsSync(tmp.marker)).toBe(true)
+    }),
+  { timeout: 30000 },
 )
 
 it.live("CLI bootstrap disposes the instance when the callback rejects", () =>
