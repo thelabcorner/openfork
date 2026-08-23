@@ -20,8 +20,7 @@ export const xai = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter 
   name: NAME,
   aliases: ALIASES,
   configured: () => Effect.map(authKey(auth, ALIASES), (key) => key !== undefined),
-  fetch: (): Effect.Effect<ProviderResult> =>
-    Effect.gen(function* () {
+  fetch: (): Effect.Effect<ProviderResult> => (Effect.gen(function* () {
       const resolved = yield* authKey(auth, ALIASES)
       // xAI auth is OAuth-style with access/refresh/expires; we treat the
       // access token stored in auth.json as the bearer token.
@@ -58,7 +57,7 @@ export const xai = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter 
       } catch (e) {
         return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: true, error: e instanceof Error ? e.message : String(e) })
       }
-    }),
+    }) as Effect.Effect<ProviderResult>,
 })
 
 function decodeUsage(buffer: ArrayBuffer): { percent?: number; resetsAt?: number } | null {
