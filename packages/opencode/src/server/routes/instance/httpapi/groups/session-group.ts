@@ -2,8 +2,6 @@ import { SessionGroup } from "@opencode-ai/schema/session-group"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import { Authorization } from "../middleware/authorization"
-import { InstanceContextMiddleware } from "../middleware/instance-context"
-import { WorkspaceRoutingMiddleware } from "../middleware/workspace-routing"
 import { described } from "./metadata"
 import { ApiNotFoundError } from "../errors"
 
@@ -143,8 +141,6 @@ export const SessionGroupApi = HttpApi.make("session-group")
           description: "Session group routes.",
         }),
       )
-      .middleware(InstanceContextMiddleware)
-      .middleware(WorkspaceRoutingMiddleware)
       .middleware(Authorization),
   )
   .annotateMerge(

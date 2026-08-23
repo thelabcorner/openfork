@@ -38,6 +38,7 @@ import { McpAuth } from "@/mcp/auth"
 import { Command } from "@/command"
 import { Truncate } from "@/tool/truncate"
 import { ToolRegistry } from "@/tool/registry"
+import { ToolInterrupt } from "@/tool/interrupt"
 import { ToolReload } from "@/tool/reload"
 import { Format } from "@/format"
 import { InstanceStore } from "@/project/instance-store"
@@ -100,6 +101,7 @@ export const AppLayer = AppNodeBuilderV1.build(
     Command.node,
     Truncate.node,
     ToolRegistry.node,
+    ToolInterrupt.node,
     ToolReload.node,
     Format.node,
     InstanceStore.node,

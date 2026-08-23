@@ -10,12 +10,14 @@ import { Question } from "@/question"
 import { ConfigApi } from "./groups/config"
 import { ControlApi } from "./groups/control"
 import { ControlPlaneApi } from "./groups/control-plane"
+import { DeviceApi } from "./groups/device"
 import { ForkCredentialApi } from "./groups/fork-credential"
 import { EventApi } from "./groups/event"
 import { ExperimentalApi } from "./groups/experimental"
 import { FileApi } from "./groups/file"
 import { InstanceApi } from "./groups/instance"
 import { McpApi } from "./groups/mcp"
+import { PairBeginApi, PairClaimApi } from "./groups/pair"
 import { PermissionApi } from "./groups/permission"
 import { ProjectApi } from "./groups/project"
 import { ProjectCopyApi } from "./groups/project-copy"
@@ -89,6 +91,9 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
 export const OpenCodeHttpApi = HttpApi.make("opencode")
   .addHttpApi(RootHttpApi)
   .addHttpApi(EventApi)
+  .addHttpApi(PairBeginApi)
+  .addHttpApi(PairClaimApi)
+  .addHttpApi(DeviceApi)
   .addHttpApi(InstanceHttpApi)
   .addHttpApi(ServerApi)
   .addHttpApi(PtyConnectApi)

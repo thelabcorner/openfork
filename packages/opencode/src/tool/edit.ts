@@ -23,6 +23,7 @@ import * as Bom from "@/util/bom"
 import { optional, PositiveInt } from "@opencode-ai/schema"
 import { AppProcess } from "@opencode-ai/core/process"
 import { TypecheckScope } from "./typecheck-scope"
+import { Conflict } from "./conflict"
 
 function normalizeLineEndings(text: string): string {
   return text.replaceAll("\r\n", "\n")
@@ -1193,7 +1194,7 @@ export function replace(content: string, oldString: string, newString: string, r
       notFound = false
       if (isDisproportionateMatch(search, oldString)) {
         throw new Error(
-          "Refusing replacement because the matched span is much larger than oldString. Re-read the file and provide the full exact oldString for the intended replacement.",
+          `Refusing replacement because the matched span is much larger than oldString. Resend this exact current-file span as oldString:\n\n${Conflict.spanConflictHint({ content, span: search })}`,
         )
       }
       if (replaceAll) {
@@ -1206,11 +1207,14 @@ export function replace(content: string, oldString: string, newString: string, r
   }
 
   if (notFound) {
-    throw new Error(
-      "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings.",
-    )
+    const message =
+      "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings."
+    const hint = Conflict.replaceConflictHint({ content, needle: oldString })
+    throw new Error(hint ? `${message}\n\n${hint}` : message)
   }
-  throw new Error("Found multiple matches for oldString. Provide more surrounding context to make the match unique.")
+  const ambiguous = "Found multiple matches for oldString. Provide more surrounding context to make the match unique."
+  const hint = Conflict.replaceConflictHint({ content, needle: oldString })
+  throw new Error(hint ? `${ambiguous}\n\n${hint}` : ambiguous)
 }
 
 function isDisproportionateMatch(search: string, oldString: string) {

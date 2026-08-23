@@ -49,12 +49,15 @@ import { Discovery } from "@/skill/discovery"
 import { Snapshot } from "@/snapshot"
 import { Storage } from "@/storage/storage"
 import { ToolRegistry } from "@/tool/registry"
+import { ToolInterrupt } from "@/tool/interrupt"
 import { ToolReload } from "@/tool/reload"
 import { Truncate } from "@/tool/truncate"
 import { Worktree } from "@/worktree"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { MoveSession } from "@opencode-ai/core/control-plane/move-session"
 import { Database } from "@opencode-ai/core/database/database"
+import { Credential } from "@opencode-ai/core/credential"
+import { Device } from "@opencode-ai/core/device"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
@@ -88,7 +91,11 @@ import {
 } from "./middleware/authorization"
 import { EventApi } from "./groups/event"
 import { PtyConnectApi } from "./groups/pty"
+import { PairBeginApi, PairClaimApi } from "./groups/pair"
+import { DeviceApi } from "./groups/device"
 import { eventHandlers } from "./handlers/event"
+import { pairHandlers, pairClaimHandlers } from "./handlers/pair"
+import { deviceHandlers } from "./handlers/device"
 import { configHandlers } from "./handlers/config"
 import { controlHandlers } from "./handlers/control"
 import { controlPlaneHandlers } from "./handlers/control-plane"
@@ -142,13 +149,26 @@ const cors = (corsOptions?: CorsOptions) =>
 // Route tree:
 // - rootApiRoutes: typed /global/* and control routes; auth is declared by RootHttpApi.
 // - eventApiRoutes: typed SSE route with instance routing context and its existing API contract.
+// - pairBeginApiRoutes / pairClaimApiRoutes: pairing ceremony; begin is authed, claim is public by design.
+// - deviceApiRoutes: paired-device management; authed.
 // - ptyConnectApiRoutes: typed WebSocket upgrade route with ticket-aware auth.
 // - instanceApiRoutes: remaining typed instance routes.
 // - uiRoute: raw catch-all fallback; auth is router middleware so public static assets can bypass it.
-const authOnlyRouterLayer = authorizationRouterMiddleware.layer.pipe(Layer.provide(ServerAuth.Config.layer))
-const httpApiAuthLayer = authorizationLayer.pipe(Layer.provide(ServerAuth.Config.layer))
+// One shared Device layer instance for every consumer (both auth middlewares,
+// pair begin/claim handlers, device manager handlers). The pairing-code store
+// lives in memory inside the Device service, so a second instance here would
+// silently split the ceremony across two maps.
+const deviceNodeLayer = AppNodeBuilderV1.build(Device.node)
+const authOnlyRouterLayer = authorizationRouterMiddleware.layer.pipe(
+  Layer.provide([ServerAuth.Config.layer, deviceNodeLayer]),
+)
+const httpApiAuthLayer = authorizationLayer.pipe(
+  Layer.provide([ServerAuth.Config.layer, deviceNodeLayer]),
+)
 const ptyConnectHttpApiAuthLayer = ptyConnectAuthorizationLayer.pipe(Layer.provide(ServerAuth.Config.layer))
-const serverHttpApiAuthLayer = serverAuthorizationLayer.pipe(Layer.provide(ServerAuth.Config.layer))
+const serverHttpApiAuthLayer = serverAuthorizationLayer.pipe(
+  Layer.provide([ServerAuth.Config.layer, deviceNodeLayer]),
+)
 const workspaceRoutingLive = workspaceRoutingLayer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal))
 const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
   Layer.provide([controlHandlers, controlPlaneHandlers, forkCredentialHandlers, globalHandlers]),
@@ -158,6 +178,20 @@ const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
 const eventApiRoutes = HttpApiBuilder.layer(EventApi).pipe(
   Layer.provide(eventHandlers),
   Layer.provide([httpApiAuthLayer, workspaceRoutingLive, instanceContextLayer]),
+)
+const pairBeginApiRoutes = HttpApiBuilder.layer(PairBeginApi).pipe(
+  Layer.provide(pairHandlers),
+  Layer.provide(httpApiAuthLayer),
+)
+const pairClaimApiRoutes = HttpApiBuilder.layer(PairClaimApi).pipe(
+  Layer.provide(pairClaimHandlers),
+  // No Authorization middleware on this group (public by design); the layer is
+  // provided only so the claim handler can reach the shared Device service.
+  Layer.provide(httpApiAuthLayer),
+)
+const deviceApiRoutes = HttpApiBuilder.layer(DeviceApi).pipe(
+  Layer.provide(deviceHandlers),
+  Layer.provide(httpApiAuthLayer),
 )
 const ptyConnectApiRoutes = HttpApiBuilder.layer(PtyConnectApi).pipe(
   Layer.provide(ptyConnectHandlers),
@@ -229,6 +263,8 @@ const app = LayerNode.group([
   Npm.node,
   FSUtil.node,
   Database.node,
+  Credential.node,
+  Device.node,
   Auth.node,
   ForkCredentials.node,
   Account.node,
@@ -271,6 +307,7 @@ const app = LayerNode.group([
   Command.node,
   Truncate.node,
   ToolRegistry.node,
+  ToolInterrupt.node,
   ToolReload.node,
   Format.node,
   Project.node,
@@ -299,6 +336,9 @@ export function createRoutes(
   return Layer.mergeAll(
     rootApiRoutes,
     eventApiRoutes,
+    pairBeginApiRoutes,
+    pairClaimApiRoutes,
+    deviceApiRoutes,
     ptyConnectApiRoutes,
     instanceRoutes,
     serverRoutes,

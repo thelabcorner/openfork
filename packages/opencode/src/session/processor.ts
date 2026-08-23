@@ -27,6 +27,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { ForkCredentials } from "@/fork/credentials"
 import { SpadSupervisor } from "./spad/supervisor"
+import type { SpadAction } from "./spad/types"
 import { toolResourceKey } from "./spad/thrash"
 
 const DOOM_LOOP_THRESHOLD = 3
@@ -76,6 +77,7 @@ interface ProcessorContext extends Input {
   blocked: boolean
   needsCompaction: boolean
   needsRecovery: { readonly prompt: string } | undefined
+  needsSpadAbort: string | undefined
   currentText: SessionV1.TextPart | undefined
   reasoningMap: Record<string, SessionV1.ReasoningPart>
   /** Whether we have already recorded the first-token timestamp on the message. */
@@ -110,6 +112,7 @@ const layer = Layer.effect(
       // so capturing inside the event handler can be too late.
       const initialSnapshot = yield* snapshot.track()
       const ctx: ProcessorContext = {
+        needsSpadAbort: undefined,
         assistantMessage: input.assistantMessage,
         sessionID: input.sessionID,
         model: input.model,
@@ -297,6 +300,24 @@ const layer = Layer.effect(
         return false
       }
 
+      // Telemetry for SPAD-R intervention rate measurement: every observe,
+      // recover, and abort action is logged with its detection stats so real
+      // traffic can be calibrated before broad auto-recovery enablement.
+      const spadTelemetry = (action: SpadAction | undefined) =>
+        action
+          ? Effect.logInfo("spad.action", {
+              "session.id": ctx.sessionID,
+              "spad.type": action.type,
+              "spad.lane": action.detection.lane,
+              "spad.channel": action.detection.channel,
+              "spad.period": action.detection.period,
+              "spad.runLength": action.detection.runLength,
+              "spad.exponent": action.detection.exponent,
+              ...("attempt" in action ? { "spad.attempt": action.attempt } : {}),
+              ...("reason" in action ? { "spad.reason": action.reason } : {}),
+            })
+          : Effect.void
+
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
         switch (value.type) {
           case "reasoning-start":
@@ -327,7 +348,14 @@ const layer = Layer.effect(
             if (!(value.id in ctx.reasoningMap)) return
             {
               const action = ctx.spad?.push(value.text)
-              if (action?.type === "abort") throw new Error(`Repetitive reasoning continued after recovery (${action.reason})`)
+              yield* spadTelemetry(action)
+              if (action?.type === "abort") {
+                // Throwing here would mix the SPAD abort with the provider
+                // stream-teardown error and trigger provider retries; the
+                // abort is finalized via halt() after the stream stops.
+                ctx.needsSpadAbort = `Repetitive reasoning continued after recovery (${action.reason})`
+                return
+              }
               if (action?.type === "recover") {
                 const signed =
                   isSignedReasoningMetadata(ctx.reasoningMap[value.id].metadata) ||
@@ -430,7 +458,11 @@ const layer = Layer.effect(
               const isMutating = value.name === "write" || value.name === "edit" || value.name === "patch"
               const resource = toolResourceKey(value.name, input)
               const toolAction = ctx.spad?.pushTool(value.name, isMutating, resource)
-              if (toolAction?.type === "abort") throw new Error(`Repetitive tool calls continued after recovery (${toolAction.reason})`)
+              yield* spadTelemetry(toolAction)
+              if (toolAction?.type === "abort") {
+                ctx.needsSpadAbort = `Repetitive tool calls continued after recovery (${toolAction.reason})`
+                return
+              }
               if (toolAction?.type === "recover") {
                 ctx.needsRecovery = { prompt: toolAction.recoveryPrompt }
                 return
@@ -575,12 +607,15 @@ const layer = Layer.effect(
           case "text-delta":
             if (!ctx.currentText) return
             const action = ctx.spad?.push(value.text)
+            yield* spadTelemetry(action)
             if (action?.type === "abort") {
-              throw new Error(`Repetitive model output continued after recovery (${action.reason})`)
+              ctx.needsSpadAbort = `Repetitive model output continued after recovery (${action.reason})`
+              return
             }
             if (action?.type === "recover") {
-              const cut = action.noTruncate ? ctx.currentText.text.length : action.quarantineFrom
-              ctx.currentText.text = ctx.currentText.text.slice(0, cut)
+              const full = ctx.currentText.text + value.text
+              const cut = action.noTruncate ? full.length : Math.max(0, Math.min(full.length, action.quarantineFrom))
+              ctx.currentText.text = full.slice(0, cut)
               yield* session.updatePart(ctx.currentText)
               ctx.needsRecovery = { prompt: action.recoveryPrompt }
               return
@@ -718,6 +753,7 @@ const layer = Layer.effect(
         })
         ctx.needsCompaction = false
         ctx.needsRecovery = undefined
+        ctx.needsSpadAbort = undefined
         ctx.spad?.markGeneration()
         ctx.shouldBreak = (yield* config.get()).experimental?.continue_loop_on_deny !== true
 
@@ -739,7 +775,9 @@ const layer = Layer.effect(
 
             yield* stream.pipe(
               Stream.tap((event) => handleEvent(event)),
-              Stream.takeUntil(() => ctx.needsCompaction || ctx.needsRecovery !== undefined),
+              Stream.takeUntil(
+                () => ctx.needsCompaction || ctx.needsRecovery !== undefined || ctx.needsSpadAbort !== undefined,
+              ),
               Stream.runDrain,
             )
           }).pipe(
@@ -750,6 +788,14 @@ const layer = Layer.effect(
                   yield* halt(new DOMException("Aborted", "AbortError"))
                 }
               }),
+            ),
+            // A SPAD recovery stop aborts the provider stream mid-response; the
+            // resulting teardown error (e.g. "connection terminated") must not
+            // fail the generation or trigger provider retries — the loop
+            // continues via ctx.needsRecovery instead.
+            Effect.catchCauseIf(
+              (cause) => !Cause.hasInterruptsOnly(cause) && ctx.needsRecovery !== undefined,
+              () => Effect.void,
             ),
             Effect.catchCauseIf(
               (cause) => !Cause.hasInterruptsOnly(cause),
@@ -775,6 +821,13 @@ const layer = Layer.effect(
           )
 
           if (ctx.needsCompaction) return "compact"
+          if (ctx.needsSpadAbort) {
+            yield* halt(new Error(ctx.needsSpadAbort))
+            // cleanup() already ran inside the stream pipeline above, so the
+            // error set by halt() must be persisted explicitly.
+            yield* session.updateMessage(ctx.assistantMessage)
+            return "stop"
+          }
           if (ctx.blocked || ctx.assistantMessage.error) return "stop"
           return "continue"
         })

@@ -19,17 +19,26 @@ import { InstanceHttpApi } from "../api"
 import {
   ConsoleSwitchPayload,
   OpenRouterEndpointsQuery,
+  OpenRouterFreeUsageQuery,
   OpenRouterTelemetryQuery,
   SessionListQuery,
   ToolListQuery,
   WorktreeApiError,
 } from "../groups/experimental"
+import { Credential } from "@opencode-ai/core/credential"
+import { Integration } from "@opencode-ai/schema/integration"
+import { OpenRouterFreeUsageTracker } from "@/openrouter/free-usage/tracker"
 
 function mapWorktreeError<A, R>(self: Effect.Effect<A, Worktree.Error, R>) {
   return self.pipe(
     Effect.mapError((error) => new WorktreeApiError({ name: error._tag, data: { message: error.message } })),
   )
 }
+
+// Process-global Free Usage trackers keyed by management key (hashed prefix) so
+// multiple accounts don't share samples/caches. The tracker itself owns 15s
+// snapshot, 6h tier/pricing, 24h schema TTLs and single-flight coalescing.
+const openRouterFreeUsageTrackers = new Map<string, OpenRouterFreeUsageTracker>()
 
 // Mirrors the renderer's parser in packages/app/src/utils/openrouter-endpoints.ts:
 // OpenRouter's `/api/v1/models/{id}/endpoints` returns `{ data: { endpoints: [] } }`
@@ -94,6 +103,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
     const background = yield* BackgroundJob.Service
     const flags = yield* RuntimeFlags.Service
     const http = yield* HttpClient.HttpClient
+    const credential = yield* Credential.Service
 
     const capabilities = Effect.fn("ExperimentalHttpApi.capabilities")(function* () {
       return { backgroundSubagents: flags.experimentalBackgroundSubagents }
@@ -235,57 +245,63 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
     })
 
     const openrouterTelemetry = Effect.fn("ExperimentalHttpApi.openrouterTelemetry")(function* (ctx: {
-      query: typeof import("../groups/experimental").OpenRouterTelemetryQuery.Type
+      query: typeof OpenRouterTelemetryQuery.Type
     }) {
-      // Best-effort proxy for the undocumented frontend telemetry endpoints.
-      const modelId = ctx.query.model
+      // Best-effort proxy — must NEVER 500. Models like "~deepseek/..." or unpublished
+      // variants have no frontend telemetry; return [] so the UI degrades to uptime.
+      const rawModelId = ctx.query.model
       const timeRange = ctx.query.timeRange ?? "1w"
-      // Resolve permaslug via author-models proxy
-      const author = modelId.slice(0, modelId.indexOf("/"))
-      const permaslugRes = yield* HttpClient.filterStatusOk(http).execute(
-        HttpClientRequest.get(
-          `https://openrouter.ai/api/frontend/v1/author-models?authorSlug=${encodeURIComponent(author)}`,
-        ).pipe(HttpClientRequest.accept("application/json")),
-      ).pipe(Effect.timeoutOrElse({ duration: "10 seconds", orElse: () => Effect.fail(new HttpApiError.InternalServerError({})) }), Effect.mapError(() => new HttpApiError.InternalServerError({})))
-      const permaslugBody = yield* permaslugRes.json.pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
-      const permaslug = (permaslugBody as { data?: { models?: Array<{ slug?: string; permaslug?: string; endpoint?: { variant?: string } }> } })?.data?.models?.find((m) => m.slug === modelId && m.endpoint?.variant === "standard")?.permaslug ?? (permaslugBody as { data?: { models?: Array<{ slug?: string; permaslug?: string }> } })?.data?.models?.find((m) => m.slug === modelId)?.permaslug
+      const modelId = rawModelId.replace(/^~+/, "")
+      const slash = modelId.indexOf("/")
+      if (slash <= 0) return []
+      const author = modelId.slice(0, slash)
+
+      const fetchJson = (url: string) =>
+        HttpClient.filterStatusOk(http)
+          .execute(HttpClientRequest.get(url).pipe(HttpClientRequest.accept("application/json")))
+          .pipe(
+            Effect.timeout("10 seconds"),
+            Effect.catch(() => Effect.succeed(null as any)),
+            Effect.flatMap((res: any) => {
+              if (!res) return Effect.succeed(null)
+              return res.json.pipe(Effect.catch(() => Effect.succeed(null)))
+            }),
+          )
+
+      const permaslugBody = (yield* fetchJson(
+        `https://openrouter.ai/api/frontend/v1/author-models?authorSlug=${encodeURIComponent(author)}`,
+      )) as { data?: { models?: Array<{ slug?: string; permaslug?: string; endpoint?: { variant?: string } }> } } | null
+      if (!permaslugBody) return []
+      const models = permaslugBody.data?.models ?? []
+      const permaslug =
+        models.find((m) => (m.slug === modelId || m.slug === rawModelId) && m.endpoint?.variant === "standard")?.permaslug ??
+        models.find((m) => m.slug === modelId || m.slug === rawModelId)?.permaslug
       if (!permaslug) return []
 
-      // Effective pricing for identity + cache ratio
-      const pricingRes = yield* HttpClient.filterStatusOk(http).execute(
-        HttpClientRequest.get(
-          `https://openrouter.ai/api/frontend/v1/stats/effective-pricing?permaslug=${encodeURIComponent(permaslug)}&shape=v7&variant=standard`,
-        ).pipe(HttpClientRequest.accept("application/json")),
-      ).pipe(Effect.timeoutOrElse({ duration: "10 seconds", orElse: () => Effect.fail(new HttpApiError.InternalServerError({})) }), Effect.mapError(() => new HttpApiError.InternalServerError({})))
-      const pricingBody = yield* pricingRes.json.pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
-      const summaries = (pricingBody as { data?: { providerSummaries?: Array<{ endpointId?: string; providerName?: string; providerSlug?: string; cacheHitRate?: number }> } })?.data?.providerSummaries ?? []
+      const pricingBody = (yield* fetchJson(
+        `https://openrouter.ai/api/frontend/v1/stats/effective-pricing?permaslug=${encodeURIComponent(permaslug)}&shape=v7&variant=standard`,
+      )) as { data?: { providerSummaries?: Array<{ endpointId?: string; providerName?: string; providerSlug?: string; cacheHitRate?: number }> } } | null
+      if (!pricingBody) return []
+      const summaries = pricingBody.data?.providerSummaries ?? []
       const allowedIds = new Set(summaries.map((s) => s.endpointId).filter((id): id is string => !!id))
 
-      // Throughput series
       let throughputLatest = new Map<string, number>()
-      try {
-        const throughputRes = yield* HttpClient.filterStatusOk(http).execute(
-          HttpClientRequest.get(
-            `https://openrouter.ai/api/frontend/v1/stats/throughput-comparison?permaslug=${encodeURIComponent(permaslug)}&timeRange=${encodeURIComponent(timeRange)}&variant=standard`,
-          ).pipe(HttpClientRequest.accept("application/json")),
-        ).pipe(Effect.timeoutOrElse({ duration: "10 seconds", orElse: () => Effect.fail(new HttpApiError.InternalServerError({})) }), Effect.mapError(() => new HttpApiError.InternalServerError({})))
-        const throughputBody = yield* throughputRes.json.pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      const throughputBody = (yield* fetchJson(
+        `https://openrouter.ai/api/frontend/v1/stats/throughput-comparison?permaslug=${encodeURIComponent(permaslug)}&timeRange=${encodeURIComponent(timeRange)}&variant=standard`,
+      )) as { data?: Array<{ x?: string; y?: Record<string, number> }> } | null
+      if (throughputBody?.data) {
         const todayStr = new Date().toISOString().slice(0, 10)
-        for (const point of ((throughputBody as { data?: Array<{ x?: string; y?: Record<string, number> }> })?.data ?? [])) {
+        for (const point of throughputBody.data ?? []) {
           const bucket = point.x?.slice(0, 10)
           if (bucket && bucket >= todayStr) continue
           for (const [rawKey, value] of Object.entries(point.y ?? {})) {
             const endpointId = rawKey.split("::", 1)[0]
-            if (allowedIds.has(endpointId) && typeof value === "number") {
-              throughputLatest.set(endpointId, value)
-            }
+            if (allowedIds.has(endpointId) && typeof value === "number") throughputLatest.set(endpointId, value)
           }
         }
-      } catch {
-        // Best-effort: throughput failure shouldn't kill telemetry.
       }
 
-      return summaries.map((summary) => {
+      const result = summaries.map((summary) => {
         const endpointId = summary.endpointId!
         const providerName = summary.providerName ?? endpointId
         const providerSlug = summary.providerSlug ?? endpointId
@@ -297,7 +313,8 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
           throughputTps: throughputLatest.has(endpointId) ? Math.round(throughputLatest.get(endpointId)! * 100) / 100 : undefined,
         }
       })
-    })
+      return result
+    } as any)
 
     const openrouterEndpoints = Effect.fn("ExperimentalHttpApi.openrouterEndpoints")(function* (ctx: {
       query: typeof OpenRouterEndpointsQuery.Type
@@ -322,6 +339,52 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       return parseOpenRouterEndpoints(body)
     })
 
+    const openrouterFreeUsage = Effect.fn("ExperimentalHttpApi.openrouterFreeUsage")(function* (ctx: {
+      query: typeof OpenRouterFreeUsageQuery.Type
+    }) {
+      const envKey = process.env.OPENROUTER_MANAGEMENT_KEY?.trim()
+      let managementKey: string | undefined = envKey && envKey.length > 0 ? envKey : undefined
+      if (!managementKey) {
+        const integrationID = Integration.ID.make("openrouter")
+        const list = (yield* credential
+          .list(integrationID)
+          .pipe(Effect.catch(() => Effect.succeed([] as Credential.Info[])))) as Credential.Info[]
+        const active = list.find((entry) => entry.active) ?? list[0]
+        if (active) {
+          if (active.value.type === "key" && typeof active.value.key === "string" && active.value.key.length > 0) {
+            managementKey = active.value.key
+          } else if (
+            active.value.type === "oauth" &&
+            typeof (active.value as unknown as { access: string }).access === "string"
+          ) {
+            managementKey = (active.value as unknown as { access: string }).access
+          }
+        }
+      }
+      if (!managementKey) {
+        const fallback = process.env.OPENROUTER_API_KEY?.trim()
+        if (fallback && fallback.length > 0) managementKey = fallback
+      }
+      if (!managementKey) return yield* Effect.fail(new HttpApiError.InternalServerError({}))
+
+      const namespace = `openrouter-free-usage:${managementKey.slice(0, 12)}`
+      let tracker = openRouterFreeUsageTrackers.get(managementKey)
+      if (!tracker) {
+        tracker = new OpenRouterFreeUsageTracker({
+          managementKey,
+          cacheNamespace: namespace,
+        })
+        openRouterFreeUsageTrackers.set(managementKey, tracker)
+      }
+      const includeValue = ctx.query.includeValue ?? true
+      const forceRefresh = ctx.query.forceRefresh ?? false
+      const report = yield* Effect.tryPromise({
+        try: () => tracker!.getUsage({ includeValue, forceRefresh }),
+        catch: (cause) => cause,
+      }).pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
+      return report
+    })
+
     return handlers
       .handle("capabilities", capabilities)
       .handle("console", getConsole)
@@ -336,7 +399,8 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       .handle("session", session)
       .handle("sessionBackground", sessionBackground)
       .handle("resource", resource)
-      .handle("openrouterTelemetry", openrouterTelemetry)
+      .handle("openrouterTelemetry", openrouterTelemetry as any)
       .handle("openrouterEndpoints", openrouterEndpoints)
+      .handle("openrouterFreeUsage", openrouterFreeUsage as any)
   }),
 )

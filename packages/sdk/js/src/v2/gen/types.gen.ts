@@ -2042,12 +2042,47 @@ export type Config = {
   experimental?: {
     disable_paste_summary?: boolean
     spad_recovery?: boolean
+    spad_observe_only?: boolean
     batch_tool?: boolean
     openTelemetry?: boolean
     primary_tools?: Array<string>
     continue_loop_on_deny?: boolean
     mcp_timeout?: number
     policies?: Array<ConfigV2ExperimentalPolicy>
+  }
+}
+
+export type PairBeginResult = {
+  code: string
+  url: string
+  expiresAt: string
+}
+
+export type PairClaimResult = {
+  token: string
+  device: {
+    id: string
+    name: string
+  }
+  server: {
+    name: string
+    version: string
+  }
+}
+
+export type PairCodeError = {
+  name: "PairCodeError"
+  data: {
+    message: string
+    reason: "invalid" | "expired" | "exhausted"
+  }
+}
+
+export type ClaimRateLimitedError = {
+  name: "ClaimRateLimitedError"
+  data: {
+    message: string
+    retryAfterMs: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   }
 }
 
@@ -2277,6 +2312,16 @@ export type McpResource = {
   client: string
 }
 
+export type OpenRouterTelemetryItem = {
+  endpointId: string
+  providerName: string
+  providerSlug: string
+  cacheHitPercent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  throughputTps?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type OpenRouterTelemetry = Array<OpenRouterTelemetryItem>
+
 export type OpenRouterEndpoint = {
   providerName: string
   tag: string
@@ -2290,6 +2335,87 @@ export type OpenRouterEndpoint = {
 }
 
 export type OpenRouterEndpoints = Array<OpenRouterEndpoint>
+
+export type OpenRouterFreeUsageModel = {
+  model: string
+  paidSibling: string
+  requests: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  tokens: {
+    prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    completion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    reasoning: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  value: {
+    equivalentPaidValueUsd: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    pricingFound: boolean
+  }
+}
+
+export type OpenRouterFreeUsage = {
+  free: {
+    remaining: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    limit: 50 | 1000
+    remainingPercent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    used: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    usedPercent: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted"
+    tier: {
+      source: "override" | "credits-api"
+      totalCreditsPurchased: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+    tokens: {
+      prompt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      completion: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      reasoning: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+    value: {
+      equivalentPaidValueUsd: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      valuedRequests: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      unvaluedRequests: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      methodology: "current-paid-sibling-list-price"
+      cacheAware: false
+      note: string
+    }
+    window: {
+      type: "calendar-day"
+      timezone: "UTC"
+      startedAt: string
+      resetsAt: string
+      secondsUntilReset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    }
+    reset: {
+      policy: "midnight-utc"
+      confidence: "high"
+      basis: string
+    }
+    rate: {
+      limitPerMinute: 20
+      observedRequestsPerMinute: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      source: "snapshot-delta" | "day-average" | "insufficient-data"
+    }
+    projection: {
+      requestsPerHour: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      rateSource: "snapshot-delta" | "day-average" | "insufficient-data"
+      sustainableRequestsPerHour: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      projectedRemainingAtReset: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      willExhaustBeforeReset: boolean
+      estimatedExhaustionAt: string
+    }
+    models: Array<OpenRouterFreeUsageModel>
+  }
+  source: {
+    mode: "openrouter-analytics"
+    scope: "account"
+    analyticsAsOf: string
+    fetchedAt: string
+    stale: boolean
+    analyticsRows: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    analyticsTruncated: boolean
+    upstreamCalls: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
 
 export type MentionResult =
   | {
@@ -2731,6 +2857,32 @@ export type ToolReloadResponse =
       ok: false
       error: string
     }
+
+export type ToolKillPayload = {
+  /**
+   * Session that owns the execution
+   */
+  sessionID: string
+  /**
+   * Tool call id of a running foreground execution
+   */
+  callID?: string
+  /**
+   * Background job id previously launched by the bash tool
+   */
+  jobId?: string
+}
+
+export type ToolKillResponse = {
+  /**
+   * Whether a live execution was found and terminated
+   */
+  killed: boolean
+  /**
+   * Background job status when jobId was targeted
+   */
+  status?: string
+}
 
 export type EventTuiPromptAppend = {
   type: "tui.prompt.append"
@@ -4042,6 +4194,15 @@ export type ConfigV2ExperimentalPolicy = {
   action: "provider.use"
   effect: PolicyEffect
   resource: string
+}
+
+export type DeviceInfo = {
+  id: string
+  name: string
+  tokenPrefix: string
+  createdAt: string
+  lastSeenAt?: string
+  revokedAt?: string
 }
 
 export type ExternalPathEntry = {
@@ -7880,6 +8041,88 @@ export type EventSubscribeResponses = {
 
 export type EventSubscribeResponse = EventSubscribeResponses[keyof EventSubscribeResponses]
 
+export type PairBeginData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/pair/begin"
+}
+
+export type PairBeginResponses = {
+  /**
+   * Single-use pairing code minted
+   */
+  200: PairBeginResult
+}
+
+export type PairBeginResponse = PairBeginResponses[keyof PairBeginResponses]
+
+export type PairClaimData = {
+  body?: {
+    code: string
+    name?: string
+  }
+  path?: never
+  query?: never
+  url: "/pair/claim"
+}
+
+export type PairClaimErrors = {
+  /**
+   * PairCodeError
+   */
+  400: PairCodeError
+  /**
+   * ClaimRateLimitedError
+   */
+  429: ClaimRateLimitedError
+}
+
+export type PairClaimError = PairClaimErrors[keyof PairClaimErrors]
+
+export type PairClaimResponses = {
+  /**
+   * Device paired; one-time token issued
+   */
+  200: PairClaimResult
+}
+
+export type PairClaimResponse = PairClaimResponses[keyof PairClaimResponses]
+
+export type DeviceListData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/devices"
+}
+
+export type DeviceListResponses = {
+  /**
+   * Paired devices
+   */
+  200: Array<DeviceInfo>
+}
+
+export type DeviceListResponse = DeviceListResponses[keyof DeviceListResponses]
+
+export type DeviceRemoveData = {
+  body?: never
+  path: {
+    deviceID: string
+  }
+  query?: never
+  url: "/devices/{deviceID}"
+}
+
+export type DeviceRemoveResponses = {
+  /**
+   * True when the device existed and was revoked
+   */
+  200: boolean
+}
+
+export type DeviceRemoveResponse = DeviceRemoveResponses[keyof DeviceRemoveResponses]
+
 export type ConfigGetData = {
   body?: never
   path?: never
@@ -8364,6 +8607,42 @@ export type ExperimentalResourceListResponses = {
 export type ExperimentalResourceListResponse =
   ExperimentalResourceListResponses[keyof ExperimentalResourceListResponses]
 
+export type ExperimentalOpenrouterTelemetryGetData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    model: string
+    timeRange?: "1w" | "3d"
+  }
+  url: "/experimental/openrouter-telemetry"
+}
+
+export type ExperimentalOpenrouterTelemetryGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * InternalServerError
+   */
+  500: EffectHttpApiErrorInternalServerError
+}
+
+export type ExperimentalOpenrouterTelemetryGetError =
+  ExperimentalOpenrouterTelemetryGetErrors[keyof ExperimentalOpenrouterTelemetryGetErrors]
+
+export type ExperimentalOpenrouterTelemetryGetResponses = {
+  /**
+   * OpenRouter telemetry
+   */
+  200: OpenRouterTelemetry
+}
+
+export type ExperimentalOpenrouterTelemetryGetResponse =
+  ExperimentalOpenrouterTelemetryGetResponses[keyof ExperimentalOpenrouterTelemetryGetResponses]
+
 export type ExperimentalOpenrouterEndpointsGetData = {
   body?: never
   path?: never
@@ -8398,6 +8677,42 @@ export type ExperimentalOpenrouterEndpointsGetResponses = {
 
 export type ExperimentalOpenrouterEndpointsGetResponse =
   ExperimentalOpenrouterEndpointsGetResponses[keyof ExperimentalOpenrouterEndpointsGetResponses]
+
+export type ExperimentalOpenrouterFreeUsageGetData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+    includeValue?: "true" | "false"
+    forceRefresh?: "true" | "false"
+  }
+  url: "/experimental/openrouter-free-usage"
+}
+
+export type ExperimentalOpenrouterFreeUsageGetErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+  /**
+   * InternalServerError
+   */
+  500: EffectHttpApiErrorInternalServerError
+}
+
+export type ExperimentalOpenrouterFreeUsageGetError =
+  ExperimentalOpenrouterFreeUsageGetErrors[keyof ExperimentalOpenrouterFreeUsageGetErrors]
+
+export type ExperimentalOpenrouterFreeUsageGetResponses = {
+  /**
+   * OpenRouter free usage
+   */
+  200: OpenRouterFreeUsage
+}
+
+export type ExperimentalOpenrouterFreeUsageGetResponse =
+  ExperimentalOpenrouterFreeUsageGetResponses[keyof ExperimentalOpenrouterFreeUsageGetResponses]
 
 export type FindTextData = {
   body?: never
@@ -11823,6 +12138,34 @@ export type ToolReloadResponses = {
 }
 
 export type ToolReloadResponse2 = ToolReloadResponses[keyof ToolReloadResponses]
+
+export type ToolKillData = {
+  body?: ToolKillPayload
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/tool/kill"
+}
+
+export type ToolKillErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ToolKillError = ToolKillErrors[keyof ToolKillErrors]
+
+export type ToolKillResponses = {
+  /**
+   * Shell kill result
+   */
+  200: ToolKillResponse
+}
+
+export type ToolKillResponse2 = ToolKillResponses[keyof ToolKillResponses]
 
 export type TuiAppendPromptData = {
   body?: {

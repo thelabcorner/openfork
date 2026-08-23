@@ -1318,7 +1318,8 @@ Generate a fresh title. Do not reuse the current title.`
               .map((part) => part.text)
               .join("\n")
             spad = new SpadSupervisor()
-            spad.beginTurn(makeTurnPolicy(userText, lastUser.format?.type === "json_schema"))
+            const policy = makeTurnPolicy(userText, lastUser.format?.type === "json_schema")
+            spad.beginTurn((yield* config.get()).experimental?.spad_observe_only ? { ...policy, observeOnly: true } : policy)
             spadStarted = true
           }
 

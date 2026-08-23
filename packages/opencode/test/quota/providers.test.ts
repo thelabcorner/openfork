@@ -142,7 +142,7 @@ describe("QuotaProviders", () => {
     const credits = result.usage?.windows.credits
     expect(credits?.usedPercent).toBe(null)
     expect(credits?.remainingPercent).toBe(null)
-    expect(credits?.valueLabel).toBe("$18.93 of $19.99 remaining")
+    expect(credits?.valueLabel).toBe("$18.93 left · $1.06 spent")
   })
 
   test("openrouter surfaces missing quota data and API errors inside the envelope", async () => {

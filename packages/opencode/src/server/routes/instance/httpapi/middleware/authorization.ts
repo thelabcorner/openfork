@@ -1,5 +1,6 @@
+import { Device } from "@opencode-ai/core/device"
 import { ServerAuth } from "@/server/auth"
-import { Effect, Encoding, Layer, Redacted } from "effect"
+import { Effect, Encoding, Layer, Option, Redacted } from "effect"
 import { HttpEffect, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiError, HttpApiMiddleware } from "effect/unstable/httpapi"
 import { hasPtyConnectTicketURL } from "@/server/shared/pty-ticket"
@@ -82,6 +83,63 @@ function credentialFromURL(url: URL, request: HttpServerRequest.HttpServerReques
   return Effect.succeed(emptyCredential())
 }
 
+// Device-token candidates, tried only after the master password check fails:
+// 1. `Authorization: Bearer <token>` header,
+// 2. the raw `auth_token` query value (EventSource cannot set headers, so the
+//    SSE route receives the paired token this way),
+// 3. the decoded Basic/query password (username ignored) so clients can keep
+//    sending the ServerConnection.Http credential shape unchanged.
+function deviceTokensFromRequest(
+  url: URL,
+  request: HttpServerRequest.HttpServerRequest,
+  credential: ServerAuth.DecodedCredentials,
+) {
+  const tokens: string[] = []
+  const bearer = /^Bearer\s+(.+)$/i.exec(request.headers.authorization ?? "")
+  if (bearer) tokens.push(bearer[1]!)
+  const query = url.searchParams.get(AUTH_TOKEN_QUERY)
+  if (query) tokens.push(query)
+  const password = Redacted.value(credential.password)
+  if (password) tokens.push(password)
+  return tokens
+}
+
+function deviceAuthorized(
+  url: URL,
+  request: HttpServerRequest.HttpServerRequest,
+  credential: ServerAuth.DecodedCredentials,
+  devices: Device.Interface | undefined,
+) {
+  if (!devices) return Effect.succeed(false)
+  return Effect.gen(function* () {
+    for (const token of deviceTokensFromRequest(url, request, credential)) {
+      const device = yield* devices.verify(token)
+      if (!device) continue
+      yield* devices.touch(device.id)
+      return true
+    }
+    return false
+  })
+}
+
+function authorizeWithDevices<A, E, R>(
+  effect: Effect.Effect<A, E, R>,
+  url: URL,
+  request: HttpServerRequest.HttpServerRequest,
+  credential: ServerAuth.DecodedCredentials,
+  config: ServerAuth.Info,
+  devices: Device.Interface | undefined,
+) {
+  return Effect.gen(function* () {
+    if (ServerAuth.authorized(credential, config)) return yield* effect
+    if (yield* deviceAuthorized(url, request, credential, devices)) return yield* effect
+    yield* HttpEffect.appendPreResponseHandler((_request, response) =>
+      Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", WWW_AUTHENTICATE)),
+    )
+    return yield* new HttpApiError.Unauthorized({})
+  })
+}
+
 function validateRawCredential<A, E, R>(
   effect: Effect.Effect<A, E, R>,
   credential: ServerAuth.DecodedCredentials,
@@ -101,6 +159,9 @@ function validateRawCredential<A, E, R>(
 export const authorizationRouterMiddleware = HttpRouter.middleware()(
   Effect.gen(function* () {
     const config = yield* ServerAuth.Config
+    // Optional dependency: harnesses that assemble the middleware without the
+    // Device layer keep master-password-only auth; production provides Device.
+    const devices = Option.getOrUndefined(yield* Effect.serviceOption(Device.Service))
     if (!ServerAuth.required(config)) return (effect) => effect
 
     return (effect) =>
@@ -108,9 +169,16 @@ export const authorizationRouterMiddleware = HttpRouter.middleware()(
         const request = yield* HttpServerRequest.HttpServerRequest
         const url = new URL(request.url, "http://localhost")
         if (isPublicUIPath(request.method, url.pathname)) return yield* effect
-        return yield* credentialFromURL(url, request).pipe(
-          Effect.flatMap((credential) => validateRawCredential(effect, credential, config)),
-        )
+        const credential = yield* credentialFromURL(url, request)
+        const authorized =
+          ServerAuth.authorized(credential, config) ||
+          (yield* deviceAuthorized(url, request, credential, devices))
+        if (!authorized)
+          return HttpServerResponse.empty({
+            status: UNAUTHORIZED,
+            headers: { "www-authenticate": WWW_AUTHENTICATE },
+          })
+        return yield* effect
       })
   }),
 )
@@ -119,12 +187,13 @@ export const authorizationLayer = Layer.effect(
   Authorization,
   Effect.gen(function* () {
     const config = yield* ServerAuth.Config
+    const devices = Option.getOrUndefined(yield* Effect.serviceOption(Device.Service))
     if (!ServerAuth.required(config)) return Authorization.of((effect) => effect)
     return Authorization.of((effect) =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest
-        return yield* credentialFromRequest(request).pipe(
-          Effect.flatMap((credential) => validateCredential(effect, credential, config)),
+        return yield* Effect.flatMap(credentialFromRequest(request), (credential) =>
+          authorizeWithDevices(effect, new URL(request.url, "http://localhost"), request, credential, config, devices),
         )
       }),
     )

@@ -67,6 +67,9 @@ export class SpadSupervisor {
       if (!this.config.autoRecoverCanonical) return false
       if ((detection.canonicalDuplicate4GramRatio ?? 0) < this.config.canonicalMinDuplicate4GramRatio) return false
     }
+    if (detection.lane === "expansion") {
+      if (!this.config.autoRecoverExpansion) return false
+    }
     if (detection.lane === "thrash" && !this.config.autoRecoverThrash) return false
     return true
   }
@@ -85,7 +88,14 @@ export class SpadSupervisor {
       // gated by duplicate ratio.
       if (detection.lane === "raw") addPersistedMotif(motif)
     }
-    return { type: "recover", attempt: this.attempts, detection, quarantineFrom: detection.runStart, recoveryPrompt: prompt, noTruncate: detection.lane === "thrash" }
+    // Quarantine the sustained loop but keep a single occurrence of the motif so
+    // the truncated part still reads as text rather than vanishing entirely.
+    const quarantineFrom = detection.runStart + (detection.period > 0 ? detection.period : 0)
+    // A thrash recovery resets cross-turn stagnation state so the post-recovery
+    // generation is judged on fresh evidence instead of the accumulated
+    // re-access stats that triggered the recovery.
+    if (detection.lane === "thrash") this.thrash.reset()
+    return { type: "recover", attempt: this.attempts, detection, quarantineFrom, recoveryPrompt: prompt, noTruncate: detection.lane === "thrash" }
   }
 
   private relapse(): SpadAction | undefined {

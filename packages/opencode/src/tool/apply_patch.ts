@@ -8,6 +8,7 @@ import { Patch } from "../patch"
 import { createTwoFilesPatch, diffLines } from "diff"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { trimDiff } from "./edit"
+import { Conflict } from "./conflict"
 import { LSP } from "@/lsp/lsp"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import DESCRIPTION from "./apply_patch.txt"
@@ -106,9 +107,17 @@ export const ApplyPatchTool = Tool.define(
           case "update": {
             // Check if file exists for update
             const stats = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
-            if (!stats || stats.type === "Directory") {
+            if (stats?.type === "Directory") {
               return yield* Effect.fail(
-                new Error(`apply_patch verification failed: Failed to read file to update: ${filePath}`),
+                new Error(`apply_patch verification failed: Failed to read file to update: ${filePath} (path is a directory)`),
+              )
+            }
+            if (!stats) {
+              const hint = yield* Conflict.missingFileHint(afs, filePath)
+              return yield* Effect.fail(
+                new Error(
+                  `apply_patch verification failed: Failed to read file to update: ${filePath}${hint ? ` (${hint})` : ""}`,
+                ),
               )
             }
 
@@ -127,7 +136,11 @@ export const ApplyPatchTool = Tool.define(
               newContent = fileUpdate.content
               bom = fileUpdate.bom
             } catch (error) {
-              return yield* Effect.fail(new Error(`apply_patch verification failed: ${error}`))
+              return yield* Effect.fail(
+                new Error(
+                  `apply_patch verification failed: ${Conflict.patchConflictDetail({ content: source.text, chunks: hunk.chunks, error })}`,
+                ),
+              )
             }
 
             const diff = trimDiff(createTwoFilesPatch(filePath, filePath, oldContent, newContent))
@@ -159,15 +172,15 @@ export const ApplyPatchTool = Tool.define(
           }
 
           case "delete": {
-            const source = yield* Bom.readFile(afs, filePath).pipe(
-              Effect.catch((error) =>
-                Effect.fail(
-                  new Error(
-                    `apply_patch verification failed: ${error instanceof Error ? error.message : String(error)}`,
-                  ),
+            const source = yield* Bom.readFile(afs, filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
+            if (!source) {
+              const hint = yield* Conflict.missingFileHint(afs, filePath)
+              return yield* Effect.fail(
+                new Error(
+                  `apply_patch verification failed: Failed to read file to delete: ${filePath}${hint ? ` (${hint})` : ""}`,
                 ),
-              ),
-            )
+              )
+            }
             const contentToDelete = source.text
             const deleteDiff = trimDiff(createTwoFilesPatch(filePath, filePath, contentToDelete, ""))
 

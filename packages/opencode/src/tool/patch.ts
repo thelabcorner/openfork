@@ -8,6 +8,7 @@ import { Patch } from "../patch"
 import { createTwoFilesPatch } from "diff"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { trimDiff } from "./edit"
+import { Conflict } from "./conflict"
 import { LSP } from "@/lsp/lsp"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { FileSystem } from "@opencode-ai/core/filesystem"
@@ -44,8 +45,6 @@ type FileChange = {
   bom: boolean
   conflict?: string
 }
-
-const errorMessage = (error: unknown) => (error instanceof Error ? error.message : String(error))
 
 export const PatchTool = Tool.define(
   "patch",
@@ -140,8 +139,13 @@ export const PatchTool = Tool.define(
           })
         } else if (hunk.type === "update") {
           const stats = yield* afs.stat(filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
-          if (!stats || stats.type === "Directory") {
-            fileChanges.push(conflict(filePath, "update", "file not found (or is a directory)"))
+          if (stats?.type === "Directory") {
+            fileChanges.push(conflict(filePath, "update", "path is a directory, not a file"))
+            continue
+          }
+          if (!stats) {
+            const hint = yield* Conflict.missingFileHint(afs, filePath)
+            fileChanges.push(conflict(filePath, "update", hint ? `file not found; ${hint}` : "file not found"))
             continue
           }
           const source = yield* Bom.readFile(afs, filePath)
@@ -168,12 +172,19 @@ export const PatchTool = Tool.define(
               bom: fileUpdate.bom,
             })
           } catch (error) {
-            fileChanges.push(conflict(filePath, "update", errorMessage(error)))
+            fileChanges.push(
+              conflict(
+                filePath,
+                "update",
+                Conflict.patchConflictDetail({ content: source.text, chunks: hunk.chunks, error }),
+              ),
+            )
           }
         } else {
           const source = yield* Bom.readFile(afs, filePath).pipe(Effect.catch(() => Effect.succeed(undefined)))
           if (source === undefined) {
-            fileChanges.push(conflict(filePath, "delete", "file not found"))
+            const hint = yield* Conflict.missingFileHint(afs, filePath)
+            fileChanges.push(conflict(filePath, "delete", hint ? `file not found; ${hint}` : "file not found"))
             continue
           }
           const diff = trimDiff(createTwoFilesPatch(filePath, filePath, source.text, ""))

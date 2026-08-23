@@ -1,5 +1,6 @@
 import { Canonicalizer } from "./canonical"
 import { DEFAULT_SPAD_CONFIG, validateConfig } from "./config"
+import { ExpansionLane } from "./expansion-lane"
 import { FormatTracker } from "./format-tracker"
 import { PeriodLane, type LaneDetection } from "./period-lane"
 import { ShingleVerifier } from "./shingle-verifier"
@@ -16,6 +17,7 @@ export class SpadDetector {
   readonly config: SpadConfig
   private readonly raw: PeriodLane
   private readonly canonical: PeriodLane
+  private readonly expansion: ExpansionLane
   private readonly canonicalizer = new Canonicalizer()
   private readonly format = new FormatTracker()
   private verifier: ShingleVerifier | undefined
@@ -23,6 +25,7 @@ export class SpadDetector {
   private rawPosition = -1
   private rawLatched = false
   private canonicalLatched = false
+  private expansionLatched = false
 
   constructor(options: DetectorOptions) {
     this.channel = options.channel
@@ -31,11 +34,12 @@ export class SpadDetector {
     this.recoveryMode = options.recoveryMode ?? false
     this.raw = new PeriodLane({ lane: "raw", ringSize: this.config.ringSize, anchorTableSize: this.config.anchorTableSize, qgram: this.config.qgram, maxPeriod: this.config.maxPeriod, maxCandidates: this.config.maxCandidates, bands: this.config.exactBands, coverageMultiplier: 1, exponentBonus: 0, storeRawPositions: false })
     this.canonical = new PeriodLane({ lane: "canonical", ringSize: this.config.ringSize, anchorTableSize: this.config.anchorTableSize, qgram: this.config.qgram, maxPeriod: this.config.maxPeriod, maxCandidates: this.config.maxCandidates, bands: this.config.exactBands, coverageMultiplier: this.config.canonicalCoverageMultiplier, exponentBonus: this.config.canonicalExponentBonus, storeRawPositions: true })
+    this.expansion = new ExpansionLane({ lane: "expansion", channel: options.channel, config: this.config, recoveryMode: this.recoveryMode })
   }
 
   reset(): void {
-    this.raw.reset(); this.canonical.reset(); this.canonicalizer.reset(); this.format.reset()
-    this.rawPosition = -1; this.rawLatched = false; this.canonicalLatched = false
+    this.raw.reset(); this.canonical.reset(); this.expansion.reset(); this.canonicalizer.reset(); this.format.reset()
+    this.rawPosition = -1; this.rawLatched = false; this.canonicalLatched = false; this.expansionLatched = false
   }
 
   get length(): number { return this.rawPosition + 1 }
@@ -101,6 +105,15 @@ export class SpadDetector {
         if (canonicalDetection) {
           this.canonicalLatched = true
           first ??= this.materialize(canonicalDetection)
+        }
+      }
+      // The expansion lane sees the raw code stream; it needs no periodicity
+      // hypothesis and therefore no multiplier beyond recovery mode.
+      if (!this.expansionLatched) {
+        const expansionDetection = this.expansion.push(code)
+        if (expansionDetection) {
+          this.expansionLatched = true
+          first ??= expansionDetection
         }
       }
     }

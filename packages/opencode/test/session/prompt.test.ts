@@ -35,6 +35,7 @@ import { SessionSummary } from "../../src/session/summary"
 import { Instruction } from "../../src/session/instruction"
 import { SessionProcessor } from "../../src/session/processor"
 import { SessionPrompt } from "../../src/session/prompt"
+import { clearPersistedMotifs } from "../../src/session/spad/pattern-store"
 import { SessionRevert } from "../../src/session/revert"
 import { SessionRunState } from "../../src/session/run-state"
 import { MessageID, PartID, SessionID } from "../../src/session/schema"
@@ -783,6 +784,7 @@ it.instance("static loop returns assistant text through local provider", () =>
 
 it.instance("SPAD recovery truncates a repetitive tail and continues with a hidden re-anchor", () =>
   Effect.gen(function* () {
+    clearPersistedMotifs()
     const { llm } = yield* useServerConfig((url) => ({
       ...providerCfg(url),
       experimental: { spad_recovery: true },
@@ -845,6 +847,297 @@ it.instance("SPAD disabled preserves repetitive output and avoids recovery", () 
     expect(result.parts.some((part) => part.type === "text" && part.text === loop)).toBe(true)
     expect(yield* llm.hits).toHaveLength(1)
   }),
+)
+
+// SPAD-R live degeneration patterns (SPAD-R-LIVE-RESEARCH.md §8.2), scripted
+// through the mock LLM server. Each test clears the persisted-motif store so
+// the cross-restart early path never pre-empts the detector under test.
+const spadSession = Effect.fn("test.spadSession")(function* (title: string) {
+  const prompt = yield* SessionPrompt.Service
+  const sessions = yield* Session.Service
+  const session = yield* sessions.create({
+    title,
+    permission: [{ permission: "*", pattern: "*", action: "allow" }],
+  })
+  return { prompt, sessions, session }
+})
+
+const countOccurrences = (text: string, needle: string) => text.split(needle).length - 1
+
+it.instance("SPAD observe-only mode preserves repetitive output without recovery", () =>
+  Effect.gen(function* () {
+    clearPersistedMotifs()
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      experimental: { spad_recovery: true, spad_observe_only: true },
+    }))
+    const { prompt, sessions, session } = yield* spadSession("SPAD observe-only")
+    const motif = "The implementation should continue from the last stable state. "
+    const loop = motif.repeat(12)
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Continue implementing the feature." }],
+    })
+    yield* llm.text(loop)
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const synthetic = messages.some((message) => message.parts.some((part) => part.type === "text" && part.synthetic === true))
+    expect(result.parts.some((part) => part.type === "text" && part.text === loop)).toBe(true)
+    expect(synthetic).toBe(false)
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("SPAD truncation keeps the healthy prefix across chunked deltas", () =>
+  Effect.gen(function* () {
+    clearPersistedMotifs()
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      experimental: { spad_recovery: true },
+    }))
+    const { prompt, sessions, session } = yield* spadSession("SPAD chunked truncation")
+    const prefix = "Here is the plan for the next milestone. "
+    const motif = "The implementation should continue from the last stable state. "
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Continue implementing the feature." }],
+    })
+    yield* llm.push(
+      reply()
+        .text(prefix)
+        .text(motif.repeat(6))
+        .text(motif.repeat(6))
+        .stop(),
+    )
+    yield* llm.text("The recovery succeeded and the task can continue.")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const truncated = messages
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "text" && part.text.includes(prefix))
+    const synthetic = messages
+      .flatMap((message) => message.parts)
+      .some((part) => part.type === "text" && part.synthetic === true && part.text.includes("repetitive output loop"))
+
+    expect(truncated?.type).toBe("text")
+    if (truncated?.type === "text") {
+      expect(truncated.text.startsWith(prefix)).toBe(true)
+      expect(countOccurrences(truncated.text, motif)).toBeLessThan(12)
+    }
+    expect(synthetic).toBe(true)
+    expect(result.parts.some((part) => part.type === "text" && part.text.includes("recovery succeeded"))).toBe(true)
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+it.instance("SPAD expansion lane recovers a growing restatement ledger", () =>
+  Effect.gen(function* () {
+    clearPersistedMotifs()
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      experimental: { spad_recovery: true },
+    }))
+    const { prompt, sessions, session } = yield* spadSession("SPAD expansion")
+    const incidents = Array.from({ length: 16 }, (_, i) => `${i + 1}. sensor-${(i % 5) + 1} reported a transient read timeout`)
+    const ledger = Array.from(
+      { length: 16 },
+      (_, c) => [`=== INCIDENT LEDGER (after cycle ${c + 1}) ===`, ...incidents.slice(0, c + 1), ""].join("\n"),
+    ).join("\n")
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Maintain the cumulative incident ledger across all cycles." }],
+    })
+    yield* llm.text(ledger)
+    yield* llm.text("The ledger is complete; all incidents are recorded.")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const synthetic = messages
+      .flatMap((message) => message.parts)
+      .some((part) => part.type === "text" && part.synthetic === true && part.text.includes("repetitive output loop"))
+    const truncated = messages
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "text" && part.text.includes("INCIDENT LEDGER"))
+
+    expect(synthetic).toBe(true)
+    expect(truncated?.type).toBe("text")
+    if (truncated?.type === "text") expect(truncated.text.length).toBeLessThan(ledger.length)
+    expect(result.parts.some((part) => part.type === "text" && part.text.includes("all incidents are recorded"))).toBe(true)
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+it.instance("SPAD canonical lane recovers whitespace and case drift loops", () =>
+  Effect.gen(function* () {
+    clearPersistedMotifs()
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      experimental: { spad_recovery: true },
+    }))
+    const { prompt, sessions, session } = yield* spadSession("SPAD canonical drift")
+    const base = "The build step failed and must be retried"
+    const drift = Array.from({ length: 60 }, (_, i) => {
+      const casing = i % 3 === 0 ? base.toUpperCase() : i % 3 === 1 ? base : base.toLowerCase()
+      return casing + "." + " ".repeat(1 + (i % 7))
+    }).join("\n")
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Investigate the failing build." }],
+    })
+    yield* llm.text(drift)
+    yield* llm.text("The investigation finished with a concrete fix.")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const synthetic = messages
+      .flatMap((message) => message.parts)
+      .some((part) => part.type === "text" && part.synthetic === true && part.text.includes("repetitive output loop"))
+    const truncated = messages
+      .flatMap((message) => message.parts)
+      .find((part) => part.type === "text" && part.text.toUpperCase().includes("BUILD STEP FAILED"))
+
+    expect(synthetic).toBe(true)
+    expect(truncated?.type).toBe("text")
+    if (truncated?.type === "text") expect(truncated.text.length).toBeLessThan(drift.length)
+    expect(result.parts.some((part) => part.type === "text" && part.text.includes("concrete fix"))).toBe(true)
+    expect(yield* llm.hits).toHaveLength(2)
+  }),
+)
+
+it.instance("SPAD aborts after a second relapse of the same motif", () =>
+  Effect.gen(function* () {
+    clearPersistedMotifs()
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      experimental: { spad_recovery: true },
+    }))
+    const { prompt, sessions, session } = yield* spadSession("SPAD relapse abort")
+    const motif = "The implementation should continue from the last stable state. "
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Continue implementing the feature." }],
+    })
+    yield* llm.text(motif.repeat(12))
+    yield* llm.text(motif.repeat(12))
+    yield* llm.text(motif.repeat(12))
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const aborted = messages.find(
+      (message) => message.info.role === "assistant" && (JSON.stringify((message.info as { error?: unknown }).error) ?? "").includes("Repetitive"),
+    )
+
+    expect(aborted).toBeDefined()
+    expect((JSON.stringify((result.info as { error?: unknown }).error) ?? "")).toContain("Repetitive")
+    expect(yield* llm.hits).toHaveLength(3)
+    expect(yield* llm.pending).toBe(0)
+  }),
+)
+
+it.instance("SPAD intent gate skips recovery when the user explicitly requests repetition", () =>
+  Effect.gen(function* () {
+    clearPersistedMotifs()
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      experimental: { spad_recovery: true },
+    }))
+    const { prompt, sessions, session } = yield* spadSession("SPAD intent gate")
+    const loop = "banana\n".repeat(400)
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Print the following word exactly 1000 times: banana" }],
+    })
+    yield* llm.text(loop)
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const synthetic = messages.some((message) => message.parts.some((part) => part.type === "text" && part.synthetic === true))
+
+    expect(result.parts.some((part) => part.type === "text" && part.text === loop)).toBe(true)
+    expect(synthetic).toBe(false)
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+// Blocked by a pre-existing event-schema bug unrelated to SPAD: persisting a
+// user message with a json_schema format fails validation inside
+// Session.updateMessage ("Expected OutputFormatJsonSchema") even though the
+// value decodes cleanly against the Format schema standalone. The
+// observe-only gate itself is covered by the spad unit suite
+// (makeTurnPolicy with json_schema forces observeOnly). Re-enable once the
+// format round-trip is fixed.
+it.instance.skip("SPAD structured output stays observe-only under json_schema format", () => Effect.void)
+
+it.instance("SPAD thrash lane recovers cross-turn tool stagnation without truncation", () =>
+  Effect.gen(function* () {
+    clearPersistedMotifs()
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      experimental: { spad_recovery: true },
+    }))
+    const { prompt, sessions, session } = yield* spadSession("SPAD thrash")
+    const narration = "Let me check the benchmark file again before deciding anything further. "
+    // Three distinct non-mutating reads per generation whose resource keys all
+    // collapse to the "benchmark.ts" basename, so the thrash lane sees pure
+    // re-access. Distinct paths avoid the doom-loop permission gate and the
+    // adapter merging identical calls.
+    const readInputs = ["alpha", "beta", "gamma"].map(
+      (dir) => ({ filePath: path.join(path.dirname(fileURLToPath(import.meta.url)), dir, "benchmark.ts") }),
+    )
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Profile the benchmark and report findings." }],
+    })
+    for (let gen = 0; gen < 3; gen++) {
+      yield* llm.push(
+        reply()
+          .text(narration)
+          .tool("read", readInputs[0])
+          .tool("read", readInputs[1])
+          .tool("read", readInputs[2]),
+      )
+    }
+    yield* llm.text("Profiling is complete; the bottleneck is the matcher hot loop.")
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    const messages = yield* sessions.messages({ sessionID: session.id })
+    const synthetic = messages
+      .flatMap((message) => message.parts)
+      .some((part) => part.type === "text" && part.synthetic === true && part.text.includes("repeated the same exploration"))
+    const narrations = messages
+      .flatMap((message) => message.parts)
+      .filter((part) => part.type === "text" && part.text.includes(narration.trim()))
+
+    expect(synthetic).toBe(true)
+    expect(narrations.length).toBeGreaterThan(0)
+    for (const part of narrations) if (part.type === "text") expect(part.text).toContain(narration.trim())
+    expect(result.parts.some((part) => part.type === "text" && part.text.includes("bottleneck"))).toBe(true)
+    expect(yield* llm.hits).toHaveLength(4)
+  }),
+  { timeout: 30000 },
 )
 
 it.instance("static loop consumes queued replies across turns", () =>

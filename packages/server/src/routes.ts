@@ -2,6 +2,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
+import { Device } from "@opencode-ai/core/device"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Credential } from "@opencode-ai/core/credential"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
@@ -27,6 +28,7 @@ import { sessionLocationLayer } from "./middleware/session-location"
 
 const applicationServices = LayerNode.group([
   Database.node,
+  Device.node,
   EventV2.node,
   httpClient,
   ToolOutputStore.cleanupNode,

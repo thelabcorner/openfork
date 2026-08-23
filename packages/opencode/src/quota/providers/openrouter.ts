@@ -48,7 +48,7 @@ export const openrouter = (http: HttpClient.HttpClient, auth: Auth.Interface): A
           windows: {
             credits: toUsageWindow({
               usedPercent: null,
-              valueLabel: `$${formatMoney(remaining)} of $${formatMoney(totalCredits)} remaining`,
+              valueLabel: `$${formatMoney(remaining)} left · $${formatMoney(totalUsage)} spent`,
             }),
           },
         },

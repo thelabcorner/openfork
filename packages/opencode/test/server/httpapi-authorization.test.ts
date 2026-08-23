@@ -3,6 +3,8 @@ import { describe, expect } from "bun:test"
 import { Effect, Layer, Option, Schema } from "effect"
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http"
 import { HttpApi, HttpApiBuilder, HttpApiEndpoint, HttpApiError, HttpApiGroup } from "effect/unstable/httpapi"
+import { Device } from "@opencode-ai/core/device"
+import { AppNodeBuilderV1 } from "../../src/effect/app-node-builder-v1"
 import { ServerAuth } from "../../src/server/auth"
 import {
   Authorization,
@@ -59,11 +61,16 @@ const v2ApiLayer = HttpRouter.serve(
 const noAuthLayer = ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode" })
 const secretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "opencode" })
 const kitSecretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "kit" })
+const deviceLayer = AppNodeBuilderV1.build(Device.node)
 
-const it = testEffect(apiLayer.pipe(Layer.provide(noAuthLayer)))
-const itSecret = testEffect(apiLayer.pipe(Layer.provide(secretLayer)))
-const itKitSecret = testEffect(apiLayer.pipe(Layer.provide(kitSecretLayer)))
-const itV2Secret = testEffect(v2ApiLayer.pipe(Layer.provide(secretLayer)))
+// provideMerge keeps Device.Service (and its Database) in the test environment
+// so bodies can mint devices against the SAME instance the middleware uses.
+const withDevice = <A, E, R>(layer: Layer.Layer<A, E, R>) => layer.pipe(Layer.provideMerge(deviceLayer))
+
+const it = testEffect(withDevice(apiLayer).pipe(Layer.provide(noAuthLayer)))
+const itSecret = testEffect(withDevice(apiLayer).pipe(Layer.provide(secretLayer)))
+const itKitSecret = testEffect(withDevice(apiLayer).pipe(Layer.provide(kitSecretLayer)))
+const itV2Secret = testEffect(withDevice(v2ApiLayer).pipe(Layer.provide(secretLayer)))
 
 const basic = (username: string, password: string) => ServerAuth.header({ username, password }) ?? ""
 
@@ -169,6 +176,80 @@ describe("HttpApi authorization middleware", () => {
       expect(response.status).toBe(401)
       expect(response.headers["www-authenticate"] ?? "").toContain("Basic")
       expect(body).toEqual({ _tag: "UnauthorizedError", message: "Authentication required" })
+    }),
+  )
+
+  itSecret.live("accepts a paired device token as a Bearer header", () =>
+    Effect.gen(function* () {
+      const devices = yield* Device.Service
+      const created = yield* devices.create()
+
+      const response = yield* getProbe({ authorization: `Bearer ${created.token}` })
+      expect(response.status).toBe(200)
+      // last_seen is recorded on successful device auth.
+      expect((yield* devices.verify(created.token))?.lastSeenAt).toBeDefined()
+    }),
+  )
+
+  itSecret.live("accepts a paired device token as a Basic password with any username", () =>
+    Effect.gen(function* () {
+      const devices = yield* Device.Service
+      const created = yield* devices.create()
+
+      const response = yield* getProbe({ authorization: basic("device", created.token) })
+      expect(response.status).toBe(200)
+    }),
+  )
+
+  itSecret.live("accepts a paired device token as the raw auth_token query param", () =>
+    Effect.gen(function* () {
+      const devices = yield* Device.Service
+      const created = yield* devices.create()
+
+      const response = yield* HttpClient.get(`/probe?auth_token=${encodeURIComponent(created.token)}`)
+      expect(response.status).toBe(200)
+    }),
+  )
+
+  itSecret.live("rejects revoked device tokens in every form", () =>
+    Effect.gen(function* () {
+      const devices = yield* Device.Service
+      const created = yield* devices.create()
+      yield* devices.revoke(created.device.id)
+
+      const [bearer, basicAuth, query] = yield* Effect.all(
+        [
+          getProbe({ authorization: `Bearer ${created.token}` }),
+          getProbe({ authorization: basic("device", created.token) }),
+          HttpClient.get(`/probe?auth_token=${encodeURIComponent(created.token)}`),
+        ],
+        { concurrency: "unbounded" },
+      )
+      expect(bearer.status).toBe(401)
+      expect(basicAuth.status).toBe(401)
+      expect(query.status).toBe(401)
+    }),
+  )
+
+  itSecret.live("master password still wins when presented alongside a device token", () =>
+    Effect.gen(function* () {
+      const devices = yield* Device.Service
+      yield* devices.create()
+      const response = yield* getProbe({ authorization: basic("opencode", "secret") })
+      expect(response.status).toBe(200)
+    }),
+  )
+
+  itV2Secret.live("accepts a paired device token on the v2 server surface", () =>
+    Effect.gen(function* () {
+      const devices = yield* Device.Service
+      const created = yield* devices.create()
+
+      const response = yield* HttpClientRequest.get("/api/probe").pipe(
+        HttpClientRequest.setHeader("authorization", `Bearer ${created.token}`),
+        HttpClient.execute,
+      )
+      expect(response.status).toBe(200)
     }),
   )
 })

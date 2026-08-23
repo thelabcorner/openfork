@@ -12,6 +12,9 @@ import { deepseek } from "./providers/deepseek"
 import { kimi } from "./providers/kimi"
 import { opencodeGo } from "./providers/opencode-go"
 import { openrouter } from "./providers/openrouter"
+import { claude } from "./providers/claude"
+import { codex } from "./providers/codex"
+import { xai } from "./providers/xai"
 
 export { UsageWindow, ProviderUsage, ProviderResult, ProviderSummary, ProvidersResult } from "./schema"
 
@@ -48,6 +51,9 @@ const layer: Layer.Layer<Service, never, Auth.Service | ForkCredentials.Service 
       openrouter(http, auth),
       kimi(http, auth),
       deepseek(http, auth),
+      claude(http, auth),
+      codex(http, auth),
+      xai(http, auth),
     ]
     const singleFlight = createSingleFlight()
 

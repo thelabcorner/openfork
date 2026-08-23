@@ -1,4 +1,4 @@
-export type SpadLane = "raw" | "canonical" | "thrash"
+export type SpadLane = "raw" | "canonical" | "thrash" | "expansion"
 export type SpadChannel = "text" | "reasoning"
 
 export interface PeriodThresholdBand {
@@ -23,6 +23,10 @@ export interface SpadConfig {
   readonly recoveryWatchChars: number
   readonly autoRecoverCanonical: boolean
   readonly canonicalMinDuplicate4GramRatio: number
+  readonly autoRecoverExpansion: boolean
+  readonly expansionMinLines: number
+  readonly expansionMinCycles: number
+  readonly expansionMinStreamChars: number
   readonly lowLexicalDistinctLetters: number
   readonly lowLexicalMinCoverage: number
   readonly autoRecoverThrash: boolean
@@ -45,6 +49,7 @@ export interface PeriodDetection {
   readonly exponent: number
   readonly agreement: number
   readonly canonicalDuplicate4GramRatio?: number
+  readonly expansionDuplicateRatio?: number
   readonly insideCodeFence: boolean
   readonly motifDistinctAsciiLetters?: number
   readonly motifHasNonAscii?: boolean

@@ -24,6 +24,8 @@ import type {
   ConfigProvidersResponses,
   ConfigUpdateErrors,
   ConfigUpdateResponses,
+  DeviceListResponses,
+  DeviceRemoveResponses,
   EventSubscribeResponses,
   EventTuiCommandExecute,
   EventTuiPromptAppend,
@@ -40,6 +42,10 @@ import type {
   ExperimentalControlPlaneMoveSessionResponses,
   ExperimentalOpenrouterEndpointsGetErrors,
   ExperimentalOpenrouterEndpointsGetResponses,
+  ExperimentalOpenrouterFreeUsageGetErrors,
+  ExperimentalOpenrouterFreeUsageGetResponses,
+  ExperimentalOpenrouterTelemetryGetErrors,
+  ExperimentalOpenrouterTelemetryGetResponses,
   ExperimentalProjectCopyGenerateNameErrors,
   ExperimentalProjectCopyGenerateNameResponses,
   ExperimentalResourceListErrors,
@@ -140,6 +146,9 @@ import type {
   ModelRef,
   MoveSessionDestination,
   OutputFormat,
+  PairBeginResponses,
+  PairClaimErrors,
+  PairClaimResponses,
   Part as Part2,
   PartDeleteErrors,
   PartDeleteResponses,
@@ -287,6 +296,9 @@ import type {
   TextPartInput,
   ToolIdsErrors,
   ToolIdsResponses,
+  ToolKillErrors,
+  ToolKillPayload,
+  ToolKillResponses,
   ToolListErrors,
   ToolListResponses,
   ToolReloadErrors,
@@ -1018,6 +1030,46 @@ export class Resource extends HeyApiClient {
   }
 }
 
+export class OpenrouterTelemetry extends HeyApiClient {
+  /**
+   * Get OpenRouter telemetry
+   *
+   * Proxy OpenRouter's frontend telemetry APIs (effective-pricing, throughput-comparison) so the renderer avoids cross-origin fetches.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      model: string
+      timeRange?: "1w" | "3d"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "model" },
+            { in: "query", key: "timeRange" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      ExperimentalOpenrouterTelemetryGetResponses,
+      ExperimentalOpenrouterTelemetryGetErrors,
+      ThrowOnError
+    >({
+      url: "/experimental/openrouter-telemetry",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class OpenrouterEndpoints extends HeyApiClient {
   /**
    * Get OpenRouter upstream providers
@@ -1050,6 +1102,46 @@ export class OpenrouterEndpoints extends HeyApiClient {
       ThrowOnError
     >({
       url: "/experimental/openrouter-endpoints",
+      ...options,
+      ...params,
+    })
+  }
+}
+
+export class OpenrouterFreeUsage extends HeyApiClient {
+  /**
+   * Get OpenRouter free usage
+   *
+   * Tracker for OpenRouter's free-model daily reservoir (50 vs 1,000 tier) using the same read-only Management API path as the standalone `openrouter-fut-api` module: 1× analytics/query in steady state, with credits/models cached 6h and single-flight coalescing.
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      includeValue?: "true" | "false"
+      forceRefresh?: "true" | "false"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "includeValue" },
+            { in: "query", key: "forceRefresh" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      ExperimentalOpenrouterFreeUsageGetResponses,
+      ExperimentalOpenrouterFreeUsageGetErrors,
+      ThrowOnError
+    >({
+      url: "/experimental/openrouter-free-usage",
       ...options,
       ...params,
     })
@@ -1400,9 +1492,19 @@ export class Experimental extends HeyApiClient {
     return (this._resource ??= new Resource({ client: this.client }))
   }
 
+  private _openrouterTelemetry?: OpenrouterTelemetry
+  get openrouterTelemetry(): OpenrouterTelemetry {
+    return (this._openrouterTelemetry ??= new OpenrouterTelemetry({ client: this.client }))
+  }
+
   private _openrouterEndpoints?: OpenrouterEndpoints
   get openrouterEndpoints(): OpenrouterEndpoints {
     return (this._openrouterEndpoints ??= new OpenrouterEndpoints({ client: this.client }))
+  }
+
+  private _openrouterFreeUsage?: OpenrouterFreeUsage
+  get openrouterFreeUsage(): OpenrouterFreeUsage {
+    return (this._openrouterFreeUsage ??= new OpenrouterFreeUsage({ client: this.client }))
   }
 
   private _projectCopy?: ProjectCopy
@@ -1725,6 +1827,88 @@ export class Event extends HeyApiClient {
   }
 }
 
+export class Pair extends HeyApiClient {
+  /**
+   * Begin device pairing
+   *
+   * Mint a single-use six-character pairing code that expires in 90 seconds and dies after five failed claims.
+   */
+  public begin<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).post<PairBeginResponses, unknown, ThrowOnError>({
+      url: "/pair/begin",
+      ...options,
+    })
+  }
+
+  /**
+   * Claim a pairing code
+   *
+   * Exchange a valid pairing code for a one-time device token. Unauthenticated by design; rate-limited per code and per client IP.
+   */
+  public claim<ThrowOnError extends boolean = false>(
+    parameters?: {
+      code?: string
+      name?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "code" },
+            { in: "body", key: "name" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<PairClaimResponses, PairClaimErrors, ThrowOnError>({
+      url: "/pair/claim",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class Device extends HeyApiClient {
+  /**
+   * List paired devices
+   *
+   * List every registered device, oldest first, including revoked ones.
+   */
+  public list<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<DeviceListResponses, unknown, ThrowOnError>({
+      url: "/devices",
+      ...options,
+    })
+  }
+
+  /**
+   * Revoke a device
+   *
+   * Soft-revoke a device; its token stops authenticating immediately.
+   */
+  public remove<ThrowOnError extends boolean = false>(
+    parameters: {
+      deviceID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "deviceID" }] }])
+    return (options?.client ?? this.client).delete<DeviceRemoveResponses, unknown, ThrowOnError>({
+      url: "/devices/{deviceID}",
+      ...options,
+      ...params,
+    })
+  }
+}
+
 export class Config2 extends HeyApiClient {
   /**
    * Get configuration
@@ -1916,6 +2100,43 @@ export class Tool extends HeyApiClient {
       url: "/tool/reload",
       ...options,
       ...params,
+    })
+  }
+
+  /**
+   * Kill a shell execution
+   *
+   * Terminate one live shell execution: either the foreground tool call identified by callID (the command process tree is force-killed and the agent continues with an aborted result) or a background job identified by jobId.
+   */
+  public kill<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      toolKillPayload?: ToolKillPayload
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { key: "toolKillPayload", map: "body" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<ToolKillResponses, ToolKillErrors, ThrowOnError>({
+      url: "/tool/kill",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 }
@@ -8821,6 +9042,16 @@ export class OpencodeClient extends HeyApiClient {
   private _event?: Event
   get event(): Event {
     return (this._event ??= new Event({ client: this.client }))
+  }
+
+  private _pair?: Pair
+  get pair(): Pair {
+    return (this._pair ??= new Pair({ client: this.client }))
+  }
+
+  private _device?: Device
+  get device(): Device {
+    return (this._device ??= new Device({ client: this.client }))
   }
 
   private _config?: Config2

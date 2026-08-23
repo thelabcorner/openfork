@@ -52,14 +52,14 @@ new file mode 100644
 OUTPUT SEMANTICS:
 - Dry-run plan lines: `A path (+N/-0)` add, `M path (+N/-M)` modify, `R old -> new` rename,
   `D path (+0/-N)` delete, each followed by `clean` or `CONFLICT: <reason>`.
-- Conflicts name the file and why (e.g. expected lines not found) so you can fix the exact hunk.
+- Conflicts name the file and why (e.g. expected lines not found), plus a bounded excerpt of the current file content nearest the failed hunk — usually enough to fix it without re-reading.
 - Pass `showDiff: true` to include the full diffs in the plan.
 - On apply, the output is the same lean A/M/D/R summary plus any LSP diagnostics per file.
 
 ERROR HANDLING & RECOVERY:
 - "patch rejected: empty patch" — you sent the envelope with no operations. Add Add/Update/Delete sections.
 - "Invalid patch: ..." — could not parse. The error shows the expected format, a one-file example, and the first 80 chars received. Re-read the format example and resubmit; do NOT blind-retry the same text.
-- "patch verification failed for N file(s): <file>: ..." (apply only) — some hunks did not match the current file contents. NOTHING was applied. Re-read the affected files and regenerate those hunks from the current content.
+- "patch verification failed for N file(s): <file>: ..." (apply only) — some hunks did not match the current file contents. NOTHING was applied. Each conflict embeds the current file content closest to the failed hunk (with line numbers) — regenerate those hunks from that excerpt when you can; re-read only if the excerpt is not enough.
 - "no changes to apply" — every hunk matched but produced no diff (the change is already present). Nothing was written.
 
 Path resolution is relative to the project directory; paths that escape the worktree require explicit user approval. All hunks are validated BEFORE any file is written — a bad hunk means nothing is applied, never a partial write.
