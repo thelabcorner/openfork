@@ -80,6 +80,7 @@
     "vite-plugin-solid": "catalog:"
   },
   "dependencies": {
+    "@corvu/drawer": "catalog:",
     "@kobalte/core": "catalog:",
     "@pierre/diffs": "catalog:",
     "@shikijs/transformers": "3.9.2",

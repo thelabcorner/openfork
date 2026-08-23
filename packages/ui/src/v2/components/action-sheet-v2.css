@@ -1,0 +1,95 @@
+[data-component="action-sheet-v2"] {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 4px 8px 8px;
+}
+
+[data-component="action-sheet-v2"] [data-slot="action-sheet-items"],
+[data-component="action-sheet-v2"] [data-slot="action-sheet-cancel"] {
+  background: var(--v2-background-bg-base);
+  border-radius: 12px;
+  overflow: hidden;
+}
+
+/* Action rows are primary tap affordances: full-width, 44px minimum (R2/R3). */
+[data-slot="action-sheet-item"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 16px;
+  border: none;
+  font-family: inherit;
+  font-weight: 440;
+  font-size: 15px;
+  line-height: 20px;
+  letter-spacing: -0.13px;
+  text-align: center;
+  color: var(--v2-text-text-base);
+  background: transparent;
+  cursor: pointer;
+  user-select: none;
+  font-variation-settings: "slnt" 0;
+}
+
+[data-slot="action-sheet-item"] + [data-slot="action-sheet-item"] {
+  border-top: 1px solid var(--v2-border-border-muted);
+}
+
+[data-slot="action-sheet-item"]:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-slot="action-sheet-item"]:active {
+  background: var(--v2-overlay-simple-overlay-pressed);
+}
+
+[data-slot="action-sheet-item"]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -2px;
+}
+
+[data-slot="action-sheet-item"][data-destructive] {
+  color: var(--v2-state-fg-danger);
+}
+
+[data-slot="action-sheet-item"]:disabled {
+  color: var(--v2-text-text-faint);
+  cursor: default;
+  background: transparent;
+}
+
+[data-slot="action-sheet-cancel"] {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  min-height: 44px;
+  padding: 10px 16px;
+  border: none;
+  font-family: inherit;
+  font-weight: 530;
+  font-size: 15px;
+  line-height: 20px;
+  letter-spacing: -0.13px;
+  text-align: center;
+  color: var(--v2-text-text-base);
+  cursor: pointer;
+  user-select: none;
+  font-variation-settings: "slnt" 0;
+}
+
+[data-slot="action-sheet-cancel"]:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-slot="action-sheet-cancel"]:active {
+  background: var(--v2-overlay-simple-overlay-pressed);
+}
+
+[data-slot="action-sheet-cancel"]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -2px;
+}

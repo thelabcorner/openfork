@@ -30,8 +30,12 @@ export function createPromptInputV2Store(input: PromptInputV2StoreInput) {
       return store()
     },
     setPrompt(prompt: PromptInputV2Prompt, cursor?: number) {
+      const current = store()
+      const cursorChanged = cursor !== undefined && cursor !== current.cursor
+      const promptEqual = isPromptInputV2PromptEqual(current.prompt, prompt)
+      if (promptEqual && !cursorChanged) return
       batch(() => {
-        setStore()("prompt", prompt)
+        if (!promptEqual) setStore()("prompt", prompt)
         if (cursor !== undefined) setStore()("cursor", cursor)
       })
     },
@@ -149,4 +153,29 @@ function withOffsets(prompt: PromptInputV2Prompt): PromptInputV2Prompt {
 
 function promptLength(prompt: PromptInputV2Prompt) {
   return prompt.reduce((length, part) => length + ("content" in part ? part.content.length : 0), 0)
+}
+
+function isPromptInputV2PromptEqual(a: PromptInputV2Prompt, b: PromptInputV2Prompt): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const partA = a[i]
+    const partB = b[i]
+    if (partA.type !== partB.type) return false
+    if (partA.type === "image" && partB.type === "image") {
+      if (partA.id !== partB.id) return false
+      continue
+    }
+    if ("content" in partA && "content" in partB) {
+      if (partA.content !== partB.content) return false
+      if (partA.type === "agent" && partB.type === "agent" && partA.name !== partB.name) return false
+      if (partA.type === "file" && partB.type === "file") {
+        if (partA.path !== partB.path) return false
+        if (partA.mime !== partB.mime) return false
+        if (partA.filename !== partB.filename) return false
+      }
+      continue
+    }
+    return false
+  }
+  return true
 }

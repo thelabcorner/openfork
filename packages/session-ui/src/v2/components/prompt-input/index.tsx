@@ -57,7 +57,8 @@ export function PromptInputV2(props: PromptInputV2Props) {
   const view = props.controller.view
   let editor: HTMLDivElement | undefined
   let editorArea: HTMLDivElement | undefined
-  let localInput = false
+  let pendingLocalUpdates = 0
+  let previousParts: PromptInputV2Prompt | undefined
   const updateCursor = () => {
     if (!editor || !window.getSelection()?.isCollapsed) return
     props.controller.onCursor(promptInputV2Cursor(editor))
@@ -71,12 +72,23 @@ export function PromptInputV2(props: PromptInputV2Props) {
 
   createEffect(() => {
     const parts = props.controller.parts()
+    const draftCursor = (props.controller as { cursor?: () => number | undefined }).cursor?.()
     if (!editor) return
-    if (localInput) {
-      localInput = false
+    if (pendingLocalUpdates > 0) {
+      pendingLocalUpdates--
+      previousParts = parts
       return
     }
-    renderPromptInputV2Editor(editor, parts)
+    if (previousParts && isPromptInputV2PromptEqual(previousParts, parts)) return
+    previousParts = parts
+    const hadFocus = document.activeElement === editor || (editor.contains(document.activeElement) && document.activeElement !== document.body)
+    // Prefer the draft's authoritative cursor (set by addMention/addAttachment/history)
+    // when it differs from the editor's current cursor; otherwise preserve the
+    // editor's existing cursor to keep typing position stable.
+    const editorCursor = hadFocus ? promptInputV2Cursor(editor) : undefined
+    const cursor = draftCursor !== undefined ? draftCursor : editorCursor
+    const scrollTop = editor.scrollTop
+    renderPromptInputV2Editor(editor, parts, cursor, scrollTop)
   })
 
   return (
@@ -175,7 +187,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
               const cursor = promptInputV2Cursor(event.currentTarget)
               const { parts: prompt, text } = parsePromptInputV2Editor(event.currentTarget)
               const images = props.controller.parts().filter((part) => part.type === "image")
-              localInput = true
+              pendingLocalUpdates++
               props.controller.onInput(text, [...prompt, ...images], cursor)
             }}
             onKeyDown={(event) => {
@@ -284,8 +296,14 @@ export function PromptInputV2(props: PromptInputV2Props) {
   )
 }
 
-function renderPromptInputV2Editor(editor: HTMLDivElement, prompt: PromptInputV2Prompt) {
+function renderPromptInputV2Editor(
+  editor: HTMLDivElement,
+  prompt: PromptInputV2Prompt,
+  cursor?: number,
+  scrollTop?: number,
+) {
   const active = document.activeElement === editor
+  const hadSelection = active && window.getSelection()?.rangeCount
   editor.replaceChildren(
     ...prompt.flatMap<Node>((part) => {
       if (part.type === "image") return []
@@ -304,13 +322,88 @@ function renderPromptInputV2Editor(editor: HTMLDivElement, prompt: PromptInputV2
       return [mention]
     }),
   )
+  if (scrollTop !== undefined) editor.scrollTop = scrollTop
   if (!active) return
+  if (cursor === undefined) {
+    // Fallback: keep previous behaviour (collapse to end) only when called
+    // from the initial mount path that does not provide a cursor.
+    if (!hadSelection) return
+    const selection = window.getSelection()
+    const range = document.createRange()
+    range.selectNodeContents(editor)
+    range.collapse(false)
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+    return
+  }
+  setEditorCursor(editor, cursor)
+  // Ensure the restored cursor is visible without jumping to top.
+  if (scrollTop === undefined) {
+    const selection = window.getSelection()
+    const anchor = selection?.anchorNode
+    if (anchor && editor.contains(anchor)) {
+      const range = selection!.getRangeAt(0)
+      const rect = range.getBoundingClientRect()
+      const editorRect = editor.getBoundingClientRect()
+      if (rect.top < editorRect.top || rect.bottom > editorRect.bottom) {
+        // Minimal scroll to keep cursor in view; preserve prior scroll if already visible.
+        const target = anchor instanceof Element ? anchor : anchor.parentElement
+        target?.scrollIntoView({ block: "nearest" })
+      }
+    }
+  }
+}
+
+function setEditorCursor(editor: HTMLDivElement, cursor: number) {
+  const walker = document.createTreeWalker(editor, NodeFilter.SHOW_TEXT)
+  let remaining = cursor
+  let node = walker.nextNode()
+  while (node) {
+    const length = node.textContent?.length ?? 0
+    if (remaining <= length) {
+      const range = document.createRange()
+      range.setStart(node, remaining)
+      range.collapse(true)
+      const selection = window.getSelection()
+      selection?.removeAllRanges()
+      selection?.addRange(range)
+      return
+    }
+    remaining -= length
+    node = walker.nextNode()
+  }
+  // Fallback: collapse to end if cursor exceeds text length (e.g. empty prompt).
   const selection = window.getSelection()
   const range = document.createRange()
   range.selectNodeContents(editor)
   range.collapse(false)
   selection?.removeAllRanges()
   selection?.addRange(range)
+}
+
+function isPromptInputV2PromptEqual(a: PromptInputV2Prompt, b: PromptInputV2Prompt): boolean {
+  if (a.length !== b.length) return false
+  for (let i = 0; i < a.length; i++) {
+    const partA = a[i]
+    const partB = b[i]
+    if (partA.type !== partB.type) return false
+    if (partA.type === "image" && partB.type === "image") {
+      if (partA.id !== partB.id) return false
+      continue
+    }
+    if ("content" in partA && "content" in partB) {
+      if (partA.content !== partB.content) return false
+      if (partA.type === "agent" && partB.type === "agent" && partA.name !== partB.name) return false
+      if (partA.type === "file" && partB.type === "file") {
+        if (partA.path !== partB.path) return false
+        if (partA.mime !== partB.mime) return false
+        if (partA.filename !== partB.filename) return false
+      }
+      continue
+    }
+    return false
+  }
+  return true
 }
 
 function parsePromptInputV2Editor(editor: HTMLDivElement) {

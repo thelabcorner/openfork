@@ -46,6 +46,19 @@ export type NavigateToSessionFn = (sessionID: string) => void
 
 export type SessionHrefFn = (sessionID: string) => string
 
+export type KillShellInput = {
+  sessionID: string
+  callID?: string
+  jobId?: string
+}
+
+export type KillShellResult = {
+  killed: boolean
+  status?: string
+}
+
+export type KillShellFn = (input: KillShellInput) => Promise<KillShellResult>
+
 export const { use: useData, provider: DataProvider } = createSimpleContext({
   name: "Data",
   init: (props: {
@@ -54,6 +67,7 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
     sessionID?: string
     onNavigateToSession?: NavigateToSessionFn
     onSessionHref?: SessionHrefFn
+    onKillShell?: KillShellFn
   }) => {
     return {
       get store() {
@@ -67,6 +81,7 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
       },
       navigateToSession: props.onNavigateToSession,
       sessionHref: props.onSessionHref,
+      killShell: props.onKillShell,
     }
   },
 })

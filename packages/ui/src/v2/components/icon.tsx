@@ -199,7 +199,11 @@ const icons = {
     viewBox: "0 0 16 16",
     body: `<path d="M8 2L14 5L8 8L2 5Z" stroke="currentColor" stroke-linejoin="round"/><path d="M2 8L8 11L14 8" stroke="currentColor" stroke-linejoin="round"/><path d="M2 11L8 14L14 11" stroke="currentColor" stroke-linejoin="round"/>`,
   },
-}
+  chats: {
+    viewBox: "0 0 16 16",
+    body: `<path d="M2.5 3.5C1.8 3.5 1.2 3.9 1.2 4.4V9C1.2 9.5 2 10 2.8 10H6L7.5 11.5L9 10H13.2C14 10 14.8 9.5 14.8 9V4.4C14.8 3.9 14 3.5 13.2 3.5H2.5Z" stroke="currentColor" stroke-linejoin="round"/><path d="M2.5 11.5C1.8 11.5 1.2 11.9 1.2 12.4V13.5C1.2 13.9 1.6 14.2 2.1 14.2H5.5L6.5 13H8.5L9.5 14.2H11.9C12.4 14.2 12.8 13.9 12.8 13.5V12.4C12.8 11.9 12.2 11.5 11.5 11.5H2.5Z" stroke="currentColor" stroke-linejoin="round"/>`,
+  },
+};
 
 const spriteID = "opencode-v2-icon-sprite"
 const symbol = (name: keyof typeof icons) => `opencode-v2-icon-${name}`

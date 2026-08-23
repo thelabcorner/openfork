@@ -42,6 +42,10 @@ window.addEventListener(
   true,
 )
 
+window.addEventListener("contextmenu", (event) => {
+  event.preventDefault()
+})
+
 const root = document.getElementById("root")
 if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
   throw new Error(t("desktop.error.dev.rootNotFound"))

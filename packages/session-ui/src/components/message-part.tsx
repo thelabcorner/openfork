@@ -1403,7 +1403,9 @@ export function UserMessageDisplay(props: {
 
   const metaHead = createMemo(() => {
     const agent = props.message.agent
+    const variant = props.message.model?.variant
     const items = [agent ? agent[0]?.toUpperCase() + agent.slice(1) : "", model()]
+    if (variant) items.push(variant)
     return items.filter((x) => !!x).join("\u00A0\u00B7\u00A0")
   })
 
@@ -1633,6 +1635,7 @@ export interface ToolProps {
   metadata: Record<string, any>
   tool: string
   sessionID?: string
+  callID?: string
   output?: string
   status?: string
   hideDetails?: boolean
@@ -1788,6 +1791,7 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
               input={input()}
               tool={part().tool}
               sessionID={part().sessionID}
+              callID={part().callID}
               metadata={partMetadata()}
               // @ts-expect-error
               output={part().state.output}
@@ -1870,9 +1874,12 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
   const meta = createMemo(() => {
     if (props.message.role !== "assistant") return ""
     const agent = (props.message as AssistantMessage).agent
+    const message = props.message as AssistantMessage
+    const variant = message.model?.variant
     const items = [
       agent ? agent[0]?.toUpperCase() + agent.slice(1) : "",
       model(),
+      variant ? variant : "",
       duration(),
       interrupted() ? i18n.t("ui.message.interrupted") : "",
     ]
@@ -2443,6 +2450,7 @@ ToolRegistry.register({
   name: "shell",
   render(props) {
     const i18n = useI18n()
+    const data = useData()
     const pending = () => props.status === "pending" || props.status === "running"
     const sawPending = pending()
     const command = createMemo(() => props.input.command ?? props.metadata.command ?? "")
@@ -2457,6 +2465,11 @@ ToolRegistry.register({
     })
     const endedAt = createMemo(() => (typeof props.metadata.endedAt === "number" ? props.metadata.endedAt : undefined))
     const timerRunning = createMemo(() => pending() || background())
+    const jobId = createMemo(() => (typeof props.metadata.jobId === "string" ? props.metadata.jobId : undefined))
+    const [stop, setStop] = createStore({ pending: false, done: false })
+    const canStop = createMemo(
+      () => !!data.killShell && !!props.sessionID && !stop.done && (!!jobId() || props.status === "running"),
+    )
 
     const handleCopy = async () => {
       const content = text()
@@ -2464,6 +2477,22 @@ ToolRegistry.register({
       if (await writeClipboard(content)) {
         setCopied(true)
         setTimeout(() => setCopied(false), 2000)
+      }
+    }
+
+    const handleStop = async (event: MouseEvent) => {
+      event.stopPropagation()
+      if (stop.pending || !data.killShell || !props.sessionID) return
+      setStop("pending", true)
+      try {
+        const result = await data.killShell(
+          background() ? { sessionID: props.sessionID, jobId: jobId() } : { sessionID: props.sessionID, callID: props.callID },
+        )
+        if (result?.killed) setStop("done", true)
+      } catch {
+        // The provider wiring surfaces request failures; nothing to add here.
+      } finally {
+        setStop("pending", false)
       }
     }
 
@@ -2490,6 +2519,26 @@ ToolRegistry.register({
                 <ShellSubmessage text={props.input.command} animate={sawPending} />
               </Show>
             </div>
+            <Show when={canStop()}>
+              <div data-component="tool-action">
+                <TooltipV2
+                  value={stop.pending ? i18n.t("ui.tool.shell.stop.stopping") : i18n.t("ui.tool.shell.stop.label")}
+                  placement="top"
+                >
+                  <IconButtonV2
+                    icon={<IconV2 name="stop" size="small" />}
+                    size="normal"
+                    variant="ghost-muted"
+                    disabled={stop.pending}
+                    onMouseDown={(e) => e.preventDefault()}
+                    onClick={handleStop}
+                    aria-label={
+                      stop.pending ? i18n.t("ui.tool.shell.stop.stopping") : i18n.t("ui.tool.shell.stop.label")
+                    }
+                  />
+                </TooltipV2>
+              </div>
+            </Show>
           </div>
         )}
       >

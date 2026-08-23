@@ -368,6 +368,9 @@ export function createPromptInputV2Controller(input: {
     removeAttachment(id: string) {
       draft.removeAttachment(id)
     },
+    cursor() {
+      return draft.state.cursor
+    },
     canSubmit() {
       const persisted = draft.state
       if (persisted.prompt.some((part) => part.type === "image")) return true

@@ -1,0 +1,109 @@
+[data-component="bottom-sheet-overlay-v2"] {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  background-color: var(--v2-overlay-simple-overlay-scrim);
+  opacity: 0;
+  transition:
+    opacity 300ms cubic-bezier(0.32, 0.72, 0, 1),
+    backdrop-filter 300ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+[data-component="bottom-sheet-overlay-v2"][data-opening] {
+  opacity: 1;
+}
+
+[data-component="bottom-sheet-overlay-v2"][data-closing] {
+  opacity: 0;
+}
+
+/* Anchored to the layout-viewport bottom; the visual-viewport clamp (inline
+   max-height + padding-bottom set by the primitive) keeps the visible box
+   above the software keyboard. corvu drives transform for drag/snap. */
+[data-component="bottom-sheet-v2"] {
+  position: fixed;
+  inset-inline: 0;
+  bottom: 0;
+  z-index: 100;
+  display: flex;
+  flex-direction: column;
+  max-height: 100dvh;
+}
+
+[data-component="bottom-sheet-v2"][data-transitioning] {
+  transition: transform 420ms cubic-bezier(0.32, 0.72, 0, 1);
+}
+
+[data-component="bottom-sheet-v2"] [data-slot="bottom-sheet-panel"] {
+  display: flex;
+  flex-direction: column;
+  flex: 1;
+  min-height: 0;
+  background: var(--v2-background-bg-layer-01);
+  border-radius: 16px 16px 0 0;
+  box-shadow: var(--v2-elevation-overlay);
+  overflow: hidden;
+}
+
+[data-slot="bottom-sheet-grabber"] {
+  flex: none;
+  width: 36px;
+  height: 4px;
+  margin: 8px auto 4px;
+  border-radius: 9999px;
+  background: var(--v2-border-border-strong);
+}
+
+[data-slot="bottom-sheet-header"] {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 8px 16px 12px;
+  flex-shrink: 0;
+}
+
+[data-slot="bottom-sheet-title"] {
+  margin: 0;
+  font-weight: 530;
+  font-size: 15px;
+  line-height: 20px;
+  letter-spacing: -0.13px;
+  color: var(--v2-text-text-base);
+  user-select: none;
+  font-variation-settings: "slnt" 0;
+}
+
+[data-slot="bottom-sheet-description"] {
+  margin: 0;
+  font-weight: 440;
+  font-size: 13px;
+  line-height: 20px;
+  letter-spacing: -0.04px;
+  color: var(--v2-text-text-muted);
+  user-select: none;
+  font-variation-settings: "slnt" 0;
+}
+
+[data-slot="bottom-sheet-body"] {
+  flex: 1;
+  min-height: 0;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+[data-slot="bottom-sheet-footer"] {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 12px 16px;
+  /* The sheet owns its bottom edge and clears the home indicator. */
+  padding-bottom: calc(env(safe-area-inset-bottom, 0px) + 12px);
+  flex-shrink: 0;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-component="bottom-sheet-v2"][data-transitioning],
+  [data-component="bottom-sheet-overlay-v2"] {
+    transition: none;
+  }
+}

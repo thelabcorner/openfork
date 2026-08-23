@@ -262,6 +262,14 @@ export function createMainWindow(id: string = randomUUID()) {
   wireFullscreen(win)
   loadWindow(win, "index.html")
   wireZoom(win)
+  wireForceRefresh(win)
+
+  // Suppress native context menus for the main renderer (our custom MenuV2.Context
+  // ones are used instead for tab context menus etc.). Guests inside <webview>
+  // keep their own behavior.
+  win.webContents.on("context-menu", (event) => {
+    event.preventDefault()
+  })
 
   win.once("ready-to-show", () => {
     autopsyMark("window-ready-to-show") // STARTUP-AUTOPSY
@@ -577,6 +585,21 @@ function wireFullscreen(win: BrowserWindow) {
 
   win.on("enter-full-screen", () => send(true))
   win.on("leave-full-screen", () => send(false))
+}
+
+// Alt+F5 always reloads this window. Intercepted in the main process via
+// before-input-event, which fires before the page sees the key — so it works
+// while the renderer is hung or crashed, and no matter what has focus inside
+// (text inputs, open app menus). Deliberately not globalShortcut: that would
+// steal the chord from every other app on the machine.
+function wireForceRefresh(win: BrowserWindow) {
+  win.webContents.on("before-input-event", (event, input) => {
+    if (input.type !== "keyDown" && input.type !== "keyUp") return
+    if (!input.alt || input.control || input.meta || input.shift) return
+    if (input.key.toLowerCase() !== "f5") return
+    event.preventDefault()
+    if (input.type === "keyDown" && !win.isDestroyed()) win.reload()
+  })
 }
 
 function clampZoom(value: number) {
