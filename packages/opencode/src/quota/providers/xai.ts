@@ -57,7 +57,7 @@ export const xai = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter 
       } catch (e) {
         return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: true, error: e instanceof Error ? e.message : String(e) })
       }
-    }) as Effect.Effect<ProviderResult>,
+    }) as Effect.Effect<ProviderResult>),
 })
 
 function decodeUsage(buffer: ArrayBuffer): { percent?: number; resetsAt?: number } | null {
