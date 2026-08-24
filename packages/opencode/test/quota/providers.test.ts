@@ -11,6 +11,8 @@ import { openrouter } from "../../src/quota/providers/openrouter"
 import { claude } from "../../src/quota/providers/claude"
 import { parseClaudeCredentials } from "../../src/quota/providers/claude"
 import { codex } from "../../src/quota/providers/codex"
+import { nvidia } from "../../src/quota/providers/nvidia"
+import { resetNvidiaUsage, trackNvidiaRequest } from "../../src/quota/providers/nvidia-usage"
 
 function authWith(entries: Record<string, Auth.Info>): Auth.Interface {
   return {
@@ -53,6 +55,24 @@ function httpWith(handler: (request: HttpClientRequest.HttpClientRequest) => Eff
 const run = <A>(effect: Effect.Effect<A>) => Effect.runPromise(effect)
 
 describe("QuotaProviders", () => {
+  test("NVIDIA reports manually tracked requests against its 40 request/minute limit", async () => {
+    const auth = authWith({ nvidia: { type: "api", key: "nvidia-key" } })
+    resetNvidiaUsage()
+    trackNvidiaRequest()
+    trackNvidiaRequest()
+
+    const adapter = nvidia(auth)
+    expect(await run(adapter.configured())).toBe(true)
+    const result = await run(adapter.fetch())
+
+    expect(result.ok).toBe(true)
+    expect(result.usage?.windows["1m"].usedPercent).toBe(5)
+    expect(result.usage?.windows["1m"].remainingPercent).toBe(95)
+    expect(result.usage?.windows["1m"].windowSeconds).toBe(60)
+
+    resetNvidiaUsage()
+  })
+
   test("missing credentials report not-configured without any network call", async () => {
     const auth = authWith({})
     const openrouterHttp = httpWith(() => Effect.die("must not be called"))
