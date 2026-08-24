@@ -467,6 +467,34 @@ export const ReactInspectInput = Schema.Struct({
   timeoutMs: Schema.optional(Schema.Number),
 })
 
+export const OpenDevtoolsInput = Schema.Struct({
+  tabId: Schema.optional(Schema.String),
+  timeoutMs: Schema.optional(Schema.Number),
+})
+
+export const OpenDevtoolsOutput = Schema.Struct({
+  devtools: Schema.Struct({
+    tabId: Schema.String,
+    open: Schema.Boolean,
+  }),
+})
+
+export const ExtensionsListInput = Schema.Struct({
+  tabId: Schema.optional(Schema.String),
+  timeoutMs: Schema.optional(Schema.Number),
+})
+
+export const ExtensionInfo = Schema.Struct({
+  id: Schema.String,
+  name: Schema.String,
+  version: Schema.String,
+  enabled: Schema.Boolean,
+})
+
+export const ExtensionsListOutput = Schema.Struct({
+  extensions: Schema.Array(ExtensionInfo),
+})
+
 // --- per-operation outputs (explicit success objects, never void) ------------
 
 /** One tab row of the FULL shared-host tab list (D5/D12). `status` returns every
@@ -761,6 +789,9 @@ export const ReactInspectOutput = Schema.Struct({
   }),
 })
 
+export const DevtoolsOutput = OpenDevtoolsOutput
+export const ExtensionsOutput = ExtensionsListOutput
+
 // --- operation tagged union --------------------------------------------------
 
 export const BrowserOperation = Schema.Union([
@@ -788,6 +819,8 @@ export const BrowserOperation = Schema.Union([
   Schema.Struct({ name: Schema.Literal("profiler_start"), input: ProfilerStartInput }),
   Schema.Struct({ name: Schema.Literal("profiler_stop"), input: ProfilerStopInput }),
   Schema.Struct({ name: Schema.Literal("react_inspect"), input: ReactInspectInput }),
+  Schema.Struct({ name: Schema.Literal("open_devtools"), input: OpenDevtoolsInput }),
+  Schema.Struct({ name: Schema.Literal("extensions_list"), input: ExtensionsListInput }),
 ])
 export type BrowserOperation = Schema.Schema.Type<typeof BrowserOperation>
 export type BrowserOperationName = BrowserOperation["name"]
