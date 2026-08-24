@@ -55,7 +55,7 @@ const layer: Layer.Layer<Service, never, Auth.Service | ForkCredentials.Service 
       claude(http, auth),
       codex(http, auth),
       xai(http, auth),
-      nvidia(http, auth),
+      nvidia(auth),
     ]
     const singleFlight = createSingleFlight()
 
