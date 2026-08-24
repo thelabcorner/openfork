@@ -1,5 +1,3 @@
-import type { JSX } from "solid-js"
-
 export type MenuItemVariant = "default" | "danger"
 
 export type MenuItemDef =
@@ -9,6 +7,7 @@ export type MenuItemDef =
       label: string
       disabled?: boolean
       variant?: MenuItemVariant
+      icon?: string
       onSelect: () => void
     }
   | {
@@ -16,7 +15,26 @@ export type MenuItemDef =
       id: string
       label: string
       disabled?: boolean
+      icon?: string
       items: MenuItemDef[]
+    }
+  | {
+      kind: "checkbox"
+      id: string
+      label: string
+      checked: boolean
+      disabled?: boolean
+      icon?: string
+      onSelect: () => void
+    }
+  | {
+      kind: "radio"
+      id: string
+      label: string
+      checked: boolean
+      disabled?: boolean
+      icon?: string
+      onSelect: () => void
     }
 
 export type MenuSectionDef = {

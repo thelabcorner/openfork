@@ -20,12 +20,11 @@ import type { AssistantMessage, Message, Part, UserMessage } from "@opencode-ai/
 import { showToast } from "@/utils/toast"
 import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
 import { useLanguage } from "@/context/language"
+import { usePlatform } from "@/context/platform"
 import { useProviders } from "@/hooks/use-providers"
 import { useSDK } from "@/context/sdk"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { formatCostPerMillion } from "@/components/model-tooltip"
-import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
-import { FreeUsageBar } from "@/components/openrouter-free-usage-bar"
 import { getSessionContext } from "./session-context-metrics"
 import { estimateSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
 import {
@@ -246,8 +245,8 @@ export function SessionContextTab() {
   const sync = useSync()
   const language = useLanguage()
   const sdk = useSDK()
+  const platform = usePlatform()
   const providers = useProviders(() => sdk().directory)
-  const freeUsage = useOpenRouterFreeUsage({ includeValue: true })
   const { params, view } = useSessionLayout()
 
   const info = createMemo(() => (params.id ? sync().session.get(params.id) : undefined))
@@ -513,13 +512,16 @@ export function SessionContextTab() {
         sessionID,
         client: sdk().client,
       })
-      const filename = sessionExportFilename(data.info)
-      downloadSessionExport(filename, data)
+      const saved = await downloadSessionExport(
+        sessionExportFilename(data.info),
+        data,
+        platform.compressExport?.bind(platform),
+      )
       showToast({
         variant: "success",
         icon: "circle-check",
         title: language.t("toast.session.export.success.title"),
-        description: language.t("toast.session.export.success.description", { filename }),
+        description: language.t("toast.session.export.success.description", { filename: saved }),
       })
     } catch (err) {
       showToast({
@@ -859,11 +861,6 @@ export function SessionContextTab() {
         onScroll={handleScroll}
       >
         <div class="flex flex-col gap-4 p-3 pb-8">
-          <Show when={freeUsage.data()}>
-            {(report) => (
-              <FreeUsageBar report={report()} compact />
-            )}
-          </Show>
           <div class="grid grid-cols-2 gap-1.5">
             <MetricCell
               label={language.t("context.metric.cacheHit")}

@@ -25,7 +25,7 @@ export function createFileMenuModel(input: FileMenuModelInput): MenuSectionDef[]
       id: "file-open",
       items: [
         { kind: "item", id: "open", label: t("projectExplorer.contextMenu.open"), onSelect: input.actions.onOpen },
-        { kind: "item", id: "addToChat", label: t("projectExplorer.contextMenu.addToChat"), onSelect: input.actions.onMention },
+        { kind: "item", id: "addToChat", label: t("projectExplorer.contextMenu.addToChat"), icon: "chats", onSelect: input.actions.onMention },
       ],
     })
   }
@@ -37,6 +37,7 @@ export function createFileMenuModel(input: FileMenuModelInput): MenuSectionDef[]
         kind: "item",
         id: "favorite",
         label: input.actions.favorited ? t("model.favorite.remove") : t("model.favorite.add"),
+        icon: "star",
         onSelect: input.actions.onFavoriteToggle,
       },
     ],
@@ -48,7 +49,7 @@ export function createFileMenuModel(input: FileMenuModelInput): MenuSectionDef[]
       { kind: "item", id: "newFile", label: t("projectExplorer.contextMenu.newFile"), onSelect: input.actions.onNewFile },
       { kind: "item", id: "newFolder", label: t("projectExplorer.contextMenu.newFolder"), onSelect: input.actions.onNewFolder },
       { kind: "item", id: "rename", label: t("projectExplorer.contextMenu.rename"), onSelect: input.actions.onRename },
-      { kind: "item", id: "delete", label: t("projectExplorer.contextMenu.delete"), onSelect: input.actions.onDelete, variant: "danger" },
+      { kind: "item", id: "delete", label: t("projectExplorer.contextMenu.delete"), icon: "trash", onSelect: input.actions.onDelete, variant: "danger" },
     ],
   })
 

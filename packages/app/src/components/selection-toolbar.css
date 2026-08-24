@@ -1,0 +1,114 @@
+/* Premium selection toolbar — shadcn-zinc, same surface as MenuV2 */
+[data-component="selection-toolbar"] {
+  position: fixed;
+  z-index: 70;
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 4px;
+  background: var(--v2-background-bg-layer-01);
+  color: var(--v2-text-text-base);
+  border-radius: 10px;
+  box-shadow: var(--v2-elevation-floating);
+  border: 0.5px solid var(--v2-border-border-base);
+  font-family: var(--v2-font-family-sans);
+  -webkit-font-smoothing: antialiased;
+  pointer-events: auto;
+  user-select: none;
+  animation: selection-toolbar-in 120ms cubic-bezier(0.16, 1, 0.3, 1);
+  transform-origin: center bottom;
+  will-change: transform, opacity;
+}
+
+@keyframes selection-toolbar-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px) scale(0.96);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+[data-component="selection-toolbar"][data-exiting] {
+  animation: selection-toolbar-out 100ms ease-in forwards;
+}
+
+@keyframes selection-toolbar-out {
+  to {
+    opacity: 0;
+    transform: translateY(2px) scale(0.98);
+  }
+}
+
+[data-slot="selection-toolbar-item"] {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border-radius: 7px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 1;
+  letter-spacing: -0.01em;
+  color: var(--v2-text-text-base);
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 120ms, color 120ms;
+}
+
+[data-slot="selection-toolbar-item"]:hover {
+  background: var(--v2-overlay-simple-overlay-hover);
+}
+
+[data-slot="selection-toolbar-item"]:active {
+  background: var(--v2-overlay-simple-overlay-pressed);
+}
+
+[data-slot="selection-toolbar-item"]:focus-visible {
+  outline: 2px solid var(--v2-border-border-focus);
+  outline-offset: -1px;
+}
+
+[data-slot="selection-toolbar-separator"] {
+  width: 1px;
+  height: 16px;
+  background: var(--v2-border-border-muted);
+  margin: 0 2px;
+  flex-shrink: 0;
+}
+
+[data-slot="selection-toolbar-icon"] {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 14px;
+  height: 14px;
+  color: var(--v2-icon-icon-muted);
+}
+
+/* Arrow/caret — same zinc surface as the toolbar */
+[data-component="selection-toolbar-arrow"] {
+  position: absolute;
+  left: 50%;
+  bottom: -5px;
+  transform: translateX(-50%) rotate(45deg);
+  width: 10px;
+  height: 10px;
+  background: var(--v2-background-bg-layer-01);
+  border-right: 0.5px solid var(--v2-border-border-base);
+  border-bottom: 0.5px solid var(--v2-border-border-base);
+}
+
+[data-component="selection-toolbar"][data-flipped] [data-component="selection-toolbar-arrow"] {
+  bottom: auto;
+  top: -5px;
+  border-right: none;
+  border-bottom: none;
+  border-left: 0.5px solid var(--v2-border-border-base);
+  border-top: 0.5px solid var(--v2-border-border-base);
+}

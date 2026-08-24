@@ -1,6 +1,7 @@
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { isRTL } from "@kobalte/core/i18n"
+import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { createSignal, Show } from "solid-js"
 import { Drawer, DrawerClose, DrawerContent } from "@/components/ui/drawer"
 import { usePlatform } from "@/context/platform"
@@ -122,21 +123,23 @@ export function TabsInfoPopup() {
             />
           </Show>
         </div>
-        <div class="relative flex min-h-0 w-full flex-1 flex-col items-start gap-6 overflow-y-auto p-8">
-          <p class="w-full shrink-0 self-stretch text-[21px] font-[610] leading-6 tracking-[-0.37px] tabular-nums text-v2-text-text-base">
-            {language.t("help.tabs.title")}
-          </p>
-          <div class="flex w-full flex-1 flex-col gap-4 text-[13px] font-[440] leading-5 tracking-[-0.04px] text-v2-text-text-base">
-            <p>{language.t("help.tabs.introduction")}</p>
-            <img src={tabsImage} alt="" class="aspect-video w-full rounded-[6px] object-cover" />
-            <p>{language.t("help.tabs.sessions")}</p>
-            <p>{language.t("help.tabs.organize")}</p>
-            <p>{language.t("help.tabs.home")}</p>
-            <img src={homeImage} alt="" class="aspect-video w-full rounded-[6px] object-cover" />
-            <p>{language.t("help.tabs.persistence")}</p>
-            <p>{language.t("help.tabs.worktrees")}</p>
+        <ScrollView class="min-h-0 w-full flex-1">
+          <div class="flex w-full flex-col items-start gap-6 p-8">
+            <p class="w-full shrink-0 self-stretch text-[21px] font-[610] leading-6 tracking-[-0.37px] tabular-nums text-v2-text-text-base">
+              {language.t("help.tabs.title")}
+            </p>
+            <div class="flex w-full flex-1 flex-col gap-4 text-[13px] font-[440] leading-5 tracking-[-0.04px] text-v2-text-text-base">
+              <p>{language.t("help.tabs.introduction")}</p>
+              <img src={tabsImage} alt="" class="aspect-video w-full rounded-[6px] object-cover" />
+              <p>{language.t("help.tabs.sessions")}</p>
+              <p>{language.t("help.tabs.organize")}</p>
+              <p>{language.t("help.tabs.home")}</p>
+              <img src={homeImage} alt="" class="aspect-video w-full rounded-[6px] object-cover" />
+              <p>{language.t("help.tabs.persistence")}</p>
+              <p>{language.t("help.tabs.worktrees")}</p>
+            </div>
           </div>
-        </div>
+        </ScrollView>
       </DrawerContent>
     </Drawer>
   )
