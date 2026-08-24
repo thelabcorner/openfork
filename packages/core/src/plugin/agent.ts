@@ -37,7 +37,6 @@ Always follow the exact output structure requested by the user prompt. Keep ever
 Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.`
 
 export const PROMPT_TITLE = `You are a title generator. You output ONLY a thread title. Nothing else.
-
 <task>
 Generate a brief title that would help the user find this conversation later.
 
@@ -151,14 +150,14 @@ export const Plugin = define({
 
       draft.update(AgentV2.ID.make("general"), (item) => {
         item.description =
-          "General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel."
+          "General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel. Proactively use read/grep limits (<=100), call hive_consolidate after tools, prefer blackboard summaries + hive_relevant to avoid bloat."
         item.mode = "subagent"
         item.permissions.push(...PermissionV2.merge(defaults, [{ action: "todowrite", resource: "*", effect: "deny" }]))
       })
 
       draft.update(AgentV2.ID.make("explore"), (item) => {
         item.description =
-          'Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. "src/components/**/*.tsx"), search code for keywords (eg. "API endpoints"), or answer questions about the codebase (eg. "how do API endpoints work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions.'
+          'Fast agent specialized for exploring codebases. Use this when you need to quickly find files by patterns (eg. "src/components/**/*.tsx"), search code for keywords (eg. "API endpoints"), or answer questions about the codebase (eg. "how do API endpoints work?"). When calling this agent, specify the desired thoroughness level: "quick" for basic searches, "medium" for moderate exploration, or "very thorough" for comprehensive analysis across multiple locations and naming conventions. Proactively use limits (<=100 on read/grep), hive_consolidate after tools, blackboard + relevance to prevent bloat.'
         item.system = PROMPT_EXPLORE
         item.mode = "subagent"
         item.permissions.push(

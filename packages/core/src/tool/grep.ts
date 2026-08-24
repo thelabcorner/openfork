@@ -62,7 +62,7 @@ const layer = Layer.effectDiscard(
       .register({
         [name]: Tool.make({
           description:
-            "Search file contents by regular expression within the active Location or an absolute managed tool-output file. Use a path to narrow the search, include to filter files by glob, and limit to bound the match count. Returns concise file resources, line numbers, and bounded line previews.",
+            "Search file contents by regular expression within the active Location or an absolute managed tool-output file. Use a path to narrow the search, include to filter files by glob, and limit (<=100 default) to bound the match count and prevent bloat. Returns concise file resources, line numbers, and bounded line previews. Prefer relevance/blackboard for large sessions.",
           input: Input,
           output: Output,
           toModelOutput: ({ output }) => [
@@ -99,8 +99,8 @@ const layer = Layer.effectDiscard(
                   cwd: info?.type === "Directory" ? target : path.dirname(target),
                   pattern: input.pattern,
                   file: info?.type === "File" ? path.basename(target) : undefined,
-                  include: input.include,
-                  limit: input.limit ?? Number.MAX_SAFE_INTEGER,
+                   include: input.include,
+                   limit: input.limit ?? 100,
                 })
                 .pipe(
                   Effect.map((result) =>

@@ -5,7 +5,6 @@ import type { SessionMessage } from "./message"
 import type { Prompt } from "./prompt"
 import type { SessionInput } from "./input"
 import type { Snapshot } from "../snapshot"
-import type { Checkpoint } from "../checkpoint"
 import { PermissionV1 } from "../v1/permission"
 import { ProjectV2 } from "../project"
 import type { SessionSchema } from "./schema"
@@ -15,7 +14,6 @@ import { Timestamps } from "../database/schema.sql"
 import type { SystemContext } from "../system-context/index"
 import { AgentV2 } from "../agent"
 import type { Revert } from "@opencode-ai/schema/revert"
-import { File } from "../file"
 
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
@@ -57,9 +55,9 @@ export const SessionTable = sqliteTable(
       variant?: string
     }>(),
     ...Timestamps,
-    paused_at: integer(),
     time_compacting: integer(),
     time_archived: integer(),
+    paused_at: integer(),
     group_id: text(),
   },
   (table) => [
@@ -70,16 +68,13 @@ export const SessionTable = sqliteTable(
   ],
 )
 
-export const SessionGroupTable = sqliteTable(
-  "session_group",
-  {
-    id: text().primaryKey(),
-    name: text().notNull(),
-    position: integer().notNull().default(0),
-    ...Timestamps,
-  },
-  (table) => [index("session_group_position_idx").on(table.position)],
-)
+export const SessionGroupTable = sqliteTable("session_group", {
+  id: text().primaryKey(),
+  name: text().notNull(),
+  position: integer().notNull(),
+  time_created: integer().notNull(),
+  time_updated: integer().notNull(),
+})
 
 export const MessageTable = sqliteTable(
   "message",
@@ -215,52 +210,34 @@ export const PartSearchBackfillTable = sqliteTable("part_search_backfill", {
   done: integer().notNull().default(0),
 })
 
-// Durable per-turn checkpoint metadata layered on top of the Snapshot shadow
-// Git engine. Each row records the explicit before/after filesystem trees for
-// one logical turn (or a manual/pre-revert point) so the turn diff and
-// cumulative diff can be recomputed and the checkpoint can be reverted without
-// re-deriving causal state. Tree objects are pinned inside the shadow repo via
-// `Snapshot.retain` so `Snapshot.cleanup()` GC pruning cannot drop them.
 export const SessionCheckpointTable = sqliteTable(
   "session_checkpoint",
   {
-    id: text().$type<Checkpoint.ID>().primaryKey(),
+    id: text().primaryKey(),
     session_id: text()
-      .$type<SessionSchema.ID>()
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
-    // Monotonic within a session; never reused even across retries/forks.
     ordinal: integer().notNull(),
-    kind: text().$type<Checkpoint.Kind>().notNull(),
-    status: text().$type<Checkpoint.Status>().notNull(),
-    // Explicit pre-turn filesystem tree (captured at the turn boundary, NOT
-    // derived from the previous checkpoint's after-snapshot).
+    kind: text().notNull(),
+    status: text().notNull(),
     before_snapshot: text(),
-    // Post-quiescence filesystem tree. Null while status === "capturing".
     after_snapshot: text(),
     user_message_id: text(),
     assistant_message_id: text(),
-    // Structured per-file diff, persisted for cheap list/timeline rendering.
-    // Recomputable via Snapshot.diff(before, after); this is a cache.
-    diff: text({ mode: "json" }).$type<File.Diff[]>(),
+    diff: text({ mode: "json" }).$type<readonly Revert.FileDiff[] | null>(),
     additions: integer().notNull().default(0),
     deletions: integer().notNull().default(0),
     files: integer().notNull().default(0),
-    // Files excluded from the snapshot (e.g. >2 MiB new untracked files).
-    excluded: text({ mode: "json" }).$type<Checkpoint.Excluded[]>(),
-    // Last error for a checkpoint in `error` status.
-    error: text({ mode: "json" }).$type<Checkpoint.CheckpointError>(),
-    // Snapshot-store epoch (project + worktree identity) at creation time.
+    excluded: text({ mode: "json" }).$type<readonly { path: string; reason: string; size?: number }[] | null>(),
+    error: text({ mode: "json" }).$type<{ code: string; message: string } | null>(),
     epoch: text().notNull(),
-    // Set when a read/diff detects the current store epoch no longer matches.
     epoch_mismatch: integer().notNull().default(0),
     created_at: integer().notNull(),
     finalized_at: integer(),
   },
   (table) => [
-    uniqueIndex("session_checkpoint_session_ordinal_idx").on(table.session_id, table.ordinal),
-    index("session_checkpoint_session_idx").on(table.session_id),
-    index("session_checkpoint_session_user_idx").on(table.session_id, table.user_message_id),
-    index("session_checkpoint_session_assistant_idx").on(table.session_id, table.assistant_message_id),
+    index("session_checkpoint_session_id_idx").on(table.session_id),
+    index("session_checkpoint_session_ordinal_idx").on(table.session_id, table.ordinal),
+    uniqueIndex("session_checkpoint_session_user_message_idx").on(table.session_id, table.user_message_id),
   ],
 )

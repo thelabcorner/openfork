@@ -119,6 +119,7 @@ export function matchQuery(query: string): string | undefined {
 
 export function search(db: Database, input: SearchInput): Effect.Effect<SearchResult, SearchError> {
   return Effect.gen(function* () {
+    const startedAt = Date.now()
     const limit = Math.min(input.limit ?? DefaultSearchLimit, MaxSearchLimit)
     const scope: SQL[] = []
     if (input.directory) scope.push(sql`s.directory = ${normalizeDirectory(input.directory)}`)
@@ -126,6 +127,7 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
     if (input.project) scope.push(sql`s.project_id = ${input.project}`)
     const scopeClause = scope.length > 0 ? sql` AND ${sql.join(scope, sql` AND `)}` : sql``
 
+    const titleStartedAt = Date.now()
     const titleRows = yield* db
       .all<typeof SessionTable.$inferSelect>(sql`
         SELECT s.*
@@ -139,6 +141,7 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
           () => new SearchError({ message: "Search query could not be executed" }),
         ),
       )
+    const titleMs = Date.now() - titleStartedAt
 
     const terms = matchTerms(input.query)
     const match = matchQuery(input.query)
@@ -166,6 +169,7 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
           WHERE session_message_fts MATCH ${match}
           ORDER BY bm25(session_message_fts)
           LIMIT ${limit}`
+    const messageStartedAt = Date.now()
     const messageRows = match
       ? yield* db
           .all<MessageRow>(sql`
@@ -189,6 +193,7 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
             ),
           )
       : []
+    const messageMs = Date.now() - messageStartedAt
 
     // V1 conversation content lives in the part table (message.data holds only
     // role and metadata). The same tokenized prefix MATCH runs over part_fts;
@@ -213,6 +218,7 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
           WHERE part_fts MATCH ${match}
           ORDER BY bm25(part_fts)
           LIMIT ${limit}`
+    const partStartedAt = Date.now()
     const partRows = match
       ? yield* db
           .all<PartRow>(sql`
@@ -237,8 +243,9 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
             ),
           )
       : []
+    const partMs = Date.now() - partStartedAt
 
-    return {
+    const result = {
       titleMatches: titleRows.map(decodeTitleRow),
       messageMatches: mergeMatches(
         [
@@ -268,6 +275,28 @@ export function search(db: Database, input: SearchInput): Effect.Effect<SearchRe
         limit,
       ),
     }
+    const elapsedMs = Date.now() - startedAt
+    if (elapsedMs >= 1_000) {
+      const backfill = yield* readBackfillState(db).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      const partBackfill = yield* readPartBackfillState(db).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      yield* Effect.logInfo("session search core completed slowly", {
+        elapsedMs,
+        titleMs,
+        messageMs,
+        partMs,
+        queryLength: input.query.length,
+        limit,
+        scoped: scope.length > 0,
+        matchTerms: terms.length,
+        titleRows: titleRows.length,
+        messageRows: messageRows.length,
+        partRows: partRows.length,
+        mergedMessages: result.messageMatches.length,
+        backfill,
+        partBackfill,
+      })
+    }
+    return result
   })
 }
 

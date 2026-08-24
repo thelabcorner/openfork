@@ -37,10 +37,11 @@ export class Info extends Schema.Class<Info>("Config.Info")({
     description: "Default model to use when no session or agent model is selected",
   }),
   small_model: Schema.String.pipe(Schema.optional).annotate({
-    description: "Small model used for lightweight background tasks such as title generation",
+    description: "Small model to use for tasks like title generation in the format of provider/model",
   }),
   title_prompt: Schema.String.pipe(Schema.optional).annotate({
-    description: "Custom instruction for generated session titles",
+    description:
+      "Custom instructions for the title generation model. Replaces the built-in default task prompt; {previousTitle} and {conversation} are available as placeholders.",
   }),
   default_agent: Schema.String.pipe(Schema.optional).annotate({
     description: "Default primary agent to use when no session agent is selected",

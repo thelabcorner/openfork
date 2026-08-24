@@ -78,7 +78,8 @@ export const Info = Schema.Struct({
     description: "Small model to use for tasks like title generation in the format of provider/model",
   }),
   title_prompt: Schema.optional(Schema.String).annotate({
-    description: "Prompt instructions to use when generating session titles",
+    description:
+      "Custom instructions for the title generation model. Replaces the built-in default task prompt; {previousTitle} and {conversation} are available as placeholders.",
   }),
   default_agent: Schema.optional(Schema.String).annotate({
     description:
@@ -172,12 +173,6 @@ export const Info = Schema.Struct({
   experimental: Schema.optional(
     Schema.Struct({
       disable_paste_summary: Schema.optional(Schema.Boolean),
-      spad_recovery: Schema.optional(Schema.Boolean).annotate({
-        description: "Enable repetitive-output recovery (SPAD-R). Enabled by default; set false to disable",
-      }),
-      spad_observe_only: Schema.optional(Schema.Boolean).annotate({
-        description: "Run SPAD-R detection in observe-only mode: log detections but never truncate or recover",
-      }),
       batch_tool: Schema.optional(Schema.Boolean).annotate({ description: "Enable the batch tool" }),
       openTelemetry: Schema.optional(Schema.Boolean).annotate({
         description: "Enable OpenTelemetry spans for AI SDK calls (using the 'experimental_telemetry' flag)",
@@ -194,6 +189,8 @@ export const Info = Schema.Struct({
       policies: Schema.optional(Schema.mutable(Schema.Array(ConfigExperimental.Policy))).annotate({
         description: "Policy statements applied to supported resources, such as provider access",
       }),
+      spad_recovery: Schema.optional(Schema.Boolean),
+      spad_observe_only: Schema.optional(Schema.Boolean),
     }),
   ),
 }).annotate({ identifier: "Config" })

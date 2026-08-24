@@ -9,10 +9,10 @@ import { SessionMessage } from "./message"
 import { SessionSchema } from "./schema"
 import { Token } from "../util/token"
 
-const DEFAULT_BUFFER = 20_000
-const DEFAULT_KEEP_TOKENS = 8_000
-const TOOL_OUTPUT_MAX_CHARS = 2_000
-const SUMMARY_OUTPUT_TOKENS = 4_096
+const DEFAULT_BUFFER = 10_000
+const DEFAULT_KEEP_TOKENS = 4_000
+const TOOL_OUTPUT_MAX_CHARS = 500
+const SUMMARY_OUTPUT_TOKENS = 2_000
 const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
 ## Objective
@@ -234,11 +234,7 @@ export const make = (dependencies: Dependencies) => {
     const context = input.model.route.defaults.limits?.context
     if (context === undefined || context <= 0) return false
     const output = input.request.generation?.maxTokens ?? input.model.route.defaults.limits?.output ?? 0
-    if (
-      estimate({ system: input.request.system, messages: input.request.messages, tools: input.request.tools }) <=
-      context - Math.max(output, config.buffer)
-    )
-      return false
+    if (estimate({ system: input.request.system, messages: input.request.messages, tools: input.request.tools }) <= context - Math.max(output, config.buffer)) return false
     return yield* compactAfterOverflow(input)
   })
   return {

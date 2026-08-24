@@ -29,6 +29,7 @@ import { ReferenceGuidance } from "./reference/guidance"
 import * as SessionRunnerLLM from "./session/runner/llm"
 import { SessionRunnerModel } from "./session/runner/model"
 import { SessionTodo } from "./session/todo"
+import { SessionTitle } from "./session/title"
 import { SkillV2 } from "./skill"
 import { SkillGuidance } from "./skill/guidance"
 import { Snapshot } from "./snapshot"
@@ -82,6 +83,7 @@ export const locationServices = LayerNode.group([
   Snapshot.node,
   Checkpoint.node,
   SessionRunnerLLM.node,
+  SessionTitle.node,
 ])
 
 export type LocationServices = LayerNode.Output<typeof locationServices>
