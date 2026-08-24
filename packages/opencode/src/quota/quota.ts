@@ -15,6 +15,7 @@ import { openrouter } from "./providers/openrouter"
 import { claude } from "./providers/claude"
 import { codex } from "./providers/codex"
 import { xai } from "./providers/xai"
+import { nvidia } from "./providers/nvidia"
 
 export { UsageWindow, ProviderUsage, ProviderResult, ProviderSummary, ProvidersResult } from "./schema"
 
@@ -54,6 +55,7 @@ const layer: Layer.Layer<Service, never, Auth.Service | ForkCredentials.Service 
       claude(http, auth),
       codex(http, auth),
       xai(http, auth),
+      nvidia(http, auth),
     ]
     const singleFlight = createSingleFlight()
 
