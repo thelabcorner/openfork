@@ -25,6 +25,9 @@ import {
   ElementTarget,
   EvaluateInput,
   EvaluateOutput,
+  ExtensionsListInput,
+  ExtensionsListOutput,
+  ExtensionInfo,
   HighlightInput,
   HighlightOutput,
   HostCapabilities,
@@ -38,6 +41,8 @@ import {
   Locator,
   NavigateInput,
   NavigateOutput,
+  OpenDevtoolsInput,
+  OpenDevtoolsOutput,
   OpenInput,
   OpenOutput,
   PressInput,
@@ -118,6 +123,9 @@ export {
   ElementTarget,
   EvaluateInput,
   EvaluateOutput,
+  ExtensionsListInput,
+  ExtensionsListOutput,
+  ExtensionInfo,
   HighlightInput,
   HighlightOutput,
   HostCapabilities,
@@ -131,6 +139,8 @@ export {
   Locator,
   NavigateInput,
   NavigateOutput,
+  OpenDevtoolsInput,
+  OpenDevtoolsOutput,
   OpenInput,
   OpenOutput,
   PressInput,
@@ -205,6 +215,8 @@ export const OperationInput = {
   profiler_start: ProfilerStartInput,
   profiler_stop: ProfilerStopInput,
   react_inspect: ReactInspectInput,
+  open_devtools: OpenDevtoolsInput,
+  extensions_list: ExtensionsListInput,
 }
 
 /** Typed output schema per operation — validates the host's success object. */
@@ -232,6 +244,8 @@ export const OperationOutput = {
   profiler_start: ProfilerStartOutput,
   profiler_stop: ProfilerStopOutput,
   react_inspect: ReactInspectOutput,
+  open_devtools: OpenDevtoolsOutput,
+  extensions_list: ExtensionsListOutput,
 }
 
 export type OperationName = keyof typeof OperationInput
@@ -264,6 +278,8 @@ export const DEFAULT_TIMEOUT_MS: Record<OperationName, number> = {
   profiler_start: 10_000,
   profiler_stop: 10_000,
   react_inspect: 10_000,
+  open_devtools: 10_000,
+  extensions_list: 10_000,
 }
 
 /** Permission family per operation (design §5 + premium amendment). */
@@ -277,6 +293,7 @@ export const FAMILY: Record<OperationName, BrowserFamily> = {
   profiler_start: "browser.read",
   profiler_stop: "browser.read",
   react_inspect: "browser.read",
+  extensions_list: "browser.read",
   open: "browser.navigate",
   claim: "browser.navigate",
   navigate: "browser.navigate",
@@ -291,6 +308,7 @@ export const FAMILY: Record<OperationName, BrowserFamily> = {
   highlight: "browser.interact",
   annotate: "browser.interact",
   evaluate: "browser.evaluate",
+  open_devtools: "browser.evaluate",
   recording_start: "browser.record",
   recording_stop: "browser.record",
 }

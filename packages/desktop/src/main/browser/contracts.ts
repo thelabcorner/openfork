@@ -773,6 +773,7 @@ export interface ScreenshotOutput {
     height: number
     viewport: Viewport
     capturedAt: number
+    path?: string
   }
 }
 export interface ClickOutput {

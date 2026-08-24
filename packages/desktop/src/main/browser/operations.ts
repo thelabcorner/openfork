@@ -223,7 +223,7 @@ export class BrowserOperations {
       case "set_muted":
         return (await this.setMuted(operation.input)) as unknown as Record<string, unknown>
       case "open_devtools":
-        return (await this.openDevtools(operation.input)) as unknown as Record<string, unknown>
+        return (await this.openDevtools(tabId, operation.input as { tabId?: string })) as unknown as Record<string, unknown>
       case "hard_reload":
         return (await this.hardReload(operation.input)) as unknown as Record<string, unknown>
       case "clear_cookies":
@@ -231,7 +231,7 @@ export class BrowserOperations {
       case "clear_cache":
         return (await this.clearCache(operation.input)) as unknown as Record<string, unknown>
       case "extensions_list":
-        return (await this.extensionsList(operation.input)) as unknown as Record<string, unknown>
+        return (await this.extensionsList(tabId, operation.input as { tabId?: string })) as unknown as Record<string, unknown>
       case "extension_set_enabled":
         return (await this.extensionSetEnabled(operation.input)) as unknown as Record<string, unknown>
       default:
@@ -429,8 +429,8 @@ export class BrowserOperations {
 
   // --- host-internal browser chrome ops (D10) ----------------------------------
 
-  private async openDevtools(input: RefreshTabInput): Promise<Record<string, unknown>> {
-    const tab = this.resolveTab(input.tabId)
+  private async openDevtools(envelopeTabId: string | undefined, input: { tabId?: string }): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId ?? envelopeTabId)
     tab.webContents.openDevTools({ mode: "detach" })
     return { devtools: { tabId: tab.runtimeTabId, open: true } }
   }
@@ -453,8 +453,8 @@ export class BrowserOperations {
     return { cleared: { tabId: tab.runtimeTabId, scope: "cache" } }
   }
 
-  private async extensionsList(input: RefreshTabInput): Promise<Record<string, unknown>> {
-    const tab = this.resolveTab(input.tabId)
+  private async extensionsList(envelopeTabId: string | undefined, input: { tabId?: string }): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId ?? envelopeTabId)
     const extensions = tab.webContents.session.extensions.getAllExtensions().map((extension) => ({
       id: extension.id,
       name: extension.name,
@@ -599,6 +599,11 @@ export class BrowserOperations {
 
   private async screenshot(tabId: string | undefined, input: ScreenshotInput): Promise<ScreenshotOutput> {
     const tab = this.resolveTab(input.tabId ?? tabId)
+    let viewport = await this.readViewport(tab)
+    if (viewport.width === 0 || viewport.height === 0) {
+      await this.resize(undefined, 1440, 900)
+      viewport = await this.readViewport(tab)
+    }
     return this.withControl(tab, "screenshot", async (send) => {
       const format = input.format ?? "png"
       const params =
@@ -607,7 +612,13 @@ export class BrowserOperations {
           : { format, fromSurface: true, captureBeyondViewport: input.fullPage ?? false }
       const captured = (await send("Page.captureScreenshot", params)) as { data?: unknown }
       if (typeof captured.data !== "string") throw new BrowserOperationFailedError("Screenshot capture returned no image data")
-      const viewport = await this.readViewport(tab)
+      const dir = this.deps.recordingDirectory
+      mkdirSync(dir, { recursive: true })
+      const timestamp = Date.now()
+      const ext = format === "jpeg" ? "jpg" : "png"
+      const artifactPath = join(dir, `screenshot-${timestamp}.${ext}`)
+      const buffer = Buffer.from(captured.data, "base64")
+      writeFileSync(artifactPath, buffer)
       return {
         screenshot: {
           tabId: tab.runtimeTabId,
@@ -618,13 +629,15 @@ export class BrowserOperations {
           width: viewport.width,
           height: viewport.height,
           viewport,
-          capturedAt: Date.now(),
+          capturedAt: timestamp,
+          path: artifactPath,
         },
       }
     })
   }
 
   // --- click / highlight ------------------------------------------------------
+
 
   private async click(tabId: string | undefined, input: ClickInput): Promise<ClickOutput> {
     const tab = this.resolveTab(tabId)
@@ -741,18 +754,27 @@ export class BrowserOperations {
         try {
           const target = ${focusExpr};
           if (!target) return { notFound: true };
-          const isText = (el) => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement;
-          const control = isText(target) ? target : target.isContentEditable ? target : null;
+          const isInput = (el) => el instanceof HTMLTextAreaElement || el instanceof HTMLInputElement;
+          const isEditable = !!target.isContentEditable;
+          const control = isInput(target) ? target : isEditable ? target : null;
           if (!control) return { notText: true };
-          ${clear ? "control.value = '';" : ""}
-          const setter = Object.getOwnPropertyDescriptor(control.constructor.prototype, 'value')?.set;
-          if (setter) setter.call(control, ${encoded});
+          const text = ${encoded};
+          if (clear) {
+            if (isEditable) control.innerText = '';
+            else control.value = '';
+          } else if (isEditable) {
+            control.innerText = (control.innerText || '') + text;
+          } else {
+            control.value = (control.value || '') + text;
+          }
           control.dispatchEvent(new Event('input', { bubbles: true }));
           control.dispatchEvent(new Event('change', { bubbles: true }));
-          const selectionStart = control.selectionStart ?? 0;
-          const selectionEnd = control.selectionEnd ?? (control.textContent ?? '').length;
+          const len = (control.innerText || control.value || '').length;
+          const selectionStart = control.selectionStart ?? len;
+          const selectionEnd = selectionStart;
+          if (!isEditable && !clear) control.setSelectionRange(len, len);
           ${input.submit ? "control.closest('form')?.requestSubmit();" : ""}
-          return { ok: true, selectionStart, selectionEnd, submitted: ${input.submit ? "true" : "false"} };
+          return { ok: true, selectionStart, selectionEnd, submitted: ${input.submit ? "true" : "false"}, isEditable };
         } catch (error) { return { error: String(error) }; }
       })()`
       const result = (await this.evaluate(send, expression, true)) as Record<string, unknown>

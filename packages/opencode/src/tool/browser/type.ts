@@ -11,7 +11,7 @@ export const BrowserTypeTool = Tool.define(
     const broker = yield* BrokerClient.Service
     return {
       description:
-        "Type text into the focused input (or one targeted by ref/locator/coords). The response echoes the resolved target and the resulting input value + caret position, plus whether Enter was submitted. PRIMARY targeting is a snapshot ref + snapshotVersion; locator/coords are escape hatches. Re-snapshot after the page changes or refs go stale (BrowserStaleRefError).",
+        "Type or append text into an input, textarea, or contenteditable (e.g. prompt fields). Defaults to appending to existing content; pass clear:true to replace. Uses snapshot ref for reliable targeting (re-snapshot after changes to avoid stale refs). Response shows resolved target, final value, caret position, and submit status.",
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>
         Effect.gen(function* () {
