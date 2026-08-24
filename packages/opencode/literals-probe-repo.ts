@@ -37,7 +37,7 @@ try {
 
 // Variadic form for comparison
 try {
-  const s = Schema.Literals("a", "b")
+  const s = Schema.Literals(["a", "b"])
   console.log("Literals(variadic): constructed OK")
 } catch (e: any) {
   console.log("Literals(variadic): CONSTRUCT CRASH:", e.message)

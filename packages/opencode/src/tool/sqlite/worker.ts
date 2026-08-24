@@ -272,7 +272,7 @@ const handleAction = (db: Database, req: WorkerRequest): WorkerOk => {
     case "query": {
       if (!sql) throw new Error("query action requires 'sql'")
       const stmt = db.prepare(sql)
-      const collected = collectRows(stmt, bind, limit ?? 200, byteCap ?? 51200)
+      const collected = collectRows(stmt, bind as unknown as ReadonlyArray<string | number | boolean | null>, limit ?? 200, byteCap ?? 51200)
       return {
         ok: true,
         rows: collected.rows,
@@ -292,19 +292,19 @@ const handleAction = (db: Database, req: WorkerRequest): WorkerOk => {
       let lastInsertRowid = 0
       let columns: string[] = []
       let columnTypes: Array<string | null | undefined> = []
-      let collected: Collected = { rows: [], total: 0, truncated: false }
+        let collected: Collected = { rows: [], total: 0, truncated: false }
       try {
         const stmt = db.prepare(sql)
         columns = stmt.columnNames
         columnTypes = safeColumnTypes(stmt)
         const rowReturning = stmt.columnNames.length > 0
         if (rowReturning) {
-          collected = collectRows(stmt, bind, limit ?? 200, byteCap ?? 51200)
+          collected = collectRows(stmt, bind as unknown as ReadonlyArray<string | number | boolean | null>, limit ?? 200, byteCap ?? 51200)
           const eff = db.query("SELECT changes() AS c, last_insert_rowid() AS id").get() as { c: number; id: number }
           changes = eff.c
           lastInsertRowid = eff.id
         } else {
-          const r = stmt.run(...bind)
+          const r = (stmt as unknown as { run: (...args: unknown[]) => { changes: number; lastInsertRowid: number | bigint } }).run(...(bind as unknown[]))
           changes = r.changes
           lastInsertRowid = Number(r.lastInsertRowid)
         }
@@ -330,7 +330,7 @@ const handleAction = (db: Database, req: WorkerRequest): WorkerOk => {
     case "explain": {
       if (!sql) throw new Error("explain action requires 'sql'")
       const stmt = db.prepare(`EXPLAIN QUERY PLAN ${sql}`)
-      const collected = collectRows(stmt, bind, limit ?? 200, byteCap ?? 51200)
+      const collected = collectRows(stmt, bind as unknown as ReadonlyArray<string | number | boolean | null>, limit ?? 200, byteCap ?? 51200)
       return {
         ok: true,
         rows: collected.rows,
@@ -351,7 +351,7 @@ const handleAction = (db: Database, req: WorkerRequest): WorkerOk => {
       const maxRows = exportLimit ?? 1_000_000
       const maxBytes = exportByteCap ?? 50 * 1024 * 1024
       let bytes = 0
-      for (const row of stmt.iterate(...bind)) {
+      for (const row of (stmt as unknown as { iterate: (...args: unknown[]) => Iterable<unknown> }).iterate(...(bind as unknown[]))) {
         total++
         const values = columns.map((c) => (row as Record<string, unknown>)[c])
         const rowBytes = values.reduce<number>((acc, v) => acc + cellBytes(v), 4)
@@ -377,7 +377,7 @@ const handleAction = (db: Database, req: WorkerRequest): WorkerOk => {
   }
 }
 
-const req = await Bun.stdin.json<WorkerRequest>()
+const req = (await Bun.stdin.json()) as WorkerRequest
 const db = openConnection(req.db, req.mode, req.attaches)
 try {
   const result = handleAction(db, req)

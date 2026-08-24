@@ -371,7 +371,7 @@ const fileIndexLayer = LayerNode.compile(FileIndex.node, [
   [Global.node, boundGlobal],
 ])
 const fileIndexRt = ManagedRuntime.make(fileIndexLayer)
-const runIndex = <A>(effect: Effect.Effect<A, unknown, never>) => fileIndexRt.runPromise(effect as never) as Promise<A>
+const runIndex = <A>(effect: Effect.Effect<A, unknown, any>) => fileIndexRt.runPromise(effect as unknown as Effect.Effect<A, unknown, never>) as Promise<A>
 
 async function benchFileIndex() {
   console.log(`\n[G] FileIndex service (dir=${BENCH_DIR})`)

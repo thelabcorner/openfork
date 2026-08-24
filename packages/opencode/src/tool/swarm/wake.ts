@@ -22,7 +22,7 @@ export function wake(
   rawInput: WakeInput,
   ctx: { coordinator: { model: { providerID: string; modelID: string } } },
 ): Effect.Effect<WakeToolResult, Error> {
-  const input = normalizeSwarmId(rawInput as unknown as Record<string, unknown>) as WakeInput
+  const input = normalizeSwarmId(rawInput as unknown as Record<string, unknown>) as unknown as WakeInput
   return Effect.gen(function* () {
     const swarm = yield* resolveSwarmTarget(store, input.swarmId, {
       coordinator: ctx.coordinator,

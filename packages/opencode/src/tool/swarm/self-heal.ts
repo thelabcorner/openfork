@@ -99,17 +99,19 @@ export function resolveSwarmTarget(
   store: SwarmStore,
   ref: string,
   opts: { coordinator: CoordinatorContext; createIfMissing?: boolean; autoRevive?: boolean },
-): Effect.Effect<SwarmTarget, Error> {
+): Effect.Effect<SwarmTarget, Error, never> {
   return Effect.gen(function* () {
-    const existing = yield* store.getByNameOrId(ref)
+    const existing = (yield* store.getByNameOrId(ref) as Effect.Effect<SwarmTarget | undefined, never, never>)
     if (!existing) {
-      if (opts.createIfMissing) return yield* store.create(ref, {})
+      if (opts.createIfMissing) return yield* store.create(ref, {}) as Effect.Effect<SwarmTarget, never, never>
       return yield* Effect.fail(new SwarmNotFoundError(ref))
     }
     if (isArchived(existing) && (opts.autoRevive ?? true)) {
-      return yield* store
-        .revive(existing, { strategy: "keep", includeStopped: true })
-        .pipe(Effect.catchAll(() => Effect.fail(archivedError(ref))))
+      const revived = yield* (store
+        .revive(existing, { strategy: "keep", includeStopped: true }) as Effect.Effect<SwarmTarget, never, never>).pipe(
+        Effect.catch(() => Effect.fail(archivedError(ref))),
+      )
+      return revived
     }
     if (isArchived(existing)) {
       return yield* Effect.fail(archivedError(ref))
@@ -269,7 +271,7 @@ export function spawnMembersAtomic(
       yield* store.spawnOne(swarm, m)
       spawned.push(m.name)
     }
-    return { spawned, skipped, evicted, recovered }
+    return { spawned, skipped, evicted, recovered: recovered.recovered }
   })
 }
 
@@ -277,7 +279,7 @@ export function wakeMemberSelfHeal(
   store: SwarmStore,
   swarm: SwarmTarget,
   name: string,
-): Effect.Effect<{ before: MemberStatus | undefined; status: string; recovered: boolean }> {
+): Effect.Effect<{ before: MemberStatus | undefined; status: string; recovered: boolean }, MemberNotFoundError, never> {
   return Effect.gen(function* () {
     const members = yield* store.listMembers(swarm)
     const m = members.find((x) => x.name === name)

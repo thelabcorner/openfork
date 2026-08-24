@@ -1,6 +1,7 @@
-import { Effect } from "effect"
+import { Effect, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+import * as AppProcess from "@opencode-ai/core/process"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
 
@@ -47,14 +48,14 @@ const findBun = Effect.fn("SqliteSubprocess.findBun")(function* () {
   for (const candidate of candidates) {
     const probe = yield* Effect.scoped(
       Effect.gen(function* () {
-        const handle = yield* (yield* ChildProcessSpawner.ChildProcessSpawner).spawn(
+        const handle = yield* (yield* ChildProcessSpawner).spawn(
           ChildProcess.make(candidate, ["--version"], { stdin: "ignore", stdout: "pipe", stderr: "pipe" }),
         )
-        const out = yield* handle.stdout.pipeToEffect()
-        const code = yield* handle.exitCode.pipe(Effect.catch(() => Effect.succeed(1)))
-        return { out: out.trim(), code }
+        const out = yield* AppProcess.collectStream(handle.stdout, undefined).pipe(Effect.map((r) => r.buffer.toString("utf8").trim()))
+        const code = yield* handle.exitCode.pipe(Effect.catch(() => Effect.succeed(1 as const)))
+        return { out, code }
       }),
-    ).pipe(Effect.catch(() => Effect.succeed({ out: "", code: 1 })))
+    ).pipe(Effect.catch(() => Effect.succeed({ out: "", code: 1 as const })))
     if (probe.code === 0 && probe.out.length > 0) return candidate
   }
   throw new Error("Bun runtime not found — install Bun (https://bun.sh) or run opencode under Bun")
@@ -65,48 +66,40 @@ export const runRemoteAction = Effect.fn("SqliteSubprocess.runRemoteAction")(fun
   req: WorkerRequest,
   abort: AbortSignal,
 ) {
-  const bunPath = yield* findBun
+  const bunPath = yield* findBun()
 
   const input = JSON.stringify(req)
 
   const handle = yield* spawner.spawn(
     ChildProcess.make(bunPath, ["run", workerPath], {
-      stdin: "pipe",
+      stdin: Stream.make(new TextEncoder().encode(input)),
       stdout: "pipe",
       stderr: "pipe",
       env: { ...process.env },
     }),
   )
 
-  const abortFiber = yield* Effect.forkScoped(
-    Effect.callback(() => {
+  yield* Effect.forkScoped(
+    Effect.callback<void>((resume) => {
       if (abort.aborted) {
-        return handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+        resume(Effect.flatMap(handle.kill({ forceKillAfter: "3 seconds" as const }), () => Effect.void).pipe(Effect.orDie))
+        return
       }
-      return Effect.sync(() => {
-        abort.addEventListener(
-          "abort",
-          () => {
-            handle.kill({ forceKillAfter: "3 seconds" }).ignore()
-          },
-          { once: true },
-        )
-      })
+      const onabort = () => {
+        Effect.runFork(handle.kill({ forceKillAfter: "3 seconds" as const }).pipe(Effect.ignore))
+      }
+      abort.addEventListener("abort", onabort, { once: true })
+      return Effect.sync(() => abort.removeEventListener("abort", onabort))
     }),
   )
 
-  const writeEffect = Effect.sync(() => {
-    const writer = handle.stdin
-    if (!writer) return
-    writer.write(input)
-    writer.end()
-  })
-
-  yield* writeEffect
-
-  const stdout = yield* handle.stdout.pipeToEffect()
-  const stderr = yield* handle.stderr.pipeToEffect()
-  const exitCode = yield* handle.exitCode.pipe(Effect.catch(() => Effect.succeed(null)))
+  const [stdoutBuf, stderrBuf] = yield* Effect.all(
+    [AppProcess.collectStream(handle.stdout, undefined), AppProcess.collectStream(handle.stderr, undefined)],
+    { concurrency: "unbounded" },
+  )
+  const stdout = stdoutBuf.buffer.toString("utf8")
+  const stderr = stderrBuf.buffer.toString("utf8")
+  const exitCode = yield* handle.exitCode.pipe(Effect.catch(() => Effect.succeed(null as unknown as number)))
 
   const trimmed = stdout.trim()
   if (trimmed === "") {

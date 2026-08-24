@@ -24,7 +24,7 @@ export function reply(
   rawInput: PermissionsReplyInput,
   ctx: { coordinator: { model: { providerID: string; modelID: string } } },
 ): Effect.Effect<PermissionsResult, Error> {
-  const input = normalizeSwarmId(rawInput as unknown as Record<string, unknown>) as PermissionsReplyInput
+  const input = normalizeSwarmId(rawInput as unknown as Record<string, unknown>) as unknown as PermissionsReplyInput
   return Effect.gen(function* () {
     const swarm = yield* resolveSwarmTarget(store, input.swarmId, {
       coordinator: ctx.coordinator,

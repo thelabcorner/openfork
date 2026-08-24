@@ -24,7 +24,7 @@ export function spawn(
   rawInput: SpawnInput,
   ctx: { coordinator: { model: { providerID: string; modelID: string } } },
 ): Effect.Effect<SpawnToolResult, Error> {
-  const input = normalizeSwarmId(rawInput as unknown as Record<string, unknown>) as SpawnInput
+  const input = normalizeSwarmId(rawInput as unknown as Record<string, unknown>) as unknown as SpawnInput
   return Effect.gen(function* () {
     let swarm
     try {
