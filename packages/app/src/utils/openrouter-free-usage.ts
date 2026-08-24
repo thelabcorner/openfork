@@ -62,7 +62,7 @@ type CacheEntry = { version: number; fetchedAt: number; report: FreeUsageReport 
 
 const CACHE_TTL_MS = 15_000
 const NEGATIVE_TTL_MS = 5 * 60_000
-const CACHE_VERSION = 1
+const CACHE_VERSION = 3
 
 const memoryCache = new Map<string, CacheEntry>()
 const inflight = new Map<string, Promise<FreeUsageReport | undefined>>()
@@ -77,7 +77,8 @@ const cacheKey = (includeValue: boolean) => `opencode.openrouter-free-usage.v1.i
 function readCache(includeValue: boolean): CacheEntry | undefined {
   const key = cacheKey(includeValue)
   const mem = memoryCache.get(key)
-  if (mem) return mem
+  if (mem?.version === CACHE_VERSION) return mem
+  if (mem) memoryCache.delete(key)
   if (typeof localStorage === "undefined") return undefined
   try {
     const raw = localStorage.getItem(key)
@@ -102,7 +103,8 @@ function writeCache(includeValue: boolean, entry: CacheEntry) {
 function readNegative(includeValue: boolean): NegativeEntry | undefined {
   const key = `${cacheKey(includeValue)}:negative`
   const mem = negativeCache.get(key)
-  if (mem) return mem
+  if (mem?.version === CACHE_VERSION) return mem
+  if (mem) negativeCache.delete(key)
   if (typeof localStorage === "undefined") return undefined
   try {
     const raw = localStorage.getItem(key)

@@ -125,3 +125,68 @@ export function worstRemainingFromWindows(windows: Array<[string, { usedPercent:
   }
   return worst
 }
+
+const FORK_WINDOW_SECONDS: Record<string, number> = { "5h": 18_000, week: 604_800, month: 2_592_000 }
+
+/**
+ * Tiered-limit gate: a provider is usable up to its MOST constrained
+ * percent window — an empty weekly blocks even a fresh 5h. Model-scoped
+ * windows (`weekly:<model>`) gate only that model and never the provider.
+ * Balance-only rows (null percents) never gate.
+ */
+export interface TierGate {
+  effectiveRemaining: number | null
+  bindingKey: string | null
+}
+
+export function resolveTierGate(
+  windows: Array<[string, { usedPercent: number | null; remainingPercent: number | null; windowSeconds: number | null }]>,
+): TierGate {
+  let effective: number | null = null
+  let bindingKey: string | null = null
+  let bindingSeconds = -1
+  for (const [key, w] of windows) {
+    if (key.startsWith("weekly:")) continue
+    const r = w.remainingPercent ?? (w.usedPercent !== null ? 100 - w.usedPercent : null)
+    if (r === null || !Number.isFinite(r)) continue
+    const secs = w.windowSeconds ?? Number.MAX_SAFE_INTEGER
+    const wins = effective === null || r < effective || (r === effective && secs > bindingSeconds)
+    if (!wins) continue
+    effective = r
+    bindingKey = key
+    bindingSeconds = secs
+  }
+  return { effectiveRemaining: effective, bindingKey }
+}
+
+export type GateState = "binding" | "gated" | "normal"
+
+export function tierGateState(key: string, remaining: number | null, gate: TierGate): GateState {
+  if (gate.bindingKey === null || gate.effectiveRemaining === null) return "normal"
+  if (key === gate.bindingKey) return "binding"
+  return remaining !== null && remaining > gate.effectiveRemaining ? "gated" : "normal"
+}
+
+/** Maps a `/fork/usage` ForkWindowUsage onto the pane's normalized UsageWindow. */
+export function forkWindowToUsageWindow(w: {
+  label: string
+  spentUSD: number
+  limitUSD: number
+  estimatedPercent?: number
+  resetsAt: number
+}): UsageWindow {
+  const used =
+    typeof w.estimatedPercent === "number"
+      ? Math.max(0, Math.min(100, w.estimatedPercent))
+      : w.limitUSD > 0
+        ? Math.max(0, Math.min(100, (w.spentUSD / w.limitUSD) * 100))
+        : null
+  return {
+    usedPercent: used,
+    remainingPercent: used !== null ? Math.max(0, Math.min(100, 100 - used)) : null,
+    windowSeconds: FORK_WINDOW_SECONDS[w.label] ?? null,
+    resetAt: w.resetsAt,
+    resetAfterSeconds: null,
+    valueLabel: null,
+  }
+}

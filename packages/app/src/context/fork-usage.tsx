@@ -1,6 +1,5 @@
 import { createSimpleContext } from "@opencode-ai/ui/context"
-import { createResource, onCleanup } from "solid-js"
-import { trackPending } from "@/utils/pending-work"
+import { createResource, createSignal, onCleanup, onMount } from "solid-js"
 import { useServerSDK } from "@/context/server-sdk"
 import { ForkClient, type ForkServer } from "@/utils/fork-client"
 
@@ -26,16 +25,22 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
     const serverSDK = useServerSDK()
     const server = (): ForkServer => serverSDK().server.http
     const heartbeatMs = props.heartbeatMs ?? HEARTBEAT_MS
+    const [armed, setArmed] = createSignal(false)
+    onMount(() => {
+      const timer = window.setTimeout(() => setArmed(true), 800)
+      onCleanup(() => window.clearTimeout(timer))
+    })
 
-    // SWR-style resources: keep the last value while a refetch is in flight.
-    const [credentials, { refetch: refetchCredentials }] = createResource(() => {
-      const done = trackPending("fork.credentials")
-      return ForkClient.list(server()).finally(done)
-    })
-    const [usage, { refetch: refetchUsage }] = createResource(() => {
-      const done = trackPending("fork.usage")
-      return ForkClient.usage(server()).finally(done)
-    })
+    const [credentials, { refetch: refetchCredentials }] = createResource(
+      () => (armed() ? server() : undefined),
+      (value) => ForkClient.list(value),
+      { initialValue: undefined },
+    )
+    const [usage, { refetch: refetchUsage }] = createResource(
+      () => (armed() ? server() : undefined),
+      (value) => ForkClient.usage(value),
+      { initialValue: undefined },
+    )
 
     // SSE: refetch local usage shortly after a step finishes (session.status
     // flips to idle at step-finish), and refresh everything on reconnect.

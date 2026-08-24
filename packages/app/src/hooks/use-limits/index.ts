@@ -1,34 +1,70 @@
 import { createMemo, createResource, createSignal, onCleanup } from "solid-js"
+import type { Accessor } from "solid-js"
 import { useServerSDK } from "@/context/server-sdk"
 import { useForkUsage } from "@/context/fork-usage"
 import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
 import {
   toneForRemaining,
-  colorForTone,
-  formatPercent,
-  displayWindowLabel,
   sortWindows,
+  resolveTierGate,
   worstRemainingFromWindows,
+  type TierGate,
+  type UsageWindow,
+  type ProviderResult,
 } from "@/utils/limits-format"
-import type { UsageWindow, ProviderResult } from "@/utils/limits-format"
 
 export interface LimitProvider {
   result: ProviderResult
   windowsSorted: [string, UsageWindow][]
   worstRemaining: number | null
   tone: ReturnType<typeof toneForRemaining>
+  gate: TierGate
 }
 
-export function useLimits() {
+const COOLDOWN_MS = 30_000
+
+/**
+ * Dedicated limits-system hook: owns provider fetching, filtering
+ * (configured-only), sorting, enrichment (worst-remaining + tone), the
+ * refresh cooldown, and Go multi-key / OpenRouter-free merges. The pane is a
+ * pure projection.
+ */
+export function useLimits(options?: { now?: Accessor<number> }) {
+  const now = options?.now ?? Date.now
   const sdk = useServerSDK()
   const forkUsage = useForkUsage()
-  const openRouterFree = useOpenRouterFreeUsage({ enabled: true })
+  // Shared singleton poller — adds no extra network traffic.
+  const freeUsage = useOpenRouterFreeUsage()
+
   const [tick, setTick] = createSignal(0)
   const [lastRefreshedAt, setLastRefreshedAt] = createSignal(0)
+  const [lastRateLimitedAt, setLastRateLimitedAt] = createSignal(0)
 
-  const COOLDOWN_MS = 30_000
-  const cooldownRemaining = () => Math.max(0, COOLDOWN_MS - (Date.now() - lastRefreshedAt()))
-  const isCoolingDown = () => cooldownRemaining() > 0
+  const CLAUDE_429_BACKOFF_MS = 180_000 // 3 min backoff after 429 for Claude
+
+  const cooldownRemainingMs = () => {
+    const base = Math.max(0, COOLDOWN_MS - (now() - lastRefreshedAt()))
+    const since429 = now() - lastRateLimitedAt()
+    const claudeBackoff = lastRateLimitedAt() > 0 ? Math.max(0, CLAUDE_429_BACKOFF_MS - since429) : 0
+    return Math.max(base, claudeBackoff)
+  }
+  const isCoolingDown = () => cooldownRemainingMs() > 0
+
+  const lastGoodQuotas = new Map<string, ProviderResult>()
+  const isRateLimited = (error?: string | null) => !!error && /429|rate.?limit/i.test(error)
+
+  const getEffectiveResult = (r: ProviderResult): ProviderResult => {
+    if (r.ok || !isRateLimited(r.error)) return r
+    const prev = lastGoodQuotas.get(r.providerId)
+    if (prev && prev.usage) {
+      return {
+        ...prev,
+        ok: false,
+        error: r.error,
+      }
+    }
+    return r
+  }
 
   const [providersRes] = createResource(
     () => tick(),
@@ -37,68 +73,104 @@ export function useLimits() {
       return response.data as { providers: Array<{ providerId: string; providerName: string; configured: boolean }> }
     },
   )
+  const providerData = createMemo(() => {
+    if (providersRes.state !== "ready" && providersRes.state !== "refreshing") return undefined
+    const latest = providersRes.latest
+    if (!latest) return undefined
+    // Claude Code is a machine account. Always surface it (and force configured)
+    // regardless of what the server reports. The presence of local creds on the
+    // backend is authoritative for visibility.
+    const hasClaude = latest.providers.some((p) => p.providerId === "claude")
+    const providers = hasClaude
+      ? latest.providers.map((p) => (p.providerId === "claude" ? { ...p, configured: true } : p))
+      : [...latest.providers, { providerId: "claude", providerName: "Claude", configured: true }]
+    return { providers }
+  })
 
   const [quotasRes] = createResource(
     () => {
-      const data = providersRes()
+      const data = providerData()
       void tick()
       return data ? { providers: data.providers, tick: tick() } : undefined
     },
     async (input) => {
-      if (!input) return []
-      const list = input.providers
       const results = await Promise.all(
-        list.map(async (entry) => {
+        input.providers.map(async (entry) => {
           try {
             const response = await sdk().client.quota.get({ providerID: entry.providerId }, { throwOnError: false })
             return response.data as ProviderResult
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error)
+          } catch (err) {
             return {
               providerId: entry.providerId,
               providerName: entry.providerName,
               ok: false,
               configured: entry.configured,
-              error: message,
+              error: err instanceof Error ? err.message : String(err),
               usage: null,
               fetchedAt: Date.now(),
             } as ProviderResult
           }
         }),
       )
+      results.forEach((r) => {
+        if (r.ok && r.usage) {
+          lastGoodQuotas.set(r.providerId, r)
+        }
+        if (r.ok && r.providerId === "claude") {
+          setLastRateLimitedAt(0)
+        } else if (!r.ok && isRateLimited(r.error) && r.providerId === "claude") {
+          setLastRateLimitedAt(Date.now())
+        }
+      })
       return results
     },
   )
 
-  const providers = createMemo(() => {
-    const raw = quotasRes()
+  // THE hide-not-connected rule — single choke point.
+  const connected = createMemo(() => {
+    if (quotasRes.state !== "ready" && quotasRes.state !== "refreshing") return undefined
+    const raw = quotasRes.latest
     if (!raw) return undefined
-    // Filter: hide not-connected providers (configured === false)
-    const connected = raw.filter((r) => r.configured)
-    return connected.sort((a, b) => {
-      if (a.configured !== b.configured) return a.configured ? -1 : 1
-      if (a.ok !== b.ok) return a.ok ? -1 : 1
-      return (a.providerName ?? a.providerId).localeCompare(b.providerName ?? b.providerId)
-    })
+    return raw.filter((r) => r.configured)
+  })
+
+  const providers = createMemo<LimitProvider[] | undefined>(() => {
+    const list = connected()
+    if (!list) return undefined
+    return list
+      .map((r) => {
+        const effective = getEffectiveResult(r)
+        const windowsSorted = effective.usage ? sortWindows(Object.entries(effective.usage.windows) as [string, UsageWindow][]) : []
+        const gate = resolveTierGate(windowsSorted)
+        const worstRemaining = effective.usage ? (gate.effectiveRemaining ?? worstRemainingFromWindows(windowsSorted)) : null
+        return { result: effective, windowsSorted, worstRemaining, tone: toneForRemaining(worstRemaining), gate }
+      })
+      .sort((a, b) => {
+        if (a.result.ok !== b.result.ok) return a.result.ok ? -1 : 1
+        return a.result.providerName.localeCompare(b.result.providerName)
+      })
   })
 
   const isLoading = () => providersRes.loading || quotasRes.loading
   const hasError = () => Boolean(providersRes.error || quotasRes.error)
+  const error = () => (providersRes.error ?? quotasRes.error) as unknown
+
+  const goByCredential = () => forkUsage.usage.latest?.byCredential ?? []
+  const goAggregate = () => forkUsage.usage.latest?.aggregate ?? []
+  const goCredentials = () => forkUsage.credentials.latest ?? []
+  const openRouterFree = () => freeUsage.data()
 
   const refresh = () => {
     if (isCoolingDown() || isLoading()) return
-    setLastRefreshedAt(Date.now())
+    setLastRefreshedAt(now())
     setTick((v) => v + 1)
+    freeUsage.refresh()
   }
 
-  // Auto-refresh on focus (debounced)
   const onFocus = () => {
-    if (document.hidden) return
-    if (isCoolingDown()) return
+    if (document.hidden || isCoolingDown()) return
     setTimeout(() => {
-      if (isCoolingDown()) return
-      setLastRefreshedAt(Date.now())
-      setTick((v) => v + 1)
+      if (!document.hidden && !isCoolingDown()) refresh()
     }, 200)
   }
   if (typeof window !== "undefined") {
@@ -106,36 +178,20 @@ export function useLimits() {
     onCleanup(() => window.removeEventListener("focus", onFocus))
   }
 
-  // Go multi-key data from ForkClient usage (reuse existing L1/L2 cache)
-  const goByCredential = () => {
-    const latest = forkUsage.usage.latest
-    if (!latest) return []
-    return latest.byCredential ?? []
-  }
-
-  // Enrich providers with sorted windows, tone, worstRemaining
-  const enrichedProviders = createMemo(() => {
-    const list = providers()
-    if (!list) return [] as LimitProvider[]
-    return list.map((r) => {
-      const windowsSorted = r.usage
-        ? sortWindows(Object.entries(r.usage.windows) as [string, UsageWindow][])
-        : []
-      const worst = r.usage ? worstRemainingFromWindows(windowsSorted) : null
-      const tone = toneForRemaining(worst)
-      return { result: r, windowsSorted, worstRemaining: worst, tone } as LimitProvider
-    })
-  })
-
   return {
-    providers: enrichedProviders,
+    providers,
     goByCredential,
-    openRouterFree: () => openRouterFree.data?.(),
+    goAggregate,
+    goCredentials,
+    openRouterFree,
     isLoading,
     hasError,
-    error: () => (providersRes.error ?? quotasRes.error) as unknown,
+    error,
     refresh,
     isCoolingDown,
-    cooldownRemainingMs: () => cooldownRemaining(),
+    cooldownRemainingMs,
   } as const
 }
+
+export type LimitsState = ReturnType<typeof useLimits>
+export type { Accessor }

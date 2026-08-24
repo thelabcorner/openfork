@@ -1,4 +1,4 @@
-import { createMemo, createResource, createSignal, For, Show, Switch, Match, onCleanup } from "solid-js"
+import { createMemo, createSignal, For, Show, Switch, Match, onCleanup } from "solid-js"
 import { ResizeHandle, type ResizeHandlePairSide } from "@opencode-ai/ui/resize-handle"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
@@ -7,9 +7,9 @@ import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { Spinner } from "@opencode-ai/ui/spinner"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { useLanguage } from "@/context/language"
-import { useServerSDK } from "@/context/server-sdk"
 import { useNow } from "@/hooks/use-now"
 import { useLimits } from "@/hooks/use-limits"
+import { FreeUsageBar } from "@/components/openrouter-free-usage-bar"
 import { LIMITS_PANEL_WIDTH_MAX, LIMITS_PANEL_WIDTH_MIN, type LimitsPanelState } from "./limits-panel-state"
 import {
   toneForRemaining,
@@ -21,32 +21,22 @@ import {
   formatCountdownSeconds,
   displayWindowLabel,
   sortWindows,
+  resolveTierGate,
+  tierGateState,
   worstRemainingFromWindows,
+  forkWindowToUsageWindow,
+  type TierGate,
+  type GateState,
+  type UsageWindow,
+  type ProviderResult,
 } from "@/utils/limits-format"
+import type { ForkCredentialInfo, ForkCredentialUsage, ForkWindowUsage } from "@/utils/fork-client"
+import type { FreeUsageReport } from "@/utils/openrouter-free-usage"
 
-type UsageWindow = {
-  usedPercent: number | null
-  remainingPercent: number | null
-  windowSeconds: number | null
-  resetAt: number | null
-  resetAfterSeconds: number | null
-  valueLabel: string | null
-}
-
-type ProviderResult = {
-  providerId: string
-  providerName: string
-  ok: boolean
-  configured: boolean
-  error?: string
-  planLabel?: string | null
-  usage: { windows: Record<string, UsageWindow>; models?: Record<string, { windows: Record<string, UsageWindow> }> } | null
-  fetchedAt: number
-}
-
-function WindowRow(props: { label: string; window: UsageWindow; now: number }) {
+function WindowRow(props: { label: string; window: UsageWindow; now: number; gateState?: GateState; gatedByLabel?: string }) {
   const language = useLanguage()
   const used = () => props.window.usedPercent
+  const isGated = () => props.gateState === "gated"
   const remaining = createMemo(() => {
     const r = props.window.remainingPercent
     if (r !== null && r !== undefined && Number.isFinite(r)) return formatRemainingPercent(r)
@@ -86,12 +76,30 @@ function WindowRow(props: { label: string; window: UsageWindow; now: number }) {
         </div>
       }
     >
-      <div class="flex flex-col gap-1.5 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-2">
-        {/* Row 1: label + countdown */}
+      <div class="flex flex-col gap-1.5 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-2" classList={{ "opacity-60": isGated() }}>
+        {/* Row 1: label + tier-gate tags + countdown */}
         <div class="flex items-center justify-between gap-2">
-          <span class="min-w-0 truncate text-[10px] font-[600] uppercase leading-3 tracking-[0.03em] text-v2-text-text-faint">
-            {displayWindowLabel(props.label, language.t)}
-          </span>
+          <div class="flex min-w-0 items-center gap-1.5">
+            <span class="min-w-0 truncate text-[10px] font-[600] uppercase leading-3 tracking-[0.03em] text-v2-text-text-faint">
+              {displayWindowLabel(props.label, language.t)}
+            </span>
+            <Show when={props.gateState === "binding"}>
+              <span
+                class="shrink-0 rounded px-1 py-0.5 text-[8px] font-[700] uppercase leading-none tracking-[0.04em]"
+                style={{
+                  color: colorForTone(tone()),
+                  "background-color": `color-mix(in srgb, ${colorForTone(tone())} 12%, transparent)`,
+                }}
+              >
+                {language.t("limits.gate.limiting")}
+              </span>
+            </Show>
+            <Show when={isGated() && props.gatedByLabel}>
+              <span class="hidden shrink-0 text-[8px] font-[520] uppercase leading-none tracking-[0.03em] text-v2-text-text-faint sm:inline">
+                · {language.t("limits.gate.cappedBy", { label: props.gatedByLabel! })}
+              </span>
+            </Show>
+          </div>
           <Show
             when={hasReset()}
             fallback={<span class="shrink-0 text-[9px] font-[440] leading-3 text-v2-text-text-faint">{language.t("limits.reset.never")}</span>}
@@ -154,15 +162,31 @@ function WindowRow(props: { label: string; window: UsageWindow; now: number }) {
   )
 }
 
-function ProviderCard(props: { result: ProviderResult; now: number }) {
+function ProviderCard(props: { result: ProviderResult; now: number; openRouterFree?: FreeUsageReport }) {
   const language = useLanguage()
   const windows = createMemo(() => {
     const usage = props.result.usage
     if (!usage) return [] as Array<[string, UsageWindow]>
     return sortWindows(Object.entries(usage.windows) as Array<[string, UsageWindow]>)
   })
-  const worstRemaining = createMemo(() => worstRemainingFromWindows(windows()))
+  const gate = createMemo<TierGate>(() => resolveTierGate(windows()))
+  const worstRemaining = createMemo(() => (gate().effectiveRemaining !== null ? gate().effectiveRemaining : worstRemainingFromWindows(windows())))
   const tone = createMemo(() => toneForRemaining(worstRemaining()))
+  const bindingKey = () => gate().bindingKey
+  // A provider is unusable while its most constrained tier sits at 0% —
+  // surface the moment that tier unlocks.
+  const blocked = () => worstRemaining() !== null && worstRemaining()! <= 0
+  const unlockSeconds = createMemo(() => {
+    if (!blocked()) return null
+    const binding = windows().find(([key]) => key === bindingKey())
+    const resetAt = binding?.[1].resetAt ?? null
+    if (resetAt === null) return null
+    return Math.max(0, Math.round((resetAt - props.now) / 1000))
+  })
+  const gatedByLabel = () => {
+    const key = bindingKey()
+    return key ? displayWindowLabel(key, language.t) : undefined
+  }
 
   return (
     <div class="flex flex-col overflow-hidden rounded-[8px] border border-v2-border-border-muted bg-v2-background-bg-base">
@@ -198,6 +222,20 @@ function ProviderCard(props: { result: ProviderResult; now: number }) {
           </div>
         </div>
         <div class="flex shrink-0 items-center gap-1.5">
+          <Show when={blocked() && unlockSeconds() !== null}>
+            <TooltipV2 value={language.t("limits.gate.blockedResetIn", { duration: formatCountdownSeconds(unlockSeconds()!, language.t) })}>
+              <span
+                class="flex items-center gap-1 rounded-md px-1.5 py-1 text-[9px] font-[600] leading-3 tabular-nums"
+                style={{
+                  color: "var(--v2-state-fg-danger)",
+                  "background-color": `color-mix(in srgb, var(--v2-state-fg-danger) 12%, transparent)`,
+                }}
+              >
+                <Icon name="outline-reset" size="small" class="size-3 shrink-0 opacity-80" />
+                {formatCountdownSeconds(unlockSeconds()!, language.t)}
+              </span>
+            </TooltipV2>
+          </Show>
           <Show when={worstRemaining() !== null}>
             <TooltipV2 value={`${formatPercent(worstRemaining(), language.intl())} ${language.t("limits.remainingLabel")}`}>
               <span
@@ -227,22 +265,215 @@ function ProviderCard(props: { result: ProviderResult; now: number }) {
               <div class="text-[10px] font-[500] leading-3 text-v2-text-text-muted">{language.t("limits.notConfiguredHint")}</div>
             </div>
           </Match>
-          <Match when={!props.result.ok}>
-            <div class="rounded-md border border-v2-border-border-muted bg-v2-state-bg-danger/40 px-2.5 py-2.5">
-              <div class="flex items-center gap-1.5 text-[10px] font-[600] leading-3 text-v2-state-fg-danger">
-                <Icon name="warning" size="small" class="size-3 shrink-0" />
-                {props.result.error ?? language.t("limits.error")}
-              </div>
-            </div>
-          </Match>
+           <Match when={!props.result.ok}>
+             <Show
+               when={windows().length > 0}
+               fallback={
+                 <div class="rounded-md border border-v2-border-border-muted bg-v2-state-bg-danger/40 px-2.5 py-2.5">
+                   <div class="flex items-center gap-1.5 text-[10px] font-[600] leading-3 text-v2-state-fg-danger">
+                     <Icon name="warning" size="small" class="size-3 shrink-0" />
+                     {props.result.error ?? language.t("limits.error")}
+                   </div>
+                 </div>
+               }
+             >
+               <For each={windows()}>
+                 {([key, w]) => {
+                   const remaining = w.remainingPercent ?? (w.usedPercent !== null ? 100 - w.usedPercent : null)
+                   return (
+                     <WindowRow
+                       label={key}
+                       window={w}
+                       now={props.now}
+                       gateState={tierGateState(key, remaining, gate())}
+                       gatedByLabel={gatedByLabel()}
+                     />
+                   )
+                 }}
+               </For>
+               <div class="mt-1 rounded bg-v2-state-bg-danger/30 px-2 py-1 text-[9px] font-[500] leading-3 text-v2-state-fg-danger">
+                 {props.result.error ?? language.t("limits.error")}
+               </div>
+             </Show>
+           </Match>
           <Match when={windows().length === 0}>
             <div class="px-2 py-3 text-center text-[10px] font-[440] leading-3 text-v2-text-text-faint">{language.t("limits.error")}</div>
           </Match>
           <Match when={true}>
-            <For each={windows()}>{([key, w]) => <WindowRow label={key} window={w} now={props.now} />}</For>
+            <For each={windows()}>
+              {([key, w]) => {
+                const remaining = w.remainingPercent ?? (w.usedPercent !== null ? 100 - w.usedPercent : null)
+                return (
+                  <WindowRow
+                    label={key}
+                    window={w}
+                    now={props.now}
+                    gateState={tierGateState(key, remaining, gate())}
+                    gatedByLabel={gatedByLabel()}
+                  />
+                )
+              }}
+            </For>
           </Match>
         </Switch>
+        <Show when={props.result.providerId === "openrouter" && props.openRouterFree}>
+          <FreeUsageBar report={props.openRouterFree!} />
+        </Show>
       </div>
+    </div>
+  )
+}
+
+function mapForkWindows(usage: ForkWindowUsage[]) {
+  return usage.map((w) => {
+    const mapped = forkWindowToUsageWindow(w)
+    const key = mapped.windowSeconds === 18_000 ? "5h" : mapped.windowSeconds === 604_800 ? "weekly" : "monthly"
+    return { key, mapped }
+  })
+}
+
+function GoKeySummary(props: { label: string; usage: ForkWindowUsage[]; active?: boolean }) {
+  const language = useLanguage()
+  const windows = createMemo(() => mapForkWindows(props.usage))
+  const gate = createMemo<TierGate>(() => resolveTierGate(windows().map(({ key, mapped }) => [key, mapped])))
+  const effectiveRemaining = () => gate().effectiveRemaining
+  const tone = () => toneForRemaining(effectiveRemaining())
+
+  return (
+    <div class="rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2 py-1.5">
+      <div class="flex items-center gap-2">
+        <span class="min-w-0 flex-1 truncate text-[10px] font-[560] leading-3 text-v2-text-text-base">{props.label}</span>
+        <Show when={props.active}>
+          <span class="rounded bg-v2-state-bg-success px-1 py-0.5 text-[8px] font-[600] uppercase leading-none text-v2-state-fg-success">
+            {language.t("dialog.credential.active")}
+          </span>
+        </Show>
+        <span
+          class="rounded px-1.5 py-0.5 text-[10px] font-[700] leading-3 tabular-nums"
+          style={{
+            color: colorForTone(tone()),
+            "background-color": `color-mix(in srgb, ${colorForTone(tone())} 12%, transparent)`,
+          }}
+        >
+          {formatPercent(effectiveRemaining(), language.intl())}
+        </span>
+      </div>
+      <div class="mt-1.5 grid grid-cols-3 gap-1 border-t border-v2-border-border-muted pt-1.5">
+        <For each={windows()}>
+          {({ key, mapped }) => {
+            const remaining = mapped.remainingPercent ?? (mapped.usedPercent !== null ? 100 - mapped.usedPercent : null)
+            return (
+              <div class="min-w-0 rounded bg-v2-background-bg-base px-1.5 py-1">
+                <div class="truncate text-[8px] font-[600] uppercase leading-3 tracking-[0.04em] text-v2-text-text-faint">
+                  {displayWindowLabel(key, language.t)}
+                </div>
+                <div class="mt-0.5 text-[11px] font-[650] leading-3 tabular-nums" style={{ color: colorForTone(toneForRemaining(remaining)) }}>
+                  {formatPercent(remaining, language.intl())}
+                </div>
+              </div>
+            )
+          }}
+        </For>
+      </div>
+    </div>
+  )
+}
+
+function GoAggregateCard(props: {
+  aggregate: ForkWindowUsage[]
+  byCredential: ForkCredentialUsage[]
+  credentials: ForkCredentialInfo[]
+  now: number
+}) {
+  const language = useLanguage()
+  const aggregateWindows = createMemo(() => mapForkWindows(props.aggregate))
+  const aggregateGate = createMemo<TierGate>(() => resolveTierGate(aggregateWindows().map(({ key, mapped }) => [key, mapped])))
+  const aggregateRemaining = () => aggregateGate().effectiveRemaining
+  const aggregateTone = () => toneForRemaining(aggregateRemaining())
+  const [keysExpanded, setKeysExpanded] = createSignal(true)
+  const keyCount = () => Math.max(props.credentials.length, props.byCredential.length)
+
+  return (
+    <div class="overflow-hidden rounded-lg border border-v2-border-border-muted bg-v2-background-bg-base shadow-sm">
+      <div class="flex items-center gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-2">
+        <ProviderIcon id="opencode-go" class="size-4 shrink-0 opacity-80" />
+        <div class="min-w-0 flex-1">
+          <div class="flex items-center gap-1.5">
+            <span class="truncate text-[11px] font-[600] leading-3 text-v2-text-text-base">OpenCode Go</span>
+            <span class="rounded bg-v2-background-bg-layer-03 px-1 py-0.5 text-[8px] font-[600] uppercase leading-none tracking-[0.03em] text-v2-text-text-faint">
+              {language.t("limits.go.aggregate")}
+            </span>
+          </div>
+          <span class="text-[9px] font-[440] leading-3 text-v2-text-text-faint">
+            {language.t("limits.go.keys", { count: keyCount(), plural: keyCount() === 1 ? "" : "s" })}
+          </span>
+        </div>
+        <span
+          class="rounded-md px-1.5 py-1 text-[11px] font-[700] leading-3 tabular-nums"
+          style={{
+            color: colorForTone(aggregateTone()),
+            "background-color": `color-mix(in srgb, ${colorForTone(aggregateTone())} 12%, transparent)`,
+            border: `1px solid color-mix(in srgb, ${colorForTone(aggregateTone())} 18%, transparent)`,
+          }}
+        >
+          {formatPercent(aggregateRemaining(), language.intl())}
+        </span>
+      </div>
+
+      <div class="flex flex-col gap-1.5 p-2">
+        <div class="flex items-center justify-between px-0.5">
+          <span class="text-[9px] font-[600] uppercase leading-3 tracking-[0.05em] text-v2-text-text-faint">
+            {language.t("limits.go.aggregate")}
+          </span>
+          <Show when={aggregateGate().bindingKey}>
+            <span class="text-[9px] leading-3 text-v2-text-text-faint">
+              {language.t("limits.gate.cappedBy", { label: displayWindowLabel(aggregateGate().bindingKey!, language.t) })}
+            </span>
+          </Show>
+        </div>
+        <For each={aggregateWindows()}>
+          {({ key, mapped }) => (
+            <WindowRow
+              label={key}
+              window={mapped}
+              now={props.now}
+              gateState={tierGateState(key, mapped.remainingPercent, aggregateGate())}
+              gatedByLabel={aggregateGate().bindingKey ? displayWindowLabel(aggregateGate().bindingKey!, language.t) : undefined}
+            />
+          )}
+        </For>
+      </div>
+
+      <Show when={props.byCredential.length > 0}>
+        <div class="border-t border-v2-border-border-muted">
+          <button
+            type="button"
+            class="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-[9px] font-[600] uppercase leading-3 tracking-[0.05em] text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover"
+            aria-expanded={keysExpanded()}
+            onClick={() => setKeysExpanded((value) => !value)}
+          >
+            <Icon name="chevron-down" size="small" class={`size-3 transition-transform ${keysExpanded() ? "" : "-rotate-90"}`} />
+            <span>{language.t("limits.go.perKey")}</span>
+            <span class="font-[440] normal-case tracking-normal">{keyCount()}</span>
+          </button>
+          <Show when={keysExpanded()}>
+            <div class="flex flex-col gap-1.5 px-2 pb-2">
+              <For each={props.byCredential}>
+                {(credential) => {
+                  const info = props.credentials.find((item) => item.id === credential.credentialID)
+                  return (
+                    <GoKeySummary
+                      label={info?.label ?? credential.credentialID}
+                      usage={credential.windows}
+                      active={info?.active}
+                    />
+                  )
+                }}
+              </For>
+            </div>
+          </Show>
+        </div>
+      </Show>
     </div>
   )
 }
@@ -250,11 +481,24 @@ function ProviderCard(props: { result: ProviderResult; now: number }) {
 function LimitsPanelContent() {
   const language = useLanguage()
   const now = useNow()
-  const { providers, goByCredential, openRouterFree, isLoading, hasError, error, refresh, isCoolingDown, cooldownRemainingMs } = useLimits()
+  const { providers, goAggregate, goByCredential, goCredentials, openRouterFree, isLoading, hasError, error, refresh, isCoolingDown, cooldownRemainingMs } = useLimits({ now })
 
   const sortedQuotas = providers
-  const atRiskCount = createMemo(() => {
+  const showGoAggregate = createMemo(() => goAggregate().length > 0 || goByCredential().length > 0)
+  const goAggregateAtRisk = createMemo(() => {
+    if (!showGoAggregate()) return false
+    const windows = mapForkWindows(goAggregate())
+    const remaining = resolveTierGate(windows.map(({ key, mapped }) => [key, mapped])).effectiveRemaining
+    return remaining !== null && remaining <= 30
+  })
+  const displayedQuotas = createMemo(() => {
     const list = sortedQuotas()
+    if (!list) return undefined
+    if (!showGoAggregate()) return list
+    return list.filter((provider) => provider.result.providerId !== "opencode-go")
+  })
+  const atRiskCount = createMemo(() => {
+    const list = displayedQuotas()
     if (!list || list.length === 0) return 0
     let count = 0
     for (const provider of list) {
@@ -267,11 +511,8 @@ function LimitsPanelContent() {
         }
       }
     }
-    return count
+    return count + (goAggregateAtRisk() ? 1 : 0)
   })
-
-  const refreshButtonDisabled = () => isCoolingDown() || isLoading()
-  const refreshClick = () => refresh()
 
   const onFocus = () => {
     if (document.hidden) return
@@ -298,7 +539,7 @@ function LimitsPanelContent() {
             when={!isLoading() && sortedQuotas()}
             fallback={<div class="text-[11px] font-[500] leading-3 text-v2-text-text-muted">{language.t("limits.loading")}</div>}
           >
-            <div class="flex items-center gap-1.5 text-[11px] font-[440] leading-3">
+             <div class="flex items-center gap-1.5 text-[11px] font-[440] leading-3">
               <Show
                 when={atRiskCount() === 0}
                 fallback={<span class="font-[520] text-v2-state-fg-warning">{language.t("limits.attentionNeeded", { count: atRiskCount(), plural: atRiskCount() === 1 ? "" : "s" })}</span>}
@@ -306,7 +547,7 @@ function LimitsPanelContent() {
                 <span class="text-v2-text-text-faint">{language.t("limits.allHealthy")}</span>
               </Show>
               <span class="text-v2-text-text-faint">·</span>
-              <span class="tabular-nums text-v2-text-text-muted">{sortedQuotas()!.length} providers</span>
+               <span class="tabular-nums text-v2-text-text-muted">{displayedQuotas()!.length + (showGoAggregate() ? 1 : 0)} providers</span>
             </div>
           </Show>
         </div>
@@ -351,13 +592,29 @@ function LimitsPanelContent() {
                 </button>
               </div>
             </Match>
-            <Match when={sortedQuotas() && sortedQuotas()!.length === 0}>
+             <Match when={displayedQuotas() && displayedQuotas()!.length === 0 && !showGoAggregate()}>
               <div class="rounded-md border border-dashed border-v2-border-border-muted bg-v2-background-bg-layer-01 px-3 py-8 text-center text-[11px] font-[440] text-v2-text-text-faint">
                 {language.t("limits.empty")}
               </div>
             </Match>
-            <Match when={sortedQuotas()}>
-              <For each={sortedQuotas()!}>{(provider) => <ProviderCard result={provider.result} now={now()} />}</For>
+             <Match when={displayedQuotas()}>
+               <For each={displayedQuotas()}>
+                {(provider) => (
+                  <ProviderCard
+                    result={provider.result}
+                    now={now()}
+                    openRouterFree={provider.result.providerId === "openrouter" ? openRouterFree() : undefined}
+                  />
+                 )}
+               </For>
+               <Show when={showGoAggregate()}>
+                 <GoAggregateCard
+                   aggregate={goAggregate()}
+                   byCredential={goByCredential()}
+                   credentials={goCredentials()}
+                   now={now()}
+                 />
+               </Show>
               <div class="px-1 pt-1 text-[9px] font-[440] leading-3 text-v2-text-text-faint">
                 {language.t("limits.subtitle")} · <span class="tabular-nums">{formatAge(sortedQuotas()![0]?.result?.fetchedAt ?? Date.now(), now(), language.t)}</span> ago
               </div>
@@ -379,7 +636,8 @@ export function LimitsPanel(props: {
   return (
     <div
       id="limits-panel"
-      class="flex h-full min-h-0 shrink-0 flex-col overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)] contain-strict"
+      class="flex h-full min-h-0 shrink-0 self-stretch flex-col overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)] contain-strict"
+      classList={{ hidden: !props.opened }}
       style={{ width: `${props.state.sidebarWidth()}px` }}
       data-limits-panel
     >
