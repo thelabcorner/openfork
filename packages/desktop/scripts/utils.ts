@@ -102,6 +102,17 @@ export async function downloadCliToResources() {
   console.log(`Copied ${cli.package} to ${dest}`)
 }
 
+export async function buildLocalCliToResources() {
+  const target = `opencode-${process.platform === "win32" ? "windows" : process.platform}-${process.arch}`
+  await $`bun run --cwd ../opencode build --single --skip-install --skip-embed-web-ui`
+
+  const source = windowsify(`../opencode/dist/${target}/bin/opencode`)
+  const destination = windowsify("resources/opencode-cli")
+  await copyFile(source, destination)
+  await Bun.write("resources/opencode-cli.version", `local-${Date.now()}`)
+  console.log(`Copied local OpenFork CLI from ${source} to ${destination}`)
+}
+
 export function windowsify(path: string) {
   if (path.endsWith(".exe")) return path
   return `${path}${process.platform === "win32" ? ".exe" : ""}`

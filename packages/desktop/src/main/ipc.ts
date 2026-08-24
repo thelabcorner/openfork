@@ -1,6 +1,8 @@
 import { execFile } from "node:child_process"
 import { stat } from "node:fs/promises"
 import { basename, join } from "node:path"
+import { constants, brotliCompress } from "node:zlib"
+import { promisify } from "node:util"
 import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron"
 import type { IpcMainEvent, IpcMainInvokeEvent } from "electron"
 import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
@@ -98,6 +100,17 @@ export function registerIpcHandlers(deps: Deps) {
   ipcMain.handle("updater-install", () => deps.updater.install())
   ipcMain.handle("set-background-color", (_event: IpcMainInvokeEvent, color: string) => deps.setBackgroundColor(color))
   ipcMain.handle("export-debug-logs", () => deps.exportDebugLogs())
+  // Callback-based zlib runs on the libuv threadpool, so compressing large
+  // session exports never blocks the main loop (a sync q2 pass on a ~55MB
+  // transcript costs ~300ms — enough to stall window chrome).
+  const brotliCompressAsync = promisify(brotliCompress)
+  ipcMain.handle("compress-export", (_event: IpcMainInvokeEvent, json: string) => {
+    const rawBytes = Buffer.byteLength(json, "utf8")
+    const quality = rawBytes < 1024 * 1024 ? 5 : 2
+    return brotliCompressAsync(json, {
+      params: { [constants.BROTLI_PARAM_QUALITY]: quality, [constants.BROTLI_PARAM_SIZE_HINT]: rawBytes },
+    })
+  })
   ipcMain.handle("set-force-focus", (event: IpcMainInvokeEvent, enabled: boolean) =>
     setForceFocus(event.sender, enabled),
   )
@@ -138,8 +151,11 @@ export function registerIpcHandlers(deps: Deps) {
     try {
       const store = getStore(name)
       const entries: Record<string, string> = {}
+      const max = 64 * 1024
       for (const [key, value] of Object.entries(store.store)) {
-        entries[key] = typeof value === "string" ? value : JSON.stringify(value)
+        const encoded = typeof value === "string" ? value : JSON.stringify(value)
+        if (encoded.length > max) continue
+        entries[key] = encoded
       }
       return entries
     } catch {

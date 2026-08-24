@@ -197,6 +197,14 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
       })
     },
 
+    async compressExport(json) {
+      try {
+        return await window.api.compressExport(json)
+      } catch {
+        return null
+      }
+    },
+
     openExternal(url: string) {
       window.api.openExternal(url)
     },

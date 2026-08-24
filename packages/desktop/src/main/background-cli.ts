@@ -24,6 +24,24 @@ export async function startBackgroundCli(logger: Logger, shellStateHome?: string
   const version = await run(bundled, ["--version"], logger)
   const binary = app.isPackaged ? await installCli(bundled, version, logger) : bundled
 
+  // DEV ONLY: force-stop any prior service in the dev state directories.
+  // This guarantees that the subsequent "service start" will exec the server
+  // from *this* freshly-built binary (the one copied by predev from packages/opencode).
+  // Without this, discovery reuses a stale daemon started by the baseline CLI or
+  // an installed build, so /quota/providers never sees the local claude adapter etc.
+  if (!app.isPackaged) {
+    const devStates = desktopStateNames
+      .map((name) => join(app.getPath("appData"), name))
+      .concat([stateHome, shellStateHome].filter((v): v is string => !!v))
+    for (const sh of [...new Set(devStates)]) {
+      try {
+        await run(binary, ["service", "stop"], logger, { stateHome: sh })
+      } catch {
+        // no service or stop failed — fine, we want it dead anyway
+      }
+    }
+  }
+
   const candidates = [
     ...new Set([stateHome, shellStateHome, ...desktopStateNames.map((name) => join(app.getPath("appData"), name))]),
   ].filter((candidate) => candidate === undefined || existsSync(candidate))

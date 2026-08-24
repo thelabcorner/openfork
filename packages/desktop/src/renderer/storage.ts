@@ -36,31 +36,30 @@ export function createDesktopStorage(api: StoreBridge) {
     // it even when valueCache already contains a pending promise for the same key.
     let bulkEntries: Record<string, string> | null = null
 
-    // Eagerly bulk-fetch all keys for this store on creation. On session mount
-    // multiple persisted() calls hit the same store file; without this, each
-    // fires a separate IPC round-trip. The fetch is non-blocking — getItem
-    // falls back to individual fetch for keys absent from the bulk result.
-    const bulkReady = api
-      .storeGetAll(name)
-      .then((entries) => {
-        bulkEntries = entries
-        for (const [key, value] of Object.entries(entries)) {
-          if (!valueCache.has(key) && !bulkConsumed.has(key)) {
-            valueCache.set(key, Promise.resolve(value))
+    let bulkReady: Promise<void> | undefined
+    const ensureBulk = () => {
+      if (bulkReady) return bulkReady
+      bulkReady = api
+        .storeGetAll(name)
+        .then((entries) => {
+          bulkEntries = entries
+          for (const [key, value] of Object.entries(entries)) {
+            if (!valueCache.has(key) && !bulkConsumed.has(key)) {
+              valueCache.set(key, Promise.resolve(value))
+            }
           }
-        }
-      })
-      .catch(() => {
-        bulkEntries = {}
-      })
+        })
+        .catch(() => {
+          bulkEntries = {}
+        })
+      return bulkReady
+    }
 
     const store: AsyncStorage = {
       getItem: (key: string) => {
         const cached = valueCache.get(key)
         if (cached) return cached
-        // First access: wait for bulk fetch, then check bulk result, then
-        // fall back to individual IPC fetch if the key was absent.
-        const promise = bulkReady
+        const promise = ensureBulk()
           .then(
             () => {
               if (bulkEntries && key in bulkEntries && !bulkConsumed.has(key)) {
