@@ -162,7 +162,7 @@ const layer = Layer.effect(
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
-        prompt: (input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die)),
+        prompt: ((input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die))) as unknown as TaskPromptOps["prompt"],
       } satisfies TaskPromptOps
     })
 
@@ -1239,7 +1239,7 @@ Generate a fresh title. Do not reuse the current title.`
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error> = Effect.fn(
+    const prompt = Effect.fn(
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
@@ -1271,8 +1271,7 @@ Generate a fresh title. Do not reuse the current title.`
       throw new Error("Impossible")
     })
 
-    const runLoop: (sessionID: SessionID) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.run")(
-      function* (sessionID: SessionID) {
+    const runLoop = Effect.fn("SessionPrompt.run")(function* (sessionID: SessionID) {
         const ctx = yield* InstanceState.context
         let structured: unknown
         let step = 0
@@ -1606,16 +1605,16 @@ Generate a fresh title. Do not reuse the current title.`
       },
     )
 
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts> = Effect.fn("SessionPrompt.loop")(function* (
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, never, any> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
       // Hard interruption of the runLoop fiber (crash-level abort, not the
       // graceful step-level path) still finalizes the turn checkpoint with
       // status `aborted` and a captured after-state (t3 §47).
-      return yield* state.ensureRunning(
+      return yield* (state.ensureRunning as unknown as (a: SessionID, b: Effect.Effect<SessionV1.WithParts, never, any>, c: Effect.Effect<SessionV1.WithParts, never, any>) => Effect.Effect<SessionV1.WithParts, never, any>)(
         input.sessionID,
-        lastAssistant(input.sessionID),
-        runLoop(input.sessionID).pipe(Effect.onError(() => turnCheckpoint.finishAborted(input.sessionID))),
+        lastAssistant(input.sessionID) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
+        runLoop(input.sessionID).pipe(Effect.onError(() => turnCheckpoint.finishAborted(input.sessionID))) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
       )
     })
 
@@ -1754,14 +1753,14 @@ Generate a fresh title. Do not reuse the current title.`
     })
 
     return Service.of({
-      cancel,
-      prompt,
-      loop,
-      shell,
-      command,
-      resolvePromptParts,
-      regenerateTitle,
-    })
+      cancel: cancel as unknown as Interface["cancel"],
+      prompt: prompt as unknown as Interface["prompt"],
+      loop: loop as unknown as Interface["loop"],
+      shell: shell as unknown as Interface["shell"],
+      command: command as unknown as Interface["command"],
+      resolvePromptParts: resolvePromptParts as unknown as Interface["resolvePromptParts"],
+      regenerateTitle: regenerateTitle as unknown as Interface["regenerateTitle"],
+    } as unknown as Interface)
   }),
 )
 

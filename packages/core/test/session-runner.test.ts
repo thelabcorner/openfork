@@ -48,6 +48,7 @@ import {
   SessionTable,
 } from "@opencode-ai/core/session/sql"
 import { SessionStore } from "@opencode-ai/core/session/store"
+import { SessionTitle } from "@opencode-ai/core/session/title"
 import { SystemContext } from "@opencode-ai/core/system-context"
 import { SystemContextRegistry } from "@opencode-ai/core/system-context/registry"
 import { SkillGuidance } from "@opencode-ai/core/skill/guidance"
@@ -235,6 +236,7 @@ const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
   [ReferenceGuidance.node, referenceGuidance],
   [PermissionV2.node, permission],
   [Config.node, config],
+  [SessionTitle.node, SessionTitle.noopLayer],
 ])
 const execution = Layer.effect(
   SessionExecution.Service,
@@ -285,11 +287,21 @@ const it = testEffect(
       [Snapshot.node, Snapshot.noopLayer],
       [SessionExecution.node, execution],
       [Config.node, config],
+      [SessionTitle.node, SessionTitle.noopLayer],
     ],
   ),
 )
 const sessionID = SessionV2.ID.make("ses_runner_test")
 const otherSessionID = SessionV2.ID.make("ses_runner_other")
+
+// Starts the drain and awaits its completion, propagating run errors. The
+// SessionV2 facade's `resume` is now pause-resume semantics (clear flag + wake),
+// so runner tests that force a drain go through the execution-level resume.
+const drainSession = (id: SessionV2.ID) =>
+  Effect.gen(function* () {
+    const execution = yield* SessionExecution.Service
+    return yield* execution.resume(id)
+  })
 
 const insertSession = (id: SessionV2.ID) =>
   Effect.gen(function* () {
@@ -354,7 +366,7 @@ const setupOverflowRecovery = Effect.gen(function* () {
     prompt: Prompt.make({ text: "Earlier question ".repeat(700) }),
     resume: false,
   })
-  yield* session.resume(sessionID)
+  yield* drainSession(sessionID)
   currentModel = recoveryModel
   requests.length = 0
   return session
@@ -482,7 +494,7 @@ const verifyEphemeralDeltas = (kind: FragmentKind) =>
     yield* Effect.yieldNow
     response = fixture.completeEvents
 
-    yield* session.resume(sessionID)
+    yield* drainSession(sessionID)
 
     const { db } = yield* Database.Service
     const deltas = yield* db
@@ -510,7 +522,7 @@ const verifyPartialFlushOnFailure = (kind: FragmentKind) =>
     yield* session.prompt({ sessionID, prompt: Prompt.make({ text: prompt }), resume: false })
     responseStream = Stream.concat(Stream.fromIterable(fixture.partialEvents), Stream.fail(failure))
 
-    expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+    expect(yield* drainSession(sessionID).pipe(Effect.flip)).toBe(failure)
     expect(yield* session.context(sessionID)).toMatchObject([
       { type: "user", text: prompt },
       {
@@ -584,7 +596,7 @@ describe("SessionRunnerLLM", () => {
         [],
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests[0]?.tools.map((tool) => tool.name)).toContain("application_context")
       expect(contexts).toEqual([
@@ -642,7 +654,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = undefined
       streamStarted = undefined
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(requests[0]?.model).toBe(model)
@@ -665,7 +677,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.prompt({ id: messageID, sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
       requests.length = 0
 
-      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+      const exit = yield* drainSession(sessionID).pipe(Effect.exit)
 
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(SystemContext.InitializationBlocked)
@@ -696,7 +708,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       yield* events.publish(SessionEvent.Moved, {
         sessionID,
@@ -705,7 +717,7 @@ describe("SessionRunnerLLM", () => {
       })
 
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
-      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+      const exit = yield* drainSession(sessionID).pipe(Effect.exit)
 
       expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
       expect(requests).toHaveLength(1)
@@ -720,7 +732,7 @@ describe("SessionRunnerLLM", () => {
       const { db } = yield* Database.Service
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First" }), resume: false })
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       yield* db
         .update(SessionContextEpochTable)
         .set({ snapshot: { invalid: { value: "bad" } } })
@@ -730,7 +742,7 @@ describe("SessionRunnerLLM", () => {
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
       requests.length = 0
 
-      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+      const exit = yield* drainSession(sessionID).pipe(Effect.exit)
 
       expect(Exit.isFailure(exit)).toBe(true)
       if (Exit.isFailure(exit)) expect(Cause.squash(exit.cause)).toBeInstanceOf(ContextSnapshotDecodeError)
@@ -746,10 +758,10 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       systemBaseline = "Changed context"
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context"],
@@ -787,7 +799,7 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = fragmentFixture("text", "text-build", ["Done"]).completeEvents
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Build agent instructions", "Initial context"])
     }),
@@ -813,7 +825,7 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = fragmentFixture("text", "text-reviewer", ["Done"]).completeEvents
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Reviewer instructions", "Initial context"])
       expect((yield* session.messages({ sessionID }))[0]).toMatchObject({ type: "assistant", agent: "reviewer" })
@@ -842,7 +854,7 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = fragmentFixture("text", "text-selected", ["Done"]).completeEvents
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Reviewer instructions", "Initial context"])
       expect((yield* session.messages({ sessionID }))[0]).toMatchObject({ type: "assistant", agent: "reviewer" })
@@ -859,7 +871,7 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       skillBaselines.set(AgentV2.ID.make("reviewer"), "Reviewer skills")
       yield* events.publish(SessionEvent.AgentSwitched, {
         sessionID,
@@ -868,7 +880,7 @@ describe("SessionRunnerLLM", () => {
         agent: "reviewer",
       })
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context\n\nBuild skills"],
@@ -902,7 +914,7 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context\n\nBuild skills"],
@@ -932,7 +944,7 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       expect(requests.map((request) => request.model)).toEqual([model])
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([["Initial context"]])
     }),
@@ -946,10 +958,10 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       systemRemoved = true
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "user", "system"])
       expect(requests[1]?.messages.at(-1)?.content).toEqual([
@@ -968,10 +980,10 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       systemBaseline = "Changed context"
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       yield* events.publish(SessionEvent.ModelSwitched, {
         sessionID,
         messageID: SessionMessage.ID.create(),
@@ -980,7 +992,7 @@ describe("SessionRunnerLLM", () => {
       })
       systemBaseline = "Replacement context"
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Third" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context"],
@@ -1000,7 +1012,7 @@ describe("SessionRunnerLLM", () => {
       yield* replaySessionProjection(sessionID)
       expect(yield* session.messages({ sessionID })).toHaveLength(6)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Fourth" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
     }),
   )
 
@@ -1013,7 +1025,7 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       yield* events.publish(SessionEvent.ModelSwitched, {
         sessionID,
         messageID: SessionMessage.ID.create(),
@@ -1022,11 +1034,11 @@ describe("SessionRunnerLLM", () => {
       })
       systemUnavailable = true
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       systemUnavailable = false
       systemBaseline = "Replacement context"
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Third" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context"],
@@ -1045,7 +1057,7 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       const compactionID = SessionMessage.ID.create()
       yield* events.publish(SessionEvent.Compaction.Started, {
         sessionID,
@@ -1063,7 +1075,7 @@ describe("SessionRunnerLLM", () => {
       })
       systemBaseline = "Replacement context"
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.map((request) => request.system.map((part) => part.text))).toEqual([
         ["Initial context"],
@@ -1071,7 +1083,7 @@ describe("SessionRunnerLLM", () => {
       ])
       yield* replaySessionProjection(sessionID)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Third" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
     }),
   )
 
@@ -1085,7 +1097,7 @@ describe("SessionRunnerLLM", () => {
         prompt: Prompt.make({ text: "Earlier question ".repeat(180) }),
         resume: false,
       })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       currentModel = compactModel
       requests.length = 0
@@ -1098,7 +1110,7 @@ describe("SessionRunnerLLM", () => {
         prompt: Prompt.make({ text: "Recent exact request ".repeat(180) }),
         resume: false,
       })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       expect(requests.map((request) => request.http?.headers)).toEqual([
@@ -1134,7 +1146,7 @@ describe("SessionRunnerLLM", () => {
         prompt: Prompt.make({ text: "Newest exact request ".repeat(180) }),
         resume: false,
       })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       expect(userTexts(requests[0])[0]).toContain(
@@ -1156,7 +1168,7 @@ describe("SessionRunnerLLM", () => {
       const recent = `RECENT_BOUNDARY ${"b".repeat(3_000)} RECENT_END`
       response = fragmentFixture("text", "text-earlier", ["Earlier answer"]).completeEvents
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: earlier }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       currentModel = compactModel
       requests.length = 0
@@ -1165,7 +1177,7 @@ describe("SessionRunnerLLM", () => {
         fragmentFixture("text", "text-final", ["Continued"]).completeEvents,
       ]
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: recent }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       const summary = userTexts(requests[0])[0]
@@ -1186,7 +1198,7 @@ describe("SessionRunnerLLM", () => {
       const session = yield* SessionV2.Service
       response = fragmentFixture("text", "text-earlier", ["Earlier answer"]).completeEvents
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Earlier question" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       const oversized = `OVERSIZED_BOUNDARY ${"x".repeat(4_500)} OVERSIZED_END`
       currentModel = compactModel
@@ -1196,7 +1208,7 @@ describe("SessionRunnerLLM", () => {
         fragmentFixture("text", "text-final", ["Continued"]).completeEvents,
       ]
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: oversized }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       const summary = userTexts(requests[0])[0]
@@ -1221,7 +1233,7 @@ describe("SessionRunnerLLM", () => {
         fragmentFixture("text", "text-final", ["Recovered"]).completeEvents,
       ]
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Continue" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(3)
       expect(userTexts(requests[1])[0]).toContain("## Objective")
@@ -1251,7 +1263,7 @@ describe("SessionRunnerLLM", () => {
         overflow(),
       ]
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Continue" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(3)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -1279,7 +1291,7 @@ describe("SessionRunnerLLM", () => {
         fragmentFixture("text", "text-final", ["Recovered"]).completeEvents,
       ]
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Continue" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(3)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -1297,7 +1309,7 @@ describe("SessionRunnerLLM", () => {
         [LLMEvent.providerError({ message: "summary unavailable" })],
       ]
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Continue" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       const context = yield* session.context(sessionID)
@@ -1320,7 +1332,7 @@ describe("SessionRunnerLLM", () => {
       const summaryGate = yield* Deferred.make<void>()
       streamGate = firstGate
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Continue" }), resume: false })
-      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const run = yield* drainSession(sessionID).pipe(Effect.forkChild)
       while (requests.length < 1) yield* Effect.yieldNow
       streamGate = summaryGate
       yield* Deferred.succeed(firstGate, undefined)
@@ -1343,10 +1355,10 @@ describe("SessionRunnerLLM", () => {
 
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       systemBaseline = "Changed context"
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       const compactionID = SessionMessage.ID.create()
       yield* events.publish(SessionEvent.Compaction.Started, {
         sessionID,
@@ -1364,7 +1376,7 @@ describe("SessionRunnerLLM", () => {
       })
       systemUnavailable = true
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Third" }), resume: false })
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests.at(-1)?.system.map((part) => part.text)).toEqual(["Initial context"])
       expect(systemTexts(requests.at(-1)!)).toContain("Changed context")
@@ -1426,7 +1438,7 @@ describe("SessionRunnerLLM", () => {
         LLMEvent.finish({ reason: "tool-calls" }),
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(requests[0]?.tools.map((tool) => tool.name)).toEqual(["echo", "defect"])
@@ -1497,7 +1509,7 @@ describe("SessionRunnerLLM", () => {
         ],
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
@@ -1551,7 +1563,7 @@ describe("SessionRunnerLLM", () => {
       toolExecutionGate = yield* Deferred.make<void>()
       toolExecutionsStarted = yield* Deferred.make<void>()
       toolExecutionsReady = 1
-      const run = yield* Effect.forkChild(session.resume(sessionID))
+      const run = yield* Effect.forkChild(drainSession(sessionID))
       yield* Deferred.await(toolExecutionsStarted)
       yield* events.publish(SessionEvent.ModelSwitched, {
         sessionID,
@@ -1596,7 +1608,7 @@ describe("SessionRunnerLLM", () => {
         LLMEvent.stepFinish({ index: 0, reason: "stop" }),
         LLMEvent.finish({ reason: "stop" }),
       ]
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       yield* replaySessionProjection(sessionID)
 
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -1616,7 +1628,7 @@ describe("SessionRunnerLLM", () => {
 
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Continue" }), resume: false })
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests[1]?.messages[1]?.content).toEqual([
         { type: "reasoning", text: "Signed thought", providerMetadata: { anthropic: { signature: "sig_1" } } },
@@ -1655,12 +1667,12 @@ describe("SessionRunnerLLM", () => {
         LLMEvent.stepFinish({ index: 0, reason: "stop" }),
         LLMEvent.finish({ reason: "stop" }),
       ]
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       yield* replaySessionProjection(sessionID)
 
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Continue" }), resume: false })
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "user"])
       expect(requests[1]?.messages[1]?.content).toMatchObject([
@@ -1713,7 +1725,7 @@ describe("SessionRunnerLLM", () => {
         Stream.fromEffect(Deferred.await(providerGate)).pipe(Stream.flatMap(() => final)),
       )
 
-      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const run = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(toolExecutionsStarted)
 
       expect(executions).toHaveLength(5)
@@ -1769,7 +1781,7 @@ describe("SessionRunnerLLM", () => {
         [],
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(executions).toEqual(["first", "second"])
       expect(requests).toHaveLength(3)
@@ -1852,9 +1864,9 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const first = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
-      const second = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const second = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Effect.yieldNow
 
       expect(requests).toHaveLength(1)
@@ -1894,7 +1906,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const first = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Change direction" }) })
       yield* Deferred.succeed(streamGate, undefined)
@@ -1943,7 +1955,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const first = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.prompt({
         sessionID,
@@ -1981,7 +1993,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const run = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.prompt({
         sessionID,
@@ -1992,7 +2004,7 @@ describe("SessionRunnerLLM", () => {
       expect(yield* Fiber.await(run)).toMatchObject({ _tag: "Failure" })
       expect(requests).toHaveLength(1)
       expect(yield* SessionInput.hasPending(db, sessionID, "queue")).toBe(true)
-      const resumed = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const resumed = yield* drainSession(sessionID).pipe(Effect.forkChild)
       while (requests.length < 2) yield* Effect.yieldNow
       yield* Deferred.succeed(streamGate, undefined)
       yield* Fiber.join(resumed)
@@ -2024,7 +2036,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const run = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.prompt({
         sessionID,
@@ -2035,7 +2047,7 @@ describe("SessionRunnerLLM", () => {
       expect(requests).toHaveLength(1)
       expect(yield* SessionInput.hasPending(db, sessionID, "steer")).toBe(true)
 
-      const resumed = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const resumed = yield* drainSession(sessionID).pipe(Effect.forkChild)
       while (requests.length < 2) yield* Effect.yieldNow
       yield* Deferred.succeed(streamGate, undefined)
       yield* Fiber.join(resumed)
@@ -2075,7 +2087,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const first = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Queue first" }), delivery: "queue" })
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Queue second" }), delivery: "queue" })
@@ -2117,7 +2129,7 @@ describe("SessionRunnerLLM", () => {
         ],
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       expect(userTexts(requests[0]!)).toEqual(["Start steering"])
@@ -2158,7 +2170,7 @@ describe("SessionRunnerLLM", () => {
       const secondGate = yield* Deferred.make<void>()
       streamGate = firstGate
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const first = yield* drainSession(sessionID).pipe(Effect.forkChild)
       while (requests.length < 1) yield* Effect.yieldNow
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Queue first" }), delivery: "queue" })
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Queue second" }), delivery: "queue" })
@@ -2212,7 +2224,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const first = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "First steer" }) })
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Second steer" }) })
@@ -2243,7 +2255,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const first = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Recover with this" }) })
       yield* Deferred.succeed(streamGate, undefined)
@@ -2299,7 +2311,7 @@ describe("SessionRunnerLLM", () => {
       })
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
@@ -2363,7 +2375,7 @@ describe("SessionRunnerLLM", () => {
       })
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user", "assistant"])
@@ -2407,7 +2419,7 @@ describe("SessionRunnerLLM", () => {
       })
       requests.length = 0
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
@@ -2448,7 +2460,7 @@ describe("SessionRunnerLLM", () => {
       yield* events.project(SessionEvent.Prompted, () => (fail ? Effect.die(defect) : Effect.void))
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Recover promoted input" }), resume: false })
 
-      expect(yield* session.resume(sessionID).pipe(Effect.catchDefect(Effect.succeed))).toBe(defect)
+      expect(yield* drainSession(sessionID).pipe(Effect.catchDefect(Effect.succeed))).toBe(defect)
       fail = false
       requests.length = 0
       response = [
@@ -2479,7 +2491,7 @@ describe("SessionRunnerLLM", () => {
       })
 
       requests.length = 0
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(userTexts(requests[0]!)).toEqual(["Run committed promotion"])
@@ -2500,9 +2512,9 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const first = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
-      const second = yield* session.resume(otherSessionID).pipe(Effect.forkChild)
+      const second = yield* drainSession(otherSessionID).pipe(Effect.forkChild)
       yield* Effect.yieldNow
 
       expect(requests).toHaveLength(2)
@@ -2575,8 +2587,8 @@ describe("SessionRunnerLLM", () => {
       })
 
       requests.length = 0
-      yield* session.resume(longSessionID)
-      yield* session.resume(otherLongSessionID)
+      yield* drainSession(longSessionID)
+      yield* drainSession(otherLongSessionID)
 
       const keys = requests.map((request) => request.providerOptions?.openai?.promptCacheKey)
       expect(keys).toEqual([longSessionID.slice(4), otherLongSessionID.slice(4)])
@@ -2598,9 +2610,9 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const first = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const first = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
-      const second = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const second = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Effect.yieldNow
 
       expect(requests).toHaveLength(1)
@@ -2611,7 +2623,7 @@ describe("SessionRunnerLLM", () => {
       streamFailure = undefined
       streamGate = undefined
       streamStarted = undefined
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       expect(requests).toHaveLength(2)
     }),
   )
@@ -2642,7 +2654,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = undefined
       streamStarted = undefined
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -2686,7 +2698,7 @@ describe("SessionRunnerLLM", () => {
         ],
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
@@ -2743,7 +2755,7 @@ describe("SessionRunnerLLM", () => {
         ],
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -2782,7 +2794,7 @@ describe("SessionRunnerLLM", () => {
         LLMEvent.finish({ reason: "tool-calls" }),
       ]
 
-      const exit = yield* session.resume(sessionID).pipe(Effect.exit)
+      const exit = yield* drainSession(sessionID).pipe(Effect.exit)
 
       expect(exit._tag).toBe("Failure")
       if (exit._tag === "Failure") expect(Cause.hasInterruptsOnly(exit.cause)).toBe(true)
@@ -2836,7 +2848,7 @@ describe("SessionRunnerLLM", () => {
         ],
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -2880,7 +2892,7 @@ describe("SessionRunnerLLM", () => {
         [],
       ]
 
-      const run = yield* session.resume(sessionID).pipe(Effect.exit, Effect.forkChild)
+      const run = yield* drainSession(sessionID).pipe(Effect.exit, Effect.forkChild)
       let pending = yield* questions.list()
       while (pending.length === 0) {
         yield* Effect.yieldNow
@@ -2923,7 +2935,7 @@ describe("SessionRunnerLLM", () => {
         Stream.fail(failure),
       )
 
-      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const run = yield* drainSession(sessionID).pipe(Effect.forkChild)
       while (executions.length === 0) yield* Effect.yieldNow
       yield* Effect.yieldNow
       yield* Deferred.succeed(toolExecutionGate, undefined)
@@ -2957,7 +2969,7 @@ describe("SessionRunnerLLM", () => {
         Stream.never,
       )
 
-      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const run = yield* drainSession(sessionID).pipe(Effect.forkChild)
       while (executions.length === 0) yield* Effect.yieldNow
       yield* session.interrupt(sessionID)
       toolExecutionGate = undefined
@@ -2987,7 +2999,7 @@ describe("SessionRunnerLLM", () => {
       requests.length = 0
       responseStream = undefined
       response = []
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       expect(requests[0]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
     }),
   )
@@ -3002,7 +3014,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const run = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.interrupt(sessionID)
       const exit = yield* Fiber.await(run)
@@ -3081,7 +3093,7 @@ describe("SessionRunnerLLM", () => {
         ],
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(2)
       expect(requests[0]?.toolChoice).toBeUndefined()
@@ -3136,7 +3148,7 @@ describe("SessionRunnerLLM", () => {
       streamGate = yield* Deferred.make<void>()
       streamStarted = yield* Deferred.make<void>()
 
-      const run = yield* session.resume(sessionID).pipe(Effect.forkChild)
+      const run = yield* drainSession(sessionID).pipe(Effect.forkChild)
       yield* Deferred.await(streamStarted)
       yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Change direction" }) })
       yield* Deferred.succeed(streamGate, undefined)
@@ -3164,7 +3176,7 @@ describe("SessionRunnerLLM", () => {
       streamStarted = undefined
       response = [LLMEvent.stepStart({ index: 0 }), LLMEvent.providerError({ message: "Provider unavailable" })]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -3183,7 +3195,7 @@ describe("SessionRunnerLLM", () => {
       requests.length = 0
       response = [LLMEvent.providerError({ message: "Provider unavailable" })]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -3207,7 +3219,7 @@ describe("SessionRunnerLLM", () => {
         LLMEvent.textEnd({ id: "text-partial" }),
         LLMEvent.providerError({ message: "prompt too long", classification: "context-overflow" }),
       ]
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -3230,7 +3242,7 @@ describe("SessionRunnerLLM", () => {
       const failure = providerUnavailable()
       responseStream = Stream.fail(failure)
 
-      expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+      expect(yield* drainSession(sessionID).pipe(Effect.flip)).toBe(failure)
       yield* replaySessionProjection(sessionID)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Fail raw stream durably" },
@@ -3257,7 +3269,7 @@ describe("SessionRunnerLLM", () => {
         LLMEvent.providerError({ message: "Provider unavailable" }),
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(executions.slice(executionCount)).toEqual(["settled"])
@@ -3282,7 +3294,7 @@ describe("SessionRunnerLLM", () => {
         LLMEvent.providerError({ message: "Provider unavailable" }),
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(requests).toHaveLength(1)
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -3310,7 +3322,7 @@ describe("SessionRunnerLLM", () => {
         }),
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
       yield* replaySessionProjection(sessionID)
 
       expect(yield* session.context(sessionID)).toMatchObject([
@@ -3343,7 +3355,7 @@ describe("SessionRunnerLLM", () => {
         Stream.fail(failure),
       )
 
-      expect(yield* session.resume(sessionID).pipe(Effect.flip)).toBe(failure)
+      expect(yield* drainSession(sessionID).pipe(Effect.flip)).toBe(failure)
       yield* replaySessionProjection(sessionID)
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Fail hosted tool on raw failure" },
@@ -3378,7 +3390,7 @@ describe("SessionRunnerLLM", () => {
         LLMEvent.finish({ reason: "stop" }),
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Two blocks" },
@@ -3414,7 +3426,7 @@ describe("SessionRunnerLLM", () => {
       streamStarted = undefined
       response = [LLMEvent.textStart({ id: "text-1" }), LLMEvent.textStart({ id: "text-1" })]
 
-      expect(yield* session.resume(sessionID).pipe(Effect.catchDefect(Effect.succeed))).toBe(
+      expect(yield* drainSession(sessionID).pipe(Effect.catchDefect(Effect.succeed))).toBe(
         "Duplicate text start: text-1",
       )
     }),
@@ -3437,7 +3449,7 @@ describe("SessionRunnerLLM", () => {
         LLMEvent.toolCall({ id: "call-parsed", name: "web_search", input: { query: "hello" }, providerExecuted: true }),
       ]
 
-      yield* session.resume(sessionID)
+      yield* drainSession(sessionID)
 
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Call provider tool" },
@@ -3458,7 +3470,7 @@ describe("SessionRunnerLLM", () => {
       streamStarted = undefined
       response = [LLMEvent.toolInputDelta({ id: "call-1", name: "read", text: "{}" })]
 
-      expect(yield* session.resume(sessionID).pipe(Effect.catchDefect(Effect.succeed))).toBe(
+      expect(yield* drainSession(sessionID).pipe(Effect.catchDefect(Effect.succeed))).toBe(
         "Tool input delta before start: call-1",
       )
     }),

@@ -31,6 +31,7 @@ import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
+import { SessionTitle } from "../title"
 import { type RunError, Service } from "./index"
 import { SessionRunnerModel } from "./model"
 import { createLLMEventPublisher } from "./publish-llm-event"
@@ -99,6 +100,7 @@ const layer = Layer.effect(
     const tools = yield* ToolRegistry.Service
     const models = yield* SessionRunnerModel.Service
     const store = yield* SessionStore.Service
+    const title = yield* SessionTitle.Service
     const location = yield* Location.Service
     const systemContext = yield* SystemContextRegistry.Service
     const skillGuidance = yield* SkillGuidance.Service
@@ -396,6 +398,12 @@ const layer = Layer.effect(
       readonly sessionID: SessionSchema.ID
       readonly force: boolean
     }) {
+      const session = yield* getSession(input.sessionID)
+      // Pause gate: a paused session never promotes or starts a provider turn,
+      // regardless of the wake path (prompt wake, coalesced follow-up, queue
+      // promotion). SessionStore.get reads fresh from the DB, so the gate is
+      // sound with no cache staleness.
+      if (session.pausedAt !== undefined) return
       const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
       const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
       if (!input.force && !hasSteer && !hasQueue) return
@@ -415,6 +423,15 @@ const layer = Layer.effect(
         shouldRun = yield* SessionInput.hasPending(db, input.sessionID, "queue")
         promotion = shouldRun ? "queue" : undefined
       }
+      // Post-run maintenance (S6 auto-title parity): runs only on non-interrupted
+      // drain completion. An interrupt-driven exit (exactly what pause triggers)
+      // propagates interruption before this hook, so a paused session never
+      // auto-titles. Auto-title re-checks default-title/one-real-user/parentID
+      // and takes a turn through the same pending registry as manual regenerate.
+      yield* title.autoTitle({
+        session: yield* getSession(input.sessionID),
+        messages: yield* getContext(input.sessionID),
+      })
     })
 
     return Service.of({
@@ -440,5 +457,6 @@ export const node = makeLocationNode({
     Config.node,
     Snapshot.node,
     Database.node,
+    SessionTitle.node,
   ],
 })

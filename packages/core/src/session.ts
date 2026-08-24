@@ -3,7 +3,7 @@ export * from "./session/schema"
 
 import { DateTime, Effect, Layer, Schema, Context, Stream } from "effect"
 import { ListAnchor } from "@opencode-ai/schema/session"
-import { and, asc, desc, eq, gt, like, lt, or, type SQL } from "drizzle-orm"
+import { and, asc, desc, eq, gt, isNotNull, isNull, like, lt, or, type SQL } from "drizzle-orm"
 import { ProjectV2 } from "./project"
 import { WorkspaceV2 } from "./workspace"
 import { ModelV2 } from "./model"
@@ -33,6 +33,7 @@ import { LocationServiceMap } from "./location-service-map"
 import { MessageDecodeError } from "./session/error"
 import { SessionEvent } from "./session/event"
 import { SessionInput } from "./session/input"
+import { SessionTitle } from "./session/title"
 import { Snapshot } from "./snapshot"
 import { SessionRevert } from "./session/revert"
 import { Revert } from "@opencode-ai/schema/revert"
@@ -170,8 +171,22 @@ export interface Interface {
   readonly compact: (input: CompactInput) => Effect.Effect<void, NotFoundError | OperationUnavailableError>
   readonly wait: (id: SessionSchema.ID) => Effect.Effect<void, NotFoundError | OperationUnavailableError>
   readonly active: Effect.Effect<ReadonlySet<SessionSchema.ID>>
-  readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError | SessionRunner.RunError>
+  readonly paused: Effect.Effect<ReadonlySet<SessionSchema.ID>>
+  /** Pauses a session durably: sets paused_at (with the durable event), interrupts any live drain, and blocks future drains. Idempotent. */
+  readonly pause: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError>
+  /**
+   * Resumes a paused session: clears paused_at (with the durable event) and
+   * wakes the drain so held inputs run. Deliberately NOT the execution-level
+   * forced-run resume — an interrupted turn is never auto-retried.
+   */
+  readonly resume: (sessionID: SessionSchema.ID) => Effect.Effect<void, NotFoundError>
   readonly interrupt: (sessionID: SessionSchema.ID) => Effect.Effect<void>
+  /** Accepts a title regeneration and runs it in the background through the shared SessionTitle race guards. */
+  readonly regenerateTitle: (input: {
+    sessionID: SessionSchema.ID
+    model?: ModelV2.Ref
+    prompt?: string
+  }) => Effect.Effect<void, NotFoundError | SessionTitle.UnavailableError>
   readonly revert: {
     readonly stage: (input: {
       sessionID: SessionSchema.ID
@@ -381,7 +396,7 @@ const layer = Layer.effect(
       prompt: Effect.fn("V2Session.prompt")((input) =>
         Effect.uninterruptible(
           Effect.gen(function* () {
-            yield* result.get(input.sessionID)
+            const session = yield* result.get(input.sessionID)
             const prompt = resolvePrompt(input.prompt)
             const messageID = input.id ?? SessionMessage.ID.create()
             const delivery = input.delivery ?? "steer"
@@ -400,7 +415,9 @@ const layer = Layer.effect(
             )
             if (!SessionInput.equivalent(admitted, expected))
               return yield* new PromptConflictError({ sessionID: input.sessionID, messageID })
-            if (input.resume !== false) yield* execution.wake(admitted.sessionID)
+            // Pause gate: admit-only while paused. Delivery is preserved (S3) —
+            // a steer typed while paused promotes ahead of held queues on resume.
+            if (input.resume !== false && session.pausedAt === undefined) yield* execution.wake(admitted.sessionID)
             return admitted
           }),
         ),
@@ -444,13 +461,85 @@ const layer = Layer.effect(
         return yield* new OperationUnavailableError({ operation: "wait" })
       }),
       active: execution.active,
+      paused: db
+        .select({ id: SessionTable.id })
+        .from(SessionTable)
+        .where(isNotNull(SessionTable.paused_at))
+        .all()
+        .pipe(
+          Effect.orDie,
+          Effect.map((rows) => {
+            const paused: ReadonlySet<SessionSchema.ID> = new Set(rows.map((row) => SessionSchema.ID.make(row.id)))
+            return paused
+          }),
+        ),
+      pause: Effect.fn("V2Session.pause")(function* (sessionID) {
+        yield* result.get(sessionID)
+        const row = yield* db
+          .select({ pausedAt: SessionTable.paused_at })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (row?.pausedAt !== undefined && row.pausedAt !== null) return
+        yield* events.publish(
+          SessionEvent.Paused,
+          {
+            sessionID,
+            timestamp: yield* DateTime.now,
+          },
+          {
+            // Atomic with the durable event: a crash between the column write and
+            // the event commit cannot desync the fast-read column from the stream.
+            commit: () =>
+              db
+                .update(SessionTable)
+                .set({ paused_at: Date.now() })
+                .where(eq(SessionTable.id, sessionID))
+                .run()
+                .pipe(Effect.orDie),
+          },
+        )
+        yield* execution.interrupt(sessionID)
+      }),
       resume: Effect.fn("V2Session.resume")(function* (sessionID) {
         yield* result.get(sessionID)
-        yield* execution.resume(sessionID)
+        const row = yield* db
+          .select({ pausedAt: SessionTable.paused_at })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get()
+          .pipe(Effect.orDie)
+        if (row?.pausedAt === undefined || row.pausedAt === null) return
+        yield* events.publish(
+          SessionEvent.Resumed,
+          {
+            sessionID,
+            timestamp: yield* DateTime.now,
+          },
+          {
+            commit: () =>
+              db
+                .update(SessionTable)
+                .set({ paused_at: null })
+                .where(eq(SessionTable.id, sessionID))
+                .run()
+                .pipe(Effect.orDie),
+          },
+        )
+        yield* execution.wake(sessionID)
       }),
       interrupt: Effect.fn("V2Session.interrupt")((sessionID) =>
         Effect.uninterruptible(execution.interrupt(sessionID)),
       ),
+      regenerateTitle: Effect.fn("V2Session.regenerateTitle")(function* (input) {
+        const session = yield* result.get(input.sessionID)
+        // SessionTitle is Location-scoped; provide the session's Location services
+        // per call (same pattern as revert.stage).
+        yield* SessionTitle.Service.use((title) =>
+          title.regenerate({ session, prompt: input.prompt, model: input.model }),
+        ).pipe(Effect.provide(locations.get(session.location)))
+      }),
       revert: {
         stage: Effect.fn("V2Session.revert.stage")(function* (input) {
           const session = yield* result.get(input.sessionID)

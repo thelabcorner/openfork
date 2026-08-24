@@ -445,6 +445,30 @@ export namespace RevertEvent {
   })
 }
 
+export const Paused = Event.define({
+  type: "session.next.paused",
+  ...options,
+  schema: Base,
+})
+export type Paused = typeof Paused.Type
+
+export const Resumed = Event.define({
+  type: "session.next.resumed",
+  ...options,
+  schema: Base,
+})
+export type Resumed = typeof Resumed.Type
+
+export const Renamed = Event.define({
+  type: "session.next.renamed",
+  ...options,
+  schema: {
+    ...Base,
+    title: Schema.String,
+  },
+})
+export type Renamed = typeof Renamed.Type
+
 export const DurableDefinitions = Event.inventory(
   AgentSwitched,
   ModelSwitched,
@@ -474,6 +498,9 @@ export const DurableDefinitions = Event.inventory(
   RevertEvent.Staged,
   RevertEvent.Cleared,
   RevertEvent.Committed,
+  Paused,
+  Resumed,
+  Renamed,
 )
 
 export const Definitions = Event.inventory(
@@ -509,6 +536,9 @@ export const Definitions = Event.inventory(
   RevertEvent.Staged,
   RevertEvent.Cleared,
   RevertEvent.Committed,
+  Paused,
+  Resumed,
+  Renamed,
 )
 
 export const Durable = Schema.Union(DurableDefinitions, { mode: "oneOf" })

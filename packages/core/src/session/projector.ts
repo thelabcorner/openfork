@@ -72,7 +72,9 @@ function sessionRow(info: SessionV1.SessionInfo): typeof SessionTable.$inferInse
     time_created: info.time.created,
     time_updated: info.time.updated,
     time_compacting: info.time.compacting,
-    time_archived: info.time.archived,
+    // Null (not undefined) so unarchive actually clears the column — drizzle
+    // skips undefined fields in `.set()`. Mirrors paused_at below.
+    time_archived: info.time.archived ?? null,
     paused_at: info.pausedAt ?? null,
   }
 }
