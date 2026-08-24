@@ -26,7 +26,7 @@ import { Revert } from "@opencode-ai/schema/revert"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
 
 const CheckpointKind = Schema.Literals(["baseline", "turn", "manual", "pre-revert"])
-const CheckpointStatus = Schema.Literals(["capturing", "ready", "partial", "error"])
+const CheckpointStatus = Schema.Literals(["capturing", "ready", "partial", "error", "aborted"])
 
 const CheckpointExcluded = Schema.Struct({
   path: Schema.String,

@@ -76,12 +76,12 @@ function fromRow(row: Row): SessionCheckpoint {
     afterSnapshot: row.after_snapshot,
     userMessageID: row.user_message_id,
     assistantMessageID: row.assistant_message_id,
-    diff: row.diff,
+    diff: (row.diff as unknown as ReadonlyArray<File.Diff> | null) ?? null,
     additions: row.additions,
     deletions: row.deletions,
     files: row.files,
-    excluded: row.excluded ?? [],
-    error: row.error,
+    excluded: (row.excluded as unknown as ReadonlyArray<Excluded> | null) ?? [],
+    error: (row.error as unknown as CheckpointError | null) ?? null,
     epoch: row.epoch,
     epochMismatch: row.epoch_mismatch === 1,
     createdAt: row.created_at,
@@ -301,7 +301,7 @@ const layer = Layer.effect(
         .get()
         .pipe(Effect.orDie)
       if (!updated) return undefined
-      return (yield* get({ sessionID: row.session_id, checkpointID: input.checkpointID }))!
+      return (yield* get({ sessionID: SessionSchema.ID.make(row.session_id), checkpointID: input.checkpointID }))!
     })
 
     const markError = Effect.fn("Checkpoint.markError")(function* (input: MarkErrorInput) {
@@ -360,6 +360,28 @@ const layer = Layer.effect(
       },
     )
 
+    // §50: tree hashes are content-addressed, so a structured diff between two
+    // trees is immutable once both exist — a perfect cache boundary. Bounded
+    // LRU keeps memory flat across long sessions.
+    const diffCache = new Map<string, readonly File.Diff[]>()
+    const DIFF_CACHE_MAX = 128
+    const cachedDiff = (key: string, compute: Effect.Effect<readonly File.Diff[], Error>) =>
+      Effect.gen(function* () {
+        const hit = diffCache.get(key)
+        if (hit) {
+          diffCache.delete(key)
+          diffCache.set(key, hit)
+          return hit
+        }
+        const value = yield* compute
+        diffCache.set(key, value)
+        if (diffCache.size > DIFF_CACHE_MAX) {
+          const oldest = diffCache.keys().next().value
+          if (oldest !== undefined) diffCache.delete(oldest)
+        }
+        return value
+      })
+
     const diff = Effect.fn("Checkpoint.diff")(function* (input: DiffInput) {
       const row = yield* db
         .select()
@@ -383,7 +405,10 @@ const layer = Layer.effect(
       const mode = input.mode ?? "turn"
       if (mode === "turn") {
         if (!row.before_snapshot || !row.after_snapshot) return []
-        return yield* snapshot.diff({ from: Snapshot.ID.make(row.before_snapshot), to: Snapshot.ID.make(row.after_snapshot) })
+        return yield* cachedDiff(
+          `t:${row.before_snapshot}:${row.after_snapshot}`,
+          snapshot.diff({ from: Snapshot.ID.make(row.before_snapshot), to: Snapshot.ID.make(row.after_snapshot) }),
+        )
       }
       const first = yield* db
         .select()
@@ -396,7 +421,10 @@ const layer = Layer.effect(
       if (!first) return []
       const fromTree = first.after_snapshot ?? first.before_snapshot
       if (!fromTree || !row.after_snapshot) return []
-      return yield* snapshot.diff({ from: Snapshot.ID.make(fromTree), to: Snapshot.ID.make(row.after_snapshot) })
+      return yield* cachedDiff(
+        `s:${fromTree}:${row.after_snapshot}`,
+        snapshot.diff({ from: Snapshot.ID.make(fromTree), to: Snapshot.ID.make(row.after_snapshot) }),
+      )
     })
 
     const releaseRefs = (row: Row) =>

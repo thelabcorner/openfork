@@ -1,0 +1,23 @@
+Time-travel checkpoints for this session. Every completed turn automatically records what the workspace looked like before and after, so you can inspect your own history and undo your own mistakes without touching the user's git repository.
+
+Modes:
+- list — checkpoint timeline for this session (oldest first). Default when you have an ordinal in mind? No: start here if unsure.
+- search — find checkpoints by file path or free text (newest first). Use to answer "which turn touched X?".
+- view — full detail for one checkpoint (by ordinal).
+- diff — per-turn changes (scope:"turn", default) or everything up to a checkpoint (scope:"session").
+- restore — make the workspace match a checkpoint again. THE UNDO BUTTON.
+
+Typical recovery workflow:
+1. You realize a change broke something → checkpoint mode:"search" touchedPath:"path/to/file.ts"
+2. Pick the ordinal from BEFORE the damage → mode:"diff" ordinal:N to verify it looks right
+3. mode:"restore" ordinal:N (dry-run preview comes first; re-run with dryRun:false and confirm:"RESTORE_CHECKPOINT" to apply)
+
+Safety properties:
+- restore NEVER touches conversation history, git index, or the user's commits — filesystem only.
+- Every applied restore first records a "pre-revert" safety checkpoint, so a restore can itself be undone by restoring to that pre-revert ordinal.
+- restore refuses while a checkpoint is mid-capture, targets from a different worktree identity, or missing confirm tokens.
+
+Notes:
+- Ordinals are stable per-session numbers shown in every listing — prefer them over IDs.
+- status meanings: capturing=in progress, ready=complete, partial=complete but some oversized files excluded, aborted=turn was interrupted (changes still recorded), error=capture failed.
+- diff output is capped by maxBytes (default 80000); raise it if you need deeper patches.

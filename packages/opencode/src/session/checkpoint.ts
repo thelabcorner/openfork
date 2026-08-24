@@ -73,7 +73,7 @@ export interface Turn {
   readonly beforeFiber: Fiber.Fiber<string | undefined>
 }
 
-interface Interface {
+export interface Interface {
   /** Insert a `capturing` row (SQLite-only, no blocking git). Returns undefined when snapshots are disabled. */
   readonly begin: (input: { sessionID: SessionID; userMessageID: string }) => Effect.Effect<Turn | undefined>
   /** Fork background finalize (status ready/partial); returns immediately. No-op for undefined turns. */
@@ -82,6 +82,19 @@ interface Interface {
   readonly finishAborted: (sessionID: SessionID) => Effect.Effect<void>
   /** CAS-mark a capturing row as error. No-op for undefined turns. */
   readonly fail: (turn: Turn | undefined, error: Checkpoint.CheckpointError) => Effect.Effect<void>
+  /**
+   * Record a pre-revert safety point: capture the CURRENT worktree as a ready
+   * `pre-revert` checkpoint so an imminent restore stays undoable (t3 §40.2).
+   * Returns undefined when snapshots are disabled.
+   */
+  readonly safetyPoint: (sessionID: SessionID) => Effect.Effect<{ checkpointID: Checkpoint.ID; ordinal: number; tree: string } | undefined>
+  /**
+   * Resolve once the session has no finalize in flight. Consumers about to
+   * touch the shadow repo (tool restore preview/apply) must quiesce first —
+   * otherwise their track()/read-tree can interleave with a finalize's
+   * index transitions.
+   */
+  readonly quiesce: (sessionID: SessionID) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/TurnCheckpoint") {}
@@ -105,6 +118,8 @@ const healed = new Set<string>()
 const locks = new Map<string, Semaphore.Semaphore>()
 const active = new Map<string, Turn>()
 const worktreeOwners = new Map<string, string>()
+// Sessions with a finalize fiber currently mutating the shadow repo.
+const finalizing = new Set<string>()
 
 const lock = (key: string) => {
   const hit = locks.get(key)
@@ -325,7 +340,22 @@ const layer = Layer.effect(
       return result
     })
 
+    // Guarded wrapper: marks the session as mutating the shadow repo so
+    // external consumers (tool restore) can quiesce before their own git ops.
     const finalize = Effect.fn("TurnCheckpoint.finalize")(function* (turn: Turn, forced?: Checkpoint.Status) {
+      finalizing.add(turn.sessionID)
+      yield* finalizeInner(turn, forced).pipe(
+        Effect.ensuring(Effect.sync(() => finalizing.delete(turn.sessionID))),
+      )
+    })
+
+    const quiesce = Effect.fn("TurnCheckpoint.quiesce")(function* (sessionID: SessionID) {
+      for (let i = 0; i < 1500 && finalizing.has(sessionID); i++) {
+        yield* Effect.sleep("20 millis")
+      }
+    })
+
+    const finalizeInner = Effect.fn("TurnCheckpoint.finalizeInner")(function* (turn: Turn, forced?: Checkpoint.Status) {
       // Join the pre-turn capture forked at begin. By quiescence it has long
       // completed, so this is instant; if the turn was very short we simply
       // wait out the remaining write-tree.
@@ -478,7 +508,63 @@ const layer = Layer.effect(
       })
     })
 
-    return Service.of({ begin, finish, finishAborted, fail })
+    const safetyPoint = Effect.fn("TurnCheckpoint.safetyPoint")(function* (sessionID: SessionID) {
+      if ((yield* config.get()).snapshot === false) return undefined
+      const tree = yield* snapshot.track()
+      if (!tree) return undefined
+      const key = yield* worktreeKey()
+      const last = yield* db
+        .select({ ordinal: SessionCheckpointTable.ordinal })
+        .from(SessionCheckpointTable)
+        .where(eq(SessionCheckpointTable.session_id, sessionID))
+        .orderBy(desc(SessionCheckpointTable.ordinal))
+        .limit(1)
+        .get()
+        .pipe(Effect.orDie)
+      const id = Checkpoint.ID.make(randomUUID())
+      const ordinal = (last?.ordinal ?? 0) + 1
+      const now = yield* Clock.currentTimeMillis
+      yield* db
+        .insert(SessionCheckpointTable)
+        .values({
+          id,
+          session_id: sessionID,
+          ordinal,
+          kind: "pre-revert",
+          status: "ready",
+          before_snapshot: null,
+          after_snapshot: tree,
+          user_message_id: null,
+          assistant_message_id: null,
+          diff: null,
+          additions: 0,
+          deletions: 0,
+          files: 0,
+          excluded: null,
+          error: null,
+          epoch: yield* epoch(),
+          epoch_mismatch: 0,
+          created_at: now,
+          finalized_at: now,
+        })
+        .run()
+        .pipe(Effect.orDie)
+      yield* retainTree(tree).pipe(Effect.ignore)
+      worktreeOwners.set(key, sessionID)
+      yield* publish(Event.Finalized, {
+        sessionID,
+        checkpointID: id,
+        ordinal,
+        kind: "pre-revert",
+        status: "ready",
+        files: 0,
+        additions: 0,
+        deletions: 0,
+      }).pipe(Effect.forkIn(scope))
+      return { checkpointID: id, ordinal, tree }
+    })
+
+    return Service.of({ begin, finish, finishAborted, fail, safetyPoint, quiesce })
   }),
 )
 
