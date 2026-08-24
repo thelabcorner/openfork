@@ -1,7 +1,7 @@
 import { createPromptProjectController } from "@/components/prompt-project-selector"
 import { useTitlebarRightMount } from "@/components/titlebar"
 import { useSettings } from "@/context/settings"
-import { createEffect } from "solid-js"
+import { createEffect, on } from "solid-js"
 import { createNewSessionDraftController } from "./new-session/new-session-draft-controller"
 import { NewSessionStatus, NewSessionView } from "./new-session/new-session-view"
 import { createNewSessionWorkspaceController } from "./new-session/new-session-workspace-controller"
@@ -27,10 +27,16 @@ export default function NewSessionPage() {
       open: () => project.setOpen(true),
     },
   })
-  createEffect(() => {
-    if (!draft.prompt.ready()) return
-    draft.input.restoreFocus()
-  })
+  createEffect(
+    on(
+      () => draft.prompt.ready(),
+      (ready) => {
+        if (!ready) return
+        draft.input.restoreFocus()
+      },
+      { defer: true },
+    ),
+  )
 
   return (
     <div class="relative size-full overflow-hidden flex flex-col">

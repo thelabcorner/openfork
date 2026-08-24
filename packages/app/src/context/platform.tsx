@@ -125,6 +125,9 @@ type PlatformBase = {
   /** Export collected diagnostic logs (desktop only) */
   exportDebugLogs?(): Promise<string>
 
+  /** Compress an export JSON string into brotli bytes off the UI thread (desktop only); null when unsupported */
+  compressExport?(json: string): Promise<Uint8Array<ArrayBuffer> | null>
+
   /** Force focus styles on interactive elements through desktop devtools (desktop only) */
   setForceFocus?(enabled: boolean): Promise<void>
 

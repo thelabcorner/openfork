@@ -31,10 +31,12 @@ type PluralKey =
   | "usage.sessions"
   | "home.sessions.search.sessionsResult"
   | "home.sessions.search.messagesResult"
+  | "home.sessions.archived.count"
   | "sessionGroup.sessions"
   | "chats.metric.messages"
   | "chats.footer.sessions"
   | "chats.footer.active"
+  | "chats.archived.count"
 
 const base = i18n.flatten({ ...en, ...uiEn })
 const dicts = new Map<Locale, Dictionary>([["en", base]])

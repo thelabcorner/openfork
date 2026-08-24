@@ -53,15 +53,22 @@ export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext(
       const root = createRoot((dispose) => {
         const serverCtx = createServerCtx(conn, server.scope(key), server.projects.forServer(key))
         return { dispose, serverCtx }
-      }, owner as any)
+      }, owner as never)
       serverCtxs.set(key, root)
       return root.serverCtx
     }
 
     createMemo(() => {
-      for (const conn of server.list) {
-        ensureServerCtx(conn)
+      const list = server.list
+      const active = server.key
+      for (const conn of list) {
+        if (ServerConnection.key(conn) === active) ensureServerCtx(conn)
       }
+      queueMicrotask(() => {
+        for (const conn of list) {
+          if (ServerConnection.key(conn) !== active) ensureServerCtx(conn)
+        }
+      })
     })
 
     createEffect(() => {

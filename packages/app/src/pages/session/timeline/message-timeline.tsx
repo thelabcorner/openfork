@@ -54,6 +54,7 @@ import type {
 } from "@opencode-ai/sdk/v2"
 import { showToast } from "@/utils/toast"
 import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
+import { SessionTextSurface } from "@/components/session-text-surface"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { Popover as KobaltePopover } from "@kobalte/core/popover"
 import { normalize } from "@opencode-ai/session-ui/session-diff"
@@ -76,7 +77,7 @@ import { scheduleConnectedMeasure } from "./measure"
 import { observeElementOffsetReconnectAware } from "./observe-element-offset"
 import { createTimelineProjection } from "./projection"
 import { MessageComment, SummaryDiff, TimelineRow, TimelineRowMap } from "./rows"
-import { filterVirtualIndexes } from "./virtual-items"
+import { collectVirtualItems, filterVirtualIndexes } from "./virtual-items"
 import { textLayoutMode } from "@/lib/text-layout"
 import { TIMELINE_FALLBACK_SIZE, TimelineRowEstimator, type RowEstimateInput } from "./estimation"
 
@@ -580,17 +581,14 @@ export function MessageTimeline(props: {
   }
   // One pass over the virtual items for both lookups: the map (per row key)
   // and the key list for <For> (per virtualizer update, i.e. per scroll frame).
-  const virtualItemsMemo = createMemo(() => {
-    const items = virtualizer.getVirtualItems()
-    const byKey = new Map<string, VirtualItem>()
-    const keys: string[] = new Array(items.length)
-    for (let i = 0; i < items.length; i++) {
-      const item = items[i]!
-      byKey.set(item.key as string, item)
-      keys[i] = item.key as string
-    }
-    return { byKey, keys }
-  })
+  // Items whose key the projection no longer contains are dropped here so an
+  // orphan row can never mount and crash on a missing TimelineRow -- see
+  // collectVirtualItems. Reading timelineRowByKey() adds no steady-state
+  // recompute: scroll-only updates keep its Map identity, and row-list
+  // updates invalidate this memo anyway.
+  const virtualItemsMemo = createMemo(() =>
+    collectVirtualItems(virtualizer.getVirtualItems(), (key) => timelineRowByKey().has(key)),
+  )
   const virtualItemByKey = () => virtualItemsMemo().byKey
   const virtualRowKeys = () => virtualItemsMemo().keys
   createEffect(() => {
@@ -687,17 +685,45 @@ export function MessageTimeline(props: {
 
   // Track the timeline content width ONCE; the estimator reuses the same
   // prepared text across width changes (no per-row measurement reads).
+  // Hysteresis + rAF debounce: parent `panelRow` width jitters 1px every 1s via
+  // `LimitsPanel` `useNow` countdown and health polls. Without this, every
+  // 1px jitter invalidates ALL `estimateSize` buckets → `totalSize` jumps
+  // hundreds of px and the virtualizer clamps `scrollTop` to 0.
   createEffect(() => {
     const root = listRoot()
     if (!root) return
+    let widthPx = root.clientWidth
+    let heightPx = root.clientHeight
+    let raf: number | undefined
+    const flush = (w: number, h: number) => {
+      const widthChanged = Math.abs(w - widthPx) >= 2
+      const heightChanged = Math.abs(h - heightPx) >= 2
+      if (!widthChanged && !heightChanged) return
+      if (widthChanged) {
+        widthPx = w
+        rowEstimator.setWidth(w)
+      }
+      if (heightChanged) {
+        heightPx = h
+        containerHeight = h
+      }
+    }
     const resizeObserver = new ResizeObserver(([entry]) => {
-      rowEstimator.setWidth(entry?.contentRect.width ?? root.clientWidth)
-      containerHeight = entry?.contentRect.height ?? root.clientHeight
+      const w = entry?.contentRect.width ?? root.clientWidth
+      const h = entry?.contentRect.height ?? root.clientHeight
+      if (raf !== undefined) cancelAnimationFrame(raf)
+      raf = requestAnimationFrame(() => {
+        raf = undefined
+        flush(w, h)
+      })
     })
     resizeObserver.observe(root)
-    rowEstimator.setWidth(root.clientWidth)
-    containerHeight = root.clientHeight
-    onCleanup(() => resizeObserver.disconnect())
+    rowEstimator.setWidth(widthPx)
+    containerHeight = heightPx
+    onCleanup(() => {
+      if (raf !== undefined) cancelAnimationFrame(raf)
+      resizeObserver.disconnect()
+    })
   })
 
   const handleListWheel = (event: WheelEvent & { currentTarget: HTMLDivElement }) => {
@@ -924,13 +950,16 @@ export function MessageTimeline(props: {
         sessionID,
         client: sdk().client,
       })
-      const filename = sessionExportFilename(data.info)
-      downloadSessionExport(filename, data)
+      const saved = await downloadSessionExport(
+        sessionExportFilename(data.info),
+        data,
+        platform.compressExport?.bind(platform),
+      )
       showToast({
         variant: "success",
         icon: "circle-check",
         title: language.t("toast.session.export.success.title"),
-        description: language.t("toast.session.export.success.description", { filename }),
+        description: language.t("toast.session.export.success.description", { filename: saved }),
       })
     } catch (err) {
       showToast({
@@ -1355,9 +1384,14 @@ export function MessageTimeline(props: {
   }
 
   function VirtualTimelineRow(props: { rowKey: string }) {
+    const initialItem = virtualItemByKey().get(props.rowKey)
+    const initialRow = timelineRowByKey().get(props.rowKey)
+    // virtualItemsMemo filters orphan keys, so both lookups hit in practice;
+    // this guard is insurance against any future path rendering a key before
+    // the projection and the virtualizer agree (previously a lying `!` that
+    // crashed the style effect on row._tag).
+    if (!initialItem || !initialRow) return null
     let element: HTMLDivElement
-    const initialItem = virtualItemByKey().get(props.rowKey)!
-    const initialRow = timelineRowByKey().get(props.rowKey)!
     const item = createMemo(() => virtualItemByKey().get(props.rowKey) ?? initialItem)
     const row = createMemo(() => timelineRowByKey().get(props.rowKey) ?? initialRow)
     const tool = () => {
@@ -1512,23 +1546,24 @@ export function MessageTimeline(props: {
           </button>
         </Show>
       </div>
-      <ScrollView
-        viewportRef={bindListRoot}
-        onWheel={handleListWheel}
-        onTouchStart={handleListTouchStart}
-        onTouchMove={handleListTouchMove}
-        onTouchEnd={handleListTouchEnd}
-        onTouchCancel={handleListTouchEnd}
-        onPointerDown={handleListPointerDown}
-        onPointerMove={handleListPointerMove}
-        onKeyDown={handleListKeyDown}
-        onScroll={handleListScroll}
-        onClick={props.onAutoScrollInteraction}
-        class="relative min-w-0 w-full h-full"
-        style={{
-          "--sticky-accordion-top": showHeader() ? "48px" : "0px",
-        }}
-      >
+      <SessionTextSurface containerRef={listRoot}>
+        <ScrollView
+          viewportRef={bindListRoot}
+          onWheel={handleListWheel}
+          onTouchStart={handleListTouchStart}
+          onTouchMove={handleListTouchMove}
+          onTouchEnd={handleListTouchEnd}
+          onTouchCancel={handleListTouchEnd}
+          onPointerDown={handleListPointerDown}
+          onPointerMove={handleListPointerMove}
+          onKeyDown={handleListKeyDown}
+          onScroll={handleListScroll}
+          onClick={props.onAutoScrollInteraction}
+          class="relative min-w-0 w-full h-full"
+          style={{
+            "--sticky-accordion-top": showHeader() ? "48px" : "0px",
+          }}
+        >
         <Show when={showHeader()}>
           <div
             data-session-title
@@ -2002,7 +2037,8 @@ export function MessageTimeline(props: {
             />
           </Show>
         </div>
-      </ScrollView>
+        </ScrollView>
+      </SessionTextSurface>
     </div>
   )
 }

@@ -57,7 +57,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
   const view = props.controller.view
   let editor: HTMLDivElement | undefined
   let editorArea: HTMLDivElement | undefined
-  let pendingLocalUpdates = 0
+  let localInput = false
   let previousParts: PromptInputV2Prompt | undefined
   const updateCursor = () => {
     if (!editor || !window.getSelection()?.isCollapsed) return
@@ -74,10 +74,20 @@ export function PromptInputV2(props: PromptInputV2Props) {
     const parts = props.controller.parts()
     const draftCursor = (props.controller as { cursor?: () => number | undefined }).cursor?.()
     if (!editor) return
-    if (pendingLocalUpdates > 0) {
-      pendingLocalUpdates--
-      previousParts = parts
-      return
+    if (localInput) {
+      localInput = false
+      // Enter/send can reset the store before the effect scheduled by the
+      // last keystroke runs. Only skip reconciliation when the DOM still
+      // represents the authoritative prompt; otherwise the reset must clear
+      // the editor instead of being mistaken for the local input update.
+      const editorParts = parsePromptInputV2Editor(editor).parts
+      const visibleParts = parts.filter(
+        (part): part is Exclude<PromptInputV2Prompt[number], PromptInputV2Attachment> => part.type !== "image",
+      )
+      if (isPromptInputV2PromptEqual(editorParts, visibleParts)) {
+        previousParts = parts
+        return
+      }
     }
     if (previousParts && isPromptInputV2PromptEqual(previousParts, parts)) return
     previousParts = parts
@@ -187,7 +197,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
               const cursor = promptInputV2Cursor(event.currentTarget)
               const { parts: prompt, text } = parsePromptInputV2Editor(event.currentTarget)
               const images = props.controller.parts().filter((part) => part.type === "image")
-              pendingLocalUpdates++
+              localInput = true
               props.controller.onInput(text, [...prompt, ...images], cursor)
             }}
             onKeyDown={(event) => {

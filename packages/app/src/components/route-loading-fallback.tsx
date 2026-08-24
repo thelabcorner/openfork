@@ -1,4 +1,5 @@
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
+import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { Spinner } from "@opencode-ai/ui/spinner"
 import { useQueryClient } from "@tanstack/solid-query"
 import { useLocation } from "@solidjs/router"
@@ -29,6 +30,10 @@ function queryPhase(query: { state: { fetchStatus: string; status: string; data?
   if (query.state.fetchStatus === "fetching") return query.state.data === undefined ? "fetching" : "refetching"
   if (query.state.status === "pending") return "disabled"
   return "idle"
+}
+
+export function RoutePlaceholder() {
+  return <div class="flex-1 min-h-0 w-full" />
 }
 
 export function RouteLoadingFallback() {
@@ -64,12 +69,19 @@ export function RouteLoadingFallback() {
   const waitMs = (item: { started: number; done: boolean }) => (item.done ? 0 : now() - item.started)
 
   createEffect(() => {
-    const active = new Set(queries().filter((item) => item.phase !== "idle").map((item) => item.key))
+    const active = new Set(
+      queries()
+        .filter((item) => item.phase !== "idle")
+        .map((item) => item.key),
+    )
     for (const item of queries()) {
       if (item.phase === "idle") continue
       const existing = seenQueries.items.find((row) => row.key === item.key)
       if (!existing) {
-        setSeenQueries("items", (items) => [...items, { key: item.key, started: Date.now(), done: false, phase: item.phase }])
+        setSeenQueries("items", (items) => [
+          ...items,
+          { key: item.key, started: Date.now(), done: false, phase: item.phase },
+        ])
         continue
       }
       if (existing.phase !== item.phase) setSeenQueries("items", (row) => row.key === item.key, "phase", item.phase)
@@ -87,9 +99,7 @@ export function RouteLoadingFallback() {
       "queries:",
       ...(seenQueries.items.length === 0
         ? ["  (none)"]
-        : seenQueries.items.map(
-            (item) => `  ${item.key} [${item.phase}] (${item.done ? 0 : now() - item.started}ms)`,
-          )),
+        : seenQueries.items.map((item) => `  ${item.key} [${item.phase}] (${item.done ? 0 : now() - item.started}ms)`)),
       "pending:",
       ...(waits().length === 0
         ? ["  (none — Solid Suspense is holding this view)"]
@@ -117,7 +127,9 @@ export function RouteLoadingFallback() {
           <Spinner class="size-5 shrink-0" style={{ color: "var(--icon-weak)" }} />
           <div class="min-w-0 flex flex-col gap-0.5">
             <div class="text-14-medium text-text-strong">{language.t("route.loading.title")}</div>
-            <div class="text-12-regular text-text-faint">{language.t("route.loading.elapsed", { seconds: seconds() })}</div>
+            <div class="text-12-regular text-text-faint">
+              {language.t("route.loading.elapsed", { seconds: seconds() })}
+            </div>
           </div>
         </div>
         <div class="text-12-regular text-text-weak">{language.t("route.loading.description")}</div>
@@ -129,26 +141,30 @@ export function RouteLoadingFallback() {
           when={seenQueries.items.length > 0}
           fallback={<div class="text-12-regular text-text-faint">{language.t("route.loading.queries.empty")}</div>}
         >
-          <ul class="flex flex-col gap-1 max-h-40 overflow-auto text-12-regular text-text-weak" dir="ltr">
-            <For each={seenQueries.items}>
-              {(item) => (
-                <li class="break-all">
-                  {item.key} · [{item.phase}] {item.done ? 0 : now() - item.started}ms
-                </li>
-              )}
-            </For>
-          </ul>
+          <ScrollView class="max-h-40" dir="ltr">
+            <ul class="flex flex-col gap-1 text-12-regular text-text-weak">
+              <For each={seenQueries.items}>
+                {(item) => (
+                  <li class="break-all">
+                    {item.key} · [{item.phase}] {item.done ? 0 : now() - item.started}ms
+                  </li>
+                )}
+              </For>
+            </ul>
+          </ScrollView>
         </Show>
         <Show when={waits().length > 0}>
-          <ul class="flex flex-col gap-1 max-h-32 overflow-auto text-12-regular text-text-weak" dir="ltr">
-            <For each={waits()}>
-              {(item) => (
-                <li class="break-all">
-                  {item.label} · {waitMs(item)}ms
-                </li>
-              )}
-            </For>
-          </ul>
+          <ScrollView class="max-h-32" dir="ltr">
+            <ul class="flex flex-col gap-1 text-12-regular text-text-weak">
+              <For each={waits()}>
+                {(item) => (
+                  <li class="break-all">
+                    {item.label} · {waitMs(item)}ms
+                  </li>
+                )}
+              </For>
+            </ul>
+          </ScrollView>
         </Show>
         <Show when={seenQueries.items.length === 0 && waits().length === 0}>
           <div class="text-12-regular text-text-faint">{language.t("route.loading.suspense")}</div>

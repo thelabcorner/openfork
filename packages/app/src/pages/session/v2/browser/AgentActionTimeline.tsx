@@ -4,11 +4,15 @@
 // event; collapses to a status-only strip when the user closes it.
 
 import { For, Show, createEffect, createMemo, createSignal } from "solid-js"
+import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { useLanguage } from "@/context/language"
 import { browserActionStore, isBrowserActionTimelineBounded } from "./browserActionStore"
 import type { ActionStatus, BrowserActionEvent } from "./types"
 
-const STATUS_KEY: Record<ActionStatus, "browser.action.running" | "browser.action.succeeded" | "browser.action.failed" | "browser.action.interrupted"> = {
+const STATUS_KEY: Record<
+  ActionStatus,
+  "browser.action.running" | "browser.action.succeeded" | "browser.action.failed" | "browser.action.interrupted"
+> = {
   running: "browser.action.running",
   succeeded: "browser.action.succeeded",
   failed: "browser.action.failed",
@@ -71,30 +75,32 @@ export function AgentActionTimeline(props: { tabId: string }) {
           </Show>
         </button>
         <Show when={!collapsed()}>
-          <div ref={listRef} class="max-h-32 overflow-y-auto px-1 pb-1" data-browser-action-timeline-list>
-            <For each={events()}>
-              {(event) => (
-                <div class="flex items-center gap-1.5 px-1 py-0.5 text-[10px] leading-none text-v2-text-text-muted">
-                  <StatusDot status={event.status} />
-                  <span class={`shrink-0 ${STATUS_CLASS[event.status]}`}>{language.t(STATUS_KEY[event.status])}</span>
-                  <span class="truncate">
-                    {event.op}
-                    <Show when={event.target}>{(target) => <>: {target()}</>}</Show>
-                  </span>
-                  <Show when={event.error}>
-                    <span class="truncate text-v2-text-text-warning" title={event.error}>
-                      {event.error}
+          <ScrollView class="max-h-32" viewportRef={(el) => (listRef = el)} data-browser-action-timeline-list>
+            <div class="px-1 pb-1">
+              <For each={events()}>
+                {(event) => (
+                  <div class="flex items-center gap-1.5 px-1 py-0.5 text-[10px] leading-none text-v2-text-text-muted">
+                    <StatusDot status={event.status} />
+                    <span class={`shrink-0 ${STATUS_CLASS[event.status]}`}>{language.t(STATUS_KEY[event.status])}</span>
+                    <span class="truncate">
+                      {event.op}
+                      <Show when={event.target}>{(target) => <>: {target()}</>}</Show>
                     </span>
-                  </Show>
-                  <Show when={event.elapsedMs !== undefined}>
-                    <span class="ml-auto shrink-0 tabular-nums text-v2-text-text-weaker">
-                      {(event.elapsedMs! / 1000).toFixed(1)}s
-                    </span>
-                  </Show>
-                </div>
-              )}
-            </For>
-          </div>
+                    <Show when={event.error}>
+                      <span class="truncate text-v2-text-text-warning" title={event.error}>
+                        {event.error}
+                      </span>
+                    </Show>
+                    <Show when={event.elapsedMs !== undefined}>
+                      <span class="ml-auto shrink-0 tabular-nums text-v2-text-text-weaker">
+                        {(event.elapsedMs! / 1000).toFixed(1)}s
+                      </span>
+                    </Show>
+                  </div>
+                )}
+              </For>
+            </div>
+          </ScrollView>
         </Show>
       </div>
     </Show>

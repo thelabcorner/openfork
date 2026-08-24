@@ -64,6 +64,8 @@ import { WslServersProvider } from "@/wsl/context"
 import DirectoryLayout, { DirectoryDataProvider } from "@/pages/directory-layout"
 import LegacyLayout from "@/pages/layout"
 import NewLayout from "@/pages/layout-new"
+import { RoutePlaceholder } from "@/components/route-loading-fallback"
+import { GenericContextMenuProvider } from "@/components/generic-context-menu"
 import { ErrorPage } from "./pages/error"
 import { useCheckServerHealth } from "./utils/server-health"
 import { legacySessionHref, legacySessionServer, parseServerKey, requireServerKey, sessionHref } from "./utils/session-route"
@@ -87,14 +89,8 @@ const SessionRoute = () => {
 
   if (params.id && settings.general.newLayoutDesigns()) {
     const sessionID = params.id
-    return (
-      <Show when={tabs.ready()}>
-        {(_) => {
-          const persisted = tabs.store.filter((item) => item.type === "session")
-          return <Navigate href={sessionHref(legacySessionServer(persisted, sessionID, server.key), sessionID)} />
-        }}
-      </Show>
-    )
+    const persisted = tabs.store.filter((item) => item.type === "session")
+    return <Navigate href={sessionHref(legacySessionServer(persisted, sessionID, server.key), sessionID)} />
   }
 
   // When the new layout is enabled, the legacy new-session route (/:dir/session with no id)
@@ -205,21 +201,27 @@ function DraftRoute() {
   const [search] = useSearchParams<{ draftId?: string }>()
   const settings = useSettings()
   const tabs = useTabs()
+  const draft = createMemo(() =>
+    search.draftId ? tabs.store.find((tab): tab is DraftTab => tab.type === "draft" && tab.draftID === search.draftId) : undefined,
+  )
+  const draftKey = createMemo(() => {
+    const found = draft()
+    return found ? `${found.server}\0${found.directory}\0${found.draftID}` : undefined
+  })
   return (
-    <Show when={tabs.ready()}>
-      <Show
-        when={tabs.store.find((tab): tab is DraftTab => tab.type === "draft" && tab.draftID === search.draftId)}
-        keyed
-        fallback={<Navigate href="/" />}
-      >
-        {(draft) => (
-          <Show
-            when={settings.general.newLayoutDesigns()}
-            fallback={<Navigate href={`/${base64Encode(draft.directory)}/session`} />}
-          >
-            <ResolvedDraftRoute draft={draft} />
-          </Show>
-        )}
+    <Show when={tabs.ready()} fallback={<RoutePlaceholder />}>
+      <Show when={draftKey()} keyed fallback={<Navigate href="/" />}>
+        {(_) => {
+          const found = draft()!
+          return (
+            <Show
+              when={settings.general.newLayoutDesigns()}
+              fallback={<Navigate href={`/${base64Encode(found.directory)}/session`} />}
+            >
+              <ResolvedDraftRoute draft={found} />
+            </Show>
+          )
+        }}
       </Show>
     </Show>
   )
@@ -299,17 +301,18 @@ declare global {
   }
 }
 
-function QueryProvider(props: ParentProps) {
-  const client = new QueryClient({
-    defaultOptions: {
-      queries: {
-        refetchOnReconnect: false,
-        refetchOnMount: false,
-        refetchOnWindowFocus: false,
-      },
+const sharedQueryClient = new QueryClient({
+  defaultOptions: {
+    queries: {
+      refetchOnReconnect: false,
+      refetchOnMount: false,
+      refetchOnWindowFocus: false,
     },
-  })
-  return <QueryClientProvider client={client}>{props.children}</QueryClientProvider>
+  },
+})
+
+function QueryProvider(props: ParentProps) {
+  return <QueryClientProvider client={sharedQueryClient}>{props.children}</QueryClientProvider>
 }
 
 function BodyDesignClass() {
@@ -448,7 +451,9 @@ export function AppBaseProviders(
               <QueryProvider>
                 <WslServersProvider>
                   <DialogProvider>
-                    <FileComponentProvider component={File}>{props.children}</FileComponentProvider>
+                    <FileComponentProvider component={File}>
+                      <GenericContextMenuProvider>{props.children}</GenericContextMenuProvider>
+                    </FileComponentProvider>
                   </DialogProvider>
                 </WslServersProvider>
               </QueryProvider>
@@ -625,39 +630,37 @@ export function AppInterface(props: {
       <GlobalProvider>
         <SettingsProvider>
           <ConnectionGate disableHealthCheck={props.disableHealthCheck} startup={props.startup}>
-            <Show when={useSettings().general.newLayoutDesigns().toString()} keyed>
-              <Dynamic
-                component={props.router ?? Router}
-                root={(routerProps) => (
-                  <TabsProvider>
-                    <PermissionProvider>
-                      <NotificationProvider>
-                        <ServerShell>
-                          {/* PWA renders the mobile arm regardless of the layout flag;
-                              web/desktop keep the legacy/new arms byte-identical. */}
-                          {pwa ? (
-                            <MobileAppLayout serverScoped={props.serverScoped}>
+            <Dynamic
+              component={props.router ?? Router}
+              root={(routerProps) => (
+                <TabsProvider>
+                  <PermissionProvider>
+                    <NotificationProvider>
+                      <ServerShell>
+                        {/* PWA renders the mobile arm regardless of the layout flag;
+                            web/desktop keep the legacy/new arms byte-identical. */}
+                        {pwa ? (
+                          <MobileAppLayout serverScoped={props.serverScoped}>
+                            {routerProps.children}
+                          </MobileAppLayout>
+                        ) : (
+                          <Show
+                            when={useSettings().general.newLayoutDesigns()}
+                            fallback={routerProps.children}
+                          >
+                            <NewAppLayout serverScoped={props.serverScoped}>
                               {routerProps.children}
-                            </MobileAppLayout>
-                          ) : (
-                            <Show
-                              when={useSettings().general.newLayoutDesigns()}
-                              fallback={routerProps.children}
-                            >
-                              <NewAppLayout serverScoped={props.serverScoped}>
-                                {routerProps.children}
-                              </NewAppLayout>
-                            </Show>
-                          )}
-                        </ServerShell>
-                      </NotificationProvider>
-                    </PermissionProvider>
-                  </TabsProvider>
-                )}
-              >
-                <Routes serverScoped={props.serverScoped} />
-              </Dynamic>
-            </Show>
+                            </NewAppLayout>
+                          </Show>
+                        )}
+                      </ServerShell>
+                    </NotificationProvider>
+                  </PermissionProvider>
+                </TabsProvider>
+              )}
+            >
+              <Routes serverScoped={props.serverScoped} />
+            </Dynamic>
           </ConnectionGate>
         </SettingsProvider>
       </GlobalProvider>
@@ -723,7 +726,7 @@ function GroupTabRoute() {
       <ServerSDKProvider server={conn}>
         <ServerSyncProvider server={conn}>
           <ForkUsageProvider>
-            <Suspense>
+            <Suspense fallback={<RoutePlaceholder />}>
               <GroupTabPage />
             </Suspense>
           </ForkUsageProvider>
@@ -739,17 +742,15 @@ function NewLayoutLegacySessionRedirect() {
   const params = useParams<{ id: string }>()
 
   return (
-    <Show when={tabs.ready()}>
-      <Navigate
-        href={sessionHref(
-          legacySessionServer(
-            tabs.store.filter((item) => item.type === "session"),
-            params.id,
-            server.key,
-          ),
+    <Navigate
+      href={sessionHref(
+        legacySessionServer(
+          tabs.store.filter((item) => item.type === "session"),
           params.id,
-        )}
-      />
-    </Show>
+          server.key,
+        ),
+        params.id,
+      )}
+    />
   )
 }

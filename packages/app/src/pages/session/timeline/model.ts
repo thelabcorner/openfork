@@ -42,7 +42,19 @@ export function createTimelineModel(input: {
           refreshTimer = undefined
           if (input.sessionID() !== id) return
           untrack(() => {
-            if (stale) void sync().session.sync(id, { force: true })
+            if (!stale) return
+            // Don't force-sync while the user is typing — the composer holds
+            // `localInput` and the timeline `force:true` would rewrite
+            // `sync().data.message[id]` (reconcile) and trigger
+            // `maybeAnchorBottom` / `rowEstimator` reflow that clamps scrollTop
+            // to 0. Freshness will be rechecked on next navigation/idle.
+            const active = document.activeElement
+            const isComposer =
+              active instanceof HTMLElement &&
+              active.isContentEditable &&
+              active.getAttribute("role") === "textbox"
+            if (isComposer) return
+            void sync().session.sync(id, { force: true })
           })
         }, 500)
       })
@@ -58,21 +70,16 @@ export function createTimelineModel(input: {
 
       const label = `session.sync:${id}`
       const done = trackPending(label)
-      // Perf marks so DevTools/perf traces attribute route-paint waits to the
-      // actual sync round-trip instead of an unlabelled Suspense gap.
       const markStart = `${label}.start`
       const markEnd = `${label}.end`
       performance.mark(markStart)
-      return Promise.resolve(sync().session.sync(id))
-        .finally(() => {
-          performance.mark(markEnd)
-          try {
-            performance.measure(label, markStart, markEnd)
-          } catch {
-            // Mark already gone (buffer eviction) — the measure is best-effort.
-          }
-          done()
-        })
+      void Promise.resolve(sync().session.sync(id)).finally(() => {
+        performance.mark(markEnd)
+        try {
+          performance.measure(label, markStart, markEnd)
+        } catch {}
+        done()
+      })
     },
   )
   const messages = createMemo(() => {

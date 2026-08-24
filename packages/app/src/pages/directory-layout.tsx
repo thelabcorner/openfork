@@ -2,7 +2,7 @@ import { DataProvider } from "@opencode-ai/session-ui/context"
 import { showToast } from "@/utils/toast"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { useLocation, useNavigate, useParams } from "@solidjs/router"
-import { type Accessor, createEffect, createMemo, createResource, onCleanup, type ParentProps, Show } from "solid-js"
+import { type Accessor, createEffect, createMemo, onCleanup, type ParentProps, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { LocalProvider } from "@/context/local"
 import { SDKProvider, useSDK } from "@/context/sdk"
@@ -12,6 +12,7 @@ import { Schema } from "effect"
 import type { ServerConnection } from "@/context/server"
 import { sessionHref } from "@/utils/session-route"
 import { useServerSync } from "@/context/server-sync"
+import { pathKey } from "@/utils/path-key"
 
 export function DirectoryDataProvider(
   props: ParentProps<{
@@ -71,18 +72,15 @@ export function DirectoryDataProvider(
     // A draft lives at /new-session?draftId=… and has no directory segment to normalize.
     if (props.draftID || props.server?.()) return
     const next = sync().data.path.directory
-    if (!next || next === directory()) return
+    if (!next) return
+    // Normalize both sides — `pathKey` handles trailing slashes / casing so a
+    // periodic `path` refetch that returns the same directory with different
+    // allocation or slash doesn't trigger a `navigate` loop that remounts the
+    // keyed `DataProvider`/`LocalProvider` and wipes prompt + scroll.
+    if (pathKey(next) === pathKey(directory())) return
     const path = location.pathname.slice(slug().length + 1)
     navigate(`/${base64Encode(next)}${path}${location.search}${location.hash}`, { replace: true })
   })
-
-  createResource(
-    () => params.id,
-    (id) =>
-      sync()
-        .session.sync(id)
-        .catch(() => {}),
-  )
 
   createEffect(() => {
     const sessionID = params.id

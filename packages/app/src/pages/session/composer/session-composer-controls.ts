@@ -1,7 +1,7 @@
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { createQuery } from "@tanstack/solid-query"
 import { useNavigate, useSearchParams } from "@solidjs/router"
-import { type Accessor, createMemo } from "solid-js"
+import { type Accessor, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import type { PromptInputControls } from "@/components/prompt-input/contracts"
 import type { PromptProjectControls } from "@/components/prompt-project-selector"
 import { useDirectoryPicker } from "@/components/directory-picker"
@@ -28,9 +28,27 @@ export function createPromptInputController(input: {
   const sdk = useSDK()
   const sync = useSync()
   const providers = useProviders(() => sdk().directory)
-  const agentsQuery = createQuery(() => input.queryOptions.agents(pathKey(sdk().directory)))
-  const globalProvidersQuery = createQuery(() => input.queryOptions.providers(null))
-  const providersQuery = createQuery(() => input.queryOptions.providers(pathKey(sdk().directory)))
+  const [catalogEnabled, setCatalogEnabled] = createSignal(false)
+  onMount(() => {
+    const timer = window.setTimeout(() => setCatalogEnabled(true), 400)
+    onCleanup(() => window.clearTimeout(timer))
+  })
+  const agentsQuery = createQuery(() => ({
+    ...input.queryOptions.agents(pathKey(sdk().directory)),
+    enabled: catalogEnabled(),
+    staleTime: 5 * 60_000,
+    placeholderData: [],
+  }))
+  const globalProvidersQuery = createQuery(() => ({
+    ...input.queryOptions.providers(null),
+    enabled: catalogEnabled(),
+    staleTime: 5 * 60_000,
+  }))
+  const providersQuery = createQuery(() => ({
+    ...input.queryOptions.providers(pathKey(sdk().directory)),
+    enabled: catalogEnabled(),
+    staleTime: 5 * 60_000,
+  }))
 
   return createMemo<PromptInputControls>(() => {
     return {

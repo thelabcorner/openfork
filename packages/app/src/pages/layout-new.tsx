@@ -1,15 +1,18 @@
 import { createEffect, lazy, onCleanup, Show, Suspense, type ParentProps } from "solid-js"
-import { RouteLoadingFallback } from "@/components/route-loading-fallback"
+import { RoutePlaceholder } from "@/components/route-loading-fallback"
 import { createStore } from "solid-js/store"
 import { createMediaQuery } from "@solid-primitives/media"
 import { DebugBar } from "@/components/debug-bar"
 import { TabsInfoPopup } from "@/components/help-button"
 import { Titlebar, type TitlebarUpdate } from "@/components/titlebar"
 import { useLayout } from "@/context/layout"
+import { SDKProvider } from "@/context/sdk"
 import { usePlatform } from "@/context/platform"
 import { setV2Toast, ToastRegion } from "@/utils/toast"
 import { createBrowserPanelV2State } from "@/pages/session/v2/browser-panel-v2-state"
 import { createChatSidebarPaneState } from "@/pages/session/v2/chat-sidebar-pane-state"
+import { LimitsPanel } from "@/pages/session/limits-panel"
+import { createLimitsPanelState } from "@/pages/session/limits-panel-state"
 
 const BrowserPanelV2 = lazy(() =>
   import("@/pages/session/v2/browser-panel-v2").then((m) => ({ default: m.BrowserPanelV2 })),
@@ -37,6 +40,10 @@ export default function NewLayout(props: ParentProps) {
   const browserV2State = createBrowserPanelV2State()
   const browserOpen = () => layout.browser.opened()
   const browserVisible = () => isDesktop() && browserOpen()
+  const limitsPanelState = createLimitsPanelState()
+  const limitsOpen = () => layout.limits.opened()
+  const limitsVisible = () => isDesktop() && limitsOpen()
+  const limitsDirectory = () => layout.projects.list()[0]?.worktree ?? ""
 
   // Project explorer panel (packages/app/src/pages/session/v2/project-explorer-panel.tsx)
   // is NOT mounted here despite mirroring the browser panel's visual treatment:
@@ -94,9 +101,9 @@ export default function NewLayout(props: ParentProps) {
             : undefined
         }
       />
-      <div class="flex min-h-0 min-w-0 flex-1 flex-row items-stretch">
+      <div class="flex h-full min-h-0 min-w-0 flex-1 flex-row items-stretch">
         <Show when={chatVisible()}>
-          <Suspense fallback={<RouteLoadingFallback />}>
+          <Suspense fallback={<RoutePlaceholder />}>
             <ChatSidebarPane
               state={chatSidebarState}
               opened={chatOpen()}
@@ -105,12 +112,17 @@ export default function NewLayout(props: ParentProps) {
           </Suspense>
         </Show>
         <main class="min-h-0 min-w-0 flex-1 overflow-x-hidden flex flex-col items-start contain-strict">
-          <Suspense fallback={<RouteLoadingFallback />}>
+          <Suspense fallback={<RoutePlaceholder />}>
             {props.children}
           </Suspense>
         </main>
+        <div class="my-2 me-2 min-h-0 shrink-0 self-stretch" classList={{ hidden: !limitsVisible() }}>
+          <SDKProvider directory={limitsDirectory}>
+            <LimitsPanel state={limitsPanelState} opened={limitsVisible()} onClose={() => layout.limits.close()} />
+          </SDKProvider>
+        </div>
         <Show when={browserVisible()}>
-          <Suspense fallback={<RouteLoadingFallback />}>
+          <Suspense fallback={<RoutePlaceholder />}>
             <BrowserPanelV2
               state={browserV2State}
               opened={browserOpen()}

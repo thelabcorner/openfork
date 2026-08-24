@@ -179,7 +179,16 @@ export const { use: useNotification, provider: NotificationProvider } = createSi
     }
 
     createEffect(() => {
-      global.servers.list().forEach((conn) => ensure(ServerConnection.key(conn)))
+      const activeKey = server.key
+      const list = global.servers.list()
+      list.forEach((conn) => {
+        if (ServerConnection.key(conn) === activeKey) ensure(ServerConnection.key(conn))
+      })
+      queueMicrotask(() => {
+        list.forEach((conn) => {
+          if (ServerConnection.key(conn) !== activeKey) ensure(ServerConnection.key(conn))
+        })
+      })
     })
 
     createEffect(() => {

@@ -317,7 +317,11 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                   server: route.server ?? server.key,
                   sessionId: activeSession.id,
                 }
-                const model = tabs.stateValue<PromptSession>(sessionTab, "prompt")?.model.current()
+                const persisted = tabs.stateValue<PromptSession>(sessionTab, "prompt")?.model.current()
+                const sessionModel = activeSession.model
+                const model = persisted ?? (sessionModel
+                  ? { providerID: sessionModel.providerID, modelID: sessionModel.id, variant: sessionModel.variant }
+                  : undefined)
                 tabs.newDraft({ server: sessionTab.server, directory: activeSession.directory }, "", model)
                 return
               }
@@ -479,36 +483,25 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                   />
                 </TooltipV2>
 
-                {/* tabsStore starts at its default ([]) until the persisted read resolves --
-                    rendering it unconditionally shows a confidently-empty tab strip that then
-                    pops to the real tab list, which reads as a flash on cold app start.
-                    tabs.ready() is already the signal the auto-add-tab effect above waits on
-                    for the same reason; gate the visible strip on it too instead of making the
-                    read itself faster (see packages/app/src/context/tabs.tsx). */}
-                <Show when={tabs.ready()}>
-                  <TitlebarTabStrip
-                    tabs={tabsStore}
-                    currentTab={currentTab}
-                    forceTruncate={tabsAreOverflowing()}
-                    pendingTabKey={pendingTabKey}
-                    onOverflowChange={setTabsAreOverflowing}
-                    onNavigate={(tab, el) => {
-                      const key = tabKey(tab)
-                      const current = currentTab()
-                      if (!current || tabKey(current) !== key) setPendingTabKey(key)
-                      tabs.select(tab)
-                      // Defer past the router's transition microtask so the scroll
-                      // lands on the post-commit strip instead of forcing a layout
-                      // on stale DOM inside the click handler.
-                      queueMicrotask(() => el?.scrollIntoView({ behavior: "instant" }))
-                    }}
-                    onClose={(tab) => {
-                      const index = tabsStore.findIndex((item) => tabKey(item) === tabKey(tab))
-                      if (index !== -1) tabsStoreActions.closeTab(index)
-                    }}
-                    onReorder={(keys) => tabsStoreActions.reorder(keys)}
-                  />
-                </Show>
+                <TitlebarTabStrip
+                  tabs={tabsStore}
+                  currentTab={currentTab}
+                  forceTruncate={tabsAreOverflowing()}
+                  pendingTabKey={pendingTabKey}
+                  onOverflowChange={setTabsAreOverflowing}
+                  onNavigate={(tab, el) => {
+                    const key = tabKey(tab)
+                    const current = currentTab()
+                    if (!current || tabKey(current) !== key) setPendingTabKey(key)
+                    tabs.select(tab)
+                    queueMicrotask(() => el?.scrollIntoView({ behavior: "instant" }))
+                  }}
+                  onClose={(tab) => {
+                    const index = tabsStore.findIndex((item) => tabKey(item) === tabKey(tab))
+                    if (index !== -1) tabsStoreActions.closeTab(index)
+                  }}
+                  onReorder={(keys) => tabsStoreActions.reorder(keys)}
+                />
                 <TooltipV2
                   placement="bottom"
                   value={

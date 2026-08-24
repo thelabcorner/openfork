@@ -1,10 +1,10 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { createSimpleContext } from "@opencode-ai/ui/context"
-import { createStore, produce } from "solid-js/store"
+import { createStore, produce, reconcile } from "solid-js/store"
 import { Persist, persisted, removePersisted, draftPersistedKeys } from "@/utils/persist"
 import { ServerConnection, useServer } from "./server"
-import { createEffect, getOwner, onCleanup, startTransition } from "solid-js"
+import { createEffect, createSignal, getOwner, onCleanup, runWithOwner, startTransition } from "solid-js"
 import { useLocation, useNavigate, useParams } from "@solidjs/router"
 import { usePlatform } from "./platform"
 import { uuid } from "@/utils/uuid"
@@ -80,14 +80,67 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       },
       createStore<Tab[]>([]),
     )
-    const [recent, setRecent, , recentReady] = persisted(Persist.window("tabs.recent"), createStore<RecentTab>({}))
-    const [info, setInfo] = persisted(Persist.window("tabs.info"), createStore<Record<string, TabInfo>>({}))
-    const [closed, setClosed, , closedReady] = persisted(Persist.window("tabs.closed"), createStore<ClosedTab[]>([]))
+    const [recent, setRecent] = createStore<RecentTab>({})
+    const [info, setInfo] = createStore<Record<string, TabInfo>>({})
+    const [closed, setClosed] = createStore<ClosedTab[]>([])
+    const [recentReadySignal, setRecentReadySignal] = createSignal(false)
+    const [closedReadySignal, setClosedReadySignal] = createSignal(false)
+    const recentReadyDeferred = Promise.withResolvers<void>()
+    const closedReadyDeferred = Promise.withResolvers<void>()
+    const recentReady = Object.assign(() => recentReadySignal(), { promise: recentReadyDeferred.promise })
+    const closedReady = Object.assign(() => closedReadySignal(), { promise: closedReadyDeferred.promise })
+    let setRecentPersist: typeof setRecent | undefined
+    let setInfoPersist: typeof setInfo | undefined
+    let setClosedPersist: typeof setClosed | undefined
+
+    const owner = getOwner()
+    const afterFirstPaint = (fn: () => void) => {
+      if (typeof requestIdleCallback === "function") {
+        requestIdleCallback(fn, { timeout: 200 })
+        return
+      }
+      requestAnimationFrame(() => requestAnimationFrame(fn))
+    }
+    afterFirstPaint(() => {
+      if (!owner) {
+        setRecentReadySignal(true)
+        setClosedReadySignal(true)
+        recentReadyDeferred.resolve()
+        closedReadyDeferred.resolve()
+        return
+      }
+      runWithOwner(owner, () => {
+        const [pRecent, pSetRecent, , pRecentReady] = persisted(Persist.window("tabs.recent"), createStore<RecentTab>({}))
+        const [pInfo, pSetInfo, , pInfoReady] = persisted(Persist.window("tabs.info"), createStore<Record<string, TabInfo>>({}))
+        const [pClosed, pSetClosed, , pClosedReady] = persisted(Persist.window("tabs.closed"), createStore<ClosedTab[]>([]))
+        createEffect(() => {
+          if (!pRecentReady()) return
+          if (recent.key === undefined && pRecent.key !== undefined) setRecent("key", pRecent.key)
+          setRecentPersist = pSetRecent
+          setRecentReadySignal(true)
+          recentReadyDeferred.resolve()
+        })
+        createEffect(() => {
+          if (!pInfoReady()) return
+          const next = { ...pInfo }
+          for (const key of Object.keys(info)) next[key] = info[key]
+          setInfo(reconcile(next))
+          setInfoPersist = pSetInfo
+        })
+        createEffect(() => {
+          if (!pClosedReady()) return
+          if (closed.length === 0 && pClosed.length > 0) setClosed(() => [...pClosed])
+          setClosedPersist = pSetClosed
+          setClosedReadySignal(true)
+          closedReadyDeferred.resolve()
+        })
+      })
+    })
 
     const params = useParams()
     const navigate = useNavigate()
     const location = useLocation()
-    const memory = createTabMemory(getOwner())
+    const memory = createTabMemory(owner)
 
     const closing = new Set<string>()
     let recentWrite = 0
@@ -100,15 +153,25 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       recentValue = key
       if (recentReady()) {
         setRecent("key", key)
+        setRecentPersist?.("key", key)
         return
       }
       void recentReady.promise?.then(() => {
-        if (write === recentWrite) setRecent("key", key)
+        if (write === recentWrite) {
+          setRecent("key", key)
+          setRecentPersist?.("key", key)
+        }
       })
     }
 
     const updateClosed = (update: (stack: ClosedTab[]) => ClosedTab[]) => {
-      const apply = () => setClosed((stack) => update(stack))
+      const apply = () => {
+        setClosed((stack) => {
+          const next = update(stack)
+          setClosedPersist?.(() => next)
+          return next
+        })
+      }
       if (closedReady()) {
         apply()
         return
@@ -125,11 +188,11 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
 
     const removeInfo = (key: string) => {
       if (!info[key]) return
-      setInfo(
-        produce((draft) => {
-          delete draft[key]
-        }),
-      )
+      const drop = (draft: Record<string, TabInfo>) => {
+        delete draft[key]
+      }
+      setInfo(produce(drop))
+      setInfoPersist?.(produce(drop))
     }
 
     onCleanup(memory.dispose)
@@ -159,7 +222,10 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
       if (!closedReady()) return
       const servers = new Set(server.list.map(ServerConnection.key))
       const next = closed.filter((entry) => servers.has(entry.tab.server))
-      if (next.length !== closed.length) setClosed(() => next)
+      if (next.length !== closed.length) {
+        setClosed(() => next)
+        setClosedPersist?.(() => next)
+      }
     })
 
     const navigateTab = (tab: Tab) => {
@@ -374,6 +440,7 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
         const result = takeClosedTab(closed, store)
         if (result.stack.length === closed.length) return
         setClosed(() => result.stack)
+        setClosedPersist?.(() => result.stack)
         const entry = result.entry
         if (!entry) return
         const index = Math.min(entry.index, store.length)
@@ -469,6 +536,7 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
         const current = info[key]
         if (current?.title === next.title && current.directory === next.directory) return
         setInfo(key, next)
+        setInfoPersist?.(key, next)
       },
       select: navigateTab,
       remember(tab: Tab) {

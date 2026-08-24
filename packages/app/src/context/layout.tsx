@@ -315,6 +315,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         },
         home: {
           selection: { server: server.key } as HomeProjectSelection,
+          archivedExpanded: false,
         },
       }),
     )
@@ -653,6 +654,10 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         selection: createMemo(() => store.home.selection),
         setSelection(selection: HomeProjectSelection) {
           setStore("home", "selection", reconcile(selection))
+        },
+        archivedExpanded: createMemo(() => store.home.archivedExpanded ?? false),
+        setArchivedExpanded(expanded: boolean) {
+          setStore("home", "archivedExpanded", expanded)
         },
       },
       handoff: {

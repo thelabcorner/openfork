@@ -1,9 +1,9 @@
 import { Platform, usePlatform } from "@/context/platform"
 import { makePersisted, type AsyncStorage, type SyncStorage } from "@solid-primitives/storage"
 import { checksum } from "@opencode-ai/core/util/encode"
-import { createResource, type Accessor } from "solid-js"
+import { createSignal, onCleanup, type Accessor } from "solid-js"
 import { trackPending } from "@/utils/pending-work"
-import type { SetStoreFunction, Store } from "solid-js/store"
+import { unwrap, type SetStoreFunction, type Store } from "solid-js/store"
 import { pathKey } from "@/utils/path-key"
 import { ScopedKey, ServerScope, type ServerScope as ServerScopeValue } from "@/utils/server-scope"
 
@@ -23,6 +23,7 @@ type PersistTarget = {
   key: string
   legacy?: string[]
   migrate?: (value: unknown) => unknown
+  defer?: boolean
 }
 
 const LEGACY_STORAGE = "default.dat"
@@ -127,6 +128,24 @@ function createDebouncedDraftStorage(draft: AsyncStorage, prefix: string): Async
   }
 }
 
+const GENERAL_DEBOUNCE_MS = 120
+const pendingGeneralFlushes = new Set<() => void>()
+let generalFlushListenersInstalled = false
+
+function flushPendingGeneralWrites() {
+  for (const flush of pendingGeneralFlushes) flush()
+}
+
+function ensureGeneralFlushListeners() {
+  if (generalFlushListenersInstalled) return
+  generalFlushListenersInstalled = true
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden") flushPendingGeneralWrites()
+  })
+  window.addEventListener("pagehide", flushPendingGeneralWrites)
+  window.addEventListener("beforeunload", flushPendingGeneralWrites)
+}
+
 function fallbackDisabled(scope: string) {
   return fallback.get(scope) === true
 }
@@ -215,12 +234,56 @@ function write(storage: Storage, key: string, value: string) {
   return ok
 }
 
-function snapshot(value: unknown) {
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function isShallowDefault(value: unknown) {
+  if (value === null || typeof value !== "object") return true
+  if (Array.isArray(value)) {
+    if (value.length > 4) return false
+    return value.every((item) => {
+      if (item === null || typeof item !== "object") return true
+      return isRecord(item) && Object.keys(item).length <= 8
+    })
+  }
+  if (!isRecord(value)) return false
+  const keys = Object.keys(value)
+  if (keys.length > 8) return false
+  return keys.every((key) => {
+    const item = value[key]
+    return item === null || typeof item !== "object" || (Array.isArray(item) && item.length === 0)
+  })
+}
+
+function cloneValue(value: unknown) {
+  const sc = globalThis.structuredClone
+  if (typeof sc === "function") {
+    try {
+      return sc(value)
+    } catch {}
+  }
   return JSON.parse(JSON.stringify(value)) as unknown
 }
 
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
+function snapshot(value: unknown) {
+  if (value === null || typeof value !== "object") return value
+  if (Array.isArray(value)) {
+    if (value.length === 0) return []
+    return cloneValue(value)
+  }
+  const record = value as Record<string, unknown>
+  const keys = Object.keys(record)
+  if (keys.length === 0) return {}
+  if (keys.length <= 24 && keys.every((key) => isShallowDefault(record[key]))) {
+    const out: Record<string, unknown> = {}
+    for (const key of keys) {
+      const item = record[key]
+      out[key] = Array.isArray(item) ? item.slice() : isRecord(item) ? { ...item } : item
+    }
+    return out
+  }
+  return cloneValue(value)
 }
 
 function merge(defaults: unknown, value: unknown): unknown {
@@ -232,21 +295,29 @@ function merge(defaults: unknown, value: unknown): unknown {
     return defaults
   }
 
-  if (isRecord(defaults)) {
-    if (!isRecord(value)) return defaults
+  if (!isRecord(defaults)) return value
+  if (!isRecord(value)) return defaults
 
-    const result: Record<string, unknown> = { ...defaults }
-    for (const key of Object.keys(value)) {
-      if (key in defaults) {
-        result[key] = merge((defaults as Record<string, unknown>)[key], (value as Record<string, unknown>)[key])
-      } else {
-        result[key] = (value as Record<string, unknown>)[key]
-      }
+  let missing = false
+  let nested = false
+  for (const key of Object.keys(defaults)) {
+    if (!(key in value)) {
+      missing = true
+      break
     }
-    return result
+    if (isRecord(defaults[key])) nested = true
   }
+  if (!missing && !nested) return value
 
-  return value
+  const result: Record<string, unknown> = { ...defaults }
+  for (const key of Object.keys(value)) {
+    if (key in defaults) {
+      result[key] = merge(defaults[key], value[key])
+    } else {
+      result[key] = value[key]
+    }
+  }
+  return result
 }
 
 function parse(value: string) {
@@ -261,6 +332,16 @@ function normalize(defaults: unknown, raw: string, migrate?: (value: unknown) =>
   const parsed = parse(raw)
   if (parsed === undefined) return
   const migrated = migrate ? migrate(parsed) : parsed
+  if (!migrate && isRecord(defaults) && isRecord(parsed)) {
+    let missing = false
+    for (const key of Object.keys(defaults)) {
+      if (!(key in parsed)) {
+        missing = true
+        break
+      }
+    }
+    if (!missing) return raw
+  }
   const merged = merge(defaults, migrated)
   return JSON.stringify(merged)
 }
@@ -278,7 +359,6 @@ function readCurrent(input: {
     input.storage.removeItem(input.key)
     return null
   }
-  if (raw !== next) input.storage.setItem(input.key, next)
   return next
 }
 
@@ -337,7 +417,6 @@ async function readCurrentAsync(input: {
     await input.storage.removeItem(input.key).catch(() => undefined)
     return null
   }
-  if (raw !== next) await input.storage.setItem(input.key, next)
   return next
 }
 
@@ -574,7 +653,7 @@ export const Persist = {
     return Persist.serverWorkspace(scope, dir, key, legacy)
   },
   prompt(target: PersistTarget): PersistTarget {
-    return { ...target, draft: true }
+    return { ...target, draft: true, defer: true }
   },
 }
 
@@ -734,28 +813,140 @@ export function persisted<T>(
     return api
   })()
 
-  const [state, setState, init] = makePersisted(store, { name: config.key, storage })
+  const reader = config.defer
+    ? {
+        getItem: async (key: string) => {
+          await afterPaint()
+          return (storage as { getItem: (k: string) => unknown }).getItem(key)
+        },
+        setItem: () => {},
+        removeItem: (key: string) => (storage as { removeItem: (k: string) => unknown }).removeItem(key),
+      }
+    : {
+        getItem: (key: string) => (storage as { getItem: (k: string) => unknown }).getItem(key),
+        setItem: () => {},
+        removeItem: (key: string) => (storage as { removeItem: (k: string) => unknown }).removeItem(key),
+      }
+
+  const [state, setStateRaw, init] = makePersisted(store, {
+    name: config.key,
+    storage: reader as never,
+    serialize: () => "",
+    deserialize: (v: string) => {
+      try {
+        return JSON.parse(v) as T
+      } catch {
+        return undefined as T
+      }
+    },
+  }) as unknown as [Store<T>, SetStoreFunction<T>, InitType]
 
   const isAsync = init instanceof Promise
-  if (isAsync) {
+  if (isAsync && !config.defer) {
     const done = trackPending(`persist:${config.key}`)
     void (init as Promise<unknown>).finally(done)
   }
-  const [ready] = createResource(
-    () => init,
-    async (initValue) => {
-      if (initValue instanceof Promise) await initValue
-      return true
-    },
-    { initialValue: !isAsync },
-  )
+  const [ready, setReady] = createSignal(!isAsync)
+  if (isAsync) {
+    void (init as Promise<unknown>).then(
+      () => setReady(true),
+      () => setReady(true),
+    )
+  }
+
+  let hydrated = !isAsync
+  let dirty = false
+  let lastJson: string | undefined
+  let writeTimer: ReturnType<typeof setTimeout> | undefined
+  let idleHandle: number | undefined
+  const cancelIdle =
+    typeof globalThis.cancelIdleCallback === "function" ? globalThis.cancelIdleCallback.bind(globalThis) : undefined
+  const requestIdle =
+    typeof globalThis.requestIdleCallback === "function" ? globalThis.requestIdleCallback.bind(globalThis) : undefined
+
+  const cancelWrite = () => {
+    if (writeTimer !== undefined) clearTimeout(writeTimer)
+    writeTimer = undefined
+    if (idleHandle !== undefined) cancelIdle?.(idleHandle)
+    idleHandle = undefined
+  }
+
+  const flushWrite = () => {
+    if (!dirty) return
+    dirty = false
+    cancelWrite()
+    try {
+      const json = persistJson(unwrap(state as unknown as Store<unknown>))
+      if (json === lastJson) return
+      lastJson = json
+      void (storage as unknown as { setItem: (k: string, v: string) => unknown }).setItem(config.key, json)
+    } catch {}
+  }
+
+  const scheduleWrite = () => {
+    dirty = true
+    if (writeTimer !== undefined) clearTimeout(writeTimer)
+    writeTimer = setTimeout(() => {
+      writeTimer = undefined
+      if (requestIdle) {
+        idleHandle = requestIdle(
+          () => {
+            idleHandle = undefined
+            flushWrite()
+          },
+          { timeout: 250 },
+        )
+        return
+      }
+      flushWrite()
+    }, GENERAL_DEBOUNCE_MS)
+  }
+
+  if (isAsync) {
+    void (init as Promise<unknown>).then(() => {
+      hydrated = true
+    })
+  }
+
+  ensureGeneralFlushListeners()
+  pendingGeneralFlushes.add(flushWrite)
+  onCleanup(() => {
+    pendingGeneralFlushes.delete(flushWrite)
+    flushWrite()
+  })
+
+  const setState = ((...args: never[]) => {
+    const result = (setStateRaw as (...input: never[]) => unknown)(...args)
+    if (hydrated) scheduleWrite()
+    return result
+  }) as typeof setStateRaw
 
   return [
     state,
     setState,
     init,
-    Object.assign(() => (ready.loading ? false : ready.latest === true), {
+    Object.assign(() => ready(), {
       promise: init instanceof Promise ? init : undefined,
     }),
   ]
+}
+
+const HISTORY_PERSIST_CAP = 100
+
+function persistJson(value: unknown) {
+  if (isRecord(value) && Array.isArray(value.entries) && value.entries.length > HISTORY_PERSIST_CAP) {
+    return JSON.stringify({ ...value, entries: value.entries.slice(0, HISTORY_PERSIST_CAP) })
+  }
+  return JSON.stringify(value)
+}
+
+function afterPaint() {
+  return new Promise<void>((resolve) => {
+    const raf = globalThis.requestAnimationFrame
+    if (typeof raf === "function") {
+      raf(() => resolve())
+      return
+    }
+    setTimeout(resolve, 0)
+  })
 }

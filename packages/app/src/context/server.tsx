@@ -254,7 +254,7 @@ export function nextServerAfterRemoval(
 
 export const { use: useServer, provider: ServerProvider } = createSimpleContext({
   name: "Server",
-  gate: true,
+    gate: false,
   init: (props: {
     defaultServer: ServerConnection.Key
     canonicalLocalServer?: ServerConnection.Key

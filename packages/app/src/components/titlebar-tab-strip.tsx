@@ -15,8 +15,6 @@ import { useGlobal, type ServerCtx } from "@/context/global"
 import { useLanguage } from "@/context/language"
 import { useCommand } from "@/context/command"
 import { useTabs } from "@/context/tabs"
-import { createTabPromptState } from "@/context/prompt"
-import { base64Encode } from "@opencode-ai/core/util/encode"
 import { showToast } from "@/utils/toast"
 import { canStartTabDrag, isTabActionTarget } from "./titlebar-tab-gesture"
 import { adjacentTabKey, mergeVisibleTabOrder } from "./titlebar-tab-order"
@@ -91,7 +89,6 @@ function SessionTabEntry(props: {
 }) {
   const tabs = useTabs()
   const language = useLanguage()
-  const sdk = createMemo(() => props.serverCtx()?.sdk ?? null)
   const cachedSession = createMemo(() => props.serverCtx()?.sync.session.peek(props.tab.sessionId))
   const persisted = createMemo(() => tabs.info[props.id])
   const [loadedSession] = createResource(
@@ -156,12 +153,6 @@ function SessionTabEntry(props: {
     const value = session()
     if (!value) return
     tabs.rememberSessionInfo(props.tab, value)
-    const current = sdk()
-    if (!current) return
-    createTabPromptState(tabs, props.tab, current.scope, {
-      dir: base64Encode(value.directory),
-      id: value.id,
-    })
   })
 
   return (
