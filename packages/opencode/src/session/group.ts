@@ -86,33 +86,61 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     const events = yield* EventV2Bridge.Service
+    const filename = Database.path()
+
+    // Small in-memory TTL cache — session-groups are read on every shell render
+    // (NewAppLayout → SessionGroupsProvider) and would otherwise contend with
+    // the single-permit sqlite semaphore during cold InstanceStore bootstraps.
+    // Reads bypass InstanceStore now (Authorization-only middleware), but still
+    // share the DB connection; a short cache keeps cold /new-session under
+    // 200ms even when N providers/agents/vcs queries are queued.
+    // Additionally, reads use a dedicated backfill connection
+    // (Database.withBackfillDb) so they don't queue behind the main
+    // InstanceStore bootstrap that holds the primary semaphore.
+    let listCache: { at: number; value: Info[] } | null = null
+    let listWithSessionsCache: {
+      at: number
+      value: Array<{ group: Info; sessions: Array<{ id: string; title: string }> }>
+    } | null = null
+    const LIST_TTL = 5_000
+    const invalidateListCache = () => {
+      listCache = null
+      listWithSessionsCache = null
+    }
 
     const list = Effect.fn("SessionGroup.list")(function* () {
-      const rows = yield* db
-        .select()
-        .from(SessionGroupTable)
-        .orderBy(asc(SessionGroupTable.position))
-        .all()
-        .pipe(Effect.orDie)
-      return rows.map(fromRow)
+      const now = Date.now()
+      if (listCache && now - listCache.at < LIST_TTL) return listCache.value
+      const rows = yield* Database.withBackfillDb(filename, (backfill) =>
+        backfill.select().from(SessionGroupTable).orderBy(asc(SessionGroupTable.position)).all(),
+      ).pipe(Effect.orDie)
+      const value = rows.map(fromRow)
+      listCache = { at: now, value }
+      return value
     })
 
     // Batched variant of `getWithSessions` for clients that need every group's
     // membership: two total queries (groups + memberships bucketed in memory)
-    // instead of one round-trip per group.
+    // instead of one round-trip per group. Uses backfill connection to avoid
+    // head-of-line blocking behind InstanceStore bootstrap.
     const listWithSessions = Effect.fn("SessionGroup.listWithSessions")(function* () {
-      const rows = yield* db
-        .select()
-        .from(SessionGroupTable)
-        .orderBy(asc(SessionGroupTable.position))
-        .all()
-        .pipe(Effect.orDie)
-      const memberships = yield* db
-        .select({ id: SessionTable.id, title: SessionTable.title, group_id: SessionTable.group_id })
-        .from(SessionTable)
-        .where(sql`"group_id" IS NOT NULL`)
-        .all()
-        .pipe(Effect.orDie)
+      const now = Date.now()
+      if (listWithSessionsCache && now - listWithSessionsCache.at < LIST_TTL) return listWithSessionsCache.value
+      const [rows, memberships] = yield* Database.withBackfillDb(filename, (backfill) =>
+        Effect.gen(function* () {
+          const r = yield* backfill
+            .select()
+            .from(SessionGroupTable)
+            .orderBy(asc(SessionGroupTable.position))
+            .all()
+          const m = yield* backfill
+            .select({ id: SessionTable.id, title: SessionTable.title, group_id: SessionTable.group_id })
+            .from(SessionTable)
+            .where(sql`"group_id" IS NOT NULL`)
+            .all()
+          return [r, m] as const
+        }),
+      ).pipe(Effect.orDie)
       const byGroup = new Map<string, Array<{ id: string; title: string }>>()
       for (const row of memberships) {
         if (!row.group_id) continue
@@ -120,7 +148,11 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         if (bucket) bucket.push({ id: row.id, title: row.title })
         else byGroup.set(row.group_id, [{ id: row.id, title: row.title }])
       }
-      return rows.map((row) => ({ group: fromRow(row), sessions: byGroup.get(row.id) ?? [] }))
+      const value = rows.map((row) => ({ group: fromRow(row), sessions: byGroup.get(row.id) ?? [] }))
+      listWithSessionsCache = { at: now, value }
+      // keep listCache coherent
+      listCache = { at: now, value: value.map((v) => v.group) }
+      return value
     })
 
     const create = Effect.fn("SessionGroup.create")(function* (input: { name: string }) {
@@ -134,6 +166,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         time_updated: now,
       }
       yield* db.insert(SessionGroupTable).values(row).run().pipe(Effect.orDie)
+      invalidateListCache()
       const info = fromRow(row)
       yield* events.publish(Event.Created, { groupID: id, info })
       return info
@@ -155,6 +188,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         .run()
         .pipe(Effect.orDie)
       const info = fromRow({ ...row, name: input.name, time_updated: now })
+      invalidateListCache()
       yield* events.publish(Event.Updated, { groupID: input.id, info })
     })
 
@@ -173,6 +207,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         .run()
         .pipe(Effect.orDie)
       yield* db.delete(SessionGroupTable).where(eq(SessionGroupTable.id, id)).run().pipe(Effect.orDie)
+      invalidateListCache()
       yield* events.publish(Event.Deleted, { groupID: id })
     })
 
@@ -192,6 +227,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         .run()
         .pipe(Effect.orDie)
       const info = fromRow({ ...row, position: input.position, time_updated: now })
+      invalidateListCache()
       yield* events.publish(Event.Updated, { groupID: input.id, info })
     })
 
@@ -210,6 +246,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         .where(sql`"id" = ${input.sessionId}`)
         .run()
         .pipe(Effect.orDie)
+      invalidateListCache()
       yield* events.publish(Event.SessionAdded, { groupID: input.groupId, sessionID: input.sessionId })
     })
 
@@ -231,6 +268,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         .where(sql`"id" = ${input.sessionId}`)
         .run()
         .pipe(Effect.orDie)
+      invalidateListCache()
       yield* events.publish(Event.SessionRemoved, { groupID: input.groupId, sessionID: input.sessionId })
     })
 
