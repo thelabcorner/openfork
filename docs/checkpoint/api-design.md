@@ -3,7 +3,7 @@
 **Lane:** `checkpoint-api` (API, events & agent UX lead)
 **Swarm:** `checkpoint-arch`
 **Depends on:** `checkpoint-core` (domain + persistence + `Snapshot.retain/release/epoch/excludedFiles` + revert extension), `checkpoint-lifecycle` (capture orchestration + 4 lifecycle events)
-**Source of truth:** `t3code-handoff.md` (§37–§39, §40, §82, §85, §91), `docs/checkpoint/lifecycle-design.md`
+**Source of truth:** `../handoff/t3code-handoff.md` (§37–§39, §40, §82, §85, §91), `docs/checkpoint/lifecycle-design.md`
 
 This document is the **API + event + tool/CLI + UI contract** for the checkpoint feature. It is grounded in the domain model agreed with `checkpoint-core`/`checkpoint-lifecycle` (restated in §1). Implementation is additive to the existing `Session`/`Snapshot`/`SessionRevert` machinery — no second Git engine.
 

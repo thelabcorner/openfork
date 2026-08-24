@@ -141,7 +141,7 @@ bun run --cwd packages/desktop package
 > [!NOTE]
 > If you make changes to the API or SDK (e.g. `packages/opencode/src/server/server.ts`), run `./script/generate.ts` to regenerate the SDK and related files.
 
-Please try to follow the [style guide](./AGENTS.md)
+Please try to follow the [style guide](docs/handoff/AGENTS.md)
 
 ### Setting up a Debugger
 

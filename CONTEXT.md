@@ -117,7 +117,7 @@ _Avoid_: Response envelope
 - Location-scoped services naturally re-resolve effective context when a moved session next runs in its destination location.
 - Moving a Session clears its active **Context Epoch**, so the destination must initialize a complete baseline before another prompt can promote.
 - Instruction discovery, source identity, persistence, and file loading belong to the instruction service; the **System Context** abstraction only composes effectful producers and renders loaded values.
-- The first instruction-service slice observes global and upward project `AGENTS.md` files as one ordered aggregate **Context Source** at each **Safe Provider-Turn Boundary**.
+- The first instruction-service slice observes global and upward project `docs/handoff/AGENTS.md` files as one ordered aggregate **Context Source** at each **Safe Provider-Turn Boundary**.
 - Built-in and instruction context producers register through the **System Context Registry** with stable contribution keys. Plugin-defined context registration and hot-reload lifecycle remain a follow-up built on the same scoped registry seam.
 - Selected-agent available-skill guidance is a **Context Source** composed with Location-wide registry sources immediately before Context Epoch admission. It lists only names and descriptions permitted for that agent; skill bodies and locations are exposed only through the permission-checked `skill` tool.
 - The selected agent and model are sampled when a provider turn starts. Changes admitted after that boundary apply to the next provider turn and do not restart the current turn.

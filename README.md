@@ -6,7 +6,7 @@ OpenFork is a branch-fork of [OpenCode](https://github.com/anomalyco/opencode) D
 - This repo: [thelabcorner/openfork](https://github.com/thelabcorner/openfork) — remote `origin`, default branch `main`
 - Sync doctrine: merge upstream **release tags** (`v1.18.x`), never a floating `upstream/dev`
 - Fork ownership map, KEEP/DROP paths, and conflict rules: [`FORK.md`](FORK.md)
-- Agent rules and skill routing: [`AGENTS.md`](AGENTS.md)
+- Agent rules and skill routing: [`docs/handoff/AGENTS.md`](docs/handoff/AGENTS.md)
 
 ## Run the desktop app from source
 

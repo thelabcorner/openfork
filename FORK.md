@@ -50,7 +50,7 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 | Extra tools | `packages/opencode/src/tool/{json,background,sqlite,git,typecheck,project,symbols,test,refactor,sympy,patch,archive,swarm,browser,reload}*` |
 | Search extras | `packages/core/src/search/**` |
 | Checkpoints | `packages/core/src/checkpoint.ts`, `packages/opencode/src/session/checkpoint.ts` |
-| Meta | `AGENTS.md`, `FORK.md`, `.github/workflows/**`, root `README.md`, `packages/desktop/src/main/updater.ts` |
+| Meta | `docs/handoff/AGENTS.md`, `FORK.md`, `.github/workflows/**`, root `README.md`, `packages/desktop/src/main/updater.ts` |
 
 ### Union — combine both sides
 

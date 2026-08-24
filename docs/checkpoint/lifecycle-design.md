@@ -2,7 +2,7 @@
 
 **Lane:** `checkpoint-lifecycle` (Turn lifecycle & capture orchestrator)
 **Swarm:** `checkpoint-arch`
-**Source of truth:** `t3code-handoff.md` (§81–§93, esp. §92 handoff prompt, §82 acceptance, §90 Q3)
+**Source of truth:** `../handoff/t3code-handoff.md` (§81–§93, esp. §92 handoff prompt, §82 acceptance, §90 Q3)
 **Scope:** Where/when to capture, quiescence barrier, exactly-once finalization, CAS, empty/failed/cancelled turns, retry dedup, subagent same-worktree attribution, crash recovery.
 
 This document is the **contract + orchestration design** for the capture lifecycle. It defines the interface `checkpoint-core` must implement (persistence + durability) and the events `checkpoint-api` exposes. Implementation lives in a new `CheckpointLifecycle` service wired into `SessionPrompt.runLoop`.

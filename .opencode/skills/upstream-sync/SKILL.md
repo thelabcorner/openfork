@@ -50,7 +50,7 @@ If the PR is a stack, wait for the tag. Skip console/stats/web-only PRs.
 4. **Fork-owned:** keep fork behavior. Apply upstream hunks only when they are unrelated bugfixes.
 5. **Union:** combine. Template: `git show a747d51764` (websearch engines ∪ opencode-go check; e2e stub kept; versions from upstream).
 6. **Pruned SaaS / nix:** delete. `git rm` the path. Then `bun run fork:prune`.
-7. **Meta** (`AGENTS.md`, `FORK.md`, workflows, updater, README): keep ours. Port a new always-on KEEP-code rule if upstream added one.
+7. **Meta** (`../../../docs/handoff/AGENTS.md`, `FORK.md`, workflows, updater, README): keep ours. Port a new always-on KEEP-code rule if upstream added one.
 8. If ownership is unclear, **stop** and ask. Do not guess.
 
 ## After the merge commit

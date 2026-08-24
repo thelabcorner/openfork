@@ -66,7 +66,7 @@ Files read (not modified): all verified present on disk.
 | `packages/ui/src/theme/` | Theme engine; JSON themes in `themes/*.json`; `useTheme` from `@opencode-ai/ui/theme/context` | glob |
 | `packages/storybook/package.json` | Storybook 9, `storybook dev -p 6006` | read |
 | `.opencode/skills/rtl-aware-development/SKILL.md` | Mandatory RTL guidance | read |
-| Root `AGENTS.md`, `packages/app/AGENTS.md`, `packages/desktop/AGENTS.md`, `packages/ui/AGENTS.md` | Repo rules (§4) | read |
+| Root `handoff/AGENTS.md`, `packages/app/AGENTS.md`, `packages/desktop/AGENTS.md`, `packages/ui/AGENTS.md` | Repo rules (§4) | read |
 
 Files created: `docs/swarm-design-uiux-handoff.md` (this file — the only artifact).
 
