@@ -25,10 +25,15 @@ export const codex = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapte
         return buildResult({ providerId: "codex", providerName: NAME, ok: false, configured: false, error: "Not configured" })
       }
       const access = resolved.key ?? ""
-      const accountId = (resolved as { accountId?: string }).accountId
-      const headers: Record<string, string> = { Authorization: `Bearer ${access}` }
-      if (accountId) headers["ChatGPT-Account-Id"] = accountId
-      const outcome = yield* fetchJson(http, USAGE_URL, access, headers)
+      // ChatGPT account scoping: prefer an explicit accountId field, then a
+      // well-known block, matching upstream's JWT/chatgpt_account_id lookup.
+      const entry = yield* Effect.catch(auth.get(resolved.id), () => Effect.succeed(undefined))
+      const record = entry as unknown as Record<string, unknown> | undefined
+      const wellKnown = record && typeof record.wellknown === "object" && record.wellknown !== null ? (record.wellknown as Record<string, unknown>) : undefined
+      const accountId =
+        (record && typeof record.accountId === "string" ? record.accountId : undefined) ??
+        (wellKnown && typeof wellKnown.account_id === "string" ? wellKnown.account_id : undefined)
+      const outcome = yield* fetchJson(http, USAGE_URL, access, accountId ? { "chatgpt-account-id": accountId } : undefined)
       if (!outcome.ok) {
         const msg = outcomeError(outcome)
         const reauthMsg = msg.includes("401") || msg.includes("403") ? "Session expired — please re-authenticate with OpenAI" : msg
@@ -56,13 +61,14 @@ function parseUsage(payload: unknown): ReturnType<typeof buildResult> {
       const seconds = typeof primary.limit_window_seconds === "number" ? primary.limit_window_seconds : null
       const label = seconds ? (seconds === 18000 ? "5h" : seconds === 604800 ? "weekly" : `${Math.round(seconds / 3600)}h`) : "rate"
       const percent = typeof primary.used_percent === "number" ? primary.used_percent : null
-      windows[label] = toUsageWindow({ usedPercent: percent, resetAt: typeof primary.reset_at === "string" ? new Date(primary.reset_at).getTime() : null })
+      windows[label] = toUsageWindow({ usedPercent: percent, windowSeconds: seconds, resetAt: typeof primary.reset_at === "string" ? new Date(primary.reset_at).getTime() : null })
     }
     if (secondary) {
       const seconds = typeof secondary.limit_window_seconds === "number" ? secondary.limit_window_seconds : null
       const label = seconds ? (seconds === 18000 ? "5h" : seconds === 604800 ? "weekly" : `${Math.round(seconds / 3600)}h`) : "rate"
       const percent = typeof secondary.used_percent === "number" ? secondary.used_percent : null
-      windows[label === "rate" ? "secondary_rate" : label] = toUsageWindow({ usedPercent: percent, resetAt: typeof secondary.reset_at === "string" ? new Date(secondary.reset_at).getTime() : null })
+      const key = label === "rate" || windows[label] !== undefined ? `${label}_secondary` : label
+      windows[key] = toUsageWindow({ usedPercent: percent, windowSeconds: seconds, resetAt: typeof secondary.reset_at === "string" ? new Date(secondary.reset_at).getTime() : null })
     }
   }
 

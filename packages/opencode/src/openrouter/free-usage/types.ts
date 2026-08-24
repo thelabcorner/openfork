@@ -17,6 +17,7 @@ export interface ModelCatalogEntry {
 
 export interface AnalyticsRow {
   model?: string | null;
+  variant?: string | null;
   request_count?: number | string | null;
   tokens_prompt?: number | string | null;
   tokens_completion?: number | string | null;

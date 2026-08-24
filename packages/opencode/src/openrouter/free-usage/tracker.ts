@@ -12,7 +12,7 @@ import {
   valueAggregate,
   type BurnSample,
 } from "./core";
-import { ANALYTICS_METRICS, OpenRouterError, OpenRouterReadClient } from "./openrouter";
+import { ANALYTICS_DIMENSIONS, ANALYTICS_METRICS, OpenRouterError, OpenRouterReadClient } from "./openrouter";
 import type { FreeDailyLimit, FreeUsageReport, GetUsageOptions, ModelCatalogEntry, TrackerCache, TrackerOptions } from "./types";
 
 const DEFAULT_SNAPSHOT_TTL = 15_000;
@@ -24,6 +24,7 @@ const DEFAULT_TIMEOUT = 10_000;
 
 interface CachedReport { report: FreeUsageReport; atMs: number }
 interface TierState { limit: FreeDailyLimit; source: "override" | "credits-api"; totalCreditsPurchased: number | null }
+interface AnalyticsSchema { metrics: string[]; dimensions: string[] }
 
 export class OpenRouterFreeUsageTracker {
   private readonly options: Required<Pick<TrackerOptions, "snapshotTtlMs" | "tierTtlMs" | "pricingTtlMs" | "schemaTtlMs" | "staleIfErrorMs" | "requestTimeoutMs">> & TrackerOptions;
@@ -194,8 +195,8 @@ export class OpenRouterFreeUsageTracker {
 
   private async analyticsWithSchemaFallback(start: Date, end: Date) {
     const schemaKey = this.key("analytics-metrics");
-    const cachedMetrics = await this.cache.get<string[]>(schemaKey);
-    if (cachedMetrics) return this.client.analytics(start, end, cachedMetrics);
+    const cachedSchema = await this.cache.get<AnalyticsSchema>(schemaKey);
+    if (cachedSchema) return this.client.analytics(start, end, cachedSchema.metrics, cachedSchema.dimensions);
     try {
       return await this.client.analytics(start, end, ANALYTICS_METRICS);
     } catch (error) {
@@ -203,8 +204,9 @@ export class OpenRouterFreeUsageTracker {
       const meta = await this.flights.run(this.key("analytics-meta"), () => this.client.analyticsMeta());
       if (!meta.dimensions.has("model") || !meta.metrics.has("request_count")) throw new Error("OpenRouter analytics schema no longer exposes model + request_count");
       const metrics = ANALYTICS_METRICS.filter((metric) => meta.metrics.has(metric));
-      await this.cache.set(schemaKey, [...metrics], this.options.schemaTtlMs);
-      return this.client.analytics(start, end, metrics);
+      const dimensions = meta.dimensions.has("variant") ? [...ANALYTICS_DIMENSIONS] : ["model"];
+      await this.cache.set(schemaKey, { metrics: [...metrics], dimensions }, this.options.schemaTtlMs);
+      return this.client.analytics(start, end, metrics, dimensions);
     }
   }
 

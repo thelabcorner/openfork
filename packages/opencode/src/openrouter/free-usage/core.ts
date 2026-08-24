@@ -19,13 +19,14 @@ export function dailyLimitForPurchasedCredits(totalCredits: number): FreeDailyLi
   return Number.isFinite(totalCredits) && totalCredits >= 10 ? 1000 : 50;
 }
 
-export function isFreeModel(model: unknown): model is string {
-  return typeof model === "string" && (model === "openrouter/free" || model.endsWith(":free"));
+export function isFreeModel(model: unknown, variant?: unknown): model is string {
+  return typeof model === "string" && (model === "openrouter/free" || model.endsWith(":free") || variant === "free");
 }
 
-export function paidSiblingCandidate(model: string): string | null {
+export function paidSiblingCandidate(model: string, variant?: unknown): string | null {
   if (model === "openrouter/free") return null;
-  return model.endsWith(":free") ? model.slice(0, -":free".length) : null;
+  if (model.endsWith(":free")) return model.slice(0, -":free".length);
+  return variant === "free" ? model : null;
 }
 
 export function remainingPercent(remaining: number, limit: number): number {
@@ -44,14 +45,14 @@ export function quotaStatus(percent: number): "healthy" | "draining" | "low" | "
 
 export function normalizeAnalyticsRow(row: AnalyticsRow): FreeModelUsage | null {
   const model = typeof row.model === "string" ? row.model : "";
-  if (!isFreeModel(model)) return null;
+  if (!isFreeModel(model, row.variant)) return null;
   const prompt = asNonNegativeNumber(row.tokens_prompt);
   const completion = asNonNegativeNumber(row.tokens_completion);
   const reasoning = Math.min(asNonNegativeNumber(row.reasoning_tokens), completion);
   const reportedTotal = asNonNegativeNumber(row.tokens_total);
   return {
     model,
-    paidSibling: paidSiblingCandidate(model),
+    paidSibling: paidSiblingCandidate(model, row.variant),
     requests: Math.floor(asNonNegativeNumber(row.request_count)),
     tokens: {
       prompt,

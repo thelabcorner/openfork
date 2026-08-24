@@ -1,5 +1,6 @@
 import { Account } from "@/account/account"
 import { Agent } from "@/agent/agent"
+import { Auth } from "@/auth"
 import { BackgroundJob } from "@/background/job"
 import { Config } from "@/config/config"
 import { InstanceState } from "@/effect/instance-state"
@@ -28,6 +29,7 @@ import {
 import { Credential } from "@opencode-ai/core/credential"
 import { Integration } from "@opencode-ai/schema/integration"
 import { OpenRouterFreeUsageTracker } from "@/openrouter/free-usage/tracker"
+import type { FreeUsageReport } from "@/openrouter/free-usage/types"
 
 function mapWorktreeError<A, R>(self: Effect.Effect<A, Worktree.Error, R>) {
   return self.pipe(
@@ -90,6 +92,63 @@ function parseOpenRouterEndpoints(payload: unknown) {
   return result
 }
 
+function degradedFreeUsageReport(note: string): FreeUsageReport {
+  const fetchedAt = new Date()
+  const resetsAt = new Date(fetchedAt.getTime() + 86_400_000)
+  return {
+    free: {
+      remaining: 0,
+      limit: 50,
+      remainingPercent: 0,
+      used: 0,
+      usedPercent: 0,
+      status: "depleted",
+      tier: { source: "override", totalCreditsPurchased: null },
+      tokens: { prompt: 0, completion: 0, reasoning: 0, total: 0 },
+      value: {
+        equivalentPaidValueUsd: 0,
+        valuedRequests: 0,
+        unvaluedRequests: 0,
+        methodology: "current-paid-sibling-list-price",
+        cacheAware: false,
+        note,
+      },
+      window: {
+        type: "calendar-day",
+        timezone: "UTC",
+        startedAt: fetchedAt.toISOString(),
+        resetsAt: resetsAt.toISOString(),
+        secondsUntilReset: 86_400,
+      },
+      reset: {
+        policy: "midnight-utc",
+        confidence: "high",
+        basis: "No usable analytics data available.",
+      },
+      rate: { limitPerMinute: 20, observedRequestsPerMinute: 0, source: "insufficient-data" },
+      projection: {
+        requestsPerHour: 0,
+        rateSource: "insufficient-data",
+        sustainableRequestsPerHour: 0,
+        projectedRemainingAtReset: 0,
+        willExhaustBeforeReset: false,
+        estimatedExhaustionAt: null,
+      },
+      models: [],
+    },
+    source: {
+      mode: "openrouter-analytics",
+      scope: "account",
+      analyticsAsOf: fetchedAt.toISOString(),
+      fetchedAt: fetchedAt.toISOString(),
+      stale: true,
+      analyticsRows: 0,
+      analyticsTruncated: false,
+      upstreamCalls: 0,
+    },
+  }
+}
+
 export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "experimental", (handlers) =>
   Effect.gen(function* () {
     const account = yield* Account.Service
@@ -104,6 +163,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
     const flags = yield* RuntimeFlags.Service
     const http = yield* HttpClient.HttpClient
     const credential = yield* Credential.Service
+    const auth = yield* Auth.Service
 
     const capabilities = Effect.fn("ExperimentalHttpApi.capabilities")(function* () {
       return { backgroundSubagents: flags.experimentalBackgroundSubagents }
@@ -345,6 +405,12 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       const envKey = process.env.OPENROUTER_MANAGEMENT_KEY?.trim()
       let managementKey: string | undefined = envKey && envKey.length > 0 ? envKey : undefined
       if (!managementKey) {
+        const stored = yield* auth.get("openrouter-management").pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (stored?.type === "api") managementKey = stored.key.trim() || undefined
+        if (stored?.type === "oauth") managementKey = stored.access.trim() || undefined
+        if (stored?.type === "wellknown") managementKey = stored.token.trim() || undefined
+      }
+      if (!managementKey) {
         const integrationID = Integration.ID.make("openrouter")
         const list = (yield* credential
           .list(integrationID)
@@ -362,10 +428,16 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
         }
       }
       if (!managementKey) {
+        const stored = yield* auth.get("openrouter").pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (stored?.type === "api") managementKey = stored.key.trim() || undefined
+        if (stored?.type === "oauth") managementKey = stored.access.trim() || undefined
+        if (stored?.type === "wellknown") managementKey = stored.token.trim() || undefined
+      }
+      if (!managementKey) {
         const fallback = process.env.OPENROUTER_API_KEY?.trim()
         if (fallback && fallback.length > 0) managementKey = fallback
       }
-      if (!managementKey) return yield* Effect.fail(new HttpApiError.InternalServerError({}))
+      if (!managementKey) return degradedFreeUsageReport("No OpenRouter key configured; usage unavailable.")
 
       const namespace = `openrouter-free-usage:${managementKey.slice(0, 12)}`
       let tracker = openRouterFreeUsageTrackers.get(managementKey)
@@ -378,11 +450,10 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       }
       const includeValue = ctx.query.includeValue ?? true
       const forceRefresh = ctx.query.forceRefresh ?? false
-      const report = yield* Effect.tryPromise({
+      return yield* Effect.tryPromise({
         try: () => tracker!.getUsage({ includeValue, forceRefresh }),
         catch: (cause) => cause,
-      }).pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
-      return report
+      }).pipe(Effect.catch(() => Effect.succeed(degradedFreeUsageReport("OpenRouter usage unavailable; a Management key is required for analytics."))))
     })
 
     return handlers

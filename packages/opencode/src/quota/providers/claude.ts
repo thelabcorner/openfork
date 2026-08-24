@@ -1,4 +1,7 @@
 import { Effect } from "effect"
+import { readFile } from "node:fs/promises"
+import { homedir } from "node:os"
+import { join } from "node:path"
 import type { Auth } from "@/auth"
 import { HttpClient } from "effect/unstable/http"
 import { buildResult, toUsageWindow } from "../format"
@@ -9,19 +12,77 @@ import { fetchJson, outcomeError } from "./http"
 /**
  * Claude (Anthropic) account quota. Ported from OpenChamber (MIT).
  */
-const ALIASES = ["claude", "anthropic"]
+const ALIASES = ["claude", "claude-code", "anthropic"]
 const NAME = "Claude"
 const USAGE_URL = "https://api.anthropic.com/api/oauth/usage"
+
+/**
+ * External-readonly credential resolution, faithful to OpenChamber's
+ * claude/auth.js: auth.json aliases first, then CLAUDE_CODE_OAUTH_TOKEN,
+ * then Claude Code's own credential file (~/.claude/.credentials.json).
+ * NEVER refreshes or writes — refreshing would sign Claude Code out.
+ */
+export function parseClaudeCredentials(text: string): string | undefined {
+  try {
+    const parsed = JSON.parse(text) as Record<string, unknown>
+    const oauth = parsed.claudeAiOauth as Record<string, unknown> | undefined
+    if (oauth && typeof oauth.accessToken === "string" && oauth.accessToken.length > 0) return oauth.accessToken
+    if (typeof parsed.accessToken === "string" && parsed.accessToken.length > 0) return parsed.accessToken
+    const tokens = parsed.tokens as Record<string, unknown> | undefined
+    if (tokens && typeof tokens.access_token === "string" && tokens.access_token.length > 0) return tokens.access_token
+    return undefined
+  } catch {
+    return undefined
+  }
+}
+
+function claudeCredentialsPaths(): string[] {
+  const configDir = process.env.CLAUDE_CONFIG_DIR?.trim()
+  const home = homedir()
+  const homes = [home, process.env.USERPROFILE, process.env.HOME].filter(
+    (value): value is string => typeof value === "string" && value.length > 0,
+  )
+  const configured = configDir
+    ? configDir.toLowerCase().endsWith(".json")
+      ? configDir
+      : join(configDir, ".credentials.json")
+    : undefined
+  return [
+    configured,
+    ...homes.map((value) => join(value, ".claude", ".credentials.json")),
+  ].filter((path, index, paths): path is string => path !== undefined && paths.indexOf(path) === index)
+}
+
+async function readExternalAccessToken(): Promise<string | undefined> {
+  const envToken = process.env.CLAUDE_CODE_OAUTH_TOKEN?.trim()
+  if (envToken) return envToken
+  for (const credPath of claudeCredentialsPaths()) {
+    try {
+      const text = await readFile(credPath, "utf8")
+      const token = parseClaudeCredentials(text)
+      if (token) return token
+    } catch {
+      continue
+    }
+  }
+  return undefined
+}
 
 export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter => ({
   id: "claude",
   name: NAME,
   aliases: ALIASES,
-  configured: () => Effect.map(authKey(auth, ALIASES), (key) => key !== undefined),
+  configured: () =>
+    Effect.gen(function* () {
+      // Claude Code is a machine account, not an opencode.json provider.
+      // Presence of its local OAuth credential is sufficient to show the card.
+      if ((yield* Effect.promise(readExternalAccessToken)) !== undefined) return true
+      return yield* Effect.map(authKey(auth, ALIASES), (key) => key !== undefined)
+    }),
   fetch: () =>
     Effect.gen(function* () {
       const resolved = yield* authKey(auth, ALIASES)
-      const accessToken = resolved?.key ?? process.env.CLAUDE_CODE_OAUTH_TOKEN ?? undefined
+      const accessToken = resolved?.key ?? (yield* Effect.promise(readExternalAccessToken))
       if (!accessToken) {
         return buildResult({ providerId: "claude", providerName: NAME, ok: false, configured: false, error: "Not configured" })
       }
@@ -77,5 +138,8 @@ function parseUsage(payload: unknown): ReturnType<typeof buildResult> {
     windows.extra_usage = toUsageWindow({ usedPercent: euPercent, valueLabel: euLimit !== undefined ? `$${euLimit.toFixed(2)}` : undefined })
   }
 
+  if (Object.keys(windows).length === 0) {
+    return buildResult({ providerId: "claude", providerName: NAME, ok: false, configured: true, error: "No quota data in response" })
+  }
   return buildResult({ providerId: "claude", providerName: NAME, ok: true, configured: true, usage: { windows }, fetchedAt: Date.now() })
 }

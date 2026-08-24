@@ -8,6 +8,9 @@ import { deepseek } from "../../src/quota/providers/deepseek"
 import { kimi } from "../../src/quota/providers/kimi"
 import { opencodeGo } from "../../src/quota/providers/opencode-go"
 import { openrouter } from "../../src/quota/providers/openrouter"
+import { claude } from "../../src/quota/providers/claude"
+import { parseClaudeCredentials } from "../../src/quota/providers/claude"
+import { codex } from "../../src/quota/providers/codex"
 
 function authWith(entries: Record<string, Auth.Info>): Auth.Interface {
   return {
@@ -215,5 +218,147 @@ describe("QuotaProviders", () => {
     const result = await run(adapter.fetch())
     expect(result.configured).toBe(false)
     expect(result.ok).toBe(false)
+  })
+})
+
+describe("ClaudeProvider", () => {
+  test("maps the limits[] array into session/weekly/model-scoped windows", async () => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN
+    const auth = authWith({ claude: { type: "oauth", access: "cc", refresh: "r", expires: 9 } } as unknown as Record<string, Auth.Info>)
+    const resetSoon = new Date(Date.now() + 3_600_000).toISOString()
+    const { client, calls } = httpWith((request) =>
+      Effect.succeed(jsonResponse(request, {
+        limits: [
+          { kind: "session", percent: 42, reset_at: resetSoon },
+          { kind: "weekly_all", percent: 18, reset_at: resetSoon },
+          { kind: "weekly_scoped", model: "claude-opus-4-1", percent: 5, reset_at: resetSoon },
+        ],
+        extra_usage: { enabled: true, monthly_limit: 10, monthly_used: 2 },
+      })),
+    )
+    const adapter = claude(client, auth)
+    expect(await run(adapter.configured())).toBe(true)
+    const result = await run(adapter.fetch())
+    expect(calls.length).toBe(1)
+    expect(calls[0].headers.authorization).toBe("Bearer cc")
+    expect(String(calls[0].headers["anthropic-beta"])).toContain("oauth")
+    expect(result.ok).toBe(true)
+    expect(result.usage?.windows["5h"].usedPercent).toBe(42)
+    expect(result.usage?.windows.weekly.usedPercent).toBe(18)
+    expect(Object.keys(result.usage?.windows ?? {}).some((key) => key.startsWith("weekly:") && key.includes("opus"))).toBe(true)
+    expect(result.usage?.windows.extra_usage).toBeDefined()
+  })
+
+  test("legacy five_hour/seven_day fields fill in when limits[] is absent", async () => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN
+    const auth = authWith({ anthropic: { type: "oauth", access: "cc" } } as unknown as Record<string, Auth.Info>)
+    const { client } = httpWith((request) =>
+      Effect.succeed(jsonResponse(request, {
+        five_hour: { percent: 70, resets_at: new Date(Date.now() + 1_000).toISOString() },
+        seven_day: { percent: 20 },
+      })),
+    )
+    const result = await run(claude(client, auth).fetch())
+    expect(result.ok).toBe(true)
+    expect(result.usage?.windows["5h"].usedPercent).toBe(70)
+    expect(result.usage?.windows.weekly.usedPercent).toBe(20)
+    expect(result.usage?.windows.extra_usage).toBeUndefined()
+  })
+
+  test("auth errors and missing data fold into the envelope without throwing", async () => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN
+    const auth = authWith({ claude: { type: "oauth", access: "cc" } } as unknown as Record<string, Auth.Info>)
+    const unauthorized = await runWith(null, 401)
+    expect(unauthorized.ok).toBe(false)
+    expect(unauthorized.error).toBe("API error: 401")
+    const empty = await runWith({})
+    expect(empty.ok).toBe(false)
+    expect(empty.error).toBe("No quota data in response")
+
+    async function runWith(body: unknown, status = 200) {
+      const { client } = httpWith((request) => Effect.succeed(jsonResponse(request, body, status)))
+      return run(claude(client, auth).fetch())
+    }
+  })
+
+  test("unconfigured without alias or env token makes no network call", async () => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN
+    // Isolate from any real ~/.claude/.credentials.json on this machine.
+    const prevUserProfile = process.env.USERPROFILE
+    const prevHome = process.env.HOME
+    process.env.USERPROFILE = "Z:\\nonexistent-opencode-test-home"
+    process.env.HOME = "/nonexistent-opencode-test-home"
+    try {
+      const auth = authWith({})
+      const { client, calls } = httpWith(() => Effect.die("must not be called"))
+      expect(await run(claude(client, auth).configured())).toBe(false)
+      const result = await run(claude(client, auth).fetch())
+      expect(result.configured).toBe(false)
+      expect(calls.length).toBe(0)
+    } finally {
+      if (prevUserProfile !== undefined) process.env.USERPROFILE = prevUserProfile
+      else delete process.env.USERPROFILE
+      if (prevHome !== undefined) process.env.HOME = prevHome
+      else delete process.env.HOME
+    }
+  })
+})
+
+describe("ClaudeCredentials", () => {
+  test("parses the claudeAiOauth envelope, bare accessToken, and tokens shapes", () => {
+    expect(parseClaudeCredentials(JSON.stringify({ claudeAiOauth: { accessToken: "tok-1", refreshToken: "r", expiresAt: 1 } }))).toBe("tok-1")
+    expect(parseClaudeCredentials(JSON.stringify({ accessToken: "tok-2" }))).toBe("tok-2")
+    expect(parseClaudeCredentials(JSON.stringify({ tokens: { access_token: "tok-3" } }))).toBe("tok-3")
+    expect(parseClaudeCredentials("{}")).toBeUndefined()
+    expect(parseClaudeCredentials("not json at all")).toBeUndefined()
+  })
+})
+
+describe("CodexProvider", () => {
+  test("maps primary/secondary rate windows plus credits and spend control", async () => {
+    const auth = authWith({ openai: { type: "oauth", access: "gpt", accountId: "acct-1" } } as unknown as Record<string, Auth.Info>)
+    const reset = new Date(Date.now() + 7_200_000).toISOString()
+    const { client, calls } = httpWith((request) =>
+      Effect.succeed(jsonResponse(request, {
+        rate_limit: {
+          primary_window: { limit_window_seconds: 18_000, used_percent: 61, reset_at: reset },
+          secondary_window: { limit_window_seconds: 604_800, used_percent: 12 },
+        },
+        credits: { balance: 4.5, unlimited: false },
+        spend_control: { individual_limit: { enabled: true, spent: 3.25, limit: 40 } },
+      })),
+    )
+    const result = await run(codex(client, auth).fetch())
+    expect(calls.length).toBe(1)
+    expect(calls[0].headers.authorization).toBe("Bearer gpt")
+    expect(String(calls[0].headers["chatgpt-account-id"])).toBe("acct-1")
+    expect(result.ok).toBe(true)
+    expect(result.usage?.windows["5h"].usedPercent).toBe(61)
+    expect(result.usage?.windows.weekly.windowSeconds).toBe(604_800)
+    expect(result.usage?.windows.credits.valueLabel).toContain("$4.50")
+    expect(result.usage?.windows.credits_spend.usedPercent).toBeCloseTo(8.125)
+  })
+
+  test("401 folds into a re-auth message and unlimited credits skip balance label", async () => {
+    const auth = authWith({ codex: { type: "oauth", access: "gpt" } } as unknown as Record<string, Auth.Info>)
+    const expired = await runWith(null, 401)
+    expect(expired.error).toContain("re-authenticate with OpenAI")
+    const unlimited = await runWith({ rate_limit: {}, credits: { unlimited: true } })
+    expect(unlimited.ok).toBe(true)
+    expect(unlimited.usage?.windows.credits.valueLabel).toBe("Unlimited")
+
+    async function runWith(body: unknown, status = 200) {
+      const { client } = httpWith((request) => Effect.succeed(jsonResponse(request, body, status)))
+      return run(codex(client, auth).fetch())
+    }
+  })
+
+  test("missing credentials report not-configured without network", async () => {
+    const auth = authWith({})
+    const { client, calls } = httpWith(() => Effect.die("must not be called"))
+    expect(await run(codex(client, auth).configured())).toBe(false)
+    const result = await run(codex(client, auth).fetch())
+    expect(result.configured).toBe(false)
+    expect(calls.length).toBe(0)
   })
 })

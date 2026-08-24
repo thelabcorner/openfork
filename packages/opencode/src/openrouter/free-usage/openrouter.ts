@@ -2,6 +2,7 @@ import type { AnalyticsRow, ModelCatalogEntry } from "./types";
 
 export const DEFAULT_ORIGIN = "https://openrouter.ai";
 export const ANALYTICS_METRICS = ["request_count", "tokens_prompt", "tokens_completion", "reasoning_tokens", "tokens_total"] as const;
+export const ANALYTICS_DIMENSIONS = ["model", "variant"] as const;
 
 export interface AnalyticsResult {
   rows: AnalyticsRow[];
@@ -43,13 +44,18 @@ export class OpenRouterReadClient {
     return payload.data.filter((entry): entry is ModelCatalogEntry => Boolean(entry) && typeof entry === "object" && typeof (entry as ModelCatalogEntry).id === "string");
   }
 
-  async analytics(start: Date, end: Date, metrics: readonly string[] = ANALYTICS_METRICS): Promise<AnalyticsResult> {
+  async analytics(
+    start: Date,
+    end: Date,
+    metrics: readonly string[] = ANALYTICS_METRICS,
+    dimensions: readonly string[] = ANALYTICS_DIMENSIONS,
+  ): Promise<AnalyticsResult> {
     const payload = await this.request("/api/v1/analytics/query", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify({
         metrics,
-        dimensions: ["model"],
+        dimensions,
         time_range: { start: start.toISOString(), end: end.toISOString() },
         limit: 1000,
       }),
