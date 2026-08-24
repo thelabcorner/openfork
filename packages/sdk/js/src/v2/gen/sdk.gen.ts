@@ -258,6 +258,7 @@ import type {
   SessionMessageResponses,
   SessionMessagesErrors,
   SessionMessagesResponses,
+  SessionNullableArchivedTimestamp,
   SessionPauseErrors,
   SessionPauseResponses,
   SessionPromptAsyncErrors,
@@ -4405,7 +4406,7 @@ export class Session2 extends HeyApiClient {
       }
       permission?: PermissionRuleset
       time?: {
-        archived?: number
+        archived?: SessionNullableArchivedTimestamp | null
       }
     },
     options?: Options<never, ThrowOnError>,

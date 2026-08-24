@@ -139,6 +139,23 @@ function matchLegacyOpenApi(input: Record<string, unknown>) {
             : operation.requestBody.content?.["application/json"]?.schema?.properties
           if (properties?.id) properties.id = { anyOf: [properties.id, { type: "null" }] }
         }
+        if (path === "/session/{sessionID}" && method === "patch") {
+          // `time.archived: null` is the unarchive contract (clears the archive
+          // timestamp) — genuinely nullable, not just optional. Re-add the null
+          // that the component-level strip above removed.
+          const ref = operation.requestBody.content?.["application/json"]?.schema?.$ref?.replace(
+            "#/components/schemas/",
+            "",
+          )
+          const properties = ref
+            ? spec.components?.schemas?.[ref]?.properties
+            : operation.requestBody.content?.["application/json"]?.schema?.properties
+          if (properties?.time?.properties?.archived) {
+            properties.time.properties.archived = {
+              anyOf: [properties.time.properties.archived, { type: "null" }],
+            }
+          }
+        }
       }
       for (const response of Object.values(operation.responses ?? {})) {
         for (const content of Object.values(response.content ?? {})) {

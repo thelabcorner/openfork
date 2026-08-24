@@ -2780,6 +2780,8 @@ export type NotFoundError = {
   }
 }
 
+export type SessionNullableArchivedTimestamp = number
+
 export type SessionNotFoundError = {
   _tag: "SessionNotFoundError"
   sessionID: string
@@ -10751,7 +10753,7 @@ export type SessionUpdateData = {
     }
     permission?: PermissionRuleset
     time?: {
-      archived?: number
+      archived?: SessionNullableArchivedTimestamp | null
     }
   }
   path: {

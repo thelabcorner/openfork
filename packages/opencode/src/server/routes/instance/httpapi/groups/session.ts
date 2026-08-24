@@ -52,13 +52,21 @@ export const MessagesQuery = Schema.Struct({
   before: Schema.optional(Schema.String),
 })
 export const StatusMap = Schema.Record(Schema.String, SessionStatus.Info)
+// Explicit nullable union for the unarchive contract (`null` clears the
+// archive timestamp). Rendered as a named component so matchLegacyOpenApi can
+// re-add the null arm its stripOptionalNull pass removes.
+const NullableArchivedTimestamp = Schema.Union([Session.ArchivedTimestamp, Schema.Null]).annotate({
+  identifier: "SessionNullableArchivedTimestamp",
+})
+
 export const UpdatePayload = Schema.Struct({
   title: Schema.optional(Schema.String),
   metadata: Schema.optional(Session.Metadata),
   permission: Schema.optional(PermissionV1.Ruleset),
   time: Schema.optional(
     Schema.Struct({
-      archived: Schema.optional(Session.ArchivedTimestamp),
+      // `null` clears the archive timestamp (unarchive); a number archives.
+      archived: Schema.optional(NullableArchivedTimestamp),
     }),
   ),
 })
