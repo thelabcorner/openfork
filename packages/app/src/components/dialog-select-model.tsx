@@ -45,9 +45,9 @@ import { useSync } from "@/context/sync"
 import { useLayout } from "@/context/layout"
 import { useSDK } from "@/context/sdk"
 import type { ForkWindowUsage } from "@/utils/fork-client"
-import { percent as usagePercent, colorFor } from "./usage-gauge-v2"
 import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
-import { FreeUsageBar } from "./openrouter-free-usage-bar"
+import type { FreeUsageReport } from "@/utils/openrouter-free-usage"
+import { percent as usagePercent, colorFor } from "./usage-gauge-v2"
 import { estimateRequestsRemaining, estimateRequestsRemainingFromCost, isUsageTrackedProvider } from "@/utils/model-usage-estimate"
 import { getUsageTables, matchUsagePricing, matchUsageProfile } from "@/utils/model-usage-profile"
 import { averageCostPerRequest, buildModelCostIndex } from "@/utils/model-usage-history"
@@ -59,10 +59,27 @@ const isFree = (provider: string, cost: { input: number } | undefined) =>
 
 type ModelState = ReturnType<typeof useLocal>["model"]
 type ModelItem = ReturnType<ModelState["list"]>[number]
+type UsageTone = "danger" | "warning" | "success"
+type ModelUsage = {
+  percent: number
+  estimatedRequests?: number
+  personalized?: boolean
+  remainingPercent?: number
+  tone?: UsageTone
+}
 
 const modelKey = (model: ModelItem) => `${model.provider.id}:${model.id}`
 const manageKey = "action:manage"
 let persistedModelSearch = ""
+
+const isOpenRouterFreeModel = (item: ModelItem) =>
+  item.provider.id === "openrouter" && (item.id === "openrouter/free" || item.id.endsWith(":free"))
+
+const openRouterFreeUsageTone = (status: FreeUsageReport["free"]["status"]): UsageTone => {
+  if (status === "depleted" || status === "terminal" || status === "critical") return "danger"
+  if (status === "low" || status === "draining") return "warning"
+  return "success"
+}
 
 // Sentinel for "let OpenRouter pick the upstream provider" — the first,
 // default-selected entry of the sub-provider picker. Storing it is never
@@ -185,13 +202,14 @@ const stretchTone = (requests: number) => {
 // models (thousands of estimated requests) read as long bars; expensive ones
 // (dozens of requests) read as short bars — a plain linear scale would crush
 // everything but the priciest model to zero given how wide that range is.
-function ModelStretchBar(props: { requests: number; maxRequests: number }) {
+function ModelStretchBar(props: { requests: number; maxRequests: number; remainingPercent?: number; tone?: UsageTone }) {
   const fraction = () => {
+    if (props.remainingPercent !== undefined) return Math.max(0, Math.min(1, props.remainingPercent / 100))
     if (props.maxRequests <= 0) return 0
     const value = Math.log1p(Math.max(0, props.requests)) / Math.log1p(props.maxRequests)
     return Math.max(0, Math.min(1, value))
   }
-  const color = () => colorFor(stretchTone(props.requests))
+  const color = () => colorFor(props.tone ?? stretchTone(props.requests))
 
   return (
     <span class="flex h-3 w-7 shrink-0 items-center overflow-hidden rounded-full bg-v2-background-bg-layer-03">
@@ -205,16 +223,21 @@ function ModelStretchBar(props: { requests: number; maxRequests: number }) {
 
 function ModelRowMeta(props: {
   item: ModelItem
-  usage?: { estimatedRequests?: number }
+  usage?: ModelUsage
   maxRequests: number
   price: JSX.Element
 }) {
   return (
     <Show
-      when={props.usage?.estimatedRequests !== undefined}
+      when={props.usage?.estimatedRequests !== undefined || props.usage?.remainingPercent !== undefined}
       fallback={<span class="shrink-0 tabular-nums text-v2-text-text-faint">{props.price}</span>}
     >
-      <ModelStretchBar requests={props.usage!.estimatedRequests!} maxRequests={props.maxRequests} />
+      <ModelStretchBar
+        requests={props.usage?.estimatedRequests ?? 0}
+        maxRequests={props.maxRequests}
+        remainingPercent={props.usage?.remainingPercent}
+        tone={props.usage?.tone}
+      />
     </Show>
   )
 }
@@ -380,7 +403,7 @@ function OpenRouterRow(props: {
   current: boolean
   favorited: boolean
   pinned: string | undefined
-  usage?: { percent: number; estimatedRequests?: number; personalized?: boolean }
+  usage?: ModelUsage
   maxRequests: number
   priceLabel: string
   rowRef: (element: HTMLElement | undefined) => void
@@ -807,17 +830,7 @@ function ModelSelectorPopoverV2View(props: {
   const profileTable = () => tables.latest?.profile ?? []
   const pricingTable = () => tables.latest?.pricing ?? []
   const sdk = useSDK()
-  const freeUsage = useOpenRouterFreeUsage({ includeValue: false })
-  const freeModelRequests = createMemo(() => {
-    const report = freeUsage.data()
-    if (!report) return new Map<string, number>()
-    const map = new Map<string, number>()
-    for (const m of report.free.models) {
-      map.set(m.model, m.requests)
-      map.set(`openrouter:${m.model}`, m.requests)
-    }
-    return map
-  })
+  const freeUsage = useOpenRouterFreeUsage()
   const [store, setStore] = createStore({ open: false, search: persistedModelSearch, active: "", rail: "", submenu: "" })
   let searchRef: HTMLInputElement | undefined
   let contentRef: HTMLDivElement | undefined
@@ -1012,6 +1025,15 @@ function ModelSelectorPopoverV2View(props: {
   // store per model per row (previously O(models * messages) on every render).
   const costIndex = createMemo(() => buildModelCostIndex(sync().data.message))
   const usageFor = (item: ModelItem) => {
+    if (isOpenRouterFreeModel(item)) {
+      const report = freeUsage.data()
+      if (!report) return undefined
+      return {
+        percent: report.free.usedPercent,
+        remainingPercent: report.free.remainingPercent,
+        tone: openRouterFreeUsageTone(report.free.status),
+      }
+    }
     if (!isUsageTrackedProvider(item.provider.id)) return undefined
     const window = activeWindow()
     if (!window) return undefined
@@ -1317,6 +1339,12 @@ function ModelSelectorPopoverV2View(props: {
     // Keep the query for the next open; the explicit clear control remains the
     // user's way to reset it. This makes repeated model switching much faster.
     setStore({ open: false, active: "", submenu: "" })
+    // Generic dismiss (outside click / MenuV2 onOpenChange false) must also
+    // notify the host (e.g. SessionContextMenu's data-model-picker-open
+    // highlight). selectModel/manage/compare already schedule their own
+    // afterClose, so this is a no-op in those paths (dismiss dedupes), but
+    // it guarantees the "clicked outside" path clears.
+    dismiss.afterClose(() => props.onClose())
   }
   const selectModel = (item: ModelItem) => {
     dismiss.preventTriggerRestore()
@@ -1445,11 +1473,6 @@ function ModelSelectorPopoverV2View(props: {
         <Show when={isFree(item.provider.id, item.cost) || item.id.endsWith(":free") || item.id === "openrouter/free"}>
           <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
         </Show>
-        <Show when={freeModelRequests().get(item.id) !== undefined || freeModelRequests().get(modelKey(item)) !== undefined}>
-          <span class="shrink-0 rounded-sm bg-v2-background-bg-layer-03 px-1 text-[10px] font-[520] tabular-nums text-v2-text-text-faint">
-            {freeModelRequests().get(item.id) ?? freeModelRequests().get(modelKey(item))} req
-          </span>
-        </Show>
         <Show when={item.latest}>
           <TagV2 class="shrink-0">{language.t("model.tag.latest")}</TagV2>
         </Show>
@@ -1543,16 +1566,9 @@ function ModelSelectorPopoverV2View(props: {
               </button>
             </div>
           </div>
-          <Show when={freeUsage.data()}>
-            {(report) => (
-              <div class="border-b border-v2-border-border-muted p-1.5">
-                <FreeUsageBar report={report()} compact />
-              </div>
-            )}
-          </Show>
           <div class="h-px bg-v2-border-border-muted" />
           <div class="flex min-h-0 max-h-[320px]">
-            <div class="flex w-8 shrink-0 flex-col items-stretch gap-0.5 border-r border-v2-border-border-muted p-0.5 py-1">
+            <div class="flex min-h-0 max-h-full w-8 shrink-0 flex-col items-stretch gap-0.5 overflow-y-auto border-r border-v2-border-border-muted p-0.5 py-1 no-scrollbar">
               <TooltipV2
                 placement="right-start"
                 gutter={6}

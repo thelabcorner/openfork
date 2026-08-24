@@ -5,6 +5,18 @@ const icons = {
     viewBox: "0 0 16 16",
     body: `<path fill-rule="evenodd" clip-rule="evenodd" d="M8 1.5C7.724 1.5 7.5 1.724 7.5 2V3.13C5.8 3.5 4.5 5 4.5 6.8C4.5 8.6 5.8 10.1 7.5 10.47V12.5H6.1C5.62 12.5 5.5 13.2 5.9 13.5H10.1C10.5 13.2 10.38 12.5 9.9 12.5H8.5V10.47C10.2 10.1 11.5 8.6 11.5 6.8C11.5 5 10.2 3.5 8.5 3.13V2C8.5 1.724 8.276 1.5 8 1.5ZM8 4.1C9.49 4.1 10.7 5.31 10.7 6.8C10.7 8.29 9.49 9.5 8 9.5C6.51 9.5 5.3 8.29 5.3 6.8C5.3 5.31 6.51 4.1 8 4.1Z" fill="currentColor"/>`,
   },
+  pin: {
+    viewBox: "0 0 16 16",
+    body: `<path d="M9.5 1.5L14.5 6.5L11.75 9.25L11.9 12.1L9.9 14.1L6.9 11.1L3.5 14.5L3 14L6.4 10.6L3.4 7.6L5.4 5.6L8.25 5.75L11 3L9.5 1.5Z" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>`,
+  },
+  "pin-filled": {
+    viewBox: "0 0 16 16",
+    body: `<path d="M9.5 1.5L14.5 6.5L11.75 9.25L11.9 12.1L9.9 14.1L6.9 11.1L3.5 14.5L3 14L6.4 10.6L3.4 7.6L5.4 5.6L8.25 5.75L11 3L9.5 1.5Z" fill="currentColor" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>`,
+  },
+  download: {
+    viewBox: "0 0 16 16",
+    body: `<path d="M8 2V10M8 10L5 7M8 10L11 7M2.5 12.5H13.5" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>`,
+  },
   edit: {
     viewBox: "0 0 16 16",
     body: `<path d="M13.5555 8.21534V13.5556H2.44434L2.44434 2.4445H7.78462M6.88878 9.11119C6.88878 9.11119 8.96327 9.0367 9.69678 8.3032L14.0301 3.96986C14.5824 3.4176 14.5824 2.52213 14.0301 1.96986C13.4778 1.4176 12.5824 1.4176 12.0301 1.96986L7.69678 6.3032C7.00513 6.99484 6.88878 9.11119 6.88878 9.11119Z" stroke="currentColor"/>`,
@@ -191,9 +203,17 @@ const icons = {
     viewBox: "0 0 16 16",
     body: `<path d="M8 1.5L13.5 3.66667V7.44444C13.5 10.8222 11.1852 13.0556 8 14.5C4.81481 13.0556 2.5 10.8222 2.5 7.44444V3.66667L8 1.5Z" fill="currentColor" fill-opacity="0.12" stroke="currentColor" stroke-linejoin="round"/><path d="M5.75 8.25L7.25 9.75L10.25 6.25" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>`,
   },
+  hourglass: {
+    viewBox: "0 0 16 16",
+    body: `<path d="M4.5 2.5H11.5L8.5 6.5L11.5 13.5H4.5L7.5 6.5Z" stroke="currentColor" stroke-linejoin="round"/><path d="M4.5 2.5H11.5" stroke="currentColor" stroke-linecap="square"/><path d="M4.5 13.5H11.5" stroke="currentColor" stroke-linecap="square"/>`,
+  },
   warning: {
     viewBox: "0 0 16 16",
     body: `<path d="M8 2L14.5 13.5H1.5L8 2Z" stroke="currentColor" stroke-linejoin="round"/><path d="M8 6.5V9.25" stroke="currentColor" stroke-linecap="round"/><circle cx="8" cy="11.25" r="0.75" fill="currentColor"/>`,
+  },
+  cache: {
+    viewBox: "0 0 16 16",
+    body: `<path d="M4 4.5C4 4.5 4 3 8 3C12 3 12 4.5 12 4.5V11.5C12 11.5 12 13 8 13C4 13 4 11.5 4 11.5V4.5Z" stroke="currentColor" stroke-linejoin="round"/><path d="M4 4.5C4 5.5 5.5 6.5 8 6.5C10.5 6.5 12 5.5 12 4.5" stroke="currentColor"/><path d="M4 8C4 9 5.5 10 8 10C10.5 10 12 9 12 8" stroke="currentColor" opacity="0.7"/>`,
   },
   layers: {
     viewBox: "0 0 16 16",

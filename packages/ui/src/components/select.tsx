@@ -3,6 +3,7 @@ import { createMemo, onCleanup, splitProps, type ComponentProps, type JSX } from
 import { pipe, groupBy, entries, map } from "remeda"
 import { Button, ButtonProps } from "./button"
 import { Icon } from "./icon"
+import { ScrollView } from "./scroll-view"
 
 export type SelectProps<T> = Omit<ComponentProps<typeof Kobalte<T>>, "value" | "onSelect" | "children"> & {
   placeholder?: string
@@ -172,7 +173,9 @@ export function Select<T>(props: SelectProps<T> & Omit<ButtonProps, "children">)
           data-component="select-content"
           data-trigger-style={local.triggerVariant}
         >
-          <Kobalte.Listbox data-slot="select-select-content-list" />
+          <ScrollView class="max-h-[12rem] [&_.scroll-view__viewport]:overflow-x-hidden">
+            <Kobalte.Listbox data-slot="select-select-content-list" />
+          </ScrollView>
         </Kobalte.Content>
       </Kobalte.Portal>
     </Kobalte>

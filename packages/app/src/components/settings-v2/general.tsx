@@ -11,6 +11,7 @@ import { TextareaV2 } from "@opencode-ai/ui/v2/textarea-v2"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
+import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useUpdaterAction } from "../updater-action"
@@ -309,10 +310,7 @@ const TitlePromptDialog: Component<{ onClose: () => void }> = (props) => {
   }
 
   return (
-    <Dialog
-      size="x-large"
-      containerClass="!w-[min(calc(100vw-40px),1040px)] !h-[min(calc(100vh-64px),760px)]"
-    >
+    <Dialog size="x-large" containerClass="!w-[min(calc(100vw-40px),1040px)] !h-[min(calc(100vh-64px),760px)]">
       <DialogHeader>
         <div class="flex min-w-0 flex-1 flex-col gap-1">
           <DialogTitle>{language.t("dialog.titlePrompt.title")}</DialogTitle>
@@ -379,12 +377,16 @@ const TitlePromptDialog: Component<{ onClose: () => void }> = (props) => {
               <div class="select-none text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-base">
                 {language.t("dialog.titlePrompt.default")}
               </div>
-              <pre
-                class="min-h-0 flex-1 overflow-auto whitespace-pre-wrap rounded-md border border-v2-border-border-muted bg-v2-background-bg-base p-3 font-mono text-[12px] leading-5 tracking-normal text-v2-text-text-muted select-none"
-                aria-label={language.t("dialog.titlePrompt.default")}
-              >
-                {DEFAULT_TITLE_PROMPT}
-              </pre>
+              <div class="min-h-0 flex-1 overflow-hidden rounded-md border border-v2-border-border-muted bg-v2-background-bg-base">
+                <ScrollView class="h-full">
+                  <pre
+                    class="whitespace-pre-wrap p-3 font-mono text-[12px] leading-5 tracking-normal text-v2-text-text-muted select-none"
+                    aria-label={language.t("dialog.titlePrompt.default")}
+                  >
+                    {DEFAULT_TITLE_PROMPT}
+                  </pre>
+                </ScrollView>
+              </div>
             </div>
           </aside>
         </div>
@@ -427,7 +429,9 @@ const TitleGenerationSection: Component = () => {
   const currentTitleModel = createMemo(() => {
     const saved = settings.general.titleGeneration()?.model
     if (!saved) return titleModelOptions()[0]
-    return titleModelOptions().find((item) => item.model?.providerID === saved.providerID && item.model.modelID === saved.modelID)
+    return titleModelOptions().find(
+      (item) => item.model?.providerID === saved.providerID && item.model.modelID === saved.modelID,
+    )
   })
   const selectTitleModel = (option: ReturnType<typeof titleModelOptions>[number] | null) => {
     const next = settings.general.titleGeneration()

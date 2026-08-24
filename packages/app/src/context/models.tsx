@@ -31,11 +31,11 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
   init: (props: { directory?: Accessor<string | undefined> } = {}) => {
     const providers = useProviders(() => props.directory?.())
 
-    // Warm the model usage profile/pricing tables in the background as soon as
-    // the app is up, so opening the model selector never waits on (or re-fires)
-    // the network fetch. The data is global (not per-directory) and the fetch
-    // is deduped + cached, so this is a single best-effort fetch at most.
-    void getUsageTables()
+    const warmUsage = () => {
+      void getUsageTables()
+    }
+    if (typeof requestIdleCallback === "function") requestIdleCallback(warmUsage, { timeout: 400 })
+    else requestAnimationFrame(warmUsage)
 
     const [store, setStore, _, ready] = persisted(
       Persist.global("model", ["model.v1"]),

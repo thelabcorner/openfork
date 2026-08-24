@@ -19,6 +19,7 @@
 
   outline: none;
 
+  font-family: var(--v2-font-family-sans);
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: geometricPrecision;
@@ -45,15 +46,17 @@
   -moz-osx-font-smoothing: grayscale;
   text-rendering: geometricPrecision;
 
+  font-family: inherit;
+
   box-sizing: border-box;
   display: flex;
   flex-direction: row;
   align-items: center;
-  gap: 8px;
-  height: 28px;
-  padding: 0 12px;
+  gap: 7px;
+  height: 25px;
+  padding: 0 8px;
   background: transparent;
-  border-radius: 4px;
+  border-radius: 3px;
   outline: none;
   cursor: default;
   user-select: none;
@@ -67,13 +70,13 @@
     flex: 1 1 auto;
     flex-direction: row;
     align-items: center;
-    gap: 8px;
+    gap: 7px;
     min-width: 0;
 
-    font-size: 13px;
-    font-weight: 440;
+    font-size: 12px;
+    font-weight: 400;
     line-height: 100%;
-    letter-spacing: -0.04px;
+    letter-spacing: -0.02px;
     color: var(--menu-v2-fg);
   }
 
@@ -119,8 +122,8 @@
     align-items: center;
     justify-content: center;
     flex: none;
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
     color: var(--menu-v2-icon);
   }
 
@@ -130,8 +133,18 @@
 
   [data-slot="menu-v2-item-chevron"] {
     flex: none;
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
+    color: var(--menu-v2-fg-muted);
+  }
+
+  [data-slot="menu-v2-item-icon"] {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    flex: none;
+    width: 14px;
+    height: 14px;
     color: var(--menu-v2-fg-muted);
   }
 
@@ -166,11 +179,12 @@
   box-sizing: border-box;
   display: flex;
   align-items: center;
-  height: 28px;
-  padding: 0 12px;
+  height: 24px;
+  padding: 0 8px;
 
-  font-size: 11px;
-  font-weight: 530;
+  font-family: inherit;
+  font-size: 10.5px;
+  font-weight: 500;
   line-height: 100%;
   letter-spacing: 0.05px;
   color: var(--v2-text-text-faint);
