@@ -49,7 +49,11 @@ function eventResponse(events: EventV2.Interface) {
     const queue = yield* Queue.unbounded<EventV2.Payload>()
     const unsubscribe = yield* events.listen((event) =>
       Effect.sync(() => {
-        // Serialize once per event id; all subscribers reuse the cached string.
+        if (
+          event.location?.directory !== instance.directory ||
+          (event.location.workspaceID !== undefined && event.location.workspaceID !== workspaceID)
+        )
+          return
         const key = event.id
         if (!serializedCache.has(key)) {
           serializedCache.set(key, JSON.stringify({ id: event.id, type: event.type, properties: event.data }))

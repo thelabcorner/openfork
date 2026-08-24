@@ -876,11 +876,14 @@ export const layerWith = (options?: LayerOptions) =>
 
       function notify(event: Payload, isolateListeners: boolean) {
         return Effect.gen(function* () {
-          yield* Effect.forEach(
-            listeners,
-            (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
-            { discard: true },
-          )
+          const snapshot = listeners.slice()
+          if (snapshot.length > 0) {
+            yield* Effect.forEach(
+              snapshot,
+              (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
+              { concurrency: 20, discard: true },
+            )
+          }
           const typed = pubsub.typed.get(event.type)
           if (typed) yield* PubSub.publish(typed, event)
           yield* PubSub.publish(pubsub.all, event)
@@ -1078,15 +1081,6 @@ export const layerWith = (options?: LayerOptions) =>
       const listen = (listener: Subscriber): Effect.Effect<Unsubscribe> =>
         Effect.sync(() => {
           listeners.push(listener)
-          // notify() runs this array on every published event (including the SSE
-          // heartbeat every 10s), so an accumulation of listeners whose owning
-          // connection died without a clean close (no FIN/RST -- laptop sleep,
-          // wifi drop, VPN blip) silently makes every future publish slower. TCP
-          // keepalive is meant to reap those, but its timing depends on OS
-          // defaults we don't fully control; log loudly if the count climbs well
-          // past what a normal session should ever have open, so a stuck growth
-          // is visible in logs instead of only showing up as an unexplained
-          // global slowdown.
           if (listeners.length > 0 && listeners.length % 50 === 0) {
             void Effect.runFork(Effect.logWarning("Event listener count is unusually high", { count: listeners.length }))
           }
