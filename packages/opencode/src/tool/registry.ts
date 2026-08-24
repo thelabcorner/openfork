@@ -22,6 +22,9 @@ import { JsonTool } from "./json"
 import { BackgroundTool } from "./background"
 import { SqliteTool } from "./sqlite"
 import { GitTool } from "./git"
+import { CheckpointTool } from "./checkpoint"
+import { TurnCheckpoint } from "@/session/checkpoint"
+import { Snapshot } from "@/snapshot"
 import { TypecheckTool } from "./typecheck"
 import { ProjectTool } from "./project"
 import { SymbolsTool } from "./symbols"
@@ -62,6 +65,8 @@ import { BrowserAnnotateTool } from "./browser/annotate"
 import { BrowserProfilerStartTool } from "./browser/profiler-start"
 import { BrowserProfilerStopTool } from "./browser/profiler-stop"
 import { BrowserReactInspectTool } from "./browser/react-inspect"
+import { BrowserOpenDevtoolsTool } from "./browser/open-devtools"
+import { BrowserExtensionsListTool } from "./browser/extensions-list"
 import { BrokerClient } from "@/browser/broker-client"
 import { Effect, Layer, Context, Ref } from "effect"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
@@ -165,6 +170,7 @@ const layer = Layer.effect(
     const backgroundtool = yield* BackgroundTool
     const sqlitetool = yield* SqliteTool
     const gittool = yield* GitTool
+    const checkpointtool = yield* CheckpointTool
     const typechecktool = yield* TypecheckTool
     const projecttool = yield* ProjectTool
     const symbolstool = yield* SymbolsTool
@@ -195,6 +201,8 @@ const layer = Layer.effect(
     const browserProfilerStart = yield* BrowserProfilerStartTool
     const browserProfilerStop = yield* BrowserProfilerStopTool
     const browserReactInspect = yield* BrowserReactInspectTool
+    const browserOpenDevtools = yield* BrowserOpenDevtoolsTool
+    const browserExtensionsList = yield* BrowserExtensionsListTool
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
 
@@ -231,6 +239,7 @@ const layer = Layer.effect(
           background: Tool.init(backgroundtool),
           sqlite: Tool.init(sqlitetool),
           git: Tool.init(gittool),
+          checkpoint: Tool.init(checkpointtool),
           typecheck: Tool.init(typechecktool),
           project: Tool.init(projecttool),
           symbols: Tool.init(symbolstool),
@@ -265,6 +274,8 @@ const layer = Layer.effect(
           browserProfilerStart: Tool.init(browserProfilerStart),
           browserProfilerStop: Tool.init(browserProfilerStop),
           browserReactInspect: Tool.init(browserReactInspect),
+          browserOpenDevtools: Tool.init(browserOpenDevtools),
+          browserExtensionsList: Tool.init(browserExtensionsList),
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
 
@@ -320,6 +331,8 @@ const layer = Layer.effect(
             tool.browserProfilerStart,
             tool.browserProfilerStop,
             tool.browserReactInspect,
+            tool.browserOpenDevtools,
+            tool.browserExtensionsList,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
@@ -482,6 +495,8 @@ export const node = LayerNode.make({
     RuntimeFlags.node,
     MCP.node,
     Database.node,
+    Snapshot.node,
+    TurnCheckpoint.node,
     Ripgrep.node,
     RipgrepBinary.node,
     BrokerClient.node,
