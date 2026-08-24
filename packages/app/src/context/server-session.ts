@@ -1055,20 +1055,21 @@ export function createServerSession(
     const eventID = eventSessionID(event)
     if (eventID) {
       touch(eventID)
+      const content = v1ContentEvents.has(event.type)
+      if (content && suspended.has(eventID)) {
+        stale.add(eventID)
+        return
+      }
+      const loaded = data.message[eventID] !== undefined || data.session_message[eventID] !== undefined
+      if (content && !loaded && !messageLoads.has(eventID)) return
       if (
+        !content &&
         !data.info[eventID] &&
         event.type !== "session.created" &&
         event.type !== "session.updated" &&
         event.type !== "session.deleted"
       )
         void resolve(eventID).catch(() => {})
-      // Mirror applyV2's suspended-session gate: a released/background tab shouldn't
-      // pay per-delta Binary.search + reconcile cost. It resyncs from session.sync
-      // when reactivated (see `fresh`), same as the V2 protocol path.
-      if (suspended.has(eventID) && v1ContentEvents.has(event.type)) {
-        stale.add(eventID)
-        return
-      }
     }
     switch (event.type) {
       case "session.created":

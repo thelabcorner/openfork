@@ -1,5 +1,6 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show, type Accessor, type JSX } from "solid-js"
-import { A, useNavigate, useParams } from "@solidjs/router"
+import { createEffect, createMemo, createSignal, For, Match, onCleanup, onMount, Show, Switch, type Accessor, type JSX } from "solid-js"
+import { createStore } from "solid-js/store"
+import { A, useIsRouting, useNavigate, useParams } from "@solidjs/router"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
@@ -7,6 +8,7 @@ import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { Spinner } from "@opencode-ai/ui/spinner"
+import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
 import { ProjectAvatar } from "@opencode-ai/ui/v2/project-avatar-v2"
 import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
 import { useLanguage } from "@/context/language"
@@ -35,16 +37,17 @@ import { aggregateSessionContextByModel, liveGenerationProgress } from "@/compon
 import { getSessionContext } from "@/components/session/session-context-metrics"
 import { computeMeasuredRate } from "@/components/prompt-input/live-generation-rate-math"
 import { SessionContextMenu } from "@/components/session-menu/session-context-menu"
-import { CHAT_SIDEBAR_RECENT_LIMIT_MIN, type ChatSidebarPaneState } from "./chat-sidebar-pane-state"
+import { CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN, CHAT_SIDEBAR_RECENT_LIMIT_MIN, type ChatSidebarPaneState } from "./chat-sidebar-pane-state"
 import type { AssistantMessage, Session } from "@opencode-ai/sdk/v2/client"
 
 type ProviderList = ReturnType<ReturnType<typeof useProviders>["all"]> extends Map<string, infer P>
   ? P[]
   : never
 
-function relativeLabel(session: Session, now: number): string {
-  const time = session.time?.updated ?? session.time?.created ?? 0
-  const diffMs = now - time
+/** Compact relative stamp ("2h", "3d", "now") for any epoch-ms timestamp. */
+function relativeStamp(ts: number | undefined, now: number): string {
+  if (!ts) return ""
+  const diffMs = now - ts
   const diffM = Math.floor(diffMs / 60000)
   const diffH = Math.floor(diffMs / 3600000)
   const diffD = Math.floor(diffMs / 86400000)
@@ -52,6 +55,10 @@ function relativeLabel(session: Session, now: number): string {
   if (diffH > 0) return `${diffH}h`
   if (diffM > 0) return `${diffM}m`
   return "now"
+}
+
+function relativeLabel(session: Session, now: number): string {
+  return relativeStamp(session.time?.updated ?? session.time?.created ?? 0, now)
 }
 
 function formatCost(value: number): string {
@@ -302,6 +309,34 @@ export function ChatSidebarPane(props: {
   // The dir-slug fallback covers sessions that are roots of no listed slice
   // (child sessions, rows beyond the store cap): their project still opens.
   const params = useParams<{ serverKey?: string; dir?: string; id?: string }>()
+  const routing = useIsRouting()
+  const [pendingSessionId, setPendingSessionId] = createSignal<string | null>(null)
+  let pendingSince = 0
+  createEffect(() => {
+    const pending = pendingSessionId()
+    if (!pending) return
+    pendingSince = Date.now()
+  })
+  createEffect(() => {
+    const pending = pendingSessionId()
+    if (!pending) return
+    if (params.id !== pending) return
+    if (routing()) return
+    const elapsed = Date.now() - pendingSince
+    const minVisible = 550
+    if (elapsed < minVisible) {
+      const id = setTimeout(() => setPendingSessionId((key) => (key === pending ? null : key)), minVisible - elapsed)
+      onCleanup(() => clearTimeout(id))
+      return
+    }
+    setPendingSessionId(null)
+  })
+  createEffect(() => {
+    const pending = pendingSessionId()
+    if (!pending) return
+    const id = setTimeout(() => setPendingSessionId((key) => (key === pending ? null : key)), 4000)
+    onCleanup(() => clearTimeout(id))
+  })
   let revealedFor: string | undefined
   createEffect(() => {
     const id = params.id
@@ -345,6 +380,94 @@ export function ChatSidebarPane(props: {
       hydrated.delete(session.id)
     } catch {
       // ignore
+    }
+  }
+
+  // ── Archived group ────────────────────────────────────────────────────────
+  // Archived roots are filtered out of every live directory store (loadSessions
+  // + trimSessions), so they live in this pane-local cache instead: fetched on
+  // demand when the group is expanded, never merged into the active stores.
+  const [archivedState, setArchivedState] = createStore({
+    loading: false,
+    error: false,
+    rows: [] as Session[],
+  })
+  let archivedFetchSeq = 0
+
+  // One request per project slice (worktree + sandboxes), deduped by path —
+  // mirrors the directories baseGroups() reads so unarchived rows resurface in
+  // exactly the groups this pane renders.
+  const archivedDirectories = createMemo(() => {
+    const dirs: string[] = []
+    for (const project of layout.projects.list()) {
+      for (const dir of [project.worktree, ...(project.sandboxes ?? [])]) {
+        if (dirs.some((existing) => pathKey(existing) === pathKey(dir))) continue
+        dirs.push(dir)
+      }
+    }
+    return dirs
+  })
+
+  const fetchArchived = async () => {
+    const dirs = archivedDirectories()
+    if (dirs.length === 0) return
+    const seq = ++archivedFetchSeq
+    // Stale-while-revalidate: keep cached rows visible on refetch, only show
+    // the skeleton when there is nothing to paint yet.
+    setArchivedState({ loading: archivedState.rows.length === 0, error: false })
+    try {
+      const results = await Promise.all(
+        dirs.map(async (directory) => {
+          // The archived filter lives on the experimental session list
+          // (/experimental/session); the plain client.session.list has no
+          // archived param.
+          const result = await serverSDK().client?.experimental?.session?.list?.({ directory, archived: true })
+          return { directory, rows: result?.data ?? [] }
+        }),
+      )
+      if (seq !== archivedFetchSeq) return
+      // The server's archived:true only DROPS the "not archived" filter — it
+      // still returns active sessions — and spans child sessions, so keep just
+      // archived roots here.
+      const seen = new Set<string>()
+      const rows = results
+        .flatMap((entry) => entry.rows)
+        .filter((session) => !!session.id && session.time?.archived != null && !session.parentID)
+        .filter((session) => !seen.has(session.id) && seen.add(session.id))
+        .sort(compareSessionTime)
+      setArchivedState({ rows, loading: false, error: false })
+    } catch {
+      if (seq !== archivedFetchSeq) return
+      setArchivedState({ loading: false, error: true })
+    }
+  }
+
+  // Refetch on every expansion (freshness) while cached rows keep the group
+  // responsive; also covers a persisted-expanded group on pane mount.
+  createEffect(() => {
+    if (!props.state.isArchivedExpanded()) return
+    void fetchArchived()
+  })
+
+  const unarchiveSession = async (session: Session) => {
+    if (!session.id) return
+    try {
+      await serverSDK()
+        .client?.session?.update?.({
+          sessionID: session.id,
+          directory: session.directory,
+          // Server contract (httpapi UpdatePayload): `null` clears the archive
+          // timestamp; a number archives. Live sync then re-inserts the row
+          // into its project group via session.updated.
+          time: { archived: null },
+        })
+      setArchivedState(
+        "rows",
+        (rows) => rows.filter((row) => row.id !== session.id),
+      )
+      hydrated.delete(session.id)
+    } catch {
+      // ignore — row stays put; the user can retry
     }
   }
 
@@ -729,6 +852,10 @@ export function ChatSidebarPane(props: {
                             now={now}
                             minuteNow={minuteNow}
                             providers={providerList}
+                            pending={pendingSessionId() === session.id}
+                            onPending={(id) => {
+                              if (params.id !== id) setPendingSessionId(id)
+                            }}
                             hydrate={() => hydrateMetrics(session)}
                             observeHydration={observeHydration}
                             archiveSession={() => archiveSession(session)}
@@ -787,6 +914,94 @@ export function ChatSidebarPane(props: {
             </For>
           </div>
         </Show>
+
+        {/* ── Archived group ──────────────────────────────────────
+            Sits after every project group, separated by a hairline. Rendered
+            outside the active-groups <Show> so it stays reachable even when
+            no active chats exist. Collapsed by default; expansion and the
+            row limit persist independently of Recent/project groups. */}
+        <section class="flex flex-col border-t border-v2-border-border-muted pb-2 pt-1.5" data-component="chats-archived-group">
+          <button
+            type="button"
+            onClick={() => props.state.toggleArchived()}
+            aria-expanded={props.state.isArchivedExpanded()}
+            aria-controls="chats-group-archived"
+            aria-label={`${language.t("chats.archived.group")}, ${language.plural("chats.archived.count", archivedState.rows.length)}`}
+            class="group/head sticky top-0 z-10 flex h-6 shrink-0 items-center gap-1.5 bg-v2-background-bg-base px-2.5 text-left transition-colors hover:bg-v2-background-bg-layer-01 focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none"
+          >
+            <IconV2
+              name="chevron-down"
+              size="small"
+              class={`size-3 shrink-0 text-v2-icon-icon-muted transition-transform duration-150 ${
+                props.state.isArchivedExpanded() ? "" : "-rotate-90"
+              }`}
+            />
+            <IconV2 name="archive" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
+            <span class="min-w-0 flex-1 truncate text-[10px] font-[560] uppercase leading-none tracking-[0.06em] text-v2-text-text-faint transition-colors group-hover/head:text-v2-text-text-muted">
+              {language.t("chats.archived.group")}
+            </span>
+            <TooltipV2 value={language.plural("chats.archived.count", archivedState.rows.length)} placement="top">
+              <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70">
+                {archivedState.rows.length}
+              </span>
+            </TooltipV2>
+          </button>
+
+          <Show when={props.state.isArchivedExpanded()}>
+            <div id="chats-group-archived" class="flex flex-col px-1.5 pt-0.5">
+              <Show
+                when={!archivedState.loading}
+                fallback={<ChatsArchivedLoading label={language.t("chats.archived.loading")} />}
+              >
+                <Show when={!archivedState.error} fallback={<ChatsArchivedError onRetry={() => void fetchArchived()} />}>
+                  <Show
+                    when={archivedState.rows.length > 0}
+                    fallback={
+                      <p class="px-2 py-1.5 text-[11px] leading-none text-v2-text-text-faint">
+                        {language.t("chats.archived.empty")}
+                      </p>
+                    }
+                  >
+                    <For each={archivedState.rows.slice(0, props.state.archivedLimit())}>
+                      {(session) => (
+                        <ArchivedRow
+                          session={session}
+                          minuteNow={minuteNow}
+                          pending={pendingSessionId() === session.id}
+                          onPending={(id) => {
+                            if (params.id !== id) setPendingSessionId(id)
+                          }}
+                          unarchiveSession={() => unarchiveSession(session)}
+                        />
+                      )}
+                    </For>
+                    {/* The full archived list is held client-side, so both
+                        controls below are exact — no estimates like the
+                        server-paged groups. */}
+                    <Show when={archivedState.rows.length > props.state.archivedLimit()}>
+                      <button
+                        type="button"
+                        class="ms-[26px] flex h-6 items-center rounded-md pe-2 text-start text-[10px] leading-none text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-muted focus-visible:outline-none"
+                        onClick={() => props.state.showMoreArchived()}
+                      >
+                        {language.t("chats.archived.showMore")}
+                      </button>
+                    </Show>
+                    <Show when={props.state.archivedLimit() > CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN}>
+                      <button
+                        type="button"
+                        class="ms-[26px] flex h-6 items-center rounded-md pe-2 text-start text-[10px] leading-none text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-muted focus-visible:outline-none"
+                        onClick={() => props.state.showLessArchived()}
+                      >
+                        {language.t("chats.archived.showLess")}
+                      </button>
+                    </Show>
+                  </Show>
+                </Show>
+              </Show>
+            </div>
+          </Show>
+        </section>
       </ScrollView>
 
       {/* ── Footer summary ────────────────────────────────────── */}
@@ -1033,6 +1248,8 @@ function ChatRow(props: {
   now: () => number
   minuteNow: () => number
   providers: () => ProviderList
+  pending?: boolean
+  onPending?: (id: string) => void
   hydrate: () => void
   observeHydration: (el: Element, hydrate: () => void) => void
   archiveSession: () => Promise<void>
@@ -1046,25 +1263,29 @@ function ChatRow(props: {
 
   const title = () => sessionTitle(props.session.title)
   const currentDir = props.directory || props.session.directory || ""
-  // Session message/permission/question stores are directory-scoped — read them
-  // from the same per-directory context the session route itself uses, not the
-  // pane's root context.
-  const dirSync = createMemo(() => serverSync().ensureDirSyncContext(currentDir))
-  const isWorking = createMemo(() => dirSync().data.session_working(props.session.id))
+  const sessionData = () => serverSync().session.data
+  const isWorking = createMemo(() => sessionData().session_working(props.session.id))
   const unseenCount = createMemo(() => notification.session.unseenCount(props.session.id))
   const hasError = createMemo(() => notification.session.unseenHasError(props.session.id))
 
   const permissionState = createMemo(() => permission.ensureServerState(ServerConnection.key(serverSDK().server)))
   const pendingPermissions = createMemo(() => {
-    const pending = dirSync().data.permission[props.session.id] ?? []
+    const pending = sessionData().permission[props.session.id] ?? []
     return pending.filter((item) => !permissionState().autoResponds(item, currentDir))
   })
-  const pendingQuestions = createMemo(() => dirSync().data.question[props.session.id] ?? [])
+  const pendingQuestions = createMemo(() => sessionData().question[props.session.id] ?? [])
   const hasPermissions = createMemo(() => pendingPermissions().length > 0)
   const hasQuestions = createMemo(() => pendingQuestions().length > 0)
   const needsAttention = createMemo(() => hasPermissions() || hasQuestions())
+  const isAutoAccepting = createMemo(() => {
+    try {
+      return permissionState().isAutoAccepting(props.session.id, currentDir)
+    } catch {
+      return false
+    }
+  })
 
-  const messages = createMemo(() => dirSync().data.message[props.session.id] ?? [])
+  const messages = createMemo(() => sessionData().message[props.session.id] ?? [])
 
   /**
    * Historical totals deliberately do NOT read `now()` — only the live turn
@@ -1072,10 +1293,10 @@ function ChatRow(props: {
    * re-aggregating the whole session once a second for every visible row.
    * Guarded: one malformed session must never take down the whole pane.
    */
-  const totals = createMemo<{ generatedSeconds: number; toolSeconds: number; cost: number } | undefined>(() => {
+  const totals = createMemo<{ generatedSeconds: number; toolSeconds: number; cost: number; cacheHitPercent: number | null } | undefined>(() => {
     try {
-      const session = aggregateSessionContextByModel(messages(), dirSync().data.part, []).session
-      return { generatedSeconds: session.generatedSeconds, toolSeconds: session.toolSeconds, cost: session.cost }
+      const session = aggregateSessionContextByModel(messages(), sessionData().part, []).session
+      return { generatedSeconds: session.generatedSeconds, toolSeconds: session.toolSeconds, cost: session.cost, cacheHitPercent: session.cacheHitPercent }
     } catch {
       return undefined
     }
@@ -1097,7 +1318,7 @@ function ChatRow(props: {
   const live = createMemo(() => {
     if (!isWorking()) return undefined
     const list = messages()
-    const parts = dirSync().data.part
+    const parts = sessionData().part
     let active: AssistantMessage | undefined
     for (let i = list.length - 1; i >= 0; i--) {
       const msg = list[i]
@@ -1144,10 +1365,6 @@ function ChatRow(props: {
     const server = serverKey()
     if (!server) return
     if (opts?.background) {
-      // Mirror home controller background open: add tab without navigating
-      // We can't import useTabs here directly without circular deps? Use global tabs store via window?
-      // Fallback: just navigate — background open is best-effort via link; context menu will at least open.
-      // For chats we use tabs API if available via dynamic import to avoid hard dep.
       void import("@/context/tabs").then(({ useTabs }) => {
         try {
           const tabs = useTabs()
@@ -1156,6 +1373,7 @@ function ChatRow(props: {
       })
       return
     }
+    props.onPending?.(props.session.id)
     navigate(`/${slug()}/session/${props.session.id}`)
   }
 
@@ -1167,49 +1385,145 @@ function ChatRow(props: {
     props.observeHydration(rowEl, props.hydrate)
   })
 
+  // Rich hover card — mirrors model-tooltip v2 density + image-1.png (title + project/branch rows)
+  const hoverProjectName = () => {
+    try {
+      const name = (props.session as unknown as { projectName?: string }).projectName as string | undefined
+      if (name) return name
+      const dir = currentDir || props.session.directory || ""
+      const segs = dir.replace(/\\/g, "/").split("/").filter(Boolean)
+      return segs[segs.length - 1] ?? dir
+    } catch {
+      return currentDir || props.session.directory || ""
+    }
+  }
+  const hoverBranch = () => {
+    try {
+      const meta = (props.session as unknown as { branch?: string; vcsBranch?: string }).branch ?? (props.session as unknown as { vcsBranch?: string }).vcsBranch
+      if (meta) return meta
+    } catch {}
+    return "main"
+  }
+
   return (
-    <SessionContextMenu
-      where="chats"
-      session={props.session}
-      server={serverKey()}
-      onOpen={handleOpen}
-      onArchive={() => void props.archiveSession()}
+    <TooltipV2
+      placement="right"
+      gutter={8}
+      contentClass="!p-0 overflow-hidden rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-layer-01 shadow-[var(--v2-elevation-floating)]"
+      value={
+        <div class="flex w-[260px] flex-col gap-2.5 px-3 py-2.5">
+          <div class="flex min-w-0 items-center gap-2">
+            <span class="flex size-5 shrink-0 items-center justify-center rounded-md bg-v2-background-bg-layer-02 text-[10px] font-[700] leading-none text-v2-text-text-muted">
+              {(hoverProjectName()[0] ?? "•").toUpperCase()}
+            </span>
+            <span class="min-w-0 flex-1 truncate text-[12px] font-[600] leading-4 tracking-[-0.01em] text-v2-text-text-base">{title() || hoverProjectName()}</span>
+            <span class="shrink-0 text-[11px] leading-none tabular-nums text-v2-text-text-faint">{relativeLabel(props.session, props.minuteNow())}</span>
+          </div>
+          <div class="h-px bg-v2-border-border-muted" />
+          <div class="flex flex-col gap-1.5">
+            <div class="flex min-w-0 items-center gap-1.5 text-[11px] leading-4">
+              <IconV2 name="folder" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
+              <span class="min-w-0 flex-1 truncate text-v2-text-text-muted">{hoverProjectName()}</span>
+              <span class="shrink-0 truncate text-[11px] text-v2-text-text-faint">{currentDir ? currentDir.replace(/\\/g, "/").split("/").slice(-2).join("/") : ""}</span>
+            </div>
+            <div class="flex items-center gap-1.5 text-[11px] leading-4">
+              <IconV2 name="branch" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
+              <span class="text-v2-text-text-muted">{hoverBranch()}</span>
+              <Show when={modelInfo()}>
+                {(info) => (
+                  <span class="ml-auto flex min-w-0 items-center gap-1 truncate text-v2-text-text-faint">
+                    <IconV2 name="cache" size="small" class="size-2.5 shrink-0 opacity-60" />
+                    <span class="truncate">{info().modelID}</span>
+                    <Show when={info().variant}>{(v) => <span class="shrink-0">· {v()}</span>}</Show>
+                  </span>
+                )}
+              </Show>
+            </div>
+          </div>
+          <Show when={totals() && ((totals()!.cost ?? 0) > 0 || contextPercent() !== null || totals()!.cacheHitPercent !== null)}>
+            <div class="h-px bg-v2-border-border-muted" />
+            <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-none tabular-nums">
+              <Show when={(totals()?.cost ?? 0) > 0}>
+                <span class="text-v2-text-text-base">{formatCost(totals()!.cost)}</span>
+              </Show>
+              <Show when={contextPercent() !== null}>
+                <span class="flex items-center gap-1 text-v2-text-text-muted">
+                  <span class="h-[3px] w-8 overflow-hidden rounded-full bg-v2-background-bg-layer-03">
+                    <span class={`block h-full rounded-full ${contextTone(contextPercent()!).bar}`} style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }} />
+                  </span>
+                  {contextPercent()}%
+                </span>
+              </Show>
+              <Show when={totals()?.cacheHitPercent !== null}>
+                <span class="flex items-center gap-1 text-v2-text-text-faint">
+                  <IconV2 name="cache" size="small" class="size-3 opacity-60" />
+                  {totals()!.cacheHitPercent}%
+                </span>
+              </Show>
+              <Show when={isAutoAccepting()}>
+                <span class="ml-auto flex items-center gap-1 rounded-[3.5px] bg-v2-state-bg-info px-1 py-0.5 text-[9px] font-[600] leading-none text-v2-state-fg-info">
+                  <IconV2 name="shield-check" size="small" class="size-2.5" />
+                  Auto
+                </span>
+              </Show>
+            </div>
+          </Show>
+        </div>
+      }
     >
-      <div
-        ref={rowEl}
-        class="group/session relative min-w-0 rounded-md transition-colors hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02"
+      <SessionContextMenu
+        where="chats"
+        session={props.session}
+        server={serverKey()}
+        onOpen={handleOpen}
+        onArchive={() => void props.archiveSession()}
       >
+        <div
+          ref={rowEl}
+          class="group/session relative min-w-0 rounded-md transition-colors hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
+        >
       <A
         href={`/${slug()}/session/${props.session.id}`}
         class="relative flex min-w-0 flex-col gap-[3px] rounded-md py-[5px] pe-1.5 ps-2 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[5px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:content-['']"
         onPointerDown={warm}
         onFocus={warm}
+        onClick={(event: MouseEvent) => {
+          if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button === 1) return
+          props.onPending?.(props.session.id)
+        }}
       >
         {/* Line 1 — status, title, attention, hover actions */}
         <div class="flex min-w-0 items-center gap-1.5">
           <span class="flex size-3 shrink-0 items-center justify-center">
             <Show
-              when={isWorking()}
+              when={props.pending}
               fallback={
                 <Show
-                  when={needsAttention() || hasError() || unseenCount() > 0}
+                  when={isWorking()}
                   fallback={
-                    <span class="size-1.5 rounded-full border border-v2-border-border-strong group-hover/session:border-v2-icon-icon-muted" />
+                    <Show
+                      when={needsAttention() || hasError() || unseenCount() > 0}
+                      fallback={
+                        <span class="size-1.5 rounded-full border border-v2-border-border-strong group-hover/session:border-v2-icon-icon-muted" />
+                      }
+                    >
+                      <span
+                        class={`size-1.5 rounded-full ${
+                          hasError()
+                            ? "bg-v2-state-fg-danger"
+                            : needsAttention()
+                              ? "bg-v2-state-fg-warning"
+                              : "bg-v2-background-bg-accent"
+                        }`}
+                      />
+                    </Show>
                   }
                 >
-                  <span
-                    class={`size-1.5 rounded-full ${
-                      hasError()
-                        ? "bg-v2-state-fg-danger"
-                        : needsAttention()
-                          ? "bg-v2-state-fg-warning"
-                          : "bg-v2-background-bg-accent"
-                    }`}
-                  />
+                  <Spinner class="size-3 text-v2-icon-icon-base" />
                 </Show>
               }
             >
-              <Spinner class="size-3 text-v2-icon-icon-base" />
+              <LoaderV2 class="size-3" aria-hidden="true" />
             </Show>
           </span>
 
@@ -1254,79 +1568,247 @@ function ChatRow(props: {
           </div>
         </div>
 
-        {/* Line 2 — metrics, aligned under the title */}
+        {/* Line 2 — left metrics (truncate) + right timer (pinned, never squeezed) */}
         <div class="flex min-w-0 items-center gap-1.5 ps-[18px]">
-          <Show when={contextPercent() !== null}>
-            <TooltipV2 value={language.t("chats.metric.context")} placement="top">
-              <span class="flex shrink-0 items-center gap-1">
-                <span class="h-[3px] w-6 overflow-hidden rounded-full bg-v2-background-bg-layer-03">
-                  <span
-                    class={`block h-full rounded-full transition-[width] duration-500 ${contextTone(contextPercent()!).bar}`}
-                    style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }}
-                  />
-                </span>
-                <span class={`text-[10px] leading-none tabular-nums ${contextTone(contextPercent()!).text}`}>
-                  {contextPercent()}%
-                </span>
-              </span>
-            </TooltipV2>
-          </Show>
-
-          <Show when={(totals()?.cost ?? 0) > 0}>
-            <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint">
-              {formatCost(totals()!.cost)}
-            </span>
-          </Show>
-
-          <Show when={modelInfo()}>
-            {(info) => (
-              <span class="min-w-0 truncate text-[10px] leading-none text-v2-text-text-faint opacity-70">
-                {info().modelID}
-                <Show when={info().variant}>{(variant) => ` · ${variant()}`}</Show>
-              </span>
-            )}
-          </Show>
-
-          <span class="min-w-0 flex-1" />
-
-          <Show
-            when={isWorking()}
-            fallback={
-              <Show when={(totals()?.generatedSeconds ?? 0) + (totals()?.toolSeconds ?? 0) > 1}>
-                <TooltipV2 value={language.t("chats.timer.accumulated")} placement="top">
-                  <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70">
-                    {formatDuration((totals()!.generatedSeconds ?? 0) + (totals()!.toolSeconds ?? 0))}
+          <div class="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
+            <Show when={contextPercent() !== null}>
+              <TooltipV2 value={language.t("chats.metric.context")} placement="top">
+                <span class="flex shrink-0 items-center gap-1">
+                  <span class="h-[3px] w-6 overflow-hidden rounded-full bg-v2-background-bg-layer-03">
+                    <span
+                      class={`block h-full rounded-full transition-[width] duration-500 ${contextTone(contextPercent()!).bar}`}
+                      style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }}
+                    />
                   </span>
-                </TooltipV2>
-              </Show>
-            }
-          >
-            {/* Keyed off isWorking, not live(): live() returns a fresh object
-                every tick, and a keyed <Show> callback would tear down and
-                recreate the whole tooltip+spans subtree each second. Plain
-                expression children compile to tracked getters, so only the
-                text nodes update in place each tick. */}
-            <TooltipV2
-              value={
-                <span>
-                  {`${language.t("chats.timer.accumulated")} · ${formatDuration(live()?.accumulatedSeconds ?? 0)}`}
-                </span>
-              }
-              placement="top"
-            >
-              <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums">
-                <Show when={(live()?.rate ?? null) !== null}>
-                  <span class="text-v2-text-text-accent opacity-80">
-                    {language.t("chats.metric.rate", { rate: live()?.rate?.toFixed(0) ?? "0" })}
+                  <span class={`text-[10px] leading-none tabular-nums ${contextTone(contextPercent()!).text}`}>
+                    {contextPercent()}%
                   </span>
-                </Show>
-                <span class="font-[560] text-v2-text-text-accent">{formatDuration(live()?.turnSeconds ?? 0)}</span>
+                </span>
+              </TooltipV2>
+            </Show>
+
+            <Show when={(totals()?.cost ?? 0) > 0}>
+              <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint">
+                {formatCost(totals()!.cost)}
               </span>
-            </TooltipV2>
-          </Show>
+            </Show>
+
+            <Show when={totals()?.cacheHitPercent !== null && totals()?.cacheHitPercent !== undefined}>
+              <TooltipV2 value={language.t("context.tooltip.cacheHit")} placement="top">
+                <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70">
+                  <IconV2 name="cache" size="small" class="size-2.5 opacity-70" />
+                  <span>{totals()!.cacheHitPercent}%</span>
+                </span>
+              </TooltipV2>
+            </Show>
+
+            <Show when={modelInfo()}>
+              {(info) => (
+                <span class="min-w-0 flex-1 truncate text-[10px] leading-none text-v2-text-text-faint opacity-70">
+                  {info().modelID}
+                  <Show when={info().variant}>{(variant) => ` · ${variant()}`}</Show>
+                </span>
+              )}
+            </Show>
+
+            <Show when={isAutoAccepting()}>
+              <TooltipV2 value={language.t("chats.badge.autoAccept")} placement="top">
+                <span class="flex shrink-0 items-center rounded-[3.5px] bg-v2-state-bg-info px-0.5 py-[1px] text-[9px] font-[560] leading-none text-v2-state-fg-info">
+                  <IconV2 name="shield-check" size="small" class="size-2.5" />
+                </span>
+              </TooltipV2>
+            </Show>
+          </div>
+
+
+           <Show
+             when={isWorking()}
+             fallback={
+               <Show when={(totals()?.generatedSeconds ?? 0) + (totals()?.toolSeconds ?? 0) > 1}>
+                 <TooltipV2 value={language.t("chats.timer.accumulated")} placement="top">
+                   <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70">
+                     {formatDuration((totals()!.generatedSeconds ?? 0) + (totals()!.toolSeconds ?? 0))}
+                   </span>
+                 </TooltipV2>
+               </Show>
+             }
+           >
+             {/* Keyed off isWorking, not live(): live() returns a fresh object
+                 every tick, and a keyed <Show> callback would tear down and
+                 recreate the whole tooltip+spans subtree each second. Plain
+                 expression children compile to tracked getters, so only the
+                 text nodes update in place each tick. Inner Switch swaps
+                 between generating / tools / waiting premium states instead of
+                 showing 0s. */}
+             <TooltipV2
+               value={
+                 <span>
+                   {`${language.t("chats.timer.accumulated")} · ${formatDuration(live()?.accumulatedSeconds ?? 0)}`}
+                 </span>
+               }
+               placement="top"
+             >
+               <Switch>
+                 <Match when={hasPermissions() || hasQuestions()}>
+                   <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-state-fg-warning">
+                     <IconV2 name="hourglass" size="small" class="size-3 animate-pulse" />
+                     <span class="font-[560]">{language.t("chats.timer.waiting")}</span>
+                     <Show when={(live()?.turnSeconds ?? 0) > 1}>
+                       <span class="font-[560] opacity-70">{formatDuration(live()!.turnSeconds)}</span>
+                     </Show>
+                   </span>
+                 </Match>
+                 <Match when={(live()?.rate ?? null) !== null}>
+                   <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums">
+                     <span class="text-v2-text-text-accent opacity-80">
+                       {language.t("chats.metric.rate", { rate: live()?.rate?.toFixed(0) ?? "0" })}
+                     </span>
+                     <span class="font-[560] text-v2-text-text-accent">{formatDuration(live()?.turnSeconds ?? 0)}</span>
+                   </span>
+                 </Match>
+                 <Match when={(live()?.turnSeconds ?? 0) > 1}>
+                   <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-text-text-muted">
+                     <IconV2 name="layers" size="small" class="size-2.5 opacity-70" />
+                     <span>{language.t("chats.timer.tools")}</span>
+                     <span class="opacity-40">·</span>
+                     <span class="font-[560] opacity-80">{formatDuration(live()!.turnSeconds)}</span>
+                   </span>
+                 </Match>
+                 <Match when={true}>
+                   <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-text-text-faint">
+                     <IconV2 name="hourglass" size="small" class="size-3 animate-pulse opacity-70" />
+                     <span>{language.t("chats.timer.thinking")}</span>
+                   </span>
+                 </Match>
+               </Switch>
+             </TooltipV2>
+           </Show>
         </div>
       </A>
       </div>
-    </SessionContextMenu>
+      </SessionContextMenu>
+    </TooltipV2>
+  )
+}
+
+function ChatsArchivedLoading(props: { label: string }) {
+  return (
+    <div class="flex flex-col gap-px px-2 py-1" aria-busy="true" aria-label={props.label}>
+      <For each={[0, 1]}>{() => <div class="h-[26px] rounded-md bg-v2-background-bg-layer-02 animate-pulse" />}</For>
+    </div>
+  )
+}
+
+function ChatsArchivedError(props: { onRetry: () => void }) {
+  const language = useLanguage()
+  return (
+    <div class="flex items-center justify-between gap-2 px-2 py-1.5" role="alert">
+      <span class="flex min-w-0 items-center gap-1.5">
+        <span aria-hidden="true" class="size-1.5 shrink-0 rounded-full bg-v2-state-border-danger" />
+        <span class="min-w-0 truncate text-[11px] leading-none text-v2-text-text-muted">
+          {language.t("chats.archived.error")}
+        </span>
+      </span>
+      <button
+        type="button"
+        class="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] leading-none text-v2-text-text-faint transition-colors hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-02 focus-visible:text-v2-text-text-muted focus-visible:outline-none"
+        onClick={() => props.onRetry()}
+      >
+        {language.t("chats.archived.retry")}
+      </button>
+    </div>
+  )
+}
+
+/**
+ * Archived rows reuse the ChatRow silhouette (same paddings, line heights and
+ * hover treatment) but stay dimmed at rest like palette archived rows, show
+ * WHEN the session was archived instead of live metrics, and surface Unarchive
+ * as the primary action — revealed on hover/focus exactly where active rows
+ * reveal Archive, so the two states mirror each other without reflow.
+ */
+function ArchivedRow(props: {
+  session: Session
+  minuteNow: () => number
+  pending?: boolean
+  onPending?: (id: string) => void
+  unarchiveSession: () => Promise<void>
+}): JSX.Element {
+  const language = useLanguage()
+
+  const title = () => sessionTitle(props.session.title)
+  const slug = () => base64Encode(props.session.directory || "")
+  // Server-known model ref — no message hydration needed for a dimmed row.
+  const modelInfo = () => props.session.model
+
+  const [busy, setBusy] = createSignal(false)
+  const unarchive = async (event: MouseEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    if (busy()) return
+    setBusy(true)
+    try {
+      await props.unarchiveSession()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div class="group/session relative min-w-0 rounded-md opacity-70 transition-[background-color,opacity] duration-[120ms] hover:bg-v2-background-bg-layer-01 hover:opacity-100 focus-within:bg-v2-background-bg-layer-01 focus-within:opacity-100">
+      <A
+        href={`/${slug()}/session/${props.session.id}`}
+        class="relative flex min-w-0 flex-col gap-[3px] rounded-md py-[5px] pe-1.5 ps-2 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base"
+        onClick={(event: MouseEvent) => {
+          if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button === 1) return
+          props.onPending?.(props.session.id)
+        }}
+      >
+        {/* Line 1 — archive glyph, title, unarchive-on-hover (mirrors ChatRow's
+            timestamp↔archive swap so nothing shifts between the two states) */}
+        <div class="flex min-w-0 items-center gap-1.5">
+          <span class="flex size-3 shrink-0 items-center justify-center">
+            <Show when={props.pending} fallback={<IconV2 name="archive" size="small" class="size-3 text-v2-icon-icon-muted" />}>
+              <LoaderV2 class="size-3" aria-hidden="true" />
+            </Show>
+          </span>
+
+          <span class="min-w-0 flex-1 truncate text-[12px] leading-[16px]">{title()}</span>
+
+          <div class="flex shrink-0 items-center">
+            <span class="text-[10px] leading-none tabular-nums text-v2-text-text-muted group-hover/session:hidden group-focus-within/session:hidden">
+              {relativeStamp(props.session.time?.archived, props.minuteNow())}
+            </span>
+            <TooltipV2 value={language.t("chats.archived.unarchive")} placement="top">
+              <button
+                type="button"
+                aria-label={language.t("chats.archived.unarchive")}
+                disabled={busy()}
+                class="hidden size-4 items-center justify-center rounded text-v2-icon-icon-muted transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-icon-icon-base group-hover/session:flex group-focus-within/session:flex"
+                onClick={unarchive}
+              >
+                <Show when={!busy()} fallback={<LoaderV2 class="size-3" aria-hidden="true" />}>
+                  <IconV2 name="archive" size="small" class="size-3 rotate-180" />
+                </Show>
+              </button>
+            </TooltipV2>
+          </div>
+        </div>
+
+        {/* Line 2 — fixed-height so every archived row matches, whether or not
+            the session carries a server-known model ref */}
+        <div class="flex min-h-[10px] min-w-0 items-center gap-1.5 ps-[18px]">
+          <Show when={modelInfo()}>
+            {(model) => (
+              <span class="min-w-0 truncate text-[10px] leading-none text-v2-text-text-faint opacity-70">
+                {model().id}
+                <Show when={model().variant}>{(variant) => ` · ${variant()}`}</Show>
+              </span>
+            )}
+          </Show>
+          <span class="min-w-0 flex-1" />
+        </div>
+      </A>
+    </div>
   )
 }

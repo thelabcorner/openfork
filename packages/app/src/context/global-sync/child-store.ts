@@ -19,6 +19,7 @@ import { QueryOptionsApi } from "../server-sync"
 import { directoryKey, type DirectoryKey } from "./utils"
 import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import type { ServerScope } from "@/utils/server-scope"
+import { safeQueryData } from "@/utils/safe-query-data"
 
 export function createChildStoreManager(input: {
   owner: Owner
@@ -155,7 +156,7 @@ export function createChildStoreManager(input: {
     if (!children[key]) {
       const vcs = runWithOwner(input.owner, () =>
         input.persist(
-          Persist.serverWorkspace(input.scope, directory, "vcs", ["vcs.v1"]),
+          { ...Persist.serverWorkspace(input.scope, directory, "vcs", ["vcs.v1"]), defer: true },
           createStore({ value: undefined as VcsInfo | undefined }),
         ),
       )
@@ -165,7 +166,7 @@ export function createChildStoreManager(input: {
 
       const meta = runWithOwner(input.owner, () =>
         input.persist(
-          Persist.serverWorkspace(input.scope, directory, "project", ["project.v1"]),
+          { ...Persist.serverWorkspace(input.scope, directory, "project", ["project.v1"]), defer: true },
           createStore({ value: undefined as ProjectMeta | undefined }),
         ),
       )
@@ -174,7 +175,7 @@ export function createChildStoreManager(input: {
 
       const icon = runWithOwner(input.owner, () =>
         input.persist(
-          Persist.serverWorkspace(input.scope, directory, "icon", ["icon.v1"]),
+          { ...Persist.serverWorkspace(input.scope, directory, "icon", ["icon.v1"]), defer: true },
           createStore({ value: undefined as string | undefined }),
         ),
       )
@@ -210,9 +211,9 @@ export function createChildStoreManager(input: {
             },
             get provider() {
               const EMPTY = { all: new Map(), connected: [], default: {} }
-              if (providerQuery.isLoading) return EMPTY
-              if (providerQuery.data?.all.size === 0 && input.global.provider.all.size > 0) return input.global.provider
-              return providerQuery.data ?? EMPTY
+              const catalog = safeQueryData(providerQuery, EMPTY)
+              if (catalog.all.size === 0 && input.global.provider.all.size > 0) return input.global.provider
+              return catalog
             },
             config: {},
             get path() {

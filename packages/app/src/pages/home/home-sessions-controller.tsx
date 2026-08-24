@@ -1,7 +1,7 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
 import { preloadMarkdown } from "@opencode-ai/session-ui/markdown-cache"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
-import { useQuery } from "@tanstack/solid-query"
+import { type InfiniteData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/solid-query"
 import { DateTime } from "luxon"
 import { type Accessor, createEffect, createMemo, createRoot, type JSX, startTransition } from "solid-js"
 import { createStore, produce } from "solid-js/store"
@@ -13,6 +13,7 @@ import {
 } from "@/context/global-sync/home-session-index"
 import type { LocalProject } from "@/context/layout"
 import { useLanguage } from "@/context/language"
+import { useLayout } from "@/context/layout"
 import { useSessionGroups } from "@/context/session-groups"
 import { ServerConnection } from "@/context/server"
 import { sessionHasOpenTab, useTabs } from "@/context/tabs"
@@ -23,7 +24,7 @@ import { pathKey } from "@/utils/path-key"
 import { showToast } from "@/utils/toast"
 import { DialogSessionGroupName } from "@/components/dialog-session-group"
 import { Binary } from "@opencode-ai/core/util/binary"
-import { archiveHomeSession } from "../home-session-archive"
+import { archiveHomeSession, loadArchivedHomeSessions, type HomeArchivedPage, unarchiveHomeSession } from "../home-session-archive"
 import type { HomeController } from "./home-controller"
 
 const HOME_SESSION_LIMIT = 64
@@ -47,7 +48,9 @@ export function createHomeSessionsController(home: HomeController) {
   const command = useCommand()
   const dialog = useDialog()
   const language = useLanguage()
+  const layout = useLayout()
   const sessionGroups = useSessionGroups()
+  const queryClient = useQueryClient()
   const [collapsed, setCollapsed] = createStore<Record<string, boolean>>({})
   const [selected, setSelected] = createStore<Record<string, boolean>>({})
   let selectionAnchor: string | undefined
@@ -83,9 +86,11 @@ export function createHomeSessionsController(home: HomeController) {
       return index
     },
     retry: false,
-    staleTime: 30_000,
-    refetchOnMount: true,
-    refetchOnReconnect: true,
+    staleTime: 5 * 60_000,
+    gcTime: 10 * 60_000,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
   }))
   const indexedSessions = createMemo(() =>
     retainHomeSessions(
@@ -104,6 +109,52 @@ export function createHomeSessionsController(home: HomeController) {
   )
   const records = createMemo(() => allRecords().slice(0, HOME_SESSION_LIMIT))
   const groups = createMemo(() => mergeGroupSessions(records(), language, sessionGroups))
+
+  const archivedKey = () => ["home", "session-archive", home.selection.value().server] as const
+  const archivedLoad = useInfiniteQuery(() => ({
+    queryKey: archivedKey(),
+    enabled: layout.home.archivedExpanded() && !!home.server.focusedContext(),
+    queryFn: async ({ pageParam, signal }) => {
+      const ctx = home.server.focusedContext()
+      if (!ctx) return { sessions: [] } satisfies HomeArchivedPage
+      return loadArchivedHomeSessions({
+        list: (query, options) => ctx.sdk.client.experimental.session.list(query, options),
+        cursor: pageParam,
+        signal,
+      })
+    },
+    initialPageParam: undefined as number | undefined,
+    getNextPageParam: (lastPage) => lastPage.cursor,
+    retry: false,
+    staleTime: 30_000,
+  }))
+  // Reading `.data` of a never-resolved query suspends under Suspense (solid
+  // adapter proxies it to a resource); gating on isSuccess keeps a pending
+  // first page from displacing the active session list.
+  const archivedPages = () => (archivedLoad.isSuccess ? (archivedLoad.data?.pages ?? []) : [])
+  const archivedRecords = createMemo(() =>
+    buildHomeSessionRecords({
+      sessions: () => archivedPages().flatMap((page) => page.sessions),
+      projectDirectories,
+      projects: home.project.list,
+      projectByID,
+    }),
+  )
+  // Optimistically drop an unarchived row; live sync re-adds it to the active
+  // list via the session.updated event.
+  const removeArchivedRow = (sessionID: string) => {
+    queryClient.setQueryData<InfiniteData<HomeArchivedPage>>(archivedKey(), (data) =>
+      data
+        ? {
+            ...data,
+            pages: data.pages.map((page) => ({
+              ...page,
+              sessions: page.sessions.filter((item) => item.id !== sessionID),
+            })),
+          }
+        : data,
+    )
+  }
   const selectedIds = () => Object.keys(selected).filter((id) => selected[id])
   const createGroup = async (name: string, sessionIds: string[] = []) => {
     const group = await sessionGroups.createGroup(name)
@@ -238,6 +289,17 @@ export function createHomeSessionsController(home: HomeController) {
       loading: () => sessionLoad.isLoading,
       searchRecords: allRecords,
     },
+    archived: {
+      records: archivedRecords,
+      count: () => archivedRecords().length,
+      expanded: layout.home.archivedExpanded,
+      toggle: () => layout.home.setArchivedExpanded(!layout.home.archivedExpanded()),
+      loading: () => archivedLoad.isLoading,
+      loadingMore: () => archivedLoad.isFetchingNextPage,
+      error: () => archivedLoad.error?.message,
+      hasMore: () => archivedLoad.hasNextPage,
+      showMore: () => void archivedLoad.fetchNextPage(),
+    },
     session: {
       showProjectName: () => !home.project.selected(),
       server: () => home.selection.value().server,
@@ -291,6 +353,29 @@ export function createHomeSessionsController(home: HomeController) {
                 if (match.found) draft.session.splice(match.index, 1)
               }),
             ),
+          onError: (cause) =>
+            showToast({
+              title: language.t("common.requestFailed"),
+              description: errorMessage(cause, language.t("common.requestFailed")),
+            }),
+        })
+      },
+      unarchive: async (session: Session) => {
+        const conn = home.server.focused()
+        const ctx = home.server.focusedContext()
+        if (!conn || !ctx) return
+        if ((await ctx.sdk.protocol) !== "v1") return
+        await unarchiveHomeSession({
+          session,
+          unarchive: async (sessionID) => {
+            await ctx.sdk.client.session.update({
+              sessionID,
+              directory: session.directory,
+              // Server contract: null clears time.archived.
+              time: { archived: null },
+            })
+            removeArchivedRow(sessionID)
+          },
           onError: (cause) =>
             showToast({
               title: language.t("common.requestFailed"),

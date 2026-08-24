@@ -8,7 +8,7 @@ import type {
 } from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
 import { getFilename } from "@opencode-ai/core/util/path"
-import { type Accessor, batch, createMemo, getOwner, onCleanup, onMount, untrack } from "solid-js"
+import { type Accessor, batch, createMemo, createSignal, getOwner, onCleanup, onMount, untrack } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import type { InitError } from "../pages/error"
@@ -248,8 +248,17 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     serverSDK.protocol,
   )
 
+  const [catalogEnabled, setCatalogEnabled] = createSignal(false)
+  onMount(() => {
+    const timer = window.setTimeout(() => setCatalogEnabled(true), 400)
+    onCleanup(() => window.clearTimeout(timer))
+  })
   const [configQuery, providerQuery, pathQuery] = useQueries(() => ({
-    queries: [queryOptionsApi.globalConfig(), queryOptionsApi.providers(null), queryOptionsApi.path(null)],
+    queries: [
+      queryOptionsApi.globalConfig(),
+      { ...queryOptionsApi.providers(null), enabled: catalogEnabled() },
+      queryOptionsApi.path(null),
+    ],
   }))
   const activeSessionsQuery = useQuery(() =>
     loadActiveSessionsQuery(serverSDK.scope, {
@@ -587,28 +596,30 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       time("applyV2", () => session.applyV2(current))
     }
     time("apply", () => session.apply(event))
-    if (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") {
-      time("home", () => homeSessions.apply(event))
+    if (homeSessions.live()) {
+      if (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") {
+        time("home", () => homeSessions.apply(event))
+      }
+      time("home", () => homeSessions.refresh(event.type))
     }
-    time("home", () => homeSessions.refresh(event.type))
     if (eventType === "integration.connection.updated") void refreshProviders()
 
-    const groupScope = `session-groups:${ServerConnection.key(serverSDK.server)}`
-    if (
-      eventType === "session_group.created" ||
-      eventType === "session_group.updated" ||
-      eventType === "session_group.deleted"
-    ) {
-      void queryClient.invalidateQueries({ queryKey: [groupScope, "session-groups"] })
-    }
-    if (
-      eventType === "session_group.session.added" ||
-      eventType === "session_group.session.removed"
-    ) {
-      void queryClient.invalidateQueries({ queryKey: [groupScope, "session-groups"] })
-      const groupId = (event.properties as { groupId?: string } | undefined)?.groupId
-      if (groupId) {
-        void queryClient.invalidateQueries({ queryKey: [groupScope, "session-group", groupId] })
+    if (homeSessions.live()) {
+      const groupScope = `session-groups:${ServerConnection.key(serverSDK.server)}`
+      const isGroupEvent =
+        eventType === "session_group.created" ||
+        eventType === "session_group.updated" ||
+        eventType === "session_group.deleted" ||
+        eventType === "session_group.session.added" ||
+        eventType === "session_group.session.removed"
+      if (isGroupEvent) {
+        void queryClient.invalidateQueries({ queryKey: [groupScope, "session-groups"] })
+        if (eventType === "session_group.session.added" || eventType === "session_group.session.removed") {
+          const groupId = (event.properties as { groupId?: string } | undefined)?.groupId
+          if (groupId) {
+            void queryClient.invalidateQueries({ queryKey: [groupScope, "session-group", groupId] })
+          }
+        }
       }
     }
 

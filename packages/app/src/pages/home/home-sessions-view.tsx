@@ -1,5 +1,5 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
-import { type Accessor, createMemo, createSignal, For, Show, Suspense } from "solid-js"
+import { type Accessor, createMemo, createSignal, For, type JSX, Show, Suspense } from "solid-js"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
@@ -20,6 +20,7 @@ import type { HomeSearchHit } from "./home-session-search-controller"
 import type { SessionSearchMessageMatch } from "./home-session-search-response"
 import { DialogSessionGroupName } from "@/components/dialog-session-group"
 import {
+  HomeArchivedSessionRow,
   HomeSessionLeadingController,
   HomeSessionProjectName,
   HomeSessionRow,
@@ -29,6 +30,7 @@ import {
 
 const HOME_SECTION_LABEL = "text-v2-text-text-muted [font-weight:440]"
 const HOME_SESSION_SEARCH_RESULTS_ID = "home-session-search-results"
+const HOME_SESSIONS_ARCHIVE_ID = "home-sessions-archive"
 
 export type HomeSessionsViewProps = {
   language: ReturnType<typeof useLanguage>
@@ -81,6 +83,16 @@ export type HomeSessionsViewProps = {
   isGroupCollapsed: (groupId: string) => boolean
   groupForSession: (sessionId: string) => string | undefined
   userGroups: () => Array<{ id: string; name: string }>
+  archivedRecords: Accessor<HomeSessionRecord[]>
+  archivedCount: Accessor<number>
+  archivedExpanded: Accessor<boolean>
+  archivedLoading: Accessor<boolean>
+  archivedLoadingMore: Accessor<boolean>
+  archivedError: Accessor<string | undefined>
+  archivedHasMore: Accessor<boolean>
+  onToggleArchived: () => void
+  onArchivedShowMore: () => void
+  onUnarchiveSession: (session: Session) => Promise<void>
 }
 
 export function HomeSessionsView(props: HomeSessionsViewProps) {
@@ -152,6 +164,7 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
               <HomeSessionsEmpty
                 onNewSession={props.canCreateSession() ? props.onCreateSession : undefined}
                 language={props.language}
+                archive={<HomeSessionsArchiveSection {...props} />}
               />
             }
           >
@@ -203,6 +216,7 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
                   </>
                 )}
               </For>
+              <HomeSessionsArchiveSection {...props} />
             </div>
           </Show>
         </Suspense>
@@ -607,6 +621,126 @@ function HomeSessionSearchMessageRow(
   )
 }
 
+function HomeSessionsArchiveSection(props: HomeSessionsViewProps) {
+  const countLabel = () => props.language.plural("home.sessions.archived.count", props.archivedCount())
+
+  return (
+    <div class="mt-6 flex min-w-0 flex-col gap-px">
+      <button
+        type="button"
+        data-action="home-sessions-archive-toggle"
+        aria-expanded={props.archivedExpanded()}
+        aria-controls={HOME_SESSIONS_ARCHIVE_ID}
+        class={`
+          flex h-8 w-full shrink-0 cursor-default items-center gap-2 rounded-[6px] border-0 bg-transparent px-3 text-left
+          transition-[background-color] duration-[120ms] ease-in-out
+          hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none
+        `}
+        onClick={props.onToggleArchived}
+      >
+        <IconV2
+          name="chevron-down"
+          size="small"
+          class="text-v2-icon-icon-muted transition-transform duration-150 ease-in-out"
+          style={{ transform: `rotate(${props.archivedExpanded() ? 0 : -90}deg)` }}
+        />
+        <span class={`min-w-0 flex-1 ${HOME_SECTION_LABEL}`}>
+          {props.language.t("home.sessions.archived.section")}
+        </span>
+        <Show when={props.archivedCount() > 0}>
+          <span
+            aria-hidden="true"
+            class="shrink-0 rounded-[4px] px-1.5 py-px text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440] bg-v2-background-bg-layer-02"
+          >
+            {countLabel()}
+          </span>
+        </Show>
+      </button>
+      <div
+        id={HOME_SESSIONS_ARCHIVE_ID}
+        role="region"
+        aria-label={props.language.t("home.sessions.archived.section")}
+        class="flex min-w-0 flex-col"
+      >
+        <Show when={props.archivedExpanded()}>
+          <Show when={!props.archivedLoading()} fallback={<HomeArchivedSkeleton />}>
+            <Show
+              when={!props.archivedError()}
+              fallback={<HomeArchivedError language={props.language} detail={props.archivedError()} />}
+            >
+              <Show
+                when={props.archivedRecords().length > 0}
+                fallback={
+                  <p
+                    class={`
+                      my-1.5 px-3 pb-2 text-[13px] leading-4 tracking-[-0.04px]
+                      text-v2-text-text-muted [font-weight:440]
+                    `}
+                  >
+                    {props.language.t("home.sessions.archived.empty")}
+                  </p>
+                }
+              >
+                <For each={props.archivedRecords()}>
+                  {(record) => <HomeArchivedSessionRow {...props} record={record} />}
+                </For>
+                <Show when={props.archivedHasMore()}>
+                  <button
+                    type="button"
+                    data-action="home-sessions-archive-more"
+                    disabled={props.archivedLoadingMore()}
+                    class={`
+                      mx-3 mt-1 mb-2 flex h-8 w-fit shrink-0 cursor-default items-center gap-1.5 rounded-[6px] border-0
+                      bg-transparent px-2 text-left text-v2-text-text-muted [font-weight:440]
+                      transition-[background-color,color] duration-[120ms] ease-in-out
+                      hover:bg-v2-background-bg-layer-01 hover:text-v2-text-text-base focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-base focus-visible:outline-none
+                    `}
+                    onClick={props.onArchivedShowMore}
+                  >
+                    {props.archivedLoadingMore()
+                      ? props.language.t("common.loading")
+                      : props.language.t("home.sessions.archived.showMore")}
+                  </button>
+                </Show>
+              </Show>
+            </Show>
+          </Show>
+        </Show>
+      </div>
+    </div>
+  )
+}
+
+function HomeArchivedSkeleton() {
+  return (
+    <div class="flex min-w-0 flex-col gap-px px-3 pt-1 pb-2" aria-busy="true">
+      <For each={[0, 1, 2]}>
+        {() => <div class="h-10 rounded-[6px] bg-v2-background-bg-deep opacity-70 animate-pulse" />}
+      </For>
+    </div>
+  )
+}
+
+function HomeArchivedError(props: { language: ReturnType<typeof useLanguage>; detail?: string }) {
+  return (
+    <div class="px-3 pt-1 pb-2" role="alert">
+      <div class="flex flex-col gap-1 rounded-[8px] border border-v2-state-border-danger/40 bg-v2-state-bg-danger/10 px-3 py-2.5">
+        <div class="flex items-center gap-2">
+          <span aria-hidden="true" class="size-1.5 shrink-0 rounded-full bg-v2-state-border-danger" />
+          <p class="text-[13px] leading-4 tracking-[-0.04px] text-v2-text-text-base [font-weight:530]">
+            {props.language.t("home.sessions.archived.error")}
+          </p>
+        </div>
+        <Show when={props.detail}>
+          <p class="pl-5 text-[12px] leading-4 tracking-[-0.04px] text-v2-text-text-muted [font-weight:440]">
+            {props.detail}
+          </p>
+        </Show>
+      </div>
+    </div>
+  )
+}
+
 function HomeSessionGroupHeader(props: {
   title: string
   titleOpacity: number
@@ -756,7 +890,11 @@ function HomeGroupEmptyState(props: {
   )
 }
 
-function HomeSessionsEmpty(props: { onNewSession?: () => void; language: ReturnType<typeof useLanguage> }) {
+function HomeSessionsEmpty(props: {
+  onNewSession?: () => void
+  language: ReturnType<typeof useLanguage>
+  archive?: JSX.Element
+}) {
   return (
     <div class="flex min-h-full flex-col items-center gap-4 px-6 pt-[52px] text-center">
       <div
@@ -781,6 +919,9 @@ function HomeSessionsEmpty(props: { onNewSession?: () => void; language: ReturnT
             {props.language.t("command.session.new")}
           </ButtonV2>
         )}
+      </Show>
+      <Show when={props.archive}>
+        {(archive) => <div class="mt-4 w-full text-left">{archive()}</div>}
       </Show>
     </div>
   )

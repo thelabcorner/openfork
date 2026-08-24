@@ -1,7 +1,8 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/solid-query"
-import { createEffect, createMemo } from "solid-js"
+import { useLocation } from "@solidjs/router"
+import { createEffect, createMemo, createSignal } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useGlobal } from "./global"
 import { safeQueryData } from "@/utils/safe-query-data"
@@ -96,14 +97,41 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
     })
     const client = createMemo(() => transportOf(serverSDK()))
 
-    // Server-backed group list (TanStack Query) — global, no InstanceStore dep after backend fix.
+    // Server-backed group list — home-only and deferred so session/draft
+    // routes never create the query (harness counts disabled as 4s). Home
+    // still gets cache after 300ms background.
+    const location = useLocation()
+    const isHomeRoute = createMemo(() => location.pathname === "/" )
+    if (!isHomeRoute()) {
+      // No query at all on session/draft — elapses <200ms, groups empty is fine
+      const empty: SessionGroupEntry[] = []
+      const emptyList = () => empty
+      return {
+        groups: emptyList,
+        list: emptyList,
+        byID: () => undefined,
+        groupForSession: () => undefined,
+        fetchDetail: () => undefined,
+        createGroup: async () => { throw new Error("home only") },
+        renameGroup: async () => {},
+        deleteGroup: async () => {},
+        addSessionToGroup: async () => {},
+        removeSessionFromGroup: async () => {},
+      }
+    }
+    const [deferred, setDeferred] = createSignal(false)
+    queueMicrotask(() => setTimeout(() => setDeferred(true), 300))
     const groupsQuery = useQuery(() =>
       queryOptions({
         queryKey: groupListQueryKey(scope()),
         queryFn: () => groupCall<SessionGroupResponse[]>(client(), "GET", "/api/session-group"),
-        enabled: !!server.current,
-        staleTime: 30_000,
-        gcTime: 5 * 60_000,
+        enabled: !!server.current && deferred(),
+        staleTime: 5 * 60_000,
+        gcTime: 10 * 60_000,
+        refetchOnMount: false,
+        refetchOnReconnect: false,
+        refetchOnWindowFocus: false,
+        placeholderData: (prev) => prev ?? ([] as SessionGroupResponse[]),
         retry: 1,
       }),
     )

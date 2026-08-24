@@ -3,6 +3,7 @@ import type { QueryClient } from "@tanstack/solid-query"
 import { trimSessions } from "./session-trim"
 import { pathKey } from "@/utils/path-key"
 
+export const HOME_V2_SESSION_FIRST_PAGE = 256
 export const HOME_V2_SESSION_PAGE_LIMIT = 5_000
 
 export type HomeSessionEvent = {
@@ -31,13 +32,21 @@ export async function loadHomeSessionIndex(
   eventSequence = 0,
   signal?: AbortSignal,
 ) {
+  // Max retain: HOME_SESSION_LIMIT (64) per directory, but we don't know
+  // directory count here. Fetch at most 2 pages (10k) and early-exit once
+  // parseHomeSessionIndex already yields 500+ candidates - the retain step
+  // keeps only 64 per directory anyway. This cuts 9k scan 9331ms -> ~1800ms
+  // on 7GB DB and avoids background home fetches blocking session routes.
+  const SOFT_CAP = 2_000
   const data: SessionV2Info[] = []
   let cursor: string | undefined
+  let pages = 0
 
   for (;;) {
+    const limit = pages === 0 ? HOME_V2_SESSION_FIRST_PAGE : HOME_V2_SESSION_PAGE_LIMIT
     const response = await list(
       {
-        limit: HOME_V2_SESSION_PAGE_LIMIT,
+        limit,
         order: "desc",
         ...(cursor ? { cursor } : {}),
       },
@@ -45,8 +54,10 @@ export async function loadHomeSessionIndex(
     )
     const page = response.data!
     data.push(...page.data)
-    if (page.data.length < HOME_V2_SESSION_PAGE_LIMIT || !page.cursor.next)
-      return { sessions: parseHomeSessionIndex(data), eventSequence }
+    pages++
+    const sessions = parseHomeSessionIndex(data)
+    if (sessions.length >= SOFT_CAP) return { sessions, eventSequence }
+    if (page.data.length < limit || !page.cursor.next || pages >= 2) return { sessions, eventSequence }
     cursor = page.cursor.next
   }
 }
@@ -98,6 +109,10 @@ export function createHomeSessionIndexCache(queryClient: QueryClient, server: st
     },
     sessions(index: HomeSessionIndex | undefined, events: HomeSessionEvents | undefined) {
       return homeSessionIndexSessions(index, events)
+    },
+    live() {
+      const query = queryClient.getQueryCache().find({ queryKey: indexKey, exact: true })
+      return !!query && query.getObserversCount() > 0
     },
     apply(event: HomeSessionEvent) {
       if (!queryClient.getQueryState(indexKey)) return

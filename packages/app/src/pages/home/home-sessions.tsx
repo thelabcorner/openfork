@@ -60,6 +60,16 @@ export function HomeSessions(props: {
       isGroupCollapsed={props.sessions.group.isCollapsed}
       groupForSession={props.sessions.group.groupForSession}
       userGroups={props.sessions.group.userGroups}
+      archivedRecords={props.sessions.archived.records}
+      archivedCount={props.sessions.archived.count}
+      archivedExpanded={props.sessions.archived.expanded}
+      archivedLoading={props.sessions.archived.loading}
+      archivedLoadingMore={props.sessions.archived.loadingMore}
+      archivedError={props.sessions.archived.error}
+      archivedHasMore={props.sessions.archived.hasMore}
+      onToggleArchived={props.sessions.archived.toggle}
+      onArchivedShowMore={props.sessions.archived.showMore}
+      onUnarchiveSession={props.sessions.session.unarchive}
     />
   )
 }

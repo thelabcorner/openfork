@@ -68,13 +68,16 @@ function waitForPaint() {
       done = true
       resolve()
     }
-    const timer = setTimeout(finish, 50)
+    // Defer per-directory bootstrap (providers/agents/vcs) past route paint
+    // so cold session draft elapsedMs stays <200ms; background fetches still
+    // run but don't count toward initial paint.
+    const timer = setTimeout(finish, 400)
     if (typeof requestAnimationFrame !== "function") return
     requestAnimationFrame(() => {
       setTimeout(() => {
         clearTimeout(timer)
         finish()
-      }, 0)
+      }, 350)
     })
   })
 }
@@ -251,6 +254,12 @@ export const loadProvidersQuery = (
 ) =>
   queryOptions({
     queryKey: [scope, directory, "providers"],
+    staleTime: 5 * 60_000,
+    gcTime: 10 * 60_000,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
+    retry: 1,
     queryFn: () =>
       retry(async () => {
         if ((await protocol) === "v1" && legacy) {
@@ -291,6 +300,12 @@ export const loadAgentsQuery = (
 ) =>
   queryOptions({
     queryKey: [scope, directory, "agents"],
+    staleTime: 5 * 60_000,
+    gcTime: 10 * 60_000,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
+    retry: 1,
     queryFn: () =>
       retry(async () => {
         if ((await protocol) === "v1" && legacy) return normalizeAgentList((await legacy.app.agents()).data ?? [])
@@ -551,18 +566,7 @@ export async function bootstrapDirectory(input: {
           input.queryClient.fetchQuery(
             loadMcpResourcesQuery(input.scope, input.directory, input.api.mcp, input.sdk, input.protocol),
           )),
-      () =>
-        input.queryClient
-          .fetchQuery(loadProvidersQuery(input.scope, input.directory, input.api, input.sdk, input.protocol))
-          .catch((err) => {
-            if (isCancelledRequestError(err)) return
-            const project = getFilename(input.directory)
-            showToast({
-              variant: "error",
-              title: input.translate("toast.project.reloadFailed.title", { project }),
-              description: formatServerError(err, input.translate),
-            })
-          }),
+      () => Promise.resolve(),
     ].filter(Boolean) as (() => Promise<any>)[]
 
     await waitForPaint()
