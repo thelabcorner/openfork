@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { fetchSessionExport, sessionExportFilename } from "./session-export"
+import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "./session-export"
 import type { Message, Part, Session } from "@opencode-ai/sdk/v2/client"
 
 describe("sessionExportFilename", () => {
@@ -57,5 +57,38 @@ describe("fetchSessionExport", () => {
         client,
       }),
     ).rejects.toThrow("Session not found: ses_missing")
+  })
+})
+
+describe("downloadSessionExport", () => {
+  test("appends .br when compression returns bytes", async () => {
+    const name = await downloadSessionExport("session.json", { a: 1 }, async () => new Uint8Array([1, 2, 3]))
+    expect(name).toBe("session.json.br")
+  })
+
+  test("keeps plain json filename when compressor returns null", async () => {
+    const name = await downloadSessionExport("session.json", { a: 1 }, async () => null)
+    expect(name).toBe("session.json")
+  })
+
+  test("falls back to plain json when compressor rejects", async () => {
+    const name = await downloadSessionExport(
+      "session.json",
+      { a: 1 },
+      async () => {
+        throw new Error("compressor failed")
+      },
+    )
+    expect(name).toBe("session.json")
+  })
+
+  test("works without a compressor (web fallback)", async () => {
+    const name = await downloadSessionExport("session.json", { a: 1 })
+    expect(name).toBe("session.json")
+  })
+
+  test("ignores empty compression output", async () => {
+    const name = await downloadSessionExport("session.json", { a: 1 }, async () => new Uint8Array(0))
+    expect(name).toBe("session.json")
   })
 })

@@ -47,9 +47,29 @@ export function sessionExportFilename(session: { id: string; title?: string; slu
   return `${clean || session.id}.json`
 }
 
-export function downloadSessionExport(filename: string, data: unknown) {
-  const json = JSON.stringify(data, null, 2)
-  const blob = new Blob([json], { type: "application/json" })
+/**
+ * Serializes compactly (pretty-printing doubles serialize time and peak memory
+ * on large transcripts) and hands the JSON string to `compress` when the
+ * platform can brotli-compress it off the UI thread. Returns the saved
+ * filename — `.br` is appended when compression succeeded.
+ */
+export async function downloadSessionExport(
+  filename: string,
+  data: unknown,
+  compress?: (json: string) => Promise<Uint8Array<ArrayBuffer> | null>,
+): Promise<string> {
+  const json = JSON.stringify(data)
+  const compressed = compress ? await compress(json).catch(() => null) : null
+  if (compressed && compressed.byteLength > 0) {
+    const name = `${filename}.br`
+    downloadBlob(name, new Blob([compressed], { type: "application/octet-stream" }))
+    return name
+  }
+  downloadBlob(filename, new Blob([json], { type: "application/json" }))
+  return filename
+}
+
+function downloadBlob(filename: string, blob: Blob) {
   const url = URL.createObjectURL(blob)
   const a = document.createElement("a")
   a.href = url
