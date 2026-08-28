@@ -8,8 +8,7 @@ import { deepseek } from "../../src/quota/providers/deepseek"
 import { kimi } from "../../src/quota/providers/kimi"
 import { opencodeGo } from "../../src/quota/providers/opencode-go"
 import { openrouter } from "../../src/quota/providers/openrouter"
-import { claude } from "../../src/quota/providers/claude"
-import { parseClaudeCredentials } from "../../src/quota/providers/claude"
+import { claude, claudeQuotaStatusSummary, parseClaudeCredentials } from "../../src/quota/providers/claude"
 import { codex } from "../../src/quota/providers/codex"
 import { nvidia } from "../../src/quota/providers/nvidia"
 import { resetNvidiaUsage, trackNvidiaRequest } from "../../src/quota/providers/nvidia-usage"
@@ -301,6 +300,20 @@ describe("ClaudeProvider", () => {
     }
   })
 
+  test("caches usage checks for 5 minutes, including rate-limit responses", async () => {
+    delete process.env.CLAUDE_CODE_OAUTH_TOKEN
+    const auth = authWith({ claude: { type: "oauth", access: "cc" } } as unknown as Record<string, Auth.Info>)
+    const { client, calls } = httpWith((request) => Effect.succeed(jsonResponse(request, null, 429)))
+    const adapter = claude(client, auth)
+
+    const first = await run(adapter.fetch())
+    const second = await run(adapter.fetch())
+
+    expect(first.error).toBe("Rate limited (429) — Anthropic is throttling usage checks")
+    expect(second).toEqual(first)
+    expect(calls.length).toBe(1)
+  })
+
   test("unconfigured without alias or env token makes no network call", async () => {
     delete process.env.CLAUDE_CODE_OAUTH_TOKEN
     // Isolate from any real ~/.claude/.credentials.json on this machine.
@@ -321,6 +334,18 @@ describe("ClaudeProvider", () => {
       if (prevHome !== undefined) process.env.HOME = prevHome
       else delete process.env.HOME
     }
+  })
+
+  test("claudeQuotaStatusSummary is redacted/bounded and advisory-only", () => {
+    const ok = { ok: true, configured: true, usage: { windows: { "5h": {} } }, fetchedAt: Date.now() } as any
+    const s = claudeQuotaStatusSummary(ok)
+    expect(s).toContain("claude: ok")
+    expect(s).toContain("configured")
+    expect(s).not.toContain("token")
+    expect(s.length).toBeLessThan(200)
+
+    const err = { ok: false, configured: true, error: "Rate limited (429) — Anthropic is throttling usage checks" } as any
+    expect(claudeQuotaStatusSummary(err)).toContain("error=Rate limited")
   })
 })
 

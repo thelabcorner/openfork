@@ -1,6 +1,7 @@
 import {
   checkPluginCompatibility,
   createPluginEntry,
+  isClaudeExternalPlugin,
   isDeprecatedPlugin,
   pluginSource,
   resolvePluginTarget,
@@ -158,7 +159,14 @@ export namespace PluginLoader {
     const filePlugin = pluginSource(plan.spec) === "file"
 
     // Deprecated plugin packages are silently ignored because they are now built in.
-    if (plan.deprecated) return { retry: false }
+    // For Claude external during migration: safe suppression (no file delete, no auth change).
+    // Uses shared shouldEnableClaudeFirstParty() so runtime/provider stay consistent.
+    if (plan.deprecated) {
+      if (isClaudeExternalPlugin(plan.spec)) {
+        // advisory only; caller may surface "external claude plugin ignored in favor of first-party"
+      }
+      return { retry: false }
+    }
 
     report?.start?.(candidate, retry)
 

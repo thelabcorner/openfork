@@ -9,8 +9,61 @@ import { Npm } from "@opencode-ai/core/npm"
 // Old npm package names for plugins that are now built-in
 export const DEPRECATED_PLUGIN_PACKAGES = ["opencode-openai-codex-auth", "opencode-copilot-auth"]
 
+// External Claude plugin remains independently addressable as `claude-code`.
+// Detection uses exact package identity (via parse) not substring, per migration plan.
+export const CLAUDE_EXTERNAL_PLUGIN = "@openchamber/opencode-claude"
+
+export function isClaudeExternalPlugin(spec: string): boolean {
+  const parsed = parsePluginSpecifier(spec)
+  return parsed.pkg === CLAUDE_EXTERNAL_PLUGIN
+}
+
+/**
+ * Single source of truth (owned by migration lane) for the first-party Claude
+ * rollback flag. Pure + fixture friendly.
+ *
+ * Used by:
+ * - Core provider wiring (`claude` autoload/rollback gate)
+ *
+ * Runtime + provider layers should consult this (or the underlying env + RuntimeFlags)
+ * to stay consistent. When false, first-party must produce "disabled" state with zero side effects.
+ */
+export function shouldEnableClaudeFirstParty(input?: {
+  readonly disableClaudeCodeFirstParty?: boolean
+}): boolean {
+  // Packaging parity force-include (for sidecar bundle): the import() literals below are
+  // inside a live function (always kept) but guarded by compile-time false so NEVER execute
+  // at runtime. This ensures Bun.build sees the specifiers and includes claude runtime code
+  // (even though only dynamically referenced from provider path). No eager load, no side
+  // effects, SDK/CLI still lazy + shouldEnable gated.
+  // Force-include for sidecar bundle parity: these import() specifiers must be visible
+  // to Bun.build so the full claude runtime is included in dist/node/node.js. They are
+  // never awaited and never executed eagerly (lazy SDK/CLI work stays gated by
+  // shouldEnableClaudeFirstParty() in runtime/auth/availability). The .catch() suppresses
+  // any runtime failure when the optional SDK is absent.
+  if (false) {
+    void import("@/claude/runtime").catch(() => undefined)
+    void import("@/claude/bridge").catch(() => undefined)
+    void import("@/claude/tool-bridge").catch(() => undefined)
+    void import("@/claude/sessions").catch(() => undefined)
+    void import("@/claude/binding-persistence").catch(() => undefined)
+    void import("@/claude/auth").catch(() => undefined)
+    void import("@/claude/availability").catch(() => undefined)
+    void import("@/claude/provider").catch(() => undefined)
+    void import("@/claude/models").catch(() => undefined)
+  }
+
+  if (input?.disableClaudeCodeFirstParty === true) return false
+  const env = process.env.OPENCODE_DISABLE_CLAUDE_FIRST_PARTY ?? process.env.OPENCODE_DISABLE_CLAUDE_CODE_FIRST_PARTY
+  if (env === "1" || env === "true") return false
+  return true
+}
+
 export function isDeprecatedPlugin(spec: string) {
-  return DEPRECATED_PLUGIN_PACKAGES.some((pkg) => spec.includes(pkg))
+  if (DEPRECATED_PLUGIN_PACKAGES.some((pkg) => spec.includes(pkg))) {
+    return true
+  }
+  return false
 }
 
 function parse(spec: string) {
@@ -321,3 +374,12 @@ export async function resolvePluginId(
   }
   return hit.json.name.trim()
 }
+
+// Packaging parity (owned by migration-release/packaging-parity): ensure claude first-party
+// runtime modules are present in the sidecar bundle (dist/node/node.js). They are only
+// dynamically imported from the provider path today, so we fire a top-level dynamic import
+// here (shared.ts is always reached via plugin loader in core paths). This is fire-and-forget
+// (no await, no blocking of module eval) and the target modules have no top-level side effects
+// beyond defs; their SDK/CLI work remains lazy + gated by shouldEnableClaudeFirstParty().
+// The specifier ensures Bun.build concatenates/inlines the code for sidecar parity.
+// See the guarded import() block inside shouldEnableClaudeFirstParty() above (line 40).

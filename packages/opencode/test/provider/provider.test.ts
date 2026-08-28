@@ -23,6 +23,7 @@ import { InstanceStore } from "@/project/instance-store"
 import { testEffect } from "../lib/effect"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { MODEL_SONNET } from "@/claude/models"
 
 const originalEnv = new Map<string, string | undefined>()
 
@@ -118,6 +119,39 @@ it.instance("provider loaded from env variable", () =>
     // merge additional options.
     expect(providers[ProviderV2.ID.anthropic].source).toBe("env")
     expect(providers[ProviderV2.ID.anthropic].options.headers["anthropic-beta"]).toBeDefined()
+  }),
+)
+
+it.instance("registers Claude Subscription separately from Claude API Key", () =>
+  Effect.gen(function* () {
+    const providers = yield* list
+    const subscription = providers[ProviderV2.ID.make("claude")]
+    const api = providers[ProviderV2.ID.make("claude-api")]
+
+    expect(subscription?.name).toBe("Claude Subscription")
+    expect(subscription?.models[MODEL_SONNET]?.providerID).toBe(ProviderV2.ID.make("claude"))
+    expect(api?.name).toBe("Claude API Key")
+    expect(Object.values(api?.models ?? {})[0]?.providerID).toBe(ProviderV2.ID.make("claude-api"))
+    // first-party port must expose the full opencode-claude catalog (fable, sonnet 5, pinned, etc.)
+    expect(subscription?.models["fable"]).toBeDefined()
+    expect(subscription?.models["sonnet"]).toBeDefined()
+    expect(subscription?.models["opus"]).toBeDefined()
+    expect(subscription?.models["haiku"]).toBeDefined()
+    expect(subscription?.models["claude-opus-4-8"]).toBeDefined()
+    expect(subscription?.models["claude-sonnet-4-6"]).toBeDefined()
+    expect(subscription?.models["claude-haiku-4-5"]).toBeDefined()
+    expect(subscription?.models["sonnet"]?.api.npm).toBe("@ai-sdk/openai-compatible")
+  }),
+)
+
+it.instance("claude subscription getLanguage does not InitError", () =>
+  Effect.gen(function* () {
+    const svc = yield* Provider.Service
+    const model = yield* svc.getModel(ProviderV2.ID.make("claude"), ModelV2.ID.make("sonnet"))
+    expect(model.api.npm).toBe("@ai-sdk/openai-compatible")
+    const language = yield* svc.getLanguage(model)
+    expect(language).toBeDefined()
+    expect(language.specificationVersion).toBe("v3")
   }),
 )
 
@@ -539,6 +573,27 @@ it.instance(
           name: "Custom API",
           npm: "@ai-sdk/openai-compatible",
           api: "https://api.example.com/v1",
+          env: [],
+          models: { "model-1": { name: "Model 1", tool_call: true, limit: { context: 8000, output: 2000 } } },
+          options: { apiKey: "test-key", baseURL: "https://custom.override.com/v1" },
+        },
+      },
+    },
+  },
+)
+
+it.instance(
+  "model inherits provider baseURL when no model api URL is declared",
+  Effect.gen(function* () {
+    const providers = yield* list
+    expect(providers[ProviderV2.ID.make("custom-api")].models["model-1"].api.url).toBe("https://custom.override.com/v1")
+  }),
+  {
+    config: {
+      provider: {
+        "custom-api": {
+          name: "Custom API",
+          npm: "@ai-sdk/openai-compatible",
           env: [],
           models: { "model-1": { name: "Model 1", tool_call: true, limit: { context: 8000, output: 2000 } } },
           options: { apiKey: "test-key", baseURL: "https://custom.override.com/v1" },

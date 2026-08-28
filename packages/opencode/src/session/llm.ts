@@ -221,6 +221,37 @@ const live: Layer.Layer<
           })
         : undefined
 
+      // First-party Claude runtime seam: claude models execute through the
+      // Agent SDK adapter instead of HTTP provider routes. The adapter keeps the
+      // SDK lazy and honors the shouldEnableClaudeFirstParty rollback gate;
+      // RuntimeFlags provides the same env signal for an early skip.
+      if (input.model.providerID === "claude" && !flags.disableClaudeCodeFirstParty) {
+        const { ClaudeRuntimeAdapter } = yield* Effect.promise(() => import("./llm/claude-runtime"))
+        const claude = ClaudeRuntimeAdapter.status({ providerID: input.model.providerID })
+        if (claude.type === "supported") {
+          yield* Effect.logInfo("llm runtime selected", {
+            "llm.runtime": "claude-agent-sdk",
+            "llm.provider": input.model.providerID,
+            "llm.model": input.model.id,
+          })
+          return {
+            type: "native" as const,
+            stream: ClaudeRuntimeAdapter.stream({
+              sessionID: input.sessionID,
+              system: prepared.system,
+              messages: prepared.messages,
+              tools: prepared.tools,
+              modelID: input.model.id,
+              providerID: input.model.providerID,
+              effort: input.user.model.variant,
+              abort: input.abort,
+              permission: perm,
+              ruleset: Permission.merge(input.agent.permission ?? [], input.permission ?? []),
+            }),
+          }
+        }
+      }
+
       // Runtime seam: native is an opt-in adapter over @opencode-ai/llm. It
       // either returns a ready LLMEvent stream or a concrete fallback reason.
       if (flags.experimentalNativeLlm) {

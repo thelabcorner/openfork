@@ -27,6 +27,13 @@ if (process.env.OPENCODE_FORCE_NODE_BUILD !== "1" && (await isFresh())) {
     format: "esm",
     sourcemap: "linked",
     external: ["jsonc-parser", "@lydell/node-pty"],
+    // Claude first-party: @anthropic-ai/claude-agent-sdk is optionalDependency (package.json) but
+    // intentionally omitted from hard deps + loaded only via guarded dynamic import (see
+    // availability.ts using indirect specifier + /* @vite-ignore */). Never bundled at build;
+    // absent at runtime -> graceful unavailable (no startup failure). claude/* runtime modules
+    // (runtime/bridge/sessions/tool-bridge/...) are reached via dynamic import from provider
+    // wiring + explicit force-include below in shared.ts to ensure sidecar bundle parity.
+    // Do not add the SDK to external[]. See docs/claude-first-party.md .
     define: {
       OPENCODE_MODELS_DEV: generated.modelsData,
       OPENCODE_VERSION: `'${Script.version}'`,

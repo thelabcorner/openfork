@@ -33,6 +33,14 @@ import { ModelStatus } from "./model-status"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { trackNvidiaRequest } from "@/quota/providers/nvidia-usage"
 import { ProviderError } from "./error"
+import { shouldEnableClaudeFirstParty } from "@/plugin/shared"
+import {
+  MODEL_IDS,
+  MODEL_METADATA,
+  modelApi,
+  PROXY_API_KEY,
+  PROXY_BASE_URL,
+} from "@/claude/models"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 300_000
 
@@ -178,6 +186,15 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
     anthropic: () =>
       Effect.succeed({
         autoload: false,
+        options: {
+          headers: {
+            "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
+          },
+        },
+      }),
+    "claude-api": () =>
+      Effect.succeed({
+        autoload: true,
         options: {
           headers: {
             "anthropic-beta": "interleaved-thinking-2025-05-14,fine-grained-tool-streaming-2025-05-14",
@@ -878,6 +895,74 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
           },
         },
       }),
+    claude: () =>
+      Effect.gen(function* () {
+        // Match @openchamber/opencode-claude: bundled openai-compatible SDK +
+        // dummy proxy key so getLanguage never tries to import Agent SDK as a
+        // create* factory. Agent SDK stays lazy in the session runtime adapter.
+        const { discoverPure, migrateLegacyReference } = yield* Effect.promise(() =>
+          import("../claude/provider").then((m) => ({
+            discoverPure: m.ClaudeProvider.discoverPure,
+            migrateLegacyReference: m.ClaudeProvider.migrateLegacyReference,
+          })),
+        )
+        const { MODEL_IDS, MODEL_METADATA, PROVIDER_ID, modelApi } = yield* Effect.promise(() =>
+          import("../claude/models").then((m) => ({
+            MODEL_IDS: m.MODEL_IDS,
+            MODEL_METADATA: m.MODEL_METADATA,
+            PROVIDER_ID: m.PROVIDER_ID,
+            modelApi: m.modelApi,
+          })),
+        )
+
+        const discovery = discoverPure()
+        const enabled = yield* Effect.sync(() => {
+          return shouldEnableClaudeFirstParty()
+        }).pipe(Effect.catch(() => Effect.succeed(true)))
+
+        return {
+          autoload: Boolean(enabled),
+          options: {
+            apiKey: PROXY_API_KEY,
+            includeUsage: true,
+            baseURL: PROXY_BASE_URL,
+            providerID: String(PROVIDER_ID),
+            status: discovery.status,
+            errorCategory: discovery.errorCategory,
+          },
+          async getModel(sdk: any, modelID: string) {
+            const canonical = migrateLegacyReference(modelID) ?? modelID
+            if (sdk.chat) return sdk.chat(canonical)
+            return sdk.languageModel(canonical)
+          },
+          async discoverModels(): Promise<Record<string, Model>> {
+            const result: Record<string, Model> = {}
+            for (const [id, meta] of Object.entries(MODEL_METADATA)) {
+              if (!MODEL_IDS.includes(id)) continue
+              result[id] = {
+                id: ModelV2.ID.make(id),
+                providerID: PROVIDER_ID,
+                name: meta.name,
+                family: meta.family,
+                api: modelApi(id),
+                status: meta.status === "unavailable" ? "unavailable" : meta.status,
+                headers: {},
+                options: { includeUsage: true },
+                cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                limit: {
+                  context: meta.contextLimit,
+                  input: undefined,
+                  output: meta.outputLimit,
+                },
+                capabilities: meta.capabilities,
+                release_date: meta.releaseDate,
+                variants: meta.variants,
+              } as Model
+            }
+            return result
+          },
+        }
+      }),
     "snowflake-cortex": Effect.fnUntraced(function* (input: Info) {
       const env = yield* dep.env()
       const auth = yield* dep.auth(input.id)
@@ -1382,6 +1467,83 @@ const layer = Layer.effect(
         const modelsDev = yield* modelsDevSvc.get()
         const catalog = mapValues(modelsDev, fromModelsDevProvider)
         const database = mapValues(catalog, toPublicInfo)
+        // Keep the API-key Anthropic transport under its own provider ID so it
+        // cannot collide with either the first-party CLI runtime (`claude`) or
+        // the external plugin (`claude-code`).
+        const anthropic = database[ProviderV2.ID.make("anthropic")]
+        if (anthropic) {
+          const claudeAPI = ProviderV2.ID.make("claude-api")
+          database[claudeAPI] = {
+            ...anthropic,
+            id: claudeAPI,
+            name: "Claude API Key",
+            models: Object.fromEntries(
+              Object.entries(anthropic.models).map(([id, model]) => [id, { ...model, providerID: claudeAPI }]),
+            ),
+          }
+        }
+        const claudeAPI = ProviderV2.ID.make("claude-api")
+        database[claudeAPI] ??= {
+          id: claudeAPI,
+          source: "custom",
+          name: "Claude API Key",
+          env: ["ANTHROPIC_API_KEY"],
+          options: {},
+          models: Object.fromEntries(
+            MODEL_IDS.map((id) => {
+              const meta = MODEL_METADATA[id]
+              return [
+                id,
+                {
+                  id: ModelV2.ID.make(id),
+                  providerID: claudeAPI,
+                  name: meta.name,
+                  family: meta.family,
+                  api: { id, url: "", npm: "@ai-sdk/anthropic" },
+                  status: meta.status === "unavailable" ? "unavailable" : meta.status,
+                  headers: {},
+                  options: {},
+                  cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                  limit: { context: meta.contextLimit, input: undefined, output: meta.outputLimit },
+                  capabilities: meta.capabilities,
+                  release_date: meta.releaseDate,
+                  variants: meta.variants,
+                } as Model,
+              ]
+            }),
+          ),
+        }
+        const claudeID = ProviderV2.ID.make("claude")
+        database[claudeID] ??= {
+          id: claudeID,
+          source: "custom",
+          name: "Claude Subscription",
+          env: [],
+          options: { apiKey: PROXY_API_KEY, includeUsage: true, baseURL: PROXY_BASE_URL },
+          models: Object.fromEntries(
+            MODEL_IDS.map((id) => {
+              const meta = MODEL_METADATA[id]
+              return [
+                id,
+                {
+                  id: ModelV2.ID.make(id),
+                  providerID: claudeID,
+                  name: meta.name,
+                  family: meta.family,
+                  api: modelApi(id),
+                  status: meta.status === "unavailable" ? "unavailable" : meta.status,
+                  headers: {},
+                  options: { includeUsage: true },
+                  cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                  limit: { context: meta.contextLimit, input: undefined, output: meta.outputLimit },
+                  capabilities: meta.capabilities,
+                  release_date: meta.releaseDate,
+                  variants: meta.variants,
+                } as Model,
+              ]
+            }),
+          ),
+        }
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
@@ -1437,8 +1599,17 @@ const layer = Layer.effect(
           const providerID = ProviderV2.ID.make(p.id)
           if (disabled.has(providerID)) continue
 
-          const provider = database[providerID]
-          if (!provider) continue
+          const provider =
+            database[providerID] ??
+            ({
+              id: providerID,
+              name: p.id,
+              source: "custom",
+              env: [],
+              options: {},
+              models: {},
+            } satisfies Info)
+          database[providerID] ??= provider
           const pluginAuth = yield* auth.get(providerID).pipe(Effect.orDie)
 
           provider.models = yield* Effect.promise(async () => {
@@ -1490,7 +1661,15 @@ const layer = Layer.effect(
               api: {
                 id: apiID,
                 npm: apiNpm,
-                url: model.provider?.api ?? provider?.api ?? existingModel?.api.url ?? modelsDev[providerID]?.api ?? "",
+                url:
+                  model.provider?.api ??
+                  provider?.api ??
+                  existingModel?.api.url ??
+                  (typeof provider.options?.baseURL === "string" && provider.options.baseURL.trim() !== ""
+                    ? provider.options.baseURL
+                    : undefined) ??
+                  modelsDev[providerID]?.api ??
+                  "",
               },
               status: model.status ?? existingModel?.status ?? "active",
               name,
@@ -1644,14 +1823,15 @@ const layer = Layer.effect(
           mergeProvider(providerID, partial)
         }
 
-        const gitlab = ProviderV2.ID.make("gitlab")
-        if (discoveryLoaders[gitlab] && providers[gitlab] && isProviderAllowed(gitlab)) {
+        for (const [id, loader] of Object.entries(discoveryLoaders)) {
+          const providerID = ProviderV2.ID.make(id)
+          if (!providers[providerID] || !isProviderAllowed(providerID)) continue
           yield* Effect.promise(async () => {
             try {
-              const discovered = await discoveryLoaders[gitlab]()
+              const discovered = await loader()
               for (const [modelID, model] of Object.entries(discovered)) {
-                if (!providers[gitlab].models[modelID]) {
-                  providers[gitlab].models[modelID] = model
+                if (!providers[providerID].models[modelID]) {
+                  providers[providerID].models[modelID] = model
                 }
               }
             } catch (e) {}
@@ -1706,6 +1886,15 @@ const layer = Layer.effect(
             delete providers[providerID]
             continue
           }
+        }
+
+        // Final identity normalization: these providers must never inherit a
+        // name from the Anthropic catalog or an old plugin/config entry.
+        if (providers[ProviderV2.ID.make("claude")]) {
+          providers[ProviderV2.ID.make("claude")].name = "Claude Subscription"
+        }
+        if (providers[ProviderV2.ID.make("claude-api")]) {
+          providers[ProviderV2.ID.make("claude-api")].name = "Claude API Key"
         }
 
         return {
@@ -2063,7 +2252,16 @@ export function parseModel(model: string) {
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [FSUtil.node, Config.node, Auth.node, ForkCredentials.node, Env.node, Plugin.node, ModelsDev.node, RuntimeFlags.node],
+  deps: [
+    FSUtil.node,
+    Config.node,
+    Auth.node,
+    ForkCredentials.node,
+    Env.node,
+    Plugin.node,
+    ModelsDev.node,
+    RuntimeFlags.node,
+  ],
 })
 
 export * as Provider from "./provider"

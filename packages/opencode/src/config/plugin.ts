@@ -1,7 +1,7 @@
 import { Glob } from "@opencode-ai/core/util/glob"
 import { ConfigPluginV1 } from "@opencode-ai/core/v1/config/plugin"
 import { pathToFileURL } from "url"
-import { isPathPluginSpec, parsePluginSpecifier, resolvePathPluginTarget } from "@/plugin/shared"
+import { isPathPluginSpec, parsePluginSpecifier, resolvePathPluginTarget, isClaudeExternalPlugin, CLAUDE_EXTERNAL_PLUGIN } from "@/plugin/shared"
 import path from "path"
 
 export type Scope = "global" | "local"
@@ -74,6 +74,26 @@ export function deduplicatePluginOrigins(plugins: Origin[]): Origin[] {
   }
 
   return list.toReversed()
+}
+
+// Migration safeguard: detect external Claude plugin declaration.
+// Reports the independently configured external claude-code plugin.
+// Does not delete user files; only reports for diagnostics/warnings.
+export function detectClaudeExternal(plugins: Origin[]): { hasExternal: boolean; sources: string[] } {
+  const matches = plugins.filter((p) => {
+    const spec = pluginSpecifier(p.spec)
+    return isClaudeExternalPlugin(spec)
+  })
+  return {
+    hasExternal: matches.length > 0,
+    sources: matches.map((m) => m.source),
+  }
+}
+
+// The first-party provider is `claude`, so the external `claude-code` plugin is
+// always allowed to coexist without provider-ID collision.
+export function shouldSuppressClaudeExternal(disableFirstParty: boolean): boolean {
+  return false
 }
 
 export * as ConfigPlugin from "./plugin"

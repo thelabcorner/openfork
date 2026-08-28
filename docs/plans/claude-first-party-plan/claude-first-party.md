@@ -1,20 +1,20 @@
-# Claude First-Party (claude-code) — Setup, Migration, Support, Rollback
+# Claude First-Party (claude) — Setup, Migration, Support, Rollback
 
 Status: integration lane (tasks 07/08/09)
 
 Date: 2026-08-24
 
-This is the first-party replacement for the external `@openchamber/opencode-claude` plugin. Provider ID remains `claude-code`. Quota source remains `claude` (advisory only).
+This is the first-party Claude CLI provider. Its provider ID is `claude`. The external `@openchamber/opencode-claude` plugin remains `claude-code`, and the API-key provider is `claude-api`. Quota source remains `claude` (advisory only).
 
 ## Setup
 
-- No npm plugin install or `plugin` entry required.
+- No npm plugin install or `plugin` entry is required for the first-party provider.
 - Requires official Claude CLI (`claude`) on PATH (or `CLAUDE_CONFIG_DIR`).
 - Auth is CLI-owned: use `claude auth login --claudeai` (or via OpenCode relay if exposed).
 - OpenCode never reads/writes/refreshes Claude credentials.
 - First-party is enabled by default. Rollback with env var (see below).
 
-Model references: `claude-code/sonnet`, `claude-code/opus`, legacy `claude-code/<model>` continue to work.
+Model references: `claude/sonnet`, `claude/opus`, and `claude-api/<model>` are first-party/API-key references. `claude-code/<model>` remains reserved for the external plugin.
 
 Effort variants (e.g. `/high`) supported via first-party.
 
@@ -36,31 +36,32 @@ Effort variants (e.g. `/high`) supported via first-party.
 - External plugin `@openchamber/opencode-claude` is detected by exact package identity (not substring).
 - See `ConfigPlugin.detectClaudeExternal(...)` and `isClaudeExternalPlugin` in `src/plugin/shared.ts`.
 
-### Precedence (compatibility window)
-1. `OPENCODE_DISABLE_CLAUDE_CODE_FIRST_PARTY=1` → first-party off, external plugin path open if declared.
-2. First-party CLI/SDK/auth available → built-in owns `claude-code`.
-3. Legacy `claude-code` provider config in opencode.json* is tolerated for aliases but does not override internal transport.
-4. External plugin is suppressed (deprecated path) unless rollback flag.
+### Provider ownership
+1. `claude` → first-party Claude CLI/Agent SDK runtime.
+2. `claude-api` → Anthropic API-key provider using the standard API transport.
+3. `claude-code` → external `@openchamber/opencode-claude` plugin.
+4. These IDs are intentionally distinct, so all three may be configured simultaneously.
 
 ### Safe duplicate prevention
-- Plugin loader skips deprecated (incl. claude external) before load.
-- No two runtimes register `claude-code`.
-- Config dedup + loader deprecation = deterministic.
+- The external Claude plugin is not marked deprecated by the first-party feature.
+- The first-party runtime never registers `claude-code`.
+- Provider IDs, config, auth, model references, and runtime selection remain separate.
 
 ### Aliases and binding
-- Legacy `claude-code/<model>` resolve directly (no alias hop in happy path).
+- `claude/<model>` resolves directly to first-party canonical model IDs.
+- `claude-code/<model>` is never migrated by first-party code.
 - Session bindings use OpenCode-owned store (project-scoped, validated cwd/project/modelFamily/settingsDigest + transcript check).
 - On mismatch: history-transfer (bounded) or fresh; never silent wrong billing.
 
 ### Rollback behavior
-- Set `OPENCODE_DISABLE_CLAUDE_CODE_FIRST_PARTY=1` (or `true`).
-- External plugin (if still in config) will load; first-party disabled.
+- Set `OPENCODE_DISABLE_CLAUDE_FIRST_PARTY=1` (or `true`) to disable only `claude`. The old `OPENCODE_DISABLE_CLAUDE_CODE_FIRST_PARTY` name remains accepted.
+- The `claude-code` external plugin and `claude-api` remain available.
 - Does **not** delete credentials, transcripts, sessions, or config.
 - Existing sessions keep their binding records (inert on rollback).
 
 ### Owned migration contract (single source)
 - `shouldEnableClaudeFirstParty({ disableClaudeCodeFirstParty? })` in `src/plugin/shared.ts`.
-- Used by plugin loader (external suppression) **and** core provider wiring (rollback gate for `claude-code` autoload).
+- Used by core provider wiring (rollback gate for `claude` autoload).
 - When disabled: first-party produces additive "disabled" readiness (distinct from error/unavailable) and fast-fails before any CLI/SDK work. Hosts can map to external-plugin fallback.
 - Re-enable by unsetting flag (or remove env).
 

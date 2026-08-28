@@ -28,6 +28,12 @@ export class Service extends ConfigService.Service<Service>()("@opencode/Runtime
     broad: bool("OPENCODE_DISABLE_CLAUDE_CODE"),
     direct: bool("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS"),
   }).pipe(Config.map((flags) => flags.broad || flags.direct)),
+  // First-party Claude (`claude` provider) opt-out. The external
+  // @openchamber/opencode-claude plugin remains independently available as `claude-code`.
+  disableClaudeCodeFirstParty: Config.all({
+    current: bool("OPENCODE_DISABLE_CLAUDE_FIRST_PARTY"),
+    legacy: bool("OPENCODE_DISABLE_CLAUDE_CODE_FIRST_PARTY"),
+  }).pipe(Config.map((flags) => flags.current || flags.legacy)),
   enableExa: Config.all({
     experimental,
     enabled: bool("OPENCODE_ENABLE_EXA"),
