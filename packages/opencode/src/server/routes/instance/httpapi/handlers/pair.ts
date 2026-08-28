@@ -11,12 +11,44 @@ function clientIP(request: HttpServerRequest.HttpServerRequest) {
   return Option.getOrUndefined(request.remoteAddress)
 }
 
+function configuredPWAURL(code: string) {
+  const configured = process.env.OPENCODE_PWA_URL?.trim()
+  if (!configured) return
+
+  try {
+    const pwa = new URL(configured)
+    if (pwa.protocol !== "http:" && pwa.protocol !== "https:") return
+
+    const server = process.env.OPENCODE_PUBLIC_URL?.trim()
+    if (server) {
+      const api = new URL(server)
+      if (api.protocol !== "http:" && api.protocol !== "https:") return
+      api.hash = ""
+      pwa.searchParams.set("server", api.toString().replace(/\/$/, ""))
+    }
+    pwa.hash = `pair=${encodeURIComponent(code)}`
+    return pwa.toString()
+  } catch {
+    return
+  }
+}
+
 function pairURL(request: HttpServerRequest.HttpServerRequest, code: string) {
+  const configured = configuredPWAURL(code)
+  if (configured) return configured
+
   const url = new URL(request.url, "http://localhost")
   const protocol = request.headers["x-forwarded-proto"] ?? url.protocol.replace(":", "")
+  const host =
+    request.headers["x-forwarded-host"]?.split(",")[0].trim() ??
+    (request.headers as Record<string, string | undefined>)["host"]?.split(",")[0].trim() ??
+    (request.headers as Record<string, string | undefined>)["Host"]?.split(",")[0].trim() ??
+    url.host
   // Fragment, not query: the code must never reach server access logs or
   // referrers — clients consume and strip it from location.hash.
-  return `${protocol}://${url.host}/#pair=${encodeURIComponent(code)}`
+  const server = process.env.OPENCODE_PUBLIC_URL?.trim()
+  const query = server ? `?server=${encodeURIComponent(server.replace(/\/$/, ""))}` : ""
+  return `${protocol}://${host}/${query}#pair=${encodeURIComponent(code)}`
 }
 
 export const pairHandlers = HttpApiBuilder.group(PairBeginApi, "pair-begin", (handlers) =>

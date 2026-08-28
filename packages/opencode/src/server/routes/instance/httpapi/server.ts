@@ -69,6 +69,7 @@ import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectCopy } from "@opencode-ai/core/project/copy"
 import { PtyTicket } from "@opencode-ai/core/pty/ticket"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
+import { PushV2 } from "@opencode-ai/core/push"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -324,6 +325,7 @@ const app = LayerNode.group([
   ProjectCopy.node,
   PtyTicket.node,
   BrowserHostBroker.node,
+  PushV2.node,
   Usage.node,
   Quota.node,
 ])

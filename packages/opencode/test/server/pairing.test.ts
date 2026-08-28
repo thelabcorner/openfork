@@ -12,6 +12,8 @@ const original = {
   flagUsername: Flag.OPENCODE_SERVER_USERNAME,
   envPassword: process.env.OPENCODE_SERVER_PASSWORD,
   envUsername: process.env.OPENCODE_SERVER_USERNAME,
+  envPublicURL: process.env.OPENCODE_PUBLIC_URL,
+  envPWAURL: process.env.OPENCODE_PWA_URL,
 }
 const auth = { username: "opencode", password: "pairing-secret" }
 
@@ -22,6 +24,10 @@ afterEach(async () => {
   else process.env.OPENCODE_SERVER_PASSWORD = original.envPassword
   if (original.envUsername === undefined) delete process.env.OPENCODE_SERVER_USERNAME
   else process.env.OPENCODE_SERVER_USERNAME = original.envUsername
+  if (original.envPublicURL === undefined) delete process.env.OPENCODE_PUBLIC_URL
+  else process.env.OPENCODE_PUBLIC_URL = original.envPublicURL
+  if (original.envPWAURL === undefined) delete process.env.OPENCODE_PWA_URL
+  else process.env.OPENCODE_PWA_URL = original.envPWAURL
   await resetDatabase()
 })
 
@@ -112,6 +118,13 @@ describe("device pairing over Server.listen", () => {
       expect(pair.code).toMatch(new RegExp(`^[23456789ABCDEFGHJKLMNPQRSTUVWXYZ]{${PAIRING.codeLength}}$`))
       expect(pair.url).toContain(`#pair=${pair.code}`)
       expect(new Date(pair.expiresAt).getTime()).toBeGreaterThan(Date.now())
+
+      process.env.OPENCODE_PUBLIC_URL = "https://api.example.test/oc"
+      process.env.OPENCODE_PWA_URL = "https://mobile.example.test/"
+      const publicPair = await begin(listener)
+      expect(publicPair.status).toBe(200)
+      const publicPairBody = (await publicPair.json()) as PairBegin
+      expect(publicPairBody.url).toMatch(/^https:\/\/mobile\.example\.test\/\?server=https%3A%2F%2Fapi\.example\.test%2Foc#pair=/)
 
       // claim is unauthenticated by design and returns a one-time token
       const claimedResponse = await claim(listener, pair.code)
