@@ -2,7 +2,7 @@
   "name": "OpenCode",
   "short_name": "OpenCode",
   "id": "/",
-  "start_url": "/",
+  "start_url": "/pwa.html",
   "scope": "/",
   "icons": [
     {

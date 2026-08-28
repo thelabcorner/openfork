@@ -1,0 +1,32 @@
+{
+  "name": "@opencode-ai/mobile",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@opencode-ai/sdk": "workspace:*",
+    "@opencode-ai/ui": "workspace:*",
+    "dompurify": "catalog:",
+    "katex": "0.16.27",
+    "marked": "catalog:",
+    "marked-shiki": "catalog:",
+    "qr-scanner": "1.4.2",
+    "remend": "catalog:",
+    "shiki": "catalog:",
+    "solid-js": "catalog:",
+    "web-haptics": "^0.0.6"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "@types/katex": "0.16.7",
+    "typescript": "catalog:",
+    "vite": "catalog:",
+    "vite-plugin-solid": "catalog:"
+  }
+}

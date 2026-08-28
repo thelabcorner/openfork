@@ -1,0 +1,11 @@
+{
+  "name": "OpenCode Mobile",
+  "short_name": "OpenCode",
+  "description": "A separate mobile client for OpenCode",
+  "start_url": "/",
+  "display": "standalone",
+  "orientation": "portrait",
+  "theme_color": "#101317",
+  "background_color": "#101317",
+  "icons": []
+}
