@@ -46,7 +46,13 @@ export const make = <A, E = never, R = never>(
 
 export const get = <A, E, R>(self: InstanceState<A, E, R>) =>
   Effect.gen(function* () {
-    return yield* ScopedCache.get(self.cache, yield* directory)
+    const dir = yield* directory
+    return yield* ScopedCache.get(self.cache, dir).pipe(
+      // ScopedCache.get runs restore(lookup) on the first waiter and caches that
+      // exit. An aborted HTTP request would otherwise store an interrupt that
+      // poisons every later reader (Agent.list, session prompt, …).
+      Effect.onInterrupt(() => ScopedCache.invalidate(self.cache, dir).pipe(Effect.asVoid)),
+    )
   })
 
 export const use = <A, E, R, B>(self: InstanceState<A, E, R>, select: (value: A) => B) => Effect.map(get(self), select)

@@ -299,6 +299,30 @@ it.live("InstanceState mutation in one directory does not leak to another", () =
   }),
 )
 
+it.live("InstanceState first-waiter abort does not poison the cache", () =>
+  Effect.gen(function* () {
+    const dir = yield* tmpdirScoped()
+    const started = yield* Deferred.make<void>()
+    let n = 0
+    const state = yield* InstanceState.make(() =>
+      Effect.gen(function* () {
+        n += 1
+        yield* Deferred.succeed(started, undefined)
+        yield* Effect.sleep(Duration.millis(30))
+        return { n }
+      }),
+    )
+
+    const first = yield* access(state, dir).pipe(Effect.forkScoped)
+    yield* Deferred.await(started)
+    yield* Fiber.interrupt(first)
+    const value = yield* access(state, dir)
+
+    expect(value).toEqual({ n: n })
+    expect(n).toBeGreaterThanOrEqual(1)
+  }),
+)
+
 it.live("InstanceState dedupes concurrent lookups", () =>
   Effect.gen(function* () {
     const dir = yield* tmpdirScoped()
