@@ -48,6 +48,9 @@ export type Event =
   | EventSessionNextRevertStaged
   | EventSessionNextRevertCleared
   | EventSessionNextRevertCommitted
+  | EventSessionNextPaused
+  | EventSessionNextResumed
+  | EventSessionNextRenamed
   | EventMessagePartDelta
   | EventSessionDiff
   | EventSessionError
@@ -1201,6 +1204,31 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "session.next.paused"
+        properties: {
+          timestamp: number
+          sessionID: string
+        }
+      }
+    | {
+        id: string
+        type: "session.next.resumed"
+        properties: {
+          timestamp: number
+          sessionID: string
+        }
+      }
+    | {
+        id: string
+        type: "session.next.renamed"
+        properties: {
+          timestamp: number
+          sessionID: string
+          title: string
+        }
+      }
+    | {
+        id: string
         type: "message.part.delta"
         properties: {
           sessionID: string
@@ -1656,6 +1684,9 @@ export type GlobalEvent = {
     | SyncEventSessionNextRevertStaged
     | SyncEventSessionNextRevertCleared
     | SyncEventSessionNextRevertCommitted
+    | SyncEventSessionNextPaused
+    | SyncEventSessionNextResumed
+    | SyncEventSessionNextRenamed
 }
 
 /**
@@ -2038,17 +2069,26 @@ export type Config = {
     tail_turns?: number
     preserve_recent_tokens?: number
     reserved?: number
+    /**
+     * Tiered models for compaction, matched by required context window
+     */
+    models?: {
+      small?: string
+      medium?: string
+      large?: string
+    }
+    prompt?: string
   }
   experimental?: {
     disable_paste_summary?: boolean
-    spad_recovery?: boolean
-    spad_observe_only?: boolean
     batch_tool?: boolean
     openTelemetry?: boolean
     primary_tools?: Array<string>
     continue_loop_on_deny?: boolean
     mcp_timeout?: number
     policies?: Array<ConfigV2ExperimentalPolicy>
+    spad_recovery?: boolean
+    spad_observe_only?: boolean
   }
 }
 
@@ -3057,6 +3097,9 @@ export type SessionDurableEvent =
   | SessionNextRevertStaged
   | SessionNextRevertCleared
   | SessionNextRevertCommitted
+  | SessionNextPaused
+  | SessionNextResumed
+  | SessionNextRenamed
 
 export type SessionHistory = {
   data: Array<SessionDurableEvent>
@@ -3070,7 +3113,7 @@ export type CheckpointInfo = {
   sessionID: string
   ordinal: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   kind: "baseline" | "turn" | "manual" | "pre-revert"
-  status: "capturing" | "ready" | "partial" | "error"
+  status: "capturing" | "ready" | "partial" | "error" | "aborted"
   userMessageID?: string
   assistantMessageID?: string
   beforeSnapshot: string
@@ -3249,6 +3292,9 @@ export type V2Event =
   | SessionNextRevertStaged
   | SessionNextRevertCleared
   | SessionNextRevertCommitted
+  | SessionNextPaused
+  | SessionNextResumed
+  | SessionNextRenamed
   | MessagePartDelta
   | SessionDiff
   | SessionError
@@ -4177,6 +4223,52 @@ export type SyncEventSessionNextRevertCommitted = {
   }
 }
 
+export type SyncEventSessionNextPaused = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.paused.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+    }
+  }
+}
+
+export type SyncEventSessionNextResumed = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.resumed.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+    }
+  }
+}
+
+export type SyncEventSessionNextRenamed = {
+  type: "sync"
+  id: string
+  syncEvent: {
+    type: "session.next.renamed.1"
+    id: string
+    seq: number
+    aggregateID: string
+    data: {
+      timestamp: number
+      sessionID: string
+      title: string
+    }
+  }
+}
+
 export type ConfigV2ReferenceGit = {
   repository: string
   branch?: string
@@ -4308,6 +4400,7 @@ export type SessionV2Info = {
     archived?: number
   }
   title: string
+  pausedAt?: number
   location: LocationRef
   subpath?: string
   revert?: RevertState
@@ -5154,6 +5247,61 @@ export type SessionNextRevertCommitted = {
     timestamp: number
     sessionID: string
     messageID: string
+  }
+}
+
+export type SessionNextPaused = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.paused"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+  }
+}
+
+export type SessionNextResumed = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.resumed"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+  }
+}
+
+export type SessionNextRenamed = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.next.renamed"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    timestamp: number
+    sessionID: string
+    title: string
   }
 }
 
@@ -6567,6 +6715,25 @@ export type ProjectCopyCopy = {
   directory: string
 }
 
+export type PushSubscriptionKeys = {
+  p256dh: string
+  auth: string
+}
+
+export type PushSubscriptionSubscribeInput = {
+  endpoint: string
+  keys: PushSubscriptionKeys
+  expirationTime?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  userAgentHint?: string
+}
+
+export type PushSubscriptionInfo = {
+  id: string
+  createdAt: string
+  lastSeenAt: string
+  userAgentHint?: string
+}
+
 export type EventModelsDevRefreshed = {
   id: string
   type: "models-dev.refreshed"
@@ -7065,6 +7232,34 @@ export type EventSessionNextRevertCommitted = {
     timestamp: number
     sessionID: string
     messageID: string
+  }
+}
+
+export type EventSessionNextPaused = {
+  id: string
+  type: "session.next.paused"
+  properties: {
+    timestamp: number
+    sessionID: string
+  }
+}
+
+export type EventSessionNextResumed = {
+  id: string
+  type: "session.next.resumed"
+  properties: {
+    timestamp: number
+    sessionID: string
+  }
+}
+
+export type EventSessionNextRenamed = {
+  id: string
+  type: "session.next.renamed"
+  properties: {
+    timestamp: number
+    sessionID: string
+    title: string
   }
 }
 
@@ -14024,7 +14219,7 @@ export type V2SessionCheckpointListData = {
   }
   query?: {
     limit?: string
-    status?: "capturing" | "ready" | "partial" | "error"
+    status?: "capturing" | "ready" | "partial" | "error" | "aborted"
     kind?: "baseline" | "turn" | "manual" | "pre-revert"
   }
   url: "/api/session/{sessionID}/checkpoint"
@@ -16338,6 +16533,103 @@ export type V2BrowserAssignResponses = {
 }
 
 export type V2BrowserAssignResponse = V2BrowserAssignResponses[keyof V2BrowserAssignResponses]
+
+export type V2PushPublicKeyGetData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/api/push/public-key"
+}
+
+export type V2PushPublicKeyGetErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2PushPublicKeyGetError = V2PushPublicKeyGetErrors[keyof V2PushPublicKeyGetErrors]
+
+export type V2PushPublicKeyGetResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: {
+      publicKey: string
+    }
+  }
+}
+
+export type V2PushPublicKeyGetResponse = V2PushPublicKeyGetResponses[keyof V2PushPublicKeyGetResponses]
+
+export type V2PushSubscriptionDeleteData = {
+  body?: never
+  path?: never
+  query: {
+    endpoint: string
+  }
+  url: "/api/push/subscription"
+}
+
+export type V2PushSubscriptionDeleteErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2PushSubscriptionDeleteError = V2PushSubscriptionDeleteErrors[keyof V2PushSubscriptionDeleteErrors]
+
+export type V2PushSubscriptionDeleteResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type V2PushSubscriptionDeleteResponse =
+  V2PushSubscriptionDeleteResponses[keyof V2PushSubscriptionDeleteResponses]
+
+export type V2PushSubscriptionCreateData = {
+  body: PushSubscriptionSubscribeInput
+  path?: never
+  query?: never
+  url: "/api/push/subscription"
+}
+
+export type V2PushSubscriptionCreateErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2PushSubscriptionCreateError = V2PushSubscriptionCreateErrors[keyof V2PushSubscriptionCreateErrors]
+
+export type V2PushSubscriptionCreateResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: PushSubscriptionInfo
+  }
+}
+
+export type V2PushSubscriptionCreateResponse =
+  V2PushSubscriptionCreateResponses[keyof V2PushSubscriptionCreateResponses]
 
 export type PtyConnectData = {
   body?: never

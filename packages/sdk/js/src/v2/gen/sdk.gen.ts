@@ -202,6 +202,7 @@ import type {
   PtyShellsResponses,
   PtyUpdateErrors,
   PtyUpdateResponses,
+  PushSubscriptionSubscribeInput,
   QuestionAnswer,
   QuestionListErrors,
   QuestionListResponses,
@@ -418,6 +419,12 @@ import type {
   V2PtyRemoveResponses,
   V2PtyUpdateErrors,
   V2PtyUpdateResponses,
+  V2PushPublicKeyGetErrors,
+  V2PushPublicKeyGetResponses,
+  V2PushSubscriptionCreateErrors,
+  V2PushSubscriptionCreateResponses,
+  V2PushSubscriptionDeleteErrors,
+  V2PushSubscriptionDeleteResponses,
   V2QuestionRequestListErrors,
   V2QuestionRequestListResponses,
   V2ReferenceListErrors,
@@ -6402,7 +6409,7 @@ export class Checkpoint extends HeyApiClient {
     parameters: {
       sessionID: string
       limit?: string
-      status?: "capturing" | "ready" | "partial" | "error"
+      status?: "capturing" | "ready" | "partial" | "error" | "aborted"
       kind?: "baseline" | "turn" | "manual" | "pre-revert"
     },
     options?: Options<never, ThrowOnError>,
@@ -8925,6 +8932,85 @@ export class Browser extends HeyApiClient {
   }
 }
 
+export class PublicKey extends HeyApiClient {
+  /**
+   * Get Web Push VAPID public key
+   *
+   * Retrieve the server's VAPID public key for PushManager.subscribe().
+   */
+  public get<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<V2PushPublicKeyGetResponses, V2PushPublicKeyGetErrors, ThrowOnError>({
+      url: "/api/push/public-key",
+      ...options,
+    })
+  }
+}
+
+export class Subscription extends HeyApiClient {
+  /**
+   * Delete a push subscription
+   *
+   * Unsubscribe a browser PushSubscription by its endpoint.
+   */
+  public delete<ThrowOnError extends boolean = false>(
+    parameters: {
+      endpoint: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "query", key: "endpoint" }] }])
+    return (options?.client ?? this.client).delete<
+      V2PushSubscriptionDeleteResponses,
+      V2PushSubscriptionDeleteErrors,
+      ThrowOnError
+    >({
+      url: "/api/push/subscription",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Create or update a push subscription
+   *
+   * Register (or refresh) a browser PushSubscription so the server can send Web Push notifications.
+   */
+  public create<ThrowOnError extends boolean = false>(
+    parameters: {
+      pushSubscriptionSubscribeInput: PushSubscriptionSubscribeInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ key: "pushSubscriptionSubscribeInput", map: "body" }] }])
+    return (options?.client ?? this.client).post<
+      V2PushSubscriptionCreateResponses,
+      V2PushSubscriptionCreateErrors,
+      ThrowOnError
+    >({
+      url: "/api/push/subscription",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
+export class Push extends HeyApiClient {
+  private _publicKey?: PublicKey
+  get publicKey(): PublicKey {
+    return (this._publicKey ??= new PublicKey({ client: this.client }))
+  }
+
+  private _subscription?: Subscription
+  get subscription(): Subscription {
+    return (this._subscription ??= new Subscription({ client: this.client }))
+  }
+}
+
 export class V2 extends HeyApiClient {
   private _health?: Health
   get health(): Health {
@@ -9019,6 +9105,11 @@ export class V2 extends HeyApiClient {
   private _browser?: Browser
   get browser(): Browser {
     return (this._browser ??= new Browser({ client: this.client }))
+  }
+
+  private _push?: Push
+  get push(): Push {
+    return (this._push ??= new Push({ client: this.client }))
   }
 }
 
