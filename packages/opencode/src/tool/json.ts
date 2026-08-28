@@ -57,7 +57,8 @@ export const Parameters = Schema.Struct({
 })
 
 type JsonInput = {
-  text: string
+  text?: string
+  raw?: Buffer
   source: string
   abs: string
   rel: string
@@ -92,9 +93,9 @@ const readJsonInput = Effect.fn("JsonTool.readInput")(function* (
   maxBytes: number,
 ) {
   if (jsonText !== undefined) {
-    const bytes = Buffer.byteLength(jsonText, "utf8")
-    if (bytes > maxBytes) throw new Error(`JSON text exceeds maxBytes (${bytes} > ${maxBytes})`)
-    return { text: jsonText, source: "jsonText", abs: "", rel: "" }
+    const buf = Buffer.from(jsonText, "utf8")
+    if (buf.length > maxBytes) throw new Error(`JSON text exceeds maxBytes (${buf.length} > ${maxBytes})`)
+    return { text: jsonText, raw: buf, source: "jsonText", abs: "", rel: "" }
   }
   if (!filePath) throw new Error("Either filePath or jsonText is required")
   const abs = path.isAbsolute(filePath) ? filePath : path.join(instance.directory, filePath)
@@ -105,27 +106,30 @@ const readJsonInput = Effect.fn("JsonTool.readInput")(function* (
   const stat = yield* Effect.promise(() => fs.stat(normalized))
   if (!stat.isFile()) throw new Error(`Not a file: ${filePath}`)
   if (stat.size > maxBytes) throw new Error(`File exceeds maxBytes (${stat.size} > ${maxBytes}): ${filePath}`)
-  const text = yield* Effect.promise(() => fs.readFile(normalized, "utf8"))
-  return { text, source: "file", abs: normalized, rel: rel.split(path.sep).join("/") }
+  const raw = yield* Effect.promise(() => fs.readFile(normalized))
+  const text = raw.includes(0) ? undefined : raw.toString("utf8") // binary if nul
+  return { text, raw, source: "file", abs: normalized, rel: rel.split(path.sep).join("/") }
 })
 
 const writeJson = Effect.fn("JsonTool.write")(function* (
   ctx: Tool.Context,
-  input: JsonInput,
+  input: JsonInput & { raw?: Buffer },
   rel: string,
-  before: string,
-  after: string,
+  before: string | Buffer,
+  after: string | Buffer,
 ) {
+  const beforeStr = Buffer.isBuffer(before) ? before.toString("base64").slice(0,64) : before
+  const afterStr = Buffer.isBuffer(after) ? after.toString("base64").slice(0,64) : after
   yield* ctx.ask({
     permission: "edit",
     patterns: [rel],
     always: [rel],
     metadata: {
       filepath: input.abs,
-      diff: trimDiff(createTwoFilesPatch(rel, rel, before, after)),
+      diff: trimDiff(createTwoFilesPatch(rel, rel, String(beforeStr), String(afterStr))),
     },
   })
-  yield* Effect.promise(() => fs.writeFile(input.abs, after, "utf8"))
+  yield* Effect.promise(() => fs.writeFile(input.abs, after))
 })
 
 export const JsonTool = Tool.define<typeof Parameters, JsonMeta, never>(
@@ -150,8 +154,9 @@ export const JsonTool = Tool.define<typeof Parameters, JsonMeta, never>(
 
           const input = yield* readJsonInput(ctx, instance, params.filePath, params.jsonText, limits.maxBytes)
           const source = input.rel || input.source
-          const beforeHash = Core.hashText(input.text)
-          const parsed = Core.parseJsonWithDiagnostics(input.text)
+          const rawForHash = input.raw ?? Buffer.from(input.text ?? "")
+          const beforeHash = Core.hashText(rawForHash)
+          const parsed = Core.parseJsonWithDiagnostics(input.raw ?? input.text ?? "", params.filePath)
           if (!parsed.ok) {
             return {
               title: "json validation failed",
@@ -160,6 +165,7 @@ export const JsonTool = Tool.define<typeof Parameters, JsonMeta, never>(
             }
           }
           const value = parsed.value
+          const inputFormat = (parsed as any).format || "json"
 
           if (mode === "validate") {
             return { title: "json validate", output: Core.validationXml(parsed, source), metadata: { mode, source, ok: true, bytes: parsed.bytes } }
@@ -213,17 +219,20 @@ export const JsonTool = Tool.define<typeof Parameters, JsonMeta, never>(
 
           if (mode === "format") {
             const indent = params.indent === 0 ? 0 : params.indent ?? 2
-            const nextText = Core.stableStringify(value, indent, Boolean(params.sortKeys)) + (indent === 0 ? "" : "\n")
-            const nextHash = Core.hashText(nextText)
+            const nextContent = Core.stringifyForFormat(value, inputFormat, indent, Boolean(params.sortKeys))
+            const isBin = inputFormat === "bson"
+            const nextForWrite = isBin ? Core.bsonSerialize(value) : nextContent
+            const nextHash = Core.hashText(isBin ? nextForWrite : nextContent)
             let written = false
             const note = input.abs
               ? "dry run; no file was written. Re-run with dryRun:false to apply (a write permission prompt will appear)."
               : "jsonText input; no file write possible"
             if (input.abs && params.dryRun === false) {
-              yield* writeJson(ctx, input, input.rel, input.text, nextText)
+              yield* writeJson(ctx, input as any, input.rel, input.raw ?? input.text ?? "", nextForWrite)
               written = true
             }
-            const preview = outputPreview(nextText)
+            const previewText = isBin ? "[binary BSON, " + (nextForWrite as Buffer).length + " bytes]" : nextContent
+            const preview = outputPreview(previewText)
             const output = [
               `<json-format source="${Core.escapeXml(source)}" written="${written}" beforeHash="${beforeHash}" afterHash="${nextHash}" bytes="${preview.bytes}" truncated="${preview.truncated}">`,
               `  <note>${Core.escapeXml(note)}</note>`,
@@ -236,15 +245,17 @@ export const JsonTool = Tool.define<typeof Parameters, JsonMeta, never>(
           if (mode === "patch") {
             const ops = params.patch ?? []
             if (!Array.isArray(ops) || ops.length === 0) throw new Error("patch mode requires a non-empty patch array")
-            const next = Core.applyJsonPatch(value, ops)
-            const nextText = Core.stableStringify(next, params.indent ?? 2, Boolean(params.sortKeys)) + "\n"
-            const nextHash = Core.hashText(nextText)
+            const nextVal = Core.applyJsonPatch(value, ops)
+            const nextContent = Core.stringifyForFormat(nextVal, inputFormat, params.indent ?? 2, Boolean(params.sortKeys))
+            const isBin = inputFormat === "bson"
+            const nextForWrite = isBin ? Core.bsonSerialize(nextVal) : nextContent
+            const nextHash = Core.hashText(isBin ? nextForWrite : nextContent)
             let written = false
             const note = input.abs
               ? "dry run; no file was written. Re-run with dryRun:false to apply (a write permission prompt will appear)."
               : "jsonText input; no file write possible"
             if (input.abs && params.dryRun === false) {
-              yield* writeJson(ctx, input, input.rel, input.text, nextText)
+              yield* writeJson(ctx, input as any, input.rel, input.raw ?? input.text ?? "", nextForWrite)
               written = true
             }
             const output = [
@@ -258,7 +269,8 @@ export const JsonTool = Tool.define<typeof Parameters, JsonMeta, never>(
 
           if (mode === "diff") {
             const other = yield* readJsonInput(ctx, instance, params.compareFilePath, params.compareJsonText, limits.maxBytes)
-            const otherParsed = Core.parseJsonWithDiagnostics(other.text)
+            const otherRaw = other.raw ?? Buffer.from(other.text ?? "")
+            const otherParsed = Core.parseJsonWithDiagnostics(otherRaw, params.compareFilePath)
             if (!otherParsed.ok) {
               return {
                 title: "json compare validation failed",

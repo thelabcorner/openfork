@@ -1,23 +1,25 @@
-Time-travel checkpoints for this session. Every completed turn automatically records what the workspace looked like before and after, so you can inspect your own history and undo your own mistakes without touching the user's git repository.
+Time-travel checkpoints. Every completed turn records the worktree. Restore
+undoes filesystem only — never conversation, git index, or the user's commits.
 
 Modes:
-- list — checkpoint timeline for this session (oldest first). Default when you have an ordinal in mind? No: start here if unsure.
-- search — find checkpoints by file path or free text (newest first). Use to answer "which turn touched X?".
-- view — full detail for one checkpoint (by ordinal).
-- diff — per-turn changes (scope:"turn", default) or everything up to a checkpoint (scope:"session").
-- restore — make the workspace match a checkpoint again. THE UNDO BUTTON.
+  list     this session's timeline (default). Footer counts OTHER sessions on
+           this worktree. Pass across:"worktree" to see them.
+  search   WHO touched a file — defaults to across:"worktree" (every session
+           that shares this disk). Isolated worktrees are not listed.
+  view     one checkpoint (ordinal in this/from session, or checkpointID)
+  diff     turn (default) or cumulative in that checkpoint's session
+  restore  THE UNDO BUTTON. Dry-run by default.
 
-Typical recovery workflow:
-1. You realize a change broke something → checkpoint mode:"search" touchedPath:"path/to/file.ts"
-2. Pick the ordinal from BEFORE the damage → mode:"diff" ordinal:N to verify it looks right
-3. mode:"restore" ordinal:N (dry-run preview comes first; re-run with dryRun:false and confirm:"RESTORE_CHECKPOINT" to apply)
+Cross-session (the thing that actually matters):
+- Ordinals are PER SESSION. Session A's 3 is not session B's 3.
+- To restore another agent's checkpoint: search → copy checkpointID →
+  restore checkpointID:"…" (preview, then dryRun:false confirm:"RESTORE_CHECKPOINT").
+- `from:"ses_…"` scopes list/view/diff to that session. Restore of a foreign
+  row still requires checkpointID so an ordinal cannot silently jump chats.
+- Restore rewrites the SHARED worktree. A pre-revert safety checkpoint is
+  recorded on THIS session so you can undo.
 
-Safety properties:
-- restore NEVER touches conversation history, git index, or the user's commits — filesystem only.
-- Every applied restore first records a "pre-revert" safety checkpoint, so a restore can itself be undone by restoring to that pre-revert ordinal.
-- restore refuses while a checkpoint is mid-capture, targets from a different worktree identity, or missing confirm tokens.
-
-Notes:
-- Ordinals are stable per-session numbers shown in every listing — prefer them over IDs.
-- status meanings: capturing=in progress, ready=complete, partial=complete but some oversized files excluded, aborted=turn was interrupted (changes still recorded), error=capture failed.
-- diff output is capped by maxBytes (default 80000); raise it if you need deeper patches.
+Typical:
+1. search touchedPath:"path/to/file.ts"
+2. diff checkpointID:"…"
+3. restore checkpointID:"…"  (preview) then again with dryRun:false confirm:"RESTORE_CHECKPOINT"

@@ -1,4 +1,6 @@
 import { createHash } from "node:crypto"
+import { parse as parseJsonc, type ParseError as JsoncParseError } from "jsonc-parser"
+import { deserialize, serialize, EJSON } from "bson"
 
 // Pure JSON analysis/manipulation helpers for the json tool. No I/O here — the
 // tool layer owns file access, permissions, and dispatch.
@@ -45,11 +47,44 @@ export type ParseResult =
   | { ok: true; value: Json; bytes: number; parseMs: number }
   | { ok: false; error: string; position: number; line: number; column: number; excerpt: string; bytes: number; parseMs: number }
 
-export function parseJsonWithDiagnostics(text: string): ParseResult {
+export function parseJsonWithDiagnostics(input: string | Uint8Array, fileHint?: string): ParseResult & { format: "json" | "jsonc" | "jsonl" | "bson" } {
   const started = performance.now()
+  let buf: any
+  if (typeof input !== "string") buf = Buffer.from(input as any)
+  const fmt = detectFormat(input, fileHint, buf)
+  if (fmt === "bson" && buf) {
+    try {
+      const native = deserialize(buf as any)
+      const value = EJSON.serialize(native) as Json
+      return { ok: true, value, bytes: buf.length, parseMs: performance.now() - started, format: "bson" }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { ok: false, error: "BSON parse failed: " + message, position: 0, line: 0, column: 0, excerpt: "", bytes: buf.length, parseMs: performance.now() - started, format: "bson" }
+    }
+  }
+  let text = typeof input === "string" ? input : (buf as Buffer).toString("utf8")
+  text = text.replace(/^\uFEFF/, "")
+  const bytes = Buffer.byteLength(text, "utf8")
+  if (fmt === "jsonl" || isProbablyJsonLines(text)) {
+    try {
+      const lines = text.split(/\r?\n/)
+      const docs: Json[] = []
+      for (const raw of lines) {
+        const ln = raw.trim()
+        if (!ln) continue
+        const v = tolerantParse(ln)
+        docs.push(v as Json)
+      }
+      return { ok: true, value: docs as Json, bytes, parseMs: performance.now() - started, format: "jsonl" }
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      return { ok: false, error: "JSONL line parse: " + message, position: 0, line: 0, column: 0, excerpt: text.slice(0, 200), bytes, parseMs: performance.now() - started, format: "jsonl" }
+    }
+  }
   try {
-    const value = JSON.parse(text) as Json
-    return { ok: true, value, bytes: Buffer.byteLength(text, "utf8"), parseMs: performance.now() - started }
+    const value = tolerantParse(text) as Json
+    const f = fmt === "jsonc" ? "jsonc" : "json"
+    return { ok: true, value, bytes, parseMs: performance.now() - started, format: f }
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err)
     const posMatch = message.match(/position\s+(\d+)/i)
@@ -72,10 +107,72 @@ export function parseJsonWithDiagnostics(text: string): ParseResult {
       line,
       column,
       excerpt,
-      bytes: Buffer.byteLength(text, "utf8"),
+      bytes,
       parseMs: performance.now() - started,
+      format: "json",
     }
   }
+}
+
+function tolerantParse(text: string): unknown {
+  try {
+    return JSON.parse(text)
+  } catch {}
+  const errors: JsoncParseError[] = []
+  const v = parseJsonc(text, errors, { allowTrailingComma: true })
+  if (errors.length) {
+    throw new Error(errors.map(e => `jsonc error at ${e.offset}`).join("; "))
+  }
+  return v
+}
+
+function isProbablyJsonLines(text: string): boolean {
+  const lines = text.trim().split(/\r?\n/).filter(l => l.trim().length > 0)
+  if (lines.length < 2) return false
+  return lines.every(l => {
+    const t = l.trim()
+    return (t[0] === "{" && t[t.length-1] === "}") || (t[0] === "[" && t[t.length-1] === "]")
+  })
+}
+
+export function detectFormat(input: string | Uint8Array, fileHint?: string, buf?: any): "json" | "jsonc" | "jsonl" | "bson" {
+  if (fileHint && /\.bson$/i.test(fileHint)) return "bson"
+  const b: any = buf ? Buffer.from(buf) : (input instanceof Uint8Array || Buffer.isBuffer(input) ? Buffer.from(input as any) : undefined)
+  if (b) {
+    if (fileHint && /\.bson$/i.test(fileHint)) return "bson"
+    // only treat buffer as bson if it has strong binary signals (nulls) or explicit hint
+    const head = b.subarray(0, Math.min(512, b.length))
+    const hasNul = head.includes(0)
+    if (hasNul) return "bson"
+    // rough bson size prefix match only if looks non-text
+    if (b.length > 4) {
+      try {
+        const sz = b.readUInt32LE(0)
+        if (sz > 4 && sz <= b.length && hasNul) return "bson"
+      } catch {}
+    }
+    // otherwise treat buffer content as text (from jsonText or text file)
+  }
+  const t = (typeof input === "string" ? input : (b ? b.toString("utf8") : String(input))).replace(/^\uFEFF/, "").trim()
+  if (fileHint && /\.jsonl|\.ndjson/i.test(fileHint)) return "jsonl"
+  if (isProbablyJsonLines(t)) return "jsonl"
+  if (/\/\*|\/\/|,[ \t\r\n]*[}\]]/.test(t)) return "jsonc"
+  return "json"
+}
+
+export function bsonSerialize(extended: unknown): Buffer {
+  const native = EJSON.deserialize(extended as any)
+  return serialize(native as any)
+}
+
+export function stringifyForFormat(value: unknown, format: string, indent?: number, sortKeys = false): string {
+  if (format === "jsonl" && Array.isArray(value)) {
+    return value.map(v => stableStringify(v, 0, sortKeys)).join("\n") + "\n"
+  }
+  if (format === "bson") {
+    return stableStringify(value, indent ?? 2, sortKeys) + "\n"
+  }
+  return stableStringify(value, indent, sortKeys) + (indent === 0 ? "" : "\n")
 }
 
 export function typeOfJson(value: unknown): JsonType {
@@ -607,8 +704,11 @@ export function diffToXml(diffs: JsonDiff[]) {
   ].join("\n")
 }
 
-export function hashText(text: string): string {
-  return createHash("sha256").update(text).digest("hex").slice(0, 16)
+export function hashText(text: string | Uint8Array): string {
+  const h = createHash("sha256")
+  if (typeof text === "string") h.update(text)
+  else h.update(Buffer.from(text))
+  return h.digest("hex").slice(0, 16)
 }
 
 export function validationXml(parsed: ParseResult, source = ""): string {

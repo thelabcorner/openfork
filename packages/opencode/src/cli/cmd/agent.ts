@@ -28,6 +28,7 @@ const AVAILABLE_PERMISSIONS = [
   "websearch",
   "lsp",
   "skill",
+  "checkpoint",
 ]
 
 const AgentCreateCommand = effectCmd({

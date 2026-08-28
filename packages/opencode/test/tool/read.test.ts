@@ -414,14 +414,17 @@ describe("tool.read truncation", () => {
     }),
   )
 
-  it.live("throws when offset is beyond end of file", () =>
+  it.live("clamps offset past EOF to the last page", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       const lines = Array.from({ length: 3 }, (_, i) => `line${i + 1}`).join("\n")
       yield* put(path.join(dir, "short.txt"), lines)
 
-      const err = yield* fail(dir, { filePath: path.join(dir, "short.txt"), offset: 4, limit: 5 })
-      expect(err.message).toContain("Offset 4 is out of range for this file (3 lines)")
+      const result = yield* exec(dir, { filePath: path.join(dir, "short.txt"), offset: 4, limit: 5 })
+      expect(result.output).toContain("line1")
+      expect(result.output).toContain("line3")
+      expect(result.output).toContain("offset 4 is past end of file — 3 lines")
+      expect(result.metadata.clamped).toBe(true)
     }),
   )
 
@@ -436,13 +439,14 @@ describe("tool.read truncation", () => {
     }),
   )
 
-  it.live("throws when offset > 1 for empty file", () =>
+  it.live("notes empty file when offset past EOF", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()
       yield* put(path.join(dir, "empty.txt"), "")
 
-      const err = yield* fail(dir, { filePath: path.join(dir, "empty.txt"), offset: 2 })
-      expect(err.message).toContain("Offset 2 is out of range for this file (0 lines)")
+      const result = yield* exec(dir, { filePath: path.join(dir, "empty.txt"), offset: 2 })
+      expect(result.output).toContain("offset 2 is past end of file — 0 lines")
+      expect(result.metadata.clamped).toBe(true)
     }),
   )
 
@@ -603,6 +607,153 @@ describe("tool.read binary detection", () => {
 
       const err = yield* fail(dir, { filePath: path.join(dir, "module.wasm") })
       expect(err.message).toContain("Cannot read binary file")
+    }),
+  )
+})
+
+describe("tool.read subtools", () => {
+  const fixture = path.join(import.meta.dir, "../../src/tool/__fixtures__/ci/symbols/src/a.ts")
+
+  it.live("accepts file_path as an alias for filePath", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "alias.txt"), "hello alias")
+      const result = yield* exec(dir, { file_path: path.join(dir, "alias.txt") })
+      expect(result.output).toContain("hello alias")
+    }),
+  )
+
+  it.live("coerces stringified filePaths JSON", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "a.txt"), "alpha")
+      yield* put(path.join(dir, "b.txt"), "beta")
+      const result = yield* exec(dir, {
+        filePaths: JSON.stringify([path.join(dir, "a.txt"), path.join(dir, "b.txt")]),
+      })
+      expect(result.output).toContain("alpha")
+      expect(result.output).toContain("beta")
+    }),
+  )
+
+  it.live("reads first 8 of an oversized filePaths batch and lists the rest", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const files = Array.from({ length: 10 }, (_, i) => path.join(dir, `f${i}.txt`))
+      yield* Effect.forEach(files, (file, i) => put(file, `content-${i}`), { concurrency: "unbounded" })
+      const result = yield* exec(dir, { filePaths: files })
+      expect(result.output).toContain("content-0")
+      expect(result.output).toContain("content-7")
+      expect(result.output).not.toContain("content-8")
+      expect(result.output).toContain("Read 8 of 10")
+      expect(result.output).toContain("f8.txt")
+    }),
+  )
+
+  it.live("pattern searches inside one file", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "src.ts"), "export function greet() {}\nexport function run() {}\n")
+      const result = yield* exec(dir, { filePath: path.join(dir, "src.ts"), pattern: "function greet" })
+      expect(result.metadata.action).toBe("grep")
+      expect(result.output).toContain("<matches")
+      expect(result.output).toContain("greet")
+      expect(result.output).not.toContain("function run")
+    }),
+  )
+
+  it.live("outline lists symbols in a typescript file", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const result = yield* exec(dir, { filePath: fixture, action: "outline" })
+      expect(result.metadata.action).toBe("outline")
+      expect(result.output).toContain("<outline")
+      expect(result.output).toContain("function greet")
+      expect(result.output).toContain("class Greeter")
+    }),
+  )
+
+  it.live("symbol jumps to a definition window", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const result = yield* exec(dir, { filePath: fixture, symbol: "Greeter" })
+      expect(result.metadata.action).toBe("around")
+      expect(result.output).toContain("export class Greeter")
+      expect(result.output).toContain("symbol class Greeter")
+    }),
+  )
+
+  it.live("tail returns the last lines", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const lines = Array.from({ length: 20 }, (_, i) => `line${i + 1}`).join("\n")
+      yield* put(path.join(dir, "tail.txt"), lines)
+      const result = yield* exec(dir, { filePath: path.join(dir, "tail.txt"), action: "tail", limit: 3 })
+      expect(result.metadata.action).toBe("tail")
+      expect(result.output).toContain("18: line18")
+      expect(result.output).toContain("20: line20")
+      expect(result.output).not.toContain("17: line17")
+    }),
+  )
+
+  it.live("heals a unique extension flip", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "pairing.ts"), "ok")
+      const result = yield* exec(dir, { filePath: path.join(dir, "pairing.tsx") })
+      expect(result.output).toContain("ok")
+      expect(result.output).toContain("<heal>")
+      expect(result.output).toContain("Requested:")
+      expect(result.output).toContain("Opened:")
+      expect(result.output).toContain("pairing.ts")
+      expect(result.output).toContain("may be the wrong one")
+      expect(result.metadata.healed).toBe(true)
+    }),
+  )
+
+  it.live("heals a unique same-name file under a nested folder", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "v2", "src", "AboutPage.tsx"), "about")
+      const result = yield* exec(dir, { filePath: path.join(dir, "src", "AboutPage.tsx") })
+      expect(result.output).toContain("about")
+      expect(result.output).toContain("<heal>")
+      expect(result.output).toContain("Requested:")
+      expect(result.output).toContain("Opened:")
+      expect(result.metadata.healed).toBe(true)
+    }),
+  )
+
+  it.live("does not heal when two same-name files exist", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "a", "foo.ts"), "alpha")
+      yield* put(path.join(dir, "b", "foo.ts"), "beta")
+      const err = yield* fail(dir, { filePath: path.join(dir, "foo.ts") })
+      expect(err.message).toContain("File not found")
+      expect(err.message).toContain("foo.ts")
+      expect(err.message).toContain("more than one hit")
+    }),
+  )
+
+  it.live("does not open a substring neighbor", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "usage.ts"), "POISON")
+      const err = yield* fail(dir, { filePath: path.join(dir, "openrouter-free-usage.ts") })
+      expect(err.message).toContain("File not found")
+      expect(err.message).not.toContain("Did you mean")
+      expect(err.message).not.toContain("POISON")
+    }),
+  )
+
+  it.live("does not open a same-stem directory", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      yield* put(path.join(dir, "git", "index.ts"), "repo")
+      const err = yield* fail(dir, { filePath: path.join(dir, "git.ts") })
+      expect(err.message).toContain("File not found")
+      expect(err.message).toContain("(directory — not opened)")
     }),
   )
 })

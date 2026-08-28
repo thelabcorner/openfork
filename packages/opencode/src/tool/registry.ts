@@ -300,6 +300,7 @@ const layer = Layer.effect(
             tool.background,
             tool.sqlite,
             tool.git,
+            tool.checkpoint,
             tool.typecheck,
             tool.project,
             tool.symbols,

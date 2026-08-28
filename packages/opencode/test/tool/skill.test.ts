@@ -2,7 +2,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
-import { Cause, Effect, Exit, Layer } from "effect"
+import { Effect } from "effect"
 import { afterEach, describe, expect } from "bun:test"
 import path from "path"
 import type { Permission } from "../../src/permission"
@@ -113,22 +113,76 @@ Use this skill.
       })).find((tool) => tool.id === SkillTool.id)
       if (!tool) throw new Error("Skill tool not found")
 
-      const exit = yield* tool
-        .execute(
-          { name: "missing-skill" },
-          {
-            ...baseCtx,
-            ask: () => Effect.void,
-          },
-        )
-        .pipe(Effect.exit)
+      const result = yield* tool.execute(
+        { name: "missing-skill" },
+        {
+          ...baseCtx,
+          ask: () => Effect.void,
+        },
+      )
 
-      expect(Exit.isFailure(exit)).toBe(true)
-      if (Exit.isFailure(exit)) {
-        const error = Cause.squash(exit.cause)
-        expect(error).toBeInstanceOf(Error)
-        if (error instanceof Error) expect(error.message).toContain('Skill "missing-skill" not found.')
+      expect(result.title).toContain("not found")
+      expect(result.output).toContain('Skill "missing-skill" not found.')
+      expect(result.output).toContain("filePath")
+    }),
+  )
+
+  it.instance("loads a skill from an arbitrary filesystem path and then by name", () =>
+    Effect.gen(function* () {
+      const dir = (yield* TestInstance).directory
+      const home = process.env.OPENCODE_TEST_HOME
+      process.env.OPENCODE_TEST_HOME = dir
+      yield* Effect.addFinalizer(() =>
+        Effect.sync(() => {
+          process.env.OPENCODE_TEST_HOME = home
+        }),
+      )
+
+      const outside = path.join(dir, "..", `adhoc-skill-${Date.now()}`)
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(outside, "SKILL.md"),
+          `---
+name: downloads-skill
+description: Imported from outside the project.
+---
+
+# Downloads Skill
+
+Do the thing.
+`,
+        ),
+      )
+      yield* Effect.promise(() => Bun.write(path.join(outside, "notes.txt"), "note"))
+
+      const registry = yield* ToolRegistry.Service
+      const agent = { name: "build", mode: "primary" as const, permission: [], options: {} }
+      const tool = (yield* registry.tools({
+        providerID: "opencode" as any,
+        modelID: "gpt-5" as any,
+        agent,
+      })).find((tool) => tool.id === SkillTool.id)
+      if (!tool) throw new Error("Skill tool not found")
+
+      const requests: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
+      const ctx: Tool.Context = {
+        ...baseCtx,
+        ask: (req) =>
+          Effect.sync(() => {
+            requests.push(req)
+          }),
       }
+
+      const fromPath = yield* tool.execute({ filePath: outside }, ctx)
+      expect(fromPath.output).toContain(`<skill_content name="downloads-skill">`)
+      expect(fromPath.output).toContain("Do the thing.")
+      expect(fromPath.metadata.source).toBe("path")
+      expect(requests.some((r) => r.permission === "read")).toBe(true)
+      expect(requests.some((r) => r.permission === "skill")).toBe(true)
+
+      const byName = yield* tool.execute({ name: "downloads-skill" }, ctx)
+      expect(byName.output).toContain(`<skill_content name="downloads-skill">`)
+      expect(byName.metadata.source).toBe("registry")
     }),
   )
 })

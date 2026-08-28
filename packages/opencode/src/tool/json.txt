@@ -1,5 +1,7 @@
 Premium JSON manipulation and analysis tool for agents.
 
+Supports: standard JSON, JSONC (comments + trailing commas via tolerant parse), JSONL/NDJSON (treated as array root), BSON (binary via extended JSON representation for structure ops).
+
 Use scaffold first when you need to understand a JSON file's structure without reading the whole thing.
 
 Writes are dry-run by default: format/patch only preview the result. Re-run with dryRun:false to apply the change; a write permission prompt will appear.
@@ -14,3 +16,6 @@ Modes:
   patch     — apply RFC6902-style patch ops; dry-run default
   diff      — structural diff between file/jsonText and compareFilePath/compareJsonText
   stats     — compact parse/scaffold metrics
+
+For JSONL input, root becomes array of documents; format/patch roundtrips as one JSON per line.
+For BSON, structure uses Extended JSON ($oid, $date etc); writes preserve binary BSON.

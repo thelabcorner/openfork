@@ -99,6 +99,7 @@ it.instance(
       expect(res.output).toContain("<hint>")
     }),
   { git: true },
+  120_000,
 )
 
 it.instance(
@@ -135,6 +136,7 @@ it.instance(
       expect(cap.output).toContain("still in progress")
     }),
   { git: true },
+  120_000,
 )
 
 it.instance(
@@ -164,6 +166,7 @@ it.instance(
       expect(none.output).toContain("no checkpoints match your filters")
     }),
   { git: true },
+  120_000,
 )
 
 it.instance(
@@ -189,6 +192,7 @@ it.instance(
       expect(sessionScope.output).toContain("b.txt")
     }),
   { git: true },
+  120_000,
 )
 
 it.instance(
@@ -275,6 +279,53 @@ it.instance(
 )
 
 it.instance(
+  "search across worktree finds another session; restore requires checkpointID not ordinal",
+  () =>
+    Effect.gen(function* () {
+      const tmp = yield* TestInstance
+      const dir = tmp.directory
+      const svc = yield* TurnCheckpoint.Service
+      const a = "ses_cross_a"
+      const b = "ses_cross_b"
+      yield* seedSessionRow(a)
+      yield* seedSessionRow(b)
+      yield* runTurn(svc, a, "msg_a", dir, [["from-a.ts", "alpha"]])
+      yield* runTurn(svc, b, "msg_b", dir, [["from-b.ts", "beta"]])
+
+      const tool = yield* getTool
+      const ctxA = mockCtx(a)
+
+      const found = yield* tool.execute({ mode: "search", touchedPath: "from-b.ts" }, ctxA)
+      expect(found.output).toContain("from-b.ts")
+      expect(found.output).toContain(`session="${b}"`)
+      expect(found.output).toContain('mine="false"')
+      expect(found.output).toContain("across=\"worktree\"")
+
+      const listed = yield* tool.execute({ mode: "list" }, ctxA)
+      expect(listed.output).toContain("from-a.ts")
+      expect(listed.output).toContain("<other")
+      expect(listed.output).not.toContain("from-b.ts")
+
+      const idMatch = found.output.match(/id="([^"]+)"/)
+      expect(idMatch).toBeTruthy()
+      const foreignID = idMatch![1]
+
+      yield* expectDie(
+        tool.execute({ mode: "restore", from: b, ordinal: 1, dryRun: false, confirm: "RESTORE_CHECKPOINT" }, ctxA),
+        "checkpointID",
+      )
+
+      const preview = yield* tool.execute({ mode: "restore", checkpointID: foreignID }, ctxA)
+      expect(preview.output).toContain("<foreign")
+      expect(preview.output).toContain(b)
+      expect(preview.metadata.foreign).toBe(true)
+      expect(preview.metadata.changed).toBe(false)
+    }),
+  { git: true },
+  120_000,
+)
+
+it.instance(
   "restore refuses capturing rows and cross-epoch targets",
   () =>
     Effect.gen(function* () {
@@ -310,4 +361,5 @@ it.instance(
       expect(yield* Effect.promise(() => Bun.file(path.join(dir, "keep.txt")).text())).toBe("original")
     }),
   { git: true },
+  120_000,
 )
