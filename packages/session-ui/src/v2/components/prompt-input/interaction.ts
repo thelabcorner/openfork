@@ -122,6 +122,13 @@ export function createPromptInputV2Controller(input: {
     draft.addText(part.content)
     return true
   }
+  const restoreFocus = (cursor?: number) => {
+    requestAnimationFrame(() => {
+      if (!editor) return
+      editor.focus()
+      setEditorCursor(editor, cursor ?? draft.state.cursor ?? promptLength(draft.state.prompt))
+    })
+  }
   const attachments = input.attachments
     ? createPromptInputV2Attachments({
         ...input.attachments,
@@ -131,7 +138,7 @@ export function createPromptInputV2Controller(input: {
           set: draft.setPrompt,
         }),
         editor: () => editor,
-        focusEditor: () => editor?.focus(),
+        focusEditor: () => restoreFocus(),
         addPart,
         setDraggingType: (type) => dispatch({ type: type ? "drag.enter" : "drag.leave" }),
       })
@@ -194,7 +201,7 @@ export function createPromptInputV2Controller(input: {
       if (item) dispatch({ type: "popover.select", item })
       return
     }
-    if (command.type === "focus.editor") requestAnimationFrame(() => editor?.focus())
+    if (command.type === "focus.editor") restoreFocus()
   }
 
   function dispatch(event: PromptInputV2InteractionEvent) {
@@ -280,13 +287,6 @@ export function createPromptInputV2Controller(input: {
     if (state.popover.activeID ? ids.includes(state.popover.activeID) : ids.length === 0) return
     dispatch({ type: "popover.results", ids })
   })
-
-  const restoreFocus = (cursor = draft.state.cursor ?? promptLength(draft.state.prompt)) => {
-    requestAnimationFrame(() => {
-      editor?.focus()
-      setEditorCursor(editor, cursor)
-    })
-  }
 
   const applyHistory = (entry: PromptInputV2HistoryEntry, position: "start" | "end") => {
     input.history?.restore?.(entry.metadata)
@@ -528,4 +528,10 @@ function setEditorCursor(editor: HTMLElement | undefined, cursor: number) {
     remaining -= length
     node = walker.nextNode()
   }
+  const selection = window.getSelection()
+  const range = document.createRange()
+  range.selectNodeContents(editor)
+  range.collapse(false)
+  selection?.removeAllRanges()
+  selection?.addRange(range)
 }

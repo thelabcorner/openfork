@@ -333,7 +333,8 @@ function renderPromptInputV2Editor(
     }),
   )
   if (scrollTop !== undefined) editor.scrollTop = scrollTop
-  if (!active) return
+  if (active && document.activeElement !== editor) editor.focus()
+  if (document.activeElement !== editor) return
   if (cursor === undefined) {
     // Fallback: keep previous behaviour (collapse to end) only when called
     // from the initial mount path that does not provide a cursor.
@@ -818,6 +819,7 @@ export function PromptInputV2Popover(props: {
           {(item) => (
             <button
               type="button"
+              tabIndex={-1}
               data-suggestion-id={item.id}
               class="flex w-full items-center gap-2 rounded-md px-2 py-1 text-start hover:bg-v2-overlay-simple-overlay-hover"
               classList={{ "bg-v2-overlay-simple-overlay-hover": props.activeID === item.id }}

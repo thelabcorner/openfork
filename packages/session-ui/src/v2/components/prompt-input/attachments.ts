@@ -94,7 +94,9 @@ export function createPromptInputV2Attachments(
     const prompt = input.capture()
     const editor = input.editor()
     if (!editor) return
-    return { prompt, cursor: prompt.cursor() ?? cursorPosition(editor) }
+    const selection = window.getSelection()
+    const inEditor = !!selection?.rangeCount && !!selection.anchorNode && editor.contains(selection.anchorNode)
+    return { prompt, cursor: inEditor ? cursorPosition(editor) : (prompt.cursor() ?? cursorPosition(editor)) }
   }
   const add = async (file: File, toast = true, target = capture(), clipboard = false) => {
     if (!target) return false
@@ -105,13 +107,13 @@ export function createPromptInputV2Attachments(
         if (toast) input.warn()
         return false
       }
-      input.focusEditor()
       input.addPart({
         type: "text",
         content: archiveInstructions(sourcePath, archiveKind, file.size),
         start: 0,
         end: 0,
       })
+      input.focusEditor()
       return true
     }
     const mime = await attachmentMime(file)
@@ -135,6 +137,7 @@ export function createPromptInputV2Attachments(
       )
     if (duplicate) {
       input.duplicate()
+      input.focusEditor()
       return true
     }
     const attachment: PromptInputV2Attachment = {
@@ -146,6 +149,7 @@ export function createPromptInputV2Attachments(
       blob,
     }
     target.prompt.set([...target.prompt.current(), attachment], target.cursor)
+    input.focusEditor()
     return true
   }
   const addAttachments = async (files: File[], toast = true, target = capture()) => {
@@ -180,7 +184,11 @@ export function createPromptInputV2Attachments(
     if (!plainText) return
     const text = plainText.includes("\r") ? plainText.replace(/\r\n?/g, "\n") : plainText
     const put = () => {
-      if (input.addPart({ type: "text", content: text, start: 0, end: 0 })) return true
+      const added = input.addPart({ type: "text", content: text, start: 0, end: 0 })
+      if (added) {
+        input.focusEditor()
+        return true
+      }
       input.focusEditor()
       return input.addPart({ type: "text", content: text, start: 0, end: 0 })
     }
@@ -195,27 +203,31 @@ export function createPromptInputV2Attachments(
     if (input.isDialogActive()) return
     event.preventDefault()
     input.setDraggingType(null)
+    const target = capture()
+    if (target?.cursor !== undefined) target.prompt.set(target.prompt.current(), target.cursor)
     const plainText = event.dataTransfer?.getData("text/plain")
     if (plainText?.startsWith("file:")) {
       const path = plainText.slice("file:".length)
-      input.focusEditor()
       input.addPart({ type: "file", path, content: `@${path}`, start: 0, end: 0 })
+      input.focusEditor()
       return
     }
     const files = event.dataTransfer?.files
     if (files && files.length > 0) {
-      await addAttachments(Array.from(files))
+      await addAttachments(Array.from(files), true, target ?? capture())
+      input.focusEditor()
       return
     }
     if (!plainText) return
     const text = plainText.includes("\r") ? plainText.replace(/\r\n?/g, "\n") : plainText
     if (largePaste(text)) {
       const file = new File([text], pasteFilename(), { type: "text/markdown" })
-      await add(file, true)
+      await add(file, true, target ?? capture())
+      input.focusEditor()
       return
     }
-    input.focusEditor()
     input.addPart({ type: "text", content: text, start: 0, end: 0 })
+    input.focusEditor()
   }
 
   onMount(() => {

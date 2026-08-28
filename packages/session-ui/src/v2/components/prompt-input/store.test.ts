@@ -78,6 +78,66 @@ describe("prompt input v2 store", () => {
     expect(prompt.state.cursor).toBe(5)
   })
 
+  test("replaces the active @query with a mention and places the cursor after it", () => {
+    const [state, setState] = createStore<PromptInputV2PersistedState>({
+      prompt: [{ type: "text", content: "see @idx", start: 0, end: 8 }],
+      cursor: 8,
+      context: { items: [] },
+    })
+    const prompt = createPromptInputV2Store([state, setState])
+
+    prompt.addMention({ type: "file", path: "src/index.ts", content: "@src/index.ts", start: 0, end: 0 })
+
+    expect(prompt.state.prompt).toEqual([
+      { type: "text", content: "see ", start: 0, end: 4 },
+      { type: "file", path: "src/index.ts", content: "@src/index.ts", start: 4, end: 17 },
+      { type: "text", content: " ", start: 17, end: 18 },
+    ])
+    expect(prompt.state.cursor).toBe(18)
+  })
+
+  test("inserts a dragged mention at the cursor without eating a prior @mention", () => {
+    const [state, setState] = createStore<PromptInputV2PersistedState>({
+      prompt: [
+        { type: "text", content: "see ", start: 0, end: 4 },
+        { type: "file", path: "one.ts", content: "@one.ts", start: 4, end: 11 },
+        { type: "text", content: " ", start: 11, end: 12 },
+      ],
+      cursor: 12,
+      context: { items: [] },
+    })
+    const prompt = createPromptInputV2Store([state, setState])
+
+    prompt.addMention({ type: "file", path: "two.ts", content: "@two.ts", start: 0, end: 0 })
+
+    expect(prompt.state.prompt).toEqual([
+      { type: "text", content: "see ", start: 0, end: 4 },
+      { type: "file", path: "one.ts", content: "@one.ts", start: 4, end: 11 },
+      { type: "text", content: " ", start: 11, end: 12 },
+      { type: "file", path: "two.ts", content: "@two.ts", start: 12, end: 19 },
+      { type: "text", content: " ", start: 19, end: 20 },
+    ])
+    expect(prompt.state.cursor).toBe(20)
+  })
+
+  test("inserts at the cursor instead of replacing an email-like @", () => {
+    const [state, setState] = createStore<PromptInputV2PersistedState>({
+      prompt: [{ type: "text", content: "user@host more", start: 0, end: 14 }],
+      cursor: 14,
+      context: { items: [] },
+    })
+    const prompt = createPromptInputV2Store([state, setState])
+
+    prompt.addMention({ type: "file", path: "src/app.ts", content: "@src/app.ts", start: 0, end: 0 })
+
+    expect(prompt.state.prompt).toEqual([
+      { type: "text", content: "user@host more", start: 0, end: 14 },
+      { type: "file", path: "src/app.ts", content: "@src/app.ts", start: 14, end: 25 },
+      { type: "text", content: " ", start: 25, end: 26 },
+    ])
+    expect(prompt.state.cursor).toBe(26)
+  })
+
   test("mutates context, attachments, and model through shared actions", () => {
     const prompt = createPromptStore()
     const context = { key: "file:src/index.ts", type: "file" as const, path: "src/index.ts" }

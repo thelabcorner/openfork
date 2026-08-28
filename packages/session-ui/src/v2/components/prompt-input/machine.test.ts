@@ -145,6 +145,9 @@ describe("prompt input v2 interaction machine", () => {
     const selected = transitionPromptInputV2(state, { type: "popover.select", item }, persisted("@index"))
 
     expect(selected.commands).toContainEqual({ type: "mention.add", item })
+    expect(selected.commands).toContainEqual({ type: "focus.editor" })
+    expect(selected.state.focus).toBe("editor")
+    expect(selected.state.popover).toEqual({ type: "closed" })
   })
 
   test("loops active popover items with arrow keys", () => {
