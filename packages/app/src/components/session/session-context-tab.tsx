@@ -15,11 +15,13 @@ import { Tag } from "@opencode-ai/ui/v2/badge-v2"
 import { DividerV2 } from "@opencode-ai/ui/v2/divider-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
+import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
 import { ProgressCircleV2 } from "@opencode-ai/ui/v2/progress-circle-v2"
 import type { AssistantMessage, Message, Part, UserMessage } from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
 import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
 import { useLanguage } from "@/context/language"
+import { useLocal } from "@/context/local"
 import { usePlatform } from "@/context/platform"
 import { useProviders } from "@/hooks/use-providers"
 import { useSDK } from "@/context/sdk"
@@ -246,6 +248,7 @@ export function SessionContextTab() {
   const language = useLanguage()
   const sdk = useSDK()
   const platform = usePlatform()
+  const local = useLocal()
   const providers = useProviders(() => sdk().directory)
   const { params, view } = useSessionLayout()
 
@@ -317,6 +320,71 @@ export function SessionContextTab() {
     return undefined
   })
   const liveMessageID = createMemo(() => liveMessage()?.id)
+
+  // Compaction runs server-side as an ordinary streaming assistant turn tagged
+  // mode/agent "compaction", so the message store is the only truthful progress
+  // signal; everything between click and first stream event is optimistic.
+  const [compactQueued, setCompactQueued] = createSignal(false)
+  const liveCompaction = createMemo(() => {
+    const msg = liveMessage()
+    return !!msg && (msg.mode === "compaction" || msg.agent === "compaction")
+  })
+  const compactBusy = () => compactQueued() || liveCompaction()
+
+  // Tiny sessions can finish before the streaming summary is ever observed;
+  // release the optimistic pending state after a short grace instead of
+  // spinning forever.
+  let compactGrace: ReturnType<typeof setTimeout> | undefined
+  createEffect(
+    on(liveCompaction, (active) => {
+      if (!active) return
+      if (compactGrace !== undefined) {
+        clearTimeout(compactGrace)
+        compactGrace = undefined
+      }
+      setCompactQueued(false)
+    }),
+  )
+  onCleanup(() => {
+    if (compactGrace !== undefined) clearTimeout(compactGrace)
+  })
+
+  const compactSession = async () => {
+    const sessionID = params.id
+    if (!sessionID || compactBusy()) return
+
+    const model = local.model.current()
+    if (!model) {
+      showToast({
+        title: language.t("toast.model.none.title"),
+        description: language.t("toast.model.none.description"),
+      })
+      return
+    }
+
+    setCompactQueued(true)
+    try {
+      await sdk().api.session.compact({
+        sessionID,
+        model: { providerID: model.providerID, modelID: model.id },
+      })
+      if (!liveCompaction() && compactGrace === undefined) {
+        compactGrace = setTimeout(() => {
+          compactGrace = undefined
+          setCompactQueued(false)
+        }, 2000)
+      }
+    } catch (err) {
+      setCompactQueued(false)
+      showToast({
+        variant: "error",
+        title: language.t("toast.session.compact.failed.title"),
+        description: err instanceof Error ? err.message : language.t("toast.session.compact.failed.description"),
+      })
+    }
+  }
+
+  const compactDisabled = () => !params.id || visibleUserMessages().length === 0 || compactBusy()
 
   const [now, setNow] = createSignal(Date.now())
   createEffect(
@@ -842,14 +910,33 @@ export function SessionContextTab() {
             {modelLabel()} · {providerLabel()}
           </span>
         </div>
-        <button
-          type="button"
-          class="flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[10px] font-[520] leading-3 text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
-          onClick={exportSession}
-        >
-          <Icon name="download" size="small" />
-          <span>{language.t("context.export.session")}</span>
-        </button>
+        <div class="flex shrink-0 items-center gap-0.5">
+          <TooltipV2
+            value={<div class="max-w-64 text-11-regular">{language.t("command.session.compact.description")}</div>}
+            placement="top"
+          >
+            <button
+              type="button"
+              data-action="context-compact"
+              class="flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[10px] font-[520] leading-3 text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base disabled:cursor-default disabled:opacity-40 disabled:hover:bg-transparent"
+              disabled={compactDisabled()}
+              onClick={() => void compactSession()}
+            >
+              <Show when={compactBusy()} fallback={<IconV2 name="compact" size="small" />}>
+                <LoaderV2 width={14} height={14} />
+              </Show>
+              <span>{language.t(compactBusy() ? "context.compact.compacting" : "context.compact.action")}</span>
+            </button>
+          </TooltipV2>
+          <button
+            type="button"
+            class="flex shrink-0 items-center gap-1.5 rounded-md px-2 py-1 text-[10px] font-[520] leading-3 text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
+            onClick={exportSession}
+          >
+            <Icon name="download" size="small" />
+            <span>{language.t("context.export.session")}</span>
+          </button>
+        </div>
       </div>
 
       <ScrollView

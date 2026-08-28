@@ -2,7 +2,7 @@ import { DataProvider } from "@opencode-ai/session-ui/context"
 import { showToast } from "@/utils/toast"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { useLocation, useNavigate, useParams } from "@solidjs/router"
-import { type Accessor, createEffect, createMemo, onCleanup, type ParentProps, Show } from "solid-js"
+import { type Accessor, createEffect, createMemo, onCleanup, type ParentProps, Show, untrack } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { LocalProvider } from "@/context/local"
 import { SDKProvider, useSDK } from "@/context/sdk"
@@ -28,7 +28,7 @@ export function DirectoryDataProvider(
   const serverSync = useServerSync()
   const sdk = useSDK()
   const language = useLanguage()
-  const directory = () => (typeof props.directory === "function" ? props.directory() : props.directory)
+  const directory = createMemo(() => (typeof props.directory === "function" ? props.directory() : props.directory))
   const slug = createMemo(() => base64Encode(directory()))
   const href = (sessionID: string) => {
     const server = props.server?.()
@@ -69,17 +69,18 @@ export function DirectoryDataProvider(
   }
 
   createEffect(() => {
-    // A draft lives at /new-session?draftId=… and has no directory segment to normalize.
-    if (props.draftID || props.server?.()) return
     const next = sync().data.path.directory
     if (!next) return
-    // Normalize both sides — `pathKey` handles trailing slashes / casing so a
-    // periodic `path` refetch that returns the same directory with different
-    // allocation or slash doesn't trigger a `navigate` loop that remounts the
-    // keyed `DataProvider`/`LocalProvider` and wipes prompt + scroll.
+    // Draft / server-scoped routes don't participate in directory normalization.
+    // Read these via untrack so the effect only re-runs when the synced directory changes
+    // (not on every location change) — avoids extra navigate checks and keeps prompt/scroll stable.
+    if (untrack(() => props.draftID || props.server?.())) return
+    // Compare via pathKey so same directory with different slash/casing doesn't remount DataProvider.
     if (pathKey(next) === pathKey(directory())) return
-    const path = location.pathname.slice(slug().length + 1)
-    navigate(`/${base64Encode(next)}${path}${location.search}${location.hash}`, { replace: true })
+    const path = untrack(() => location.pathname.slice(slug().length + 1))
+    const search = untrack(() => location.search)
+    const hash = untrack(() => location.hash)
+    navigate(`/${base64Encode(next)}${path}${search}${hash}`, { replace: true })
   })
 
   createEffect(() => {
@@ -90,11 +91,11 @@ export function DirectoryDataProvider(
   })
 
   return (
-    <Show when={directory()} keyed>
-      {(directory) => (
+    <Show when={directory()} keyed fallback={null}>
+      {(dir) => (
         <DataProvider
           data={sync().data}
-          directory={directory}
+          directory={dir}
           sessionID={params.id}
           onNavigateToSession={(sessionID: string) => navigate(href(sessionID))}
           onSessionHref={href}
@@ -122,15 +123,23 @@ export default function Layout(props: ParentProps) {
   const navigate = useNavigate()
   let invalid = ""
 
+  // Return undefined (not "") for missing/invalid so Show's `when` is `string | undefined`
+  // — avoids an extra "" remount and makes the keyed value non-nullable inside the child.
   const resolved = createMemo(() => {
-    if (!params.dir) return ""
-    return decodeDirectory(params.dir) ?? ""
+    try {
+      const dir = params.dir
+      if (!dir) return undefined
+      return decodeDirectory(dir)
+    } catch {
+      return undefined
+    }
   })
 
   createEffect(() => {
     const dir = params.dir
     if (!dir) return
-    if (resolved()) {
+    const value = resolved()
+    if (value) {
       invalid = ""
       return
     }
@@ -145,10 +154,10 @@ export default function Layout(props: ParentProps) {
   })
 
   return (
-    <Show when={resolved()} keyed>
-      {(resolved) => (
-        <SDKProvider directory={resolved}>
-          <DirectoryDataProvider directory={resolved}>{props.children}</DirectoryDataProvider>
+    <Show when={resolved()} keyed fallback={null}>
+      {(value) => (
+        <SDKProvider directory={value}>
+          <DirectoryDataProvider directory={value}>{props.children}</DirectoryDataProvider>
         </SDKProvider>
       )}
     </Show>

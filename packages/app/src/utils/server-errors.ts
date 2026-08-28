@@ -28,7 +28,11 @@ function tr(translator: Translator | undefined, key: string, text: string, vars?
 export function isCancelledRequestError(error: unknown) {
   if (!error) return false
   if (typeof error === "object") {
-    if ("name" in error && (error.name === "AbortError" || error.name === "TimeoutError")) return true
+    if (
+      "name" in error &&
+      (error.name === "AbortError" || error.name === "TimeoutError" || error.name === "InterruptError")
+    )
+      return true
     const status =
       "cause" in error && typeof error.cause === "object" && error.cause && "status" in error.cause
         ? error.cause.status
@@ -38,7 +42,7 @@ export function isCancelledRequestError(error: unknown) {
     if (status === 499) return true
   }
   const message = error instanceof Error ? error.message : String(error)
-  return /\b499\b/.test(message)
+  return /\b499\b/.test(message) || message.startsWith("All fibers interrupted without error")
 }
 
 export function formatServerError(error: unknown, translate?: Translator, fallback?: string) {

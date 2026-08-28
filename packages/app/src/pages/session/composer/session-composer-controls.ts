@@ -16,6 +16,7 @@ import { useSync } from "@/context/sync"
 import { useTabs } from "@/context/tabs"
 import { useProviders } from "@/hooks/use-providers"
 import { pathKey } from "@/utils/path-key"
+import { chatsRoot } from "@opencode-ai/core/project/chat-paths"
 
 export function createPromptInputController(input: {
   sessionKey: Accessor<string>
@@ -101,17 +102,28 @@ export function createPromptProjectControls() {
   const [search] = useSearchParams<{ draftId?: string }>()
   const projectServer = () => serverSDK().server
   const projectServerCtx = createMemo(() => global.ensureServerCtx(projectServer()))
+  const chatProject = () => {
+    const root = chatsRoot()
+    return {
+      name: "Chat",
+      id: "chats",
+      worktree: root,
+      sandboxes: [],
+    } as const
+  }
+
   const projects = createMemo(() => {
-    if (server.list.length <= 1) {
-      return search.draftId ? projectServerCtx().projects.list() : layout.projects.list()
-    }
-    return server.list.flatMap((conn) => {
-      const item = { key: ServerConnection.key(conn), name: serverName(conn) }
-      return global
-        .ensureServerCtx(conn)
-        .projects.list()
-        .map((project) => ({ ...project, server: item }))
-    })
+    const chat = chatProject()
+    const list = server.list.length <= 1
+      ? (search.draftId ? projectServerCtx().projects.list() : layout.projects.list())
+      : server.list.flatMap((conn) => {
+          const item = { key: ServerConnection.key(conn), name: serverName(conn) }
+          return global
+            .ensureServerCtx(conn)
+            .projects.list()
+            .map((project) => ({ ...project, server: item }))
+        })
+    return [chat, ...list]
   })
   const selectProject = (worktree: string, serverKey?: string) => {
     const conn = serverKey ? server.list.find((conn) => ServerConnection.key(conn) === serverKey) : projectServer()

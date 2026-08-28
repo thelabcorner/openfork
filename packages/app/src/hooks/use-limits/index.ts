@@ -40,7 +40,7 @@ export function useLimits(options?: { now?: Accessor<number> }) {
   const [lastRefreshedAt, setLastRefreshedAt] = createSignal(0)
   const [lastRateLimitedAt, setLastRateLimitedAt] = createSignal(0)
 
-  const CLAUDE_429_BACKOFF_MS = 180_000 // 3 min backoff after 429 for Claude
+  const CLAUDE_429_BACKOFF_MS = 300_000 // 5 min backoff after 429 for Claude — matches backend CLAUDE_429_DEFAULT_MS
 
   const cooldownRemainingMs = () => {
     const base = Math.max(0, COOLDOWN_MS - (now() - lastRefreshedAt()))

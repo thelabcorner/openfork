@@ -16,13 +16,14 @@ export function createMenuDismissController(content: () => HTMLElement | undefin
       if (!restoreTrigger) event.preventDefault()
     },
     /** Runs an action after the menu unmounts and its focus-close work has settled. */
-    afterClose(callback: () => void) {
+    afterClose(callback: () => void, valid: () => boolean = () => true) {
       const complete = () => {
+        if (!valid()) return
         if (content()?.isConnected) {
           requestAnimationFrame(complete)
           return
         }
-        requestAnimationFrame(() => requestAnimationFrame(callback))
+        requestAnimationFrame(() => requestAnimationFrame(() => valid() && callback()))
       }
       requestAnimationFrame(complete)
     },

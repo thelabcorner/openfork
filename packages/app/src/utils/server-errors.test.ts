@@ -166,6 +166,14 @@ describe("isCancelledRequestError", () => {
     expect(isCancelledRequestError({ status: 499 })).toBe(true)
   })
 
+  test("matches Effect interrupt-only failures", () => {
+    expect(
+      isCancelledRequestError(
+        Object.assign(new Error("All fibers interrupted without error at Agent.state"), { name: "InterruptError" }),
+      ),
+    ).toBe(true)
+  })
+
   test("does not match real server failures", () => {
     expect(isCancelledRequestError(new Error("Request failed with status 503"))).toBe(false)
     expect(isCancelledRequestError(new Error("opencode server GET /agent/ → 500"))).toBe(false)

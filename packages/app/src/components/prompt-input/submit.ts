@@ -23,6 +23,11 @@ import { createPromptSubmissionState } from "./submission-state"
 import { normalizeSessionInfo } from "@/utils/session"
 import { Event } from "@opencode-ai/schema/event"
 import { blobDataUrl } from "@/utils/draft-store"
+import { chatsRoot, isChatDirectory } from "@opencode-ai/core/project/chat-paths"
+
+function joinPath(...parts: string[]): string {
+  return parts.filter((p) => p && p !== ".").join("/").replace(/\/+/g, "/")
+}
 
 type PendingPrompt = {
   abort: AbortController
@@ -363,6 +368,13 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     let client = sdk().client
 
     if (isNewSession) {
+      // Chat session: generate a unique sub-directory under chats root.
+      if (isChatDirectory(projectDirectory)) {
+        const timestamp = Date.now()
+        const random = Math.random().toString(36).slice(2, 8)
+        sessionDirectory = joinPath(chatsRoot(), `${timestamp}-${random}`)
+      }
+
       if (worktreeSelection === "create") {
         const createdWorktree = await client.worktree
           .create({ directory: projectDirectory })

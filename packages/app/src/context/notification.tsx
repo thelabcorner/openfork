@@ -23,14 +23,25 @@ const ERROR_SOUND_DEBOUNCE_MS = 5_000
 let lastErrorSoundTime = 0
 let lastErrorToastTime = 0
 
-function sessionErrorDescription(error: unknown, fallback: string) {
+function sessionErrorMessage(error: unknown) {
   if (typeof error === "string") return error
   if (error && typeof error === "object" && "data" in error) {
     const data = (error as { data?: { message?: string } }).data
     if (data?.message) return data.message
   }
   if (error instanceof Error) return error.message
-  return fallback
+  return
+}
+
+function isBenignSessionError(error: unknown) {
+  if (!error || typeof error !== "object") return false
+  if ("name" in error && (error.name === "MessageAbortedError" || error.name === "InterruptError")) return true
+  const message = sessionErrorMessage(error)
+  return typeof message === "string" && message.startsWith("All fibers interrupted without error")
+}
+
+function sessionErrorDescription(error: unknown, fallback: string) {
+  return sessionErrorMessage(error) ?? fallback
 }
 
 type NotificationBase = {
@@ -396,7 +407,7 @@ function createServerNotificationState(input: {
     const error = "error" in event.properties ? event.properties.error : undefined
     console.error("[session.error]", { directory, sessionID, error })
     if (!sessionID) return
-    if (error && typeof error === "object" && "name" in error && error.name === "MessageAbortedError") return
+    if (isBenignSessionError(error)) return
 
     void lookup(directory, sessionID).then((session) => {
       if (meta.disposed) return

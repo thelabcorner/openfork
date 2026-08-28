@@ -7,9 +7,12 @@ import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
-import { createEffect, createMemo, createSignal, on, onCleanup, Show } from "solid-js"
-import { ModelSelectorPopoverV2 } from "@/components/dialog-select-model"
+import { createEffect, createMemo, createSignal, lazy, on, onCleanup, Show, Suspense } from "solid-js"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
+const ModelSelectorPopoverV2 = lazy(async () => {
+  const mod = await import("@/components/dialog-select-model")
+  return { default: mod.ModelSelectorPopoverV2 }
+})
 import type { PromptInputProps } from "@/components/prompt-input/contracts"
 import { normalizePromptHistoryEntry, promptLength, type PromptHistoryComment } from "@/components/prompt-input/history"
 import { createPersistedPromptInputHistory } from "@/components/prompt-input/history-store"
@@ -770,11 +773,9 @@ function PromptInputV2ModelControl(props: {
           </ButtonV2>
         }
       >
-        <ModelSelectorPopoverV2
-          model={props.model}
-          trigger={(triggerProps) => (
+        <Suspense
+          fallback={
             <ButtonV2
-              {...triggerProps}
               variant="ghost-muted"
               size="normal"
               style={{ height: "28px" }}
@@ -785,9 +786,27 @@ function PromptInputV2ModelControl(props: {
             >
               {content()}
             </ButtonV2>
-          )}
-          onClose={props.onClose}
-        />
+          }
+        >
+          <ModelSelectorPopoverV2
+            model={props.model}
+            trigger={(triggerProps) => (
+              <ButtonV2
+                {...triggerProps}
+                variant="ghost-muted"
+                size="normal"
+                style={{ height: "28px" }}
+                class="min-w-0 max-w-[220px] justify-start ![font-weight:440] group"
+                classList={{ "animate-in fade-in": shouldAnimate() }}
+                data-action="prompt-model"
+                data-control-type="popover"
+              >
+                {content()}
+              </ButtonV2>
+            )}
+            onClose={props.onClose}
+          />
+        </Suspense>
       </Show>
     </TooltipV2>
   )

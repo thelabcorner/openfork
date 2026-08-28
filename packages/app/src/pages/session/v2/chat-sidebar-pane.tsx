@@ -38,6 +38,7 @@ import { getSessionContext } from "@/components/session/session-context-metrics"
 import { computeMeasuredRate } from "@/components/prompt-input/live-generation-rate-math"
 import { SessionContextMenu } from "@/components/session-menu/session-context-menu"
 import { CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN, CHAT_SIDEBAR_RECENT_LIMIT_MIN, type ChatSidebarPaneState } from "./chat-sidebar-pane-state"
+import { chatsRoot } from "@opencode-ai/core/project/chat-paths"
 import type { AssistantMessage, Session } from "@opencode-ai/sdk/v2/client"
 
 type ProviderList = ReturnType<ReturnType<typeof useProviders>["all"]> extends Map<string, infer P>
@@ -242,7 +243,7 @@ export function ChatSidebarPane(props: {
 
     for (const project of projects) {
       const rows = pinWorkingFirst(projectRows.get(project.worktree) ?? [])
-      if (rows.length === 0) continue
+      if (rows.length === 0 && project.id !== "chats") continue
       const [store] = serverSync().child(project.worktree, { bootstrap: false })
       const meta = projectForSession(rows[0], projects) ?? project
       result.push({
@@ -254,6 +255,22 @@ export function ChatSidebarPane(props: {
         // sessionTotal starts at 0 (not undefined) until the first load, so the
         // loaded-row count is the honest fallback while the estimate is cold.
         total: store.sessionTotal > 0 ? store.sessionTotal : rows.length,
+      })
+    }
+
+    // Dedicated Chats group — sessions with the dummy "chats" project.
+    const chatRoot = chatsRoot()
+    const chatRows = pinWorkingFirst(projectRows.get(chatRoot) ?? [])
+    const chatProject = projects.find((p) => p.id === "chats" || p.worktree === chatRoot)
+    if (chatProject || chatRows.length > 0) {
+      const [store] = serverSync().child(chatRoot, { bootstrap: false })
+      result.push({
+        key: "chats",
+        label: language.t("chats.title"),
+        directory: chatRoot,
+        project: chatProject ? projectForSession(chatRows[0], projects) ?? chatProject : undefined,
+        sessions: chatRows,
+        total: store.sessionTotal > 0 ? store.sessionTotal : chatRows.length,
       })
     }
     return result
@@ -290,7 +307,7 @@ export function ChatSidebarPane(props: {
   // Footer counts server-known roots per directory (sessionTotal estimates),
   // not loaded rows — loaded rows are capped per store and would undercount.
   const totalSessions = createMemo(() =>
-    groups().reduce((sum, group) => (group.key === "recent" ? sum : sum + group.total), 0),
+    (groups() ?? []).reduce((sum, group) => (group?.key === "recent" ? sum : sum + (group?.total ?? 0)), 0),
   )
 
   const workingCount = createMemo(() => {
@@ -793,7 +810,7 @@ export function ChatSidebarPane(props: {
       {/* ── Session tree ──────────────────────────────────────── */}
       <ScrollView class="min-h-0 flex-1">
         <Show
-          when={groups().length > 0}
+          when={(groups() ?? []).length > 0}
           fallback={
             <div class="flex flex-col items-center gap-2 px-4 py-10 text-center">
               <IconV2 name="chats" size="small" class="size-5 text-v2-icon-icon-muted opacity-60" />
@@ -840,6 +857,30 @@ export function ChatSidebarPane(props: {
                     <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70">
                       {group.total}
                     </span>
+                    <Show when={group.directory}>
+                      <TooltipV2 value={language.t("command.session.new")} placement="top">
+                        <span
+                          role="button"
+                          tabIndex={0}
+                          class="inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-v2-text-text-faint hover:bg-v2-background-bg-layer-03 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
+                          aria-label={language.t("command.session.new")}
+                          onClick={(event) => {
+                            event.stopPropagation()
+                            event.preventDefault()
+                            navigateToNewSession(group.directory)
+                          }}
+                          onKeyDown={(event) => {
+                            if (event.key === "Enter" || event.key === " ") {
+                              event.stopPropagation()
+                              event.preventDefault()
+                              navigateToNewSession(group.directory)
+                            }
+                          }}
+                        >
+                          <IconV2 name="plus" size="small" />
+                        </span>
+                      </TooltipV2>
+                    </Show>
                   </button>
 
                   <Show when={isExpanded(group.key)}>

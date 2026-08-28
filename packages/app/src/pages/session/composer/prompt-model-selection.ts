@@ -93,6 +93,11 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
         models.subProvider.set({ providerID: item.providerID, modelID: item.modelID }, value)
       },
     },
+    order: {
+      get: models.order.get,
+      set: models.order.set,
+      clear: models.order.clear,
+    },
     variant: {
       configured() {
         const item = input.agent()

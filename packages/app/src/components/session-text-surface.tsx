@@ -67,11 +67,28 @@ export function SessionTextSurface(props: ParentProps<{ containerRef?: () => HTM
   let surfaceRef: HTMLDivElement | undefined
   const container = () => props.containerRef?.() ?? surfaceRef
 
-  // Context-menu target tracking — captured on pointerdown so the menu can
-  // enable/disable items based on what was actually right-clicked.
+  // Context-menu state — controlled DropdownMenu at cursor position.
+  // Using a hidden fixed trigger avoids Kobalte's ContextMenu `display: contents`
+  // large-area trigger bug where `excludedElements: [triggerRef]` prevents
+  // DismissableLayer from closing on left-click outside Content but still inside
+  // the trigger area (the whole session viewport). The hidden 1px trigger
+  // ensures `pointerdown outside` correctly dismisses.
   const [target, setTarget] = createSignal<Element | null>(null)
+  const [open, setOpen] = createSignal(false)
+  const [anchor, setAnchor] = createSignal<{ x: number; y: number }>({ x: 0, y: 0 })
+  let triggerRef: HTMLButtonElement | undefined
   const editable = () => isEditableTarget(target())
   const selectable = () => hasSelection()
+
+  const handleContextMenu = (e: MouseEvent) => {
+    const targetEl = e.target as Element | null
+    if (targetEl?.closest('[data-component="menu-v2-content"]')) return
+    setTarget(targetEl)
+    setAnchor({ x: e.clientX, y: e.clientY })
+    e.preventDefault()
+    e.stopPropagation()
+    setOpen(true)
+  }
 
   const copy = () => {
     const text = selectedText()
@@ -197,23 +214,35 @@ export function SessionTextSurface(props: ParentProps<{ containerRef?: () => HTM
       <div
         ref={surfaceRef}
         data-session-surface
-        class="contents"
-        onPointerDown={(e) => setTarget(e.target as Element)}
+        onContextMenu={handleContextMenu}
+        onPointerDown={(e: PointerEvent) => setTarget(e.target as Element)}
+        style={{ display: "contents" }}
       >
-        <MenuV2.Context>
-          <MenuV2.Context.Trigger as="div" class="contents">
-            {props.children}
-          </MenuV2.Context.Trigger>
-          <MenuV2.Context.Portal>
-            <MenuV2.Context.Content>
-              <MenuV2.Item disabled={!selectable()} onSelect={() => copySelection()}>
-                <span class="flex items-center gap-2 w-full">
-                  <span data-slot="menu-v2-item-icon">
-                    <Icon name="outline-copy" size="small" />
-                  </span>
-                  {language.t("common.copy")}
-                </span>
-              </MenuV2.Item>
+        {props.children}
+        <MenuV2 open={open()} onOpenChange={setOpen} placement="right-start" gutter={2} shift={2} flip overflowPadding={8}>
+          <MenuV2.Trigger
+            ref={(el: HTMLButtonElement) => {
+              triggerRef = el
+            }}
+            style={
+              {
+                position: "fixed",
+                left: `${anchor().x}px`,
+                top: `${anchor().y}px`,
+                width: "1px",
+                height: "1px",
+                opacity: "0",
+                "pointer-events": "none",
+                padding: "0",
+                border: "0",
+              } as any
+            }
+            aria-hidden="true"
+            tabIndex={-1}
+          />
+          <MenuV2.Portal>
+            <MenuV2.Content>
+              {/* Session actions — only meaningful with a selection */}
               <MenuV2.Item disabled={!selectable()} onSelect={() => addToChat()}>
                 <span class="flex items-center gap-2 w-full">
                   <span data-slot="menu-v2-item-icon">
@@ -239,10 +268,19 @@ export function SessionTextSurface(props: ParentProps<{ containerRef?: () => HTM
                 </span>
               </MenuV2.Item>
               <MenuV2.Separator />
-              <MenuV2.Item disabled={!editable() || !selectable()} onSelect={cut}>
+              {/* Edit operations — identical to GenericContextMenuProvider */}
+              <MenuV2.Item disabled={!selectable()} onSelect={() => copySelection()}>
                 <span class="flex items-center gap-2 w-full">
                   <span data-slot="menu-v2-item-icon">
                     <Icon name="outline-copy" size="small" />
+                  </span>
+                  {language.t("common.copy")}
+                </span>
+              </MenuV2.Item>
+              <MenuV2.Item disabled={!editable() || !selectable()} onSelect={cut}>
+                <span class="flex items-center gap-2 w-full">
+                  <span data-slot="menu-v2-item-icon">
+                    <Icon name="edit" size="small" />
                   </span>
                   {language.t("common.cut")}
                 </span>
@@ -259,14 +297,14 @@ export function SessionTextSurface(props: ParentProps<{ containerRef?: () => HTM
               <MenuV2.Item onSelect={selectAll}>
                 <span class="flex items-center gap-2 w-full">
                   <span data-slot="menu-v2-item-icon">
-                    <Icon name="plus" size="small" />
+                    <Icon name="expand" size="small" />
                   </span>
                   {language.t("common.selectAll")}
                 </span>
               </MenuV2.Item>
-            </MenuV2.Context.Content>
-          </MenuV2.Context.Portal>
-        </MenuV2.Context>
+            </MenuV2.Content>
+          </MenuV2.Portal>
+        </MenuV2>
       </div>
     </>
   )
