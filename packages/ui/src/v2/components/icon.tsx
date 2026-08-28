@@ -65,6 +65,10 @@ const icons = {
     viewBox: "0 0 16 16",
     body: `<path d="M2 8H14M2 4.664H14M2 11.336H14" stroke="currentColor"/>`,
   },
+  grip: {
+    viewBox: "0 0 16 16",
+    body: `<circle cx="5.5" cy="4.5" r="1.25" fill="currentColor"/><circle cx="10.5" cy="4.5" r="1.25" fill="currentColor"/><circle cx="5.5" cy="8" r="1.25" fill="currentColor"/><circle cx="10.5" cy="8" r="1.25" fill="currentColor"/><circle cx="5.5" cy="11.5" r="1.25" fill="currentColor"/><circle cx="10.5" cy="11.5" r="1.25" fill="currentColor"/>`,
+  },
   plus: {
     viewBox: "0 0 16 16",
     body: `<path d="M8 2.88867V13.1109" stroke="currentColor" stroke-linejoin="round"/><path d="M2.88867 8H13.1109" stroke="currentColor" stroke-linejoin="round"/>`,
@@ -80,6 +84,13 @@ const icons = {
   collapse: {
     viewBox: "0 0 16 16",
     body: `<path d="M8 1V6M11 3L8 6L5 3" stroke="currentColor"/><path d="M8 15V10M11 13L8 10L5 13" stroke="currentColor"/><path d="M4 8H6" stroke="currentColor"/><path d="M7 8H9" stroke="currentColor"/><path d="M10 8H12" stroke="currentColor"/>`,
+  },
+  // Compact — inward arrows squeezing content into one condensed line.
+  // Vertically symmetric, so it is non-directional and never mirrored for RTL
+  // (rtl-aware-development skill).
+  compact: {
+    viewBox: "0 0 16 16",
+    body: `<path d="M8 1.5V5.5M5.75 3.25L8 5.5L10.25 3.25" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/><path d="M8 14.5V10.5M5.75 12.75L8 10.5L10.25 12.75" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.5 8H12.5" stroke="currentColor" stroke-linecap="round"/>`,
   },
   check: {
     viewBox: "0 0 16 16",
@@ -222,6 +233,14 @@ const icons = {
   chats: {
     viewBox: "0 0 16 16",
     body: `<path d="M2.5 3.5C1.8 3.5 1.2 3.9 1.2 4.4V9C1.2 9.5 2 10 2.8 10H6L7.5 11.5L9 10H13.2C14 10 14.8 9.5 14.8 9V4.4C14.8 3.9 14 3.5 13.2 3.5H2.5Z" stroke="currentColor" stroke-linejoin="round"/><path d="M2.5 11.5C1.8 11.5 1.2 11.9 1.2 12.4V13.5C1.2 13.9 1.6 14.2 2.1 14.2H5.5L6.5 13H8.5L9.5 14.2H11.9C12.4 14.2 12.8 13.9 12.8 13.5V12.4C12.8 11.9 12.2 11.5 11.5 11.5H2.5Z" stroke="currentColor" stroke-linejoin="round"/>`,
+  },
+  clock: {
+    viewBox: "0 0 16 16",
+    body: `<circle cx="8" cy="8" r="5.75" stroke="currentColor"/><path d="M8 5.2V8L10.8 9.6" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/>`,
+  },
+  history: {
+    viewBox: "0 0 16 16",
+    body: `<circle cx="8" cy="8" r="5.75" stroke="currentColor"/><path d="M8 5.2V8L10.8 9.6" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.2 8C3.2 5.35 5.35 3.2 8 3.2" stroke="currentColor" stroke-linecap="round" opacity="0.85"/>`,
   },
 };
 

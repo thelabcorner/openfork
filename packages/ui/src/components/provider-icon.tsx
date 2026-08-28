@@ -9,7 +9,12 @@ export type ProviderIconProps = JSX.SVGElementTags["svg"] & {
 
 export const ProviderIcon: Component<ProviderIconProps> = (props) => {
   const [local, rest] = splitProps(props, ["id", "class", "classList"])
-  const resolved = createMemo(() => (iconNames.includes(local.id as IconName) ? local.id : "synthetic"))
+  const resolved = createMemo(() => {
+    // Claude subscription and API-key providers intentionally have distinct
+    // IDs, but share Anthropic's visual identity.
+    if (local.id === "claude" || local.id === "claude-api") return "anthropic"
+    return iconNames.includes(local.id as IconName) ? local.id : "synthetic"
+  })
   return (
     <svg
       data-component="provider-icon"
