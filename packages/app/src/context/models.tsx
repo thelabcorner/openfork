@@ -17,13 +17,21 @@ type Store = {
   recent: ModelKey[]
   variant?: Record<string, string | undefined>
   subProvider?: Record<string, string | undefined>
+  order?: Record<string, string[]>
 }
 
-const RECENT_LIMIT = 5
+const RECENT_LIMIT = 10
+const ALWAYS_VISIBLE_PROVIDERS = new Set(["claude"])
 
 function modelKey(model: ModelKey) {
   return `${model.providerID}:${model.modelID}`
 }
+
+// Manual model order is persisted per selector section. Provider ids are
+// user-defined slugs, so both kinds get a prefix to stay collision-free.
+const FAVORITES_SECTION = "favorites"
+const sectionKeyFor = (section: string) =>
+  section === FAVORITES_SECTION ? "section:favorites" : `section:provider:${section}`
 
 export const { use: useModels, provider: ModelsProvider } = createSimpleContext({
   name: "Models",
@@ -44,6 +52,7 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
         recent: [],
         variant: {},
         subProvider: {},
+        order: {},
       }),
     )
 
@@ -130,6 +139,7 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       const state = visibility().get(key)
       if (state === "hide") return false
       if (state === "show") return true
+      if (ALWAYS_VISIBLE_PROVIDERS.has(model.providerID)) return true
       if (latestSet().has(key)) return true
       // Newly-added models default ON (no matter what); only releases that
       // aged out of the recent window default to off.
@@ -181,6 +191,25 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       setStore("subProvider", key, value)
     }
 
+    // Manual display order inside a model-selector section ("favorites" or a
+    // provider group). Each entry stores the full snapshot of
+    // `providerID:modelID` keys in the user's chosen order; snapshots are
+    // written by drag-to-reorder / Alt+Arrow in the selector and applied on
+    // top of the default cost sort.
+    const getOrder = (section: string) => store.order?.[sectionKeyFor(section)]
+    const setOrder = (section: string, keys: string[]) => {
+      const key = sectionKeyFor(section)
+      if (!store.order) {
+        setStore("order", { [key]: keys })
+        return
+      }
+      setStore("order", key, keys)
+    }
+    const clearOrder = (section: string) => {
+      const key = sectionKeyFor(section)
+      if (store.order) (setStore as unknown as (a: string, b: string, c: string[] | undefined) => void)("order", key, undefined)
+    }
+
     const [recentModels] = createResource(
       async () => {
         const recent = store.recent
@@ -211,6 +240,11 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       subProvider: {
         get: getSubProvider,
         set: setSubProvider,
+      },
+      order: {
+        get: getOrder,
+        set: setOrder,
+        clear: clearOrder,
       },
     }
   },

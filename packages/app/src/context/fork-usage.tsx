@@ -33,12 +33,12 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
 
     const [credentials, { refetch: refetchCredentials }] = createResource(
       () => (armed() ? server() : undefined),
-      (value) => ForkClient.list(value),
+      (value) => ForkClient.list(value).catch(() => undefined),
       { initialValue: undefined },
     )
     const [usage, { refetch: refetchUsage }] = createResource(
       () => (armed() ? server() : undefined),
-      (value) => ForkClient.usage(value),
+      (value) => ForkClient.usage(value).catch(() => undefined),
       { initialValue: undefined },
     )
 

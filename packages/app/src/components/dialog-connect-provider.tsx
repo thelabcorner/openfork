@@ -41,6 +41,12 @@ import { decode64 } from "@/utils/base64"
 const CUSTOM_ID = "_custom"
 type ConnectMethod = Extract<IntegrationMethod, { type: "key" | "oauth" }>
 
+const providerDisplayName = (id: string, fallback: string) => {
+  if (id === "claude") return "Claude Subscription"
+  if (id === "claude-api") return "Claude API Key"
+  return fallback
+}
+
 export function useProviderConnectController(options: { onBack?: () => void } = {}) {
   const [store, setStore] = createStore({ selected: undefined as string | undefined })
   const reset = () => setStore("selected", undefined)
@@ -167,6 +173,7 @@ function ProviderPicker(props: {
     if (id === "openai") return language.t("dialog.provider.openai.note")
     if (id.startsWith("github-copilot")) return language.t("dialog.provider.copilot.note")
     if (id === "opencode-go") return language.t("dialog.provider.opencodeGo.tagline")
+    if (id === "claude") return language.t("dialog.provider.claudeCode.note")
     return undefined
   }
 
@@ -179,7 +186,13 @@ function ProviderPicker(props: {
       key={(x) => x?.id}
       items={() => {
         language.locale()
-        return [{ id: CUSTOM_ID, name: customLabel() }, ...providers.all().values()]
+        return [
+          { id: CUSTOM_ID, name: customLabel() },
+          ...Array.from(providers.all().values(), (provider) => ({
+            ...provider,
+            name: providerDisplayName(provider.id, provider.name),
+          })),
+        ]
       }}
       filterKeys={["id", "name"]}
       groupBy={(x) => (popularProviders.includes(x.id) ? popularGroup() : otherGroup())}
@@ -236,12 +249,18 @@ function ProviderPickerV2(props: {
     active: undefined as string | undefined,
     connecting: undefined as string | undefined,
   })
-  const featured = ["opencode", "opencode-go", "anthropic", "openai", "google", "openrouter", "vercel"]
+  const featured = ["opencode", "opencode-go", "claude", "claude-api", "claude-code", "openai", "google", "openrouter", "vercel"]
   const custom = () => ({ id: CUSTOM_ID, name: language.t("dialog.provider.custom.label") })
   const all = createMemo(() => {
     language.locale()
     const query = store.filter.trim().toLowerCase()
-    const values = [custom(), ...providers.all().values()]
+    const values = [
+      custom(),
+      ...Array.from(providers.all().values(), (provider) => ({
+        ...provider,
+        name: providerDisplayName(provider.id, provider.name),
+      })),
+    ]
     if (!query) return values
     return values.filter((provider) => `${provider.id} ${provider.name}`.toLowerCase().includes(query))
   })
@@ -405,9 +424,10 @@ function ProviderConnection(props: {
     timer.current = undefined
   })
 
-  const provider = createMemo(
-    () => providers.all().get(props.provider) ?? serverSync().data.provider.all.get(props.provider)!,
-  )
+  const provider = createMemo(() => {
+    const value = providers.all().get(props.provider) ?? serverSync().data.provider.all.get(props.provider)!
+    return value ? { ...value, name: providerDisplayName(props.provider, value.name) } : value
+  })
   const fallback = createMemo<ConnectMethod[]>(() => [
     {
       type: "key" as const,
@@ -706,6 +726,22 @@ function ProviderConnection(props: {
       auto = true
       void selectMethod(0)
     }
+  })
+
+  let claudeAuto = false
+  createEffect(() => {
+    if (claudeAuto || props.provider !== "claude" || loading()) return
+    claudeAuto = true
+    void (async () => {
+      await serverSync().refreshProviders().catch(() => undefined)
+      dialog.close()
+      showToast({
+        variant: "success",
+        icon: "circle-check",
+        title: language.t("provider.connect.toast.claudeSubscription.title"),
+        description: language.t("provider.connect.toast.claudeSubscription.description"),
+      })
+    })()
   })
 
   async function complete() {
@@ -1148,6 +1184,21 @@ function ProviderConnection(props: {
           autofocus={!newLayout() && store.methodIndex === undefined ? true : undefined}
         >
           <Switch>
+            <Match when={props.provider === "claude"}>
+              <div
+                class={
+                  newLayout()
+                    ? "flex flex-col gap-5 px-3 text-[13px] font-[440] leading-5 tracking-[-0.04px] text-v2-text-text-muted"
+                    : "flex flex-col gap-4 text-14-regular text-text-base"
+                }
+              >
+                <div>{language.t("provider.connect.claudeSubscription.description")}</div>
+                <div>
+                  <code class="rounded bg-input-base px-1.5 py-1">claude auth login --claudeai</code>
+                </div>
+                <div>{language.t("provider.connect.claudeSubscription.return")}</div>
+              </div>
+            </Match>
             <Match when={loading()}>
               <div class="text-14-regular text-text-base">
                 <div class="flex items-center gap-x-2">

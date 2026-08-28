@@ -1,7 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { matchesModelSearch } from "./dialog-select-model-search"
+import { createModelSearchMatcher, matchesModelSearch } from "./dialog-select-model-search"
 
 describe("matchesModelSearch", () => {
+  test("does not match when prepared fields are temporarily unavailable", () => {
+    expect(createModelSearchMatcher("claude")(undefined)).toBe(false)
+  })
   test("matches model names across separators", () => {
     expect(matchesModelSearch("gpt 5", ["GPT-5.5"])).toBe(true)
     expect(matchesModelSearch("gpt-5", ["GPT-5.5"])).toBe(true)

@@ -1,7 +1,10 @@
-import { Show, type Component, type JSX } from "solid-js"
+import { createMemo, Show, type Component, type JSX } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { DEEPSEEK_PEAK_RATES, deepSeekRatePeriod, isDeepSeekPeakPricedModel, type DeepSeekRate } from "@/utils/model-peak-pricing"
-import { stripUnlimitedSuffix } from "@/utils/model-badges"
+import { stripUnlimitedSuffix, hasPublishedPricing } from "@/utils/model-badges"
+import { blendedCost, evaluateModelUsageYield, FALLBACK_WORKLOAD_CORPUS } from "@/utils/model-usage-yield"
+import { buildHitRateIndex, buildModelCostIndex } from "@/utils/model-usage-history"
+import { useSync } from "@/context/sync"
 
 type InputKey = "text" | "image" | "audio" | "video" | "pdf"
 type InputMap = Record<InputKey, boolean>
@@ -167,18 +170,28 @@ export const ModelTooltip: Component<{
   v2?: boolean
   usage?: { percent: number; estimatedRequests?: number; personalized?: boolean }
   period?: ReturnType<typeof deepSeekRatePeriod>
+  /** Optional precomputed Usage Yield — if omitted, fallback corpus is used synchronously. */
+  yield?: ReturnType<typeof evaluateModelUsageYield>
+  /** Optional explicit hit rate 0-1 (or 0-100) for this provider+model. When provided it overrides personal/openrouter lookup. */
+  hitRate?: number
 }> = (props) => {
   const language = useLanguage()
+  const providerLabel = (model: ModelInfo) => {
+    if (model.provider.id === "claude") return language.t("model.provider.claudeSubscription")
+    if (model.provider.id === "claude-api") return language.t("model.provider.claudeApiKey")
+    return model.provider.name
+  }
   const sourceName = (model: ModelInfo) => {
     const value = `${model.id} ${model.name}`.toLowerCase()
 
+    if (model.provider.id === "claude" || model.provider.id === "claude-api") return providerLabel(model)
     if (/claude|anthropic/.test(value)) return language.t("model.provider.anthropic")
     if (/gpt|o[1-4]|codex|openai/.test(value)) return language.t("model.provider.openai")
     if (/gemini|palm|bard|google/.test(value)) return language.t("model.provider.google")
     if (/grok|xai/.test(value)) return language.t("model.provider.xai")
     if (/llama|meta/.test(value)) return language.t("model.provider.meta")
 
-    return model.provider.name
+    return providerLabel(model)
   }
   const inputLabel = (value: string) => {
     if (value === "text") return language.t("model.input.text")
@@ -228,11 +241,120 @@ export const ModelTooltip: Component<{
   const context = () => language.t("model.tooltip.context", { limit: props.model.limit.context.toLocaleString() })
   const contextLimit = () => props.model.limit.context.toLocaleString(language.intl())
 
+  // Usage Yield V2 (§5-6, §11, §31): derived synchronously from fallback corpus so
+  // the tooltip can show "how much usage $1 buys" (§2) without awaiting the
+  // live fetch. Share the same corpusFingerprint logic as the selector.
+  // Personal measured $/request is blended heavily (70%) when available so the
+  // tooltip reflects your actual workload, not just the generic corpus.
+  const fallbackBands = createMemo(() => {
+    const w = [...FALLBACK_WORKLOAD_CORPUS]
+    const corpus = w.map((c) => ({ ...c }))
+    corpus.sort((a, b) => a.contextTokens - b.contextTokens)
+    const q1 = Math.floor(corpus.length / 4)
+    const q3 = Math.ceil((corpus.length * 3) / 4)
+    return {
+      corpus,
+      light: corpus.slice(0, q1),
+      typical: corpus.slice(q1, q3),
+      heavy: corpus.slice(q3),
+      fingerprint: "fallback-16-aug26",
+    }
+  })
+  // Best-effort personal index — may be unavailable outside a sync provider (e.g. storybook).
+  let syncForTooltip: ReturnType<typeof useSync> | undefined
+  try {
+    syncForTooltip = useSync()
+  } catch {
+    syncForTooltip = undefined
+  }
+  const personalForTooltip = createMemo(() => {
+    if (!syncForTooltip) return undefined
+    try {
+      const idx = buildModelCostIndex(syncForTooltip().data.message)
+      const key = `${props.model.provider.id ?? "unknown"}:${props.model.id}`
+      const entry = idx.get(key)
+      if (!entry) return undefined
+      return { cost: entry.sum / entry.count, count: entry.count }
+    } catch {
+      return undefined
+    }
+  })
+  const hitRateForTooltip = createMemo(() => {
+    if (!syncForTooltip) return undefined
+    try {
+      const idx = buildHitRateIndex(syncForTooltip().data.message)
+      const key = `${props.model.provider.id ?? "unknown"}:${props.model.id}`
+      const direct = idx.get(key)
+      if (direct) {
+        const denom = direct.input + direct.cacheRead
+        if (denom > 0 && direct.count >= 3) return direct.cacheRead / denom
+      }
+      let sum = 0
+      let cnt = 0
+      for (const [k, entry] of idx.entries()) {
+        if (k.endsWith(`:${props.model.id}`)) {
+          const denom = entry.input + entry.cacheRead
+          if (denom > 0 && entry.count >= 3) {
+            sum += entry.cacheRead / denom
+            cnt++
+          }
+        }
+      }
+      if (cnt > 0) return sum / cnt
+      return undefined
+    } catch {
+      return undefined
+    }
+  })
+  const derivedYield = createMemo(() => {
+    if (props.yield) return props.yield
+    if (!props.model.cost || !hasPublishedPricing(props.model.cost)) return undefined
+    if (props.free || props.unlimited) return undefined
+    try {
+      const hitRate = props.hitRate ?? hitRateForTooltip()
+      const base = evaluateModelUsageYield(
+        {
+          id: props.model.id,
+          name: props.model.name,
+          provider: { id: props.model.provider.id ?? "unknown" },
+          cost: {
+            input: props.model.cost.input,
+            output: props.model.cost.output,
+            cache: { read: props.model.cost.cache?.read ?? 0, write: props.model.cost.cache?.write ?? 0 },
+          },
+        },
+        fallbackBands() as never,
+        hitRate !== undefined ? { hitRate } : undefined,
+      )
+      const personal = personalForTooltip()
+      if (!personal) return base
+      // Blend personal heavily (§31) into the primary cost/yield so the tooltip
+      // mirrors the selector's sorting. Light/heavy stay corpus-derived for context.
+      const blended = blendedCost(base.primary.costPerEquivalentRequest ?? 0, personal.cost, personal.count)
+      const blendedYield = blended > 0 ? 1 / blended : base.primary.equivalentRequestsPerDollar
+      return {
+        ...base,
+        primary: {
+          ...base.primary,
+          costPerEquivalentRequest: blended,
+          equivalentRequestsPerDollar: blendedYield,
+        },
+        // Mark as personalized for callers that care (tooltip could show hint).
+        warnings: [...base.warnings, ...(personal.count >= 3 ? ["personalized"] : [])],
+      } as typeof base
+    } catch {
+      return undefined
+    }
+  })
+
   if (props.v2) {
     return (
-      <div class="flex w-[224px] flex-col gap-2">
+      <div class="flex w-[224px] max-w-[calc(100vw-30px)] flex-col gap-2 overflow-hidden max-h-[calc(100vh-30px)]">
         <ModelTooltipRow name={language.t("model.tooltip.model")} value={name()} />
-        <ModelTooltipRow name={language.t("model.tooltip.provider")} value={props.model.provider.name} />
+        <ModelTooltipRow
+          name={language.t("model.tooltip.provider")}
+          value={providerLabel(props.model)}
+        />
         <Show when={inputs()}>
           {(value) => <ModelTooltipRow name={language.t("model.tooltip.inputs")} value={value()} />}
         </Show>
@@ -241,6 +363,51 @@ export const ModelTooltip: Component<{
         <Show when={props.model.cost && (props.model.cost.input > 0 || props.model.cost.output > 0 || (props.model.cost.cache?.read ?? 0) > 0)}>
           <div class="h-px bg-v2-border-border-muted" />
           <ModelTooltipCostTable model={props.model} cost={props.model.cost!} period={props.period} />
+        </Show>
+        <Show when={(props.hitRate ?? hitRateForTooltip()) !== undefined}>
+          <ModelTooltipRow
+            name={language.t("model.tooltip.cacheHitRate.label")}
+            value={<span class="tabular-nums">{Math.round((props.hitRate ?? hitRateForTooltip()!) * 100)}%</span>}
+          />
+        </Show>
+        <Show when={derivedYield()}>
+          {(y) => (
+            <>
+              <div class="h-px bg-v2-border-border-muted" />
+              <ModelTooltipRow
+                name={
+                  <span title={language.t("model.tooltip.usageYield.hint") as unknown as string}>
+                    {language.t("model.tooltip.usageYield.label")}
+                  </span>
+                }
+                value={<span class="tabular-nums">{Math.round(y().primary.equivalentRequestsPerDollar ?? 0).toLocaleString(language.intl())} / $1</span>}
+              />
+              <ModelTooltipRow
+                name={language.t("model.tooltip.usageYield.cost")}
+                value={
+                  y().primary.costPerEquivalentRequest
+                    ? new Intl.NumberFormat(language.intl(), { style: "currency", currency: "USD", minimumFractionDigits: 4, maximumFractionDigits: 6 }).format(y().primary.costPerEquivalentRequest!)
+                    : "—"
+                }
+              />
+              <Show when={y().workload.light && y().workload.heavy}>
+                <ModelTooltipRow
+                  name={language.t("model.tooltip.usageYield.light")}
+                  value={<span class="tabular-nums">{Math.round(y().workload.light!.requestsPerDollar).toLocaleString(language.intl())} / $1</span>}
+                />
+                <ModelTooltipRow
+                  name={language.t("model.tooltip.usageYield.heavy")}
+                  value={<span class="tabular-nums">{Math.round(y().workload.heavy!.requestsPerDollar).toLocaleString(language.intl())} / $1</span>}
+                />
+              </Show>
+              <Show when={y().regimes.some((r) => r.kind === "time")}>
+                <ModelTooltipRow
+                  name={language.t("model.tooltip.usageYield.regime")}
+                  value={<span class="text-[11px]">{y().regimes.find((r) => r.label === "expected") ? `${Math.round(y().regimes.find((r) => r.label === "expected")!.requestsPerDollar ?? 0).toLocaleString(language.intl())} exp` : "—"}</span>}
+                />
+              </Show>
+            </>
+          )}
         </Show>
         <Show when={props.usage?.estimatedRequests !== undefined}>
           <div class="h-px bg-v2-border-border-muted" />
@@ -262,7 +429,7 @@ export const ModelTooltip: Component<{
   }
 
   return (
-    <div class="flex flex-col gap-1 py-1">
+    <div class="flex max-w-[calc(100vw-30px)] flex-col gap-1 overflow-hidden py-1 max-h-[calc(100vh-30px)]">
       <div class="text-13-medium">{title()}</div>
       <Show when={inputs()}>
         {(value) => (

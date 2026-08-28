@@ -22,8 +22,11 @@ export const createModelSearchMatcher = (query: string) => {
   if (tokens.length === 0) return () => true
   const compactTokens = tokens.map((token) => token.replaceAll(" ", ""))
 
-  return (fields: ReturnType<typeof prepareModelSearchFields>) =>
-    tokens.every((token, index) => fields.some((field) => field.normalized.includes(token) || field.compact.includes(compactTokens[index])))
+  return (fields: ReturnType<typeof prepareModelSearchFields> | undefined) =>
+    !!fields &&
+    tokens.every((token, index) =>
+      fields.some((field) => field.normalized.includes(token) || field.compact.includes(compactTokens[index])),
+    )
 }
 
 export const matchesModelSearch = (query: string, values: string[]) =>

@@ -10,6 +10,9 @@ import { matchesModelSearch } from "../dialog-select-model-search"
 import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
 import { FreeUsageBar, FreeUsageModelsTable } from "@/components/openrouter-free-usage-bar"
 import { useSDK } from "@/context/sdk"
+import { useSync } from "@/context/sync"
+import { buildPersonalFallbackMap, buildPricingFallbackMap, compareByCheapness } from "@/utils/model-cost"
+import { buildModelCostIndex } from "@/utils/model-usage-history"
 import "../settings-v2/settings-v2.css"
 
 type ModelItem = ReturnType<ReturnType<typeof useLocal>["model"]["list"]>[number]
@@ -19,6 +22,8 @@ type SortKey = "cost" | "context" | "name"
 const formatCompact = (value: number) =>
   new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value)
 
+// V1 fallback (input+output) retained only for column display; sorting now uses
+// Usage Yield (§5-6) via compareByCheapness with fallback corpus.
 const blended = (item: ModelItem) => item.cost.input + item.cost.output
 
 /** OpenRouter endpoint telemetry for a single model, best-effort. */
@@ -82,26 +87,61 @@ export function ModelsPanelContent() {
     model.list().filter((item) => model.visible({ modelID: item.id, providerID: item.provider.id })),
   )
 
+  let sync: ReturnType<typeof useSync> | undefined
+  try {
+    sync = useSync()
+  } catch {
+    sync = undefined
+  }
+  const personalCosts = createMemo(() => {
+    if (!sync) return undefined
+    const idx = buildModelCostIndex(sync().data.message)
+    if (idx.size === 0) return undefined
+    const map = new Map<string, { cost: number; count: number }>()
+    for (const [k, entry] of idx.entries()) map.set(k, { cost: entry.sum / entry.count, count: entry.count })
+    return map
+  })
+  const pricingFallback = createMemo(() => {
+    const map = buildPricingFallbackMap(all() as never)
+    return map.size > 0 ? map : undefined
+  })
+  const personalFallback = createMemo(() => {
+    const p = personalCosts()
+    if (!p) return undefined
+    const map = buildPersonalFallbackMap(p)
+    return map.size > 0 ? map : undefined
+  })
+
   const filtered = createMemo(() => {
     const query = search().trim().toLowerCase()
     let list = all()
     if (query) list = list.filter((item) => matchesModelSearch(query, [item.name, item.id, item.provider.name]))
     const key = sortKey()
+    const pCosts = personalCosts()
+    const priceFallback = pricingFallback()
+    const pFallback = personalFallback()
     return [...list].sort((a, b) => {
       if (key === "name") return a.name.localeCompare(b.name)
-      if (key === "context") return b.limit.context - a.limit.context || blended(a) - blended(b)
-      return blended(a) - blended(b) || a.name.localeCompare(b.name)
+      if (key === "context")
+        return b.limit.context - a.limit.context || compareByCheapness(a as never, b as never, undefined, undefined, pCosts as never, priceFallback as never, pFallback as never)
+      return compareByCheapness(a as never, b as never, undefined, undefined, pCosts as never, priceFallback as never, pFallback as never)
     })
   })
 
   // Cheapest provider per distinct model id (the selector can host the same
   // model under several providers; this surfaces the cheapest inference path).
+  // Uses Usage Yield V2 (workload-normalized, §5-6) blended heavily with
+  // personal measured yield (§31) plus cross-provider pricing/usage fallbacks
+  // so the "cheapest" badge reflects your actual usage, not just headline input rates.
   const cheapestByModel = createMemo(() => {
     const map = new Map<string, ModelItem[]>()
     for (const item of all()) map.set(item.id, [...(map.get(item.id) ?? []), item])
+    const pCosts = personalCosts()
+    const priceFallback = pricingFallback()
+    const pFallback = personalFallback()
     return [...map.values()]
-      .map((group) => [...group].sort((a, b) => blended(a) - blended(b)))
-      .sort((a, b) => blended(a[0]) - blended(b[0]))
+      .map((group) => [...group].sort((a, b) => compareByCheapness(a as never, b as never, undefined, undefined, pCosts as never, priceFallback as never, pFallback as never)))
+      .sort((a, b) => compareByCheapness(a[0] as never, b[0] as never, undefined, undefined, pCosts as never, priceFallback as never, pFallback as never))
       .slice(0, 6)
   })
 

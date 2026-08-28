@@ -12,7 +12,7 @@ import { Switch as SwitchV2 } from "@opencode-ai/ui/v2/switch-v2"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { stripUnlimitedSuffix } from "@/utils/model-badges"
 import { useFilteredList } from "@opencode-ai/ui/hooks"
-import { For, Show, type Component } from "solid-js"
+import { createMemo, For, Show, type Component } from "solid-js"
 import { useLocal } from "@/context/local"
 import { popularProviders } from "@/hooks/use-providers"
 import { useLanguage } from "@/context/language"
@@ -21,6 +21,9 @@ import { DialogConnectProvider } from "./dialog-connect-provider"
 import { decode64 } from "@/utils/base64"
 import { SettingsListV2 } from "./settings-v2/parts/list"
 import { SettingsRowV2 } from "./settings-v2/parts/row"
+import { buildPersonalFallbackMap, buildPricingFallbackMap, compareByCheapness } from "@/utils/model-cost"
+import { buildModelCostIndex } from "@/utils/model-usage-history"
+import { useSync } from "@/context/sync"
 import "./settings-v2/settings-v2.css"
 
 type ModelItem = ReturnType<ReturnType<typeof useLocal>["model"]["list"]>[number]
@@ -137,12 +140,41 @@ export const DialogManageModelsV2: Component = () => {
   const setModelVisibility = (item: ModelItem, checked: boolean) => {
     local.model.setVisibility({ modelID: item.id, providerID: item.provider.id }, checked)
   }
-  const modelCost = (item: ModelItem) => item.cost.input + item.cost.output
+  // Personal data is more relevant than the generic corpus (§31): blend personal
+  // $/request heavily (70%) when we have ≥3 samples for that model.
+  let sync: ReturnType<typeof useSync> | undefined
+  try {
+    sync = useSync()
+  } catch {
+    sync = undefined
+  }
+  const personalCosts = createMemo(() => {
+    if (!sync) return undefined
+    const idx = buildModelCostIndex(sync().data.message)
+    if (idx.size === 0) return undefined
+    const map = new Map<string, { cost: number; count: number }>()
+    for (const [k, entry] of idx.entries()) map.set(k, { cost: entry.sum / entry.count, count: entry.count })
+    return map
+  })
+  const pricingFallback = createMemo(() => {
+    const map = buildPricingFallbackMap(local.model.list() as never)
+    return map.size > 0 ? map : undefined
+  })
+  const personalFallback = createMemo(() => {
+    const p = personalCosts()
+    if (!p) return undefined
+    const map = buildPersonalFallbackMap(p)
+    return map.size > 0 ? map : undefined
+  })
+  // Usage Yield V2: workload-normalized cheapness (§5-6) blended heavily with
+  // personal measured yield (§31) plus cross-provider pricing/usage fallbacks
+  // (same model id ~same cost). Falls back to pinned 16-tuple when no live corpus.
   const list = useFilteredList<ModelItem>({
     items: () => local.model.list(),
     key: (x) => `${x.provider.id}:${x.id}`,
     filterKeys: ["provider.name", "name", "id"],
-    sortBy: (a, b) => modelCost(a) - modelCost(b) || a.name.localeCompare(b.name),
+    sortBy: (a, b) =>
+      compareByCheapness(a as never, b as never, undefined, undefined, personalCosts() as never, pricingFallback() as never, personalFallback() as never),
     groupBy: (x) => x.provider.id,
     sortGroupsBy: (a, b) => {
       const aRank = popularProviders.indexOf(a.category)
