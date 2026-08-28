@@ -1036,6 +1036,44 @@ describe("ProviderTransform.schema - gemini array items", () => {
     expect(result.properties.nodes.items).toBeDefined()
     expect(result.properties.edges.items.type).toBe("string")
   })
+
+  test("adds missing items for Gemma served through OpenRouter", () => {
+    const gemmaModel = {
+      providerID: "openrouter",
+      api: {
+        id: "google/gemma-4-31b-it:free",
+      },
+    } as any
+
+    const schema = {
+      type: "object",
+      properties: {
+        args: { type: "array" },
+        patch: { type: "array" },
+      },
+    } as any
+
+    const result = ProviderTransform.schema(gemmaModel, schema) as any
+
+    expect(result.properties.args.items).toEqual({ type: "string" })
+    expect(result.properties.patch.items).toEqual({ type: "string" })
+  })
+
+  test("uses the Google publisher namespace independently of the model family name", () => {
+    const model = {
+      providerID: "openrouter",
+      api: {
+        id: "google/future-tool-model",
+      },
+    } as any
+
+    const result = ProviderTransform.schema(model, {
+      type: "object",
+      properties: { values: { type: "array" } },
+    } as any) as any
+
+    expect(result.properties.values.items).toEqual({ type: "string" })
+  })
 })
 
 describe("ProviderTransform.schema - gemini nested array items", () => {

@@ -11,7 +11,6 @@ import { NVIDIA_LIMIT_PER_MINUTE, nvidiaUsage } from "./nvidia-usage"
  */
 const NAME = "NVIDIA"
 const ALIASES = ["nvidia"]
-const LIMIT_PER_MINUTE = 40
 
 export { resetNvidiaUsage, trackNvidiaRequest } from "./nvidia-usage"
 

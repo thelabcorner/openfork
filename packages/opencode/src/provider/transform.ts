@@ -1551,8 +1551,14 @@ export function schema(model: Provider.Model, schema: JSONSchema7): JSONSchema7 
     }
   }
 
-  // Convert integer enums to string enums for Google/Gemini
-  if (model.providerID === "google" || model.api.id.includes("gemini")) {
+  // Convert schemas to Google's supported subset using provider metadata where available.
+  const googleSchema =
+    model.providerID === "google" ||
+    model.api.npm === "@ai-sdk/google" ||
+    model.api.npm === "@ai-sdk/google-vertex" ||
+    model.api.id.toLowerCase().startsWith("google/") ||
+    model.api.id.toLowerCase().includes("gemini")
+  if (googleSchema) {
     const isPlainObject = (node: unknown): node is Record<string, any> =>
       typeof node === "object" && node !== null && !Array.isArray(node)
     const hasCombiner = (node: unknown) =>

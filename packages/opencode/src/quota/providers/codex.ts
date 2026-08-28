@@ -1,7 +1,7 @@
 import { Effect } from "effect"
 import type { Auth } from "@/auth"
 import { HttpClient } from "effect/unstable/http"
-import { buildResult, toUsageWindow } from "../format"
+import { buildResult, toTimestamp, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
 import { fetchJson, outcomeError } from "./http"
@@ -61,14 +61,14 @@ function parseUsage(payload: unknown): ReturnType<typeof buildResult> {
       const seconds = typeof primary.limit_window_seconds === "number" ? primary.limit_window_seconds : null
       const label = seconds ? (seconds === 18000 ? "5h" : seconds === 604800 ? "weekly" : `${Math.round(seconds / 3600)}h`) : "rate"
       const percent = typeof primary.used_percent === "number" ? primary.used_percent : null
-      windows[label] = toUsageWindow({ usedPercent: percent, windowSeconds: seconds, resetAt: typeof primary.reset_at === "string" ? new Date(primary.reset_at).getTime() : null })
+      windows[label] = toUsageWindow({ usedPercent: percent, windowSeconds: seconds, resetAt: toTimestamp(primary.reset_at) })
     }
     if (secondary) {
       const seconds = typeof secondary.limit_window_seconds === "number" ? secondary.limit_window_seconds : null
       const label = seconds ? (seconds === 18000 ? "5h" : seconds === 604800 ? "weekly" : `${Math.round(seconds / 3600)}h`) : "rate"
       const percent = typeof secondary.used_percent === "number" ? secondary.used_percent : null
       const key = label === "rate" || windows[label] !== undefined ? `${label}_secondary` : label
-      windows[key] = toUsageWindow({ usedPercent: percent, windowSeconds: seconds, resetAt: typeof secondary.reset_at === "string" ? new Date(secondary.reset_at).getTime() : null })
+      windows[key] = toUsageWindow({ usedPercent: percent, windowSeconds: seconds, resetAt: toTimestamp(secondary.reset_at) })
     }
   }
 
