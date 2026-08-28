@@ -96,12 +96,12 @@ describe("SPAD frontier — unseen fixtures", () => {
     expect(!hit || hit.lane !== "raw").toBe(true);
   });
 
-  test("tool loop period 1 after 16 non-mutating triggers (FP guard)", () => {
+  test("tool loop period 1 after 24 non-mutating triggers (FP guard) - resource-aware", () => {
     clearPersistedMotifs();
     const sup = new SpadSupervisor();
     sup.beginTurn(makeTurnPolicy("do work"));
     let hit: any;
-    for (let i = 0; i < 15; i++) hit = sup.pushTool("bash", false);
+    for (let i = 0; i < 23; i++) hit = sup.pushTool("bash", false);
     expect(hit).toBeUndefined();
     hit = sup.pushTool("bash", false);
     expect(hit?.type).toBe("recover");
@@ -111,10 +111,10 @@ describe("SPAD frontier — unseen fixtures", () => {
     clearPersistedMotifs();
     const sup = new SpadSupervisor();
     sup.beginTurn(makeTurnPolicy("do work"));
-    for (let i = 0; i < 15; i++) sup.pushTool("read", false);
+    for (let i = 0; i < 23; i++) sup.pushTool("read", false);
     sup.pushTool("write", true);
     let hit: any;
-    for (let i = 0; i < 15; i++) hit = sup.pushTool("read", false);
+    for (let i = 0; i < 23; i++) hit = sup.pushTool("read", false);
     expect(hit).toBeUndefined();
   });
 
@@ -125,6 +125,24 @@ describe("SPAD frontier — unseen fixtures", () => {
     let hit: any;
     for (let i = 0; i < 12; i++) hit = sup.pushTool("bash", false) ?? hit;
     expect(hit).toBeUndefined();
+  });
+
+  test("tool loop with distinct resources does NOT trigger - distinct file exploration is not a loop", () => {
+    clearPersistedMotifs();
+    const sup = new SpadSupervisor();
+    sup.beginTurn(makeTurnPolicy("Survey the repo", false));
+    let hit: any;
+    for (let i = 0; i < 24; i++) hit = sup.pushTool("read", false, `module_${i}.ts`) ?? hit;
+    expect(hit).toBeUndefined();
+    // Same file repeated 24 times SHOULD trigger (true loop)
+    clearPersistedMotifs();
+    const sup2 = new SpadSupervisor();
+    sup2.beginTurn(makeTurnPolicy("do work", false));
+    let hit2: any;
+    for (let i = 0; i < 23; i++) hit2 = sup2.pushTool("read", false, "same.ts");
+    expect(hit2).toBeUndefined();
+    hit2 = sup2.pushTool("read", false, "same.ts");
+    expect(hit2?.type).toBe("recover");
   });
 
   test("reasoning unsigned can recover, signed stays observe via processor path simulated via supervisor observeOnly", () => {

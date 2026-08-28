@@ -77,18 +77,18 @@ describe("SPAD more fixtures — unseen", () => {
     expect(a?.detection.canonicalDuplicate4GramRatio).toBeGreaterThan(0.65);
   });
 
-  test("tool sequences — 15 reads no trigger, 16 triggers, write resets", () => {
+  test("tool sequences — 23 reads no trigger, 24 triggers, write resets (resource-aware threshold)", () => {
     clearPersistedMotifs();
     const sup = new SpadSupervisor();
     sup.beginTurn(makeTurnPolicy("explore"));
-    for (let i = 0; i < 15; i++) expect(sup.pushTool("read", false)).toBeUndefined();
+    for (let i = 0; i < 23; i++) expect(sup.pushTool("read", false)).toBeUndefined();
     expect(sup.pushTool("read", false)?.type).toBe("recover");
     clearPersistedMotifs();
     const sup2 = new SpadSupervisor();
     sup2.beginTurn(makeTurnPolicy("explore"));
-    for (let i = 0; i < 15; i++) sup2.pushTool("read", false);
+    for (let i = 0; i < 23; i++) sup2.pushTool("read", false);
     sup2.pushTool("write", true);
-    for (let i = 0; i < 15; i++) expect(sup2.pushTool("read", false)).toBeUndefined();
+    for (let i = 0; i < 23; i++) expect(sup2.pushTool("read", false)).toBeUndefined();
   });
 
   test("three user json fixtures as negatives/positives", () => {

@@ -20,7 +20,7 @@ export const DEFAULT_SPAD_CONFIG: SpadConfig = Object.freeze({
   canonicalExponentBonus: 2,
   codeFenceCoverageMultiplier: 1.75,
   recoveryThresholdMultiplier: 0.65,
-  maxRecoveryAttempts: 2,
+  maxRecoveryAttempts: 3,
   relapseMatchChars: 96,
   recoveryWatchChars: 1536,
   autoRecoverCanonical: true,

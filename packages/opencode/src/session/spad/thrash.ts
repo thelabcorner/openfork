@@ -15,26 +15,36 @@ function isRecord(v: unknown): v is Record<string, unknown> {
  * genuinely different commands stay distinct resources (avoiding false
  * re-access on e.g. `bash`).
  */
-export function toolResourceKey(name: string, input: unknown): string {
+export function toolResourceKey(name: string, input: unknown, mutationResult?: string): string {
   const n = name.toLowerCase()
   const rec = isRecord(input) ? input : {}
   const path = rec.filePath ?? rec.path ?? rec.file_path
   if (typeof path === "string") {
-    return path.toLowerCase().split(/[\\/]/).pop()!
+    // Hash more of the toolcall: include the exact line/offset reference
+    // (not just basename) so reads of different sections don't falsely
+    // collapse to the same resource identity.
+    const fullPath = path.toLowerCase()
+    const offset = typeof rec.offset === "number" ? `:o${rec.offset}` : ""
+    const limit = typeof rec.limit === "number" ? `:l${rec.limit}` : ""
+    const baseName = fullPath.split(/[\\/]/).pop()!
+    const mutationSig = mutationResult ? `:m${mutationResult.slice(0, 16).replace(/\s+/g, "_")}` : ""
+    return `${baseName}${offset}${limit}${mutationSig}`
   }
   const pat = rec.pattern ?? rec.glob ?? rec.query ?? rec.url ?? rec.src
   if (typeof pat === "string") {
     const base = pat.toLowerCase().split(/[\\/]/).pop()!.split(/[?*{}]/)[0]!
-    return base
+    const mutationSig = mutationResult ? `:m${mutationResult.slice(0, 16).replace(/\s+/g, "_")}` : ""
+    return `${base}${mutationSig}`
   }
   let sig = ""
   for (const value of Object.values(rec)) {
     if (typeof value === "string" && value.length > 1) {
-      sig = value.slice(0, 24).toLowerCase().replace(/\s+/g, " ")
+      sig = value.slice(0, 40).toLowerCase().replace(/\s+/g, " ")
       break
     }
   }
-  return sig ? `${n}:${sig}` : n
+  const mutationSig = mutationResult ? `:m${mutationResult.slice(0, 16).replace(/\s+/g, "_")}` : ""
+  return sig ? `${n}:${sig}${mutationSig}` : `${n}${mutationSig}`
 }
 
 function normalizeWords(delta: string): string[] {

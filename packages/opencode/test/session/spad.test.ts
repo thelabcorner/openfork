@@ -134,7 +134,7 @@ describe("SPAD-R core", () => {
     expect(action?.type).toBe("observe")
   })
 
-  test("recovery escalates from recover to recover to abort", () => {
+  test("recovery escalates from recover to recover to abort (budget 3)", () => {
     const supervisor = new SpadSupervisor()
     supervisor.beginTurn(makeTurnPolicy("Continue implementing the feature."))
     supervisor.startPart("text")
@@ -153,7 +153,12 @@ describe("SPAD-R core", () => {
     supervisor.startPart("text", true)
     let third
     for (let i = 0; i < relapse.length; i += 17) { third = supervisor.push(relapse.slice(i, i + 17)); if (third) break }
-    expect(third?.type).toBe("abort")
+    expect(third?.type).toBe("recover")
+    expect(third?.type === "recover" ? third.attempt : 0).toBe(3)
+    supervisor.startPart("text", true)
+    let fourth
+    for (let i = 0; i < relapse.length; i += 17) { fourth = supervisor.push(relapse.slice(i, i + 17)); if (fourth) break }
+    expect(fourth?.type).toBe("abort")
   })
 
   test("random healthy fuzz has zero raw triggers", () => {

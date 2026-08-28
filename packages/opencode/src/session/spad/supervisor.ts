@@ -156,7 +156,7 @@ export class SpadSupervisor {
     this.thrash.pushTool(tool, isMutating, resource)
     const thrashHit = this.thrash.evaluate(this.channel)
     if (thrashHit && this.interventionAllowed(thrashHit)) return this.triggerRecovery(thrashHit, thrashRecoveryPrompt(this.attempts))
-    const hit = this.toolLoop.push(tool, isMutating)
+    const hit = this.toolLoop.push(tool, isMutating, resource)
     if (!hit) return undefined
     const detection: PeriodDetection = {
       kind: "periodic-attractor",
@@ -173,6 +173,9 @@ export class SpadSupervisor {
     if (this.attempts >= this.config.maxRecoveryAttempts) return { type: "abort", detection, reason: "recovery-budget-exhausted" }
     this.attempts++
     this.lastToolDetection = detection
+    // Reset lane so post-recovery generation needs a fresh sustained period to re-trigger,
+    // instead of firing on the very next tool call and burning the budget in 2 calls.
+    this.toolLoop.reset()
     return { type: "recover", attempt: this.attempts, detection, quarantineFrom: 0, recoveryPrompt: toolRecoveryPrompt(this.attempts) }
   }
 
