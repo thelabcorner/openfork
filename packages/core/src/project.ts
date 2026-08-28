@@ -10,6 +10,7 @@ import { makeGlobalNode } from "./effect/app-node"
 import { Hash } from "./util/hash"
 import { ProjectDirectories } from "./project/directories"
 import { ProjectSchema } from "./project/schema"
+import { chatsRoot, isChatDirectory } from "./project/chat-paths"
 
 export const ID = ProjectSchema.ID
 export type ID = ProjectSchema.ID
@@ -108,6 +109,15 @@ const layer = Layer.effect(
     })
 
     const resolve = Effect.fn("Project.resolve")(function* (input: AbsolutePath) {
+      // Chat sessions: no worktree/repo inheritance; dedicated dummy project.
+      if (isChatDirectory(input)) {
+        const root = chatsRoot()
+        return {
+          id: ID.make("chats"),
+          directory: AbsolutePath.make(root),
+          vcs: undefined,
+        }
+      }
       const repo = yield* git.repo.discover(input)
       if (!repo) return { id: ID.global, directory: AbsolutePath.make(path.parse(input).root), vcs: undefined }
 

@@ -13,7 +13,7 @@ const DEFAULT_BUFFER = 10_000
 const DEFAULT_KEEP_TOKENS = 4_000
 const TOOL_OUTPUT_MAX_CHARS = 500
 const SUMMARY_OUTPUT_TOKENS = 2_000
-const SUMMARY_TEMPLATE = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
+export const DEFAULT_COMPACTION_PROMPT = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
 ## Objective
 - [one or two brief sentences describing what the user is trying to accomplish]
@@ -44,6 +44,7 @@ Rules:
 - Use terse bullets, not prose paragraphs.
 - Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
 - Do not mention the summary process or that context was compacted.`
+const SUMMARY_TEMPLATE = DEFAULT_COMPACTION_PROMPT
 const SUMMARY_UPDATE_INSTRUCTIONS = `The <prior-summary> summarizes everything that happened before the <conversation>. Construct a new summary that combines both. The <prior-summary> is discarded after this: anything you do not carry into the new summary is lost.
 
 When combining:
@@ -63,6 +64,7 @@ type Settings = {
   readonly auto: boolean
   readonly buffer: number
   readonly tokens: number
+  readonly prompt?: string
 }
 
 type Dependencies = {
@@ -157,19 +159,34 @@ const select = (
   }
 }
 
-export const buildPrompt = (input: { readonly previousSummary?: string; readonly context: readonly string[] }) => {
+export const buildPrompt = (input: {
+  readonly previousSummary?: string
+  readonly context: readonly string[]
+  readonly customPrompt?: string
+}) => {
+  const effectiveTemplate = input.customPrompt?.trim() ? input.customPrompt.trim() : SUMMARY_TEMPLATE
+  // Support placeholder replacement when user includes them explicitly; otherwise use structured wrapping.
+  const hasPlaceholders =
+    effectiveTemplate.includes("{conversation}") || effectiveTemplate.includes("{previousSummary}")
+  if (hasPlaceholders) {
+    const conversationBlock = input.context.join("\n\n")
+    return effectiveTemplate
+      .replaceAll("{conversation}", conversationBlock)
+      .replaceAll("{previousSummary}", input.previousSummary ?? "")
+      .trim()
+  }
   const conversation = `Here is the conversation so far:\n\n<conversation>\n${input.context.join("\n\n")}\n</conversation>`
   if (!input.previousSummary)
     return [
       conversation,
       "Create a new anchored summary from the conversation history in the <conversation> tags above so another coding agent can continue the work.",
-      SUMMARY_TEMPLATE,
+      effectiveTemplate,
     ].join("\n\n")
   return [
     conversation,
     `Here is the summary of the conversation before the <conversation> above:\n\n<prior-summary>\n${input.previousSummary}\n</prior-summary>`,
     SUMMARY_UPDATE_INSTRUCTIONS,
-    SUMMARY_TEMPLATE,
+    effectiveTemplate,
   ].join("\n\n")
 }
 
@@ -185,6 +202,7 @@ export const make = (dependencies: Dependencies) => {
     const summaryPrompt = buildPrompt({
       previousSummary: previousSummary?.type === "compaction" ? previousSummary.summary : undefined,
       context: [previousSummary?.type === "compaction" ? previousSummary.recent : "", selected.head].filter(Boolean),
+      customPrompt: config.prompt,
     })
     const summaryOutput = Math.min(output || SUMMARY_OUTPUT_TOKENS, SUMMARY_OUTPUT_TOKENS)
     if (Token.estimate(summaryPrompt) > context - summaryOutput) return false

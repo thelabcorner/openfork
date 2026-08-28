@@ -168,6 +168,23 @@ export const Info = Schema.Struct({
       reserved: Schema.optional(NonNegativeInt).annotate({
         description: "Token buffer for compaction. Leaves enough window to avoid overflow during compaction.",
       }),
+      models: Schema.optional(
+        Schema.Struct({
+          small: Schema.optional(Schema.String).annotate({
+            description: "Model for small compaction contexts (e.g. provider/model for <8k tokens)",
+          }),
+          medium: Schema.optional(Schema.String).annotate({
+            description: "Model for medium compaction contexts (e.g. provider/model for <32k tokens)",
+          }),
+          large: Schema.optional(Schema.String).annotate({
+            description: "Model for large compaction contexts (e.g. provider/model for large contexts)",
+          }),
+        }).annotate({ description: "Tiered models for compaction, matched by required context window" }),
+      ),
+      prompt: Schema.optional(Schema.String).annotate({
+        description:
+          "Custom prompt for compaction summarization. Replaces the built-in summary template; {conversation} and {previousSummary} are replaced when present.",
+      }),
     }),
   ),
   experimental: Schema.optional(

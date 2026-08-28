@@ -7,9 +7,17 @@ export class Keep extends Schema.Class<Keep>("ConfigV2.Compaction.Keep")({
   tokens: NonNegativeInt.pipe(Schema.optional),
 }) {}
 
+export class Models extends Schema.Class<Models>("ConfigV2.Compaction.Models")({
+  small: Schema.String.pipe(Schema.optional),
+  medium: Schema.String.pipe(Schema.optional),
+  large: Schema.String.pipe(Schema.optional),
+}) {}
+
 export class Info extends Schema.Class<Info>("ConfigV2.Compaction")({
   auto: Schema.Boolean.pipe(Schema.optional),
   prune: Schema.Boolean.pipe(Schema.optional),
   keep: Keep.pipe(Schema.optional),
   buffer: NonNegativeInt.pipe(Schema.optional),
+  models: Models.pipe(Schema.optional),
+  prompt: Schema.String.pipe(Schema.optional),
 }) {}
