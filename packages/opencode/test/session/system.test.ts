@@ -77,6 +77,8 @@ const it = testEffect(
           all: () => Effect.succeed(skills),
           dirs: () => Effect.succeed([]),
           available: () => Effect.succeed(skills),
+          loadFromPath: (fileOrDir) =>
+            Effect.fail(new Skill.InvalidError({ path: fileOrDir, message: "not used in this test" })),
         }),
       ),
     ],

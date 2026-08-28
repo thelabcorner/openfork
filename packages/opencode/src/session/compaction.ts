@@ -31,6 +31,19 @@ const TOOL_OUTPUT_MAX_CHARS = 2_000
 const PRUNE_PROTECTED_TOOLS = ["skill"]
 const MIN_PRESERVE_RECENT_TOKENS = 2_000
 const MAX_PRESERVE_RECENT_TOKENS = 15_000
+const COMPACTION_OUTPUT_RESERVE = 2_000
+const COMPACTION_TIER_ORDER = ["small", "medium", "large"] as const
+type CompactionTier = (typeof COMPACTION_TIER_ORDER)[number]
+
+function parseCompactionModel(value: string): { providerID: ProviderV2.ID; modelID: ModelV2.ID } | undefined {
+  const trimmed = value.trim()
+  if (!trimmed || !trimmed.includes("/")) return undefined
+  const [providerID, ...rest] = trimmed.split("/")
+  if (!providerID || rest.length === 0) return undefined
+  const modelID = rest.join("/")
+  if (!modelID) return undefined
+  return { providerID: ProviderV2.ID.make(providerID), modelID: ModelV2.ID.make(modelID) }
+}
 type Turn = {
   start: number
   end: number
@@ -268,6 +281,69 @@ const layer = Layer.effect(
       }
     })
 
+    const resolveTierCandidates = Effect.fn("SessionCompaction.resolveTierCandidates")(function* (input: {
+      cfg: ConfigV1.Info
+      agentModel?: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
+    }) {
+      const raw = input.cfg.compaction?.models
+      const tierDefs: Array<{ tier: CompactionTier; raw?: string }> = [
+        { tier: "small", raw: raw?.small },
+        { tier: "medium", raw: raw?.medium },
+        { tier: "large", raw: raw?.large },
+      ]
+      if (!tierDefs[2]!.raw && input.agentModel) {
+        tierDefs[2]!.raw = `${input.agentModel.providerID}/${input.agentModel.modelID}`
+      }
+      const candidates: Array<{ tier: CompactionTier; model: Provider.Model; ref: { providerID: ProviderV2.ID; modelID: ModelV2.ID } }> =
+        []
+      for (const def of tierDefs) {
+        if (!def.raw) continue
+        const parsed = parseCompactionModel(def.raw)
+        if (!parsed) {
+          yield* Effect.logWarning("compaction tier model parse failed", { tier: def.tier, raw: def.raw })
+          continue
+        }
+        const maybe = yield* provider.getModel(parsed.providerID, parsed.modelID).pipe(Effect.option)
+        if (maybe._tag === "None" || maybe.value === undefined) {
+          yield* Effect.logWarning("compaction tier model unavailable", {
+            tier: def.tier,
+            providerID: parsed.providerID,
+            modelID: parsed.modelID,
+          })
+          continue
+        }
+        candidates.push({ tier: def.tier, model: maybe.value, ref: parsed })
+      }
+      candidates.sort((a, b) => {
+        const ca = a.model.limit.context || Number.MAX_SAFE_INTEGER
+        const cb = b.model.limit.context || Number.MAX_SAFE_INTEGER
+        return ca - cb
+      })
+      return candidates
+    })
+
+    const pickCompactionModel = Effect.fn("SessionCompaction.pickCompactionModel")(function* (input: {
+      candidates: Array<{ tier: CompactionTier; model: Provider.Model }>
+      needed: number
+      fallback: Provider.Model
+    }) {
+      if (input.candidates.length === 0) return { model: input.fallback, tier: "session" as const }
+      for (const c of input.candidates) {
+        const ctx = c.model.limit.context
+        if (!ctx || ctx === 0) return { model: c.model, tier: c.tier }
+        if (input.needed < ctx - COMPACTION_OUTPUT_RESERVE) return { model: c.model, tier: c.tier }
+      }
+      const largest = input.candidates.at(-1)!
+      const largestCtx = largest.model.limit.context || Number.MAX_SAFE_INTEGER
+      if (input.needed < largestCtx - COMPACTION_OUTPUT_RESERVE) return { model: largest.model, tier: largest.tier }
+      yield* Effect.logWarning("compaction prompt exceeds all tier contexts, falling back to session model", {
+        needed: input.needed,
+        tiers: input.candidates.map((c) => ({ tier: c.tier, context: c.model.limit.context })),
+        fallback: input.fallback.limit.context,
+      })
+      return { model: input.fallback, tier: "session" as const }
+    })
+
     // goes backwards through parts until there are PRUNE_PROTECT tokens worth of tool
     // calls, then erases output of older tool calls to free context space
     const prune = Effect.fn("SessionCompaction.prune")(function* (input: { sessionID: SessionID }) {
@@ -356,18 +432,19 @@ const layer = Layer.effect(
       }
 
       const agent = yield* agents.get("compaction")
-      const model = agent.model
-        ? yield* provider.getModel(agent.model.providerID, agent.model.modelID).pipe(Effect.orDie)
-        : yield* provider.getModel(userMessage.model.providerID, userMessage.model.modelID).pipe(Effect.orDie)
       const cfg = yield* config.get()
+      const sessionModel = yield* provider
+        .getModel(userMessage.model.providerID, userMessage.model.modelID)
+        .pipe(Effect.orDie)
       const history = compactionPart && messages.at(-1)?.info.id === input.parentID ? messages.slice(0, -1) : messages
       const prior = completedCompactions(history)
       const hidden = new Set(prior.flatMap((item) => [item.userIndex, item.assistantIndex]))
       const previousSummary = prior.at(-1)?.summary
+      // Budget/select is gated on the session model window (overflow predicate) — not the tier model.
       const selected = yield* select({
         messages: history.filter((_, index) => !hidden.has(index)),
         cfg,
-        model,
+        model: sessionModel,
       })
       // Allow plugins to inject context or replace compaction prompt.
       const compacting = yield* plugin.trigger(
@@ -378,17 +455,37 @@ const layer = Layer.effect(
       const msgs = structuredClone(selected.head)
       yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
       const conversation = msgs.map(serialize).filter(Boolean).join("\n\n")
+      const customPrompt = cfg.compaction?.prompt?.trim() ? cfg.compaction.prompt.trim() : undefined
       const nextPrompt =
         compacting.prompt ??
         [
           buildPrompt({
             previousSummary,
             context: [conversation],
+            customPrompt,
           }),
           ...compacting.context,
         ]
           .filter(Boolean)
           .join("\n\n")
+      // Tier-aware model selection: pick smallest tier whose window fits the prompt + reserve.
+      const needed = Token.estimate(nextPrompt) + COMPACTION_OUTPUT_RESERVE
+      const tierCandidates = yield* resolveTierCandidates({ cfg, agentModel: agent.model })
+      const picked = yield* pickCompactionModel({
+        candidates: tierCandidates,
+        needed,
+        fallback: sessionModel,
+      })
+      const model = picked.model
+      yield* Effect.logInfo("compaction tier selected", {
+        sessionID: input.sessionID,
+        tier: picked.tier,
+        providerID: model.providerID,
+        modelID: model.id,
+        needed,
+        context: model.limit.context,
+        headSize: selected.head.length,
+      })
       const ctx = yield* InstanceState.context
       const msg: SessionV1.Assistant = {
         id: MessageID.ascending(),

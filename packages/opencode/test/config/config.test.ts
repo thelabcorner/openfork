@@ -1805,6 +1805,25 @@ describe("deduplicatePluginOrigins", () => {
   )
 })
 
+describe("Claude migration config helpers (duplicate detection)", () => {
+  test("detectClaudeExternal identifies by exact pkg, reports sources", () => {
+    const origins = [
+      { spec: "@openchamber/opencode-claude", source: "global", scope: "global" as const },
+      { spec: "other@1", source: "local", scope: "local" as const },
+      { spec: "@openchamber/opencode-claude@0.14", source: "project/opencode.json", scope: "local" as const },
+    ]
+    const hit = ConfigPlugin.detectClaudeExternal(origins)
+    expect(hit.hasExternal).toBe(true)
+    expect(hit.sources.length).toBe(2)
+    expect(hit.sources).toContain("global")
+  })
+
+    test("shouldSuppressClaudeExternal is always false because provider IDs are distinct", () => {
+      expect(ConfigPlugin.shouldSuppressClaudeExternal(false)).toBe(false)
+      expect(ConfigPlugin.shouldSuppressClaudeExternal(true)).toBe(false)
+  })
+})
+
 describe("OPENCODE_DISABLE_PROJECT_CONFIG", () => {
   it.instance(
     "skips project config files when flag is set",

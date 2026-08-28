@@ -1541,6 +1541,15 @@ describe("session.message-v2.fromError", () => {
     expect((result as SessionV1.APIError).data.message).toInclude("decompression")
   })
 
+  test("classifies Effect interrupt-only failures as AbortedError", () => {
+    const interrupt = Object.assign(new Error("All fibers interrupted without error at Agent.state"), {
+      name: "InterruptError",
+    })
+    const result = MessageV2.fromError(interrupt, { providerID })
+    expect(result.name).toBe("MessageAbortedError")
+    expect((result as { data: { message: string } }).data.message).toBe("Aborted")
+  })
+
   test("classifies ZlibError as AbortedError when abort context is provided", () => {
     const zlibError = new Error(
       'ZlibError fetching "https://opencode.cloudflare.dev/anthropic/messages". For more information, pass `verbose: true` in the second argument to fetch()',

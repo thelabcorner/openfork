@@ -603,14 +603,23 @@ function isAfter(info: Info, other?: Info) {
   return info.id > other.id
 }
 
+function isInterruptError(e: unknown) {
+  if (!e || typeof e !== "object") return false
+  const name = "name" in e ? String(e.name) : ""
+  if (name === "InterruptError") return true
+  const message = "message" in e && typeof e.message === "string" ? e.message : ""
+  return message.startsWith("All fibers interrupted without error")
+}
+
 export function fromError(
   e: unknown,
   ctx: { providerID: ProviderV2.ID; aborted?: boolean },
 ): NonNullable<Assistant["error"]> {
   switch (true) {
     case e instanceof DOMException && e.name === "AbortError":
+    case isInterruptError(e):
       return new AbortedError(
-        { message: e.message },
+        { message: e instanceof Error && e.name === "AbortError" ? e.message : "Aborted" },
         {
           cause: e,
         },
