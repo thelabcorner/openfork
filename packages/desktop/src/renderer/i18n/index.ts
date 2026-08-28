@@ -61,7 +61,8 @@ export function initI18n(): Promise<Locale> {
   if (cached) return cached
 
   const promise = (async () => {
-    const raw = await window.api.storeGet("opencode.global.dat", "language").catch(() => null)
+    const api = (typeof window !== "undefined" ? (window as unknown as { api?: typeof window.api }).api : undefined)
+    const raw = await (api?.storeGet?.("opencode.global.dat", "language") as Promise<string | null> | undefined)?.catch(() => null) ?? null
     const next = pickLocale(parseStored(raw)) ?? state.locale
 
     state.locale = next

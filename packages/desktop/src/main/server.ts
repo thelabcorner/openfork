@@ -114,8 +114,15 @@ export async function spawnLocalServer(
         return
       }
       if (message.type === "error") {
-        options.onStderr?.(`sidecar startup error: ${message.error.stack ?? message.error.message}`)
-        fail(Object.assign(new Error(message.error.message), { stack: message.error.stack }))
+        const detail = message.error.stack ?? message.error.message
+        options.onStderr?.(`sidecar startup error: ${detail} (port ${port})`)
+        const err = Object.assign(new Error(message.error.message || `Sidecar failed to start on ${hostname}:${port}`), {
+          stack: message.error.stack,
+        })
+        // Preserve EADDRINUSE code for callers that want to retry
+        const code = /EADDRINUSE/.test(detail) ? "EADDRINUSE" : undefined
+        if (code) (err as NodeJS.ErrnoException).code = code
+        fail(err)
       }
     }
     const onExit = (code: number) => {
@@ -217,6 +224,9 @@ function createSidecarEnv(): Record<string, string> {
   )
   delete env.DEBUG
   if (process.platform === "linux") delete env.LD_PRELOAD
+  // Don't propagate OPENCODE_PORT to the sidecar — the desktop picks its own
+  // ephemeral port to avoid colliding with `opencode serve` / JetBrains ACP.
+  delete env.OPENCODE_PORT
   return env
 }
 
@@ -225,7 +235,12 @@ function delay(ms: number) {
 }
 
 function serializeError(error: unknown) {
-  if (error instanceof Error) return { message: error.message, stack: error.stack }
+  if (error instanceof Error) {
+    const cause = (error as Error & { cause?: unknown }).cause
+    const causeMessage = cause instanceof Error ? cause.message : cause ? String(cause) : ""
+    const message = error.message || causeMessage || String(error)
+    return { message, stack: error.stack ?? (cause instanceof Error ? cause.stack : undefined) }
+  }
   return { message: String(error) }
 }
 

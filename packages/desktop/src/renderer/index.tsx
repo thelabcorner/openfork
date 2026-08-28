@@ -32,6 +32,36 @@ import "./styles.css"
 import { Splash } from "@opencode-ai/ui/logo"
 import { useTheme } from "@opencode-ai/ui/theme/context"
 
+// ── Desktop outside Electron (5173 preview) ─────────────────────────────────
+// 5173 is electron-vite’s renderer dev server, NOT the mobile PWA. The PWA
+// lives on 3001 (packages/mobile/vite.config.ts). When the renderer is
+// opened raw in a browser, window.api (Electron preload) is absent and every
+// top-level window.api.* access throws. Install a no-op shim early so the
+// renderer degrades gracefully instead of white-screening.
+if (typeof window !== "undefined" && !(window as unknown as { api?: unknown }).api) {
+  console.warn("[desktop] window.api missing – running outside Electron (5173 preview). Mobile PWA is on 3001. Using no-op shim.")
+  const noop = (..._a: unknown[]) => Promise.resolve(null) as unknown as Promise<never>
+  const sub = () => () => {}
+  ;(window as unknown as { api: Record<string, unknown> }).api = new Proxy(
+    {
+      updater: { subscribe: sub, check: noop, install: noop },
+      onDeepLink: sub,
+      onMenuCommand: sub,
+      consumeInitialDeepLinks: async () => [] as string[],
+      awaitInitialization: async () => null,
+      getWindowID: async () => "browser",
+      setBackgroundColor: noop,
+      setNativeTranslations: noop,
+    } as Record<string, unknown>,
+    {
+      get(target, prop) {
+        if (prop in target) return (target as Record<string, unknown>)[prop as string]
+        return (..._a: unknown[]) => Promise.resolve(null)
+      },
+    },
+  ) as unknown as typeof window.api
+}
+
 window.addEventListener(
   "error",
   (event) => {

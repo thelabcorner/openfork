@@ -166,7 +166,13 @@ function parseCommand(value: unknown): SidecarCommand | undefined {
 }
 
 function serializeError(error: unknown) {
-  if (error instanceof Error) return { message: error.message, stack: error.stack }
+  if (error instanceof Error) {
+    const cause = (error as Error & { cause?: unknown }).cause
+    const causeMessage = cause instanceof Error ? cause.message : cause ? String(cause) : ""
+    const message = error.message || causeMessage || String(error)
+    const stack = error.stack ?? (cause instanceof Error ? cause.stack : undefined)
+    return { message, stack }
+  }
   return { message: String(error) }
 }
 

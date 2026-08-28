@@ -33,6 +33,7 @@ const clamp = (value: number) => Math.min(Math.max(value, MIN_ZOOM_LEVEL), MAX_Z
 
 const applyZoom = (next: number) => {
   requestedZoom = next
+  if (!window.api || typeof window.api.setZoomFactor !== "function") return
   void window.api
     .setZoomFactor(next)
     .then(() => {
@@ -45,23 +46,30 @@ const applyZoom = (next: number) => {
     })
 }
 
-window.api.onZoomFactorChanged((factor) => {
-  requestedZoom = clamp(factor)
-  setWebviewZoom(requestedZoom)
-})
+if (window.api && typeof window.api.onZoomFactorChanged === "function") {
+  window.api.onZoomFactorChanged((factor) => {
+    requestedZoom = clamp(factor)
+    setWebviewZoom(requestedZoom)
+  })
+}
 
-void window.api.getPinchZoomEnabled().then((enabled) => {
-  pinchZoomEnabled = enabled
-})
+if (window.api && typeof window.api.getPinchZoomEnabled === "function") {
+  window.api.getPinchZoomEnabled().then((enabled: boolean) => {
+    pinchZoomEnabled = enabled
+  })
+}
 
-window.api.onPinchZoomEnabledChanged((enabled) => {
-  pinchZoomEnabled = enabled
-  resetWheelPinch()
-})
+if (window.api && typeof window.api.onPinchZoomEnabledChanged === "function") {
+  window.api.onPinchZoomEnabledChanged((enabled: boolean) => {
+    pinchZoomEnabled = enabled
+    resetWheelPinch()
+  })
+}
 
 const setPinchZoomEnabled = (enabled: boolean) => {
   pinchZoomEnabled = enabled
   resetWheelPinch()
+  if (!window.api || typeof window.api.setPinchZoomEnabled !== "function") return Promise.resolve()
   return window.api.setPinchZoomEnabled(enabled)
 }
 

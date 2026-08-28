@@ -38,7 +38,7 @@ export function DesktopFirstLaunchOnboarding(props: { initialUrl: string; onLoad
         servers: server.list.map(ServerConnection.key),
       })
 
-      const directory = await window.api.finishFirstLaunchOnboarding(shouldTrigger)
+      const directory = await (api.finishFirstLaunchOnboarding?.(shouldTrigger) ?? Promise.resolve(null))
       if (!shouldTrigger || !directory) return
 
       console.info("[desktop-onboarding] starting first launch draft", { directory })

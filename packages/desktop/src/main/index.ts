@@ -79,7 +79,7 @@ function useEnvProxy() {
     // Electron 41.2 runs Node 24.14.1; latest @types/node@24 is 24.12.2.
     ;(http as any).setGlobalProxyFromEnv()
   } catch (error) {
-    logger.warn("failed to load proxy environment", error)
+    if (logger) logger.warn("failed to load proxy environment", error)
   }
 }
 
@@ -288,7 +288,9 @@ const main = Effect.gen(function* () {
       const win = getLastFocusedWindow()
       if (win) sendMenuCommand(win, id)
     },
-    checkForUpdates: () => void showUpdaterDialog(updater, true),
+    checkForUpdates: () => {
+      if (updater) void showUpdaterDialog(updater, true)
+    },
     relaunch,
   }
   registerIpcHandlers({
@@ -313,8 +315,10 @@ const main = Effect.gen(function* () {
     setDisplayBackend: async () => undefined,
     checkAppExists: (appName) => checkAppExists(appName),
     resolveAppPath: async (appName) => resolveAppPath(appName),
-    updater,
-    showUpdater: () => showUpdaterDialog(updater, true),
+    updater: updater ?? undefined,
+    showUpdater: () => {
+      if (updater) void showUpdaterDialog(updater, true)
+    },
     setBackgroundColor: (color) => setBackgroundColor(color),
     exportDebugLogs: () => exportDebugLogs(),
     recordFatalRendererError: (error) => writeLog("renderer", "fatal renderer error", { ...error }, "error"),
@@ -345,11 +349,12 @@ const main = Effect.gen(function* () {
     },
   })
   registerBrowserIpcHandlers(browserEngine)
-  void updater.start()
-  autopsyMark("updater-start-fired") // STARTUP-AUTOPSY (async network check kicked off pre-window)
-  const updateTimer = setInterval(() => void updater.check(), 10 * 60 * 1000)
-  updateTimer.unref()
-  app.once("will-quit", () => clearInterval(updateTimer))
+  if (updater) {
+    void updater.start()
+    const updateTimer = setInterval(() => void updater.check(), 10 * 60 * 1000)
+    updateTimer.unref()
+    app.once("will-quit", () => clearInterval(updateTimer))
+  }
   yield* Effect.promise(() => startNetLog()).pipe(
     Effect.catch((error) =>
       Effect.sync(() => {
@@ -400,13 +405,7 @@ const main = Effect.gen(function* () {
       return
     }
 
-    const port = yield* Effect.gen(function* () {
-      const fromEnv = process.env.OPENCODE_PORT
-      if (fromEnv) {
-        const parsed = Number.parseInt(fromEnv, 10)
-        if (!Number.isNaN(parsed)) return parsed
-      }
-
+    const pickEphemeralPort = Effect.gen(function* () {
       const res = yield* Deferred.make<number, unknown>()
       const socket = createServer()
       socket.on("error", (e) => Deferred.failSync(res, () => e))
@@ -417,26 +416,89 @@ const main = Effect.gen(function* () {
           Deferred.failSync(res, () => new Error("Failed to get port"))
           return
         }
-        const port = address.port
-        socket.close(() => Effect.runSync(Deferred.succeed(res, port)))
+        const p = address.port
+        socket.close(() => Effect.runSync(Deferred.succeed(res, p)))
       })
-
       return yield* Deferred.await(res)
     })
-    const hostname = "127.0.0.1"
-    const url = `http://${hostname}:${port}`
-    const password = randomUUID()
 
-    logger.log("spawning sidecar", { url })
-    autopsyMark("sidecar-spawn-start") // STARTUP-AUTOPSY
-    const { listener, health } = yield* Effect.promise(() =>
-      spawnLocalServer(hostname, port, password, {
-        userDataPath: app.getPath("userData"),
-        onStdout: (message) => writeLog("server", "stdout", { message }),
-        onStderr: (message) => writeLog("server", "stderr", { message }, "warn"),
-        onExit: (code) => writeLog("utility", "sidecar exited", { code }, "warn"),
-      }),
-    )
+    const isEAddrInUse = (error: unknown): boolean => {
+      if (!error) return false
+      if (typeof error === "string") return error.includes("EADDRINUSE")
+      const e = error as { code?: string; message?: string; cause?: unknown; error?: unknown; _tag?: string }
+      if (e.code === "EADDRINUSE") return true
+      if (typeof e.message === "string" && e.message.includes("EADDRINUSE")) return true
+      if (e.cause) return isEAddrInUse(e.cause)
+      if (e.error && e.error !== error) return isEAddrInUse(e.error)
+      return false
+    }
+
+    // OPENCODE_PORT is a global CLI env that collides with JetBrains ACP (4096) and
+    // any `opencode serve --port` instances. Desktop's sidecar must be
+    // independent: always use an ephemeral port. Honor an explicit desktop-only
+    // override (OPENCODE_DESKTOP_PORT) if the developer needs a fixed port.
+    if (process.env.OPENCODE_PORT) {
+      logger.log(`OPENCODE_PORT=${process.env.OPENCODE_PORT} ignored for desktop sidecar (using ephemeral port to avoid EADDRINUSE)`)
+    }
+    const fromEnv = process.env.OPENCODE_DESKTOP_PORT
+    const parsedEnvPort = fromEnv ? Number.parseInt(fromEnv, 10) : NaN
+    const hasEnvPort = fromEnv !== undefined && !Number.isNaN(parsedEnvPort) && parsedEnvPort !== 0
+
+    const hostname = "127.0.0.1"
+    let port: number
+    let password = randomUUID()
+    let spawnResult: Awaited<ReturnType<typeof spawnLocalServer>> | null = null
+
+    const trySpawn = (p: number) =>
+      Effect.tryPromise({
+        try: () =>
+          spawnLocalServer(hostname, p, password, {
+            userDataPath: app.getPath("userData"),
+            onStdout: (message) => writeLog("server", "stdout", { message }),
+            onStderr: (message) => writeLog("server", "stderr", { message }, "warn"),
+            onExit: (code) => writeLog("utility", "sidecar exited", { code }, "warn"),
+          }),
+        catch: (cause) => cause as unknown,
+      })
+
+    if (hasEnvPort) {
+      port = parsedEnvPort
+      logger.log("spawning sidecar", { url: `http://${hostname}:${port}`, source: "env" })
+      autopsyMark("sidecar-spawn-start") // STARTUP-AUTOPSY
+      spawnResult = yield* trySpawn(port).pipe(
+        Effect.catchIf(isEAddrInUse, () =>
+          Effect.gen(function* () {
+            logger.warn(`sidecar port ${port} in use (EADDRINUSE), retrying with ephemeral port`, {
+              error: `EADDRINUSE ${hostname}:${port}`,
+            })
+            port = yield* pickEphemeralPort
+            password = randomUUID()
+            logger.log("spawning sidecar", { url: `http://${hostname}:${port}`, source: "fallback" })
+            autopsyMark("sidecar-spawn-retry") // STARTUP-AUTOPSY
+            return yield* trySpawn(port)
+          }),
+        ),
+      )
+    } else {
+      port = yield* pickEphemeralPort
+      logger.log("spawning sidecar", { url: `http://${hostname}:${port}`, source: "ephemeral" })
+      autopsyMark("sidecar-spawn-start") // STARTUP-AUTOPSY
+      spawnResult = yield* trySpawn(port).pipe(
+        Effect.catchIf(isEAddrInUse, () =>
+          Effect.gen(function* () {
+            logger.warn(`ephemeral port ${port} in use, retrying`, { error: `EADDRINUSE ${hostname}:${port}` })
+            port = yield* pickEphemeralPort
+            password = randomUUID()
+            logger.log("spawning sidecar", { url: `http://${hostname}:${port}`, source: "ephemeral-retry" })
+            autopsyMark("sidecar-spawn-retry")
+            return yield* trySpawn(port)
+          }),
+        ),
+      )
+    }
+
+    const url = `http://${hostname}:${port}`
+    const { listener, health } = spawnResult!
     autopsyMark("sidecar-ready-msg") // STARTUP-AUTOPSY (utility process sent {type:"ready"})
     server = listener
     readyData = { url, username: "opencode", password }

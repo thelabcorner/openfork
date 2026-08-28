@@ -11,7 +11,7 @@
   "scripts": {
     "typecheck": "tsgo -b",
     "predev": "bun ./scripts/predev.ts",
-    "dev": "electron-vite dev",
+    "dev": "concurrently -n desktop,pwa -c blue,green \"electron-vite dev\" \"bun --cwd ../mobile dev\"",
     "prebuild": "bun ./scripts/prebuild.ts",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
@@ -46,6 +46,7 @@
     "@types/node": "catalog:",
     "@typescript/native-preview": "catalog:",
     "@valibot/to-json-schema": "1.6.0",
+    "concurrently": "^9.1.2",
     "electron": "42.3.3",
     "electron-builder": "26.15.2",
     "electron-vite": "^5",
