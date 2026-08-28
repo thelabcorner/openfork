@@ -16,10 +16,11 @@ import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useUpdaterAction } from "../updater-action"
 import { useSettings } from "@/context/settings"
-import { useModels } from "@/context/models"
 import { useServerSync } from "@/context/server-sync"
 import { ExternalLink } from "../external-link"
 import { SettingsListV2 } from "./parts/list"
+import { SettingsLocalScope } from "./parts/local-scope"
+import { SettingsModelPickerV2 } from "./parts/model-picker"
 import { SettingsRowV2 } from "./parts/row"
 import { LayoutRetirementNotice, LayoutTransitionToggle } from "./interface-transition"
 import {
@@ -45,6 +46,37 @@ Your output must be:
 - A single line
 - <=50 characters
 - No explanations`
+const DEFAULT_COMPACTION_PROMPT = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
+<template>
+## Objective
+- [one or two brief sentences describing what the user is trying to accomplish]
+
+## Important Details
+- [constraints/preferences, decisions and why, important facts/assumptions, exact context needed to continue, or "(none)"]
+
+## Work State
+### Completed
+- [finished work, verified facts, or changes made; otherwise "(none)"]
+
+### Active
+- [current work, partial changes, or investigation state; otherwise "(none)"]
+
+### Blocked
+- [blockers, failing commands, or unknowns; otherwise "(none)"]
+
+## Next Move
+1. [immediate concrete action, or "(none)"]
+2. [next action if known, or "(none)"]
+
+## Relevant Files
+- [file or directory path: why it matters, or "(none)"]
+</template>
+
+Rules:
+- Keep every section, even when empty.
+- Use terse bullets, not prose paragraphs.
+- Preserve exact file paths, symbols, commands, error strings, URLs, and identifiers when known.
+- Do not mention the summary process or that context was compacted.`
 const fontSettings = {
   ui: {
     action: "settings-ui-font",
@@ -406,38 +438,139 @@ const TitlePromptDialog: Component<{ onClose: () => void }> = (props) => {
   )
 }
 
+const CompactionPromptDialog: Component<{ onClose: () => void }> = (props) => {
+  const language = useLanguage()
+  const settings = useSettings()
+  const serverSync = useServerSync()
+  const savedPrompt = () => settings.general.compaction()?.prompt?.trim()
+  const [prompt, setPrompt] = createSignal(savedPrompt() || DEFAULT_COMPACTION_PROMPT)
+  const usesDefaultPrompt = createMemo(() => prompt().trim() === DEFAULT_COMPACTION_PROMPT.trim())
+
+  const save = () => {
+    const next = settings.general.compaction() ?? {}
+    const value = prompt().trim()
+    const promptValue = value && value !== DEFAULT_COMPACTION_PROMPT.trim() ? value : undefined
+    const hasModels = next.small || next.medium || next.large
+    if (promptValue === undefined && !hasModels) {
+      settings.general.setCompaction(undefined)
+    } else {
+      settings.general.setCompaction({ ...next, prompt: promptValue })
+    }
+    void serverSync().updateConfig({
+      compaction: {
+        prompt: promptValue,
+      },
+    } as unknown as Record<string, unknown>)
+    props.onClose()
+  }
+
+  return (
+    <Dialog size="x-large" containerClass="!w-[min(calc(100vw-40px),1040px)] !h-[min(calc(100vh-64px),760px)]">
+      <DialogHeader>
+        <div class="flex min-w-0 flex-1 flex-col gap-1">
+          <DialogTitle>{language.t("dialog.compactionPrompt.title")}</DialogTitle>
+          <p data-slot="dialog-description" class="max-w-[720px]">
+            {language.t("dialog.compactionPrompt.description")}
+          </p>
+        </div>
+      </DialogHeader>
+      <DividerV2 />
+      <DialogBody class="flex w-full flex-1 flex-col gap-4 overflow-hidden px-5 pt-5 pb-2">
+        <div class="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+          <div class="flex min-h-0 flex-col gap-3">
+            <div class="flex flex-wrap items-center gap-2">
+              <span
+                class="inline-flex h-6 select-none items-center rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-02 px-2 text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-muted"
+                data-current={usesDefaultPrompt() ? "" : undefined}
+              >
+                {language.t("dialog.compactionPrompt.default")}
+              </span>
+              <span class="text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
+                {usesDefaultPrompt() ? language.t("settings.general.row.compactionModel.default") : "Custom"}
+              </span>
+            </div>
+
+            <TextareaV2
+              autofocus
+              rows={18}
+              class="!min-h-0 !w-full !flex-1"
+              value={prompt()}
+              placeholder={language.t("dialog.compactionPrompt.placeholder")}
+              spellcheck={false}
+              autocorrect="off"
+              autocomplete="off"
+              autocapitalize="off"
+              aria-label={language.t("dialog.compactionPrompt.title")}
+              onInput={(event) => setPrompt(event.currentTarget.value)}
+            />
+          </div>
+
+          <aside class="flex min-h-0 flex-col gap-3 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 p-3">
+            <div class="flex flex-col gap-2">
+              <div class="select-none text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-base">
+                Tokens
+              </div>
+              <div class="flex flex-col gap-2 text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
+                <span class="flex items-start gap-2">
+                  <code class="mt-[-1px] rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">
+                    {"{conversation}"}
+                  </code>
+                  <span>{language.t("dialog.compactionPrompt.token.conversation")}</span>
+                </span>
+                <span class="flex items-start gap-2">
+                  <code class="mt-[-1px] rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">
+                    {"{previousSummary}"}
+                  </code>
+                  <span>{language.t("dialog.compactionPrompt.token.previousSummary")}</span>
+                </span>
+              </div>
+            </div>
+
+            <DividerV2 />
+
+            <div class="flex min-h-0 flex-1 flex-col gap-2">
+              <div class="select-none text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-base">
+                {language.t("dialog.compactionPrompt.default")}
+              </div>
+              <div class="min-h-0 flex-1 overflow-hidden rounded-md border border-v2-border-border-muted bg-v2-background-bg-base">
+                <ScrollView class="h-full">
+                  <pre
+                    class="whitespace-pre-wrap p-3 font-mono text-[12px] leading-5 tracking-normal text-v2-text-text-muted select-none"
+                    aria-label={language.t("dialog.compactionPrompt.default")}
+                  >
+                    {DEFAULT_COMPACTION_PROMPT}
+                  </pre>
+                </ScrollView>
+              </div>
+            </div>
+          </aside>
+        </div>
+      </DialogBody>
+      <DialogFooter>
+        <ButtonV2 type="button" variant="ghost" class="mr-auto" onClick={() => setPrompt(DEFAULT_COMPACTION_PROMPT)}>
+          {language.t("dialog.compactionPrompt.reset")}
+        </ButtonV2>
+        <ButtonV2 type="button" variant="neutral" onClick={props.onClose}>
+          {language.t("common.cancel")}
+        </ButtonV2>
+        <ButtonV2 type="button" variant="contrast" onClick={save}>
+          {language.t("common.save")}
+        </ButtonV2>
+      </DialogFooter>
+    </Dialog>
+  )
+}
+
 const TitleGenerationSection: Component = () => {
   const language = useLanguage()
   const dialog = useDialog()
   const settings = useSettings()
   const serverSync = useServerSync()
-  const models = useModels()
-  const titleModels = createMemo(() =>
-    models
-      .list()
-      .filter((item) => models.visible({ modelID: item.id, providerID: item.provider.id }))
-      .map((item) => ({
-        id: `${item.provider.id}/${item.id}`,
-        label: `${item.provider.name} / ${item.name}`,
-        model: { providerID: item.provider.id, modelID: item.id },
-      })),
-  )
-  const titleModelOptions = createMemo(() => [
-    { id: "", label: language.t("settings.general.row.titleModel.default"), model: undefined },
-    ...titleModels().sort((a, b) => a.label.localeCompare(b.label)),
-  ])
-  const currentTitleModel = createMemo(() => {
-    const saved = settings.general.titleGeneration()?.model
-    if (!saved) return titleModelOptions()[0]
-    return titleModelOptions().find(
-      (item) => item.model?.providerID === saved.providerID && item.model.modelID === saved.modelID,
-    )
-  })
-  const selectTitleModel = (option: ReturnType<typeof titleModelOptions>[number] | null) => {
+  const selectTitleModel = (model: { providerID: string; modelID: string } | undefined) => {
     const next = settings.general.titleGeneration()
-    settings.general.setTitleGeneration({ ...next, model: option?.model })
+    settings.general.setTitleGeneration({ ...next, model })
     void serverSync().updateConfig({
-      small_model: option?.model ? `${option.model.providerID}/${option.model.modelID}` : undefined,
+      small_model: model ? `${model.providerID}/${model.modelID}` : undefined,
     })
   }
 
@@ -450,16 +583,11 @@ const TitleGenerationSection: Component = () => {
           description={language.t("settings.general.row.titleModel.description")}
         >
           <div class="flex items-center gap-1.5">
-            <SelectV2
-              appearance="inline"
-              data-action="settings-title-model"
-              options={titleModelOptions()}
-              current={currentTitleModel()}
-              value={(option) => option.id}
-              label={(option) => option.label}
-              onSelect={selectTitleModel}
-              placement="bottom-end"
-              gutter={6}
+            <SettingsModelPickerV2
+              action="settings-title-model"
+              value={settings.general.titleGeneration()?.model}
+              defaultLabel={language.t("settings.general.row.titleModel.default")}
+              onChange={selectTitleModel}
             />
             <TooltipV2 placement="top" gutter={4} value={language.t("settings.general.row.titlePrompt.edit")}>
               <IconButtonV2
@@ -473,6 +601,89 @@ const TitleGenerationSection: Component = () => {
               />
             </TooltipV2>
           </div>
+        </SettingsRowV2>
+      </SettingsListV2>
+    </div>
+  )
+}
+
+const CompactionSection: Component = () => {
+  const language = useLanguage()
+  const dialog = useDialog()
+  const settings = useSettings()
+  const serverSync = useServerSync()
+  const selectCompactionModel = (tier: "small" | "medium" | "large") => (model: { providerID: string; modelID: string } | undefined) => {
+    const next = settings.general.compaction() ?? {}
+    const updated = { ...next, [tier]: model }
+    if (!updated.small && !updated.medium && !updated.large && !updated.prompt) {
+      settings.general.setCompaction(undefined)
+    } else {
+      settings.general.setCompaction(updated as typeof next)
+    }
+    void serverSync().updateConfig({
+      compaction: {
+        models: {
+          small: updated.small ? `${updated.small.providerID}/${updated.small.modelID}` : undefined,
+          medium: updated.medium ? `${updated.medium.providerID}/${updated.medium.modelID}` : undefined,
+          large: updated.large ? `${updated.large.providerID}/${updated.large.modelID}` : undefined,
+        },
+      },
+    } as unknown as Record<string, unknown>)
+  }
+  const defaultCompactionLabel = () => language.t("settings.general.row.compactionModel.default")
+
+  return (
+    <div class="settings-v2-section">
+      <h3 class="settings-v2-section-title">{language.t("settings.general.section.compaction")}</h3>
+      <SettingsListV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.compactionModel.small.title")}
+          description={language.t("settings.general.row.compactionModel.small.description")}
+        >
+          <SettingsModelPickerV2
+            action="settings-compaction-model-small"
+            value={settings.general.compaction()?.small}
+            defaultLabel={defaultCompactionLabel()}
+            onChange={selectCompactionModel("small")}
+          />
+        </SettingsRowV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.compactionModel.medium.title")}
+          description={language.t("settings.general.row.compactionModel.medium.description")}
+        >
+          <SettingsModelPickerV2
+            action="settings-compaction-model-medium"
+            value={settings.general.compaction()?.medium}
+            defaultLabel={defaultCompactionLabel()}
+            onChange={selectCompactionModel("medium")}
+          />
+        </SettingsRowV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.compactionModel.large.title")}
+          description={language.t("settings.general.row.compactionModel.large.description")}
+        >
+          <SettingsModelPickerV2
+            action="settings-compaction-model-large"
+            value={settings.general.compaction()?.large}
+            defaultLabel={defaultCompactionLabel()}
+            onChange={selectCompactionModel("large")}
+          />
+        </SettingsRowV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.compactionPrompt.title")}
+          description={language.t("settings.general.row.compactionPrompt.description")}
+        >
+          <TooltipV2 placement="top" gutter={4} value={language.t("settings.general.row.compactionPrompt.edit")}>
+            <IconButtonV2
+              type="button"
+              variant="ghost-muted"
+              size="small"
+              data-action="settings-compaction-prompt-edit"
+              icon={<Icon name="edit" />}
+              aria-label={language.t("settings.general.row.compactionPrompt.edit")}
+              onClick={() => dialog.show(() => <CompactionPromptDialog onClose={() => dialog.close()} />)}
+            />
+          </TooltipV2>
         </SettingsRowV2>
       </SettingsListV2>
     </div>
@@ -760,7 +971,10 @@ export const SettingsGeneralV2: Component<{
 
         <GeneralSection />
 
-        <TitleGenerationSection />
+        <SettingsLocalScope>
+          <TitleGenerationSection />
+          <CompactionSection />
+        </SettingsLocalScope>
 
         <AppearanceSection controller={appearance} />
 

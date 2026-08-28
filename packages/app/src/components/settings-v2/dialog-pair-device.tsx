@@ -7,7 +7,7 @@ import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type Component, Show, createEffect, onCleanup, onMount } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLanguage } from "@/context/language"
-import { useSDK } from "@/context/sdk"
+import { useServerSDK } from "@/context/server-sdk"
 import { useNow } from "@/hooks/use-now"
 import { beginPairing, formatPairingCode, type PairingSession } from "./pairing"
 import { QrCode } from "./qr-code"
@@ -16,7 +16,7 @@ import "./settings-v2.css"
 export const DialogPairDevice: Component = () => {
   const dialog = useDialog()
   const language = useLanguage()
-  const sdk = useSDK()
+  const sdk = useServerSDK()
   const now = useNow()
   const [store, setStore] = createStore({
     session: undefined as PairingSession | undefined,

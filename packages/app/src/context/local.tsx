@@ -342,6 +342,17 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
           models.subProvider.set({ providerID: item.providerID, modelID: item.modelID }, value)
         },
       },
+      order: {
+        get(section: string) {
+          return models.order.get(section)
+        },
+        set(section: string, keys: string[]) {
+          models.order.set(section, keys)
+        },
+        clear(section: string) {
+          models.order.clear(section)
+        },
+      },
       variant: {
         configured,
         selected,

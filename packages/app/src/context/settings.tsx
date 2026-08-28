@@ -24,6 +24,18 @@ export interface TitleGenerationSettings {
   prompt?: string
 }
 
+export interface CompactionModelRef {
+  providerID: string
+  modelID: string
+}
+
+export interface CompactionSettings {
+  small?: CompactionModelRef
+  medium?: CompactionModelRef
+  large?: CompactionModelRef
+  prompt?: string
+}
+
 export interface Settings {
   general: {
     autoSave: boolean
@@ -45,6 +57,7 @@ export interface Settings {
     newInterfaceNoticeDismissed?: boolean
     shouldDisplayTabsToast?: boolean
     titleGeneration?: TitleGenerationSettings
+    compaction?: CompactionSettings
   }
   appearance: {
     fontSize: number
@@ -461,6 +474,10 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         titleGeneration: withFallback(() => store.general?.titleGeneration, undefined),
         setTitleGeneration(value: TitleGenerationSettings | undefined) {
           setStore("general", "titleGeneration", value)
+        },
+        compaction: withFallback(() => store.general?.compaction, undefined),
+        setCompaction(value: CompactionSettings | undefined) {
+          setStore("general", "compaction", value)
         },
       },
       visibility: {

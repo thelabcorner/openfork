@@ -739,7 +739,7 @@
 }
 
 .settings-v2-tab-body.settings-v2-devices {
-  gap: 0;
+  gap: 32px;
 }
 
 .settings-v2-tab-header.settings-v2-devices-header {
@@ -829,6 +829,55 @@
 .settings-v2-devices-status-description {
   max-width: 320px;
   line-height: 18px;
+}
+
+.settings-v2-devices-intro {
+  margin-top: 12px;
+  font-size: 13px;
+  font-weight: 440;
+  line-height: 20px;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-v2-devices-error {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  border-radius: 6px;
+  background: var(--v2-state-bg-danger-subtle, rgba(239, 68, 68, 0.08));
+  border: 0.5px solid var(--v2-state-border-danger, rgba(239, 68, 68, 0.2));
+  color: var(--v2-state-fg-danger);
+  font-size: 13px;
+  font-weight: 440;
+  line-height: 1;
+  margin-bottom: 16px;
+}
+
+.settings-v2-devices-pwa-url {
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 12px;
+  font-weight: 440;
+  font-family: var(--v2-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  color: var(--v2-text-text-muted);
+  background: var(--v2-background-bg-layer-02);
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.settings-v2-devices-code {
+  font-family: var(--v2-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  font-weight: 440;
+  color: var(--v2-text-text-muted);
+  background: var(--v2-background-bg-layer-02);
+  border: 0.5px solid var(--v2-border-border-muted);
+  border-radius: 4px;
+  padding: 1px 4px;
 }
 
 [data-component="dialog-v2"].settings-v2-pair-dialog [data-slot="dialog-container"] {

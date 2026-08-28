@@ -1,9 +1,11 @@
 import type { DirectorySDK } from "@/context/sdk"
+import type { ServerSDK } from "@/context/server-sdk"
 
 // Seam between the pairing UI and server-auth's (p1) endpoints. Every
 // unified-SDK call lives here so route shapes land in one place. The routes
 // (/pair/begin, /devices, /devices/{deviceID}) are instance/httpapi — they
 // exist ONLY in @opencode-ai/sdk/v2, never in packages/client.
+type SdkWithPairing = Pick<DirectorySDK, "client"> | Pick<ServerSDK, "client">
 
 export interface PairingSession {
   /** URL the QR code encodes — the phone opens it to claim the session. */
@@ -32,13 +34,13 @@ const epochMs = (iso: string) => {
   return Number.isFinite(parsed) ? parsed : Date.now()
 }
 
-export const beginPairing = async (sdk: DirectorySDK): Promise<PairingSession> => {
+export const beginPairing = async (sdk: SdkWithPairing): Promise<PairingSession> => {
   const response = await sdk.client.pair.begin({ throwOnError: true })
   const result = response.data
   return { url: result.url, code: result.code, expiresAt: epochMs(result.expiresAt) }
 }
 
-export const listDevices = async (sdk: DirectorySDK): Promise<PairedDevice[]> => {
+export const listDevices = async (sdk: SdkWithPairing): Promise<PairedDevice[]> => {
   const response = await sdk.client.device.list({ throwOnError: true })
   // The registry soft-revokes and keeps rows — the manager shows active devices only.
   return response.data
@@ -52,7 +54,7 @@ export const listDevices = async (sdk: DirectorySDK): Promise<PairedDevice[]> =>
     }))
 }
 
-export const revokeDevice = async (sdk: DirectorySDK, id: string): Promise<void> => {
+export const revokeDevice = async (sdk: SdkWithPairing, id: string): Promise<void> => {
   await sdk.client.device.remove({ deviceID: id }, { throwOnError: true })
 }
 
