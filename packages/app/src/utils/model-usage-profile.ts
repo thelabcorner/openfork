@@ -9,7 +9,14 @@
 export type UsageProfile = { input: number; cached: number; output: number }
 export type UsagePricing = { input: number; output: number; cache: { read: number; write: number } }
 type ProfileEntry = { names: string[]; profile: UsageProfile }
-type PricingEntry = { names: string[]; pricing: UsagePricing }
+export type PricingEntry = {
+  names: string[]
+  pricing: UsagePricing
+  /** §8: parsed context threshold, if the row is a tiered model (e.g. Qwen ≤256K vs >256K). */
+  threshold?: { operator: "<=" | ">"; tokens: number }
+  /** §9: time regime for DeepSeek Off-Peak vs Peak rows. */
+  timeRegime?: "peak" | "off-peak"
+}
 type CacheEntry = { fetchedAt: number; entries: ProfileEntry[] }
 
 const SOURCE_URL = "https://raw.githubusercontent.com/anomalyco/opencode/dev/packages/web/src/content/docs/go.mdx"
@@ -93,13 +100,41 @@ function parsePricingTable(markdown: string): PricingEntry[] {
     if (!line.trimStart().startsWith("|")) continue
     const cells = line.split("|").slice(1, -1).map((cell) => cell.trim())
     if (cells.length < 5 || cells[0] === "Model" || /^[-: ]+$/.test(cells[0])) continue
+    const rawName = cells[0]
+    // §8-9: extract regime metadata before stripping the parenthetical.
+    // Order matters: check time regime first (DeepSeek), then threshold.
+    let timeRegime: PricingEntry["timeRegime"] | undefined
+    let threshold: PricingEntry["threshold"] | undefined
+    const paren = rawName.match(/\(([^)]+)\)/)
+    if (paren) {
+      const inside = paren[1].toLowerCase()
+      if (inside.includes("off-peak")) timeRegime = "off-peak"
+      else if (inside.includes("peak") && !inside.includes("off-peak")) timeRegime = "peak"
+      else {
+        // Threshold variants: "≤ 200K tokens", "> 200K tokens", "≤ 256K tokens" etc.
+        // The char may be ≤ (U+2264) or <=. Normalize.
+        const t = inside.replace(/\u2264/g, "<=").replace(/\u2265/g, ">=")
+        const m = t.match(/([<>]=?)\s*([\d.]+)\s*k/i)
+        if (m) {
+          const op = m[1] as "<=" | ">" | ">=" | "<"
+          const num = Number(m[2]) * 1000
+          if (Number.isFinite(num)) {
+            // Our pricing table only uses ≤ and >.
+            const normalizedOp: "<=" | ">" = op === "<=" || op === "<" ? "<=" : ">"
+            threshold = { operator: normalizedOp, tokens: num }
+          }
+        }
+      }
+    }
     entries.push({
-      names: expandNames(cells[0].replace(/\s*\([^)]*\)/g, "")),
+      names: expandNames(rawName.replace(/\s*\([^)]*\)/g, "")),
       pricing: {
         input: parseMoney(cells[1]),
         output: parseMoney(cells[2]),
         cache: { read: parseMoney(cells[3]), write: parseMoney(cells[4]) },
       },
+      ...(threshold ? { threshold } : {}),
+      ...(timeRegime ? { timeRegime } : {}),
     })
   }
   return entries
@@ -211,3 +246,46 @@ export function matchUsagePricing(
   }
   return undefined
 }
+
+/**
+ * Collect ALL tier rows for a model (§8) — e.g. Qwen ≤256K vs >256K, Grok
+ * ≤200K vs >200K — so the workload-corpus pricer (§5.2) can select the tier a
+ * given workload actually activates. Returns undefined when the model has no
+ * threshold tiers (the common case) or when entries are malformed.
+ *
+ * Time-regime rows (DeepSeek peak/off-peak) are intentionally excluded here:
+ * they are handled by the time-regime branch in model-usage-yield.ts.
+ */
+export function collectThresholdPricing(
+  entries: PricingEntry[],
+  model: { name: string; family?: string; id: string },
+): Array<{ thresholdTokens: number; operator: "<=" | ">"; cost: { input: number; output: number; cache: { read: number; write: number } } }> | undefined {
+  const candidates = [model.family, model.name, model.id].filter((x): x is string => !!x).map(normalize)
+  const matched: Array<{ thresholdTokens: number; operator: "<=" | ">"; cost: ModelCostLike }> = []
+  for (const entry of entries) {
+    if (entry.timeRegime) continue // §9: not a context tier
+    if (!entry.threshold) continue
+    let hit = false
+    for (const rawName of entry.names) {
+      const key = normalize(rawName)
+      if (key && candidates.some((c) => c === key || c.includes(key) || key.includes(c))) {
+        hit = true
+        break
+      }
+    }
+    if (hit) {
+      matched.push({
+        thresholdTokens: entry.threshold.tokens,
+        operator: entry.threshold.operator,
+        cost: { input: entry.pricing.input, output: entry.pricing.output, cache: { read: entry.pricing.cache.read, write: entry.pricing.cache.write } },
+      })
+    }
+  }
+  // §8 requires exactly one ≤ and one > with the same threshold token.
+  if (matched.length !== 2) return undefined
+  matched.sort((a, b) => a.thresholdTokens - b.thresholdTokens)
+  if (matched[0].operator !== "<=" || matched[1].operator !== ">" || matched[0].thresholdTokens !== matched[1].thresholdTokens) return undefined
+  return matched as Array<{ thresholdTokens: number; operator: "<=" | ">"; cost: { input: number; output: number; cache: { read: number; write: number } } }>
+}
+
+type ModelCostLike = { input: number; output: number; cache: { read: number; write: number } }
