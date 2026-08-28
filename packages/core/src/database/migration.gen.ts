@@ -46,5 +46,6 @@ export const migrations = (
     import("./migration/20260816000000_add_session_groups"),
     import("./migration/20260820000000_session_checkpoint"),
     import("./migration/20260823001121_device_registry"),
+    import("./migration/20260826190148_push_notifications"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

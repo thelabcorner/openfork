@@ -148,6 +148,26 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`push_subscription\` (
+          \`id\` text PRIMARY KEY,
+          \`endpoint\` text NOT NULL UNIQUE,
+          \`p256dh\` text NOT NULL,
+          \`auth\` text NOT NULL,
+          \`expiration_time\` integer,
+          \`user_agent_hint\` text,
+          \`created_at\` integer NOT NULL,
+          \`last_seen_at\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`push_vapid_key\` (
+          \`id\` text PRIMARY KEY,
+          \`public_key\` text NOT NULL,
+          \`private_key\` text NOT NULL,
+          \`created_at\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`message\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
@@ -220,7 +240,7 @@ export default {
         CREATE TABLE \`session_group\` (
           \`id\` text PRIMARY KEY,
           \`name\` text NOT NULL,
-          \`position\` integer DEFAULT 0 NOT NULL,
+          \`position\` integer NOT NULL,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL
         );
@@ -279,9 +299,9 @@ export default {
           \`model\` text,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
-          \`paused_at\` integer,
           \`time_compacting\` integer,
           \`time_archived\` integer,
+          \`paused_at\` integer,
           \`group_id\` text,
           CONSTRAINT \`fk_session_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
         );
@@ -321,17 +341,13 @@ export default {
       )
       yield* tx.run(`CREATE INDEX \`part_message_id_id_idx\` ON \`part\` (\`message_id\`,\`id\`);`)
       yield* tx.run(`CREATE INDEX \`part_session_idx\` ON \`part\` (\`session_id\`);`)
+      yield* tx.run(`CREATE INDEX \`session_checkpoint_session_id_idx\` ON \`session_checkpoint\` (\`session_id\`);`)
       yield* tx.run(
-        `CREATE UNIQUE INDEX \`session_checkpoint_session_ordinal_idx\` ON \`session_checkpoint\` (\`session_id\`,\`ordinal\`);`,
-      )
-      yield* tx.run(`CREATE INDEX \`session_checkpoint_session_idx\` ON \`session_checkpoint\` (\`session_id\`);`)
-      yield* tx.run(
-        `CREATE INDEX \`session_checkpoint_session_user_idx\` ON \`session_checkpoint\` (\`session_id\`,\`user_message_id\`);`,
+        `CREATE INDEX \`session_checkpoint_session_ordinal_idx\` ON \`session_checkpoint\` (\`session_id\`,\`ordinal\`);`,
       )
       yield* tx.run(
-        `CREATE INDEX \`session_checkpoint_session_assistant_idx\` ON \`session_checkpoint\` (\`session_id\`,\`assistant_message_id\`);`,
+        `CREATE UNIQUE INDEX \`session_checkpoint_session_user_message_idx\` ON \`session_checkpoint\` (\`session_id\`,\`user_message_id\`);`,
       )
-      yield* tx.run(`CREATE INDEX \`session_group_position_idx\` ON \`session_group\` (\`position\`);`)
       yield* tx.run(
         `CREATE INDEX \`session_input_session_pending_delivery_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`,\`delivery\`,\`admitted_seq\`);`,
       )

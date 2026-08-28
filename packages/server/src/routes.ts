@@ -7,6 +7,7 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Credential } from "@opencode-ai/core/credential"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
+import { PushV2 } from "@opencode-ai/core/push"
 import { PermissionSaved } from "@opencode-ai/core/permission/saved"
 import { PtyTicket } from "@opencode-ai/core/pty/ticket"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -40,6 +41,7 @@ const applicationServices = LayerNode.group([
   PtyEnvironment.node,
   LocationServiceMap.node,
   BrowserHostBroker.node,
+  PushV2.node,
 ])
 
 export function createRoutes(password?: string) {

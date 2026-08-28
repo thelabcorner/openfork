@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "5475787e-5da2-46ec-aece-653343330ff1",
+  "id": "c88682f4-40dd-45dd-b2b9-9a375bf6e79b",
   "prevIds": [
-    "796658a2-5a8b-4bde-b6c0-6615be4f0ead"
+    "5475787e-5da2-46ec-aece-653343330ff1"
   ],
   "ddl": [
     {
@@ -56,6 +56,14 @@
     },
     {
       "name": "project",
+      "entityType": "tables"
+    },
+    {
+      "name": "push_subscription",
+      "entityType": "tables"
+    },
+    {
+      "name": "push_vapid_key",
       "entityType": "tables"
     },
     {
@@ -944,6 +952,126 @@
       "generated": null,
       "name": "id",
       "entityType": "columns",
+      "table": "push_subscription"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "endpoint",
+      "entityType": "columns",
+      "table": "push_subscription"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "p256dh",
+      "entityType": "columns",
+      "table": "push_subscription"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "auth",
+      "entityType": "columns",
+      "table": "push_subscription"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "expiration_time",
+      "entityType": "columns",
+      "table": "push_subscription"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_agent_hint",
+      "entityType": "columns",
+      "table": "push_subscription"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "push_subscription"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_seen_at",
+      "entityType": "columns",
+      "table": "push_subscription"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "push_vapid_key"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "public_key",
+      "entityType": "columns",
+      "table": "push_vapid_key"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "private_key",
+      "entityType": "columns",
+      "table": "push_vapid_key"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "push_vapid_key"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
       "table": "message"
     },
     {
@@ -1370,7 +1498,7 @@
       "type": "integer",
       "notNull": true,
       "autoincrement": false,
-      "default": "0",
+      "default": null,
       "generated": null,
       "name": "position",
       "entityType": "columns",
@@ -1822,16 +1950,6 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
-      "name": "paused_at",
-      "entityType": "columns",
-      "table": "session"
-    },
-    {
-      "type": "integer",
-      "notNull": false,
-      "autoincrement": false,
-      "default": null,
-      "generated": null,
       "name": "time_compacting",
       "entityType": "columns",
       "table": "session"
@@ -1843,6 +1961,16 @@
       "default": null,
       "generated": null,
       "name": "time_archived",
+      "entityType": "columns",
+      "table": "session"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "paused_at",
       "entityType": "columns",
       "table": "session"
     },
@@ -2331,6 +2459,24 @@
         "id"
       ],
       "nameExplicit": false,
+      "name": "push_subscription_pk",
+      "table": "push_subscription",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "push_vapid_key_pk",
+      "table": "push_vapid_key",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
       "name": "message_pk",
       "table": "message",
       "entityType": "pks"
@@ -2564,16 +2710,12 @@
         {
           "value": "session_id",
           "isExpression": false
-        },
-        {
-          "value": "ordinal",
-          "isExpression": false
         }
       ],
-      "isUnique": true,
+      "isUnique": false,
       "where": null,
       "origin": "manual",
-      "name": "session_checkpoint_session_ordinal_idx",
+      "name": "session_checkpoint_session_id_idx",
       "entityType": "indexes",
       "table": "session_checkpoint"
     },
@@ -2582,12 +2724,16 @@
         {
           "value": "session_id",
           "isExpression": false
+        },
+        {
+          "value": "ordinal",
+          "isExpression": false
         }
       ],
       "isUnique": false,
       "where": null,
       "origin": "manual",
-      "name": "session_checkpoint_session_idx",
+      "name": "session_checkpoint_session_ordinal_idx",
       "entityType": "indexes",
       "table": "session_checkpoint"
     },
@@ -2602,44 +2748,12 @@
           "isExpression": false
         }
       ],
-      "isUnique": false,
+      "isUnique": true,
       "where": null,
       "origin": "manual",
-      "name": "session_checkpoint_session_user_idx",
+      "name": "session_checkpoint_session_user_message_idx",
       "entityType": "indexes",
       "table": "session_checkpoint"
-    },
-    {
-      "columns": [
-        {
-          "value": "session_id",
-          "isExpression": false
-        },
-        {
-          "value": "assistant_message_id",
-          "isExpression": false
-        }
-      ],
-      "isUnique": false,
-      "where": null,
-      "origin": "manual",
-      "name": "session_checkpoint_session_assistant_idx",
-      "entityType": "indexes",
-      "table": "session_checkpoint"
-    },
-    {
-      "columns": [
-        {
-          "value": "position",
-          "isExpression": false
-        }
-      ],
-      "isUnique": false,
-      "where": null,
-      "origin": "manual",
-      "name": "session_group_position_idx",
-      "entityType": "indexes",
-      "table": "session_group"
     },
     {
       "columns": [
@@ -2857,6 +2971,15 @@
       "name": "device_token_hash_unique",
       "entityType": "uniques",
       "table": "device"
+    },
+    {
+      "columns": [
+        "endpoint"
+      ],
+      "nameExplicit": false,
+      "name": "push_subscription_endpoint_unique",
+      "entityType": "uniques",
+      "table": "push_subscription"
     }
   ],
   "renames": []
