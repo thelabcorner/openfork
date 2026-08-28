@@ -22,6 +22,8 @@ const AGENTS_EXTERNAL_DIR = ".agents"
 const EXTERNAL_SKILL_PATTERN = "skills/**/SKILL.md"
 const OPENCODE_SKILL_PATTERN = "{skill,skills}/**/SKILL.md"
 const SKILL_PATTERN = "**/SKILL.md"
+const LOCAL_SKILL_DIR_NAMES = ["agent-skills", "skills", ".skills", "agent_skills", ".agent-skills", "custom-skills"]
+const SKILL_MD_CANDIDATES = ["SKILL.md", "skill.md", "Skill.md"]
 
 // Built-in skill that ships with opencode. The model's intuition for what an
 // opencode.json should look like is often wrong, and opencode hard-fails on
@@ -57,6 +59,57 @@ function isSkillFrontmatter(data: unknown): data is { name: string; description?
   )
 }
 
+// Self-healing helpers: normalize names (kebab/snake/case/space tolerant) for local agent-skills
+const normalizeSkillName = (n: string) =>
+  n.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
+
+const findByNormalized = (skills: Record<string, Info>, name: string) => {
+  const norm = normalizeSkillName(name)
+  for (const [k, v] of Object.entries(skills)) {
+    if (normalizeSkillName(k) === norm) return v
+    if (normalizeSkillName(v.name) === norm) return v
+  }
+  return undefined
+}
+
+const deriveSkillName = (file: string) => {
+  const base = path.basename(file)
+  if (SKILL_MD_CANDIDATES.some((c) => c.toLowerCase() === base.toLowerCase())) {
+    return normalizeSkillName(path.basename(path.dirname(file))) || "imported-skill"
+  }
+  return normalizeSkillName(base.replace(/\.(md|markdown)$/i, "")) || "imported-skill"
+}
+
+const resolveSkillMarkdown = Effect.fnUntraced(function* (fsys: FSUtil.Interface, fileOrDir: string) {
+  if (yield* fsys.isFile(fileOrDir)) return fileOrDir
+  if (yield* fsys.isDir(fileOrDir)) {
+    for (const candidate of SKILL_MD_CANDIDATES) {
+      const next = path.join(fileOrDir, candidate)
+      if (yield* fsys.isFile(next)) return next
+    }
+    const matches = yield* Effect.tryPromise({
+      try: () =>
+        Glob.scan("*.md", {
+          cwd: fileOrDir,
+          absolute: true,
+          include: "file",
+        }),
+      catch: (error) => error,
+    }).pipe(Effect.catch(() => Effect.succeed([] as string[])))
+    const named = matches.find((m) => SKILL_MD_CANDIDATES.some((c) => path.basename(m).toLowerCase() === c.toLowerCase()))
+    if (named) return named
+    if (matches[0]) return matches[0]
+    return yield* new InvalidError({
+      path: fileOrDir,
+      message: `No SKILL.md (or other markdown skill file) in directory: ${fileOrDir}`,
+    })
+  }
+  return yield* new InvalidError({
+    path: fileOrDir,
+    message: `Skill path not found (file or directory): ${fileOrDir}`,
+  })
+})
+
 export class InvalidError extends Schema.TaggedErrorClass<InvalidError>()("SkillInvalidError", {
   path: Schema.String,
   message: Schema.optional(Schema.String),
@@ -74,7 +127,8 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Ski
   available: Schema.Array(Schema.String),
 }) {
   override get message() {
-    return `Skill "${this.name}" not found. Available skills: ${this.available.join(", ") || "none"}`
+    const list = this.available.join(", ") || "none"
+    return `Skill "${this.name}" not found. Not in local skills folders (agent-skills/, skills/, .skills/, etc.) or registered.\nAvailable: ${list}\nTip: Use skill({ mode: "list" }), a normalized name, or skill({ filePath: "..." }) for a skill outside this project (Downloads, another repo, etc.).`
   }
 }
 
@@ -99,6 +153,7 @@ export interface Interface {
   readonly all: () => Effect.Effect<Info[]>
   readonly dirs: () => Effect.Effect<string[]>
   readonly available: (agent?: Agent.Info) => Effect.Effect<Info[]>
+  readonly loadFromPath: (fileOrDir: string) => Effect.Effect<Info, InvalidError>
 }
 
 const add = Effect.fnUntraced(function* (state: State, match: string) {
@@ -218,6 +273,22 @@ const discoverSkills = Effect.fnUntraced(function* (
     yield* scan(state, dir, SKILL_PATTERN)
   }
 
+  // Self-healing local discovery: support many folder names for skills (agent-skills, skills, .skills, etc.)
+  // Multiple folders are allowed and all are scanned. Uses **/SKILL.md so subdir-per-skill works.
+  for (const dirName of LOCAL_SKILL_DIR_NAMES) {
+    const localDir = path.join(worktree, dirName)
+    if (yield* fsys.isDir(localDir)) {
+      yield* scan(state, localDir, SKILL_PATTERN, { scope: `local ${dirName}` })
+    }
+    // upward for monorepos / nested
+    const ups = yield* fsys
+      .up({ targets: [dirName], start: directory, stop: worktree })
+      .pipe(Effect.catch(() => Effect.succeed([] as string[])))
+    for (const root of ups) {
+      yield* scan(state, root, SKILL_PATTERN, { scope: `local ${dirName}` })
+    }
+  }
+
   for (const url of cfg.skills?.urls ?? []) {
     const pulledDirs = yield* discovery.pull(url)
     for (const dir of pulledDirs) {
@@ -282,14 +353,45 @@ const layer = Layer.effect(
 
     const get = Effect.fn("Skill.get")(function* (name: string) {
       const s = yield* InstanceState.get(state)
-      return s.skills[name]
+      return s.skills[name] ?? findByNormalized(s.skills, name)
     })
 
     const require = Effect.fn("Skill.require")(function* (name: string) {
       const s = yield* InstanceState.get(state)
-      const info = s.skills[name]
+      const info = s.skills[name] ?? findByNormalized(s.skills, name)
       if (info) return info
       return yield* new NotFoundError({ name, available: Object.keys(s.skills).toSorted() })
+    })
+
+    const loadFromPath = Effect.fn("Skill.loadFromPath")(function* (fileOrDir: string) {
+      const file = yield* resolveSkillMarkdown(fsys, fileOrDir)
+      const md = yield* Effect.tryPromise({
+        try: () => ConfigMarkdown.parse(file),
+        catch: (err) => err,
+      }).pipe(
+        Effect.catch((err) =>
+          Effect.fail(
+            new InvalidError({
+              path: file,
+              message: FrontmatterError.isInstance(err)
+                ? err.data.message
+                : `Failed to parse skill markdown: ${err instanceof Error ? err.message : String(err)}`,
+            }),
+          ),
+        ),
+      )
+      const name = isSkillFrontmatter(md.data) ? md.data.name : deriveSkillName(file)
+      const description = isSkillFrontmatter(md.data) ? md.data.description : undefined
+      const info: Info = {
+        name,
+        description,
+        location: file,
+        content: md.content,
+      }
+      const s = yield* InstanceState.get(state)
+      s.skills[name] = info
+      s.dirs.add(path.dirname(file))
+      return info
     })
 
     const all = Effect.fn("Skill.all")(function* () {
@@ -308,7 +410,7 @@ const layer = Layer.effect(
       return list.filter((skill) => Permission.evaluate("skill", skill.name, agent.permission).action !== "deny")
     })
 
-    return Service.of({ get, require, all, dirs, available })
+    return Service.of({ get, require, all, dirs, available, loadFromPath })
   }),
 )
 
