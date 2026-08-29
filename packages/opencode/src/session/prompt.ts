@@ -41,6 +41,8 @@ import { ShellID } from "@/tool/shell/id"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
+import { SessionIngress, formatMonitorEvents } from "./ingress"
+import { Question } from "@/question"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
 import { Cause, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
@@ -156,6 +158,8 @@ const layer = Layer.effect(
     const llm = yield* LLM.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const ingress = yield* SessionIngress.Service
+    const question = yield* Question.Service
     const database = yield* Database.Service
     const { db } = database
     let dispatchFn: TaskPromptOps["dispatch"] | undefined
@@ -1344,19 +1348,34 @@ Generate a fresh title. Do not reuse the current title.`
             !hasToolCalls &&
             lastAssistant.parentID === lastUser.id
           ) {
-            const orphan = lastAssistantMsg?.parts.find(
-              (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
-            )
-            if (orphan) {
-              yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
-                "session.id": sessionID,
-                messageID: lastAssistant.id,
-                tool: orphan.tool,
-                callID: orphan.callID,
-              })
+            const hasPendingIngress = yield* ingress.hasPending(sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
+            let gated = false
+            if (hasPendingIngress) {
+              const pendingQs2 = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
+              gated = pendingQs2.some((q: any) => q.sessionID === sessionID) || (yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))).some((p: any) => p.sessionID === sessionID)
+              if (!gated) {
+                yield* Effect.logInfo("loop continuing for pending monitor ingress", { sessionID })
+                // don't break — next iteration will drain ingress as system context
+              } else {
+                yield* Effect.logInfo("loop not continuing — ingress gated", { sessionID })
+              }
             }
-            yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
-            break
+            if (!hasPendingIngress || gated) {
+              const orphan = lastAssistantMsg?.parts.find(
+                (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
+              )
+              if (orphan) {
+                yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
+                  "session.id": sessionID,
+                  messageID: lastAssistant.id,
+                  tool: orphan.tool,
+                  callID: orphan.callID,
+                })
+              }
+              yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
+              break
+            }
+            // else: pending ingress present, not gated → continue loop to process event
           }
 
           step++
@@ -1490,6 +1509,22 @@ Generate a fresh title. Do not reuse the current title.`
 
             yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
 
+            // Drain monitor ingress at safe boundary — respecting Question/Permission gates (§48-49)
+            let monitorContext: string | undefined
+            {
+              const pendingQs = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
+              const hasQuestion = pendingQs.some((q: any) => q.sessionID === sessionID)
+              const pendingPs = yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
+              const hasPermission = pendingPs.some((p: any) => p.sessionID === sessionID)
+              if (!hasQuestion && !hasPermission) {
+                const evs = yield* ingress.drain(sessionID).pipe(Effect.catch(() => Effect.succeed([] as any[])))
+                if (evs.length > 0) monitorContext = formatMonitorEvents(evs as any)
+              } else if (hasQuestion || hasPermission) {
+                // keep queued — do not drain when gate active
+                yield* Effect.logInfo("monitor ingress gated — retaining events", { sessionID, hasQuestion, hasPermission })
+              }
+            }
+
             const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
@@ -1502,6 +1537,7 @@ Generate a fresh title. Do not reuse the current title.`
               ...instructions,
               ...(mcpInstructions ? [mcpInstructions] : []),
               ...(skills ? [skills] : []),
+              ...(monitorContext ? [monitorContext] : []),
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
@@ -1613,15 +1649,42 @@ Generate a fresh title. Do not reuse the current title.`
     const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, never, any> = Effect.fn("SessionPrompt.loop")(function* (
       input: LoopInput,
     ) {
-      // Hard interruption of the runLoop fiber (crash-level abort, not the
-      // graceful step-level path) still finalizes the turn checkpoint with
-      // status `aborted` and a captured after-state (t3 ┬º47).
       return yield* (state.ensureRunning as unknown as (a: SessionID, b: Effect.Effect<SessionV1.WithParts, never, any>, c: Effect.Effect<SessionV1.WithParts, never, any>) => Effect.Effect<SessionV1.WithParts, never, any>)(
         input.sessionID,
         lastAssistant(input.sessionID) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
         runLoop(input.sessionID).pipe(Effect.onError(() => turnCheckpoint.finishAborted(input.sessionID))) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
       )
     })
+
+    // Register monitor ingress wake handler — enqueue first, wake second, coalesce if busy, gate on Question/Permission (§42-49)
+    yield* ingress.registerWakeHandler(
+      (sessionID: SessionID) =>
+        Effect.gen(function* () {
+          const pendingQs = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])), Effect.as([]))
+          if (pendingQs.some((q: any) => q.sessionID === sessionID)) {
+            yield* Effect.logInfo("monitor wake gated by question", { sessionID })
+            return
+          }
+          const pendingPs = yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])), Effect.as([]))
+          if (pendingPs.some((p: any) => p.sessionID === sessionID)) {
+            yield* Effect.logInfo("monitor wake gated by permission", { sessionID })
+            return
+          }
+          const s = yield* sessions.get(sessionID).pipe(Effect.catch(() => Effect.succeed(undefined as any)))
+          if (!s) return
+          if (s.pausedAt !== undefined) {
+            yield* Effect.logInfo("monitor wake gated by paused session", { sessionID })
+            return
+          }
+          const st = yield* status.get(sessionID)
+          if (st.type !== "idle") {
+            yield* Effect.logInfo("monitor wake coalesced (busy)", { sessionID, status: st.type })
+            return
+          }
+          yield* Effect.logInfo("monitor wake — starting loop for pending ingress", { sessionID })
+          yield* loop({ sessionID }).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.ignore)
+        }) as Effect.Effect<void>,
+    )
 
     dispatchFn = Effect.fn("SessionPrompt.dispatch")(function* (
       input: PromptInput,
@@ -1944,6 +2007,8 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,
+    SessionIngress.node,
+    Question.node,
   ],
 })
 

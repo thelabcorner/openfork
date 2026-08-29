@@ -3,7 +3,7 @@ import path from "path"
 import * as Tool from "./tool"
 import DESCRIPTION from "./background.txt"
 import { BackgroundJob } from "@/background/job"
-import { ShellJobs, jobLogPath, jobMetaPath, jobFileStem } from "@/background/shell-jobs"
+import { ShellJobs, jobLogPath, jobMetaPath, jobMetaPathLegacy, jobFileStem } from "@/background/shell-jobs"
 import { ShellID } from "./shell/id"
 import { BashArity } from "@/permission/arity"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -37,6 +37,8 @@ type Params = Schema.Schema.Type<typeof Parameters>
 type Row = {
   id: string
   status: string
+  kind: string
+  description?: string
   command: string
   startedAt?: number
   timeoutMs?: number
@@ -66,7 +68,7 @@ const metaNumber = (meta: Record<string, unknown> | undefined, key: string): num
 
 function renderList(rows: Row[]): string {
   if (rows.length === 0) return "No background jobs."
-  const header = `${"Job".padEnd(24)} ${"Status".padEnd(14)} Command`
+  const header = `${"Job".padEnd(24)} ${"Status".padEnd(14)} ${"Kind".padEnd(10)} Command`
   const lines = [header]
   for (const row of rows) {
     const status =
@@ -77,11 +79,14 @@ function renderList(rows: Row[]): string {
           : row.exit !== null && row.exit !== undefined
             ? `${row.status} (exit ${row.exit})`
             : row.status
-    lines.push(`${row.id.padEnd(24)} ${status.padEnd(14)} ${row.command.slice(0, 60)}`)
+    const kind = (row.kind ?? "shell").padEnd(10)
+    const cmd = row.description ? `${row.command.slice(0, 45)} — ${row.description}` : row.command.slice(0, 60)
+    lines.push(`${row.id.padEnd(24)} ${status.padEnd(14)} ${kind} ${cmd}`)
   }
   if (rows.length > 0) {
     lines.push("")
     lines.push("Use `background status {id}` for details, `background read {id}` for output, `background kill {id}` to terminate.")
+    lines.push("Monitor jobs share this manager; start them with the `monitor` tool.")
   }
   return lines.join("\n")
 }
@@ -110,9 +115,13 @@ export const BackgroundTool = Tool.define(
       const entry = yield* jobs.get(id)
       const info = yield* background.get(id)
       if (entry || info) {
+        const kind = (entry as any)?.kind ?? (info?.metadata as any)?.kind ?? "shell"
+        const description = (entry as any)?.description ?? metaString(info?.metadata, "description")
         return {
           id,
           status: info?.status ?? "running",
+          kind,
+          description,
           command: entry?.command ?? info?.title ?? id,
           startedAt: info?.started_at,
           timeoutMs: metaNumber(info?.metadata, "timeoutMs"),
@@ -120,17 +129,23 @@ export const BackgroundTool = Tool.define(
           exit: exitOf(info),
         }
       }
-      // stale leftover on disk
-      const meta = yield* fs.readJson(jobMetaPath(id)).pipe(Effect.catch(() => Effect.succeed(undefined)))
+      // stale leftover on disk — try new subdir then legacy
+      const meta = yield* fs.readJson(jobMetaPath(id)).pipe(
+        Effect.catch(() => fs.readJson(jobMetaPathLegacy(id))),
+      ).pipe(Effect.catch(() => Effect.succeed(undefined)))
       if (meta && typeof meta === "object" && "id" in meta && typeof meta.id === "string") {
         const record = meta as Record<string, unknown>
         const metaId = record.id as string
         const command = typeof record.command === "string" ? record.command : undefined
         const startedAt = typeof record.startedAt === "number" ? record.startedAt : undefined
         const logPath = typeof record.logPath === "string" ? record.logPath : undefined
+        const kind = typeof record.kind === "string" ? record.kind : "shell"
+        const description = typeof record.description === "string" ? record.description : undefined
         return {
           id: metaId,
           status: "stale",
+          kind,
+          description,
           command: command ?? metaId,
           startedAt,
           logPath: logPath ?? jobLogPath(metaId),
@@ -180,26 +195,31 @@ export const BackgroundTool = Tool.define(
               const rows: Row[] = infos.map((info) => ({
                 id: info.id,
                 status: info.status,
+                kind: metaString(info.metadata, "kind") ?? "shell",
+                description: metaString(info.metadata, "description"),
                 command: info.title ?? info.id,
                 startedAt: info.started_at,
                 logPath: metaString(info.metadata, "logPath"),
                 exit: exitOf(info),
               }))
-              // stale leftovers from disk
+              // stale leftovers from disk — check both legacy flat dir and new subdir
               const live = new Set(rows.map((row) => row.id))
-              const entries = yield* fs.readDirectoryEntries(TRUNCATION_DIR).pipe(
-                Effect.catch(() => Effect.succeed([])),
-              )
-              for (const entry of entries) {
-                if (!entry.name.startsWith("job_") || !entry.name.endsWith(".json")) continue
-                const meta = yield* fs.readJson(path.join(TRUNCATION_DIR, entry.name)).pipe(
+              const scanDirs = [TRUNCATION_DIR, path.join(TRUNCATION_DIR, "job-output")]
+              const entries: Array<{ name: string; dir: string }> = []
+              for (const dir of scanDirs) {
+                const chunk = yield* fs.readDirectoryEntries(dir).pipe(Effect.catch(() => Effect.succeed([] as any[])))
+                for (const e of chunk as any[]) entries.push({ name: e.name, dir })
+              }
+              for (const { name, dir } of entries) {
+                if (!name.startsWith("job_") || !name.endsWith(".json")) continue
+                const meta = yield* fs.readJson(path.join(dir, name)).pipe(
                   Effect.catch(() => Effect.succeed(undefined)),
                 )
                 if (!meta || typeof meta !== "object") continue
-                const m = meta as { id?: string; command?: string; startedAt?: number }
-                const id = m.id ?? jobFileStem(entry.name.slice(0, -".json".length))
+                const m = meta as { id?: string; command?: string; startedAt?: number; kind?: string; description?: string }
+                const id = m.id ?? jobFileStem(name.slice(0, -".json".length))
                 if (!id || live.has(id)) continue
-                rows.push({ id, status: "stale", command: m.command ?? id, startedAt: m.startedAt, logPath: jobLogPath(id) })
+                rows.push({ id, status: "stale", kind: m.kind ?? "shell", description: m.description, command: m.command ?? id, startedAt: m.startedAt, logPath: jobLogPath(id) })
                 live.add(id)
               }
               rows.sort((a, b) => (a.startedAt ?? 0) - (b.startedAt ?? 0))
@@ -215,8 +235,10 @@ export const BackgroundTool = Tool.define(
               const row = yield* jobRow(params.id)
               if (!row) throw new Error(`No such job: ${params.id}`)
               const lines = [
-                `<job id="${row.id}" status="${row.status}">`,
+                `<job id="${row.id}" status="${row.status}" kind="${row.kind}">`,
                 `<command>${row.command}</command>`,
+                `Kind: ${row.kind}`,
+                ...(row.description ? [`Description: ${row.description}`] : []),
                 `Status: ${row.status}${row.exit !== null && row.exit !== undefined ? ` (exit ${row.exit})` : ""}`,
               ]
               if (row.startedAt) lines.push(`Started: ${new Date(row.startedAt).toISOString()}`)

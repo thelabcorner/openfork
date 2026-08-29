@@ -819,6 +819,9 @@ export const ShellTool = Tool.define(
               forceKillAfter: "3 seconds",
             }),
           )
+          const shellDelivery = input.notify
+            ? { mode: "completion" as const, ownerSessionID: ctx.sessionID as unknown as string }
+            : { mode: "none" as const }
           yield* jobs.register({
             id: input.jobId,
             handle,
@@ -830,7 +833,10 @@ export const ShellTool = Tool.define(
             metaPath: input.metaPath,
             notify: input.notify,
             timeoutMs: input.timeoutMs,
-          })
+            kind: "shell",
+            delivery: shellDelivery,
+            startedAt: Date.now(),
+          } as any)
           yield* Effect.addFinalizer(() => jobs.remove(input.jobId).pipe(Effect.ignore))
 
           yield* Effect.forkScoped(
@@ -989,12 +995,19 @@ export const ShellTool = Tool.define(
                     jobId,
                     logPath,
                     notify: wantsNotify,
+                    kind: "shell",
+                    delivery: wantsNotify
+                      ? { mode: "completion", ownerSessionID: ctx.sessionID }
+                      : { mode: "none" },
                     startedAt,
                     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
                   }
 
                   yield* fs.ensureDir(TRUNCATION_DIR)
                   yield* fs.writeFileString(logPath, "")
+                  const shellMetaDelivery = wantsNotify
+                    ? { mode: "completion" as const, ownerSessionID: ctx.sessionID as unknown as string }
+                    : { mode: "none" as const }
                   yield* fs.writeJson(metaPath, {
                     id: jobId,
                     command: params.command,
@@ -1002,6 +1015,8 @@ export const ShellTool = Tool.define(
                     cwd,
                     startedAt,
                     notify: wantsNotify,
+                    kind: "shell",
+                    delivery: shellMetaDelivery,
                     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
                   })
 

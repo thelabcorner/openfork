@@ -2,8 +2,8 @@ Manages commands launched in the background with the `bash` tool (`background: t
 
 Actions (use the `action` parameter):
 
-- `list` — List every background job in this project plus `stale` leftovers from before a restart. Columns: id, status, command, started time, log path.
-- `status` — Full status for one job: status (running/completed/error/cancelled/stale), exit code, command, started/completed times, and the log path. Pass the job `id` returned at launch.
+- `list` — List every background job in this project plus `stale` leftovers from before a restart. Columns: id, status, kind (shell|monitor), command (+ monitor description), started time, log path.
+- `status` — Full status for one job: status (running/completed/error/cancelled/stale), kind, description (for monitors), exit code, command, started/completed times, and the log path. Pass the job `id` returned at launch.
 - `read` — Read the job's log file (live progress while running, full output after it finishes). `offset` is the 1-indexed line to start from (default 1); `limit` is the max number of lines to return (default 2000). Returns `(no output yet)` when the job has not produced output. Full logs are never truncated by this tool — use `offset`/`limit` to page.
 - `wait` — Block until the job finishes (or until `timeout` ms, if given; `0` polls once). Returns the final status, exit code, and a tail of the output. Omit `timeout` to wait indefinitely.
 - `send` — Write `input` to the job's stdin (a newline is appended if the input does not end with one). Only works while the job is running; errors if the job already exited. Requires the same `bash` permission as the job's original command.
@@ -12,5 +12,6 @@ Actions (use the `action` parameter):
 Notes:
 
 - Jobs are scoped to the project instance and die on restart; leftover logs are listed as `stale` and remain readable for 7 days.
-- A job started in one session can be managed from any session in the same project; only the launching session receives the completion notification (when launched with `notify: true`).
+- A job started in one session can be managed from any session in the same project; only the launching session receives the completion notification (when launched with `notify: true`). Monitor jobs use the same manager — start them with the `monitor` tool and control them here.
 - `kill`/`send` ask for the `bash` permission using the job's original command, so an existing "always allow" rule for that command covers them with no extra prompts.
+- Monitor jobs appear with `kind=monitor` and their `description` in `list`/`status`; they share the same `read`/`wait`/`send`/`kill` lifecycle — there is no separate monitor manager.

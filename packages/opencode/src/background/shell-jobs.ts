@@ -5,6 +5,19 @@ import { InstanceState } from "@/effect/instance-state"
 import { TRUNCATION_DIR } from "@/tool/truncation-dir"
 import path from "path"
 
+export type ShellJobKind = "shell" | "monitor"
+
+export type ShellJobDelivery =
+  | { readonly mode: "none" }
+  | { readonly mode: "completion"; readonly ownerSessionID: string }
+  | {
+      readonly mode: "events"
+      readonly ownerSessionID: string
+      readonly description: string
+      readonly debounceMs: number
+      readonly eventStream: "stdout"
+    }
+
 export type ShellJobEntry = {
   id: string
   handle: ChildProcessHandle
@@ -16,6 +29,10 @@ export type ShellJobEntry = {
   metaPath: string
   notify: boolean
   timeoutMs?: number
+  kind: ShellJobKind
+  delivery: ShellJobDelivery
+  startedAt: number
+  description?: string
 }
 
 export interface Interface {

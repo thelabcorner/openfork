@@ -20,6 +20,7 @@ import { SkillTool } from "./skill"
 import { ArchiveTool } from "./archive"
 import { JsonTool } from "./json"
 import { BackgroundTool } from "./background"
+import { MonitorTool } from "./monitor"
 import { SqliteTool } from "./sqlite"
 import { GitTool } from "./git"
 import { CheckpointTool } from "./checkpoint"
@@ -87,6 +88,9 @@ import { Skill } from "../skill"
 import { Permission } from "@/permission"
 import { BackgroundJob } from "@/background/job"
 import { ShellJobs } from "@/background/shell-jobs"
+import { MonitorDelivery } from "@/background/monitor-delivery"
+import { SessionIngress } from "@/session/ingress"
+import { ShellJob } from "@/background/shell-job"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -171,6 +175,7 @@ const layer = Layer.effect(
     const archivetool = yield* ArchiveTool
     const jsontool = yield* JsonTool
     const backgroundtool = yield* BackgroundTool
+    const monitortool = yield* MonitorTool
     const sqlitetool = yield* SqliteTool
     const gittool = yield* GitTool
     const checkpointtool = yield* CheckpointTool
@@ -241,6 +246,7 @@ const layer = Layer.effect(
           archive: Tool.init(archivetool),
           json: Tool.init(jsontool),
           background: Tool.init(backgroundtool),
+          monitor: Tool.init(monitortool),
           sqlite: Tool.init(sqlitetool),
           git: Tool.init(gittool),
           checkpoint: Tool.init(checkpointtool),
@@ -303,6 +309,7 @@ const layer = Layer.effect(
             tool.archive,
             tool.json,
             tool.background,
+            tool.monitor,
             tool.sqlite,
             tool.git,
             tool.checkpoint,
@@ -491,6 +498,9 @@ export const node = LayerNode.make({
     Project.node,
     BackgroundJob.node,
     ShellJobs.node,
+    MonitorDelivery.node,
+    SessionIngress.node,
+    ShellJob.node,
     Provider.node,
     LSP.node,
     Instruction.node,
