@@ -1325,6 +1325,18 @@ function ModelSelectorPopoverV2View(props: {
     void getOpenRouterEndpoints(modelID, fetchOpenRouterEndpoints).then(async (result) => {
       const endpoints = result ? await addOpenRouterTelemetry(modelID, result) : result
       if (!disposed) setOpenRouterStore(modelID, { loading: false, endpoints })
+      // Prune a stale pinned upstream provider that would brick the model.
+      // OpenRouter returns 404 "No allowed providers are available" when
+      // `provider.only` contains a provider that no longer serves the model
+      // (e.g. tencent for xiaomi/mimo-v2.5-20260422). The pin is persisted per
+      // model, so we clear it automatically when we discover it's invalid.
+      if (endpoints && local?.model) {
+        const key = { providerID: "openrouter", modelID }
+        const pinned = local.model.subProvider.get(key)
+        if (pinned && !endpoints.some((entry) => entry.provider === pinned)) {
+          local.model.subProvider.set(key, undefined)
+        }
+      }
     })
   }
 

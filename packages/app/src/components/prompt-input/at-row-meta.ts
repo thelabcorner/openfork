@@ -61,10 +61,39 @@ export function formatRelativeTime(mtimeMs: number, now: number = Date.now()): s
   return `${years}y ago`
 }
 
-// A size is only trustworthy alongside a trustworthy timestamp: absent metadata
-// coerced to 0 upstream would otherwise render as a fabricated "0 B".
-export function hasKnownFileMeta(size: number | undefined, mtime: number | undefined): size is number {
-  return typeof size === "number" && Number.isFinite(size) && size >= 0 && typeof mtime === "number" && mtime > 0
+export function formatAbsoluteTime(mtimeMs: number, locale: string = "en"): string {
+  if (!Number.isFinite(mtimeMs) || mtimeMs <= 0) return ""
+  try {
+    return new Intl.DateTimeFormat(locale, {
+      dateStyle: "medium",
+      timeStyle: "short",
+    }).format(new Date(mtimeMs))
+  } catch {
+    return new Date(mtimeMs).toLocaleString()
+  }
+}
+
+export function formatFolderCount(count: number): string {
+  if (!Number.isFinite(count) || count < 0) return ""
+  if (count < 1000) return `${count}`
+  if (count < 10000) return `${(count / 1000).toFixed(1)}k`
+  if (count < 1_000_000) return `${Math.round(count / 1000)}k`
+  return `${(count / 1_000_000).toFixed(1)}M`
+}
+
+// Size and mtime are independently valid. Previously size required mtime>0,
+// which hid size/lineCount when mtime was missing/zero. Each field now
+// validates on its own so consumers can render whatever is available.
+export function hasKnownFileMeta(size: number | undefined, _mtime: number | undefined): size is number {
+  return typeof size === "number" && Number.isFinite(size) && size >= 0
+}
+
+export function hasKnownMtime(mtime: number | undefined): boolean {
+  return typeof mtime === "number" && Number.isFinite(mtime) && mtime > 0
+}
+
+export function hasKnownLineCount(lines: number | undefined): boolean {
+  return typeof lines === "number" && Number.isFinite(lines) && lines >= 0
 }
 
 export function formatLineCount(lines: number): string {

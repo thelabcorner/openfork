@@ -7,7 +7,7 @@ import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
-import { createEffect, createMemo, createSignal, lazy, on, onCleanup, Show, Suspense } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, lazy, on, onCleanup, Show, Suspense } from "solid-js"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
 const ModelSelectorPopoverV2 = lazy(async () => {
   const mod = await import("@/components/dialog-select-model")
@@ -494,8 +494,38 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       resource,
     })),
   )
+  const sdkClient = useSDK()
+  const [skillsResource] = createResource(async () => {
+    try {
+      const result: any = await sdkClient().client.v2.skill.list({})
+      if (Array.isArray(result)) return result
+      if (Array.isArray(result?.data)) {
+        // Unified SDK wrapper vs Location.response shape: data may be the array or { location, data: [...] }
+        const inner = result.data
+        if (Array.isArray(inner)) return inner
+      }
+      if (Array.isArray(result?.data?.data)) return result.data.data
+      if (Array.isArray(result?.data?.data?.data)) return result.data.data.data
+      return []
+    } catch {
+      return []
+    }
+  })
+  const skills = createMemo<PromptInputV2Suggestion[]>(() => {
+    const raw = skillsResource() as unknown
+    const list: any[] = Array.isArray(raw) ? raw : []
+    return list.map((skill: any) => ({
+      id: `skill:${skill.name}`,
+      kind: "skill" as const,
+      label: `@${skill.name}`,
+      title: skill.name,
+      description: skill.description ?? "",
+      mention: { type: "skill" as const, name: skill.name, content: `@${skill.name}`, start: 0, end: 0 },
+    }))
+  })
   const context = createMemo<PromptInputV2Suggestion[]>(() => [
     ...references(),
+    ...skills(),
     ...props.controls.agents.available
       .filter((agent) => !agent.hidden && agent.mode !== "primary")
       .map((agent) => ({

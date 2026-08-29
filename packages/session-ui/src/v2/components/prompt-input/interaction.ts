@@ -4,12 +4,15 @@ import { useFilteredList } from "@opencode-ai/ui/hooks"
 import { createPromptInputV2Attachments, largePaste, pasteFilename, type PromptInputV2AttachmentConfig } from "./attachments"
 import { createPromptInputV2Store, type PromptInputV2StoreInput } from "./store"
 import type {
+  PromptInputV2AgentPart,
   PromptInputV2Attachment,
   PromptInputV2Comment,
+  PromptInputV2FilePart,
   PromptInputV2History,
   PromptInputV2HistoryEntry,
   PromptInputV2Option,
   PromptInputV2PersistedState,
+  PromptInputV2SkillPart,
   PromptInputV2Suggestion,
 } from "./types"
 import {
@@ -115,8 +118,8 @@ export function createPromptInputV2Controller(input: {
   }
   function addPart(part: PromptInputV2PersistedState["prompt"][number]) {
     if (part.type === "image") return false
-    if (part.type === "file" || part.type === "agent") {
-      draft.addMention(part)
+    if (part.type === "file" || part.type === "agent" || part.type === "skill") {
+      draft.addMention(part as PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart)
       return true
     }
     draft.addText(part.content)

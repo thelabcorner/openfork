@@ -25,6 +25,12 @@ export type PromptInputV2AgentPart = PromptInputV2PartBase & {
   name: string
 }
 
+export type PromptInputV2SkillPart = PromptInputV2PartBase & {
+  type: "skill"
+  name: string
+  description?: string
+}
+
 export type PromptInputV2ExternalPathPart = PromptInputV2PartBase & {
   type: "external-path"
   path: string
@@ -45,6 +51,7 @@ export type PromptInputV2Prompt = (
   | PromptInputV2TextPart
   | PromptInputV2FilePart
   | PromptInputV2AgentPart
+  | PromptInputV2SkillPart
   | PromptInputV2ExternalPathPart
   | PromptInputV2Attachment
 )[]
@@ -102,7 +109,7 @@ export type PromptInputV2Option = {
 
 export type PromptInputV2Suggestion = {
   id: string
-  kind: "agent" | "command" | "file" | "reference" | "resource"
+  kind: "agent" | "command" | "file" | "reference" | "resource" | "skill"
   label: string
   title?: string
   trigger?: string
@@ -110,7 +117,7 @@ export type PromptInputV2Suggestion = {
   path?: string
   keybind?: string[]
   recent?: boolean
-  mention?: PromptInputV2FilePart | PromptInputV2AgentPart
+  mention?: PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart
   /** Character offsets into `label` matched by the server-side query, when known (file search results). */
   positions?: number[]
   /** File size in bytes, when known (file search results). */

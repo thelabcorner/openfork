@@ -324,6 +324,7 @@ function renderPromptInputV2Editor(
       mention.dataset.mention =
         part.type === "file" && part.mime === "application/x-directory" ? "reference" : part.type
       if (part.type === "agent") mention.dataset.name = part.name
+      if (part.type === "skill") mention.dataset.name = part.name
       if (part.type === "file") {
         mention.dataset.path = part.path
         if (part.mime) mention.dataset.mime = part.mime
@@ -437,6 +438,17 @@ function parsePromptInputV2Editor(editor: HTMLDivElement) {
     if (element.dataset.mention === "agent") {
       parts.push({
         type: "agent",
+        name: element.dataset.name ?? content.slice(1),
+        content,
+        start: position,
+        end: position + content.length,
+      })
+      position += content.length
+      return
+    }
+    if (element.dataset.mention === "skill") {
+      parts.push({
+        type: "skill",
         name: element.dataset.name ?? content.slice(1),
         content,
         start: position,
@@ -792,18 +804,18 @@ export function PromptInputV2Popover(props: {
 }) {
   return (
     <div
-      class="absolute inset-x-0 -top-2 z-40 flex max-h-80 -translate-y-full flex-col overflow-auto rounded-xl bg-v2-background-bg-base p-2 shadow-[var(--v2-elevation-raised)] no-scrollbar"
+      class="absolute inset-x-0 -top-2 z-40 flex max-h-72 -translate-y-full flex-col overflow-auto rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-base p-1 shadow-[var(--v2-elevation-floating)] no-scrollbar"
       onMouseDown={(event) => event.preventDefault()}
     >
       <Show when={props.search}>
         {(search) => (
-          <div class="px-2 py-1">
+          <div class="mb-1 border-b border-v2-border-border-muted px-1.5 pb-1">
             <input
               ref={(element) => requestAnimationFrame(() => element.focus())}
               value={search().value}
               aria-label={search().label}
               placeholder={search().placeholder}
-              class="w-full bg-transparent text-[13px] leading-5 text-v2-text-text-base outline-none placeholder:text-v2-text-text-faint"
+              class="w-full bg-transparent px-0.5 py-1 text-[12.5px] leading-4 text-v2-text-text-base outline-none placeholder:text-v2-text-text-faint"
               onInput={(event) => search().onValueChange(event.currentTarget.value)}
               onKeyDown={(event) => search().onKeyDown(event)}
               onMouseDown={(event) => event.stopPropagation()}
@@ -813,7 +825,7 @@ export function PromptInputV2Popover(props: {
       </Show>
       <Show
         when={props.items.length > 0}
-        fallback={<div class="px-2 py-1 text-v2-text-text-muted">{props.emptyLabel}</div>}
+        fallback={<div class="px-2 py-2 text-[12px] text-v2-text-text-faint">{props.emptyLabel}</div>}
       >
         <For each={props.items}>
           {(item) => (
@@ -821,25 +833,35 @@ export function PromptInputV2Popover(props: {
               type="button"
               tabIndex={-1}
               data-suggestion-id={item.id}
-              class="flex w-full items-center gap-2 rounded-md px-2 py-1 text-start hover:bg-v2-overlay-simple-overlay-hover"
+              class="flex h-[26px] w-full shrink-0 items-center gap-2 rounded-[6px] px-1.5 text-start hover:bg-v2-overlay-simple-overlay-hover"
               classList={{ "bg-v2-overlay-simple-overlay-hover": props.activeID === item.id }}
               onPointerMove={() => props.onActiveChange(item)}
               onClick={() => props.onSelect(item)}
             >
-              <div class="flex min-w-0 flex-1 items-center gap-2">
-                <PromptInputV2SuggestionIcon item={item} />
-                <span class="shrink-0 text-v2-text-text-base">
+              <div class="flex min-w-0 flex-1 items-center gap-2 overflow-hidden">
+                <PromptInputV2SuggestionIcon item={item} active={props.activeID === item.id} />
+                <div
+                  class="flex min-w-0 items-baseline gap-1.5 overflow-hidden"
+                  classList={{
+                    "flex-1": item.kind === "file",
+                    "shrink-0 max-w-[48%]": item.kind !== "file",
+                  }}
+                >
                   <PromptInputV2SuggestionLabel item={item} query={props.query} />
-                </span>
-                <Show when={item.description}>
-                  <span class="min-w-0 truncate text-v2-text-text-muted">{item.description}</span>
+                </div>
+                <Show when={item.kind !== "file" && item.description}>
+                  <span class="min-w-0 flex-1 truncate text-[12px] leading-4 text-v2-text-text-faint">
+                    {item.description}
+                  </span>
                 </Show>
               </div>
               <Show when={promptInputV2SuggestionMeta(item)}>
-                {(meta) => <span class="shrink-0 text-[11px] tabular-nums text-v2-text-text-faint">{meta()}</span>}
+                {(meta) => (
+                  <span class="shrink-0 text-[10.5px] tabular-nums text-v2-text-text-faint">{meta()}</span>
+                )}
               </Show>
               <Show when={item.keybind?.length}>
-                <span class="shrink-0 text-v2-text-text-muted">{item.keybind?.join("+")}</span>
+                <KeybindV2 keys={item.keybind ?? []} variant="ghost" />
               </Show>
             </button>
           )}
@@ -854,20 +876,13 @@ export function PromptInputV2Popover(props: {
 // searchContextFiles's mapping in prompt-input-v2.tsx.
 function promptInputV2SuggestionMeta(item: PromptInputV2Suggestion): string | undefined {
   if (item.kind !== "file") return undefined
-  // Epoch-0 / negative timestamps are coerced-absent metadata, never real:
-  // a size is only shown when the mtime pair is trustworthy.
-  const mtime = item.mtime
-  const hasTime = typeof mtime === "number" && Number.isFinite(mtime) && mtime > 0
   const parts: string[] = []
-  if (hasTime && typeof item.size === "number" && Number.isFinite(item.size) && item.size >= 0)
+  if (typeof item.size === "number" && Number.isFinite(item.size) && item.size >= 0)
     parts.push(formatPromptInputV2FileSize(item.size))
-  if (hasTime && mtime !== undefined) parts.push(formatPromptInputV2RelativeTime(mtime))
-  if (
-    hasTime &&
-    typeof item.lineCount === "number" &&
-    Number.isFinite(item.lineCount) &&
-    item.lineCount >= 0
-  )
+  // Epoch-0 / negative timestamps are coerced-absent metadata, never real.
+  if (typeof item.mtime === "number" && Number.isFinite(item.mtime) && item.mtime > 0)
+    parts.push(formatPromptInputV2RelativeTime(item.mtime))
+  if (typeof item.lineCount === "number" && Number.isFinite(item.lineCount) && item.lineCount >= 0)
     parts.push(formatPromptInputV2LineCount(item.lineCount))
   return parts.length > 0 ? parts.join(" · ") : undefined
 }
@@ -922,12 +937,46 @@ function formatPromptInputV2RelativeTime(mtimeMs: number, now: number = Date.now
 // expose match indices. This is a deliberate pragmatic choice, not a
 // fabricated positions array.
 function PromptInputV2SuggestionLabel(props: { item: PromptInputV2Suggestion; query?: string }) {
-  const segments = createMemo(() => highlightPromptInputV2Label(props.item.label, props.item.positions, props.query))
+  const split = createMemo(() => {
+    // Only file-kind suggestions carry a full path as their label (recent files /
+    // searchContextFiles results) — split those into a bright filename + a muted
+    // directory, mirroring how dense IDE pickers (JetBrains, VS Code) present paths.
+    if (props.item.kind !== "file") return undefined
+    return splitPromptInputV2PathSegments(props.item.label, props.item.positions, props.query)
+  })
   return (
-    <For each={segments()}>
+    <Show
+      when={split()}
+      fallback={
+        <span class="min-w-0 truncate text-[12.5px] font-[440] leading-4 text-v2-text-text-base">
+          <PromptInputV2LabelSegments
+            segments={highlightPromptInputV2Label(props.item.label, props.item.positions, props.query)}
+          />
+        </span>
+      }
+    >
+      {(value) => (
+        <>
+          <span class="min-w-0 truncate text-[12.5px] font-[440] leading-4 text-v2-text-text-base">
+            <PromptInputV2LabelSegments segments={value().nameSegments} />
+          </span>
+          <Show when={value().dirSegments.length}>
+            <span class="min-w-0 truncate text-[11px] font-[440] leading-4 text-v2-text-text-faint">
+              <PromptInputV2LabelSegments segments={value().dirSegments} />
+            </span>
+          </Show>
+        </>
+      )}
+    </Show>
+  )
+}
+
+function PromptInputV2LabelSegments(props: { segments: PromptInputV2LabelSegment[] }) {
+  return (
+    <For each={props.segments}>
       {(segment) =>
         segment.matched ? (
-          <span class="rounded-[2px] bg-v2-overlay-simple-overlay-hover text-v2-text-text-accent">{segment.text}</span>
+          <span class="font-[600] text-v2-text-text-accent">{segment.text}</span>
         ) : (
           <>{segment.text}</>
         )
@@ -937,6 +986,37 @@ function PromptInputV2SuggestionLabel(props: { item: PromptInputV2Suggestion; qu
 }
 
 type PromptInputV2LabelSegment = { text: string; matched: boolean }
+
+// Splits a full-path label into filename/directory segment runs at the last
+// path separator, preserving match highlighting across the split point.
+function splitPromptInputV2PathSegments(
+  label: string,
+  positions: number[] | undefined,
+  query: string | undefined,
+): { dirSegments: PromptInputV2LabelSegment[]; nameSegments: PromptInputV2LabelSegment[] } | undefined {
+  const nameStart = label.length - getFilename(label).length
+  if (nameStart <= 0) return undefined
+  const segments = highlightPromptInputV2Label(label, positions, query)
+  const dirSegments: PromptInputV2LabelSegment[] = []
+  const nameSegments: PromptInputV2LabelSegment[] = []
+  let offset = 0
+  for (const segment of segments) {
+    const start = offset
+    const end = offset + segment.text.length
+    offset = end
+    if (end <= nameStart) {
+      dirSegments.push(segment)
+      continue
+    }
+    if (start >= nameStart) {
+      nameSegments.push(segment)
+      continue
+    }
+    dirSegments.push({ text: segment.text.slice(0, nameStart - start), matched: segment.matched })
+    nameSegments.push({ text: segment.text.slice(nameStart - start), matched: segment.matched })
+  }
+  return { dirSegments, nameSegments }
+}
 
 function highlightPromptInputV2Label(label: string, positions: number[] | undefined, query: string | undefined): PromptInputV2LabelSegment[] {
   if (positions && positions.length > 0) {
@@ -1009,14 +1089,15 @@ export function PromptInputV2SubmitButton(props: {
   )
 }
 
-function PromptInputV2SuggestionIcon(props: { item: PromptInputV2Suggestion }) {
-  if (props.item.kind === "agent") return <Icon name="brain" size="small" class="shrink-0 text-icon-info-active" />
-  if (props.item.kind === "command") return <Icon name="terminal" size="small" class="shrink-0 text-icon-info-active" />
-  if (props.item.kind === "resource") return <Icon name="mcp" size="small" class="shrink-0 text-icon-info-active" />
+function PromptInputV2SuggestionIcon(props: { item: PromptInputV2Suggestion; active?: boolean }) {
+  const color = props.active ? "text-v2-icon-icon-base" : "text-v2-icon-icon-muted"
+  if (props.item.kind === "agent") return <Icon name="brain" size="small" class={`shrink-0 ${color}`} />
+  if (props.item.kind === "command") return <Icon name="terminal" size="small" class={`shrink-0 ${color}`} />
+  if (props.item.kind === "resource") return <Icon name="mcp" size="small" class={`shrink-0 ${color}`} />
   return (
     <FileIcon
       node={{ path: props.item.path ?? props.item.label, type: props.item.kind === "reference" ? "directory" : "file" }}
-      class="size-4 shrink-0"
+      class={`size-4 shrink-0 ${color}`}
     />
   )
 }

@@ -13,6 +13,7 @@ import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { buildPersonalFallbackMap, buildPricingFallbackMap, compareByCheapness } from "@/utils/model-cost"
 import { buildModelCostIndex } from "@/utils/model-usage-history"
+import { Section } from "@/components/session/insights-primitives"
 import "../settings-v2/settings-v2.css"
 
 type ModelItem = ReturnType<ReturnType<typeof useLocal>["model"]["list"]>[number]
@@ -62,16 +63,6 @@ function TelemetryRow(props: { endpoint: EndpointTelemetry }) {
   )
 }
 
-function Section(props: { title: string; children: import("solid-js").JSX.Element }) {
-  return (
-    <section class="flex flex-col gap-2">
-      <h3 class="text-[10px] font-[600] uppercase leading-3 tracking-[0.02em] text-v2-text-text-faint">
-        {props.title}
-      </h3>
-      {props.children}
-    </section>
-  )
-}
 
 export function ModelsPanelContent() {
   const language = useLanguage()

@@ -19,6 +19,8 @@ import {
   createCommandPaletteFileEntry,
   createCommandPaletteModel,
   createServerSessionEntries,
+  formatCommandPaletteFileSize,
+  formatCommandPaletteLineCount,
   uniqueCommandPaletteEntries,
   type CommandPaletteEntry,
 } from "./command-palette"
@@ -41,12 +43,18 @@ export function DialogCommandPaletteV2(props: { onOpenFile?: (path: string) => v
     const q = text.trim()
     if (!q) return [...palette.preferredCommandEntries(), ...palette.recentFileEntries()]
 
-    const [files, nextSessions] = await Promise.all([palette.file.searchFiles(q), Promise.resolve(palette.sessions(q))])
+    const [mentions, nextSessions] = await Promise.all([
+      palette.file.searchMentions(q, { limit: 50 }),
+      Promise.resolve(palette.sessions(q)),
+    ])
     const category = palette.language.t("palette.group.files")
     return [
       ...palette.commandEntries().filter((entry) => matchesEntry(entry, q)),
       ...nextSessions,
-      ...files.map((path) => createCommandPaletteFileEntry(path, category)),
+      ...mentions.results.flatMap((entry) => {
+        if (entry.kind !== "file" || entry.type === "directory") return []
+        return [createCommandPaletteFileEntry(entry.path, category, entry)]
+      }),
     ]
   }
 
@@ -259,6 +267,20 @@ function PaletteRow(props: {
       ? { server: props.item.server, directory: props.item.directory, sessionID: props.item.sessionID }
       : undefined
 
+  // Right-aligned, muted metadata (file size / modified time / line count), when
+  // available — only mention-search results (typed queries) currently carry it;
+  // pinned recents/root listing don't fetch file stats.
+  const fileMeta = () => {
+    const parts: string[] = []
+    if (typeof props.item.size === "number" && Number.isFinite(props.item.size) && props.item.size >= 0)
+      parts.push(formatCommandPaletteFileSize(props.item.size))
+    if (typeof props.item.mtime === "number" && Number.isFinite(props.item.mtime) && props.item.mtime > 0)
+      parts.push(getRelativeTime(new Date(props.item.mtime).toISOString(), props.language.t))
+    if (typeof props.item.lineCount === "number" && Number.isFinite(props.item.lineCount) && props.item.lineCount >= 0)
+      parts.push(formatCommandPaletteLineCount(props.item.lineCount))
+    return parts.filter(Boolean).join(" · ") || undefined
+  }
+
   return (
     <button
       type="button"
@@ -276,13 +298,16 @@ function PaletteRow(props: {
     >
       <Switch
         fallback={
-          <div class="command-palette-v2-row-main">
-            <FileIcon node={{ path: props.item.path ?? "", type: "file" }} class="command-palette-v2-row-icon size-4" />
-            <div class="command-palette-v2-file-path">
-              <span class="command-palette-v2-file-dir">{getDirectory(props.item.path ?? "")}</span>
-              <span class="command-palette-v2-file-name">{getFilename(props.item.path ?? "")}</span>
+          <>
+            <div class="command-palette-v2-row-main">
+              <FileIcon node={{ path: props.item.path ?? "", type: "file" }} class="command-palette-v2-row-icon size-4" />
+              <div class="command-palette-v2-file-path">
+                <span class="command-palette-v2-file-name">{getFilename(props.item.path ?? "")}</span>
+                <span class="command-palette-v2-file-dir">{getDirectory(props.item.path ?? "").replace(/\/$/, "")}</span>
+              </div>
             </div>
-          </div>
+            <Show when={fileMeta()}>{(meta) => <span class="command-palette-v2-meta">{meta()}</span>}</Show>
+          </>
         }
       >
         <Match when={props.item.type === "command"}>

@@ -13,6 +13,8 @@ import {
   formatLineCount,
   formatRelativeTime,
   hasKnownFileMeta,
+  hasKnownLineCount,
+  hasKnownMtime,
   symbolIconGroup,
   truncateMiddle,
 } from "./at-row-meta"
@@ -256,7 +258,10 @@ function AtPathContent(props: { option: Extract<AtOption, { type: "file" }>; v2:
   const size = () => props.option.size
   const mtime = () => props.option.mtime
   const lineCount = () => props.option.lineCount
-  const hasMeta = () => !isDirectory() && hasKnownFileMeta(size(), mtime())
+  const hasSize = () => !isDirectory() && hasKnownFileMeta(size(), mtime())
+  const hasMtime = () => !isDirectory() && hasKnownMtime(mtime())
+  const hasLines = () => !isDirectory() && hasKnownLineCount(lineCount())
+  const hasAnyMeta = () => hasSize() || hasMtime() || hasLines()
   const kicker = () => (isDirectory() ? "Folder" : ext() ? `File • ${ext()!.toUpperCase()}` : "File")
   return (
     <AtRichRow
@@ -285,17 +290,21 @@ function AtPathContent(props: { option: Extract<AtOption, { type: "file" }>; v2:
             {truncateMiddle(props.option.path, 72)}
           </span>
           <span class="ms-auto shrink-0 flex items-center gap-1.5 text-[11px] tabular-nums leading-none">
-            <Show when={hasMeta()}>
+            <Show when={hasSize()}>
               <span class="inline-flex items-center gap-1 text-zinc-200 bg-zinc-800 border border-zinc-700/50 rounded-full px-2 py-0.5 shadow-sm">
                 {formatFileSize(size()!)}
               </span>
             </Show>
-            <Show when={hasMeta()}>
-              <span class="text-zinc-600">·</span>
+            <Show when={hasMtime()}>
+              <Show when={hasSize()}>
+                <span class="text-zinc-600">·</span>
+              </Show>
               <span class="text-zinc-400">{formatRelativeTime(mtime()!)}</span>
             </Show>
-            <Show when={hasMeta() && typeof lineCount() === "number" && Number.isFinite(lineCount()!)}>
-              <span class="text-zinc-600">·</span>
+            <Show when={hasLines()}>
+              <Show when={hasSize() || hasMtime()}>
+                <span class="text-zinc-600">·</span>
+              </Show>
               <span class="inline-flex items-center gap-1 text-zinc-400">
                 <span class="text-zinc-600">#</span>
                 {formatLineCount(lineCount()!)}

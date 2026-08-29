@@ -9,12 +9,13 @@
 }
 
 [data-component="dialog-v2"]:has(.command-palette-v2) [data-slot="dialog-container"] {
-  width: min(calc(100vw - 24px), 640px);
+  width: min(calc(100vw - 24px), 600px);
   height: auto;
-  min-height: 280px;
-  max-height: min(calc(100vh - 96px), 480px);
-  margin-top: max(48px, calc((100vh - 480px) / 2));
-  border-radius: 12px;
+  min-height: 240px;
+  max-height: min(calc(100vh - 96px), 440px);
+  margin-top: max(48px, calc((100vh - 440px) / 2));
+  border-radius: 10px;
+  border: 1px solid var(--v2-border-border-muted);
   background: var(--v2-background-bg-base);
   box-shadow: var(--v2-elevation-floating);
 }
@@ -30,40 +31,37 @@
 
 .command-palette-v2-search {
   flex-shrink: 0;
-  padding: 6px;
+  padding: 5px;
+  border-bottom: 1px solid var(--v2-border-border-muted);
 }
 
 .command-palette-v2-search [data-component="text-input-v2"] {
   width: 100%;
-  height: 36px;
+  height: 32px;
   border-radius: 6px;
   outline: 0;
-  background: color-mix(in srgb, var(--v2-background-bg-layer-02) 60%, transparent);
+  background: transparent;
   box-shadow: none;
   transition:
     background-color 120ms ease-in-out,
     box-shadow 120ms ease-in-out;
 }
 
-.command-palette-v2-search [data-component="text-input-v2"]:where(:hover):not([data-disabled], [data-invalid]),
-.command-palette-v2-search [data-component="text-input-v2"]:where(:focus-within):not([data-disabled], [data-invalid]) {
-  background: var(--v2-background-bg-layer-02);
-  box-shadow: none;
-}
-
 .command-palette-v2-search [data-component="text-input-v2"] [data-slot="text-input-v2-value"] {
   border-radius: 6px;
   background: transparent;
-  gap: 8px;
+  gap: 6px;
 }
 
 .command-palette-v2-search [data-component="text-input-v2"] [data-slot="text-input-v2-leading-icon"] {
-  padding-left: 12px;
+  padding-left: 10px;
+  color: var(--v2-icon-icon-muted);
 }
 
 .command-palette-v2-search [data-component="text-input-v2"] [data-slot="text-input-v2-input"] {
   border-radius: 6px;
   background: transparent;
+  font-size: 13px;
 }
 
 .command-palette-v2-scroll {
@@ -74,8 +72,8 @@
 .command-palette-v2-results {
   display: flex;
   flex-direction: column;
-  gap: 16px;
-  padding: 6px 6px 8px;
+  gap: 8px;
+  padding: 5px 5px 6px;
 }
 
 .command-palette-v2-group {
@@ -85,32 +83,33 @@
 }
 
 .command-palette-v2-group-title {
-  margin: 6px 0;
-  padding: 0 12px;
-  color: var(--v2-text-text-muted);
-  font-size: 13px;
-  font-weight: 440;
-  line-height: 16px;
-  letter-spacing: -0.04px;
+  margin: 4px 0 3px;
+  padding: 0 10px;
+  color: var(--v2-text-text-faint);
+  font-size: 10px;
+  font-weight: 590;
+  line-height: 14px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
   user-select: none;
 }
 
 .command-palette-v2-row {
   display: flex;
   width: 100%;
-  height: 36px;
+  height: 30px;
   flex-shrink: 0;
   align-items: center;
   justify-content: space-between;
   gap: 8px;
-  padding: 0 12px;
+  padding: 0 10px;
   border: 0;
-  border-radius: 6px;
+  border-radius: 5px;
   background: transparent;
   color: var(--v2-text-text-base);
   text-align: left;
   cursor: default;
-  scroll-margin: 6px 0;
+  scroll-margin: 5px 0;
 }
 
 .command-palette-v2-row[data-active] {
@@ -135,6 +134,10 @@
   color: var(--v2-icon-icon-muted);
 }
 
+.command-palette-v2-row[data-active] .command-palette-v2-row-icon {
+  color: var(--v2-icon-icon-base);
+}
+
 .command-palette-v2-row-text {
   display: flex;
   min-width: 0;
@@ -146,9 +149,9 @@
   min-width: 0;
   overflow: hidden;
   color: var(--v2-text-text-base);
-  font-size: 13px;
-  font-weight: 530;
-  line-height: 16px;
+  font-size: 12.5px;
+  font-weight: 500;
+  line-height: 15px;
   letter-spacing: -0.04px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -158,10 +161,10 @@
 .command-palette-v2-meta {
   min-width: 0;
   overflow: hidden;
-  color: var(--v2-text-text-muted);
-  font-size: 13px;
+  color: var(--v2-text-text-faint);
+  font-size: 12px;
   font-weight: 440;
-  line-height: 16px;
+  line-height: 15px;
   letter-spacing: -0.04px;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -169,21 +172,25 @@
 
 .command-palette-v2-meta {
   flex-shrink: 0;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
 }
 
 .command-palette-v2-file-path {
   display: flex;
   min-width: 0;
   align-items: baseline;
-  font-size: 13px;
-  line-height: 16px;
+  gap: 6px;
+  font-size: 12.5px;
+  line-height: 15px;
   letter-spacing: -0.04px;
 }
 
 .command-palette-v2-file-dir {
   min-width: 0;
   overflow: hidden;
-  color: var(--v2-text-text-muted);
+  color: var(--v2-text-text-faint);
+  font-size: 11px;
   font-weight: 440;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -192,16 +199,16 @@
 .command-palette-v2-file-name {
   flex-shrink: 0;
   color: var(--v2-text-text-base);
-  font-weight: 530;
+  font-weight: 500;
   white-space: nowrap;
 }
 
 .command-palette-v2-state {
   display: grid;
-  min-height: 120px;
+  min-height: 100px;
   place-items: center;
-  color: var(--v2-text-text-muted);
-  font-size: 13px;
+  color: var(--v2-text-text-faint);
+  font-size: 12.5px;
   font-weight: 440;
   line-height: 16px;
   letter-spacing: -0.04px;

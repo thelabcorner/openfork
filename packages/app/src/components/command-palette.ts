@@ -31,6 +31,9 @@ export type CommandPaletteEntry = {
   project?: LocalProject
   archived?: number
   updated?: number
+  size?: number
+  mtime?: number
+  lineCount?: number
 }
 
 const ENTRY_LIMIT = 5
@@ -52,14 +55,45 @@ export function uniqueCommandPaletteEntries(items: CommandPaletteEntry[]) {
   })
 }
 
-export function createCommandPaletteFileEntry(path: string, category: string): CommandPaletteEntry {
+export function createCommandPaletteFileEntry(
+  path: string,
+  category: string,
+  meta?: { size?: number; mtime?: number; lineCount?: number },
+): CommandPaletteEntry {
   return {
     id: "file:" + path,
     type: "file",
     title: path,
     category,
     path,
+    size: meta?.size,
+    mtime: meta?.mtime,
+    lineCount: meta?.lineCount,
   }
+}
+
+// Mirrors the density-formatting used by the anchored @-mention popover
+// (packages/session-ui .../prompt-input/index.tsx) so both spotlight
+// presentations read the same file size / line count.
+export function formatCommandPaletteFileSize(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return ""
+  if (bytes < 1000) return `${bytes} B`
+  const units = ["KB", "MB", "GB", "TB"]
+  let value = bytes / 1000
+  let unitIndex = 0
+  while (value >= 1000 && unitIndex < units.length - 1) {
+    value /= 1000
+    unitIndex++
+  }
+  return `${value.toFixed(value < 10 ? 1 : 0)} ${units[unitIndex]}`
+}
+
+export function formatCommandPaletteLineCount(lines: number): string {
+  if (!Number.isFinite(lines) || lines < 0) return ""
+  if (lines === 1) return "1 line"
+  if (lines < 1000) return `${lines} lines`
+  if (lines < 10000) return `${(lines / 1000).toFixed(1)}k lines`
+  return `${Math.round(lines / 1000)}k lines`
 }
 
 export function createCommandPaletteFileOpener(onOpenFile?: (path: string) => void) {
