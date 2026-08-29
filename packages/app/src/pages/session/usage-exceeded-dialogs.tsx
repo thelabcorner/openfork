@@ -1,5 +1,7 @@
 import { useSDK } from "@/context/sdk"
+import { useServerSDK } from "@/context/server-sdk"
 import { Persist, persisted } from "@/utils/persist"
+import { appendZenLimitHit } from "@/utils/zen-free-usage"
 import { SessionStatus } from "@opencode-ai/sdk/v2"
 import { onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
@@ -35,6 +37,7 @@ function goUpsellKeys(status: SessionStatus) {
 
 export function useUsageExceededDialogs() {
   const sdk = useSDK()
+  const serverSDK = useServerSDK()
   const dialog = useDialog()
   const { params } = useSessionLayout()
   const { t, locale } = useI18n()
@@ -49,6 +52,10 @@ export function useUsageExceededDialogs() {
       [GO_UPSELL_ACCOUNT_RATE_LIMIT_DONT_SHOW]: null as null | number,
     }),
   )
+  const [zenLimitHits, setZenLimitHits] = persisted(
+    Persist.serverGlobal(serverSDK().scope, "zen-free-tier-hits"),
+    createStore({ entries: [] as number[] }),
+  )
 
   onCleanup(
     sdk().event.on("session.status", (evt) => {
@@ -56,6 +63,16 @@ export function useUsageExceededDialogs() {
       if (evt.properties.status.type !== "retry") return
       const { action } = evt.properties.status
       if (!action) return
+
+      // This is the strongest signal available to the Zen quota learner. Log
+      // it independently of whether the upsell dialog is suppressed, already
+      // visible, or disabled by the user. Nearby retries are collapsed into
+      // one exhaustion episode before persistence.
+      if (action.reason === "free_tier_limit" && GO_UPSELL_PROVIDERS.has(action.provider)) {
+        const at = Date.now()
+        setZenLimitHits("entries", appendZenLimitHit(zenLimitHits.entries, at))
+      }
+
       if (dialog.active) return
 
       const keys = goUpsellKeys(evt.properties.status)
