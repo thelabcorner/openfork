@@ -37,6 +37,7 @@ type PluralKey =
   | "chats.footer.sessions"
   | "chats.footer.active"
   | "chats.archived.count"
+  | "projectExplorer.folder.count"
 
 const base = i18n.flatten({ ...en, ...uiEn })
 const dicts = new Map<Locale, Dictionary>([["en", base]])

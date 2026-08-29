@@ -56,6 +56,30 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       }),
     )
 
+    // One-time migration: clear stale OpenRouter provider pin that bricks
+    // xiaomi/mimo-v2.5-20260422 (tencent no longer serves it, but persisted
+    // preference still sends `provider: { only: ["tencent"] }` and triggers
+    // "No allowed providers are available" on every request). Generic stale
+    // handling also runs when endpoints are fetched (dialog-select-model.tsx).
+    void ready.promise?.then(() => {
+      const stale = store.subProvider
+      if (!stale) return
+      // Specific known-bad pin from the bug report.
+      const staleKey = "openrouter:xiaomi/mimo-v2.5-20260422"
+      if (stale[staleKey] === "tencent") {
+        setStore("subProvider", staleKey, undefined)
+      }
+      // Also prune any other "tencent" pin for the dated 20260422 variant
+      // family where tencent is not a known provider - best-effort, avoids
+      // leaving a bricked model if the id shifts slightly (e.g. suffix).
+      for (const [key, value] of Object.entries(stale)) {
+        if (value !== "tencent") continue
+        if (key.includes("mimo-v2.5-20260422") && key.startsWith("openrouter:")) {
+          setStore("subProvider", key, undefined)
+        }
+      }
+    })
+
     const available = createMemo(() =>
       providers.connected().flatMap((p) =>
         Object.values(p.models).map((m) => ({
@@ -213,7 +237,7 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
     const [recentModels] = createResource(
       async () => {
         const recent = store.recent
-        await ready.promise
+        if (ready.promise) await ready.promise
         return recent
       },
       (p) => p,

@@ -188,18 +188,22 @@ export function createChildStoreManager(input: {
           const initialIcon = icon[0].value
           const [mcpEnabled, setMcpEnabled] = createSignal(false)
           const [instanceQueriesEnabled, setInstanceQueriesEnabled] = createSignal(false)
+          // Deferred tier: lsp + references are not on critical paint and can
+          // idle-delay to avoid the 36-request burst. They auto-enable after
+          // instanceQueriesEnabled has been true for one idle callback.
+          const [deferredQueriesEnabled, setDeferredQueriesEnabled] = createSignal(false)
 
           const pathQuery = useQuery(() => ({ ...input.queryOptions.path(key), enabled: instanceQueriesEnabled() }))
           const mcpQuery = useQuery(() => ({ ...input.queryOptions.mcp(key), enabled: mcpEnabled() }))
           const mcpResourceQuery = useQuery(() => ({ ...input.queryOptions.mcpResources(key), enabled: mcpEnabled() }))
-          const lspQuery = useQuery(() => ({ ...input.queryOptions.lsp(key), enabled: instanceQueriesEnabled() }))
+          const lspQuery = useQuery(() => ({ ...input.queryOptions.lsp(key), enabled: deferredQueriesEnabled() }))
           const providerQuery = useQuery(() => ({
             ...input.queryOptions.providers(key),
             enabled: instanceQueriesEnabled(),
           }))
           const referenceQuery = useQuery(() => ({
             ...input.queryOptions.references(key),
-            enabled: instanceQueriesEnabled(),
+            enabled: deferredQueriesEnabled(),
           }))
 
           const child = createStore<State>({
@@ -248,7 +252,7 @@ export function createChildStoreManager(input: {
               return mcpResourceQuery.isLoading ? {} : (mcpResourceQuery.data ?? {})
             },
             get lsp_ready() {
-              return instanceQueriesEnabled() && !lspQuery.isLoading
+              return deferredQueriesEnabled() && !lspQuery.isLoading
             },
             get lsp() {
               return lspQuery.isLoading ? [] : (lspQuery.data ?? [])
@@ -263,7 +267,27 @@ export function createChildStoreManager(input: {
           children[key] = child
           disposers.set(key, dispose)
           mcpToggles.set(key, setMcpEnabled)
-          activationToggles.set(key, setInstanceQueriesEnabled)
+          activationToggles.set(key, (value: boolean) => {
+            setInstanceQueriesEnabled(value)
+            if (!value) {
+              setDeferredQueriesEnabled(false)
+              return
+            }
+            // Burst control: first two active directories get lsp/references
+            // immediately (tests + critical path); beyond that idle-defer so
+            // startup goes from 24 parallel lsp+ref+path+provider requests to
+            // 4-8 + deferred 16, cutting 705ms thundering herd.
+            const immediate = activeDirectories.size < 2
+            if (immediate) {
+              setDeferredQueriesEnabled(true)
+              return
+            }
+            if (typeof requestIdleCallback === "function") {
+              requestIdleCallback(() => setDeferredQueriesEnabled(true), { timeout: 900 })
+            } else {
+              setTimeout(() => setDeferredQueriesEnabled(true), 180)
+            }
+          })
 
           const onPersistedInit = (init: Promise<string> | string | null, run: () => void) => {
             if (!(init instanceof Promise)) return

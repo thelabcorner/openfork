@@ -506,10 +506,16 @@ export function MessageTimeline(props: {
       }
     },
     anchorTo: "end",
-    followOnAppend: true,
-    scrollEndThreshold: 80,
+    get scrollEndThreshold() {
+      // While following, only the stick band counts as "at end". The old 80px
+      // window re-anchored the first inertial ticks of a fast upward fling.
+      return props.shouldAnchorBottom() ? 10 : 0
+    },
     get scrollMargin() {
       return showHeader() ? 64 : 0
+    },
+    get followOnAppend() {
+      return props.shouldAnchorBottom()
     },
     overscan: 50,
     paddingEnd: 64,
@@ -545,7 +551,7 @@ export function MessageTimeline(props: {
   const anchorResizedBottom = () => {
     if (resizeAnchorScheduled || props.hasScrollGesture()) return
     resizeAnchorScheduled = true
-    queueMicrotask(() => {
+    requestAnimationFrame(() => {
       resizeAnchorScheduled = false
       if (!props.shouldAnchorBottom() || props.hasScrollGesture()) return
       virtualizer.scrollToEnd()
@@ -611,6 +617,7 @@ export function MessageTimeline(props: {
   })
 
   let overscanFrame: number | undefined
+  let maybeAnchorFrame: number | undefined
   onMount(() => {
     overscanFrame = requestAnimationFrame(() => {
       if (props.shouldAnchorBottom()) virtualizer.scrollToEnd()
@@ -628,7 +635,12 @@ export function MessageTimeline(props: {
     if (resizePinFrame !== undefined) cancelAnimationFrame(resizePinFrame)
     clearPrependAnchor()
     if (prependAnchorFrame !== undefined) cancelAnimationFrame(prependAnchorFrame)
-    virtualizer.scrollToEnd()
+    if (maybeAnchorFrame !== undefined) return
+    maybeAnchorFrame = requestAnimationFrame(() => {
+      maybeAnchorFrame = undefined
+      if (!props.shouldAnchorBottom() || props.hasScrollGesture()) return
+      virtualizer.scrollToEnd()
+    })
   }
 
   // NOTE: this component instance is shared across session tabs (only remounts
@@ -656,6 +668,7 @@ export function MessageTimeline(props: {
     while (timelineCache.size > 16) timelineCache.delete(timelineCache.keys().next().value!)
     if (resizePinFrame !== undefined) cancelAnimationFrame(resizePinFrame)
     if (overscanFrame !== undefined) cancelAnimationFrame(overscanFrame)
+    if (maybeAnchorFrame !== undefined) cancelAnimationFrame(maybeAnchorFrame)
     props.setRevealMessage?.(() => {})
     props.setRevealRow?.(() => {})
     props.setScrollToEnd?.(() => {})
@@ -770,7 +783,9 @@ export function MessageTimeline(props: {
   }
 
   const handleListPointerMove = (event: PointerEvent) => {
-    if (event.buttons !== 1) return
+    // Left (1) or middle (4): middle-click autoscroll holds button 4 while
+    // the cursor offset drives inertial scrolling.
+    if ((event.buttons & 5) === 0) return
     props.onMarkScrollGesture(event.target)
   }
 
@@ -787,9 +802,13 @@ export function MessageTimeline(props: {
     if (prependLoading) updatePrependAnchor()
     props.onScheduleScrollState(event.currentTarget)
     props.onHistoryScroll()
-    if (!props.hasScrollGesture()) return
-    props.onUserScroll()
     props.onAutoScrollHandleScroll()
+    const el = event.currentTarget
+    const away = el.scrollHeight - el.clientHeight - el.scrollTop > 2
+    // Keep the gesture window alive for inertial / middle-click autoscroll,
+    // which produce scroll events without pointer buttons after mouseup.
+    if (!props.hasScrollGesture() && !away) return
+    props.onUserScroll()
     props.onMarkScrollGesture(event.currentTarget)
   }
 

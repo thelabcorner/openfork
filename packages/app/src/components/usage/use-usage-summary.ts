@@ -26,7 +26,7 @@ export function createUsageSummary(input: {
   windowDef: Accessor<UsageWindowDef>
   projectID: Accessor<string | null>
   refreshTick: Accessor<number>
-  }) {
+}) {
   const serverSDK = useServerSDK()
   let activeController: AbortController | undefined
   const [summary] = createResource(

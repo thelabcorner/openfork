@@ -497,16 +497,16 @@ export function SessionHeader() {
                           variant="ghost"
                           class="titlebar-icon w-8 h-6 p-0 box-border"
                           aria-label={language.t("command.usage.toggle")}
-                          aria-expanded={layout.usage.opened()}
-                          aria-controls="usage-panel"
-                          onClick={() => void startTransition(() => layout.usage.toggle())}
+                          aria-expanded={layout.sessionContext.opened() && layout.sessionContext.tab() === "usage"}
+                          aria-controls="context-panel"
+                          onClick={() => void startTransition(() => layout.sessionContext.selectTab("usage"))}
                         >
                           <Icon
                             size="small"
                             name="usage"
                             classList={{
-                              "text-icon-strong": layout.usage.opened(),
-                              "text-icon-weak": !layout.usage.opened(),
+                              "text-icon-strong": layout.sessionContext.opened() && layout.sessionContext.tab() === "usage",
+                              "text-icon-weak": !(layout.sessionContext.opened() && layout.sessionContext.tab() === "usage"),
                             }}
                           />
                         </Button>
@@ -517,16 +517,16 @@ export function SessionHeader() {
                           variant="ghost"
                           class="titlebar-icon w-8 h-6 p-0 box-border"
                           aria-label={language.t("command.limits.toggle")}
-                          aria-expanded={layout.limits.opened()}
-                          aria-controls="limits-panel"
-                          onClick={() => void startTransition(() => layout.limits.toggle())}
+                          aria-expanded={layout.sessionContext.opened() && layout.sessionContext.tab() === "limits"}
+                          aria-controls="context-panel"
+                          onClick={() => void startTransition(() => layout.sessionContext.selectTab("limits"))}
                         >
                           <Icon
                             size="small"
                             name="providers"
                             classList={{
-                              "text-icon-strong": layout.limits.opened(),
-                              "text-icon-weak": !layout.limits.opened(),
+                              "text-icon-strong": layout.sessionContext.opened() && layout.sessionContext.tab() === "limits",
+                              "text-icon-weak": !(layout.sessionContext.opened() && layout.sessionContext.tab() === "limits"),
                             }}
                           />
                         </Button>

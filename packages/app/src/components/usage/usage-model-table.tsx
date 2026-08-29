@@ -1,15 +1,33 @@
-import { createMemo, createSignal, For, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useLanguage } from "@/context/language"
 import { formatNumber, formatTokens, formatTokensExact, formatUSD, formatUSDCompact } from "./usage-format"
 import { UsageTooltipContent } from "./usage-chart"
-import type { ModelGroup } from "./usage-model-groups"
+import { SortHeader } from "./usage-table"
+import { createColumnSort } from "./usage-sort"
+import type { ModelGroup, TokenBreakdown } from "./usage-model-groups"
 import type { modelsForProvider } from "./usage-model-groups"
 
 const GROUPED_GRID = "grid-cols-[14px_minmax(0,1fr)_44px_56px_64px_36px]"
 const FLAT_GRID = "grid-cols-[minmax(0,1fr)_44px_56px_64px_36px]"
+
+type SortColumn = "model" | "requests" | "cost" | "tokens" | "share"
+
+/** $/1M tokens — a blended rate useful for comparing cost-efficiency across models. */
+const blendedRate = (cost: number, tokens: number) => (tokens > 0 ? (cost / tokens) * 1_000_000 : 0)
+
+function tokenBreakdownRows(language: ReturnType<typeof useLanguage>, breakdown: TokenBreakdown, cost: number, tokens: number) {
+  return [
+    { label: language.t("usage.table.inputTokens"), value: formatTokensExact(breakdown.input, language.intl()) },
+    { label: language.t("usage.table.outputTokens"), value: formatTokensExact(breakdown.output, language.intl()) },
+    { label: language.t("usage.table.cacheReadTokens"), value: formatTokensExact(breakdown.cacheRead, language.intl()) },
+    { label: language.t("usage.table.cacheWriteTokens"), value: formatTokensExact(breakdown.cacheWrite, language.intl()) },
+    { label: language.t("usage.table.reasoningTokens"), value: formatTokensExact(breakdown.reasoning, language.intl()) },
+    { label: language.t("usage.table.rate"), value: formatUSD(blendedRate(cost, tokens), language.intl()) },
+  ]
+}
 
 /**
  * Every unique model name gets exactly one row here, however many
@@ -18,18 +36,36 @@ const FLAT_GRID = "grid-cols-[minmax(0,1fr)_44px_56px_64px_36px]"
  * list would hide. A filter box is offered once the list is long enough that
  * scanning it stops being the fastest way to find one model.
  */
-export function UsageModelTable(props: { groups: ModelGroup[] }) {
+export function UsageModelTable(props: { groups: ModelGroup[]; metric?: "cost" | "tokens" }) {
   const language = useLanguage()
   const [query, setQuery] = createSignal("")
   const [expanded, setExpanded] = createSignal<ReadonlySet<string>>(new Set())
+  const sort = createColumnSort<ModelGroup, SortColumn>(props.metric === "tokens" ? "tokens" : "cost", (group, column) => {
+    switch (column) {
+      case "model":
+        return group.modelID
+      case "requests":
+        return group.messages
+      case "cost":
+        return group.cost
+      case "tokens":
+        return group.tokens
+      case "share":
+        return group.share
+    }
+  })
+  createEffect(() => sort.syncDefault(props.metric === "tokens" ? "tokens" : "cost"))
 
   const filtered = createMemo(() => {
     const q = query().trim().toLowerCase()
     if (!q) return props.groups
     return props.groups.filter(
-      (group) => group.modelID.toLowerCase().includes(q) || group.providers.some((entry) => entry.providerID.toLowerCase().includes(q)),
+      (group) =>
+        group.modelID.toLowerCase().includes(q) ||
+        group.providers.some((entry) => entry.providerID.toLowerCase().includes(q) || entry.modelID.toLowerCase().includes(q)),
     )
   })
+  const sorted = createMemo(() => sort.sort(filtered()))
 
   const toggle = (modelID: string) => {
     setExpanded((prev) => {
@@ -52,23 +88,23 @@ export function UsageModelTable(props: { groups: ModelGroup[] }) {
         />
       </Show>
       <div class="flex flex-col overflow-hidden rounded-md border border-v2-border-border-muted">
-        <div class={`grid ${GROUPED_GRID} items-center gap-1 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2 py-1 text-[8px] font-[600] uppercase leading-3 tracking-[0.03em] text-v2-text-text-faint`}>
+        <div class={`grid ${GROUPED_GRID} items-center gap-1 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2 py-1`}>
           <span />
-          <span>{language.t("usage.table.model")}</span>
-          <span class="text-right">{language.t("usage.table.requests")}</span>
-          <span class="text-right">{language.t("usage.table.cost")}</span>
-          <span class="text-right">{language.t("usage.table.tokens")}</span>
-          <span class="text-right">{language.t("usage.table.share")}</span>
+          <SortHeader label={language.t("usage.table.model")} column="model" active={sort.column()} direction={sort.direction()} onClick={sort.toggle} />
+          <SortHeader label={language.t("usage.table.requests")} column="requests" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
+          <SortHeader label={language.t("usage.table.cost")} column="cost" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
+          <SortHeader label={language.t("usage.table.tokens")} column="tokens" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
+          <SortHeader label={language.t("usage.table.share")} column="share" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
         </div>
         <Show
-          when={filtered().length > 0}
+          when={sorted().length > 0}
           fallback={
             <div class="px-2 py-3 text-center text-[10px] font-[440] text-v2-text-text-faint">
               {language.t("usage.models.empty")}
             </div>
           }
         >
-          <For each={filtered()}>
+          <For each={sorted()}>
             {(group) => {
               const isOpen = () => expanded().has(group.modelID)
               return (
@@ -84,6 +120,7 @@ export function UsageModelTable(props: { groups: ModelGroup[] }) {
                           { label: language.t("usage.metric.tokens"), value: formatTokensExact(group.tokens, language.intl()) },
                           { label: language.t("usage.table.share"), value: `${Math.round(group.share * 100)}%` },
                           { label: language.t("usage.metric.cacheSavings"), value: formatUSD(group.cacheSavings, language.intl()) },
+                          ...tokenBreakdownRows(language, group.tokenBreakdown, group.cost, group.tokens),
                         ]}
                       />
                     }
@@ -130,6 +167,12 @@ export function UsageModelTable(props: { groups: ModelGroup[] }) {
                             <span class="flex min-w-0 items-center gap-1 truncate">
                               <ProviderIcon id={entry.providerID} class="size-2.5 shrink-0 opacity-60" />
                               <span class="min-w-0 truncate">{entry.providerID}</span>
+                              {/* The group can now merge providers that route the same model under different id strings
+                                  (e.g. a direct API vs. an OpenRouter `vendor/model-id`) — surface the raw id whenever it
+                                  differs from the group's canonical label, so "why is this here" is never a mystery. */}
+                              <Show when={entry.modelID !== group.modelID}>
+                                <span class="min-w-0 truncate text-v2-text-text-faint">({entry.modelID})</span>
+                              </Show>
                               <Show when={entry.variant}>
                                 <span class="shrink-0 rounded-sm bg-v2-background-bg-layer-03 px-1 text-[8px] uppercase leading-3.5 text-v2-text-text-faint">
                                   {entry.variant}
@@ -155,26 +198,44 @@ export function UsageModelTable(props: { groups: ModelGroup[] }) {
 }
 
 /** A single provider's own models — already scoped, so a flat (non-grouped) table. */
-export function UsageProviderModelTable(props: { rows: ReturnType<typeof modelsForProvider> }) {
+export function UsageProviderModelTable(props: { rows: ReturnType<typeof modelsForProvider>; metric?: "cost" | "tokens" }) {
   const language = useLanguage()
+  type ProviderModelRow = ReturnType<typeof modelsForProvider>[number]
+  const sort = createColumnSort<ProviderModelRow, SortColumn>(props.metric === "tokens" ? "tokens" : "cost", (row, column) => {
+    switch (column) {
+      case "model":
+        return row.modelID
+      case "requests":
+        return row.messages
+      case "cost":
+        return row.cost
+      case "tokens":
+        return row.tokens
+      case "share":
+        return row.share
+    }
+  })
+  createEffect(() => sort.syncDefault(props.metric === "tokens" ? "tokens" : "cost"))
+  const sorted = createMemo(() => sort.sort(props.rows))
+
   return (
     <div class="flex flex-col overflow-hidden rounded-md border border-v2-border-border-muted">
-      <div class={`grid ${FLAT_GRID} items-center gap-1 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2 py-1 text-[8px] font-[600] uppercase leading-3 tracking-[0.03em] text-v2-text-text-faint`}>
-        <span>{language.t("usage.table.model")}</span>
-        <span class="text-right">{language.t("usage.table.requests")}</span>
-        <span class="text-right">{language.t("usage.table.cost")}</span>
-        <span class="text-right">{language.t("usage.table.tokens")}</span>
-        <span class="text-right">{language.t("usage.table.share")}</span>
+      <div class={`grid ${FLAT_GRID} items-center gap-1 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2 py-1`}>
+        <SortHeader label={language.t("usage.table.model")} column="model" active={sort.column()} direction={sort.direction()} onClick={sort.toggle} />
+        <SortHeader label={language.t("usage.table.requests")} column="requests" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
+        <SortHeader label={language.t("usage.table.cost")} column="cost" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
+        <SortHeader label={language.t("usage.table.tokens")} column="tokens" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
+        <SortHeader label={language.t("usage.table.share")} column="share" active={sort.column()} direction={sort.direction()} align="right" onClick={sort.toggle} />
       </div>
       <Show
-        when={props.rows.length > 0}
+        when={sorted().length > 0}
         fallback={
           <div class="px-2 py-3 text-center text-[10px] font-[440] text-v2-text-text-faint">
             {language.t("usage.models.empty")}
           </div>
         }
       >
-        <For each={props.rows}>
+        <For each={sorted()}>
           {(row) => (
             <TooltipV2
               placement="right"
@@ -187,6 +248,7 @@ export function UsageProviderModelTable(props: { rows: ReturnType<typeof modelsF
                     { label: language.t("usage.metric.tokens"), value: formatTokensExact(row.tokens, language.intl()) },
                     { label: language.t("usage.table.share"), value: `${Math.round(row.share * 100)}%` },
                     { label: language.t("usage.metric.cacheSavings"), value: formatUSD(row.cacheSavings, language.intl()) },
+                    ...tokenBreakdownRows(language, row.tokenBreakdown, row.cost, row.tokens),
                   ]}
                 />
               }

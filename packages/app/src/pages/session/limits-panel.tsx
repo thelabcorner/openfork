@@ -1,4 +1,4 @@
-import { createMemo, createSignal, For, Show, Switch, Match, type JSX } from "solid-js"
+import { createMemo, createSignal, For, Show, Switch, Match, type Accessor, type JSX } from "solid-js"
 import { ResizeHandle, type ResizeHandlePairSide } from "@opencode-ai/ui/resize-handle"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
@@ -472,9 +472,9 @@ function GoGroup(props: {
 
 type Entry = { key: string; sort: number; kind: "provider"; provider: LimitProvider } | { key: string; sort: number; kind: "go" }
 
-function LimitsPanelContent() {
+export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
   const language = useLanguage()
-  const now = useNow()
+  const now = useNow(() => props.active?.() ?? true)
   const { providers, goAggregate, goByCredential, goCredentials, openRouterFree, isLoading, hasError, error, refresh, isCoolingDown, cooldownRemainingMs } = useLimits({ now })
 
   const showGoAggregate = createMemo(() => goAggregate().length > 0 || goByCredential().length > 0)

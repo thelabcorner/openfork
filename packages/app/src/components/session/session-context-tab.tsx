@@ -1,5 +1,5 @@
 import { createMemo, createEffect, createSignal, on, onCleanup, For, Show } from "solid-js"
-import type { JSX } from "solid-js"
+import type { Accessor, JSX } from "solid-js"
 import { useSync } from "@/context/sync"
 import { checksum } from "@opencode-ai/core/util/encode"
 import { findLast } from "@opencode-ai/core/util/array"
@@ -39,8 +39,11 @@ import {
   type ModelCostRate,
 } from "./session-context-model-metrics"
 import { createSessionContextFormatter } from "./session-context-format"
+import { MetricCell, Section } from "./insights-primitives"
 
 const emptyLiveProgress: LiveGenerationProgress = { generatedSeconds: 0, toolSeconds: 0 }
+const emptySessionParts: Record<string, Part[] | undefined> = {}
+const emptyProviderList: Parameters<typeof aggregateSessionContextByModel>[2] = []
 
 const BREAKDOWN_COLOR: Record<SessionContextBreakdownKey, string> = {
   system: "var(--syntax-info)",
@@ -67,72 +70,6 @@ const COST_COLOR = {
 
 type CategorySegment = { key: string; label: string; amount: number; color: string; display: string }
 
-function Section(props: { title: string; value?: string; tooltip?: string; children: JSX.Element }) {
-  return (
-    <section class="flex flex-col gap-2">
-      <div class="flex items-baseline justify-between gap-2">
-        <h3 class="flex items-center gap-1 text-[10px] font-[600] uppercase leading-3 tracking-[0.02em] text-v2-text-text-faint">
-          <span>{props.title}</span>
-          <Show when={props.tooltip}>
-            {(tooltip) => (
-              <TooltipV2 value={<div class="max-w-64 text-11-regular">{tooltip()}</div>}>
-                <span class="inline-flex text-v2-text-text-faint hover:text-v2-text-text-muted" tabIndex={0}>
-                  <IconV2 name="help" size="small" />
-                </span>
-              </TooltipV2>
-            )}
-          </Show>
-        </h3>
-        <Show when={props.value}>
-          <span class="text-[10px] font-[520] tabular-nums text-v2-text-text-muted">{props.value}</span>
-        </Show>
-      </div>
-      {props.children}
-    </section>
-  )
-}
-
-function LiveDot(props: { color?: string }) {
-  return (
-    <span class="relative flex size-1.5 shrink-0">
-      <span
-        class="absolute inline-flex size-full animate-ping rounded-full opacity-60"
-        style={{ "background-color": props.color ?? "var(--syntax-success)" }}
-      />
-      <span class="relative inline-flex size-1.5 rounded-full" style={{ "background-color": props.color ?? "var(--syntax-success)" }} />
-    </span>
-  )
-}
-
-function MetricCell(props: { label: string; value: JSX.Element; sub?: string; tooltip?: string; live?: boolean }) {
-  return (
-    <div class="flex min-w-0 flex-col gap-0.5 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2 py-1.5">
-      <div class="flex items-center gap-1">
-        <Show when={props.live}>
-          <LiveDot />
-        </Show>
-        <span class="min-w-0 truncate text-[9px] font-[500] uppercase leading-3 tracking-[0.02em] text-v2-text-text-faint">
-          {props.label}
-        </span>
-        <Show when={props.tooltip}>
-          {(tooltip) => (
-            <TooltipV2 value={<div class="max-w-64 text-11-regular">{tooltip()}</div>}>
-              <span class="inline-flex shrink-0 text-v2-text-text-faint hover:text-v2-text-text-muted" tabIndex={0}>
-                <IconV2 name="help" size="small" />
-              </span>
-            </TooltipV2>
-          )}
-        </Show>
-      </div>
-      <span class="min-w-0 truncate text-[13px] font-[600] leading-4 tabular-nums text-v2-text-text-base">
-        {props.value}
-      </span>
-      <Show when={props.sub}>
-        <span class="truncate text-[9px] font-[440] leading-3 text-v2-text-text-faint">{props.sub}</span>
-      </Show>
-    </div>
-  )
-}
 
 function InfoCard(props: { children: JSX.Element }) {
   return <div class="flex flex-col overflow-hidden rounded-md border border-v2-border-border-muted">{props.children}</div>
@@ -243,7 +180,7 @@ function messagePreviewText(parts: Part[]): string | undefined {
 const emptyMessages: Message[] = []
 const emptyUserMessages: UserMessage[] = []
 
-export function SessionContextTab() {
+export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const sync = useSync()
   const language = useLanguage()
   const sdk = useSDK()
@@ -251,11 +188,13 @@ export function SessionContextTab() {
   const local = useLocal()
   const providers = useProviders(() => sdk().directory)
   const { params, view } = useSessionLayout()
+  const active = () => props.active?.() ?? true
 
   const info = createMemo(() => (params.id ? sync().session.get(params.id) : undefined))
 
-  const messages = createMemo(
-    () => {
+  const messages = createMemo<Message[]>(
+    (previous) => {
+      if (!active()) return previous
       const id = params.id
       if (!id) return emptyMessages
       return (sync().data.message[id] ?? []) as Message[]
@@ -284,14 +223,20 @@ export function SessionContextTab() {
   // Reading the whole part store makes this pane invalidate for every
   // session's streaming delta. Keep a narrow projection of only the active
   // session's message parts instead.
-  const sessionParts = createMemo(() => {
+  const sessionParts = createMemo<Record<string, Part[] | undefined>>((previous) => {
+    if (!active()) return previous
     const all = sync().data.part
     const result: Record<string, Part[] | undefined> = {}
     for (const message of messages()) result[message.id] = all[message.id] as Part[] | undefined
     return result
-  })
+  }, emptySessionParts)
 
-  const ctx = createMemo(() => getSessionContext(messages(), [...providers.all().values()]))
+  const providerList = createMemo<Parameters<typeof aggregateSessionContextByModel>[2]>((previous) => {
+    if (!active()) return previous
+    return [...providers.all().values()]
+  }, emptyProviderList)
+
+  const ctx = createMemo(() => getSessionContext(messages(), providerList()))
   const formatter = createMemo(() => createSessionContextFormatter(language.intl()))
   const [rawOpen, setRawOpen] = createSignal<string[]>([])
 
@@ -388,12 +333,15 @@ export function SessionContextTab() {
 
   const [now, setNow] = createSignal(Date.now())
   createEffect(
-    on(liveMessageID, (id) => {
-      if (!id) return
-      setNow(Date.now())
-      const interval = setInterval(() => setNow(Date.now()), 1000)
-      onCleanup(() => clearInterval(interval))
-    }),
+    on(
+      () => [active(), liveMessageID()] as const,
+      ([isActive, id]) => {
+        if (!isActive || !id) return
+        setNow(Date.now())
+        const interval = setInterval(() => setNow(Date.now()), 1000)
+        onCleanup(() => clearInterval(interval))
+      },
+    ),
   )
 
   const liveDelta = createMemo<LiveGenerationProgress>(() => {
@@ -474,8 +422,6 @@ export function SessionContextTab() {
   ] satisfies { label: string; value: () => JSX.Element }[]
 
   const usagePercent = createMemo(() => ctx()?.usage ?? null)
-
-  const providerList = createMemo(() => [...providers.all().values()])
 
   const aggregate = createMemo(
     on(
@@ -636,8 +582,9 @@ export function SessionContextTab() {
 
   createEffect(
     on(
-      () => messages().length,
-      () => {
+      () => [active(), params.id, messages().length] as const,
+      ([isActive]) => {
+        if (!isActive) return
         requestAnimationFrame(restoreScroll)
       },
       { defer: true },
@@ -852,7 +799,10 @@ export function SessionContextTab() {
   }
 
   const RawMessage = (props: { message: Message }) => {
-    const parts = createMemo(() => getParts(props.message.id))
+    const parts = createMemo<Part[]>((previous) => {
+      if (!active()) return previous
+      return getParts(props.message.id)
+    }, [] as Part[])
     const preview = createMemo(() => messagePreviewText(parts()))
     const isOpen = () => rawOpen().includes(props.message.id)
 

@@ -106,6 +106,12 @@ export const loadMcpQuery = (
     readonly [ServerScope, string, "mcp"]
   >({
     queryKey: [scope, directory, "mcp"] as const,
+    staleTime: 5 * 60_000,
+    gcTime: 10 * 60_000,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
+    retry: 1,
     queryFn: async () => {
       if ((await protocol) === "v1" && legacy) return (await legacy.mcp.status()).data ?? {}
       return api
@@ -128,6 +134,12 @@ export const loadMcpResourcesQuery = (
     readonly [ServerScope, string, "mcpResources"]
   >({
     queryKey: [scope, directory, "mcpResources"] as const,
+    staleTime: 5 * 60_000,
+    gcTime: 10 * 60_000,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
+    retry: 1,
     queryFn: async () => {
       if ((await protocol) === "v1" && legacy) {
         return Object.fromEntries(
@@ -149,6 +161,12 @@ export const loadMcpResourcesQuery = (
 export const loadLspQuery = (scope: ServerScope, directory: string, sdk: OpencodeClient) =>
   queryOptions({
     queryKey: [scope, directory, "lsp"] as const,
+    staleTime: 5 * 60_000,
+    gcTime: 10 * 60_000,
+    refetchOnMount: false,
+    refetchOnReconnect: false,
+    refetchOnWindowFocus: false,
+    retry: 1,
     queryFn: () => sdk.lsp.status().then((r) => r.data ?? []),
   })
 
@@ -250,7 +268,12 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const [catalogEnabled, setCatalogEnabled] = createSignal(false)
   onMount(() => {
-    const timer = window.setTimeout(() => setCatalogEnabled(true), 400)
+    // Optimized: 30ms is enough to let the route's Suspense settle; the prior
+    // 400ms artificially inflated every session nav's critical path and made
+    // the global providers fetch land in the middle of the per-directory
+    // burst (705ms trace). Providers are still bg-preferred but no longer
+    // block paint; cache (5min staleTime) makes the follow-up instant.
+    const timer = window.setTimeout(() => setCatalogEnabled(true), 30)
     onCleanup(() => window.clearTimeout(timer))
   })
   const [configQuery, providerQuery, pathQuery] = useQueries(() => ({

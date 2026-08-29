@@ -325,9 +325,13 @@ export function ChatSidebarPane(props: {
   // would undo itself on the next store tick and collapse would feel broken.
   // The dir-slug fallback covers sessions that are roots of no listed slice
   // (child sessions, rows beyond the store cap): their project still opens.
-  const params = useParams<{ serverKey?: string; dir?: string; id?: string }>()
+  const params = useParams<{ serverKey?: string; dir?: string; id?: string; sessionId?: string }>()
   const routing = useIsRouting()
   const [pendingSessionId, setPendingSessionId] = createSignal<string | null>(null)
+  // The titlebar navigates to canonical /server/... routes while sidebar rows
+  // retain the legacy directory URL. Derive selection from the route's session
+  // identity instead of relying on <A>'s URL-matched `active` class.
+  const activeSessionId = createMemo(() => params.id ?? params.sessionId)
   let pendingSince = 0
   createEffect(() => {
     const pending = pendingSessionId()
@@ -890,6 +894,7 @@ export function ChatSidebarPane(props: {
                           <ChatRow
                             session={session}
                             directory={group.directory}
+                            selected={activeSessionId() === session.id}
                             now={now}
                             minuteNow={minuteNow}
                             providers={providerList}
@@ -1008,6 +1013,7 @@ export function ChatSidebarPane(props: {
                         <ArchivedRow
                           session={session}
                           minuteNow={minuteNow}
+                          selected={activeSessionId() === session.id}
                           pending={pendingSessionId() === session.id}
                           onPending={(id) => {
                             if (params.id !== id) setPendingSessionId(id)
@@ -1286,6 +1292,7 @@ function ChatsSearchMessageRow(
 function ChatRow(props: {
   session: Session
   directory: string
+  selected?: boolean
   now: () => number
   minuteNow: () => number
   providers: () => ProviderList
@@ -1521,11 +1528,13 @@ function ChatRow(props: {
       >
         <div
           ref={rowEl}
-          class="group/session relative min-w-0 rounded-md transition-colors hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
+          class="group/session relative min-w-0 rounded-md transition-colors hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 has-[data-selected]:bg-v2-background-bg-layer-02 [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
         >
       <A
         href={`/${slug()}/session/${props.session.id}`}
-        class="relative flex min-w-0 flex-col gap-[3px] rounded-md py-[5px] pe-1.5 ps-2 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[5px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:content-['']"
+        class="relative flex min-w-0 flex-col gap-[3px] rounded-md py-[5px] pe-1.5 ps-2 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[5px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:content-[''] data-[selected]:text-v2-text-text-base data-[selected]:before:absolute data-[selected]:before:inset-y-[5px] data-[selected]:before:start-0 data-[selected]:before:w-[2px] data-[selected]:before:rounded-full data-[selected]:before:bg-v2-background-bg-accent data-[selected]:before:content-['']"
+        data-selected={props.selected ? "" : undefined}
+        aria-current={props.selected ? "page" : undefined}
         onPointerDown={warm}
         onFocus={warm}
         onClick={(event: MouseEvent) => {
@@ -1771,6 +1780,7 @@ function ChatsArchivedError(props: { onRetry: () => void }) {
 function ArchivedRow(props: {
   session: Session
   minuteNow: () => number
+  selected?: boolean
   pending?: boolean
   onPending?: (id: string) => void
   unarchiveSession: () => Promise<void>
@@ -1796,10 +1806,12 @@ function ArchivedRow(props: {
   }
 
   return (
-    <div class="group/session relative min-w-0 rounded-md opacity-70 transition-[background-color,opacity] duration-[120ms] hover:bg-v2-background-bg-layer-01 hover:opacity-100 focus-within:bg-v2-background-bg-layer-01 focus-within:opacity-100">
+    <div class="group/session relative min-w-0 rounded-md opacity-70 transition-[background-color,opacity] duration-[120ms] hover:bg-v2-background-bg-layer-01 hover:opacity-100 focus-within:bg-v2-background-bg-layer-01 focus-within:opacity-100 has-[data-selected]:bg-v2-background-bg-layer-02 has-[data-selected]:opacity-100">
       <A
         href={`/${slug()}/session/${props.session.id}`}
-        class="relative flex min-w-0 flex-col gap-[3px] rounded-md py-[5px] pe-1.5 ps-2 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base"
+        class="relative flex min-w-0 flex-col gap-[3px] rounded-md py-[5px] pe-1.5 ps-2 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[5px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:content-[''] data-[selected]:text-v2-text-text-base data-[selected]:before:absolute data-[selected]:before:inset-y-[5px] data-[selected]:before:start-0 data-[selected]:before:w-[2px] data-[selected]:before:rounded-full data-[selected]:before:bg-v2-background-bg-accent data-[selected]:before:content-['']"
+        data-selected={props.selected ? "" : undefined}
+        aria-current={props.selected ? "page" : undefined}
         onClick={(event: MouseEvent) => {
           if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button === 1) return
           props.onPending?.(props.session.id)

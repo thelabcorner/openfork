@@ -36,6 +36,8 @@ const DEFAULT_TERMINAL_HEIGHT = 280
 const DEFAULT_BROWSER_PANEL_OPENED = false
 const DEFAULT_PROJECT_EXPLORER_PANEL_OPENED = false
 const DEFAULT_SESSION_CONTEXT_PANEL_OPENED = false
+export type SessionContextTab = "context" | "usage" | "limits"
+export const DEFAULT_SESSION_CONTEXT_TAB: SessionContextTab = "context"
 const DEFAULT_USAGE_PANEL_OPENED = false
 const DEFAULT_MODELS_PANEL_OPENED = false
 const DEFAULT_LIMITS_PANEL_OPENED = false
@@ -244,25 +246,56 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         return next
       })()
 
+      const sessionContextRaw = (value as Record<string, unknown>).sessionContext
+      const usageRaw = (value as Record<string, unknown>).usage
+      const limitsRaw = (value as Record<string, unknown>).limits
+      const migratedSessionContext = (() => {
+        if (!isRecord(sessionContextRaw)) return sessionContextRaw
+        if (typeof (sessionContextRaw as Record<string, unknown>).tab === "string") return sessionContextRaw
+        const hasSession = !!((sessionContextRaw as Record<string, unknown>).panelOpened as boolean)
+        const hasUsage = !!(isRecord(usageRaw) ? (usageRaw as Record<string, unknown>).panelOpened : false)
+        const hasLimits = !!(isRecord(limitsRaw) ? (limitsRaw as Record<string, unknown>).panelOpened : false)
+        let tab: SessionContextTab = DEFAULT_SESSION_CONTEXT_TAB
+        if (hasSession) tab = "context"
+        else if (hasUsage) tab = "usage"
+        else if (hasLimits) tab = "limits"
+        const mergedOpened = !!(hasSession || hasUsage || hasLimits)
+        return {
+          ...sessionContextRaw,
+          panelOpened: mergedOpened ? true : ((sessionContextRaw as Record<string, unknown>).panelOpened as boolean) ?? DEFAULT_SESSION_CONTEXT_PANEL_OPENED,
+          tab,
+        }
+      })()
+
+      const hasUsageKey = "usage" in value
+      const migratedWithoutUsage = hasUsageKey && (migratedSessionContext !== sessionContextRaw || (isRecord(sessionContextRaw) && typeof (sessionContextRaw as Record<string, unknown>).tab === "string"))
+
       if (
         migratedSidebar === sidebar &&
         migratedFileTree === fileTree &&
         migratedSessionTabs === value.sessionTabs &&
-        sessionView === value.sessionView
+        sessionView === value.sessionView &&
+        migratedSessionContext === sessionContextRaw &&
+        !migratedWithoutUsage
       ) {
         return value
       }
 
-      return {
+      const nextValue: Record<string, unknown> = {
         ...value,
         sidebar: migratedSidebar,
         fileTree: migratedFileTree,
         sessionTabs: migratedSessionTabs,
         sessionView,
+        sessionContext: migratedSessionContext,
       }
+      if (migratedWithoutUsage) {
+        delete (nextValue as Record<string, unknown>).usage
+      }
+      return nextValue
     }
 
-    const target = Persist.serverGlobal(serverSdk().scope, "layout", ["layout.v7"])
+    const target = Persist.serverGlobal(serverSdk().scope, "layout", ["layout.v8", "layout.v7"])
     const [store, setStore, _, ready] = persisted(
       { ...target, migrate },
       createStore({
@@ -284,9 +317,7 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         },
         sessionContext: {
           panelOpened: DEFAULT_SESSION_CONTEXT_PANEL_OPENED,
-        },
-        usage: {
-          panelOpened: DEFAULT_USAGE_PANEL_OPENED,
+          tab: DEFAULT_SESSION_CONTEXT_TAB as SessionContextTab,
         },
         models: {
           panelOpened: DEFAULT_MODELS_PANEL_OPENED,
@@ -823,16 +854,24 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       },
       sessionContext: {
         opened: createMemo(() => store.sessionContext?.panelOpened ?? DEFAULT_SESSION_CONTEXT_PANEL_OPENED),
+        tab: createMemo(() => (store.sessionContext as { tab?: SessionContextTab })?.tab ?? DEFAULT_SESSION_CONTEXT_TAB),
+        setTab(tab: SessionContextTab) {
+          if (!store.sessionContext) {
+            setStore("sessionContext", { panelOpened: DEFAULT_SESSION_CONTEXT_PANEL_OPENED, tab })
+            return
+          }
+          setStore("sessionContext", "tab", tab)
+        },
         open() {
           if (!store.sessionContext) {
-            setStore("sessionContext", { panelOpened: true })
+            setStore("sessionContext", { panelOpened: true, tab: DEFAULT_SESSION_CONTEXT_TAB })
             return
           }
           setStore("sessionContext", "panelOpened", true)
         },
         close() {
           if (!store.sessionContext) {
-            setStore("sessionContext", { panelOpened: false })
+            setStore("sessionContext", { panelOpened: false, tab: DEFAULT_SESSION_CONTEXT_TAB })
             return
           }
           setStore("sessionContext", "panelOpened", false)
@@ -840,35 +879,28 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         toggle() {
           const current = store.sessionContext?.panelOpened ?? DEFAULT_SESSION_CONTEXT_PANEL_OPENED
           if (!store.sessionContext) {
-            setStore("sessionContext", { panelOpened: !current })
+            setStore("sessionContext", { panelOpened: !current, tab: DEFAULT_SESSION_CONTEXT_TAB })
             return
           }
           setStore("sessionContext", "panelOpened", !current)
         },
-      },
-      usage: {
-        opened: createMemo(() => store.usage?.panelOpened ?? DEFAULT_USAGE_PANEL_OPENED),
-        open() {
-          if (!store.usage) {
-            setStore("usage", { panelOpened: true })
+        selectTab(tab: SessionContextTab) {
+          const isOpen = store.sessionContext?.panelOpened ?? DEFAULT_SESSION_CONTEXT_PANEL_OPENED
+          const currentTab = (store.sessionContext as { tab?: SessionContextTab })?.tab ?? DEFAULT_SESSION_CONTEXT_TAB
+          if (isOpen && currentTab === tab) {
+            if (!store.sessionContext) {
+              setStore("sessionContext", { panelOpened: false, tab })
+              return
+            }
+            setStore("sessionContext", "panelOpened", false)
             return
           }
-          setStore("usage", "panelOpened", true)
-        },
-        close() {
-          if (!store.usage) {
-            setStore("usage", { panelOpened: false })
+          if (!store.sessionContext) {
+            setStore("sessionContext", { panelOpened: true, tab })
             return
           }
-          setStore("usage", "panelOpened", false)
-        },
-        toggle() {
-          const current = store.usage?.panelOpened ?? DEFAULT_USAGE_PANEL_OPENED
-          if (!store.usage) {
-            setStore("usage", { panelOpened: !current })
-            return
-          }
-          setStore("usage", "panelOpened", !current)
+          setStore("sessionContext", "tab", tab)
+          setStore("sessionContext", "panelOpened", true)
         },
       },
       models: {

@@ -49,11 +49,13 @@ export default function NewLayout(props: ParentProps) {
   // is NOT mounted here despite mirroring the browser panel's visual treatment:
   // unlike the browser (server-scoped only), it needs a resolved *directory*
   // via useFile()/useSDK(), which only exists inside a session/draft route's
-  // own SDKProvider+FileProvider subtree (see session.tsx's SessionProviders).
-  // Mounting it at this shell level throws "File context must be used within
-  // a context provider" at runtime. It's mounted inside session.tsx's Page()
-  // instead; layout.projectExplorer's open/close state (below) still lives
-  // here in the shared context so the titlebar toggle works regardless.
+  // own SDKProvider+FileProvider subtree (session.tsx SessionProviders, and
+  // app.tsx ResolvedDraftRoute + DraftProviders for /new-session). Mounting it
+  // at this shell level throws "File context must be used within a context
+  // provider" at runtime. Session and new-session pages mount it locally;
+  // layout.projectExplorer open/close still lives here so the titlebar toggle
+  // works on both routes. The new-session tree follows the project selector
+  // because SDKProvider.directory is the draft's selected worktree.
 
   // The browser host client module is loaded lazily (it drags the whole
   // browser pane graph with it); the subscription is torn down via a

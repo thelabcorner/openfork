@@ -511,8 +511,9 @@ function legacyWorkspaceStorage(dir: string) {
 }
 
 function serverWorkspaceTarget(scope: ServerScopeValue, dir: string, key: string, legacy?: string[]): PersistTarget {
-  if (scope !== ServerScope.local) return { storage: workspaceStorage(ScopedKey.from(scope, pathKey(dir))), key }
-  return { storage: workspaceStorage(pathKey(dir)), legacyStorageNames: legacyWorkspaceStorage(dir), key, legacy }
+  if (scope !== ServerScope.local)
+    return { storage: workspaceStorage(ScopedKey.from(scope, pathKey(dir))), key, defer: true }
+  return { storage: workspaceStorage(pathKey(dir)), legacyStorageNames: legacyWorkspaceStorage(dir), key, legacy, defer: true }
 }
 
 function localStorageWithPrefix(prefix: string): SyncStorage {

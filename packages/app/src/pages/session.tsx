@@ -91,9 +91,7 @@ import {
   SESSION_PANEL_WIDTH_MIN,
   sessionPanelWidthMax,
 } from "@/pages/session/session-panel-width"
-import { USAGE_PANEL_WIDTH_MIN } from "@/pages/session/usage-panel-state"
 import { MODELS_PANEL_WIDTH_MIN } from "@/pages/session/models-panel-state"
-import { LIMITS_PANEL_WIDTH_MIN } from "@/pages/session/limits-panel-state"
 import { CONTEXT_PANEL_WIDTH_MIN } from "@/pages/session/context-panel-state"
 import {
   PROJECT_EXPLORER_TREE_WIDTH_MIN,
@@ -104,12 +102,8 @@ import {
 import { SessionSidePanel } from "@/pages/session/session-side-panel"
 import { ContextPanel } from "@/pages/session/context-panel"
 import { createContextPanelState } from "@/pages/session/context-panel-state"
-import { UsagePanel } from "@/pages/session/usage-panel"
-import { createUsagePanelState } from "@/pages/session/usage-panel-state"
 import { ModelsPanel } from "@/pages/session/models-panel"
 import { createModelsPanelState } from "@/pages/session/models-panel-state"
-import { LimitsPanel } from "@/pages/session/limits-panel"
-import { createLimitsPanelState } from "@/pages/session/limits-panel-state"
 import { sessionPanelLayout } from "@/pages/session/session-panel-layout"
 
 /**
@@ -611,14 +605,9 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   )
   const desktopProjectExplorerOpen = createMemo(() => isDesktop() && layout.projectExplorer.opened())
   const desktopContextPanelOpen = createMemo(() => isDesktop() && layout.sessionContext.opened())
-  const desktopUsagePanelOpen = createMemo(() => isDesktop() && layout.usage.opened())
   const desktopModelsPanelOpen = createMemo(() => isDesktop() && layout.models.opened())
-  const desktopLimitsPanelOpen = createMemo(() => isDesktop() && layout.limits.opened())
-  const desktopLegacyLimitsPanelOpen = createMemo(() => !newSessionDesign() && desktopLimitsPanelOpen())
   const contextPanelState = createContextPanelState()
-  const usagePanelState = createUsagePanelState()
   const modelsPanelState = createModelsPanelState()
-  const limitsPanelState = createLimitsPanelState()
   const desktopSessionResizeOpen = createMemo(() => newSessionDesign() && desktopTerminalOpen())
   const desktopSidePanelOpen = createMemo(() => desktopSessionResizeOpen() || desktopFileTreeOpen())
   const desktopSessionSiblingOpen = createMemo(
@@ -626,27 +615,21 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       desktopSidePanelOpen() ||
       desktopProjectExplorerOpen() ||
       desktopContextPanelOpen() ||
-      desktopUsagePanelOpen() ||
-      desktopModelsPanelOpen() ||
-      desktopLegacyLimitsPanelOpen(),
+      desktopModelsPanelOpen(),
   )
   const sessionPanelGapCount = createMemo(
     () =>
       Number(desktopProjectExplorerOpen()) +
       Number(desktopSidePanelOpen()) +
       Number(desktopContextPanelOpen()) +
-      Number(desktopUsagePanelOpen()) +
-      Number(desktopModelsPanelOpen()) +
-       Number(desktopLegacyLimitsPanelOpen()),
+      Number(desktopModelsPanelOpen()),
   )
   const sessionPanelReservedWidth = createMemo(
     () =>
       (desktopProjectExplorerOpen() ? projectExplorerState.panelWidth() : 0) +
       (desktopFileTreeOpen() && !desktopSessionResizeOpen() ? layout.fileTree.width() : 0) +
       (desktopContextPanelOpen() ? contextPanelState.sidebarWidth() : 0) +
-      (desktopUsagePanelOpen() ? usagePanelState.sidebarWidth() : 0) +
-      (desktopModelsPanelOpen() ? modelsPanelState.sidebarWidth() : 0) +
-      (desktopLegacyLimitsPanelOpen() ? limitsPanelState.sidebarWidth() : 0),
+      (desktopModelsPanelOpen() ? modelsPanelState.sidebarWidth() : 0),
   )
   const sessionPanelReservedGap = createMemo(() =>
     settings.general.newLayoutDesigns() ? sessionPanelGapCount() * 8 : 0,
@@ -691,14 +674,6 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
         min: FILE_TREE_PANE_WIDTH_MIN,
         el: byId("session-side-panel"),
       })
-    if (desktopUsagePanelOpen())
-      list.push({
-        id: "usage",
-        size: () => usagePanelState.sidebarWidth(),
-        resize: (v) => usagePanelState.resizeSidebar(v),
-        min: USAGE_PANEL_WIDTH_MIN,
-        el: byId("usage-panel"),
-      })
     if (desktopModelsPanelOpen())
       list.push({
         id: "models",
@@ -706,14 +681,6 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
         resize: (v) => modelsPanelState.resizeSidebar(v),
         min: MODELS_PANEL_WIDTH_MIN,
         el: byId("models-panel"),
-      })
-    if (desktopLegacyLimitsPanelOpen())
-      list.push({
-        id: "limits",
-        size: () => limitsPanelState.sidebarWidth(),
-        resize: (v) => limitsPanelState.resizeSidebar(v),
-        min: LIMITS_PANEL_WIDTH_MIN,
-        el: byId("limits-panel"),
       })
     if (desktopContextPanelOpen())
       list.push({
@@ -750,7 +717,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       terminal: desktopTerminalOpen(),
       files: desktopFileTreeOpen(),
       context: desktopContextPanelOpen(),
-      usage: desktopUsagePanelOpen(),
+      usage: false,
       models: desktopModelsPanelOpen(),
         limits: false,
     }),
@@ -1275,7 +1242,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   )
   onCleanup(() => textHighlighter.dispose())
 
-  const scrollGestureWindowMs = 250
+  const scrollGestureWindowMs = 400
 
   const markScrollGesture = (target?: EventTarget | null) => {
     const root = scroller
@@ -1569,9 +1536,10 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   )
 
   const autoScroll = createAutoScroll({
-    // Follow immediately after submit, including the small interval before
-    // the server's busy status event reaches the directory store. The hook
-    // still opts out as soon as the user scrolls away from the bottom.
+    // Stay eligible to follow after submit, including the small interval
+    // before the server's busy status event reaches the directory store.
+    // Escape is owned by the hook: any upward scroll delta drops follow
+    // even while this remains true.
     working: () => true,
     overflowAnchor: "none",
   })
@@ -2503,25 +2471,11 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
             />
           </Suspense>
         </Show>
-        <Show when={!newSessionDesign() && desktopUsagePanelOpen()}>
-          <UsagePanel
-            state={usagePanelState}
-            opened={desktopUsagePanelOpen()}
-            onClose={() => layout.usage.close()}
-          />
-        </Show>
         <Show when={!newSessionDesign() && desktopModelsPanelOpen()}>
           <ModelsPanel
             state={modelsPanelState}
             opened={desktopModelsPanelOpen()}
             onClose={() => layout.models.close()}
-          />
-        </Show>
-        <Show when={!newSessionDesign() && desktopLimitsPanelOpen()}>
-          <LimitsPanel
-            state={limitsPanelState}
-            opened={desktopLimitsPanelOpen()}
-            onClose={() => layout.limits.close()}
           />
         </Show>
         <Show when={!newSessionDesign() && desktopContextPanelOpen()}>
@@ -2538,7 +2492,6 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
                 (isDesktop() &&
                   (desktopFileTreeOpen() ||
                     desktopContextPanelOpen() ||
-                    desktopUsagePanelOpen() ||
                      desktopModelsPanelOpen())) ||
                 terminalOpen()
               }
@@ -2561,7 +2514,6 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
                     isDesktop() &&
                     (desktopFileTreeOpen() ||
                       desktopContextPanelOpen() ||
-                      desktopUsagePanelOpen() ||
                        desktopModelsPanelOpen())
                   }
                 >
@@ -2580,14 +2532,6 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
                       pair={dividerBefore("fileTree")}
                     />
                   </Suspense>
-                </Show>
-                <Show when={desktopUsagePanelOpen()}>
-                  <UsagePanel
-                    state={usagePanelState}
-                    opened={desktopUsagePanelOpen()}
-                    onClose={() => layout.usage.close()}
-                    pair={dividerBefore("usage")}
-                  />
                 </Show>
                 <Show when={desktopModelsPanelOpen()}>
                   <ModelsPanel

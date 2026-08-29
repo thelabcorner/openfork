@@ -646,7 +646,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     viewCommand({
       id: "usage.toggle",
       title: language.t("command.usage.toggle"),
-      onSelect: () => void startTransition(() => layout.usage.toggle()),
+      onSelect: () => void startTransition(() => layout.sessionContext.selectTab("usage")),
     }),
     viewCommand({
       id: "models.toggle",
@@ -656,7 +656,7 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
     viewCommand({
       id: "limits.toggle",
       title: language.t("command.limits.toggle"),
-      onSelect: () => void startTransition(() => layout.limits.toggle()),
+      onSelect: () => void startTransition(() => layout.sessionContext.selectTab("limits")),
     }),
     ...(shown()
       ? [
