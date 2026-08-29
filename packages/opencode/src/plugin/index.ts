@@ -21,6 +21,7 @@ import { AzureAuthPlugin } from "./azure"
 import { DigitalOceanAuthPlugin } from "./digitalocean"
 import { XaiAuthPlugin } from "./xai"
 import { CerebrasPlugin } from "./cerebras"
+import { WorkBuddyPlugin } from "./workbuddy"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { ClaudeAuthPlugin } from "./claude"
 import { Effect, Layer, Context } from "effect"
@@ -81,6 +82,7 @@ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
     AzureAuthPlugin,
     DigitalOceanAuthPlugin,
     SnowflakeCortexAuthPlugin,
+    WorkBuddyPlugin,
     XaiAuthPlugin,
     CerebrasPlugin,
     ClaudeAuthPlugin,
