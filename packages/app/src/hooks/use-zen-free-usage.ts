@@ -18,7 +18,7 @@ const BACKFILL_REFRESH_MS = ZEN_FREE_WINDOW_MS
 const MAX_HIT_WINDOWS = 16
 const QUERY_CONCURRENCY = 3
 const OBSERVATION_DEDUPE_MS = 60_000
-const GO_UPSELL_PROVIDERS = new Set(["opencode", "opencode-go"])
+const ZEN_PROVIDER = "opencode"
 
 type Resolution = "hour" | "day"
 type LearningStore = {
@@ -37,12 +37,7 @@ type RangeJob = {
 function isFreeTierLimitStatus(status: unknown) {
   if (!status || typeof status !== "object") return false
   const value = status as { type?: string; action?: { provider?: string; reason?: string } }
-  return (
-    value.type === "retry" &&
-    value.action?.reason === "free_tier_limit" &&
-    typeof value.action.provider === "string" &&
-    GO_UPSELL_PROVIDERS.has(value.action.provider)
-  )
+  return value.type === "retry" && value.action?.reason === "free_tier_limit" && value.action.provider === ZEN_PROVIDER
 }
 
 function mergeObservations(current: readonly ZenLimitObservation[], incoming: readonly ZenLimitObservation[], now: number) {
