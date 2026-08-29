@@ -100,6 +100,8 @@ export type ModelEntitlementRuntime = {
   learnedLimit: number | null
   history: number[]
   recentTimestamps: number[]
+  lastObservationAt: number | null
+  serverCode: number | null
 }
 
 export function emptyModelRuntime(): ModelEntitlementRuntime {
@@ -112,6 +114,8 @@ export function emptyModelRuntime(): ModelEntitlementRuntime {
     learnedLimit: null,
     history: [],
     recentTimestamps: [],
+    lastObservationAt: null,
+    serverCode: null,
   }
 }
 
@@ -131,6 +135,7 @@ export function absorbLearnedLimit(runtime: ModelEntitlementRuntime, observedAtH
 export function recordTimestamp(runtime: ModelEntitlementRuntime, at: number) {
   runtime.recentTimestamps.push(at)
   if (runtime.recentTimestamps.length > TIMESTAMP_CAP) runtime.recentTimestamps.shift()
+  runtime.lastObservationAt = at
 }
 
 export type ModelEntitlementReport = {
@@ -144,8 +149,13 @@ export type ModelEntitlementReport = {
   status: ModelEntitlementStatus
   confidence: "low" | "medium" | "high"
   accuracy: "observed" | "estimate" | "server-confirmed"
+  exhaustedObserved: boolean
+  serverCode: number | null
   resetAt: number | null
+  resetSource: "server-6004" | "inferred" | "unknown"
+  windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
   windowStartedAt: number | null
+  lastObservationAt: number | null
   burnPerHour: number | null
   estimatedExhaustionAt: number | null
   willLikelyExhaustBeforeReset: boolean | null
@@ -157,7 +167,7 @@ export type ModelEntitlementReport = {
 export function buildModelEntitlementReport(model: string, runtime: ModelEntitlementRuntime, now: number): ModelEntitlementReport {
   const canonical = canonicalModelId(model)
   const prior = canonical ? WORKBUDDY_LIMIT_RESEARCH[canonical] : undefined
-  const windowLimited = runtime.windowLimited && runtime.resetAt !== null && now < runtime.resetAt
+  const windowLimited = runtime.windowLimited
   const limitEstimate = runtime.learnedLimit ?? prior?.limitEstimate ?? null
   const usedObserved = runtime.observed
   const remainingEstimate = windowLimited ? 0 : limitEstimate !== null ? Math.max(0, limitEstimate - usedObserved) : null
@@ -168,7 +178,10 @@ export function buildModelEntitlementReport(model: string, runtime: ModelEntitle
   const unit = prior?.unit ?? "requests"
 
   const recentHour = runtime.recentTimestamps.filter((t) => now - t <= BURN_WINDOW_MS)
-  const burnPerHour = recentHour.length >= 2 ? recentHour.length : null
+  const recentSpan = recentHour.length >= 2 ? recentHour[recentHour.length - 1]! - recentHour[0]! : 0
+  const burnPerHour = recentHour.length >= 2 && recentSpan > 0
+    ? ((recentHour.length - 1) / recentSpan) * 3_600_000
+    : null
 
   const inferredResetAt = !windowLimited && canonical === "hy3" && runtime.windowStartedAt !== null ? runtime.windowStartedAt + HY3_WINDOW_MS : null
   const resetAt = windowLimited ? runtime.resetAt : inferredResetAt
@@ -192,8 +205,17 @@ export function buildModelEntitlementReport(model: string, runtime: ModelEntitle
     status,
     confidence,
     accuracy,
+    exhaustedObserved: windowLimited,
+    serverCode: runtime.serverCode,
     resetAt,
+    resetSource: windowLimited && runtime.resetAt !== null ? "server-6004" : inferredResetAt !== null ? "inferred" : "unknown",
+    windowType: prior?.windowPolicy === "server-defined"
+      ? "server-defined"
+      : prior?.windowPolicy === "inferred-rolling-24h"
+        ? "inferred-rolling-24h"
+        : "unknown",
     windowStartedAt: runtime.windowStartedAt,
+    lastObservationAt: runtime.lastObservationAt,
     burnPerHour,
     estimatedExhaustionAt,
     willLikelyExhaustBeforeReset,
