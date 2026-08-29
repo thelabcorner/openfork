@@ -17,6 +17,150 @@ export interface FilteredListProps<T> {
   noInitialSelection?: boolean
 }
 
+function splitCamelCase(text: string): string[] {
+  // Split PascalCase / camelCase by detecting uppercase letters that start new words.
+  // Example: "dialogSelectModel" -> ["dialog", "select", "model"]
+  // Example: "DialogSelectModel" -> ["Dialog", "Select", "Model"]
+  const words = text
+    .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .trim()
+    .split(/\s+/)
+  return words.filter((w) => w.length > 0)
+}
+
+function extractAcronym(text: string): string {
+  // Extract acronym from PascalCase / camelCase by taking the first letter of each word segment.
+  // Example: "DialogSelectModel" -> "DSM"
+  const words = splitCamelCase(text)
+  return words.map((w) => w[0]?.toUpperCase() ?? "").join("")
+}
+
+function getNestedValue(obj: any, path: string): string {
+  return path.split(".").reduce((val, key) => (val !== null && val !== undefined ? val[key] : undefined), obj) ?? ""
+}
+
+function densityBonus(needle: string, haystack: string): number {
+  if (!needle || typeof needle !== "string" || !haystack || typeof haystack !== "string") return 0
+  const needleTokens = needle
+    .toLowerCase()
+    .split(/[\s\-_.]+/)
+    .filter((t) => t.length > 0)
+  if (needleTokens.length === 0) return 0
+  const hayLower = haystack.toLowerCase()
+  let maxConsecutive = 0
+  let currentConsecutive = 0
+  let tokenIndex = 0
+  // Scan haystack for consecutive token sequence matches
+  for (let i = 0; i < hayLower.length; i++) {
+    const remaining = hayLower.slice(i)
+    if (tokenIndex < needleTokens.length && remaining.startsWith(needleTokens[tokenIndex])) {
+      currentConsecutive++
+      i += needleTokens[tokenIndex].length - 1
+      tokenIndex++
+      if (currentConsecutive > maxConsecutive) maxConsecutive = currentConsecutive
+    } else {
+      // Reset: try to match current token from this position
+      if (tokenIndex > 0) {
+        // Backtrack: try to restart sequence from earlier token
+        tokenIndex = 0
+        currentConsecutive = 0
+        i-- // retry same position with reset
+      } else {
+        currentConsecutive = 0
+      }
+    }
+  }
+  // Also count any partial consecutive runs found
+  return maxConsecutive
+}
+
+function tokenScore(needle: string, haystack: string): number {
+  const needleTokens = needle
+    .toLowerCase()
+    .split(/[\s\-_.]+/)
+    .filter((t) => t.length > 0)
+  if (needleTokens.length === 0) return 0
+  const hayLower = haystack.toLowerCase()
+
+  // Build expanded token set: original text + camel-split words + acronym
+  const camelWords = splitCamelCase(haystack)
+  const acronym = extractAcronym(haystack)
+  const expandedTokens = [
+    ...camelWords.map((w) => w.toLowerCase()),
+    acronym.toLowerCase(),
+  ].filter((t) => t.length > 0)
+
+  let score = 0
+  for (const token of needleTokens) {
+    // Check original haystack first
+    const inOriginal = hayLower.includes(token)
+    const inExpanded = expandedTokens.some((et) => et === token || et.includes(token))
+
+    if (!inOriginal && !inExpanded) return 0
+
+    // Score acronym hits with very high priority
+    const acronymLower = acronym.toLowerCase()
+    if (token === acronymLower && acronymLower.length > 0) {
+      score += 10 // High priority for acronym match
+      continue
+    }
+
+    // Original haystack scoring
+    const index = hayLower.indexOf(token)
+    const isAtPositionZero = index === 0
+    const isAfterDelimiter = index > 0 && /[\/\.\-\_\s]/.test(hayLower[index - 1])
+    if (isAtPositionZero || isAfterDelimiter) {
+      score += 2
+    } else {
+      score += 1
+    }
+
+    // Also score against camel-split words
+    for (const word of camelWords) {
+      const wordLower = word.toLowerCase()
+      if (wordLower === token) {
+        score += 2 // Word-level match on split token
+      } else if (wordLower.includes(token)) {
+        score += 1
+      }
+    }
+  }
+  return score
+}
+
+function recencyBonus(item: any): number {
+  // Small UX tweak: recently-modified files rank slightly higher.
+  // Uses the `mtime` field from PromptInputV2Suggestion (file search results).
+  // 7-day window, linear decay, capped at +30 points so it never overrides
+  // a strong token match.
+  const mtime = (item as any)?.mtime
+  if (typeof mtime !== "number" || !Number.isFinite(mtime) || mtime <= 0) return 0
+  const daysSince = (Date.now() - mtime) / (1000 * 60 * 60 * 24)
+  if (daysSince >= 7) return 0
+  return Math.min(30, Math.max(0, (7 - daysSince) * 5))
+}
+
+function filterWithTokens<T>(needle: string, items: T[], keys?: string[]): T[] {
+  if (!needle) return items
+  const needleTokens = needle
+    .toLowerCase()
+    .split(/[\s\-_.]+/)
+    .filter((t) => t.length > 0)
+  if (needleTokens.length === 0) return items
+
+  const results = items
+    .map((item) => {
+      const text = keys ? keys.map((k) => String(getNestedValue(item, k))).join(" ") : String(item)
+      const score = tokenScore(needle, text) + recencyBonus(item)
+      return { item, score }
+    })
+    .filter(({ score }) => score > 0)
+    .sort((a, b) => b.score - a.score || String(a.item).localeCompare(String(b.item)))
+    .map(({ item }) => item)
+  return results
+}
+
 export function useFilteredList<T>(props: FilteredListProps<T>) {
   const [store, setStore] = createStore<{ filter: string }>({ filter: "" })
 
@@ -39,10 +183,46 @@ export function useFilteredList<T>(props: FilteredListProps<T>) {
           const skipFilter = props.skipFilter
           const filterable = skipFilter ? x.filter((item) => !skipFilter(item)) : x
           const skipped = skipFilter ? x.filter(skipFilter) : []
-          const filtered =
-            !props.filterKeys && Array.isArray(filterable) && filterable.every((e) => typeof e === "string")
-              ? (fuzzysort.go(needle, filterable).map((x) => x.target) as T[])
-              : fuzzysort.go(needle, filterable, { keys: props.filterKeys! }).map((x) => x.obj)
+
+          let filtered: T[]
+          const tokenFiltered = filterWithTokens(needle, filterable, props.filterKeys)
+          let fuzzFiltered: T[] = []
+          if (!props.filterKeys && Array.isArray(filterable) && filterable.every((e) => typeof e === "string")) {
+            fuzzFiltered = fuzzysort.go(needle, filterable).map((x: any) => x.target) as T[]
+          } else {
+            fuzzFiltered = fuzzysort.go(needle, filterable, { keys: props.filterKeys! }).map((x: any) => x.obj)
+          }
+          // Combine: token matches first (ranked by score), then fuzzysort-only hits
+          // Score fuzzFiltered hits with density bonus for consecutive token sequences
+          const tokenSet = new Set(tokenFiltered.map((item) => props.key(item)))
+          const fuzzWithDensity = fuzzFiltered
+            .filter((item) => !tokenSet.has(props.key(item)))
+            .map((item) => {
+              const text = props.filterKeys
+                ? props.filterKeys.map((k) => String(getNestedValue(item, k))).join(" ")
+                : String(item)
+              const density = densityBonus(query, text)
+              return { item, density }
+            })
+          // Sort combined: token score first, then density bonus, then alphabetical
+          const tokenWithScore = tokenFiltered.map((item) => {
+            const text = props.filterKeys
+              ? props.filterKeys.map((k) => String(getNestedValue(item, k))).join(" ")
+              : String(item)
+            return { item, score: tokenScore(query, text), density: densityBonus(query, text) }
+          })
+          const combinedSorted = [
+            ...tokenWithScore.sort((a, b) => {
+              if (b.score !== a.score) return b.score - a.score
+              if (b.density !== a.density) return b.density - a.density
+              return String(a.item).localeCompare(String(b.item))
+            }).map(({ item }) => item),
+            ...fuzzWithDensity.sort((a, b) => {
+              if (b.density !== a.density) return b.density - a.density
+              return String(a.item).localeCompare(String(b.item))
+            }).map(({ item }) => item),
+          ]
+          filtered = combinedSorted
           return skipped.length ? [...filtered, ...skipped] : filtered
         },
         groupBy((x) => (props.groupBy ? props.groupBy(x) : "")),

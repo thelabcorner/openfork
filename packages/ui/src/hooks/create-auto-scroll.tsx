@@ -2,6 +2,12 @@ import { createEffect, on, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { createEventListener } from "@solid-primitives/event-listener"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
+import {
+  AUTO_SCROLL_ESCAPE_PX,
+  AUTO_SCROLL_STICK_PX,
+  classifyAutoScroll,
+  isProgrammaticScroll,
+} from "./auto-scroll-intent"
 
 export interface AutoScrollOptions {
   working: () => boolean
@@ -13,10 +19,13 @@ export interface AutoScrollOptions {
 export function createAutoScroll(options: AutoScrollOptions) {
   let settling = false
   let settleTimer: ReturnType<typeof setTimeout> | undefined
-  let autoTimer: ReturnType<typeof setTimeout> | undefined
-  let auto: { top: number; time: number } | undefined
+  // One-shot programmatic marker: consumed on the next scroll frame.
+  let pendingProg: number | null = null
+  let lastScrollTop = 0
+  let stickRaf: number | undefined
 
-  const threshold = () => options.bottomThreshold ?? 10
+  const stickThreshold = () => options.bottomThreshold ?? AUTO_SCROLL_STICK_PX
+  const escapeThreshold = () => Math.max(AUTO_SCROLL_ESCAPE_PX, stickThreshold() * 2.4)
 
   const [store, setStore] = createStore({
     contentRef: undefined as HTMLElement | undefined,
@@ -34,39 +43,16 @@ export function createAutoScroll(options: AutoScrollOptions) {
     return el.scrollHeight - el.clientHeight > 1
   }
 
-  // Browsers can dispatch scroll events asynchronously. If new content arrives
-  // between us calling `scrollTo()` and the subsequent `scroll` event firing,
-  // the handler can see a non-zero `distanceFromBottom` and incorrectly assume
-  // the user scrolled.
-  const markAuto = (el: HTMLElement) => {
-    auto = {
-      top: Math.max(0, el.scrollHeight - el.clientHeight),
-      time: Date.now(),
-    }
-
-    if (autoTimer) clearTimeout(autoTimer)
-    autoTimer = setTimeout(() => {
-      auto = undefined
-      autoTimer = undefined
-    }, 1500)
-  }
-
-  const isAuto = (el: HTMLElement) => {
-    const a = auto
-    if (!a) return false
-
-    if (Date.now() - a.time > 1500) {
-      auto = undefined
-      return false
-    }
-
-    return Math.abs(el.scrollTop - a.top) < 2
+  const markProg = (el: HTMLElement) => {
+    pendingProg = Math.max(0, el.scrollHeight - el.clientHeight)
   }
 
   const scrollToBottomNow = (behavior: ScrollBehavior) => {
     const el = store.scrollRef
     if (!el) return
-    markAuto(el)
+    markProg(el)
+    const max = Math.max(0, el.scrollHeight - el.clientHeight)
+    lastScrollTop = max
     if (behavior === "smooth") {
       el.scrollTo({ top: el.scrollHeight, behavior })
       return
@@ -88,7 +74,8 @@ export function createAutoScroll(options: AutoScrollOptions) {
 
     const distance = distanceFromBottom(el)
     if (distance < 2) {
-      markAuto(el)
+      markProg(el)
+      lastScrollTop = el.scrollTop
       return
     }
 
@@ -97,7 +84,28 @@ export function createAutoScroll(options: AutoScrollOptions) {
     scrollToBottomNow("auto")
   }
 
+  const scheduleStick = () => {
+    if (stickRaf !== undefined) return
+    stickRaf = requestAnimationFrame(() => {
+      stickRaf = undefined
+      const el = store.scrollRef
+      if (!el) return
+      if (!canScroll(el)) {
+        if (store.userScrolled) setStore("userScrolled", false)
+        return
+      }
+      if (!active() || store.userScrolled) return
+      scrollToBottom(false)
+    })
+  }
+
   const stop = () => {
+    if (stickRaf !== undefined) {
+      cancelAnimationFrame(stickRaf)
+      stickRaf = undefined
+    }
+    pendingProg = null
+
     const el = store.scrollRef
     if (!el) return
     if (!canScroll(el)) {
@@ -110,40 +118,81 @@ export function createAutoScroll(options: AutoScrollOptions) {
     options.onUserInteracted?.()
   }
 
+  const isNestedScrollable = (target: EventTarget | null) => {
+    const el = store.scrollRef
+    const node = target instanceof Element ? target : undefined
+    const nested = node?.closest("[data-scrollable]")
+    return !!(el && nested && nested !== el)
+  }
+
   const handleWheel = (e: WheelEvent) => {
     if (e.deltaY >= 0) return
-    // If the user is scrolling within a nested scrollable region (tool output,
-    // code block, etc), don't treat it as leaving the "follow bottom" mode.
-    // Those regions opt in via `data-scrollable`.
-    const el = store.scrollRef
-    const target = e.target instanceof Element ? e.target : undefined
-    const nested = target?.closest("[data-scrollable]")
-    if (el && nested && nested !== el) return
+    if (isNestedScrollable(e.target)) return
     stop()
   }
 
-  const handleScroll = () => {
+  // Windows/Chrome middle-click autoscroll starts on button 1 and keeps
+  // synthesizing scroll after mouseup from cursor offset. Escape on the
+  // press, before the first tick can race a stick-to-bottom write.
+  const handlePointerDown = (e: PointerEvent) => {
+    if (e.button !== 1) return
+    if (isNestedScrollable(e.target)) return
+    stop()
+  }
+
+  const onScrollInternal = () => {
     const el = store.scrollRef
     if (!el) return
 
+    // Parent onScroll + this listener can both fire for one browser event.
+    // Processing twice would see delta=0 on the second pass and re-stick.
+    if (el.scrollTop === lastScrollTop && pendingProg === null) return
+
     if (!canScroll(el)) {
       if (store.userScrolled) setStore("userScrolled", false)
+      lastScrollTop = el.scrollTop
+      pendingProg = null
       return
     }
 
-    if (distanceFromBottom(el) < threshold()) {
+    const dist = distanceFromBottom(el)
+    const delta = el.scrollTop - lastScrollTop
+    lastScrollTop = el.scrollTop
+
+    const programmatic = isProgrammaticScroll({
+      pendingTop: pendingProg,
+      scrollTop: el.scrollTop,
+      delta,
+    })
+    pendingProg = null
+
+    const intent = classifyAutoScroll({
+      distance: dist,
+      delta,
+      stickThreshold: stickThreshold(),
+      escapeThreshold: escapeThreshold(),
+      isProgrammatic: programmatic,
+    })
+
+    if (intent === "prog") {
+      if (dist < stickThreshold() && store.userScrolled) setStore("userScrolled", false)
+      return
+    }
+
+    if (intent === "escape") {
+      if (!store.userScrolled) {
+        setStore("userScrolled", true)
+        options.onUserInteracted?.()
+      }
+      return
+    }
+
+    if (intent === "stick") {
       if (store.userScrolled) setStore("userScrolled", false)
-      return
     }
-
-    // Ignore scroll events triggered by our own scrollToBottom calls.
-    if (!store.userScrolled && isAuto(el)) {
-      scrollToBottom(false)
-      return
-    }
-
-    stop()
   }
+
+  const handleScroll = () => onScrollInternal()
 
   const handleInteraction = () => {
     if (!active()) return
@@ -179,10 +228,9 @@ export function createAutoScroll(options: AutoScrollOptions) {
       }
       if (!active()) return
       if (store.userScrolled) return
-      // ResizeObserver fires after layout, before paint.
-      // Keep the bottom locked in the same frame to avoid visible
-      // "jump up then catch up" artifacts while streaming content.
-      scrollToBottom(false)
+      // Coalesce rapid content growth (streaming) into one rAF stick so we
+      // don't fight a concurrent user scroll that happened this frame.
+      scheduleStick()
     },
   )
 
@@ -213,15 +261,28 @@ export function createAutoScroll(options: AutoScrollOptions) {
     updateOverflowAnchor(el)
   })
 
+  createEffect(() => {
+    const el = store.scrollRef
+    if (!el) return
+    lastScrollTop = el.scrollTop
+    const handler = () => onScrollInternal()
+    el.addEventListener("scroll", handler, { passive: true })
+    onCleanup(() => el.removeEventListener("scroll", handler))
+  })
+
   createEventListener(() => store.scrollRef, "wheel", handleWheel, { passive: true })
+  createEventListener(() => store.scrollRef, "pointerdown", handlePointerDown, { passive: true })
 
   onCleanup(() => {
     if (settleTimer) clearTimeout(settleTimer)
-    if (autoTimer) clearTimeout(autoTimer)
+    if (stickRaf !== undefined) cancelAnimationFrame(stickRaf)
   })
 
   return {
-    scrollRef: (el: HTMLElement | undefined) => setStore("scrollRef", el),
+    scrollRef: (el: HTMLElement | undefined) => {
+      if (el) lastScrollTop = el.scrollTop
+      setStore("scrollRef", el)
+    },
     contentRef: (el: HTMLElement | undefined) => setStore("contentRef", el),
     handleScroll,
     handleInteraction,
