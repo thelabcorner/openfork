@@ -89,8 +89,9 @@
  *   exactly one Attempt, counted as `authRecoveries`, never a redundant Generation)
  */
 
-import { writeFileSync, readFileSync, unlinkSync } from "fs"
+import { mkdirSync, renameSync, writeFileSync, readFileSync, unlinkSync } from "fs"
 import { tmpdir } from "os"
+import { dirname } from "path"
 import {
   absorbLearnedLimit,
   buildModelEntitlementReport,
@@ -168,6 +169,8 @@ export type RunGenerationOpts = {
   priority: number
   /** Stable per-generation label for observability. */
   genKey: string
+  /** Exact upstream model id. Promotional hard limits are keyed by this model. */
+  model?: string
   /** Session key for fair scheduling (e.g. OpenCode session id). */
   session?: string
   /** Reads credential expiry at call time (closure over live cred). */
@@ -227,9 +230,13 @@ type PersistedModelEntitlement = {
   windowStartedAt: number | null
   learnedLimit: number | null
   history: number[]
+  recentTimestamps?: number[]
+  lastObservationAt?: number | null
+  serverCode?: number | null
 }
 
 type Persisted = {
+  schema?: number
   state: EntitlementState
   resetAt: number | null
   limitedEpoch: string | null
@@ -294,6 +301,7 @@ async function safeBody(res: Response): Promise<string> {
 }
 
 type Pending = {
+  model: string
   priority: number
   session: string
   seq: number
@@ -337,6 +345,7 @@ export class WorkBuddyEntitlementGovernor {
   private cooldownUntil = 0
   private limitedEpoch: string | undefined
   private readonly generationKeys = new Set<string>()
+  private readonly models = new Map<string, ModelEntitlementRuntime>()
 
   // adaptive backpressure
   private pressure = 0
@@ -361,26 +370,55 @@ export class WorkBuddyEntitlementGovernor {
     // session enforces it without re-probing Tencent.
     const p = loadPersisted(this.entitlementFile)
     if (!p) return
-    if (p.state === "WINDOW_LIMITED" && typeof p.resetAt === "number" && p.resetAt > Date.now()) {
-      this.state = "WINDOW_LIMITED"
-      this.resetAt = p.resetAt
-    } else if (p.state === "QUOTA_EXHAUSTED") {
+    if (p.state === "QUOTA_EXHAUSTED") {
       this.state = "QUOTA_EXHAUSTED"
       this.limitedEpoch = p.limitedEpoch ?? undefined
     }
+    for (const [model, saved] of Object.entries(p.models ?? {})) {
+      const runtime = emptyModelRuntime()
+      runtime.windowLimited = saved.windowLimited
+      runtime.resetAt = saved.resetAt
+      runtime.accuracy = saved.accuracy
+      runtime.observed = Math.max(0, saved.observed)
+      runtime.windowStartedAt = saved.windowStartedAt
+      runtime.learnedLimit = saved.learnedLimit
+      runtime.history = [...saved.history].slice(-5)
+      runtime.recentTimestamps = [...(saved.recentTimestamps ?? [])].slice(-200)
+      runtime.lastObservationAt = saved.lastObservationAt ?? runtime.recentTimestamps.at(-1) ?? null
+      runtime.serverCode = saved.serverCode ?? (saved.windowLimited ? 6004 : null)
+      this.models.set(model, runtime)
+    }
+    this.expireModels(Date.now())
   }
 
   // --- persistence ------------------------------------------------------------
   private persist() {
-    if (this.state === "WINDOW_LIMITED" || this.state === "QUOTA_EXHAUSTED") {
-      try {
-        writeFileSync(
-          this.entitlementFile,
-          JSON.stringify({ state: this.state, resetAt: this.resetAt ?? null, limitedEpoch: this.limitedEpoch ?? null, at: Date.now() }),
-        )
-      } catch {
-        // best-effort
-      }
+    try {
+      mkdirSync(dirname(this.entitlementFile), { recursive: true })
+      const models = Object.fromEntries([...this.models.entries()].map(([model, runtime]) => [model, {
+        windowLimited: runtime.windowLimited,
+        resetAt: runtime.resetAt,
+        accuracy: runtime.accuracy,
+        observed: runtime.observed,
+        windowStartedAt: runtime.windowStartedAt,
+        learnedLimit: runtime.learnedLimit,
+        history: runtime.history,
+        recentTimestamps: runtime.recentTimestamps,
+        lastObservationAt: runtime.lastObservationAt,
+        serverCode: runtime.serverCode,
+      }]))
+      const temp = `${this.entitlementFile}.${process.pid}.tmp`
+      writeFileSync(temp, JSON.stringify({
+        schema: 2,
+        state: this.state,
+        resetAt: this.resetAt ?? null,
+        limitedEpoch: this.limitedEpoch ?? null,
+        at: Date.now(),
+        models,
+      }))
+      renameSync(temp, this.entitlementFile)
+    } catch {
+      // best-effort
     }
   }
 
@@ -388,17 +426,68 @@ export class WorkBuddyEntitlementGovernor {
     this.state = "READY"
     this.resetAt = undefined
     this.limitedEpoch = undefined
-    try {
-      unlinkSync(this.entitlementFile)
-    } catch {
-      // best-effort
-    }
+    this.persist()
   }
 
   private setState(state: EntitlementState, resetAt?: number) {
     this.state = state
     this.resetAt = resetAt
     this.persist()
+  }
+
+  private modelKey(model: string): string {
+    return canonicalModelId(model) ?? model.toLowerCase()
+  }
+
+  private runtimeFor(model: string): ModelEntitlementRuntime {
+    const key = this.modelKey(model)
+    let runtime = this.models.get(key)
+    if (!runtime) {
+      runtime = emptyModelRuntime()
+      this.models.set(key, runtime)
+    }
+    return runtime
+  }
+
+  private expireModel(model: string, now: number): boolean {
+    const runtime = this.models.get(this.modelKey(model))
+    if (!runtime) return false
+    const inferredResetAt = this.modelKey(model) === "hy3" && runtime.windowStartedAt !== null
+      ? runtime.windowStartedAt + 24 * 60 * 60 * 1000
+      : null
+    const resetAt = runtime.windowLimited ? runtime.resetAt : inferredResetAt
+    if (resetAt === null || now < resetAt) return false
+    runtime.windowLimited = false
+    runtime.resetAt = null
+    runtime.accuracy = "estimate"
+    runtime.observed = 0
+    runtime.windowStartedAt = null
+    runtime.recentTimestamps = []
+    runtime.lastObservationAt = null
+    runtime.serverCode = null
+    return true
+  }
+
+  private expireModels(now: number) {
+    let changed = false
+    for (const model of this.models.keys()) changed = this.expireModel(model, now) || changed
+    if (changed) this.persist()
+  }
+
+  canAdmitModel(model: string, now = Date.now()): boolean {
+    if (this.expireModel(model, now)) this.persist()
+    return !this.runtimeFor(model).windowLimited
+  }
+
+  modelReport(model: string, now = Date.now()): ModelEntitlementReport {
+    if (this.expireModel(model, now)) this.persist()
+    return buildModelEntitlementReport(this.modelKey(model), this.runtimeFor(model), now)
+  }
+
+  modelReports(now = Date.now()): ModelEntitlementReport[] {
+    this.expireModels(now)
+    const keys = new Set<string>(["hy3", "hy4-preview", ...this.models.keys()])
+    return [...keys].map((model) => buildModelEntitlementReport(model, this.runtimeFor(model), now))
   }
 
   // --- adaptive backpressure (reduce on pressure, never maximize throughput) ---
@@ -461,17 +550,16 @@ export class WorkBuddyEntitlementGovernor {
   }
 
   // --- admission ---------------------------------------------------------------
-  private admit(priority: number, session: string, signal?: AbortSignal): Promise<void> {
+  private admit(priority: number, session: string, model: string, signal?: AbortSignal): Promise<void> {
     const now = Date.now()
     if (signal?.aborted) return Promise.reject(new AdmissionError(499, 0, "generation canceled before admission", "cancel"))
 
-    // A learned window limit is enforced locally until its reset time.
-    if (this.state === "WINDOW_LIMITED") {
-      if (this.resetAt && now < this.resetAt) {
-        const ra = Math.ceil((this.resetAt - now) / 1000)
-        return Promise.reject(new AdmissionError(429, ra, `frequency window limit until ${new Date(this.resetAt).toISOString()}`, "window"))
-      }
-      this.clearHardLimit()
+    // A learned promotional limit blocks only this account+model bucket.
+    if (!this.canAdmitModel(model, now)) {
+      const runtime = this.runtimeFor(model)
+      const ra = runtime.resetAt ? Math.max(1, Math.ceil((runtime.resetAt - now) / 1000)) : 3600
+      const until = runtime.resetAt ? ` until ${new Date(runtime.resetAt).toISOString()}` : ""
+      return Promise.reject(new AdmissionError(429, ra, `${this.modelKey(model)} frequency window limit${until}`, "window"))
     }
     // A learned hard credit limit is enforced locally; re-auth (token change) clears it.
     if (this.state === "QUOTA_EXHAUSTED") {
@@ -489,7 +577,7 @@ export class WorkBuddyEntitlementGovernor {
       return Promise.reject(new AdmissionError(503, 1, "admission queue full", "queue"))
     }
     return new Promise<void>((resolve, reject) => {
-      const pending: Pending = { priority, session, seq: this.seq++, resolve, reject, signal }
+      const pending: Pending = { model, priority, session, seq: this.seq++, resolve, reject, signal }
       const cancel = () => {
         const index = this.pending.indexOf(pending)
         if (index < 0) return
@@ -513,6 +601,12 @@ export class WorkBuddyEntitlementGovernor {
       }
       const next = this.selectNext()
       if (!next) break
+      if (!this.canAdmitModel(next.model)) {
+        const runtime = this.runtimeFor(next.model)
+        const retryAfter = runtime.resetAt ? Math.max(1, Math.ceil((runtime.resetAt - Date.now()) / 1000)) : 3600
+        next.reject(new AdmissionError(429, retryAfter, `${this.modelKey(next.model)} frequency window limit`, "window"))
+        continue
+      }
       if (next.signal?.aborted) {
         next.reject(new AdmissionError(499, 0, "generation canceled while queued", "cancel"))
         continue
@@ -531,6 +625,7 @@ export class WorkBuddyEntitlementGovernor {
 
   async runGeneration(opts: RunGenerationOpts): Promise<RunGenerationResult> {
     const session = opts.session ?? "default"
+    const model = opts.model ?? "unknown"
     if (this.generationKeys.has(opts.genKey)) {
       throw new AdmissionError(409, 0, `duplicate logical generation: ${opts.genKey}`, "duplicate")
     }
@@ -551,10 +646,19 @@ export class WorkBuddyEntitlementGovernor {
       if (this.state === "QUOTA_EXHAUSTED" && opts.enrollmentEpoch && this.limitedEpoch && opts.enrollmentEpoch !== this.limitedEpoch) {
         this.clearHardLimit()
       }
-      await this.admit(opts.priority, session, opts.signal)
+      await this.admit(opts.priority, session, model, opts.signal)
       admitted = true
       if (opts.enrollmentEpoch) this.limitedEpoch = this.limitedEpoch ?? opts.enrollmentEpoch
       this.generations++
+      const promotional = canonicalModelId(model)
+      if (promotional) {
+        const runtime = this.runtimeFor(promotional)
+        const now = Date.now()
+        runtime.observed++
+        runtime.windowStartedAt = runtime.windowStartedAt ?? now
+        recordTimestamp(runtime, now)
+        this.persist()
+      }
       let refreshedThisGeneration = false
       let first: AttemptOutcome | null = null
       let res: Response | null = null
@@ -574,7 +678,7 @@ export class WorkBuddyEntitlementGovernor {
         res = await opts.transport()
         this.attempts++
         const outcome = { status: res.status, ok: res.ok }
-        await this.observe(outcome, res)
+        await this.observe(model, outcome, res)
         if (outcome.ok) {
           this.committed++
           if (refreshedThisGeneration) this.authRecoveries++
@@ -611,14 +715,23 @@ export class WorkBuddyEntitlementGovernor {
     }
   }
 
-  private async observe(outcome: AttemptOutcome, res: Response) {
+  private async observe(model: string, outcome: AttemptOutcome, res: Response) {
     const retryAfter = res.headers.get("retry-after")
     if (outcome.status === 429) {
       const raw = await safeBody(res)
+      const code = parseErrorCode(raw)
       const resetAt = parseResetAt(raw, retryAfter)
-      if (resetAt && resetAt > Date.now()) {
-        // Authoritative window limit - learn once, enforce locally.
-        this.setState("WINDOW_LIMITED", resetAt)
+      if (code === 6004 || (code !== 14003 && resetAt && /usage exceeds frequency limit/i.test(raw))) {
+        // Authoritative hard state is account+model scoped. A 14003 may carry
+        // Retry-After, but it is transport pressure and must never deplete the
+        // promotional window.
+        const runtime = this.runtimeFor(model)
+        runtime.windowLimited = true
+        runtime.resetAt = resetAt && resetAt > Date.now() ? resetAt : null
+        runtime.accuracy = "server-confirmed"
+        runtime.serverCode = 6004
+        absorbLearnedLimit(runtime, runtime.observed)
+        this.persist()
       } else {
         // Frequency pressure without a known reset: short backoff + adaptive easing.
         const backoff = Math.min(TRANSIENT_CAP_MS, 2000 * Math.pow(2, this.authRecoveries)) + Math.floor(Math.random() * 1000)
@@ -641,6 +754,7 @@ export class WorkBuddyEntitlementGovernor {
   }
 
   metrics() {
+    const reports = this.modelReports()
     return {
       state: this.state,
       resetAt: this.resetAt ?? null,
@@ -657,6 +771,7 @@ export class WorkBuddyEntitlementGovernor {
       amplification: this.generations ? Number((this.attempts / this.generations).toFixed(3)) : 1,
       cooldownUntil: this.cooldownUntil,
       hardLimited: this.state === "QUOTA_EXHAUSTED",
+      models: Object.fromEntries(reports.map((report) => [report.model, report])),
     }
   }
 }
