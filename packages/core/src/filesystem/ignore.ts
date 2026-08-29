@@ -29,6 +29,7 @@ const FOLDERS = new Set([
   "mypy_cache",
   ".history",
   ".gradle",
+  ".opencode",
 ])
 
 const FILES = [

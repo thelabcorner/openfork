@@ -61,35 +61,33 @@ describe("Device", () => {
       // Single-use: the same code cannot claim twice.
       const again = yield* devices.claim({ code: pairing.code }).pipe(Effect.flip)
       expect(again._tag).toBe("PairCodeError")
+      if (again._tag !== "PairCodeError") throw new Error("expected PairCodeError")
       expect(again.reason).toBe("invalid")
     }),
   )
 
-  it.effect("pairing code dies after the configured number of failed attempts", () =>
+  it.effect("unmatched guesses do not invalidate a live pairing", () =>
     Effect.gen(function* () {
       const devices = yield* Device.Service
       const pairing = yield* devices.beginPairing()
 
-      for (let i = 0; i < PAIRING.maxAttempts - 1; i++) {
-        const error = yield* Effect.flip(devices.claim({ code: "WRONG" }))
+      for (let i = 0; i < CLAIM_RATE_LIMIT.burst; i++) {
+        const error = yield* Effect.flip(devices.claim({ code: "WRONG", ip: `10.0.0.${i}` }))
+        if (error._tag !== "PairCodeError") throw new Error("expected PairCodeError")
         expect(error.reason).toBe("invalid")
       }
-      // The correct code still works before the cap is hit.
       yield* devices.claim({ code: pairing.code })
     }),
   )
 
-  it.effect("pairing code is exhausted after max failed attempts", () =>
+  it.effect("claim rate-limits globally across spoofed client identities", () =>
     Effect.gen(function* () {
       const devices = yield* Device.Service
-      const pairing = yield* devices.beginPairing()
-
-      for (let i = 0; i < PAIRING.maxAttempts; i++) {
-        const error = yield* Effect.flip(devices.claim({ code: "WRONG" }))
-        expect(error.reason).toBe("invalid")
+      for (let i = 0; i < CLAIM_RATE_LIMIT.globalBurst; i++) {
+        yield* Effect.flip(devices.claim({ code: "WRONG", ip: `198.51.100.${i}` })).pipe(Effect.ignore)
       }
-      const dead = yield* Effect.flip(devices.claim({ code: pairing.code }))
-      expect(dead.reason).toBe("exhausted")
+      const limited = yield* Effect.flip(devices.claim({ code: "WRONG", ip: "203.0.113.1" }))
+      expect(limited._tag).toBe("ClaimRateLimitedError")
     }),
   )
 
@@ -99,6 +97,7 @@ describe("Device", () => {
       const pairing = yield* devices.beginPairing()
       yield* TestClock.adjust(PAIRING.ttlMs + 1)
       const error = yield* Effect.flip(devices.claim({ code: pairing.code }))
+      if (error._tag !== "PairCodeError") throw new Error("expected PairCodeError")
       expect(error.reason).toBe("expired")
     }),
   )
@@ -111,6 +110,7 @@ describe("Device", () => {
       }
       const limited = yield* Effect.flip(devices.claim({ code: "NOPE", ip: "192.168.0.9" }))
       expect(limited._tag).toBe("ClaimRateLimitedError")
+      if (limited._tag !== "ClaimRateLimitedError") throw new Error("expected ClaimRateLimitedError")
       expect(limited.retryAfterMs).toBeGreaterThan(0)
       // A different IP is unaffected.
       yield* Effect.flip(devices.claim({ code: "NOPE", ip: "192.168.0.10" }))

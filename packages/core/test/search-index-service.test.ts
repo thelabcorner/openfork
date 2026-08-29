@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { Effect, Layer } from "effect"
+import { Effect, Layer, Option } from "effect"
 import { SearchIndex } from "@opencode-ai/core/search/index-service"
 import { ChunkStore } from "@opencode-ai/core/search/chunk-store"
 import { Location } from "@opencode-ai/core/location"
@@ -53,6 +53,14 @@ const makeLayer = (directory: string, dataDir: string, seededFiles: string[]) =>
       Layer.succeed(FSUtil.Service, {
         realPath: (target: string) => Effect.succeed(target),
         isDir: () => Effect.succeed(false),
+        stat: () =>
+          Effect.succeed({
+            size: 100,
+            mtime: Option.some(new Date()),
+            ino: Option.some(0),
+            type: "File",
+          } as unknown as FSUtil.Stat),
+        readFileStringSafe: () => Effect.succeed("a\nb\nc"),
       } as unknown as FSUtil.Interface),
     ),
   )

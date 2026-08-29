@@ -13,12 +13,13 @@ import { Identifier } from "./id/id"
 const PAIR_ALPHABET = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"
 const PAIR_CODE_LENGTH = 6
 const PAIR_TTL_MS = 90_000
-const PAIR_MAX_ATTEMPTS = 5
-// Per-IP token bucket for the unauthenticated /pair/claim route: burst of 10,
-// refilled at 10 tokens/minute. A wrong-guess flood cannot outpace this even
-// though each code also dies after PAIR_MAX_ATTEMPTS failed attempts.
+// Per-client and process-wide token buckets protect the unauthenticated claim
+// route. The global bucket remains effective when a proxy header is spoofed.
 const CLAIM_IP_BURST = 10
 const CLAIM_IP_REFILL_PER_MINUTE = 10
+const CLAIM_GLOBAL_BURST = 30
+const CLAIM_GLOBAL_REFILL_PER_MINUTE = 30
+const CLAIM_BUCKET_CAPACITY = 1024
 const TOKEN_BYTES = 32
 const TOKEN_PREFIX_LENGTH = 8
 const DEFAULT_DEVICE_NAME = "Paired device"
@@ -30,12 +31,13 @@ export const PAIRING = {
   codeLength: PAIR_CODE_LENGTH,
   alphabet: PAIR_ALPHABET,
   ttlMs: PAIR_TTL_MS,
-  maxAttempts: PAIR_MAX_ATTEMPTS,
 } as const
 
 export const CLAIM_RATE_LIMIT = {
   burst: CLAIM_IP_BURST,
   refillPerMinute: CLAIM_IP_REFILL_PER_MINUTE,
+  globalBurst: CLAIM_GLOBAL_BURST,
+  globalRefillPerMinute: CLAIM_GLOBAL_REFILL_PER_MINUTE,
 } as const
 
 export class Info extends Schema.Class<Info>("Device.Info")({
@@ -93,8 +95,6 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/co
 type PairingSession = {
   readonly codeHash: Buffer
   readonly expiresAt: number
-  attempts: number
-  dead: boolean
 }
 
 function hashHex(input: string) {
@@ -113,14 +113,15 @@ function normalizeCode(code: string) {
 
 type Bucket = { tokens: number; updatedAt: number }
 
-function takeIpToken(buckets: Map<string, Bucket>, ip: string, now: number) {
-  const refillPerMs = CLAIM_IP_REFILL_PER_MINUTE / 60_000
-  const bucket = buckets.get(ip)
+function takeToken(buckets: Map<string, Bucket>, key: string, now: number, burst: number, refillPerMinute: number) {
+  const refillPerMs = refillPerMinute / 60_000
+  const bucket = buckets.get(key)
   if (!bucket) {
-    buckets.set(ip, { tokens: CLAIM_IP_BURST - 1, updatedAt: now })
+    while (buckets.size >= CLAIM_BUCKET_CAPACITY) buckets.delete(buckets.keys().next().value!)
+    buckets.set(key, { tokens: burst - 1, updatedAt: now })
     return { ok: true as const, retryAfterMs: 0 }
   }
-  const tokens = Math.min(CLAIM_IP_BURST, bucket.tokens + (now - bucket.updatedAt) * refillPerMs)
+  const tokens = Math.min(burst, bucket.tokens + (now - bucket.updatedAt) * refillPerMs)
   if (tokens < 1) return { ok: false as const, retryAfterMs: Math.ceil((1 - tokens) / refillPerMs) }
   bucket.tokens = tokens - 1
   bucket.updatedAt = now
@@ -130,7 +131,6 @@ function takeIpToken(buckets: Map<string, Bucket>, ip: string, now: number) {
 const IP_BUCKET_IDLE_MS = 10 * 60_000
 
 function pruneBuckets(buckets: Map<string, Bucket>, now: number) {
-  if (buckets.size < 1000) return
   for (const [ip, bucket] of buckets) {
     if (now - bucket.updatedAt > IP_BUCKET_IDLE_MS) buckets.delete(ip)
   }
@@ -145,6 +145,7 @@ const layer = Layer.effect(
     // 90 seconds, so surviving a server restart mid-ceremony has no value.
     const pairings = new Map<string, PairingSession>()
     const ipBuckets = new Map<string, Bucket>()
+    const globalBuckets = new Map<string, Bucket>()
 
     const info = (row: typeof DeviceTable.$inferSelect) =>
       new Info({
@@ -221,25 +222,28 @@ const layer = Layer.effect(
         let code = ""
         for (let i = 0; i < PAIR_CODE_LENGTH; i++) code += PAIR_ALPHABET[randomInt(PAIR_ALPHABET.length)]
         const expiresAt = now + PAIR_TTL_MS
-        pairings.set(hashHex(code), { codeHash: hashDigest(code), expiresAt, attempts: 0, dead: false })
+        pairings.set(hashHex(code), { codeHash: hashDigest(code), expiresAt })
         return new Pairing({ code, expiresAt: new Date(expiresAt).toISOString() })
       }),
       claim: Effect.fn("Device.claim")(function* (input) {
         const now = yield* Clock.currentTimeMillis
         prunePairings(now)
         pruneBuckets(ipBuckets, now)
-        if (input.ip) {
-          const taken = takeIpToken(ipBuckets, input.ip, now)
-          if (!taken.ok) return yield* new ClaimRateLimitedError({ retryAfterMs: taken.retryAfterMs })
-        }
+        const global = takeToken(globalBuckets, "claim", now, CLAIM_GLOBAL_BURST, CLAIM_GLOBAL_REFILL_PER_MINUTE)
+        if (!global.ok) return yield* new ClaimRateLimitedError({ retryAfterMs: global.retryAfterMs })
+        const client = takeToken(
+          ipBuckets,
+          input.ip ?? "unknown",
+          now,
+          CLAIM_IP_BURST,
+          CLAIM_IP_REFILL_PER_MINUTE,
+        )
+        if (!client.ok) return yield* new ClaimRateLimitedError({ retryAfterMs: client.retryAfterMs })
         // Constant-time comparison: the provided code is hashed once and its
         // fixed-length digest is compared against every live session digest
         // with timingSafeEqual — no variable-time byte comparison over secret
-        // material ever runs. A wrong code matches no session, so every failed
-        // claim burns one attempt on each live code (fail closed): after
-        // PAIR_MAX_ATTEMPTS failed claims all live codes are dead. Dead and
-        // expired codes stay as tombstones until shortly before pruning so a
-        // late correct guess reads "exhausted"/"expired", not "invalid".
+        // material ever runs. Unmatched guesses never mutate live pairings;
+        // otherwise an anonymous attacker could invalidate every active OTP.
         const provided = hashDigest(normalizeCode(input.code))
         let matchedKey: string | undefined
         for (const [key, session] of pairings) {
@@ -249,17 +253,11 @@ const layer = Layer.effect(
           }
         }
         if (!matchedKey) {
-          for (const [, session] of pairings) {
-            if (session.dead || session.expiresAt <= now) continue
-            session.attempts += 1
-            if (session.attempts >= PAIR_MAX_ATTEMPTS) session.dead = true
-          }
           return yield* new PairCodeError({ reason: "invalid" })
         }
         const session = pairings.get(matchedKey)
         pairings.delete(matchedKey)
         if (!session) return yield* new PairCodeError({ reason: "invalid" })
-        if (session.dead) return yield* new PairCodeError({ reason: "exhausted" })
         if (session.expiresAt <= now) return yield* new PairCodeError({ reason: "expired" })
         return yield* insertDevice(input.name ?? DEFAULT_DEVICE_NAME)
       }),

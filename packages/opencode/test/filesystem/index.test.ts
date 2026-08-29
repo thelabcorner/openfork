@@ -12,9 +12,11 @@ import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
 import { Hash } from "@opencode-ai/core/util/hash"
+import { ChunkStore } from "@opencode-ai/core/search/chunk-store"
 import { tmpdir } from "../fixture/fixture"
 
 const cachePathFor = (dataDir: string, dir: string) => path.join(dataDir, "file-index", `${Hash.sha256(dir)}.json`)
+const dbPathFor = (dataDir: string, dir: string) => ChunkStore.dbPathFor(dir, dataDir)
 
 const write = (dir: string, name: string, content = "") => Effect.promise(() => Bun.write(path.join(dir, name), content))
 
@@ -59,10 +61,26 @@ describe("FileIndex", () => {
         expect(paths(entries)).toContain("src/")
 
         yield* index.flush()
-        const bytes = yield* Effect.promise(() => fs.readFile(cachePathFor(data.path, tmp.path)))
+        // Unified SQLite persistence: FileIndex now writes `fileIndex` meta
+        // into `file-index/<hash>.db`, not a standalone JSON file.
+        const dbPath = dbPathFor(data.path, tmp.path)
+        const chunkStore = yield* Effect.gen(function* () {
+          const store = yield* ChunkStore.Service
+          return yield* store.getMeta("fileIndex")
+        }).pipe(Effect.provide(ChunkStore.layerFromPath(dbPath)), Effect.scoped)
+        expect(chunkStore).toBeDefined()
+        const bytes = new TextEncoder().encode(chunkStore!)
         const blob = yield* IndexSerialization.decode(bytes)
         expect(blob.subtrees[""].entries.map((e) => String(e.path))).toContain("a.txt")
         expect(blob.subtrees["src"].entries.map((e) => String(e.path))).toContain("src/b.ts")
+        // Legacy JSON should have been cleaned up
+        const legacyExists = yield* Effect.promise(() =>
+          fs
+            .stat(cachePathFor(data.path, tmp.path))
+            .then(() => true)
+            .catch(() => false),
+        )
+        expect(legacyExists).toBe(false)
       })),
     )
   })
@@ -151,10 +169,12 @@ describe("FileIndex", () => {
         yield* index.list(rp(""))
         yield* index.flush()
 
-        const dir = path.dirname(cachePathFor(data.path, tmp.path))
+        const dir = path.dirname(dbPathFor(data.path, tmp.path))
         const files = yield* Effect.promise(() => fs.readdir(dir))
         expect(files.filter((f) => f.endsWith(".tmp"))).toEqual([])
-        expect(files).toContain(path.basename(cachePathFor(data.path, tmp.path)))
+        expect(files).toContain(path.basename(dbPathFor(data.path, tmp.path)))
+        // No legacy JSON should remain
+        expect(files).not.toContain(path.basename(cachePathFor(data.path, tmp.path)))
       })),
     )
   })

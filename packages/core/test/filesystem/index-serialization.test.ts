@@ -78,6 +78,48 @@ test("invalid JSON is rejected as invalid", () => {
   expect(runFailure(IndexSerialization.decode(new TextEncoder().encode("{not json"))).reason).toBe("invalid")
 })
 
+test("compact encode stores file size/mtime as a 4-tuple and dirs as a 2-tuple", () => {
+  const subtrees = new Map([
+    [
+      "src",
+      {
+        at: 1,
+        entries: [
+          { path: "src/a.ts", type: "file" as const, size: 1280, mtime: 1_700_000_000_000 },
+          { path: "src/lib", type: "directory" as const },
+        ],
+      },
+    ],
+  ])
+  const bytes = IndexSerialization.encodeCompact({
+    builtAt: 2,
+    root: "/repo",
+    rootStat: { mtimeMs: 3, size: 4, ino: 5 },
+    subtrees,
+  })
+  const decoded = IndexSerialization.decodeCompact(bytes)
+  expect(decoded?.root).toBe("/repo")
+  expect(decoded?.subtrees.get("src")?.entries).toEqual([
+    { path: "src/a.ts", type: "file", size: 1280, mtime: 1_700_000_000_000 },
+    { path: "src/lib", type: "directory" },
+  ])
+})
+
+test("compact decode accepts legacy 2-tuple file entries without size", () => {
+  const blob = {
+    v: 2,
+    b: 1,
+    r: "/repo",
+    s: [1, 2, 3],
+    d: [["", 1, [[0, "README.md"], [1, "src"]]]],
+  }
+  const decoded = IndexSerialization.decodeCompact(new TextEncoder().encode(JSON.stringify(blob)))
+  expect(decoded?.subtrees.get("")?.entries).toEqual([
+    { path: "README.md", type: "file", size: undefined, mtime: undefined },
+    { path: "src", type: "directory" },
+  ])
+})
+
 test("canonical JSON sorts keys and omits whitespace", () => {
   const json = IndexSerialization.canonicalJson({ b: 1, a: { d: 2, c: 3 } })
   expect(json).toBe('{"a":{"c":3,"d":2},"b":1}')

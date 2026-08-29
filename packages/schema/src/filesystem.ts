@@ -15,6 +15,11 @@ export interface Entry extends Schema.Schema.Type<typeof Entry> {}
 export const Entry = Schema.Struct({
   path: RelativePath,
   type: Schema.Literals(["file", "directory"]),
+  // Bytes on disk. Files: stat size. Directories: recursive sum of known
+  // descendant file sizes when the subtree is indexed. Omitted until captured.
+  size: Schema.Number.pipe(optional),
+  // Epoch-ms mtime. Files only. Paired with size for mention/explorer meta.
+  mtime: Schema.Number.pipe(optional),
 }).annotate({ identifier: "FileSystem.Entry" })
 
 export interface Submatch extends Schema.Schema.Type<typeof Submatch> {}
