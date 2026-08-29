@@ -13,6 +13,8 @@ export const ProviderIcon: Component<ProviderIconProps> = (props) => {
     // Claude subscription and API-key providers intentionally have distinct
     // IDs, but share Anthropic's visual identity.
     if (local.id === "claude" || local.id === "claude-api") return "anthropic"
+    // OpenCode Zen free quota is IP-based and shares the OpenCode brand.
+    if (local.id === "opencode-zen" || local.id === "zen" || local.id === "opencode-free") return "opencode"
     return iconNames.includes(local.id as IconName) ? local.id : "synthetic"
   })
   return (

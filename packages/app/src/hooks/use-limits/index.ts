@@ -74,16 +74,35 @@ export function useLimits(options?: { now?: Accessor<number> }) {
     },
   )
   const providerData = createMemo(() => {
-    if (providersRes.state !== "ready" && providersRes.state !== "refreshing") return undefined
     const latest = providersRes.latest
-    if (!latest) return undefined
+    const isReady = providersRes.state === "ready" || providersRes.state === "refreshing"
+    // Fallback when the providers endpoint fails or is still loading: still
+    // surface the automatic providers so Zen is never hidden behind a fetch
+    // error. Zen is IP-based and needs no enrollment.
+    if (!isReady || !latest) {
+      if (providersRes.error) {
+        return {
+          providers: [
+            { providerId: "opencode-zen", providerName: "OpenCode Zen", configured: true },
+            { providerId: "claude", providerName: "Claude", configured: true },
+          ],
+        }
+      }
+      return undefined
+    }
     // Claude Code is a machine account. Always surface it (and force configured)
     // regardless of what the server reports. The presence of local creds on the
     // backend is authoritative for visibility.
     const hasClaude = latest.providers.some((p) => p.providerId === "claude")
-    const providers = hasClaude
+    let providers = hasClaude
       ? latest.providers.map((p) => (p.providerId === "claude" ? { ...p, configured: true } : p))
       : [...latest.providers, { providerId: "claude", providerName: "Claude", configured: true }]
+    // OpenCode Zen free quota is IP-based and requires no enrollment.
+    // Always inject it so the Limits pane shows local free usage even if the
+    // server's provider list is stale or the DB snapshot is empty.
+    if (!providers.some((p) => p.providerId === "opencode-zen")) {
+      providers = [...providers, { providerId: "opencode-zen", providerName: "OpenCode Zen", configured: true }]
+    }
     return { providers }
   })
 
@@ -146,6 +165,11 @@ export function useLimits(options?: { now?: Accessor<number> }) {
         return { result: effective, windowsSorted, worstRemaining, tone: toneForRemaining(worstRemaining), gate }
       })
       .sort((a, b) => {
+        // Pin OpenCode Zen at the top — it's the only automatic/IP-based
+        // free quota and should be visible without scrolling.
+        const aIsZen = a.result.providerId === "opencode-zen"
+        const bIsZen = b.result.providerId === "opencode-zen"
+        if (aIsZen !== bIsZen) return aIsZen ? -1 : 1
         if (a.result.ok !== b.result.ok) return a.result.ok ? -1 : 1
         return a.result.providerName.localeCompare(b.result.providerName)
       })

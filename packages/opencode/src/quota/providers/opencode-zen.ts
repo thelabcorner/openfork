@@ -167,8 +167,19 @@ export const opencodeZen = (usage: ZenFreeUsage): Adapter => ({
   aliases: ["zen", "opencode-free", "opencode-zen-free"],
   configured: () => Effect.succeed(true),
   fetch: () =>
-    Effect.map(usage.snapshot(), (snapshot) => {
-      const fetchedAt = Date.now()
-      return zenFreeProviderResult(estimateZenFreeLimit({ snapshot, now: fetchedAt }), fetchedAt)
-    }),
+    Effect.catchAll(usage.snapshot(), () =>
+      Effect.succeed({
+        since: zenUtcDayStart(Date.now() - ZEN_FREE_DAY_MS),
+        until: Date.now(),
+        currentDayStart: zenUtcDayStart(Date.now()),
+        currentRequests: 0,
+        days: [],
+        limitHits: [],
+      } as ZenFreeSnapshot),
+    ).pipe(
+      Effect.map((snapshot) => {
+        const fetchedAt = Date.now()
+        return zenFreeProviderResult(estimateZenFreeLimit({ snapshot, now: fetchedAt }), fetchedAt)
+      }),
+    ),
 })
