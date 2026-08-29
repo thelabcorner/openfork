@@ -30,6 +30,15 @@ type WeightedValue = { value: number; weight: number }
 
 type UsageModelRow = UsageSummaryResponse["models"][number]
 
+/** OpenCode's anonymous limiter buckets requests by UTC YYYYMMDD. */
+export function zenUtcDayStart(timestamp: number) {
+  return Math.floor(timestamp / ZEN_FREE_WINDOW_MS) * ZEN_FREE_WINDOW_MS
+}
+
+export function zenUtcDayEnd(timestamp: number) {
+  return zenUtcDayStart(timestamp) + ZEN_FREE_WINDOW_MS
+}
+
 /**
  * OpenCode Zen's anonymous/free traffic is recorded under the `opencode`
  * provider with zero recorded/estimated cost. Paid Console traffic can share
@@ -84,13 +93,13 @@ function hitWeight(now: number, at: number) {
  * Learn a time-varying free-tier cap without pretending censored successful
  * usage is an exact quota observation.
  *
- * - A successful 24h window only proves `limit >= requests`.
- * - A structured `free_tier_limit` rejection is a tight cap observation.
- * - Hit observations use exponential recency weighting (14d half-life).
- * - The documented/observed 200 req/day behavior remains a weak prior and
- *   bootstrap fallback, not a hard ceiling.
- * - Recent successful windows can invalidate a stale learned cap by turning
- *   the result back into an explicit lower bound.
+ * OpenCode's anonymous limiter is a UTC-calendar-day Redis counter. A
+ * successful day therefore proves only `limit >= requests`; a structured
+ * `free_tier_limit` rejection gives a tight observation for that day's cap.
+ * Hit observations use exponential recency weighting (14d half-life), while
+ * the observed 200 req/day behavior remains a weak bootstrap prior rather
+ * than a hard ceiling. This also lets the learner naturally discover the
+ * temporary 2x allowance OpenCode grants to new anonymous identities.
  */
 export function estimateZenFreeLimit(input: {
   now: number
@@ -125,7 +134,7 @@ export function estimateZenFreeLimit(input: {
 
   // Successful history is censored. Keep it as a hard lower bound only while
   // it is recent enough to plausibly describe the current quota regime. Once
-  // we have a limit hit, pre-hit success windows belong to the old regime and
+  // we have a limit hit, pre-hit success days belong to the old regime and
   // must not prevent a legitimate downward quota change from being learned.
   let knownAtLeast = used
   for (const observation of observations) {
@@ -204,14 +213,11 @@ export function zenEstimateToProviderResult(estimate: ZenFreeUsageEstimate, fetc
     fetchedAt,
     usage: {
       windows: {
-        [`24h · ${sourceLabel}`]: {
+        [`daily · ${sourceLabel}`]: {
           usedPercent,
           remainingPercent,
           windowSeconds: ZEN_FREE_WINDOW_MS / 1000,
-          // Rolling-window quotas do not have one wall-clock reset. This is
-          // the latest time all usage observed at fetch time is guaranteed to
-          // have rolled out if no additional requests are made.
-          resetAt: estimate.used > 0 ? fetchedAt + ZEN_FREE_WINDOW_MS : null,
+          resetAt: zenUtcDayEnd(fetchedAt),
           resetAfterSeconds: null,
           valueLabel,
         },
