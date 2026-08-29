@@ -6,21 +6,17 @@ import {
   type DesktopMenuEntry,
   type DesktopMenuRole,
 } from "@opencode-ai/app/desktop-menu"
-
 import { UPDATER_ENABLED } from "./constants"
 import { runDesktopMenuAction } from "./desktop-menu-actions"
 import { openExternalURL } from "./windows"
 import { nativeT } from "./native-translations"
-
 type Deps = {
   trigger: (id: string) => void
   checkForUpdates: () => void
   relaunch: () => void
 }
-
 export function createMenu(deps: Deps) {
   if (process.platform !== "darwin") return
-
   const template = DESKTOP_MENU.filter((menu) => desktopMenuVisible(menu, "macos")).map((menu) => {
     if (menu.role) return { role: nativeRole(menu.role), label: nativeT(menu.labelKey) }
     return {
@@ -30,20 +26,16 @@ export function createMenu(deps: Deps) {
         .map((entry) => nativeItem(entry, deps)),
     }
   })
-
   Menu.setApplicationMenu(Menu.buildFromTemplate(template))
 }
-
 function nativeItem(entry: DesktopMenuEntry, deps: Deps): MenuItemConstructorOptions {
   if (entry.type === "separator") return { type: "separator" }
   if (entry.role) return { role: nativeRole(entry.role), label: entry.labelKey ? nativeT(entry.labelKey) : undefined }
-
   const item: MenuItemConstructorOptions = {
     label: entry.labelKey ? nativeT(entry.labelKey) : undefined,
     accelerator: entry.accelerator?.macos,
     enabled: entry.enabled === "updater" ? UPDATER_ENABLED : undefined,
   }
-
   if (entry.command) {
     const command = entry.command
     item.click = () => deps.trigger(command)
@@ -60,10 +52,8 @@ function nativeItem(entry: DesktopMenuEntry, deps: Deps): MenuItemConstructorOpt
     const href = entry.href
     item.click = () => openExternalURL(href)
   }
-
   return item
 }
-
 function nativeRole(role: DesktopMenuRole) {
   return role as NonNullable<MenuItemConstructorOptions["role"]>
 }

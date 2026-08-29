@@ -1,16 +1,15 @@
 import { autopsyMark } from "./autopsy-timing" // STARTUP-AUTOPSY: temporary probe, see 02-main-process.md
 import { randomUUID } from "node:crypto"
-import { mkdirSync, rmSync } from "node:fs"
+import { mkdirSync, rmSync, writeFileSync } from "node:fs"
 import * as http from "node:http"
 import { createServer } from "node:net"
 import { homedir, tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
+import { fileURLToPath } from "node:url"
 import { getCACertificates, setDefaultCACertificates } from "node:tls"
 import type { Event } from "electron"
 import { app, BrowserWindow } from "electron"
-
 import { Deferred, Effect, Fiber } from "effect"
-
 import type { ServerReadyData } from "../preload/types"
 import { checkAppExists, resolveAppPath } from "./apps"
 import { CHANNEL } from "./constants"
@@ -52,7 +51,6 @@ import { setNativeTranslations } from "./native-translations"
 import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
 import { registerBrowserIpcHandlers } from "./ipc"
 import { wireWebviewHardening } from "./windows"
-
 const APP_NAMES: Record<string, string> = {
   dev: "OpenCode Dev",
   beta: "OpenCode Beta",
@@ -66,14 +64,12 @@ const APP_IDS: Record<string, string> = {
 const TEST_ONBOARDING = process.env.OPENCODE_TEST_ONBOARDING === "1"
 const SIDECAR_VERSION = process.env.OPENCODE_SIDECAR_V2 === "1" ? "v2" : "v1"
 const jsCallStackFeature = "DocumentPolicyIncludeJSCallStacksInCrashReports"
-
+const mobileDevUrlFile = fileURLToPath(new URL("../../../mobile/.opencode-dev-url", import.meta.url))
 let logger: ReturnType<typeof initLogging>
 let server: SidecarListener | null = null
 let readyData: ServerReadyData | null = null
 let browserEngine: BrowserEngine | null = null
-
 const pendingDeepLinks: string[] = []
-
 function useEnvProxy() {
   try {
     // Electron 41.2 runs Node 24.14.1; latest @types/node@24 is 24.12.2.
@@ -82,21 +78,22 @@ function useEnvProxy() {
     if (logger) logger.warn("failed to load proxy environment", error)
   }
 }
-
 function emitDeepLinks(urls: string[]) {
   if (urls.length === 0) return
   pendingDeepLinks.push(...urls)
   const win = getLastFocusedWindow()
   if (win) sendDeepLinks(win, urls)
 }
-
 async function killSidecar() {
   if (!server) return
   const current = server
   server = null
   await current.stop()
 }
-
+function writeMobileDevUrl(url: string) {
+  mkdirSync(dirname(mobileDevUrlFile), { recursive: true })
+  writeFileSync(mobileDevUrlFile, url, "utf8")
+}
 function ensureLoopbackNoProxy() {
   const loopback = ["127.0.0.1", "localhost", "::1"]
   const upsert = (key: string) => {
@@ -104,33 +101,25 @@ function ensureLoopbackNoProxy() {
       .split(",")
       .map((value: string) => value.trim())
       .filter((value: string) => Boolean(value))
-
     for (const host of loopback) {
       if (items.some((value: string) => value.toLowerCase() === host)) continue
       items.push(host)
     }
-
     process.env[key] = items.join(",")
   }
-
   upsert("NO_PROXY")
   upsert("no_proxy")
 }
-
 const main = Effect.gen(function* () {
   autopsyMark("main-body-start") // STARTUP-AUTOPSY
-
   // on macOS apps run in `/` which can cause issues with ripgrep
   try {
     process.chdir(homedir())
   } catch {}
-
   process.env.OPENCODE_DISABLE_EMBEDDED_WEB_UI = "true"
-
   const appId = app.isPackaged ? APP_IDS[CHANNEL] : "ai.opencode.desktop.dev"
   const onboardingTestRoot = ((): string | undefined => {
     if (!TEST_ONBOARDING) return
-
     const root = join(tmpdir(), `opencode-onboarding-${randomUUID()}`)
     rmSync(root, { recursive: true, force: true })
     ;["data", "config", "cache", "state", "desktop", "session"].forEach((dir) =>
@@ -153,7 +142,6 @@ const main = Effect.gen(function* () {
   initializeOldLayoutEligibility(app.getPath("userData"))
   logger = initLogging()
   initCrashReporter()
-
   const wslServers = createWslServersController(
     app.getVersion(),
     async (distro) => {
@@ -170,6 +158,7 @@ const main = Effect.gen(function* () {
     },
   )
   const stopSidecars = async () => {
+    rmSync(mobileDevUrlFile, { force: true })
     await killSidecar()
     wslServers.stopAll()
   }
@@ -180,33 +169,28 @@ const main = Effect.gen(function* () {
       app.quit()
     })
   }
-
   try {
     setDefaultCACertificates([...new Set([...getCACertificates("default"), ...getCACertificates("system")])])
   } catch (error) {
     logger.warn("failed to load system certificates", error)
   }
-
   logger.log("app starting", {
     version: app.getVersion(),
     packaged: app.isPackaged,
     onboardingTest: Boolean(onboardingTestRoot),
   })
-
   ensureLoopbackNoProxy()
   useEnvProxy()
   app.commandLine.appendSwitch("proxy-bypass-list", "<-loopback>")
   const features = app.commandLine.getSwitchValue("enable-features")
   app.commandLine.appendSwitch("enable-features", features ? `${jsCallStackFeature},${features}` : jsCallStackFeature)
   if (!app.isPackaged) app.commandLine.appendSwitch("remote-debugging-port", "9222")
-
   if (!app.requestSingleInstanceLock()) {
     app.quit()
     return
   }
-
-  const shellEnv = preferAppEnv(app.getPath("userData"))
-
+  rmSync(mobileDevUrlFile, { force: true })
+  preferAppEnv(app.getPath("userData"))
   app.on("second-instance", (_event: Event, argv: string[]) => {
     const urls = argv.filter((arg: string) => arg.startsWith("opencode://"))
     if (urls.length) {
@@ -219,48 +203,38 @@ const main = Effect.gen(function* () {
       win.focus()
     }
   })
-
   app.on("open-url", (event: Event, url: string) => {
     event.preventDefault()
     logger.log("deep link received via open-url", { url })
     emitDeepLinks([url])
   })
-
   app.on("before-quit", () => {
     setAppQuitting()
     void stopSidecars()
   })
-
   app.on("will-quit", () => {
     setAppQuitting()
     void stopSidecars()
   })
-
   app.on("child-process-gone", (_event, details) => {
     writeLog("utility", "child process gone", { details }, "error")
   })
-
   app.on("render-process-gone", (_event, webContents, details) => {
     writeLog("window", "app render process gone", { url: safeWebContentsURL(webContents), details }, "error")
   })
-
   setRelaunchHandler(() => {
     relaunch()
   })
-
   for (const signal of ["SIGINT", "SIGTERM"] as const) {
     process.on(signal, () => {
       setAppQuitting()
       void stopSidecars().finally(() => app.quit())
     })
   }
-
   const serverReady = Deferred.makeUnsafe<ServerReadyData, unknown>()
-
   autopsyMark("whenReady-wait-start") // STARTUP-AUTOPSY
   yield* Effect.promise(() => app.whenReady())
   autopsyMark("whenReady-done") // STARTUP-AUTOPSY
-
   if (!TEST_ONBOARDING) migrate()
   autopsyMark("migrate-done") // STARTUP-AUTOPSY
   yield* Effect.promise(() => cleanupStoreFiles(app.getPath("userData"))).pipe(
@@ -328,7 +302,6 @@ const main = Effect.gen(function* () {
   })
   registerWslIpcHandlers(wslServers)
   autopsyMark("ipc-registered") // STARTUP-AUTOPSY (includes draft-store sqlite open + orphan scan)
-
   // Browser engine: guest registry + CDP control + arbitration + host bridge.
   // Constructed once; start() (host hello) happens after the sidecar is up.
   browserEngine = new BrowserEngine({
@@ -362,7 +335,6 @@ const main = Effect.gen(function* () {
       }),
     ),
   )
-
   // Show a window as soon as we can instead of blocking on the sidecar (backend
   // process spawn + up-to-30s health-check poll below). The renderer's own
   // LoadingSplash already awaits `serverReady` via the `awaitInitialization` IPC
@@ -379,32 +351,26 @@ const main = Effect.gen(function* () {
     if (BrowserWindow.getAllWindows().length > 0) return
     restoreMainWindows()
   })
-
   autopsyMark("windows-restore-start") // STARTUP-AUTOPSY
   const windows = restoreMainWindows()
   autopsyMark("windows-created", { count: windows.length }) // STARTUP-AUTOPSY
   if (windows.length) createMenu(menuDeps)
-
   const loadingTask = yield* Effect.gen(function* () {
     logger.log("sidecar connection started", { version: SIDECAR_VERSION })
-
     ensureLoopbackNoProxy()
     useEnvProxy()
-
     if (SIDECAR_VERSION === "v2") {
       logger.log("spawning v2 sidecar")
-      const sidecar = yield* Effect.promise(() => startBackgroundCli(logger, shellEnv?.XDG_STATE_HOME))
+      const sidecar = yield* Effect.promise(() => startBackgroundCli(logger))
       readyData = { url: sidecar.url, username: sidecar.username, password: sidecar.password }
+      writeMobileDevUrl(sidecar.url)
       yield* Deferred.succeed(serverReady, readyData)
-
       if (process.platform === "win32") {
         void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
       }
-
       logger.log("loading task finished")
       return
     }
-
     const pickEphemeralPort = Effect.gen(function* () {
       const res = yield* Deferred.make<number, unknown>()
       const socket = createServer()
@@ -421,7 +387,6 @@ const main = Effect.gen(function* () {
       })
       return yield* Deferred.await(res)
     })
-
     const isEAddrInUse = (error: unknown): boolean => {
       if (!error) return false
       if (typeof error === "string") return error.includes("EADDRINUSE")
@@ -432,7 +397,6 @@ const main = Effect.gen(function* () {
       if (e.error && e.error !== error) return isEAddrInUse(e.error)
       return false
     }
-
     // OPENCODE_PORT is a global CLI env that collides with JetBrains ACP (4096) and
     // any `opencode serve --port` instances. Desktop's sidecar must be
     // independent: always use an ephemeral port. Honor an explicit desktop-only
@@ -443,12 +407,10 @@ const main = Effect.gen(function* () {
     const fromEnv = process.env.OPENCODE_DESKTOP_PORT
     const parsedEnvPort = fromEnv ? Number.parseInt(fromEnv, 10) : NaN
     const hasEnvPort = fromEnv !== undefined && !Number.isNaN(parsedEnvPort) && parsedEnvPort !== 0
-
     const hostname = "127.0.0.1"
     let port: number
     let password = randomUUID()
     let spawnResult: Awaited<ReturnType<typeof spawnLocalServer>> | null = null
-
     const trySpawn = (p: number) =>
       Effect.tryPromise({
         try: () =>
@@ -460,7 +422,6 @@ const main = Effect.gen(function* () {
           }),
         catch: (cause) => cause as unknown,
       })
-
     if (hasEnvPort) {
       port = parsedEnvPort
       logger.log("spawning sidecar", { url: `http://${hostname}:${port}`, source: "env" })
@@ -496,18 +457,16 @@ const main = Effect.gen(function* () {
         ),
       )
     }
-
     const url = `http://${hostname}:${port}`
     const { listener, health } = spawnResult!
     autopsyMark("sidecar-ready-msg") // STARTUP-AUTOPSY (utility process sent {type:"ready"})
     server = listener
     readyData = { url, username: "opencode", password }
+    writeMobileDevUrl(url)
     yield* Deferred.succeed(serverReady, readyData)
-
     if (process.platform === "win32") {
       void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
     }
-
     yield* Effect.promise(() => health.wait).pipe(
       Effect.timeout("30 seconds"),
       Effect.catch((e) =>
@@ -517,13 +476,10 @@ const main = Effect.gen(function* () {
       ),
     )
     autopsyMark("sidecar-health-done") // STARTUP-AUTOPSY
-
     logger.log("loading task finished")
   }).pipe(forwardInitializationFailure(serverReady), Effect.forkChild)
-
   yield* Fiber.await(loadingTask)
   autopsyMark("loading-task-done") // STARTUP-AUTOPSY
-
   // Sidecar is up (serverReady settled by the loadingTask above): start the
   // browser host bridge (loopback listener + sidecar hello registration).
   const engine = browserEngine
@@ -536,10 +492,8 @@ const main = Effect.gen(function* () {
       ),
     )
   }
-
   app.once("will-quit", () => {
     void browserEngine?.stop()
   })
 })
-
 Effect.runFork(main)

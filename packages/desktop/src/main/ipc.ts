@@ -7,7 +7,6 @@ import { app, BrowserWindow, clipboard, dialog, ipcMain, shell } from "electron"
 import type { IpcMainEvent, IpcMainInvokeEvent } from "electron"
 import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
 import { parseDesktopNativeBundle, type DesktopNativeBundle } from "@opencode-ai/app/i18n/desktop-native"
-
 import type { FatalRendererError, ServerReadyData, TitlebarTheme } from "../preload/types"
 import { runDesktopMenuAction } from "./desktop-menu-actions"
 import { setForceFocus } from "./debug"
@@ -28,14 +27,11 @@ import { createDesktopDraftStore } from "./draft-store"
 import { nativeT } from "./native-translations"
 import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
 import type { HostOwner } from "./browser/contracts"
-
 const pickerFilters = (ext?: string[]) => {
   if (!ext || ext.length === 0) return undefined
   return [{ name: nativeT("desktop.dialog.files"), extensions: ext }]
 }
-
 const pickedFiles = createPickedFileAuthorizations()
-
 type Deps = {
   killSidecar: () => Promise<void> | void
   relaunch: () => void
@@ -57,7 +53,6 @@ type Deps = {
   recordFatalRendererError: (error: FatalRendererError) => Promise<void> | void
   setNativeTranslations: (bundle: DesktopNativeBundle) => void
 }
-
 export function registerIpcHandlers(deps: Deps) {
   const drafts = createDesktopDraftStore(join(app.getPath("userData"), "drafts.sqlite"))
   const updaterSubscriptions = createUpdaterSubscriptions()
@@ -65,7 +60,6 @@ export function registerIpcHandlers(deps: Deps) {
   app.on("before-quit", () => drafts.flush())
   app.once("will-quit", () => drafts.close())
   app.on("browser-window-created", (_event, win) => win.on("session-end", () => drafts.flush()))
-
   ipcMain.handle("kill-sidecar", () => deps.killSidecar())
   ipcMain.handle("await-initialization", () => deps.awaitInitialization())
   ipcMain.handle("consume-initial-deep-links", () => deps.consumeInitialDeepLinks())
@@ -178,7 +172,6 @@ export function registerIpcHandlers(deps: Deps) {
     const data = drafts.getBlob(id)
     return data ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : null
   })
-
   ipcMain.handle(
     "open-directory-picker",
     async (_event: IpcMainInvokeEvent, opts?: { multiple?: boolean; title?: string; defaultPath?: string }) => {
@@ -191,7 +184,6 @@ export function registerIpcHandlers(deps: Deps) {
       return opts?.multiple ? result.filePaths : result.filePaths[0]
     },
   )
-
   ipcMain.handle(
     "open-file-picker",
     async (
@@ -217,15 +209,12 @@ export function registerIpcHandlers(deps: Deps) {
       return { token, files }
     },
   )
-
   ipcMain.handle("read-picked-file", async (event: IpcMainInvokeEvent, token: string, filePath: string) => {
     return pickedFiles.read(event.sender.id, token, filePath)
   })
-
   ipcMain.handle("release-picked-files", (event: IpcMainInvokeEvent, token: string) => {
     pickedFiles.release(event.sender.id, token)
   })
-
   ipcMain.handle(
     "save-file-picker",
     async (_event: IpcMainInvokeEvent, opts?: { title?: string; defaultPath?: string }) => {
@@ -237,15 +226,12 @@ export function registerIpcHandlers(deps: Deps) {
       return result.filePath ?? null
     },
   )
-
   ipcMain.on("open-external", (_event: IpcMainEvent, url: string) => {
     openExternalURL(url)
   })
-
   ipcMain.on("open-local-file", (_event: IpcMainEvent, url: string) => {
     openLocalFileURL(url)
   })
-
   ipcMain.handle("open-path", async (_event: IpcMainInvokeEvent, path: string, app?: string) => {
     if (!app) return shell.openPath(path)
     await new Promise<void>((resolve, reject) => {
@@ -254,7 +240,6 @@ export function registerIpcHandlers(deps: Deps) {
       execFile(cmd, args, (err) => (err ? reject(err) : resolve()))
     })
   })
-
   ipcMain.handle("reveal-path", async (_event: IpcMainInvokeEvent, path: string) => {
     const exists = await stat(path).then(
       () => true,
@@ -264,7 +249,6 @@ export function registerIpcHandlers(deps: Deps) {
     shell.showItemInFolder(path)
     return true
   })
-
   ipcMain.handle("read-clipboard-image", () => {
     const image = clipboard.readImage()
     if (image.isEmpty()) return null
@@ -272,7 +256,6 @@ export function registerIpcHandlers(deps: Deps) {
     const size = image.getSize()
     return { buffer, width: size.width, height: size.height }
   })
-
   ipcMain.handle("get-window-id", (event: IpcMainInvokeEvent) => {
     const win = BrowserWindow.fromWebContents(event.sender)
     if (!win) throw new Error("Window not found")
@@ -280,31 +263,25 @@ export function registerIpcHandlers(deps: Deps) {
     if (!id) throw new Error("Window ID not found")
     return id
   })
-
   ipcMain.handle("get-window-focused", (event: IpcMainInvokeEvent) => {
     const win = BrowserWindow.fromWebContents(event.sender)
     return win?.isFocused() ?? false
   })
-
   ipcMain.handle("get-window-fullscreen", (event: IpcMainInvokeEvent) => {
     const win = BrowserWindow.fromWebContents(event.sender)
     return win?.isFullScreen() ?? false
   })
-
   ipcMain.handle("set-window-focus", (event: IpcMainInvokeEvent) => {
     const win = BrowserWindow.fromWebContents(event.sender)
     win?.focus()
   })
-
   ipcMain.handle("show-window", (event: IpcMainInvokeEvent) => {
     const win = BrowserWindow.fromWebContents(event.sender)
     win?.show()
   })
-
   ipcMain.on("relaunch", () => {
     deps.relaunch()
   })
-
   ipcMain.handle("get-zoom-factor", (event: IpcMainInvokeEvent) => event.sender.getZoomFactor())
   ipcMain.handle("set-zoom-factor", (event: IpcMainInvokeEvent, factor: number) => {
     event.sender.setZoomFactor(factor)
@@ -328,128 +305,102 @@ export function registerIpcHandlers(deps: Deps) {
     })
   })
 }
-
 export function sendMenuCommand(win: BrowserWindow, id: string) {
   win.webContents.send("menu-command", id)
 }
-
 export function sendDeepLinks(win: BrowserWindow, urls: string[]) {
   win.webContents.send("deep-link", urls)
 }
-
 // --- browser engine IPC (window.api.browser) ---------------------------------
-
 export function registerBrowserIpcHandlers(engine: BrowserEngine) {
   // Only the app's own renderer windows may drive the browser engine; a guest
   // webview or any other webContents must not reach these handlers.
   const trusted = (event: IpcMainInvokeEvent): boolean =>
     BrowserWindow.fromWebContents(event.sender) !== null
-
   ipcMain.handle("browser-get-state", (event) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.getState()
   })
-
   ipcMain.handle("browser-open-tab", (event, url: string, opts?: { activate?: boolean; newTab?: boolean }) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.openTab(url, opts)
   })
-
   ipcMain.handle("browser-activate-tab", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.activateTab(tabId)
   })
-
   ipcMain.handle("browser-close-tab", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.closeTab(tabId)
   })
-
   ipcMain.handle("browser-register-webview", (event, runtimeTabId: string, webContentsId: number, generation?: number) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.registerWebview(runtimeTabId, webContentsId, generation)
   })
-
   ipcMain.handle("browser-unregister-webview", (event, runtimeTabId: string, webContentsId?: number, generation?: number) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.unregisterWebview(runtimeTabId, webContentsId, generation)
   })
-
   ipcMain.handle("browser-human-input", (event, runtimeTabId: string, signal: unknown) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     engine.api.humanInput(runtimeTabId, signal)
   })
-
   ipcMain.handle("browser-assign-tab", (event, tabId: string, owner: HostOwner) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.assignTab(tabId, owner)
   })
-
   ipcMain.handle("browser-close-range", (event, tabId: string, mode: "left" | "right" | "others" | "all") => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.closeRange(tabId, mode)
   })
-
   ipcMain.handle("browser-refresh-tab", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.refreshTab(tabId)
   })
-
   ipcMain.handle("browser-duplicate-tab", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.duplicateTab(tabId)
   })
-
   ipcMain.handle("browser-set-tab-muted", (event, tabId: string, muted: boolean) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.setTabMuted(tabId, muted)
   })
-
   ipcMain.handle("browser-open-devtools", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.openDevtools(tabId)
   })
-
   ipcMain.handle("browser-hard-reload", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.hardReload(tabId)
   })
-
   ipcMain.handle("browser-clear-cookies", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.clearCookies(tabId)
   })
-
   ipcMain.handle("browser-clear-cache", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.clearCache(tabId)
   })
-
   ipcMain.handle("browser-set-appearance", (event, appearance: "system" | "light" | "dark") => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.setAppearance(appearance)
   })
-
   ipcMain.handle("browser-list-extensions", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.listExtensions(tabId)
   })
-
   ipcMain.handle("browser-set-extension-enabled", (event, tabId: string, extensionId: string, enabled: boolean) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.setExtensionEnabled(tabId, extensionId, enabled)
   })
-
   ipcMain.handle("browser-get-guest-preload", (event) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return resolveGuestPreloadPath()
   })
-
   ipcMain.handle("browser-start-annotation", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.startAnnotation(tabId)
   })
-
   ipcMain.handle("browser-cancel-annotation", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     engine.api.cancelAnnotation(tabId)

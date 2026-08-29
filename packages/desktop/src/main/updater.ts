@@ -5,9 +5,7 @@ import { getLogger } from "./logging"
 import { getStore } from "./store"
 import { setAppQuitting } from "./windows"
 import { nativeT } from "./native-translations"
-
 const key = "ready"
-
 export async function setupAutoUpdater(stop: () => Promise<void>) {
   const logger = getLogger()
   if (!UPDATER_ENABLED) {
@@ -28,7 +26,6 @@ export async function setupAutoUpdater(stop: () => Promise<void>) {
       log: (message, data) => logger.log(message, data),
     })
   }
-
   const imported = await import("electron-updater")
   const autoUpdater = imported.autoUpdater ?? imported.default.autoUpdater
   autoUpdater.logger = logger
@@ -43,7 +40,6 @@ export async function setupAutoUpdater(stop: () => Promise<void>) {
     allowDowngrade: autoUpdater.allowDowngrade,
     currentVersion: app.getVersion(),
   })
-
   const store = getStore("opencode.updater")
   return createUpdaterController({
     enabled: UPDATER_ENABLED,
@@ -78,7 +74,6 @@ export async function setupAutoUpdater(stop: () => Promise<void>) {
     log: (message, data) => logger.log(message, data),
   })
 }
-
 export async function showUpdaterDialog(
   controller: Awaited<ReturnType<typeof setupAutoUpdater>>,
   alertOnFail: boolean,
@@ -103,7 +98,6 @@ export async function showUpdaterDialog(
     return
   }
   if (state.status !== "ready") return
-
   const response = await dialog.showMessageBox({
     type: "info",
     message: nativeT("desktop.updater.dialog.ready.message", { version: state.version }),

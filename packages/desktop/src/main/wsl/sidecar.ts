@@ -6,21 +6,18 @@ import { checkHealth } from "../server"
 import { type WslCommandLine, resolveWslOpencode, shellEscape, wslArgs } from "./runtime"
 import { pollWslHealth } from "./startup"
 import { nativeT } from "../native-translations"
-
 export type WslSidecar = {
   listener: { stop: () => void; onExit: (cb: (code: number | null, signal: NodeJS.Signals | null) => void) => void }
   url: string
   username: string | null
   password: string
 }
-
 export async function spawnWslSidecar(
   distro: string,
   opts: { onLine?: (line: WslCommandLine) => void; healthTimeoutMs?: number } = {},
 ): Promise<WslSidecar> {
   const opencode = await resolveWslOpencode(distro)
   if (!opencode) throw new Error(nativeT("desktop.wsl.error.opencodeNotInstalled", { distro }))
-
   const port = await allocatePort()
   const password = randomUUID()
   const username = "opencode"
@@ -42,7 +39,6 @@ export async function spawnWslSidecar(
     windowsHide: true,
   })
   child.stdin.end(script)
-
   const recentOutput: string[] = []
   const emit = (line: WslCommandLine) => {
     if (!line.text.trim()) return
@@ -52,7 +48,6 @@ export async function spawnWslSidecar(
   }
   forwardLines(child.stdout, "stdout", emit)
   forwardLines(child.stderr, "stderr", emit)
-
   const exit = new Promise<never>((_, reject) => {
     child.once("error", reject)
     child.once("exit", (code, signal) => reject(new Error(startupFailure(code, signal, recentOutput))))
@@ -69,7 +64,6 @@ export async function spawnWslSidecar(
         timeoutMs,
       )),
   )
-
   await Promise.race([health, exit, timedOut])
     .catch((error) => {
       child.kill()
@@ -89,7 +83,6 @@ export async function spawnWslSidecar(
     password,
   }
 }
-
 function allocatePort() {
   return new Promise<number>((resolve, reject) => {
     const server = createServer()
@@ -105,7 +98,6 @@ function allocatePort() {
     })
   })
 }
-
 function forwardLines(
   stream: NodeJS.ReadableStream,
   source: WslCommandLine["stream"],
@@ -123,7 +115,6 @@ function forwardLines(
     if (pending) onLine({ stream: source, text: pending })
   })
 }
-
 function startupFailure(code: number | null, signal: NodeJS.Signals | null, recentOutput: string[]) {
   const suffix = recentOutput.length ? `\n${recentOutput.join("\n")}` : ""
   return nativeT("desktop.wsl.error.serverExitedBeforeHealthy", {

@@ -5,20 +5,16 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { ZipWriter, BlobWriter, BlobReader } from "@zip.js/zip.js"
 import { dirname, join } from "node:path"
 import { homedir } from "node:os"
-
 const MAX_LOG_AGE_DAYS = 7
 const TAIL_LINES = 1000
 const EXPORT_WINDOW = 24 * 60 * 60 * 1000
 const MAX_EXPORT_FILE_SIZE = 50 * 1024 * 1024
 const NET_LOG_SIZE = 20 * 1024 * 1024
-
 let root = ""
 let run = ""
 let netLogPath: string | undefined
-
 let logger: MainLogger
 export const getLogger = () => logger
-
 export function initLogging() {
   initRunDirectory()
   log.transports.file.maxSize = 5 * 1024 * 1024
@@ -32,7 +28,6 @@ export function initLogging() {
   cleanup()
   return (logger = log)
 }
-
 export function initCrashReporter() {
   const dir = join(app.getPath("userData"), "Crashpad")
   mkdirSync(dir, { recursive: true })
@@ -40,20 +35,17 @@ export function initCrashReporter() {
   crashReporter.start({ uploadToServer: false, compress: true })
   write("crash", "crash reporter started", { path: dir })
 }
-
 export async function startNetLog() {
   if (netLog.currentlyLogging) return
   netLogPath = join(run, "network.netlog")
   await netLog.startLogging(netLogPath, { captureMode: "default", maxFileSize: NET_LOG_SIZE })
   write("network", "net log started", { path: netLogPath })
 }
-
 export async function exportDebugLogs() {
   const restartNetLog = netLog.currentlyLogging
   if (restartNetLog) {
     await netLog.stopLogging().catch((error) => write("network", "failed to stop net log", { error }))
   }
-
   const output = join(app.getPath("downloads"), `opencode-debug-${stamp()}.zip`)
   try {
     write("main", "exporting debug logs", { output })
@@ -71,7 +63,6 @@ export async function exportDebugLogs() {
     }
   }
 }
-
 export function write(
   name: string,
   message: string,
@@ -86,7 +77,6 @@ export function write(
   }
   scoped[level](message)
 }
-
 export function tail(): string {
   try {
     const path = log.transports.file.getFile().path
@@ -97,28 +87,23 @@ export function tail(): string {
     return ""
   }
 }
-
 function initRunDirectory() {
   root = join(app.getPath("userData"), "logs")
   run = join(root, stamp())
   mkdirSync(run, { recursive: true })
 }
-
 function stamp() {
   return new Date()
     .toISOString()
     .replace(/[-:]/g, "")
     .replace(/\.\d+Z$/, "")
 }
-
 function safeLogName(name: string) {
   return name.replace(/[^a-z0-9_.-]/gi, "_") || "main"
 }
-
 function cleanup() {
   const dir = root || dirname(log.transports.file.getFile().path)
   const cutoff = Date.now() - MAX_LOG_AGE_DAYS * 24 * 60 * 60 * 1000
-
   for (const entry of readdirSync(dir)) {
     const file = join(dir, entry)
     try {
@@ -129,7 +114,6 @@ function cleanup() {
     }
   }
 }
-
 function manifest() {
   return {
     generated: new Date().toISOString(),
@@ -148,14 +132,11 @@ function manifest() {
     netLog: netLogPath,
   }
 }
-
 function serverLogRoots() {
   const xdgData = process.env.XDG_DATA_HOME || join(homedir(), ".local", "share")
   return [...new Set([join(xdgData, "opencode", "log"), join(app.getPath("userData"), "opencode", "log")])]
 }
-
 type Entry = { name: string; path?: string; data?: Buffer }
-
 function collect(dir: string, prefix: string): Entry[] {
   if (!existsSync(dir)) return []
   const cutoff = Date.now() - EXPORT_WINDOW
@@ -177,7 +158,6 @@ function collect(dir: string, prefix: string): Entry[] {
   walk(dir)
   return result
 }
-
 async function writeZip(output: string, entries: Entry[]) {
   const writer = new ZipWriter(new BlobWriter("application/zip"))
   for (const entry of entries) {
@@ -187,13 +167,11 @@ async function writeZip(output: string, entries: Entry[]) {
   const zip = await writer.close()
   writeFileSync(output, Buffer.from(await zip.arrayBuffer()))
 }
-
 function initConsoleTransport() {
   if (app.isPackaged) {
     log.transports.console.level = false
     return
   }
-
   const write = log.transports.console.writeFn.bind(log.transports.console)
   log.transports.console.writeFn = (options) => {
     try {
@@ -204,7 +182,6 @@ function initConsoleTransport() {
     }
   }
 }
-
 function isBrokenPipe(err: unknown) {
   return typeof err === "object" && err !== null && "code" in err && err.code === "EPIPE"
 }

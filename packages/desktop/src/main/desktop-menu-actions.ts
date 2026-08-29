@@ -1,12 +1,10 @@
 import { BrowserWindow } from "electron"
 import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
 import { createMainWindow, updateTitlebar } from "./windows"
-
 export type DesktopMenuActionHandlers = Partial<{
   checkForUpdates: () => void
   relaunch: () => void
 }>
-
 export function runDesktopMenuAction(
   win: BrowserWindow | null,
   action: DesktopMenuAction,
@@ -76,7 +74,6 @@ export function runDesktopMenuAction(
       return
   }
 }
-
 function setZoom(win: BrowserWindow | null, value: number) {
   if (!win) return
   win.webContents.setZoomFactor(Math.min(Math.max(value, 0.2), 10))

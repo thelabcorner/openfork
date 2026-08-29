@@ -1,6 +1,5 @@
 import { app, BrowserWindow, nativeTheme, session, webContents } from "electron"
 import type { WebContents } from "electron"
-
 import { ControlArbiter } from "./arbitration"
 import {
   BROWSER_PARTITION,
@@ -14,7 +13,6 @@ import {
   toWireGuestTabState,
   type WireGuestTabState,
 } from "./contracts"
-
 // Webview guest registry. The renderer owns the <webview> DOM element; this
 // registry owns the identity, lifecycle, and state of the guest webContents.
 // Registration validates the T3 ownership contract:
@@ -22,10 +20,8 @@ import {
 // Control arbitration lives in the ControlArbiter and CDP sessions in the
 // ControlSessionManager (both injected); this module only observes the guest
 // and forwards human input / crash signals to its callbacks.
-
 /** Engine-internal tab record: full guest state plus the live webContents. */
 export type GuestRecord = GuestTabState & { webContents: WebContents }
-
 export type GuestRegistryOptions = {
   windowId: string
   arbiter: ControlArbiter
@@ -39,19 +35,16 @@ export type GuestRegistryOptions = {
   onHumanInput: (runtimeTabId: string, signal: HumanInputSignal) => void
   logger?: { log: (message: string, meta?: unknown) => void; error: (message: string, meta?: unknown) => void }
 }
-
 export function isValidGuestWebContents(wc: WebContents, hostWebContents: WebContents) {
   if (wc.isDestroyed()) return false
   if (wc.getType() !== "webview") return false
   return wc.hostWebContents === hostWebContents
 }
-
 export function isBrowserGuestUrl(value: string) {
   if (!URL.canParse(value)) return false
   const url = new URL(value)
   return url.protocol === "http:" || url.protocol === "https:"
 }
-
 export class GuestRegistry {
   private readonly tabs = new Map<string, GuestRecord>()
   private readonly snapshotRefs = new Map<string, Map<string, unknown>>()
@@ -63,9 +56,7 @@ export class GuestRegistry {
    * active while any exist (and Map ORDER stays insertion order — activation
    * must not reorder the strip the way the session tabs UI keeps positions). */
   private activeTabId: string | null = null
-
   constructor(private readonly options: GuestRegistryOptions) {}
-
   get activeTab(): GuestRecord | undefined {
     if (this.activeTabId !== null) {
       const tracked = this.tabs.get(this.activeTabId)
@@ -73,37 +64,30 @@ export class GuestRegistry {
     }
     return this.tabs.values().next().value
   }
-
   get size(): number {
     return this.tabs.size
   }
-
   get(runtimeTabId: string): GuestRecord | undefined {
     return this.tabs.get(runtimeTabId)
   }
-
   list(): GuestRecord[] {
     return [...this.tabs.values()]
   }
-
   activate(runtimeTabId: string): GuestRecord | undefined {
     const record = this.tabs.get(runtimeTabId)
     if (!record) return undefined
     this.activeTabId = runtimeTabId
     return record
   }
-
   /** Map an engine record to the wire tab state broadcast to the renderer. */
   tabState(record: GuestRecord): WireGuestTabState {
     return toWireGuestTabState(record, record === this.activeTab)
   }
-
   /** Push the current wire state for a tab to the onStateChange consumer. */
   sync(runtimeTabId: string): void {
     const record = this.tabs.get(runtimeTabId)
     if (record) this.options.onStateChange(this.tabState(record))
   }
-
   /** Resolve a tab for an operation; undefined when unknown or crashed. */
   requireTab(runtimeTabId?: string): GuestRecord | undefined {
     const record = runtimeTabId ? this.tabs.get(runtimeTabId) : undefined
@@ -111,7 +95,6 @@ export class GuestRegistry {
     if (record.crashed) return undefined
     return record
   }
-
   /**
    * The renderer mounts the <webview> and reports it here. Creates the tab
    * record on first registration (open requests flow through the renderer, so
@@ -129,7 +112,6 @@ export class GuestRegistry {
       throw new Error("Invalid webview guest: not a webview or not hosted by this window")
     }
     if (!this.options.isTrustedHost(host)) throw new Error("Untrusted host window for browser guest")
-
     const record: GuestRecord =
       existing ??
       (({
@@ -171,7 +153,6 @@ export class GuestRegistry {
     this.sync(runtimeTabId)
     return record
   }
-
   /** Tear down a tab: clear arbitration, refs, and the partition lease. */
   unregister(runtimeTabId: string, webContentsId?: number, generation?: number): void {
     const record = this.tabs.get(runtimeTabId)
@@ -184,14 +165,12 @@ export class GuestRegistry {
     if (this.activeTabId === runtimeTabId) this.activeTabId = this.tabs.keys().next().value ?? null
     this.releasePartition(BROWSER_PARTITION)
   }
-
   /** The agent is about to synthesize input; pre-register it for arbitration. */
   expectAgentInput(signal: HumanInputSignal): void {
     const active = this.activeTab
     if (!active) return
     this.options.arbiter.expectAgentInput(active.runtimeTabId, signal)
   }
-
   setController(runtimeTabId: string, controller: Controller): void {
     this.options.arbiter.setControllerFor(runtimeTabId, controller)
     const record = this.tabs.get(runtimeTabId)
@@ -199,7 +178,6 @@ export class GuestRegistry {
     record.controller = this.options.arbiter.controller(runtimeTabId)
     this.sync(runtimeTabId)
   }
-
   /** Flip a tab's owner (claim, assign, orphan) and push the wire state out. */
   setOwner(runtimeTabId: string, owner: HostOwner): void {
     const record = this.tabs.get(runtimeTabId)
@@ -207,67 +185,53 @@ export class GuestRegistry {
     record.owner = owner
     this.sync(runtimeTabId)
   }
-
   setMuted(runtimeTabId: string, muted: boolean): void {
     const record = this.tabs.get(runtimeTabId)
     if (!record) return
     record.muted = muted
     this.sync(runtimeTabId)
   }
-
   controller(runtimeTabId: string): Controller {
     return this.options.arbiter.controller(runtimeTabId)
   }
-
   setAppearance(next: Appearance): void {
     this.appearance = next
     for (const record of this.tabs.values()) record.colorScheme = this.resolveColorScheme()
     this.options.onStateChange(this.activeTab ? this.tabState(this.activeTab) : null)
   }
-
   getAppearance(): Appearance {
     return this.appearance
   }
-
   setRecording(next: { active: boolean; recordingId?: string }): void {
     this.recording = next
     this.options.onStateChange(this.activeTab ? this.tabState(this.activeTab) : null)
   }
-
   getRecording(): { active: boolean; recordingId?: string } {
     return this.recording
   }
-
   bumpSnapshotVersion(runtimeTabId: string): number {
     const record = this.tabs.get(runtimeTabId)
     if (!record) return 0
     record.snapshotVersion += 1
     return record.snapshotVersion
   }
-
   setSnapshotRefs(runtimeTabId: string, refs: Map<string, unknown>): void {
     this.snapshotRefs.set(runtimeTabId, refs)
   }
-
   getSnapshotRefs(runtimeTabId: string): Map<string, unknown> | undefined {
     return this.snapshotRefs.get(runtimeTabId)
   }
-
   teardown(): void {
     for (const runtimeTabId of [...this.tabs.keys()]) this.unregister(runtimeTabId)
   }
-
   // --- internals -------------------------------------------------------------
-
   private resolveColorScheme(): "light" | "dark" {
     if (this.appearance !== "system") return this.appearance
     return app.isReady() ? (nativeTheme.shouldUseDarkColors ? "dark" : "light") : "light"
   }
-
   private touchPartition(partition: string) {
     this.partitionRefs.set(partition, (this.partitionRefs.get(partition) ?? 0) + 1)
   }
-
   private releasePartition(partition: string) {
     const next = (this.partitionRefs.get(partition) ?? 1) - 1
     if (next > 0) {
@@ -284,7 +248,6 @@ export class GuestRegistry {
       })
     }
   }
-
   private wireGuest(record: GuestRecord, wc: WebContents) {
     const runtimeTabId = record.runtimeTabId
     const webContentsId = wc.id
@@ -359,7 +322,6 @@ export class GuestRegistry {
       this.options.onGuestGone(runtimeTabId, wc.id)
       this.sync(runtimeTabId)
     })
-
     // Guest-posted human input (from the sandboxed guest preload). The agent's
     // own CDP-dispatched input echoes back here too — the arbiter matches it
     // against the expected-agent-input queue so only REAL human input preempts.
@@ -369,7 +331,6 @@ export class GuestRegistry {
       if (!signal || !isHumanInputSignal(signal)) return
       this.options.onHumanInput(record.runtimeTabId, signal)
     })
-
     // Deny popups inside the hosted guest. Loading the popup target in-place
     // can cause consent/login retry loops on sites that expect a separate tab.
     wc.setWindowOpenHandler(({ url }) => {

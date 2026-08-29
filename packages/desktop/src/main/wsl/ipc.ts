@@ -4,13 +4,11 @@ import type { WslServersController } from "./servers"
 import { requireWslIpcString, requireWslIpcStrings } from "./policy"
 import type { WslServersState } from "../../preload/types"
 import { nativeT } from "../native-translations"
-
 export function registerWslIpcHandlers(controller: WslServersController) {
   if (process.platform !== "win32") {
     registerUnavailableWslIpcHandlers()
     return
   }
-
   const subscriptions = new Map<number, () => void>()
   const unsubscribe = (id: number) => {
     const off = subscriptions.get(id)
@@ -18,12 +16,10 @@ export function registerWslIpcHandlers(controller: WslServersController) {
     off()
     subscriptions.delete(id)
   }
-
   app.once("will-quit", () => {
     subscriptions.forEach((off) => off())
     subscriptions.clear()
   })
-
   ipcMain.handle("wsl-servers-subscribe", (event) => {
     const id = event.sender.id
     if (subscriptions.has(id)) return
@@ -66,7 +62,6 @@ export function registerWslIpcHandlers(controller: WslServersController) {
     controller.startServer(requireWslIpcString("server id", id)),
   )
 }
-
 function registerUnavailableWslIpcHandlers() {
   const unavailable = () => {
     throw new Error(nativeT("desktop.wsl.error.windowsOnly"))
@@ -85,7 +80,6 @@ function registerUnavailableWslIpcHandlers() {
     servers: [],
     job: null,
   })
-
   ipcMain.handle("wsl-servers-subscribe", (event) => {
     event.sender.send("wsl-servers-event", { type: "state", state: state() })
   })

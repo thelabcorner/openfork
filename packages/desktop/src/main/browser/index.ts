@@ -1,13 +1,11 @@
 // BrowserEngine facade: composes the guest registry, control arbitration, CDP
 // control sessions, operations, and the host HTTP bridge; owns the
 // renderer-facing IPC surface (window.api.browser) and window broadcasts.
-
-import { BrowserWindow } from "electron"
 import type { WebContents } from "electron"
+import { BrowserWindow } from "electron"
 import { randomUUID } from "node:crypto"
 import { dirname, join } from "node:path"
 import { fileURLToPath } from "node:url"
-
 import { BrowserOperations } from "./operations"
 import { GuestRegistry } from "./guest"
 import { ControlArbiter } from "./arbitration"
@@ -26,7 +24,6 @@ import {
   type WireGuestTabState,
   rangeTargets,
 } from "./contracts"
-
 // wireGuest (guest.ts) calls sync() on every micro-transition of a
 // navigation (start-loading, title, navigate, stop-loading can all fire
 // within the same tick, and SPA pages firing did-navigate-in-page on every
@@ -37,7 +34,6 @@ import {
 // and downstream consumers only care about the latest value, not every
 // intermediate one.
 const GUEST_STATE_EVENT_DEBOUNCE_MS = 80
-
 export interface BrowserEngineOptions {
   windowId: string
   /** Latest sidecar endpoint+auth (from ServerReadyData); null until ready. */
@@ -48,7 +44,6 @@ export interface BrowserEngineOptions {
   recordingDirectory: string
   logger?: { log: (message: string, meta?: unknown) => void; error: (message: string, meta?: unknown) => void }
 }
-
 export interface BrowserRenderApi {
   getState: () => BrowserState
   openTab: (url: string, opts?: { activate?: boolean; newTab?: boolean }) => { tabId: string }
@@ -78,7 +73,6 @@ export interface BrowserRenderApi {
   startAnnotation: (tabId: string) => Promise<BrowserAnnotationResult | null>
   cancelAnnotation: (tabId: string) => void
 }
-
 export class BrowserEngine {
   readonly arbiter = new ControlArbiter()
   readonly sessions = new ControlSessionManager({ arbiter: this.arbiter })
@@ -92,7 +86,6 @@ export class BrowserEngine {
   private readonly pendingActivation = new Set<string>()
   private readonly guestStateEventTimers = new Map<string, ReturnType<typeof setTimeout>>()
   private started = false
-
   constructor(options: BrowserEngineOptions) {
     this.options = options
     const capabilities: HostCapabilities = {
@@ -161,7 +154,6 @@ export class BrowserEngine {
       logger: options.logger,
     })
   }
-
   /** Human input (guest preload ipc or renderer-forwarded): preemption decision + controller lifecycle. */
   private handleHumanInput(runtimeTabId: string, signal: unknown): void {
     void this.arbiter.handleHumanInput(runtimeTabId, signal as HumanInputSignal).then(() => {
@@ -171,14 +163,12 @@ export class BrowserEngine {
       this.registry.sync(runtimeTabId)
     })
   }
-
   /** Called after the app server is ready: start the host bridge. */
   async start(): Promise<void> {
     if (this.started) return
     this.started = true
     await this.host.start()
   }
-
   async stop(): Promise<void> {
     if (!this.started) return
     this.started = false
@@ -189,11 +179,9 @@ export class BrowserEngine {
     await this.sessions.detachAll()
     await this.host.stop()
   }
-
   get isHostConnected(): boolean {
     return this.host.isConnected
   }
-
   getState(): BrowserState {
     const tabs = this.registry.list().map((record) => this.registry.tabState(record))
     const active = this.registry.activeTab
@@ -223,7 +211,6 @@ export class BrowserEngine {
       tabs,
     }
   }
-
   /** Renderer-facing API (window.api.browser). */
   readonly api: BrowserRenderApi = {
     getState: () => this.getState(),
@@ -327,7 +314,6 @@ export class BrowserEngine {
       this.annotation.cancel(tabId)
     },
   }
-
   /** User-authority close (D9): preempt the arbiter + detach the CDP session so
    * an in-flight agent op aborts (never hangs), then destroy and emit tab.closed. */
   private closeTabInternal(tabId: string): string[] {
@@ -342,13 +328,11 @@ export class BrowserEngine {
     this.options.broadcast("browser-tab-close", { tabId })
     return [tabId]
   }
-
   private closeTabs(tabIds: readonly string[]): string[] {
     const closed: string[] = []
     for (const tabId of tabIds) closed.push(...this.closeTabInternal(tabId))
     return closed
   }
-
   private scheduleGuestStateEvent(tab: WireGuestTabState): void {
     const existing = this.guestStateEventTimers.get(tab.tabId)
     if (existing) clearTimeout(existing)
@@ -360,7 +344,6 @@ export class BrowserEngine {
     this.guestStateEventTimers.set(tab.tabId, timer)
   }
 }
-
 /** Absolute path of the browser-guest preload bundle (electron-vite "preview" input). */
 export const resolveGuestPreloadPath = (): string =>
   join(dirname(fileURLToPath(import.meta.url)), "../preload/preview.js")

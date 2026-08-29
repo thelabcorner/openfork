@@ -11,7 +11,7 @@
   "scripts": {
     "typecheck": "tsgo -b",
     "predev": "bun ./scripts/predev.ts",
-    "dev": "concurrently -n desktop,pwa -c blue,green \"electron-vite dev\" \"bun --cwd ../mobile dev\"",
+    "dev": "concurrently -n desktop,pwa -c blue,green \"bun ./scripts/dev-electron.ts\" \"bun --cwd ../mobile dev\"",
     "prebuild": "bun ./scripts/prebuild.ts",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
@@ -73,4 +73,3 @@
     "@parcel/watcher-win32-x64": "2.5.1"
   }
 }
-
