@@ -35,6 +35,11 @@ tsconfig.tsbuildinfo
 
 # Agent swarm databases (local-only, never commit)
 .opencode/swarms/*.chunkdb*
+# Unified file indexes now live in Global.data/file-index/ (SQLite + JSON).
+# Legacy repo-local Brotli copy and any future .opencode file-index artifacts
+# must stay untracked — they are derived caches, not source.
+.opencode/file-index*
+.opencode/*.br
 
 # Local run artifacts (probe/e2e/profiling output)
 *.log
