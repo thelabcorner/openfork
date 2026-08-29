@@ -14,7 +14,7 @@
 
 OpenCode Zen has an anonymous/promotional free-model quota, but OpenCode does not publish the actual numeric deployment limit in source or public documentation. The limiter implementation is public, while the numeric values are loaded from the deployment secret `ZEN_LIMITS` through `Subscription.getFreeLimits()`.
 
-The correct OpenFork feature therefore cannot be a hardcoded exact counter. It is a **local estimator of a hidden, time-varying, IP-scoped quota** built from evidence already persisted in the user's OpenCode database.
+The correct OpenFork feature therefore cannot be a hardcoded exact counter like we were able to make with the OpenRouter FUT API. It instead is a CUSTOM **local estimator of a hidden, time-varying, IP-scoped quota** built from evidence already persisted in the user's OpenCode database.
 
 The key architectural decisions are:
 
