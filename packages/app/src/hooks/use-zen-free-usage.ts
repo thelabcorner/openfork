@@ -8,6 +8,7 @@ import {
   countZenFreeRequests,
   estimateZenFreeLimit,
   zenEstimateToProviderResult,
+  zenUtcDayStart,
   ZEN_FREE_HISTORY_MS,
   ZEN_FREE_WINDOW_MS,
   type ZenLimitObservation,
@@ -79,7 +80,7 @@ async function runPool<T>(jobs: readonly T[], concurrency: number, worker: (job:
  * Current usage comes from the exact same `usage.summary` DB-backed endpoint
  * as the Usage pane. A compact persisted observation log learns the quota over
  * time: recent structured limit hits are high-confidence cap observations,
- * while successful historical 24h windows remain censored lower bounds.
+ * while successful historical UTC quota days remain censored lower bounds.
  */
 export function useZenFreeUsage() {
   const serverSDK = useServerSDK()
@@ -113,7 +114,7 @@ export function useZenFreeUsage() {
     () => refreshTick(),
     async () => {
       const fetchedAt = Date.now()
-      const summary = await fetchSummary(fetchedAt - ZEN_FREE_WINDOW_MS, fetchedAt, "hour")
+      const summary = await fetchSummary(zenUtcDayStart(fetchedAt), fetchedAt, "hour")
       return { used: countZenFreeRequests(summary), fetchedAt }
     },
   )
@@ -148,10 +149,10 @@ export function useZenFreeUsage() {
       const needsBackfill = !learning.lastBackfillAt || now - learning.lastBackfillAt >= BACKFILL_REFRESH_MS
 
       if (needsBackfill) {
-        // Stable, complete UTC 24h slices. Fourteen local DB queries once per
-        // day is intentionally bounded; normal refreshes only query current
-        // usage, so this does not turn the Limits heartbeat into DB churn.
-        const anchor = Math.floor(now / ZEN_FREE_WINDOW_MS) * ZEN_FREE_WINDOW_MS
+        // Stable, complete UTC quota days. Fourteen local DB queries once per
+        // day is intentionally bounded; normal refreshes query only the active
+        // UTC day, so the Limits heartbeat cannot trigger historical DB churn.
+        const anchor = zenUtcDayStart(now)
         for (let index = 0; index < BACKFILL_DAYS; index++) {
           const until = anchor - index * ZEN_FREE_WINDOW_MS
           const since = until - ZEN_FREE_WINDOW_MS
@@ -168,7 +169,7 @@ export function useZenFreeUsage() {
           (item) => item.kind === "limit-hit" && Math.abs(item.at - at) < OBSERVATION_DEDUPE_MS,
         )
         if (already) continue
-        jobs.push({ at, kind: "limit-hit", since: at - ZEN_FREE_WINDOW_MS, until: at })
+        jobs.push({ at, kind: "limit-hit", since: zenUtcDayStart(at), until: at })
       }
 
       const observations: ZenLimitObservation[] = []
