@@ -41,6 +41,38 @@ export const ProviderModelUsage = Schema.Struct({
 })
 export type ProviderModelUsage = Schema.Schema.Type<typeof ProviderModelUsage>
 
+export const WorkBuddyModelLimit = Schema.Struct({
+  model: Schema.String,
+  canonical: Schema.NullOr(Schema.String),
+  unit: Schema.String,
+  usedObserved: Schema.Finite,
+  limitEstimate: Schema.NullOr(Schema.Finite),
+  remainingEstimate: Schema.NullOr(Schema.Finite),
+  remainingPercent: Schema.NullOr(Schema.Finite),
+  status: Schema.Literal("healthy", "draining", "low", "critical", "terminal", "depleted", "unknown"),
+  confidence: Schema.Literal("low", "medium", "high"),
+  accuracy: Schema.Literal("observed", "estimate", "server-confirmed"),
+  exhaustedObserved: Schema.Boolean,
+  serverCode: Schema.NullOr(Schema.Finite),
+  resetAt: Schema.NullOr(Schema.Finite),
+  resetSource: Schema.Literal("server-6004", "inferred", "unknown"),
+  windowType: Schema.Literal("server-defined", "inferred-rolling-24h", "unknown"),
+  windowStartedAt: Schema.NullOr(Schema.Finite),
+  lastObservationAt: Schema.NullOr(Schema.Finite),
+  burnPerHour: Schema.NullOr(Schema.Finite),
+  estimatedExhaustionAt: Schema.NullOr(Schema.Finite),
+  willLikelyExhaustBeforeReset: Schema.NullOr(Schema.Boolean),
+  coverage: Schema.Literal("opencode-only"),
+})
+export type WorkBuddyModelLimit = Schema.Schema.Type<typeof WorkBuddyModelLimit>
+
+export const WorkBuddyAccountLimits = Schema.Struct({
+  accountId: Schema.String,
+  label: Schema.String,
+  models: Schema.Array(WorkBuddyModelLimit),
+})
+export type WorkBuddyAccountLimits = Schema.Schema.Type<typeof WorkBuddyAccountLimits>
+
 export const ProviderUsage = Schema.Struct({
   windows: Schema.Record(Schema.String, UsageWindow),
   models: Schema.optional(Schema.Record(Schema.String, ProviderModelUsage)),
@@ -57,6 +89,8 @@ export const ProviderUsage = Schema.Struct({
    * per-account lookup can only fall back to aggregate behavior.
    */
   accountLabels: Schema.optional(Schema.Record(Schema.String, Schema.String)),
+  /** WorkBuddy promotional frequency windows, separate from package-credit windows. */
+  workbuddyAccounts: Schema.optional(Schema.Array(WorkBuddyAccountLimits)),
 })
 export type ProviderUsage = Schema.Schema.Type<typeof ProviderUsage>
 

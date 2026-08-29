@@ -1,6 +1,6 @@
 import { Effect } from "effect"
 import { AccountVault, accountLabels, stableAccountIdentity, type Credential } from "@/plugin/workbuddy-accounts"
-import { discoverWorkBuddyCatalog } from "@/plugin/workbuddy"
+import { discoverWorkBuddyCatalog, workBuddyLimitSnapshot } from "@/plugin/workbuddy"
 import { asObject, buildResult, toNumber, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import type { UsageWindow } from "../schema"
@@ -424,7 +424,8 @@ export const workbuddy = (fetchImpl: WorkBuddyFetch = globalThis.fetch.bind(glob
         }
 
         const planLabel = accounts.length === 1 ? results[0]?.planLabel : undefined
-        if (!anyOk) {
+        const workbuddyAccounts = workBuddyLimitSnapshot()
+        if (!anyOk && workbuddyAccounts.length === 0) {
           return buildResult({
             providerId: ID,
             providerName: NAME,
@@ -446,6 +447,7 @@ export const workbuddy = (fetchImpl: WorkBuddyFetch = globalThis.fetch.bind(glob
             // can resolve an account-qualified model id (`hy4-preview@wb-<uid>`)
             // to the quota window that funds it. The two are not string-derivable.
             ...(labels.size > 0 ? { accountLabels: Object.fromEntries(labels) } : {}),
+            ...(workbuddyAccounts.length > 0 ? { workbuddyAccounts } : {}),
           },
           fetchedAt: Date.now(),
           nextRefreshAt,

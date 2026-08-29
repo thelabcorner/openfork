@@ -24,6 +24,36 @@ export interface ProviderModelUsage {
   promotionLabel?: string | null
 }
 
+export interface WorkBuddyModelLimit {
+  model: string
+  canonical: string | null
+  unit: string
+  usedObserved: number
+  limitEstimate: number | null
+  remainingEstimate: number | null
+  remainingPercent: number | null
+  status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted" | "unknown"
+  confidence: "low" | "medium" | "high"
+  accuracy: "observed" | "estimate" | "server-confirmed"
+  exhaustedObserved: boolean
+  serverCode: number | null
+  resetAt: number | null
+  resetSource: "server-6004" | "inferred" | "unknown"
+  windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
+  windowStartedAt: number | null
+  lastObservationAt: number | null
+  burnPerHour: number | null
+  estimatedExhaustionAt: number | null
+  willLikelyExhaustBeforeReset: boolean | null
+  coverage: "opencode-only"
+}
+
+export interface WorkBuddyAccountLimits {
+  accountId: string
+  label: string
+  models: WorkBuddyModelLimit[]
+}
+
 export interface ProviderResult {
   providerId: string
   providerName: string
@@ -36,6 +66,7 @@ export interface ProviderResult {
     models?: Record<string, ProviderModelUsage>
     /** Stable account key -> the label used in `windows` keys. See the schema note. */
     accountLabels?: Record<string, string>
+    workbuddyAccounts?: WorkBuddyAccountLimits[]
   } | null
   fetchedAt: number
   /**
