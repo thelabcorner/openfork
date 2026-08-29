@@ -623,7 +623,8 @@ export class AccountRouter {
 
     const eligible = accounts.filter((account) => {
       const state = account.governor.metrics().state as EntitlementState
-      if (state === "WINDOW_LIMITED" || state === "QUOTA_EXHAUSTED") return false
+      if (state === "QUOTA_EXHAUSTED") return false
+      if (!account.governor.canAdmitModel(requestedModel)) return false
       if (account.catalog && !account.catalog.ids.has(requestedModel)) return false
       return true
     })

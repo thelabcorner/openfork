@@ -179,6 +179,17 @@ export function setTestAccountStore(root: string | undefined) {
   accountRouter = new AccountRouter({ registry: accountRegistry })
 }
 
+/** Live, non-secret account/model quota snapshot consumed by the Limits adapter. */
+export function workBuddyLimitSnapshot(now = Date.now()) {
+  const accounts = accountRegistry.all()
+  const labels = accountLabels(accounts)
+  return accounts.map((account) => ({
+    accountId: account.id,
+    label: labels.get(account.id) ?? account.id,
+    models: account.governor.modelReports(now),
+  }))
+}
+
 function backendFor(cred: Credential): string {
   // Production routing is driven solely by the credential's auth.domain. The
   // only override is the test-only injected backend (setTestBackend).
@@ -812,6 +823,7 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
     result = await account.governor.runGeneration({
       priority: priorityFor(payload, messages),
       genKey: `${account.id}:${requestId}`,
+      model: requestedModel,
       session,
       isExpired: () => isExpired(cred),
       refresh: () => singleflightRefresh(account),
