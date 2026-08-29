@@ -10765,10 +10765,18 @@ export type QuotaGetResponses = {
               valueLabel: string
             }
           }
+          rate?: number
+          rateFree?: boolean
+          rateLabel?: string
+          promotionLabel?: string
         }
+      }
+      accountLabels?: {
+        [key: string]: string
       }
     }
     fetchedAt: number
+    nextRefreshAt?: number
   }
 }
 
