@@ -3,6 +3,7 @@ import type { Accessor } from "solid-js"
 import { useServerSDK } from "@/context/server-sdk"
 import { useForkUsage } from "@/context/fork-usage"
 import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
+import { useZenFreeUsage } from "@/hooks/use-zen-free-usage"
 import {
   toneForRemaining,
   sortWindows,
@@ -26,8 +27,8 @@ const COOLDOWN_MS = 30_000
 /**
  * Dedicated limits-system hook: owns provider fetching, filtering
  * (configured-only), sorting, enrichment (worst-remaining + tone), the
- * refresh cooldown, and Go multi-key / OpenRouter-free merges. The pane is a
- * pure projection.
+ * refresh cooldown, and Go multi-key / OpenRouter-free / Zen-free merges.
+ * The pane is a pure projection.
  */
 export function useLimits(options?: { now?: Accessor<number> }) {
   const now = options?.now ?? Date.now
@@ -35,6 +36,8 @@ export function useLimits(options?: { now?: Accessor<number> }) {
   const forkUsage = useForkUsage()
   // Shared singleton poller — adds no extra network traffic.
   const freeUsage = useOpenRouterFreeUsage()
+  // DB-backed local tracker using the same usage.summary source as Usage.
+  const zenFreeUsage = useZenFreeUsage()
 
   const [tick, setTick] = createSignal(0)
   const [lastRefreshedAt, setLastRefreshedAt] = createSignal(0)
@@ -134,21 +137,31 @@ export function useLimits(options?: { now?: Accessor<number> }) {
     return raw.filter((r) => r.configured)
   })
 
+  const enrich = (result: ProviderResult): LimitProvider => {
+    const windowsSorted = result.usage ? sortWindows(Object.entries(result.usage.windows) as [string, UsageWindow][]) : []
+    const gate = resolveTierGate(windowsSorted)
+    const worstRemaining = result.usage ? (gate.effectiveRemaining ?? worstRemainingFromWindows(windowsSorted)) : null
+    return { result, windowsSorted, worstRemaining, tone: toneForRemaining(worstRemaining), gate }
+  }
+
   const providers = createMemo<LimitProvider[] | undefined>(() => {
     const list = connected()
     if (!list) return undefined
-    return list
-      .map((r) => {
-        const effective = getEffectiveResult(r)
-        const windowsSorted = effective.usage ? sortWindows(Object.entries(effective.usage.windows) as [string, UsageWindow][]) : []
-        const gate = resolveTierGate(windowsSorted)
-        const worstRemaining = effective.usage ? (gate.effectiveRemaining ?? worstRemainingFromWindows(windowsSorted)) : null
-        return { result: effective, windowsSorted, worstRemaining, tone: toneForRemaining(worstRemaining), gate }
-      })
-      .sort((a, b) => {
-        if (a.result.ok !== b.result.ok) return a.result.ok ? -1 : 1
-        return a.result.providerName.localeCompare(b.result.providerName)
-      })
+    const merged = list.map((r) => enrich(getEffectiveResult(r)))
+
+    // Anonymous OpenCode Zen does not appear as a configured quota provider,
+    // so inject the learned DB-backed result into the same normalized provider
+    // abstraction. If OpenCode is actually connected and supplies an official
+    // quota result, the official provider wins and we do not duplicate it.
+    const zen = zenFreeUsage.result()
+    if (zen && !merged.some((provider) => provider.result.providerId === zen.providerId)) {
+      merged.push(enrich(zen))
+    }
+
+    return merged.sort((a, b) => {
+      if (a.result.ok !== b.result.ok) return a.result.ok ? -1 : 1
+      return a.result.providerName.localeCompare(b.result.providerName)
+    })
   })
 
   const isLoading = () => providersRes.loading || quotasRes.loading
@@ -165,6 +178,7 @@ export function useLimits(options?: { now?: Accessor<number> }) {
     setLastRefreshedAt(now())
     setTick((v) => v + 1)
     freeUsage.refresh()
+    zenFreeUsage.refresh()
   }
 
   const onFocus = () => {
