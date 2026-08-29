@@ -7,6 +7,23 @@ export interface UsageWindow {
   valueLabel: string | null
 }
 
+/**
+ * Per-model metadata for providers that bill per request rather than per token.
+ *
+ * `rate` is the provider's own consumption rate per request in its billing unit
+ * (WorkBuddy: credits). `0`/absent means "not published" and is NOT "free" —
+ * `rateFree` marks a genuine zero-cost promotion and `promotionLabel` carries
+ * the badge the provider is currently showing (e.g. "Free now"). A missing rate
+ * must degrade to "no estimate", never to "unlimited requests".
+ */
+export interface ProviderModelUsage {
+  windows: Record<string, UsageWindow>
+  rate?: number
+  rateFree?: boolean
+  rateLabel?: string | null
+  promotionLabel?: string | null
+}
+
 export interface ProviderResult {
   providerId: string
   providerName: string
@@ -14,8 +31,19 @@ export interface ProviderResult {
   configured: boolean
   error?: string
   planLabel?: string | null
-  usage: { windows: Record<string, UsageWindow>; models?: Record<string, { windows: Record<string, UsageWindow> }> } | null
+  usage: {
+    windows: Record<string, UsageWindow>
+    models?: Record<string, ProviderModelUsage>
+    /** Stable account key -> the label used in `windows` keys. See the schema note. */
+    accountLabels?: Record<string, string>
+  } | null
   fetchedAt: number
+  /**
+   * Epoch ms before which a re-read is served from the adapter's own cache.
+   * Absent (or 0) means a refresh always does real work — never treat it as
+   * "never refresh", or an older server would disable the button forever.
+   */
+  nextRefreshAt?: number
 }
 
 /**
@@ -116,9 +144,85 @@ export function sortWindows(entries: Array<[string, UsageWindow]>) {
   })
 }
 
+/**
+ * A WorkBuddy quota window's key encodes account + package scope (see
+ * `quota/providers/workbuddy.ts`'s header comment for the full grammar):
+ * `"aggregate:basic|gift|extra|combined"` (summed across every enrolled
+ * account) or `"account:<label>:Basic|Gift|Extra|Combined"` (one account's
+ * own breakdown, nested under it in the collapsible per-account section).
+ *
+ * WorkBuddy credits are additive, not tiered: Basic hitting 0% does not mean
+ * the account is exhausted if Extra or Gift still has balance. So ONLY
+ * `aggregate:combined` (the Basic+Extra+Gift sum) should ever gate or feed
+ * the "worst remaining" indicator — the individual basic/gift/extra windows,
+ * and every `account:*` window (combined included), are informational only,
+ * exactly like `weekly:<model>` is excluded for Claude's model-scoped rows.
+ */
+export type WorkBuddyWindowKey =
+  | { scope: "aggregate"; kind: "basic" | "gift" | "extra" | "combined" }
+  | { scope: "account"; account: string; kind: "Basic" | "Gift" | "Extra" | "Combined" }
+
+export function parseWorkBuddyKey(key: string): WorkBuddyWindowKey | null {
+  if (key.startsWith("aggregate:")) {
+    const kind = key.slice("aggregate:".length)
+    if (kind === "basic" || kind === "gift" || kind === "extra" || kind === "combined") return { scope: "aggregate", kind }
+    return null
+  }
+  if (key.startsWith("account:")) {
+    const rest = key.slice("account:".length)
+    const idx = rest.lastIndexOf(":")
+    if (idx < 0) return null
+    const kind = rest.slice(idx + 1)
+    if (kind !== "Basic" && kind !== "Gift" && kind !== "Extra" && kind !== "Combined") return null
+    return { scope: "account", account: rest.slice(0, idx), kind }
+  }
+  return null
+}
+
+function isWorkBuddyNonGating(key: string): boolean {
+  const parsed = parseWorkBuddyKey(key)
+  if (!parsed) return false
+  return !(parsed.scope === "aggregate" && parsed.kind === "combined")
+}
+
+/**
+ * Absolute credit counts behind a WorkBuddy window.
+ *
+ * The quota adapter publishes only percentages plus a `valueLabel` like
+ * `"412 / 2000 pts (top-up value ~$12.36)"`, but a stretch estimate needs real
+ * numbers: `remaining / rate` is meaningless when `remaining` is a percent. The
+ * label is a display string, so it is parsed here rather than by widening the
+ * wire contract — the adapter stays free to change its wording for humans.
+ * Returns null when the label shape isn't recognized, so callers degrade to
+ * "no bar" instead of dividing a percent by a rate.
+ */
+export function workBuddyCredits(window: UsageWindow): { remaining: number; total: number } | null {
+  const label = window.valueLabel
+  if (!label) return null
+  // Accept "412 / 2000 pts" and a bare "2000 pts".
+  const match = label.match(/([0-9][0-9.,]*)\s*\/\s*([0-9][0-9.,]*)\s*pts/i)
+  const num = (raw: string) => Number(raw.replace(/,/g, ""))
+  if (match) {
+    const total = num(match[2]!)
+    const used = num(match[1]!)
+    if (!Number.isFinite(total) || !Number.isFinite(used) || total <= 0) return null
+    return { remaining: Math.max(0, total - used), total }
+  }
+  const bare = label.match(/([0-9][0-9.,]*)\s*pts/i)
+  if (bare) {
+    const total = num(bare[1]!)
+    if (!Number.isFinite(total) || total <= 0) return null
+    const pct = window.remainingPercent
+    if (pct !== null && Number.isFinite(pct)) return { remaining: (total * Math.max(0, Math.min(100, pct))) / 100, total }
+    return { remaining: total, total }
+  }
+  return null
+}
+
 export function worstRemainingFromWindows(windows: Array<[string, { usedPercent: number | null; remainingPercent: number | null }]>) {
   let worst: number | null = null
-  for (const [, w] of windows) {
+  for (const [key, w] of windows) {
+    if (key.startsWith("weekly:") || isWorkBuddyNonGating(key)) continue
     const r = w.remainingPercent ?? (w.usedPercent !== null ? 100 - w.usedPercent : null)
     if (r === null || !Number.isFinite(r)) continue
     if (worst === null || r < worst) worst = r
@@ -146,7 +250,7 @@ export function resolveTierGate(
   let bindingKey: string | null = null
   let bindingSeconds = -1
   for (const [key, w] of windows) {
-    if (key.startsWith("weekly:")) continue
+    if (key.startsWith("weekly:") || isWorkBuddyNonGating(key)) continue
     const r = w.remainingPercent ?? (w.usedPercent !== null ? 100 - w.usedPercent : null)
     if (r === null || !Number.isFinite(r)) continue
     const secs = w.windowSeconds ?? Number.MAX_SAFE_INTEGER

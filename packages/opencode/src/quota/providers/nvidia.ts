@@ -1,6 +1,7 @@
 import { Effect } from "effect"
 import type { Auth } from "@/auth"
 import { buildResult, toUsageWindow } from "../format"
+import { NEXT_REFRESH_NOW } from "./http"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
 import { NVIDIA_LIMIT_PER_MINUTE, nvidiaUsage } from "./nvidia-usage"
@@ -35,6 +36,8 @@ export const nvidia = (auth: Auth.Interface): Adapter => ({
         configured: true,
         usage: { windows },
         fetchedAt: Date.now(),
+        // Purely local computation — a refresh always recomputes.
+        nextRefreshAt: NEXT_REFRESH_NOW,
       }),
     )
   },

@@ -18,6 +18,7 @@ import { claude } from "./providers/claude"
 import { codex } from "./providers/codex"
 import { xai } from "./providers/xai"
 import { nvidia } from "./providers/nvidia"
+import { workbuddy } from "./providers/workbuddy"
 
 export { UsageWindow, ProviderUsage, ProviderResult, ProviderSummary, ProvidersResult } from "./schema"
 
@@ -65,6 +66,7 @@ const layer: Layer.Layer<
       codex(http, auth),
       xai(http, auth),
       nvidia(auth),
+      workbuddy(),
     ]
     const singleFlight = createSingleFlight()
 

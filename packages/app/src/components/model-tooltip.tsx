@@ -168,7 +168,20 @@ export const ModelTooltip: Component<{
   free?: boolean
   unlimited?: boolean
   v2?: boolean
-  usage?: { percent: number; estimatedRequests?: number; personalized?: boolean }
+  usage?: {
+    percent: number
+    estimatedRequests?: number
+    personalized?: boolean
+    /** WorkBuddy-only credit/request breakdown, rendered in place of the USD-window rows. */
+    workbuddy?: {
+      rate: number
+      free: boolean
+      account: string
+      remainingCredits: number
+      totalCredits?: number
+      estimatedRequests: number
+    }
+  }
   period?: ReturnType<typeof deepSeekRatePeriod>
   /** Optional precomputed Usage Yield — if omitted, fallback corpus is used synchronously. */
   yield?: ReturnType<typeof evaluateModelUsageYield>
@@ -409,7 +422,39 @@ export const ModelTooltip: Component<{
             </>
           )}
         </Show>
-        <Show when={props.usage?.estimatedRequests !== undefined}>
+        <Show when={props.usage?.workbuddy}>
+          {(wb) => (
+            <>
+              <div class="h-px bg-v2-border-border-muted" />
+              <ModelTooltipRow
+                name={language.t("model.tooltip.workbuddy.rate")}
+                value={
+                  wb().free
+                    ? language.t("model.tooltip.workbuddy.free")
+                    : language.t("model.tooltip.workbuddy.rateValue", { rate: wb().rate })
+                }
+              />
+              <ModelTooltipRow
+                name={language.t("model.tooltip.workbuddy.credits")}
+                value={language.t("model.tooltip.workbuddy.creditsValue", {
+                  remaining: Math.round(wb().remainingCredits).toLocaleString(language.intl()),
+                  total: Math.round(wb().totalCredits ?? 0).toLocaleString(language.intl()),
+                  account: wb().account,
+                })}
+              />
+              <Show when={!wb().free}>
+                <ModelTooltipRow
+                  name={language.t("model.tooltip.workbuddy.requests")}
+                  value={language.t("model.tooltip.workbuddy.requestsValue", {
+                    count: Math.round(wb().estimatedRequests).toLocaleString(language.intl()),
+                    account: wb().account,
+                  })}
+                />
+              </Show>
+            </>
+          )}
+        </Show>
+        <Show when={props.usage?.estimatedRequests !== undefined && !props.usage?.workbuddy}>
           <div class="h-px bg-v2-border-border-muted" />
           <ModelTooltipRow
             name={language.t("model.tooltip.usage.requests")}

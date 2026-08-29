@@ -21,14 +21,42 @@ export const UsageWindow = Schema.Struct({
 })
 export type UsageWindow = Schema.Schema.Type<typeof UsageWindow>
 
+/**
+ * Per-model metadata for providers that price per model rather than per token.
+ *
+ * `rate` is the provider's own consumption rate per request, in the provider's
+ * billing unit (WorkBuddy: credits). `0`/absent means "not published" — it is
+ * NOT "free"; `rateFree` distinguishes a genuine zero-cost promotion, and
+ * `promotionLabel` carries the badge text the provider is currently showing
+ * (e.g. "Free now"). A client turns `rate` into an estimate by dividing the
+ * account's remaining balance by it, so a missing rate must degrade to "no
+ * estimate" rather than to "infinite requests".
+ */
+export const ProviderModelUsage = Schema.Struct({
+  windows: Schema.Record(Schema.String, UsageWindow),
+  rate: Schema.optional(Schema.Finite),
+  rateFree: Schema.optional(Schema.Boolean),
+  rateLabel: Schema.optional(Schema.NullOr(Schema.String)),
+  promotionLabel: Schema.optional(Schema.NullOr(Schema.String)),
+})
+export type ProviderModelUsage = Schema.Schema.Type<typeof ProviderModelUsage>
+
 export const ProviderUsage = Schema.Struct({
   windows: Schema.Record(Schema.String, UsageWindow),
-  models: Schema.optional(
-    Schema.Record(
-      Schema.String,
-      Schema.Struct({ windows: Schema.Record(Schema.String, UsageWindow) }),
-    ),
-  ),
+  models: Schema.optional(Schema.Record(Schema.String, ProviderModelUsage)),
+  /**
+   * Maps the provider's stable account key onto the (possibly disambiguated)
+   * label used in the `windows` keys.
+   *
+   * The two are NOT string-derivable: WorkBuddy's stable id comes from the
+   * Tencent UID (`wb-215789ee-…`) while its display label comes from the
+   * nickname (`arcfit.dev@gmail.com`), and a second account with the same
+   * nickname gets a disambiguating suffix. The frontend needs both — the
+   * account-qualified model id carries the stable key, the quota window carries
+   * the label — so the pairing is published rather than guessed. Without it a
+   * per-account lookup can only fall back to aggregate behavior.
+   */
+  accountLabels: Schema.optional(Schema.Record(Schema.String, Schema.String)),
 })
 export type ProviderUsage = Schema.Schema.Type<typeof ProviderUsage>
 
@@ -41,6 +69,19 @@ export const ProviderResult = Schema.Struct({
   planLabel: Schema.optional(Schema.NullOr(Schema.String)),
   usage: Schema.NullOr(ProviderUsage),
   fetchedAt: Schema.Finite,
+  /**
+   * Epoch ms before which a re-read is guaranteed to be served from this
+   * adapter's own cache, so a client refresh would repaint identical numbers.
+   * Uncached adapters omit it (refresh always does real work); an adapter
+   * backing off from a 429 sets it to the end of its cooldown. The UI takes
+   * the MAX across providers: refreshing is only useful once the slowest
+   * cached provider can actually return something new.
+   *
+   * Absent means "unknown / not cached" — clients must treat a missing value
+   * as "refresh now", never as "never refresh", otherwise a server that
+   * predates this field would disable refresh forever.
+   */
+  nextRefreshAt: Schema.optional(Schema.Finite),
 })
 export type ProviderResult = Schema.Schema.Type<typeof ProviderResult>
 

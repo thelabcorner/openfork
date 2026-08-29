@@ -14,7 +14,7 @@ import {
 import type { UsageWindow } from "../schema"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
-import { createQuotaCache, fetchJson, outcomeError } from "./http"
+import { createQuotaCache, fetchJson, NEXT_REFRESH_NOW, outcomeError } from "./http"
 
 /**
  * Kimi for Coding weekly usage. Ported from OpenChamber (MIT)
@@ -42,19 +42,34 @@ export const kimi = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter
         return buildResult({ providerId: "kimi-for-coding", providerName: NAME, ok: false, configured: false, error: "Not configured" })
       }
       const fresh = cache.fresh(resolved.key)
-      if (fresh) return fresh
+      if (fresh) return withNextRefresh(fresh, cache)
       if (cache.isCoolingDown()) {
         const cachedResult = cache.cachedResult()
-        if (cachedResult) return cachedResult
-        return buildResult({ providerId: "kimi-for-coding", providerName: NAME, ok: false, configured: true, error: "Rate limited — Kimi is throttling usage checks" })
+        if (cachedResult) return withNextRefresh(cachedResult, cache)
+        return buildResult({
+          providerId: "kimi-for-coding",
+          providerName: NAME,
+          ok: false,
+          configured: true,
+          error: "Rate limited — Kimi is throttling usage checks",
+          nextRefreshAt: cache.nextRefreshAt(),
+        })
       }
       const outcome = yield* fetchJson(http, KIMI_QUOTA_URL, resolved.key)
       if (!outcome.ok) {
-        const errorResult = buildResult({ providerId: "kimi-for-coding", providerName: NAME, ok: false, configured: true, error: outcomeError(outcome) })
         if (outcome.error === "status" && outcome.status === 429) {
+          const errorResult = buildResult({ providerId: "kimi-for-coding", providerName: NAME, ok: false, configured: true, error: outcomeError(outcome) })
           cache.coolDown(errorResult, outcome.retryAfterMs, resolved.key)
+          return withNextRefresh(errorResult, cache)
         }
-        return errorResult
+        return buildResult({
+          providerId: "kimi-for-coding",
+          providerName: NAME,
+          ok: false,
+          configured: true,
+          error: outcomeError(outcome),
+          nextRefreshAt: NEXT_REFRESH_NOW,
+        })
       }
       const payload = asObject(outcome.body) ?? {}
       const windows: Record<string, UsageWindow> = {}
@@ -87,7 +102,11 @@ export const kimi = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter
         usage: { windows },
       })
       cache.store(result, resolved.key)
-      return result
+      return withNextRefresh(result, cache)
     }),
   }
+}
+
+function withNextRefresh(result: ReturnType<typeof buildResult>, cache: ReturnType<typeof createQuotaCache<ReturnType<typeof buildResult>>>) {
+  return { ...result, nextRefreshAt: cache.nextRefreshAt() }
 }

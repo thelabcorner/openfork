@@ -69,16 +69,20 @@ export const buildResult = (input: {
   ok: boolean
   configured: boolean
   error?: string
+  planLabel?: string | null
   usage?: ProviderResult["usage"]
   fetchedAt?: number
+  nextRefreshAt?: number
 }): ProviderResult => ({
   providerId: input.providerId,
   providerName: input.providerName,
   ok: input.ok,
   configured: input.configured,
   ...(input.error !== undefined ? { error: input.error } : {}),
+  ...(input.planLabel !== undefined ? { planLabel: input.planLabel } : {}),
   usage: input.usage ?? null,
   fetchedAt: input.fetchedAt ?? Date.now(),
+  ...(input.nextRefreshAt !== undefined ? { nextRefreshAt: input.nextRefreshAt } : {}),
 })
 
 /**

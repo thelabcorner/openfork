@@ -1,8 +1,9 @@
 import { Effect } from "effect"
 import type { Auth } from "@/auth"
 import type { ForkCredentials } from "@/fork/credentials"
-import { officialUsageCache, type OfficialSnapshot, type OfficialUsageCache } from "@/fork/usage-cache"
+import { officialUsageCache, OFFICIAL_TTL_MS, type OfficialSnapshot, type OfficialUsageCache } from "@/fork/usage-cache"
 import { buildResult, toUsageWindow } from "../format"
+import { NEXT_REFRESH_NOW } from "./http"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
 
@@ -45,6 +46,9 @@ export const opencodeGo = (
 
 function snapshotToResult(snapshot: OfficialSnapshot): ReturnType<typeof buildResult> {
   const usage = snapshot.snapshot
+  // The gate holds one remote read per OFFICIAL_TTL_MS, so a refresh before
+  // that expires just re-serves this same snapshot.
+  const nextRefreshAt = snapshot.fetchedAt > 0 ? snapshot.fetchedAt + OFFICIAL_TTL_MS : NEXT_REFRESH_NOW
   if (!usage) {
     return buildResult({
       providerId: "opencode-go",
@@ -53,6 +57,7 @@ function snapshotToResult(snapshot: OfficialSnapshot): ReturnType<typeof buildRe
       configured: true,
       error: "Usage data unavailable",
       fetchedAt: snapshot.fetchedAt || undefined,
+      nextRefreshAt,
     })
   }
   const windows: Record<string, ReturnType<typeof toUsageWindow>> = {}
@@ -68,5 +73,6 @@ function snapshotToResult(snapshot: OfficialSnapshot): ReturnType<typeof buildRe
     configured: true,
     usage: { windows },
     fetchedAt: snapshot.fetchedAt || undefined,
+    nextRefreshAt,
   })
 }

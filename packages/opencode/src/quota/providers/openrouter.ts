@@ -4,7 +4,7 @@ import { HttpClient } from "effect/unstable/http"
 import { asObject, buildResult, formatMoney, toNumber, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
-import { fetchJson, outcomeError } from "./http"
+import { fetchJson, NEXT_REFRESH_NOW, outcomeError } from "./http"
 
 /**
  * OpenRouter prepaid credits. Ported from OpenChamber (MIT)
@@ -29,14 +29,29 @@ export const openrouter = (http: HttpClient.HttpClient, auth: Auth.Interface): A
       }
       const outcome = yield* fetchJson(http, OPENROUTER_CREDITS_URL, resolved.key)
       if (!outcome.ok) {
-        return buildResult({ providerId: "openrouter", providerName: NAME, ok: false, configured: true, error: outcomeError(outcome) })
+        return buildResult({
+          providerId: "openrouter",
+          providerName: NAME,
+          ok: false,
+          configured: true,
+          error: outcomeError(outcome),
+          // Uncached: a balance read is cheap and a refresh always hits upstream.
+          nextRefreshAt: NEXT_REFRESH_NOW,
+        })
       }
       const payload = asObject(outcome.body) ?? {}
       const credits = asObject(payload.data) ?? {}
       const totalCredits = toNumber(credits.total_credits)
       const totalUsage = toNumber(credits.total_usage)
       if (totalCredits === null || totalUsage === null) {
-        return buildResult({ providerId: "openrouter", providerName: NAME, ok: false, configured: true, error: "No quota data in response" })
+        return buildResult({
+          providerId: "openrouter",
+          providerName: NAME,
+          ok: false,
+          configured: true,
+          error: "No quota data in response",
+          nextRefreshAt: NEXT_REFRESH_NOW,
+        })
       }
       const remaining = Math.max(0, totalCredits - totalUsage)
       return buildResult({
@@ -52,6 +67,7 @@ export const openrouter = (http: HttpClient.HttpClient, auth: Auth.Interface): A
             }),
           },
         },
+        nextRefreshAt: NEXT_REFRESH_NOW,
       })
     }),
 })

@@ -1,5 +1,6 @@
 import { Effect } from "effect"
 import type { Adapter } from "../registry"
+import { NEXT_REFRESH_NOW } from "./http"
 import { toUsageWindow } from "../format"
 import type { ProviderResult } from "../schema"
 import {
@@ -148,6 +149,9 @@ export function zenFreeProviderResult(estimate: ZenFreeLimitEstimate, fetchedAt:
     configured: true,
     planLabel,
     fetchedAt,
+    // Zen reads a local usage snapshot, not a remote account endpoint: there
+    // is no upstream to protect, so a refresh always does real work.
+    nextRefreshAt: NEXT_REFRESH_NOW,
     usage: {
       windows: {
         [`daily ${sourceLabel}`]: toUsageWindow({
@@ -166,20 +170,15 @@ export const opencodeZen = (usage: ZenFreeUsage): Adapter => ({
   name: NAME,
   aliases: ["zen", "opencode-free", "opencode-zen-free"],
   configured: () => Effect.succeed(true),
+  // `usage.snapshot()`'s error channel is `never` — it cannot fail — so there
+  // is nothing to catch here. (A prior version wrapped this in
+  // `Effect.catchAll`, which doesn't exist on this Effect version, with a
+  // fallback snapshot built from an unimported `zenUtcDayStart`; every call
+  // threw before ever reaching the map below, which is why every Zen request
+  // was failing.)
   fetch: () =>
-    Effect.catchAll(usage.snapshot(), () =>
-      Effect.succeed({
-        since: zenUtcDayStart(Date.now() - ZEN_FREE_DAY_MS),
-        until: Date.now(),
-        currentDayStart: zenUtcDayStart(Date.now()),
-        currentRequests: 0,
-        days: [],
-        limitHits: [],
-      } as ZenFreeSnapshot),
-    ).pipe(
-      Effect.map((snapshot) => {
-        const fetchedAt = Date.now()
-        return zenFreeProviderResult(estimateZenFreeLimit({ snapshot, now: fetchedAt }), fetchedAt)
-      }),
-    ),
+    Effect.map(usage.snapshot(), (snapshot) => {
+      const fetchedAt = Date.now()
+      return zenFreeProviderResult(estimateZenFreeLimit({ snapshot, now: fetchedAt }), fetchedAt)
+    }),
 })

@@ -1646,6 +1646,11 @@ const layer = Layer.effect(
               ]),
             )
           })
+          // A provider hook can create a provider from scratch (`source:
+          // "custom"`) without requiring an API-key entry or config stanza.
+          // Register the freshly discovered model set now; otherwise the data
+          // lands in `database` but never enters the public `providers` map.
+          mergeProvider(providerID, { source: "custom" })
         }
 
         // extend database from config

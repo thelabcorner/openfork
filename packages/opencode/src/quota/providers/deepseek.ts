@@ -4,7 +4,7 @@ import { HttpClient } from "effect/unstable/http"
 import { asObject, buildResult, formatMoney, toNumber, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
-import { fetchJson, outcomeError, type FetchOutcome } from "./http"
+import { fetchJson, NEXT_REFRESH_NOW, outcomeError, type FetchOutcome } from "./http"
 
 /**
  * DeepSeek prepaid balance. Ported from OpenChamber (MIT)
@@ -36,7 +36,14 @@ export const deepseek = (http: HttpClient.HttpClient, auth: Auth.Interface): Ada
       }
       const outcome = yield* fetchJson(http, DEEPSEEK_QUOTA_URL, resolved.key, { "Accept-Encoding": "identity" })
       if (!outcome.ok) {
-        return buildResult({ providerId: "deepseek", providerName: NAME, ok: false, configured: true, error: deepseekError(outcome) })
+        return buildResult({
+          providerId: "deepseek",
+          providerName: NAME,
+          ok: false,
+          configured: true,
+          error: deepseekError(outcome),
+          nextRefreshAt: NEXT_REFRESH_NOW,
+        })
       }
       const payload = asObject(outcome.body) ?? {}
       const balanceInfos = Array.isArray(payload.balance_infos) ? payload.balance_infos : []
@@ -45,7 +52,14 @@ export const deepseek = (http: HttpClient.HttpClient, auth: Auth.Interface): Ada
         balanceInfos.map(asObject).find((info) => info?.currency === "CNY")
       const totalBalance = toNumber(balanceInfo?.total_balance)
       if (totalBalance === null) {
-        return buildResult({ providerId: "deepseek", providerName: NAME, ok: false, configured: true, error: "No quota data in response" })
+        return buildResult({
+          providerId: "deepseek",
+          providerName: NAME,
+          ok: false,
+          configured: true,
+          error: "No quota data in response",
+          nextRefreshAt: NEXT_REFRESH_NOW,
+        })
       }
       const symbol = balanceInfo?.currency === "CNY" ? "¥" : "$"
       const money = formatMoney(totalBalance)
@@ -59,6 +73,7 @@ export const deepseek = (http: HttpClient.HttpClient, auth: Auth.Interface): Ada
             credits_balance: toUsageWindow({ usedPercent: null, valueLabel: money === null ? null : `${symbol}${money}` }),
           },
         },
+        nextRefreshAt: NEXT_REFRESH_NOW,
       })
     }),
 })

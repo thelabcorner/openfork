@@ -58,6 +58,16 @@ describe("QuotaFormat", () => {
     expect(pinned.error).toBe("x")
   })
 
+  test("nextRefreshAt is omitted unless the adapter publishes one", () => {
+    const none = buildResult({ providerId: "p", providerName: "P", ok: true, configured: true })
+    expect("nextRefreshAt" in none).toBe(false)
+    const pinned = buildResult({ providerId: "p", providerName: "P", ok: true, configured: true, nextRefreshAt: 500 })
+    expect(pinned.nextRefreshAt).toBe(500)
+    // 0 is a real value ("refresh now"), not a falsy default to be dropped.
+    const now = buildResult({ providerId: "p", providerName: "P", ok: true, configured: true, nextRefreshAt: 0 })
+    expect(now.nextRefreshAt).toBe(0)
+  })
+
   test("computeUsedPercent follows the Kimi precedence rules", () => {
     expect(computeUsedPercent(100, 30, null)).toBe(30)
     expect(computeUsedPercent(100, null, 25)).toBe(75)

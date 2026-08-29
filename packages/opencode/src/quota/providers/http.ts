@@ -65,6 +65,9 @@ const CACHE_TTL_MS = 300_000
 const COOLDOWN_DEFAULT_MS = 300_000
 const COOLDOWN_MAX_MS = 3_600_000
 
+/** Epoch ms for "refresh now" — a provider with no cache is always re-readable. */
+export const NEXT_REFRESH_NOW = 0
+
 /**
  * Shared in-memory cache + 429-cooldown for a single provider adapter
  * instance. Every provider hits its upstream usage endpoint on each
@@ -91,6 +94,17 @@ export function createQuotaCache<T>(key: string, options?: { ttlMs?: number; coo
     },
     cachedResult(): T | undefined {
       return cached?.result
+    },
+    /**
+     * Epoch ms before which a re-read is guaranteed to be served from cache,
+     * so calling `quota.get()` again would repaint identical numbers. After a
+     * 429 this is the end of the cooldown (up to `cooldownMaxMs`), which can
+     * exceed the normal TTL — that longer backoff is exactly what the UI
+     * needs to show. No cache entry means "refresh is useful right now".
+     */
+    nextRefreshAt(): number {
+      if (!cached) return 0
+      return Math.max(cached.fetchedAt + ttlMs, cooldownUntil)
     },
     reset(): void {
       cached = undefined

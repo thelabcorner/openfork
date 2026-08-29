@@ -5,7 +5,7 @@ import { buildResult, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import type { ProviderResult } from "../schema"
 import { authKey } from "./key"
-import { createQuotaCache } from "./http"
+import { createQuotaCache, NEXT_REFRESH_NOW } from "./http"
 
 /**
  * xAI (Grok) billing-cycle quota. Ported from OpenChamber (MIT)
@@ -42,11 +42,18 @@ export const xai = (_http: HttpClient.HttpClient, auth: Auth.Interface, fetchImp
           return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: false, error: "Not configured" })
         }
         const fresh = cache.fresh(accessToken)
-        if (fresh) return fresh
+        if (fresh) return withNextRefresh(fresh, cache)
         if (cache.isCoolingDown()) {
           const cachedResult = cache.cachedResult()
-          if (cachedResult) return cachedResult
-          return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: true, error: "Rate limited — xAI is throttling usage checks" })
+          if (cachedResult) return withNextRefresh(cachedResult, cache)
+          return buildResult({
+            providerId: "xai",
+            providerName: NAME,
+            ok: false,
+            configured: true,
+            error: "Rate limited — xAI is throttling usage checks",
+            nextRefreshAt: cache.nextRefreshAt(),
+          })
         }
         // Never rejects -> the gen's error channel stays `never`.
         const outcome = yield* Effect.promise(() => performFetch(accessToken, fetchImpl))
@@ -54,8 +61,9 @@ export const xai = (_http: HttpClient.HttpClient, auth: Auth.Interface, fetchImp
           const errorResult = buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: true, error: outcome.message })
           if (outcome.message === "Rate limited") {
             cache.coolDown(errorResult, undefined, accessToken)
+            return withNextRefresh(errorResult, cache)
           }
-          return errorResult
+          return { ...errorResult, nextRefreshAt: NEXT_REFRESH_NOW }
         }
         const decoded = decodeXaiGrpcWeb(outcome.bytes)
         if (!decoded || decoded.percent === null) {
@@ -74,9 +82,13 @@ export const xai = (_http: HttpClient.HttpClient, auth: Auth.Interface, fetchImp
           fetchedAt: Date.now(),
         })
         cache.store(result, accessToken)
-        return result
+        return withNextRefresh(result, cache)
       }),
   }
+}
+
+function withNextRefresh(result: ProviderResult, cache: ReturnType<typeof createQuotaCache<ProviderResult>>) {
+  return { ...result, nextRefreshAt: cache.nextRefreshAt() }
 }
 
 async function performFetch(token: string, fetchImpl: XaiFetch): Promise<WireOutcome> {

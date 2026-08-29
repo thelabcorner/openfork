@@ -22,7 +22,9 @@ import {
   resolveTierGate,
   tierGateState,
   forkWindowToUsageWindow,
+  parseWorkBuddyKey,
   type TierGate,
+  type UsageWindow,
 } from "@/utils/limits-format"
 import type { ForkCredentialInfo, ForkCredentialUsage, ForkWindowUsage } from "@/utils/fork-client"
 import type { FreeUsageReport } from "@/utils/openrouter-free-usage"
@@ -168,7 +170,7 @@ function DrainMeter(props: { remaining: number | null; tone: Tone; dense?: boole
   )
 }
 
-function CountdownText(props: { now: number; resetAt: number | null; resetAfterSeconds?: number | null }) {
+function CountdownText(props: { now: number; resetAt: number | null; resetAfterSeconds?: number | null; mode?: "countdown" | "date" }) {
   const language = useLanguage()
   const seconds = createMemo(() => {
     if (props.resetAt !== null && props.resetAt !== undefined && Number.isFinite(props.resetAt)) {
@@ -179,6 +181,27 @@ function CountdownText(props: { now: number; resetAt: number | null; resetAfterS
     }
     return null
   })
+  // A one-time expiry (a gift/top-up pack) reads better as a fixed date than
+  // a recurring "resets in" countdown, which implies the cadence repeats.
+  // Short form (no weekday/time) to fit the reset column; the full date is
+  // still one hover away via the title tooltip.
+  if (props.mode === "date") {
+    const shortDate = () => {
+      if (!props.resetAt) return null
+      try {
+        return new Intl.DateTimeFormat(language.intl(), { month: "short", day: "numeric" }).format(new Date(props.resetAt))
+      } catch {
+        return new Date(props.resetAt).toLocaleDateString()
+      }
+    }
+    return (
+      <span class="truncate text-[9.5px] leading-none tabular-nums text-v2-text-text-faint" title={props.resetAt ? formatResetDate(props.resetAt, language.intl()) : undefined}>
+        <Show when={shortDate()} fallback={<span class="opacity-45">{language.t("limits.expires.never")}</span>}>
+          {shortDate()}
+        </Show>
+      </span>
+    )
+  }
   return (
     <span
       class="truncate text-[9.5px] leading-none tabular-nums text-v2-text-text-faint"
@@ -207,6 +230,8 @@ function WindowRow(props: {
   dim?: boolean
   /** Summary rows (e.g. a Go key's header line) show the percent but no bar — only the actual 5h/weekly/monthly rows underneath drain. */
   noMeter?: boolean
+  /** "date" for one-time expiries (gift/top-up packs) instead of a "resets in" countdown. */
+  resetMode?: "countdown" | "date"
 }) {
   const language = useLanguage()
   const title = () =>
@@ -243,11 +268,180 @@ function WindowRow(props: {
           {formatPercent(props.remaining, language.intl())}
         </span>
         <div class="flex justify-end">
-          <CountdownText now={props.now} resetAt={props.resetAt} resetAfterSeconds={props.resetAfterSeconds} />
+          <CountdownText now={props.now} resetAt={props.resetAt} resetAfterSeconds={props.resetAfterSeconds} mode={props.resetMode} />
         </div>
       </Show>
       <span />
     </div>
+  )
+}
+
+const WORKBUDDY_KIND_I18N = {
+  basic: "limits.workbuddy.basic",
+  gift: "limits.workbuddy.gift",
+  extra: "limits.workbuddy.extra",
+  combined: "limits.workbuddy.combined",
+} as const
+
+/**
+ * WorkBuddy is genuinely multi-account (see quota/providers/workbuddy.ts's
+ * key grammar), so its windows can't just be dumped into the generic flat
+ * list — with N accounts each carrying Basic/Gift/Extra, the account's own
+ * label needs to appear ONCE as a group header, not on every one of its
+ * rows. Mirrors OpenCode Go's aggregate-on-top + collapsible per-key layout.
+ *
+ * WorkBuddy credits are additive, not tiered (Basic exhausting doesn't stop
+ * you — Extra, then Gift, still work), so unlike every other provider on
+ * this pane, the individual Basic/Gift/Extra rows never drive tone or the
+ * "exhausted" tag. Only the combined Basic+Extra+Gift row does — both at the
+ * aggregate level (the whole card) and per-account (that account's header).
+ */
+function WorkBuddyBody(props: { windows: [string, UsageWindow][]; now: number }) {
+  const language = useLanguage()
+  const [expanded, setExpanded] = createSignal(true)
+  const kindLabel = (kind: "basic" | "gift" | "extra" | "combined" | "Basic" | "Gift" | "Extra" | "Combined") =>
+    language.t(WORKBUDDY_KIND_I18N[kind.toLowerCase() as "basic" | "gift" | "extra" | "combined"])
+
+  const aggregateByKind = createMemo(() => {
+    const byKind: Partial<Record<"basic" | "gift" | "extra" | "combined", UsageWindow>> = {}
+    for (const [key, w] of props.windows) {
+      const parsed = parseWorkBuddyKey(key)
+      if (parsed?.scope === "aggregate") byKind[parsed.kind] = w
+    }
+    return byKind
+  })
+  const aggregateCombined = () => aggregateByKind().combined
+  const aggregateRows = createMemo(() => {
+    const byKind = aggregateByKind()
+    return (["basic", "gift", "extra"] as const).flatMap((kind) => (byKind[kind] ? [{ kind, window: byKind[kind]! }] : []))
+  })
+
+  const accounts = createMemo(() => {
+    const byAccount = new Map<string, Partial<Record<"Basic" | "Gift" | "Extra" | "Combined", UsageWindow>>>()
+    for (const [key, w] of props.windows) {
+      const parsed = parseWorkBuddyKey(key)
+      if (parsed?.scope !== "account") continue
+      const entry = byAccount.get(parsed.account) ?? {}
+      entry[parsed.kind] = w
+      byAccount.set(parsed.account, entry)
+    }
+    return [...byAccount.entries()].sort((a, b) => a[0].localeCompare(b[0]))
+  })
+
+  return (
+    <>
+      <div class="flex flex-col divide-y divide-v2-border-border-muted/50 border-t border-v2-border-border-muted/50">
+        <Show when={aggregateCombined()}>
+          {(combined) => {
+            const remaining = () => remainingOf(combined())
+            const rTone = () => toneForRemaining(remaining())
+            return (
+              <WindowRow
+                now={props.now}
+                guide="branch"
+                label={kindLabel("combined")}
+                tag={
+                  <Show when={rTone() === "danger"}>
+                    <StatePill tone="danger">{language.t("limits.gate.limiting")}</StatePill>
+                  </Show>
+                }
+                remaining={remaining()}
+                valueLabel={combined().valueLabel}
+                used={combined().usedPercent}
+                tone={rTone()}
+                resetAt={combined().resetAt}
+                resetAfterSeconds={combined().resetAfterSeconds}
+              />
+            )
+          }}
+        </Show>
+        <For each={aggregateRows()}>
+          {(row, index) => {
+            const remaining = remainingOf(row.window)
+            const rTone = toneForRemaining(remaining)
+            return (
+              <WindowRow
+                now={props.now}
+                guide={index() === aggregateRows().length - 1 ? "leaf" : "branch"}
+                label={kindLabel(row.kind)}
+                remaining={remaining}
+                valueLabel={row.window.valueLabel}
+                used={row.window.usedPercent}
+                tone={rTone}
+                resetAt={row.window.resetAt}
+                resetAfterSeconds={row.window.resetAfterSeconds}
+                resetMode={row.kind === "basic" ? "countdown" : "date"}
+              />
+            )
+          }}
+        </For>
+      </div>
+
+      <Show when={accounts().length > 0}>
+        <div class="border-t border-v2-border-border-muted/50">
+          <button
+            type="button"
+            class="flex w-full items-center gap-1.5 px-2.5 py-1.5 text-left text-[9px] font-[600] uppercase leading-3 tracking-[0.04em] text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover"
+            aria-expanded={expanded()}
+            onClick={() => setExpanded((v) => !v)}
+          >
+            <Icon name="chevron-down" size="small" class="size-2.5 transition-transform" classList={{ "-rotate-90": !expanded() }} />
+            {language.t("limits.workbuddy.perAccount")}
+            <span class="font-[440] normal-case tracking-normal">{accounts().length}</span>
+          </button>
+          <Show when={expanded()}>
+            <For each={accounts()}>
+              {([account, rows]) => {
+                const orderedKinds = createMemo(() => (["Basic", "Gift", "Extra"] as const).filter((k) => rows[k]))
+                // Additive, not tiered: an account is only "exhausted" when
+                // Basic+Extra+Gift combined hit 0, not when Basic alone does.
+                const combinedRemaining = () => (rows.Combined ? remainingOf(rows.Combined) : null)
+                const exhausted = () => combinedRemaining() !== null && combinedRemaining()! <= 0
+                return (
+                  <>
+                    <WindowRow
+                      now={props.now}
+                      guide="branch"
+                      label={account}
+                      tag={
+                        <Show when={exhausted()}>
+                          <StatePill tone="danger">{language.t("limits.gate.limiting")}</StatePill>
+                        </Show>
+                      }
+                      remaining={combinedRemaining()}
+                      tone={toneForRemaining(combinedRemaining())}
+                      resetAt={rows.Basic?.resetAt ?? null}
+                      noMeter
+                    />
+                    <For each={orderedKinds()}>
+                      {(kind, index) => {
+                        const w = () => rows[kind]!
+                        const remaining = () => remainingOf(w())
+                        return (
+                          <WindowRow
+                            now={props.now}
+                            guide={index() === orderedKinds().length - 1 ? "leaf" : "branch"}
+                            depth={2}
+                            label={kindLabel(kind)}
+                            remaining={remaining()}
+                            valueLabel={w().valueLabel}
+                            used={w().usedPercent}
+                            tone={toneForRemaining(remaining())}
+                            resetAt={w().resetAt}
+                            resetAfterSeconds={w().resetAfterSeconds}
+                            resetMode={kind === "Basic" ? "countdown" : "date"}
+                          />
+                        )
+                      }}
+                    </For>
+                  </>
+                )
+              }}
+            </For>
+          </Show>
+        </div>
+      </Show>
+    </>
   )
 }
 
@@ -304,46 +498,53 @@ function ProviderGroup(props: { provider: LimitProvider; now: number; openRouter
         </div>
       </Show>
 
-      <div class="flex flex-col divide-y divide-v2-border-border-muted/50 border-t border-v2-border-border-muted/50 empty:border-t-0">
-        <For each={windows()}>
-          {([key, w], index) => {
-            const remaining = remainingOf(w)
-            const rTone = toneForRemaining(remaining)
-            const state = tierGateState(key, remaining, gate())
-            const isLast = () => index() === windows().length - 1 && !props.openRouterFree
-            return (
+      <Show
+        when={result().providerId === "workbuddy"}
+        fallback={
+          <div class="flex flex-col divide-y divide-v2-border-border-muted/50 border-t border-v2-border-border-muted/50 empty:border-t-0">
+            <For each={windows()}>
+              {([key, w], index) => {
+                const remaining = remainingOf(w)
+                const rTone = toneForRemaining(remaining)
+                const state = tierGateState(key, remaining, gate())
+                const isLast = () => index() === windows().length - 1 && !props.openRouterFree
+                return (
+                  <WindowRow
+                    now={props.now}
+                    guide={isLast() ? "leaf" : "branch"}
+                    label={displayWindowLabel(key, language.t)}
+                    tag={
+                      <Show when={state === "binding"}>
+                        <StatePill tone={rTone}>{language.t("limits.gate.limiting")}</StatePill>
+                      </Show>
+                    }
+                    remaining={remaining}
+                    valueLabel={w.valueLabel}
+                    used={w.usedPercent}
+                    tone={rTone}
+                    resetAt={w.resetAt}
+                    resetAfterSeconds={w.resetAfterSeconds}
+                    dim={state === "gated"}
+                  />
+                )
+              }}
+            </For>
+            <Show when={!!props.openRouterFree}>
               <WindowRow
                 now={props.now}
-                guide={isLast() ? "leaf" : "branch"}
-                label={displayWindowLabel(key, language.t)}
-                tag={
-                  <Show when={state === "binding"}>
-                    <StatePill tone={rTone}>{language.t("limits.gate.limiting")}</StatePill>
-                  </Show>
-                }
-                remaining={remaining}
-                valueLabel={w.valueLabel}
-                used={w.usedPercent}
-                tone={rTone}
-                resetAt={w.resetAt}
-                resetAfterSeconds={w.resetAfterSeconds}
-                dim={state === "gated"}
+                guide="leaf"
+                label={language.t("openrouter.free.title")}
+                remaining={Math.round(props.openRouterFree!.free.remainingPercent * 10) / 10}
+                used={100 - props.openRouterFree!.free.remainingPercent}
+                tone={toneForRemaining(props.openRouterFree!.free.remainingPercent)}
+                resetAt={openRouterFreeResetAt(props.openRouterFree!)}
               />
-            )
-          }}
-        </For>
-        <Show when={!!props.openRouterFree}>
-          <WindowRow
-            now={props.now}
-            guide="leaf"
-            label={language.t("openrouter.free.title")}
-            remaining={Math.round(props.openRouterFree!.free.remainingPercent * 10) / 10}
-            used={100 - props.openRouterFree!.free.remainingPercent}
-            tone={toneForRemaining(props.openRouterFree!.free.remainingPercent)}
-            resetAt={openRouterFreeResetAt(props.openRouterFree!)}
-          />
-        </Show>
-      </div>
+            </Show>
+          </div>
+        }
+      >
+        <WorkBuddyBody windows={windows()} now={props.now} />
+      </Show>
     </div>
   )
 }

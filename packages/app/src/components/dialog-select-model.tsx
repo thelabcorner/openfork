@@ -48,6 +48,8 @@ import { arrayMove } from "@dnd-kit/helpers"
 import { createModelSearchMatcher, prepareModelSearchFields } from "./dialog-select-model-search"
 import { applySectionOrder } from "./dialog-select-model-order"
 import { useForkUsage } from "@/context/fork-usage"
+import { useWorkBuddyUsage, type WorkBuddyModelUsage } from "@/hooks/use-workbuddy-usage"
+import { WorkBuddyFreeBadge } from "./workbuddy-free-badge"
 import { useSync } from "@/context/sync"
 import { useLayout } from "@/context/layout"
 import { useSDK } from "@/context/sdk"
@@ -72,6 +74,13 @@ type ModelUsage = {
   personalized?: boolean
   remainingPercent?: number
   tone?: UsageTone
+  /**
+   * WorkBuddy-only: credits-per-request and the funding account behind the
+   * estimate. Present only when the model is served by WorkBuddy, so the
+   * tooltip can explain an estimate that is measured in *requests bought by
+   * remaining credits* rather than dollars remaining in a time window.
+   */
+  workbuddy?: WorkBuddyModelUsage
 }
 
 const modelKey = (model: ModelItem) => `${model.provider.id}:${model.id}`
@@ -501,7 +510,10 @@ function OpenRouterRow(props: {
       >
         <ProviderIcon id={props.item.provider.id} class="size-3.5 shrink-0 opacity-60" />
         <span class="min-w-0 flex-1 truncate leading-5">{stripUnlimitedSuffix(props.item.name)}</span>
-        <Show when={isFreeModel(props.item as never)}>
+        <Show when={props.item.provider.id === "workbuddy"}>
+          <WorkBuddyFreeBadge modelID={props.item.id} />
+        </Show>
+        <Show when={props.item.provider.id !== "workbuddy" && isFreeModel(props.item as never)}>
           <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
         </Show>
         <Show when={props.item.latest}>
@@ -1084,6 +1096,11 @@ function ModelSelectorPopoverV2View(props: {
   }
   const forkUsage = useForkUsage()
   const sync = useSync()
+  // WorkBuddy bills credits-per-request across several independent accounts, so
+  // its stretch estimate cannot ride the OpenCode-Go USD-window path. This is a
+  // pure projection of the quota result `useLimits` already polls — no extra
+  // network traffic.
+  const workbuddy = useWorkBuddyUsage()
   const [store, setStore] = createStore({ open: false, search: persistedModelSearch, active: "", tooltip: "", rail: "", submenu: "" })
   const [tables] = createResource(
     () => (store.open ? true : undefined),
@@ -1486,6 +1503,26 @@ function ModelSelectorPopoverV2View(props: {
     return buildModelCostIndex(sync().data.message)
   })
   const usageFor = (item: ModelItem) => {
+    // WorkBuddy: credits-per-request funded by one account's remaining balance.
+    // Checked first because these models carry no USD cost at all, so the
+    // token-priced path below would render "—" and no bar.
+    if (item.provider.id === "workbuddy") {
+      // Pass the full (possibly account-qualified) id: `hy4-preview@wb-<id>`
+      // must be funded by that account, not by the best account overall.
+      const estimate = workbuddy.forModel(item.id)
+      if (!estimate) return undefined
+      const account = workbuddy.accounts().find((entry) => entry.id === estimate.account || entry.account === estimate.account)
+      return {
+        percent: 100 - estimate.remainingPercent,
+        estimatedRequests: estimate.estimatedRequests,
+        remainingPercent: estimate.remainingPercent,
+        tone: stretchTone(estimate.estimatedRequests) as UsageTone,
+        workbuddy: {
+          ...estimate,
+          ...(account ? { totalCredits: account.totalCredits } : {}),
+        } as WorkBuddyModelUsage,
+      }
+    }
     if (isOpenRouterFreeModel(item)) {
       const report = freeUsage.data()
       if (!report) return undefined
@@ -1970,10 +2007,20 @@ function ModelSelectorPopoverV2View(props: {
     const effectiveCost = () => (hasPublishedPricing(item.cost) ? item.cost : fallbackCost() ?? item.cost)
     const isBorrowed = () => !hasPublishedPricing(item.cost) && !!fallbackCost()
     const effectiveItem = () => (isBorrowed() ? ({ ...item, cost: effectiveCost() } as ModelItem) : item)
-    const price = () =>
-      hasPublishedPricing(effectiveCost())
+    const price = () => {
+      // WorkBuddy publishes no token price — it charges credits per request.
+      // Showing "—" would waste the slot and hide the single most useful
+      // number, so show the actual consumption rate instead.
+      if (item.provider.id === "workbuddy") {
+        const rate = workbuddy.rateFor(item.id)
+        if (!rate) return "—"
+        if (rate.free) return rate.promotion ?? language.t("model.tag.free")
+        return rate.rate > 0 ? `x${rate.rate}` : "—"
+      }
+      return hasPublishedPricing(effectiveCost())
         ? `${isBorrowed() ? "~" : ""}${formatPricePerM(effectiveCost().input + effectiveCost().output)}`
         : "—"
+    }
     if (item.provider.id === "openrouter") {
       const cached = () => openRouterStore[item.id]
       return (
@@ -2018,10 +2065,13 @@ function ModelSelectorPopoverV2View(props: {
         <ProviderIcon id={item.provider.id} class="size-3.5 shrink-0 opacity-60" />
         <span class="min-w-0 flex-1 truncate leading-5">{stripUnlimitedSuffix(item.name)}</span>
         <DeepSeekRateBadge model={item} v2 period={deepSeekPeriod()} />
+        <Show when={item.provider.id === "workbuddy"}>
+          <WorkBuddyFreeBadge modelID={item.id} />
+        </Show>
         <Show when={isUnlimitedModel(item)}>
           <TagV2 class="shrink-0">{language.t("model.tag.unlimited")}</TagV2>
         </Show>
-        <Show when={isFreeModel(item as never)}>
+        <Show when={item.provider.id !== "workbuddy" && isFreeModel(item as never)}>
           <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
         </Show>
         <Show when={item.latest}>

@@ -4,7 +4,7 @@ import { HttpClient } from "effect/unstable/http"
 import { buildResult, toTimestamp, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
-import { createQuotaCache, fetchJson, outcomeError } from "./http"
+import { createQuotaCache, fetchJson, NEXT_REFRESH_NOW, outcomeError } from "./http"
 
 /**
  * Codex / ChatGPT account quota. Ported from OpenChamber (MIT).
@@ -29,11 +29,18 @@ export const codex = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapte
         }
         const access = resolved.key ?? ""
         const fresh = cache.fresh(access)
-        if (fresh) return fresh
+        if (fresh) return withNextRefresh(fresh, cache)
         if (cache.isCoolingDown()) {
           const cachedResult = cache.cachedResult()
-          if (cachedResult) return cachedResult
-          return buildResult({ providerId: "codex", providerName: NAME, ok: false, configured: true, error: "Rate limited — OpenAI is throttling usage checks" })
+          if (cachedResult) return withNextRefresh(cachedResult, cache)
+          return buildResult({
+            providerId: "codex",
+            providerName: NAME,
+            ok: false,
+            configured: true,
+            error: "Rate limited — OpenAI is throttling usage checks",
+            nextRefreshAt: cache.nextRefreshAt(),
+          })
         }
         // ChatGPT account scoping: prefer an explicit accountId field, then a
         // well-known block, matching upstream's JWT/chatgpt_account_id lookup.
@@ -50,15 +57,20 @@ export const codex = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapte
           const errorResult = buildResult({ providerId: "codex", providerName: NAME, ok: false, configured: true, error: reauthMsg })
           if (outcome.error === "status" && outcome.status === 429) {
             cache.coolDown(errorResult, outcome.retryAfterMs, access)
+            return withNextRefresh(errorResult, cache)
           }
-          return errorResult
+          return { ...errorResult, nextRefreshAt: NEXT_REFRESH_NOW }
         }
         const payload = outcome.body as Record<string, unknown> | null
         const result = parseUsage(payload)
         cache.store(result, access)
-        return result
+        return withNextRefresh(result, cache)
       }),
   }
+}
+
+function withNextRefresh(result: ReturnType<typeof buildResult>, cache: ReturnType<typeof createQuotaCache<ReturnType<typeof buildResult>>>) {
+  return { ...result, nextRefreshAt: cache.nextRefreshAt() }
 }
 
 function parseUsage(payload: unknown): ReturnType<typeof buildResult> {

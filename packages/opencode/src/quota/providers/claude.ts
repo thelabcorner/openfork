@@ -7,7 +7,7 @@ import { HttpClient } from "effect/unstable/http"
 import { buildResult, toTimestamp, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
-import { fetchJson, outcomeError } from "./http"
+import { fetchJson, NEXT_REFRESH_NOW, outcomeError } from "./http"
 
 /**
  * Claude (Anthropic) account quota. Ported from OpenChamber (MIT).
@@ -99,15 +99,17 @@ export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapt
           cached = undefined
           cooldownUntil = 0
         }
-        if (cached && cached.accessToken === accessToken && now - cached.fetchedAt < USAGE_CACHE_TTL_MS) return cached.result
+        if (cached && cached.accessToken === accessToken && now - cached.fetchedAt < USAGE_CACHE_TTL_MS)
+          return { ...cached.result, nextRefreshAt: nextRefreshAtOf(cached.fetchedAt, cooldownUntil) }
         if (now < cooldownUntil) {
-          if (cached?.result) return cached.result
+          if (cached?.result) return { ...cached.result, nextRefreshAt: nextRefreshAtOf(cached.fetchedAt, cooldownUntil) }
           return buildResult({
             providerId: "claude",
             providerName: NAME,
             ok: false,
             configured: true,
             error: "Rate limited (429) — Anthropic is throttling usage checks",
+            nextRefreshAt: cooldownUntil,
           })
         }
 
@@ -116,7 +118,7 @@ export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapt
           const result = parseUsage(outcome.body)
           cached = { accessToken, fetchedAt: Date.now(), result }
           cooldownUntil = 0
-          return result
+          return { ...result, nextRefreshAt: nextRefreshAtOf(cached.fetchedAt, cooldownUntil) }
         }
         if (outcome.error === "status" && outcome.status === 429) {
           const retryMs = outcome.retryAfterMs
@@ -129,6 +131,7 @@ export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapt
             ok: false,
             configured: true,
             error: outcomeError(outcome),
+            nextRefreshAt: cooldownUntil,
           })
           cached = { accessToken, fetchedAt: Date.now(), result: errorResult }
           return errorResult
@@ -139,12 +142,23 @@ export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapt
           ok: false,
           configured: true,
           error: outcomeError(outcome),
+          nextRefreshAt: NEXT_REFRESH_NOW,
         })
         cached = { accessToken, fetchedAt: Date.now(), result }
         // Non-429 errors don't impose cooldown — next call after TTL will retry.
         return result
       }),
   }
+}
+
+/**
+ * Claude hand-rolls its cache instead of using `createQuotaCache`, so it
+ * computes the same "earliest useful re-read" value: the end of the TTL, or
+ * the end of a 429 backoff when one is active (a 429 can push this out to
+ * CLAUDE_429_MAX_MS, which the refresh button must respect).
+ */
+function nextRefreshAtOf(fetchedAt: number, cooldownUntil: number) {
+  return Math.max(fetchedAt + USAGE_CACHE_TTL_MS, cooldownUntil)
 }
 
 function parseUsage(payload: unknown): ReturnType<typeof buildResult> {

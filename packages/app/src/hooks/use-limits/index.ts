@@ -21,7 +21,18 @@ export interface LimitProvider {
   gate: TierGate
 }
 
-const COOLDOWN_MS = 30_000
+/**
+ * Floor on the refresh cooldown, independent of provider caching. Even when
+ * every provider could be re-read instantly, a manual refresh fires one
+ * request per provider, so this stops genuine button-mashing.
+ */
+const REFRESH_FLOOR_MS = 5_000
+
+// Mirrors the backend's CLAUDE_429_DEFAULT_MS. Kept client-side because the
+// backend's own nextRefreshAt only reports a cooldown once it has been
+// observed on a later read — this covers the gap on the read that GETS the
+// 429, where the pane would otherwise re-enable immediately.
+const CLAUDE_429_BACKOFF_MS = 300_000
 
 /**
  * Dedicated limits-system hook: owns provider fetching, filtering
@@ -40,13 +51,11 @@ export function useLimits(options?: { now?: Accessor<number> }) {
   const [lastRefreshedAt, setLastRefreshedAt] = createSignal(0)
   const [lastRateLimitedAt, setLastRateLimitedAt] = createSignal(0)
 
-  const CLAUDE_429_BACKOFF_MS = 300_000 // 5 min backoff after 429 for Claude — matches backend CLAUDE_429_DEFAULT_MS
-
   const cooldownRemainingMs = () => {
-    const base = Math.max(0, COOLDOWN_MS - (now() - lastRefreshedAt()))
+    const floor = Math.max(0, REFRESH_FLOOR_MS - (now() - lastRefreshedAt()))
     const since429 = now() - lastRateLimitedAt()
     const claudeBackoff = lastRateLimitedAt() > 0 ? Math.max(0, CLAUDE_429_BACKOFF_MS - since429) : 0
-    return Math.max(base, claudeBackoff)
+    return Math.max(floor, claudeBackoff, providerCooldownRemainingMs())
   }
   const isCoolingDown = () => cooldownRemainingMs() > 0
 
@@ -113,21 +122,33 @@ export function useLimits(options?: { now?: Accessor<number> }) {
       return data ? { providers: data.providers, tick: tick() } : undefined
     },
     async (input) => {
+      const fallback = (entry: { providerId: string; providerName: string; configured: boolean }, message: string): ProviderResult => ({
+        providerId: entry.providerId,
+        providerName: entry.providerName,
+        ok: false,
+        configured: entry.configured,
+        error: message,
+        usage: null,
+        fetchedAt: Date.now(),
+      })
       const results = await Promise.all(
         input.providers.map(async (entry) => {
           try {
             const response = await sdk().client.quota.get({ providerID: entry.providerId }, { throwOnError: false })
+            // The generated client's non-throwing branches (network failure,
+            // HTTP error status, unknown-provider 404) all resolve with
+            // `data: undefined` rather than rejecting — casting that straight
+            // to ProviderResult let `undefined` reach `r.ok` downstream and
+            // throw out of this fetcher entirely, surfacing as "Couldn't load
+            // limits" for every provider instead of just this one.
+            if (!response.data) {
+              const err = response.error
+              const message = err instanceof Error ? err.message : typeof err === "string" ? err : "Request failed"
+              return fallback(entry, message)
+            }
             return response.data as ProviderResult
           } catch (err) {
-            return {
-              providerId: entry.providerId,
-              providerName: entry.providerName,
-              ok: false,
-              configured: entry.configured,
-              error: err instanceof Error ? err.message : String(err),
-              usage: null,
-              fetchedAt: Date.now(),
-            } as ProviderResult
+            return fallback(entry, err instanceof Error ? err.message : String(err))
           }
         }),
       )
@@ -173,6 +194,26 @@ export function useLimits(options?: { now?: Accessor<number> }) {
         if (a.result.ok !== b.result.ok) return a.result.ok ? -1 : 1
         return a.result.providerName.localeCompare(b.result.providerName)
       })
+  })
+
+  /**
+   * How long until a refresh would actually return new numbers.
+   *
+   * Every adapter that caches its upstream read (kimi/codex/xai/workbuddy via
+   * createQuotaCache, claude, opencode-go) publishes `nextRefreshAt` — the
+   * epoch ms its own cache expires, or the end of a 429 backoff. Refreshing
+   * before the SLOWEST one expires re-serves identical data for that provider,
+   * so the cooldown is the max across providers rather than a flat guess.
+   *
+   * Providers without that field (older servers, or adapters that read
+   * locally like Zen/NVIDIA) contribute 0 — a missing value means "refresh
+   * is useful now", never "never refresh".
+   */
+  const providerCooldownRemainingMs = createMemo(() => {
+    const list = providers()
+    if (!list) return 0
+    const latest = list.reduce((max, p) => Math.max(max, p.result.nextRefreshAt ?? 0), 0)
+    return Math.max(0, latest - now())
   })
 
   const isLoading = () => providersRes.loading || quotasRes.loading
