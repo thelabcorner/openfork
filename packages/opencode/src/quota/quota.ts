@@ -6,11 +6,13 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { HttpClient } from "effect/unstable/http"
 import { Auth } from "@/auth"
 import { ForkCredentials } from "@/fork/credentials"
+import * as ZenFreeUsage from "@/usage/zen-free"
 import type { ProviderResult, ProvidersResult } from "./schema"
 import { createSingleFlight, resolveAdapter, type Adapter } from "./registry"
 import { deepseek } from "./providers/deepseek"
 import { kimi } from "./providers/kimi"
 import { opencodeGo } from "./providers/opencode-go"
+import { opencodeZen } from "./providers/opencode-zen"
 import { openrouter } from "./providers/openrouter"
 import { claude } from "./providers/claude"
 import { codex } from "./providers/codex"
@@ -21,10 +23,11 @@ export { UsageWindow, ProviderUsage, ProviderResult, ProviderSummary, ProvidersR
 
 /**
  * Proactive provider-account quota reads, ported from OpenChamber's quota
- * tracker (MIT). Deliberately separate from Usage.Service (historical local
- * session analytics) and from SessionRetry (authoritative provider-failure
- * handling): quota results are advisory display state only — fetches fold
- * every failure into an ok=false result and never gate inference.
+ * tracker (MIT). Deliberately separate from the generic Usage.Service
+ * historical analytics and from SessionRetry's authoritative provider-failure
+ * handling: quota results are advisory display state only and never gate
+ * inference. OpenCode Zen is the one local usage-backed quota source because
+ * its anonymous free limit has no provider usage endpoint.
  */
 
 export class QuotaProviderNotFoundError extends Schema.TaggedErrorClass<QuotaProviderNotFoundError>()(
@@ -41,14 +44,20 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Quota") {}
 
-const layer: Layer.Layer<Service, never, Auth.Service | ForkCredentials.Service | HttpClient.HttpClient> = Layer.effect(
+const layer: Layer.Layer<
+  Service,
+  never,
+  Auth.Service | ForkCredentials.Service | HttpClient.HttpClient | ZenFreeUsage.Service
+> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const auth = yield* Auth.Service
     const credentials = yield* ForkCredentials.Service
     const http = yield* HttpClient.HttpClient
+    const zenFreeUsage = yield* ZenFreeUsage.Service
     const adapters: readonly Adapter[] = [
       opencodeGo(auth, credentials),
+      opencodeZen(zenFreeUsage),
       openrouter(http, auth),
       kimi(http, auth),
       deepseek(http, auth),
@@ -83,4 +92,8 @@ const layer: Layer.Layer<Service, never, Auth.Service | ForkCredentials.Service 
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer, deps: [Auth.node, ForkCredentials.node, httpClient] })
+export const node = LayerNode.make({
+  service: Service,
+  layer,
+  deps: [Auth.node, ForkCredentials.node, httpClient, ZenFreeUsage.node],
+})
