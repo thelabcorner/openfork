@@ -1,5 +1,4 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { InstanceState } from "@/effect/instance-state"
 import { SessionID } from "@/session/schema"
 import { SessionIngress, type SessionIngressEvent } from "@/session/ingress"
 import { BackgroundJob } from "@/background/job"

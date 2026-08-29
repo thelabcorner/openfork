@@ -1,5 +1,4 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { InstanceState } from "@/effect/instance-state"
 import { Shell } from "@opencode-ai/core/shell"
 import { Identifier } from "@/id/id"
 import { BackgroundJob } from "@/background/job"
