@@ -16,6 +16,7 @@ const GO_UPSELL_ACCOUNT_RATE_LIMIT_LAST_SEEN_AT = "go_upsell_account_rate_limit_
 const GO_UPSELL_ACCOUNT_RATE_LIMIT_DONT_SHOW = "go_upsell_account_rate_limit_dont_show"
 const GO_UPSELL_WINDOW = 86_400_000 // 24 hrs
 const GO_UPSELL_PROVIDERS = new Set(["opencode", "opencode-go"])
+const ZEN_PROVIDER = "opencode"
 
 function goUpsellKeys(status: SessionStatus) {
   if (status.type !== "retry" || !status.action) return
@@ -64,11 +65,12 @@ export function useUsageExceededDialogs() {
       const { action } = evt.properties.status
       if (!action) return
 
-      // This is the strongest signal available to the Zen quota learner. Log
-      // it independently of whether the upsell dialog is suppressed, already
-      // visible, or disabled by the user. Nearby retries are collapsed into
-      // one exhaustion episode before persistence.
-      if (action.reason === "free_tier_limit" && GO_UPSELL_PROVIDERS.has(action.provider)) {
+      // `FreeUsageLimitError` is the strongest Zen quota signal available.
+      // Only public `opencode` traffic belongs to this learner; Go has its own
+      // quota accounting and must never contaminate the anonymous Zen model.
+      // Log independently of dialog suppression/cooldown so UI preferences do
+      // not erase calibration data.
+      if (action.reason === "free_tier_limit" && action.provider === ZEN_PROVIDER) {
         const at = Date.now()
         setZenLimitHits("entries", appendZenLimitHit(zenLimitHits.entries, at))
       }
