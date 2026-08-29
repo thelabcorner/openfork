@@ -43,7 +43,7 @@ import { Truncate } from "@/tool/truncate"
 import { Image } from "@/image/image"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -86,10 +86,10 @@ IMPORTANT:
 const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested structured output. You MUST use the StructuredOutput tool to provide your final response. Do NOT respond with plain text - you MUST call the StructuredOutput tool with your answer formatted according to the schema.`
 
 // Injected (request-only) when a generation is an automatic continuation of
-// one that ended with finish "unknown" — the provider stream dropped before a
+// one that ended with finish "unknown" ΓÇö the provider stream dropped before a
 // stop reason. Without this the model is asked to produce another assistant
 // turn with no new input, which it experiences as a blank/phantom user message.
-const UNKNOWN_FINISH_CONTINUATION_PROMPT = `[AUTOMATIC CONTINUATION — system, not the user] Your previous response was cut off mid-stream: the provider connection dropped before a completion signal arrived (finish reason "unknown"). Nothing new was asked and there is no new user request. Resume exactly where you stopped: continue the same task or sentence WITHOUT repeating output you already produced, without apologizing, and without asking the user anything. If you genuinely cannot continue, state in one short line what you were doing, then immediately proceed with the next concrete step.`
+const UNKNOWN_FINISH_CONTINUATION_PROMPT = `[AUTOMATIC CONTINUATION ΓÇö system, not the user] Your previous response was cut off mid-stream: the provider connection dropped before a completion signal arrived (finish reason "unknown"). Nothing new was asked and there is no new user request. Resume exactly where you stopped: continue the same task or sentence WITHOUT repeating output you already produced, without apologizing, and without asking the user anything. If you genuinely cannot continue, state in one short line what you were doing, then immediately proceed with the next concrete step.`
 
 function mcpResourceBase64Size(value: string) {
   const trimmed = value.replace(/\s/g, "")
@@ -158,11 +158,16 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const database = yield* Database.Service
     const { db } = database
+    let dispatchFn: TaskPromptOps["dispatch"] | undefined
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
         prompt: ((input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die))) as unknown as TaskPromptOps["prompt"],
+        dispatch: ((input: PromptInput, options?: { wait?: boolean }) =>
+          dispatchFn
+            ? dispatchFn(input, options)
+            : Effect.die(new Error("dispatch not initialized"))) as TaskPromptOps["dispatch"],
       } satisfies TaskPromptOps
     })
 
@@ -210,7 +215,7 @@ const layer = Layer.effect(
     // Shared title-generation body, used by auto-title (ensureTitle) and the V1
     // regenerateTitle endpoint. Resolves the title model, streams the conversation,
     // and sanitizes the result to a single line. Returns `undefined` when nothing
-    // usable is produced (empty/garbage output, no title agent, no anchor) — the
+    // usable is produced (empty/garbage output, no title agent, no anchor) ΓÇö the
     // caller keeps the existing title untouched.
     const generateTitle = Effect.fn("SessionPrompt.generateTitle")(function* (input: {
       sessionID: SessionID
@@ -229,8 +234,8 @@ const layer = Layer.effect(
 
       const ag = yield* agents.get("title")
       if (!ag) return
-      // Candidate cascade: explicit picker choice → agent.title.model →
-      // config/plugin small model → session/default model. Runtime failures on
+      // Candidate cascade: explicit picker choice ΓåÆ agent.title.model ΓåÆ
+      // config/plugin small model ΓåÆ session/default model. Runtime failures on
       // one candidate should not make manual retitle fail while another usable
       // model is available.
       const resolve = (providerID: ProviderV2.ID, modelID: ModelV2.ID) =>
@@ -274,8 +279,8 @@ const layer = Layer.effect(
               model: mdl,
               sessionID: input.sessionID,
               retries: 2,
-              // The caller resolves the task prompt (custom → default); the current
-              // title replaces the `{previousTitle}` token (retitle §3.5).
+              // The caller resolves the task prompt (custom ΓåÆ default); the current
+              // title replaces the `{previousTitle}` token (retitle ┬º3.5).
               messages: [
                 { role: "user", content: input.prompt.replaceAll("{previousTitle}", input.previousTitle) },
                 ...msgs,
@@ -358,8 +363,8 @@ const layer = Layer.effect(
         prompt: "Generate a title for this conversation:\n",
       })
       if (!t) return
-      // Manual rename wins (retitle §6): only write when the title is still the
-      // baseline captured at loop start — a rename made while generation was in
+      // Manual rename wins (retitle ┬º6): only write when the title is still the
+      // baseline captured at loop start ΓÇö a rename made while generation was in
       // flight discards the generated title.
       const current = yield* sessions.get(input.session.id).pipe(Effect.orDie)
       if (current.title !== input.session.title) return
@@ -414,7 +419,7 @@ const layer = Layer.effect(
       })
       // The first real user message stays pinned at the front of the context and
       // everything newer follows chronologically, so the opening intent always
-      // reaches the title model (retitle §3.5).
+      // reaches the title model (retitle ┬º3.5).
       const context = history.slice(firstIdx)
       const cfg = yield* config.get()
       // Custom prompt; empty/whitespace falls back to the configured title
@@ -1445,7 +1450,7 @@ Generate a fresh title. Do not reuse the current title.`
             .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
           // True when THIS generation is an automatic continuation of a
-          // previous one that ended with finish "unknown" — the #43892 case.
+          // previous one that ended with finish "unknown" ΓÇö the #43892 case.
           const continuingAfterUnknown =
             lastAssistant?.finish === "unknown" && lastAssistant.parentID === lastUser.id
 
@@ -1514,7 +1519,7 @@ Generate a fresh title. Do not reuse the current title.`
                 // a stop reason), the loop starts ANOTHER generation with no
                 // new user input. Left unexplained, models experience this as
                 // a blank prompt / phantom user turn and may restart, ask the
-                // user what happened, or freeze. Tell it why — REQUEST-ONLY,
+                // user what happened, or freeze. Tell it why ΓÇö REQUEST-ONLY,
                 // never persisted into the session.
                 ...(continuingAfterUnknown
                   ? [{ role: "user" as const, content: UNKNOWN_FINISH_CONTINUATION_PROMPT }]
@@ -1555,7 +1560,7 @@ Generate a fresh title. Do not reuse the current title.`
             if (finished && !handle.message.error) {
               // Surface any content-filter finish (e.g. Anthropic stop_reason:
               // refusal) as an error. These turns may have produced no visible
-              // output at all — previously the session went idle silently — or
+              // output at all ΓÇö previously the session went idle silently ΓÇö or
               // partial text that was cut off by the provider's filter.
               if (handle.message.finish === "content-filter") {
                 handle.message.error = new SessionV1.ContentFilterError({
@@ -1610,13 +1615,52 @@ Generate a fresh title. Do not reuse the current title.`
     ) {
       // Hard interruption of the runLoop fiber (crash-level abort, not the
       // graceful step-level path) still finalizes the turn checkpoint with
-      // status `aborted` and a captured after-state (t3 §47).
+      // status `aborted` and a captured after-state (t3 ┬º47).
       return yield* (state.ensureRunning as unknown as (a: SessionID, b: Effect.Effect<SessionV1.WithParts, never, any>, c: Effect.Effect<SessionV1.WithParts, never, any>) => Effect.Effect<SessionV1.WithParts, never, any>)(
         input.sessionID,
         lastAssistant(input.sessionID) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
         runLoop(input.sessionID).pipe(Effect.onError(() => turnCheckpoint.finishAborted(input.sessionID))) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
       )
     })
+
+    dispatchFn = Effect.fn("SessionPrompt.dispatch")(function* (
+      input: PromptInput,
+      options?: { wait?: boolean },
+    ) {
+      const admitted = yield* prompt({ ...input, noReply: true })
+      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      if (session.pausedAt !== undefined) {
+        return { admitted, paused: true }
+      }
+      const run = loop({ sessionID: input.sessionID }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.gen(function* () {
+            yield* Effect.logError("session tool dispatch failed", {
+              "session.id": input.sessionID,
+              cause: Cause.pretty(cause),
+            })
+            const error = Cause.squash(cause)
+            const message = error instanceof Error ? error.message : String(error)
+            yield* events
+              .publish(Session.Event.Error, {
+                sessionID: input.sessionID,
+                error: { name: "DispatchError", message } as any,
+              })
+              .pipe(Effect.ignore)
+            return yield* Effect.failCause(cause)
+          }),
+        ),
+      )
+      const fiber = yield* run.pipe(Effect.forkIn(scope, { startImmediately: true }))
+      if (options?.wait !== true) {
+        return { admitted, paused: false }
+      }
+      const exit = yield* Fiber.await(fiber)
+      if (Exit.isSuccess(exit)) {
+        return { admitted, paused: false, result: exit.value }
+      }
+      return { admitted, paused: false }
+    }) as unknown as TaskPromptOps["dispatch"]
 
     const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
       "SessionPrompt.shell",
@@ -1815,7 +1859,7 @@ export const CommandInput = Schema.Struct({
   arguments: Schema.String,
   command: Schema.String,
   variant: Schema.optional(Schema.String),
-  // Inlined (no identifier annotation) to keep the original SDK output — the
+  // Inlined (no identifier annotation) to keep the original SDK output ΓÇö the
   // PromptInput call site below references FilePartInput by ref via the
   // Schema export in message-v2.ts.
   parts: Schema.optional(

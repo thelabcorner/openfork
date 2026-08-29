@@ -6,8 +6,6 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { PairBeginApi, PairClaimApi, ApiClaimRateLimitedError, ApiPairCodeError } from "../groups/pair"
 
 function clientIP(request: HttpServerRequest.HttpServerRequest) {
-  const forwarded = request.headers["x-forwarded-for"]?.split(",")[0].trim()
-  if (forwarded) return forwarded
   return Option.getOrUndefined(request.remoteAddress)
 }
 

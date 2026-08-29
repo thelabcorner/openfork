@@ -98,7 +98,19 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     subProvider !== "auto" &&
     input.model.api.npm === "@openrouter/ai-sdk-provider"
   ) {
-    options.provider = { only: [subProvider] }
+    // Defensive: ignore a known-stale pin that bricks the model. The
+    // `tencent` upstream no longer serves `xiaomi/mimo-v2.5-20260422` (see
+    // dialog-select-model.tsx and models.tsx migrations). Even though the
+    // frontend clears the persisted value when endpoints are fetched, a stale
+    // value can still be in-flight for the current request or for users who
+    // have not yet opened the picker. Sending `provider: { only: ["tencent"] }`
+    // triggers OpenRouter's 404 "No allowed providers are available" on every
+    // attempt and would otherwise retry 5 times. Dropping the pin here makes
+    // the request fall back to OpenRouter Auto routing and succeed.
+    const isStaleTencentMimo = subProvider === "tencent" && input.model.id.includes("mimo-v2.5-20260422")
+    if (!isStaleTencentMimo) {
+      options.provider = { only: [subProvider] }
+    }
   }
   if (
     input.model.api.npm === "@ai-sdk/azure" &&

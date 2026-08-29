@@ -3,6 +3,7 @@ import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "e
 import { Quota } from "@/quota/quota"
 import { ApiNotFoundError } from "../errors"
 import { described } from "./metadata"
+import { Authorization } from "../middleware/authorization"
 
 export const QuotaPaths = {
   providers: "/quota/providers",
@@ -42,5 +43,6 @@ export const QuotaApi = HttpApi.make("quota").add(
         title: "quota",
         description: "Proactive provider-account quota status. Advisory display state only.",
       }),
-    ),
+    )
+    .middleware(Authorization),
 )

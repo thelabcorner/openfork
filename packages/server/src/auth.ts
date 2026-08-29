@@ -15,6 +15,7 @@ export type DecodedCredentials = {
 export type Info = {
   readonly password: Option.Option<string>
   readonly username: string
+  readonly publicUrl?: string
 }
 
 export class Config extends Context.Service<Config, Info>()("@opencode/ServerAuthConfig") {
@@ -30,6 +31,7 @@ export class Config extends Context.Service<Config, Info>()("@opencode/ServerAut
           yield* EffectConfig.all({
             password: EffectConfig.string("OPENCODE_SERVER_PASSWORD").pipe(EffectConfig.option),
             username: EffectConfig.string("OPENCODE_SERVER_USERNAME").pipe(EffectConfig.withDefault("opencode")),
+            publicUrl: EffectConfig.string("OPENCODE_PUBLIC_URL").pipe(EffectConfig.withDefault("")),
           }),
         )
       }),
@@ -39,6 +41,10 @@ export class Config extends Context.Service<Config, Info>()("@opencode/ServerAut
 
 export function required(config: Info) {
   return Option.isSome(config.password) && config.password.value !== ""
+}
+
+export function publiclyExposed(config: Info) {
+  return !!config.publicUrl?.trim()
 }
 
 export function authorized(credentials: DecodedCredentials, config: Info) {

@@ -23,6 +23,7 @@ import { BackgroundTool } from "./background"
 import { SqliteTool } from "./sqlite"
 import { GitTool } from "./git"
 import { CheckpointTool } from "./checkpoint"
+import { SessionTool } from "./session"
 import { TurnCheckpoint } from "@/session/checkpoint"
 import { Snapshot } from "@/snapshot"
 import { TypecheckTool } from "./typecheck"
@@ -34,6 +35,8 @@ import { SympyTool } from "./sympy"
 import * as Tool from "./tool"
 import { buildCustomTools } from "./custom"
 import { Config } from "@/config/config"
+import { SessionStatus } from "@/session/status"
+import { Project } from "@/project/project"
 import { Plugin } from "../plugin"
 import { Provider } from "@/provider/provider"
 
@@ -171,6 +174,7 @@ const layer = Layer.effect(
     const sqlitetool = yield* SqliteTool
     const gittool = yield* GitTool
     const checkpointtool = yield* CheckpointTool
+    const sessiontool = yield* SessionTool
     const typechecktool = yield* TypecheckTool
     const projecttool = yield* ProjectTool
     const symbolstool = yield* SymbolsTool
@@ -240,6 +244,7 @@ const layer = Layer.effect(
           sqlite: Tool.init(sqlitetool),
           git: Tool.init(gittool),
           checkpoint: Tool.init(checkpointtool),
+          session: Tool.init(sessiontool),
           typecheck: Tool.init(typechecktool),
           project: Tool.init(projecttool),
           symbols: Tool.init(symbolstool),
@@ -301,6 +306,7 @@ const layer = Layer.effect(
             tool.sqlite,
             tool.git,
             tool.checkpoint,
+            tool.session,
             tool.typecheck,
             tool.project,
             tool.symbols,
@@ -361,7 +367,7 @@ const layer = Layer.effect(
       const current = yield* Ref.get(stateRef)
       // Invariant: in-flight execute closures were captured at build time (the
       // ai-sdk tool() wraps the def at resolve), so this swap affects only the
-      // NEXT resolve — a running tool call keeps the def it started with.
+      // NEXT resolve ΓÇö a running tool call keeps the def it started with.
       yield* Ref.set(stateRef, { ...current, custom })
       const currentIds = new Set(current.custom.map((tool) => tool.id))
       const nextIds = new Set(custom.map((tool) => tool.id))
@@ -481,6 +487,8 @@ export const node = LayerNode.make({
     Agent.node,
     Skill.node,
     Session.node,
+    SessionStatus.node,
+    Project.node,
     BackgroundJob.node,
     ShellJobs.node,
     Provider.node,

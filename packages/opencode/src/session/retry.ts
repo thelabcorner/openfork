@@ -40,6 +40,11 @@ const RETRYABLE_MESSAGE_PATTERNS = [
   /\btry again (?:later|in\b)|\b(?:currently|temporarily) at capacity\b/i,
 ]
 
+const NON_RETRYABLE_MESSAGE_PATTERNS = [
+  /no allowed providers are available/i,
+  /provider\.only.*permits only/i,
+]
+
 function cap(ms: number) {
   return Math.min(ms, RETRY_MAX_DELAY)
 }
@@ -86,6 +91,17 @@ export function retryable(error: Err, provider: string) {
   // context overflow errors should not be retried
   if (SessionV1.ContextOverflowError.isInstance(error)) return undefined
   if (SessionV1.APIError.isInstance(error)) {
+    // Client configuration errors like an invalid OpenRouter `provider.only`
+    // must never be retried - the request will fail identically on every
+    // attempt until the user clears the stale upstream-provider pin. The
+    // provider returns a 404/400 with "No allowed providers are available"
+    // even when the outer HTTP status is 500 from a gateway, so we check the
+    // message body before the generic 5xx retry gate.
+    if (
+      matchesNonRetryableMessage(error.data.message) ||
+      matchesNonRetryableMessage(error.data.responseBody)
+    )
+      return undefined
     const status = error.data.statusCode
     // 5xx errors are transient server failures and should always be retried,
     // even when the provider SDK doesn't explicitly mark them as retryable.
@@ -156,6 +172,10 @@ export function retryable(error: Err, provider: string) {
 
 function matchesRetryableMessage(value: unknown) {
   return typeof value === "string" && RETRYABLE_MESSAGE_PATTERNS.some((pattern) => pattern.test(value))
+}
+
+function matchesNonRetryableMessage(value: unknown) {
+  return typeof value === "string" && NON_RETRYABLE_MESSAGE_PATTERNS.some((pattern) => pattern.test(value))
 }
 
 function str(value: unknown) {

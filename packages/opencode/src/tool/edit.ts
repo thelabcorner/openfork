@@ -69,7 +69,8 @@ const BatchOp = Schema.Union([
 ])
 
 export const Parameters = Schema.Struct({
-  filePath: Schema.String.annotate({ description: "The absolute path to the file to modify" }),
+  filePath: Schema.optional(Schema.String).annotate({ description: "The absolute path to the file to modify (alias: file_path)" }),
+  file_path: Schema.optional(Schema.String).annotate({ description: "Alias for filePath" }),
   oldString: Schema.optional(Schema.String).annotate({ description: "The text to replace" }),
   newString: Schema.optional(Schema.String).annotate({
     description: "The text to replace it with (must be different from oldString)",
@@ -361,14 +362,15 @@ export const EditTool = Tool.define<
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<EditMetadata>) =>
         Effect.gen(function* () {
-          if (!params.filePath) {
-            throw new Error("filePath is required")
+          const filePathParam = params.filePath ?? params.file_path
+          if (!filePathParam) {
+            throw new Error("filePath (or file_path alias) is required")
           }
 
           const instance = yield* InstanceState.context
-          const filePath = path.isAbsolute(params.filePath)
-            ? params.filePath
-            : path.join(instance.directory, params.filePath)
+          const filePath = path.isAbsolute(filePathParam)
+            ? filePathParam
+            : path.join(instance.directory, filePathParam)
           yield* assertExternalDirectoryEffect(ctx, filePath)
 
           // Exact path has priority (back-compat; cheap params are ignored
@@ -677,6 +679,7 @@ const runTypecheckAfterEdit = Effect.fn("EditTool.runTypecheck")(function* (
   filePath: string,
   instance: { directory: string; worktree: string },
   ctx: Tool.Context,
+  maxErrors?: number,
 ) {
   if (!TypecheckScope.isTsFile(filePath)) return undefined
   const app = yield* Effect.serviceOption(AppProcess.Service)
@@ -689,7 +692,7 @@ const runTypecheckAfterEdit = Effect.fn("EditTool.runTypecheck")(function* (
     worktree: instance.worktree,
     tsconfigDir,
     files: [filePath],
-    maxErrors: 30,
+    maxErrors: maxErrors ?? 30,
     timeoutMs: 30_000,
     signal: ctx.abort,
   })
@@ -1210,7 +1213,9 @@ export function replace(content: string, oldString: string, newString: string, r
     const message =
       "Could not find oldString in the file. It must match exactly, including whitespace, indentation, and line endings."
     const hint = Conflict.replaceConflictHint({ content, needle: oldString })
-    throw new Error(hint ? `${message}\n\n${hint}` : message)
+    const aroundHint =
+      "\nHINT: Use read({action:\"around\", symbol:\"<name>\"}) to find the exact text around a symbol, or grep({pattern:\"<text>\"}) to locate it in the file."
+    throw new Error(hint ? `${message}\n\n${hint}${aroundHint}` : `${message}${aroundHint}`)
   }
   const ambiguous = "Found multiple matches for oldString. Provide more surrounding context to make the match unique."
   const hint = Conflict.replaceConflictHint({ content, needle: oldString })

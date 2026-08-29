@@ -183,7 +183,7 @@ describe("device pairing over Server.listen", () => {
   test("claim rejects wrong codes with 400 and rate-limits floods with 429", async () => {
     const listener = await startListener()
     try {
-      const wrong = await claim(listener, "WRONG")
+      const wrong = await claim(listener, "WRONG2")
       expect(wrong.status).toBe(400)
       const body = (await wrong.json()) as { name?: string; data?: { reason?: string } }
       expect(body.name).toBe("PairCodeError")
@@ -192,7 +192,7 @@ describe("device pairing over Server.listen", () => {
       // Per-IP bucket: burst is CLAIM_RATE_LIMIT.burst; one attempt already spent.
       let sawRateLimit = false
       for (let i = 0; i < 24; i++) {
-        const response = await claim(listener, "WRONG")
+        const response = await claim(listener, "WRONG2")
         if (response.status === 429) {
           sawRateLimit = true
           const limited = (await response.json()) as { data?: { retryAfterMs?: number } }
@@ -201,6 +201,24 @@ describe("device pairing over Server.listen", () => {
         }
       }
       expect(sawRateLimit).toBe(true)
+    } finally {
+      await stop(listener).catch(() => undefined)
+    }
+  })
+
+  test("claim rejects oversized request bodies", async () => {
+    const listener = await startListener()
+    try {
+      const response = await fetch(new URL(PairPaths.claim, listener.url), {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ code: "ABC234", name: "x".repeat(9 * 1024) }),
+      })
+      // Body exceeds the 8 KiB claim limit (and the 80-char name bound) — either
+      // the transport limit (413) or schema validation (400) is an acceptable
+      // rejection; the point is it does not succeed and does not consume
+      // unbounded resources.
+      expect([400, 413].includes(response.status)).toBe(true)
     } finally {
       await stop(listener).catch(() => undefined)
     }

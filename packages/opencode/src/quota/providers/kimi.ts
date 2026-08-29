@@ -14,7 +14,7 @@ import {
 import type { UsageWindow } from "../schema"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
-import { fetchJson, outcomeError } from "./http"
+import { createQuotaCache, fetchJson, outcomeError } from "./http"
 
 /**
  * Kimi for Coding weekly usage. Ported from OpenChamber (MIT)
@@ -27,7 +27,10 @@ const ALIASES = ["kimi-for-coding", "kimi"]
 const NAME = "Kimi for Coding"
 const KIMI_QUOTA_URL = "https://api.kimi.com/coding/v1/usages"
 
-export const kimi = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter => ({
+export const kimi = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter => {
+  const cache = createQuotaCache<ReturnType<typeof buildResult>>("kimi-for-coding")
+
+  return {
   id: "kimi-for-coding",
   name: NAME,
   aliases: ALIASES,
@@ -38,9 +41,20 @@ export const kimi = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter
       if (!resolved) {
         return buildResult({ providerId: "kimi-for-coding", providerName: NAME, ok: false, configured: false, error: "Not configured" })
       }
+      const fresh = cache.fresh(resolved.key)
+      if (fresh) return fresh
+      if (cache.isCoolingDown()) {
+        const cachedResult = cache.cachedResult()
+        if (cachedResult) return cachedResult
+        return buildResult({ providerId: "kimi-for-coding", providerName: NAME, ok: false, configured: true, error: "Rate limited — Kimi is throttling usage checks" })
+      }
       const outcome = yield* fetchJson(http, KIMI_QUOTA_URL, resolved.key)
       if (!outcome.ok) {
-        return buildResult({ providerId: "kimi-for-coding", providerName: NAME, ok: false, configured: true, error: outcomeError(outcome) })
+        const errorResult = buildResult({ providerId: "kimi-for-coding", providerName: NAME, ok: false, configured: true, error: outcomeError(outcome) })
+        if (outcome.error === "status" && outcome.status === 429) {
+          cache.coolDown(errorResult, outcome.retryAfterMs, resolved.key)
+        }
+        return errorResult
       }
       const payload = asObject(outcome.body) ?? {}
       const windows: Record<string, UsageWindow> = {}
@@ -65,12 +79,15 @@ export const kimi = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter
           resetAt: toTimestamp(detail?.resetTime),
         })
       }
-      return buildResult({
+      const result = buildResult({
         providerId: "kimi-for-coding",
         providerName: NAME,
         ok: true,
         configured: true,
         usage: { windows },
       })
+      cache.store(result, resolved.key)
+      return result
     }),
-})
+  }
+}

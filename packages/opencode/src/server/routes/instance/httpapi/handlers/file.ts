@@ -56,7 +56,13 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       )
     })
 
-    const fileMutationError = (error: FileMutation.StaleContentError | FileMutation.TargetExistsError | LocationMutation.PathError | FSUtil.Error) =>
+    const fileMutationError = (
+      error:
+        | FileMutation.StaleContentError
+        | FileMutation.TargetExistsError
+        | LocationMutation.PathError
+        | FSUtil.Error,
+    ) =>
       new FileMutationError({
         name: "FileMutationError",
         data:
@@ -75,11 +81,13 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
     ) {
       if (!expectedHash) return undefined
       const fs = yield* FSUtil.Service
-      const current = yield* fs.readFile(target.canonical).pipe(
-        Effect.catchReason("PlatformError", "NotFound", () =>
-          Effect.fail(new FileMutation.StaleContentError({ path: target.canonical })),
-        ),
-      )
+      const current = yield* fs
+        .readFile(target.canonical)
+        .pipe(
+          Effect.catchReason("PlatformError", "NotFound", () =>
+            Effect.fail(new FileMutation.StaleContentError({ path: target.canonical })),
+          ),
+        )
       if (Hash.sha256(Buffer.from(current)) !== expectedHash) {
         return yield* new FileMutation.StaleContentError({ path: target.canonical })
       }
@@ -155,14 +163,28 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
     }) {
       const started = performance.now()
       const page = yield* filesystem(
-        FileSystem.Service.use((fs) =>
-          fs.searchMentions({
+        Effect.gen(function* () {
+          const fs = yield* FileSystem.Service
+          const index = yield* FileIndex.Service
+          const raw = yield* fs.searchMentions({
             query: ctx.query.query,
             limit: ctx.query.limit ?? 30,
             offset: ctx.query.offset ?? 0,
             symbols: ctx.query.symbols !== "false",
-          }),
-        ),
+          })
+          // FileIndex is the canonical size/mtime catalog. Ranking still
+          // comes from the search backend (fff / ripgrep / SearchIndex);
+          // we join catalog metadata here so @-mentions and the explorer
+          // share one source of truth without a second walk.
+          const results = raw.results.map((row) => {
+            if (row.kind !== "file" || row.type === "directory" || !row.path) return row
+            if (row.size !== undefined && row.mtime !== undefined) return row
+            const hit = index.lookup(row.path)
+            if (!hit) return row
+            return { ...row, size: row.size ?? hit.size, mtime: row.mtime ?? hit.mtime }
+          })
+          return { ...raw, results }
+        }),
       ).pipe(Effect.orDie)
       yield* Effect.logInfo("find search", {
         query: ctx.query.query,
@@ -179,13 +201,24 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       return []
     })
 
-    const list = Effect.fn("FileHttpApi.list")(function* (ctx: { query: { path: string } }) {
+    const list = Effect.fn("FileHttpApi.list")(function* (ctx: {
+      query: { path: string; limit?: number; offset?: number }
+    }) {
       return yield* filesystem(
         Effect.gen(function* () {
           const index = yield* FileIndex.Service
           const location = yield* Location.Service
           const ignored = yield* ignoredFiles(location.project.directory)
-          return (yield* index.list(RelativePath.make(ctx.query.path))).map((item) => {
+          const all = yield* index
+            .list(RelativePath.make(ctx.query.path))
+            .pipe(Effect.catch(() => Effect.succeed([] as readonly FileSystem.Entry[])))
+          // Chunked pagination for huge directories: slice before the
+          // relatively expensive `ignored.ignores + basename + resolve`
+          // mapping so each chunk pays O(chunk) not O(total).
+          const start = ctx.query.offset ?? 0
+          const end = ctx.query.limit !== undefined ? start + ctx.query.limit : undefined
+          const slice = end !== undefined ? all.slice(start, end) : all
+          return slice.map((item) => {
             const absolute = path.resolve(location.directory, item.path)
             return {
               name: path.basename(item.path),
@@ -195,6 +228,8 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
               ignored: ignored.ignores(
                 path.relative(location.project.directory, absolute) + (item.type === "directory" ? "/" : ""),
               ),
+              ...(typeof item.size === "number" ? { size: item.size } : {}),
+              ...(typeof item.mtime === "number" ? { mtime: item.mtime } : {}),
             }
           })
         }),
@@ -288,9 +323,7 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
           const files = yield* FileMutation.Service
           const target = yield* mutations.resolve({ path: ctx.payload.path, kind: ctx.payload.kind })
           const result =
-            ctx.payload.kind === "file"
-              ? yield* files.create({ target, content: "" })
-              : yield* files.mkdir({ target })
+            ctx.payload.kind === "file" ? yield* files.create({ target, content: "" }) : yield* files.mkdir({ target })
           yield* publishMutation(result.target, "add", ctx.payload.kind === "file")
           return {}
         }),
@@ -319,10 +352,11 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       while (true) {
         if (yield* fs.existsSafe(current)) return current
         const parent = path.dirname(current)
-        if (parent === current) return yield* new ExternalPathError({
-          name: "ExternalPathError",
-          data: { message: `No existing ancestor directory for path: ${target}`, code: "not_found" as const },
-        })
+        if (parent === current)
+          return yield* new ExternalPathError({
+            name: "ExternalPathError",
+            data: { message: `No existing ancestor directory for path: ${target}`, code: "not_found" as const },
+          })
         current = parent
       }
     })
@@ -365,39 +399,41 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
           Permission.fromConfig({ external_directory: { "*": "ask" } }),
           Permission.fromConfig(cfg.permission ?? {}),
         )
-        yield* permissionSvc.ask({
-          sessionID: SessionID.make(ctx.query.sessionID),
-          permission: "external_directory",
-          patterns: [glob],
-          always: [glob],
-          metadata: { filepath: base, parentDir: base },
-          ruleset,
-        }).pipe(
-          Effect.catchTag("PermissionDeniedError", () =>
-            Effect.fail(
-              new ExternalPermissionDeniedError({
-                name: "ExternalPermissionDeniedError",
-                data: { message: `Access denied to ${base}`, glob },
-              }),
+        yield* permissionSvc
+          .ask({
+            sessionID: SessionID.make(ctx.query.sessionID),
+            permission: "external_directory",
+            patterns: [glob],
+            always: [glob],
+            metadata: { filepath: base, parentDir: base },
+            ruleset,
+          })
+          .pipe(
+            Effect.catchTag("PermissionDeniedError", () =>
+              Effect.fail(
+                new ExternalPermissionDeniedError({
+                  name: "ExternalPermissionDeniedError",
+                  data: { message: `Access denied to ${base}`, glob },
+                }),
+              ),
             ),
-          ),
-          Effect.catchTag("PermissionRejectedError", () =>
-            Effect.fail(
-              new ExternalPermissionDeniedError({
-                name: "ExternalPermissionDeniedError",
-                data: { message: `Access rejected for ${base}`, glob },
-              }),
+            Effect.catchTag("PermissionRejectedError", () =>
+              Effect.fail(
+                new ExternalPermissionDeniedError({
+                  name: "ExternalPermissionDeniedError",
+                  data: { message: `Access rejected for ${base}`, glob },
+                }),
+              ),
             ),
-          ),
-          Effect.catchTag("PermissionCorrectedError", () =>
-            Effect.fail(
-              new ExternalPermissionDeniedError({
-                name: "ExternalPermissionDeniedError",
-                data: { message: `Access rejected for ${base}`, glob },
-              }),
+            Effect.catchTag("PermissionCorrectedError", () =>
+              Effect.fail(
+                new ExternalPermissionDeniedError({
+                  name: "ExternalPermissionDeniedError",
+                  data: { message: `Access rejected for ${base}`, glob },
+                }),
+              ),
             ),
-          ),
-        )
+          )
       }
 
       const ancestor = yield* deepestExistingAncestor(base)

@@ -2500,6 +2500,8 @@ export type FileNode = {
   absolute: string
   type: "file" | "directory"
   ignored: boolean
+  size?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  mtime?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
 export type FileContent = {
@@ -5537,6 +5539,8 @@ export type PermissionSavedInfo = {
 export type FileSystemEntry = {
   path: string
   type: "file" | "directory"
+  size?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  mtime?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
 export type FileSystemWriteResult = {
@@ -9056,6 +9060,8 @@ export type FileListData = {
     directory?: string
     workspace?: string
     path: string
+    limit?: string
+    offset?: string
   }
   url: "/file"
 }
@@ -9085,6 +9091,8 @@ export type FileReadData = {
     directory?: string
     workspace?: string
     path: string
+    limit?: string
+    offset?: string
   }
   url: "/file/content"
 }

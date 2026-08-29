@@ -10,6 +10,14 @@ const hop = new Set([
   "upgrade",
   "host",
 ])
+const credential = new Set([
+  "authorization",
+  "cookie",
+  "proxy-authorization",
+  "x-api-key",
+  "x-auth-token",
+  "cf-access-jwt-assertion",
+])
 
 function sanitize(out: Headers) {
   for (const key of hop) out.delete(key)
@@ -26,6 +34,12 @@ export function headers(input: Request | HeadersInit | Record<string, string>, e
   for (const [key, value] of new Headers(extra).entries()) {
     out.set(key, value)
   }
+  return out
+}
+
+export function externalHeaders(input: Request | HeadersInit | Record<string, string>, extra?: HeadersInit) {
+  const out = headers(input, extra)
+  for (const key of credential) out.delete(key)
   return out
 }
 

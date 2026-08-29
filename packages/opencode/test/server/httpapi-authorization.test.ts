@@ -59,6 +59,11 @@ const v2ApiLayer = HttpRouter.serve(
 ).pipe(Layer.provideMerge(NodeHttpServer.layerTest))
 
 const noAuthLayer = ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode" })
+const publicNoAuthLayer = ServerAuth.Config.configLayer({
+  password: Option.none(),
+  username: "opencode",
+  publicUrl: "https://api.example.test",
+})
 const secretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "opencode" })
 const kitSecretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "kit" })
 const deviceLayer = AppNodeBuilderV1.build(Device.node)
@@ -68,9 +73,11 @@ const deviceLayer = AppNodeBuilderV1.build(Device.node)
 const withDevice = <A, E, R>(layer: Layer.Layer<A, E, R>) => layer.pipe(Layer.provideMerge(deviceLayer))
 
 const it = testEffect(withDevice(apiLayer).pipe(Layer.provide(noAuthLayer)))
+const itPublic = testEffect(withDevice(apiLayer).pipe(Layer.provide(publicNoAuthLayer)))
 const itSecret = testEffect(withDevice(apiLayer).pipe(Layer.provide(secretLayer)))
 const itKitSecret = testEffect(withDevice(apiLayer).pipe(Layer.provide(kitSecretLayer)))
 const itV2Secret = testEffect(withDevice(v2ApiLayer).pipe(Layer.provide(secretLayer)))
+const itV2Public = testEffect(withDevice(v2ApiLayer).pipe(Layer.provide(publicNoAuthLayer)))
 
 const basic = (username: string, password: string) => ServerAuth.header({ username, password }) ?? ""
 
@@ -89,6 +96,20 @@ describe("HttpApi authorization middleware", () => {
 
       expect(response.status).toBe(200)
       expect(yield* response.json).toBe("ok")
+    }),
+  )
+
+  itPublic.live("fails closed without credentials when a public URL is configured", () =>
+    Effect.gen(function* () {
+      const response = yield* getProbe()
+      expect(response.status).toBe(401)
+    }),
+  )
+
+  itV2Public.live("fails closed on v2 routes when a public URL is configured", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClient.get("/api/probe")
+      expect(response.status).toBe(401)
     }),
   )
 

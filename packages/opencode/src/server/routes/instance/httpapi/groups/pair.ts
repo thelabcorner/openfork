@@ -16,8 +16,8 @@ export const PairBeginResult = Schema.Struct({
 }).annotate({ identifier: "PairBeginResult" })
 
 export const PairClaimInput = Schema.Struct({
-  code: Schema.String,
-  name: Schema.optional(Schema.String),
+  code: Schema.String.check(Schema.isMinLength(6), Schema.isMaxLength(16)),
+  name: Schema.optional(Schema.String.check(Schema.isMaxLength(80))),
 })
 
 export const PairedDeviceInfo = Schema.Struct({
@@ -67,7 +67,7 @@ export const PairBeginApi = HttpApi.make("pair-begin").add(
           identifier: "pair.begin",
           summary: "Begin device pairing",
           description:
-            "Mint a single-use six-character pairing code that expires in 90 seconds and dies after five failed claims.",
+            "Mint a single-use six-character pairing code that expires in 90 seconds.",
         }),
       ),
     )
@@ -87,7 +87,7 @@ export const PairClaimApi = HttpApi.make("pair-claim").add(
           identifier: "pair.claim",
           summary: "Claim a pairing code",
           description:
-            "Exchange a valid pairing code for a one-time device token. Unauthenticated by design; rate-limited per code and per client IP.",
+            "Exchange a valid pairing code for a one-time device token. Unauthenticated by design; globally and per-client rate-limited.",
         }),
       ),
     )

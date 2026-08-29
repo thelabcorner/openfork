@@ -61,6 +61,54 @@ export function outcomeError(outcome: Extract<FetchOutcome, { ok: false }>): str
   return outcome.message
 }
 
+const CACHE_TTL_MS = 300_000
+const COOLDOWN_DEFAULT_MS = 300_000
+const COOLDOWN_MAX_MS = 3_600_000
+
+/**
+ * Shared in-memory cache + 429-cooldown for a single provider adapter
+ * instance. Every provider hits its upstream usage endpoint on each
+ * `quota.get()` call from the frontend (mount, window focus, manual
+ * refresh) — without this, a provider that doesn't special-case 429 keeps
+ * getting hammered every ~30s even while it's actively throttling us,
+ * extending the block instead of backing off. Claude already had this
+ * pattern hand-rolled; this generalizes it so every adapter gets the same
+ * protection for free.
+ */
+export function createQuotaCache<T>(key: string, options?: { ttlMs?: number; cooldownDefaultMs?: number; cooldownMaxMs?: number }) {
+  const ttlMs = options?.ttlMs ?? CACHE_TTL_MS
+  const cooldownDefaultMs = options?.cooldownDefaultMs ?? COOLDOWN_DEFAULT_MS
+  const cooldownMaxMs = options?.cooldownMaxMs ?? COOLDOWN_MAX_MS
+  let cached: { key: string; fetchedAt: number; result: T } | undefined
+  let cooldownUntil = 0
+  return {
+    fresh(currentKey = key): T | undefined {
+      if (cached && cached.key === currentKey && Date.now() - cached.fetchedAt < ttlMs) return cached.result
+      return undefined
+    },
+    isCoolingDown(): boolean {
+      return Date.now() < cooldownUntil
+    },
+    cachedResult(): T | undefined {
+      return cached?.result
+    },
+    reset(): void {
+      cached = undefined
+      cooldownUntil = 0
+    },
+    store(result: T, currentKey = key): void {
+      cached = { key: currentKey, fetchedAt: Date.now(), result }
+      cooldownUntil = 0
+    },
+    /** Cache the error result and back off for `retryAfterMs` (capped), or a default window. */
+    coolDown(result: T, retryAfterMs: number | undefined, currentKey = key): void {
+      const capped = retryAfterMs !== undefined ? Math.min(Math.max(retryAfterMs, 1000), cooldownMaxMs) : cooldownDefaultMs
+      cooldownUntil = Date.now() + capped
+      cached = { key: currentKey, fetchedAt: Date.now(), result }
+    },
+  }
+}
+
 export const fetchJson = (
   http: HttpClient.HttpClient,
   url: string,

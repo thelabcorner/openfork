@@ -1841,7 +1841,7 @@ export class Pair extends HeyApiClient {
   /**
    * Begin device pairing
    *
-   * Mint a single-use six-character pairing code that expires in 90 seconds and dies after five failed claims.
+   * Mint a single-use six-character pairing code that expires in 90 seconds.
    */
   public begin<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).post<PairBeginResponses, unknown, ThrowOnError>({
@@ -1853,7 +1853,7 @@ export class Pair extends HeyApiClient {
   /**
    * Claim a pairing code
    *
-   * Exchange a valid pairing code for a one-time device token. Unauthenticated by design; rate-limited per code and per client IP.
+   * Exchange a valid pairing code for a one-time device token. Unauthenticated by design; globally and per-client rate-limited.
    */
   public claim<ThrowOnError extends boolean = false>(
     parameters?: {
@@ -2447,6 +2447,8 @@ export class File extends HeyApiClient {
       directory?: string
       workspace?: string
       path: string
+      limit?: string
+      offset?: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -2458,6 +2460,8 @@ export class File extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "query", key: "path" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "offset" },
           ],
         },
       ],
@@ -2479,6 +2483,8 @@ export class File extends HeyApiClient {
       directory?: string
       workspace?: string
       path: string
+      limit?: string
+      offset?: string
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -2490,6 +2496,8 @@ export class File extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "query", key: "path" },
+            { in: "query", key: "limit" },
+            { in: "query", key: "offset" },
           ],
         },
       ],

@@ -2,6 +2,7 @@ import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
 import { Usage } from "@/usage/usage"
 import { described } from "./metadata"
+import { Authorization } from "../middleware/authorization"
 
 export const UsagePaths = {
   summary: "/usage/summary",
@@ -29,5 +30,6 @@ export const UsageApi = HttpApi.make("usage").add(
         }),
       ),
     )
+    .middleware(Authorization)
     .annotateMerge(OpenApi.annotations({ title: "usage", description: "Global usage analytics." })),
 )

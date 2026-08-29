@@ -110,4 +110,23 @@ describe("ProxyUtil", () => {
       expect(result.get("x-extra")).toBe("added")
     })
   })
+
+  describe("externalHeaders", () => {
+    test("strips credentials before requests leave the local server", () => {
+      const result = ProxyUtil.externalHeaders({
+        authorization: "Basic secret",
+        cookie: "session=secret",
+        "proxy-authorization": "Basic proxy-secret",
+        "x-api-key": "secret",
+        "cf-access-jwt-assertion": "secret",
+        accept: "text/html",
+      })
+      expect(result.get("authorization")).toBeNull()
+      expect(result.get("cookie")).toBeNull()
+      expect(result.get("proxy-authorization")).toBeNull()
+      expect(result.get("x-api-key")).toBeNull()
+      expect(result.get("cf-access-jwt-assertion")).toBeNull()
+      expect(result.get("accept")).toBe("text/html")
+    })
+  })
 })

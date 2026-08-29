@@ -19,6 +19,10 @@ export interface TaskPromptOps {
   cancel(sessionID: SessionID): Effect.Effect<void>
   resolvePromptParts(template: string): Effect.Effect<SessionPrompt.PromptInput["parts"]>
   prompt(input: SessionPrompt.PromptInput): Effect.Effect<SessionV1.WithParts>
+  dispatch?(
+    input: SessionPrompt.PromptInput,
+    options?: { wait?: boolean },
+  ): Effect.Effect<{ admitted: SessionV1.WithParts; paused: boolean; result?: SessionV1.WithParts }>
 }
 
 const id = "task"
@@ -30,13 +34,13 @@ const BACKGROUND_DESCRIPTION = [
 ].join(" ")
 const BACKGROUND_STARTED = [
   "The task is working in the background. You will be notified automatically when it finishes.",
-  "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
+  "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work ΓÇö avoid working with the same files or topics it is using.",
   "Work on non-overlapping tasks, or briefly tell the user what you launched and end your response.",
 ].join("\n")
 const BACKGROUND_UPDATED = [
   "Additional context sent to the running background task.",
   "The task is still working in the background. You will be notified automatically when it finishes.",
-  "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work — avoid working with the same files or topics it is using.",
+  "DO NOT sleep, poll for progress, ask the task for status, or duplicate this task's work ΓÇö avoid working with the same files or topics it is using.",
   "Work on non-overlapping tasks, or briefly tell the user what you sent and end your response.",
 ].join("\n")
 

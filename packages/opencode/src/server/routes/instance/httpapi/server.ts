@@ -1,6 +1,6 @@
-import { Config as EffectConfig, Context, Effect, Layer } from "effect"
+import { Config as EffectConfig, Context, Effect, FileSystem, Layer } from "effect"
 import { HttpApiBuilder, OpenApi } from "effect/unstable/httpapi"
-import { HttpClient, HttpMiddleware, HttpRouter, HttpServer, HttpServerResponse } from "effect/unstable/http"
+import { HttpClient, HttpMiddleware, HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import * as Socket from "effect/unstable/socket/Socket"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Observability from "@opencode-ai/core/observability"
@@ -146,6 +146,17 @@ const cors = (corsOptions?: CorsOptions) =>
     }),
     { global: true },
   )
+
+const requestBodyLimit = HttpRouter.middleware(
+  (effect) =>
+    Effect.gen(function* () {
+      const request = yield* HttpServerRequest.HttpServerRequest
+      const path = new URL(request.url, "http://localhost").pathname
+      const maximum = path === "/pair/claim" ? 8 * 1024 : 64 * 1024 * 1024
+      return yield* Effect.provideService(effect, HttpServerRequest.MaxBodySize, FileSystem.Size(maximum))
+    }),
+  { global: true },
+)
 
 // Route tree:
 // - rootApiRoutes: typed /global/* and control routes; auth is declared by RootHttpApi.
@@ -352,6 +363,7 @@ export function createRoutes(
       compressionLayer,
       corsVaryFix,
       fenceLayer,
+      requestBodyLimit,
       cors(corsOptions),
       AppNodeBuilderV1.build(MoveSession.node, [[LocationServiceMap.node, locationServiceMapV2]]),
       HttpServer.layerServices,

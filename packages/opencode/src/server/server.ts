@@ -228,24 +228,19 @@ const KEEP_ALIVE_TIMEOUT_MS = 60_000
 // at or below keepAliveTimeout could cut a connection off right as we've
 // told it to stay alive.
 const HEADERS_TIMEOUT_MS = KEEP_ALIVE_TIMEOUT_MS + 5_000
+const REQUEST_TIMEOUT_MS = 30_000
+const MAX_CONNECTIONS = 256
 
 function serverLayer(opts: { port: number; hostname: string }) {
   const server = createServer()
   server.on("connection", (socket) => socket.setKeepAlive(true, SOCKET_KEEPALIVE_DELAY_MS))
   server.keepAliveTimeout = KEEP_ALIVE_TIMEOUT_MS
   server.headersTimeout = HEADERS_TIMEOUT_MS
-  // Node's server.requestTimeout (default 300_000ms since Node 18) is meant to
-  // protect an internet-facing server from slow-loris-style clients that never
-  // finish sending a request. In practice it's also a well-known footgun for
-  // long-lived streaming responses: Node does not reset it once the response
-  // starts, so an SSE connection that's actively receiving heartbeats every
-  // 10s can still get killed by the server ~5 minutes after it opened, for no
-  // reason visible to the client or to our own heartbeat/keepalive logic --
-  // it just looks like a random disconnect, with no correlation to load or
-  // chat activity, because the timer runs regardless of either. This server
-  // only ever accepts loopback connections from our own trusted Electron
-  // renderer, so the DoS protection this exists for doesn't apply here.
-  server.requestTimeout = 0
+  server.maxConnections = MAX_CONNECTIONS
+  // Bound the time allowed to receive a complete request. Streaming responses
+  // remain open after their request has completed, while slow request bodies
+  // cannot hold a tunneled listener indefinitely.
+  server.requestTimeout = REQUEST_TIMEOUT_MS
   const serverRef = { closeStarted: false, forceStop: false }
   const close = server.close.bind(server)
   // Keep shutdown owned by NodeHttpServer, but honor listener.stop(true) by

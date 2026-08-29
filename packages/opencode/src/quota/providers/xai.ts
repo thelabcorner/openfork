@@ -5,6 +5,7 @@ import { buildResult, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import type { ProviderResult } from "../schema"
 import { authKey } from "./key"
+import { createQuotaCache } from "./http"
 
 /**
  * xAI (Grok) billing-cycle quota. Ported from OpenChamber (MIT)
@@ -25,41 +26,58 @@ type WireOutcome =
   | { readonly kind: "ok"; readonly bytes: Uint8Array }
   | { readonly kind: "error"; readonly message: string }
 
-export const xai = (_http: HttpClient.HttpClient, auth: Auth.Interface, fetchImpl: XaiFetch = globalThis.fetch.bind(globalThis)): Adapter => ({
-  id: "xai",
-  name: NAME,
-  aliases: ALIASES,
-  configured: () => Effect.map(authKey(auth, ALIASES), (key) => key !== undefined),
-  fetch: (): Effect.Effect<ProviderResult> =>
-    Effect.gen(function* () {
-      const resolved = yield* authKey(auth, ALIASES)
-      const accessToken = resolved?.key
-      if (!accessToken) {
-        return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: false, error: "Not configured" })
-      }
-      // Never rejects -> the gen's error channel stays `never`.
-      const outcome = yield* Effect.promise(() => performFetch(accessToken, fetchImpl))
-      if (outcome.kind === "error") {
-        return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: true, error: outcome.message })
-      }
-      const decoded = decodeXaiGrpcWeb(outcome.bytes)
-      if (!decoded || decoded.percent === null) {
-        return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: true, error: "No quota data in response" })
-      }
-      return buildResult({
-        providerId: "xai",
-        providerName: NAME,
-        ok: true,
-        configured: true,
-        usage: {
-          windows: {
-            billing_cycle: toUsageWindow({ usedPercent: decoded.percent, resetAt: decoded.resetAt }),
+export const xai = (_http: HttpClient.HttpClient, auth: Auth.Interface, fetchImpl: XaiFetch = globalThis.fetch.bind(globalThis)): Adapter => {
+  const cache = createQuotaCache<ProviderResult>("xai")
+
+  return {
+    id: "xai",
+    name: NAME,
+    aliases: ALIASES,
+    configured: () => Effect.map(authKey(auth, ALIASES), (key) => key !== undefined),
+    fetch: (): Effect.Effect<ProviderResult> =>
+      Effect.gen(function* () {
+        const resolved = yield* authKey(auth, ALIASES)
+        const accessToken = resolved?.key
+        if (!accessToken) {
+          return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: false, error: "Not configured" })
+        }
+        const fresh = cache.fresh(accessToken)
+        if (fresh) return fresh
+        if (cache.isCoolingDown()) {
+          const cachedResult = cache.cachedResult()
+          if (cachedResult) return cachedResult
+          return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: true, error: "Rate limited — xAI is throttling usage checks" })
+        }
+        // Never rejects -> the gen's error channel stays `never`.
+        const outcome = yield* Effect.promise(() => performFetch(accessToken, fetchImpl))
+        if (outcome.kind === "error") {
+          const errorResult = buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: true, error: outcome.message })
+          if (outcome.message === "Rate limited") {
+            cache.coolDown(errorResult, undefined, accessToken)
+          }
+          return errorResult
+        }
+        const decoded = decodeXaiGrpcWeb(outcome.bytes)
+        if (!decoded || decoded.percent === null) {
+          return buildResult({ providerId: "xai", providerName: NAME, ok: false, configured: true, error: "No quota data in response" })
+        }
+        const result = buildResult({
+          providerId: "xai",
+          providerName: NAME,
+          ok: true,
+          configured: true,
+          usage: {
+            windows: {
+              billing_cycle: toUsageWindow({ usedPercent: decoded.percent, resetAt: decoded.resetAt }),
+            },
           },
-        },
-        fetchedAt: Date.now(),
-      })
-    }),
-})
+          fetchedAt: Date.now(),
+        })
+        cache.store(result, accessToken)
+        return result
+      }),
+  }
+}
 
 async function performFetch(token: string, fetchImpl: XaiFetch): Promise<WireOutcome> {
   try {

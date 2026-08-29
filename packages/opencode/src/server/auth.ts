@@ -17,12 +17,17 @@ export type DecodedCredentials = {
 export class Config extends ConfigService.Service<Config>()("@opencode/ServerAuthConfig", {
   password: EffectConfig.string("OPENCODE_SERVER_PASSWORD").pipe(EffectConfig.option),
   username: EffectConfig.string("OPENCODE_SERVER_USERNAME").pipe(EffectConfig.withDefault("opencode")),
+  publicUrl: EffectConfig.string("OPENCODE_PUBLIC_URL").pipe(EffectConfig.withDefault("")),
 }) {}
 
 export type Info = Context.Service.Shape<typeof Config>
 
 export function required(config: Info) {
   return Option.isSome(config.password) && config.password.value !== ""
+}
+
+export function publiclyExposed(config: Info) {
+  return !!config.publicUrl?.trim()
 }
 
 export function authorized(credentials: DecodedCredentials, config: Info) {

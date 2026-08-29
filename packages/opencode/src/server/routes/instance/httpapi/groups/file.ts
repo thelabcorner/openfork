@@ -15,6 +15,15 @@ import { described } from "./metadata"
 export const FileQuery = Schema.Struct({
   ...WorkspaceRoutingQueryFields,
   path: Schema.String,
+  // Chunked listing for extremely huge repos. Without limit the handler
+  // returns the full directory (backwards compatible). With limit/offset the
+  // response is a paginated slice, letting the explorer stream 100k-entry
+  // directories in 1k-item chunks instead of one 10 MB JSON payload that
+  // times out as "Failed to fetch".
+  limit: Schema.optional(
+    Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(5000)),
+  ),
+  offset: Schema.optional(Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(0))),
 })
 
 export const FindTextQuery = Schema.Struct({
@@ -154,6 +163,8 @@ export const LegacyEntry = Schema.Struct({
   absolute: Schema.String,
   type: Schema.Literals(["file", "directory"]),
   ignored: Schema.Boolean,
+  size: Schema.optional(Schema.Number),
+  mtime: Schema.optional(Schema.Number),
 }).annotate({ identifier: "FileNode" })
 
 export const LegacyContent = Schema.Struct({

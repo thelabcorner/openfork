@@ -180,6 +180,38 @@ export function parseAPICallError(input: { providerID: ProviderV2.ID; error: API
     }
   }
 
+  // Invalid OpenRouter `provider.only` / stale upstream pin is a client
+  // configuration error, not a transient provider failure. The upstream
+  // returns 404 with "No allowed providers are available" even when the
+  // outer gateway status is 500, so we force non-retryable here.
+  const rawBody = input.error.responseBody ?? ""
+  const rawMessage = input.error.message ?? ""
+  const isInvalidProviderPin =
+    /no allowed providers are available/i.test(rawBody) ||
+    /no allowed providers are available/i.test(rawMessage) ||
+    /no allowed providers are available/i.test(m) ||
+    /provider\.only.*permits only/i.test(rawBody) ||
+    /provider\.only.*permits only/i.test(m)
+  if (isInvalidProviderPin) {
+    const metadata = input.error.url ? { url: input.error.url } : undefined
+    // Append user-actionable guidance: the persisted `provider.only` pin is
+    // stale (e.g. `tencent` for `xiaomi/mimo-v2.5-20260422`). The frontend
+    // auto-clears it when endpoints are next fetched, but this message helps
+    // users who see the error before that happens.
+    const guidance =
+      " Your pinned upstream provider no longer serves this model. Open the model picker, choose Auto (clear the provider pin), and retry. The app will also clear a stale `tencent` pin for this model automatically."
+    const helpfulMessage = m.includes("No allowed providers") ? `${m}${guidance}` : m
+    return {
+      type: "api_error",
+      message: helpfulMessage,
+      statusCode: input.error.statusCode,
+      isRetryable: false,
+      responseHeaders: input.error.responseHeaders,
+      responseBody: input.error.responseBody,
+      metadata,
+    }
+  }
+
   const metadata = input.error.url ? { url: input.error.url } : undefined
   return {
     type: "api_error",

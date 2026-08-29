@@ -79,7 +79,7 @@ export const authorizationLayer = Layer.effect(
     // Optional dependency: harnesses that assemble the middleware without the
     // Device layer keep master-password-only auth; production provides Device.
     const devices = Option.getOrUndefined(yield* Effect.serviceOption(Device.Service))
-    if (!ServerAuth.required(config)) return Authorization.of((effect) => effect)
+    if (!ServerAuth.required(config) && !ServerAuth.publiclyExposed(config)) return Authorization.of((effect) => effect)
     return Authorization.of((effect) =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest

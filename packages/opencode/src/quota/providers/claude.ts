@@ -161,7 +161,7 @@ function parseUsage(payload: unknown): ReturnType<typeof buildResult> {
       const e = entry as Record<string, unknown>
       const kind = typeof e.kind === "string" ? e.kind : ""
       const percent = typeof e.percent === "number" ? e.percent : null
-      const resetsAt = toTimestamp(e.reset_at)
+      const resetsAt = toTimestamp(e.reset_at ?? e.resets_at ?? e.reset_time ?? e.resetsAt ?? e.resetAt)
       if (kind === "session") {
         windows["5h"] = toUsageWindow({ usedPercent: percent, resetAt: resetsAt })
       } else if (kind === "weekly_all") {

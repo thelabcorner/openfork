@@ -1,0 +1,13 @@
+Inspect and control the user's OpenCode sessions.
+
+Sessions created or prompted with this tool are user-facing conversations the user can open and continue. Never use this tool to delegate parts of your own current task; use task or swarm capabilities for agent delegation.
+
+Use one action per call.
+
+Existing-session actions use sessionId as the source of truth. Do not invent or guess a directory for a session.
+
+list discovers sessions. status only reads status. messages only reads existing conversation text. send always adds a NEW user prompt.
+
+create, send, and fork return without waiting by default. The target session continues independently after this call. Set wait only when the user explicitly asks or your very next step genuinely requires the completed result. Do not poll a session you just dispatched.
+
+Session deletion is unavailable.

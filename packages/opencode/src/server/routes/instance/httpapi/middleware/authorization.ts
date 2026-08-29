@@ -14,6 +14,10 @@ const AUTH_TOKEN_QUERY = "auth_token"
 const UNAUTHORIZED = 401
 const WWW_AUTHENTICATE = 'Basic realm="Secure Area"'
 
+function authenticationRequired(config: ServerAuth.Info) {
+  return ServerAuth.required(config) || ServerAuth.publiclyExposed(config)
+}
+
 // Avoid HttpApiSecurity alternatives here: Effect security middleware wraps the
 // full handler, so a downstream failure can make the next auth alternative run
 // and remap an authorized NotFound into Unauthorized.
@@ -44,7 +48,7 @@ function validateCredential<A, E, R>(
   config: ServerAuth.Info,
 ) {
   return Effect.gen(function* () {
-    if (!ServerAuth.required(config)) return yield* effect
+    if (!authenticationRequired(config)) return yield* effect
     if (!ServerAuth.authorized(credential, config)) {
       yield* HttpEffect.appendPreResponseHandler((_request, response) =>
         Effect.succeed(HttpServerResponse.setHeader(response, "www-authenticate", WWW_AUTHENTICATE)),
@@ -145,7 +149,7 @@ function validateRawCredential<A, E, R>(
   credential: ServerAuth.DecodedCredentials,
   config: ServerAuth.Info,
 ) {
-  if (!ServerAuth.required(config)) return effect
+  if (!authenticationRequired(config)) return effect
   if (!ServerAuth.authorized(credential, config))
     return Effect.succeed(
       HttpServerResponse.empty({
@@ -162,7 +166,7 @@ export const authorizationRouterMiddleware = HttpRouter.middleware()(
     // Optional dependency: harnesses that assemble the middleware without the
     // Device layer keep master-password-only auth; production provides Device.
     const devices = Option.getOrUndefined(yield* Effect.serviceOption(Device.Service))
-    if (!ServerAuth.required(config)) return (effect) => effect
+    if (!authenticationRequired(config)) return (effect) => effect
 
     return (effect) =>
       Effect.gen(function* () {
@@ -188,7 +192,7 @@ export const authorizationLayer = Layer.effect(
   Effect.gen(function* () {
     const config = yield* ServerAuth.Config
     const devices = Option.getOrUndefined(yield* Effect.serviceOption(Device.Service))
-    if (!ServerAuth.required(config)) return Authorization.of((effect) => effect)
+    if (!authenticationRequired(config)) return Authorization.of((effect) => effect)
     return Authorization.of((effect) =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest
@@ -204,7 +208,7 @@ export const ptyConnectAuthorizationLayer = Layer.effect(
   PtyConnectAuthorization,
   Effect.gen(function* () {
     const config = yield* ServerAuth.Config
-    if (!ServerAuth.required(config)) return PtyConnectAuthorization.of((effect) => effect)
+    if (!authenticationRequired(config)) return PtyConnectAuthorization.of((effect) => effect)
     return PtyConnectAuthorization.of((effect) =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest
