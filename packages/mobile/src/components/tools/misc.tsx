@@ -3,6 +3,7 @@ import type { JSX } from "solid-js"
 import type { ToolPart } from "@opencode-ai/sdk/v2/client"
 import { IconExternalLink } from "../../icons"
 import { CappedCode, EmptyNote, Section, inputString, stripAnsi } from "./shared"
+import { safeExternalUrl } from "../../security"
 
 function outputText(part: ToolPart): string {
   const raw =
@@ -50,11 +51,19 @@ export function TaskSummary(props: { part: ToolPart }) {
 
 export function FetchDetail(props: { part: ToolPart }): JSX.Element {
   const url = createMemo(() => inputString(props.part, "url") ?? "")
+  const href = createMemo(() => safeExternalUrl(url()))
   return (
-    <a class="fetch-url" href={url()} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()}>
-      <IconExternalLink size={9} />
-      <span>{url()}</span>
-    </a>
+    <Show
+      when={href()}
+      fallback={<span class="fetch-url"><span>{url()}</span></span>}
+    >
+      {(safe) => (
+        <a class="fetch-url" href={safe()} target="_blank" rel="noopener noreferrer" onClick={(e) => e.stopPropagation()}>
+          <IconExternalLink size={9} />
+          <span>{url()}</span>
+        </a>
+      )}
+    </Show>
   )
 }
 

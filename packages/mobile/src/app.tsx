@@ -11,8 +11,9 @@ import { SessionsView } from "./views/SessionsView"
 import { SettingsView } from "./views/SettingsView"
 import type { SessionRuntime } from "./components/SessionRow"
 import type { RuntimeStatus } from "./components/SessionStatus"
-import { reconcilePushSubscription } from "./push"
+import { disableNotifications, reconcilePushSubscription } from "./push"
 import {
+  DEVICE_ID_KEY,
   DEVICE_TOKEN_KEY,
   SERVER_URL_KEY,
   claimPair,
@@ -812,11 +813,17 @@ export function App() {
     setState({ status: "connecting", error: "" })
     try {
       const serverUrl = normalizeServerUrl(state.serverUrl)
+      const storedToken = readStorage(DEVICE_TOKEN_KEY)
+      const storedServer = readStorage(SERVER_URL_KEY)
+      if (state.token && state.token === storedToken && storedServer && normalizeServerUrl(storedServer) !== serverUrl) {
+        throw new Error("This device token is bound to another server. Forget the device before changing servers.")
+      }
       const nextClient = createClient(serverUrl, state.token || undefined)
       const health = await nextClient.global.health({ throwOnError: true })
       if (!health.data) throw new Error("Server returned no health info")
       client = nextClient
       writeStorage(SERVER_URL_KEY, serverUrl)
+      if (state.token) writeStorage(DEVICE_TOKEN_KEY, state.token)
       setState({ serverUrl, serverVersion: health.data.version, status: "connected" })
       // Archived is lazy — only fetched when the Archive tab is opened (saves 1 RTT on launch)
       await Promise.all([refresh(), loadProviders(), loadProjects(), loadLimits()])
@@ -842,9 +849,11 @@ export function App() {
     try {
       setState({ status: "connecting", error: "Claiming device..." })
       const serverUrl = normalizeServerUrl(state.serverUrl)
-      const token = await claimPair(serverUrl, state.pairing)
-      writeStorage(DEVICE_TOKEN_KEY, token)
-      setState({ token, pairing: "", error: "" })
+      const claimed = await claimPair(serverUrl, state.pairing)
+      writeStorage(SERVER_URL_KEY, serverUrl)
+      writeStorage(DEVICE_TOKEN_KEY, claimed.token)
+      writeStorage(DEVICE_ID_KEY, claimed.deviceID)
+      setState({ token: claimed.token, pairing: "", error: "" })
       await connect()
     } catch (error) {
       setState({ status: "error", error: pairClaimErrorMessage(error) })
@@ -932,7 +941,27 @@ export function App() {
     setProjectsList([])
   }
 
-  const forgetDevice = () => {
+  const forgetDevice = async () => {
+    eventsAbort?.abort()
+    const source = client ?? (state.serverUrl && state.token ? createClient(normalizeServerUrl(state.serverUrl), state.token) : undefined)
+    if (source) {
+      try {
+        await disableNotifications(source)
+      } catch {
+        // Revocation remains the important boundary if push cleanup fails.
+      }
+      try {
+        let deviceID = readStorage(DEVICE_ID_KEY)
+        if (!deviceID && state.token) {
+          const devices = await source.device.list({ throwOnError: true })
+          deviceID = devices.data?.find((device) => !device.revokedAt && device.tokenPrefix === state.token.slice(0, 8))?.id
+        }
+        if (deviceID) await source.device.remove({ deviceID }, { throwOnError: true })
+      } catch {
+        // Clear local credentials even when the server is offline.
+      }
+    }
+    clearStorage(DEVICE_ID_KEY)
     clearStorage(DEVICE_TOKEN_KEY)
     setState("token", "")
     disconnect()
@@ -1302,8 +1331,7 @@ export function App() {
             <Show when={!isReconnecting() && pairMode() === "scan"}>
               <PairingCamera
                 onPairCode={(code, serverUrl) => {
-                  if (import.meta.env.DEV) {
-                  } else if (serverUrl) {
+                  if (!import.meta.env.DEV && serverUrl) {
                     setState("serverUrl", serverUrl)
                   }
                   setState({ pairing: code, error: "" })

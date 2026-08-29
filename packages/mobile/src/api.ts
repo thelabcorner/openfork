@@ -2,6 +2,7 @@ import { createOpencodeClient, type Message, type OpencodeClient, type Part } fr
 
 export const SERVER_URL_KEY = "opencode.mobile.serverUrl"
 export const DEVICE_TOKEN_KEY = "opencode.mobile.deviceToken"
+export const DEVICE_ID_KEY = "opencode.mobile.deviceID"
 
 export type MessageBundle = {
   info: Message
@@ -11,6 +12,17 @@ export type MessageBundle = {
 export type LaunchConfig = {
   serverUrl?: string
   pairCode?: string
+}
+
+export function selectLaunchServer(input: {
+  requested?: string
+  fallback?: string
+  pairCode?: string
+  storedToken?: string
+  storedServer?: string
+}) {
+  if (!input.pairCode && input.storedToken && input.storedServer) return input.storedServer
+  return input.requested ?? input.fallback
 }
 
 export function readLaunchConfig(): LaunchConfig {
@@ -29,14 +41,25 @@ export function readLaunchConfig(): LaunchConfig {
   // from the LAN IP. Same-origin via the vite proxy is the only reachable
   // path — stale localStorage (old 127.0.0.1 / LAN IP) would poison it, and
   // the IP can change between dev sessions.
+  // The vite proxy target itself is driven by VITE_OPENCODE_SERVER_URL /
+  // OPENCODE_DEV_PROXY_TARGET (vite.config.ts) so the browser must stay on
+  // location.origin (the vite origin) to stay same-origin through the proxy.
+  // An explicit ?server= param (LAN URL from desktop's runtime context) still
+  // wins when present — e.g. desktop QR pairing in dev.
   if (import.meta.env.DEV) {
     const qsServer = params.get("server")?.trim()
-    const envServer = (import.meta.env.VITE_OPENCODE_SERVER_URL as string | undefined)?.trim()
-    const serverUrl = qsServer || envServer || location.origin
+    const serverUrl = qsServer || location.origin
     return { serverUrl, pairCode }
   }
 
-  const explicitServerUrl = params.get("server") ?? readStorage(SERVER_URL_KEY) ?? import.meta.env.VITE_OPENCODE_SERVER_URL
+  const storedServer = readStorage(SERVER_URL_KEY)
+  const explicitServerUrl = selectLaunchServer({
+    requested: params.get("server") ?? undefined,
+    fallback: storedServer ?? import.meta.env.VITE_OPENCODE_SERVER_URL,
+    pairCode,
+    storedToken: readStorage(DEVICE_TOKEN_KEY),
+    storedServer,
+  })
   return {
     // Server-minted launch URLs point at the API server itself, so a pair
     // launch with no explicit server defaults to this page's origin. Never
@@ -49,6 +72,10 @@ export function readLaunchConfig(): LaunchConfig {
 export function normalizeServerUrl(value: string) {
   const url = new URL(value.trim())
   if (url.protocol !== "http:" && url.protocol !== "https:") throw new Error("Server URL must use HTTP or HTTPS")
+  const local = url.hostname === "localhost" || url.hostname === "127.0.0.1" || url.hostname === "[::1]"
+  if (!import.meta.env.DEV && url.protocol !== "https:" && !local) throw new Error("Remote servers must use HTTPS")
+  url.username = ""
+  url.password = ""
   url.hash = ""
   return url.toString().replace(/\/$/, "")
 }
@@ -94,7 +121,7 @@ export function createClient(serverUrl: string, token?: string): OpencodeClient 
 export async function claimPair(serverUrl: string, code: string) {
   const response = await createClient(serverUrl).pair.claim({ code, name: "OpenCode Mobile" }, { throwOnError: true })
   if (!response.data) throw new Error("The server did not return a device token")
-  return response.data.token
+  return { token: response.data.token, deviceID: response.data.device.id }
 }
 
 type PairClaimErrorBody = {
@@ -114,9 +141,9 @@ export function pairClaimErrorMessage(error: unknown): string {
   }
   if (body?.name === "PairCodeError") {
     if (body.data?.reason === "expired") return "This code has expired"
-    if (body.data?.reason === "exhausted") return "This code is dead after too many failed attempts"
     if (body.data?.reason === "invalid") return "Unknown or already used code"
   }
+  if (typeof body?.data?.message === "string") return body.data.message
   return error.message || "Pair claim failed"
 }
 

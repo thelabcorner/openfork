@@ -1,4 +1,4 @@
-const CACHE = "opencode-mobile-shell-v3"
+const CACHE = "opencode-mobile-shell-v4"
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting())
@@ -62,11 +62,15 @@ self.addEventListener("fetch", (event) => {
   const request = event.request
   const url = new URL(request.url)
   if (request.method !== "GET" || url.origin !== self.location.origin) return
+  if (request.headers.has("authorization")) return
+  const cacheableDestination = ["document", "script", "style", "font", "image", "manifest"].includes(request.destination)
+  if (!cacheableDestination) return
   event.respondWith(
     caches.open(CACHE).then(async (cache) => {
       const cached = await cache.match(request)
       const response = await fetch(request).catch(() => cached)
-      if (response && response.ok && !url.pathname.endsWith("/manifest.webmanifest")) {
+      const cacheControl = response?.headers.get("cache-control") ?? ""
+      if (response && response.ok && !/\b(?:no-store|private)\b/i.test(cacheControl)) {
         await cache.put(request, response.clone())
       }
       return response ?? new Response("Offline", { status: 503 })

@@ -12,7 +12,7 @@ export function SettingsView(props: {
   client?: OpencodeClient
   installPrompt: boolean
   onInstall: () => void
-  onForgetDevice: () => void
+  onForgetDevice: () => void | Promise<void>
   onDisconnect: () => void
 }) {
   return (

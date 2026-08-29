@@ -31,8 +31,15 @@ sidecar API separately through Cloudflare Tunnel, then configure:
 ```powershell
 $env:OPENCODE_PUBLIC_URL = "https://opencode-api.example.com"
 $env:OPENCODE_PWA_URL = "https://opencode-mobile.example.com/"
+$env:OPENCODE_SERVER_PASSWORD = "<a-long-random-secret>"
 opencode serve --port 4096 --cors https://opencode-mobile.example.com
 ```
+
+Tunnel only the API listener on `127.0.0.1:4096`; never expose the Vite
+development server. Disable CDN caching for API responses and rate-limit
+`POST /pair/claim` at the Cloudflare edge. Do not remove the server password:
+public-URL deployments fail closed without either master credentials or a
+previously paired device token.
 
 Settings > Devices creates a QR URL on the PWA origin. The URL carries the API
 origin in a query parameter and the short-lived pairing code in the fragment.
