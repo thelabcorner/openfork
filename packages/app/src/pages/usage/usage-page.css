@@ -1,0 +1,69 @@
+/* Usage dashboard palette.
+
+   Every colour on this page routes through one of these variables rather than
+   reaching for a raw v2 token, for two reasons:
+
+   1. The raw accent token is tuned for small interactive affordances (links,
+      focus rings) where it is a few pixels of colour. Filling dozens of bars,
+      gauges and chart areas with it turns a dense analytics page into a wall of
+      saturated blue. Everything here is mixed toward `transparent`, which
+      recedes correctly in BOTH themes — on a dark theme it reads darker, on a
+      light theme lighter — instead of hard-coding a darker hex that would blow
+      out under a light theme.
+
+   2. Surfaces are mixed toward `--v2-background-bg-base` so panels sit only
+      just above the page rather than glowing off it, which is what makes a
+      dashboard read as one continuous instrument panel instead of a pile of
+      floating cards.
+
+   Chart primitives shared with the sidebar Usage panel reference these with a
+   fallback (`var(--usage-accent, var(--v2-text-text-accent))`), so they keep
+   their original colours anywhere outside this page. */
+
+[data-component="usage-dashboard"] {
+  /* Data ink. `strong` is reserved for the single most important series in a
+     view (the hero line, a highlighted bar); `soft`/`faint` carry secondary
+     series and fills so one chart never has two things shouting. */
+  --usage-accent: color-mix(in oklab, var(--v2-text-text-accent) 52%, transparent);
+  --usage-accent-strong: color-mix(in oklab, var(--v2-text-text-accent) 72%, transparent);
+  --usage-accent-soft: color-mix(in oklab, var(--v2-text-text-accent) 30%, transparent);
+  --usage-accent-faint: color-mix(in oklab, var(--v2-text-text-accent) 14%, transparent);
+
+  /* Positive/quantity-of-value ink, used only for money you did not spend
+     (cache savings, subsidised usage) so "free" is legible at a glance without
+     adding a second decorative hue to everything else. */
+  --usage-credit: color-mix(in oklab, var(--syntax-success, #4a9f6a) 58%, transparent);
+  --usage-credit-soft: color-mix(in oklab, var(--syntax-success, #4a9f6a) 22%, transparent);
+
+  /* Surfaces, in stacking order: page → panel → inset (tracks, table heads). */
+  --usage-panel: color-mix(in oklab, var(--v2-background-bg-layer-01) 60%, var(--v2-background-bg-base));
+  --usage-inset: color-mix(in oklab, var(--v2-background-bg-layer-02) 45%, var(--v2-background-bg-base));
+  --usage-track: color-mix(in oklab, var(--v2-background-bg-layer-03) 55%, var(--v2-background-bg-base));
+  --usage-hover: color-mix(in oklab, var(--v2-text-text-base) 5%, transparent);
+
+  /* One hairline weight for the whole page. Panel borders, the grid gutters
+     that separate stat cells, and table rules are all the same line so the
+     layout reads as a single ruled sheet. */
+  --usage-line: color-mix(in oklab, var(--v2-border-border-muted) 62%, var(--v2-background-bg-base));
+}
+
+/* Hairline grid: cells are separated by a 1px gap that each cell fills with a
+   1px outline, so adjacent outlines meet exactly and every seam is one rule
+   wide.
+
+   The outline (rather than colouring the CONTAINER's background and letting it
+   show through the gaps) is what lets a grid hold any number of cells: with a
+   background-coloured container, a ragged last row leaves the leftover tract
+   painted in the rule colour, so the layout silently breaks the moment a stat
+   is added. Outlines overflow the container and are clipped by `Panel`'s
+   `overflow-hidden`, which also trims the outer ring against the panel border. */
+[data-component="usage-dashboard"] [data-slot="usage-rule-grid"] {
+  display: grid;
+  gap: 1px;
+  background-color: var(--usage-panel);
+}
+
+[data-component="usage-dashboard"] [data-slot="usage-rule-grid"] > * {
+  background-color: var(--usage-panel);
+  box-shadow: 0 0 0 1px var(--usage-line);
+}

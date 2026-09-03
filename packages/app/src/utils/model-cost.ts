@@ -25,6 +25,7 @@ import {
 } from "./model-usage-yield"
 import { hasPublishedPricing, isUnlimitedModel } from "./model-badges"
 import type { UsageProfile } from "./model-usage-profile"
+import { bigramCounts, normalizeModelName, similarityWithCounts } from "./string-similarity"
 
 export type { ModelCost, Workload }
 export { FALLBACK_WORKLOAD_CORPUS, FALLBACK_CORPUS_FINGERPRINT, classifyMonetaryClass, compareModelsByUsageYield }
@@ -88,7 +89,24 @@ export function compareByCheapness(
   const classB = classifyMonetaryClass({ id: b.id, name: b.name, provider: b.provider, cost: b.cost })
   const tierOrder: Record<ReturnType<typeof classifyMonetaryClass>, number> = { "quota-exempt": 0, "free-limited-known": 1, "free-limited-unknown": 2, paid: 3 }
   if (classA !== classB) return tierOrder[classA] - tierOrder[classB]
-  if (classA !== "paid") return a.name.localeCompare(b.name)
+  if (classA !== "paid") {
+    // Free/quota-exempt tier (§19): the model still costs the user $0 either
+    // way, so an inferred sibling price never moves it out of this tier —
+    // but it DOES tell us which free option is the better deal, so use it as
+    // the in-tier sort key instead of falling straight to alphabetical.
+    // Without this, a fuzzy/exact-inferred price is computed and available
+    // (via `pricingFallback`) but silently never consulted for any model
+    // that classifies as free before reaching the paid-only code below.
+    const inferredA = hasPublishedPricing(a.cost) ? a.cost : pricingFallback?.get(a.id)
+    const inferredB = hasPublishedPricing(b.cost) ? b.cost : pricingFallback?.get(b.id)
+    if (!!inferredA !== !!inferredB) return inferredA ? -1 : 1
+    if (inferredA && inferredB) {
+      const valueA = corpusMedianCost(a, inferredA, effectiveCorpus, keyA, thresholdPricingMap, hitRates, hitRateFallback)
+      const valueB = corpusMedianCost(b, inferredB, effectiveCorpus, keyB, thresholdPricingMap, hitRates, hitRateFallback)
+      if (valueA !== valueB) return valueB - valueA // higher inferred value (better free deal) first
+    }
+    return a.name.localeCompare(b.name)
+  }
 
   // Effective pricing: if a model is unpriced on this provider but the same
   // model id has published pricing on another provider (common, §pricing-fallback),
@@ -144,6 +162,24 @@ function median(values: number[]): number {
   return s.length % 2 === 0 ? (s[m - 1] + s[m]) / 2 : s[m]
 }
 
+/** Workload-corpus median $/request for an already-resolved cost — shared by
+ * the paid-tier ranking path and the free-tier "which free deal is better"
+ * in-tier ranking path (see the `classA !== "paid"` branches above/below). */
+function corpusMedianCost(
+  m: CheapnessModel,
+  cost: ModelCost,
+  effectiveCorpus: Workload[],
+  key: string,
+  thresholdPricingMap?: Map<string, Array<{ thresholdTokens: number; operator: "<=" | ">"; cost: ModelCost }>>,
+  hitRates?: Map<string, number>,
+  hitRateFallback?: Map<string, number>,
+): number {
+  const t = thresholdPricingMap?.get(key)
+  const regimes = compilePricingRegimes(m as CheapnessModel & { provider: { id: string } }, cost, t)
+  const hr = hitRates?.get(key) ?? hitRateFallback?.get(m.id)
+  return median(effectiveCorpus.map((w) => priceWorkload(w, regimes, hr).expected))
+}
+
 /**
  * Bulk O(n) ranking helper for hot sort paths (dialog-select-model).
  * Computes the blended corpus cost once per model instead of once per
@@ -163,27 +199,38 @@ export function sortByCheapness(
   hitRateFallback?: Map<string, number>,
 ): CheapnessModel[] {
   const effectiveCorpus = (corpus ?? FALLBACK_WORKLOAD_CORPUS) as unknown as Workload[]
-  type Rank = { tier: number; priced: number; blended: number; name: string; id: string; provider: string }
+  type Rank = { tier: number; isPaid: boolean; priced: number; blended: number; hasFreeValue: number; freeValue: number; name: string; id: string; provider: string }
   const rankOf = (m: CheapnessModel): Rank => {
     const klass = classifyMonetaryClass({ id: m.id, name: m.name, provider: m.provider, cost: m.cost })
     const tierOrder: Record<ReturnType<typeof classifyMonetaryClass>, number> = { "quota-exempt": 0, "free-limited-known": 1, "free-limited-unknown": 2, paid: 3 }
     const tier = tierOrder[klass]
-    if (klass !== "paid") return { tier, priced: 0, blended: 0, name: m.name, id: m.id, provider: m.provider.id }
+    const key = `${m.provider.id}:${m.id}`
+    if (klass !== "paid") {
+      // Mirrors compareByCheapness's free-tier branch: cost stays $0 either
+      // way (tier never changes), but an inferred sibling price still ranks
+      // "which free deal is better" instead of falling straight to
+      // alphabetical — see the comment there for why this branch exists.
+      const inferred = hasPublishedPricing(m.cost) ? m.cost : pricingFallback?.get(m.id)
+      if (!inferred) return { tier, isPaid: false, priced: 0, blended: 0, hasFreeValue: 0, freeValue: 0, name: m.name, id: m.id, provider: m.provider.id }
+      const freeValue = corpusMedianCost(m, inferred, effectiveCorpus, key, thresholdPricingMap, hitRates, hitRateFallback)
+      return { tier, isPaid: false, priced: 0, blended: 0, hasFreeValue: 1, freeValue, name: m.name, id: m.id, provider: m.provider.id }
+    }
     const effCost = hasPublishedPricing(m.cost) ? m.cost : pricingFallback?.get(m.id) ?? m.cost
     const priced = hasPublishedPricing(effCost) ? 0 : 1
-    if (priced) return { tier, priced, blended: 0, name: m.name, id: m.id, provider: m.provider.id }
-    const key = `${m.provider.id}:${m.id}`
-    const t = thresholdPricingMap?.get(key)
-    const regimes = compilePricingRegimes(m as CheapnessModel & { provider: { id: string } }, effCost, t)
-    const hr = hitRates?.get(key) ?? hitRateFallback?.get(m.id)
-    const corpusCost = median(effectiveCorpus.map((w) => priceWorkload(w, regimes, hr).expected))
+    if (priced) return { tier, isPaid: true, priced, blended: 0, hasFreeValue: 0, freeValue: 0, name: m.name, id: m.id, provider: m.provider.id }
+    const corpusCost = corpusMedianCost(m, effCost, effectiveCorpus, key, thresholdPricingMap, hitRates, hitRateFallback)
     const p = personalCosts?.get(key) ?? personalFallback?.get(m.id)
     const blended = p ? blendedCost(corpusCost, p.cost, p.count) : corpusCost
-    return { tier, priced, blended, name: m.name, id: m.id, provider: m.provider.id }
+    return { tier, isPaid: true, priced, blended, hasFreeValue: 0, freeValue: 0, name: m.name, id: m.id, provider: m.provider.id }
   }
   const scored = models.map((m) => ({ m, r: rankOf(m) }))
   scored.sort((a, b) => {
     if (a.r.tier !== b.r.tier) return a.r.tier - b.r.tier
+    if (!a.r.isPaid) {
+      if (a.r.hasFreeValue !== b.r.hasFreeValue) return b.r.hasFreeValue - a.r.hasFreeValue
+      if (a.r.hasFreeValue && a.r.freeValue !== b.r.freeValue) return b.r.freeValue - a.r.freeValue
+      return a.r.name.localeCompare(b.r.name) || a.r.id.localeCompare(b.r.id)
+    }
     if (a.r.priced !== b.r.priced) return a.r.priced - b.r.priced
     if (a.r.priced) return a.r.name.localeCompare(b.r.name) || a.r.id.localeCompare(b.r.id)
     if (a.r.blended !== b.r.blended) return a.r.blended - b.r.blended
@@ -212,6 +259,76 @@ export function buildPricingFallbackMap(models: CheapnessModel[]): Map<string, M
     // Prefer non-openrouter: if current is non-OR, overwrite; if current is OR, never overwrite a non-OR entry.
     if (!isOpenRouter(m)) {
       map.set(m.id, m.cost)
+    }
+  }
+  return map
+}
+
+export type FuzzyPricingMatch = { cost: ModelCost; score: number; donorId: string }
+
+/**
+ * Fuzzy pricing fallback: for a model with no published pricing and no exact
+ * model-id sibling (`buildPricingFallbackMap` already covers that case), find
+ * the best name-matching PAID model — any provider — and borrow its price.
+ * Catches free-tier variants that ship under a different id than their paid
+ * counterpart (e.g. "hy3" vs "hy3-free"), which exact-id matching can't see.
+ *
+ * Purely additive to `buildPricingFallbackMap`: never call this in place of
+ * it, only to fill gaps it leaves (see `mergePricingFallbacks`, which always
+ * prefers an exact match over a fuzzy one). Ties prefer non-openrouter donors,
+ * mirroring `buildPricingFallbackMap`'s preference.
+ *
+ * O(unpriced × paid) — build once behind a memo gated on dialog-open/page-
+ * mount (same pattern as the existing `pricingFallback` memos), never inside
+ * a hot per-compare sort loop.
+ */
+export function buildFuzzyPricingFallbackMap(models: CheapnessModel[], threshold = 0.75): Map<string, FuzzyPricingMatch> {
+  const paid = models.filter((m) => hasPublishedPricing(m.cost))
+  const unpriced = models.filter((m) => !hasPublishedPricing(m.cost))
+  if (paid.length === 0 || unpriced.length === 0) return new Map<string, FuzzyPricingMatch>()
+
+  // Collapse donors by normalized name — pricing is per-model, not per-provider
+  // row, so `model|provider` duplicates are identical work (Y1). Prefer
+  // non-openrouter on collision to preserve tie-breaking.
+  const donorByKey = new Map<string, CheapnessModel>()
+  for (const m of paid) {
+    const key = normalizeModelName(m.name || m.id)
+    if (!key) continue
+    const existing = donorByKey.get(key)
+    if (!existing) donorByKey.set(key, m)
+    else if (existing.provider.id === "openrouter" && m.provider.id !== "openrouter") donorByKey.set(key, m)
+  }
+  const dedupedDonors = Array.from(donorByKey, ([key, model]) => ({ key, model, counts: bigramCounts(key) }))
+
+  // Group unpriced queries by normalized key so one similarity scan serves all
+  // provider replicas of the same model (same 49× redundancy).
+  const queryGroups = new Map<string, { models: CheapnessModel[]; counts: Map<string, number> }>()
+  for (const m of unpriced) {
+    const q = normalizeModelName(m.name || m.id)
+    if (!q) continue
+    const g = queryGroups.get(q)
+    if (g) g.models.push(m)
+    else queryGroups.set(q, { models: [m], counts: bigramCounts(q) })
+  }
+
+  const map = new Map<string, FuzzyPricingMatch>()
+  for (const [query, { models: group, counts: qCounts }] of queryGroups) {
+    let best: { model: CheapnessModel; score: number } | undefined
+    const qLen = query.length
+    for (const candidate of dedupedDonors) {
+      // Dice upper bound: max achievable is 2*min/(lenA+lenB). Skip if it
+      // cannot reach threshold — cheap string-length check before bigram work.
+      const cLen = candidate.key.length
+      if ((2 * Math.min(qLen, cLen)) / (qLen + cLen) < threshold) continue
+      const score = similarityWithCounts(query, qCounts, candidate.key, candidate.counts)
+      if (score < threshold) continue
+      if (!best || score > best.score || (score === best.score && best.model.provider.id === "openrouter" && candidate.model.provider.id !== "openrouter")) {
+        best = { model: candidate.model, score }
+      }
+    }
+    if (!best) continue
+    for (const m of group) {
+      if (!map.has(m.id)) map.set(m.id, { cost: best.model.cost, score: best.score, donorId: best.model.id })
     }
   }
   return map
@@ -250,6 +367,47 @@ export function buildPersonalFallbackMap(
 // ---------------------------------------------------------------------------
 //  Display helpers
 // ---------------------------------------------------------------------------
+
+export type EffectiveCost = { cost: ModelCost; borrowed: boolean; fuzzyScore?: number }
+
+/**
+ * Resolves a model's cost for display/ranking: its own published pricing if
+ * present, otherwise the exact-id fallback, otherwise the fuzzy-name fallback
+ * (exact always wins over fuzzy). `borrowed` is true whenever the cost did
+ * not come from the model's own published pricing — callers use it to render
+ * the "~" inferred-price prefix. `fuzzyScore` is only set when the fuzzy map
+ * supplied the match, so callers can show a confidence hint if desired.
+ *
+ * The single shared implementation of the "effective cost" idiom that used
+ * to be duplicated inline at every price-display call site in
+ * dialog-select-model.tsx — extending the fallback maps (e.g. adding fuzzy
+ * matching) now upgrades every one of those call sites, and the usage page's
+ * valuation views, at once.
+ */
+export function resolveEffectiveCost(
+  model: { id: string; cost: ModelCost },
+  exactFallback?: Map<string, ModelCost>,
+  fuzzyFallback?: Map<string, FuzzyPricingMatch>,
+): EffectiveCost {
+  if (hasPublishedPricing(model.cost)) return { cost: model.cost, borrowed: false }
+  const exact = exactFallback?.get(model.id)
+  if (exact) return { cost: exact, borrowed: true }
+  const fuzzy = fuzzyFallback?.get(model.id)
+  if (fuzzy) return { cost: fuzzy.cost, borrowed: true, fuzzyScore: fuzzy.score }
+  return { cost: model.cost, borrowed: false }
+}
+
+/** Merges an exact-id fallback map with a fuzzy-name fallback map, exact
+ * always taking priority for any id present in both. */
+export function mergePricingFallbacks(
+  exact: Map<string, ModelCost> | undefined,
+  fuzzy: Map<string, FuzzyPricingMatch> | undefined,
+): Map<string, ModelCost> | undefined {
+  if (!fuzzy || fuzzy.size === 0) return exact
+  const merged = new Map(exact ?? [])
+  for (const [id, entry] of fuzzy) if (!merged.has(id)) merged.set(id, entry.cost)
+  return merged.size > 0 ? merged : undefined
+}
 
 /**
  * Whether a model should be treated as "free" for badge purposes (§10, §19).

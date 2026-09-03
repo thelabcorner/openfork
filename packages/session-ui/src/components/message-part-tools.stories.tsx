@@ -167,12 +167,126 @@ export const GenericMcpToolProse = {
   ),
 }
 
+const SKILL_MARKDOWN_BODY = `## Production-grade visual interface system for premium product software
+
+**Purpose:** Produce premium, production-grade interface surfaces rooted in disciplined visual systems. This skill governs **how the product looks and presents**, not application logic.
+
+### Principles
+
+1. Establish a type scale before touching layout.
+2. Prefer system spacing tokens over hand-picked pixel values.
+3. Motion should clarify state changes, never decorate them.
+
+\`\`\`ts
+export const spacing = { xs: 4, sm: 8, md: 12, lg: 16, xl: 24 }
+\`\`\`
+
+See \`reference/tokens.md\` for the full palette and elevation scale.`
+
 export const Skill = {
   render: () => (
     <ToolCard
       tool="skill"
-      input={{ name: "dataviz" }}
-      output={"Loaded skill \"dataviz\": palette guidance, mark specs, and interaction rules for charts."}
+      input={{ name: "premium-ui-skill" }}
+      metadata={{ mode: "load", name: "premium-ui-skill", dir: "/repo/.opencode/skills/premium-ui-skill", source: "registry" }}
+      output={[
+        `<skill_content name="premium-ui-skill">`,
+        `# Skill: premium-ui-skill`,
+        "",
+        SKILL_MARKDOWN_BODY,
+        "",
+        "Base directory for this skill: /repo/.opencode/skills/premium-ui-skill",
+        "Relative paths in this skill (e.g., scripts/, reference/) are relative to this base directory.",
+        "Note: file list is sampled.",
+        "",
+        "<skill_files>",
+        "<file>/repo/.opencode/skills/premium-ui-skill/SKILL.md</file>",
+        "<file>/repo/.opencode/skills/premium-ui-skill/reference/tokens.md</file>",
+        "<file>/repo/.opencode/skills/premium-ui-skill/reference/motion.md</file>",
+        "</skill_files>",
+        "</skill_content>",
+      ].join("\n")}
+      status="completed"
+    />
+  ),
+}
+
+export const SkillMultiple = {
+  render: () => (
+    <ToolCard
+      tool="skill"
+      input={{ names: ["dataviz", "premium-ui-skill"] }}
+      metadata={{ mode: "load", names: ["dataviz", "premium-ui-skill"] }}
+      output={[
+        [
+          `<skill_content name="dataviz">`,
+          `# Skill: dataviz`,
+          "",
+          "Palette guidance, mark specs, and interaction rules for charts. Read before writing chart code.",
+          "",
+          "Base directory for this skill: /repo/.opencode/skills/dataviz",
+          "Note: file list is sampled.",
+          "",
+          "<skill_files>",
+          "<file>/repo/.opencode/skills/dataviz/SKILL.md</file>",
+          "<file>/repo/.opencode/skills/dataviz/references/palette.md</file>",
+          "</skill_files>",
+          "</skill_content>",
+        ].join("\n"),
+        [
+          `<skill_content name="premium-ui-skill">`,
+          `# Skill: premium-ui-skill`,
+          "",
+          SKILL_MARKDOWN_BODY,
+          "",
+          "Base directory for this skill: /repo/.opencode/skills/premium-ui-skill",
+          "Note: file list is sampled.",
+          "",
+          "<skill_files>",
+          "<file>/repo/.opencode/skills/premium-ui-skill/SKILL.md</file>",
+          "</skill_files>",
+          "</skill_content>",
+        ].join("\n"),
+      ].join("\n\n")}
+      status="completed"
+    />
+  ),
+}
+
+export const SkillList = {
+  render: () => (
+    <ToolCard
+      tool="skill"
+      input={{ mode: "list" }}
+      metadata={{ mode: "list", count: 4, names: ["dataviz", "premium-ui-skill", "premium-ux-skill", "customize-opencode"] }}
+      output={[
+        `<skills mode="list" count="4">`,
+        "  - dataviz: Chart, graph, plot, dashboard, or data visualization guidance.",
+        "  - premium-ui-skill: Production-grade visual interface system for premium product software.",
+        "  - premium-ux-skill: Interaction and flow design patterns for premium product software.",
+        "  - customize-opencode: opencode's own configuration schemas and agent/skill/plugin authoring.",
+        "</skills>",
+      ].join("\n")}
+      status="completed"
+    />
+  ),
+}
+
+export const SkillNotFound = {
+  render: () => (
+    <ToolCard
+      tool="skill"
+      input={{ name: "nonexistent-skill" }}
+      metadata={{ mode: "load", name: "nonexistent-skill", count: 4 }}
+      output={[
+        'Skill "nonexistent-skill" not found. Not in local skills folders (agent-skills/, skills/, .skills/, etc.) or registered.',
+        "",
+        "Available skills (project folders + previously imported paths):",
+        "- dataviz: Chart, graph, plot, dashboard, or data visualization guidance.",
+        "- premium-ui-skill: Production-grade visual interface system for premium product software.",
+        "",
+        'Use skill({ mode: "list" }) to list all.',
+      ].join("\n")}
       status="completed"
     />
   ),

@@ -6,13 +6,16 @@ import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { HttpClient } from "effect/unstable/http"
 import { Auth } from "@/auth"
 import { ForkCredentials } from "@/fork/credentials"
+import * as VerdentFreeUsage from "@/usage/verdent-free"
 import * as ZenFreeUsage from "@/usage/zen-free"
 import type { ProviderResult, ProvidersResult } from "./schema"
 import { createSingleFlight, resolveAdapter, type Adapter } from "./registry"
 import { deepseek } from "./providers/deepseek"
+import { genspark } from "./providers/genspark"
 import { kimi } from "./providers/kimi"
 import { opencodeGo } from "./providers/opencode-go"
 import { opencodeZen } from "./providers/opencode-zen"
+import { verdent } from "./providers/verdent"
 import { openrouter } from "./providers/openrouter"
 import { claude } from "./providers/claude"
 import { codex } from "./providers/codex"
@@ -48,7 +51,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Qu
 const layer: Layer.Layer<
   Service,
   never,
-  Auth.Service | ForkCredentials.Service | HttpClient.HttpClient | ZenFreeUsage.Service
+  Auth.Service | ForkCredentials.Service | HttpClient.HttpClient | ZenFreeUsage.Service | VerdentFreeUsage.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -56,12 +59,15 @@ const layer: Layer.Layer<
     const credentials = yield* ForkCredentials.Service
     const http = yield* HttpClient.HttpClient
     const zenFreeUsage = yield* ZenFreeUsage.Service
+    const verdentFreeUsage = yield* VerdentFreeUsage.Service
     const adapters: readonly Adapter[] = [
       opencodeGo(auth, credentials),
       opencodeZen(zenFreeUsage),
+      verdent(verdentFreeUsage),
       openrouter(http, auth),
       kimi(http, auth),
       deepseek(http, auth),
+      genspark(http, auth),
       claude(http, auth),
       codex(http, auth),
       xai(http, auth),
@@ -69,8 +75,14 @@ const layer: Layer.Layer<
       workbuddy(),
     ]
     const singleFlight = createSingleFlight()
+    // 30s cache for provider list - configured checks involve file I/O (claude token file, workbuddy vault scan)
+    // and the list rarely changes (only on auth add/remove). This makes second Limits open instant.
+    let providersCache: { at: number; value: ProvidersResult } | undefined
+    const PROVIDERS_TTL_MS = 30_000
 
     const providers = Effect.fn("Quota.providers")(function* () {
+      const now = Date.now()
+      if (providersCache && now - providersCache.at < PROVIDERS_TTL_MS) return providersCache.value
       const summaries = yield* Effect.forEach(
         adapters,
         (adapter) =>
@@ -81,7 +93,9 @@ const layer: Layer.Layer<
           })),
         { concurrency: "unbounded" },
       )
-      return { providers: summaries }
+      const result = { providers: summaries }
+      providersCache = { at: now, value: result }
+      return result
     })
 
     const get = Effect.fn("Quota.get")(function* (input: { readonly providerID: string }) {
@@ -97,5 +111,5 @@ const layer: Layer.Layer<
 export const node = LayerNode.make({
   service: Service,
   layer,
-  deps: [Auth.node, ForkCredentials.node, httpClient, ZenFreeUsage.node],
+  deps: [Auth.node, ForkCredentials.node, httpClient, ZenFreeUsage.node, VerdentFreeUsage.node],
 })

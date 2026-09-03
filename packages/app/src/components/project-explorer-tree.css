@@ -6,6 +6,9 @@
 [data-component="project-explorer-tree"] {
   display: flex;
   flex-direction: column;
+  gap: 0;
+  padding: 0;
+  margin: 0;
   font-variant-numeric: tabular-nums;
 }
 
@@ -38,6 +41,12 @@
 [data-component="project-explorer-tree"] [data-slot="project-explorer-row"][data-selected] {
   background-color: var(--v2-overlay-simple-overlay-pressed);
   color: var(--v2-text-text-base);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"][data-drag-over] {
+  background-color: var(--v2-state-bg-info);
+  outline: 1px solid var(--v2-border-border-focus);
+  outline-offset: -1px;
 }
 
 [data-component="project-explorer-tree"] [data-slot="project-explorer-row"][data-focused] {
@@ -85,6 +94,83 @@
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-meta"] {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-inline-start: auto;
+  min-width: 0;
+  max-width: 46%;
+  justify-content: flex-end;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-count"] {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 16px;
+  height: 14px;
+  padding: 0 4px;
+  border-radius: 999px;
+  background: var(--v2-background-bg-layer-03);
+  color: var(--v2-text-text-muted);
+  font-size: 10px;
+  font-weight: 550;
+  letter-spacing: -0.01px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-count"][data-empty] {
+  background: transparent;
+  border: 1px dashed var(--v2-border-border-base);
+  color: var(--v2-text-text-faint);
+  font-weight: 440;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-size"],
+[data-component="project-explorer-tree"] [data-slot="project-explorer-lines"],
+[data-component="project-explorer-tree"] [data-slot="project-explorer-time"] {
+  flex: none;
+  font-size: 10.5px;
+  font-weight: 440;
+  letter-spacing: -0.02px;
+  color: var(--v2-text-text-faint);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-time"] {
+  opacity: 0.9;
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"][data-selected] [data-slot="project-explorer-size"],
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"][data-selected] [data-slot="project-explorer-lines"],
+[data-component="project-explorer-tree"] [data-slot="project-explorer-row"][data-selected] [data-slot="project-explorer-time"] {
+  color: var(--v2-text-text-muted);
+}
+
+/* Narrow pane: gracefully degrade meta — time first, then lines, then size.
+   At ~220px the meta would otherwise push the filename to 0 width. */
+@media (max-width: 340px) {
+  [data-component="project-explorer-tree"] [data-slot="project-explorer-time"] {
+    display: none;
+  }
+}
+@media (max-width: 300px) {
+  [data-component="project-explorer-tree"] [data-slot="project-explorer-lines"] {
+    display: none;
+  }
+}
+@media (max-width: 260px) {
+  [data-component="project-explorer-tree"] [data-slot="project-explorer-size"] {
+    display: none;
+  }
 }
 
 /* Git-status color drives the filename text directly — no letter badge. */
@@ -211,4 +297,13 @@
   padding-inline: 8px;
   font-size: 11px;
   color: var(--v2-text-text-faint);
+}
+
+[data-component="project-explorer-tree"] [data-slot="project-explorer-error"] {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 16px;
 }

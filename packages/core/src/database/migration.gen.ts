@@ -47,5 +47,7 @@ export const migrations = (
     import("./migration/20260820000000_session_checkpoint"),
     import("./migration/20260823001121_device_registry"),
     import("./migration/20260826190148_push_notifications"),
+    import("./migration/20260830011549_memory_subsystem"),
+    import("./migration/20260831000000_conversation_control"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

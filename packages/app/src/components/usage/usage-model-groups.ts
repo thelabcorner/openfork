@@ -21,6 +21,9 @@ export type ModelProviderBreakdown = {
   tokenBreakdown: TokenBreakdown
   share: number
   cacheSavings: number
+  /** Sum of (completed - created) wall time and the record count backing it — lets callers derive tok/s as (tokenBreakdown.output+reasoning)/durationMs*1000, guarding durationRecords > 0. */
+  durationMs: number
+  durationRecords: number
 }
 
 export type ModelGroup = {
@@ -32,6 +35,8 @@ export type ModelGroup = {
   tokenBreakdown: TokenBreakdown
   share: number
   cacheSavings: number
+  durationMs: number
+  durationRecords: number
   /** One entry per distinct provider+variant that served this model, sorted by cost desc. */
   providers: ModelProviderBreakdown[]
   providerCount: number
@@ -94,6 +99,8 @@ export function groupModelsByName(models: UsageModelRow[], identify: IdentifyMod
         tokenBreakdown: emptyBreakdown(),
         share: 0,
         cacheSavings: 0,
+        durationMs: 0,
+        durationRecords: 0,
         providers: [],
         providerCount: 0,
       }
@@ -106,6 +113,8 @@ export function groupModelsByName(models: UsageModelRow[], identify: IdentifyMod
     group.tokenBreakdown = addBreakdown(group.tokenBreakdown, row.tokens)
     group.share += row.share
     group.cacheSavings += row.cacheSavings
+    group.durationMs += row.durationMs
+    group.durationRecords += row.durationRecords
     group.providers.push({
       providerID: row.providerID,
       modelID: row.modelID,
@@ -116,6 +125,8 @@ export function groupModelsByName(models: UsageModelRow[], identify: IdentifyMod
       tokenBreakdown: { ...row.tokens },
       share: row.share,
       cacheSavings: row.cacheSavings,
+      durationMs: row.durationMs,
+      durationRecords: row.durationRecords,
     })
   }
 
@@ -141,6 +152,8 @@ export function modelsForProvider(models: UsageModelRow[], providerID: string) {
       tokenBreakdown: { ...row.tokens },
       share: row.share,
       cacheSavings: row.cacheSavings,
+      durationMs: row.durationMs,
+      durationRecords: row.durationRecords,
     }))
     .sort((a, b) => b.cost - a.cost)
 }

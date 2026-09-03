@@ -16,17 +16,16 @@ import {
 } from "@/pages/session/context-panel-state"
 
 const loadContextTab = () => import("@/components/session/session-context-tab")
-const loadUsageTab = () => import("@/components/usage/usage-panel-content")
 
 const SessionContextTab = lazy(() => loadContextTab().then((module) => ({ default: module.SessionContextTab })))
-const UsagePanelContent = lazy(() => loadUsageTab().then((module) => ({ default: module.UsagePanelContent })))
 
 /**
- * ContextPanel — unified right pane for Context / Usage / Limits.
+ * ContextPanel — unified right pane for Context / Limits.
  * Tab bodies load on intent, mount on first visit, then remain mounted to
- * preserve scroll and local state. Usage and Limits retain their global data
- * across session changes; Context detaches from session streams while hidden,
- * and the Limits display clock pauses while it is not visible.
+ * preserve scroll and local state. Limits retains its global data across
+ * session changes; Context detaches from session streams while hidden, and
+ * the Limits display clock pauses while it is not visible. Usage moved out
+ * to the standalone /usage page.
  */
 export function ContextPanel(props: {
   state: ContextPanelState
@@ -38,7 +37,6 @@ export function ContextPanel(props: {
   const initial = props.state.tab()
   const [visited, setVisited] = createStore<Record<ContextTab, boolean>>({
     context: initial === "context",
-    usage: initial === "usage",
     limits: initial === "limits",
   })
 
@@ -53,7 +51,6 @@ export function ContextPanel(props: {
 
   const handleTabIntent = (value: string) => {
     if (value === "context") void loadContextTab()
-    if (value === "usage") void loadUsageTab()
   }
 
   const contextActive = () => props.state.visible() && props.state.tab() === "context"
@@ -79,7 +76,6 @@ export function ContextPanel(props: {
           onIntent={handleTabIntent}
           options={[
             { value: "context", label: language.t("session.tab.context") },
-            { value: "usage", label: language.t("usage.panel.title") },
             { value: "limits", label: language.t("limits.panel.title") },
           ]}
         />
@@ -112,25 +108,6 @@ export function ContextPanel(props: {
               >
                 <Suspense fallback={<TabFallback />}>
                   <SessionContextTab active={contextActive} />
-                </Suspense>
-              </ErrorBoundary>
-            </Show>
-          </div>
-          <div
-            class="absolute inset-0 flex flex-col"
-            hidden={props.state.tab() !== "usage"}
-            aria-hidden={props.state.tab() !== "usage"}
-          >
-            <Show when={visited.usage} fallback={<TabFallback />}>
-              <ErrorBoundary
-                fallback={(error) => (
-                  <div class="flex h-full flex-col items-center justify-center gap-1 px-3 text-center">
-                    <span class="text-[10px] font-[600] uppercase leading-3 text-v2-state-fg-danger">{String(error)}</span>
-                  </div>
-                )}
-              >
-                <Suspense fallback={<TabFallback />}>
-                  <UsagePanelContent />
                 </Suspense>
               </ErrorBoundary>
             </Show>

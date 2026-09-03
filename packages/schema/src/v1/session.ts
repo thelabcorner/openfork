@@ -196,6 +196,7 @@ export const CompactionPart = Schema.Struct({
   ...partBase,
   type: Schema.Literal("compaction"),
   auto: Schema.Boolean,
+  continueAfter: Schema.optional(Schema.Boolean),
   overflow: Schema.optional(Schema.Boolean),
   tail_start_id: Schema.optional(MessageID),
 }).annotate({ identifier: "CompactionPart" })

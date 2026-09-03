@@ -266,37 +266,87 @@ export class BrowserEngine {
       return { closed: this.closeTabs(rangeTargets(ordered, tabId, mode)) }
     },
     refreshTab: async (tabId) => {
-      await this.operations.dispatch(tabId, { name: "refresh", input: { tabId } }, "")
+      try {
+        await this.operations.dispatch(tabId, { name: "refresh", input: { tabId } }, "")
+      } catch {
+        const activeId = this.registry.activeTab?.runtimeTabId
+        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "refresh", input: { tabId: activeId } }, "").catch(() => undefined)
+      }
     },
     duplicateTab: async (tabId) => {
-      const result = (await this.operations.dispatch(tabId, { name: "duplicate", input: { tabId } }, "")) as {
-        duplicated?: { tabId?: string; url?: string }
+      try {
+        const result = (await this.operations.dispatch(tabId, { name: "duplicate", input: { tabId } }, "")) as {
+          duplicated?: { tabId?: string; url?: string }
+        }
+        return { tabId: result.duplicated?.tabId ?? tabId, url: result.duplicated?.url ?? "" }
+      } catch {
+        return { tabId, url: "" }
       }
-      return { tabId: result.duplicated?.tabId ?? tabId, url: result.duplicated?.url ?? "" }
     },
     setTabMuted: async (tabId, muted) => {
-      await this.operations.dispatch(tabId, { name: "set_muted", input: { tabId, muted } }, "")
+      try {
+        await this.operations.dispatch(tabId, { name: "set_muted", input: { tabId, muted } }, "")
+      } catch {
+        const activeId = this.registry.activeTab?.runtimeTabId
+        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "set_muted", input: { tabId: activeId, muted } }, "").catch(() => undefined)
+      }
     },
     openDevtools: async (tabId) => {
-      await this.operations.dispatch(tabId, { name: "open_devtools", input: { tabId } }, "")
+      try {
+        await this.operations.dispatch(tabId, { name: "open_devtools", input: { tabId } }, "")
+      } catch {
+        const activeId = this.registry.activeTab?.runtimeTabId
+        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "open_devtools", input: { tabId: activeId } }, "").catch(() => undefined)
+      }
     },
     hardReload: async (tabId) => {
-      await this.operations.dispatch(tabId, { name: "hard_reload", input: { tabId } }, "")
+      try {
+        await this.operations.dispatch(tabId, { name: "hard_reload", input: { tabId } }, "")
+      } catch {
+        const activeId = this.registry.activeTab?.runtimeTabId
+        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "hard_reload", input: { tabId: activeId } }, "").catch(() => undefined)
+      }
     },
     clearCookies: async (tabId) => {
-      await this.operations.dispatch(tabId, { name: "clear_cookies", input: { tabId } }, "")
+      try {
+        await this.operations.dispatch(tabId, { name: "clear_cookies", input: { tabId } }, "")
+      } catch {
+        const activeId = this.registry.activeTab?.runtimeTabId
+        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "clear_cookies", input: { tabId: activeId } }, "").catch(() => undefined)
+      }
     },
     clearCache: async (tabId) => {
-      await this.operations.dispatch(tabId, { name: "clear_cache", input: { tabId } }, "")
+      try {
+        await this.operations.dispatch(tabId, { name: "clear_cache", input: { tabId } }, "")
+      } catch {
+        const activeId = this.registry.activeTab?.runtimeTabId
+        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "clear_cache", input: { tabId: activeId } }, "").catch(() => undefined)
+      }
     },
     setAppearance: async (appearance) => {
       await this.operations.dispatch(undefined, { name: "set_appearance", input: { appearance } }, "")
     },
     listExtensions: async (tabId) => {
-      const result = (await this.operations.dispatch(tabId, { name: "extensions_list", input: { tabId } }, "")) as {
-        extensions?: ExtensionInfo[]
+      try {
+        const result = (await this.operations.dispatch(tabId, { name: "extensions_list", input: { tabId } }, "")) as {
+          extensions?: ExtensionInfo[]
+        }
+        return result.extensions ?? []
+      } catch (error) {
+        // stale tabId (agent session tab closed) must not crash the chrome menu
+        const activeId = this.registry.activeTab?.runtimeTabId
+        if (activeId && activeId !== tabId) {
+          try {
+            const fallback = (await this.operations.dispatch(activeId, { name: "extensions_list", input: { tabId: activeId } }, "")) as {
+              extensions?: ExtensionInfo[]
+            }
+            return fallback.extensions ?? []
+          } catch {
+            return []
+          }
+        }
+        return []
       }
-      return result.extensions ?? []
     },
     setExtensionEnabled: async (tabId, extensionId, enabled) => {
       await this.operations.dispatch(

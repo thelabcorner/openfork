@@ -230,6 +230,7 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
               ),
               ...(typeof item.size === "number" ? { size: item.size } : {}),
               ...(typeof item.mtime === "number" ? { mtime: item.mtime } : {}),
+              ...(typeof item.lineCount === "number" ? { lineCount: item.lineCount } : {}),
             }
           })
         }),

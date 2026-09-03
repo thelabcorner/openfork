@@ -249,6 +249,7 @@ export function MessageTimeline(props: {
   setScrollRef: (el: HTMLDivElement | undefined) => void
   onScheduleScrollState: (el: HTMLDivElement) => void
   onAutoScrollHandleScroll: () => void
+  onAutoScrollProgrammatic: (top: number) => void
   onMarkScrollGesture: (target?: EventTarget | null) => void
   hasScrollGesture: () => boolean
   onUserScroll: () => void
@@ -494,6 +495,7 @@ export function MessageTimeline(props: {
     scrollToFn: (offset, options, instance) => {
       // Expose the computed range before core writes an anchor correction so the browser does not clamp it to the old height.
       if (virtualContent) virtualContent.style.height = `${instance.getTotalSize()}px`
+      props.onAutoScrollProgrammatic(offset + (options.adjustments ?? 0))
       elementScroll(offset, options, instance)
     },
     get getItemKey() {

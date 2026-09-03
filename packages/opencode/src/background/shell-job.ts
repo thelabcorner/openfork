@@ -12,6 +12,7 @@ import { Effect, Layer, Context, Stream, Scope } from "effect"
 import { createWriteStream } from "node:fs"
 import * as Truncate from "@/tool/truncate"
 import type { SessionID } from "@/session/schema"
+import { rewriteBashHeredocsForPowerShell } from "@/util/powershell-heredoc"
 
 const previewBound = (text: string, max = 30_000) => (text.length <= max ? text : "...\n\n" + text.slice(-max))
 
@@ -44,7 +45,8 @@ function escapeXML(text: string) {
 
 function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv, stdin: any = "ignore", options: any = {}) {
   if (process.platform === "win32" && Shell.ps(shell)) {
-    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
+    const powershellCommand = rewriteBashHeredocsForPowerShell(command)
+    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", powershellCommand], {
       cwd,
       env,
       stdin,

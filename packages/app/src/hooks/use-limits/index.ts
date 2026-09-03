@@ -1,4 +1,4 @@
-import { createMemo, createResource, createSignal, onCleanup } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, onCleanup } from "solid-js"
 import type { Accessor } from "solid-js"
 import { useServerSDK } from "@/context/server-sdk"
 import { useForkUsage } from "@/context/fork-usage"
@@ -12,6 +12,7 @@ import {
   type UsageWindow,
   type ProviderResult,
 } from "@/utils/limits-format"
+import { loadLimitsCache, saveLimitsCache } from "@/utils/limits-persistent-cache"
 
 export interface LimitProvider {
   result: ProviderResult
@@ -39,6 +40,14 @@ const CLAUDE_429_BACKOFF_MS = 300_000
  * (configured-only), sorting, enrichment (worst-remaining + tone), the
  * refresh cooldown, and Go multi-key / OpenRouter-free merges. The pane is a
  * pure projection.
+ *
+ * Performance optimizations:
+ * - Persistent localStorage cache (quota-cache.json equivalent) -> instant paint
+ *   on cold open, survives reloads/restarts, stale-while-revalidate.
+ * - Only configured providers are fetched (cuts 10 -> 2-3 HTTP calls).
+ * - Incremental per-provider updates: each `quota.get` resolves independently
+ *   and paints its card immediately; the slowest provider no longer blocks the
+ *   entire pane (no `Promise.all` barrier).
  */
 export function useLimits(options?: { now?: Accessor<number> }) {
   const now = options?.now ?? Date.now
@@ -62,6 +71,36 @@ export function useLimits(options?: { now?: Accessor<number> }) {
   const lastGoodQuotas = new Map<string, ProviderResult>()
   const isRateLimited = (error?: string | null) => !!error && /429|rate.?limit/i.test(error)
 
+  /**
+   * The generated hey-api client returns `response.error` as the parsed JSON
+   * body for HTTP-error responses, which is usually a structured OpenAPI error
+   * envelope (`{ name: "NotFoundError", data: { message: "..." } }`) and NOT
+   * an `Error` or a string. The previous fallback string was a literal
+   * "Request failed", which surfaced in the Limits pane as a placeholder with
+   * zero diagnostic value. Walk the common envelope shapes here so the user
+   * sees the real reason — "Unsupported quota provider: workbuddy", the
+   * upstream's 502 message, etc. The string check is the cheap path; the
+   * object check is the realistic one.
+   */
+  const describeResponseError = (err: unknown): string => {
+    if (err === null || err === undefined) return "Request failed"
+    if (err instanceof Error) return err.message || err.name || "Request failed"
+    if (typeof err === "string") return err
+    if (typeof err === "object") {
+      const obj = err as { message?: unknown; name?: unknown; data?: { message?: unknown } | unknown; error?: unknown }
+      if (obj.data && typeof obj.data === "object" && obj.data !== null) {
+        const inner = (obj.data as { message?: unknown }).message
+        if (typeof inner === "string" && inner.length > 0) return inner
+      }
+      if (typeof obj.message === "string" && obj.message.length > 0) return obj.message
+      if (typeof obj.name === "string" && obj.name.length > 0) {
+        return typeof obj.error === "string" && obj.error.length > 0 ? `${obj.name}: ${obj.error}` : obj.name
+      }
+      if (typeof obj.error === "string" && obj.error.length > 0) return obj.error
+    }
+    return "Request failed"
+  }
+
   const getEffectiveResult = (r: ProviderResult): ProviderResult => {
     if (r.ok || !isRateLimited(r.error)) return r
     const prev = lastGoodQuotas.get(r.providerId)
@@ -75,6 +114,22 @@ export function useLimits(options?: { now?: Accessor<number> }) {
     return r
   }
 
+  // --- Persistent cache hydration ---
+  const initialCache = typeof window !== "undefined" ? loadLimitsCache() : undefined
+  const initialMap = new Map<string, ProviderResult>()
+  if (initialCache) {
+    for (const r of initialCache.results) {
+      initialMap.set(r.providerId, r)
+      if (r.ok && r.usage) lastGoodQuotas.set(r.providerId, r)
+    }
+    // Prime 429 backoff if cached entry was rate-limited
+    for (const r of initialCache.results) {
+      if (!r.ok && isRateLimited(r.error) && r.providerId === "claude") {
+        setLastRateLimitedAt(r.fetchedAt)
+      }
+    }
+  }
+
   const [providersRes] = createResource(
     () => tick(),
     async () => {
@@ -85,17 +140,24 @@ export function useLimits(options?: { now?: Accessor<number> }) {
   const providerData = createMemo(() => {
     const latest = providersRes.latest
     const isReady = providersRes.state === "ready" || providersRes.state === "refreshing"
-    // Fallback when the providers endpoint fails or is still loading: still
-    // surface the automatic providers so Zen is never hidden behind a fetch
-    // error. Zen is IP-based and needs no enrollment.
+    // If we have a persistent cache and providers endpoint is still loading/error,
+    // serve the cached provider list instantly (stale-while-revalidate).
     if (!isReady || !latest) {
       if (providersRes.error) {
+        // Try persistent cache first
+        if (initialCache && initialCache.providers.length > 0) {
+          return { providers: initialCache.providers }
+        }
         return {
           providers: [
             { providerId: "opencode-zen", providerName: "OpenCode Zen", configured: true },
             { providerId: "claude", providerName: "Claude", configured: true },
           ],
         }
+      }
+      if (initialCache && !isReady) {
+        // providers endpoint still loading - use cached list for instant paint
+        if (initialCache.providers.length > 0) return { providers: initialCache.providers }
       }
       return undefined
     }
@@ -115,68 +177,140 @@ export function useLimits(options?: { now?: Accessor<number> }) {
     return { providers }
   })
 
-  const [quotasRes] = createResource(
-    () => {
-      const data = providerData()
-      void tick()
-      return data ? { providers: data.providers, tick: tick() } : undefined
-    },
-    async (input) => {
-      const fallback = (entry: { providerId: string; providerName: string; configured: boolean }, message: string): ProviderResult => ({
-        providerId: entry.providerId,
-        providerName: entry.providerName,
-        ok: false,
-        configured: entry.configured,
-        error: message,
-        usage: null,
-        fetchedAt: Date.now(),
-      })
-      const results = await Promise.all(
-        input.providers.map(async (entry) => {
+  // Incremental quota map - each provider updates independently
+  const [quotaMap, setQuotaMap] = createSignal<Map<string, ProviderResult>>(new Map(initialMap))
+  const [pendingCount, setPendingCount] = createSignal(0)
+  const [quotaError, setQuotaError] = createSignal<unknown>(undefined)
+
+  // Track which generation we're on to ignore stale fetches after a tick bump
+  let fetchGeneration = 0
+
+  createEffect(() => {
+    const data = providerData()
+    const currentTick = tick()
+    if (!data) return
+    // Only fetch configured providers - cuts 10 -> 2-3 calls, huge latency win
+    const toFetch = data.providers.filter((p) => p.configured)
+    if (toFetch.length === 0) {
+      setQuotaMap(new Map())
+      setPendingCount(0)
+      return
+    }
+    const generation = ++fetchGeneration
+    setPendingCount(toFetch.length)
+    setQuotaError(undefined)
+
+    const fallback = (entry: { providerId: string; providerName: string; configured: boolean }, message: string): ProviderResult => ({
+      providerId: entry.providerId,
+      providerName: entry.providerName,
+      ok: false,
+      configured: entry.configured,
+      error: message,
+      usage: null,
+      fetchedAt: Date.now(),
+    })
+
+    let completed = 0
+    const resultsThisGen = new Map<string, ProviderResult>()
+
+    const checkDone = () => {
+      completed++
+      if (completed === toFetch.length && generation === fetchGeneration) {
+        setPendingCount(0)
+        // Persist successful batch for instant next-open
+        const allResults = Array.from(resultsThisGen.values())
+        if (allResults.length > 0) {
           try {
-            const response = await sdk().client.quota.get({ providerID: entry.providerId }, { throwOnError: false })
-            // The generated client's non-throwing branches (network failure,
-            // HTTP error status, unknown-provider 404) all resolve with
-            // `data: undefined` rather than rejecting — casting that straight
-            // to ProviderResult let `undefined` reach `r.ok` downstream and
-            // throw out of this fetcher entirely, surfacing as "Couldn't load
-            // limits" for every provider instead of just this one.
-            if (!response.data) {
-              const err = response.error
-              const message = err instanceof Error ? err.message : typeof err === "string" ? err : "Request failed"
-              return fallback(entry, message)
-            }
-            return response.data as ProviderResult
-          } catch (err) {
-            return fallback(entry, err instanceof Error ? err.message : String(err))
+            saveLimitsCache(data.providers, allResults)
+          } catch {}
+        }
+      }
+    }
+
+    for (const entry of toFetch) {
+      // For stale-while-revalidate: if we have a cached entry that's still fresh
+      // per localStorage TTL, we can keep showing it while background refresh happens.
+      // But we still fetch - the in-memory fetch will dedup via backend cache (5 min TTL)
+      // so it's cheap. We just don't clear the map before fetches complete.
+      const fetchOne = async () => {
+        try {
+          const response = await sdk().client.quota.get({ providerID: entry.providerId }, { throwOnError: false })
+          let result: ProviderResult
+          if (!response.data) {
+            const message = describeResponseError(response.error)
+            result = fallback(entry, message)
+          } else {
+            result = response.data as ProviderResult
           }
-        }),
-      )
-      results.forEach((r) => {
-        if (r.ok && r.usage) {
-          lastGoodQuotas.set(r.providerId, r)
+          if (generation !== fetchGeneration) return
+          resultsThisGen.set(result.providerId, result)
+          if (result.ok && result.usage) lastGoodQuotas.set(result.providerId, result)
+          if (result.ok && result.providerId === "claude") setLastRateLimitedAt(0)
+          else if (!result.ok && isRateLimited(result.error) && result.providerId === "claude") setLastRateLimitedAt(Date.now())
+          setQuotaMap((prev) => {
+            const next = new Map(prev)
+            next.set(result.providerId, result)
+            return next
+          })
+        } catch (err) {
+          if (generation !== fetchGeneration) return
+          const result = fallback(entry, err instanceof Error ? err.message : String(err))
+          resultsThisGen.set(result.providerId, result)
+          setQuotaMap((prev) => {
+            const next = new Map(prev)
+            next.set(result.providerId, result)
+            return next
+          })
+          // Only surface as resource error if we have no cached data at all
+          if (quotaMap().size === 0 && initialMap.size === 0) setQuotaError(err)
+        } finally {
+          if (generation === fetchGeneration) checkDone()
         }
-        if (r.ok && r.providerId === "claude") {
-          setLastRateLimitedAt(0)
-        } else if (!r.ok && isRateLimited(r.error) && r.providerId === "claude") {
-          setLastRateLimitedAt(Date.now())
-        }
-      })
-      return results
-    },
-  )
+      }
+      void fetchOne()
+    }
+  })
+
+  // Initialize from persistent cache immediately if available and providerData not yet ready
+  // This effect ensures that even before providerData resolves, we show cached quotas
+  // (handled via initialMap above). No extra work needed.
 
   // THE hide-not-connected rule — single choke point.
+  // Now derived from incremental map, not from a single blocking resource.
+  // Intersect with the current configured provider list so a removed provider
+  // doesn't linger from cache, and pending providers simply don't appear yet
+  // (incremental paint).
   const connected = createMemo(() => {
-    if (quotasRes.state !== "ready" && quotasRes.state !== "refreshing") return undefined
-    const raw = quotasRes.latest
-    if (!raw) return undefined
-    return raw.filter((r) => r.configured)
+    const map = quotaMap()
+    const data = providerData()
+    if (map.size === 0) {
+      if (initialMap.size > 0) {
+        if (data) {
+          const allowed = new Set(data.providers.filter((p) => p.configured).map((p) => p.providerId))
+          const filtered = Array.from(initialMap.values()).filter((r) => allowed.has(r.providerId))
+          if (filtered.length > 0) return filtered
+          return Array.from(initialMap.values()).filter((r) => r.configured)
+        }
+        return Array.from(initialMap.values()).filter((r) => r.configured)
+      }
+      return undefined
+    }
+    if (data) {
+      const allowed = new Set(data.providers.filter((p) => p.configured).map((p) => p.providerId))
+      const filtered = Array.from(map.values()).filter((r) => allowed.has(r.providerId))
+      // If we have a map but none match current configured set, fall back to showing
+      // whatever is configured in the map (covers initial cache before providerData refresh)
+      if (filtered.length > 0) return filtered
+      if (map.size > 0) return Array.from(map.values()).filter((r) => r.configured)
+    }
+    return Array.from(map.values()).filter((r) => r.configured)
   })
 
   const providers = createMemo<LimitProvider[] | undefined>(() => {
     const list = connected()
     if (!list) return undefined
+    // If incremental fetches are still in flight, we may have partial results.
+    // Show what we have immediately rather than waiting for all.
     return list
       .map((r) => {
         const effective = getEffectiveResult(r)
@@ -216,9 +350,21 @@ export function useLimits(options?: { now?: Accessor<number> }) {
     return Math.max(0, latest - now())
   })
 
-  const isLoading = () => providersRes.loading || quotasRes.loading
-  const hasError = () => Boolean(providersRes.error || quotasRes.error)
-  const error = () => (providersRes.error ?? quotasRes.error) as unknown
+  const isLoading = () => {
+    // If we have cached data to show, don't block on network
+    if (providers() !== undefined) return false
+    // No data yet - show loading if either providers or quotas are pending
+    if (providersRes.loading) return true
+    if (pendingCount() > 0) return true
+    // If we have initial cache, not loading
+    if (initialMap.size > 0) return false
+    return false
+  }
+  const hasError = () => {
+    if (providers() !== undefined) return false
+    return Boolean(providersRes.error || quotaError())
+  }
+  const error = () => (providersRes.error ?? quotaError()) as unknown
 
   const goByCredential = () => forkUsage.usage.latest?.byCredential ?? []
   const goAggregate = () => forkUsage.usage.latest?.aggregate ?? []

@@ -27,6 +27,10 @@ export const Parameters = Schema.Struct({
   }),
   search: Schema.optional(Schema.String).annotate({ description: "list: title search substring" }),
   roots: Schema.optional(Schema.Boolean).annotate({ description: "list: only root sessions (parentID null)" }),
+  parentId: Schema.optional(Schema.String).annotate({
+    description:
+      "list: only sessions with this parent — finds subagent/task child sessions (e.g. to recover a failed task)",
+  }),
   includeArchived: Schema.optional(Schema.Boolean).annotate({ description: "list: include archived sessions" }),
   withStatus: Schema.optional(Schema.Boolean).annotate({ description: "list: attach live status per session" }),
   role: Schema.optional(Schema.Literals(["all", "user", "assistant"])).annotate({
@@ -249,6 +253,12 @@ const validateActionParams = Effect.fn("SessionTool.validateActionParams")(funct
   if (params.includeArchived !== undefined && action !== "list") {
     return yield* Effect.fail(new Error("includeArchived is only valid for list"))
   }
+  if (params.parentId !== undefined && action !== "list") {
+    return yield* Effect.fail(new Error("parentId is only valid for list"))
+  }
+  if (params.parentId !== undefined && params.roots === true) {
+    return yield* Effect.fail(new Error("parentId cannot be combined with roots"))
+  }
   if (params.role !== undefined && action !== "messages") {
     return yield* Effect.fail(new Error("role is only valid for messages"))
   }
@@ -384,12 +394,14 @@ export const SessionTool = Tool.define<typeof Parameters, Metadata, Session.Serv
       const current = yield* InstanceState.context
       const scopeVal = params.scope ?? "current"
       const limit = normalizeLimit(params.limit, 10)
+      const parentID = params.parentId !== undefined ? SessionID.make(params.parentId) : undefined
       let rows: Session.Info[] = []
       if (scopeVal === "global") {
         const globalRows = yield* sessions
           .listGlobal({
             limit,
             search: params.search?.trim() || undefined,
+            parentID,
             roots: params.roots,
             archived: params.includeArchived === true,
           })
@@ -422,6 +434,7 @@ export const SessionTool = Tool.define<typeof Parameters, Metadata, Session.Serv
             scope: "project",
             limit,
             search: params.search?.trim() || undefined,
+            parentID,
             roots: params.roots,
           })
           .pipe(Effect.orDie)
@@ -432,6 +445,7 @@ export const SessionTool = Tool.define<typeof Parameters, Metadata, Session.Serv
             directory: current.directory,
             limit,
             search: params.search?.trim() || undefined,
+            parentID,
             roots: params.roots,
           })
           .pipe(Effect.orDie)

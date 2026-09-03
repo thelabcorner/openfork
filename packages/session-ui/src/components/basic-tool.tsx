@@ -17,15 +17,30 @@ import { createStore } from "solid-js/store"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
 import { Icon, type IconProps } from "@opencode-ai/ui/icon"
 import { TextShimmer } from "@opencode-ai/ui/text-shimmer"
-import { CodeView, SmartToolOutput, ToolSection } from "./tool-output"
+import { SmartToolOutput } from "./tool-output"
+import { ToolParams } from "./tool-parts"
+
+export type ResultTone = "neutral" | "success" | "warning" | "danger"
 
 export type TriggerTitle = {
   title: string
   titleClass?: string
   subtitle?: string
   subtitleClass?: string
+  /** Paths read better truncated from the left; commands from the right. */
+  subtitleTruncate?: "start" | "end"
+  subtitleMono?: boolean
   args?: string[]
   argsClass?: string
+  /**
+   * What the call returned, shown right-aligned in the collapsed row so the
+   * outcome is legible without expanding: "142 lines", "exit 0 · 4.2s",
+   * "22 matches · 3 files".
+   */
+  result?: string
+  resultTone?: ResultTone
+  /** Diff counts, rendered in place of `result` when present. */
+  changes?: { additions: number; deletions: number }
   action?: JSX.Element
 }
 
@@ -37,9 +52,30 @@ const isTriggerTitle = (val: any): val is TriggerTitle => {
 
 export interface BasicToolProps {
   icon: IconProps["name"]
+  /** Replaces the badge glyph — e.g. a progress indicator while a subagent runs. */
+  iconContent?: JSX.Element
+  /**
+   * Identity colour for the badge (subagent colours). Tints the badge only; the
+   * title stays neutral so a column of rows still scans as one column.
+   */
+  accent?: string
   trigger: TriggerTitle | JSX.Element | ((open: Accessor<boolean>) => JSX.Element)
   children?: JSX.Element
   status?: string
+  /**
+   * Result slot for renderers that supply a custom `trigger` element and so
+   * cannot express it via `TriggerTitle`. Takes precedence over the trigger's
+   * own `result` when both are set.
+   */
+  result?: string
+  resultTone?: ResultTone
+  changes?: { additions: number; deletions: number }
+  /**
+   * `card` (default) frames one tool's output as a single panel. `tree` uses an
+   * indented rail and belongs to expansions holding several items — a
+   * multi-file patch, a grouped run of calls. `plain` opts out of both.
+   */
+  contentVariant?: "card" | "tree" | "plain"
   hideDetails?: boolean
   defaultOpen?: boolean
   open?: boolean
@@ -195,17 +231,45 @@ export function BasicTool(props: BasicToolProps) {
     setOpen(value)
   }
 
+  const titleProps = () => (isTriggerTitle(props.trigger) ? props.trigger : undefined)
+
+  const result = () => {
+    if (pending()) return undefined
+    const title = titleProps()
+    const changes = props.changes ?? title?.changes
+    if (changes) return { kind: "changes" as const, changes }
+    const text = props.result ?? title?.result
+    if (text) return { kind: "text" as const, text, tone: props.resultTone ?? title?.resultTone ?? "neutral" }
+    return undefined
+  }
+
+  /**
+   * A single tool's output reads as a card — one framed panel hanging off the
+   * row. The indented rail is reserved for `tree`, where the expansion holds
+   * *several* things (a multi-file patch, a grouped run of calls) and the
+   * indent is doing real work showing containment.
+   */
+  const body = () => (
+    <div data-slot="tool-content" data-variant={props.contentVariant ?? "card"}>
+      {props.children}
+    </div>
+  )
+
   const trigger = () => (
     <div
       data-component="tool-trigger"
       data-clickable={props.clickable ? "true" : undefined}
       data-hide-details={props.hideDetails ? "true" : undefined}
       data-status={props.status}
+      data-accent={props.accent ? "true" : undefined}
+      style={props.accent ? { "--tool-badge-accent": props.accent } : undefined}
     >
       <div data-slot="basic-tool-tool-trigger-content">
-        <Show when={props.icon}>
+        <Show when={props.icon || props.iconContent}>
           <span data-slot="basic-tool-tool-icon" data-status={props.status}>
-            <Icon name={props.icon} size="small" style={{ "stroke-width": 1.5 }} />
+            <Show when={props.iconContent} fallback={<Icon name={props.icon} size="small" style={{ "stroke-width": 1.5 }} />}>
+              {props.iconContent}
+            </Show>
           </span>
         </Show>
         <div data-slot="basic-tool-tool-info">
@@ -225,8 +289,13 @@ export function BasicTool(props: BasicToolProps) {
                     </span>
                     <Show when={!pending() || title().subtitle || title().args?.length}>
                       <Show when={title().subtitle}>
+                        <span data-slot="basic-tool-tool-sep" aria-hidden="true">
+                          ·
+                        </span>
                         <span
                           data-slot="basic-tool-tool-subtitle"
+                          data-truncate={title().subtitleTruncate}
+                          data-mono={title().subtitleMono ? "true" : undefined}
                           classList={{
                             [title().subtitleClass ?? ""]: !!title().subtitleClass,
                             clickable: !!props.onSubtitleClick,
@@ -238,7 +307,8 @@ export function BasicTool(props: BasicToolProps) {
                             }
                           }}
                         >
-                          {title().subtitle}
+                          {/* Wrapper keeps LTR order intact under the rtl left-truncation trick. */}
+                          <span>{title().subtitle}</span>
                         </span>
                       </Show>
                       <Show when={title().args?.length}>
@@ -267,6 +337,27 @@ export function BasicTool(props: BasicToolProps) {
           </Switch>
         </div>
       </div>
+      <Show when={result()}>
+        {(value) => (
+          <Switch>
+            <Match when={value().kind === "changes" && value()}>
+              {(entry) => (
+                <span data-slot="basic-tool-tool-diff">
+                  <span data-slot="basic-tool-tool-diff-add">+{entry().changes!.additions}</span>
+                  <span data-slot="basic-tool-tool-diff-del">&minus;{entry().changes!.deletions}</span>
+                </span>
+              )}
+            </Match>
+            <Match when={value().kind === "text" && value()}>
+              {(entry) => (
+                <span data-slot="basic-tool-tool-result" data-tone={entry().tone}>
+                  {entry().text}
+                </span>
+              )}
+            </Match>
+          </Switch>
+        )}
+      </Show>
       <Show when={hasChildren() && !props.hideDetails && !props.locked && (!pending() || props.allowOpenWhilePending)}>
         <Collapsible.Arrow />
       </Show>
@@ -308,12 +399,12 @@ export function BasicTool(props: BasicToolProps) {
             overflow: initialOpen ? "visible" : "hidden",
           }}
         >
-          <Show when={!props.defer || ready()}>{props.children}</Show>
+          <Show when={!props.defer || ready()}>{body()}</Show>
         </div>
       </Show>
       <Show when={!props.animated && hasChildren() && !props.hideDetails}>
         <Collapsible.Content>
-          <Show when={!props.defer || ready()}>{props.children}</Show>
+          <Show when={!props.defer || ready()}>{body()}</Show>
         </Collapsible.Content>
       </Show>
     </Collapsible>
@@ -339,6 +430,14 @@ function args(input: Record<string, unknown> | undefined, extraSkip: string[] = 
     .slice(0, 3)
 }
 
+/**
+ * Floor for tools without a bespoke renderer.
+ *
+ * This used to print the raw input as a syntax-highlighted JSON block above a
+ * markdown dump of the output, which is how `browser_status`, `memory`,
+ * `session` and every MCP tool ended up unreadable. Params are now a dense chip
+ * strip and the output stands on its own.
+ */
 export function GenericTool(props: {
   tool: string
   status?: string
@@ -348,13 +447,11 @@ export function GenericTool(props: {
   icon?: IconProps["name"]
   title?: string
   subtitle?: string
+  result?: string
+  resultTone?: ResultTone
   argsSkip?: string[]
 }) {
   const i18n = useI18n()
-  const inputJson = createMemo(() => {
-    if (!props.input || Object.keys(props.input).length === 0) return undefined
-    return JSON.stringify(props.input, null, 2)
-  })
 
   return (
     <BasicTool
@@ -364,20 +461,14 @@ export function GenericTool(props: {
         title: props.title ?? i18n.t("ui.basicTool.called", { tool: props.tool }),
         subtitle: props.subtitle ?? label(props.input),
         args: args(props.input, props.argsSkip),
+        result: props.result,
+        resultTone: props.resultTone,
       }}
       hideDetails={props.hideDetails}
     >
-      <Show when={inputJson()}>
-        {(json) => (
-          <ToolSection label={i18n.t("ui.basicTool.input")}>
-            <CodeView contents={json()} filename="input.json" />
-          </ToolSection>
-        )}
-      </Show>
+      <ToolParams input={props.input} skip={props.argsSkip} />
       <Show when={props.output}>
-        <ToolSection label={i18n.t("ui.basicTool.output")}>
-          <SmartToolOutput output={props.output} />
-        </ToolSection>
+        <SmartToolOutput output={props.output} />
       </Show>
     </BasicTool>
   )

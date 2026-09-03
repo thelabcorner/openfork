@@ -353,45 +353,82 @@ export function registerBrowserIpcHandlers(engine: BrowserEngine) {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.closeRange(tabId, mode)
   })
-  ipcMain.handle("browser-refresh-tab", (event, tabId: string) => {
+  ipcMain.handle("browser-refresh-tab", async (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.refreshTab(tabId)
+    try {
+      return await engine.api.refreshTab(tabId)
+    } catch {
+      return
+    }
   })
-  ipcMain.handle("browser-duplicate-tab", (event, tabId: string) => {
+  ipcMain.handle("browser-duplicate-tab", async (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.duplicateTab(tabId)
+    try {
+      return await engine.api.duplicateTab(tabId)
+    } catch {
+      return { tabId, url: "" }
+    }
   })
-  ipcMain.handle("browser-set-tab-muted", (event, tabId: string, muted: boolean) => {
+  ipcMain.handle("browser-set-tab-muted", async (event, tabId: string, muted: boolean) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.setTabMuted(tabId, muted)
+    try {
+      return await engine.api.setTabMuted(tabId, muted)
+    } catch {
+      return
+    }
   })
-  ipcMain.handle("browser-open-devtools", (event, tabId: string) => {
+  ipcMain.handle("browser-open-devtools", async (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.openDevtools(tabId)
+    try {
+      return await engine.api.openDevtools(tabId)
+    } catch {
+      return
+    }
   })
-  ipcMain.handle("browser-hard-reload", (event, tabId: string) => {
+  ipcMain.handle("browser-hard-reload", async (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.hardReload(tabId)
+    try {
+      return await engine.api.hardReload(tabId)
+    } catch {
+      return
+    }
   })
-  ipcMain.handle("browser-clear-cookies", (event, tabId: string) => {
+  ipcMain.handle("browser-clear-cookies", async (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.clearCookies(tabId)
+    try {
+      return await engine.api.clearCookies(tabId)
+    } catch {
+      return
+    }
   })
-  ipcMain.handle("browser-clear-cache", (event, tabId: string) => {
+  ipcMain.handle("browser-clear-cache", async (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.clearCache(tabId)
+    try {
+      return await engine.api.clearCache(tabId)
+    } catch {
+      return
+    }
   })
   ipcMain.handle("browser-set-appearance", (event, appearance: "system" | "light" | "dark") => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.setAppearance(appearance)
   })
-  ipcMain.handle("browser-list-extensions", (event, tabId: string) => {
+  ipcMain.handle("browser-list-extensions", async (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.listExtensions(tabId)
+    try {
+      return await engine.api.listExtensions(tabId)
+    } catch {
+      // Stale tab (agent session) must not crash the renderer chrome menu
+      return []
+    }
   })
-  ipcMain.handle("browser-set-extension-enabled", (event, tabId: string, extensionId: string, enabled: boolean) => {
+  ipcMain.handle("browser-set-extension-enabled", async (event, tabId: string, extensionId: string, enabled: boolean) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.setExtensionEnabled(tabId, extensionId, enabled)
+    try {
+      return await engine.api.setExtensionEnabled(tabId, extensionId, enabled)
+    } catch {
+      return
+    }
   })
   ipcMain.handle("browser-get-guest-preload", (event) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")

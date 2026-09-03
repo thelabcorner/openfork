@@ -52,19 +52,39 @@ export function readLaunchConfig(): LaunchConfig {
     return { serverUrl, pairCode }
   }
 
-  const storedServer = readStorage(SERVER_URL_KEY)
+  let storedServer = readStorage(SERVER_URL_KEY)
+  // Migration: earlier builds stored the PWA origin itself (e.g.
+  // https://opencode.thedabcorner.site) as the API URL. That origin
+  // is a static Pages deployment and will always 500 on /pair/claim.
+  // If the baked VITE_OPENCODE_SERVER_URL points elsewhere, ignore the
+  // stale value so the baked URL (or ?server= param) can take over.
+  const baked = (import.meta.env.VITE_OPENCODE_SERVER_URL as string | undefined)?.trim()
+  try {
+    if (storedServer && baked && normalizeServerUrl(storedServer) === normalizeServerUrl(location.origin) && normalizeServerUrl(baked) !== normalizeServerUrl(location.origin)) {
+      try {
+        localStorage.removeItem(SERVER_URL_KEY)
+      } catch {}
+      storedServer = undefined
+    }
+  } catch {
+    // Invalid stored/baked URL — fall through to normal selection.
+  }
   const explicitServerUrl = selectLaunchServer({
     requested: params.get("server") ?? undefined,
-    fallback: storedServer ?? import.meta.env.VITE_OPENCODE_SERVER_URL,
+    fallback: storedServer ?? baked,
     pairCode,
     storedToken: readStorage(DEVICE_TOKEN_KEY),
     storedServer,
   })
   return {
-    // Server-minted launch URLs point at the API server itself, so a pair
-    // launch with no explicit server defaults to this page's origin. Never
-    // applied to normal launches.
-    serverUrl: pairCode && !explicitServerUrl ? location.origin : explicitServerUrl,
+    // In production the static PWA origin is never the API origin
+    // (see docs/plans/pwa-mobile/08-separate-origin.md). A pairing
+    // link from the desktop always carries ?server=, and manual code
+    // entry must use the baked VITE_OPENCODE_SERVER_URL or the
+    // previously stored value. Returning undefined here surfaces
+    // “No server URL set” instead of silently POSTing to the static
+    // host and getting a 500.
+    serverUrl: explicitServerUrl,
     pairCode,
   }
 }
@@ -144,7 +164,20 @@ export function pairClaimErrorMessage(error: unknown): string {
     if (body.data?.reason === "invalid") return "Unknown or already used code"
   }
   if (typeof body?.data?.message === "string") return body.data.message
-  return error.message || "Pair claim failed"
+  // The static PWA host (e.g. opencode.thedabcorner.site) has no /pair/claim.
+  // When the PWA posts there it gets a 500 with an empty body from Cloudflare
+  // Pages. Surface the API origin in that case so the user can tell it's the
+  // wrong instance and fix the server URL.
+  const raw = error.message || ""
+  if (cause?.status === 500 && (!body || Object.keys(body as object).length === 0)) {
+    return raw.includes("/pair/claim")
+      ? `${raw} — the API at this address is not an opencode server. Check the Server URL in Advanced and make sure the tunnel (OPENCODE_PUBLIC_URL) is running.`
+      : raw
+  }
+  if (raw.includes("Failed to fetch") || raw.includes("NetworkError") || raw.includes("Load failed")) {
+    return `${raw} — could not reach the API. Check the Server URL, tunnel, and that the server allows this PWA origin via --cors.`
+  }
+  return raw || "Pair claim failed"
 }
 
 export async function openEvents(

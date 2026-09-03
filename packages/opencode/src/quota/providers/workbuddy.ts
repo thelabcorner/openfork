@@ -1,6 +1,6 @@
 import { Effect } from "effect"
 import { AccountVault, accountLabels, stableAccountIdentity, type Credential } from "@/plugin/workbuddy-accounts"
-import { discoverWorkBuddyCatalog, workBuddyLimitSnapshot } from "@/plugin/workbuddy"
+import { discoverWorkBuddyCatalog, workBuddyLimitSnapshot, recordWorkBuddyPackageCredits } from "@/plugin/workbuddy"
 import { asObject, buildResult, toNumber, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import type { UsageWindow } from "../schema"
@@ -397,10 +397,17 @@ export const workbuddy = (fetchImpl: WorkBuddyFetch = globalThis.fetch.bind(glob
         let anyOk = false
         results.forEach((r, index) => {
           if (r.packages.length > 0 || !r.error) {
-            const label = labels.get(stableAccountIdentity(accounts[index]!)) ?? stableAccountIdentity(accounts[index]!)
+            const accountId = stableAccountIdentity(accounts[index]!)
+            const label = labels.get(accountId) ?? accountId
             Object.assign(windows, accountWindows(label, r.packages))
             allPackages.push(...r.packages)
             anyOk = true
+            // Opportunistically push the combined balance to the router so
+            // automatic account selection can avoid a 0-credit account
+            // instead of learning it the hard way via a wasted 402 — see
+            // `recordWorkBuddyPackageCredits`.
+            const combined = combinedBucket(r.packages)
+            if (combined.remaining !== null) recordWorkBuddyPackageCredits(accountId, combined.remaining)
           }
           if (r.error) errors.push(r.error)
         })
@@ -425,7 +432,12 @@ export const workbuddy = (fetchImpl: WorkBuddyFetch = globalThis.fetch.bind(glob
 
         const planLabel = accounts.length === 1 ? results[0]?.planLabel : undefined
         const workbuddyAccounts = workBuddyLimitSnapshot()
-        if (!anyOk && workbuddyAccounts.length === 0) {
+        // hy3/hy4-preview always get a placeholder entry (zero observed, no
+        // window hit yet) even on an account that has never routed a single
+        // request through it — that placeholder must not count as "we have
+        // data" and mask a real package-credit fetch failure (401/5xx).
+        const hasModelSignal = workbuddyAccounts.some((a) => a.models.some((m) => m.usedObserved > 0 || m.exhaustedObserved))
+        if (!anyOk && !hasModelSignal) {
           return buildResult({
             providerId: ID,
             providerName: NAME,

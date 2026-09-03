@@ -39,6 +39,7 @@ import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { Session } from "@/session/session"
 import { SessionGroup } from "@/session/group"
+import * as SessionContextProjector from "@/session/context/projector"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
 import { Todo } from "@/session/todo"
@@ -114,6 +115,7 @@ import { ptyConnectHandlers, ptyHandlers } from "./handlers/pty"
 import { questionHandlers } from "./handlers/question"
 import { quotaHandlers } from "./handlers/quota"
 import { sessionHandlers } from "./handlers/session"
+import { sessionContextHandlers } from "./handlers/session-context"
 import { sessionGroupHandlers } from "./handlers/session-group"
 import { syncHandlers } from "./handlers/sync"
 import { toolHandlers } from "./handlers/tool"
@@ -224,6 +226,7 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     providerHandlers,
     quotaHandlers,
     sessionHandlers,
+    sessionContextHandlers,
     sessionGroupHandlers,
     syncHandlers,
     toolHandlers,
@@ -300,6 +303,7 @@ const app = LayerNode.group([
   Session.node,
   SessionGroup.node,
   SessionProjector.node,
+  SessionContextProjector.node,
   SessionStatus.node,
   SessionUsage.node,
   BackgroundJob.node,

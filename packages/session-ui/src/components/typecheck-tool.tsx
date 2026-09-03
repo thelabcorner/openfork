@@ -1,6 +1,7 @@
-import { createMemo, For, Show } from "solid-js"
+import { createMemo, createSignal, For, Show } from "solid-js"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
 import { SmartToolOutput } from "./tool-output"
+import { ToolBadge, ToolBlock, ToolBoundedList, ToolEmpty, ToolPath, ToolRow, ToolStats } from "./tool-parts"
 
 function unescapeXml(text: string) {
   return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
@@ -64,48 +65,68 @@ function groupByFile(diagnostics: Diagnostic[]) {
   return [...groups.entries()].map(([file, items]) => ({ file, items }))
 }
 
-function TriageStrip(props: { counts: Record<"P0" | "P1" | "P2" | "P3", number> }) {
-  return (
-    <div data-component="typecheck-triage">
-      <For each={["P0", "P1", "P2", "P3"] as const}>
-        {(tier) => (
-          <Show when={props.counts[tier] > 0}>
-            <span data-slot="typecheck-triage-badge" data-tier={tier}>
-              {tier} · {props.counts[tier]}
-            </span>
-          </Show>
-        )}
-      </For>
-    </div>
-  )
+/**
+ * Typecheck output.
+ *
+ * The previous rendering printed every diagnostic's full message *and* its
+ * suggestion as stacked blocks, so an 80-error run buried the conversation. The
+ * suggestion is near-identical boilerplate across diagnostics, so it is only
+ * shown when a row is opened.
+ *
+ * Shape: stats → files (collapsed, bounded) → diagnostics (one line each,
+ * click to expand).
+ */
+
+const TIERS = ["P0", "P1", "P2", "P3"] as const
+
+function tierTone(tier: (typeof TIERS)[number]) {
+  if (tier === "P0") return "danger" as const
+  if (tier === "P1") return "warning" as const
+  return "neutral" as const
 }
 
 function DiagnosticRow(props: { diagnostic: Diagnostic }) {
+  const [open, setOpen] = createSignal(false)
+  const d = () => props.diagnostic
   return (
-    <div data-slot="typecheck-diagnostic" data-severity={props.diagnostic.severity}>
-      <div data-slot="typecheck-diagnostic-head">
-        <span data-slot="typecheck-diagnostic-severity">{props.diagnostic.severity}</span>
-        <span data-slot="typecheck-diagnostic-loc">
-          {props.diagnostic.line}:{props.diagnostic.column}
-        </span>
-        <span data-slot="typecheck-diagnostic-code">{props.diagnostic.code}</span>
-      </div>
-      <div data-slot="typecheck-diagnostic-message">{props.diagnostic.message}</div>
-      <Show when={props.diagnostic.suggestion}>
-        <div data-slot="typecheck-diagnostic-suggestion">{props.diagnostic.suggestion}</div>
+    <div data-component="typecheck-diagnostic" data-open={open() ? "true" : undefined}>
+      <ToolRow
+        onClick={() => setOpen(!open())}
+        lead={<span data-slot="typecheck-loc">{`${d().line}:${d().column}`}</span>}
+        primary={d().message}
+        mono={false}
+        trailing={<span data-slot="typecheck-code">{d().code}</span>}
+      />
+      <Show when={open()}>
+        <div data-slot="typecheck-detail">
+          <div data-slot="typecheck-detail-message">{d().message}</div>
+          <Show when={d().suggestion}>
+            <div data-slot="typecheck-detail-suggestion">{d().suggestion}</div>
+          </Show>
+        </div>
       </Show>
     </div>
   )
 }
 
-function FileGroup(props: { file: string; items: Diagnostic[] }) {
+function FileGroup(props: { file: string; items: Diagnostic[]; defaultOpen?: boolean }) {
+  const [open, setOpen] = createSignal(props.defaultOpen ?? false)
   return (
-    <div data-slot="typecheck-file-group">
-      <div data-slot="typecheck-file-header">
-        <span data-slot="typecheck-file-path">{props.file}</span>
-        <span data-slot="typecheck-file-count">{props.items.length}</span>
-      </div>
-      <For each={props.items}>{(d) => <DiagnosticRow diagnostic={d} />}</For>
+    <div data-component="typecheck-file" data-open={open() ? "true" : undefined}>
+      <ToolRow
+        onClick={() => setOpen(!open())}
+        lead={<span data-slot="typecheck-file-caret">{open() ? "▾" : "▸"}</span>}
+        primary={<ToolPath path={props.file} />}
+        truncate="start"
+        trailing={String(props.items.length)}
+      />
+      <Show when={open()}>
+        <div data-slot="typecheck-file-body">
+          <ToolBoundedList items={props.items} limit={10} scroll>
+            {(item) => <DiagnosticRow diagnostic={item} />}
+          </ToolBoundedList>
+        </div>
+      </Show>
     </div>
   )
 }
@@ -122,25 +143,43 @@ export function TypecheckOutput(props: { output: string }) {
     P3: extractInt(triageBlock(), "p3"),
   }))
   const diagnosticsBlock = createMemo(() => extractTag(root()?.inner ?? "", "diagnostics")?.inner)
-  const groups = createMemo(() => groupByFile(extractDiagnostics(diagnosticsBlock() ?? "")))
+  const diagnostics = createMemo(() => extractDiagnostics(diagnosticsBlock() ?? ""))
+  const groups = createMemo(() => groupByFile(diagnostics()))
+
+  const stats = createMemo(() => {
+    const items: { label: string; value: string; tone?: "danger" | "success" | "neutral" }[] = [
+      {
+        label: i18n.t("ui.tool.typecheck.stat.errors"),
+        value: String(diagnostics().length),
+        tone: diagnostics().length ? "danger" : "success",
+      },
+    ]
+    if (groups().length) items.push({ label: i18n.t("ui.tool.typecheck.stat.files"), value: String(groups().length) })
+    for (const tier of TIERS) {
+      if (counts()[tier] > 0) items.push({ label: tier, value: String(counts()[tier]) })
+    }
+    return items
+  })
 
   return (
     <Show when={root()} fallback={<SmartToolOutput output={props.output} />}>
-      <div data-component="typecheck-output">
-        <div data-slot="typecheck-status-banner" data-status={status()}>
-          <span data-slot="typecheck-status-label">
-            {status() === "passed" ? i18n.t("ui.tool.typecheck.passed") : i18n.t("ui.tool.typecheck.failed")}
-          </span>
-          <Show when={groups().length}>
-            <TriageStrip counts={counts()} />
-          </Show>
-        </div>
-        <Show when={groups().length}>
-          <div data-slot="typecheck-groups">
-            <For each={groups()}>{(group) => <FileGroup file={group.file} items={group.items} />}</For>
-          </div>
-        </Show>
-      </div>
+      <Show
+        when={diagnostics().length > 0}
+        fallback={
+          <ToolEmpty>
+            <ToolBadge tone="success">{i18n.t("ui.tool.typecheck.passed")}</ToolBadge>
+          </ToolEmpty>
+        }
+      >
+        <ToolStats items={stats()} />
+        <ToolBlock>
+          <ToolBoundedList items={groups()} limit={6}>
+            {(group, index) => (
+              <FileGroup file={group.file} items={group.items} defaultOpen={index === 0 && groups().length === 1} />
+            )}
+          </ToolBoundedList>
+        </ToolBlock>
+      </Show>
     </Show>
   )
 }

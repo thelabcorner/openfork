@@ -3,6 +3,7 @@ import type { Model } from "@opencode-ai/sdk/v2"
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "http"
 import { randomBytes } from "crypto"
 import { AdmissionError, type RunGenerationOpts } from "./workbuddy-governor"
+import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 import {
   AccountRegistry,
   AccountRouter,
@@ -122,6 +123,8 @@ type CatalogEntry = {
   name: string
   family: string
   context: number
+  /** Selectable context sizes advertised by WorkBuddy, including the default. */
+  contextWindows?: number[]
   output: number
   reasoning: boolean
   release: string
@@ -139,6 +142,32 @@ type CatalogEntry = {
   creditsLabel: string
   /** Active promotion badge, e.g. "Free now". */
   promotionLabel?: string
+}
+
+const CONTEXT_MODEL_MARKER = "#ctx-"
+
+function contextModelId(modelID: string, context: number): string {
+  return `${modelID}${CONTEXT_MODEL_MARKER}${context}`
+}
+
+export function decodeWorkBuddyContextModel(modelID: string): { model: string; contextWindowTokens?: number } {
+  const match = modelID.match(/^(.*)#ctx-(\d+)$/)
+  if (!match) return { model: modelID }
+  const contextWindowTokens = Number(match[2])
+  return Number.isSafeInteger(contextWindowTokens) && contextWindowTokens > 0
+    ? { model: match[1]!, contextWindowTokens }
+    : { model: modelID }
+}
+
+function formatContextWindow(context: number): string {
+  if (context >= 1_000_000) return `${context / 1_000_000}M context`
+  if (context >= 1_000) return `${Math.round(context / 1_000)}K context`
+  return `${context} context`
+}
+
+function contextWindowsFor(entry: CatalogEntry): number[] {
+  const values = [entry.context, ...(entry.contextWindows ?? [])].filter((value) => Number.isSafeInteger(value) && value > 0)
+  return [...new Set(values)].sort((a, b) => a - b)
 }
 
 /**
@@ -188,6 +217,18 @@ export function workBuddyLimitSnapshot(now = Date.now()) {
     label: labels.get(account.id) ?? account.id,
     models: account.governor.modelReports(now),
   }))
+}
+
+/**
+ * Pushed by the quota adapter (`quota/providers/workbuddy.ts`) after a fresh
+ * package-balance read succeeds. Tencent's backend runs its own
+ * Basic+Gift+Extra balance check before every generation regardless of a
+ * model's published rate, so `AccountRouter.select()` needs this cached
+ * figure to steer automatic (non-pinned) requests away from a known-drained
+ * account instead of discovering it the hard way with a wasted 402.
+ */
+export function recordWorkBuddyPackageCredits(accountId: string, combinedRemaining: number) {
+  accountRegistry.get(accountId)?.governor.setPackageCredits(combinedRemaining)
 }
 
 function backendFor(cred: Credential): string {
@@ -479,7 +520,9 @@ const discoveryCache = new Map<string, { at: number; catalog: CatalogEntry[] }>(
  * `workbuddy-ai/<version>` UA or it answers with a payload that has no models.
  */
 async function discoverCatalog(cred: Credential): Promise<CatalogEntry[] | null> {
-  return (await discoverFromConfig(cred)) ?? (await discoverFromEnterprise(cred))
+  // Parallelize the two catalog sources - worst-case 15s not 30s
+  const [fromConfig, fromEnterprise] = await Promise.all([discoverFromConfig(cred), discoverFromEnterprise(cred)])
+  return fromConfig ?? fromEnterprise
 }
 
 /**
@@ -537,12 +580,14 @@ function parseConfigPayload(json: any): CatalogEntry[] | null {
     // empty CLI list would otherwise hide every model.
     if (cliIds.size && !cliIds.has(id)) continue
     const credits = parseCreditRate(m?.credits)
+    const context = Number(m?.maxInputTokens ?? m?.contextWindow?.defaultLength ?? m?.maxAllowedSize ?? 0) || 0
+    const contextWindows = parseWorkBuddyContextWindows(m?.contextWindow, context)
     out.push({
       id,
       name: typeof m?.name === "string" && m.name ? m.name : id,
       family: familyFor(id, m?.vendor),
-      context:
-        Number(m?.maxInputTokens ?? m?.contextWindow?.defaultLength ?? m?.maxAllowedSize ?? 0) || 0,
+      context,
+      ...(contextWindows.length > 0 ? { contextWindows } : {}),
       output: Number(m?.maxOutputTokens ?? m?.maxTokens ?? 0) || 0,
       reasoning: Boolean(m?.supportsReasoning ?? m?.reasoning),
       release: typeof m?.release === "string" ? m.release : "",
@@ -554,6 +599,48 @@ function parseConfigPayload(json: any): CatalogEntry[] | null {
     })
   }
   return out.length ? out : null
+}
+
+/** Extract only explicit selectable sizes; min/max bounds are not choices. */
+export function parseWorkBuddyContextWindows(raw: unknown, fallback: number): number[] {
+  const values: number[] = []
+  const add = (value: unknown) => {
+    const n = typeof value === "number" ? value : typeof value === "string" && /^\d+$/.test(value) ? Number(value) : NaN
+    if (Number.isSafeInteger(n) && n > 0) values.push(n)
+  }
+  if (Array.isArray(raw)) {
+    for (const item of raw) {
+      if (item && typeof item === "object") {
+        const record = item as Record<string, unknown>
+        add(record.tokens ?? record.tokenCount ?? record.length ?? record.size ?? record.value)
+      } else add(item)
+    }
+  } else if (raw && typeof raw === "object") {
+    const object = raw as Record<string, unknown>
+    for (const key of [
+      "supportedLengths",
+      "allowedLengths",
+      "availableLengths",
+      "lengths",
+      "windowSizes",
+      "contextSizes",
+      "supported",
+      "presets",
+      "choices",
+      "values",
+    ]) {
+      const list = object[key]
+      if (Array.isArray(list)) for (const item of list) {
+        if (item && typeof item === "object") {
+          const record = item as Record<string, unknown>
+          add(record.tokens ?? record.tokenCount ?? record.length ?? record.size ?? record.value)
+        } else add(item)
+      }
+    }
+    add(object.defaultLength)
+  }
+  add(fallback)
+  return [...new Set(values)].sort((a, b) => a - b)
 }
 
 /**
@@ -676,6 +763,12 @@ function mergeCatalog(staticCatalog: CatalogEntry[], live: CatalogEntry[]): Cata
       name: e.name || cur.name,
       family: e.family && e.family !== "unknown" ? e.family : cur.family,
       context: Math.max(cur.context, e.context),
+      contextWindows: contextWindowsFor({
+        ...cur,
+        ...e,
+        context: Math.max(cur.context, e.context),
+        contextWindows: [...(cur.contextWindows ?? []), ...(e.contextWindows ?? [])],
+      }),
       output: e.output || cur.output,
       reasoning: e.reasoning || cur.reasoning,
       attachment: e.attachment || cur.attachment,
@@ -739,10 +832,14 @@ function priorityFor(payload: any, messages: any[]): number {
   return 2
 }
 
-function decodeAccountModel(requestedModel: string): { model: string; accountId?: string } {
-  const separator = requestedModel.lastIndexOf("@wb-")
-  if (separator <= 0) return { model: requestedModel }
-  return { model: requestedModel.slice(0, separator), accountId: requestedModel.slice(separator + 1) }
+function decodeAccountModel(requestedModel: string): { model: string; accountId?: string; contextWindowTokens?: number } {
+  const split = splitAccountModelID(requestedModel, [{ id: "workbuddy", accountPrefix: "wb-", aliasMarkers: ["#ctx-"] }])
+  const context = decodeWorkBuddyContextModel(split.baseModelID)
+  return {
+    model: context.model,
+    ...(split.accountID ? { accountId: split.accountID } : {}),
+    ...(context.contextWindowTokens !== undefined ? { contextWindowTokens: context.contextWindowTokens } : {}),
+  }
 }
 
 async function handleCompletions(req: IncomingMessage, res: ServerResponse, payload: any) {
@@ -789,11 +886,12 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
     stream: true,
     stream_options: { include_usage: true },
   }
+  if (decoded.contextWindowTokens !== undefined) body.context_window_tokens = decoded.contextWindowTokens
   // Pass through the OpenAI fields the backend understands.
   for (const key of [
     "tools", "tool_choice", "temperature", "top_p", "stop",
     "presence_penalty", "frequency_penalty", "reasoning_effort",
-    "max_tokens", "max_completion_tokens", "response_format", "user",
+    "max_tokens", "max_completion_tokens", "response_format", "user", "context_window_tokens", "contextWindowTokens",
   ]) {
     if (payload?.[key] !== undefined) body[key] = payload[key]
   }
@@ -888,6 +986,10 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
       } catch {
         // Client cancellation/upstream drop: release in finally below.
       }
+      // Credit/token accounting is per completed generation, so it is recorded
+      // once here — after the body is drained — rather than per SSE chunk, and
+      // only on a path that actually reached the client.
+      account.governor.recordUsage(requestedModel, acc.usage)
       if (!cancellation.signal.aborted && !res.writableEnded && !res.destroyed) {
         return sendJson(res, 200, completionFrom(acc, requestedModel))
       }
@@ -904,6 +1006,11 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
     const reader = upstream.body.getReader()
     const decoder = new TextDecoder()
     let buffer = ""
+    // The streamed path still needs the usage object: the final chunk carries
+    // the per-request credit/token accounting, and without absorbing it the
+    // governor would never learn real spend for streaming callers (the common
+    // case for the agent loop).
+    const acc = newAccumulator(requestedModel)
     try {
       for (;;) {
         const { done, value } = await reader.read()
@@ -912,12 +1019,18 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
         buffer += decoder.decode(value, { stream: true })
         for (const [chunk, rest] of parseSSE(buffer)) {
           if (cancellation.signal.aborted || res.destroyed) break
+          absorb(acc, chunk)
           res.write(`data: ${JSON.stringify(chunk)}\n\n`)
           buffer = rest
         }
       }
     } catch {
       // Client disconnected or upstream dropped mid-stream.
+    }
+    // Record only when the stream ran to completion: a cancelled or truncated
+    // generation produced no final usage and must not be counted.
+    if (!cancellation.signal.aborted && !res.destroyed) {
+      account.governor.recordUsage(requestedModel, acc.usage)
     }
     if (!res.writableEnded && !res.destroyed && !cancellation.signal.aborted) {
       res.write("data: [DONE]\n\n")
@@ -970,16 +1083,17 @@ async function ensureProxy(): Promise<ProxyState | undefined> {
           const accounts = accountRegistry.all()
           const selectedId = url.searchParams.get("account") ?? undefined
           const selected = selectedId ? accounts.find((account) => account.id === selectedId) : accounts[0]
-          const output: any[] = []
-          const seen = new Set<string>()
-          for (const account of accounts) {
+        const output: any[] = []
+        const seen = new Set<string>()
+        for (const account of accounts) {
             if (selected && account.id !== selected.id && selectedId) continue
             const catalog = await catalogFor(account)
             for (const entry of catalog) {
-              const id = selectedId ? entry.id : `${entry.id}@${account.id}`
-              if (seen.has(id)) continue
-              seen.add(id)
-              output.push({ id, object: "model", created: 0, owned_by: `${PROVIDER_ID}:${account.id}`, context: entry.context })
+              for (const item of exposedModels("", entry, selectedId ? undefined : account.id)) {
+                if (seen.has(item.id)) continue
+                seen.add(item.id)
+                output.push({ id: item.id, object: "model", created: 0, owned_by: `${PROVIDER_ID}:${account.id}`, context: item.limit.context })
+              }
             }
           }
           // Keep the ergonomic default `workbuddy/hy4-preview` for automatic
@@ -987,7 +1101,11 @@ async function ensureProxy(): Promise<ProxyState | undefined> {
           if (!selectedId && selected) {
             const catalog = await catalogFor(selected)
             for (const entry of catalog) {
-              if (!seen.has(entry.id)) output.push({ id: entry.id, object: "model", created: 0, owned_by: PROVIDER_ID, context: entry.context })
+              for (const item of exposedModels("", entry)) {
+                if (seen.has(item.id)) continue
+                seen.add(item.id)
+                output.push({ id: item.id, object: "model", created: 0, owned_by: PROVIDER_ID, context: item.limit.context })
+              }
             }
           }
           return sendJson(res, 200, { object: "list", data: output })
@@ -1027,20 +1145,31 @@ async function ensureProxy(): Promise<ProxyState | undefined> {
 
 // ------------------------------------------------------------------------ plugin
 
-function toModel(baseURL: string, headers: Record<string, string>, entry: CatalogEntry, exposedId = entry.id, accountLabel?: string): Model {
+function toModel(
+  baseURL: string,
+  headers: Record<string, string>,
+  entry: CatalogEntry,
+  exposedId = entry.id,
+  accountLabel?: string,
+  contextWindowTokens = entry.context,
+): Model {
+  const hasAlternateContext = contextWindowsFor(entry).length > 1 && exposedId.includes(CONTEXT_MODEL_MARKER)
   return {
     id: exposedId,
     providerID: PROVIDER_ID,
     // Account-qualified models show a human label (nickname, usually the email)
     // instead of the `wb-...` routing id, which is unreadable in a picker.
-    name: accountLabel ? `${entry.name} (${accountLabel})` : entry.name,
+    name: `${accountLabel ? `${entry.name} (${accountLabel})` : entry.name}${hasAlternateContext ? ` (${formatContextWindow(contextWindowTokens)})` : ""}`,
     family: entry.family,
-    api: { id: entry.id, url: baseURL, npm: NPM },
+    // Keep the exposed alias on the transport model so the loopback proxy can
+    // recover the selected context size and account before forwarding the bare
+    // WorkBuddy catalog id upstream.
+    api: { id: exposedId, url: baseURL, npm: NPM },
     status: "active",
     headers,
     options: {},
     cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
-    limit: { context: entry.context, output: entry.output },
+    limit: { context: contextWindowTokens, output: entry.output },
     capabilities: {
       temperature: true,
       reasoning: entry.reasoning,
@@ -1051,8 +1180,20 @@ function toModel(baseURL: string, headers: Record<string, string>, entry: Catalo
       interleaved: true,
     },
     release_date: entry.release,
-    variants: {},
+    variants: undefined,
   }
+}
+
+function exposedModels(baseURL: string, entry: CatalogEntry, accountId?: string, accountLabel?: string, headers: Record<string, string> = {}) {
+  const windows = contextWindowsFor(entry)
+  const suffix = accountId ? `@${accountId}` : ""
+  const models: Model[] = [toModel(baseURL, headers, entry, `${entry.id}${suffix}`, accountLabel, entry.context)]
+  for (const context of windows) {
+    if (context === entry.context) continue
+    const id = `${contextModelId(entry.id, context)}${suffix}`
+    models.push(toModel(baseURL, headers, entry, id, accountLabel, context))
+  }
+  return models
 }
 
 function oauthMethod(realm: WorkBuddyOAuthRealm, label: string) {
@@ -1102,14 +1243,12 @@ export async function WorkBuddyPlugin(_input: PluginInput): Promise<Hooks> {
         const accounts = accountRegistry.all()
         const labels = accountLabels(accounts)
         const merged: Record<string, Model> = { ...provider.models }
-        const used = new Set<string>()
-
         for (const account of accounts) {
           const catalog = await catalogFor(account)
           for (const entry of catalog) {
-            const exposedId = `${entry.id}@${account.id}`
-            merged[exposedId] = toModel(baseURL, { ...headers, "X-WorkBuddy-Account": account.id }, entry, exposedId, labels.get(account.id))
-            used.add(entry.id)
+            for (const item of exposedModels(baseURL, entry, account.id, labels.get(account.id), { ...headers, "X-WorkBuddy-Account": account.id })) {
+              merged[item.id] = item
+            }
           }
         }
 
@@ -1119,7 +1258,9 @@ export async function WorkBuddyPlugin(_input: PluginInput): Promise<Hooks> {
         if (first) {
           const catalog = await catalogFor(first)
           for (const entry of catalog) {
-            if (!merged[entry.id] || !used.has(entry.id)) merged[entry.id] = toModel(baseURL, headers, entry)
+            if (!merged[entry.id]) {
+              for (const item of exposedModels(baseURL, entry, undefined, undefined, headers)) merged[item.id] = item
+            }
           }
         }
         return merged

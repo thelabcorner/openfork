@@ -10,9 +10,8 @@ import { matchesModelSearch } from "../dialog-select-model-search"
 import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
 import { FreeUsageBar, FreeUsageModelsTable } from "@/components/openrouter-free-usage-bar"
 import { useSDK } from "@/context/sdk"
-import { useSync } from "@/context/sync"
 import { buildPersonalFallbackMap, buildPricingFallbackMap, compareByCheapness } from "@/utils/model-cost"
-import { buildModelCostIndex } from "@/utils/model-usage-history"
+import { usePersonalUsage } from "@/context/personal-usage"
 import { Section } from "@/components/session/insights-primitives"
 import "../settings-v2/settings-v2.css"
 
@@ -78,18 +77,15 @@ export function ModelsPanelContent() {
     model.list().filter((item) => model.visible({ modelID: item.id, providerID: item.provider.id })),
   )
 
-  let sync: ReturnType<typeof useSync> | undefined
+  let personal: ReturnType<typeof usePersonalUsage> | undefined
   try {
-    sync = useSync()
+    personal = usePersonalUsage()
   } catch {
-    sync = undefined
+    personal = undefined
   }
   const personalCosts = createMemo(() => {
-    if (!sync) return undefined
-    const idx = buildModelCostIndex(sync().data.message)
-    if (idx.size === 0) return undefined
-    const map = new Map<string, { cost: number; count: number }>()
-    for (const [k, entry] of idx.entries()) map.set(k, { cost: entry.sum / entry.count, count: entry.count })
+    const map = personal?.personalCosts()
+    if (!map || map.size === 0) return undefined
     return map
   })
   const pricingFallback = createMemo(() => {

@@ -632,6 +632,7 @@ export type CompactionPart = {
   messageID: string
   type: "compaction"
   auto: boolean
+  continueAfter?: boolean
   overflow?: boolean
   tail_start_id?: string
 }
@@ -2502,6 +2503,7 @@ export type FileNode = {
   ignored: boolean
   size?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   mtime?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  lineCount?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
 export type FileContent = {
@@ -2888,6 +2890,72 @@ export type SessionBusyError = {
   _tag: "SessionBusyError"
   sessionID: string
   message: string
+}
+
+export type SessionContextOperation =
+  | {
+      type: "message.exclude"
+      messageID: string
+    }
+  | {
+      type: "message.include"
+      messageID: string
+    }
+  | {
+      type: "text.replace"
+      messageID: string
+      partID?: string
+      content: string
+    }
+  | {
+      type: "text.restore"
+      messageID: string
+      partID?: string
+    }
+  | {
+      type: "message.pin"
+      messageID: string
+    }
+  | {
+      type: "message.unpin"
+      messageID: string
+    }
+  | {
+      type: "tool.collapse"
+      messageID: string
+      partID: string
+    }
+  | {
+      type: "tool.restore"
+      messageID: string
+      partID: string
+    }
+
+export type SessionContextLedgerEntry = {
+  messageID: string
+  type: "system" | "user" | "assistant" | "tool" | "compaction"
+  role: string
+  preview: string
+  tokenEstimate: number
+  excluded: boolean
+  pinned: boolean
+  edited: boolean
+  hasSignedReasoning: boolean
+  partCount: number
+  timeCreated: number
+}
+
+export type SessionContextLedger = {
+  sessionID: string
+  entries: Array<SessionContextLedgerEntry>
+  totals: {
+    messageCount: number
+    excludedCount: number
+    pinnedCount: number
+    editedCount: number
+    estimatedTokens: number
+    estimatedTokensExcluded: number
+  }
 }
 
 export type ToolReloadResponse =
@@ -5541,6 +5609,7 @@ export type FileSystemEntry = {
   type: "file" | "directory"
   size?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   mtime?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  lineCount?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
 export type FileSystemWriteResult = {
@@ -10774,6 +10843,74 @@ export type QuotaGetResponses = {
       accountLabels?: {
         [key: string]: string
       }
+      workbuddyAccounts?: Array<{
+        accountId: string
+        label: string
+        models: Array<{
+          model: string
+          canonical: string
+          unit: string
+          usedObserved: number
+          limitEstimate: number
+          remainingEstimate: number
+          remainingPercent: number
+          status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted" | "unknown"
+          confidence: "low" | "medium" | "high"
+          accuracy: "observed" | "estimate" | "server-confirmed"
+          exhaustedObserved: boolean
+          serverCode: number
+          resetAt: number
+          resetSource: "server-6004" | "inferred" | "unknown"
+          windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
+          windowStartedAt: number
+          secondsUntilReset: number
+          lastObservationAt: number
+          burnPerHour: number
+          estimatedExhaustionAt: number
+          willLikelyExhaustBeforeReset: boolean
+          creditsObserved: number
+          tokensInput: number
+          tokensOutput: number
+          tokensCacheHit: number
+          tokensCacheMiss: number
+          creditsPersonalized: boolean
+          coverage: "opencode-only"
+        }>
+      }>
+      verdentAccounts?: Array<{
+        accountId: string
+        label: string
+        models: Array<{
+          model: string
+          canonical: string
+          unit: string
+          usedObserved: number
+          limitEstimate: number
+          remainingEstimate: number
+          remainingPercent: number
+          status: "healthy" | "draining" | "low" | "critical" | "terminal" | "depleted" | "unknown"
+          confidence: "low" | "medium" | "high"
+          accuracy: "observed" | "estimate" | "server-confirmed"
+          exhaustedObserved: boolean
+          serverCode: number
+          resetAt: number
+          resetSource: "server-6004" | "inferred" | "unknown"
+          windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
+          windowStartedAt: number
+          secondsUntilReset: number
+          lastObservationAt: number
+          burnPerHour: number
+          estimatedExhaustionAt: number
+          willLikelyExhaustBeforeReset: boolean
+          creditsObserved: number
+          tokensInput: number
+          tokensOutput: number
+          tokensCacheHit: number
+          tokensCacheMiss: number
+          creditsPersonalized: boolean
+          coverage: "opencode-only"
+        }>
+      }>
     }
     fetchedAt: number
     nextRefreshAt?: number
@@ -11270,6 +11407,9 @@ export type SessionMessageResponse = SessionMessageResponses[keyof SessionMessag
 export type SessionForkData = {
   body?: {
     messageID?: string
+    edge?: "before" | "after"
+    kind?: "manual" | "regenerate" | "temporary" | "model-comparison"
+    workspaceMode?: "shared-current" | "new-worktree"
   }
   path: {
     sessionID: string
@@ -11932,6 +12072,203 @@ export type PartUpdateResponses = {
 }
 
 export type PartUpdateResponse = PartUpdateResponses[keyof PartUpdateResponses]
+
+export type SessionContextApplyOpsData = {
+  body?: {
+    operations: Array<SessionContextOperation>
+  }
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/context/ops"
+}
+
+export type SessionContextApplyOpsErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionContextApplyOpsError = SessionContextApplyOpsErrors[keyof SessionContextApplyOpsErrors]
+
+export type SessionContextApplyOpsResponses = {
+  /**
+   * Context ops applied
+   */
+  200: {
+    batchID: string
+    timestamp: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type SessionContextApplyOpsResponse = SessionContextApplyOpsResponses[keyof SessionContextApplyOpsResponses]
+
+export type SessionContextOpsHistoryData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/context/ops/history"
+}
+
+export type SessionContextOpsHistoryErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionContextOpsHistoryError = SessionContextOpsHistoryErrors[keyof SessionContextOpsHistoryErrors]
+
+export type SessionContextOpsHistoryResponses = {
+  /**
+   * Context operation history
+   */
+  200: Array<{
+    id: string
+    batchID: string
+    operations: Array<unknown>
+    timestamp: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }>
+}
+
+export type SessionContextOpsHistoryResponse =
+  SessionContextOpsHistoryResponses[keyof SessionContextOpsHistoryResponses]
+
+export type SessionContextLedgerData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/context/ledger"
+}
+
+export type SessionContextLedgerErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionContextLedgerError = SessionContextLedgerErrors[keyof SessionContextLedgerErrors]
+
+export type SessionContextLedgerResponses = {
+  /**
+   * Context ledger
+   */
+  200: SessionContextLedger
+}
+
+export type SessionContextLedgerResponse = SessionContextLedgerResponses[keyof SessionContextLedgerResponses]
+
+export type SessionContextPreviewData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/context/preview"
+}
+
+export type SessionContextPreviewErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionContextPreviewError = SessionContextPreviewErrors[keyof SessionContextPreviewErrors]
+
+export type SessionContextPreviewResponses = {
+  /**
+   * Context preview
+   */
+  200: {
+    beforeTokens: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    afterTokens: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    removedTokens: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    messageCount: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    effectiveCount: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    earliestMutationIndex?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type SessionContextPreviewResponse = SessionContextPreviewResponses[keyof SessionContextPreviewResponses]
+
+export type SessionContextForkOriginData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/session/{sessionID}/fork-origin"
+}
+
+export type SessionContextForkOriginErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+}
+
+export type SessionContextForkOriginError = SessionContextForkOriginErrors[keyof SessionContextForkOriginErrors]
+
+export type SessionContextForkOriginResponses = {
+  /**
+   * Fork origin
+   */
+  200: {
+    sessionID: string
+    parentSessionID: string
+    sourceMessageID?: string
+    edge?: string
+    kind: string
+    workspaceMode: string
+    createdAt: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+}
+
+export type SessionContextForkOriginResponse =
+  SessionContextForkOriginResponses[keyof SessionContextForkOriginResponses]
 
 export type SessionGroupListData = {
   body?: never
@@ -12876,6 +13213,8 @@ export type UsageSummaryResponses = {
         reasoning: number
       }
       share: number
+      durationMs: number
+      durationRecords: number
     }>
     models: Array<{
       providerID: string
@@ -12894,6 +13233,8 @@ export type UsageSummaryResponses = {
       }
       share: number
       cacheSavings: number
+      durationMs: number
+      durationRecords: number
     }>
     variants: Array<{
       variant: string
@@ -12920,6 +13261,7 @@ export type UsageSummaryResponses = {
       cost: number
       tokens: number
       messages: number
+      sessions: number
     }>
     dow: [
       {
@@ -12958,6 +13300,23 @@ export type UsageSummaryResponses = {
         messages: number
       },
     ]
+    punchcard: Array<{
+      cost: number
+      tokens: number
+      messages: number
+    }>
+    sessions: Array<{
+      sessionID: string
+      title: string
+      projectID: string
+      projectName: string
+      messages: number
+      cost: number
+      tokens: number
+      models: number
+      start: number
+      end: number
+    }>
     hours: [
       {
         cost: number

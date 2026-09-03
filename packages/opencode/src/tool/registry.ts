@@ -21,6 +21,7 @@ import { ArchiveTool } from "./archive"
 import { JsonTool } from "./json"
 import { BackgroundTool } from "./background"
 import { MonitorTool } from "./monitor"
+import { MemoryTool } from "./memory"
 import { SqliteTool } from "./sqlite"
 import { GitTool } from "./git"
 import { CheckpointTool } from "./checkpoint"
@@ -98,6 +99,7 @@ import { MCP } from "@/mcp"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { AppProcess } from "@opencode-ai/core/process"
 import { McpCatalog } from "@/mcp/catalog"
+import { Memory } from "@opencode-ai/core/memory"
 
 export function webSearchEnabled(
   providerID: ProviderV2.ID,
@@ -176,6 +178,7 @@ const layer = Layer.effect(
     const jsontool = yield* JsonTool
     const backgroundtool = yield* BackgroundTool
     const monitortool = yield* MonitorTool
+    const memorytool = yield* MemoryTool
     const sqlitetool = yield* SqliteTool
     const gittool = yield* GitTool
     const checkpointtool = yield* CheckpointTool
@@ -247,6 +250,7 @@ const layer = Layer.effect(
           json: Tool.init(jsontool),
           background: Tool.init(backgroundtool),
           monitor: Tool.init(monitortool),
+          memory: Tool.init(memorytool),
           sqlite: Tool.init(sqlitetool),
           git: Tool.init(gittool),
           checkpoint: Tool.init(checkpointtool),
@@ -310,6 +314,7 @@ const layer = Layer.effect(
             tool.json,
             tool.background,
             tool.monitor,
+            tool.memory,
             tool.sqlite,
             tool.git,
             tool.checkpoint,
@@ -519,6 +524,7 @@ export const node = LayerNode.make({
     Ripgrep.node,
     RipgrepBinary.node,
     BrokerClient.node,
+    Memory.node,
   ],
 })
 

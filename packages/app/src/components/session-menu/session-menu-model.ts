@@ -34,6 +34,10 @@ export type SessionMenuActions = {
   copySessionId?: () => void
   renameSession?: () => void
   togglePin?: () => void
+  newSessionInProject?: () => void
+  openProjectInExplorer?: () => void
+  copyProjectPath?: () => void
+  forkConversation?: () => void
 }
 
 export type SessionMenuModelInput = {
@@ -373,6 +377,30 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
     })
   } else if (input.where === "group-tab") {
     // Fallback — already handled via isGroup above, but keep for type safety
+  }
+
+  if (hasSession && !input.isGroup && input.actions.newSessionInProject) {
+    sections.push({
+      id: "newSession",
+      items: [{
+        kind: "item",
+        id: "newSessionInProject",
+        label: t("command.session.newInProject"),
+        icon: "plus",
+        onSelect: () => input.actions.newSessionInProject?.(),
+      }],
+    })
+  }
+
+  if (hasSession && !input.isGroup && (input.actions.openProjectInExplorer || input.actions.copyProjectPath)) {
+    sections.push({ id: "project", items: [
+      ...(input.actions.openProjectInExplorer ? [{ kind: "item" as const, id: "openProjectInExplorer", label: t("session.header.reveal.fileExplorer"), icon: "folder" as const, onSelect: () => input.actions.openProjectInExplorer?.() }] : []),
+      ...(input.actions.copyProjectPath ? [{ kind: "item" as const, id: "copyProjectPath", label: t("session.header.open.copyPath"), icon: "outline-copy" as const, onSelect: () => input.actions.copyProjectPath?.() }] : []),
+    ] })
+  }
+
+  if (hasSession && !input.isGroup && input.actions.forkConversation) {
+    sections.push({ id: "fork", items: [{ kind: "item", id: "forkConversation", label: t("command.session.fork"), icon: "branch", onSelect: () => input.actions.forkConversation?.() }] })
   }
 
   // ── Section 5: close / archive

@@ -53,14 +53,46 @@ export function createSingleFlight() {
         return exit.value
       }
       const failure = Cause.squash(exit.cause)
+      // The "Request failed" placeholder used to hide whatever the adapter
+      // actually threw. Real causes are a mix: an `Error` (most), a defect
+      // string (e.g. `throw "upstream busy"`), a structured object, or
+      // `undefined` (an interrupt). Coerce each into something a user can
+      // act on — a generic fallback is a UX failure, not a safe default.
+      const reason = describeCause(failure)
       const failureResult = buildResult({
         providerId: key,
         providerName: key,
         ok: false,
         configured: true,
-        error: failure instanceof Error ? failure.message : "Request failed",
+        error: reason,
       })
       yield* Deferred.succeed(deferred, failureResult)
       return failureResult
     })
+}
+
+/**
+ * Best-effort human-readable rendering of whatever an adapter threw. The
+ * previous "Request failed" fallback hid real failures behind a generic
+ * placeholder — every user who has ever asked "why does the WorkBuddy card
+ * just say Request failed?" was a victim of that. Coerce defensively:
+ * Errors carry a useful message, plain objects may carry `.message`/`.name`,
+ * primitives stringify safely, and `undefined` (an interrupt) gets a real
+ * reason rather than a vanishing placeholder.
+ */
+function describeCause(failure: unknown): string {
+  if (failure instanceof Error) return failure.message || failure.name || "Adapter threw an error"
+  if (failure === null) return "Adapter returned null"
+  if (failure === undefined) return "Adapter exited without a result"
+  if (typeof failure === "string") return failure
+  if (typeof failure === "number" || typeof failure === "boolean" || typeof failure === "bigint") return String(failure)
+  if (typeof failure === "object") {
+    const obj = failure as { message?: unknown; name?: unknown; error?: unknown }
+    if (typeof obj.message === "string" && obj.message.length > 0) return obj.message
+    if (typeof obj.name === "string" && obj.name.length > 0) {
+      return typeof obj.error === "string" && obj.error.length > 0 ? `${obj.name}: ${obj.error}` : obj.name
+    }
+    if (typeof obj.error === "string" && obj.error.length > 0) return obj.error
+  }
+  return "Adapter threw a non-error value"
 }

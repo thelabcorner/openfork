@@ -9,11 +9,76 @@
 
 ## Local Dev
 
+**The ONLY sanctioned way to run this app is `bun run dev` from `packages/desktop`.** It runs
+`concurrently` with two halves: `desktop` (`scripts/dev-electron.ts` → `electron-vite dev` → Electron,
+which spawns the opencode **sidecar** backend) and `pwa` (`bun --cwd ../mobile dev`, Vite on **:3301**).
+
+- The desktop UI you are changing renders **inside Electron**, from the electron-vite renderer dev
+  server on **`:5173`**. Loading `:5173` in an ordinary browser does NOT work — it dies with
+  `TypeError: api.subscribe is not a function` because the Electron preload bridge is absent.
+- `:3301` is the **mobile PWA pairing client**, not the desktop UI. It shows a "Pair this device"
+  QR screen. Do not use it to verify desktop UI changes.
+- `:3301` proxies the `API_PREFIXES` (see `packages/mobile/vite.config.ts`) to the sidecar, whose URL
+  it reads **per request** from the well-known file `packages/mobile/.opencode-dev-url`. The sidecar
+  binds an ephemeral port, so this file — not any hardcoded number — is the single source of truth
+  for the backend address.
+- If `/quota/providers` (or any API prefix) on `:3301` returns **503 `DesktopSidecarUnavailableError`**,
+  the Electron half is not running. `.opencode-dev-url` will be missing. Fix that by getting the desktop
+  app running — do NOT start a standalone backend to work around it.
 - `opencode dev web` proxies `https://app.opencode.ai`, so local UI/CSS changes will not show there.
-- For local UI changes, run the backend and app dev servers separately.
-- Backend (from `packages/opencode`): `bun run --conditions=browser ./src/index.ts serve --port 4096`
-- App (from `packages/app`): `bun dev -- --port 4444`
-- Open `http://localhost:4444` to verify UI changes (it targets the backend at `http://localhost:4096`).
+
+### NEVER do this (this has burned real debugging time)
+
+- **Do NOT start your own backend** with `bun run --conditions=browser ./src/index.ts serve --port 4096`,
+  and do NOT start `packages/app`'s Vite standalone (`bun dev -- --port 4444`). Neither is wired to the
+  sidecar this app actually uses. This was the previous contents of this section; it was wrong.
+- **Many unrelated OpenCode instances run on this machine at all times, and that is expected** — the user
+  keeps different versions for different purposes. Examples seen in the wild: WebStorm's bundled ACP agents
+  (`~/AppData/Local/JetBrains/WebStorm*/acp-agents/opencode/<version>/opencode.exe acp`, often a dozen of
+  them) and `:4096`. **A listening port is not evidence it is our backend.**
+- Consequence of getting this wrong: you talk to a *stale, different-version* server, its routes 404 into
+  the SPA HTML fallback, and the app dies at boot with
+  `Request is not supported by this version of OpenCode Server (Server responded with text/html)`.
+  That error means **you are on the wrong backend**, not that a route is missing.
+
+### Inspecting the running desktop UI (CDP)
+
+The only way to inspect the real renderer is Chrome DevTools Protocol:
+
+```sh
+# from packages/desktop. `unset` is REQUIRED: this shell inherits
+# ELECTRON_RUN_AS_NODE from the host, which makes Electron boot as plain Node and
+# die with "The requested module 'electron' does not provide an export named
+# 'BrowserWindow'". scripts/dev-electron.ts deletes it for exactly this reason.
+unset ELECTRON_RUN_AS_NODE && bunx electron-vite dev --remoteDebuggingPort 9222
+```
+
+Then drive `http://127.0.0.1:9222/json/list` → the page whose url contains `5173`, and issue
+`Runtime.evaluate` over its `webSocketDebuggerUrl`. The Project Explorer only mounts on a **session**
+page, not the home/chats view, so navigate to a session first (`a[data-slot="tab-link"]`, dispatching
+`pointerdown`/`mousedown`/`mouseup`/`click` — a bare `.click()` does not navigate) and then use the
+`button[aria-label="Toggle project explorer"]`.
+
+### Changing packages/core? You MUST rebuild the sidecar
+
+`electron-vite dev` alone does **not** rebuild the sidecar. The sidecar is a prebuilt bundle produced
+by `bun run predev` (`buildLocalCliToResources()` + `build-node.ts`); its own comment reads *"the
+hodgepodge means dev sidecar != the exe"*. `bun run dev` runs `predev` automatically via the npm
+lifecycle hook, but invoking `electron-vite dev` directly skips it. Edits to `packages/core`
+(FileIndex, filesystem, quota, …) will silently have no effect until you run `bun run predev` and
+restart Electron. Symptom: your fix is in the source, tests pass, and the running app is unchanged.
+
+### Identify the right process before debugging
+
+Never infer the backend from `netstat` alone. Confirm the command line:
+
+```sh
+# our dev runner (expect: concurrently -n desktop,pwa ... packages/desktop)
+powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -match 'concurrently|electron-vite' } | Select-Object ProcessId,CommandLine | Format-List"
+
+# the authoritative backend URL (missing => sidecar is down)
+cat packages/mobile/.opencode-dev-url
+```
 
 ## API Clients — Which SDK to Use (app is hybrid)
 

@@ -975,173 +975,142 @@
   overflow: hidden;
 }
 
-[data-component="typecheck-output"] {
+[data-component="skill-empty-state"] {
+  padding: 10px 12px;
+  border: 0.5px dashed var(--v2-border-border-base);
+  border-radius: 8px;
+  font-size: 12.5px;
+  color: var(--v2-text-text-faint, var(--text-weak));
+}
+
+[data-component="skill-loaded-list"] {
   display: flex;
   flex-direction: column;
   gap: 8px;
   width: 100%;
-
-  [data-slot="typecheck-status-banner"] {
-    --typecheck-color: var(--v2-green-700, #15803d);
-
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    padding: 6px 10px;
-    border-radius: 8px;
-    border: 0.5px solid color-mix(in srgb, var(--typecheck-color) 28%, transparent);
-    background: color-mix(in srgb, var(--typecheck-color) 8%, transparent);
-
-    &[data-status="failed"] {
-      --typecheck-color: var(--icon-negative, #f1484f);
-    }
-  }
-
-  [data-slot="typecheck-status-label"] {
-    font-size: 12.5px;
-    font-weight: var(--font-weight-medium);
-    color: var(--typecheck-color);
-  }
 }
 
-[data-component="typecheck-triage"] {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  margin-inline-start: auto;
-
-  [data-slot="typecheck-triage-badge"] {
-    --tier-color: var(--v2-text-text-muted);
-
-    display: inline-flex;
-    align-items: center;
-    padding: 2px 6px;
-    border-radius: 4px;
-    font-size: 10.5px;
-    font-weight: var(--font-weight-medium);
-    font-variant-numeric: tabular-nums;
-    color: var(--tier-color);
-    background: color-mix(in srgb, var(--tier-color) 14%, transparent);
-    border: 0.5px solid color-mix(in srgb, var(--tier-color) 30%, transparent);
-
-    &[data-tier="P0"] {
-      --tier-color: var(--icon-negative, #f1484f);
-    }
-
-    &[data-tier="P1"] {
-      --tier-color: #f97316;
-    }
-
-    &[data-tier="P2"] {
-      --tier-color: var(--v2-yellow-700, #b45309);
-    }
-
-    &[data-tier="P3"] {
-      --tier-color: var(--v2-text-text-faint, var(--text-weak));
-    }
-  }
-}
-
-[data-slot="typecheck-groups"] {
+[data-component="skill-content-card"] {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-}
-
-[data-slot="typecheck-file-group"] {
+  gap: 8px;
+  width: 100%;
+  padding: 10px 12px;
   border: 0.5px solid var(--v2-border-border-base);
-  border-radius: 8px;
-  overflow: hidden;
+  border-radius: 10px;
   background: var(--background-stronger, color-mix(in srgb, currentColor 3%, transparent));
 
-  [data-slot="typecheck-file-header"] {
+  [data-slot="skill-content-header"] {
     display: flex;
     align-items: center;
     gap: 8px;
-    padding: 6px 10px;
-    border-bottom: 0.5px solid var(--v2-border-border-base);
-    font-family: var(--font-family-mono);
-    font-size: 12px;
-    color: var(--text-strong);
   }
 
-  [data-slot="typecheck-file-count"] {
+  [data-slot="skill-content-name"] {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 13px;
+    font-weight: var(--font-weight-medium);
+    color: var(--text-strong);
+
+    [data-component="icon"] {
+      width: 13px;
+      height: 13px;
+      color: var(--icon-interactive-base);
+    }
+  }
+
+  [data-slot="skill-content-file-count"] {
     margin-inline-start: auto;
     font-size: 11px;
     font-variant-numeric: tabular-nums;
     color: var(--v2-text-text-faint, var(--text-weak));
   }
 
-  [data-slot="typecheck-diagnostic"] {
-    --severity-color: var(--v2-text-text-muted);
-
-    padding: 8px 10px;
-    border-bottom: 0.5px solid var(--v2-border-border-base);
-
-    &:last-child {
-      border-bottom: none;
-    }
-
-    &[data-severity="P0"] {
-      --severity-color: var(--icon-negative, #f1484f);
-    }
-
-    &[data-severity="P1"] {
-      --severity-color: #f97316;
-    }
-
-    &[data-severity="P2"] {
-      --severity-color: var(--v2-yellow-700, #b45309);
-    }
-  }
-
-  [data-slot="typecheck-diagnostic-head"] {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    margin-bottom: 3px;
-  }
-
-  [data-slot="typecheck-diagnostic-severity"] {
-    display: inline-flex;
-    align-items: center;
-    padding: 1px 5px;
-    border-radius: 4px;
-    font-size: 10px;
-    font-weight: var(--font-weight-medium);
-    color: var(--severity-color);
-    background: color-mix(in srgb, var(--severity-color) 14%, transparent);
-    border: 0.5px solid color-mix(in srgb, var(--severity-color) 30%, transparent);
-  }
-
-  [data-slot="typecheck-diagnostic-loc"] {
+  [data-slot="skill-content-basedir"] {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-family: var(--font-family-mono);
     font-size: 11px;
-    font-variant-numeric: tabular-nums;
     color: var(--v2-text-text-faint, var(--text-weak));
   }
 
-  [data-slot="typecheck-diagnostic-code"] {
+  [data-slot="skill-content-body"] {
+    padding-top: 4px;
+    border-top: 0.5px solid var(--v2-border-border-base);
+  }
+}
+
+[data-component="skill-file-list"] {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+
+  [data-slot="skill-file-chip"] {
+    display: inline-flex;
+    align-items: center;
+    padding: 2px 6px;
+    border-radius: 4px;
     font-family: var(--font-family-mono);
-    font-size: 11px;
+    font-size: 10.5px;
+    color: var(--v2-text-text-muted);
+    background: color-mix(in srgb, currentColor 6%, transparent);
+    border: 0.5px solid var(--v2-border-border-base);
+
+    &[data-more] {
+      cursor: pointer;
+      color: var(--icon-interactive-base);
+      background: color-mix(in srgb, var(--icon-interactive-base) 10%, transparent);
+      border-color: color-mix(in srgb, var(--icon-interactive-base) 26%, transparent);
+    }
+  }
+}
+
+[data-component="skill-list"] {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  width: 100%;
+  border: 0.5px solid var(--v2-border-border-base);
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--background-stronger, color-mix(in srgb, currentColor 3%, transparent));
+
+  [data-slot="skill-list-row"] {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    padding: 6px 10px;
+    min-width: 0;
+  }
+
+  [data-slot="skill-list-name"] {
+    flex-shrink: 0;
+    font-family: var(--font-family-mono);
+    font-size: 12px;
+    font-weight: var(--font-weight-medium);
     color: var(--icon-interactive-base);
   }
 
-  [data-slot="typecheck-diagnostic-message"] {
-    font-size: 12.5px;
-    color: var(--text-strong);
-    line-height: var(--line-height-large);
-  }
-
-  [data-slot="typecheck-diagnostic-suggestion"] {
-    margin-top: 3px;
-    padding-left: 8px;
-    border-left: 2px solid color-mix(in srgb, var(--icon-interactive-base) 40%, transparent);
+  [data-slot="skill-list-description"] {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-size: 12px;
     color: var(--v2-text-text-muted);
-    line-height: var(--line-height-large);
   }
 }
+
+
+
+
+
+
+
+
 
 [data-component="sqlite-table-wrap"] {
   display: flex;
@@ -1454,99 +1423,81 @@
   }
 }
 
+/* Matches the standard tool row: identity left, target beside it, outcome far
+   right via the shell's result slot. The old rule grew the title with
+   `flex: 1 1 auto` under `space-between`, which floated the directory into the
+   middle of the row. */
 [data-component="edit-trigger"],
 [data-component="write-trigger"] {
   display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
+  align-items: baseline;
+  gap: 5px;
   width: 100%;
+  min-width: 0;
 
   [data-slot="message-part-title-area"] {
-    flex-grow: 1;
     display: flex;
-    align-items: center;
-    gap: 8px;
+    align-items: baseline;
+    gap: 5px;
     min-width: 0;
+    flex: 1 1 auto;
   }
 
   [data-slot="message-part-title"] {
-    flex: 1 1 auto;
+    flex-shrink: 0;
     display: flex;
-    align-items: center;
-    gap: 8px;
+    align-items: baseline;
+    gap: 5px;
     min-width: 0;
-    font-family: var(--font-family-sans);
-    font-size: 14px;
-    font-style: normal;
-    font-weight: var(--font-weight-medium);
-    line-height: var(--line-height-large);
-    letter-spacing: var(--letter-spacing-normal);
+    font-family: var(--v2-font-family-sans, "Inter", sans-serif);
+    font-size: 13px;
+    font-weight: 500;
+    line-height: 18px;
+    letter-spacing: -0.04px;
+    color: var(--v2-text-text-base);
+  }
+
+  [data-slot="message-part-title-filename"] {
+    font-family: var(--v2-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 11.5px;
+    font-weight: 400;
     color: var(--v2-text-text-muted);
   }
 
+  [data-slot="message-part-path"] {
+    flex: 0 1 auto;
+    min-width: 0;
+    overflow: hidden;
+  }
+
+  [data-slot="message-part-directory"] {
+    display: block;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    direction: rtl;
+    text-align: left;
+    font-family: var(--v2-font-family-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 11px;
+    line-height: 18px;
+    color: var(--v2-text-text-faint);
+  }
+
   [data-slot="message-part-title-spinner"] {
-    margin-left: 4px;
-    width: 16px;
-    height: 16px;
+    width: 14px;
+    height: 14px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
     color: var(--v2-text-text-muted);
-
-    [data-component="spinner"] {
-      width: 16px;
-      height: 16px;
-    }
-  }
-
-  [data-slot="message-part-title-text"] {
-    flex-shrink: 0;
-    text-transform: capitalize;
-    color: var(--v2-text-text-base);
-  }
-
-  [data-slot="message-part-title-filename"] {
-    /* No text-transform - preserve original filename casing */
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-weight: var(--font-weight-regular);
-    direction: ltr;
-    unicode-bidi: isolate;
-  }
-
-  [data-slot="message-part-path"] {
-    display: flex;
-    flex-grow: 1;
-    min-width: 0;
-    font-weight: var(--font-weight-regular);
-    direction: ltr;
-    unicode-bidi: isolate;
-  }
-
-  [data-slot="message-part-directory"] {
-    color: var(--v2-text-text-muted);
-    text-overflow: ellipsis;
-    overflow: hidden;
-    white-space: nowrap;
-    direction: rtl;
-    text-align: left;
-  }
-
-  [data-slot="message-part-filename"] {
-    color: var(--v2-text-text-base);
-    flex-shrink: 0;
   }
 
   [data-slot="message-part-actions"] {
-    display: flex;
-    gap: 16px;
+    display: inline-flex;
     align-items: center;
-    justify-content: flex-end;
     flex-shrink: 0;
+    margin-left: auto;
   }
 }
 
@@ -1821,6 +1772,8 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
 [data-component="git-summary"],
 [data-component="git-commit-result"],
 [data-component="git-raw"],
+[data-component="skill-content-card"],
+[data-component="skill-list"],
 [data-component="todos"],
 [data-component="diagnostics"],
 .error-card {

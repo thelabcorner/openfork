@@ -34,6 +34,8 @@ export const formatTokensExact = (value: number, locale?: string) =>
 export const formatRate = (value: number, locale?: string) =>
   formatter(`rate:${locale ?? ""}`, locale, { maximumFractionDigits: 1 }).format(value)
 
+export const formatTokensPerSecond = (value: number, locale?: string) => `${formatRate(value, locale)} tok/s`
+
 export const formatPercent = (value: number, locale?: string) =>
   formatter(`pct:${locale ?? ""}`, locale, { style: "percent", maximumFractionDigits: 1 }).format(value)
 

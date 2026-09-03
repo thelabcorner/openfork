@@ -27,7 +27,7 @@ type WireOutcome =
   | { readonly kind: "error"; readonly message: string }
 
 export const xai = (_http: HttpClient.HttpClient, auth: Auth.Interface, fetchImpl: XaiFetch = globalThis.fetch.bind(globalThis)): Adapter => {
-  const cache = createQuotaCache<ProviderResult>("xai")
+  const cache = createQuotaCache<ProviderResult>("xai", { persistentKey: "xai" })
 
   return {
     id: "xai",

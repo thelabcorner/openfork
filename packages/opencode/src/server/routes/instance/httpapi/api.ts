@@ -26,6 +26,7 @@ import { PtyApi, PtyConnectApi } from "./groups/pty"
 import { QuotaApi } from "./groups/quota"
 import { QuestionApi } from "./groups/question"
 import { SessionApi } from "./groups/session"
+import { SessionContextApi } from "./groups/session-context"
 import { SessionGroupApi } from "./groups/session-group"
 import { SyncApi } from "./groups/sync"
 import { ToolApi } from "./groups/tool"
@@ -80,6 +81,7 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
   .addHttpApi(ProviderApi)
   .addHttpApi(QuotaApi)
   .addHttpApi(SessionApi)
+  .addHttpApi(SessionContextApi)
   .addHttpApi(SessionGroupApi)
   .addHttpApi(SyncApi)
   .addHttpApi(ToolApi)

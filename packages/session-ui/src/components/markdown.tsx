@@ -385,7 +385,18 @@ export function Markdown(
       if (!live && !streamed) return
       return { key: owner, text: local.text, live }
     },
-    (src) => projectMarkdown(src.key, src.text, src.live),
+    (src) =>
+      projectMarkdown(src.key, src.text, src.live).catch((error) => {
+        // Component cleanup cancels in-flight worker requests. Do not turn that
+        // expected cancellation into an unhandled createResource rejection.
+        if (
+          error instanceof MarkdownWorkerDisposedError ||
+          error instanceof MarkdownWorkerSupersededError
+        ) {
+          return { text: src.text, blocks: [] } satisfies Projection
+        }
+        throw error
+      }),
     { initialValue: pendingProjection("") },
   )
   const currentProjection = () => {

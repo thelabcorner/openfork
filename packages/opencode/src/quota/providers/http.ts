@@ -1,5 +1,6 @@
 import { Effect, Option } from "effect"
 import { HttpClient, HttpClientRequest } from "effect/unstable/http"
+import { loadPersistentQuotaEntry, savePersistentQuotaEntry } from "../persistent-cache"
 
 /**
  * Bounded GET-JSON seam for provider account endpoints. Adapters receive a
@@ -7,7 +8,7 @@ import { HttpClient, HttpClientRequest } from "effect/unstable/http"
  * its result envelope the way OpenChamber's per-provider try/catch did.
  */
 
-const REQUEST_TIMEOUT = "10 seconds"
+const REQUEST_TIMEOUT = "5 seconds"
 
 export type FetchOutcome =
   | { readonly ok: true; readonly body: unknown }
@@ -78,15 +79,33 @@ export const NEXT_REFRESH_NOW = 0
  * pattern hand-rolled; this generalizes it so every adapter gets the same
  * protection for free.
  */
-export function createQuotaCache<T>(key: string, options?: { ttlMs?: number; cooldownDefaultMs?: number; cooldownMaxMs?: number }) {
+export function createQuotaCache<T>(key: string, options?: { ttlMs?: number; cooldownDefaultMs?: number; cooldownMaxMs?: number; persistentKey?: string }) {
   const ttlMs = options?.ttlMs ?? CACHE_TTL_MS
   const cooldownDefaultMs = options?.cooldownDefaultMs ?? COOLDOWN_DEFAULT_MS
   const cooldownMaxMs = options?.cooldownMaxMs ?? COOLDOWN_MAX_MS
+  const persistentKey = options?.persistentKey
   let cached: { key: string; fetchedAt: number; result: T } | undefined
   let cooldownUntil = 0
+  // Hydrate from persistent file on first creation (survives restarts, instant stale)
+  if (persistentKey) {
+    try {
+      const persisted = loadPersistentQuotaEntry<T>(persistentKey)
+      if (persisted) {
+        cached = { key, fetchedAt: persisted.fetchedAt, result: persisted.result }
+        cooldownUntil = persisted.cooldownUntil
+      }
+    } catch {}
+  }
+  const persist = (fetchedAt: number, result: T, cdUntil: number) => {
+    if (!persistentKey) return
+    try {
+      savePersistentQuotaEntry(persistentKey, fetchedAt, result, cdUntil)
+    } catch {}
+  }
   return {
     fresh(currentKey = key): T | undefined {
       if (cached && cached.key === currentKey && Date.now() - cached.fetchedAt < ttlMs) return cached.result
+      // Persistent stale is still served as fresh if within TTL - already above
       return undefined
     },
     isCoolingDown(): boolean {
@@ -94,6 +113,14 @@ export function createQuotaCache<T>(key: string, options?: { ttlMs?: number; coo
     },
     cachedResult(): T | undefined {
       return cached?.result
+    },
+    /** Stale result regardless of TTL - for stale-while-revalidate instant paint */
+    staleResult(): T | undefined {
+      return cached?.result
+    },
+    /** Whether we have any cached entry (fresh or stale) */
+    hasCache(): boolean {
+      return !!cached
     },
     /**
      * Epoch ms before which a re-read is guaranteed to be served from cache,
@@ -111,14 +138,18 @@ export function createQuotaCache<T>(key: string, options?: { ttlMs?: number; coo
       cooldownUntil = 0
     },
     store(result: T, currentKey = key): void {
-      cached = { key: currentKey, fetchedAt: Date.now(), result }
+      const now = Date.now()
+      cached = { key: currentKey, fetchedAt: now, result }
       cooldownUntil = 0
+      persist(now, result, 0)
     },
     /** Cache the error result and back off for `retryAfterMs` (capped), or a default window. */
     coolDown(result: T, retryAfterMs: number | undefined, currentKey = key): void {
       const capped = retryAfterMs !== undefined ? Math.min(Math.max(retryAfterMs, 1000), cooldownMaxMs) : cooldownDefaultMs
-      cooldownUntil = Date.now() + capped
-      cached = { key: currentKey, fetchedAt: Date.now(), result }
+      const now = Date.now()
+      cooldownUntil = now + capped
+      cached = { key: currentKey, fetchedAt: now, result }
+      persist(now, result, cooldownUntil)
     },
   }
 }

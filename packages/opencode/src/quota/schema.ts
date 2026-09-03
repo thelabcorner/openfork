@@ -49,19 +49,46 @@ export const WorkBuddyModelLimit = Schema.Struct({
   limitEstimate: Schema.NullOr(Schema.Finite),
   remainingEstimate: Schema.NullOr(Schema.Finite),
   remainingPercent: Schema.NullOr(Schema.Finite),
-  status: Schema.Literal("healthy", "draining", "low", "critical", "terminal", "depleted", "unknown"),
-  confidence: Schema.Literal("low", "medium", "high"),
-  accuracy: Schema.Literal("observed", "estimate", "server-confirmed"),
+  status: Schema.Union([
+    Schema.Literal("healthy"),
+    Schema.Literal("draining"),
+    Schema.Literal("low"),
+    Schema.Literal("critical"),
+    Schema.Literal("terminal"),
+    Schema.Literal("depleted"),
+    Schema.Literal("unknown"),
+  ]),
+  confidence: Schema.Union([Schema.Literal("low"), Schema.Literal("medium"), Schema.Literal("high")]),
+  accuracy: Schema.Union([Schema.Literal("observed"), Schema.Literal("estimate"), Schema.Literal("server-confirmed")]),
   exhaustedObserved: Schema.Boolean,
   serverCode: Schema.NullOr(Schema.Finite),
   resetAt: Schema.NullOr(Schema.Finite),
-  resetSource: Schema.Literal("server-6004", "inferred", "unknown"),
-  windowType: Schema.Literal("server-defined", "inferred-rolling-24h", "unknown"),
+  resetSource: Schema.Union([Schema.Literal("server-6004"), Schema.Literal("inferred"), Schema.Literal("unknown")]),
+  windowType: Schema.Union([
+    Schema.Literal("server-defined"),
+    Schema.Literal("inferred-rolling-24h"),
+    Schema.Literal("unknown"),
+  ]),
   windowStartedAt: Schema.NullOr(Schema.Finite),
+  /** Seconds until the next reset boundary; null when no window is known. */
+  secondsUntilReset: Schema.NullOr(Schema.Finite),
   lastObservationAt: Schema.NullOr(Schema.Finite),
   burnPerHour: Schema.NullOr(Schema.Finite),
   estimatedExhaustionAt: Schema.NullOr(Schema.Finite),
   willLikelyExhaustBeforeReset: Schema.NullOr(Schema.Boolean),
+  /**
+   * Consumption WorkBuddy ACTUALLY reported for this model in the current
+   * window, summed per completed generation. This is the real spend figure —
+   * not `usedObserved × publishedRate` — and it is what lets the picker invert
+   * remaining credits into an accurate request estimate.
+   */
+  creditsObserved: Schema.Finite,
+  tokensInput: Schema.Finite,
+  tokensOutput: Schema.Finite,
+  tokensCacheHit: Schema.Finite,
+  tokensCacheMiss: Schema.Finite,
+  /** True once enough real samples exist to trust the local average rate. */
+  creditsPersonalized: Schema.Boolean,
   coverage: Schema.Literal("opencode-only"),
 })
 export type WorkBuddyModelLimit = Schema.Schema.Type<typeof WorkBuddyModelLimit>
@@ -72,6 +99,38 @@ export const WorkBuddyAccountLimits = Schema.Struct({
   models: Schema.Array(WorkBuddyModelLimit),
 })
 export type WorkBuddyAccountLimits = Schema.Schema.Type<typeof WorkBuddyAccountLimits>
+
+/**
+ * One configured Zen API key, for the limits panel's per-key rows. `resetAt`
+ * is the governor's own value — the same timestamp the failover router orders
+ * by — so the displayed countdown and the router's next pick always agree.
+ * `keyId` is a stable hash of the key; the raw API key never crosses this
+ * surface. `queuePosition` is the 1-based rank in the failover ordering
+ * (used keys by `resetAt` ascending, never-used keys last); null when the
+ * ordering is not applicable (a single key, or no router state yet).
+ */
+export const ZenKeyLimits = Schema.Struct({
+  keyId: Schema.String,
+  label: Schema.String,
+  state: Schema.Union([
+    Schema.Literal("ready"),
+    Schema.Literal("cooling"),
+    Schema.Literal("exhausted"),
+    Schema.Literal("unknown"),
+  ]),
+  exhausted: Schema.Boolean,
+  everUsed: Schema.Boolean,
+  resetAt: Schema.NullOr(Schema.Finite),
+  resetAfterSeconds: Schema.NullOr(Schema.Finite),
+  usedObserved: Schema.NullOr(Schema.Finite),
+  limitEstimate: Schema.NullOr(Schema.Finite),
+  remainingPercent: Schema.NullOr(Schema.Finite),
+  estimateSource: Schema.NullOr(
+    Schema.Union([Schema.Literal("fallback"), Schema.Literal("learned"), Schema.Literal("lower-bound")]),
+  ),
+  queuePosition: Schema.NullOr(Schema.Finite),
+})
+export type ZenKeyLimits = Schema.Schema.Type<typeof ZenKeyLimits>
 
 export const ProviderUsage = Schema.Struct({
   windows: Schema.Record(Schema.String, UsageWindow),
@@ -91,6 +150,10 @@ export const ProviderUsage = Schema.Struct({
   accountLabels: Schema.optional(Schema.Record(Schema.String, Schema.String)),
   /** WorkBuddy promotional frequency windows, separate from package-credit windows. */
   workbuddyAccounts: Schema.optional(Schema.Array(WorkBuddyAccountLimits)),
+  /** Verdent account-local model frequency observations; shared windows stay in `windows`. */
+  verdentAccounts: Schema.optional(Schema.Array(WorkBuddyAccountLimits)),
+  /** Zen per-key rows: governor state, reset countdown, and failover-queue position per configured key. */
+  zenAccounts: Schema.optional(Schema.Array(ZenKeyLimits)),
 })
 export type ProviderUsage = Schema.Schema.Type<typeof ProviderUsage>
 

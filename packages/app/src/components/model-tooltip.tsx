@@ -5,6 +5,8 @@ import { stripUnlimitedSuffix, hasPublishedPricing } from "@/utils/model-badges"
 import { blendedCost, evaluateModelUsageYield, FALLBACK_WORKLOAD_CORPUS } from "@/utils/model-usage-yield"
 import { buildHitRateIndex, buildModelCostIndex } from "@/utils/model-usage-history"
 import { useSync } from "@/context/sync"
+import { usePersonalUsage } from "@/context/personal-usage"
+import { splitModelIDForProvider } from "@/utils/model-account-identity"
 
 type InputKey = "text" | "image" | "audio" | "video" | "pdf"
 type InputMap = Record<InputKey, boolean>
@@ -34,6 +36,17 @@ type ModelInfo = {
   }
 }
 
+/**
+ * Account-qualified ids are a transport contract for these two providers.
+ * Parse only their known suffixes so a model id containing an unrelated `@`
+ * remains untouched, and so Verdent's `@300k` context alias is not mistaken
+ * for an account.
+ */
+export function parseModelAccount(modelID: string, providerID?: string): string | undefined {
+  if (providerID !== "workbuddy" && providerID !== "verdent") return undefined
+  return splitModelIDForProvider(modelID, providerID).accountID
+}
+
 // cost.* is already expressed in $ per 1M tokens (see model-usage-estimate.ts,
 // which divides by 1_000_000 to get $ for a token count) — format directly.
 //
@@ -54,6 +67,17 @@ export function formatCostPerMillion(value: number): string {
 // but not impossible), so this reuses the same growing-precision formatter
 // rather than assuming 2 decimals are always enough once scaled.
 const formatCostPerBillion = (value: number) => formatCostPerMillion(value * 1000)
+
+const CREDITS_PER_DOLLAR = 7500 / 20
+
+export function formatCreditsPerMillion(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "—"
+  const credits = value * CREDITS_PER_DOLLAR
+  let decimals = credits < 10 ? 2 : credits < 100 ? 1 : 0
+  while (decimals < 4 && Number(credits.toFixed(decimals)) === 0) decimals++
+  return `${credits.toLocaleString(undefined, { minimumFractionDigits: decimals, maximumFractionDigits: decimals })} credits/M`
+}
+const formatCreditsPerBillion = (value: number) => formatCreditsPerMillion(value * 1000)
 
 const costFormatterCache = new Map<number, Intl.NumberFormat>()
 function costFormatter(decimals: number): Intl.NumberFormat {
@@ -94,11 +118,12 @@ function ModelTooltipCostTable(props: {
   const peakRates = () => (isDeepSeekPeakPricedModel({ id: props.model.id, provider: { id: props.model.provider.id ?? "" } }) ? DEEPSEEK_PEAK_RATES[props.model.id] : undefined)
   const currentPeriod = () => props.period ?? deepSeekRatePeriod(new Date())
 
+  const isGenspark = () => props.model.provider.id === "genspark"
   const row = (label: string, value: number) => (
     <>
       <span class="min-w-0 truncate text-v2-text-text-muted">{label}</span>
-      <span class="text-right tabular-nums text-v2-text-text-base">{formatCostPerMillion(value)}</span>
-      <span class="text-right tabular-nums text-v2-text-text-base">{formatCostPerBillion(value)}</span>
+      <span class="text-right tabular-nums text-v2-text-text-base">{isGenspark() ? formatCreditsPerMillion(value) : formatCostPerMillion(value)}</span>
+      <span class="text-right tabular-nums text-v2-text-text-base">{isGenspark() ? formatCreditsPerBillion(value) : formatCostPerBillion(value)}</span>
     </>
   )
 
@@ -180,6 +205,13 @@ export const ModelTooltip: Component<{
       remainingCredits: number
       totalCredits?: number
       estimatedRequests: number
+      /** True when `rate` was measured from real usage, not the catalog. */
+      personalized?: boolean
+    }
+    genspark?: {
+      rateCreditsPerM: number
+      remainingCredits: number
+      estimatedRequests: number
     }
   }
   period?: ReturnType<typeof deepSeekRatePeriod>
@@ -253,6 +285,7 @@ export const ModelTooltip: Component<{
   }
   const context = () => language.t("model.tooltip.context", { limit: props.model.limit.context.toLocaleString() })
   const contextLimit = () => props.model.limit.context.toLocaleString(language.intl())
+  const account = () => parseModelAccount(props.model.id, props.model.provider.id)
 
   // Usage Yield V2 (§5-6, §11, §31): derived synchronously from fallback corpus so
   // the tooltip can show "how much usage $1 buys" (§2) without awaiting the
@@ -273,18 +306,28 @@ export const ModelTooltip: Component<{
       fingerprint: "fallback-16-aug26",
     }
   })
-  // Best-effort personal index — may be unavailable outside a sync provider (e.g. storybook).
+  // Best-effort personal index — prefers durable learner, falls back to
+  // ephemeral scan for storybook / tests without the provider.
   let syncForTooltip: ReturnType<typeof useSync> | undefined
   try {
     syncForTooltip = useSync()
   } catch {
     syncForTooltip = undefined
   }
+  let personalForCtx: ReturnType<typeof usePersonalUsage> | undefined
+  try {
+    personalForCtx = usePersonalUsage()
+  } catch {
+    personalForCtx = undefined
+  }
   const personalForTooltip = createMemo(() => {
+    const key = `${props.model.provider.id ?? "unknown"}:${props.model.id}`
+    // Durable first (survives LRU / restart)
+    const durable = personalForCtx?.getCost(props.model.provider.id ?? "unknown", props.model.id)
+    if (durable) return durable
     if (!syncForTooltip) return undefined
     try {
       const idx = buildModelCostIndex(syncForTooltip().data.message)
-      const key = `${props.model.provider.id ?? "unknown"}:${props.model.id}`
       const entry = idx.get(key)
       if (!entry) return undefined
       return { cost: entry.sum / entry.count, count: entry.count }
@@ -293,6 +336,23 @@ export const ModelTooltip: Component<{
     }
   })
   const hitRateForTooltip = createMemo(() => {
+    const directDurable = personalForCtx?.getHitRate(props.model.provider.id ?? "unknown", props.model.id)
+    if (directDurable !== undefined) return directDurable
+    // Cross-provider fallback from durable store
+    if (personalForCtx) {
+      const all = personalForCtx.hitRates()
+      if (all.size > 0) {
+        let sum = 0
+        let cnt = 0
+        for (const [k, v] of all.entries()) {
+          if (k.endsWith(`:${props.model.id}`)) {
+            sum += v
+            cnt++
+          }
+        }
+        if (cnt > 0) return sum / cnt
+      }
+    }
     if (!syncForTooltip) return undefined
     try {
       const idx = buildHitRateIndex(syncForTooltip().data.message)
@@ -364,6 +424,14 @@ export const ModelTooltip: Component<{
     return (
       <div class="flex w-[224px] max-w-[calc(100vw-30px)] flex-col gap-2 overflow-hidden max-h-[calc(100vh-30px)]">
         <ModelTooltipRow name={language.t("model.tooltip.model")} value={name()} />
+        <Show when={account()}>
+          {(value) => (
+            <ModelTooltipRow
+              name={language.t("model.tooltip.account")}
+              value={<span title={value()}>{value()}</span>}
+            />
+          )}
+        </Show>
         <ModelTooltipRow
           name={language.t("model.tooltip.provider")}
           value={providerLabel(props.model)}
@@ -373,9 +441,17 @@ export const ModelTooltip: Component<{
         </Show>
         <ModelTooltipRow name={language.t("model.tooltip.reasoning")} value={reasoning()} />
         <ModelTooltipRow name={language.t("model.tooltip.context.label")} value={contextLimit()} />
-        <Show when={props.model.cost && (props.model.cost.input > 0 || props.model.cost.output > 0 || (props.model.cost.cache?.read ?? 0) > 0)}>
+        <Show when={(props.model.cost && (props.model.cost.input > 0 || props.model.cost.output > 0 || (props.model.cost.cache?.read ?? 0) > 0)) || props.model.provider.id === "genspark"}>
           <div class="h-px bg-v2-border-border-muted" />
-          <ModelTooltipCostTable model={props.model} cost={props.model.cost!} period={props.period} />
+          <ModelTooltipCostTable
+            model={props.model}
+            cost={
+              props.model.provider.id === "genspark" && (!props.model.cost || (props.model.cost.input === 0 && props.model.cost.output === 0))
+                ? { input: 0.6, output: 0.6, cache: { read: 0, write: 0 } }
+                : props.model.cost!
+            }
+            period={props.period}
+          />
         </Show>
         <Show when={(props.hitRate ?? hitRateForTooltip()) !== undefined}>
           <ModelTooltipRow
@@ -450,11 +526,33 @@ export const ModelTooltip: Component<{
                     account: wb().account,
                   })}
                 />
+                {/* Mirrors the OpenCode Go row: state whether the rate behind
+                     this estimate was measured from real usage or is the
+                     catalog's sticker price, so the number is never mistaken
+                     for more precise than it is. */}
+                <ModelTooltipRow
+                  name={language.t("model.tooltip.usage.source")}
+                  value={
+                    wb().personalized
+                      ? language.t("model.tooltip.usage.source.personal")
+                      : language.t("model.tooltip.usage.source.estimated")
+                  }
+                />
               </Show>
             </>
           )}
         </Show>
-        <Show when={props.usage?.estimatedRequests !== undefined && !props.usage?.workbuddy}>
+        <Show when={props.usage?.genspark}>
+          {(gs) => (
+            <>
+              <div class="h-px bg-v2-border-border-muted" />
+              <ModelTooltipRow name="Credits/M" value={formatCreditsPerMillion(gs().rateCreditsPerM)} />
+              <ModelTooltipRow name="Remaining" value={`${Math.round(gs().remainingCredits).toLocaleString(language.intl())} credits`} />
+              <ModelTooltipRow name="Est. requests" value={`${Math.round(gs().estimatedRequests).toLocaleString(language.intl())}`} />
+            </>
+          )}
+        </Show>
+        <Show when={props.usage?.estimatedRequests !== undefined && !props.usage?.workbuddy && !props.usage?.genspark}>
           <div class="h-px bg-v2-border-border-muted" />
           <ModelTooltipRow
             name={language.t("model.tooltip.usage.requests")}
@@ -485,13 +583,25 @@ export const ModelTooltip: Component<{
       </Show>
       <div class="text-12-regular text-text-invert-base">{reasoning()}</div>
       <div class="text-12-regular text-text-invert-base">{context()}</div>
-      <Show when={props.model.cost && (props.model.cost.input > 0 || props.model.cost.output > 0 || (props.model.cost.cache?.read ?? 0) > 0)}>
+      <Show when={props.model.cost || props.model.provider.id === "genspark"}>
         <div class="text-12-regular text-text-invert-base">
-          {language.t("model.tooltip.cost", {
-            input: formatCostPerMillion(props.model.cost!.input),
-            cached: formatCostPerMillion(props.model.cost!.cache?.read ?? 0),
-            output: formatCostPerMillion(props.model.cost!.output),
-          })}
+          {(() => {
+            const isG = props.model.provider.id === "genspark"
+            // Genspark cost is 0 in static catalog; use observed 225/M fallback so tooltip isn't empty
+            if (isG && (!props.model.cost || (props.model.cost.input === 0 && props.model.cost.output === 0))) {
+              return language.t("model.tooltip.cost", {
+                input: formatCreditsPerMillion(225),
+                cached: formatCreditsPerMillion(0),
+                output: formatCreditsPerMillion(225),
+              })
+            }
+            const fmt = isG ? formatCreditsPerMillion : formatCostPerMillion
+            return language.t("model.tooltip.cost", {
+              input: fmt(props.model.cost!.input),
+              cached: fmt(props.model.cost!.cache?.read ?? 0),
+              output: fmt(props.model.cost!.output),
+            })
+          })()}
         </div>
       </Show>
     </div>

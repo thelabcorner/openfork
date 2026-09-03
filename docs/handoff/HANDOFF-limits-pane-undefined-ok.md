@@ -387,6 +387,83 @@ Also note `outcomeError()` (`http.ts:53`) hardcodes "Anthropic is throttling…"
 provider's 429, which is wrong copy and makes `isRateLimited()` detection provider-agnostic only
 by accident.
 
+## 8b. WorkBuddy "Request failed" — FIXED
+
+### The actual error the user hit
+
+While investigating, the user reported the WorkBuddy card showing the literal
+string `Request failed`. That exact string is produced in **two** places, and
+BOTH were fixed:
+
+1. **`quota/registry.ts:61`** — the `singleFlight` defect handler used
+   `failure instanceof Error ? failure.message : "Request failed"`. Any non-Error
+   defect (a thrown string, a structured object, `undefined` from an interrupt)
+   collapsed into the useless placeholder.
+2. **`use-limits/index.ts:211`** — the frontend fallback for
+   `response.data === undefined` ran
+   `err instanceof Error ? err.message : typeof err === "string" ? err : "Request failed"`.
+   The hey-api client returns the **parsed JSON body** for HTTP errors, which is
+   a structured OpenAPI envelope (`{ name: "NotFoundError", data: { message: "..." } }`)
+   — never an `Error`, never a string. So every 4xx/5xx became "Request failed".
+
+Fixes: `describeCause()` in `registry.ts` and `describeResponseError()` in
+`use-limits/index.ts` both walk the common shapes (`Error.message`, nested
+`data.message`, `message`, `name`, `error`, primitives) so the user sees the real
+reason.
+
+### The root cause underneath: `Schema.Literal` is broken in Effect v4 beta
+
+The validation error the user actually saw was:
+
+```
+Expected "low", got "high" at ["usage"]["workbuddyAccounts"][0]["models"][0]["confidence"]
+```
+
+`Schema.Literal("low", "medium", "high")` **only accepts the first argument** in
+`effect@4.0.0-beta.83`. Verified directly:
+
+```ts
+Schema.decodeUnknownSync(Schema.Literal("low", "medium", "high"))("high")
+// -> SchemaError: Expected "low", got "high"
+```
+
+The array form `Schema.Literal(["low","medium","high"])` is also broken (it
+accepts any string). **Use `Schema.Union([...])` instead** — verified working.
+
+This affects every multi-value `Schema.Literal(...)` in the codebase. Only the
+six in `quota/schema.ts` (`WorkBuddyModelLimit`'s status/confidence/accuracy/
+resetSource/windowType/coverage) were fixed here, because they are on the
+workbuddy limits path. **The rest are still latent bugs.** A non-exhaustive list
+from `rg 'Schema\.Literal\(' packages/opencode/src`: `mcp/index.ts`,
+`provider/provider.ts`, `session/message.ts` (many), `config/v2-compat.ts`,
+`account/account.ts`. A systematic sweep is recommended — grep for
+`Schema.Literal(` with **more than one argument**.
+
+### A third bug found: the adapter reported `ok: true` on total failure
+
+`workbuddy.ts` returned `ok: true` with **empty windows** whenever
+`workbuddyAccounts.length > 0` (i.e. the local governor had seen prior traffic),
+even if every account's resource fetch had failed. The limits pane then rendered
+a healthy-looking empty card. Fixed by returning `ok: false` with the upstream
+error whenever `anyOk` is false, regardless of governor state.
+
+### Verification
+
+- New test: `test/quota/providers/workbuddy.test.ts` — "a transient 5xx surfaces
+  the upstream HTTP error verbatim, not a generic 'Request failed'".
+- `bun test test/quota`: **57 pass / 0 fail**. `test/quota + test/fork`: **78 pass / 0 fail**.
+- Regenerated `packages/sdk/js` (`bun run build`); the union now appears in
+  `types.gen.ts:10789` as `"low" | "medium" | "high"`.
+- Typecheck: 0 errors in `workbuddy.ts`. `packages/app` unchanged at 9
+  pre-existing errors (none in limits files).
+
+### Note on the pre-existing 401 test
+
+The test "surfaces a re-auth error without throwing on a 401" was **already
+failing on clean `main`** before any of my changes (verified via `git stash`). It
+was masked because the adapter returned `ok: true`; it now passes with the
+`anyOk` fix above.
+
 ## 9. Concurrent edits — READ BEFORE CONTINUING
 
 Another agent/session is editing the same files in this workspace. Evidence: while working I

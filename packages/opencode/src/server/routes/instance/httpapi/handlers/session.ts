@@ -219,8 +219,11 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       return yield* SessionError.mapStorageNotFound(
         session.fork({
           sessionID: ctx.params.sessionID,
-          messageID: ctx.payload?.messageID,
-        }),
+          messageID: (ctx.payload as any)?.messageID,
+          edge: (ctx.payload as any)?.edge,
+          kind: (ctx.payload as any)?.kind,
+          workspaceMode: (ctx.payload as any)?.workspaceMode,
+        } as any),
       )
     })
 
@@ -397,7 +400,9 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof SummarizePayload.Type
     }) {
-      yield* revertSvc.cleanup(yield* requireSession(ctx.params.sessionID))
+      const current = yield* requireSession(ctx.params.sessionID)
+      const wasRunning = (yield* statusSvc.get(ctx.params.sessionID)).type !== "idle"
+      yield* revertSvc.cleanup(current)
       const messages = yield* SessionError.mapStorageNotFound(session.messages({ sessionID: ctx.params.sessionID }))
       const defaultAgent = yield* agentSvc.defaultAgent()
       const currentAgent = messages.findLast((message) => message.info.role === "user")?.info.agent ?? defaultAgent
@@ -410,6 +415,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
           modelID: ctx.payload.modelID,
         },
         auto: ctx.payload.auto ?? false,
+        continueAfter: wasRunning,
       })
       yield* promptSvc.loop({ sessionID: ctx.params.sessionID })
       return true

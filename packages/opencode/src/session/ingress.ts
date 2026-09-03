@@ -1,7 +1,7 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceState } from "@/effect/instance-state"
 import { SessionID } from "./schema"
-import { Context, Effect, Layer, Scope, SynchronizedRef } from "effect"
+import { Context, Effect, Layer, Ref, Scope } from "effect"
 
 export type MonitorIngressEvent = {
   readonly id: string
@@ -26,7 +26,6 @@ const MAX_PENDING_BATCHES = 64
 interface State {
   queues: Map<SessionID, SessionIngressEvent[]>
   overflow: Map<SessionID, number>
-  wakeHandler?: (sessionID: SessionID) => Effect.Effect<void>
 }
 
 export interface Interface {
@@ -78,6 +77,11 @@ const layer = Layer.effect(
         return s
       }),
     )
+    // Wake handler is global (not per-instance) — it wakes the session loop for any directory.
+    // Storing it per-instance via InstanceState would require an InstanceRef at registration time,
+    // but registration happens once at server startup when no instance exists, causing
+    // "InstanceRef not provided" and crashing Server.listen (desktop sidecar). Keep it global.
+    const wakeHandlerRef = yield* Ref.make<(sessionID: SessionID) => Effect.Effect<void> | undefined>(undefined)
 
     const publish: Interface["publish"] = Effect.fn("SessionIngress.publish")(function* (event) {
       const scope = yield* Scope.Scope
@@ -99,8 +103,9 @@ const layer = Layer.effect(
       const next = [...existing, event]
       data.queues.set(event.sessionID, next)
       yield* Effect.logInfo("monitor ingress enqueued", { sessionID: event.sessionID, jobID: event.jobID, seq: `${event.sequenceFrom}-${event.sequenceTo}` })
-      if (data.wakeHandler) {
-        yield* data.wakeHandler(event.sessionID).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.ignore)
+      const wakeHandler = yield* Ref.get(wakeHandlerRef)
+      if (wakeHandler) {
+        yield* wakeHandler(event.sessionID).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.ignore)
       }
     })
 
@@ -139,8 +144,7 @@ const layer = Layer.effect(
     })
 
     const registerWakeHandler: Interface["registerWakeHandler"] = Effect.fn("SessionIngress.registerWakeHandler")(function* (handler) {
-      const data = yield* InstanceState.get(state)
-      data.wakeHandler = handler
+      yield* Ref.set(wakeHandlerRef, handler)
     })
 
     return Service.of({ publish, drain, peek, hasPending, pendingCount, clear, overflowCount, registerWakeHandler })

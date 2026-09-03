@@ -4,10 +4,18 @@ import { tmpdir } from "os"
 import { join } from "path"
 import { Effect } from "effect"
 import { AccountVault } from "@/plugin/workbuddy-accounts"
+import { setTestAccountStore } from "@/plugin/workbuddy"
 import { workbuddy, type WorkBuddyFetch } from "@/quota/providers/workbuddy"
+import { createSingleFlight } from "@/quota/registry"
 
+// `workBuddyLimitSnapshot()` (folded into every fetch() result as
+// `workbuddyAccounts`) reads the plugin's module-level account registry, not
+// the `AccountVault(root)` these tests construct directly — without pointing
+// it at the same temp root, these tests would read whatever real WorkBuddy
+// accounts happen to be enrolled on the machine running them.
 function withVault(run: (root: string) => Promise<void> | void) {
   const root = mkdtempSync(join(tmpdir(), "wb-quota-test-"))
+  setTestAccountStore(root)
   return Promise.resolve(run(root)).finally(() => rmSync(root, { recursive: true, force: true }))
 }
 
@@ -212,5 +220,29 @@ describe("quota/providers/workbuddy", () => {
       expect(result.ok).toBe(false)
       expect(result.configured).toBe(true)
       expect(result.error).toMatch(/re-authenticate/i)
+    }))
+
+  test("a transient 5xx surfaces the upstream HTTP error verbatim, not a generic 'Request failed'", () =>
+    withVault(async (root) => {
+      const vault = new AccountVault(root)
+      vault.save({
+        path: "",
+        accessToken: "token-5xx",
+        refreshToken: "",
+        domain: "www.workbuddy.ai",
+        uid: "uid-5xx",
+        enterpriseId: "",
+        expiresAt: Date.now() + 3_600_000,
+        nickname: "Account 5xx",
+      })
+      const fetchImpl: WorkBuddyFetch = async () => jsonResponse({ message: "upstream busy" }, 502)
+      const adapter = workbuddy(fetchImpl, root)
+      const result = await Effect.runPromise(adapter.fetch())
+      expect(result.ok).toBe(false)
+      expect(result.configured).toBe(true)
+      // The end-user must see the real failure reason; "Request failed" is
+      // a defect placeholder that hides what's actually wrong.
+      expect(result.error).not.toBe("Request failed")
+      expect(result.error).toBe("HTTP 502")
     }))
 })

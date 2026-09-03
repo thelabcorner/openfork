@@ -8,6 +8,7 @@ import { resolveFileDiff } from "./session-diff"
 import { Markdown } from "./markdown"
 import { SmartToolOutput } from "./tool-output"
 import { ToolFileAccordion } from "./message-part"
+import { ToolBadge, ToolBoundedList, ToolEmpty, ToolPath, ToolRow, ToolStats } from "./tool-parts"
 
 function unescapeXml(text: string) {
   return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
@@ -49,23 +50,64 @@ function statusTone(code: string): StatusTone {
   return "neutral"
 }
 
+const TONE_ORDER: StatusTone[] = ["conflict", "modify", "add", "delete", "untracked", "neutral"]
+
+const TONE_BADGE: Record<StatusTone, "danger" | "warning" | "success" | "accent" | "neutral"> = {
+  conflict: "danger",
+  modify: "warning",
+  add: "success",
+  delete: "danger",
+  untracked: "neutral",
+  neutral: "neutral",
+}
+
+/**
+ * Status is grouped by change kind and bounded.
+ *
+ * A repo mid-refactor can report 200+ paths; the previous rendering emitted one
+ * unbounded row each, which buried everything after it in the conversation. The
+ * counts are the headline, the paths are on demand.
+ */
 function GitStatusList(props: { entries: StatusEntry[] }) {
   const i18n = useI18n()
+
+  const groups = createMemo(() => {
+    const byTone = new Map<StatusTone, StatusEntry[]>()
+    for (const entry of props.entries) {
+      const tone = statusTone(entry.code)
+      const list = byTone.get(tone) ?? []
+      list.push(entry)
+      byTone.set(tone, list)
+    }
+    return TONE_ORDER.flatMap((tone) => {
+      const items = byTone.get(tone)
+      return items?.length ? [{ tone, items }] : []
+    })
+  })
+
+  const stats = createMemo(() =>
+    groups().map((group) => ({
+      label: i18n.t(`ui.tool.git.tone.${group.tone}` as never),
+      value: String(group.items.length),
+      tone: TONE_BADGE[group.tone] === "neutral" ? undefined : (TONE_BADGE[group.tone] as any),
+    })),
+  )
+
   return (
     <Show
       when={props.entries.length > 0}
-      fallback={<div data-component="git-empty-state">{i18n.t("ui.tool.git.clean")}</div>}
+      fallback={<ToolEmpty>{i18n.t("ui.tool.git.clean")}</ToolEmpty>}
     >
-      <div data-component="git-status-list">
-        <For each={props.entries}>
-          {(entry) => (
-            <div data-slot="git-status-row" data-tone={statusTone(entry.code)}>
-              <span data-slot="git-status-code">{entry.code.trim() || "?"}</span>
-              <span data-slot="git-status-path">{entry.path}</span>
-            </div>
-          )}
-        </For>
-      </div>
+      <ToolStats items={stats()} />
+      <ToolBoundedList items={props.entries} limit={10} scroll>
+        {(entry) => (
+          <ToolRow
+            lead={<ToolBadge tone={TONE_BADGE[statusTone(entry.code)]} mono>{entry.code.trim() || "?"}</ToolBadge>}
+            primary={<ToolPath path={entry.path} />}
+            truncate="start"
+          />
+        )}
+      </ToolBoundedList>
     </Show>
   )
 }

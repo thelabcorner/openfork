@@ -832,7 +832,13 @@ export function App() {
       startEventLoop(nextClient)
     } catch (error) {
       client = undefined
-      setState({ status: "error", error: (error instanceof Error ? error.message : "Connection failed") })
+      const raw = error instanceof Error ? error.message : "Connection failed"
+      const hint =
+        raw.includes("Failed to fetch") || raw.includes("NetworkError") || raw.includes("Load failed")
+          ? `${raw} — could not reach ${state.serverUrl}. Is the tunnel running and is --cors set to allow ${location.origin}?`
+          : raw
+      setState({ status: "error", error: hint })
+      if (hint !== raw) setAdvancedOpen(true)
     }
   }
 
@@ -843,6 +849,7 @@ export function App() {
         status: "error",
         error: "No server URL set — open \"Advanced: server URL & device token\" below, enter your OpenCode server address, then try again.",
       })
+      setAdvancedOpen(true)
       if (fromScan) setPairMode("code")
       return
     }
@@ -856,7 +863,13 @@ export function App() {
       setState({ token: claimed.token, pairing: "", error: "" })
       await connect()
     } catch (error) {
-      setState({ status: "error", error: pairClaimErrorMessage(error) })
+      const msg = pairClaimErrorMessage(error)
+      setState({ status: "error", error: msg })
+      // Wrong-instance 500s and network errors are always a server-URL
+      // problem — surface Advanced so the user can see/correct it.
+      if (msg.includes("not an opencode server") || msg.includes("could not reach the API") || msg.includes("No server URL")) {
+        setAdvancedOpen(true)
+      }
       if (fromScan) setPairMode("code")
     }
   }

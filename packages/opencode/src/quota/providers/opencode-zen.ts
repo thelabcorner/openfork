@@ -2,7 +2,8 @@ import { Effect } from "effect"
 import type { Adapter } from "../registry"
 import { NEXT_REFRESH_NOW } from "./http"
 import { toUsageWindow } from "../format"
-import type { ProviderResult } from "../schema"
+import type { ProviderResult, ZenKeyLimits } from "../schema"
+import { zenLimitSnapshot } from "@/plugin/zen"
 import {
   ZEN_FREE_DAY_MS,
   type Interface as ZenFreeUsage,
@@ -32,6 +33,46 @@ export type ZenFreeLimitEstimate = {
 
 function clampPercent(value: number) {
   return Math.max(0, Math.min(100, value))
+}
+
+const ZEN_KEY_STATE: Record<string, ZenKeyLimits["state"]> = {
+  READY: "ready",
+  COOLING_DOWN: "cooling",
+  QUOTA_EXHAUSTED: "exhausted",
+}
+
+/**
+ * One limits-panel row per configured Zen key. The free-tier estimate is
+ * computed per account from the shared usage snapshot (the free limiter is
+ * IP-scoped, so the pool window is common; per-key differentiation comes from
+ * the governor state and the failover queue). Rows carry the governor's own
+ * resetAt — the exact timestamp the router orders by — so the displayed
+ * countdown and the next failover pick always agree.
+ */
+export function zenKeyLimitsRows(snapshot: ZenFreeSnapshot, now = Date.now()): ZenKeyLimits[] {
+  return zenLimitSnapshot(now).map((entry) => {
+    const estimate = estimateZenFreeLimit({ snapshot, now })
+    const usedObserved = entry.everUsed ? estimate.used : null
+    const resetAfterSeconds =
+      entry.resetAt === null ? null : Math.max(0, Math.round((entry.resetAt - now) / 1000))
+    return {
+      keyId: entry.accountId,
+      label: entry.label,
+      state: ZEN_KEY_STATE[entry.state] ?? "unknown",
+      exhausted: entry.state === "QUOTA_EXHAUSTED",
+      everUsed: entry.everUsed,
+      resetAt: entry.resetAt,
+      resetAfterSeconds,
+      usedObserved,
+      limitEstimate: estimate.limit,
+      remainingPercent:
+        usedObserved === null || estimate.limit === null
+          ? null
+          : clampPercent(100 - (usedObserved / estimate.limit) * 100),
+      estimateSource: usedObserved === null ? null : estimate.source,
+      queuePosition: entry.queuePosition,
+    }
+  })
 }
 
 function weightedMedian(values: readonly WeightedValue[]) {
@@ -179,6 +220,16 @@ export const opencodeZen = (usage: ZenFreeUsage): Adapter => ({
   fetch: () =>
     Effect.map(usage.snapshot(), (snapshot) => {
       const fetchedAt = Date.now()
-      return zenFreeProviderResult(estimateZenFreeLimit({ snapshot, now: fetchedAt }), fetchedAt)
+      const estimate = estimateZenFreeLimit({ snapshot, now: fetchedAt })
+      const result = zenFreeProviderResult(estimate, fetchedAt)
+      const zenKeys = zenKeyLimitsRows(snapshot, fetchedAt)
+      if (zenKeys.length === 0) return result
+      return {
+        ...result,
+        usage: {
+          windows: result.usage?.windows ?? {},
+          zenAccounts: zenKeys,
+        },
+      }
     }),
 })

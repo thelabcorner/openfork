@@ -22,6 +22,7 @@ export const IndexEntry = Schema.Struct({
   type: Schema.Literals(["file", "directory"]),
   size: Schema.optional(Schema.Number),
   mtime: Schema.optional(Schema.Number),
+  lineCount: Schema.optional(Schema.Number),
 }).annotate({ identifier: "FileIndex.Entry" })
 
 export interface IndexSubtree extends Schema.Schema.Type<typeof IndexSubtree> {}

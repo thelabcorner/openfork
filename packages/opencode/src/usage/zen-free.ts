@@ -7,7 +7,7 @@ export const ZEN_FREE_DAY_MS = 86_400_000
 export const ZEN_FREE_HISTORY_DAYS = 90
 export const ZEN_FREE_HISTORY_MS = ZEN_FREE_HISTORY_DAYS * ZEN_FREE_DAY_MS
 
-const SNAPSHOT_CACHE_TTL_MS = 5_000
+const SNAPSHOT_CACHE_TTL_MS = 30_000
 
 export type ZenFreeRequestEvent = {
   at: number
@@ -170,47 +170,51 @@ const layer = Layer.effect(
       const value = yield* queryPermit.withPermits(1)(
         withBackfillDb(filename, (conn) =>
           Effect.gen(function* () {
-            const requests = yield* conn
-              .all<ZenRequestRow>(sql`
-                SELECT
-                  p.time_created AS at,
-                  json_extract(m.data, '$.modelID') AS model_id
-                FROM part p
-                JOIN message m ON m.id = p.message_id
-                WHERE p.time_created >= ${since}
-                  AND p.time_created < ${now}
-                  AND json_extract(p.data, '$.type') = 'step-finish'
-                  AND json_extract(m.data, '$.role') = 'assistant'
-                  AND json_extract(m.data, '$.providerID') = 'opencode'
-                ORDER BY p.time_created ASC
-              `)
-              .pipe(Effect.orDie)
-
-            const limitErrors = yield* conn
-              .all<ZenLimitErrorRow>(sql`
-                SELECT
-                  COALESCE(
-                    json_extract(m.data, '$.time.completed'),
-                    m.time_updated,
-                    m.time_created
-                  ) AS at,
-                  json_extract(m.data, '$.modelID') AS model_id
-                FROM message m
-                WHERE COALESCE(
-                    json_extract(m.data, '$.time.completed'),
-                    m.time_updated,
-                    m.time_created
-                  ) >= ${since}
-                  AND json_extract(m.data, '$.role') = 'assistant'
-                  AND json_extract(m.data, '$.providerID') = 'opencode'
-                  AND json_extract(m.data, '$.error.name') = 'APIError'
-                  AND instr(
-                    COALESCE(json_extract(m.data, '$.error.data.responseBody'), ''),
-                    'FreeUsageLimitError'
-                  ) > 0
-                ORDER BY at ASC
-              `)
-              .pipe(Effect.orDie)
+            const [requests, limitErrors] = yield* Effect.all(
+              [
+                conn
+                  .all<ZenRequestRow>(sql`
+                    SELECT
+                      p.time_created AS at,
+                      json_extract(m.data, '$.modelID') AS model_id
+                    FROM part p
+                    JOIN message m ON m.id = p.message_id
+                    WHERE p.time_created >= ${since}
+                      AND p.time_created < ${now}
+                      AND json_extract(p.data, '$.type') = 'step-finish'
+                      AND json_extract(m.data, '$.role') = 'assistant'
+                      AND json_extract(m.data, '$.providerID') = 'opencode'
+                    ORDER BY p.time_created ASC
+                  `)
+                  .pipe(Effect.orDie),
+                conn
+                  .all<ZenLimitErrorRow>(sql`
+                    SELECT
+                      COALESCE(
+                        json_extract(m.data, '$.time.completed'),
+                        m.time_updated,
+                        m.time_created
+                      ) AS at,
+                      json_extract(m.data, '$.modelID') AS model_id
+                    FROM message m
+                    WHERE COALESCE(
+                        json_extract(m.data, '$.time.completed'),
+                        m.time_updated,
+                        m.time_created
+                      ) >= ${since}
+                      AND json_extract(m.data, '$.role') = 'assistant'
+                      AND json_extract(m.data, '$.providerID') = 'opencode'
+                      AND json_extract(m.data, '$.error.name') = 'APIError'
+                      AND instr(
+                        COALESCE(json_extract(m.data, '$.error.data.responseBody'), ''),
+                        'FreeUsageLimitError'
+                      ) > 0
+                    ORDER BY at ASC
+                  `)
+                  .pipe(Effect.orDie),
+              ],
+              { concurrency: 2 },
+            )
 
             return buildZenFreeSnapshot({
               now,

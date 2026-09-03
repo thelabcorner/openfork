@@ -20,6 +20,9 @@ describe("isProgrammaticScroll", () => {
     expect(isProgrammaticScroll({ pendingTop: 800, scrollTop: 798, delta: -5 })).toBe(false)
     expect(isProgrammaticScroll({ pendingTop: 800, scrollTop: 799, delta: -1.2 })).toBe(false)
   })
+  test("allows an explicitly attributed virtualizer correction to move upward", () => {
+    expect(isProgrammaticScroll({ pendingTop: 800, scrollTop: 798, delta: -5, allowUpward: true })).toBe(true)
+  })
   test("is inactive without a pending write", () => {
     expect(isProgrammaticScroll({ pendingTop: null, scrollTop: 800, delta: 0 })).toBe(false)
   })
@@ -29,6 +32,9 @@ describe("classifyAutoScroll", () => {
   test("treats programmatic frames as prog unless the user is moving up decisively", () => {
     expect(classifyAutoScroll({ ...thresholds, distance: 0, delta: 0, isProgrammatic: true })).toBe("prog")
     expect(classifyAutoScroll({ ...thresholds, distance: 4, delta: -2, isProgrammatic: true })).toBe("escape")
+    expect(
+      classifyAutoScroll({ ...thresholds, distance: 40, delta: -12, isProgrammatic: true, programmaticCorrection: true }),
+    ).toBe("prog")
   })
   test("does not escape on micro-jitter at the bottom", () => {
     expect(classifyAutoScroll({ ...thresholds, distance: 2, delta: -0.6, isProgrammatic: false })).toBe("stick")

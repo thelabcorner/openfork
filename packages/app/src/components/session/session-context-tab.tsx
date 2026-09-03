@@ -11,6 +11,7 @@ import { File } from "@opencode-ai/session-ui/file"
 import { Markdown } from "@opencode-ai/session-ui/markdown"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { AccordionV2 } from "@opencode-ai/ui/v2/accordion-v2"
+import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Tag } from "@opencode-ai/ui/v2/badge-v2"
 import { DividerV2 } from "@opencode-ai/ui/v2/divider-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
@@ -177,8 +178,46 @@ function messagePreviewText(parts: Part[]): string | undefined {
   return text.length > PREVIEW_LENGTH ? `${text.slice(0, PREVIEW_LENGTH)}…` : text
 }
 
+function partSummaryText(part: Part): string | undefined {
+  if (part.type === "text" || part.type === "reasoning") return part.text.trim() || undefined
+  if (part.type === "subtask") return part.description || part.prompt
+  if (part.type === "tool") return part.tool
+  if (part.type === "file") return part.filename || part.mime
+  if (part.type === "step-finish") return part.reason
+  if (part.type === "patch") return `${part.files.length} · ${part.hash.slice(0, 12)}`
+  if (part.type === "agent") return part.name
+  if (part.type === "retry") return `${part.error.name} · ${part.attempt}`
+  return undefined
+}
+
 const emptyMessages: Message[] = []
 const emptyUserMessages: UserMessage[] = []
+
+type ContextLedgerEntry = {
+  messageID: string
+  type: string
+  role: string
+  preview: string
+  tokenEstimate: number
+  excluded: boolean
+  pinned: boolean
+  edited: boolean
+  hasSignedReasoning: boolean
+  partCount: number
+  timeCreated: number
+}
+
+type ContextLedger = {
+  entries: ContextLedgerEntry[]
+  totals: {
+    messageCount: number
+    excludedCount: number
+    pinnedCount: number
+    editedCount: number
+    estimatedTokens: number
+    estimatedTokensExcluded: number
+  }
+}
 
 export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const sync = useSync()
@@ -551,6 +590,75 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   let pending: { x: number; y: number } | undefined
   const getParts = (id: string) => (sync().data.part[id] ?? []) as Part[]
 
+  const [ledger, setLedger] = createSignal<ContextLedger | null>(null)
+  const [ledgerBusy, setLedgerBusy] = createSignal<string | null>(null)
+  const [ledgerError, setLedgerError] = createSignal<string | null>(null)
+
+  const fetchLedger = async (sessionID = params.id) => {
+    if (!sessionID) return
+    try {
+      const res = await (sdk().client as unknown as {
+        sessionContext: { ledger: (p: Record<string, unknown>) => Promise<{ data: unknown }> }
+      }).sessionContext.ledger({ sessionID })
+      const data = (res as unknown as { data?: unknown }).data ?? res
+      if (params.id === sessionID) {
+        setLedger(data as ContextLedger)
+        setLedgerError(null)
+      }
+    } catch (e) {
+      if (params.id === sessionID) setLedgerError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  createEffect(
+    on(
+      () => [active(), params.id] as const,
+      ([isActive, sessionID]) => {
+        if (!isActive || !sessionID) return
+        setLedger(null)
+        setLedgerError(null)
+        void fetchLedger(sessionID)
+      },
+    ),
+  )
+  createEffect(
+    on(
+      () => messages().length,
+      () => {
+        if (active()) void fetchLedger()
+      },
+    ),
+  )
+
+  const applyLedgerOperation = async (op: Record<string, unknown>) => {
+    const sessionID = params.id
+    if (!sessionID) return
+    const key = `${op.type}:${op.messageID}`
+    setLedgerBusy(key)
+    try {
+      await (sdk().client as unknown as {
+        sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
+      }).sessionContext.applyOps({ sessionID, operations: [op] })
+      await fetchLedger(sessionID)
+      showToast({ variant: "success", title: language.t("context.ledger.applied") })
+    } catch (e) {
+      showToast({
+        variant: "error",
+        title: language.t("common.requestFailed"),
+        description: e instanceof Error ? e.message : String(e),
+      })
+    } finally {
+      setLedgerBusy(null)
+    }
+  }
+
+  const ledgerUsagePercent = createMemo(() => {
+    const limit = ctx()?.limit
+    const tokens = ledger()?.totals.estimatedTokens
+    if (!limit || tokens === undefined) return null
+    return (tokens / limit) * 100
+  })
+
   const restoreScroll = () => {
     const el = scroll
     if (!el) return
@@ -738,6 +846,20 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
       return text || undefined
     })
 
+    const reasoningText = createMemo(() => {
+      const text = props.parts
+        .filter((part): part is Extract<Part, { type: "reasoning" }> => part.type === "reasoning")
+        .map((part) => part.text)
+        .join("\n\n")
+        .trim()
+      return text || undefined
+    })
+
+    const partFallback = createMemo(() => {
+      if (bodyText() || reasoningText() || toolCalls().length > 0) return []
+      return props.parts
+    })
+
     return (
       <div class="flex flex-col gap-3">
         <Show when={metrics()}>
@@ -784,6 +906,17 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
           )}
         </Show>
 
+        <Show when={!bodyText() && reasoningText()}>
+          {(text) => (
+            <div class="rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-2">
+              <div class="mb-1 text-[9px] font-[600] uppercase leading-3 tracking-[0.02em] text-v2-text-text-faint">
+                {language.t("context.rawMessages.reasoning")}
+              </div>
+              <Markdown text={text()} class="text-[11px] leading-4 text-v2-text-text-muted" />
+            </div>
+          )}
+        </Show>
+
         <Show when={toolCalls().length > 0}>
           <div class="flex flex-col gap-1.5">
             <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">
@@ -792,6 +925,33 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
             <InfoCard>
               <For each={toolCalls()}>{(part) => <ToolCallRow part={part} />}</For>
             </InfoCard>
+          </div>
+        </Show>
+
+        <Show when={partFallback().length > 0}>
+          <div class="flex flex-col gap-1.5">
+            <div class="flex items-center justify-between gap-2 text-[10px] font-[440] leading-3 text-v2-text-text-muted">
+              <span>{language.t("context.rawMessages.partSummary")}</span>
+              <span class="tabular-nums text-v2-text-text-faint">{partFallback().length}</span>
+            </div>
+            <InfoCard>
+              <For each={partFallback()}>
+                {(part) => (
+                  <div class="flex min-w-0 items-center gap-1.5 border-b border-v2-border-border-muted px-2 py-1 last:border-0">
+                    <Tag>{part.type}</Tag>
+                    <span class="min-w-0 truncate text-[10px] text-v2-text-text-muted">
+                      {partSummaryText(part) ?? language.t("context.rawMessages.structuredPart")}
+                    </span>
+                  </div>
+                )}
+              </For>
+            </InfoCard>
+          </div>
+        </Show>
+
+        <Show when={!bodyText() && !reasoningText() && toolCalls().length === 0 && props.parts.length === 0}>
+          <div class="rounded-md border border-dashed border-v2-border-border-muted px-2.5 py-2 text-[10px] leading-3 text-v2-text-text-faint">
+            {language.t("context.rawMessages.noContent")}
           </div>
         </Show>
       </div>
@@ -804,28 +964,116 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
       return getParts(props.message.id)
     }, [] as Part[])
     const preview = createMemo(() => messagePreviewText(parts()))
+    const entry = createMemo(() => ledger()?.entries.find((item) => item.messageID === props.message.id))
     const isOpen = () => rawOpen().includes(props.message.id)
 
     return (
       <Accordion.Item value={props.message.id}>
-        <StickyAccordionHeader>
-          <Accordion.Trigger>
-            <div class="flex w-full items-center justify-between gap-2 px-1">
+        <StickyAccordionHeader class="group relative">
+          <Accordion.Trigger class="!h-11 !items-start !py-1.5 !pr-32">
+            <div class="flex min-w-0 flex-1 flex-col gap-0.5 px-1">
               <div class="flex min-w-0 items-center gap-1.5">
+                <span
+                  class="size-1.5 shrink-0 rounded-full bg-v2-text-text-faint"
+                  classList={{
+                    "bg-v2-state-fg-warning": !!entry()?.pinned && !entry()?.excluded,
+                    "bg-v2-state-fg-danger": !!entry()?.excluded,
+                  }}
+                />
                 <Tag>{props.message.role}</Tag>
                 <Show when={preview()}>
-                  <span class="min-w-0 truncate text-[10px] font-[440] italic text-v2-text-text-muted">{preview()}</span>
+                  <span
+                    class="min-w-0 truncate text-[10px] font-[440] italic text-v2-text-text-muted"
+                    classList={{ "line-through opacity-60": entry()?.excluded }}
+                  >
+                    {preview()}
+                  </span>
                 </Show>
-                <span class="shrink-0 text-[10px] font-[440] text-v2-text-text-faint">{props.message.id}</span>
               </div>
-              <div class="flex shrink-0 items-center gap-3">
-                <div class="shrink-0 text-[10px] font-[440] tabular-nums text-v2-text-text-faint">
-                  {formatter().time(props.message.time.created)}
-                </div>
-                <Icon name="chevron-grabber-vertical" size="small" class="shrink-0 text-v2-text-text-faint" />
+              <div class="flex min-w-0 items-center gap-1.5 text-[9px] font-[440] leading-3 text-v2-text-text-faint">
+                <span class="min-w-0 truncate font-mono">{props.message.id}</span>
+                <span class="text-v2-text-text-faint/60">·</span>
+                <Show when={entry()}>
+                  {(item) => <span class="shrink-0 tabular-nums">{formatter().number(item().tokenEstimate)} tok</span>}
+                </Show>
+                <span class="text-v2-text-text-faint/60">·</span>
+                <span class="shrink-0 tabular-nums">{formatter().time(props.message.time.created)}</span>
+                <Show when={entry()?.edited}>
+                  <span class="rounded bg-v2-state-bg-info px-1 py-0.5 text-[8px] font-[600] uppercase leading-none text-v2-state-fg-info">
+                    {language.t("context.ledger.edited")}
+                  </span>
+                </Show>
+                <Show when={entry()?.excluded}>
+                  <span class="rounded bg-v2-state-bg-danger px-1 py-0.5 text-[8px] font-[600] uppercase leading-none text-v2-state-fg-danger">
+                    {language.t("context.ledger.excluded")}
+                  </span>
+                </Show>
+                <Show when={entry()?.pinned}>
+                  <span class="rounded bg-v2-state-bg-warning px-1 py-0.5 text-[8px] font-[600] uppercase leading-none text-v2-state-fg-warning">
+                    {language.t("context.ledger.pinned")}
+                  </span>
+                </Show>
+                <Show when={entry()?.hasSignedReasoning}>
+                  <TooltipV2 value={language.t("context.ledger.locked.tooltip")}>
+                    <span class="rounded bg-v2-background-bg-layer-03 px-1 py-0.5 text-[8px]" tabIndex={0}>
+                      {language.t("context.ledger.locked")}
+                    </span>
+                  </TooltipV2>
+                </Show>
               </div>
             </div>
           </Accordion.Trigger>
+          <Show when={entry()}>
+            {(item) => (
+              <div class="absolute right-1 top-1/2 z-[1] flex -translate-y-1/2 items-center gap-0.5 rounded-md bg-v2-background-bg-base/95 pl-1 shadow-[-8px_0_12px_-8px_var(--v2-background-bg-base)]">
+                <Show
+                  when={!item().excluded}
+                  fallback={
+                    <ButtonV2
+                      variant="ghost-muted"
+                      size="small"
+                      class="!h-5 !px-1.5 !text-[10px] !leading-3"
+                      disabled={ledgerBusy() === `message.include:${item().messageID}`}
+                      onClick={() => void applyLedgerOperation({ type: "message.include", messageID: item().messageID })}
+                    >
+                      {language.t("context.ledger.restore")}
+                    </ButtonV2>
+                  }
+                >
+                  <ButtonV2
+                    variant="ghost-muted"
+                    size="small"
+                    class="!h-5 !px-1.5 !text-[10px] !leading-3"
+                    disabled={item().hasSignedReasoning || ledgerBusy() === `message.exclude:${item().messageID}`}
+                    title={
+                      item().hasSignedReasoning
+                        ? language.t("context.ledger.locked.tooltip")
+                        : language.t("context.ledger.remove.tooltip")
+                    }
+                    onClick={() => void applyLedgerOperation({ type: "message.exclude", messageID: item().messageID })}
+                  >
+                    {language.t("context.ledger.remove")}
+                  </ButtonV2>
+                </Show>
+                <ButtonV2
+                  variant={item().pinned ? "warning" : "ghost-muted"}
+                  size="small"
+                  class="!h-5 !w-5 !min-w-5 !px-0"
+                  icon={item().pinned ? "pin-filled" : "pin"}
+                  disabled={ledgerBusy() === `message.${item().pinned ? "unpin" : "pin"}:${item().messageID}`}
+                  title={language.t(item().pinned ? "context.ledger.unpin" : "context.ledger.pin")}
+                  aria-label={language.t(item().pinned ? "context.ledger.unpin" : "context.ledger.pin")}
+                  onClick={() =>
+                    void applyLedgerOperation({
+                      type: item().pinned ? "message.unpin" : "message.pin",
+                      messageID: item().messageID,
+                    })
+                  }
+                />
+                <Icon name="chevron-grabber-vertical" size="small" class="mx-0.5 shrink-0 text-v2-text-text-faint" />
+              </div>
+            )}
+          </Show>
         </StickyAccordionHeader>
         <Accordion.Content class="bg-v2-background-bg-layer-01">
           <Show when={isOpen()}>
@@ -1071,18 +1319,126 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
             )}
           </Show>
 
-          <div class="flex flex-col gap-2">
-            <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">
-              {language.t("context.rawMessages.title")}
+          <section class="flex flex-col gap-2">
+            <div class="flex items-baseline justify-between gap-2">
+              <div class="min-w-0">
+                <h3 class="flex items-center gap-1 text-[10px] font-[600] uppercase leading-3 tracking-[0.02em] text-v2-text-text-faint">
+                  {language.t("context.ledger.title")}
+                  <TooltipV2 value={<div class="max-w-64 text-11-regular">{language.t("context.ledger.tooltip")}</div>}>
+                    <span class="inline-flex text-v2-text-text-faint hover:text-v2-text-text-muted" tabIndex={0}>
+                      <IconV2 name="help" size="small" />
+                    </span>
+                  </TooltipV2>
+                </h3>
+                <p class="mt-1 text-[10px] leading-3 text-v2-text-text-faint">{language.t("context.ledger.description")}</p>
+              </div>
+              <span class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-muted">
+                {messages().length.toLocaleString(language.intl())}
+              </span>
             </div>
-            <Accordion
-              multiple
-              value={rawOpen()}
-              onChange={(value) => setRawOpen(Array.isArray(value) ? value : value ? [value] : [])}
-            >
-              <For each={messages()}>{(message) => <RawMessage message={message} />}</For>
-            </Accordion>
-          </div>
+
+            <div class="overflow-hidden rounded-lg border border-v2-border-border-muted bg-v2-background-bg-base shadow-[var(--v2-elevation-sunken)]">
+              <Show
+                when={ledger()}
+                fallback={
+                  <div class="border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-2 text-[10px] leading-3 text-v2-text-text-faint">
+                    {language.t(ledgerError() ? "context.ledger.error" : "context.ledger.loading")}
+                  </div>
+                }
+              >
+                {(l) => (
+                  <div class="flex flex-col gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-2">
+                    <div class="flex items-center justify-between gap-2">
+                      <div class="flex min-w-0 items-center gap-1.5">
+                        <ProgressCircleV2
+                          percentage={ledgerUsagePercent() ?? 0}
+                          size={16}
+                          strokeWidth={2}
+                        />
+                        <span class="text-[10px] font-[560] leading-3 text-v2-text-text-base">
+                          {language.t("context.ledger.effective")}
+                        </span>
+                      </div>
+                      <span class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-muted">
+                        {formatter().number(l().totals.estimatedTokens)} {language.t("context.ledger.tokens")}
+                      </span>
+                    </div>
+                    <RatioBar
+                      percent={ledgerUsagePercent()}
+                      color="var(--syntax-info)"
+                    />
+                    <div class="grid grid-cols-3 gap-1.5">
+                      <MetricCell label={language.t("context.ledger.messages")} value={`${l().totals.messageCount}`} />
+                      <MetricCell
+                        label={language.t("context.ledger.included")}
+                        value={`${l().totals.messageCount - l().totals.excludedCount}`}
+                      />
+                      <MetricCell
+                        label={language.t("context.ledger.excluded")}
+                        value={`${l().totals.excludedCount}`}
+                        tooltip={language.t("context.ledger.excluded.tooltip")}
+                      />
+                    </div>
+                    <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-[9px] leading-3 text-v2-text-text-faint">
+                      <span>{language.t("context.ledger.occupancy", { tokens: formatter().number(l().totals.estimatedTokens) })}</span>
+                      <Show when={l().totals.pinnedCount > 0}>
+                        <span class="text-v2-text-text-faint/60">·</span>
+                        <span>{language.t("context.ledger.pinnedCount", { count: l().totals.pinnedCount })}</span>
+                      </Show>
+                      <Show when={l().totals.editedCount > 0}>
+                        <span class="text-v2-text-text-faint/60">·</span>
+                        <span>{language.t("context.ledger.editedCount", { count: l().totals.editedCount })}</span>
+                      </Show>
+                    </div>
+                  </div>
+                )}
+              </Show>
+
+              <div class="flex items-center justify-between gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-base px-2.5 py-1.5">
+                <div class="flex min-w-0 items-center gap-1.5">
+                  <span class="text-[10px] font-[560] leading-3 text-v2-text-text-base">{language.t("context.ledger.messages")}</span>
+                  <span class="text-[9px] leading-3 text-v2-text-text-faint">{language.t("context.ledger.inspectHint")}</span>
+                </div>
+                <Show when={messages().length > 0}>
+                  <div class="flex shrink-0 items-center gap-0.5">
+                    <button
+                      type="button"
+                      class="rounded px-1.5 py-1 text-[9px] font-[520] leading-3 text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
+                      onClick={() => setRawOpen(messages().map((message) => message.id))}
+                    >
+                      {language.t("context.ledger.expandAll")}
+                    </button>
+                    <button
+                      type="button"
+                      class="rounded px-1.5 py-1 text-[9px] font-[520] leading-3 text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
+                      onClick={() => setRawOpen([])}
+                    >
+                      {language.t("context.ledger.collapseAll")}
+                    </button>
+                  </div>
+                </Show>
+              </div>
+
+              <Show
+                when={messages().length > 0}
+                fallback={<div class="px-2.5 py-3 text-[10px] leading-3 text-v2-text-text-faint">{language.t("context.ledger.empty")}</div>}
+              >
+                <Accordion
+                  multiple
+                  value={rawOpen()}
+                  onChange={(value) => setRawOpen(Array.isArray(value) ? value : value ? [value] : [])}
+                >
+                  <For each={messages()}>{(message) => <RawMessage message={message} />}</For>
+                </Accordion>
+              </Show>
+
+              <Show when={ledger()?.totals.excludedCount || ledger()?.totals.editedCount}>
+                <div class="border-t border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-1.5 text-[9px] leading-3 text-v2-text-text-faint">
+                  {language.t("context.ledger.spendNote")}
+                </div>
+              </Show>
+            </div>
+          </section>
         </div>
       </ScrollView>
     </div>

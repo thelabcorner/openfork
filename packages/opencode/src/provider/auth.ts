@@ -1,4 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { EventV2 } from "@opencode-ai/core/event"
+import { Integration } from "@opencode-ai/core/integration"
 import type { AuthOAuthResult, Hooks } from "@opencode-ai/plugin"
 import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { Auth } from "@/auth"
@@ -106,11 +108,12 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Pr
 
 export const use = serviceUse(Service)
 
-const layer: Layer.Layer<Service, never, Auth.Service | Plugin.Service> = Layer.effect(
+const layer: Layer.Layer<Service, never, Auth.Service | Plugin.Service | EventV2.Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const auth = yield* Auth.Service
     const plugin = yield* Plugin.Service
+    const events = yield* EventV2.Service
     const state = yield* InstanceState.make<State>(
       Effect.fn("ProviderAuth.state")(function* () {
         const plugins = yield* plugin.list()
@@ -218,12 +221,23 @@ const layer: Layer.Layer<Service, never, Auth.Service | Plugin.Service> = Layer.
           ...extra,
         })
       }
+
+      // Legacy provider auth hooks can maintain additional credential state
+      // (for example Verdent's multi-account vault) outside Auth. Publish the
+      // shared update event so cached provider models and clients refresh too.
+      yield* events.publish(Integration.Event.ConnectionUpdated, {
+        integrationID: Integration.ID.make(input.providerID),
+      })
     })
 
     return Service.of({ methods, authorize, callback })
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [Auth.node, Plugin.node] })
+export const node = LayerNode.make({
+  service: Service,
+  layer: layer,
+  deps: [Auth.node, Plugin.node, EventV2.node],
+})
 
 export * as ProviderAuth from "./auth"

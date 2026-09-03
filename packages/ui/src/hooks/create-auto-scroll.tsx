@@ -14,6 +14,8 @@ export interface AutoScrollOptions {
   onUserInteracted?: () => void
   overflowAnchor?: "none" | "auto" | "dynamic"
   bottomThreshold?: number
+  /** Set when another scroll coordinator owns content-follow writes. */
+  scrollOwner?: "self" | "external"
 }
 
 export function createAutoScroll(options: AutoScrollOptions) {
@@ -21,6 +23,7 @@ export function createAutoScroll(options: AutoScrollOptions) {
   let settleTimer: ReturnType<typeof setTimeout> | undefined
   // One-shot programmatic marker: consumed on the next scroll frame.
   let pendingProg: number | null = null
+  let pendingProgAllowsUpward = false
   let lastScrollTop = 0
   let stickRaf: number | undefined
 
@@ -45,6 +48,14 @@ export function createAutoScroll(options: AutoScrollOptions) {
 
   const markProg = (el: HTMLElement) => {
     pendingProg = Math.max(0, el.scrollHeight - el.clientHeight)
+    pendingProgAllowsUpward = false
+  }
+
+  const markProgrammatic = (top: number) => {
+    const el = store.scrollRef
+    if (!el) return
+    pendingProg = Math.max(0, Math.min(top, Math.max(0, el.scrollHeight - el.clientHeight)))
+    pendingProgAllowsUpward = true
   }
 
   const scrollToBottomNow = (behavior: ScrollBehavior) => {
@@ -71,6 +82,8 @@ export function createAutoScroll(options: AutoScrollOptions) {
     if (!el) return
 
     if (!force && store.userScrolled) return
+
+    if (options.scrollOwner === "external" && !force) return
 
     const distance = distanceFromBottom(el)
     if (distance < 2) {
@@ -105,6 +118,7 @@ export function createAutoScroll(options: AutoScrollOptions) {
       stickRaf = undefined
     }
     pendingProg = null
+    pendingProgAllowsUpward = false
 
     const el = store.scrollRef
     if (!el) return
@@ -163,8 +177,10 @@ export function createAutoScroll(options: AutoScrollOptions) {
       pendingTop: pendingProg,
       scrollTop: el.scrollTop,
       delta,
+      allowUpward: pendingProgAllowsUpward,
     })
     pendingProg = null
+    pendingProgAllowsUpward = false
 
     const intent = classifyAutoScroll({
       distance: dist,
@@ -172,6 +188,7 @@ export function createAutoScroll(options: AutoScrollOptions) {
       stickThreshold: stickThreshold(),
       escapeThreshold: escapeThreshold(),
       isProgrammatic: programmatic,
+      programmaticCorrection: programmatic && pendingProgAllowsUpward,
     })
 
     if (intent === "prog") {
@@ -226,6 +243,7 @@ export function createAutoScroll(options: AutoScrollOptions) {
         if (store.userScrolled) setStore("userScrolled", false)
         return
       }
+      if (options.scrollOwner === "external") return
       if (!active()) return
       if (store.userScrolled) return
       // Coalesce rapid content growth (streaming) into one rAF stick so we
@@ -293,6 +311,7 @@ export function createAutoScroll(options: AutoScrollOptions) {
     },
     scrollToBottom: () => scrollToBottom(false),
     forceScrollToBottom: () => scrollToBottom(true),
+    markProgrammatic,
     userScrolled: () => store.userScrolled,
   }
 }

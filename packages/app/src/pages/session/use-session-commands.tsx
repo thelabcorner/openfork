@@ -643,11 +643,15 @@ export const useSessionCommands = (actions: SessionCommandContext) => {
       keybind: "mod+shift+l",
       onSelect: () => layout.sessionContext.toggle(),
     }),
-    viewCommand({
-      id: "usage.toggle",
-      title: language.t("command.usage.toggle"),
-      onSelect: () => void startTransition(() => layout.sessionContext.selectTab("usage")),
-    }),
+    ...(settings.general.newLayoutDesigns()
+      ? [
+          viewCommand({
+            id: "usage.toggle",
+            title: language.t("command.usage.toggle"),
+            onSelect: () => navigate("/usage"),
+          }),
+        ]
+      : []),
     viewCommand({
       id: "models.toggle",
       title: language.t("command.models.toggle"),

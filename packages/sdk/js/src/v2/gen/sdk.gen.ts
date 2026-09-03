@@ -221,6 +221,17 @@ import type {
   SessionChildrenResponses,
   SessionCommandErrors,
   SessionCommandResponses,
+  SessionContextApplyOpsErrors,
+  SessionContextApplyOpsResponses,
+  SessionContextForkOriginErrors,
+  SessionContextForkOriginResponses,
+  SessionContextLedgerErrors,
+  SessionContextLedgerResponses,
+  SessionContextOperation,
+  SessionContextOpsHistoryErrors,
+  SessionContextOpsHistoryResponses,
+  SessionContextPreviewErrors,
+  SessionContextPreviewResponses,
   SessionCreateErrors,
   SessionCreateResponses,
   SessionDeleteErrors,
@@ -4733,6 +4744,9 @@ export class Session2 extends HeyApiClient {
       directory?: string
       workspace?: string
       messageID?: string
+      edge?: "before" | "after"
+      kind?: "manual" | "regenerate" | "temporary" | "model-comparison"
+      workspaceMode?: "shared-current" | "new-worktree"
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -4745,6 +4759,9 @@ export class Session2 extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "messageID" },
+            { in: "body", key: "edge" },
+            { in: "body", key: "kind" },
+            { in: "body", key: "workspaceMode" },
           ],
         },
       ],
@@ -5367,6 +5384,195 @@ export class Part extends HeyApiClient {
         ...options?.headers,
         ...params.headers,
       },
+    })
+  }
+}
+
+export class SessionContext extends HeyApiClient {
+  /**
+   * Apply context operations
+   *
+   * Apply a batch of context operations (exclude, include, edit, pin, etc.) as one durable event. Reversible by applying inverse ops.
+   */
+  public applyOps<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+      operations?: Array<SessionContextOperation>
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "operations" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      SessionContextApplyOpsResponses,
+      SessionContextApplyOpsErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/context/ops",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get context operation history
+   *
+   * Retrieve the audit trail of context operations for a session.
+   */
+  public opsHistory<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionContextOpsHistoryResponses,
+      SessionContextOpsHistoryErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/context/ops/history",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get context ledger
+   *
+   * Retrieve the actionable context ledger: per-message token estimates, exclusion/edit/pin status, and totals. Occupancy vs spend vs cache are separate.
+   */
+  public ledger<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionContextLedgerResponses,
+      SessionContextLedgerErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/context/ledger",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Preview next request context
+   *
+   * Show before/after token counts and effective context size without mutating.
+   */
+  public preview<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionContextPreviewResponses,
+      SessionContextPreviewErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/context/preview",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get fork origin
+   *
+   * Retrieve lineage metadata for a forked session.
+   */
+  public forkOrigin<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<
+      SessionContextForkOriginResponses,
+      SessionContextForkOriginErrors,
+      ThrowOnError
+    >({
+      url: "/session/{sessionID}/fork-origin",
+      ...options,
+      ...params,
     })
   }
 }
@@ -9272,6 +9478,11 @@ export class OpencodeClient extends HeyApiClient {
   private _part?: Part
   get part(): Part {
     return (this._part ??= new Part({ client: this.client }))
+  }
+
+  private _sessionContext?: SessionContext
+  get sessionContext(): SessionContext {
+    return (this._sessionContext ??= new SessionContext({ client: this.client }))
   }
 
   private _sessionGroup?: SessionGroup

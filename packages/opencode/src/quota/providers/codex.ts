@@ -14,7 +14,7 @@ const NAME = "Codex"
 const USAGE_URL = "https://chatgpt.com/backend-api/wham/usage"
 
 export const codex = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter => {
-  const cache = createQuotaCache<ReturnType<typeof buildResult>>("codex")
+  const cache = createQuotaCache<ReturnType<typeof buildResult>>("codex", { persistentKey: "codex" })
 
   return {
     id: "codex",

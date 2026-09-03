@@ -241,3 +241,63 @@ export const SessionCheckpointTable = sqliteTable(
     uniqueIndex("session_checkpoint_session_user_message_idx").on(table.session_id, table.user_message_id),
   ],
 )
+
+// ── Conversation Control: Context State Overlay ─────────────────────
+// Fork-owned tables. See FORK.md — these are fork-owned, never upstream.
+
+export const SessionContextStateTable = sqliteTable(
+  "session_context_state",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    message_id: text().$type<MessageID>().notNull(),
+    excluded: integer({ mode: "boolean" }).notNull().default(false),
+    pinned: integer({ mode: "boolean" }).notNull().default(false),
+    override_data: text({ mode: "json" }).$type<Record<string, unknown> | null>(),
+    override_search_text: text(),
+    modified_seq: integer(),
+    modified_at: integer().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.session_id, table.message_id] }),
+    index("session_context_state_session_idx").on(table.session_id),
+  ],
+)
+
+export const SessionContextOpsTable = sqliteTable(
+  "session_context_ops",
+  {
+    id: text().primaryKey(),
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    batch_id: text().notNull(),
+    operations: text({ mode: "json" }).$type<unknown[]>().notNull(),
+    timestamp: integer().notNull(),
+  },
+  (table) => [
+    index("session_context_ops_session_idx").on(table.session_id),
+    index("session_context_ops_session_time_idx").on(table.session_id, table.timestamp),
+  ],
+)
+
+export const SessionForkOriginTable = sqliteTable(
+  "session_fork_origin",
+  {
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .primaryKey()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    parent_session_id: text().$type<SessionSchema.ID>().notNull(),
+    source_message_id: text().$type<MessageID>(),
+    source_seq: integer(),
+    edge: text().$type<"before" | "after">(),
+    kind: text().$type<"manual" | "regenerate" | "temporary" | "model-comparison">().notNull(),
+    workspace_mode: text().$type<"shared-current" | "new-worktree">().notNull(),
+    created_at: integer().notNull(),
+  },
+  (table) => [index("session_fork_origin_parent_idx").on(table.parent_session_id)],
+)

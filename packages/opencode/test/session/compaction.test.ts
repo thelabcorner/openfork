@@ -594,6 +594,32 @@ describe("session.compaction.create", () => {
     ),
   )
 
+  it.live(
+    "persists continueAfter on a manual compaction marker",
+    provideTmpdirInstance(() =>
+      Effect.gen(function* () {
+        const compact = yield* SessionCompaction.Service
+        const ssn = yield* SessionNs.Service
+        const info = yield* ssn.create({})
+
+        yield* compact.create({
+          sessionID: info.id,
+          agent: "build",
+          model: ref,
+          auto: false,
+          continueAfter: true,
+        })
+
+        const msgs = yield* ssn.messages({ sessionID: info.id })
+        expect(msgs[0]?.parts[0]).toMatchObject({
+          type: "compaction",
+          auto: false,
+          continueAfter: true,
+        })
+      }),
+    ),
+  )
+
   it.live.skip(
     "projects a compaction message to v2 (v2 projector disabled)",
     provideTmpdirInstance(() =>
@@ -932,6 +958,61 @@ describe("session.compaction.process", () => {
       if (last?.parts[0]?.type === "text") {
         expect(last.parts[0].text).toContain("Continue if you have next steps")
       }
+    }),
+  )
+
+  it.instance(
+    "adds synthetic continue prompt when continueAfter is enabled",
+    Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      const msg = yield* createUserMessage(session.id, "hello")
+      const msgs = yield* ssn.messages({ sessionID: session.id })
+
+      const result = yield* SessionCompaction.use.process({
+        parentID: msg.id,
+        messages: msgs,
+        sessionID: session.id,
+        auto: false,
+        continueAfter: true,
+      })
+
+      const all = yield* ssn.messages({ sessionID: session.id })
+      const last = all.at(-1)
+
+      expect(result).toBe("continue")
+      expect(last?.parts[0]).toMatchObject({
+        type: "text",
+        synthetic: true,
+        metadata: { compaction_continue: true },
+      })
+    }),
+  )
+
+  it.instance(
+    "does not add synthetic continuation after a newer user message is admitted",
+    Effect.gen(function* () {
+      const ssn = yield* SessionNs.Service
+      const session = yield* ssn.create({})
+      const parent = yield* createUserMessage(session.id, "summarize this")
+      const beforeAdmission = yield* ssn.messages({ sessionID: session.id })
+      yield* createUserMessage(session.id, "new request")
+
+      const result = yield* SessionCompaction.use.process({
+        parentID: parent.id,
+        messages: beforeAdmission,
+        sessionID: session.id,
+        auto: false,
+        continueAfter: true,
+      })
+
+      const all = yield* ssn.messages({ sessionID: session.id })
+      const synthetic = all.flatMap((message) => message.parts).find(
+        (part) => part.type === "text" && part.metadata?.compaction_continue === true,
+      )
+
+      expect(result).toBe("continue")
+      expect(synthetic).toBeUndefined()
     }),
   )
 

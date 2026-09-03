@@ -11,6 +11,7 @@ import { getFilename } from "@opencode-ai/core/util/path"
 import { createEffect, createMemo, createSignal, For, onMount, Show, startTransition } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Portal } from "solid-js/web"
+import { useNavigate } from "@solidjs/router"
 import { useCommand } from "@/context/command"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
@@ -140,6 +141,7 @@ export function SessionHeader() {
   const platform = usePlatform()
   const language = useLanguage()
   const settings = useSettings()
+  const navigate = useNavigate()
   const sync = useSync()
   const terminal = useTerminal()
   const { params, view } = useSessionLayout()
@@ -492,25 +494,18 @@ export function SessionHeader() {
                         </Button>
                       </TooltipKeybind>
 
-                      <Tooltip placement="bottom" value={language.t("command.usage.toggle")}>
-                        <Button
-                          variant="ghost"
-                          class="titlebar-icon w-8 h-6 p-0 box-border"
-                          aria-label={language.t("command.usage.toggle")}
-                          aria-expanded={layout.sessionContext.opened() && layout.sessionContext.tab() === "usage"}
-                          aria-controls="context-panel"
-                          onClick={() => void startTransition(() => layout.sessionContext.selectTab("usage"))}
-                        >
-                          <Icon
-                            size="small"
-                            name="usage"
-                            classList={{
-                              "text-icon-strong": layout.sessionContext.opened() && layout.sessionContext.tab() === "usage",
-                              "text-icon-weak": !(layout.sessionContext.opened() && layout.sessionContext.tab() === "usage"),
-                            }}
-                          />
-                        </Button>
-                      </Tooltip>
+                      <Show when={settings.general.newLayoutDesigns()}>
+                        <Tooltip placement="bottom" value={language.t("usage.panel.title")}>
+                          <Button
+                            variant="ghost"
+                            class="titlebar-icon w-8 h-6 p-0 box-border"
+                            aria-label={language.t("usage.panel.title")}
+                            onClick={() => navigate("/usage")}
+                          >
+                            <Icon size="small" name="usage" class="text-icon-weak" />
+                          </Button>
+                        </Tooltip>
+                      </Show>
 
                       <Tooltip placement="bottom" value={language.t("command.limits.toggle")}>
                         <Button

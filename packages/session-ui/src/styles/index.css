@@ -11,5 +11,6 @@
 @import "../components/tool-count-label.css" layer(components);
 @import "../components/tool-count-summary.css" layer(components);
 @import "../components/file-search.css" layer(components);
+@import "../components/tool-parts.css" layer(components);
 @import "../components/tool-error-card.css" layer(components);
 @import "../components/tool-status-title.css" layer(components);

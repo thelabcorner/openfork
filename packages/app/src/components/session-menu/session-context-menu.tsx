@@ -1,4 +1,4 @@
-import { createMemo, createSignal, getOwner, runWithOwner, Show, type ParentProps } from "solid-js"
+import { createMemo, createSignal, getOwner, onCleanup, runWithOwner, Show, type ParentProps } from "solid-js"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { useLanguage } from "@/context/language"
@@ -28,6 +28,7 @@ import { DirectoryDataProvider } from "@/pages/directory-layout"
 import { DialogRenameSession } from "@/components/dialog-rename-session"
 import { isSessionPinned, toggleSessionPin } from "@/utils/pinned-sessions"
 import { fetchSessionExport, sessionExportFilename, downloadSessionExport } from "@/utils/session-export"
+import type { ServerScope } from "@/utils/server-scope"
 
 const promptFromSession = (sess: Session | undefined): PromptModel | undefined => {
   const model = sess?.model
@@ -62,11 +63,23 @@ export type SessionContextMenuProps = ParentProps<{
   inGroupId?: string
   onOpen?: (opts?: { background?: boolean }) => void
   onArchive?: () => Promise<void> | void
+  onChangeModel?: (request: SessionModelPickerRequest) => void
+  onNewSessionInProject?: () => void
+  onOpenProjectInExplorer?: () => void
+  onCopyProjectPath?: () => void
+  onForkConversation?: () => void
   // Group overrides — if not provided, generic sessionGroups mutations are used
   onAddToGroup?: (groupId: string) => void
   onRemoveFromGroup?: () => void
   onCreateGroup?: (name: string, sessionIds?: string[]) => Promise<string> | void
 }>
+
+export type SessionModelPickerRequest = {
+  session: Session
+  server?: ServerConnection.Key
+  serverScope: ServerScope
+  anchor: { top: number; left: number }
+}
 
 /**
  * Unified session right-click menu — one shared architecture for tabs, home, and chats.
@@ -319,6 +332,12 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     // Capture synchronously — this is the pointerdown that selected "Change
     // model" itself, so the popover spawns right there, like a submenu flyout.
     const anchor = { top: lastPointerPosition.y, left: lastPointerPosition.x }
+    if (props.onChangeModel) {
+      const ctx = serverCtx()
+      if (!ctx) return
+      props.onChangeModel({ session: sess, server: props.server, serverScope: ctx.sdk.scope, anchor })
+      return
+    }
     void ensurePromptSession().then((ps) => {
       const model = ps?.model
       if (!model) return
@@ -503,8 +522,12 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
         exportJson,
         copySessionId,
         renameSession,
-        togglePin,
-      },
+         togglePin,
+         newSessionInProject: props.onNewSessionInProject,
+         openProjectInExplorer: props.onOpenProjectInExplorer,
+         copyProjectPath: props.onCopyProjectPath,
+         forkConversation: props.onForkConversation,
+       },
     }),
   )
 
@@ -524,13 +547,13 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
           </MenuV2.Context.Content>
         </MenuV2.Context.Portal>
       </MenuV2.Context>
-      <Show when={modelPicker()}>
+      <Show when={modelPicker()} keyed>
         {(state) => (
           <SessionModelPopoverHost
-            session={state().session}
-            server={state().server}
-            promptModel={state().promptModel}
-            anchor={state().anchor}
+            session={state.session}
+            server={state.server}
+            promptModel={state.promptModel}
+            anchor={state.anchor}
             onClose={() => setModelPicker(null)}
           />
         )}
@@ -569,6 +592,45 @@ function SessionModelPopoverHost(props: {
     <ScopedLocalProvider session={props.session} server={props.server}>
       <ModelWrapperPopover session={props.session} promptModel={props.promptModel} anchor={props.anchor} onClose={props.onClose} />
     </ScopedLocalProvider>
+  )
+}
+
+/**
+ * Stable host for menus rendered inside volatile row wrappers (for example a
+ * TooltipV2). Prompt state and providers are created only while the picker is
+ * open, under this host's owner rather than the row that issued the request.
+ */
+export function SessionModelPicker(props: SessionModelPickerRequest & { onClose: () => void }) {
+  const prompt = createPromptSession(props.serverScope, {
+    dir: base64Encode(props.session.directory),
+    id: props.session.id,
+  })
+  const [ready, setReady] = createSignal(prompt.ready())
+  let disposed = false
+
+  if (!ready()) {
+    void Promise.resolve(prompt.ready.promise)
+      .then(() => {
+        if (!disposed) setReady(true)
+      })
+      .catch(() => {
+        if (!disposed) props.onClose()
+      })
+  }
+  onCleanup(() => {
+    disposed = true
+  })
+
+  return (
+    <Show when={ready()}>
+      <SessionModelPopoverHost
+        session={props.session}
+        server={props.server}
+        promptModel={prompt.model}
+        anchor={props.anchor}
+        onClose={props.onClose}
+      />
+    </Show>
   )
 }
 
@@ -642,12 +704,12 @@ function SessionModelPopover(props: {
   void import("@/components/dialog-select-model").then((mod) => setComp(() => mod.ModelSelectorPopoverV2))
 
   return (
-    <Show when={Comp()}>
-      {(compAccessor) => {
-        const C = compAccessor()
+    <Show when={Comp()} keyed>
+      {(C) => {
         return (
           <C
             model={props.model}
+            defaultOpen
             onClose={props.onClose}
             trigger={(triggerProps) => (
               <button
@@ -656,30 +718,6 @@ function SessionModelPopover(props: {
                 ref={(el: HTMLButtonElement) => {
                   const forwardRef = (triggerProps as { ref?: (el: HTMLButtonElement) => void }).ref
                   if (typeof forwardRef === "function") forwardRef(el)
-                  // Kobalte's DropdownMenu.Trigger opens on `pointerdown`
-                  // (see MenuTrigger in @kobalte/core), not `click` — a plain
-                  // el.click() dispatches only a MouseEvent "click" and is
-                  // silently ignored, so the popover never opened.
-                  requestAnimationFrame(() => {
-                    el.dispatchEvent(
-                      new PointerEvent("pointerdown", {
-                        bubbles: true,
-                        cancelable: true,
-                        pointerId: 1,
-                        pointerType: "mouse",
-                        button: 0,
-                      }),
-                    )
-                    el.dispatchEvent(
-                      new PointerEvent("pointerup", {
-                        bubbles: true,
-                        cancelable: true,
-                        pointerId: 1,
-                        pointerType: "mouse",
-                        button: 0,
-                      }),
-                    )
-                  })
                 }}
                 style={{ position: "fixed", top: `${props.anchor.top}px`, left: `${props.anchor.left}px`, width: "1px", height: "1px", opacity: 0, "pointer-events": "none" }}
                 tabIndex={-1}

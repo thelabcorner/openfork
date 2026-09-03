@@ -1297,9 +1297,52 @@ Generate a fresh title. Do not reuse the current title.`
            yield* status.set(sessionID, { type: "busy" })
            yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-           let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-             Effect.provideService(Database.Service, database),
-           )
+            let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            )
+            // ── Conversation Control: Effective Context Compiler ─────
+            // Fork-owned seam (see FORK.md). Filters excluded/pinned/edits before
+            // provider lowering. Best-effort — falls back to canonical on error.
+            {
+              const maybeCompiled = yield* Effect.gen(function* () {
+                const { EffectiveContextCompiler } = yield* Effect.promise(
+                  () => import("./context/compiler"),
+                )
+                const compiled = yield* (EffectiveContextCompiler.compileForSession as any)({
+                  messages: msgs,
+                  sessionID,
+                }).pipe(Effect.provideService(Database.Service, database))
+                const issues = EffectiveContextCompiler.validateEffectiveHistory(compiled.effective)
+                if (issues.length > 0) {
+                  yield* Effect.logWarning("effective context validation warnings", {
+                    sessionID,
+                    issues,
+                  })
+                  return undefined
+                }
+                if (compiled.warnings.length > 0) {
+                  yield* Effect.logWarning("effective context compiler warnings", {
+                    sessionID,
+                    warnings: compiled.warnings,
+                  })
+                }
+                return compiled
+              }).pipe(
+                Effect.catch((e) =>
+                  Effect.logWarning("effective context compile failed — using canonical", {
+                    sessionID,
+                    error: String(e),
+                  }).pipe(Effect.as(undefined)),
+                ),
+                Effect.catchDefect((e) =>
+                  Effect.logWarning("effective context compile defect — using canonical", {
+                    sessionID,
+                    error: String(e),
+                  }).pipe(Effect.as(undefined)),
+                ),
+              )
+              if (maybeCompiled) msgs = (maybeCompiled as any).effective as any
+            }
 
            const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
 
@@ -1401,9 +1444,24 @@ Generate a fresh title. Do not reuse the current title.`
               parentID: lastUser.id,
               sessionID,
               auto: task.auto,
+              continueAfter: task.continueAfter,
               overflow: task.overflow,
             })
+            // A prompt can be admitted while compaction is generating its
+            // summary. Re-read after compaction: the original continuation
+            // decision predates that prompt, so stopping here would leave the
+            // newly admitted user message stranded until another wake.
+            const afterCompaction = yield* MessageV2.stream(sessionID).pipe(
+              Effect.provideService(Database.Service, database),
+            )
+            const newestUser = MessageV2.latest(afterCompaction).user
+            const hasConcurrentUser =
+              newestUser !== undefined &&
+              (newestUser.time.created > lastUser.time.created ||
+                (newestUser.time.created === lastUser.time.created && newestUser.id > lastUser.id))
+            if (hasConcurrentUser) continue
             if (result === "stop") break
+            if (!task.auto && !task.continueAfter) break
             continue
           }
 

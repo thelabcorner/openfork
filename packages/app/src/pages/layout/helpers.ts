@@ -94,12 +94,17 @@ export function getProjectAvatarSource(id?: string, icon?: { color?: string; url
 }
 
 export function projectForSession<T extends { id?: string; worktree: string; sandboxes?: string[] }>(
-  session: Session,
+  session: Session | undefined,
   projects: T[],
   byID: Map<string, T> = new Map(projects.flatMap((project) => (project.id ? [[project.id, project] as const] : []))),
 ) {
-  const direct = byID.get(session.projectID)
-  if (direct) return direct
+  if (!session) return undefined
+  // projectID is optional on older/partial Session payloads — fall back to directory match
+  const projectID = (session as Session & { projectID?: string }).projectID
+  if (projectID) {
+    const direct = byID.get(projectID)
+    if (direct) return direct
+  }
   const directory = pathKey(session.directory)
   return projects.find(
     (project) =>

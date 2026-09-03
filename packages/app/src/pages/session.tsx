@@ -1542,6 +1542,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
     // even while this remains true.
     working: () => true,
     overflowAnchor: "none",
+    scrollOwner: "external",
   })
   createEffect(
     on(
@@ -1594,6 +1595,12 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
 
     const el = scroller
     if (el) scheduleScrollState(el)
+  }
+
+  const onPromptSubmit = () => {
+    comments.clear()
+    // A submitted prompt is an explicit request to follow its response.
+    resumeScroll()
   }
 
   // When the user returns to the bottom, treat the active message as "latest".
@@ -1989,7 +1996,55 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
     download()
   }
 
-  const actions = { revert, openAttachment }
+  const fork = async (input: { sessionID: string; messageID: string }) => {
+    const edge = "before" as const
+    const parts = sync().data.part[input.messageID] ?? []
+    const restored = extractPromptFromParts(parts, {
+      directory: sdk().directory,
+      attachmentName: language.t("common.attachment"),
+    })
+    const dir = base64Encode(sdk().directory)
+    try {
+      const client = sdk().client as unknown as {
+        session: { fork: (p: Record<string, unknown>) => Promise<{ data: { id: string } } | { id: string }> }
+      }
+      const forked = await client.session.fork({ sessionID: input.sessionID, messageID: input.messageID, edge, kind: "manual" })
+      const raw = forked as unknown as { data?: { id: string }; id?: string }
+      const id = raw.data?.id ?? raw.id
+      if (!id) throw new Error("fork did not return id")
+      prompt.set(restored as never, undefined, { dir, id })
+      navigate(`/${dir}/session/${id}`)
+    } catch (err) {
+      showToast({ title: language.t("common.requestFailed"), description: err instanceof Error ? err.message : String(err), variant: "error" })
+    }
+  }
+
+  const exclude = async (input: { sessionID: string; messageID: string }) => {
+    try {
+      await (sdk().client as unknown as {
+        sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
+      }).sessionContext.applyOps({ sessionID: input.sessionID, operations: [{ type: "message.exclude", messageID: input.messageID }] })
+      showToast({ title: language.t("context.ledger.removed"), variant: "success" })
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err)
+      if (msg.includes("signed reasoning")) {
+        showToast({ title: language.t("context.ledger.locked.title"), description: msg, variant: "error" })
+      } else showToast({ title: language.t("common.requestFailed"), description: msg, variant: "error" })
+    }
+  }
+
+  const pin = async (input: { sessionID: string; messageID: string }) => {
+    try {
+      await (sdk().client as unknown as {
+        sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
+      }).sessionContext.applyOps({ sessionID: input.sessionID, operations: [{ type: "message.pin", messageID: input.messageID }] })
+      showToast({ title: language.t("context.ledger.pinned"), variant: "success" })
+    } catch (err) {
+      showToast({ title: language.t("common.requestFailed"), description: err instanceof Error ? err.message : String(err), variant: "error" })
+    }
+  }
+
+  const actions = { revert, fork, exclude, pin, openAttachment }
 
   createEffect(() => {
     const sessionID = params.id
@@ -2149,8 +2204,9 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
                   scroll={ui.scroll}
                   onResumeScroll={resumeScroll}
                   setScrollRef={setScrollRef}
-                  onScheduleScrollState={scheduleScrollState}
-                  onAutoScrollHandleScroll={autoScroll.handleScroll}
+                   onScheduleScrollState={scheduleScrollState}
+                   onAutoScrollHandleScroll={autoScroll.handleScroll}
+                   onAutoScrollProgrammatic={autoScroll.markProgrammatic}
                   onMarkScrollGesture={markScrollGesture}
                   hasScrollGesture={hasScrollGesture}
                   onUserScroll={markUserScroll}
@@ -2302,10 +2358,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
                       }}
                       newSessionWorktree={newSessionWorktree()}
                       onNewSessionWorktreeReset={() => setStore("newSessionWorktree", "main")}
-                      onSubmit={() => {
-                        comments.clear()
-                        resumeScroll()
-                      }}
+                      onSubmit={onPromptSubmit}
                       edit={editingFollowup()}
                       onEditLoaded={clearFollowupEdit}
                       shouldQueue={queueEnabled}
@@ -2330,10 +2383,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
                         return newSessionWorktree()
                       },
                       onNewSessionWorktreeReset: () => setStore("newSessionWorktree", "main"),
-                      onSubmit: () => {
-                        comments.clear()
-                        resumeScroll()
-                      },
+                      onSubmit: onPromptSubmit,
                       get edit() {
                         return editingFollowup()
                       },

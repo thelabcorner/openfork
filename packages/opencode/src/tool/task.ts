@@ -1,4 +1,4 @@
-import * as Tool from "./tool"
+import { Tool } from "./tool"
 import DESCRIPTION from "./task.txt"
 import { ToolJsonSchema } from "./json-schema"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
@@ -31,6 +31,7 @@ const BACKGROUND_DESCRIPTION = [
   "Foreground is the default; use it when you need the result before continuing.",
   "Use background only for independent work that can run while you continue elsewhere.",
   "You will be notified automatically when it finishes.",
+  "When launching several independent background subagents, call this tool several times in the SAME assistant message.",
 ].join(" ")
 const BACKGROUND_STARTED = [
   "The task is working in the background. You will be notified automatically when it finishes.",
@@ -45,9 +46,17 @@ const BACKGROUND_UPDATED = [
 ].join("\n")
 
 const BaseParameterFields = {
-  description: Schema.String.annotate({ description: "A short (3-5 words) description of the task" }),
-  prompt: Schema.String.annotate({ description: "The task for the agent to perform" }),
-  subagent_type: Schema.String.annotate({ description: "The type of specialized agent to use for this task" }),
+  description: Schema.String.annotate({
+    description: "A short (3-5 words) description. Use a distinct description for each parallel subagent.",
+  }),
+  prompt: Schema.String.annotate({
+    description:
+      "A complete standalone task for this subagent, including scope, constraints, and exactly what it must return. It cannot see the parent conversation.",
+  }),
+  subagent_type: Schema.String.annotate({
+    description:
+      "The specialized agent type. For independent work, call this tool multiple times in the same assistant message, once per subagent, so they run in parallel.",
+  }),
   task_id: Schema.optional(Schema.String).annotate({
     description:
       "This should only be set if you mean to resume a previous task (you can pass a prior task_id and the task will continue the same subagent session as before instead of creating a fresh one)",
@@ -72,14 +81,49 @@ function renderOutput(input: {
   text: string
 }) {
   const tag = input.state === "error" ? "task_error" : "task_result"
+  const escapeXml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+  const safeText = input.text.replace(/<\/?(?:task|task_result|task_error)(?:\s|>)/gi, (match) =>
+    match.replace("<", "&lt;").replace(">", "&gt;"),
+  )
   return [
-    `<task id="${input.sessionID}" state="${input.state}">`,
-    ...(input.summary ? [`<summary>${input.summary}</summary>`] : []),
+    `<task id="${escapeXml(input.sessionID)}" state="${input.state}">`,
+    ...(input.summary ? [`<summary>${escapeXml(input.summary)}</summary>`] : []),
     `<${tag}>`,
-    input.text,
+    safeText,
     `</${tag}>`,
     "</task>",
   ].join("\n")
+}
+
+const MAX_PARTIAL_CHARS = 600
+
+function truncatePartial(text: string) {
+  const clean = text.trim()
+  if (clean.length <= MAX_PARTIAL_CHARS) return clean
+  return `${clean.slice(0, MAX_PARTIAL_CHARS)}… [truncated]`
+}
+
+function lastTextPart(parts: SessionV1.WithParts["parts"]) {
+  for (let i = parts.length - 1; i >= 0; i--) {
+    const part = parts[i]
+    if (part?.type === "text" && part.text.trim() !== "") return part.text
+  }
+  return undefined
+}
+
+function resumeHint(sessionID: SessionID) {
+  return [
+    `Work completed so far is preserved in session ${sessionID}; do not redo it from scratch.`,
+    `Resume that session with full context by calling task again with task_id "${sessionID}" and a continuation prompt, or inspect it with the session tool (action "messages", sessionId "${sessionID}").`,
+  ].join(" ")
+}
+
+function failRecoverable(sessionID: SessionID, error: string, parts: SessionV1.WithParts["parts"]) {
+  const text = lastTextPart(parts)
+  const partial = text ? `\n\nPartial progress before failure:\n${truncatePartial(text)}` : ""
+  return Effect.fail(
+    new Error(`Subagent failed (task_id: ${sessionID}): ${error}${partial}\n\n${resumeHint(sessionID)}`),
+  )
 }
 
 export const TaskTool = Tool.define(
@@ -219,13 +263,24 @@ export const TaskTool = Tool.define(
             "message" in result.info.error.data && typeof result.info.error.data.message === "string"
               ? result.info.error.data.message
               : result.info.error.name
-          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${message}`))
+          return yield* failRecoverable(nextSession.id, message, result.parts)
         }
         const failed = result.parts.findLast((item) => item.type === "tool" && item.state.status === "error")
         if (failed?.type === "tool" && failed.state.status === "error") {
-          return yield* Effect.fail(new Error(`Subagent failed (task_id: ${nextSession.id}): ${failed.state.error}`))
+          return yield* failRecoverable(nextSession.id, failed.state.error ?? "unknown tool error", result.parts)
         }
         return result.parts.findLast((item) => item.type === "text")?.text ?? ""
+      })
+
+      const childTail = Effect.fn("TaskTool.childTail")(function* (sessionID: SessionID) {
+        const history = yield* sessions
+          .messages({ sessionID })
+          .pipe(Effect.catch(() => Effect.succeed([] as SessionV1.WithParts[])))
+        for (let i = history.length - 1; i >= 0; i--) {
+          const text = history[i] ? lastTextPart(history[i]!.parts) : undefined
+          if (text) return truncatePartial(text)
+        }
+        return undefined
       })
 
       const inject = Effect.fn("TaskTool.injectBackgroundResult")(function* (
@@ -332,6 +387,7 @@ export const TaskTool = Tool.define(
       return yield* Effect.acquireUseRelease(
         Effect.sync(() => {
           ctx.abort.addEventListener("abort", onAbort)
+          if (ctx.abort.aborted) onAbort()
         }),
         () =>
           Effect.gen(function* () {
@@ -339,9 +395,16 @@ export const TaskTool = Tool.define(
               background.wait({ id: nextSession.id }).pipe(Effect.map((waited) => waited.info)),
               background.waitForPromotion(nextSession.id),
             )
+            if (!result) return yield* Effect.fail(new Error(`Subagent job disappeared (task_id: ${nextSession.id}).`))
             if (result?.metadata?.background === true) return backgroundResult()
             if (result?.status === "error") return yield* Effect.fail(new Error(result.error ?? "Task failed"))
-            if (result?.status === "cancelled") return yield* Effect.fail(new Error("Task cancelled"))
+            if (result?.status === "cancelled") {
+              const tail = yield* childTail(nextSession.id)
+              const partial = tail ? `\n\nPartial progress before cancellation:\n${tail}` : ""
+              return yield* Effect.fail(
+                new Error(`Task cancelled (task_id: ${nextSession.id}).${partial}\n\n${resumeHint(nextSession.id)}`),
+              )
+            }
             return {
               title: params.description,
               metadata,

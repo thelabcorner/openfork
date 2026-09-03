@@ -104,6 +104,9 @@ export const ProviderBucket = Schema.Struct({
   unpricedRecords: Schema.Finite,
   tokens: TokenTotals,
   share: Schema.Finite,
+  /** Sum of (completed - created) wall time, scoped to this provider — mirrors UsageTotals.durationMs. */
+  durationMs: Schema.Finite,
+  durationRecords: Schema.Finite,
 })
 export type ProviderBucket = Schema.Schema.Type<typeof ProviderBucket>
 
@@ -116,6 +119,9 @@ export const ModelBucket = Schema.Struct({
   tokens: TokenTotals,
   share: Schema.Finite,
   cacheSavings: Schema.Finite,
+  /** Sum of (completed - created) wall time, scoped to this model — mirrors UsageTotals.durationMs. */
+  durationMs: Schema.Finite,
+  durationRecords: Schema.Finite,
 })
 export type ModelBucket = Schema.Schema.Type<typeof ModelBucket>
 
@@ -150,6 +156,9 @@ export const DayBucket = Schema.Struct({
   cost: Schema.Finite,
   tokens: Schema.Finite,
   messages: Schema.Finite,
+  /** Distinct sessions touched on this local day — lets the client show
+   * "how many separate pieces of work", not just raw turn count. */
+  sessions: Schema.Finite,
 })
 export type DayBucket = Schema.Schema.Type<typeof DayBucket>
 
@@ -159,6 +168,37 @@ const CountBucket = Schema.Struct({
   messages: Schema.Finite,
 })
 export type CountBucket = Schema.Schema.Type<typeof CountBucket>
+
+export const EntitySeries = Schema.Struct({
+  /** `providerID` for a provider series, `providerID/modelID` for a model one
+   * (variants merged, matching how the client groups them). */
+  key: Schema.String,
+  /** Parallel arrays aligned index-for-index with `periods`. Kept as bare
+   * number arrays rather than an array of bucket objects: a per-entity series
+   * repeats the same timestamps for every entity, and re-sending `start` on
+   * each one would roughly triple the payload for no information. */
+  cost: Schema.Array(Schema.Finite),
+  tokens: Schema.Array(Schema.Finite),
+  messages: Schema.Array(Schema.Finite),
+})
+export type EntitySeries = Schema.Schema.Type<typeof EntitySeries>
+
+export const SessionBucket = Schema.Struct({
+  sessionID: Schema.String,
+  title: Schema.String,
+  projectID: Schema.String,
+  projectName: Schema.String,
+  messages: Schema.Finite,
+  cost: Schema.Finite,
+  tokens: Schema.Finite,
+  /** Distinct provider/model pairs used in this session. */
+  models: Schema.Finite,
+  /** First and last assistant-message completion in the window, so the client
+   * can show both when the session ran and how long it stayed active. */
+  start: Schema.Finite,
+  end: Schema.Finite,
+})
+export type SessionBucket = Schema.Schema.Type<typeof SessionBucket>
 
 export const PricingMode = Schema.Literals(["recorded", "estimated", "mixed", "unpriced"])
 export type PricingMode = typeof PricingMode.Type
@@ -193,6 +233,25 @@ export const UsageSummary = Schema.Struct({
     CountBucket,
     CountBucket,
   ]),
+  /** Per-provider usage over time, aligned with `periods`. Provider cardinality
+   * is naturally small, so every provider gets a series. */
+  providerSeries: Schema.Array(EntitySeries),
+  /** Per-model usage over time, aligned with `periods`. Emitted richest-first
+   * under a fixed number budget (see MAX_SERIES_VALUES) so a long window with
+   * hundreds of models cannot balloon the response; models past the budget
+   * simply have no series and the client omits their trend rather than drawing
+   * a partial one. */
+  modelSeries: Schema.Array(EntitySeries),
+  /** Day-of-week x hour-of-day activity grid, 168 entries in local time,
+   * indexed `dow * 24 + hour`. `dow`/`hours` are its two marginals and stay
+   * for callers that only need one axis — the cross product is what makes a
+   * punchcard ("Tuesdays at 9pm") possible, and it cannot be reconstructed
+   * from the marginals. */
+  punchcard: Schema.Array(CountBucket),
+  /** Heaviest sessions in the window, ranked by total tokens (not cost, so a
+   * session run entirely on free models still ranks by the work it did),
+   * capped at MAX_SESSIONS. */
+  sessions: Schema.Array(SessionBucket),
   /** Hour of day 0..23 in local time. */
   hours: Schema.Tuple([
     CountBucket,
@@ -257,6 +316,7 @@ type UsageRow = {
   project_id: string
   directory: string
   project_name: string | null
+  session_title: string | null
 }
 
 type ModelRates = { input: number; output: number; cacheRead: number; cacheWrite: number }
@@ -268,6 +328,11 @@ const DAY_MS = 24 * HOUR_MS
 // buckets can reach thousands). Charts only need a representative sample.
 const MAX_PERIODS = 400
 const MAX_DAYS = 500
+const MAX_SESSIONS = 50
+// Budget in emitted numbers per series kind (each entity costs 3 x period
+// count). Scales the number of charted models to the window: a 30-bucket month
+// covers every model, a 400-bucket all-time view covers the top ~50.
+const MAX_SERIES_VALUES = 60_000
 
 // Summary results are aggregated and small; cache them briefly so repeated
 // panel opens and rapid range switching do not re-scan the message table. The
@@ -360,6 +425,7 @@ const layer = Layer.effect(
                   COALESCE(json_extract(m.data, '$.tokens.reasoning'), 0) AS reasoning_tokens,
                   s.project_id,
                   s.directory,
+                  s.title AS session_title,
                   p.name AS project_name
                 FROM message m
                 JOIN session s ON s.id = m.session_id
@@ -427,6 +493,10 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
   const days = new Map<number, Mutable<DayBucket>>()
   const dow = Array.from({ length: 7 }, emptyBucket)
   const hours = Array.from({ length: 24 }, emptyBucket)
+  const punchcard = Array.from({ length: 7 * 24 }, emptyBucket)
+  const sessionBuckets = new Map<string, Mutable<SessionBucket>>()
+  const sessionModels = new Map<string, Set<string>>()
+  const daySessions = new Map<number, Set<string>>()
   const sessions = new Set<string>()
   const providerSessions = new Map<string, Set<string>>()
   const projectSessions = new Map<string, Set<string>>()
@@ -509,12 +579,18 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
       unpricedRecords: 0,
       tokens: zeroTokens(),
       share: 0,
+      durationMs: 0,
+      durationRecords: 0,
     }
     provider.messages += 1
     if (source === "recorded") provider.cost += cost
     if (source === "estimated") provider.estimatedCost += cost
     if (source === "unpriced") provider.unpricedRecords += 1
     addTokens(provider.tokens, tokens)
+    if (row.created_ms !== null && completed >= row.created_ms) {
+      provider.durationMs += completed - row.created_ms
+      provider.durationRecords += 1
+    }
     providers.set(providerID, provider)
 
     const modelKey = `${providerID}/${modelID}\u0000${row.variant ?? ""}`
@@ -529,6 +605,8 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
       tokens: zeroTokens(),
       share: 0,
       cacheSavings: 0,
+      durationMs: 0,
+      durationRecords: 0,
     }
     model.messages += 1
     if (source === "recorded") model.cost += cost
@@ -536,6 +614,10 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
     if (source === "unpriced") model.unpricedRecords += 1
     addTokens(model.tokens, tokens)
     model.cacheSavings += saved
+    if (row.created_ms !== null && completed >= row.created_ms) {
+      model.durationMs += completed - row.created_ms
+      model.durationRecords += 1
+    }
     models.set(modelKey, model)
 
     const variant = row.variant ?? null
@@ -565,11 +647,17 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
     periods.set(periodStart, period)
 
     const dayStart = localDayStart(completed)
-    const day = days.get(dayStart) ?? { start: dayStart, cost: 0, tokens: 0, messages: 0 }
+    const day = days.get(dayStart) ?? { start: dayStart, cost: 0, tokens: 0, messages: 0, sessions: 0 }
     day.cost += cost
     day.tokens += totalTokens(tokens)
     day.messages += 1
     days.set(dayStart, day)
+    let daySessionSet = daySessions.get(dayStart)
+    if (!daySessionSet) {
+      daySessionSet = new Set()
+      daySessions.set(dayStart, daySessionSet)
+    }
+    daySessionSet.add(row.session_id)
 
     const local = new Date(completed)
     const dowIndex = local.getDay()
@@ -580,6 +668,36 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
     hours[hourIndex].cost += cost
     hours[hourIndex].tokens += totalTokens(tokens)
     hours[hourIndex].messages += 1
+    const punchIndex = dowIndex * 24 + hourIndex
+    punchcard[punchIndex].cost += cost
+    punchcard[punchIndex].tokens += totalTokens(tokens)
+    punchcard[punchIndex].messages += 1
+
+    // Rows arrive ordered by completion ascending, so `start` is set once on
+    // first sight and `end` simply tracks the latest row for the session.
+    const sessionBucket = sessionBuckets.get(row.session_id) ?? {
+      sessionID: row.session_id,
+      title: row.session_title ?? "",
+      projectID: row.project_id,
+      projectName: row.project_name ?? basename(row.directory),
+      messages: 0,
+      cost: 0,
+      tokens: 0,
+      models: 0,
+      start: completed,
+      end: completed,
+    }
+    sessionBucket.messages += 1
+    sessionBucket.cost += cost
+    sessionBucket.tokens += totalTokens(tokens)
+    sessionBucket.end = completed
+    sessionBuckets.set(row.session_id, sessionBucket)
+    let sessionModelSet = sessionModels.get(row.session_id)
+    if (!sessionModelSet) {
+      sessionModelSet = new Set()
+      sessionModels.set(row.session_id, sessionModelSet)
+    }
+    sessionModelSet.add(`${providerID}/${modelID}`)
   }
 
   totals.sessions = sessions.size
@@ -596,6 +714,12 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
   }
   for (const project of projects.values()) {
     project.sessions = projectSessions.get(project.projectID)?.size ?? 0
+  }
+  for (const day of days.values()) {
+    day.sessions = daySessions.get(day.start)?.size ?? 0
+  }
+  for (const session of sessionBuckets.values()) {
+    session.models = sessionModels.get(session.sessionID)?.size ?? 0
   }
 
   const processedTokens = totals.tokens.output + totals.tokens.reasoning
@@ -638,6 +762,10 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
     days: downsample([...days.values()].sort((a, b) => a.start - b.start), MAX_DAYS),
     dow: dow as unknown as UsageSummary["dow"],
     hours: hours as unknown as UsageSummary["hours"],
+    punchcard,
+    // Ranked by tokens rather than cost so a session run entirely on free or
+    // unpriced models is not silently absent from "your heaviest work".
+    sessions: [...sessionBuckets.values()].sort((a, b) => b.tokens - a.tokens).slice(0, MAX_SESSIONS),
     pricing: {
       coverage: safeDiv(totals.pricedRecords, totals.messages),
       mode,

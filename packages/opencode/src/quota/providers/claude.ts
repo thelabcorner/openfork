@@ -8,6 +8,7 @@ import { buildResult, toTimestamp, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import { authKey } from "./key"
 import { fetchJson, NEXT_REFRESH_NOW, outcomeError } from "./http"
+import { loadPersistentQuotaEntry, savePersistentQuotaEntry } from "../persistent-cache"
 
 /**
  * Claude (Anthropic) account quota. Ported from OpenChamber (MIT).
@@ -74,6 +75,14 @@ async function readExternalAccessToken(): Promise<string | undefined> {
 export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter => {
   let cached: { accessToken: string; fetchedAt: number; result: ReturnType<typeof buildResult> } | undefined
   let cooldownUntil = 0
+  // Hydrate from persistent file (survives restart) - lazy, token-agnostic stale
+  try {
+    const persisted = loadPersistentQuotaEntry<ReturnType<typeof buildResult>>("claude")
+    if (persisted) {
+      cached = { accessToken: "persisted", fetchedAt: persisted.fetchedAt, result: persisted.result as ReturnType<typeof buildResult> }
+      cooldownUntil = persisted.cooldownUntil
+    }
+  } catch {}
 
   return {
     id: "claude",
@@ -96,8 +105,12 @@ export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapt
 
         const now = Date.now()
         if (cached && cached.accessToken !== accessToken) {
-          cached = undefined
-          cooldownUntil = 0
+          if (cached.accessToken === "persisted") {
+            cached.accessToken = accessToken
+          } else {
+            cached = undefined
+            cooldownUntil = 0
+          }
         }
         if (cached && cached.accessToken === accessToken && now - cached.fetchedAt < USAGE_CACHE_TTL_MS)
           return { ...cached.result, nextRefreshAt: nextRefreshAtOf(cached.fetchedAt, cooldownUntil) }
@@ -118,6 +131,7 @@ export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapt
           const result = parseUsage(outcome.body)
           cached = { accessToken, fetchedAt: Date.now(), result }
           cooldownUntil = 0
+          try { savePersistentQuotaEntry("claude", cached.fetchedAt, result, cooldownUntil) } catch {}
           return { ...result, nextRefreshAt: nextRefreshAtOf(cached.fetchedAt, cooldownUntil) }
         }
         if (outcome.error === "status" && outcome.status === 429) {
@@ -134,6 +148,7 @@ export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapt
             nextRefreshAt: cooldownUntil,
           })
           cached = { accessToken, fetchedAt: Date.now(), result: errorResult }
+          try { savePersistentQuotaEntry("claude", cached.fetchedAt, errorResult, cooldownUntil) } catch {}
           return errorResult
         }
         const result = buildResult({
@@ -145,6 +160,7 @@ export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapt
           nextRefreshAt: NEXT_REFRESH_NOW,
         })
         cached = { accessToken, fetchedAt: Date.now(), result }
+        try { savePersistentQuotaEntry("claude", cached.fetchedAt, result, 0) } catch {}
         // Non-429 errors don't impose cooldown — next call after TTL will retry.
         return result
       }),

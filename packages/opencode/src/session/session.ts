@@ -276,6 +276,9 @@ export type CreateInput = Types.DeepMutable<Schema.Schema.Type<typeof CreateInpu
 export const ForkInput = Schema.Struct({
   sessionID: SessionID,
   messageID: Schema.optional(MessageID),
+  edge: Schema.optional(Schema.Literals(["before", "after"])),
+  kind: Schema.optional(Schema.Literals(["manual", "regenerate", "temporary", "model-comparison"])),
+  workspaceMode: Schema.optional(Schema.Literals(["shared-current", "new-worktree"])),
 })
 export const GetInput = SessionID
 export const ChildrenInput = SessionID
@@ -307,6 +310,7 @@ export type ListInput = {
   scope?: "project"
   path?: string
   workspaceID?: WorkspaceV2.ID
+  parentID?: SessionID
   roots?: boolean
   start?: number
   search?: string
@@ -315,6 +319,7 @@ export type ListInput = {
 
 export type GlobalListInput = {
   directory?: string
+  parentID?: SessionID
   roots?: boolean
   start?: number
   cursor?: number
@@ -425,7 +430,13 @@ export interface Interface {
     permission?: PermissionV1.Ruleset
     workspaceID?: WorkspaceV2.ID
   }) => Effect.Effect<Info>
-  readonly fork: (input: { sessionID: SessionID; messageID?: MessageID }) => Effect.Effect<Info, NotFound>
+  readonly fork: (input: {
+    sessionID: SessionID
+    messageID?: MessageID
+    edge?: "before" | "after"
+    kind?: "manual" | "regenerate" | "temporary" | "model-comparison"
+    workspaceMode?: "shared-current" | "new-worktree"
+  }) => Effect.Effect<Info, NotFound>
   readonly touch: (sessionID: SessionID) => Effect.Effect<void>
   readonly get: (id: SessionID) => Effect.Effect<Info, NotFound>
   readonly setTitle: (input: { sessionID: SessionID; title: string }) => Effect.Effect<void>
@@ -559,6 +570,7 @@ const layer: Layer.Layer<
     const listGlobal = Effect.fn("Session.listGlobal")(function* (input?: GlobalListInput) {
       const conditions: SQL[] = []
       if (input?.directory) conditions.push(eq(SessionTable.directory, input.directory))
+      if (input?.parentID) conditions.push(eq(SessionTable.parent_id, input.parentID))
       if (input?.roots) conditions.push(isNull(SessionTable.parent_id))
       if (input?.start) conditions.push(gte(SessionTable.time_updated, input.start))
       if (input?.cursor) conditions.push(lt(SessionTable.time_updated, input.cursor))
@@ -692,10 +704,21 @@ const layer: Layer.Layer<
       })
     })
 
-    const fork = Effect.fn("Session.fork")(function* (input: { sessionID: SessionID; messageID?: MessageID }) {
+    const fork = Effect.fn("Session.fork")(function* (input: {
+      sessionID: SessionID
+      messageID?: MessageID
+      edge?: "before" | "after"
+      kind?: "manual" | "regenerate" | "temporary" | "model-comparison"
+      workspaceMode?: "shared-current" | "new-worktree"
+    }) {
       const ctx = yield* InstanceState.context
       const original = yield* get(input.sessionID)
       const title = getForkedTitle(original.title)
+      const kind = input.kind ?? "manual"
+      const workspaceMode = input.workspaceMode ?? "shared-current"
+      // Legacy API (no edge) is exclusive-before; new API defaults to after when edge is omitted but kind is explicit,
+      // but for backward compat with existing tests/clients, default to "before" when edge is undefined.
+      const edge = input.edge ?? "before"
       const session = yield* createNext({
         directory: ctx.directory,
         path: sessionPath(ctx.worktree, ctx.directory),
@@ -704,10 +727,71 @@ const layer: Layer.Layer<
         metadata: structuredClone(original.metadata),
       })
       const msgs = yield* messages({ sessionID: input.sessionID })
-      const idMap = new Map<string, MessageID>()
-      const target = input.messageID ? msgs.findIndex((msg) => msg.info.id === input.messageID) : msgs.length
 
-      for (const msg of msgs.slice(0, target < 0 ? msgs.length : target)) {
+      // ── Boundary resolution with completed-turn snapping ──────────
+      let target: number
+      if (!input.messageID) {
+        // Fork from end — snap to last completed turn
+        let lastCompleted = msgs.length
+        for (let i = msgs.length - 1; i >= 0; i--) {
+          const m = msgs[i]
+          if (!m) continue
+          if (m.info.role === "user") { lastCompleted = i + 1; break }
+          if (m.info.role === "assistant") {
+            const a = m.info as SessionV1.Assistant
+            if (a.time.completed || a.error) { lastCompleted = i + 1; break }
+          }
+        }
+        target = lastCompleted
+      } else {
+        const idx = msgs.findIndex((msg) => msg.info.id === input.messageID)
+        if (idx < 0) target = msgs.length
+        else {
+          const m = msgs[idx]!
+          if (m.info.role === "assistant") {
+            const a = m.info as SessionV1.Assistant
+            if (!a.time.completed && !a.error) {
+              // Streaming assistant — snap backward
+              let lastCompleted = 0
+              for (let i = idx - 1; i >= 0; i--) {
+                const mm = msgs[i]!
+                if (mm.info.role === "user") { lastCompleted = i + 1; break }
+                if (mm.info.role === "assistant" && ((mm.info as SessionV1.Assistant).time.completed || (mm.info as SessionV1.Assistant).error)) { lastCompleted = i + 1; break }
+              }
+              target = lastCompleted
+            } else {
+              target = edge === "before" ? idx : idx + 1
+            }
+          } else {
+            target = edge === "before" ? idx : idx + 1
+          }
+        }
+      }
+
+      // ── Effective-context inheritance ─────────────────────────────
+      // Respect exclusions/edits: fork inherits effective context, not raw canonical.
+      // We still need to fetch state for the source session and filter at materialization.
+      let effectiveIDs: Set<string> | undefined
+      try {
+        const { SessionContextState } = yield* Effect.promise(() => import("./context/state"))
+        const stateMap = yield* (SessionContextState.getState as any)(input.sessionID).pipe(
+          Effect.catch(() => Effect.succeed(new Map())),
+        ) as Map<string, any>
+        if (stateMap.size > 0) {
+          effectiveIDs = new Set()
+          for (const msg of msgs.slice(0, target)) {
+            const s = stateMap.get(msg.info.id)
+            if (!s?.excluded || s?.pinned) effectiveIDs.add(msg.info.id)
+          }
+        }
+      } catch {}
+      const idMap = new Map<string, MessageID>()
+      const includedCount = effectiveIDs ? effectiveIDs.size : target
+
+      for (const msg of msgs.slice(0, target)) {
+        // Skip excluded messages (unless pinned) — fork inherits effective context
+        if (effectiveIDs && !effectiveIDs.has(msg.info.id)) continue
+
         const newID = MessageID.ascending()
         idMap.set(msg.info.id, newID)
 
@@ -720,18 +804,64 @@ const layer: Layer.Layer<
         })
 
         for (const part of msg.parts) {
-          const p: SessionV1.Part = {
+          // Apply overlay overrides if any — text.replace at fork time
+          let partToWrite: SessionV1.Part = {
             ...part,
             id: PartID.ascending(),
             messageID: cloned.id,
             sessionID: session.id,
           }
-          if (p.type === "compaction" && p.tail_start_id) {
-            p.tail_start_id = idMap.get(p.tail_start_id)
+          try {
+            const { SessionContextState } = yield* Effect.promise(() => import("./context/state"))
+            const ms = yield* (SessionContextState.getMessageState as any)(input.sessionID, msg.info.id).pipe(
+              Effect.catch(() => Effect.succeed(undefined)),
+            )
+            if (ms?.overrideData && !ms.excluded) {
+              const od = ms.overrideData as any
+              if (od.text != null && partToWrite.type === "text") {
+                if (!od.partID || od.partID === part.id) {
+                  ;(partToWrite as any).text = od.text
+                }
+              }
+              // Collapsed tool output is already handled via compacted flag at compile time,
+              // but also materialize as truncated here for fork hygiene.
+            }
+          } catch {}
+          if (partToWrite.type === "compaction" && (partToWrite as any).tail_start_id) {
+            ;(partToWrite as any).tail_start_id = idMap.get((partToWrite as any).tail_start_id)
           }
-          yield* updatePart(p)
+          // Preserve callID verbatim (provider-visible identity) — regenerate id only
+          yield* updatePart(partToWrite)
         }
       }
+
+      // ── Fork provenance (overlay table + durable event) ──────────
+      try {
+        const { SessionContextState } = yield* Effect.promise(() => import("./context/state"))
+        yield* (SessionContextState.setForkOrigin as any)({
+          sessionID: session.id,
+          parentSessionID: input.sessionID,
+          sourceMessageID: input.messageID,
+          edge,
+          kind,
+          workspaceMode,
+        }).pipe(Effect.catch(() => Effect.void))
+      } catch {}
+
+      // Preserve group_id lineage if sessions belong to a group — child joins same group
+      if ((original as any).groupID) {
+        try {
+          const { db } = yield* Database.Service
+          const { SessionTable } = yield* Effect.promise(() => import("@opencode-ai/core/session/sql")).then((m) => m)
+          void SessionTable
+          // Direct update: set group_id on the forked session row to match original's group
+          // This is best-effort; failure doesn't break the fork.
+          yield* Effect.tryPromise(() =>
+            (db as any).update(SessionTable).set({ group_id: (original as any).groupID }).where((eq as any)(SessionTable.id, session.id)).run(),
+          ).pipe(Effect.catch(() => Effect.void))
+        } catch {}
+      }
+
       return session
     })
 
@@ -996,6 +1126,9 @@ function listByProject(
     if (input.directory) {
       conditions.push(eq(SessionTable.directory, input.directory))
     }
+  }
+  if (input.parentID) {
+    conditions.push(eq(SessionTable.parent_id, input.parentID))
   }
   if (input.roots) {
     conditions.push(isNull(SessionTable.parent_id))

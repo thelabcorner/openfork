@@ -165,6 +165,7 @@ export const LegacyEntry = Schema.Struct({
   ignored: Schema.Boolean,
   size: Schema.optional(Schema.Number),
   mtime: Schema.optional(Schema.Number),
+  lineCount: Schema.optional(Schema.Number),
 }).annotate({ identifier: "FileNode" })
 
 export const LegacyContent = Schema.Struct({

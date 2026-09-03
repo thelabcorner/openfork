@@ -423,22 +423,24 @@ export const browserHostClient = {
   closeRange: (tabId: string, mode: "left" | "right" | "others" | "all") =>
     rawBrowser()?.closeRange(tabId, mode) ?? Promise.resolve({ closed: [] }),
   /** Host-level webview reload (D8a). */
-  refreshTab: (tabId: string) => rawBrowser()?.refreshTab(tabId) ?? Promise.resolve(),
+  refreshTab: (tabId: string) => (rawBrowser()?.refreshTab(tabId) ?? Promise.resolve()).catch(() => undefined),
   /** Clone the tab with the same URL; the duplicate INHERITS the source owner (D8). */
-  duplicateTab: (tabId: string) => rawBrowser()?.duplicateTab(tabId) ?? Promise.resolve({ tabId, url: "" }),
+  duplicateTab: (tabId: string) =>
+    (rawBrowser()?.duplicateTab(tabId) ?? Promise.resolve({ tabId, url: "" })).catch(() => ({ tabId, url: "" })),
   /** Per-tab audio mute toggle (D8b). */
-  setTabMuted: (tabId: string, muted: boolean) => rawBrowser()?.setTabMuted(tabId, muted) ?? Promise.resolve(),
+  setTabMuted: (tabId: string, muted: boolean) =>
+    (rawBrowser()?.setTabMuted(tabId, muted) ?? Promise.resolve()).catch(() => undefined),
 
-  /** Chrome chrome ops (D10) — all host-level, tab-scoped. */
-  openDevtools: (tabId: string) => rawBrowser()?.openDevtools(tabId) ?? Promise.resolve(),
-  hardReload: (tabId: string) => rawBrowser()?.hardReload(tabId) ?? Promise.resolve(),
-  clearCookies: (tabId: string) => rawBrowser()?.clearCookies(tabId) ?? Promise.resolve(),
-  clearCache: (tabId: string) => rawBrowser()?.clearCache(tabId) ?? Promise.resolve(),
-  setAppearance: (appearance: BrowserAppearance) => rawBrowser()?.setAppearance(appearance) ?? Promise.resolve(),
+  /** Chrome chrome ops (D10) — all host-level, tab-scoped. Catch stale-tab rejections so a removed agent tab never crashes the chrome menu. */
+  openDevtools: (tabId: string) => (rawBrowser()?.openDevtools(tabId) ?? Promise.resolve()).catch(() => undefined),
+  hardReload: (tabId: string) => (rawBrowser()?.hardReload(tabId) ?? Promise.resolve()).catch(() => undefined),
+  clearCookies: (tabId: string) => (rawBrowser()?.clearCookies(tabId) ?? Promise.resolve()).catch(() => undefined),
+  clearCache: (tabId: string) => (rawBrowser()?.clearCache(tabId) ?? Promise.resolve()).catch(() => undefined),
+  setAppearance: (appearance: BrowserAppearance) => (rawBrowser()?.setAppearance(appearance) ?? Promise.resolve()).catch(() => undefined),
   listExtensions: (tabId: string) =>
-    rawBrowser()?.listExtensions(tabId) ?? Promise.resolve([]),
+    (rawBrowser()?.listExtensions(tabId) ?? Promise.resolve([])).catch(() => []),
   setExtensionEnabled: (tabId: string, extensionId: string, enabled: boolean) =>
-    rawBrowser()?.setExtensionEnabled(tabId, extensionId, enabled) ?? Promise.resolve(),
+    (rawBrowser()?.setExtensionEnabled(tabId, extensionId, enabled) ?? Promise.resolve()).catch(() => undefined),
 
   /** Draft no-ops: navigation flows through the engine's broker ops; not on the surface yet. */
   navigate: (_tabId: string, _url: string) => Promise.resolve(),

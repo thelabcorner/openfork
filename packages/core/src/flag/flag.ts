@@ -28,6 +28,11 @@ export const Flag = {
   OPENCODE_DISABLE_AUTOCOMPACT: truthy("OPENCODE_DISABLE_AUTOCOMPACT"),
   OPENCODE_DISABLE_MODELS_FETCH: truthy("OPENCODE_DISABLE_MODELS_FETCH"),
   OPENCODE_DISABLE_MOUSE: truthy("OPENCODE_DISABLE_MOUSE"),
+  // Persistent experiential memory. Getter so the read path can be toggled at
+  // runtime (tests / CLI) without a process restart.
+  get OPENCODE_DISABLE_MEMORY() {
+    return truthy("OPENCODE_DISABLE_MEMORY")
+  },
   // Evaluated at access time (not module load) so tests, the CLI, and external
   // tooling can toggle sealing at runtime.
   get OPENCODE_SEAL_ENABLED() {

@@ -40,6 +40,12 @@ import {
   toElementState,
 } from "./scripts-resolve"
 import {
+  installReactHookScript,
+  profilerStartScript,
+  profilerStopScript,
+  reactPresentScript,
+} from "./scripts-profiler"
+import {
   BROWSER_PROTOCOL_VERSION,
   AGENT_CURSOR_CLICK_LEAD_MS,
   AGENT_CURSOR_MOVE_MS,
@@ -201,9 +207,9 @@ export class BrowserOperations {
       case "query":
         return (await this.query(tabId, operation.input)) as unknown as Record<string, unknown>
       case "profiler_start":
-        return (await this.profilerStart(tabId)) as unknown as Record<string, unknown>
+        return (await this.profilerStart(tabId, operation.input as { component?: string })) as unknown as Record<string, unknown>
       case "profiler_stop":
-        return (await this.profilerStop(tabId)) as unknown as Record<string, unknown>
+        return (await this.profilerStop(tabId, operation.input as { component?: string })) as unknown as Record<string, unknown>
       case "react_inspect":
         return (await this.reactInspect(tabId, operation.input)) as unknown as Record<string, unknown>
       case "refresh":
@@ -566,7 +572,7 @@ export class BrowserOperations {
     const tab = this.resolveTab(input.tabId ?? tabId)
     let viewport = await this.readViewport(tab)
     if (viewport.width === 0 || viewport.height === 0) {
-      await this.resize(undefined, 1440, 900)
+      await this.resize(undefined, { width: 1440, height: 900 })
       viewport = await this.readViewport(tab)
     }
     return this.withControl(tab, "screenshot", async (send) => {
@@ -1022,28 +1028,50 @@ export class BrowserOperations {
       },
     }
   }
-  private async profilerStart(tabId: string | undefined): Promise<Record<string, unknown>> {
+  private async profilerStart(tabId: string | undefined, input?: { component?: string }): Promise<Record<string, unknown>> {
     const tab = this.resolveTab(tabId)
-    const detected = await this.withControl(tab, "profiler_start", async (send) =>
-      this.evaluate(send, PROFILER_INSTALL_SCRIPT, true),
-    )
-    if (detected === false) throw new BrowserNotAReactAppError()
-    return { started: { snapshotVersion: this.deps.registry.get(tab.runtimeTabId)?.snapshotVersion ?? 0 } }
+    const component = input?.component
+    return this.withControl(tab, "profiler_start", async (send) => {
+      // Ensure the minimal DevTools hook exists so future commits are captured
+      await this.evaluate(send, installReactHookScript(), true).catch(() => undefined)
+      const present = (await this.evaluate(send, reactPresentScript(), true)) as boolean
+      if (present === false) throw new BrowserNotAReactAppError()
+      const started = (await this.evaluate(send, profilerStartScript(component), true)) as
+        | { noReact?: boolean; already?: boolean; started?: boolean }
+        | null
+      if (started?.noReact) throw new BrowserNotAReactAppError()
+      return { started: { snapshotVersion: this.deps.registry.get(tab.runtimeTabId)?.snapshotVersion ?? 0 } }
+    })
   }
-  private async profilerStop(tabId: string | undefined): Promise<Record<string, unknown>> {
+  private async profilerStop(tabId: string | undefined, _input?: { component?: string }): Promise<Record<string, unknown>> {
     const tab = this.resolveTab(tabId)
     const result = await this.withControl(tab, "profiler_stop", async (send) =>
-      this.evaluate(send, PROFILER_COLLECT_SCRIPT, true),
+      this.evaluate(send, profilerStopScript(), true),
     )
-    const parsed = (result ?? {}) as { commitCount?: number; windowMs?: number; components?: Array<{ name: string; renders: number }>; propsDiff?: unknown }
-    const components = (parsed.components ?? []).slice(0, PROFILER_MAX_COMPONENTS)
+    const parsed = (result ?? {}) as {
+      noReact?: boolean
+      commits?: number
+      windowMs?: number
+      topRenders?: Array<{ name: string; count: number }>
+      propsDiff?: unknown
+      truncated?: boolean
+    }
+    if (parsed.noReact) {
+      // Distinguish "profiler never started" from "not a React app"
+      const present = (await this.withControl(tab, "profiler_stop", async (send) =>
+        this.evaluate(send, reactPresentScript(), true),
+      ).catch(() => false)) as boolean
+      if (!present) throw new BrowserNotAReactAppError()
+      return { profiled: { commits: 0, windowMs: 0, topRenders: [], propsDiff: undefined, truncated: false } }
+    }
+    const topRenders = (parsed.topRenders ?? []).slice(0, PROFILER_MAX_COMPONENTS)
     return {
       profiled: {
-        commits: parsed.commitCount ?? 0,
+        commits: parsed.commits ?? 0,
         windowMs: parsed.windowMs ?? 0,
-        topRenders: components.map((component) => ({ name: component.name, count: component.renders })),
+        topRenders,
         propsDiff: parsed.propsDiff,
-        truncated: (parsed.components ?? []).length > PROFILER_MAX_COMPONENTS,
+        truncated: parsed.truncated ?? false,
       },
     }
   }
@@ -1570,74 +1598,4 @@ play();
 ${images}
 </body></html>`
 }
-// --- React profiler in-page scripts (premium amendment §3) --------------------
-// Installs a DevTools hook when absent (for FUTURE commits), detects React via
-// DOM fiber keys when the hook is missing, and records bounded per-commit
-// fiber-walk render counts. Returns false when the page is not a React app.
-const PROFILER_INSTALL_SCRIPT = `(() => {
-  const MAX_FIBERS = ${PROFILER_MAX_FIBERS_PER_COMMIT};
-  const MAX_COMMITS = ${PROFILER_MAX_COMMITS};
-  const MAX_PROPS = ${PROFILER_MAX_PROPS};
-  const hasReact =
-    (typeof window.__REACT_DEVTOOLS_GLOBAL_HOOK__ !== 'undefined' && window.__REACT_DEVTOOLS_GLOBAL_HOOK__.renderers && window.__REACT_DEVTOOLS_GLOBAL_HOOK__.renderers.size > 0) ||
-    (document.body && Object.keys(document.body).some((k) => k.startsWith('__reactFiber')));
-  if (!hasReact) return false;
-  if (!window.__opencodeProfiler) {
-    window.__opencodeProfiler = { startedAt: Date.now(), commits: [], renderCounts: {}, propsDiff: undefined };
-  }
-  const profiler = window.__opencodeProfiler;
-  const hook = window.__REACT_DEVTOOLS_GLOBAL_HOOK__;
-  const walk = (fiber, counts) => {
-    const seen = new Set();
-    let budget = MAX_FIBERS;
-    const visit = (node) => {
-      if (!node || budget <= 0) return;
-      budget--;
-      if (typeof node.type === 'function' || typeof node.type === 'string') {
-        const name = (node.type.name || node.type.displayName || node.elementType?.name || 'Anonymous');
-        counts[name] = (counts[name] || 0) + 1;
-      }
-      if (node.child) visit(node.child);
-      if (node.sibling) visit(node.sibling);
-    };
-    visit(fiber);
-    void seen;
-  };
-  const onCommit = (fiberRoot) => {
-    if (profiler.commits.length >= MAX_COMMITS) return;
-    const counts = {};
-    const root = fiberRoot && (fiberRoot.current || fiberRoot);
-    if (root) walk(root, counts);
-    profiler.commits.push({ at: Date.now(), counts });
-    for (const key of Object.keys(counts)) {
-      profiler.renderCounts[key] = (profiler.renderCounts[key] || 0) + counts[key];
-    }
-  };
-  if (hook && !profiler.wired) {
-    profiler.wired = true;
-    if (typeof hook.onCommitFiberRoot === 'function') {
-      const original = hook.onCommitFiberRoot;
-      hook.onCommitFiberRoot = function (rendererID, root, priorityLevel, didFatal) {
-        try { onCommit(root); } catch {}
-        return original.call(this, rendererID, root, priorityLevel, didFatal);
-      };
-    } else {
-      hook.onCommitFiberRoot = onCommit;
-    }
-  }
-  return true;
-})()`
-const PROFILER_COLLECT_SCRIPT = `(() => {
-  const profiler = window.__opencodeProfiler;
-  if (!profiler) return { commitCount: 0, windowMs: 0, components: [] };
-  const components = Object.entries(profiler.renderCounts)
-    .map(([name, renders]) => ({ name, renders }))
-    .sort((a, b) => b.renders - a.renders)
-    .slice(0, ${PROFILER_MAX_COMPONENTS});
-  return {
-    commitCount: profiler.commits.length,
-    windowMs: Date.now() - profiler.startedAt,
-    components,
-    propsDiff: profiler.propsDiff,
-  };
-})()`
+// profiler scripts now live in ./scripts-profiler (single source of truth)

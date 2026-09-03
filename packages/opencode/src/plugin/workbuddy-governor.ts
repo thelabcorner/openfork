@@ -96,6 +96,7 @@ import {
   absorbLearnedLimit,
   buildModelEntitlementReport,
   canonicalModelId,
+  consumptionFrom,
   emptyModelRuntime,
   parseErrorCode,
   recordTimestamp,
@@ -233,6 +234,12 @@ type PersistedModelEntitlement = {
   recentTimestamps?: number[]
   lastObservationAt?: number | null
   serverCode?: number | null
+  /** Real per-window consumption, added in schema v2; absent in older files. */
+  creditsObserved?: number
+  tokensInput?: number
+  tokensOutput?: number
+  tokensCacheHit?: number
+  tokensCacheMiss?: number
 }
 
 type Persisted = {
@@ -285,6 +292,8 @@ export function parseResetAt(raw: string, retryAfter?: string | null): number | 
         const mm = (tm[3] ?? "00").padStart(2, "0")
         iso += `${sign}${hh}:${mm}`
       }
+    } else if (/UTC\+8/i.test(raw)) {
+      iso += "+08:00"
     }
     const t = Date.parse(iso)
     if (!Number.isNaN(t)) return t
@@ -347,6 +356,20 @@ export class WorkBuddyEntitlementGovernor {
   private readonly generationKeys = new Set<string>()
   private readonly models = new Map<string, ModelEntitlementRuntime>()
 
+  /**
+   * Pushed opportunistically by the quota adapter after a package-balance
+   * poll succeeds (see `quota/providers/workbuddy.ts`'s `fetchAccountUsage`
+   * caller). Tencent's backend runs its OWN Basic+Gift+Extra balance check
+   * before every generation regardless of a model's published rate, so a
+   * 0-credit account 402s even on a nominally free promotional model — this
+   * cache lets the router steer automatic (non-pinned) selection away from
+   * that account instead of discovering it the hard way. Not persisted: it
+   * is a live snapshot refreshed on whatever cadence the Limits pane polls
+   * at. `null` means "unknown" and must never be treated as exhausted —
+   * better to try an account we haven't heard from than silently exclude it.
+   */
+  private packageCreditsRemaining: number | null = null
+
   // adaptive backpressure
   private pressure = 0
 
@@ -386,6 +409,13 @@ export class WorkBuddyEntitlementGovernor {
       runtime.recentTimestamps = [...(saved.recentTimestamps ?? [])].slice(-200)
       runtime.lastObservationAt = saved.lastObservationAt ?? runtime.recentTimestamps.at(-1) ?? null
       runtime.serverCode = saved.serverCode ?? (saved.windowLimited ? 6004 : null)
+      // Older persisted files predate consumption tracking; default to zero
+      // rather than dropping the window state we do have.
+      runtime.creditsObserved = Math.max(0, saved.creditsObserved ?? 0)
+      runtime.tokensInput = Math.max(0, saved.tokensInput ?? 0)
+      runtime.tokensOutput = Math.max(0, saved.tokensOutput ?? 0)
+      runtime.tokensCacheHit = Math.max(0, saved.tokensCacheHit ?? 0)
+      runtime.tokensCacheMiss = Math.max(0, saved.tokensCacheMiss ?? 0)
       this.models.set(model, runtime)
     }
     this.expireModels(Date.now())
@@ -406,6 +436,11 @@ export class WorkBuddyEntitlementGovernor {
         recentTimestamps: runtime.recentTimestamps,
         lastObservationAt: runtime.lastObservationAt,
         serverCode: runtime.serverCode,
+        creditsObserved: runtime.creditsObserved,
+        tokensInput: runtime.tokensInput,
+        tokensOutput: runtime.tokensOutput,
+        tokensCacheHit: runtime.tokensCacheHit,
+        tokensCacheMiss: runtime.tokensCacheMiss,
       }]))
       const temp = `${this.entitlementFile}.${process.pid}.tmp`
       writeFileSync(temp, JSON.stringify({
@@ -465,6 +500,13 @@ export class WorkBuddyEntitlementGovernor {
     runtime.recentTimestamps = []
     runtime.lastObservationAt = null
     runtime.serverCode = null
+    // Consumption is per-window: what was spent before the reset says nothing
+    // about the new window's balance, so the running sums restart too.
+    runtime.creditsObserved = 0
+    runtime.tokensInput = 0
+    runtime.tokensOutput = 0
+    runtime.tokensCacheHit = 0
+    runtime.tokensCacheMiss = 0
     return true
   }
 
@@ -479,15 +521,77 @@ export class WorkBuddyEntitlementGovernor {
     return !this.runtimeFor(model).windowLimited
   }
 
+  /**
+   * Fold one completed request's REAL consumption into the model's window.
+   *
+   * `usage` is whatever upstream streamed back. WorkBuddy reports the actual
+   * credit cost per generation, which is strictly better evidence than the
+   * catalog's published rate: it already reflects this user's prompt size,
+   * reasoning volume, and cache behaviour. Summing it answers "how many
+   * credits/points did I burn in this window" and, divided by the observed
+   * request count, yields the true average cost per request the picker needs.
+   *
+   * Called once per logical generation, after a successful response — never
+   * per SSE chunk, and never for a transport retry or a 14003 (which produced
+   * no generation and consumed nothing measurable).
+   */
+  recordUsage(model: string, usage: unknown, at = Date.now()) {
+    const consumption = consumptionFrom(usage)
+    if (!consumption) return
+    if (this.expireModel(model, at)) this.persist()
+    const runtime = this.runtimeFor(model)
+    runtime.creditsObserved += consumption.credit
+    runtime.tokensInput += consumption.input
+    runtime.tokensOutput += consumption.output
+    runtime.tokensCacheHit += consumption.cacheHit
+    runtime.tokensCacheMiss += consumption.cacheMiss
+    this.persist()
+  }
+
   modelReport(model: string, now = Date.now()): ModelEntitlementReport {
     if (this.expireModel(model, now)) this.persist()
     return buildModelEntitlementReport(this.modelKey(model), this.runtimeFor(model), now)
   }
 
+  /**
+   * Record a provider-specific quota error discovered inside a successful HTTP
+   * stream. HTTP status observation cannot see these 200 + SSE error frames,
+   * so adapters call this after translating the frame. The model bucket stays
+   * account-local; a later explicit re-enrollment or inferred reset clears it.
+   */
+  recordInBandRateLimit(model: string, raw: string, now = Date.now()) {
+    const lower = raw.toLowerCase()
+    const resetAt = parseResetAt(raw) ?? (
+      lower.includes("weekly")
+        ? now + 7 * 24 * 60 * 60 * 1000
+        : lower.includes("5-hour") || lower.includes("5 hour") || lower.includes("5h")
+          ? now + 5 * 60 * 60 * 1000
+          : now + 24 * 60 * 60 * 1000
+    )
+    const runtime = this.runtimeFor(model)
+    runtime.windowLimited = true
+    runtime.resetAt = resetAt > now ? resetAt : now + 60_000
+    runtime.accuracy = "server-confirmed"
+    runtime.serverCode = 429
+    absorbLearnedLimit(runtime, runtime.observed)
+    this.persist()
+  }
+
+  /**
+   * Only canonical promotional models (hy3/hy4-preview) are always reported —
+   * every other model this account has ever routed through also gets a
+   * runtime entry (see `runtimeFor`), but surfacing all of them would bury
+   * the two models this feature is actually about under a wall of "0
+   * observed" rows for models with no promotional-quota story at all. A
+   * non-canonical model only earns a row once it has real evidence attached
+   * (usage or a hard 6004 hit).
+   */
   modelReports(now = Date.now()): ModelEntitlementReport[] {
     this.expireModels(now)
     const keys = new Set<string>(["hy3", "hy4-preview", ...this.models.keys()])
-    return [...keys].map((model) => buildModelEntitlementReport(model, this.runtimeFor(model), now))
+    return [...keys]
+      .map((model) => buildModelEntitlementReport(model, this.runtimeFor(model), now))
+      .filter((r) => r.canonical !== null || r.usedObserved > 0 || r.exhaustedObserved)
   }
 
   // --- adaptive backpressure (reduce on pressure, never maximize throughput) ---
@@ -721,15 +825,26 @@ export class WorkBuddyEntitlementGovernor {
       const raw = await safeBody(res)
       const code = parseErrorCode(raw)
       const resetAt = parseResetAt(raw, retryAfter)
-      if (code === 6004 || (code !== 14003 && resetAt && /usage exceeds frequency limit/i.test(raw))) {
-        // Authoritative hard state is account+model scoped. A 14003 may carry
-        // Retry-After, but it is transport pressure and must never deplete the
-        // promotional window.
+      const isHardFrequency = code === 6000 || code === 6004 || /usage exceeds frequency limit|frequency window limit/i.test(raw)
+      if (isHardFrequency && code !== 14003 && resetAt) {
+        // Authoritative hard state is STRICTLY account+model scoped (not account-global).
+        // A 14003 ("too many requests") may carry Retry-After, but it is transient transport
+        // pressure and must never deplete the 24h promotional window. Only 6000/6004 with an
+        // explicit resetAt hits the per-model WINDOW_LIMITED.
         const runtime = this.runtimeFor(model)
         runtime.windowLimited = true
         runtime.resetAt = resetAt && resetAt > Date.now() ? resetAt : null
         runtime.accuracy = "server-confirmed"
-        runtime.serverCode = 6004
+        runtime.serverCode = code ?? 6000
+        absorbLearnedLimit(runtime, runtime.observed)
+        this.persist()
+      } else if (isHardFrequency && code !== 14003) {
+        // Fallback: server said frequency limit without parsable reset — treat as hard but infer 24h
+        const runtime = this.runtimeFor(model)
+        runtime.windowLimited = true
+        runtime.resetAt = resetAt && resetAt > Date.now() ? resetAt : Date.now() + 24 * 60 * 60 * 1000
+        runtime.accuracy = "server-confirmed"
+        runtime.serverCode = code ?? 6000
         absorbLearnedLimit(runtime, runtime.observed)
         this.persist()
       } else {
@@ -753,6 +868,16 @@ export class WorkBuddyEntitlementGovernor {
     }
   }
 
+  /** Called by the quota adapter after a fresh package-balance read. */
+  setPackageCredits(remaining: number) {
+    this.packageCreditsRemaining = Number.isFinite(remaining) ? Math.max(0, remaining) : null
+  }
+
+  /** True unless we have POSITIVE evidence the account's package balance is at 0. */
+  hasKnownCredits(): boolean {
+    return this.packageCreditsRemaining === null || this.packageCreditsRemaining > 0
+  }
+
   metrics() {
     const reports = this.modelReports()
     return {
@@ -771,6 +896,7 @@ export class WorkBuddyEntitlementGovernor {
       amplification: this.generations ? Number((this.attempts / this.generations).toFixed(3)) : 1,
       cooldownUntil: this.cooldownUntil,
       hardLimited: this.state === "QUOTA_EXHAUSTED",
+      packageCreditsRemaining: this.packageCreditsRemaining,
       models: Object.fromEntries(reports.map((report) => [report.model, report])),
     }
   }

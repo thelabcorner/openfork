@@ -36,7 +36,8 @@ import { useData } from "../context"
 import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type UiI18n, useI18n } from "@opencode-ai/ui/context/i18n"
-import { BasicTool, GenericTool } from "./basic-tool"
+import { BasicTool, GenericTool, type TriggerTitle } from "./basic-tool"
+import { ToolBoundedList, ToolEmpty, ToolParams, ToolRow } from "./tool-parts"
 import { Accordion } from "@opencode-ai/ui/accordion"
 import { StickyAccordionHeader } from "@opencode-ai/ui/sticky-accordion-header"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
@@ -57,7 +58,6 @@ import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
-import { Spinner } from "@opencode-ai/ui/spinner"
 import { TextShimmer } from "@opencode-ai/ui/text-shimmer"
 import { AnimatedCountList } from "./tool-count-summary"
 import { ToolStatusTitle } from "./tool-status-title"
@@ -69,9 +69,24 @@ import { readPartText } from "./message-part-text"
 import { SmartToolOutput } from "./tool-output"
 import { ShellTimer } from "./shell-timer"
 import { GitOutput } from "./git-tool"
+import { SkillOutput } from "./skill-tool"
+import { getToolResult } from "./tool-result"
 import { TypecheckOutput } from "./typecheck-tool"
 import { SqliteOutput } from "./sqlite-tool"
 import { SympyOutput } from "./sympy-tool"
+import {
+  ArchiveOutput,
+  BrowserOutput,
+  CheckpointOutput,
+  JsonOutput,
+  MemoryOutput,
+  MonitorOutput,
+  ProjectOutput,
+  SessionOutput,
+  SymbolsOutput,
+  TestOutput,
+  WebfetchOutput,
+} from "./builtin-tools"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 
 async function writeClipboard(text: string): Promise<boolean> {
@@ -185,6 +200,10 @@ export type SessionAction = (input: { sessionID: string; messageID: string }) =>
 export type UserActions = {
   fork?: SessionAction
   revert?: SessionAction
+  exclude?: SessionAction
+  include?: SessionAction
+  pin?: SessionAction
+  unpin?: SessionAction
   openAttachment?: (file: FilePart) => void
 }
 
@@ -378,6 +397,9 @@ export type ToolInfo = {
   icon: IconProps["name"]
   title: string
   subtitle?: string
+  /** Paths read better truncated from the left, commands from the right. */
+  subtitleTruncate?: "start" | "end"
+  subtitleMono?: boolean
 }
 
 function agentTitle(i18n: UiI18n, type?: string) {
@@ -492,6 +514,10 @@ export function getToolInfo(
   metadata: Record<string, unknown> | undefined = {},
 ): ToolInfo {
   const i18n = useI18n()
+  // Paths render project-relative; combined with left-truncation the tail —
+  // the part you actually recognise — is what survives a narrow column.
+  const projectPath = (value: unknown) =>
+    typeof value === "string" && value ? relativizeProjectPath(value, useData().directory) : undefined
   if (tool.startsWith("browser_")) {
     return {
       icon: "window-cursor",
@@ -504,25 +530,29 @@ export function getToolInfo(
       return {
         icon: "glasses",
         title: i18n.t("ui.tool.read"),
-        subtitle: input.filePath ? getFilename(input.filePath) : undefined,
+        subtitle: projectPath(input.filePath),
+        subtitleTruncate: "start",
       }
     case "list":
       return {
         icon: "bullet-list",
         title: i18n.t("ui.tool.list"),
-        subtitle: input.path ? getFilename(input.path) : undefined,
+        subtitle: projectPath(input.path),
+        subtitleTruncate: "start",
       }
     case "glob":
       return {
         icon: "magnifying-glass-menu",
         title: i18n.t("ui.tool.glob"),
         subtitle: input.pattern,
+        subtitleMono: true,
       }
     case "grep":
       return {
         icon: "magnifying-glass-menu",
         title: i18n.t("ui.tool.grep"),
         subtitle: input.pattern,
+        subtitleMono: true,
       }
     case "webfetch":
       return {
@@ -553,18 +583,21 @@ export function getToolInfo(
         icon: "console",
         title: i18n.t("ui.tool.shell"),
         subtitle: input.command,
+        subtitleMono: true,
       }
     case "edit":
       return {
         icon: "code-lines",
         title: i18n.t("ui.messagePart.title.edit"),
-        subtitle: input.filePath ? getFilename(input.filePath) : undefined,
+        subtitle: projectPath(input.filePath),
+        subtitleTruncate: "start",
       }
     case "write":
       return {
         icon: "code-lines",
         title: i18n.t("ui.messagePart.title.write"),
-        subtitle: input.filePath ? getFilename(input.filePath) : undefined,
+        subtitle: projectPath(input.filePath),
+        subtitleTruncate: "start",
       }
     case "patch":
     case "apply_patch":
@@ -585,11 +618,24 @@ export function getToolInfo(
         icon: "bubble-5",
         title: i18n.t("ui.tool.questions"),
       }
-    case "skill":
+    case "skill": {
+      const mode = typeof metadata?.mode === "string" ? metadata.mode : input.mode
+      if (mode === "list" || mode === "search") {
+        const count = typeof metadata?.count === "number" ? metadata.count : undefined
+        return {
+          icon: "brain",
+          title: i18n.t(mode === "search" ? "ui.tool.skill.mode.search" : "ui.tool.skill.mode.list"),
+          subtitle: count !== undefined ? `${count} ${i18n.t(count === 1 ? "ui.tool.skill.count.one" : "ui.tool.skill.count.other")}` : undefined,
+        }
+      }
+      const names = Array.isArray(metadata?.names) ? (metadata.names as unknown[]).filter((n) => typeof n === "string") : []
+      const name = names[0] ?? metadata?.name ?? input.name
       return {
         icon: "brain",
-        title: input.name || i18n.t("ui.tool.skill"),
+        title: typeof name === "string" && name ? name : i18n.t("ui.tool.skill"),
+        subtitle: names.length > 1 ? `+${names.length - 1}` : undefined,
       }
+    }
     case "git":
       return {
         icon: "branch",
@@ -1438,6 +1484,31 @@ export function UserMessageDisplay(props: {
       .finally(() => setState("busy", false))
   }
 
+  const fork = () => {
+    const act = props.actions?.fork
+    if (!act || busy()) return
+    setState("busy", true)
+    void Promise.resolve()
+      .then(() => act({ sessionID: props.message.sessionID, messageID: props.message.id }))
+      .finally(() => setState("busy", false))
+  }
+  const exclude = () => {
+    const act = props.actions?.exclude
+    if (!act || busy()) return
+    setState("busy", true)
+    void Promise.resolve()
+      .then(() => act({ sessionID: props.message.sessionID, messageID: props.message.id }))
+      .finally(() => setState("busy", false))
+  }
+  const pin = () => {
+    const act = props.actions?.pin
+    if (!act || busy()) return
+    setState("busy", true)
+    void Promise.resolve()
+      .then(() => act({ sessionID: props.message.sessionID, messageID: props.message.id }))
+      .finally(() => setState("busy", false))
+  }
+
   const renderAttachments = () => (
     <Show when={attachments().length > 0}>
       <div data-slot="user-message-attachments">
@@ -1561,6 +1632,72 @@ export function UserMessageDisplay(props: {
               }}
               aria-label={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.message.copyMessage")}
             />
+          </Show>
+          <Show when={props.actions?.fork}>
+            <TooltipV2 value={i18n.t("ui.message.forkMessage", { defaultValue: "Fork from here" })} placement="top" gutter={4}>
+              <IconButtonV2
+                icon={<IconV2 name="branch" size="small" />}
+                size="normal"
+                variant="ghost-muted"
+                disabled={!!busy()}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  fork()
+                }}
+                aria-label={i18n.t("ui.message.forkMessage", { defaultValue: "Fork from here" })}
+              />
+            </TooltipV2>
+          </Show>
+          <Show when={props.actions?.exclude || props.actions?.include}>
+            <TooltipV2
+              value={
+                props.actions?.exclude
+                  ? i18n.t("ui.message.removeFromContext", { defaultValue: "Remove from context" })
+                  : i18n.t("ui.message.restoreToContext", { defaultValue: "Restore to context" })
+              }
+              placement="top"
+              gutter={4}
+            >
+              <IconButtonV2
+                icon={<IconV2 name="trash" size="small" />}
+                size="normal"
+                variant="ghost-muted"
+                disabled={!!busy()}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  if (props.actions?.exclude) exclude()
+                  else props.actions?.include?.({ sessionID: props.message.sessionID, messageID: props.message.id })
+                }}
+                aria-label={i18n.t("ui.message.removeFromContext", { defaultValue: "Remove from context" })}
+              />
+            </TooltipV2>
+          </Show>
+          <Show when={props.actions?.pin || props.actions?.unpin}>
+            <TooltipV2
+              value={
+                props.actions?.pin
+                  ? i18n.t("ui.message.pinToContext", { defaultValue: "Pin to context" })
+                  : i18n.t("ui.message.unpinFromContext", { defaultValue: "Unpin from context" })
+              }
+              placement="top"
+              gutter={4}
+            >
+              <IconButtonV2
+                icon={<IconV2 name={props.actions?.pin ? "pin" : "pin-filled"} size="small" />}
+                size="normal"
+                variant="ghost-muted"
+                disabled={!!busy()}
+                onMouseDown={(e) => e.preventDefault()}
+                onClick={(e) => {
+                  e.stopPropagation()
+                  if (props.actions?.pin) pin()
+                  else props.actions?.unpin?.({ sessionID: props.message.sessionID, messageID: props.message.id })
+                }}
+                aria-label={i18n.t("ui.message.pinToContext", { defaultValue: "Pin to context" })}
+              />
+            </TooltipV2>
           </Show>
         </div>
       </Show>
@@ -1763,7 +1900,11 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
               }
               return (
                 <ToolErrorCard
-                  tool={part().tool}
+                  info={getToolInfo(
+                    part().tool,
+                    "input" in part().state ? (part().state as any).input : {},
+                    partMetadata(),
+                  )}
                   error={error()}
                   title={
                     part().tool === "websearch" ? webSearchProviderLabel(partMetadata().provider, i18n) : undefined
@@ -2102,29 +2243,23 @@ function parseGlobOutput(output: string): GlobResult {
 function GlobResults(props: { result: GlobResult }) {
   const i18n = useI18n()
   return (
-    <div
-      data-component="glob-results"
-      data-scrollable
-      tabIndex={0}
-      role="region"
-      aria-label={i18n.t("ui.scrollView.ariaLabel")}
+    <Show
+      when={props.result.files.length > 0}
+      fallback={<ToolEmpty>{i18n.t("ui.tool.glob.noMatches")}</ToolEmpty>}
     >
-      <Show when={props.result.files.length === 0}>
-        <div data-slot="glob-empty">{i18n.t("ui.tool.glob.noMatches")}</div>
-      </Show>
-      <For each={props.result.files}>
+      <ToolBoundedList items={props.result.files} limit={12} scroll>
         {(file) => (
-          <div data-slot="glob-file-row">
-            <FileIcon node={{ path: file, type: "file" }} />
-            <span data-slot="glob-file-name">{getFilename(file)}</span>
-            <span data-slot="glob-file-dir">{getDirectory(file)}</span>
-          </div>
+          <ToolRow
+            lead={<FileIcon node={{ path: file, type: "file" }} />}
+            primary={getFilename(file)}
+            secondary={getDirectory(file)}
+          />
         )}
-      </For>
+      </ToolBoundedList>
       <Show when={props.result.truncated}>
-        <div data-slot="glob-truncated">{i18n.t("ui.tool.glob.truncated")}</div>
+        <ToolEmpty>{i18n.t("ui.tool.glob.truncated")}</ToolEmpty>
       </Show>
-    </div>
+    </Show>
   )
 }
 
@@ -2151,8 +2286,10 @@ ToolRegistry.register({
           icon="glasses"
           trigger={{
             title: i18n.t("ui.tool.read"),
-            subtitle: props.input.filePath ? getFilename(props.input.filePath) : "",
+            subtitle: relativizeProjectPath(props.input.filePath ?? "", data.directory),
+            subtitleTruncate: "start",
             args,
+            ...resultProps(props),
           }}
         >
           <Show
@@ -2209,7 +2346,12 @@ ToolRegistry.register({
       <BasicTool
         {...props}
         icon="bullet-list"
-        trigger={{ title: i18n.t("ui.tool.list"), subtitle: getDirectory(props.input.path || "/") }}
+        trigger={{
+          title: i18n.t("ui.tool.list"),
+          subtitle: getDirectory(props.input.path || "/"),
+          subtitleTruncate: "start",
+          ...resultProps(props),
+        }}
       >
         <SmartToolOutput output={props.output} />
       </BasicTool>
@@ -2228,8 +2370,10 @@ ToolRegistry.register({
         icon="magnifying-glass-menu"
         trigger={{
           title: i18n.t("ui.tool.glob"),
-          subtitle: getDirectory(props.input.path || "/"),
-          args: props.input.pattern ? ["pattern=" + props.input.pattern] : [],
+          subtitle: props.input.pattern,
+          subtitleMono: true,
+          args: props.input.path ? [getDirectory(props.input.path)] : [],
+          ...resultProps(props),
         }}
       >
         <Show when={parsed()} fallback={<SmartToolOutput output={props.output} />}>
@@ -2254,8 +2398,10 @@ ToolRegistry.register({
         icon="magnifying-glass-menu"
         trigger={{
           title: i18n.t("ui.tool.grep"),
-          subtitle: getDirectory(props.input.path || "/"),
+          subtitle: props.input.pattern,
+          subtitleMono: true,
           args,
+          ...resultProps(props),
         }}
       >
         <Show when={parsed()} fallback={<SmartToolOutput output={props.output} />}>
@@ -2333,7 +2479,7 @@ ToolRegistry.register({
           subtitleClass: "exa-tool-query",
         }}
       >
-        <ExaOutput output={props.output} />
+        <WebfetchOutput output={props.output ?? ""} input={props.input} />
       </BasicTool>
     )
   },
@@ -2386,53 +2532,31 @@ ToolRegistry.register({
       open()
     }
 
-    const trigger = () => (
-      <div
-        data-component="task-tool-card"
-        style={{
-          "--task-agent-color": v2Tone(),
-          "--task-agent-legacy-color": tone(),
-        }}
-      >
-        <div data-component="task-tool-surface">
-          <div data-slot="basic-tool-tool-info-structured">
-            <div data-slot="basic-tool-tool-info-main">
-              <Show
-                when={running()}
-                fallback={
-                  <Show when={newLayout()}>
-                    <span data-component="task-tool-icon">
-                      <Icon name="subagent" size="small" />
-                    </span>
-                  </Show>
-                }
-              >
-                <span data-component="task-tool-spinner" style={{ color: tone() ?? "var(--icon-interactive-base)" }}>
-                  <Show when={newLayout()} fallback={<Spinner />}>
-                    <SessionProgressIndicatorV2
-                      style={{ color: v2Tone() ?? "light-dark(var(--v2-text-text-base), #ffffff)" }}
-                    />
-                  </Show>
-                </span>
-              </Show>
-              <span data-component="task-tool-title">{title()}</span>
-              <Show when={subtitle()}>
-                <span data-slot="basic-tool-tool-subtitle">{subtitle()}</span>
-              </Show>
-            </div>
-          </div>
-        </div>
-        <Show when={clickable()}>
-          <div data-component="task-tool-action">
-            <Icon name="square-arrow-top-right" size="small" />
-          </div>
-        </Show>
-      </div>
-    )
+    /**
+     * A subagent call is a tool call, so it gets the same row as any other:
+     * badge, title, target. The agent's colour tints the badge rather than the
+     * title — identity without shouting, and a column of rows still scans as a
+     * column.
+     */
+    const trigger = (): TriggerTitle => ({
+      title: title(),
+      subtitle: subtitle(),
+      action: clickable() ? (
+        <span data-slot="task-open-affordance">
+          <Icon name="square-arrow-top-right" size="small" />
+        </span>
+      ) : undefined,
+    })
 
     return (
       <BasicTool
-        icon="task"
+        icon="subagent"
+        iconContent={
+          running() ? (
+            <SessionProgressIndicatorV2 style={{ color: "currentColor" }} />
+          ) : undefined
+        }
+        accent={v2Tone() ?? tone()}
         status={props.status}
         trigger={trigger()}
         hideDetails
@@ -2499,6 +2623,7 @@ ToolRegistry.register({
     return (
       <BasicTool
         {...props}
+        {...resultProps(props)}
         icon="console"
         allowOpenWhilePending
         trigger={(open) => (
@@ -2645,6 +2770,7 @@ ToolRegistry.register({
       <div data-component="edit-tool">
         <BasicTool
           {...props}
+          {...resultProps(props)}
           icon="code-lines"
           defer={props.deferContent !== false}
           trigger={
@@ -2662,11 +2788,6 @@ ToolRegistry.register({
                   <div data-slot="message-part-path">
                     <span data-slot="message-part-directory">{getDirectory(props.input.filePath!)}</span>
                   </div>
-                </Show>
-              </div>
-              <div data-slot="message-part-actions">
-                <Show when={!pending() && props.metadata.filediff}>
-                  <DiffChanges changes={props.metadata.filediff} />
                 </Show>
               </div>
             </div>
@@ -2712,6 +2833,7 @@ ToolRegistry.register({
       <div data-component="write-tool">
         <BasicTool
           {...props}
+          {...resultProps(props)}
           icon="code-lines"
           defer={props.deferContent !== false}
           trigger={
@@ -2797,9 +2919,11 @@ ToolRegistry.register({
               {...props}
               icon="code-lines"
               defer={props.deferContent !== false}
+              contentVariant="tree"
               trigger={{
                 title: i18n.t("ui.tool.patch"),
                 subtitle: subtitle(),
+                ...resultProps(props),
               }}
             >
               <Show when={files().length > 0}>
@@ -2991,6 +3115,7 @@ ToolRegistry.register({
         trigger={{
           title: i18n.t("ui.tool.todos"),
           subtitle: subtitle(),
+          ...resultProps(props),
         }}
       >
         <Show when={todos().length}>
@@ -3086,6 +3211,37 @@ ToolRegistry.register({
   },
 })
 
+/**
+ * Result fields for a hand-built trigger. Spread into `trigger={{ ... }}` so
+ * renderers with bespoke titles still report their outcome in the collapsed row.
+ */
+function resultProps(props: ToolProps) {
+  const result = getToolResult({
+    tool: props.tool,
+    args: props.input,
+    metadata: props.metadata,
+    output: props.output,
+    status: props.status,
+  })
+  return { result: result?.text, resultTone: result?.tone, changes: result?.changes }
+}
+
+/**
+ * Standard trigger for a tool row: identity from `getToolInfo`, outcome from
+ * `getToolResult`. Renderers that need nothing bespoke use this so the result
+ * slot stays consistent across tools.
+ */
+function toolTrigger(props: ToolProps): TriggerTitle {
+  const info = getToolInfo(props.tool, props.input, props.metadata)
+  return {
+    title: info.title,
+    subtitle: info.subtitle,
+    subtitleTruncate: info.subtitleTruncate,
+    subtitleMono: info.subtitleMono,
+    ...resultProps(props),
+  }
+}
+
 const BROWSER_TOOLS = [
   "browser_annotate",
   "browser_claim",
@@ -3117,6 +3273,7 @@ ToolRegistry.register({
   render(props) {
     const i18n = useI18n()
     const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
     const status = createMemo(() => {
       const value = props.metadata.status
       return typeof value === "string" ? value : undefined
@@ -3145,6 +3302,7 @@ ToolRegistry.register({
           title: info().title,
           subtitle: info().subtitle,
           args: jobId() ? [jobId()!] : [],
+          ...resultProps(props),
         }}
       >
         <Show when={status()}>
@@ -3170,12 +3328,13 @@ ToolRegistry.register({
   name: "git",
   render(props) {
     const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
     const mode = createMemo(() => (typeof props.input.mode === "string" ? props.input.mode : "status"))
     return (
       <BasicTool
         {...props}
         icon={info().icon}
-        trigger={{ title: info().title, subtitle: info().subtitle }}
+        trigger={trigger()}
       >
         <Show when={props.output}>
           <GitOutput mode={mode()} output={props.output!} />
@@ -3189,8 +3348,9 @@ ToolRegistry.register({
   name: "typecheck",
   render(props) {
     const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
     return (
-      <BasicTool {...props} icon={info().icon} trigger={{ title: info().title, subtitle: info().subtitle }}>
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
         <Show when={props.output}>
           <TypecheckOutput output={props.output!} />
         </Show>
@@ -3203,11 +3363,27 @@ ToolRegistry.register({
   name: "sqlite",
   render(props) {
     const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
     const action = createMemo(() => (typeof props.input.action === "string" ? props.input.action : "query"))
     return (
-      <BasicTool {...props} icon={info().icon} trigger={{ title: info().title, subtitle: info().subtitle }}>
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
         <Show when={props.output}>
           <SqliteOutput action={action()} output={props.output!} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
+  name: "skill",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <Show when={props.output}>
+          <SkillOutput output={props.output!} />
         </Show>
       </BasicTool>
     )
@@ -3218,8 +3394,9 @@ ToolRegistry.register({
   name: "sympy",
   render(props) {
     const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
     return (
-      <BasicTool {...props} icon={info().icon} trigger={{ title: info().title, subtitle: info().subtitle }}>
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
         <Show when={props.output}>
           <SympyOutput output={props.output!} />
         </Show>
@@ -3228,30 +3405,47 @@ ToolRegistry.register({
   },
 })
 
-const STRUCTURED_TOOLS: Record<string, string | undefined> = {
-  test: "action",
-  json: "mode",
-  archive: "action",
-  project: "action",
-  symbols: "action",
-  ...Object.fromEntries(BROWSER_TOOLS.map((name) => [name, undefined])),
+function builtinRenderer(Output: (p: { output: string; input?: Record<string, any> }) => any, actionKey?: string) {
+  return (props: ToolProps) => {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <ToolParams input={props.input} skip={actionKey ? [actionKey] : []} />
+        <Show when={props.output}>
+          <Output output={props.output!} input={props.input} />
+        </Show>
+      </BasicTool>
+    )
+  }
 }
 
-for (const [name, actionKey] of Object.entries(STRUCTURED_TOOLS)) {
-  ToolRegistry.register({
-    name,
-    render(props) {
-      const i18n = useI18n()
-      const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
-      return (
-        <GenericTool
-          {...props}
-          icon={info().icon}
-          title={info().title}
-          subtitle={info().subtitle}
-          argsSkip={actionKey ? [actionKey] : []}
-        />
-      )
-    },
-  })
+ToolRegistry.register({ name: "monitor", render: builtinRenderer(MonitorOutput) })
+ToolRegistry.register({ name: "checkpoint", render: builtinRenderer(CheckpointOutput, "mode") })
+ToolRegistry.register({ name: "archive", render: builtinRenderer(ArchiveOutput, "action") })
+ToolRegistry.register({ name: "json", render: builtinRenderer(JsonOutput, "mode") })
+ToolRegistry.register({
+  name: "test",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <ToolParams input={props.input} skip={["action"]} />
+        <Show when={props.output}>
+          <TestOutput output={props.output!} metadata={props.metadata} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({ name: "memory", render: builtinRenderer(MemoryOutput, "action") })
+ToolRegistry.register({ name: "session", render: builtinRenderer(SessionOutput, "action") })
+ToolRegistry.register({ name: "project", render: builtinRenderer(ProjectOutput, "action") })
+ToolRegistry.register({ name: "symbols", render: builtinRenderer(SymbolsOutput, "action") })
+
+for (const name of BROWSER_TOOLS) {
+  ToolRegistry.register({ name, render: builtinRenderer(BrowserOutput) })
 }
+

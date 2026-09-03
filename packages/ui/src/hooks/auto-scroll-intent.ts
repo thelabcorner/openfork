@@ -9,8 +9,9 @@ export function classifyAutoScroll(input: {
   stickThreshold: number
   escapeThreshold: number
   isProgrammatic: boolean
+  programmaticCorrection?: boolean
 }): AutoScrollIntent {
-  if (input.isProgrammatic && input.delta >= -1) return "prog"
+  if (input.isProgrammatic && (input.delta >= -1 || input.programmaticCorrection)) return "prog"
 
   // Balanced: small micro-jitter at the very bottom should not tear follow.
   // Require either a decisive flick (< -1.5) anywhere, or a modest uptick
@@ -32,8 +33,9 @@ export function isProgrammaticScroll(input: {
   pendingTop: number | null
   scrollTop: number
   delta: number
+  allowUpward?: boolean
 }): boolean {
   if (input.pendingTop === null) return false
-  if (input.delta < -1) return false
+  if (!input.allowUpward && input.delta < -1) return false
   return Math.abs(input.scrollTop - input.pendingTop) < 3
 }

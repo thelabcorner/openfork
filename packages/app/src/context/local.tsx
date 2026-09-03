@@ -14,6 +14,7 @@ import { useSDK } from "./sdk"
 import { useSync } from "./sync"
 import { useServerSDK } from "./server-sdk"
 import { ScopedKey, type ServerScope } from "@/utils/server-scope"
+import { splitModelIDForProvider } from "@/utils/model-account-identity"
 
 export type ModelKey = { providerID: string; modelID: string; variant?: string }
 
@@ -100,7 +101,15 @@ export const { use: useLocal, provider: LocalProvider } = createSimpleContext({
 
     const validModel = (model: ModelKey) => {
       const provider = providers.all().get(model.providerID)
-      return !!provider?.models[model.modelID] && connected().has(model.providerID)
+      if (!provider || !connected().has(model.providerID)) return false
+      if (provider.models[model.modelID]) return true
+      // Account-qualified ids (`model@vd-…`, `model@zen-…`) are routing
+      // metadata decoded server-side (verdent proxy, zen fetch wrapper);
+      // validate the base model id so a pinned account isn't silently
+      // snapped back to the previous model. Unknown providers return the id
+      // unchanged, preserving the strict check for everyone else.
+      const base = splitModelIDForProvider(model.modelID, model.providerID).baseModelID
+      return base !== model.modelID && !!provider.models[base]
     }
 
     const firstModel = (...items: Array<() => ModelKey | undefined>) => {

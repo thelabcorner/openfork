@@ -1,14 +1,17 @@
-import { type ComponentProps, createMemo, Show, splitProps } from "solid-js"
+import { createMemo, Show } from "solid-js"
 import { createStore } from "solid-js/store"
-import { Card } from "@opencode-ai/ui/card"
-import { Collapsible } from "@opencode-ai/ui/collapsible"
-import { Icon } from "@opencode-ai/ui/icon"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
+import { BasicTool } from "./basic-tool"
+import { ToolErrorPanel } from "./tool-error-panel"
+import type { ToolInfo } from "./message-part"
 
-export interface ToolErrorCardProps extends Omit<ComponentProps<typeof Card>, "children" | "variant"> {
-  tool: string
+export interface ToolErrorCardProps {
+  /** Identity for the row, computed by the caller — passing it rather than
+   *  importing `getToolInfo` here keeps this module free of a cycle back into
+   *  `message-part`. */
+  info: ToolInfo
   error: string
   title?: string
   defaultOpen?: boolean
@@ -19,72 +22,21 @@ export interface ToolErrorCardProps extends Omit<ComponentProps<typeof Card>, "c
   onSubtitleClick?: (event: MouseEvent) => void
 }
 
+/**
+ * A failed call is still a tool call, so it renders as the same row: same badge
+ * icon, same title, same target. Only the tone changes, plus `failed` in the
+ * result slot and the error in the expanded card.
+ *
+ * The previous design was a separate red-tinted card that dropped the tool's
+ * icon and repurposed the subtitle to hold an error headline — which meant a
+ * failed `read` never told you which file it was reading.
+ */
 export function ToolErrorCard(props: ToolErrorCardProps) {
   const i18n = useI18n()
-  const [state, setState] = createStore({
-    open: props.defaultOpen ?? false,
-    copied: false,
-  })
-  const open = () => props.open ?? state.open
-  const copied = () => state.copied
-  const [split, rest] = splitProps(props, [
-    "tool",
-    "error",
-    "title",
-    "defaultOpen",
-    "open",
-    "onOpenChange",
-    "subtitle",
-    "href",
-    "onSubtitleClick",
-  ])
-  const setOpen = (value: boolean) => {
-    if (props.open === undefined) setState("open", value)
-    props.onOpenChange?.(value)
-  }
-  const name = createMemo(() => {
-    if (split.title) return split.title
-    const map: Record<string, string> = {
-      read: "ui.tool.read",
-      list: "ui.tool.list",
-      glob: "ui.tool.glob",
-      grep: "ui.tool.grep",
-      task: "ui.tool.task",
-      webfetch: "ui.tool.webfetch",
-      websearch: "ui.tool.websearch",
-      bash: "ui.tool.shell",
-      shell: "ui.tool.shell",
-      patch: "ui.tool.patch",
-      apply_patch: "ui.tool.patch",
-      question: "ui.tool.questions",
-    }
-    const key = map[split.tool]
-    if (!key) return split.tool
-    if (!key.includes(".")) return key
-    return i18n.t(key)
-  })
-  const cleaned = createMemo(() => split.error.replace(/^Error:\s*/, "").trim())
-  const tail = createMemo(() => {
-    const value = cleaned()
-    const prefix = `${split.tool} `
-    if (value.startsWith(prefix)) return value.slice(prefix.length)
-    return value
-  })
+  const [state, setState] = createStore({ copied: false })
 
-  const subtitle = createMemo(() => {
-    if (split.subtitle) return split.subtitle
-    const parts = tail().split(": ")
-    if (parts.length <= 1) return i18n.t("ui.toolErrorCard.failed")
-    const head = (parts[0] ?? "").trim()
-    if (!head) return i18n.t("ui.toolErrorCard.failed")
-    return head[0] ? head[0].toUpperCase() + head.slice(1) : i18n.t("ui.toolErrorCard.failed")
-  })
-
-  const body = createMemo(() => {
-    const parts = tail().split(": ")
-    if (parts.length <= 1) return cleaned()
-    return parts.slice(1).join(": ").trim() || cleaned()
-  })
+  const info = () => props.info
+  const cleaned = createMemo(() => props.error.replace(/^Error:\s*/, "").trim())
 
   const copy = async () => {
     const text = cleaned()
@@ -94,75 +46,37 @@ export function ToolErrorCard(props: ToolErrorCardProps) {
     setTimeout(() => setState("copied", false), 2000)
   }
 
+  const copyLabel = () => (state.copied ? i18n.t("ui.message.copied") : i18n.t("ui.toolErrorCard.copyError"))
+
   return (
-    <Card {...rest} data-kind="tool-error-card" data-open={open() ? "true" : "false"} variant="error">
-      <Collapsible class="tool-collapsible" data-open={open() ? "true" : "false"} open={open()} onOpenChange={setOpen}>
-        <Collapsible.Trigger>
-          <div data-component="tool-trigger">
-            <div data-slot="basic-tool-tool-trigger-content">
-              <span data-slot="basic-tool-tool-indicator" data-component="tool-error-card-icon">
-                <Icon name="close-small" size="small" style={{ "stroke-width": 1.5 }} />
-              </span>
-              <div data-slot="basic-tool-tool-info">
-                <div data-slot="basic-tool-tool-info-structured">
-                  <div data-slot="basic-tool-tool-info-main">
-                    <span data-slot="basic-tool-tool-title">{name()}</span>
-                    <Show
-                      when={split.href && split.subtitle}
-                      fallback={<span data-slot="basic-tool-tool-subtitle">{subtitle()}</span>}
-                    >
-                      <a
-                        data-slot="basic-tool-tool-subtitle"
-                        class="clickable subagent-link"
-                        href={split.href!}
-                        onClick={(event) => {
-                          event.stopPropagation()
-                          split.onSubtitleClick?.(event)
-                        }}
-                      >
-                        {subtitle()}
-                      </a>
-                    </Show>
-                  </div>
-                </div>
-              </div>
-            </div>
-            <Collapsible.Arrow />
-          </div>
-        </Collapsible.Trigger>
-        <Collapsible.Content>
-          <div data-slot="tool-error-card-content">
-            <Show when={body()}>
-              {(value) => (
-                <div data-slot="tool-error-card-panel">
-                  <div data-slot="tool-error-card-panel-copy">
-                    <Tooltip
-                      value={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.toolErrorCard.copyError")}
-                      placement="top"
-                      gutter={4}
-                    >
-                      <IconButton
-                        icon={copied() ? "check" : "copy"}
-                        size="small"
-                        variant="ghost"
-                        onMouseDown={(e) => e.preventDefault()}
-                        onClick={(e) => {
-                          e.stopPropagation()
-                          void copy()
-                        }}
-                        aria-label={copied() ? i18n.t("ui.message.copied") : i18n.t("ui.toolErrorCard.copyError")}
-                      />
-                    </Tooltip>
-                  </div>
-                  <pre data-slot="tool-error-card-panel-text">
-                    <code>{value()}</code>
-                  </pre>
-                </div>
-              )}
-            </Show>
-          </div>
-        </Collapsible.Content>
-      </Collapsible>
-    </Card>
+    <BasicTool
+      icon={info().icon}
+      status="error"
+      defaultOpen={props.defaultOpen}
+      open={props.open}
+      onOpenChange={props.onOpenChange}
+      allowOpenWhilePending
+      trigger={{
+        title: props.title ?? info().title,
+        // An explicit subtitle (the subagent link) wins; otherwise show the same
+        // target a successful row would have.
+        subtitle: props.subtitle ?? info().subtitle,
+        subtitleTruncate: props.subtitle ? undefined : info().subtitleTruncate,
+        subtitleMono: props.subtitle ? undefined : info().subtitleMono,
+        subtitleClass: props.href ? "clickable subagent-link" : undefined,
+        result: i18n.t("ui.toolErrorCard.failed"),
+        resultTone: "danger",
+      }}
+      onSubtitleClick={
+        props.href
+          ? () => {
+              const event = new MouseEvent("click", { button: 0 })
+              props.onSubtitleClick?.(event)
+            }
+          : undefined
+      }
+    >
+      <ToolErrorPanel error={props.error} />
+    </BasicTool>
   )
 }

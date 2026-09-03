@@ -110,6 +110,102 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`memory_anchor\` (
+          \`id\` text PRIMARY KEY,
+          \`memory_id\` text NOT NULL,
+          \`kind\` text NOT NULL,
+          \`value\` text NOT NULL,
+          \`normalized\` text NOT NULL,
+          CONSTRAINT \`fk_memory_anchor_memory_id_memory_entry_id_fk\` FOREIGN KEY (\`memory_id\`) REFERENCES \`memory_entry\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`memory_entry\` (
+          \`id\` text PRIMARY KEY,
+          \`topic_id\` text NOT NULL,
+          \`scope\` text NOT NULL,
+          \`project_id\` text,
+          \`workspace_id\` text,
+          \`kind\` text NOT NULL,
+          \`origin\` text NOT NULL,
+          \`stable_key\` text,
+          \`title\` text NOT NULL,
+          \`content\` text NOT NULL,
+          \`search_text\` text DEFAULT '' NOT NULL,
+          \`status\` text DEFAULT 'active' NOT NULL,
+          \`valid_from\` integer NOT NULL,
+          \`valid_to\` integer,
+          \`supersedes_id\` text,
+          \`superseded_by_id\` text,
+          \`content_hash\` text NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          \`time_last_used\` integer,
+          \`use_count\` integer DEFAULT 0 NOT NULL,
+          CONSTRAINT \`fk_memory_entry_topic_id_memory_topic_id_fk\` FOREIGN KEY (\`topic_id\`) REFERENCES \`memory_topic\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`memory_evidence\` (
+          \`id\` text PRIMARY KEY,
+          \`memory_id\` text NOT NULL,
+          \`source_type\` text NOT NULL,
+          \`session_id\` text,
+          \`message_id\` text,
+          \`part_id\` text,
+          \`commit_sha\` text,
+          \`path\` text,
+          \`line_start\` integer,
+          \`line_end\` integer,
+          \`source_hash\` text,
+          \`observed_at\` integer NOT NULL,
+          \`excerpt\` text,
+          CONSTRAINT \`fk_memory_evidence_memory_id_memory_entry_id_fk\` FOREIGN KEY (\`memory_id\`) REFERENCES \`memory_entry\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`memory_ingest\` (
+          \`session_id\` text PRIMARY KEY,
+          \`last_ingested_seq\` integer DEFAULT 0 NOT NULL,
+          \`target_seq\` integer,
+          \`status\` text NOT NULL,
+          \`retries\` integer DEFAULT 0 NOT NULL,
+          \`last_error\` text,
+          \`time_started\` integer,
+          \`time_updated\` integer NOT NULL,
+          \`time_completed\` integer
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`memory_suppression\` (
+          \`id\` text PRIMARY KEY,
+          \`scope\` text NOT NULL,
+          \`project_id\` text,
+          \`workspace_id\` text,
+          \`content_hash\` text,
+          \`memory_id\` text,
+          \`reason\` text,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`memory_topic\` (
+          \`id\` text PRIMARY KEY,
+          \`scope\` text NOT NULL,
+          \`project_id\` text,
+          \`workspace_id\` text,
+          \`key\` text NOT NULL,
+          \`title\` text NOT NULL,
+          \`description\` text NOT NULL,
+          \`projection\` text,
+          \`projection_version\` integer DEFAULT 0 NOT NULL,
+          \`projection_dirty\` integer DEFAULT 1 NOT NULL,
+          \`pinned\` integer DEFAULT 0 NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`permission\` (
           \`id\` text PRIMARY KEY,
           \`project_id\` text NOT NULL,
@@ -333,6 +429,31 @@ export default {
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_value_agg_sha_idx\` ON \`event_value\` (\`aggregate_id\`,\`sha256\`);`)
+      yield* tx.run(`CREATE INDEX \`memory_anchor_normalized_idx\` ON \`memory_anchor\` (\`normalized\`);`)
+      yield* tx.run(`CREATE INDEX \`memory_anchor_kind_value_idx\` ON \`memory_anchor\` (\`kind\`,\`value\`);`)
+      yield* tx.run(`CREATE INDEX \`memory_anchor_memory_idx\` ON \`memory_anchor\` (\`memory_id\`);`)
+      yield* tx.run(`CREATE INDEX \`memory_entry_topic_idx\` ON \`memory_entry\` (\`topic_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`memory_entry_scope_idx\` ON \`memory_entry\` (\`scope\`,\`project_id\`,\`workspace_id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`memory_entry_status_idx\` ON \`memory_entry\` (\`status\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`memory_entry_stable_key_idx\` ON \`memory_entry\` (\`scope\`,\`project_id\`,\`stable_key\`,\`status\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`memory_entry_content_hash_idx\` ON \`memory_entry\` (\`scope\`,\`content_hash\`);`)
+      yield* tx.run(`CREATE INDEX \`memory_entry_time_updated_idx\` ON \`memory_entry\` (\`time_updated\`);`)
+      yield* tx.run(`CREATE INDEX \`memory_evidence_memory_idx\` ON \`memory_evidence\` (\`memory_id\`);`)
+      yield* tx.run(`CREATE INDEX \`memory_evidence_session_idx\` ON \`memory_evidence\` (\`session_id\`);`)
+      yield* tx.run(`CREATE INDEX \`memory_ingest_status_idx\` ON \`memory_ingest\` (\`status\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`memory_suppression_hash_idx\` ON \`memory_suppression\` (\`scope\`,\`content_hash\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`memory_suppression_memory_idx\` ON \`memory_suppression\` (\`memory_id\`);`)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`memory_topic_scope_key_idx\` ON \`memory_topic\` (\`scope\`,\`project_id\`,\`workspace_id\`,\`key\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`memory_topic_project_idx\` ON \`memory_topic\` (\`project_id\`);`)
+      yield* tx.run(`CREATE INDEX \`memory_topic_workspace_idx\` ON \`memory_topic\` (\`workspace_id\`);`)
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )

@@ -242,6 +242,10 @@ const icons = {
     viewBox: "0 0 16 16",
     body: `<circle cx="8" cy="8" r="5.75" stroke="currentColor"/><path d="M8 5.2V8L10.8 9.6" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round"/><path d="M3.2 8C3.2 5.35 5.35 3.2 8 3.2" stroke="currentColor" stroke-linecap="round" opacity="0.85"/>`,
   },
+  usage: {
+    viewBox: "0 0 16 16",
+    body: `<path d="M2.5 13.5V9.5M6.5 13.5V6.5M10.5 13.5V4M14 13.5V8" stroke="currentColor" stroke-linecap="square"/>`,
+  },
 };
 
 const spriteID = "opencode-v2-icon-sprite"

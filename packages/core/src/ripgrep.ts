@@ -257,6 +257,13 @@ const layer = Layer.effect(
                 .replace(/^(?:\.[\\/])+/u, "")
                 .replace(/^[\\/]+/u, "")
                 .replaceAll("\\", "/")
+              // ripgrep JSON `lines.text` includes the line terminator (`\n` or
+              // `\r\n` for CRLF files). Strip it so `Match.text` is a clean
+              // single line — otherwise tool output builders embed stray
+              // newlines and the UI grep parser (which splits on `\n` and
+              // matches `/^ {2}Line (\d+): (.*)$/`, where `.` never matches
+              // `\r`) silently drops every CRLF match.
+              const clean = match.lines.text.replace(/\r?\n$/, "")
               return Match.make({
                 entry: Entry.make({
                   path: RelativePath.make(relative),
@@ -265,9 +272,9 @@ const layer = Layer.effect(
                 line: match.line_number,
                 offset: match.absolute_offset,
                 text:
-                  match.lines.text.length > 2_000
-                    ? match.lines.text.slice(0, 2_000).replace(/[\uD800-\uDBFF]$/, "") + "..."
-                    : match.lines.text,
+                  clean.length > 2_000
+                    ? clean.slice(0, 2_000).replace(/[\uD800-\uDBFF]$/, "") + "..."
+                    : clean,
                 submatches: match.submatches.map((submatch) => ({
                   text: submatch.match.text,
                   start: submatch.start,

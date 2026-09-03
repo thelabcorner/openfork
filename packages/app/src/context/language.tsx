@@ -39,6 +39,17 @@ type PluralKey =
   | "chats.archived.count"
   | "projectExplorer.folder.count"
 
+const pluralCountFormatters = new Map<string, Intl.NumberFormat>()
+/** Locale-grouped rendering of a plural string's `{{count}}` placeholder. */
+function pluralCount(locale: string, count: number) {
+  let formatter = pluralCountFormatters.get(locale)
+  if (!formatter) {
+    formatter = new Intl.NumberFormat(locale, { maximumFractionDigits: 0 })
+    pluralCountFormatters.set(locale, formatter)
+  }
+  return formatter.format(count)
+}
+
 const base = i18n.flatten({ ...en, ...uiEn })
 const dicts = new Map<Locale, Dictionary>([["en", base]])
 
@@ -83,7 +94,14 @@ export const { use: useLanguage, provider: LanguageProvider } = createSimpleCont
       const current = base as Record<string, string>
       const candidate = `${key}.${category}`
       const fallback = `${key}.other`
-      return i18n.resolveTemplate(current[candidate] ?? current[fallback] ?? fallback, { ...params, count })
+      // `{{count}}` is display text, so it goes through the locale's number
+      // format — otherwise every plural string in the app renders a bare
+      // `26662 turns` with no group separators. The plural CATEGORY is still
+      // chosen from the numeric value above, before formatting.
+      return i18n.resolveTemplate(current[candidate] ?? current[fallback] ?? fallback, {
+        ...params,
+        count: pluralCount(intl(), count),
+      })
     }
 
     const label = (value: Locale) => DESKTOP_NATIVE_LABELS[value]

@@ -12,13 +12,15 @@ import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
 import { Hash } from "@opencode-ai/core/util/hash"
-import { ChunkStore } from "@opencode-ai/core/search/chunk-store"
+import { ChunkStore, KIND_DIR, KIND_FILE } from "@opencode-ai/core/search/chunk-store"
 import { tmpdir } from "../fixture/fixture"
 
 const cachePathFor = (dataDir: string, dir: string) => path.join(dataDir, "file-index", `${Hash.sha256(dir)}.json`)
 const dbPathFor = (dataDir: string, dir: string) => ChunkStore.dbPathFor(dir, dataDir)
 
 const write = (dir: string, name: string, content = "") => Effect.promise(() => Bun.write(path.join(dir, name), content))
+
+const enc = (p: string) => new TextEncoder().encode(p)
 
 const rp = (p: string) => RelativePath.make(p as RelativePath)
 
@@ -155,6 +157,51 @@ describe("FileIndex", () => {
         yield* write(tmp.path, "b.txt", "b")
         entries = yield* index.list(rp(""))
         expect(paths(entries)).toContain("b.txt")
+      })),
+    )
+  })
+
+  test("search-chunk hydrate drops paths deleted while the process was stopped", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Bun.write(path.join(dir, "kept.txt"), "kept")
+        await fs.mkdir(path.join(dir, "ghost"))
+        await Bun.write(path.join(dir, "ghost", "inner.txt"), "inner")
+      },
+    })
+    await using data = await tmpdir()
+
+    // Simulate the pre-existing state that caused this bug: a search index
+    // written by an EARLIER process, plus a directory deleted while no
+    // FileIndex was running. No watcher event ever fires for the deletion, so
+    // there is no tombstone — only the search chunks name the ghost path.
+    const dbPath = dbPathFor(data.path, tmp.path)
+    await Effect.runPromise(
+      Effect.gen(function* () {
+        const store = yield* ChunkStore.Service
+        yield* store.append([
+          { kind: KIND_FILE, entries: [enc("kept.txt"), enc("ghost/inner.txt")] },
+          { kind: KIND_DIR, entries: [enc("ghost")] },
+        ])
+      }).pipe(
+        Effect.provide(ChunkStore.layerFromPath(dbPath)),
+        Effect.scoped,
+        Effect.orDie,
+      ),
+    )
+    await fs.rm(path.join(tmp.path, "ghost"), { recursive: true, force: true })
+
+    await Effect.runPromise(
+      withIndex(tmp.path, data.path, Effect.gen(function* () {
+        const index = yield* FileIndex.Service
+        const root = yield* index.list(rp(""))
+        expect(paths(root)).toContain("kept.txt")
+        expect(paths(root)).not.toContain("ghost/")
+
+        // A nested directory hydrated the same way is confirmed on its own
+        // first list, not just the root.
+        const nested = yield* index.list(rp("ghost"))
+        expect(paths(nested)).toEqual([])
       })),
     )
   })

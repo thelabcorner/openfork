@@ -61,6 +61,7 @@ import { SettingsProvider, useSettings } from "@/context/settings"
 import { TabsProvider, useTabs, type DraftTab } from "@/context/tabs"
 import { SDKProvider, useSDK } from "@/context/sdk"
 import { WslServersProvider } from "@/wsl/context"
+import { PersonalUsageIngest, PersonalUsageProvider } from "@/context/personal-usage"
 import DirectoryLayout, { DirectoryDataProvider } from "@/pages/directory-layout"
 import LegacyLayout from "@/pages/layout"
 import NewLayout from "@/pages/layout-new"
@@ -73,6 +74,7 @@ import { createSessionLineage } from "@/pages/session/session-lineage"
 
 import { SessionPage, SessionRouteErrorBoundary, TargetSessionCenterRoute, TargetSessionRouteContent } from "@/pages/session"
 import { NewHome } from "@/pages/home"
+import { UsagePage } from "@/pages/usage-page"
 import { LegacyHome } from "@/pages/home/legacy-home"
 import MobileLayout from "@/pages/layout-mobile"
 
@@ -126,7 +128,10 @@ function TargetServerRoute(props: ParentProps) {
     <Show when={serverKey()} keyed fallback={<ErrorPage error={new Error("Invalid server route")} />}>
       <ServerSDKProvider server={conn}>
         <ServerSyncProvider server={conn}>
-          <ForkUsageProvider>{props.children}</ForkUsageProvider>
+          <ForkUsageProvider>
+            <PersonalUsageIngest />
+            {props.children}
+          </ForkUsageProvider>
         </ServerSyncProvider>
       </ServerSDKProvider>
     </Show>
@@ -181,7 +186,10 @@ function SelectedServerProviders(props: ParentProps) {
       <ServerSDKProvider>
         <ServerSyncProvider>
           <SessionGroupsProvider>
-            <ForkUsageProvider>{props.children}</ForkUsageProvider>
+            <ForkUsageProvider>
+              <PersonalUsageIngest />
+              {props.children}
+            </ForkUsageProvider>
           </SessionGroupsProvider>
         </ServerSyncProvider>
       </ServerSDKProvider>
@@ -238,6 +246,7 @@ function ResolvedDraftRoute(props: { draft: DraftTab }) {
       <ServerSDKProvider server={conn}>
         <ServerSyncProvider server={conn}>
           <ForkUsageProvider>
+            <PersonalUsageIngest />
             <ModelsProvider directory={directory}>
               <SDKProvider directory={directory}>
                 <DirectoryDataProvider directory={directory} server={serverKey}>
@@ -450,11 +459,13 @@ export function AppBaseProviders(
             >
               <QueryProvider>
                 <WslServersProvider>
-                  <DialogProvider>
-                    <FileComponentProvider component={File}>
-                      <GenericContextMenuProvider>{props.children}</GenericContextMenuProvider>
-                    </FileComponentProvider>
-                  </DialogProvider>
+                  <PersonalUsageProvider>
+                    <DialogProvider>
+                      <FileComponentProvider component={File}>
+                        <GenericContextMenuProvider>{props.children}</GenericContextMenuProvider>
+                      </FileComponentProvider>
+                    </DialogProvider>
+                  </PersonalUsageProvider>
                 </WslServersProvider>
               </QueryProvider>
             </ErrorBoundary>
@@ -694,6 +705,7 @@ function Routes(props: { serverScoped?: JSX.Element }) {
       </Route>
       <Show when={settings.general.newLayoutDesigns()}>
         <Route path="/" component={NewHome} />
+        <Route path="/usage" component={UsagePage} />
         <Route path="/:dir/session/:id" component={NewLayoutLegacySessionRedirect} />
         <Route
           path="/server/:serverKey/session/:id"
@@ -726,6 +738,7 @@ function GroupTabRoute() {
       <ServerSDKProvider server={conn}>
         <ServerSyncProvider server={conn}>
           <ForkUsageProvider>
+            <PersonalUsageIngest />
             <Suspense fallback={<RoutePlaceholder />}>
               <GroupTabPage />
             </Suspense>

@@ -1,5 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import os from "os"
+import { readFile as readFileNode } from "node:fs/promises"
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import fuzzysort from "fuzzysort"
 import { Config } from "@/config/config"
@@ -19,7 +20,7 @@ import { iife } from "@/util/iife"
 import { Global } from "@opencode-ai/core/global"
 import path from "path"
 import { pathToFileURL } from "url"
-import { Effect, Layer, Context, Schema, Types } from "effect"
+import { Effect, Layer, Context, Schema, Types, Stream } from "effect"
 import { EffectBridge } from "@/effect/bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { EffectPromise } from "@/effect/promise"
@@ -34,6 +35,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { trackNvidiaRequest } from "@/quota/providers/nvidia-usage"
 import { ProviderError } from "./error"
 import { shouldEnableClaudeFirstParty } from "@/plugin/shared"
+import { zenProviderFetch } from "@/plugin/zen"
 import {
   MODEL_IDS,
   MODEL_METADATA,
@@ -41,8 +43,42 @@ import {
   PROXY_API_KEY,
   PROXY_BASE_URL,
 } from "@/claude/models"
+import {
+  MODEL_IDS as GENSPARK_MODEL_IDS,
+  MODEL_METADATA as GENSPARK_MODEL_METADATA,
+  PROXY_OPTION as GENSPARK_PROXY_OPTION,
+  PROVIDER_ID as GENSPARK_PROVIDER_ID,
+  PROVIDER_NAME as GENSPARK_PROVIDER_NAME,
+  apiURL as gensparkApiURL,
+  resolveApiKey as resolveGensparkApiKey,
+} from "@/genspark/models"
+import { GensparkCatalog } from "@/genspark/catalog"
+import { Integration } from "@opencode-ai/core/integration"
+import { EventV2 } from "@opencode-ai/core/event"
 
 const OPENAI_HEADER_TIMEOUT_DEFAULT = 300_000
+
+async function readLegacyGensparkKeyFromConfig(): Promise<string | undefined> {
+  if (process.env.BUN_TEST || process.env.NODE_ENV === "test" || !!process.env.OPENCODE_TEST_HOME || !!process.env.VITEST) return undefined
+  const { join } = await import("node:path")
+  let dir = process.cwd()
+  for (let i = 0; i < 6; i++) {
+    try {
+      const raw = await readFileNode(join(dir, ".opencode.json"), "utf8")
+      const parsed = JSON.parse(raw) as { provider?: Record<string, { options?: { apiKey?: unknown } }> }
+      const candidates = [
+        parsed.provider?.["genspark"]?.options?.apiKey,
+        parsed.provider?.["genspark-llm-proxy"]?.options?.apiKey,
+        parsed.provider?.["genspark-gemini-proxy"]?.options?.apiKey,
+      ]
+      for (const c of candidates) if (typeof c === "string" && c.trim()) return c.trim()
+    } catch {}
+    const parent = (await import("node:path")).join(dir, "..")
+    if (parent === dir) break
+    dir = parent
+  }
+  return undefined
+}
 
 function wrapSSE(res: Response, ms: number, ctl: AbortController) {
   if (typeof ms !== "number" || ms <= 0) return res
@@ -165,6 +201,7 @@ type CustomDep = {
   config: () => Effect.Effect<ConfigV1.Info>
   env: () => Effect.Effect<Record<string, string | undefined>>
   get: (key: string) => Effect.Effect<string | undefined>
+  gensparkCatalog: (apiKey: string | undefined) => Effect.Effect<GensparkCatalog.Catalog, never, never>
 }
 
 function selectAzureLanguageModel(sdk: any, modelID: string, useChat: boolean) {
@@ -221,7 +258,7 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
 
       return {
         autoload: Object.keys(input.models).length > 0,
-        options: ok ? {} : { apiKey: "public" },
+        options: { ...(ok ? {} : { apiKey: "public" }), fetch: zenProviderFetch },
       }
     }),
     openai: () =>
@@ -1084,6 +1121,78 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
         options,
       }
     }),
+    genspark: Effect.fnUntraced(function* (input: Info) {
+      const env = yield* dep.env()
+      const auth = yield* dep.auth(input.id)
+      let apiKey = yield* Effect.promise(() =>
+        resolveGensparkApiKey({
+          authKey: auth?.type === "api" ? auth.key : undefined,
+          env,
+        }),
+      )
+      if (!apiKey) {
+        const legacy = yield* Effect.promise(() => readLegacyGensparkKeyFromConfig()).pipe(
+          Effect.catch(() => Effect.succeed(undefined)),
+        )
+        if (legacy) apiKey = legacy
+      }
+      if (!apiKey) {
+        const fallback = GENSPARK_MODEL_METADATA
+        input.models = Object.fromEntries(
+          Object.entries(fallback).map(([id, meta]) => [
+            id,
+            {
+              id: ModelV2.ID.make(id),
+              providerID: input.id,
+              name: meta.name,
+              family: meta.family,
+              api: { id, url: gensparkApiURL(), npm: "@ai-sdk/openai-compatible" },
+              status: "active",
+              headers: {},
+              options: {},
+              cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+              limit: { context: meta.limit.context, input: meta.limit.input, output: meta.limit.output },
+              capabilities: meta.capabilities,
+              release_date: "",
+              variants: meta.variants,
+            } as Model,
+          ]),
+        )
+        return { autoload: true, options: { ...GENSPARK_PROXY_OPTION } }
+      }
+      // The legacy fallback for the no-key case is handled by the quota
+      // adapter (which reads .opencode.json directly) and by the user
+      // migrating the key to Auth/env.
+      const catalog = yield* dep.gensparkCatalog(apiKey)
+      // Replacement, not merge: the live endpoint is authoritative. The static
+      // snapshot in catalog.ts is only the offline/no-credential fallback, so
+      // merging it in would let stale entries shadow current ones. The add-only
+      // discovery hook below cannot express this, hence doing it here.
+      input.models = Object.fromEntries(
+        Object.entries(catalog.models).map(([id, meta]) => [
+          id,
+          {
+            id: ModelV2.ID.make(id),
+            providerID: input.id,
+            name: meta.name,
+            family: meta.family,
+            api: { id, url: gensparkApiURL(), npm: "@ai-sdk/openai-compatible" },
+            status: "active",
+            headers: {},
+            options: {},
+            cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+            limit: { context: meta.limit.context, input: meta.limit.input, output: meta.limit.output },
+            capabilities: meta.capabilities,
+            release_date: "",
+            variants: meta.variants,
+          } as Model,
+        ]),
+      )
+      return {
+        autoload: true,
+        options: apiKey ? { ...GENSPARK_PROXY_OPTION, apiKey } : { ...GENSPARK_PROXY_OPTION },
+      }
+    }),
   }
 }
 
@@ -1480,6 +1589,7 @@ const layer = Layer.effect(
     const plugin = yield* Plugin.Service
     const modelsDevSvc = yield* ModelsDev.Service
     const runtimeFlags = yield* RuntimeFlags.Service
+    const gensparkCatalog = yield* GensparkCatalog.Service
 
     const state = yield* InstanceState.make<State>(() =>
       Effect.gen(function* () {
@@ -1565,6 +1675,37 @@ const layer = Layer.effect(
             }),
           ),
         }
+        const gensparkID = ProviderV2.ID.make(GENSPARK_PROVIDER_ID)
+        database[gensparkID] ??= {
+          id: gensparkID,
+          source: "custom",
+          name: GENSPARK_PROVIDER_NAME,
+          env: ["GSK_API_KEY", "GENSPARK_API_KEY"],
+          options: { ...GENSPARK_PROXY_OPTION },
+          models: Object.fromEntries(
+            GENSPARK_MODEL_IDS.map((id) => {
+              const meta = GENSPARK_MODEL_METADATA[id]
+              return [
+                id,
+                {
+                  id: ModelV2.ID.make(id),
+                  providerID: gensparkID,
+                  name: meta.name,
+                  family: meta.family,
+                  api: { id, url: gensparkApiURL(), npm: "@ai-sdk/openai-compatible" },
+                  status: "active",
+                  headers: {},
+                  options: {},
+                  cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+                  limit: { context: meta.limit.context, input: meta.limit.input, output: meta.limit.output },
+                  capabilities: meta.capabilities,
+                  release_date: "",
+                  variants: meta.variants,
+                } as Model,
+              ]
+            }),
+          ),
+        }
 
         const providers: Record<ProviderV2.ID, Info> = {} as Record<ProviderV2.ID, Info>
         const languages = new Map<string, LanguageModelV3>()
@@ -1583,6 +1724,7 @@ const layer = Layer.effect(
           config: () => config.get(),
           env: () => env.all(),
           get: (key: string) => env.get(key),
+          gensparkCatalog: (apiKey: string | undefined) => gensparkCatalog.get(apiKey),
         }
 
         function mergeProvider(providerID: ProviderV2.ID, provider: Partial<Info>) {
@@ -1932,6 +2074,13 @@ const layer = Layer.effect(
           varsLoaders,
         }
       }),
+    )
+
+    const events = yield* EventV2.Service
+    yield* events.subscribe(Integration.Event.ConnectionUpdated).pipe(
+      Stream.filter((event) => event.data.integrationID === Integration.ID.make("verdent")),
+      Stream.runForEach(() => InstanceState.invalidate(state).pipe(Effect.asVoid)),
+      Effect.forkScoped({ startImmediately: true }),
     )
 
     const list = Effect.fn("Provider.list")(() => InstanceState.use(state, (s) => s.providers))
@@ -2287,6 +2436,8 @@ export const node = LayerNode.make({
     Plugin.node,
     ModelsDev.node,
     RuntimeFlags.node,
+    GensparkCatalog.node,
+    EventV2.node,
   ],
 })
 

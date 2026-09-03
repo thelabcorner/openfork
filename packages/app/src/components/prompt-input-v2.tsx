@@ -32,8 +32,12 @@ import { useForkUsage } from "@/context/fork-usage"
 import { useSync } from "@/context/sync"
 import { SessionUsageWarningBanner } from "@/components/session-usage-warning-banner"
 import { createSessionTabs } from "@/pages/session/helpers"
+import { focusLimitsProvider } from "@/pages/session/limits-panel-state"
+import { useLimits } from "@/hooks/use-limits"
+import { useNow } from "@/hooks/use-now"
+import { buildArcModel, type ArcModel } from "@/components/prompt-input/limit-arc"
+import { LimitArcCard, LimitArcGlyph } from "@/components/prompt-input/limit-arc-view"
 import { showToast } from "@/utils/toast"
-import type { ForkWindowUsage } from "@/utils/fork-client"
 import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
 import {
   createPromptInputV2Controller,
@@ -69,7 +73,7 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
         variantControlVisible={!props.controller.model.loading}
         attachKeybind={command.keybindParts("file.attach")}
         attachShortcut={command.keybind("file.attach")}
-        usageControl={<PromptInputV2UsageArc />}
+        usageControl={<PromptInputV2UsageArc model={props.controller.model.selection} />}
         autoAcceptControl={
           <PromptInputV2AutoAcceptToggle
             active={props.controller.autoAccept.active()}
@@ -188,107 +192,157 @@ export function PromptInputV2AutoAcceptToggle(props: { active: boolean; onToggle
   )
 }
 
-function PromptInputV2UsageArc() {
+/**
+ * The composer's limit arc.
+ *
+ * Was a hard-wired OpenCode-Go tripartite ring: it drew Go's 5h/week/month
+ * fork spend regardless of which provider the composer was actually pointed
+ * at, so a Claude or WorkBuddy session got a ring describing an account it
+ * would never bill. Now the arity and the contents follow the SELECTED model's
+ * provider — three sectors for a provider with three real cadences, two for a
+ * credit-pack provider, one for an IP-based free tier — and every number is the
+ * same projection the Limits pane renders, so the two can never disagree.
+ *
+ * `useLimits` is instantiated here rather than lifted into a context because
+ * that is the established pattern in this app (see `use-workbuddy-usage`): it
+ * owns a resource plus a side-effecting fetch loop, is guarded against trees
+ * that cannot provide its SDK context, and its requests are deduped by the
+ * server's own quota cache.
+ */
+function PromptInputV2UsageArc(props: { model: PromptInputV2ComposerController["model"]["selection"] }) {
   const dialog = useDialog()
   const language = useLanguage()
+  const layout = useLayout()
   const sdk = useSDK()
   const forkUsage = useForkUsage()
-  const activeCredentialID = () => forkUsage.activeCredentialID()
-  const windows = () =>
-    forkUsage.usage.latest?.byCredential.find((entry) => entry.credentialID === activeCredentialID())?.windows ??
-    forkUsage.usage.latest?.aggregate ??
-    []
-  const remaining = (label: ForkWindowUsage["label"]) => {
-    const window = windows().find((item) => item.label === label)
-    if (!window) return 100
-    return Math.max(0, Math.min(100, 100 - usedPercent(window)))
+
+  let limits: ReturnType<typeof useLimits> | undefined
+  try {
+    limits = useLimits()
+  } catch {
+    limits = undefined
   }
-  const openCredentials = (event: MouseEvent & { currentTarget: HTMLButtonElement }) => {
-    event.currentTarget.blur()
+
+  // The hover card is the only thing that needs a live clock, so the global
+  // 1s tick is subscribed to only while the pointer is on the button — the
+  // composer is mounted for the whole session and must not hold a timer open
+  // for a countdown nobody is reading.
+  const [hovering, setHovering] = createSignal(false)
+  const now = useNow(hovering)
+
+  const selected = () => props.model.current()
+  const providerID = () => selected()?.provider?.id
+  const modelID = () => selected()?.id
+  const modelName = () => selected()?.name
+
+  // Deliberately does not fall back to `usage.latest.aggregate` — that spans
+  // every credential the account has ever used, which pins the ring near 100%
+  // regardless of the active key's real spend. See the identical note in
+  // `session-usage-warning-banner.tsx`.
+  const forkWindows = () => {
+    const credentialID = forkUsage.activeCredentialID()
+    if (!credentialID) return []
+    return forkUsage.usage.latest?.byCredential.find((entry) => entry.credentialID === credentialID)?.windows ?? []
+  }
+  const forkLabel = () => forkUsage.credentials.latest?.find((credential) => credential.active)?.label
+
+  // Already polled by `useLimits` via the shared singleton — reading it here
+  // costs nothing extra and is the only limit that can stop a `:free` model.
+  const openRouterFree = () => {
+    const report = limits?.openRouterFree()
+    if (!report) return undefined
+    return { remainingPercent: report.free.remainingPercent, resetsAt: report.free.window.resetsAt }
+  }
+
+  const arc = createMemo<ArcModel>(() =>
+    buildArcModel({
+      modelProviderID: providerID(),
+      modelID: modelID(),
+      modelName: modelName(),
+      providers: limits?.providers(),
+      openRouterFree: openRouterFree(),
+      fork: {
+        windows: forkWindows(),
+        credentialLabel: forkLabel(),
+        credentialCount: forkUsage.credentials.latest?.length ?? 0,
+      },
+    }),
+  )
+
+  const openSwitcher = () => {
     void import("./dialog-credential-switcher").then((module) => {
       void dialog.show(() => <module.DialogCredentialSwitcherV2 directory={() => sdk().directory} />)
     })
   }
 
+  const openLimits = () => {
+    // Limits render in two places — the standalone pane and the session
+    // context tab — and both mount the same `LimitsPanelContent`, so honour
+    // whichever the user already has open instead of stacking a second one.
+    // `selectTab` toggles the tab shut when it is already showing; clicking
+    // the arc is always "show me this", never "hide it", hence the guard.
+    if (!layout.limits.opened() && !(layout.sessionContext.opened() && layout.sessionContext.tab() === "limits")) {
+      layout.sessionContext.selectTab("limits")
+    }
+    const target = arc().quotaProviderID
+    if (target) focusLimitsProvider(target)
+  }
+
+  const onClick = (event: MouseEvent & { currentTarget: HTMLButtonElement }) => {
+    event.currentTarget.blur()
+    if (arc().switchable && (event.altKey || event.shiftKey)) {
+      openSwitcher()
+      return
+    }
+    openLimits()
+  }
+
+  const hint = () =>
+    arc().switchable
+      ? language.t("prompt.limits.hint.openAndSwitch")
+      : language.t("prompt.limits.hint.open")
+
+  const ariaLabel = () => {
+    const model = arc()
+    if (model.status !== "ready" || model.worst === null) {
+      return language.t("prompt.limits.aria.unknown", { provider: model.providerName ?? "" })
+    }
+    return language.t("prompt.limits.aria.remaining", {
+      provider: model.providerName ?? "",
+      percent: Math.round(model.worst),
+    })
+  }
+
   return (
-    <TooltipV2 placement="top" gutter={4} value={language.t("dialog.credential.manageKeys")}>
+    <TooltipV2
+      placement="top"
+      gutter={6}
+      openDelay={220}
+      contentStyle={{ padding: "0", "flex-direction": "column", "align-items": "stretch" }}
+      value={<LimitArcCard model={arc()} modelName={modelName()} now={now()} hint={hint()} />}
+    >
       <IconButtonV2
         type="button"
         data-action="prompt-usage"
+        data-limit-provider={arc().quotaProviderID ?? undefined}
         variant="ghost-muted"
         size="large"
-        icon={<TripartiteArc rolling={remaining("5h")} weekly={remaining("week")} monthly={remaining("month")} />}
-        aria-label={language.t("dialog.credential.manageKeys")}
-        onClick={openCredentials}
+        class="group"
+        icon={<LimitArcGlyph model={arc()} />}
+        aria-label={ariaLabel()}
+        onPointerEnter={() => setHovering(true)}
+        onPointerLeave={() => setHovering(false)}
+        onFocus={() => setHovering(true)}
+        onBlur={() => setHovering(false)}
+        onContextMenu={(event: MouseEvent) => {
+          if (!arc().switchable) return
+          event.preventDefault()
+          openSwitcher()
+        }}
+        onClick={onClick}
       />
     </TooltipV2>
   )
-}
-
-function TripartiteArc(props: { rolling: number; weekly: number; monthly: number }) {
-  const sector = (start: number, end: number, remaining: number, color: string) => {
-    const bounded = Math.max(0, Math.min(100, remaining))
-    const span = end >= start ? end - start : end + 360 - start
-    const finish = start + span * (bounded / 100)
-    return (
-      <g>
-        <path
-          d={arcPath(12, 12, 7.5, start, end)}
-          fill="none"
-          stroke="currentColor"
-          stroke-width="2.2"
-          stroke-linecap="round"
-          opacity="0.22"
-        />
-        <Show when={bounded > 0}>
-          <path
-            d={arcPath(12, 12, 7.5, start, finish)}
-            fill="none"
-            stroke={color}
-            stroke-width="2.2"
-            stroke-linecap="round"
-          />
-        </Show>
-      </g>
-    )
-  }
-
-  return (
-    <svg viewBox="0 0 24 24" class="size-5" role="presentation" aria-hidden="true">
-      {sector(0, 115, props.rolling, remainingColor(props.rolling, 0))}
-      {sector(120, 235, props.weekly, remainingColor(props.weekly, 1))}
-      {sector(240, 355, props.monthly, remainingColor(props.monthly, 2))}
-    </svg>
-  )
-}
-
-function remainingColor(remaining: number, base: number) {
-  if (remaining <= 8) return "color-mix(in srgb, var(--v2-state-fg-danger) 72%, currentColor)"
-  if (remaining <= 35) return "color-mix(in srgb, var(--v2-state-fg-warning) 68%, currentColor)"
-  if (base === 0) return "color-mix(in srgb, var(--v2-icon-icon-base) 72%, currentColor)"
-  if (base === 1) return "color-mix(in srgb, var(--v2-icon-icon-base) 62%, currentColor)"
-  return "color-mix(in srgb, var(--v2-icon-icon-base) 52%, currentColor)"
-}
-
-function usedPercent(window: ForkWindowUsage) {
-  if (typeof window.estimatedPercent === "number") return Math.max(0, Math.min(100, window.estimatedPercent))
-  if (window.limitUSD <= 0) return 0
-  return Math.max(0, Math.min(100, (window.spentUSD / window.limitUSD) * 100))
-}
-
-function arcPath(cx: number, cy: number, r: number, start: number, end: number) {
-  const startPoint = polar(cx, cy, r, end)
-  const endPoint = polar(cx, cy, r, start)
-  const delta = end >= start ? end - start : end + 360 - start
-  return ["M", startPoint.x, startPoint.y, "A", r, r, 0, delta <= 180 ? 0 : 1, 0, endPoint.x, endPoint.y].join(" ")
-}
-
-function polar(cx: number, cy: number, r: number, angle: number) {
-  const radian = ((angle - 90) * Math.PI) / 180
-  return {
-    x: cx + r * Math.cos(radian),
-    y: cy + r * Math.sin(radian),
-  }
 }
 
 export function usePromptInputV2Controller(props: PromptInputV2ControllerProps): PromptInputV2ComposerController {

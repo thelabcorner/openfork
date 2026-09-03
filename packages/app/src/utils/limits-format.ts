@@ -41,10 +41,24 @@ export interface WorkBuddyModelLimit {
   resetSource: "server-6004" | "inferred" | "unknown"
   windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
   windowStartedAt: number | null
+  /** Seconds until the next reset boundary; null when no window is known. */
+  secondsUntilReset: number | null
   lastObservationAt: number | null
   burnPerHour: number | null
   estimatedExhaustionAt: number | null
   willLikelyExhaustBeforeReset: boolean | null
+  /**
+   * Consumption WorkBuddy ACTUALLY reported for this model in the current
+   * window, summed per completed generation — the real spend figure, not
+   * `usedObserved × publishedRate`.
+   */
+  creditsObserved: number
+  tokensInput: number
+  tokensOutput: number
+  tokensCacheHit: number
+  tokensCacheMiss: number
+  /** True once enough real samples exist to trust the local average rate. */
+  creditsPersonalized: boolean
   coverage: "opencode-only"
 }
 
@@ -52,6 +66,27 @@ export interface WorkBuddyAccountLimits {
   accountId: string
   label: string
   models: WorkBuddyModelLimit[]
+}
+
+/**
+ * One configured Zen API key, mirrored from the server's quota schema. `resetAt`
+ * is the same governor timestamp the failover router orders by; `queuePosition`
+ * is the 1-based failover rank (used keys by resetAt ascending, never-used keys
+ * last), null when the ordering is not applicable.
+ */
+export interface ZenKeyLimits {
+  keyId: string
+  label: string
+  state: "ready" | "cooling" | "exhausted" | "unknown"
+  exhausted: boolean
+  everUsed: boolean
+  resetAt: number | null
+  resetAfterSeconds: number | null
+  usedObserved: number | null
+  limitEstimate: number | null
+  remainingPercent: number | null
+  estimateSource: "fallback" | "learned" | "lower-bound" | null
+  queuePosition: number | null
 }
 
 export interface ProviderResult {
@@ -67,6 +102,8 @@ export interface ProviderResult {
     /** Stable account key -> the label used in `windows` keys. See the schema note. */
     accountLabels?: Record<string, string>
     workbuddyAccounts?: WorkBuddyAccountLimits[]
+    verdentAccounts?: WorkBuddyAccountLimits[]
+    zenAccounts?: ZenKeyLimits[]
   } | null
   fetchedAt: number
   /**
@@ -123,7 +160,11 @@ export function formatResetDate(ms: number | null, locale?: string): string {
   }
 }
 
-export function formatAge(fetchedAt: number, now: number, t: (key: string, params?: Record<string, string | number | boolean>) => string): string {
+export function formatAge(
+  fetchedAt: number,
+  now: number,
+  t: (key: string, params?: Record<string, string | number | boolean>) => string,
+): string {
   const diff = Math.max(0, now - fetchedAt)
   if (diff < 45_000) return t("limits.updated.justNow")
   const minutes = Math.floor(diff / 60_000)
@@ -134,7 +175,10 @@ export function formatAge(fetchedAt: number, now: number, t: (key: string, param
   return t("common.time.daysAgo.short", { count: days })
 }
 
-export function formatCountdownSeconds(seconds: number, t: (key: string, params?: Record<string, string | number | boolean>) => string): string {
+export function formatCountdownSeconds(
+  seconds: number,
+  t: (key: string, params?: Record<string, string | number | boolean>) => string,
+): string {
   if (seconds <= 0) return t("usage.duration.zero")
   const totalSeconds = Math.floor(seconds)
   const s = totalSeconds % 60
@@ -148,7 +192,10 @@ export function formatCountdownSeconds(seconds: number, t: (key: string, params?
   return t("usage.duration.minutesSeconds", { minutes: m, seconds: s })
 }
 
-export function displayWindowLabel(key: string, t: (key: string, params?: Record<string, string | number | boolean>) => string): string {
+export function displayWindowLabel(
+  key: string,
+  t: (key: string, params?: Record<string, string | number | boolean>) => string,
+): string {
   const lower = key.toLowerCase()
   if (lower === "5h") return t("limits.window.5h.short")
   if (lower === "weekly") return t("limits.window.weekly")
@@ -196,7 +243,8 @@ export type WorkBuddyWindowKey =
 export function parseWorkBuddyKey(key: string): WorkBuddyWindowKey | null {
   if (key.startsWith("aggregate:")) {
     const kind = key.slice("aggregate:".length)
-    if (kind === "basic" || kind === "gift" || kind === "extra" || kind === "combined") return { scope: "aggregate", kind }
+    if (kind === "basic" || kind === "gift" || kind === "extra" || kind === "combined")
+      return { scope: "aggregate", kind }
     return null
   }
   if (key.startsWith("account:")) {
@@ -244,13 +292,40 @@ export function workBuddyCredits(window: UsageWindow): { remaining: number; tota
     const total = num(bare[1]!)
     if (!Number.isFinite(total) || total <= 0) return null
     const pct = window.remainingPercent
-    if (pct !== null && Number.isFinite(pct)) return { remaining: (total * Math.max(0, Math.min(100, pct))) / 100, total }
+    if (pct !== null && Number.isFinite(pct))
+      return { remaining: (total * Math.max(0, Math.min(100, pct))) / 100, total }
     return { remaining: total, total }
   }
   return null
 }
 
-export function worstRemainingFromWindows(windows: Array<[string, { usedPercent: number | null; remainingPercent: number | null }]>) {
+/**
+ * Whether an account's TOTAL package balance (Basic+Gift+Extra combined) is
+ * fully drained.
+ *
+ * WorkBuddy's promotional Hy3/Hy4 models publish a 0.00x credit rate, so in
+ * theory a 24h-window check alone should decide whether they're usable. In
+ * practice (observed 2026-08-31) Tencent's backend runs its own balance
+ * check before every generation regardless of the model's rate, and rejects
+ * with `[14018] Credits exhausted` on a zero-balance account even when the
+ * model's own frequency window has plenty of headroom left. A free model is
+ * therefore only ACTUALLY usable when both are true: its own window has
+ * headroom AND the account has ANY package credit left — this checks the
+ * second condition so callers can stop advertising a promo model as healthy
+ * on an account that will 402 on the very first request.
+ */
+export function workBuddyAccountCreditsExhausted(windows: Record<string, UsageWindow>, accountLabel?: string): boolean {
+  const key = accountLabel ? `account:${accountLabel}:Combined` : "aggregate:combined"
+  const window = windows[key]
+  if (!window) return false
+  const remaining = window.remainingPercent ?? (window.usedPercent !== null ? 100 - window.usedPercent : null)
+  if (remaining === null) return false
+  return remaining <= 0
+}
+
+export function worstRemainingFromWindows(
+  windows: Array<[string, { usedPercent: number | null; remainingPercent: number | null }]>,
+) {
   let worst: number | null = null
   for (const [key, w] of windows) {
     if (key.startsWith("weekly:") || isWorkBuddyNonGating(key)) continue
@@ -275,7 +350,9 @@ export interface TierGate {
 }
 
 export function resolveTierGate(
-  windows: Array<[string, { usedPercent: number | null; remainingPercent: number | null; windowSeconds: number | null }]>,
+  windows: Array<
+    [string, { usedPercent: number | null; remainingPercent: number | null; windowSeconds: number | null }]
+  >,
 ): TierGate {
   let effective: number | null = null
   let bindingKey: string | null = null
@@ -324,4 +401,93 @@ export function forkWindowToUsageWindow(w: {
     resetAfterSeconds: null,
     valueLabel: null,
   }
+}
+
+export function workbuddyModelDisplayName(model: string): string {
+  const lower = model.toLowerCase()
+  if (lower === "hy3" || lower.startsWith("hy3")) return "Hy3"
+  if (lower === "hy4-preview" || lower.startsWith("hy4-preview")) return "Hy4 Preview"
+  return model
+}
+
+export function verdentModelDisplayName(model: string): string {
+  const lower = model.toLowerCase()
+  if (lower === "deepseek-v4-flash-free") return "DeepSeek-V4-Flash-0731"
+  if (lower === "glm-5.3-flash-free") return "GLM-5.3-Flash"
+  return model
+}
+
+export function workbuddyModelToUsageWindow(m: WorkBuddyModelLimit): UsageWindow {
+  return {
+    usedPercent: m.remainingPercent !== null ? 100 - m.remainingPercent : null,
+    remainingPercent: m.remainingPercent,
+    windowSeconds: null,
+    resetAt: m.resetAt,
+    resetAfterSeconds: m.secondsUntilReset,
+    valueLabel:
+      m.limitEstimate !== null ? `${m.usedObserved} / ~${m.limitEstimate} ${m.unit}` : `${m.usedObserved} observed`,
+  }
+}
+
+export interface WorkBuddyModelAggregate {
+  canonical: string
+  label: string
+  usedObserved: number
+  limitEstimate: number | null
+  remainingPercent: number | null
+  resetAt: number | null
+  confidence: "low" | "medium" | "high"
+  accounts: number
+  anyExhausted: boolean
+}
+
+/**
+ * Folds every account's per-model report into ONE row per model family
+ * (Hy3, Hy4 Preview, ...) — the number the user actually wants first ("how
+ * much Hy3 do I have left across everything"), not a blended-across-models
+ * average that mixes two different research priors into a meaningless
+ * figure. `limitEstimate`/`remainingPercent` sum observed usage and the
+ * research-derived budget across accounts, same shape as the package-credit
+ * Combined row below it. `resetAt` is the SOONEST account's reset — that's
+ * the next moment the aggregate number actually changes.
+ */
+export function aggregateWorkbuddyModels(accounts: WorkBuddyAccountLimits[]): WorkBuddyModelAggregate[] {
+  const byCanonical = new Map<string, WorkBuddyModelLimit[]>()
+  for (const account of accounts) {
+    for (const m of account.models) {
+      const key = m.canonical ?? m.model
+      const list = byCanonical.get(key)
+      if (list) list.push(m)
+      else byCanonical.set(key, [m])
+    }
+  }
+  const confidenceRank = { low: 0, medium: 1, high: 2 } as const
+  const rows: WorkBuddyModelAggregate[] = []
+  for (const [canonical, models] of byCanonical) {
+    const usedObserved = models.reduce((sum, m) => sum + m.usedObserved, 0)
+    const limits = models.map((m) => m.limitEstimate)
+    const limitEstimate = limits.every((v): v is number => v !== null) ? limits.reduce((a, b) => a + b, 0) : null
+    const remainingPercent =
+      limitEstimate !== null && limitEstimate > 0
+        ? Math.max(0, Math.min(100, ((limitEstimate - usedObserved) / limitEstimate) * 100))
+        : null
+    const resets = models.map((m) => m.resetAt).filter((v): v is number => v !== null && Number.isFinite(v))
+    const resetAt = resets.length ? Math.min(...resets) : null
+    const confidence = models.reduce<"low" | "medium" | "high">(
+      (best, m) => (confidenceRank[m.confidence] > confidenceRank[best] ? m.confidence : best),
+      "low",
+    )
+    rows.push({
+      canonical,
+      label: workbuddyModelDisplayName(models[0]!.model),
+      usedObserved,
+      limitEstimate,
+      remainingPercent,
+      resetAt,
+      confidence,
+      accounts: models.length,
+      anyExhausted: models.some((m) => m.exhaustedObserved),
+    })
+  }
+  return rows.sort((a, b) => a.label.localeCompare(b.label))
 }

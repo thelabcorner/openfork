@@ -1,5 +1,13 @@
 import { describe, test, expect } from "bun:test"
-import { buildPersonalFallbackMap, buildPricingFallbackMap, compareByCheapness } from "./model-cost"
+import {
+  buildFuzzyPricingFallbackMap,
+  buildPersonalFallbackMap,
+  buildPricingFallbackMap,
+  compareByCheapness,
+  mergePricingFallbacks,
+  sortByCheapness,
+  type CheapnessModel,
+} from "./model-cost"
 
 describe("model-cost fallback", () => {
   test("pricing fallback prefers non-openrouter and shares across providers", () => {
@@ -38,5 +46,42 @@ describe("model-cost fallback", () => {
     // With fallback, expensiveCorpusButCheapPersonal has personal fallback (0.001) which is cheap, so it should outrank
     const withFallback = compareByCheapness(expensiveCorpusButCheapPersonal as never, cheap as never, undefined, undefined, personal as never, undefined, personalFallback as never)
     expect(withFallback).toBeLessThan(0)
+  })
+
+  test("a free-tier model with fuzzy-inferred pricing ranks by that value within its tier, not just alphabetically", () => {
+    // Regression for: classifyMonetaryClass runs on the model's own $0 cost
+    // BEFORE any pricing-fallback lookup, so a model that tier-classifies as
+    // free (openrouter ":free" suffix here) used to short-circuit straight to
+    // `a.name.localeCompare(b.name)` and never consult the fallback map at
+    // all — meaning fuzzy/exact-inferred pricing was computed but silently
+    // never used for ranking any free-tier model.
+    const hy3Paid: CheapnessModel = { id: "hy3", name: "Hy3", provider: { id: "vendor-x" }, cost: { input: 3, output: 15, cache: { read: 0.3, write: 0 } } }
+    const hy3Free: CheapnessModel = {
+      id: "openrouter/hy3:free",
+      name: "Hy3 (Free)",
+      provider: { id: "openrouter" },
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    }
+    // Alphabetically first ("Aaa" < "Hy3") but has no paid sibling to infer from.
+    const otherFree: CheapnessModel = {
+      id: "openrouter/aaa:free",
+      name: "Aaa (Free)",
+      provider: { id: "openrouter" },
+      cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+    }
+    const paidModel: CheapnessModel = { id: "mid", name: "Mid", provider: { id: "vendor-y" }, cost: { input: 1, output: 1, cache: { read: 0, write: 0 } } }
+
+    const fuzzy = buildFuzzyPricingFallbackMap([hy3Paid, hy3Free, otherFree, paidModel])
+    const merged = mergePricingFallbacks(undefined, fuzzy)
+    expect(merged?.get("openrouter/hy3:free")?.input).toBe(3)
+    expect(merged?.has("openrouter/aaa:free")).toBe(false)
+
+    const sorted = sortByCheapness([otherFree, hy3Free, paidModel], undefined, undefined, undefined, merged)
+    expect(sorted.map((m) => m.id)).toEqual(["openrouter/hy3:free", "openrouter/aaa:free", "mid"])
+
+    // compareByCheapness (the O(n log n) comparator path) must agree.
+    expect(compareByCheapness(hy3Free as never, otherFree as never, undefined, undefined, undefined, merged as never)).toBeLessThan(0)
+    // Free tier still always outranks paid regardless of inferred value (§19 intact).
+    expect(compareByCheapness(otherFree as never, paidModel as never, undefined, undefined, undefined, merged as never)).toBeLessThan(0)
   })
 })

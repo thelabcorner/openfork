@@ -8,6 +8,8 @@ Existing-session actions use sessionId as the source of truth. Do not invent or 
 
 list discovers sessions. status only reads status. messages only reads existing conversation text. send always adds a NEW user prompt.
 
+list filters: search, roots, parentId. Use parentId to enumerate the child sessions of one session — subagent/task children appear there, which is how you recover a failed or interrupted task's session id after it scrolled out of context.
+
 create, send, and fork return without waiting by default. The target session continues independently after this call. Set wait only when the user explicitly asks or your very next step genuinely requires the completed result. Do not poll a session you just dispatched.
 
 Session deletion is unavailable.

@@ -1,5 +1,6 @@
 import { Popover as Kobalte } from "@kobalte/core/popover"
 import {
+  batch,
   Component,
   ComponentProps,
   createEffect,
@@ -49,21 +50,59 @@ import { createModelSearchMatcher, prepareModelSearchFields } from "./dialog-sel
 import { applySectionOrder } from "./dialog-select-model-order"
 import { useForkUsage } from "@/context/fork-usage"
 import { useWorkBuddyUsage, type WorkBuddyModelUsage } from "@/hooks/use-workbuddy-usage"
-import { WorkBuddyFreeBadge } from "./workbuddy-free-badge"
+import { useVerdentUsage } from "@/hooks/use-verdent-usage"
+import { useGensparkUsage, formatCreditsPerMillion, type GensparkModelUsage } from "@/hooks/use-genspark-usage"
+import { WorkBuddyFreeBadge, workBuddyFreeLabel } from "./workbuddy-free-badge"
 import { useSync } from "@/context/sync"
 import { useLayout } from "@/context/layout"
 import { useSDK } from "@/context/sdk"
-import type { ForkWindowUsage } from "@/utils/fork-client"
+import { useServerSDK } from "@/context/server-sdk"
+import { useServerSync } from "@/context/server-sync"
+import { usePersonalUsage } from "@/context/personal-usage"
+import { useLimits } from "@/hooks/use-limits"
+import { useNow } from "@/hooks/use-now"
+import { ForkClient, type ForkWindowUsage } from "@/utils/fork-client"
 import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
 import type { FreeUsageReport } from "@/utils/openrouter-free-usage"
 import { percent as usagePercent, colorFor } from "./usage-gauge-v2"
-import { estimateRequestsRemaining, estimateRequestsRemainingFromCost, isUsageTrackedProvider } from "@/utils/model-usage-estimate"
-import { getUsageTables, matchUsagePricing, matchUsageProfile, collectThresholdPricing } from "@/utils/model-usage-profile"
-import { averageCostPerRequest, buildHitRateIndex, buildModelCostIndex } from "@/utils/model-usage-history"
+import { toneForRemaining } from "@/utils/limits-format"
+import {
+  collapseAccountVariants,
+  expandForQuery,
+  groupForModelID,
+  indexModelGroups,
+  type ModelGroup,
+  variantForPolicy,
+} from "./dialog-select-model-accounts"
+import { MULTI_ACCOUNT_PROVIDERS, type AutoPolicy } from "@/utils/multi-account-providers"
+import { splitModelIDForProvider } from "@/utils/model-account-identity"
+import { AccountOptionList, accountLabelForVariant, type AccountOptionUsage } from "./model-account-submenu"
+import { ModelStretchBar, stretchTone } from "./model-stretch-bar"
+import {
+  estimateRequestsRemaining,
+  estimateRequestsRemainingFromCost,
+  isUsageTrackedProvider,
+} from "@/utils/model-usage-estimate"
+import {
+  getUsageTables,
+  matchUsagePricing,
+  matchUsageProfile,
+  collectThresholdPricingFromIndex,
+  prepareThresholdIndex,
+} from "@/utils/model-usage-profile"
+import { buildHitRateIndex, buildModelCostIndex } from "@/utils/model-usage-history"
 import { deepSeekRatePeriod, isDeepSeekPeakPricedModel } from "@/utils/model-peak-pricing"
 import { isUnlimitedModel, stripUnlimitedSuffix, hasPublishedPricing } from "@/utils/model-badges"
-import { buildPersonalFallbackMap, buildPricingFallbackMap, sortByCheapness, isFreeModel } from "@/utils/model-cost"
-import { buildStandardWorkloadCorpus, FALLBACK_WORKLOAD_CORPUS, type Workload } from "@/utils/model-usage-yield"
+import {
+  buildFuzzyPricingFallbackMap,
+  buildPersonalFallbackMap,
+  buildPricingFallbackMap,
+  mergePricingFallbacks,
+  resolveEffectiveCost,
+  sortByCheapness,
+  isFreeModel,
+} from "@/utils/model-cost"
+import { buildStandardWorkloadCorpus, FALLBACK_WORKLOAD_CORPUS, type CorpusBands, type Workload } from "@/utils/model-usage-yield"
 
 type ModelState = ReturnType<typeof useLocal>["model"]
 type ModelItem = ReturnType<ModelState["list"]>[number]
@@ -81,6 +120,7 @@ type ModelUsage = {
    * remaining credits* rather than dollars remaining in a time window.
    */
   workbuddy?: WorkBuddyModelUsage
+  genspark?: GensparkModelUsage
 }
 
 const modelKey = (model: ModelItem) => `${model.provider.id}:${model.id}`
@@ -96,7 +136,7 @@ const openRouterFreeUsageTone = (status: FreeUsageReport["free"]["status"]): Usa
   return "success"
 }
 
-// Sentinel for "let OpenRouter pick the upstream provider" — the first,
+// Sentinel for "let OpenRouter pick the upstream provider" ΓÇö the first,
 // default-selected entry of the sub-provider picker. Storing it is never
 // persisted; choosing it clears the pinned preference so nothing reaches the
 // request (`request.ts` additionally guards against it defensively).
@@ -104,24 +144,24 @@ const favoritesRailKey = "favorites"
 const recentRailKey = "recent"
 
 // ---------------------------------------------------------------------------
-//  Cheapness V2: Usage Yield ranking (§5-6, §19, §31 of
+//  Cheapness V2: Usage Yield ranking (┬º5-6, ┬º19, ┬º31 of
 //  cheapness-v2-usage-yield-proposal). See utils/model-usage-yield.ts for the
 //  full derivation. Summary:
 //  - Every PAID model is priced against the SAME standardized workload corpus
 //    (16 deduped Go tuples, not its own idiosyncratic profile), via
-//    priceWorkload = (I·P_I + K·P_K + O·P_O)/1M (§5.2).
-//  - Primary cost is the median corpus cost (§6); Light/Typical/Heavy bands
-//    (§7) are derived from context quartiles for diagnostics.
-//  - Context-threshold tiers (§8: Qwen ≤/ >256K, Grok ≤/ >200K, GPT Luna ≤/ >272K)
-//    select the tier the workload actually activates — not just the cheapest row.
-//  - Time regimes (§9: DeepSeek Peak/Off-Peak) blend to expected yield with the
+//    priceWorkload = (I┬╖P_I + K┬╖P_K + O┬╖P_O)/1M (┬º5.2).
+//  - Primary cost is the median corpus cost (┬º6); Light/Typical/Heavy bands
+//    (┬º7) are derived from context quartiles for diagnostics.
+//  - Context-threshold tiers (┬º8: Qwen Γëñ/ >256K, Grok Γëñ/ >200K, GPT Luna Γëñ/ >272K)
+//    select the tier the workload actually activates ΓÇö not just the cheapest row.
+//  - Time regimes (┬º9: DeepSeek Peak/Off-Peak) blend to expected yield with the
 //    documented 20.83% peak fraction (35/168 weekly hours).
-//  - Free taxonomy (§10, §19): quota-exempt (Unlimited) → free-limited-known →
-//    free-limited-unknown → paid-by-yield. Free models never divide by zero;
-//    their rank is tier-ordered (§19) and capacity is shown separately.
-//  - Personal measured yield (§31): your own $/request (averageCostPerRequest
-//    from buildModelCostIndex, ≥3 samples) is blended heavily — 70% personal
-//    vs 30% corpus, extrapolated across *all* providers (§32-33). Your history
+//  - Free taxonomy (┬º10, ┬º19): quota-exempt (Unlimited) ΓåÆ free-limited-known ΓåÆ
+//    free-limited-unknown ΓåÆ paid-by-yield. Free models never divide by zero;
+//    their rank is tier-ordered (┬º19) and capacity is shown separately.
+//  - Personal measured yield (┬º31): your own $/request (averageCostPerRequest
+//    from buildModelCostIndex, ΓëÑ3 samples) is blended heavily ΓÇö 70% personal
+//    vs 30% corpus, extrapolated across *all* providers (┬º32-33). Your history
 //    is more relevant than the generic workload, but the corpus remains a 30%
 //    prior to avoid overfitting early samples.
 //  - Cross-provider pricing fallback: same model id across providers is ~same
@@ -132,7 +172,7 @@ const recentRailKey = "recent"
 //    shape. If you used claude-sonnet via anthropic but not via openrouter,
 //    borrow that personal $/request (70% weight) to value the openrouter
 //    variant instead of falling back to the generic corpus.
-//  - Unpriced models with no sibling pricing (§25) sort last; §28 deterministic tiebreakers: yield → name → id.
+//  - Unpriced models with no sibling pricing (┬º25) sort last; ┬º28 deterministic tiebreakers: yield ΓåÆ name ΓåÆ id.
 // ---------------------------------------------------------------------------
 const providerDisplayName = (id: string, fallback: string) => {
   if (id === "claude") return "Claude Subscription"
@@ -160,6 +200,9 @@ const ModelList: Component<{
   model?: ModelState
 }> = (props) => {
   const model = props.model ?? useLocal().model
+  // One view-level quota projection. Row renderers stay presentational: the
+  // WorkBuddy quota resource must never be created once per model row.
+  const workbuddy = useWorkBuddyUsage()
   const language = useLanguage()
 
   const models = createMemo(() =>
@@ -223,11 +266,58 @@ const ModelList: Component<{
       {(i) => (
         <div class="w-full flex items-center gap-x-2 text-13-regular">
           <span class="truncate">{stripUnlimitedSuffix(i.name)}</span>
+          <Show when={i.provider.id === "workbuddy"}>
+            {(() => {
+              const value = workbuddy.forModel(i.id)
+              return (
+                <>
+                  <WorkBuddyFreeBadge label={workBuddyFreeLabel(workbuddy.rateFor(i.id))} />
+                  <Show when={value}>
+                    {(usage) => (
+                      <>
+                        <ModelStretchBar
+                          requests={usage().estimatedRequests}
+                          remainingPercent={usage().remainingPercent}
+                          tone={
+                            usage().remainingPercent !== undefined
+                              ? (toneForRemaining(usage().remainingPercent) as UsageTone)
+                              : (stretchTone(usage().estimatedRequests) as UsageTone)
+                          }
+                        />
+                        <span
+                          class="shrink-0 text-[10px] font-[520] tabular-nums"
+                          classList={{
+                            "text-v2-state-fg-danger": usage().creditsExhausted,
+                            "text-v2-text-text-faint": !usage().creditsExhausted,
+                          }}
+                          title={
+                            usage().creditsExhausted
+                              ? `${usage().account} ┬╖ ${language.t("model.tooltip.workbuddy.noCredits")}`
+                              : `${usage().account} ┬╖ ${usage().free ? `~${usage().estimatedRequests} promo requests left (24h) ┬╖ ${usage().remainingPercent?.toFixed(1) ?? "ΓÇö"}%` : `x${usage().rate} credits/request`}`
+                          }
+                        >
+                          {usage().creditsExhausted
+                            ? language.t("model.tag.noCredits")
+                            : usage().free &&
+                                Number.isFinite(usage().estimatedRequests) &&
+                                usage().estimatedRequests !== Number.POSITIVE_INFINITY
+                              ? `~${Math.round(usage().estimatedRequests).toLocaleString()}`
+                              : usage().free
+                                ? "Free"
+                                : `~${Number.isFinite(usage().estimatedRequests) ? Math.round(usage().estimatedRequests).toLocaleString() : "Γê₧"}`}
+                        </span>
+                      </>
+                    )}
+                  </Show>
+                </>
+              )
+            })()}
+          </Show>
           <DeepSeekRateBadge model={i} />
           <Show when={isUnlimitedModel(i)}>
             <Tag>{language.t("model.tag.unlimited")}</Tag>
           </Show>
-          <Show when={isFreeModel(i as never)}>
+          <Show when={i.provider.id !== "workbuddy" && i.provider.id !== "genspark" && isFreeModel(i as never)}>
             <Tag>{language.t("model.tag.free")}</Tag>
           </Show>
           <Show when={i.latest}>
@@ -239,46 +329,8 @@ const ModelList: Component<{
   )
 }
 
-// Tiers on the *absolute* number of requests you could still make with this
-// model, not on % of budget spent (that figure is identical for every model
-// sharing a credential and says nothing about a specific model's affordability).
-const stretchTone = (requests: number) => {
-  if (requests <= 8) return "danger"
-  if (requests <= 40) return "warning"
-  return "success"
-}
-
-// A relative "how much stretch do I get from this model" bar: length is the
-// estimated remaining-request count for this model on a log scale, normalized
-// against the most generous model currently visible. Cheap/high-throughput
-// models (thousands of estimated requests) read as long bars; expensive ones
-// (dozens of requests) read as short bars — a plain linear scale would crush
-// everything but the priciest model to zero given how wide that range is.
-function ModelStretchBar(props: { requests: number; maxRequests: number; remainingPercent?: number; tone?: UsageTone }) {
-  const fraction = () => {
-    if (props.remainingPercent !== undefined) return Math.max(0, Math.min(1, props.remainingPercent / 100))
-    if (props.maxRequests <= 0) return 0
-    const value = Math.log1p(Math.max(0, props.requests)) / Math.log1p(props.maxRequests)
-    return Math.max(0, Math.min(1, value))
-  }
-  const color = () => colorFor(props.tone ?? stretchTone(props.requests))
-
-  return (
-    <span class="flex h-3 w-7 shrink-0 items-center overflow-hidden rounded-full bg-v2-background-bg-layer-03">
-      <span
-        class="h-full rounded-full transition-[width] duration-300"
-        style={{ width: `${fraction() * 100}%`, "background-color": color() }}
-      />
-    </span>
-  )
-}
-
-function ModelRowMeta(props: {
-  item: ModelItem
-  usage?: ModelUsage
-  maxRequests: number
-  price: JSX.Element
-}) {
+function ModelRowMeta(props: { item: ModelItem; usage?: ModelUsage; price: JSX.Element }) {
+  const language = useLanguage()
   return (
     <Show
       when={props.usage?.estimatedRequests !== undefined || props.usage?.remainingPercent !== undefined}
@@ -286,15 +338,36 @@ function ModelRowMeta(props: {
     >
       <ModelStretchBar
         requests={props.usage?.estimatedRequests ?? 0}
-        maxRequests={props.maxRequests}
         remainingPercent={props.usage?.remainingPercent}
         tone={props.usage?.tone}
       />
+      <Show when={props.usage?.workbuddy}>
+        {(workbuddy) => (
+          <span
+            class="max-w-[92px] shrink-0 truncate text-[9px] font-[520] tabular-nums leading-5"
+            classList={{
+              "text-v2-state-fg-danger": workbuddy().creditsExhausted,
+              "text-v2-text-text-faint": !workbuddy().creditsExhausted,
+            }}
+            title={
+              workbuddy().creditsExhausted
+                ? `${workbuddy().account} ┬╖ ${language.t("model.tooltip.workbuddy.noCredits")}`
+                : `${workbuddy().account} ┬╖ ${workbuddy().rate > 0 ? `x${workbuddy().rate} credits/request` : "Free now"}`
+            }
+          >
+            {workbuddy().creditsExhausted
+              ? language.t("model.tag.noCredits")
+              : workbuddy().free
+                ? "Free"
+                : `~${Number.isFinite(workbuddy().estimatedRequests) ? Math.round(workbuddy().estimatedRequests).toLocaleString() : "Γê₧"}`}
+          </span>
+        )}
+      </Show>
     </Show>
   )
 }
 
-// Tiers on *uptime* — the closest honest "which upstream should I trust"
+// Tiers on *uptime* ΓÇö the closest honest "which upstream should I trust"
 // signal OpenRouter's public API actually populates (its throughput/latency
 // fields are null for every provider). Same color language as the usage bar.
 const uptimeTone = (uptime: number) => {
@@ -377,10 +450,7 @@ function OpenRouterEndpointList(props: {
   }
 
   return (
-    <ScrollView
-      class="max-h-[336px] w-full [&_.scroll-view__viewport]:overscroll-contain"
-      viewportRef={setScrollRoot}
-    >
+    <ScrollView class="max-h-[336px] w-full [&_.scroll-view__viewport]:overscroll-contain" viewportRef={setScrollRoot}>
       <div class="relative" style={{ height: `${virtualizer.getTotalSize()}px` }}>
         <For each={virtualizer.getVirtualItems()}>
           {(virtualRow) => {
@@ -393,15 +463,14 @@ function OpenRouterEndpointList(props: {
             const cacheHit = entry.telemetry?.cacheHitPercent
             const throughput = entry.telemetry?.throughputTps
             return (
-              <div
-                class="absolute inset-x-0 top-0"
-                style={{ transform: `translateY(${virtualRow.start}px)` }}
-              >
+              <div class="absolute inset-x-0 top-0" style={{ transform: `translateY(${virtualRow.start}px)` }}>
                 <MenuV2.Item
                   data-endpoint-index={virtualRow.index}
                   class="w-full !h-auto !min-h-[42px] !items-stretch !gap-0 !p-0 [&_[data-slot=menu-v2-item-content]]:!flex [&_[data-slot=menu-v2-item-content]]:!flex-col [&_[data-slot=menu-v2-item-content]]:!items-stretch [&_[data-slot=menu-v2-item-content]]:!gap-0 [&_[data-slot=menu-v2-item-content]]:!p-0 [&_[data-slot=menu-v2-item-content]]:!flex-1"
                   data-selected={isSelected ? true : undefined}
-                  tabIndex={focusedIndex() === virtualRow.index || (focusedIndex() < 0 && virtualRow.index === 0) ? 0 : -1}
+                  tabIndex={
+                    focusedIndex() === virtualRow.index || (focusedIndex() < 0 && virtualRow.index === 0) ? 0 : -1
+                  }
                   onFocus={() => setFocusedIndex(virtualRow.index)}
                   onKeyDown={(event) => {
                     if (event.key !== "ArrowDown" && event.key !== "ArrowUp") return
@@ -417,11 +486,17 @@ function OpenRouterEndpointList(props: {
                         id={providerIconId(entry.provider, entry.providerName)}
                         class="size-3.5 shrink-0 opacity-70"
                       />
-                      <span class="min-w-0 flex-1 truncate text-[12px] font-[450] leading-none tracking-[-0.02px] text-v2-text-text-base">{entry.providerName}</span>
+                      <span class="min-w-0 flex-1 truncate text-[12px] font-[450] leading-none tracking-[-0.02px] text-v2-text-text-base">
+                        {entry.providerName}
+                      </span>
                       <Show when={isCheapest}>
-                        <span class="shrink-0 rounded-[3px] bg-v2-state-bg-success/10 px-1 py-0 text-[9px] font-[600] leading-3 tracking-[0.04px] text-v2-state-fg-success">{language.t("dialog.model.subprovider.best")}</span>
+                        <span class="shrink-0 rounded-[3px] bg-v2-state-bg-success/10 px-1 py-0 text-[9px] font-[600] leading-3 tracking-[0.04px] text-v2-state-fg-success">
+                          {language.t("dialog.model.subprovider.best")}
+                        </span>
                       </Show>
-                      <span class="shrink-0 text-[11px] font-[500] tabular-nums leading-none text-v2-text-text-muted">{price}</span>
+                      <span class="shrink-0 text-[11px] font-[500] tabular-nums leading-none text-v2-text-text-muted">
+                        {price}
+                      </span>
                       <Show when={isSelected}>
                         <Icon name="check" size="small" class="size-3 shrink-0 text-v2-text-text-accent" />
                       </Show>
@@ -429,16 +504,26 @@ function OpenRouterEndpointList(props: {
                     <div class="flex min-w-0 items-center gap-1 pl-5 text-[10px] font-[450] leading-none text-v2-text-text-faint">
                       <span class="min-w-0 truncate tabular-nums">{entry.tag}</span>
                       <Show when={uptime !== undefined}>
-                        <span class="inline-flex shrink-0 items-center gap-1 tabular-nums" title={language.t("dialog.model.subprovider.uptime")}>
-                          <span class="size-1 shrink-0 rounded-full" style={{ "background-color": colorFor(uptimeTone(uptime!)) }} />
+                        <span
+                          class="inline-flex shrink-0 items-center gap-1 tabular-nums"
+                          title={language.t("dialog.model.subprovider.uptime")}
+                        >
+                          <span
+                            class="size-1 shrink-0 rounded-full"
+                            style={{ "background-color": colorFor(uptimeTone(uptime!)) }}
+                          />
                           <span style={{ color: colorFor(uptimeTone(uptime!)) }}>{uptime!.toFixed(1)}%</span>
                         </span>
                       </Show>
                       <Show when={throughput !== undefined}>
-                        <span class="shrink-0 tabular-nums" title="Throughput (tokens/s)">· {throughput} tok/s</span>
+                        <span class="shrink-0 tabular-nums" title="Throughput (tokens/s)">
+                          ┬╖ {throughput} tok/s
+                        </span>
                       </Show>
                       <Show when={cacheHit !== undefined}>
-                        <span class="shrink-0 tabular-nums" title="Cache hit rate">· ~{cacheHit}%</span>
+                        <span class="shrink-0 tabular-nums" title="Cache hit rate">
+                          ┬╖ ~{cacheHit}%
+                        </span>
                       </Show>
                     </div>
                   </div>
@@ -456,7 +541,7 @@ function OpenRouterEndpointList(props: {
 // whose header shows the model's full `ModelTooltip` (so the tooltip is part
 // of the submenu, not a separate floating element competing with its hover-
 // open) followed by the upstream-provider picker. The Sub is rendered outside
-// the RadioGroup — see `rowList`. Best-effort endpoints fetch; failure
+// the RadioGroup ΓÇö see `rowList`. Best-effort endpoints fetch; failure
 // degrades to Auto-only with no entry list.
 function OpenRouterRow(props: {
   item: ModelItem
@@ -465,8 +550,9 @@ function OpenRouterRow(props: {
   favorited: boolean
   pinned: string | undefined
   usage?: ModelUsage
-  maxRequests: number
   priceLabel: string
+  /** WorkBuddy promotion badge label, resolved by the parent to keep rows pure. */
+  freeLabel?: string
   rowRef: (element: HTMLElement | undefined) => void
   endpoints: OpenRouterEndpoint[] | undefined
   loading: boolean
@@ -511,9 +597,15 @@ function OpenRouterRow(props: {
         <ProviderIcon id={props.item.provider.id} class="size-3.5 shrink-0 opacity-60" />
         <span class="min-w-0 flex-1 truncate leading-5">{stripUnlimitedSuffix(props.item.name)}</span>
         <Show when={props.item.provider.id === "workbuddy"}>
-          <WorkBuddyFreeBadge modelID={props.item.id} />
+          <WorkBuddyFreeBadge label={props.freeLabel} />
         </Show>
-        <Show when={props.item.provider.id !== "workbuddy" && isFreeModel(props.item as never)}>
+        <Show
+          when={
+            props.item.provider.id !== "workbuddy" &&
+            props.item.provider.id !== "genspark" &&
+            isFreeModel(props.item as never)
+          }
+        >
           <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
         </Show>
         <Show when={props.item.latest}>
@@ -525,7 +617,6 @@ function OpenRouterRow(props: {
         <ModelRowMeta
           item={props.item}
           usage={props.usage}
-          maxRequests={props.maxRequests}
           price={<span class="text-[10px] font-[520] leading-5">{props.priceLabel}</span>}
         />
         <ModelFavoriteToggle favorited={props.favorited} onToggle={props.onToggleFavorite} />
@@ -536,10 +627,10 @@ function OpenRouterRow(props: {
             data-model-selector-submenu
             class="w-64 rounded-md border-0 bg-v2-background-bg-layer-01 p-1 shadow-[var(--v2-elevation-floating)] focus:outline-none"
           >
-          <div
-            class="mb-1 border-b border-v2-border-border-muted px-3 pb-1.5"
-            style={{ "font-size": "11px", "line-height": "12px", "font-weight": 530 }}
-          >
+            <div
+              class="mb-1 border-b border-v2-border-border-muted px-3 pb-1.5"
+              style={{ "font-size": "11px", "line-height": "12px", "font-weight": 530 }}
+            >
               <ModelTooltip
                 model={props.item}
                 latest={props.item.latest}
@@ -550,44 +641,162 @@ function OpenRouterRow(props: {
                 hitRate={props.hitRate}
                 v2
               />
-          </div>
-          <MenuV2.Item
-            data-selected={!props.pinned ? true : undefined}
-            onSelect={() => props.onPickProvider(undefined)}
-          >
-            <span class="min-w-0 flex-1 truncate">{language.t("dialog.model.subprovider.auto")}</span>
-            <Show when={!props.pinned}>
-              <Icon name="check" size="small" class="shrink-0 text-v2-text-text-accent" />
-            </Show>
-          </MenuV2.Item>
-          <MenuV2.Separator class="my-0.5" />
-          <Show
-            when={props.loading}
-            fallback={
-              <Show
-                when={props.endpoints && props.endpoints.length > 0}
-                fallback={
-                  <MenuV2.Item disabled>
-                    <span class="min-w-0 flex-1 truncate">
-                      {props.endpoints === undefined
-                        ? language.t("dialog.model.subprovider.error")
-                        : language.t("dialog.model.subprovider.empty")}
-                    </span>
-                  </MenuV2.Item>
-                }
-              >
-                <OpenRouterEndpointList
-                  endpoints={props.endpoints!}
-                  pinned={props.pinned}
-                  onPickProvider={props.onPickProvider}
-                />
+            </div>
+            <MenuV2.Item
+              data-selected={!props.pinned ? true : undefined}
+              onSelect={() => props.onPickProvider(undefined)}
+            >
+              <span class="min-w-0 flex-1 truncate">{language.t("dialog.model.subprovider.auto")}</span>
+              <Show when={!props.pinned}>
+                <Icon name="check" size="small" class="shrink-0 text-v2-text-text-accent" />
               </Show>
-            }
-          >
-            <MenuV2.Item disabled>
-              <span class="min-w-0 flex-1 truncate">{language.t("common.loading")}</span>
             </MenuV2.Item>
-          </Show>
+            <MenuV2.Separator class="my-0.5" />
+            <Show
+              when={props.loading}
+              fallback={
+                <Show
+                  when={props.endpoints && props.endpoints.length > 0}
+                  fallback={
+                    <MenuV2.Item disabled>
+                      <span class="min-w-0 flex-1 truncate">
+                        {props.endpoints === undefined
+                          ? language.t("dialog.model.subprovider.error")
+                          : language.t("dialog.model.subprovider.empty")}
+                      </span>
+                    </MenuV2.Item>
+                  }
+                >
+                  <OpenRouterEndpointList
+                    endpoints={props.endpoints!}
+                    pinned={props.pinned}
+                    onPickProvider={props.onPickProvider}
+                  />
+                </Show>
+              }
+            >
+              <MenuV2.Item disabled>
+                <span class="min-w-0 flex-1 truncate">{language.t("common.loading")}</span>
+              </MenuV2.Item>
+            </Show>
+          </MenuV2.SubContent>
+        </MenuV2.Portal>
+      </Show>
+    </MenuV2.Sub>
+  )
+}
+
+function MultiAccountRow(props: {
+  item: ModelItem
+  displayName: string
+  variants: { accountID: string; item: ModelItem }[]
+  navKey: string
+  current: boolean
+  selectedAccountID?: string
+  auto?: ModelItem
+  selectedAuto?: boolean
+  favorited: boolean
+  usage?: ModelUsage
+  priceLabel: string
+  freeLabel?: string
+  accountLabels?: Readonly<Record<string, string>> | ReadonlyMap<string, string>
+  rowRef: (element: HTMLElement | undefined) => void
+  onActivate: () => void
+  onDeactivate: () => void
+  onToggleFavorite: () => void
+  usageForAccount?: (accountID: string) => AccountOptionUsage | undefined
+  submenuOpen: boolean
+  onSubmenuChange: (open: boolean) => void
+  onSelectAuto: () => void
+  onSelectAccount: (accountID: string) => void
+}) {
+  const language = useLanguage()
+  return (
+    <MenuV2.Sub gutter={6} overlap overflowPadding={8} open={props.submenuOpen} onOpenChange={props.onSubmenuChange}>
+      <MenuV2.SubTrigger
+        ref={props.rowRef}
+        data-option-key={props.navKey}
+        data-selected-model={props.current ? true : undefined}
+        aria-label={`${props.displayName}, ${props.variants.length} accounts`}
+        title={props.variants.map((variant) => accountLabelForVariant(variant, props.accountLabels)).join(", ")}
+        class="scroll-my-6 w-full"
+        classList={{ "!bg-v2-overlay-simple-overlay-hover": props.current }}
+        onMouseEnter={props.onActivate}
+        onMouseLeave={props.onDeactivate}
+      >
+        <ProviderIcon id={props.item.provider.id} class="size-3.5 shrink-0 opacity-60" />
+        <span class="min-w-0 flex-1 truncate leading-5">{stripUnlimitedSuffix(props.displayName)}</span>
+        <Show when={props.item.provider.id === "workbuddy"}>
+          <WorkBuddyFreeBadge label={props.freeLabel} />
+        </Show>
+        <Show
+          when={
+            props.item.provider.id !== "workbuddy" &&
+            props.item.provider.id !== "genspark" &&
+            isFreeModel(props.item as never)
+          }
+        >
+          <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
+        </Show>
+        <Show when={props.item.latest}>
+          <TagV2 class="shrink-0">{language.t("model.tag.latest")}</TagV2>
+        </Show>
+        <Show when={isUnlimitedModel(props.item)}>
+          <TagV2 class="shrink-0">{language.t("model.tag.unlimited")}</TagV2>
+        </Show>
+        <Show when={props.selectedAccountID}>
+          {(selected) => {
+            const variant = props.variants.find((entry) => entry.accountID === selected())
+            return (
+              <span
+                class="max-w-[72px] shrink-0 truncate rounded-[3px] bg-v2-overlay-simple-overlay-hover px-1 text-[9px] font-[600] text-v2-text-text-faint"
+                title={selected()}
+              >
+                {variant ? accountLabelForVariant(variant, props.accountLabels) : selected()}
+              </span>
+            )
+          }}
+        </Show>
+        <ModelRowMeta
+          item={props.item}
+          usage={props.usage}
+          price={<span class="text-[10px] font-[520] leading-5">{props.priceLabel}</span>}
+        />
+        <Show when={props.current}>
+          <Icon name="check" size="small" class="shrink-0 text-v2-text-text-accent" />
+        </Show>
+        <ModelFavoriteToggle favorited={props.favorited} onToggle={props.onToggleFavorite} />
+      </MenuV2.SubTrigger>
+      <Show when={props.submenuOpen}>
+        <MenuV2.Portal>
+          <MenuV2.SubContent
+            data-model-selector-submenu
+            class="overflow-hidden rounded-md border-0 bg-v2-background-bg-layer-01 p-1 shadow-[var(--v2-elevation-floating)] focus:outline-none"
+            style={{ width: "300px", "min-width": "300px", "max-width": "calc(100vw - 24px)" }}
+          >
+            <div
+              class="mb-1 min-w-0 w-full overflow-hidden border-b border-v2-border-border-muted px-2.5 pb-1 [&>div]:!w-full [&>div]:!max-w-full"
+              style={{ "font-size": "11px", "line-height": "12px", "font-weight": 530 }}
+            >
+              <ModelTooltip
+                model={props.item}
+                latest={props.item.latest}
+                free={isFreeModel(props.item as never)}
+                unlimited={isUnlimitedModel(props.item)}
+                usage={props.usage}
+                v2
+              />
+            </div>
+            <AccountOptionList
+              variants={props.variants}
+              auto={props.auto}
+              selectedAuto={props.selectedAuto}
+              selectedAccountID={props.selectedAccountID}
+              usageForAccount={props.usageForAccount}
+              accountLabels={props.accountLabels}
+              onSelectAuto={props.onSelectAuto}
+              onSelect={props.onSelectAccount}
+            />
           </MenuV2.SubContent>
         </MenuV2.Portal>
       </Show>
@@ -606,7 +815,7 @@ function ModelFavoriteToggle(props: { favorited: boolean; onToggle: () => void }
       aria-pressed={props.favorited}
       onPointerDown={(event) => {
         // Kobalte's selectable items select on pointerdown (mousedown), not
-        // click — preventDefault alone doesn't stop it from bubbling to the
+        // click ΓÇö preventDefault alone doesn't stop it from bubbling to the
         // RadioItem's own pointerdown handler and selecting the model.
         event.preventDefault()
         event.stopPropagation()
@@ -631,14 +840,15 @@ function ModelFavoriteToggle(props: { favorited: boolean; onToggle: () => void }
 function DeepSeekRateBadge(props: { model: ModelItem; v2?: boolean; period?: ReturnType<typeof deepSeekRatePeriod> }) {
   const language = useLanguage()
   // Only create a fallback timer when the caller didn't provide a shared period
-  // and this row is actually a DeepSeek peak-priced model — avoids N timers for
+  // and this row is actually a DeepSeek peak-priced model ΓÇö avoids N timers for
   // N rows (previously every row created a 60s interval unconditionally).
   let fallbackNow: (() => Date) | undefined
   if (props.period === undefined && isDeepSeekPeakPricedModel(props.model)) {
     const now = createPolled(() => new Date(), 60_000)
     fallbackNow = now
   }
-  const period = () => props.period ?? (fallbackNow ? deepSeekRatePeriod(fallbackNow()) : deepSeekRatePeriod(new Date()))
+  const period = () =>
+    props.period ?? (fallbackNow ? deepSeekRatePeriod(fallbackNow()) : deepSeekRatePeriod(new Date()))
   const label = () => (period() === "peak" ? language.t("model.tag.peak") : language.t("model.tag.offpeak"))
   const badge = () =>
     props.v2 ? (
@@ -768,6 +978,7 @@ export function ModelSelectorPopoverV2(props: {
   trigger: ModelSelectorTrigger
   placement?: ComponentProps<typeof MenuV2>["placement"]
   onClose?: () => void
+  defaultOpen?: boolean
 }) {
   const dialog = useDialog()
   const layout = useLayout()
@@ -779,9 +990,9 @@ export function ModelSelectorPopoverV2(props: {
   }
   const directory = () => (local ? decode64(local.slug()) : undefined)
   // Lift open state so the controller's heavy memos (message scans, yield sorts)
-  // are gated while the popover is closed — otherwise every `message.updated`
+  // are gated while the popover is closed ΓÇö otherwise every `message.updated`
   // token during streaming re-sorts the full catalog idle.
-  const [isOpen, setIsOpen] = createSignal(false)
+  const [isOpen, setIsOpen] = createSignal(props.defaultOpen ?? false)
   const controller = createModelSelectorController({
     model: props.model,
     provider: () => props.provider,
@@ -804,9 +1015,15 @@ export function ModelSelectorPopoverV2(props: {
       isFavorite={controller.isFavorite}
       onToggleFavorite={controller.toggleFavorite}
       current={controller.current}
+      currentVariant={controller.currentVariant}
+      groupOf={controller.groupOf}
+      variants={controller.variants}
+      selectVariant={controller.selectVariant}
       select={controller.select}
       subProviderGet={controller.subProviderGet}
       subProviderSet={controller.subProviderSet}
+      pricingFallback={controller.mergedPricingFallback}
+      tables={controller.tables}
       onExternalOpenChange={setIsOpen}
       onCompare={handleCompare}
       onManage={() => {
@@ -823,6 +1040,7 @@ export function ModelSelectorPopoverV2(props: {
       }}
       onClose={() => props.onClose?.()}
       model={props.model}
+      defaultOpen={props.defaultOpen}
     />
   )
 }
@@ -835,7 +1053,7 @@ function createModelSelectorController(input: {
 }) {
   const model = input.model ?? useLocal().model
   // Personal measured $/request is more relevant than the generic corpus
-  // (§31). Build the per-model personal index once per sync-change and blend
+  // (┬º31). Build the per-model personal index once per sync-change and blend
   // it heavily (70%) with the standardized corpus when ranking.
   let sync: ReturnType<typeof useSync> | undefined
   try {
@@ -843,45 +1061,227 @@ function createModelSelectorController(input: {
   } catch {
     sync = undefined
   }
+  let personal: ReturnType<typeof usePersonalUsage> | undefined
+  try {
+    personal = usePersonalUsage()
+  } catch {
+    personal = undefined
+  }
   const isOpen = () => input.open?.() ?? true
+  const [rankReady, setRankReady] = createSignal(false)
+  createEffect(() => {
+    if (!isOpen()) {
+      setRankReady(false)
+      return
+    }
+    // Defer the ~50ms ranking (fuzzy + sort) one frame so open->flush is cheap
+    // (~5ms alphabetical) and ranking lands after paint. openOrder pins the
+    // first ranked order so rows don't jump on subsequent recomputes.
+    const handle =
+      typeof requestIdleCallback !== "undefined"
+        ? requestIdleCallback(() => setRankReady(true), { timeout: 80 })
+        : setTimeout(() => setRankReady(true), 16)
+    onCleanup(() => {
+      if (typeof cancelIdleCallback !== "undefined" && typeof (handle as unknown as number) === "number") cancelIdleCallback(handle as unknown as number)
+      else clearTimeout(handle as unknown as ReturnType<typeof setTimeout>)
+    })
+  })
+  // Durable learner: ingest live assistant messages into the global persisted
+  // store so "your usage" survives LRU eviction (SESSION_CACHE_LIMIT=40) and
+  // cold restarts. The store is deduped by message id, capped at 200/model,
+  // and debounced globally via PersonalUsageIngest; this local ingest ensures
+  // the open selector's sort reflects very recent messages within <1s.
+  createEffect(() => {
+    if (!isOpen()) return
+    if (!sync || !personal || !personal.ready()) return
+    const msgMap = sync().data.message
+    const total = Object.values(msgMap).reduce((sum, arr) => sum + (arr?.length ?? 0), 0)
+    void total
+    queueMicrotask(() => personal!.ingest(msgMap))
+  })
   const personalCosts = createMemo(() => {
-    if (!isOpen()) return undefined
+    if (!isOpen() || !rankReady()) return undefined
+    const durable = personal?.personalCosts()
+    if (durable && durable.size > 0) return durable
+    // Fallback: ephemeral scan before durable has been populated (first
+    // run after upgrade, or provider not mounted in tests/storybook).
     if (!sync) return undefined
     const idx = buildModelCostIndex(sync().data.message)
     if (idx.size === 0) return undefined
     const map = new Map<string, { cost: number; count: number }>()
-    for (const [k, entry] of idx.entries()) {
-      map.set(k, { cost: entry.sum / entry.count, count: entry.count })
-    }
+    for (const [k, entry] of idx.entries()) map.set(k, { cost: entry.sum / entry.count, count: entry.count })
     return map.size > 0 ? map : undefined
   })
-  // §21.4, §28: the ranking corpus upgrades from the pinned fallback to the
-  // live Go workload when the tables fetch succeeds — deterministic either way.
+  // ┬º21.4, ┬º28: the ranking corpus upgrades from the pinned fallback to the
+  // live Go workload when the tables fetch succeeds ΓÇö deterministic either way.
   // Gated on open: avoid fetching+parsing while the picker is closed and idle.
   const [tables] = createResource(
     () => (isOpen() ? true : undefined),
     () => getUsageTables(),
   )
+  // Cross-open in-memory cache (IndexedDB explicitly rejected: async +
+  // structured-clone overhead, stale-rank risk). The fuzzy build
+  // (O(unpriced × paid)) + threshold scan + corpus build are the ~50ms open
+  // cost; keep them across closes keyed on catalog fingerprint so a reopen
+  // with an unchanged catalog reuses them instead of rebuilding.
+  let cachedMergedPricing: Map<string, import("@/utils/model-cost").ModelCost> | undefined
+  let cachedMergedCatalogFp = ""
+  let cachedThreshold: Map<
+    string,
+    Array<{
+      thresholdTokens: number
+      operator: "<=" | ">"
+      cost: { input: number; output: number; cache: { read: number; write: number } }
+    }>
+  > | undefined
+  let cachedThresholdFp = ""
+  let cachedBands: CorpusBands | undefined
+  let cachedBandsTablesFp = ""
+  let openOrderCfp: string | undefined
+  let openOrderTfp: string | undefined
+  let openOrderUsageRev: string | undefined
+  // Set while closed; consumed once on the next open edge so usage-accrued
+  // between opens invalidates the pin exactly once per open. Mid-open
+  // recomputes never re-check (stability-within-open).
+  let openEdgeUsageCheck = false
+  // Lightweight usage revision over the personal/hit-rate inputs that feed
+  // the sort. The retained pin must not override freshly accrued usage:
+  // personalCosts/hitRates refresh per open but are not part of the catalog
+  // fingerprint, so without this a new usage sample would be sorted and then
+  // re-pinned back to the stale order. Fallback maps derive deterministically
+  // from the primaries, so hashing the primaries suffices. Costs use
+  // toPrecision(10) — stable for identical doubles, sensitive to real change.
+  function usageRevOf(
+    pCosts: Map<string, { cost: number; count: number }> | undefined,
+    hr: Map<string, number> | undefined,
+  ): string {
+    let h = 0x811c9dc5
+    const mix = (s: string) => {
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i)
+        h = Math.imul(h, 0x01000193)
+      }
+      h ^= 0x9e3779b9
+      h = Math.imul(h, 0x01000193)
+    }
+    if (pCosts) {
+      mix(`p${pCosts.size}`)
+      for (const k of [...pCosts.keys()].sort()) {
+        const e = pCosts.get(k)!
+        mix(`${k}=${e.cost.toPrecision(10)}:${e.count}`)
+      }
+    } else mix("p-")
+    if (hr) {
+      mix(`h${hr.size}`)
+      for (const k of [...hr.keys()].sort()) {
+        mix(`${k}=${(hr.get(k)!).toPrecision(10)}`)
+      }
+    } else mix("h-")
+    return (h >>> 0).toString(16).padStart(8, "0")
+  }
+  // Catalog fingerprint: model.list length + FNV-1a ids hash. Empty list
+  // yields "" so the empty-local-list fallback path (view's props.models(""))
+  // is preserved and never poisons the cache.
+  function catalogIdsFp(): string {
+    let raw: Array<{ id: string; provider: { id: string } }> = []
+    try {
+      raw = model.list() as unknown as Array<{ id: string; provider: { id: string } }>
+    } catch {
+      return ""
+    }
+    if (raw.length === 0) return ""
+    let h = 0x811c9dc5
+    for (const item of raw) {
+      const s = `${item.provider.id}:${item.id}`
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i)
+        h = Math.imul(h, 0x01000193)
+      }
+      h ^= 0x9e3779b9
+      h = Math.imul(h, 0x01000193)
+    }
+    return `${raw.length}:${(h >>> 0).toString(16).padStart(8, "0")}`
+  }
+  // Tables fingerprint: profile/pricing lengths + FNV over pricing row names
+  // (threshold-relevant) and profile tuple stream. Cheap, deterministic.
+  function tablesFp(): string {
+    const t = tables.latest as import("@/utils/model-usage-profile").UsageTables | undefined
+    const profile = t?.profile
+    const pricing = t?.pricing
+    if (!profile || !pricing || (profile.length === 0 && pricing.length === 0)) return ""
+    let h = 0x811c9dc5
+    const mix = (s: string) => {
+      for (let i = 0; i < s.length; i++) {
+        h ^= s.charCodeAt(i)
+        h = Math.imul(h, 0x01000193)
+      }
+      h ^= 0x9e3779b9
+      h = Math.imul(h, 0x01000193)
+    }
+    for (const e of profile) {
+      for (const n of e.names) mix(n)
+      mix(`${e.profile.input}|${e.profile.cached}|${e.profile.output}`)
+    }
+    for (const e of pricing) {
+      for (const n of e.names) mix(n)
+      mix(`${e.pricing.input}|${e.pricing.output}|${e.pricing.cache.read}|${e.pricing.cache.write}`)
+    }
+    return `p${profile.length}:r${pricing.length}:${(h >>> 0).toString(16).padStart(8, "0")}`
+  }
   const bands = createMemo(() => {
-    if (!isOpen()) return undefined
+    // Cache-first: identical tables fingerprint reuses bands without rebuild,
+    // even across closes (memos below are idle-gated while closed).
+    const tfp = tablesFp()
+    if (tfp && cachedBands && cachedBandsTablesFp === tfp) return cachedBands
+    if (!isOpen() || !rankReady()) return undefined
     const p = tables.latest?.profile
     if (!p || p.length === 0) return undefined
-    return buildStandardWorkloadCorpus(p.map((e) => e.profile))
+    const built = buildStandardWorkloadCorpus(p.map((e) => e.profile))
+    if (tfp) {
+      cachedBands = built
+      cachedBandsTablesFp = tfp
+    }
+    return built
   })
   const thresholdMap = createMemo(() => {
-    if (!isOpen()) return undefined
+    // Cache-first keyed on catalog + tables fingerprint; exact same output as
+    // a fresh build (same builders), reused across closes.
+    const cfp = catalogIdsFp()
+    const tfp = tablesFp()
+    const fp = cfp && tfp ? `${cfp}|${tfp}` : ""
+    if (fp && cachedThreshold && cachedThresholdFp === fp) return cachedThreshold
+    if (!isOpen() || !rankReady()) return undefined
     const pricing = tables.latest?.pricing
     if (!pricing || pricing.length === 0) return undefined
-    // Build threshold-tier map for Qwen/Grok/GPT-Luna style dual rows (§8).
+    // Build threshold-tier map for Qwen/Grok/GPT-Luna style dual rows (┬º8).
     // Use the full model list (not just visible/filtered) so that a model
     // hidden via visibility still contributes its threshold tiers for fallback.
-    const map = new Map<string, Array<{ thresholdTokens: number; operator: "<=" | ">"; cost: { input: number; output: number; cache: { read: number; write: number } } }>>()
+    const map = new Map<
+      string,
+      Array<{
+        thresholdTokens: number
+        operator: "<=" | ">"
+        cost: { input: number; output: number; cache: { read: number; write: number } }
+      }>
+    >()
     const raw = model.list()
+    // Y3 hoisted: the pricing table is invariant across this loop, so prepare
+    // the threshold index (filter + name normalize) once instead of per model.
+    const prepared = prepareThresholdIndex(pricing)
     for (const item of raw) {
-      const tp = collectThresholdPricing(pricing, { name: item.name, family: (item as unknown as { family?: string }).family, id: item.id })
+      const tp = collectThresholdPricingFromIndex(prepared, {
+        name: item.name,
+        family: (item as unknown as { family?: string }).family,
+        id: item.id,
+      })
       if (tp) map.set(modelKey(item as ModelItem), tp as never)
     }
-    return map.size > 0 ? map : undefined
+    const out = map.size > 0 ? map : undefined
+    if (fp && out) {
+      cachedThreshold = out
+      cachedThresholdFp = fp
+    }
+    return out
   })
 
   const unsorted = createMemo(() =>
@@ -894,35 +1294,146 @@ function createModelSelectorController(input: {
         provider: { ...item.provider, name: providerDisplayName(item.provider.id, item.provider.name) },
       })),
   )
+  const collapsedGroups = createMemo(() => collapseAccountVariants(unsorted(), MULTI_ACCOUNT_PROVIDERS))
+  const groupIndex = createMemo(() => indexModelGroups(collapsedGroups()))
   // Pricing fallback: same model id across providers is ~same price (except
   // openrouter). If a model is unpriced on one provider, borrow a sibling's
   // published price instead of sorting it as unpriced/last. Build from the
   // full catalog (not just visible/filtered) so that a hidden sibling can
   // still donate its pricing.
   const pricingFallback = createMemo(() => {
-    if (!isOpen()) return undefined
+    if (!isOpen() || !rankReady()) return undefined
     const list = model.list()
     if (list.length === 0) return undefined
     const map = buildPricingFallbackMap(list as never)
     return map.size > 0 ? map : undefined
+  })
+  // Fuzzy sibling of the exact-id fallback above: catches free-tier variants
+  // that ship under a different id than their paid counterpart (any provider,
+  // ΓëÑ75% name-similarity confidence ΓÇö see string-similarity.ts). Merged with,
+  // never replacing, the exact map (exact always wins on a shared id).
+  const fuzzyPricingFallback = createMemo(() => {
+    if (!isOpen() || !rankReady()) return undefined
+    const list = model.list()
+    if (list.length === 0) return undefined
+    const map = buildFuzzyPricingFallbackMap(list as never)
+    return map.size > 0 ? map : undefined
+  })
+  const mergedPricingFallback = createMemo(() => {
+    // Cache-first: unchanged catalog fingerprint reuses the merged map
+    // (exact-wins-over-fuzzy preserved via mergePricingFallbacks) without
+    // rebuilding the O(unpriced × paid) fuzzy scan. Never caches the
+    // empty-catalog case so the view's props.models("") fallback stays intact.
+    const cfp = catalogIdsFp()
+    if (cfp && cachedMergedPricing && cachedMergedCatalogFp === cfp) return cachedMergedPricing
+    if (!isOpen() || !rankReady()) return undefined
+    const merged = mergePricingFallbacks(pricingFallback(), fuzzyPricingFallback())
+    if (cfp && merged) {
+      cachedMergedPricing = merged
+      cachedMergedCatalogFp = cfp
+    }
+    return merged
+  })
+  // Pre-warm fuzzy + threshold + bands during idle after mount, not on click.
+  // Kicks the usage-tables fetch and builds the expensive maps from whatever
+  // catalog/tables are already available, so the first open hits warm caches.
+  // Identical builders → identical scores; no ranking behavior change.
+  onMount(() => {
+    const warm = () => {
+      try {
+        const cfp = catalogIdsFp()
+        if (cfp && cfp !== cachedMergedCatalogFp) {
+          try {
+            const list = model.list() as never
+            if ((list as unknown as Array<unknown>).length > 0) {
+              const exact = buildPricingFallbackMap(list)
+              const fuzzy = buildFuzzyPricingFallbackMap(list)
+              const merged = mergePricingFallbacks(exact.size > 0 ? exact : undefined, fuzzy.size > 0 ? fuzzy : undefined)
+              if (merged) {
+                cachedMergedPricing = merged
+                cachedMergedCatalogFp = cfp
+              }
+            }
+          } catch {}
+        }
+        void getUsageTables()
+          .then((t) => {
+            try {
+              if (!t) return
+              const live = t as import("@/utils/model-usage-profile").UsageTables
+              // Bands warm from the fetched profiles.
+              try {
+                if (live.profile.length > 0) {
+                  const built = buildStandardWorkloadCorpus(live.profile.map((e) => e.profile))
+                  void built
+                  // Cache under the resource fingerprint when available so the
+                  // open path hits; otherwise leave bands caching to open.
+                  const tfpNow = tablesFp()
+                  if (tfpNow) {
+                    cachedBands = built
+                    cachedBandsTablesFp = tfpNow
+                  }
+                }
+              } catch {}
+              // Threshold warm from fetched pricing + current catalog.
+              try {
+                const cfpNow = catalogIdsFp()
+                const tfpNow = tablesFp()
+                const fpNow = cfpNow && tfpNow ? `${cfpNow}|${tfpNow}` : ""
+                if (fpNow && cachedThresholdFp !== fpNow && live.pricing.length > 0) {
+                  const raw = model.list()
+                  if (raw.length > 0) {
+                    const prepared = prepareThresholdIndex(live.pricing)
+                    const map = new Map<
+                      string,
+                      Array<{
+                        thresholdTokens: number
+                        operator: "<=" | ">"
+                        cost: { input: number; output: number; cache: { read: number; write: number } }
+                      }>
+                    >()
+                    for (const item of raw) {
+                      const tp = collectThresholdPricingFromIndex(prepared, {
+                        name: (item as { name: string }).name,
+                        family: (item as unknown as { family?: string }).family,
+                        id: (item as { id: string }).id,
+                      })
+                      if (tp) map.set(modelKey(item as ModelItem), tp as never)
+                    }
+                    if (map.size > 0) {
+                      cachedThreshold = map
+                      cachedThresholdFp = fpNow
+                    }
+                  }
+                }
+              } catch {}
+            } catch {}
+          })
+          .catch(() => {})
+      } catch {}
+    }
+    if (typeof requestIdleCallback !== "undefined") requestIdleCallback(() => warm(), { timeout: 2000 })
+    else setTimeout(warm, 100)
   })
   // Personal fallback: same model across providers shares your workload shape.
   // If you used claude-sonnet via anthropic (personal data exists) but not via
   // openrouter, borrow that personal $/request to value the openrouter variant
   // instead of falling back to the generic corpus.
   const personalFallback = createMemo(() => {
-    if (!isOpen()) return undefined
+    if (!isOpen() || !rankReady()) return undefined
     const p = personalCosts()
     if (!p) return undefined
     const map = buildPersonalFallbackMap(p)
     return map.size > 0 ? map : undefined
   })
   // Hit rate: personal cache hit rate per provider:model, with cross-provider
-  // fallback by model id. When available (≥3 samples), the workload's prompt
+  // fallback by model id. When available (ΓëÑ3 samples), the workload's prompt
   // is re-split as K'=T*h, I'=T*(1-h) so a provider/model that actually hits
   // cache 80% of the time is correctly seen as cheaper than one that hits 20%.
   const hitRates = createMemo(() => {
-    if (!isOpen()) return undefined
+    if (!isOpen() || !rankReady()) return undefined
+    const durable = personal?.hitRates()
+    if (durable && durable.size > 0) return durable
     if (!sync) return undefined
     const idx = buildHitRateIndex(sync().data.message)
     if (idx.size === 0) return undefined
@@ -936,7 +1447,7 @@ function createModelSelectorController(input: {
     return map.size > 0 ? map : undefined
   })
   const hitRateFallback = createMemo(() => {
-    if (!isOpen()) return undefined
+    if (!isOpen() || !rankReady()) return undefined
     const h = hitRates()
     if (!h) return undefined
     const byModel = new Map<string, { sum: number; count: number }>()
@@ -956,52 +1467,144 @@ function createModelSelectorController(input: {
   })
   let openOrder: string[] | undefined
   const allModels = createMemo(() => {
-    const list = [...unsorted()]
-    if (!isOpen()) {
-      openOrder = undefined
-      // Closed picker: avoid Usage Yield ranking entirely. The trigger only
-      // needs the current model name, not a globally sorted catalog. Returning
-      // a cheap alphabetical order isolates the composer from message-store
-      // churn (every `message.updated` token) and from the O(n log n) yield
-      // comparator. Full ranking is computed once on open.
+    const list = collapsedGroups().map((group) => group.canonical)
+    if (!isOpen() || !rankReady()) {
+      if (!isOpen()) {
+        // Keep openOrder across closes; invalidate only when the catalog
+        // fingerprint (model.list length + ids hash + tables fingerprint)
+        // changed. Empty fingerprints are treated as unknown, never as a
+        // change: the tables fetch typically resolves mid-first-open, and
+        // "" -> loaded must adopt the new tables fingerprint, not discard
+        // the pinned order. Empty catalog never invalidates (fallback path
+        // preserved).
+        const cfpNow = catalogIdsFp()
+        const tfpNow = tablesFp()
+        if (openOrder !== undefined && cfpNow) {
+          if (openOrderCfp !== undefined && cfpNow !== openOrderCfp) openOrder = undefined
+          else if (tfpNow && openOrderTfp && tfpNow !== openOrderTfp) openOrder = undefined
+        }
+        if (openOrder === undefined) {
+          openOrderCfp = undefined
+          openOrderTfp = undefined
+          openOrderUsageRev = undefined
+        } else if (tfpNow && !openOrderTfp) {
+          openOrderTfp = tfpNow
+        }
+        // Arm the one-shot usage check for the next open edge.
+        openEdgeUsageCheck = true
+      }
       return list.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
     }
     const b = bands()
     const tmap = thresholdMap()
     const pCosts = personalCosts()
     const pFallback = personalFallback()
-    const priceFallback = pricingFallback()
+    const priceFallback = mergedPricingFallback()
     const hr = hitRates()
     const hrFallback = hitRateFallback()
     const corpus = b?.corpus
-    // Delegates to Usage Yield V2 (§5-6) blended heavily with personal
-    // measured $/request (§31): personal 70% vs corpus 30% when available,
-    // plus cross-provider pricing/usage/hit-rate fallbacks so that a model
-    // missing data on one provider borrows from a sibling provider offering
-    // the same model. Hit rate re-splits the prompt (K'=T*h) when available.
-    // Falls back to workload-normalized fallback corpus (§5.1 pinned 16-tuple)
-    // so sorting stays synchronous and deterministic even before fetch (§28).
-    // Use bulk O(n) scoring: one median per model, not one per compare.
-    const sorted = sortByCheapness(list as never, corpus, tmap as never, pCosts as never, priceFallback as never, pFallback as never, hr as never, hrFallback as never) as unknown as typeof list
+    const sorted = sortByCheapness(
+      list as never,
+      corpus,
+      tmap as never,
+      pCosts as never,
+      priceFallback as never,
+      pFallback as never,
+      hr as never,
+      hrFallback as never,
+    ) as unknown as typeof list
+    let result: typeof list
     if (!openOrder) {
       openOrder = sorted.map(modelKey)
-      return sorted
+      openOrderCfp = catalogIdsFp() || undefined
+      openOrderTfp = tablesFp() || undefined
+      openOrderUsageRev = usageRevOf(pCosts, hr)
+      openEdgeUsageCheck = false
+      result = sorted
+    } else if (openEdgeUsageCheck) {
+      // One-shot per open: usage accrued between opens (new personal samples
+      // or hit-rate shifts) adopts the fresh order instead of being overridden
+      // by the stale pin. Mid-open recomputes skip this (pin stays stable).
+      openEdgeUsageCheck = false
+      const rev = usageRevOf(pCosts, hr)
+      if (rev !== openOrderUsageRev) {
+        openOrder = sorted.map(modelKey)
+        openOrderCfp = catalogIdsFp() || undefined
+        openOrderTfp = tablesFp() || undefined
+        openOrderUsageRev = rev
+        result = sorted
+      } else {
+        const rank = new Map(openOrder.map((key, index) => [key, index]))
+        result = sorted.sort(
+          (a, b) =>
+            (rank.get(modelKey(a)) ?? Number.POSITIVE_INFINITY) - (rank.get(modelKey(b)) ?? Number.POSITIVE_INFINITY),
+        )
+      }
+    } else {
+      const rank = new Map(openOrder.map((key, index) => [key, index]))
+      result = sorted.sort(
+        (a, b) =>
+          (rank.get(modelKey(a)) ?? Number.POSITIVE_INFINITY) - (rank.get(modelKey(b)) ?? Number.POSITIVE_INFINITY),
+      )
     }
-    const rank = new Map(openOrder.map((key, index) => [key, index]))
-    return sorted.sort(
-      (a, b) => (rank.get(modelKey(a)) ?? Number.POSITIVE_INFINITY) - (rank.get(modelKey(b)) ?? Number.POSITIVE_INFINITY),
-    )
+    return result
   })
   const searchableFields = createMemo(() => {
-    return new Map(
-      allModels().map((item) => [item, prepareModelSearchFields([item.name, item.id, item.provider.name])] as const),
-    )
+    if (!isOpen()) return new Map<ModelItem, ReturnType<typeof prepareModelSearchFields>>()
+    const fields = new Map<ModelItem, ReturnType<typeof prepareModelSearchFields>>()
+    for (const group of collapsedGroups()) {
+      fields.set(
+        group.canonical,
+        prepareModelSearchFields([
+          group.label,
+          group.canonical.name,
+          group.canonical.id,
+          group.canonical.provider.name,
+          ...group.variants.flatMap((variant) => [variant.accountID, variant.item.name, variant.item.id]),
+        ]),
+      )
+    }
+    return fields
   })
 
   const key = (item: ModelItem) => ({ modelID: item.id, providerID: item.provider.id })
+  // `model.current()` values are `{ id, providerID, ... }` — they carry NO
+  // `modelID` and NO `provider` object at runtime (see models.tsx:150,
+  // local.tsx:258), so `modelKey(value as ModelItem)` builds
+  // `"undefined:<id>"` and every groupIndex lookup misses. Build the index
+  // key from the flat fields instead: `${providerID}:${id}` matches the
+  // `modelKey(item)` keys the index is built with.
+  const currentKey = (value: { providerID: string; id: string }) => `${value.providerID}:${value.id}`
+  const currentGroup = (value: { providerID: string; modelID: string }) =>
+    groupIndex().get(`${value.providerID}:${value.modelID}`) ??
+    groupForModelID(collapsedGroups(), value.providerID, value.modelID)
+  const toCurrentRef = (value: { providerID: string; id: string }) => ({
+    providerID: value.providerID,
+    modelID: value.id,
+  })
   const current = createMemo(() => {
     const value = model.current()
-    return value ? modelKey(value) : undefined
+    if (!value) return undefined
+    return currentGroup(toCurrentRef(value))?.key ?? currentKey(value)
+  })
+  const currentVariant = createMemo(() => {
+    const value = model.current()
+    return value
+      ? groupIndex()
+          .get(currentKey(value))
+          ?.variants.find((variant) => variant.item.id === value.id)
+      : undefined
+  })
+  // Account pinned on the current model, including ids the group index never
+  // saw (synthesized submenu rows). Falls back to parsing the transport
+  // suffix (`model@vd-…`, `model@zen-…`) so the checkmark survives.
+  const currentAccountID = createMemo(() => {
+    const value = model.current()
+    if (!value) return undefined
+    const group = currentGroup(toCurrentRef(value))
+    const byItem = group?.variants.find((variant) => variant.item.id === value.id)
+    if (byItem) return byItem.accountID
+    return splitModelIDForProvider(value.id, value.providerID).accountID
   })
 
   return {
@@ -1010,8 +1613,16 @@ function createModelSelectorController(input: {
       if (!query) return allModels()
       const matches = createModelSearchMatcher(query)
       const fields = searchableFields()
-      return allModels().filter((item) => {
-        const prepared = fields.get(item)
+      const matchedGroups = collapsedGroups().filter((group) => {
+        const prepared = fields.get(group.canonical)
+        return prepared ? matches(prepared) : false
+      })
+      const expanded = expandForQuery(matchedGroups, query)
+      // `expandForQuery` uses a substring check for account labels; retain the
+      // existing fuzzy matcher for regular model/provider queries.
+      return expanded.filter((item) => {
+        const group = groupIndex().get(modelKey(item))
+        const prepared = group ? fields.get(group.canonical) : undefined
         return prepared ? matches(prepared) : false
       })
     },
@@ -1024,32 +1635,66 @@ function createModelSelectorController(input: {
       }
       return Array.from(byProvider, ([category, items]) => ({ category, items })).sort(sortModelGroups)
     },
-    favorites: (models: ModelItem[]) => models.filter((item) => model.favorite.isFavorite(key(item))),
+    favorites: (_models: ModelItem[]) => {
+      const out: ModelItem[] = []
+      for (const group of collapsedGroups()) {
+        const favorited =
+          model.favorite.isFavorite(key(group.canonical)) ||
+          group.variants.some((variant) => model.favorite.isFavorite(key(variant.item)))
+        if (favorited) out.push(group.canonical)
+      }
+      return out
+    },
     recents: (models: ModelItem[]) => {
-      const byKey = new Map(models.map((item) => [modelKey(item), item] as const))
+      const byKey = groupIndex()
       const ordered: ModelItem[] = []
+      const seen = new Set<string>()
       const recentItems = model.recent() ?? []
       for (const entry of recentItems) {
         if (!entry) continue
         const k = modelKey(entry)
-        const item = byKey.get(k)
-        if (!item) continue
-        if (model.favorite.isFavorite(key(item))) continue
-        ordered.push(item)
+        const group = byKey.get(k)
+        if (!group || seen.has(group.key)) continue
+        if (
+          model.favorite.isFavorite(key(group.canonical)) ||
+          group.variants.some((variant) => model.favorite.isFavorite(key(variant.item)))
+        )
+          continue
+        if (!models.some((item) => modelKey(item) === modelKey(group.canonical))) continue
+        seen.add(group.key)
+        ordered.push(group.canonical)
       }
       return ordered
     },
-    isFavorite: (item: ModelItem) => model.favorite.isFavorite(key(item)),
+    isFavorite: (item: ModelItem) => {
+      const group = groupIndex().get(modelKey(item))
+      return group
+        ? model.favorite.isFavorite(key(group.canonical)) ||
+            group.variants.some((variant) => model.favorite.isFavorite(key(variant.item)))
+        : model.favorite.isFavorite(key(item))
+    },
     toggleFavorite: (item: ModelItem) => model.favorite.toggle(key(item)),
     current,
+    currentVariant,
+    groupOf: (item: ModelItem): ModelGroup<ModelItem> | undefined => groupIndex().get(modelKey(item)),
+    variants: (item: ModelItem) => groupIndex().get(modelKey(item))?.variants ?? [],
+    selectVariant: (item: ModelItem, selection: string | AutoPolicy) => {
+      const group = groupIndex().get(modelKey(item))
+      const selected = group ? variantForPolicy(group, selection) : undefined
+      if (selected) {
+        model.set({ modelID: selected.id, providerID: selected.provider.id }, { recent: true })
+        input.onSelect()
+      }
+    },
     select: (item: ModelItem) => {
       model.set({ modelID: item.id, providerID: item.provider.id }, { recent: true })
       input.onSelect()
     },
-    subProviderGet: (item: ModelItem) =>
-      model.subProvider.get({ providerID: item.provider.id, modelID: item.id }),
+    subProviderGet: (item: ModelItem) => model.subProvider.get({ providerID: item.provider.id, modelID: item.id }),
     subProviderSet: (item: ModelItem, value: string | undefined) =>
       model.subProvider.set({ providerID: item.provider.id, modelID: item.id }, value),
+    mergedPricingFallback: () => mergedPricingFallback(),
+    tables: () => tables.latest as import("@/utils/model-usage-profile").UsageTables | undefined,
   }
 }
 
@@ -1069,6 +1714,10 @@ function ModelSelectorPopoverV2View(props: {
   isFavorite: (item: ModelItem) => boolean
   onToggleFavorite: (item: ModelItem) => void
   current: () => string | undefined
+  currentVariant: () => { accountID: string; item: ModelItem } | undefined
+  groupOf: (item: ModelItem) => ModelGroup<ModelItem> | undefined
+  variants: (item: ModelItem) => { accountID: string; item: ModelItem }[]
+  selectVariant: (item: ModelItem, selection: string | AutoPolicy) => void
   select: (item: ModelItem) => void
   subProviderGet: (item: ModelItem) => string | undefined
   subProviderSet: (item: ModelItem, value: string | undefined) => void
@@ -1078,6 +1727,9 @@ function ModelSelectorPopoverV2View(props: {
   onClose: () => void
   model?: ModelState
   onExternalOpenChange?: (open: boolean) => void
+  defaultOpen?: boolean
+  pricingFallback?: () => Map<string, import("@/utils/model-cost").ModelCost> | undefined
+  tables?: () => import("@/utils/model-usage-profile").UsageTables | undefined
 }) {
   const language = useLanguage()
   let local: ReturnType<typeof useLocal> | undefined
@@ -1096,24 +1748,233 @@ function ModelSelectorPopoverV2View(props: {
   }
   const forkUsage = useForkUsage()
   const sync = useSync()
+  // Fork credential activation (opencode-go account switching) needs the raw
+  // server handle. Same try/catch pattern as local/personal above so
+  // storybook/tests without the provider degrade instead of throwing.
+  let serverSDK: ReturnType<typeof useServerSDK> | undefined
+  try {
+    serverSDK = useServerSDK()
+  } catch {
+    serverSDK = undefined
+  }
+  // Provider catalog refresh (see selectAccount step 2b): the Verdent/Zen
+  // models hooks emit per-account ids at provider-load time, but the app
+  // caches that catalog while quota reads the vault live — accounts enrolled
+  // after load (vault edit) appear in the submenu but not the catalog until
+  // the `providers` queries are refetched. Same degrade-on-missing pattern.
+  let serverSync: ReturnType<typeof useServerSync> | undefined
+  try {
+    serverSync = useServerSync()
+  } catch {
+    serverSync = undefined
+  }
+  const forkServer = () => serverSDK?.().server.http
+  const forkDirectory = (): string | undefined => {
+    try {
+      return local ? decode64(local.slug()) : undefined
+    } catch {
+      return undefined
+    }
+  }
+  let personal: ReturnType<typeof usePersonalUsage> | undefined
+  try {
+    personal = usePersonalUsage()
+  } catch {
+    personal = undefined
+  }
+  // Ingest live messages into durable store while open - ensures very recent
+  // samples (post-debounce window) still affect the tooltip/stretch bars.
+  createEffect(() => {
+    if (!store.open) return
+    if (!personal || !personal.ready()) return
+    const msgMap = sync().data.message
+    const total = Object.values(msgMap).reduce((sum, arr) => sum + (arr?.length ?? 0), 0)
+    void total
+    queueMicrotask(() => personal!.ingest(msgMap))
+  })
   // WorkBuddy bills credits-per-request across several independent accounts, so
   // its stretch estimate cannot ride the OpenCode-Go USD-window path. This is a
-  // pure projection of the quota result `useLimits` already polls — no extra
+  // pure projection of the quota result `useLimits` already polls ΓÇö no extra
   // network traffic.
   const workbuddy = useWorkBuddyUsage()
-  const [store, setStore] = createStore({ open: false, search: persistedModelSearch, active: "", tooltip: "", rail: "", submenu: "" })
-  const [tables] = createResource(
-    () => (store.open ? true : undefined),
+  const verdent = useVerdentUsage()
+  const genspark = useGensparkUsage()
+  const [store, setStore] = createStore({
+    open: props.defaultOpen ?? false,
+    search: persistedModelSearch,
+    active: "",
+    tooltip: "",
+    rail: "",
+    submenu: "",
+  })
+  // Account labels for the model picker ΓÇö the server's model names are cached
+  // in Provider.list() and still carry the old numeric label until the cache is
+  // invalidated after a vault edit. Quota's `verdentAccounts`/`workbuddyAccounts`
+  // are live (read directly from the vault on every poll), so prefer those.
+  const limitsNow = useNow(() => store.open)
+  const limits = useLimits({ now: limitsNow } as any)
+  const accountLabels = createMemo(() => {
+    const map = new Map<string, string>()
+    for (const p of limits.providers() ?? []) {
+      const usage = (p as any).result?.usage
+      for (const acct of usage?.verdentAccounts ?? [])
+        if (acct.accountId && acct.label) map.set(acct.accountId, acct.label)
+      for (const acct of usage?.workbuddyAccounts ?? [])
+        if (acct.accountId && acct.label) map.set(acct.accountId, acct.label)
+      for (const acct of usage?.zenAccounts ?? []) if (acct.keyId && acct.label) map.set(acct.keyId, acct.label)
+    }
+    // OpenCode Go keys live in the fork credential store (forkUsage), not the
+    // quota adapter, so the labels map won't pick them up otherwise.
+    for (const cred of forkUsage.credentials.latest ?? [])
+      if (cred.id && cred.label) map.set(cred.id, cred.label)
+    return map.size > 0 ? map : undefined
+  })
+  // Verdent accounts as reported live by the quota adapter (`verdentAccounts`),
+  // used to synthesize the account submenu when the catalog exposes no
+  // per-account model variants.
+  const verdentAccounts = createMemo<{ accountId: string; label: string }[]>(() => {
+    const out: { accountId: string; label: string }[] = []
+    const seen = new Set<string>()
+    for (const p of limits.providers() ?? []) {
+      const usage = (p as any).result?.usage
+      for (const acct of usage?.verdentAccounts ?? []) {
+        if (!acct?.accountId || seen.has(acct.accountId)) continue
+        seen.add(acct.accountId)
+        out.push({ accountId: acct.accountId, label: acct.label ?? acct.accountId })
+      }
+    }
+    return out
+  })
+  const zenKeyLimits = createMemo(() => {
+    const map = new Map<
+      string,
+      {
+        label: string
+        exhausted: boolean
+        usedObserved: number | null
+        limitEstimate: number | null
+        remainingPercent: number | null
+      }
+    >()
+    for (const p of limits.providers() ?? []) {
+      const usage = (p as any).result?.usage
+      for (const acct of usage?.zenAccounts ?? []) if (acct.keyId) map.set(acct.keyId, acct)
+    }
+    return map
+  })
+  // Backend variants exist only for providers whose plugin emits them
+  // (workbuddy, verdent, and Zen's `opencode`). opencode-go keys live in the
+  // fork credential store, so they never arrive as catalog variants. When a
+  // provider has >1 key/credential but no collapsed group, synthesize a
+  // display-only group so the row renders the account submenu (which embeds
+  // the model tooltip) instead of a plain row plus the floating tooltip.
+  // Shared by tooltip suppression and row rendering so the two can't drift.
+  // Per-row group cache: building the synthesized variant arrays
+  // (Array.from + map + labeled clones) on every call costs one allocation
+  // burst per mounted virtual row per render. Cache by model key and reuse
+  // while the inputs are unchanged (source group identity + live account
+  // source sizes). O(1) hit path; recompute only when quota/credential data
+  // actually changes.
+  const buildAccountGroup = (
+    item: ModelItem,
+    group: ModelGroup<ModelItem> | undefined,
+  ): ModelGroup<ModelItem> | undefined => {
+    if (group && group.variants.length > 1) return group
+    // Embed the label in parens on the synthesized variant name so the
+    // `accountLabelForVariant` fallback parser (used when the labels map
+    // hasn't been populated yet — e.g. quota still loading) can still show
+    // a human name instead of the raw accountID. accountLabels() is also
+    // populated for every key here as a belt-and-suspenders fallback.
+    const labeledClone = (accountID: string, label: string) =>
+      ({ ...item, id: `${item.id}@${accountID}`, name: label ? `${item.name} (${label})` : item.name }) as ModelItem
+    const plainClone = (accountID: string) => ({ ...item, id: `${item.id}@${accountID}` }) as ModelItem
+    const build = (variants: { accountID: string; item: ModelItem }[]) =>
+      ({
+        key: `${item.provider.id}:${item.id}`,
+        canonical: item,
+        label: item.name,
+        auto: item,
+        variants,
+      }) as ModelGroup<ModelItem>
+
+    if (item.provider.id === "opencode" && zenKeyLimits().size > 1)
+      return build(
+        Array.from(zenKeyLimits().entries()).map(([keyId, info]) => ({
+          accountID: keyId,
+          item: labeledClone(keyId, info.label),
+        })),
+      )
+    if (item.provider.id === "opencode-go" && (forkUsage.credentials.latest?.length ?? 0) > 1)
+      return build(
+        (forkUsage.credentials.latest ?? []).map((cred) => ({
+          accountID: cred.id,
+          item: labeledClone(cred.id, cred.label),
+        })),
+      )
+    // Verdent: fall back to the quota-reported account list when the catalog
+    // exposes no per-account variants.
+    if (item.provider.id === "verdent" && verdentAccounts().length > 1)
+      return build(
+        verdentAccounts().map((acct) => ({
+          accountID: acct.accountId,
+          item: labeledClone(acct.accountId, acct.label),
+        })),
+      )
+    // Suppress "unused param" for plainClone — kept for any future source
+    // that needs the un-labeled shape.
+    void plainClone
+    return group
+  }
+  const accountGroupCache = new Map<
+    string,
+    {
+      sourceGroup: ModelGroup<ModelItem> | undefined
+      zenSize: number
+      forkLen: number
+      verdentLen: number
+      result: ModelGroup<ModelItem> | undefined
+    }
+  >()
+  onCleanup(() => accountGroupCache.clear())
+  const accountGroupFor = (item: ModelItem): ModelGroup<ModelItem> | undefined => {
+    const key = modelKey(item)
+    const sourceGroup = props.groupOf(item)
+    const zenSize = zenKeyLimits().size
+    const forkLen = forkUsage.credentials.latest?.length ?? 0
+    const verdentLen = verdentAccounts().length
+    const cached = accountGroupCache.get(key)
+    if (
+      cached &&
+      cached.sourceGroup === sourceGroup &&
+      cached.zenSize === zenSize &&
+      cached.forkLen === forkLen &&
+      cached.verdentLen === verdentLen
+    )
+      return cached.result
+    const result = buildAccountGroup(item, sourceGroup)
+    accountGroupCache.set(key, { sourceGroup, zenSize, forkLen, verdentLen, result })
+    return result
+  }
+
+  const [localTables] = createResource(
+    () => (store.open && !props.tables ? true : undefined),
     () => getUsageTables(),
   )
-  const profileTable = () => tables.latest?.profile ?? []
-  const pricingTable = () => tables.latest?.pricing ?? []
+  const tablesLatest = () => props.tables?.() ?? localTables.latest
+  const profileTable = () => tablesLatest()?.profile ?? []
+  const pricingTable = () => tablesLatest()?.pricing ?? []
   const sdk = useSDK()
   const freeUsage = useOpenRouterFreeUsage()
   // Pricing fallback for display: same model id across providers is ~same cost
   // (except openrouter). Build from the full catalog so that an unpriced
-  // variant can show a borrowed sibling price instead of "—".
+  // variant can show a borrowed sibling price instead of "ΓÇö".
+  // Y2 dedup: reuse controller's mergedPricingFallback when available to avoid
+  // building the same two maps twice per open. The controller's maps are built
+  // from model.list() (full catalog); the view's fallback to props.models("")
+  // is preserved only for the empty-local-list edge case where the controller
+  // has no data.
   const pricingFallbackForDisplay = createMemo(() => {
+    if (props.pricingFallback?.()) return undefined
     if (!store.open) return undefined
     let list: ModelItem[] = []
     try {
@@ -1129,12 +1990,39 @@ function ModelSelectorPopoverV2View(props: {
     const map = buildPricingFallbackMap(list as never)
     return map.size > 0 ? map : undefined
   })
-  // Hit rate maps: personal (own aggregate) heavily weighted, plus openrouter telemetry.
-  // Personal is built from sync messages; openrouter is built from openRouterStore endpoints.
+  // Fuzzy sibling of the exact-id display fallback above ΓÇö see the matching
+  // comment on the controller-scoped `fuzzyPricingFallback` memo above.
+  const fuzzyPricingFallbackForDisplay = createMemo(() => {
+    if (props.pricingFallback?.()) return undefined
+    if (!store.open) return undefined
+    let list: ModelItem[] = []
+    try {
+      const maybe = local?.model.list() ?? []
+      if (maybe.length > 0) list = maybe as ModelItem[]
+    } catch {}
+    if (list.length === 0) {
+      try {
+        list = props.models("") as ModelItem[]
+      } catch {}
+    }
+    if (list.length === 0) return undefined
+    const map = buildFuzzyPricingFallbackMap(list as never)
+    return map.size > 0 ? map : undefined
+  })
+  const mergedPricingFallbackForDisplay = createMemo(() => {
+    const fromController = props.pricingFallback?.()
+    if (fromController) return fromController
+    return mergePricingFallbacks(pricingFallbackForDisplay(), fuzzyPricingFallbackForDisplay())
+  })
+  // Hit rate maps: durable personal aggregate (survives LRU) + openrouter telemetry.
+  // Personal is now the global persisted learner (deduped by message id, 200/model).
+  // Openrouter is built from openRouterStore endpoints.
   // Both are per provider:model and also aggregated by model id for cross-provider fallback.
-  // Gated on store.open: scanning 20k messages for hit rates is wasted while closed.
+  // Gated on store.open: map derivation is cheap but still gated.
   const personalHitRates = createMemo(() => {
     if (!store.open) return undefined
+    const durable = personal?.hitRates()
+    if (durable && durable.size > 0) return durable
     const idx = buildHitRateIndex(sync().data.message)
     if (idx.size === 0) return undefined
     const map = new Map<string, number>()
@@ -1170,7 +2058,9 @@ function ModelSelectorPopoverV2View(props: {
   const openRouterHitRates = createMemo(() => {
     if (!store.open) return undefined
     const map = new Map<string, number>()
-    for (const [modelId, entry] of Object.entries(openRouterStore as Record<string, { endpoints?: OpenRouterEndpoint[] }>)) {
+    for (const [modelId, entry] of Object.entries(
+      openRouterStore as Record<string, { endpoints?: OpenRouterEndpoint[] }>,
+    )) {
       const eps = (entry as { endpoints?: OpenRouterEndpoint[] })?.endpoints
       if (!eps || eps.length === 0) continue
       let sum = 0
@@ -1230,12 +2120,12 @@ function ModelSelectorPopoverV2View(props: {
 
   // Centralized OpenRouter endpoint cache: one store + ring prefetcher instead of
   // per-row signals + per-hover fetches that each hit localStorage + network.
-  // V2 Usage Yield helpers for endpoint sorting (§5-6, corpus §5.1, median §6).
+  // V2 Usage Yield helpers for endpoint sorting (┬º5-6, corpus ┬º5.1, median ┬º6).
   // Same standardized workload used for model ranking so endpoint order is
-  // yield-consistent with the model selector (§32). Corpus upgrades to live
+  // yield-consistent with the model selector (┬º32). Corpus upgrades to live
   // when Go profiles have been fetched; otherwise the pinned 16-tuple fallback.
   const getEndpointCorpus = (): Workload[] => {
-    const live = tables.latest?.profile ?? []
+    const live = tablesLatest()?.profile ?? []
     if (live.length > 0) {
       try {
         const bands = buildStandardWorkloadCorpus(live.map((entry) => entry.profile))
@@ -1250,13 +2140,21 @@ function ModelSelectorPopoverV2View(props: {
     const mid = Math.floor(sorted.length / 2)
     return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
   }
-  // §5.2 tokenCost with cache-hit blending. When telemetry provides hit rate,
-  // the missed portion of cachedReadTokens is priced at prompt (cache miss → fresh input).
-  // effectiveCache = hit*cacheRead + (1-hit)*prompt. Undefined hit → assume 1 (no penalty for unknown).
+  // ┬º5.2 tokenCost with cache-hit blending. When telemetry provides hit rate,
+  // the missed portion of cachedReadTokens is priced at prompt (cache miss ΓåÆ fresh input).
+  // effectiveCache = hit*cacheRead + (1-hit)*prompt. Undefined hit ΓåÆ assume 1 (no penalty for unknown).
   const endpointMedianCost = (endpoint: OpenRouterEndpoint, corpus: Workload[]): number => {
     const hit = endpoint.telemetry?.cacheHitPercent !== undefined ? endpoint.telemetry.cacheHitPercent / 100 : 1
-    const effectiveCacheRead = Number.isFinite(hit) ? endpoint.pricing.cacheRead * hit + endpoint.pricing.prompt * (1 - hit) : endpoint.pricing.cacheRead
-    const costs = corpus.map((workload) => (workload.freshInputTokens * endpoint.pricing.prompt + workload.cachedReadTokens * effectiveCacheRead + workload.outputTokens * endpoint.pricing.completion) / 1_000_000)
+    const effectiveCacheRead = Number.isFinite(hit)
+      ? endpoint.pricing.cacheRead * hit + endpoint.pricing.prompt * (1 - hit)
+      : endpoint.pricing.cacheRead
+    const costs = corpus.map(
+      (workload) =>
+        (workload.freshInputTokens * endpoint.pricing.prompt +
+          workload.cachedReadTokens * effectiveCacheRead +
+          workload.outputTokens * endpoint.pricing.completion) /
+        1_000_000,
+    )
     return medianCost(costs)
   }
   const fetchOpenRouterEndpoints = async (model: string): Promise<OpenRouterEndpoint[]> => {
@@ -1275,10 +2173,10 @@ function ModelSelectorPopoverV2View(props: {
         uptime: entry.uptime === undefined ? undefined : Number(entry.uptime),
       }
     })
-    // Cheapest → most expensive via V2 Usage Yield (§5-6): median cost across
+    // Cheapest ΓåÆ most expensive via V2 Usage Yield (┬º5-6): median cost across
     // the same standardized workload corpus used for model ranking. Every
     // paid upstream is priced against the SAME 16 workloads (deduped Go profiles,
-    // §5.1), median of per-workload costs is the comparison (§6). This replaces
+    // ┬º5.1), median of per-workload costs is the comparison (┬º6). This replaces
     // ad-hoc 800/65k/220 weighting with corpus-true economics.
     const corpus = getEndpointCorpus()
     endpoints.sort((a, b) => {
@@ -1296,13 +2194,20 @@ function ModelSelectorPopoverV2View(props: {
     // Best-effort: telemetry augments uptime/price but must never break the submenu.
     // The server now never 500s (returns [] on no telemetry), so this is silent.
     try {
-      const response = await sdk().client.experimental.openrouterTelemetry.get({ model, timeRange: "1w" }, { throwOnError: true })
+      const response = await sdk().client.experimental.openrouterTelemetry.get(
+        { model, timeRange: "1w" },
+        { throwOnError: true },
+      )
       const telemetry = response.data ?? []
       if (telemetry.length === 0) return endpoints
       const enriched = endpoints.map((entry) => {
-        const value = telemetry.find((item) => item.providerName === entry.providerName || item.providerSlug === entry.provider)
-        const cacheHitPercent = value && Number.isFinite(Number(value.cacheHitPercent)) ? Number(value.cacheHitPercent) : undefined
-        const throughputTps = value && Number.isFinite(Number(value.throughputTps)) ? Number(value.throughputTps) : undefined
+        const value = telemetry.find(
+          (item) => item.providerName === entry.providerName || item.providerSlug === entry.provider,
+        )
+        const cacheHitPercent =
+          value && Number.isFinite(Number(value.cacheHitPercent)) ? Number(value.cacheHitPercent) : undefined
+        const throughputTps =
+          value && Number.isFinite(Number(value.throughputTps)) ? Number(value.throughputTps) : undefined
         return value && cacheHitPercent !== undefined
           ? {
               ...entry,
@@ -1313,10 +2218,10 @@ function ModelSelectorPopoverV2View(props: {
             }
           : entry
       })
-      // Re-sort with cache-hit blended yield (§5.2 + cache-miss as prompt). A
-      // low hit rate materially raises effective cost (missed cache → prompt),
+      // Re-sort with cache-hit blended yield (┬º5.2 + cache-miss as prompt). A
+      // low hit rate materially raises effective cost (missed cache ΓåÆ prompt),
       // so a superficially cheap cacheRead with 60% hit can sort behind a
-      // slightly pricier but 95% hit provider — exactly the correction V2 wants
+      // slightly pricier but 95% hit provider ΓÇö exactly the correction V2 wants
       // when hit data is available. Falls back to hit=1 for unknowns (no penalty).
       const corpus = getEndpointCorpus()
       enriched.sort((a, b) => {
@@ -1330,7 +2235,7 @@ function ModelSelectorPopoverV2View(props: {
       })
       return enriched
     } catch (error) {
-      // Silent best-effort — log for diagnostics, do not toast (would spam for ~ models).
+      // Silent best-effort ΓÇö log for diagnostics, do not toast (would spam for ~ models).
       console.warn("[openrouter-telemetry] best-effort fetch failed", { model, error: String(error) })
       return endpoints
     }
@@ -1384,13 +2289,13 @@ function ModelSelectorPopoverV2View(props: {
       hoverTimer = undefined
     }
   }
-  const setSubmenu = (navKey: string, open: boolean, modelID: string) => {
+  const setSubmenu = (navKey: string, open: boolean, modelID: string, prefetchOpenRouter = true) => {
     if (!open) {
       if (store.submenu === navKey) setStore("submenu", "")
       return
     }
     setStore("submenu", navKey)
-    ensureOpenRouter(modelID)
+    if (prefetchOpenRouter) ensureOpenRouter(modelID)
   }
   const activate = (navKey: string) => {
     if (store.submenu && store.submenu !== navKey) setStore("submenu", "")
@@ -1422,7 +2327,7 @@ function ModelSelectorPopoverV2View(props: {
   // after every response and moved virtual rows underneath the pointer.
   const models = createMemo(() => props.models(store.search))
   // The provider rail is derived from the full (search-filtered) model list so
-  // it never collapses when one provider is selected — filtering happens below.
+  // it never collapses when one provider is selected ΓÇö filtering happens below.
   const railProviders = createMemo(() => {
     const seen = new Map<string, string>()
     for (const item of models()) {
@@ -1438,10 +2343,8 @@ function ModelSelectorPopoverV2View(props: {
   const groups = createMemo(() => props.groups(railModels()))
   const favorites = createMemo(() => props.favorites(models()))
   const recents = createMemo(() => props.recents(models()))
-  const showFavorites = () =>
-    favorites().length > 0 && (store.rail === "" || store.rail === favoritesRailKey)
-  const showRecents = () =>
-    recents().length > 0 && (store.rail === "" || store.rail === recentRailKey)
+  const showFavorites = () => favorites().length > 0 && (store.rail === "" || store.rail === favoritesRailKey)
+  const showRecents = () => recents().length > 0 && (store.rail === "" || store.rail === recentRailKey)
   const showProviderGroups = () => store.rail !== favoritesRailKey && store.rail !== recentRailKey
   const hasContent = () => {
     if (store.rail === favoritesRailKey) return favorites().length > 0
@@ -1479,8 +2382,6 @@ function ModelSelectorPopoverV2View(props: {
     const map = new Map<string, ModelItem>()
     for (const item of models()) {
       map.set(modelKey(item), item)
-      map.set(`fav:${modelKey(item)}`, item)
-      map.set(`recent:${modelKey(item)}`, item)
     }
     return map
   })
@@ -1495,23 +2396,31 @@ function ModelSelectorPopoverV2View(props: {
     const windows = forkUsage.usage.latest?.byCredential.find((entry) => entry.credentialID === credentialID)?.windows
     return windows?.find((entry) => entry.label === "5h")
   })
-  // One O(messages) pass, memoized, instead of rescanning the whole message
-  // store per model per row (previously O(models * messages) on every render).
-  // Gated on open: the usage bars are only visible while the picker is open.
-  const costIndex = createMemo(() => {
-    if (!store.open) return new Map() as ReturnType<typeof buildModelCostIndex>
-    return buildModelCostIndex(sync().data.message)
+  // Durable learner: personal $/request from the global persisted store
+  // (deduped, 200/model, survives LRU). Falls back to an ephemeral scan
+  // while the store is hydrating or on first run after upgrade.
+  const durableCosts = createMemo(() => {
+    if (!store.open) return undefined
+    const durable = personal?.personalCosts()
+    if (durable && durable.size > 0) return durable
+    const idx = buildModelCostIndex(sync().data.message)
+    if (idx.size === 0) return undefined
+    const map = new Map<string, { cost: number; count: number }>()
+    for (const [k, entry] of idx.entries()) map.set(k, { cost: entry.sum / entry.count, count: entry.count })
+    return map.size > 0 ? map : undefined
   })
   const usageFor = (item: ModelItem) => {
     // WorkBuddy: credits-per-request funded by one account's remaining balance.
     // Checked first because these models carry no USD cost at all, so the
-    // token-priced path below would render "—" and no bar.
+    // token-priced path below would render "ΓÇö" and no bar.
     if (item.provider.id === "workbuddy") {
       // Pass the full (possibly account-qualified) id: `hy4-preview@wb-<id>`
       // must be funded by that account, not by the best account overall.
       const estimate = workbuddy.forModel(item.id)
       if (!estimate) return undefined
-      const account = workbuddy.accounts().find((entry) => entry.id === estimate.account || entry.account === estimate.account)
+      const account = workbuddy
+        .accounts()
+        .find((entry) => entry.id === estimate.account || entry.account === estimate.account)
       return {
         percent: 100 - estimate.remainingPercent,
         estimatedRequests: estimate.estimatedRequests,
@@ -1521,6 +2430,31 @@ function ModelSelectorPopoverV2View(props: {
           ...estimate,
           ...(account ? { totalCredits: account.totalCredits } : {}),
         } as WorkBuddyModelUsage,
+      }
+    }
+    if (item.provider.id === "verdent") {
+      const estimate = verdent.forModel(item.id)
+      if (!estimate) return undefined
+      return {
+        percent: 100 - estimate.remainingPercent,
+        estimatedRequests: estimate.estimatedRequests,
+        remainingPercent: estimate.remainingPercent,
+        tone: stretchTone(estimate.estimatedRequests) as UsageTone,
+        workbuddy: estimate as unknown as WorkBuddyModelUsage,
+      }
+    }
+    if (item.provider.id === "genspark") {
+      const cost = resolveEffectiveCost(item, mergedPricingFallbackForDisplay()).cost
+      const dollarPerM = (cost.input ?? 0) + (cost.output ?? 0)
+      if (!(dollarPerM > 0)) return undefined
+      const estimate = genspark.forModel(dollarPerM)
+      if (!estimate) return undefined
+      return {
+        percent: 100,
+        estimatedRequests: estimate.estimatedRequests,
+        remainingPercent: undefined,
+        tone: stretchTone(estimate.estimatedRequests) as UsageTone,
+        genspark: estimate,
       }
     }
     if (isOpenRouterFreeModel(item)) {
@@ -1535,8 +2469,9 @@ function ModelSelectorPopoverV2View(props: {
     if (!isUsageTrackedProvider(item.provider.id)) return undefined
     const window = activeWindow()
     if (!window) return undefined
-    const key = { id: item.id, providerID: item.provider.id }
-    const personalCost = averageCostPerRequest(costIndex(), key)
+    const durableKey = `${item.provider.id}:${item.id}`
+    const personalEntry = durableCosts()?.get(durableKey)
+    const personalCost = personalEntry?.cost
     const estimatedRequests =
       personalCost !== undefined
         ? estimateRequestsRemainingFromCost(window, personalCost)
@@ -1573,20 +2508,20 @@ function ModelSelectorPopoverV2View(props: {
   const tooltipModel = createMemo<ModelItem | undefined>(() => {
     const active = store.tooltip
     if (!active || active === manageKey) return undefined
-    const candidate =
-      modelByKey().get(active) ??
-      modelByKey().get(
-        active.startsWith("fav:")
-          ? active.slice(4)
-          : active.startsWith("recent:")
-            ? active.slice(7)
-            : active,
-      )
-    if (!candidate || candidate.provider.id === "openrouter") return undefined
-    if (store.rail !== "" && store.rail !== favoritesRailKey && store.rail !== recentRailKey && candidate.provider.id !== store.rail)
+    const plain = active.startsWith("fav:") ? active.slice(4) : active.startsWith("recent:") ? active.slice(7) : active
+    const candidate = modelByKey().get(plain)
+    if (!candidate || candidate.provider.id === "openrouter" || (accountGroupFor(candidate)?.variants.length ?? 0) > 1)
+      return undefined
+    if (
+      store.rail !== "" &&
+      store.rail !== favoritesRailKey &&
+      store.rail !== recentRailKey &&
+      candidate.provider.id !== store.rail
+    )
       return undefined
     if (store.rail === favoritesRailKey && !props.isFavorite(candidate)) return undefined
-    if (store.rail === recentRailKey && !recents().some((item) => modelKey(item) === modelKey(candidate))) return undefined
+    if (store.rail === recentRailKey && !recents().some((item) => modelKey(item) === modelKey(candidate)))
+      return undefined
     if (!store.open) return undefined
     return candidate
   })
@@ -1692,12 +2627,21 @@ function ModelSelectorPopoverV2View(props: {
     const result: SelectorRenderRow[] = []
     if (showFavorites()) {
       result.push({ kind: "header", key: "header:favorites", title: language.t("dialog.model.favorites") })
-      result.push(...favorites().map((item) => ({ kind: "item" as const, key: favoriteKey(item), navKey: favoriteKey(item), item })))
+      result.push(
+        ...favorites().map((item) => ({
+          kind: "item" as const,
+          key: favoriteKey(item),
+          navKey: favoriteKey(item),
+          item,
+        })),
+      )
       result.push({ kind: "separator", key: "separator:favorites" })
     }
     if (showRecents()) {
       result.push({ kind: "header", key: "header:recent", title: language.t("dialog.model.recent") })
-      result.push(...recents().map((item) => ({ kind: "item" as const, key: recentKey(item), navKey: recentKey(item), item })))
+      result.push(
+        ...recents().map((item) => ({ kind: "item" as const, key: recentKey(item), navKey: recentKey(item), item })),
+      )
       result.push({ kind: "separator", key: "separator:recent" })
     }
     if (showProviderGroups()) {
@@ -1728,7 +2672,8 @@ function ModelSelectorPopoverV2View(props: {
     initialRect: { width: 316, height: 320 },
     get estimateSize() {
       const snapshot = renderRows()
-      return (index: number) => (snapshot[index]?.kind === "header" ? 28 : snapshot[index]?.kind === "separator" ? 5 : 28)
+      return (index: number) =>
+        snapshot[index]?.kind === "header" ? 24 : snapshot[index]?.kind === "separator" ? 5 : 25
     },
     overscan: 8,
     get getItemKey() {
@@ -1737,10 +2682,15 @@ function ModelSelectorPopoverV2View(props: {
     },
     get rangeExtractor() {
       const snapshot = renderRows()
-      const active = store.active
+      const indexByNavKey = new Map<string, number>()
+      for (let i = 0; i < snapshot.length; i++) {
+        const row = snapshot[i]
+        if (row.kind === "item") indexByNavKey.set(row.navKey, i)
+      }
       return (range: Parameters<typeof defaultRangeExtractor>[0]) => {
         const indexes = defaultRangeExtractor(range)
-        const activeIndex = snapshot.findIndex((row) => row.kind === "item" && row.navKey === active)
+        const active = store.active
+        const activeIndex = indexByNavKey.get(active) ?? -1
         if (activeIndex < 0 || indexes.includes(activeIndex)) return indexes
         return [...indexes, activeIndex].sort((a, b) => a - b)
       }
@@ -1814,14 +2764,6 @@ function ModelSelectorPopoverV2View(props: {
     for (const item of visibleUsageItems()) map.set(modelKey(item), usageFor(item))
     return map
   })
-  const maxRequests = createMemo(() => {
-    let max = 0
-    for (const item of visibleUsageItems()) {
-      const requests = usageMap().get(modelKey(item))?.estimatedRequests
-      if (requests !== undefined && requests > max) max = requests
-    }
-    return max
-  })
   const navKeys = () => rows().map((row) => row.navKey)
   createEffect(
     on(
@@ -1855,8 +2797,14 @@ function ModelSelectorPopoverV2View(props: {
     if (open) {
       cancelHoverIntent()
       dismiss.allowTriggerRestore()
-      setStore({ open: true, active: initialActive(), tooltip: "", submenu: "" })
-      props.onExternalOpenChange?.(true)
+      // One flush for BOTH gates. `store.open` (view) and the controller's
+      // `isOpen` signal (L993, flipped via onExternalOpenChange) are separate
+      // reactive layers; unbatched, opening invalidates ~19 gated memos across
+      // both and re-renders between them. batch() collapses that to one pass.
+      batch(() => {
+        setStore({ open: true, active: initialActive(), tooltip: "", submenu: "" })
+        props.onExternalOpenChange?.(true)
+      })
       focusTimer = setTimeout(() => {
         focusTimer = undefined
         focusFrame = requestAnimationFrame(() => {
@@ -1873,8 +2821,17 @@ function ModelSelectorPopoverV2View(props: {
     focusFrame = 0
     // Keep the query for the next open; the explicit clear control remains the
     // user's way to reset it. This makes repeated model switching much faster.
-    setStore({ open: false, active: "", tooltip: "", submenu: "" })
-    props.onExternalOpenChange?.(false)
+    // Mirrors the open branch: both gates flip in one flush.
+    batch(() => {
+      setStore({ open: false, active: "", tooltip: "", submenu: "" })
+      setUsageReady(false)
+      props.onExternalOpenChange?.(false)
+    })
+    if (typeof requestIdleCallback === "function") {
+      requestIdleCallback(() => setUsageReady(true), { timeout: 200 })
+    } else {
+      setTimeout(() => setUsageReady(true), 0)
+    }
   }
   let closeAction: (() => void) | undefined
   let closeGeneration = 0
@@ -1950,11 +2907,23 @@ function ModelSelectorPopoverV2View(props: {
       }
     })
   }
+  let searchDebounceTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => {
+    if (searchDebounceTimer !== undefined) clearTimeout(searchDebounceTimer)
+  })
   const setSearch = (value: string) => {
     cancelHoverIntent()
     setStore({ tooltip: "", submenu: "" })
     persistedModelSearch = value
-    setStore("search", value)
+    if (searchDebounceTimer !== undefined) clearTimeout(searchDebounceTimer)
+    if (value === "") {
+      setStore("search", value)
+      return
+    }
+    searchDebounceTimer = setTimeout(() => {
+      searchDebounceTimer = undefined
+      setStore("search", value)
+    }, 100)
   }
 
   // Wait for the search memo to settle before choosing the first result. Reading
@@ -1967,7 +2936,6 @@ function ModelSelectorPopoverV2View(props: {
         const firstKey = navKeys()[0] ?? manageKey
         if (store.active !== firstKey) setStore("active", firstKey)
         if (scrollRoot()) {
-          virtualizer.measure()
           virtualizer.scrollToOffset(0)
         }
       },
@@ -1981,11 +2949,7 @@ function ModelSelectorPopoverV2View(props: {
       document,
       "keydown",
       (event: KeyboardEvent) => {
-        if (
-          store.submenu &&
-          event.target instanceof Element &&
-          event.target.closest("[data-model-selector-submenu]")
-        ) {
+        if (store.submenu && event.target instanceof Element && event.target.closest("[data-model-selector-submenu]")) {
           return
         }
         handleDocumentSearchKeydown(searchRef, event, store.search, setSearch)
@@ -1994,32 +2958,196 @@ function ModelSelectorPopoverV2View(props: {
     )
   })
 
+  // Account selection must always land on something the app can actually
+  // use. `local.model.set` writes any id, but `current()` resolves through
+  // `validModel`, which requires the id to exist in the provider catalog —
+  // writing an unknown id silently snaps back to the previous model. A
+  // synthesized submenu can offer an account the catalog doesn't expose
+  // yet (stale cache after a vault edit — quota reads the vault live,
+  // Provider.list is cached at load; or a different id domain like fork
+  // credentials), so resolve in order: real variant → catalog-known
+  // candidate → catalog refresh + retry → provider mechanism → honest
+  // automatic-routing fallback.
+  // View-level (defined once, not once per row): `renderRow` runs for every
+  // mounted virtual row, so a per-row `async` closure here would allocate the
+  // whole resolve chain per row per render. Rows pass a tiny wrapper instead.
+  const selectAccountFor = async (
+    item: ModelItem,
+    group: ModelGroup<ModelItem> | undefined,
+    accountID: string,
+  ) => {
+    try {
+      // 1. Real catalog variant — always routable.
+      if (group?.variants.some((variant) => variant.accountID === accountID)) {
+        props.selectVariant(item, accountID)
+        return
+      }
+      // Strip any existing account suffix first so re-pinning from a
+      // variant row (e.g. search results) can't stack `@a@b`. Context
+      // suffixes (`@300k`) survive — same account, other window.
+      const base = splitModelIDForProvider(item.id, item.provider.id).baseModelID
+      const candidate = `${base}@${accountID}`
+      const catalogHas = () => {
+        try {
+          const catalog = (local?.model.list() ?? []) as ModelItem[]
+          return catalog.some((entry) => entry.provider.id === item.provider.id && entry.id === candidate)
+        } catch {
+          return false
+        }
+      }
+      // 2. Hidden-but-real: the id exists in the full (unfiltered) catalog.
+      if (catalogHas()) {
+        props.select({ ...item, id: candidate } as ModelItem)
+        return
+      }
+      // 2b. Stale catalog: the provider's models hook emits per-account
+      // ids at load time, but accounts enrolled afterwards (vault edit)
+      // only appear in live quota — never in the cached catalog. Refresh
+      // the `providers` queries once and re-check; the memos rebuild
+      // reactively, so a hit here also fixes the next open. If the proxy
+      // itself is down this changes nothing and we fall through.
+      // `useServerSync` returns an accessor (mirrors `useServerSDK`), so it
+      // must be invoked before reaching `refreshProviders`.
+      try {
+        await serverSync?.()?.refreshProviders()
+        if (catalogHas()) {
+          props.select({ ...item, id: candidate } as ModelItem)
+          return
+        }
+      } catch {
+        // Fall through to the provider mechanism below.
+      }
+      // 3. opencode-go routes by activating a fork credential — the model
+      // id must stay clean, never `model@<uuid>`.
+      if (item.provider.id === "opencode-go") {
+        const server = forkServer()
+        if (!server) throw new Error("no server")
+        await ForkClient.select(server, accountID, forkDirectory())
+        forkUsage.refreshAll()
+        props.select(item)
+        return
+      }
+      // 4. Degraded: the account can't be pinned because the provider
+      // backend isn't exposing per-account models. Fall back to automatic
+      // routing with an explanation instead of a silent no-op.
+      props.select(item)
+      showToast({
+        title: language.t("dialog.model.account.routingAutomatic"),
+        description: language.t("dialog.model.account.routingAutomaticDescription"),
+      })
+    } catch (error) {
+      showToast({
+        title: language.t("common.requestFailed"),
+        description: error instanceof Error ? error.message : undefined,
+        variant: "error",
+      })
+    }
+  }
+  // Per-provider account-usage resolvers, defined once per view. The
+  // `usageForAccount` prop previously built a fresh 4-branch closure tree on
+  // every MultiAccountRow render; each branch closes over view memos and is
+  // only invoked when the submenu opens, so stable shared functions + a
+  // per-item cached picker cut per-render allocation to an O(1) map hit.
+  const usageForWorkbuddyAccount = (item: ModelItem) => (accountID: string) =>
+    workbuddy.forModel(`${item.id}@${accountID}`)
+  const usageForVerdentAccount = (item: ModelItem) => (accountID: string) =>
+    verdent.forModel(`${item.id}@${accountID}`)
+  const usageForZenAccount = (_item: ModelItem) => (accountID: string) => {
+    const key = zenKeyLimits().get(accountID)
+    if (!key) return undefined
+    const estimatedRequests =
+      key.limitEstimate !== null && key.usedObserved !== null
+        ? key.limitEstimate - key.usedObserved
+        : Number.POSITIVE_INFINITY
+    return {
+      estimatedRequests,
+      ...(key.remainingPercent !== null ? { remainingPercent: key.remainingPercent } : {}),
+      account: key.label,
+      creditsExhausted: key.exhausted,
+    }
+  }
+  const usageForGoAccount = (item: ModelItem) => (accountID: string) => {
+    // Go windows are USD budgets (spentUSD/limitUSD), not
+    // request counts — reuse the same estimator the Go row
+    // path uses instead of inventing parallel math.
+    const usage = forkUsage.usage.latest?.byCredential.find((entry) => entry.credentialID === accountID)
+    const window = usage?.windows.find((entry) => entry.label === "5h")
+    if (!window) return undefined
+    const remainingUSD = Math.max(0, window.limitUSD - window.spentUSD)
+    const remainingPercent =
+      window.estimatedPercent ?? (window.limitUSD > 0 ? (remainingUSD / window.limitUSD) * 100 : undefined)
+    // `estimateRequestsRemaining` returns `undefined` when the model has no
+    // usable cost (unpriced and no fallback) — surface "no data" rather than
+    // a mistyped `undefined` where `AccountOptionUsage` requires a number.
+    const estimatedRequests = estimateRequestsRemaining(window, item.cost, undefined)
+    if (estimatedRequests === undefined) return undefined
+    return {
+      estimatedRequests,
+      ...(remainingPercent !== undefined ? { remainingPercent } : {}),
+      account: accountLabels()?.get(accountID) ?? accountID,
+      creditsExhausted: remainingUSD <= 0,
+    }
+  }
+  const usageForAccountCache = new Map<string, { item: ModelItem; fn: ((accountID: string) => AccountOptionUsage | undefined) | undefined }>()
+  onCleanup(() => usageForAccountCache.clear())
+  const usageForAccountFor = (item: ModelItem) => {
+    const key = modelKey(item)
+    const cached = usageForAccountCache.get(key)
+    if (cached && cached.item === item) return cached.fn
+    const fn =
+      item.provider.id === "workbuddy"
+        ? usageForWorkbuddyAccount(item)
+        : item.provider.id === "verdent"
+          ? usageForVerdentAccount(item)
+          : item.provider.id === "opencode"
+            ? usageForZenAccount(item)
+            : item.provider.id === "opencode-go"
+              ? usageForGoAccount(item)
+              : undefined
+    usageForAccountCache.set(key, { item, fn })
+    return fn
+  }
+
   const renderRow = (item: ModelItem, navKey: string) => {
     const itemKey = modelKey(item)
     const current = () => props.current() === itemKey
     const usage = () => usageMap().get(itemKey)
-    // Cross-provider pricing fallback for display: if this provider's variant
-    // is unpriced but a sibling provider offers the same model id with pricing,
-    // show the borrowed price (with "~" to hint it's sibling-derived) instead
-    // of "—" so the user sees why it's sorted where it is. Sorting already
-    // uses the same fallback via buildPricingFallbackMap in the controller.
-    const fallbackCost = () => pricingFallbackForDisplay()?.get(item.id)
-    const effectiveCost = () => (hasPublishedPricing(item.cost) ? item.cost : fallbackCost() ?? item.cost)
-    const isBorrowed = () => !hasPublishedPricing(item.cost) && !!fallbackCost()
+    // Cross-provider + fuzzy-name pricing fallback for display: if this
+    // provider's variant is unpriced but a sibling provider offers the same
+    // (or a name-matched free/paid variant) model with pricing, show the
+    // borrowed price (with "~" to hint it's inferred) instead of "ΓÇö" so the
+    // user sees why it's sorted where it is. Sorting already uses the same
+    // fallback (see mergedPricingFallback in the controller).
+    const effective = () => resolveEffectiveCost(item, mergedPricingFallbackForDisplay())
+    const effectiveCost = () => effective().cost
+    const isBorrowed = () => effective().borrowed
     const effectiveItem = () => (isBorrowed() ? ({ ...item, cost: effectiveCost() } as ModelItem) : item)
+    const group = props.groupOf(item)
+    const displayGroup = accountGroupFor(item)
+    // Thin per-row wrapper over the view-level `selectAccountFor` (defined
+    // once above): the full resolve chain must not be reallocated per mounted
+    // virtual row. See the comment on `selectAccountFor` for the guarantees.
+    const selectAccount = (accountID: string) => void selectAccountFor(item, group, accountID)
     const price = () => {
-      // WorkBuddy publishes no token price — it charges credits per request.
-      // Showing "—" would waste the slot and hide the single most useful
+      // WorkBuddy publishes no token price ΓÇö it charges credits per request.
+      // Showing "ΓÇö" would waste the slot and hide the single most useful
       // number, so show the actual consumption rate instead.
       if (item.provider.id === "workbuddy") {
         const rate = workbuddy.rateFor(item.id)
-        if (!rate) return "—"
+        if (!rate) return "ΓÇö"
         if (rate.free) return rate.promotion ?? language.t("model.tag.free")
-        return rate.rate > 0 ? `x${rate.rate}` : "—"
+        return rate.rate > 0 ? `x${rate.rate}` : "ΓÇö"
+      }
+      if (item.provider.id === "genspark") {
+        const cost = effectiveCost()
+        const dollarPerM = hasPublishedPricing(cost) ? cost.input + cost.output : undefined
+        const rate = genspark.rateFor(dollarPerM)
+        if (!rate) return "ΓÇö"
+        return `${isBorrowed() ? "~" : ""}${formatCreditsPerMillion(rate.creditsPerM)}`
       }
       return hasPublishedPricing(effectiveCost())
         ? `${isBorrowed() ? "~" : ""}${formatPricePerM(effectiveCost().input + effectiveCost().output)}`
-        : "—"
+        : "ΓÇö"
     }
     if (item.provider.id === "openrouter") {
       const cached = () => openRouterStore[item.id]
@@ -2031,8 +3159,8 @@ function ModelSelectorPopoverV2View(props: {
           favorited={props.isFavorite(item)}
           pinned={props.subProviderGet(item)}
           usage={usage()}
-          maxRequests={maxRequests()}
           priceLabel={price()}
+          freeLabel={workBuddyFreeLabel(workbuddy.rateFor(item.id))}
           rowRef={setRowRef(navKey)}
           endpoints={cached()?.endpoints}
           loading={cached()?.loading ?? false}
@@ -2051,6 +3179,53 @@ function ModelSelectorPopoverV2View(props: {
         />
       )
     }
+    if (displayGroup && displayGroup.variants.length > 1) {
+      return (
+        <MultiAccountRow
+          item={effectiveItem()}
+          displayName={displayGroup.label}
+          variants={displayGroup.variants}
+          navKey={navKey}
+          current={current()}
+          selectedAccountID={
+            current()
+              ? (props.currentVariant()?.accountID ??
+                (item.provider.id === "opencode-go" ? forkUsage.activeCredentialID() : undefined))
+              : undefined
+          }
+          auto={displayGroup.auto}
+          selectedAuto={
+            current() && !props.currentVariant() && item.provider.id !== "opencode-go"
+          }
+          favorited={props.isFavorite(item)}
+          usage={usage()}
+          priceLabel={price()}
+          freeLabel={workBuddyFreeLabel(workbuddy.rateFor(item.id))}
+          accountLabels={accountLabels()}
+          // View-level cached picker (`usageForAccountFor`, defined once
+          // above): the 4-branch closure tree used to be rebuilt per row per
+          // render. O(1) map hit; resolvers read live memos when invoked.
+          usageForAccount={usageForAccountFor(item)}
+          rowRef={setRowRef(navKey)}
+          onActivate={() => activate(navKey)}
+          onDeactivate={() => deactivate(navKey)}
+          onToggleFavorite={() => props.onToggleFavorite(item)}
+          submenuOpen={store.submenu === navKey}
+          onSubmenuChange={(open) => setSubmenu(navKey, open, item.id, false)}
+          onSelectAuto={() => {
+            dismiss.preventTriggerRestore()
+            // Single closeWith: selectModel wraps in another closeWith, which
+            // bails on `!store.open` after unmount — nesting it here silently
+            // dropped every Auto selection. Call props.select directly.
+            closeWith(() => props.select(item))
+          }}
+          onSelectAccount={(accountID) => {
+            dismiss.preventTriggerRestore()
+            closeWith(() => void selectAccount(accountID))
+          }}
+        />
+      )
+    }
     return (
       <MenuV2.Item
         ref={setRowRef(navKey)}
@@ -2063,15 +3238,21 @@ function ModelSelectorPopoverV2View(props: {
         onSelect={() => selectModel(item)}
       >
         <ProviderIcon id={item.provider.id} class="size-3.5 shrink-0 opacity-60" />
-        <span class="min-w-0 flex-1 truncate leading-5">{stripUnlimitedSuffix(item.name)}</span>
-        <DeepSeekRateBadge model={item} v2 period={deepSeekPeriod()} />
+        <span class="min-w-0 flex-1 truncate leading-5">{stripUnlimitedSuffix(group?.label ?? item.name)}</span>
+        {/* Guard the badge mount: `DeepSeekRateBadge` is a no-render `Show`
+            for every non-DeepSeek row, but mounting the component still costs
+            a context read + effect per virtual row. Skip it entirely unless
+            this row can actually show it. */}
+        <Show when={isDeepSeekPeakPricedModel(item)}>
+          <DeepSeekRateBadge model={item} v2 period={deepSeekPeriod()} />
+        </Show>
         <Show when={item.provider.id === "workbuddy"}>
-          <WorkBuddyFreeBadge modelID={item.id} />
+          <WorkBuddyFreeBadge label={workBuddyFreeLabel(workbuddy.rateFor(item.id))} />
         </Show>
         <Show when={isUnlimitedModel(item)}>
           <TagV2 class="shrink-0">{language.t("model.tag.unlimited")}</TagV2>
         </Show>
-        <Show when={item.provider.id !== "workbuddy" && isFreeModel(item as never)}>
+        <Show when={item.provider.id !== "workbuddy" && item.provider.id !== "genspark" && isFreeModel(item as never)}>
           <TagV2 class="shrink-0">{language.t("model.tag.free")}</TagV2>
         </Show>
         <Show when={item.latest}>
@@ -2080,7 +3261,6 @@ function ModelSelectorPopoverV2View(props: {
         <ModelRowMeta
           item={item}
           usage={usage()}
-          maxRequests={maxRequests()}
           price={<span class="text-[10px] font-[520] leading-5">{price()}</span>}
         />
         <Show when={current()}>
@@ -2092,7 +3272,13 @@ function ModelSelectorPopoverV2View(props: {
   }
 
   return (
-    <MenuV2 open={store.open} modal={false} placement={props.placement ?? "top-start"} gutter={6} onOpenChange={onOpenChange}>
+    <MenuV2
+      open={store.open}
+      modal={false}
+      placement={props.placement ?? "top-start"}
+      gutter={6}
+      onOpenChange={onOpenChange}
+    >
       <MenuV2.Trigger as={props.trigger} />
       <MenuV2.Portal>
         <MenuV2.Content
@@ -2178,8 +3364,8 @@ function ModelSelectorPopoverV2View(props: {
                 <button
                   type="button"
                   class="relative flex size-7 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"
-                   classList={{ "!text-v2-state-fg-warning": store.rail === favoritesRailKey }}
-                   aria-label={language.t("dialog.model.favorites")}
+                  classList={{ "!text-v2-state-fg-warning": store.rail === favoritesRailKey }}
+                  aria-label={language.t("dialog.model.favorites")}
                   onClick={() => {
                     tooltipSuppressedFor = store.tooltip
                     setTooltipPos(null)
@@ -2201,8 +3387,8 @@ function ModelSelectorPopoverV2View(props: {
                 <button
                   type="button"
                   class="relative flex size-7 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"
-                   classList={{ "!text-v2-text-text-accent": store.rail === recentRailKey }}
-                   aria-label={language.t("dialog.model.recent")}
+                  classList={{ "!text-v2-text-text-accent": store.rail === recentRailKey }}
+                  aria-label={language.t("dialog.model.recent")}
                   onClick={() => {
                     tooltipSuppressedFor = store.tooltip
                     setTooltipPos(null)
@@ -2225,10 +3411,13 @@ function ModelSelectorPopoverV2View(props: {
                       (event.target instanceof Element && !!event.target.closest("[data-action]")),
                   }),
                 ]}
-                modifiers={[RestrictToVerticalAxis, RestrictToElement.configure({ element: () => railListRef ?? null })]}
-                 plugins={(defaults) => [
-                   ...defaults,
-                   AutoScroller.configure({ acceleration: 8, threshold: { x: 0, y: 0.05 } }),
+                modifiers={[
+                  RestrictToVerticalAxis,
+                  RestrictToElement.configure({ element: () => railListRef ?? null }),
+                ]}
+                plugins={(defaults) => [
+                  ...defaults,
+                  AutoScroller.configure({ acceleration: 8, threshold: { x: 0, y: 0.05 } }),
                   Feedback.configure({ dropAnimation: null }),
                 ]}
                 onDragEnd={(event) => {
@@ -2246,43 +3435,48 @@ function ModelSelectorPopoverV2View(props: {
               >
                 <div ref={railListRef} class="flex flex-col gap-0.5">
                   <For each={railProviders()}>
-                  {(provider, index) => {
-                    const sortable = useSortable({
-                      get id() { return provider.id },
-                      get index() { return index() },
-                    })
-                    return (
-                      <TooltipV2 placement="right-start" gutter={6} openDelay={0} value={<span class="text-[12px] font-[500]">{provider.name}</span>}>
-                        <button
-                          ref={sortable.ref}
-                          data-sortable-id={provider.id}
-                          type="button"
-                          class="relative flex size-7 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"
-                           classList={{ "!text-v2-text-text-accent": store.rail === provider.id }}
-                           aria-label={provider.name}
-                          onClick={() => {
-                            tooltipSuppressedFor = store.tooltip
-                            setTooltipPos(null)
-                            setStore("rail", store.rail === provider.id ? "" : provider.id)
-                          }}
+                    {(provider, index) => {
+                      const sortable = useSortable({
+                        get id() {
+                          return provider.id
+                        },
+                        get index() {
+                          return index()
+                        },
+                      })
+                      return (
+                        <TooltipV2
+                          placement="right-start"
+                          gutter={6}
+                          openDelay={0}
+                          value={<span class="text-[12px] font-[500]">{provider.name}</span>}
                         >
-                          <Show when={store.rail === provider.id}>
-                            <span class="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-v2-text-text-accent" />
-                          </Show>
-                          <ProviderIcon id={provider.id} class="size-4 shrink-0 opacity-70" />
-                        </button>
-                      </TooltipV2>
-                    )
-                  }}
-                </For>
+                          <button
+                            ref={sortable.ref}
+                            data-sortable-id={provider.id}
+                            type="button"
+                            class="relative flex size-7 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"
+                            classList={{ "!text-v2-text-text-accent": store.rail === provider.id }}
+                            aria-label={provider.name}
+                            onClick={() => {
+                              tooltipSuppressedFor = store.tooltip
+                              setTooltipPos(null)
+                              setStore("rail", store.rail === provider.id ? "" : provider.id)
+                            }}
+                          >
+                            <Show when={store.rail === provider.id}>
+                              <span class="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-v2-text-text-accent" />
+                            </Show>
+                            <ProviderIcon id={provider.id} class="size-4 shrink-0 opacity-70" />
+                          </button>
+                        </TooltipV2>
+                      )
+                    }}
+                  </For>
                 </div>
               </DragDropProvider>
-             </div>
-            <ScrollView
-              data-slot="model-selector-scroll"
-              class="min-h-0 flex-1"
-              viewportRef={setScrollRoot}
-            >
+            </div>
+            <ScrollView data-slot="model-selector-scroll" class="min-h-0 flex-1" viewportRef={setScrollRoot}>
               <Show
                 when={hasContent()}
                 fallback={
@@ -2317,7 +3511,9 @@ function ModelSelectorPopoverV2View(props: {
                               fallback={
                                 <Show
                                   when={row.key === "header:recent"}
-                                  fallback={<Icon name="star-filled" size="small" class="shrink-0 text-v2-state-fg-warning" />}
+                                  fallback={
+                                    <Icon name="star-filled" size="small" class="shrink-0 text-v2-state-fg-warning" />
+                                  }
                                 >
                                   <Icon name="clock" size="small" class="shrink-0 text-v2-text-text-faint" />
                                 </Show>
@@ -2384,21 +3580,23 @@ function ModelSelectorPopoverV2View(props: {
                     })
                   }}
                   data-component="tooltip-v2"
-                  style={{
-                    position: "fixed",
-                    left: `${position().x}px`,
-                    top: `${position().y}px`,
-                    "pointer-events": "none",
-                    "z-index": 1000,
-                    "max-width": "calc(100vw - 30px)",
-                    "max-height": "calc(100vh - 30px)",
-                  } as never}
+                  style={
+                    {
+                      position: "fixed",
+                      left: `${position().x}px`,
+                      top: `${position().y}px`,
+                      "pointer-events": "none",
+                      "z-index": 1000,
+                      "max-width": "calc(100vw - 30px)",
+                      "max-height": "calc(100vh - 30px)",
+                    } as never
+                  }
                 >
                   <ModelTooltip
                     model={(() => {
                       const m = item()
-                      const fallback = pricingFallbackForDisplay()?.get(m.id)
-                      return fallback && !hasPublishedPricing(m.cost) ? ({ ...m, cost: fallback } as never) : m
+                      const effective = resolveEffectiveCost(m, mergedPricingFallbackForDisplay())
+                      return effective.borrowed ? ({ ...m, cost: effective.cost } as never) : m
                     })()}
                     latest={item().latest}
                     free={isFreeModel(item() as never)}

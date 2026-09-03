@@ -22,8 +22,7 @@ import { decode64 } from "@/utils/base64"
 import { SettingsListV2 } from "./settings-v2/parts/list"
 import { SettingsRowV2 } from "./settings-v2/parts/row"
 import { buildPersonalFallbackMap, buildPricingFallbackMap, compareByCheapness } from "@/utils/model-cost"
-import { buildModelCostIndex } from "@/utils/model-usage-history"
-import { useSync } from "@/context/sync"
+import { usePersonalUsage } from "@/context/personal-usage"
 import "./settings-v2/settings-v2.css"
 
 type ModelItem = ReturnType<ReturnType<typeof useLocal>["model"]["list"]>[number]
@@ -142,18 +141,16 @@ export const DialogManageModelsV2: Component = () => {
   }
   // Personal data is more relevant than the generic corpus (§31): blend personal
   // $/request heavily (70%) when we have ≥3 samples for that model.
-  let sync: ReturnType<typeof useSync> | undefined
+  // Durable learner (global, survives LRU) — not an ephemeral sync scan.
+  let personal: ReturnType<typeof usePersonalUsage> | undefined
   try {
-    sync = useSync()
+    personal = usePersonalUsage()
   } catch {
-    sync = undefined
+    personal = undefined
   }
   const personalCosts = createMemo(() => {
-    if (!sync) return undefined
-    const idx = buildModelCostIndex(sync().data.message)
-    if (idx.size === 0) return undefined
-    const map = new Map<string, { cost: number; count: number }>()
-    for (const [k, entry] of idx.entries()) map.set(k, { cost: entry.sum / entry.count, count: entry.count })
+    const map = personal?.personalCosts()
+    if (!map || map.size === 0) return undefined
     return map
   })
   const pricingFallback = createMemo(() => {

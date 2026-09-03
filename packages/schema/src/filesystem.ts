@@ -20,6 +20,9 @@ export const Entry = Schema.Struct({
   size: Schema.Number.pipe(optional),
   // Epoch-ms mtime. Files only. Paired with size for mention/explorer meta.
   mtime: Schema.Number.pipe(optional),
+  // Number of logical text lines when the file is small and decodable enough
+  // to inspect during indexing. Binary and oversized files omit this field.
+  lineCount: Schema.Number.pipe(optional),
 }).annotate({ identifier: "FileSystem.Entry" })
 
 export interface Submatch extends Schema.Schema.Type<typeof Submatch> {}

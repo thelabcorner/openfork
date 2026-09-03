@@ -92,8 +92,11 @@ export function buildStandardWorkloadCorpus(profiles: UsageProfile[]): CorpusBan
   }
   // If upstream returns nothing (fetch failure + cold cache), fall back to the
   // pinned 16-tuple so ranking stays defined — marked low-confidence by caller.
-  const effective = corpus.length > 0 ? corpus : [...FALLBACK_WORKLOAD_CORPUS]
+  let effective = corpus.length > 0 ? corpus : [...FALLBACK_WORKLOAD_CORPUS]
   effective.sort((a, b) => a.contextTokens - b.contextTokens || a.freshInputTokens - b.freshInputTokens)
+  // Cap to prevent unbounded corpus from making sort O(n × corpus) explode
+  // (latent risk flagged by cold-open-profiler: 16→240 = 6.75× sort cost).
+  if (effective.length > 64) effective = effective.slice(0, 64)
 
   const fingerprint = effective.length === FALLBACK_WORKLOAD_CORPUS.length && effective.every((w, i) => w.contextTokens === FALLBACK_WORKLOAD_CORPUS[i].contextTokens)
     ? FALLBACK_CORPUS_FINGERPRINT

@@ -16,6 +16,7 @@ import { getProjectAvatarVariant, useLayout, type LocalProject } from "@/context
 import { useServerSync } from "@/context/server-sync"
 import { useNotification } from "@/context/notification"
 import { usePermission } from "@/context/permission"
+import { usePlatform } from "@/context/platform"
 import { useServerSDK } from "@/context/server-sdk"
 import { ServerConnection } from "@/context/server"
 import { useGlobal } from "@/context/global"
@@ -36,7 +37,11 @@ import { compareSessionTime, getProjectAvatarSource, projectForSession, displayN
 import { aggregateSessionContextByModel, liveGenerationProgress } from "@/components/session/session-context-model-metrics"
 import { getSessionContext } from "@/components/session/session-context-metrics"
 import { computeMeasuredRate } from "@/components/prompt-input/live-generation-rate-math"
-import { SessionContextMenu } from "@/components/session-menu/session-context-menu"
+import {
+  SessionContextMenu,
+  SessionModelPicker,
+  type SessionModelPickerRequest,
+} from "@/components/session-menu/session-context-menu"
 import { CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN, CHAT_SIDEBAR_RECENT_LIMIT_MIN, type ChatSidebarPaneState } from "./chat-sidebar-pane-state"
 import { chatsRoot } from "@opencode-ai/core/project/chat-paths"
 import type { AssistantMessage, Session } from "@opencode-ai/sdk/v2/client"
@@ -146,6 +151,22 @@ export function ChatSidebarPane(props: {
   const minuteTick = setInterval(() => setMinuteNow(Date.now()), 30_000)
   onCleanup(() => clearInterval(minuteTick))
 
+  // One picker for the pane. Keeping it outside every row's TooltipV2 avoids
+  // changing a tooltip trigger from one child to two while its context menu is
+  // closing, which would dispose the deferred model popover before it opened.
+  const [modelPicker, setModelPicker] = createSignal<SessionModelPickerRequest | null>(null)
+  let modelPickerFrame = 0
+  const openModelPicker = (request: SessionModelPickerRequest) => {
+    if (modelPickerFrame) cancelAnimationFrame(modelPickerFrame)
+    modelPickerFrame = requestAnimationFrame(() => {
+      modelPickerFrame = 0
+      setModelPicker(request)
+    })
+  }
+  onCleanup(() => {
+    if (modelPickerFrame) cancelAnimationFrame(modelPickerFrame)
+  })
+
   // Model context limits are provider-global, so resolving the catalog once for
   // the pane avoids one provider query per row.
   const providers = useProviders(() => layout.projects.list()[0]?.worktree)
@@ -245,7 +266,7 @@ export function ChatSidebarPane(props: {
       const rows = pinWorkingFirst(projectRows.get(project.worktree) ?? [])
       if (rows.length === 0 && project.id !== "chats") continue
       const [store] = serverSync().child(project.worktree, { bootstrap: false })
-      const meta = projectForSession(rows[0], projects) ?? project
+      const meta = (rows[0] ? projectForSession(rows[0], projects) : undefined) ?? project
       result.push({
         key: pathKey(project.worktree),
         label: displayName(project),
@@ -268,7 +289,7 @@ export function ChatSidebarPane(props: {
         key: "chats",
         label: language.t("chats.title"),
         directory: chatRoot,
-        project: chatProject ? projectForSession(chatRows[0], projects) ?? chatProject : undefined,
+        project: chatProject ? (chatRows[0] ? projectForSession(chatRows[0], projects) : undefined) ?? chatProject : undefined,
         sessions: chatRows,
         total: store.sessionTotal > 0 ? store.sessionTotal : chatRows.length,
       })
@@ -616,13 +637,13 @@ export function ChatSidebarPane(props: {
   return (
     <div
       id="chat-sidebar-pane"
-      class="relative my-2 ms-2 flex min-h-0 shrink-0 select-none flex-col self-stretch overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-raised)]"
+      class="relative my-2 ms-2 flex min-h-0 shrink-0 select-none flex-col self-stretch overflow-hidden rounded-[8px] border border-v2-border-border-base/50 bg-v2-background-bg-base shadow-[0_1px_2px_0_var(--v2-alpha-dark-6),0_1px_3px_0_var(--v2-alpha-dark-4),0_0_0_0.5px_var(--v2-alpha-dark-8)]"
       style={{ width: `${props.state.sidebarWidth()}px` }}
       data-chat-sidebar-pane
     >
-      {/* ── Title bar ─────────────────────────────────────────── */}
-      <div class="flex h-9 shrink-0 items-center gap-1.5 px-2.5">
-        <span class="text-[11px] font-[560] leading-none tracking-[0.02em] text-v2-text-text-base">
+      {/* ── Title bar — zinc/IDE dense header ─────────────────── */}
+      <div class="flex h-9 shrink-0 items-center gap-1.5 border-b border-v2-border-border-muted/50 px-2.5">
+        <span class="text-[10px] font-[600] uppercase leading-none tracking-[0.08em] text-v2-text-text-muted">
           {language.t("chats.title")}
         </span>
         <Show when={workingCount() > 0}>
@@ -635,6 +656,16 @@ export function ChatSidebarPane(props: {
         </Show>
 
         <div class="ms-auto flex items-center gap-0.5">
+          <TooltipV2 value={language.t("usage.panel.title")} placement="bottom">
+            <IconButtonV2
+              type="button"
+              variant="ghost-muted"
+              size="small"
+              onClick={() => navigate("/usage")}
+              aria-label={language.t("usage.panel.title")}
+              icon={<IconV2 name="usage" />}
+            />
+          </TooltipV2>
           <TooltipV2 value={language.t("command.session.new")} placement="bottom">
             <IconButtonV2
               type="button"
@@ -660,8 +691,8 @@ export function ChatSidebarPane(props: {
         </div>
       </div>
 
-      {/* ── Session search (homepage inline search, pane-adapted) ── */}
-      <div class="shrink-0 px-2 pb-2">
+      {/* ── Session search — zinc inset field ─────────────────── */}
+      <div class="shrink-0 bg-v2-background-bg-base px-2 pb-2 pt-2">
         <div ref={search.element.setRoot} data-component="chats-session-search" class="relative z-30 w-full">
           <Show when={search.query.open()}>
             <div
@@ -750,11 +781,12 @@ export function ChatSidebarPane(props: {
               </div>
             </div>
           </Show>
-          <label class="relative z-20 flex h-7 w-full items-center gap-1.5 rounded-[6px] py-1 pl-2 pr-1 bg-v2-background-bg-layer-02/60 text-v2-icon-icon-muted transition-[background-color] duration-[120ms] ease-in-out hover:bg-v2-background-bg-layer-02 focus-within:bg-v2-background-bg-layer-02">
-            <IconV2 name="magnifying-glass" size="small" class="shrink-0" />
+          <label class="relative z-20 flex h-[26px] w-full items-center gap-1.5 rounded-[7px] border border-v2-border-border-base/60 bg-v2-background-bg-layer-01 px-1.5 text-v2-icon-icon-muted shadow-[inset_0_1px_1px_var(--v2-alpha-dark-6),inset_0_0.5px_0.5px_var(--v2-alpha-dark-4)] transition-[border-color,background-color,box-shadow] duration-150 hover:border-v2-border-border-base hover:bg-v2-background-bg-layer-02 focus-within:border-v2-border-border-strong focus-within:bg-v2-background-bg-base focus-within:shadow-[0_0_0_2px_var(--v2-alpha-dark-8)]">
+            <IconV2 name="magnifying-glass" size="small" class="shrink-0 opacity-80" />
             <input
               ref={search.element.setInput}
-              class="relative z-20 min-w-0 flex-1 border-0 bg-transparent text-[12px] outline-0 text-v2-text-text-base [font-weight:440] placeholder:text-v2-text-text-faint"
+              class="relative z-20 min-w-0 flex-1 border-0 bg-transparent text-[12px] font-[440] leading-none tracking-[-0.01em] text-v2-text-text-base outline-0 placeholder:text-v2-text-text-faint/70 [&::-webkit-search-cancel-button]:hidden [&::-webkit-search-decoration]:hidden"
+              type="text"
               value={search.query.value()}
               placeholder={language.t("chats.search.placeholder")}
               aria-label={language.t("chats.search.placeholder")}
@@ -906,6 +938,19 @@ export function ChatSidebarPane(props: {
                             observeHydration={observeHydration}
                             archiveSession={() => archiveSession(session)}
                             prefetchSession={() => prefetchSession(session)}
+                             onChangeModel={openModelPicker}
+                             onNewSessionInProject={() => navigateToNewSession(session.directory || group.directory)}
+                             onOpenProjectInExplorer={() => {
+                               const directory = session.directory || group.directory
+                               if (directory) void platform.revealPath?.(directory)
+                             }}
+                             onCopyProjectPath={() => {
+                               const directory = session.directory || group.directory
+                               if (directory) void navigator.clipboard.writeText(directory)
+                             }}
+                             onForkConversation={() => {
+                               void import("@/components/dialog-fork").then(({ DialogFork }) => dialog.show(() => <DialogFork sessionID={session.id} />))
+                             }}
                           />
                         )}
                       </For>
@@ -1071,6 +1116,14 @@ export function ChatSidebarPane(props: {
         pair={resizePair()}
         class="!absolute !inset-y-0 !right-0"
       />
+      <Show when={modelPicker()} keyed>
+        {(request) => (
+          <SessionModelPicker
+            {...request}
+            onClose={() => setModelPicker(null)}
+          />
+        )}
+      </Show>
     </div>
   )
 }
@@ -1302,12 +1355,17 @@ function ChatRow(props: {
   observeHydration: (el: Element, hydrate: () => void) => void
   archiveSession: () => Promise<void>
   prefetchSession: () => void
+  onChangeModel: (request: SessionModelPickerRequest) => void
+  onNewSessionInProject: () => void
+  onOpenProjectInExplorer: () => void
+  onCopyProjectPath: () => void
 }): JSX.Element {
   const language = useLanguage()
   const serverSync = useServerSync()
   const serverSDK = useServerSDK()
   const notification = useNotification()
   const permission = usePermission()
+  const platform = usePlatform()
 
   const title = () => sessionTitle(props.session.title)
   const currentDir = props.directory || props.session.directory || ""
@@ -1525,6 +1583,10 @@ function ChatRow(props: {
         server={serverKey()}
         onOpen={handleOpen}
         onArchive={() => void props.archiveSession()}
+        onChangeModel={props.onChangeModel}
+        onNewSessionInProject={props.onNewSessionInProject}
+        onOpenProjectInExplorer={props.onOpenProjectInExplorer}
+        onCopyProjectPath={props.onCopyProjectPath}
       >
         <div
           ref={rowEl}

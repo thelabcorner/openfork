@@ -36,9 +36,8 @@ const DEFAULT_TERMINAL_HEIGHT = 280
 const DEFAULT_BROWSER_PANEL_OPENED = false
 const DEFAULT_PROJECT_EXPLORER_PANEL_OPENED = false
 const DEFAULT_SESSION_CONTEXT_PANEL_OPENED = false
-export type SessionContextTab = "context" | "usage" | "limits"
+export type SessionContextTab = "context" | "limits"
 export const DEFAULT_SESSION_CONTEXT_TAB: SessionContextTab = "context"
-const DEFAULT_USAGE_PANEL_OPENED = false
 const DEFAULT_MODELS_PANEL_OPENED = false
 const DEFAULT_LIMITS_PANEL_OPENED = false
 const DEFAULT_CHATS_PANEL_OPENED = false
@@ -251,13 +250,20 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
       const limitsRaw = (value as Record<string, unknown>).limits
       const migratedSessionContext = (() => {
         if (!isRecord(sessionContextRaw)) return sessionContextRaw
-        if (typeof (sessionContextRaw as Record<string, unknown>).tab === "string") return sessionContextRaw
+        // The Usage tab was removed from the context panel (it's now the
+        // standalone /usage page) — any store still pointing at it falls
+        // back to Context rather than rendering an empty tab body.
+        const existingTab = (sessionContextRaw as Record<string, unknown>).tab
+        if (typeof existingTab === "string") {
+          if (existingTab === "usage") return { ...sessionContextRaw, tab: "context" as SessionContextTab }
+          return sessionContextRaw
+        }
         const hasSession = !!((sessionContextRaw as Record<string, unknown>).panelOpened as boolean)
         const hasUsage = !!(isRecord(usageRaw) ? (usageRaw as Record<string, unknown>).panelOpened : false)
         const hasLimits = !!(isRecord(limitsRaw) ? (limitsRaw as Record<string, unknown>).panelOpened : false)
         let tab: SessionContextTab = DEFAULT_SESSION_CONTEXT_TAB
         if (hasSession) tab = "context"
-        else if (hasUsage) tab = "usage"
+        else if (hasUsage) tab = "context"
         else if (hasLimits) tab = "limits"
         const mergedOpened = !!(hasSession || hasUsage || hasLimits)
         return {

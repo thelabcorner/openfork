@@ -28,7 +28,7 @@ const NAME = "Kimi for Coding"
 const KIMI_QUOTA_URL = "https://api.kimi.com/coding/v1/usages"
 
 export const kimi = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter => {
-  const cache = createQuotaCache<ReturnType<typeof buildResult>>("kimi-for-coding")
+  const cache = createQuotaCache<ReturnType<typeof buildResult>>("kimi-for-coding", { persistentKey: "kimi-for-coding" })
 
   return {
   id: "kimi-for-coding",

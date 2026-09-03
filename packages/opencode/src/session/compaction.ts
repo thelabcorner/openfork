@@ -186,6 +186,7 @@ export interface Interface {
     messages: SessionV1.WithParts[]
     sessionID: SessionID
     auto: boolean
+    continueAfter?: boolean
     overflow?: boolean
   }) => Effect.Effect<"continue" | "stop">
   readonly create: (input: {
@@ -193,6 +194,7 @@ export interface Interface {
     agent: string
     model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
     auto: boolean
+    continueAfter?: boolean
     overflow?: boolean
   }) => Effect.Effect<void>
 }
@@ -397,6 +399,7 @@ const layer = Layer.effect(
       messages: SessionV1.WithParts[]
       sessionID: SessionID
       auto: boolean
+      continueAfter?: boolean
       overflow?: boolean
     }) {
       const parent = input.messages.findLast((m) => m.info.id === input.parentID)
@@ -562,7 +565,16 @@ const layer = Layer.effect(
         })
       }
 
-      if (result === "continue" && input.auto) {
+      const currentMessages = yield* session.messages({ sessionID: input.sessionID })
+      const hasNewerUserMessage = currentMessages.some(
+        (message) =>
+          message.info.role === "user" &&
+          message.info.id !== input.parentID &&
+          (message.info.time.created > userMessage.time.created ||
+            (message.info.time.created === userMessage.time.created && message.info.id > userMessage.id)),
+      )
+
+      if (result === "continue" && (input.auto || input.continueAfter) && !hasNewerUserMessage) {
         if (replay) {
           const original = replay.info
           const replayMsg = yield* session.updateMessage({
@@ -658,6 +670,7 @@ const layer = Layer.effect(
       agent: string
       model: { providerID: ProviderV2.ID; modelID: ModelV2.ID }
       auto: boolean
+      continueAfter?: boolean
       overflow?: boolean
     }) {
       const msg = yield* session.updateMessage({
@@ -674,6 +687,7 @@ const layer = Layer.effect(
         sessionID: msg.sessionID,
         type: "compaction",
         auto: input.auto,
+        ...(input.continueAfter ? { continueAfter: true } : {}),
         overflow: input.overflow,
       })
     })

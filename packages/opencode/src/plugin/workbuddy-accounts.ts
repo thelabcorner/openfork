@@ -618,7 +618,25 @@ export class AccountRouter {
     if (existing) {
       const account = accounts.find((item) => item.id === existing)
       if (!account) return undefined
-      return { account, bound: true, reason: "affinity" }
+      // Auto-rotate on 429: if the bound account is blocked for this model
+      // (would hit a window/cooldown/quota admission failure), break affinity
+      // so the session can pool-rotate to an eligible account instead of
+      // staying stuck on the failing one.
+      const now = Date.now()
+      const metrics = account.governor.metrics()
+      // A known-zero package balance blocks EVERY model on this account, not
+      // just paid ones: Tencent's server runs its own balance check before
+      // every generation regardless of a model's published rate, so a
+      // 0-credit account 402s even on a nominally free promotional model.
+      const blocked = metrics.state === "QUOTA_EXHAUSTED" ||
+                      !account.governor.canAdmitModel(requestedModel, now) ||
+                      !!(metrics.cooldownUntil && now < metrics.cooldownUntil) ||
+                      !account.governor.hasKnownCredits()
+      if (blocked) {
+        this.unbind(session)
+      } else {
+        return { account, bound: true, reason: "affinity" }
+      }
     }
 
     const eligible = accounts.filter((account) => {
@@ -629,14 +647,22 @@ export class AccountRouter {
       return true
     })
     if (!eligible.length) return undefined
-    eligible.sort((a, b) => {
+    // Prefer accounts we KNOW have package credit left; a 0-credit account is
+    // deprioritized rather than excluded outright, because the cached balance
+    // (pushed opportunistically by the quota adapter, see
+    // `WorkBuddyEntitlementGovernor.setPackageCredits`) can be stale — trying
+    // it is still better than a hard "no eligible account" failure when it's
+    // the only option.
+    const funded = eligible.filter((account) => account.governor.hasKnownCredits())
+    const pool = funded.length > 0 ? funded : eligible
+    pool.sort((a, b) => {
       const am = a.governor.metrics()
       const bm = b.governor.metrics()
       const aLoad = am.active + am.queued + (am.state === "READY" ? 0 : 1000)
       const bLoad = bm.active + bm.queued + (bm.state === "READY" ? 0 : 1000)
       return aLoad - bLoad || a.id.localeCompare(b.id)
     })
-    const account = eligible[0]
+    const account = pool[0]
     this.bindings.set(session, account.id)
     return { account, bound: true, reason: "automatic" }
   }

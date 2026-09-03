@@ -102,6 +102,23 @@ export type ModelEntitlementRuntime = {
   recentTimestamps: number[]
   lastObservationAt: number | null
   serverCode: number | null
+  /**
+   * REAL WorkBuddy-reported consumption accumulated over the current window.
+   *
+   * The proxy receives per-request `credit` and token fields in the streamed
+   * usage object from upstream (see WORKBUDDY_USAGE_API_RESEARCH.md — the
+   * forensic `rawUsage` shape). Summing them gives the user a true spend
+   * figure rather than `observed × publishedRate`, which is what allows the
+   * picker to invert credits-left into a precise request estimate and to
+   * backtrack "how many did I burn in the last 24h".
+   *
+   * Reset to zero by `expireModel` when the frequency window rolls over.
+   */
+  creditsObserved: number
+  tokensInput: number
+  tokensOutput: number
+  tokensCacheHit: number
+  tokensCacheMiss: number
 }
 
 export function emptyModelRuntime(): ModelEntitlementRuntime {
@@ -116,12 +133,24 @@ export function emptyModelRuntime(): ModelEntitlementRuntime {
     recentTimestamps: [],
     lastObservationAt: null,
     serverCode: null,
+    creditsObserved: 0,
+    tokensInput: 0,
+    tokensOutput: 0,
+    tokensCacheHit: 0,
+    tokensCacheMiss: 0,
   }
 }
 
 const HISTORY_CAP = 5
 const TIMESTAMP_CAP = 200
 const BURN_WINDOW_MS = 60 * 60 * 1000
+
+/**
+ * Observations required before the locally averaged credit cost is trusted over
+ * the catalog's published rate. Mirrors the OpenCode Go picker's personal-cost
+ * threshold: one or two samples are noise, a handful is a signal.
+ */
+export const MIN_SAMPLES_FOR_PERSONAL_RATE = 3
 
 /** Feeds one confirmed hard-limit hit count into the learned-limit history (doc section 34, "reconcile"). */
 export function absorbLearnedLimit(runtime: ModelEntitlementRuntime, observedAtHit: number) {
@@ -155,10 +184,23 @@ export type ModelEntitlementReport = {
   resetSource: "server-6004" | "inferred" | "unknown"
   windowType: "server-defined" | "inferred-rolling-24h" | "unknown"
   windowStartedAt: number | null
+  /** Milliseconds until the next reset boundary. null when no window is known. */
+  secondsUntilReset: number | null
   lastObservationAt: number | null
   burnPerHour: number | null
   estimatedExhaustionAt: number | null
   willLikelyExhaustBeforeReset: boolean | null
+  /**
+    * Sum of `credit` WorkBuddy reported via upstream `usage` for this model in
+    * the current window — the real spend, not a sticker × observed estimate.
+    */
+  creditsObserved: number
+  tokensInput: number
+  tokensOutput: number
+  tokensCacheHit: number
+  tokensCacheMiss: number
+  /** True once we've accumulated enough real spend to invert for an estimate. */
+  creditsPersonalized: boolean
   /** OpenCode only sees generations it routed itself — see doc section 33. */
   coverage: "opencode-only"
 }
@@ -194,6 +236,11 @@ export function buildModelEntitlementReport(model: string, runtime: ModelEntitle
   const willLikelyExhaustBeforeReset =
     estimatedExhaustionAt !== null && resetAt !== null ? estimatedExhaustionAt < resetAt : null
 
+  const secondsUntilReset = resetAt !== null && resetAt > now ? Math.round((resetAt - now) / 1000) : null
+  // Enough real spend to invert credits-left into a request estimate. Below
+  // this the average is dominated by whichever single prompt happened to run.
+  const creditsPersonalized = runtime.observed >= MIN_SAMPLES_FOR_PERSONAL_RATE && runtime.creditsObserved > 0
+
   return {
     model,
     canonical,
@@ -215,10 +262,17 @@ export function buildModelEntitlementReport(model: string, runtime: ModelEntitle
         ? "inferred-rolling-24h"
         : "unknown",
     windowStartedAt: runtime.windowStartedAt,
+    secondsUntilReset,
     lastObservationAt: runtime.lastObservationAt,
     burnPerHour,
     estimatedExhaustionAt,
     willLikelyExhaustBeforeReset,
+    creditsObserved: runtime.creditsObserved,
+    tokensInput: runtime.tokensInput,
+    tokensOutput: runtime.tokensOutput,
+    tokensCacheHit: runtime.tokensCacheHit,
+    tokensCacheMiss: runtime.tokensCacheMiss,
+    creditsPersonalized,
     coverage: "opencode-only",
   }
 }
@@ -227,4 +281,72 @@ export function buildModelEntitlementReport(model: string, runtime: ModelEntitle
 export function parseErrorCode(raw: string): number | undefined {
   const m = raw.match(/"code"\s*:\s*"?(\d+)"?/)
   return m ? Number(m[1]) : undefined
+}
+
+/**
+ * The consumption WorkBuddy reported for ONE request.
+ *
+ * Tencent bills in credits and reports the real figure per generation, which is
+ * the honest replacement for "published rate × requests": it already accounts
+ * for prompt size, reasoning volume, and cache behaviour.
+ */
+export type ObservedConsumption = {
+  credit: number
+  input: number
+  output: number
+  cacheHit: number
+  cacheMiss: number
+}
+
+/**
+ * Pull real per-request consumption out of a streamed usage object.
+ *
+ * The upstream shape is not one fixed contract, so every field is read through
+ * several observed spellings:
+ *  - credits may sit at `credit`, `credits`, `used_credit`, or nested under
+ *    `rawUsage` (the forensic project-JSONL shape documented in
+ *    WORKBUDDY_USAGE_API_RESEARCH.md).
+ *  - tokens are OpenAI-shaped, with the cache split under either
+ *    `prompt_cache_hit_tokens` / `prompt_cache_miss_tokens` or the nested
+ *    `prompt_tokens_details.cached_tokens` form.
+ *
+ * Returns undefined when nothing numeric is present, so callers skip the
+ * sample rather than recording a phantom zero. This matters most for the free
+ * Hy models: the forensics show `rawUsage.credit = 0` for them, and a recorded
+ * 0 must be preserved as a REAL zero (free), not treated as missing data.
+ */
+export function consumptionFrom(usage: unknown): ObservedConsumption | undefined {
+  if (!usage || typeof usage !== "object") return undefined
+  const raw = usage as Record<string, unknown>
+  const nested = (raw.rawUsage ?? raw.raw_usage) as Record<string, unknown> | undefined
+  const num = (...keys: string[]): number | undefined => {
+    for (const key of keys) {
+      for (const source of [raw, nested]) {
+        const value = source?.[key]
+        if (typeof value === "number" && Number.isFinite(value)) return value
+        if (typeof value === "string" && value.trim()) {
+          const parsed = Number(value)
+          if (Number.isFinite(parsed)) return parsed
+        }
+      }
+    }
+    return undefined
+  }
+
+  const credit = num("credit", "credits", "used_credit", "usedCredit", "consume_credit")
+  const input = num("prompt_tokens", "promptTokens", "input_tokens")
+  const output = num("completion_tokens", "completionTokens", "output_tokens")
+  const details = (raw.prompt_tokens_details ?? nested?.prompt_tokens_details) as Record<string, unknown> | undefined
+  const cacheHit = num("prompt_cache_hit_tokens", "promptCacheHitTokens", "cache_read_input_tokens") ??
+    (typeof details?.cached_tokens === "number" ? details.cached_tokens : undefined)
+  const cacheMiss = num("prompt_cache_miss_tokens", "promptCacheMissTokens")
+
+  if (credit === undefined && input === undefined && output === undefined) return undefined
+  return {
+    credit: credit ?? 0,
+    input: input ?? 0,
+    output: output ?? 0,
+    cacheHit: cacheHit ?? 0,
+    cacheMiss: cacheMiss ?? (input !== undefined && cacheHit !== undefined ? Math.max(0, input - cacheHit) : 0),
+  }
 }

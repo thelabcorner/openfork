@@ -29,6 +29,7 @@ import { ShellJobs, jobLogPath, jobMetaPath } from "@/background/shell-jobs"
 import { Identifier } from "@/id/id"
 import type { TaskPromptOps } from "./task"
 import { Scope } from "effect"
+import { rewriteBashHeredocsForPowerShell } from "@/util/powershell-heredoc"
 
 export { Parameters } from "./shell/prompt"
 
@@ -372,7 +373,8 @@ function cmd(
   options: { forceKillAfter?: Duration.Input } = {},
 ) {
   if (process.platform === "win32" && Shell.ps(shell)) {
-    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", command], {
+    const powershellCommand = rewriteBashHeredocsForPowerShell(command)
+    return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", powershellCommand], {
       cwd,
       env,
       stdin,

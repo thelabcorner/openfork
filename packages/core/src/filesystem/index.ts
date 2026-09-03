@@ -115,19 +115,38 @@ export const layer = Layer.effect(
     const isOpencodePath = (p: string) => p === ".opencode" || p.startsWith(".opencode/")
 
     const subtrees = new Map<string, Subtree>()
+    /** Subtrees loaded from the search chunks, pending confirmation against disk. */
+    const unverified = new Set<string>()
     const byPath = new Map<string, FileSystem.Entry>()
     let builtAt = 0
     let rootStat: RootStat | undefined
     let loaded = false
     let persistRevision = 0
 
+    // A directory listing can never legitimately contain the same path twice,
+    // but a persisted index can: `hydrate` front-decodes the file and directory
+    // chunks and pushes every decoded path into its parent group, so a path
+    // duplicated across chunks is emitted once per occurrence. Those duplicates
+    // reach the client as repeated children of one directory — `docs` in this
+    // repo listed 45 children for 19 real ones, with `docs/handoff` eight times.
+    // Deduping here covers every writer (hydrate, live scan, restore) instead of
+    // just the one that happened to produce it, and keeps `byPath` consistent
+    // with the entries actually stored.
     const setSubtree = (dir: string, entries: FileSystem.Entry[], at = Date.now()) => {
       const prev = subtrees.get(dir)
       if (prev) {
         for (const e of prev.entries) byPath.delete(catalogKey(String(e.path)))
       }
-      subtrees.set(dir, { at, entries })
-      for (const e of entries) byPath.set(catalogKey(String(e.path)), e)
+      const seen = new Set<string>()
+      const deduped: FileSystem.Entry[] = []
+      for (const e of entries) {
+        const key = catalogKey(String(e.path))
+        if (seen.has(key)) continue
+        seen.add(key)
+        deduped.push(e)
+      }
+      subtrees.set(dir, { at, entries: deduped })
+      for (const e of deduped) byPath.set(catalogKey(String(e.path)), e)
     }
 
     const dropSubtree = (dir: string) => {
@@ -138,6 +157,8 @@ export const layer = Layer.effect(
     }
 
     const STAT_CONCURRENCY = 24
+    const LINE_COUNT_MAX_BYTES = 512 * 1024
+    const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|pdf|zip|tar|gz|tgz|bz2|xz|7z|rar|mp4|mp3|mov|avi|mkv|wasm|pyc|class|o|so|dll|exe|bin|dat|lock)$/i
     const attachMeta = (entries: readonly FileSystem.Entry[]): Effect.Effect<FileSystem.Entry[]> =>
       Effect.forEach(
         entries,
@@ -145,14 +166,20 @@ export const layer = Layer.effect(
           if (entry.type !== "file") return Effect.succeed(entry)
           const abs = path.join(root, catalogKey(String(entry.path)))
           return fs.stat(abs).pipe(
-            Effect.map((info) => {
+            Effect.flatMap((info) => {
               const size = Number(info.size)
               const mtime = Option.getOrElse(info.mtime, () => new Date(0)).getTime()
-              return {
+              const base = {
                 ...entry,
                 size: Number.isFinite(size) ? size : undefined,
                 mtime: mtime > 0 ? mtime : undefined,
               }
+              if (!Number.isFinite(size) || size > LINE_COUNT_MAX_BYTES || BINARY_EXT_RE.test(String(entry.path)))
+                return Effect.succeed(base)
+              return fs.readFileStringSafe(abs).pipe(
+                Effect.map((text) => (text === undefined ? base : { ...base, lineCount: text.split("\n").length })),
+                Effect.catch(() => Effect.succeed(base)),
+              )
             }),
             Effect.catch(() => Effect.succeed(entry)),
           )
@@ -383,6 +410,7 @@ export const layer = Layer.effect(
               type: isDir ? "directory" : "file",
               ...(meta?.size !== undefined ? { size: meta.size } : {}),
               ...(meta?.mtime !== undefined ? { mtime: meta.mtime } : {}),
+              ...(meta?.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
             }
             ensureGroup(dir).push(entry)
             if (isDir) ensureGroup(p)
@@ -394,7 +422,27 @@ export const layer = Layer.effect(
           for (const [dir, entries] of groups) {
             if (entries.length === 0 && dir !== "") continue
             entries.sort(compareEntries)
+            // These entries come from the SEARCH chunks, which carry no build
+            // timestamp and — unlike the `fileIndex` blob, restored with its real
+            // per-subtree `sub.at` — are not an authoritative directory listing.
+            // They can name paths deleted while this process was not running, so
+            // no watcher event ever tombstoned them.
+            //
+            // There is no honest `at` to use here: `Date.now()` claims the data
+            // was verified this instant, which permanently disables the
+            // `isDirStale` (`mtime >= at`) check for anything that changed
+            // offline, and the DB's own mtime is the time the SEARCH index was
+            // last written, which is routinely newer than the directory it
+            // describes. Either way `docs/chunkdb`, `docs/claude-first-party`
+            // and `docs/pwa-mobile` kept being served long after
+            // `chore: reorganize docs` deleted them.
+            //
+            // So do not encode trust in a timestamp at all: mark the subtree
+            // unverified and let the first `list` of that directory confirm it
+            // against disk. Cost is one targeted rescan per directory actually
+            // opened, after which it is cached normally.
             setSubtree(dir, entries, now)
+            unverified.add(dir)
             any = true
           }
           if (!any) return false
@@ -452,7 +500,10 @@ export const layer = Layer.effect(
     const buildDir = (dirPath: string): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (isOpencodePath(dirPath)) return
-        const listed = yield* filesystem.list({ path: RelativePath.make(dirPath) }).pipe(Effect.option)
+        const listed = yield* filesystem.list({ path: RelativePath.make(dirPath) }).pipe(
+          Effect.option,
+          Effect.catchDefect(() => Effect.succeed(Option.none())),
+        )
         if (Option.isNone(listed)) return
         const raw = normalizeEntries(listed.value).filter((e) => !isOpencodePath(String(e.path)))
         const withMeta = yield* attachMeta(raw)
@@ -466,6 +517,7 @@ export const layer = Layer.effect(
       Effect.gen(function* () {
         byPath.clear()
         subtrees.clear()
+        unverified.clear()
         yield* buildDir("")
         builtAt = Date.now()
         rootStat = yield* currentRootStat()
@@ -475,9 +527,20 @@ export const layer = Layer.effect(
     const targetedScan = (dirPath: string): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (isOpencodePath(dirPath)) return
-        const entries = normalizeEntries(yield* filesystem.list({ path: RelativePath.make(dirPath) }).pipe(Effect.orDie)).filter(
-          (e) => !isOpencodePath(String(e.path)),
+        const listed = yield* filesystem.list({ path: RelativePath.make(dirPath) }).pipe(
+          Effect.option,
+          Effect.catchDefect(() => Effect.succeed(Option.none())),
         )
+        // A directory can disappear between hydrate and verification (deleted
+        // while this process was stopped) or between two lists. `orDie` here
+        // turned an ordinary offline deletion into an `Unexpected server
+        // error` for the whole request, so treat "gone" as "empty": drop the
+        // stale subtree instead of serving paths that no longer exist.
+        if (Option.isNone(listed)) {
+          if (dropSubtree(dirPath)) yield* markDirty()
+          return
+        }
+        const entries = normalizeEntries(listed.value).filter((e) => !isOpencodePath(String(e.path)))
         const withMeta = yield* attachMeta(entries)
         setSubtree(dirPath, withMeta)
         yield* markDirty()
@@ -507,9 +570,14 @@ export const layer = Layer.effect(
       const dirPath = normalizeDirPath(input)
       const cached = subtrees.get(dirPath)
       if (cached) {
+        if (unverified.has(dirPath)) {
+          unverified.delete(dirPath)
+          yield* targetedScan(dirPath)
+          return withDirMeta(subtrees.get(dirPath)?.entries ?? [])
+        }
         if (yield* isDirStale(dirPath, cached.at)) {
           yield* targetedScan(dirPath)
-          return withDirMeta(subtrees.get(dirPath)!.entries)
+          return withDirMeta(subtrees.get(dirPath)?.entries ?? [])
         }
         if (cached.entries.some((e) => e.type === "file" && e.size === undefined)) {
           const withMeta = yield* attachMeta(cached.entries)
@@ -526,10 +594,10 @@ export const layer = Layer.effect(
           Effect.forkIn(scope),
           Effect.ignore as any,
         ) as any)
-        return withDirMeta(subtrees.get(dirPath)!.entries)
+        return withDirMeta(subtrees.get(dirPath)?.entries ?? [])
       }
       yield* targetedScan(dirPath)
-      return withDirMeta(subtrees.get(dirPath)!.entries)
+      return withDirMeta(subtrees.get(dirPath)?.entries ?? [])
     })
 
     const invalidate = Effect.fn("FileIndex.invalidate")(function* (dirPath: string) {
