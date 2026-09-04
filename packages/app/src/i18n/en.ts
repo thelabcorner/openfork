@@ -355,6 +355,7 @@ export const dict = {
   "dialog.model.account.section.accounts": "Accounts",
   "dialog.model.account.section.routing": "Routing",
   "dialog.model.account.auto": "Auto",
+  "dialog.model.account.aria": "{{name}}, {{count}} accounts",
   "dialog.model.account.count": "{{count}} total",
   "dialog.model.account.routingAutomatic": "Using automatic routing",
   "dialog.model.account.routingAutomaticDescription":
@@ -381,9 +382,10 @@ export const dict = {
   "dialog.credential.manageKeys": "Manage API keys",
   "dialog.credential.title": "OpenCode API keys",
   "dialog.credential.description":
-    "Switch between your connected OpenCode API keys, or manage the ones you have saved.",
-  "dialog.credential.active": "Active",
-  "dialog.credential.select": "Switch to this key",
+    "Set your default OpenCode API key and manage the keys you have saved. Bare requests route to the default key; per-account requests are pinned by model.",
+  "dialog.credential.default": "Default",
+  "dialog.credential.setDefault": "Set as default",
+  "dialog.credential.envSource": "Environment",
   "dialog.credential.rename": "Rename",
   "dialog.credential.remove": "Remove",
   "dialog.credential.add": "Add API key",
@@ -625,7 +627,8 @@ export const dict = {
   "limits.zen.queue.next": "Next up",
   "limits.zen.queue.position": "#{{position}}",
   "limits.zen.queue.reserve": "Reserve",
-  "limits.zen.queue.title": "Failover order: the key resetting soonest is picked next; unused keys are held in reserve.",
+  "limits.zen.queue.title":
+    "Failover order: the key resetting soonest is picked next; unused keys are held in reserve.",
   "limits.zen.estimated": "{{used}} / ~{{limit}} req",
   "limits.zen.observed": "{{used}} req observed",
 
@@ -1362,6 +1365,7 @@ export const dict = {
   "notification.action.goToSession": "Go to session",
 
   "notification.session.responseReady.title": "Response ready",
+  "notification.session.responseReady.description": "Your agent finished this chat.",
   "notification.session.error.title": "Session error",
   "notification.session.error.fallbackDescription": "An error occurred",
 
