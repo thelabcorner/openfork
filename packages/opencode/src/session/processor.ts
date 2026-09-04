@@ -26,6 +26,8 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { ForkCredentials } from "@/fork/credentials"
+import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
+import { stableZenIdentity } from "@/plugin/zen-accounts"
 import { SpadSupervisor } from "./spad/supervisor"
 import type { SpadAction } from "./spad/types"
 import { toolResourceKey } from "./spad/thrash"
@@ -526,6 +528,20 @@ const layer = Layer.effect(
           case "step-finish": {
             const completedSnapshot = yield* snapshot.track()
             yield* Effect.forEach(Object.keys(ctx.reasoningMap), finishReasoning)
+            // Anthropic reports thinking blocks it removed before the model saw the
+            // prompt. Prefix mismatches mean opencode changed history behind a signed
+            // block; log them so the churn can be tracked down.
+            const dropped = isRecord(value.providerMetadata?.anthropic)
+              ? value.providerMetadata.anthropic.inputTransformations
+              : undefined
+            if (Array.isArray(dropped) && dropped.length > 0) {
+              yield* Effect.logWarning("thinking blocks dropped by provider", {
+                sessionID: ctx.sessionID,
+                messageID: ctx.assistantMessage.id,
+                model: ctx.model.id,
+                transformations: JSON.stringify(dropped),
+              })
+            }
             const usage = Session.getUsage({
               model: ctx.model,
               usage: value.usage ?? new Usage({}),
@@ -547,12 +563,28 @@ const layer = Layer.effect(
             })
             yield* session.updateMessage(ctx.assistantMessage)
             if (ctx.model.providerID === "opencode" || ctx.model.providerID === "opencode-go") {
-              const credential = yield* forkCredentials.active()
-              if (credential)
-                yield* forkCredentials.recordUsage({
-                  messageID: ctx.assistantMessage.id,
-                  credentialID: credential.id,
-                })
+              // Per-key attribution: the model id carries the `@zen-...` account
+              // suffix naming the key that served this message. The fork vault
+              // keeps the credential UUID as its primary key, so resolve the
+              // suffix back to the vault id for the usage join.
+              const accountID =
+                typeof ctx.model.id === "string" ? splitAccountModelID(ctx.model.id).accountID : undefined
+              if (accountID) {
+                // The fork store read must never take down a step-finish: a
+                // missing vault/unknown account simply skips attribution, and
+                // any store fault collapses to a no-op instead of failing the
+                // stream (the pinned account may be an env key the vault does
+                // not know about, or was deleted mid-session).
+                yield* Effect.gen(function* () {
+                  const credentials = yield* forkCredentials.list()
+                  const match = credentials.find((credential) => stableZenIdentity(credential.key) === accountID)
+                  if (match)
+                    yield* forkCredentials.recordUsage({
+                      messageID: ctx.assistantMessage.id,
+                      credentialID: match.id,
+                    })
+                }).pipe(Effect.ignore)
+              }
             }
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
