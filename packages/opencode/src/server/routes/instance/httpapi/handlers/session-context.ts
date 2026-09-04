@@ -1,5 +1,5 @@
-import { HttpApiBuilder } from "effect/unstable/httpapi"
-import { Effect, Schema } from "effect"
+import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
+import { Cause, Effect, Option } from "effect"
 import { InstanceHttpApi } from "../api"
 import { Database } from "@opencode-ai/core/database/database"
 import { Session } from "@/session/session"
@@ -7,13 +7,39 @@ import { MessageV2 } from "@/session/message-v2"
 import { SessionContextState } from "@/session/context/state"
 import { SessionLedger } from "@/session/context/ledger"
 import { EffectiveContextCompiler } from "@/session/context/compiler"
+import { ApiNotFoundError } from "../errors"
+
+/**
+ * Translate any non-declared domain failure to the group's declared error
+ * channel ([HttpApiError.BadRequest, ApiNotFoundError]). Declared errors pass
+ * through untouched so 404s stay 404s; everything else becomes a 400.
+ */
+const translate = <A, R>(effect: Effect.Effect<A, unknown, R>): Effect.Effect<A, ApiNotFoundError | HttpApiError.BadRequest, R> =>
+  effect.pipe(
+    Effect.catchCause((cause) => {
+      const failure = Cause.findErrorOption(cause)
+      if (Option.isSome(failure)) {
+        const error = failure.value
+        if (error instanceof ApiNotFoundError || error instanceof HttpApiError.BadRequest) {
+          return Effect.fail(error)
+        }
+      }
+      return Effect.fail(new HttpApiError.BadRequest())
+    }),
+  )
+
+/** Apply `translate` to the effect produced by an `Effect.fn` builder function. */
+const translateHandler =
+  <A, R>(f: (...args: any[]) => Effect.Effect<A, unknown, R>) =>
+  (...args: any[]): Effect.Effect<A, ApiNotFoundError | HttpApiError.BadRequest, R> =>
+    translate(f(...args))
 
 export const sessionContextHandlers = HttpApiBuilder.group(InstanceHttpApi, "session-context", (handlers) =>
   Effect.gen(function* () {
     const session = yield* Session.Service
     const database = yield* Database.Service
 
-    const applyOps = Effect.fn("session-context.applyOps")(function* ({ params, payload }: any) {
+    const applyOps = translateHandler(Effect.fn("session-context.applyOps")(function* ({ params, payload }: any) {
       const { sessionID } = params as { sessionID: string }
       // Validate session exists
       yield* session.get(sessionID as any)
@@ -24,8 +50,8 @@ export const sessionContextHandlers = HttpApiBuilder.group(InstanceHttpApi, "ses
       // Pre-validate: load messages once to check signed reasoning
       const all = yield* MessageV2.stream(sessionID as any).pipe(
         Effect.provideService(Database.Service, database),
-        Effect.catch(() => Effect.succeed([] as any[])),
-      ) as any[]
+        Effect.catch(() => Effect.succeed([] as never)),
+      )
       const byId = new Map(all.map((m: any) => [m.info.id, m]))
 
       for (const op of ops) {
@@ -46,32 +72,37 @@ export const sessionContextHandlers = HttpApiBuilder.group(InstanceHttpApi, "ses
         operations: ops as any,
       })
       return result
-    })
+    }),
+  )
 
-    const opsHistory = Effect.fn("session-context.opsHistory")(function* ({ params }: any) {
+    const opsHistory = translateHandler(Effect.fn("session-context.opsHistory")(function* ({ params }: any) {
       const { sessionID } = params as { sessionID: string }
       yield* session.get(sessionID as any)
       const rows = yield* SessionContextState.getOpsHistory(sessionID as any)
       return rows
-    })
+    }),
+  )
 
-    const ledger = Effect.fn("session-context.ledger")(function* ({ params }: any) {
+    const ledger = translateHandler(Effect.fn("session-context.ledger")(function* ({ params }: any) {
       const { sessionID } = params as { sessionID: string }
       yield* session.get(sessionID as any)
       const all = yield* MessageV2.stream(sessionID as any).pipe(
         Effect.provideService(Database.Service, database),
-      ) as any[]
+        Effect.catch(() => Effect.succeed([] as never)),
+      )
       const filtered = MessageV2.filterCompacted(all as any)
       const result = yield* SessionLedger.build({ sessionID, messages: filtered as any })
       return result
-    })
+    }),
+  )
 
-    const preview = Effect.fn("session-context.preview")(function* ({ params }: any) {
+    const preview = translateHandler(Effect.fn("session-context.preview")(function* ({ params }: any) {
       const { sessionID } = params as { sessionID: string }
       yield* session.get(sessionID as any)
       const all = yield* MessageV2.stream(sessionID as any).pipe(
         Effect.provideService(Database.Service, database),
-      ) as any[]
+        Effect.catch(() => Effect.succeed([] as never)),
+      )
       const filtered = MessageV2.filterCompacted(all as any)
       const ledgerData = yield* SessionLedger.build({ sessionID, messages: filtered as any })
       const compiled = yield* EffectiveContextCompiler.compileForSession({
@@ -112,14 +143,16 @@ export const sessionContextHandlers = HttpApiBuilder.group(InstanceHttpApi, "ses
         effectiveCount: (compiled as any).effective.length,
         earliestMutationIndex,
       }
-    })
+    }),
+  )
 
-    const forkOrigin = Effect.fn("session-context.forkOrigin")(function* ({ params }: any) {
+    const forkOrigin = translateHandler(Effect.fn("session-context.forkOrigin")(function* ({ params }: any) {
       const { sessionID } = params as { sessionID: string }
       const origin = yield* SessionContextState.getForkOrigin(sessionID as any)
       if (!origin) return yield* Effect.fail(new Error(`No fork origin for session ${sessionID}`))
       return origin
-    })
+    }),
+  )
 
     return handlers
       .handle("applyOps", applyOps)

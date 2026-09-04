@@ -58,9 +58,13 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppNodeBuilderV1 } from "./app-node-builder-v1"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 
 export const AppLayer = AppNodeBuilderV1.build(
   LayerNode.group([
+    filesystem,
+    CrossSpawnSpawner.node,
     Npm.node,
     FSUtil.node,
     Database.node,

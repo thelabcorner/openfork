@@ -394,7 +394,7 @@ const layer = Layer.effect(
       }
     })
 
-    const processCompaction = Effect.fn("SessionCompaction.process")(function* (input: {
+    const processCompactionEffect = Effect.fn("SessionCompaction.process")(function* (input: {
       parentID: MessageID
       messages: SessionV1.WithParts[]
       sessionID: SessionID
@@ -664,6 +664,11 @@ const layer = Layer.effect(
       }
       return result
     })
+    // Wrap the Effect.fn builder in a real callable: errors are unexpected
+    // here (the compaction driver owns failure handling), so surface them as
+    // defects instead of leaking a NotFoundError channel.
+    const processCompaction: Interface["process"] = (input) =>
+      processCompactionEffect(input).pipe(Effect.orDie)
 
     const create = Effect.fn("SessionCompaction.create")(function* (input: {
       sessionID: SessionID

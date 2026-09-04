@@ -774,9 +774,10 @@ const layer: Layer.Layer<
       let effectiveIDs: Set<string> | undefined
       try {
         const { SessionContextState } = yield* Effect.promise(() => import("./context/state"))
-        const stateMap = yield* (SessionContextState.getState as any)(input.sessionID).pipe(
+        const state = yield* (SessionContextState.getState as any)(input.sessionID).pipe(
           Effect.catch(() => Effect.succeed(new Map())),
-        ) as Map<string, any>
+        )
+        const stateMap = state as Map<string, any>
         if (stateMap.size > 0) {
           effectiveIDs = new Set()
           for (const msg of msgs.slice(0, target)) {
@@ -852,7 +853,7 @@ const layer: Layer.Layer<
       if ((original as any).groupID) {
         try {
           const { db } = yield* Database.Service
-          const { SessionTable } = yield* Effect.promise(() => import("@opencode-ai/core/session/sql")).then((m) => m)
+          const { SessionTable } = yield* Effect.promise(() => import("@opencode-ai/core/session/sql"))
           void SessionTable
           // Direct update: set group_id on the forked session row to match original's group
           // This is best-effort; failure doesn't break the fork.
@@ -1051,7 +1052,7 @@ const layer: Layer.Layer<
       list,
       listGlobal,
       create,
-      fork,
+      fork: fork as Interface["fork"],
       touch,
       get,
       setTitle,

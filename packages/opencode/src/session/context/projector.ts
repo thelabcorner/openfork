@@ -118,7 +118,8 @@ const layer = Layer.effectDiscard(
               break
           }
         }
-      }),
+      })
+    .pipe(Effect.orDie) as unknown as Effect.Effect<void>,
     )
 
     yield* events.project(SessionContext.ForkCreated, (event) =>

@@ -77,7 +77,7 @@ export const isExcluded = Effect.fn("SessionContextState.isExcluded")(function* 
   const row = yield* db
     .select()
     .from(SessionContextStateTable)
-    .where(and(eq(SessionContextStateTable.session_id, sessionID), eq(SessionContextStateTable.message_id, messageID)))
+    .where(and(eq(SessionContextStateTable.session_id, sessionID), eq(SessionContextStateTable.message_id, messageID as MessageID)))
     .get()
     .pipe(Effect.orDie)
   return row?.excluded ?? false
@@ -348,9 +348,11 @@ export const setForkOrigin = Effect.fn("SessionContextState.setForkOrigin")(func
   yield* db
     .insert(SessionForkOriginTable)
     .values({
-      session_id: input.sessionID,
-      parent_session_id: input.parentSessionID,
-      source_message_id: input.sourceMessageID,
+      // The core table brands with `SessionSchema.ID`; the local `SessionID`
+      // is a sibling declaration, so cast at the boundary.
+      session_id: input.sessionID as any,
+      parent_session_id: input.parentSessionID as any,
+      source_message_id: input.sourceMessageID as any,
       edge: input.edge,
       kind: input.kind,
       workspace_mode: input.workspaceMode,

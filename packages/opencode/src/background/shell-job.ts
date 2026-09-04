@@ -6,6 +6,7 @@ import { ShellJobs, jobLogPath, jobMetaPath, type ShellJobDelivery, type ShellJo
 import { MonitorDelivery } from "@/background/monitor-delivery"
 import { TRUNCATION_DIR } from "@/tool/truncation-dir"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { Effect, Layer, Context, Stream, Scope } from "effect"
@@ -132,7 +133,7 @@ const layer = Layer.effect(
       // For V1 we keep synthetic injection for shell completion, monitor uses ingress
     })
 
-    const launch: Interface["launch"] = Effect.fn("ShellJob.launch")(function* (input, ctx): Effect.Effect<LaunchResult, Error, unknown> {
+    const launch: Interface["launch"] = Effect.fn("ShellJob.launch")(function* (input, ctx) {
       const jobId = yield* ensureJobId(input.id)
       const logPath = jobLogPath(jobId)
       const metaPath = jobMetaPath(jobId)
@@ -366,7 +367,7 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer,
-  deps: [BackgroundJob.node, ShellJobs.node, MonitorDelivery.node, Truncate.node],
+  deps: [BackgroundJob.node, ShellJobs.node, MonitorDelivery.node, Truncate.node, CrossSpawnSpawner.node, FSUtil.node],
 })
 
 export * as ShellJob from "./shell-job"

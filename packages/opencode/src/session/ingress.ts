@@ -81,10 +81,13 @@ const layer = Layer.effect(
     // Storing it per-instance via InstanceState would require an InstanceRef at registration time,
     // but registration happens once at server startup when no instance exists, causing
     // "InstanceRef not provided" and crashing Server.listen (desktop sidecar). Keep it global.
-    const wakeHandlerRef = yield* Ref.make<(sessionID: SessionID) => Effect.Effect<void> | undefined>(undefined)
+    type WakeHandler = (sessionID: SessionID) => Effect.Effect<void>
+    const wakeHandlerRef = yield* Ref.make<WakeHandler | undefined>(undefined)
+    // Capture the layer scope once and close over it so `publish` keeps
+    // Requirement = never (Interface declares `Effect<void, never, never>`).
+    const layerScope = yield* Scope.Scope
 
     const publish: Interface["publish"] = Effect.fn("SessionIngress.publish")(function* (event) {
-      const scope = yield* Scope.Scope
       const data = yield* InstanceState.get(state)
       const existing = data.queues.get(event.sessionID) ?? []
       if (existing.length >= MAX_PENDING_BATCHES) {
@@ -105,7 +108,7 @@ const layer = Layer.effect(
       yield* Effect.logInfo("monitor ingress enqueued", { sessionID: event.sessionID, jobID: event.jobID, seq: `${event.sequenceFrom}-${event.sequenceTo}` })
       const wakeHandler = yield* Ref.get(wakeHandlerRef)
       if (wakeHandler) {
-        yield* wakeHandler(event.sessionID).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.ignore)
+        yield* wakeHandler(event.sessionID).pipe(Effect.forkIn(layerScope, { startImmediately: true }), Effect.ignore)
       }
     })
 
