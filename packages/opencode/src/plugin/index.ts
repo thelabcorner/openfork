@@ -23,7 +23,7 @@ import { XaiAuthPlugin } from "./xai"
 import { CerebrasPlugin } from "./cerebras"
 import { WorkBuddyPlugin } from "./workbuddy"
 import { VerdentPlugin } from "./verdent"
-import { ZenPlugin } from "./zen"
+import { ZenPlugin, ZenGoPlugin } from "./zen"
 import { SnowflakeCortexAuthPlugin } from "./snowflake-cortex"
 import { ClaudeAuthPlugin } from "./claude"
 import { GensparkAuthPlugin } from "./genspark"
@@ -88,6 +88,7 @@ function internalPlugins(flags: RuntimeFlags.Info): PluginInstance[] {
     WorkBuddyPlugin,
     VerdentPlugin,
     ZenPlugin,
+    ZenGoPlugin,
     XaiAuthPlugin,
     CerebrasPlugin,
     ClaudeAuthPlugin,

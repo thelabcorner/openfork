@@ -19,6 +19,8 @@ export type AccountModelParts = {
 export const ACCOUNT_MODEL_PROVIDERS: readonly AccountModelProvider[] = [
   { id: "workbuddy", accountPrefix: "wb-", aliasMarkers: ["#ctx-"] },
   { id: "verdent", accountPrefix: "vd-", aliasMarkers: [] },
+  { id: "opencode", accountPrefix: "zen-", aliasMarkers: [] },
+  { id: "opencode-go", accountPrefix: "zen-", aliasMarkers: [] },
 ]
 
 /**

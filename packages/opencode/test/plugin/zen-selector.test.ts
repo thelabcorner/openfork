@@ -1,25 +1,36 @@
 import { describe, expect, test } from "bun:test"
-import { mkdirSync, rmSync } from "fs"
-import { tmpdir } from "os"
-import { join } from "path"
+import type { PluginInput } from "@opencode-ai/plugin"
 import {
+  ZenGoPlugin,
   ZenPlugin,
-  resetZenForkNotice,
-  setTestZenAccountStore,
+  resetZenPoolForTest,
   setTestZenFetch,
-  setTestZenForkActive,
+  setTestZenVaultCredentials,
   zenLimitSnapshot,
   zenProviderFetch,
 } from "@/plugin/zen"
 
-function freshRoot(): string {
-  const root = join(tmpdir(), `opencode-zen-selector-${process.pid}-${Math.random().toString(36).slice(2)}`)
-  mkdirSync(root, { recursive: true })
-  return root
-}
-
-function cleanup(root: string) {
-  rmSync(root, { recursive: true, force: true })
+function configure(keys: string[]) {
+  resetZenPoolForTest()
+  setTestZenVaultCredentials(undefined)
+  const names = ["OPENCODE_API_KEY", "OPENCODE_API_KEY_2", "OPENCODE_API_KEY_3"]
+  const original = names.map((name) => process.env[name])
+  for (const [index, name] of names.entries()) {
+    const value = keys[index]
+    if (value === undefined) delete process.env[name]
+    else process.env[name] = value
+  }
+  setTestZenVaultCredentials([])
+  return () => {
+    for (const [index, name] of names.entries()) {
+      const value = original[index]
+      if (value === undefined) delete process.env[name]
+      else process.env[name] = value
+    }
+    setTestZenFetch(undefined)
+    setTestZenVaultCredentials(undefined)
+    resetZenPoolForTest()
+  }
 }
 
 function baseCatalog() {
@@ -37,35 +48,25 @@ function baseCatalog() {
 }
 
 async function modelsHook() {
-  const hooks = await ZenPlugin({ serverUrl: new URL("http://127.0.0.1:1") } as any)
+  const hooks = await ZenPlugin({ serverUrl: new URL("http://127.0.0.1:1") } as PluginInput)
   return hooks.provider!.models!
 }
 
 describe("zen models hook", () => {
-  test("empty registry leaves the catalog unchanged", async () => {
-    const root = freshRoot()
-    setTestZenAccountStore(root)
-    const original = process.env.OPENCODE_API_KEY
-    delete process.env.OPENCODE_API_KEY
+  test("empty pool leaves the catalog unchanged", async () => {
+    const dispose = configure([])
     try {
       const models = await modelsHook()
       const catalog = baseCatalog()
       const result = await models(catalog, {})
       expect(result).toBe(catalog.models)
     } finally {
-      if (original === undefined) delete process.env.OPENCODE_API_KEY
-      else process.env.OPENCODE_API_KEY = original
-      cleanup(root)
+      dispose()
     }
   })
 
   test("each key emits one variant per base model with label names and qualified api ids", async () => {
-    const root = freshRoot()
-    setTestZenAccountStore(root)
-    const original = process.env.OPENCODE_API_KEY
-    const original2 = process.env.OPENCODE_API_KEY_2
-    process.env.OPENCODE_API_KEY = "selector-key-a"
-    process.env.OPENCODE_API_KEY_2 = "selector-key-b"
+    const dispose = configure(["selector-key-a", "selector-key-b"])
     try {
       const models = await modelsHook()
       const result = await models(baseCatalog(), {})
@@ -77,15 +78,44 @@ describe("zen models hook", () => {
       for (const id of variants) {
         const model = result[id]!
         expect(model.api.id).toBe(id)
+        expect(model.id).toBe(id)
         expect(model.name.startsWith("Grok Code (key-")).toBe(true)
         expect(id).not.toContain("selector-key")
       }
     } finally {
-      if (original === undefined) delete process.env.OPENCODE_API_KEY
-      else process.env.OPENCODE_API_KEY = original
-      if (original2 === undefined) delete process.env.OPENCODE_API_KEY_2
-      else process.env.OPENCODE_API_KEY_2 = original2
-      cleanup(root)
+      dispose()
+    }
+  })
+
+  test("already-qualified catalog models are never re-qualified", async () => {
+    const dispose = configure(["key-a"])
+    try {
+      const models = await modelsHook()
+      const catalog = baseCatalog()
+      catalog.models = {
+        "grok-code": catalog.models["grok-code"],
+        "grok-code@zen-already": { ...catalog.models["grok-code"], id: "grok-code@zen-already" },
+      }
+      const result = await models(catalog, {})
+      // The pre-qualified model is kept as-is; the bare one gains exactly one
+      // new per-account variant — never a double-qualified `@zen-…@zen-…` id.
+      const ids = Object.keys(result)
+      expect(ids.filter((id) => id.includes("@")).length).toBe(2)
+      expect(ids.some((id) => id.includes("@zen-already@zen-"))).toBe(false)
+    } finally {
+      dispose()
+    }
+  })
+
+  test("ZenGoPlugin emits the same per-account variants for opencode-go", async () => {
+    const dispose = configure(["go-key-a", "go-key-b"])
+    try {
+      const hooks = await ZenGoPlugin({ serverUrl: new URL("http://127.0.0.1:1") } as PluginInput)
+      expect(hooks.provider!.id).toBe("opencode-go")
+      const result = await hooks.provider!.models!(baseCatalog(), {})
+      expect(Object.keys(result).filter((id) => id.startsWith("grok-code@zen-")).length).toBe(2)
+    } finally {
+      dispose()
     }
   })
 })
@@ -109,38 +139,16 @@ describe("zen provider fetch wrapper", () => {
     return { headers, body }
   }
 
-  function runFetch(model: string, session = "session-selector") {
+  function runFetch(model: string) {
     return zenProviderFetch("https://opencode.ai/zen/v1/chat/completions", {
       method: "POST",
-      headers: new Headers({ "x-opencode-session": session }),
+      headers: new Headers({ "x-opencode-session": "session-selector" }),
       body: JSON.stringify({ model, messages: [{ role: "user", content: "hi" }] }),
     })
   }
 
-  function withKeys(keys: string[], run: () => Promise<void>) {
-    const root = freshRoot()
-    setTestZenAccountStore(root)
-    resetZenForkNotice()
-    const names = ["OPENCODE_API_KEY", "OPENCODE_API_KEY_2"]
-    const original = names.map((name) => process.env[name])
-    for (const [index, name] of names.entries()) process.env[name] = keys[index]
-    setTestZenForkActive(false)
-    return {
-      async finally() {
-        for (const [index, name] of names.entries()) {
-          const value = original[index]
-          if (value === undefined) delete process.env[name]
-          else process.env[name] = value
-        }
-        setTestZenForkActive(undefined)
-        setTestZenFetch(undefined)
-        cleanup(root)
-      },
-    }
-  }
-
-  test("qualified id pins the session and de-qualifies the wire model", async () => {
-    const handle = withKeys(["wrap-key-a", "wrap-key-b"], async () => {})
+  test("qualified id routes to that account and de-qualifies the wire model", async () => {
+    const dispose = configure(["wrap-key-a", "wrap-key-b"])
     try {
       stubFetch([new Response(JSON.stringify({ choices: [] }), { status: 200 })])
       const snapshot = zenLimitSnapshot()
@@ -148,30 +156,28 @@ describe("zen provider fetch wrapper", () => {
       await runFetch(`model-x@${target}`)
       expect(lastCall().body.model).toBe("model-x")
       expect(lastCall().headers.get("Authorization")).toBe("Bearer wrap-key-b")
-      await runFetch("model-x")
-      expect(lastCall().headers.get("Authorization")).toBe("Bearer wrap-key-b")
     } finally {
-      handle.finally()
+      dispose()
     }
   })
 
-  test("auto:sticky routes through the router and de-qualifies the wire model", async () => {
-    const handle = withKeys(["sticky-key-a", "sticky-key-b"], async () => {})
+  test("the same session's next request uses the resolved key, with no session-pin side effect", async () => {
+    const dispose = configure(["pin-key-a", "pin-key-b"])
     try {
       stubFetch([new Response(JSON.stringify({ choices: [] }), { status: 200 })])
-      await runFetch("model-y@zen-auto:sticky")
-      const first = lastCall()
-      expect(first.body.model).toBe("model-y")
-      expect(first.headers.get("Authorization")?.startsWith("Bearer sticky-key-")).toBe(true)
+      const target = zenLimitSnapshot()[1]!.accountId
+      await runFetch(`model-y@${target}`)
+      expect(lastCall().headers.get("Authorization")).toBe("Bearer pin-key-b")
+      // Bare models resolve the default account each time (no affinity).
       await runFetch("model-y")
-      expect(lastCall().headers.get("Authorization")).toBe(first.headers.get("Authorization"))
+      expect(lastCall().headers.get("Authorization")).toBe("Bearer pin-key-a")
     } finally {
-      handle.finally()
+      dispose()
     }
   })
 
-  test("a non-ok response is observed into the routed key's governor", async () => {
-    const handle = withKeys(["observe-key-a"], async () => {})
+  test("a non-ok response is observed into the routed key's pool state", async () => {
+    const dispose = configure(["observe-key-a"])
     try {
       stubFetch([
         new Response(JSON.stringify({ error: { message: "FreeUsageLimitError" } }), {
@@ -179,29 +185,14 @@ describe("zen provider fetch wrapper", () => {
           headers: { "retry-after": "120" },
         }),
       ])
-      const account = zenLimitSnapshot()[0]!
-      await runFetch(`model-z@${account.accountId}`)
-      const after = zenLimitSnapshot()[0]!
-      expect(after.state).toBe("COOLING_DOWN")
-      expect(after.resetAt).not.toBeNull()
-      expect(after.hits.length).toBe(1)
-      expect(after.hits[0]!.kind).toBe("rate-limit")
+      const account = zenLimitSnapshot()
+      const target = account[0]!.accountId
+      await runFetch(`model-z@${target}`)
+      const after = zenLimitSnapshot()
+      expect(after.find((row) => row.accountId === target)!.state).toBe("COOLING_DOWN")
+      expect(after.find((row) => row.accountId === target)!.resetAt).not.toBeNull()
     } finally {
-      handle.finally()
-    }
-  })
-
-  test("ok responses stream through untouched and are not observed as failures", async () => {
-    const handle = withKeys(["clean-key-a"], async () => {})
-    try {
-      const ok = new Response(JSON.stringify({ choices: [] }), { status: 200 })
-      stubFetch([ok])
-      await runFetch("model-w")
-      const account = zenLimitSnapshot()[0]!
-      expect(account.state).toBe("READY")
-      expect(account.hits.length).toBe(0)
-    } finally {
-      handle.finally()
+      dispose()
     }
   })
 })

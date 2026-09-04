@@ -13,7 +13,6 @@ import { serviceUse } from "@opencode-ai/core/effect/service-use"
 import { type LanguageModelV3 } from "@ai-sdk/provider"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { Auth } from "../auth"
-import { ForkCredentials } from "../fork/credentials"
 import { Env } from "../env"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { iife } from "@/util/iife"
@@ -35,7 +34,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { trackNvidiaRequest } from "@/quota/providers/nvidia-usage"
 import { ProviderError } from "./error"
 import { shouldEnableClaudeFirstParty } from "@/plugin/shared"
-import { zenProviderFetch } from "@/plugin/zen"
+import { zenProviderFetch, syncZenAccountPool, zenQuotaAccounts } from "@/plugin/zen"
 import {
   MODEL_IDS,
   MODEL_METADATA,
@@ -240,12 +239,19 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
       }),
     opencode: Effect.fnUntraced(function* (input: Info) {
       const env = yield* dep.env()
+      // Both zen providers draw from one unified key pool (env keys + fork
+      // vault). Pool presence is therefore a credential source independent of
+      // the legacy env/auth/config gates; sync once so vault keys are visible
+      // before this loader decides whether the provider is available.
+      yield* Effect.promise(() => syncZenAccountPool())
+      const poolHasCredentials = zenQuotaAccounts().length > 0
       const hasKey = iife(() => {
         if (input.env.some((item) => env[item])) return true
         return false
       })
       const ok =
         hasKey ||
+        poolHasCredentials ||
         Boolean(yield* dep.auth(input.id)) ||
         Boolean((yield* dep.config()).provider?.["opencode"]?.options?.apiKey)
 
@@ -259,6 +265,21 @@ function custom(dep: CustomDep): Record<string, CustomLoader> {
       return {
         autoload: Object.keys(input.models).length > 0,
         options: { ...(ok ? {} : { apiKey: "public" }), fetch: zenProviderFetch },
+      }
+    }),
+    "opencode-go": Effect.fnUntraced(function* (input: Info) {
+      const env = yield* dep.env()
+      yield* Effect.promise(() => syncZenAccountPool())
+      const hasKey = input.env.some((item) => env[item])
+      const ok =
+        hasKey ||
+        zenQuotaAccounts().length > 0 ||
+        Boolean(yield* dep.auth(input.id)) ||
+        Boolean((yield* dep.config()).provider?.["opencode-go"]?.options?.apiKey)
+
+      return {
+        autoload: ok,
+        options: { fetch: zenProviderFetch },
       }
     }),
     openai: () =>
@@ -1584,7 +1605,6 @@ const layer = Layer.effect(
     const fs = yield* FSUtil.Service
     const config = yield* Config.Service
     const auth = yield* Auth.Service
-    const forkCredentials = yield* ForkCredentials.Service
     const env = yield* Env.Service
     const plugin = yield* Plugin.Service
     const modelsDevSvc = yield* ModelsDev.Service
@@ -1927,18 +1947,6 @@ const layer = Layer.effect(
               source: "api",
               key: provider.key,
             })
-          }
-        }
-
-        // Fork: the opencode/opencode-go key is managed by our own multi-key
-        // credential store rather than auth.json once the user has connected
-        // through it — override with whichever credential is marked active.
-        const forkActive = yield* forkCredentials.active()
-        if (forkActive) {
-          for (const id of ["opencode", "opencode-go"]) {
-            const providerID = ProviderV2.ID.make(id)
-            if (disabled.has(providerID)) continue
-            mergeProvider(providerID, { source: "api", key: forkActive.key })
           }
         }
 

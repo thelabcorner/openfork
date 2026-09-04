@@ -44,23 +44,20 @@ const ZEN_KEY_STATE: Record<string, ZenKeyLimits["state"]> = {
 /**
  * One limits-panel row per configured Zen key. The free-tier estimate is
  * computed per account from the shared usage snapshot (the free limiter is
- * IP-scoped, so the pool window is common; per-key differentiation comes from
- * the governor state and the failover queue). Rows carry the governor's own
- * resetAt — the exact timestamp the router orders by — so the displayed
- * countdown and the next failover pick always agree.
+ * IP-scoped, so the pool window is common across keys; per-key
+ * differentiation comes only from the in-memory 402/429 observation).
  */
 export function zenKeyLimitsRows(snapshot: ZenFreeSnapshot, now = Date.now()): ZenKeyLimits[] {
+  const estimate = estimateZenFreeLimit({ snapshot, now })
   return zenLimitSnapshot(now).map((entry) => {
-    const estimate = estimateZenFreeLimit({ snapshot, now })
-    const usedObserved = entry.everUsed ? estimate.used : null
-    const resetAfterSeconds =
-      entry.resetAt === null ? null : Math.max(0, Math.round((entry.resetAt - now) / 1000))
+    const usedObserved = estimate.used
+    const resetAfterSeconds = entry.resetAt === null ? null : Math.max(0, Math.round((entry.resetAt - now) / 1000))
     return {
       keyId: entry.accountId,
       label: entry.label,
       state: ZEN_KEY_STATE[entry.state] ?? "unknown",
       exhausted: entry.state === "QUOTA_EXHAUSTED",
-      everUsed: entry.everUsed,
+      isDefault: entry.isDefault,
       resetAt: entry.resetAt,
       resetAfterSeconds,
       usedObserved,
@@ -70,7 +67,6 @@ export function zenKeyLimitsRows(snapshot: ZenFreeSnapshot, now = Date.now()): Z
           ? null
           : clampPercent(100 - (usedObserved / estimate.limit) * 100),
       estimateSource: usedObserved === null ? null : estimate.source,
-      queuePosition: entry.queuePosition,
     }
   })
 }

@@ -101,13 +101,10 @@ export const WorkBuddyAccountLimits = Schema.Struct({
 export type WorkBuddyAccountLimits = Schema.Schema.Type<typeof WorkBuddyAccountLimits>
 
 /**
- * One configured Zen API key, for the limits panel's per-key rows. `resetAt`
- * is the governor's own value — the same timestamp the failover router orders
- * by — so the displayed countdown and the router's next pick always agree.
- * `keyId` is a stable hash of the key; the raw API key never crosses this
- * surface. `queuePosition` is the 1-based rank in the failover ordering
- * (used keys by `resetAt` ascending, never-used keys last); null when the
- * ordering is not applicable (a single key, or no router state yet).
+ * One configured Zen API key (env or vault), for the limits panel's per-key
+ * rows. `resetAt` is a best-effort in-memory 429 observation, not a learned
+ * estimate. `keyId` is a stable hash of the key; the raw API key never
+ * crosses this surface.
  */
 export const ZenKeyLimits = Schema.Struct({
   keyId: Schema.String,
@@ -119,7 +116,7 @@ export const ZenKeyLimits = Schema.Struct({
     Schema.Literal("unknown"),
   ]),
   exhausted: Schema.Boolean,
-  everUsed: Schema.Boolean,
+  isDefault: Schema.Boolean,
   resetAt: Schema.NullOr(Schema.Finite),
   resetAfterSeconds: Schema.NullOr(Schema.Finite),
   usedObserved: Schema.NullOr(Schema.Finite),
@@ -128,7 +125,6 @@ export const ZenKeyLimits = Schema.Struct({
   estimateSource: Schema.NullOr(
     Schema.Union([Schema.Literal("fallback"), Schema.Literal("learned"), Schema.Literal("lower-bound")]),
   ),
-  queuePosition: Schema.NullOr(Schema.Finite),
 })
 export type ZenKeyLimits = Schema.Schema.Type<typeof ZenKeyLimits>
 
@@ -152,7 +148,7 @@ export const ProviderUsage = Schema.Struct({
   workbuddyAccounts: Schema.optional(Schema.Array(WorkBuddyAccountLimits)),
   /** Verdent account-local model frequency observations; shared windows stay in `windows`. */
   verdentAccounts: Schema.optional(Schema.Array(WorkBuddyAccountLimits)),
-  /** Zen per-key rows: governor state, reset countdown, and failover-queue position per configured key. */
+  /** Zen per-key rows: unified-pool state and reset countdown per configured key. */
   zenAccounts: Schema.optional(Schema.Array(ZenKeyLimits)),
 })
 export type ProviderUsage = Schema.Schema.Type<typeof ProviderUsage>

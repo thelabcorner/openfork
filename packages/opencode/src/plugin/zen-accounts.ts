@@ -1,43 +1,37 @@
 import { createHash } from "crypto"
-import { mkdirSync } from "fs"
-import { tmpdir } from "os"
-import { join } from "path"
-import { ZenGovernor } from "./zen-governor"
 
-export type ZenAccountSource = "env"
+export type ZenAccountSource = "env" | "vault"
+
+export type ZenAccountState = "READY" | "COOLING_DOWN" | "QUOTA_EXHAUSTED"
 
 export type ZenAccount = {
   id: string
   label: string
   apiKey: string
-  governor: ZenGovernor
   source: ZenAccountSource
-  mtime: number
-  everUsed: boolean
-}
-
-export type ZenRegistryOptions = {
-  persistenceDir?: string
-}
-
-export type ZenSelection = {
-  account: ZenAccount
-  bound: boolean
-  reason: "explicit" | "affinity" | "automatic"
+  isDefault: boolean
 }
 
 export type ZenEnvCredential = {
   apiKey: string
-  source: ZenAccountSource
+  source: "env"
   path: string
+}
+
+export type ZenVaultCredential = {
+  /** Vault DB primary key (uuid) — distinct from the routing id derived below. */
+  vaultId: string
+  apiKey: string
+  label?: string
+  isDefault?: boolean
 }
 
 const ENV_NUMBERED_MAX = 10
 
 /**
- * Stable account identity derived only from the key: logs, bindings, and
- * persisted governor state address accounts without ever exposing the raw
- * secret (mirrors stableVerdentIdentity).
+ * Stable account identity derived only from the key, shared by env keys and
+ * vault keys so the same physical key never produces two routing ids
+ * regardless of where it is declared.
  */
 export function stableZenIdentity(apiKey: string): string {
   const hash = createHash("sha256").update(apiKey).digest("hex")
@@ -65,173 +59,112 @@ export function zenEnvCredentials(env: Record<string, string | undefined> = proc
   return out
 }
 
-export class ZenRegistry {
-  private readonly persistenceDir: string
-  private accountsById = new Map<string, ZenAccount>()
-  private discoveredAt = 0
+type FailureState = { state: ZenAccountState; resetAt: number | undefined }
 
-  constructor(options: ZenRegistryOptions = {}) {
-    this.persistenceDir = options.persistenceDir ?? join(tmpdir(), "opencode-zen-accounts")
-    mkdirSync(this.persistenceDir, { recursive: true })
-  }
+/**
+ * Unified key pool for both "opencode" (Zen free) and "opencode-go" (Go paid)
+ * providers, which share the same physical `OPENCODE_API_KEY` env keys plus
+ * fork-vault keys. Deliberately simple: no session affinity, no learned
+ * cooldown windows, no persistence — mirrors how verdent/workbuddy bind one
+ * key per session, except here the "session" is the model's account suffix,
+ * resolved once per request by the caller.
+ *
+ * In-memory 402/429 tracking is best-effort and process-local; a restart
+ * clears it, which is fine because upstream re-teaches it within one request.
+ */
+export class ZenAccountPool {
+  private accounts = new Map<string, ZenAccount>()
+  private failures = new Map<string, FailureState>()
 
-  persistenceFile(accountId: string): string {
-    return join(this.persistenceDir, `${accountId}-zen-governor.json`)
-  }
-
-  private accountFrom(credential: ZenEnvCredential): ZenAccount {
-    const id = stableZenIdentity(credential.apiKey)
-    const prior = this.accountsById.get(id)
-    if (prior) {
-      prior.mtime = Date.now()
-      return prior
-    }
-    return {
-      id,
-      label: `key-${id.slice(4, 12)}`,
-      apiKey: credential.apiKey,
-      governor: new ZenGovernor({ persistenceFile: this.persistenceFile(id) }),
-      source: credential.source,
-      mtime: Date.now(),
-      everUsed: false,
-    }
-  }
-
-  discover(): ZenAccount[] {
-    const now = Date.now()
-    if (now - this.discoveredAt < 1000) return [...this.accountsById.values()]
+  /** Rebuild the pool from current env + the vault credentials passed in. */
+  sync(vaultCredentials: ZenVaultCredential[] = []): ZenAccount[] {
     const next = new Map<string, ZenAccount>()
-    for (const credential of zenEnvCredentials()) {
+    const envCredentials = zenEnvCredentials()
+    for (const credential of envCredentials) {
       const id = stableZenIdentity(credential.apiKey)
       if (next.has(id)) continue
-      next.set(id, this.accountFrom(credential))
+      next.set(id, {
+        id,
+        label: `key-${id.slice(4, 12)}`,
+        apiKey: credential.apiKey,
+        source: "env",
+        isDefault: next.size === 0,
+      })
     }
-    this.accountsById = next
-    this.discoveredAt = now
+    let vaultDefaultTaken = false
+    for (const credential of vaultCredentials) {
+      const id = stableZenIdentity(credential.apiKey)
+      if (next.has(id)) continue
+      // Env keys always take default precedence (first-declared wins); among
+      // vault-only pools, honor the caller-designated default wherever it sits.
+      const flagDefault = envCredentials.length === 0 && (credential.isDefault ?? false) && !vaultDefaultTaken
+      if (flagDefault) vaultDefaultTaken = true
+      next.set(id, {
+        id,
+        label: credential.label?.trim() || `key-${id.slice(4, 12)}`,
+        apiKey: credential.apiKey,
+        source: "vault",
+        isDefault: flagDefault,
+      })
+    }
+    // If nothing was marked default (e.g. all-vault pool with no default
+    // flag set), fall back to the first account in insertion order.
+    if (next.size > 0 && ![...next.values()].some((account) => account.isDefault)) {
+      const first = next.values().next().value as ZenAccount
+      first.isDefault = true
+    }
+    this.accounts = next
     return [...next.values()]
   }
 
   all(): ZenAccount[] {
-    return this.discover()
+    return [...this.accounts.values()]
   }
 
   get(id: string): ZenAccount | undefined {
-    this.discover()
-    return this.accountsById.get(id)
+    return this.accounts.get(id)
   }
 
-  snapshot() {
-    return this.all().map((account) => ({
-      id: account.id,
-      label: account.label,
-      source: account.source,
-      everUsed: account.everUsed,
-      governor: account.governor.metrics(),
-    }))
-  }
-}
-
-export class ZenRouter {
-  private readonly registry: ZenRegistry
-  private bindings = new Map<string, string>()
-
-  constructor(options: { registry: ZenRegistry }) {
-    this.registry = options.registry
+  defaultAccount(): ZenAccount | undefined {
+    return this.all().find((account) => account.isDefault) ?? this.all()[0]
   }
 
-  bind(session: string, accountId: string): ZenAccount | undefined {
-    const account = this.registry.get(accountId)
-    if (!account) return undefined
-    this.bindings.set(session, account.id)
-    account.everUsed = true
-    return account
-  }
-
-  unbind(session: string) {
-    this.bindings.delete(session)
-  }
-
-  binding(session: string): string | undefined {
-    return this.bindings.get(session)
-  }
-
-  /**
-   * Failover queue: (1) already-used keys first, ordered by resetAt ascending
-   * so the soonest-resetting key serves next; (2) never-used keys always last
-   * in reserve. Front-loads keys closest to reset — deliberately NOT load
-   * balancing; there is no per-key concurrency signal worth balancing on.
-   */
-  failoverOrder(accounts: ZenAccount[], now = Date.now()): ZenAccount[] {
-    return [...accounts].sort((a, b) => {
-      const aUsed = a.everUsed ? 0 : 1
-      const bUsed = b.everUsed ? 0 : 1
-      if (aUsed !== bUsed) return aUsed - bUsed
-      const ar = a.governor.currentResetAt(now) ?? 0
-      const br = b.governor.currentResetAt(now) ?? 0
-      return ar - br || a.id.localeCompare(b.id)
-    })
-  }
-
-  select(session: string, requestedModel: string, explicitAccountId?: string): ZenSelection | undefined {
-    const now = Date.now()
-    const accounts = this.registry.all()
-    if (explicitAccountId) {
-      const account = accounts.find((item) => item.id === explicitAccountId)
-      if (!account) return undefined
-      this.bindings.set(session, account.id)
-      account.everUsed = true
-      return { account, bound: true, reason: "explicit" }
+  /** Record a non-ok response's status against the account for display purposes only. */
+  observe(accountId: string, status: number, resetAt: number | undefined) {
+    if (status === 402) {
+      this.failures.set(accountId, { state: "QUOTA_EXHAUSTED", resetAt: undefined })
+      return
     }
+    if (status === 429) {
+      this.failures.set(accountId, { state: "COOLING_DOWN", resetAt })
+      return
+    }
+    if (status >= 200 && status < 300) {
+      this.failures.delete(accountId)
+    }
+  }
 
-    const existing = this.bindings.get(session)
-    let failedOver = false
-    if (existing) {
-      const account = accounts.find((item) => item.id === existing)
-      if (!account) {
-        this.bindings.delete(session)
-      } else if (account.governor.usable(now)) {
-        return { account, bound: true, reason: "affinity" }
-      } else {
-        this.unbind(session)
-        failedOver = true
+  state(accountId: string, now = Date.now()): FailureState {
+    const failure = this.failures.get(accountId)
+    if (!failure) return { state: "READY", resetAt: undefined }
+    if (failure.state === "COOLING_DOWN" && failure.resetAt !== undefined && now >= failure.resetAt) {
+      this.failures.delete(accountId)
+      return { state: "READY", resetAt: undefined }
+    }
+    return failure
+  }
+
+  snapshot(now = Date.now()) {
+    return this.all().map((account) => {
+      const { state, resetAt } = this.state(account.id, now)
+      return {
+        accountId: account.id,
+        label: account.label,
+        source: account.source,
+        isDefault: account.isDefault,
+        state,
+        resetAt: resetAt ?? null,
       }
-    }
-
-    const eligible = accounts.filter((account) => account.governor.usable(now))
-    if (eligible.length === 0) {
-      // Every key is cooling down or exhausted: fail over to the least-bad key
-      // by earliest reset and let upstream re-teach the governor.
-      const leastBad = [...accounts].sort((a, b) => {
-        const ar = a.governor.currentResetAt(now) ?? Number.POSITIVE_INFINITY
-        const br = b.governor.currentResetAt(now) ?? Number.POSITIVE_INFINITY
-        return ar - br || a.id.localeCompare(b.id)
-      })[0]
-      if (!leastBad) return undefined
-      leastBad.everUsed = true
-      this.bindings.set(session, leastBad.id)
-      return { account: leastBad, bound: true, reason: "automatic" }
-    }
-
-    // Failover rebinds through the two-rule queue: already-used keys first,
-    // ordered by resetAt ascending, never-used keys held last in reserve.
-    // A session binding for the first time instead brings a reserve key into
-    // service — parallelism is different sessions holding different keys, so
-    // untouched keys are preferred for new bindings.
-    const pool = failedOver
-      ? this.failoverOrder(eligible, now)
-      : this.failoverOrder(
-          eligible.filter((account) => !account.everUsed).length > 0
-            ? eligible.filter((account) => !account.everUsed)
-            : eligible,
-          now,
-        )
-    const account = pool[0]
-    account.everUsed = true
-    this.bindings.set(session, account.id)
-    return { account, bound: true, reason: "automatic" }
-  }
-
-  bindingsSnapshot() {
-    return [...this.bindings.entries()].map(([session, account]) => ({ session, account }))
+    })
   }
 }
