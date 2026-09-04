@@ -490,6 +490,8 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
   const variants = new Map<string | null, Mutable<VariantBucket>>()
   const projects = new Map<string, Mutable<ProjectBucket>>()
   const periods = new Map<number, Mutable<PeriodBucket>>()
+  const providerSeriesData = new Map<string, Map<number, { cost: number; tokens: number; messages: number }>>()
+  const modelSeriesData = new Map<string, Map<number, { cost: number; tokens: number; messages: number }>>()
   const days = new Map<number, Mutable<DayBucket>>()
   const dow = Array.from({ length: 7 }, emptyBucket)
   const hours = Array.from({ length: 24 }, emptyBucket)
@@ -646,6 +648,30 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
     period.messages += 1
     periods.set(periodStart, period)
 
+    let providerPeriod = providerSeriesData.get(providerID)
+    if (!providerPeriod) {
+      providerPeriod = new Map()
+      providerSeriesData.set(providerID, providerPeriod)
+    }
+    let providerSlot = providerPeriod.get(periodStart) ?? { cost: 0, tokens: 0, messages: 0 }
+    providerSlot.cost += cost
+    providerSlot.tokens += totalTokens(tokens)
+    providerSlot.messages += 1
+    providerPeriod.set(periodStart, providerSlot)
+
+    // Variants merged into one model series, matching how the client groups them.
+    const seriesModelKey = `${providerID}/${modelID}`
+    let modelPeriod = modelSeriesData.get(seriesModelKey)
+    if (!modelPeriod) {
+      modelPeriod = new Map()
+      modelSeriesData.set(seriesModelKey, modelPeriod)
+    }
+    let modelSlot = modelPeriod.get(periodStart) ?? { cost: 0, tokens: 0, messages: 0 }
+    modelSlot.cost += cost
+    modelSlot.tokens += totalTokens(tokens)
+    modelSlot.messages += 1
+    modelPeriod.set(periodStart, modelSlot)
+
     const dayStart = localDayStart(completed)
     const day = days.get(dayStart) ?? { start: dayStart, cost: 0, tokens: 0, messages: 0, sessions: 0 }
     day.cost += cost
@@ -746,6 +772,39 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
 
   const mostUsedModel = findMostUsedModel(models.values(), totals.messages)
 
+    const finalPeriods = downsample([...periods.values()].sort((a, b) => a.start - b.start), MAX_PERIODS)
+    const alignSeries = (data: Iterable<[string, Map<number, { cost: number; tokens: number; messages: number }>]>): EntitySeries[] => {
+      const out: EntitySeries[] = []
+      for (const [key, perStart] of data) {
+        const cost = new Array<number>(finalPeriods.length).fill(0)
+        const tokens = new Array<number>(finalPeriods.length).fill(0)
+        const messages = new Array<number>(finalPeriods.length).fill(0)
+        for (const [start, bucket] of perStart) {
+          let fi = finalPeriods.length - 1
+          while (fi > 0 && finalPeriods[fi]!.start > start) fi--
+          if (finalPeriods.length > 0 && finalPeriods[fi]!.start <= start) {
+            cost[fi]! += bucket.cost
+            tokens[fi]! += bucket.tokens
+            messages[fi]! += bucket.messages
+          }
+        }
+        out.push({ key, cost, tokens, messages })
+      }
+      return out
+    }
+    const modelBudget = Math.max(1, Math.floor(MAX_SERIES_VALUES / Math.max(1, finalPeriods.length)))
+    const modelSeries = alignSeries(
+      [...modelSeriesData.entries()]
+        .sort((a, b) => {
+          let am = 0
+          let bm = 0
+          for (const [, bucket] of a[1]) am += bucket.messages
+          for (const [, bucket] of b[1]) bm += bucket.messages
+          return bm - am
+        })
+        .slice(0, modelBudget),
+    )
+
   return {
     since: request.since,
     until: request.until,
@@ -758,11 +817,13 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
     models: [...models.values()].sort((a, b) => b.cost + b.estimatedCost - (a.cost + a.estimatedCost)),
     variants: [...variants.values()].sort((a, b) => b.messages - a.messages),
     projects: [...projects.values()].sort((a, b) => b.cost - a.cost),
-    periods: downsample([...periods.values()].sort((a, b) => a.start - b.start), MAX_PERIODS),
+    periods: finalPeriods,
     days: downsample([...days.values()].sort((a, b) => a.start - b.start), MAX_DAYS),
     dow: dow as unknown as UsageSummary["dow"],
     hours: hours as unknown as UsageSummary["hours"],
     punchcard,
+    providerSeries: alignSeries(providerSeriesData),
+    modelSeries,
     // Ranked by tokens rather than cost so a session run entirely on free or
     // unpriced models is not silently absent from "your heaviest work".
     sessions: [...sessionBuckets.values()].sort((a, b) => b.tokens - a.tokens).slice(0, MAX_SESSIONS),
