@@ -44,6 +44,17 @@ function sessionErrorDescription(error: unknown, fallback: string) {
   return sessionErrorMessage(error) ?? fallback
 }
 
+function notificationSessionTitle(title: string | undefined, sessionID: string) {
+  const value = title?.replace(/\s+/g, " ").trim()
+  if (!value) return sessionID
+  return value.length > 96 ? `${value.slice(0, 95).trimEnd()}…` : value
+}
+
+function notificationProjectName(directory: string) {
+  const value = directory.split(/[\\/]/).filter(Boolean).at(-1) ?? directory
+  return value.length > 64 ? `${value.slice(0, 63).trimEnd()}…` : value
+}
+
 type NotificationBase = {
   directory?: string
   session?: string
@@ -381,6 +392,11 @@ function createServerNotificationState(input: {
         void playSoundById(settings.sounds.agent())
       }
 
+      const sessionTitle = notificationSessionTitle(session.title, sessionID ?? "session")
+      const projectName = notificationProjectName(directory)
+      const notificationTitle = `${language.t("notification.session.responseReady.title")} · ${sessionTitle}`
+      const notificationDescription = `${projectName} · ${language.t("notification.session.responseReady.description")}`
+
       append({
         directory,
         time,
@@ -391,9 +407,7 @@ function createServerNotificationState(input: {
 
       const href = `/${base64Encode(directory)}/session/${sessionID}`
       if (settings.notifications.agent()) {
-        void platform.notify(language.t("notification.session.responseReady.title"), session.title ?? sessionID, () =>
-          input.navigate(href),
-        )
+        void platform.notify(notificationTitle, notificationDescription, () => input.navigate(href))
       }
     })
   }
@@ -429,13 +443,14 @@ function createServerNotificationState(input: {
         session: sessionID,
         error,
       })
-      const description = sessionErrorDescription(
-        error,
-        language.t("notification.session.error.fallbackDescription"),
-      )
+      const description = sessionErrorDescription(error, language.t("notification.session.error.fallbackDescription"))
+      const sessionTitle = notificationSessionTitle(session?.title, sessionID)
+      const projectName = notificationProjectName(directory)
+      const notificationTitle = `${language.t("notification.session.error.title")} · ${sessionTitle}`
+      const notificationDescription = `${projectName} · ${description}`
       const href = `/${base64Encode(directory)}/session/${sessionID}`
       if (settings.notifications.errors()) {
-        void platform.notify(language.t("notification.session.error.title"), description, () => input.navigate(href))
+        void platform.notify(notificationTitle, notificationDescription, () => input.navigate(href))
       }
 
       const now = Date.now()
@@ -443,8 +458,8 @@ function createServerNotificationState(input: {
         lastErrorToastTime = now
         showToast({
           variant: "error",
-          title: language.t("notification.session.error.title"),
-          description,
+          title: notificationTitle,
+          description: notificationDescription,
         })
       }
     })

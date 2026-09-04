@@ -1,4 +1,4 @@
-const CACHE = "opencode-mobile-shell-v4"
+const CACHE = "opencode-mobile-shell-v5"
 
 self.addEventListener("install", (event) => {
   event.waitUntil(self.skipWaiting())
@@ -27,8 +27,11 @@ self.addEventListener("push", (event) => {
   event.waitUntil(
     self.registration.showNotification(title, {
       body: notification.body,
-      icon: notification.icon ?? "/icons/icon-192.png",
-      badge: notification.badge ?? "/icons/badge-96.png",
+      // Raster, not the SVG: Chromium's notification image decoder does not
+      // handle image/svg+xml, so an SVG here renders as no icon at all on the
+      // platform that receives most of these.
+      icon: notification.icon ?? "/icon-192.png",
+      badge: notification.badge ?? "/badge-96.png",
       tag: notification.tag,
       silent: notification.silent ?? false,
       timestamp: notification.timestamp,

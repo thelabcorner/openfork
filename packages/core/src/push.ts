@@ -13,6 +13,10 @@ import { Database } from "./database/database"
 import { EventV2 } from "./event"
 import { makeGlobalNode } from "./effect/app-node"
 import { PushSubscriptionTable, PushVapidKeyTable } from "./push/sql"
+import { ProjectTable } from "./project/sql"
+import { SessionTable } from "./session/sql"
+import { SessionSchema } from "./session/schema"
+import { completedCopy, failedCopy, permissionCopy, questionCopy, type PushSessionContext } from "./push-copy"
 
 export const ID = PushSubscription.ID
 export type ID = typeof ID.Type
@@ -48,8 +52,11 @@ function envelope(notification: PushNotificationPayload) {
       title: notification.title,
       body: notification.body,
       navigate: notification.navigate,
-      icon: notification.icon ?? "/icons/icon-192.png",
-      badge: notification.badge ?? "/icons/badge-96.png",
+      // Must stay in sync with the service-worker fallback in
+      // packages/mobile/public/sw.js. Raster only — Chromium will not decode
+      // an SVG for a notification icon.
+      icon: notification.icon ?? "/icon-192.png",
+      badge: notification.badge ?? "/badge-96.png",
       tag: notification.tag,
       silent: notification.silent ?? false,
       app_badge: notification.appBadge,
@@ -120,6 +127,44 @@ const layer = Layer.effect(
     webpush.setVapidDetails(VAPID_SUBJECT, vapid.publicKey, vapid.privateKey)
     const events = yield* EventV2.Service
 
+    // Push events contain a session id but intentionally do not duplicate the
+    // session title/project metadata. Resolve that metadata at send time so a
+    // phone sees which chat finished instead of a generic "Session finished".
+    // This lookup is best-effort: a deleted/raced session must not prevent a
+    // useful fallback notification from being delivered.
+    const sessionContext = Effect.fn("PushV2.sessionContext")(function* (sessionID: string) {
+      const row = yield* db
+        .select({
+          title: SessionTable.title,
+          directory: SessionTable.directory,
+          projectName: ProjectTable.name,
+          parentID: SessionTable.parent_id,
+        })
+        .from(SessionTable)
+        .leftJoin(ProjectTable, eq(ProjectTable.id, SessionTable.project_id))
+        .where(eq(SessionTable.id, sessionID as SessionSchema.ID))
+        .get()
+        .pipe(
+          Effect.catch(() => Effect.succeed(undefined)),
+          Effect.orDie,
+        )
+      if (!row) return undefined
+      return {
+        title: row.title,
+        directory: row.directory,
+        projectName: row.projectName,
+        parentID: row.parentID,
+      }
+    })
+
+    const contextualNotification = (
+      sessionID: string,
+      build: (context: PushSessionContext | undefined) => PushNotificationPayload,
+    ) =>
+      Effect.gen(function* () {
+        return build(yield* sessionContext(sessionID))
+      })
+
     const info = (row: typeof PushSubscriptionTable.$inferSelect): Info => ({
       id: row.id,
       createdAt: new Date(row.created_at).toISOString(),
@@ -174,7 +219,11 @@ const layer = Layer.effect(
     })
 
     const unsubscribeByEndpoint = Effect.fn("PushV2.unsubscribeByEndpoint")(function* (endpoint: string) {
-      yield* db.delete(PushSubscriptionTable).where(eq(PushSubscriptionTable.endpoint, endpoint)).run().pipe(Effect.orDie)
+      yield* db
+        .delete(PushSubscriptionTable)
+        .where(eq(PushSubscriptionTable.endpoint, endpoint))
+        .run()
+        .pipe(Effect.orDie)
       yield* Effect.logInfo("Push subscription retired", { endpointHash: hashEndpoint(endpoint) })
     })
 
@@ -182,15 +231,11 @@ const layer = Layer.effect(
       Effect.gen(function* () {
         const result = yield* Effect.tryPromise({
           try: () =>
-            webpush.sendNotification(
-              { endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } },
-              body,
-              {
-                TTL: options.ttl,
-                urgency: options.urgency,
-                topic: options.topic?.slice(0, 32),
-              },
-            ),
+            webpush.sendNotification({ endpoint: row.endpoint, keys: { p256dh: row.p256dh, auth: row.auth } }, body, {
+              TTL: options.ttl,
+              urgency: options.urgency,
+              topic: options.topic?.slice(0, 32),
+            }),
           catch: (error) => ({ ok: false as const, error: error as { statusCode?: number } }),
         }).pipe(
           Effect.map(() => ({ ok: true as const, error: undefined })),
@@ -257,11 +302,16 @@ const layer = Layer.effect(
         if (now - at > 10_000) settledAt.delete(key)
       }
     }
-    const notifyIfStillPending = (id: string, notification: PushNotificationPayload, options: SendOptions) =>
+    const notifyIfStillPending = (
+      id: string,
+      sessionID: string,
+      build: (context: PushSessionContext | undefined) => PushNotificationPayload,
+      options: SendOptions,
+    ) =>
       Effect.gen(function* () {
         yield* Effect.sleep(PENDING_RECHECK)
         if (settledAt.delete(id)) return
-        yield* push.notifyAll(notification, options)
+        yield* push.notifyAll(yield* contextualNotification(sessionID, build), options)
       })
 
     yield* events.subscribe(PermissionV2.Event.Replied).pipe(
@@ -282,12 +332,21 @@ const layer = Layer.effect(
         Effect.forkScoped(
           notifyIfStillPending(
             event.data.id,
-            {
-              title: "Permission requested",
-              body: `${event.data.action} needs your approval`,
-              navigate: `/session/${event.data.sessionID}`,
-              tag: `permission-${event.data.sessionID}`,
-              data: { sessionID: event.data.sessionID, kind: "permission" },
+            event.data.sessionID,
+            (context) => {
+              const copy = permissionCopy(context, event.data.sessionID, event.data.action)
+              return {
+                title: copy.title,
+                body: copy.body,
+                navigate: `/session/${event.data.sessionID}`,
+                tag: `permission-${event.data.sessionID}`,
+                data: {
+                  sessionID: event.data.sessionID,
+                  kind: "permission",
+                  sessionTitle: copy.sessionTitle,
+                  project: copy.projectLabel,
+                },
+              }
             },
             { ttl: 60, urgency: "high", topic: topicFor("permission", event.data.sessionID) },
           ),
@@ -301,12 +360,21 @@ const layer = Layer.effect(
         Effect.forkScoped(
           notifyIfStillPending(
             event.data.id,
-            {
-              title: "Question from agent",
-              body: event.data.questions[0]?.question,
-              navigate: `/session/${event.data.sessionID}`,
-              tag: `question-${event.data.sessionID}`,
-              data: { sessionID: event.data.sessionID, kind: "question" },
+            event.data.sessionID,
+            (context) => {
+              const copy = questionCopy(context, event.data.sessionID, event.data.questions[0]?.question)
+              return {
+                title: copy.title,
+                body: copy.body,
+                navigate: `/session/${event.data.sessionID}`,
+                tag: `question-${event.data.sessionID}`,
+                data: {
+                  sessionID: event.data.sessionID,
+                  kind: "question",
+                  sessionTitle: copy.sessionTitle,
+                  project: copy.projectLabel,
+                },
+              }
             },
             { ttl: 60, urgency: "high", topic: topicFor("question", event.data.sessionID) },
           ),
@@ -317,16 +385,26 @@ const layer = Layer.effect(
 
     yield* events.subscribe(SessionEvent.Step.Failed).pipe(
       Stream.runForEach((event) =>
-        push.notifyAll(
-          {
-            title: "Session failed",
-            body: "The agent hit an error and stopped.",
-            navigate: `/session/${event.data.sessionID}`,
-            tag: `session-failed-${event.data.sessionID}`,
-            data: { sessionID: event.data.sessionID, kind: "session-failed" },
-          },
-          { ttl: 300, urgency: "high", topic: topicFor("session-failed", event.data.sessionID) },
-        ),
+        Effect.gen(function* () {
+          const context = yield* sessionContext(event.data.sessionID)
+          if (context?.parentID) return
+          const copy = failedCopy(context, event.data.sessionID, event.data.error)
+          yield* push.notifyAll(
+            {
+              title: copy.title,
+              body: copy.body,
+              navigate: `/session/${event.data.sessionID}`,
+              tag: `session-failed-${event.data.sessionID}`,
+              data: {
+                sessionID: event.data.sessionID,
+                kind: "session-failed",
+                sessionTitle: copy.sessionTitle,
+                project: copy.projectLabel,
+              },
+            },
+            { ttl: 300, urgency: "high", topic: topicFor("session-failed", event.data.sessionID) },
+          )
+        }),
       ),
       Effect.forkScoped({ startImmediately: true }),
     )
@@ -340,16 +418,21 @@ const layer = Layer.effect(
         }
         if (event.data.status.type === "idle") {
           if (!busySessions.delete(sessionID)) return Effect.void
-          return push.notifyAll(
-            {
-              title: "Session finished",
-              body: "Your agent session is done.",
-              navigate: `/session/${sessionID}`,
-              tag: `session-done-${sessionID}`,
-              data: { sessionID, kind: "session-done" },
-            },
-            { ttl: 3600, urgency: "normal", topic: topicFor("session-done", sessionID) },
-          )
+          return Effect.gen(function* () {
+            const context = yield* sessionContext(sessionID)
+            if (context?.parentID) return
+            const copy = completedCopy(context, sessionID)
+            yield* push.notifyAll(
+              {
+                title: copy.title,
+                body: copy.body,
+                navigate: `/session/${sessionID}`,
+                tag: `session-done-${sessionID}`,
+                data: { sessionID, kind: "session-done", sessionTitle: copy.sessionTitle, project: copy.projectLabel },
+              },
+              { ttl: 3600, urgency: "normal", topic: topicFor("session-done", sessionID) },
+            )
+          })
         }
         return Effect.void
       }),
