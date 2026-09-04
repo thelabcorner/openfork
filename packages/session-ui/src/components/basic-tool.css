@@ -51,8 +51,18 @@
   }
 }
 
+/* Shell output should sit on the same base surface as the edit diff viewer. */
+[data-slot="tool-content"][data-variant="card"]:has(> [data-component="bash-output"]) {
+  --tool-surface-card: var(--opencode-diffs-bg, var(--color-background-stronger));
+}
+
 [data-component="collapsible"].tool-collapsible {
   --tool-content-gap: 2px;
+
+  /* Height the row occupies once it is pinned (see the sticky rule in
+     message-part.css). Anything that pins *below* the row — the diff's own file
+     header — offsets by this, so the two must be defined in one place. */
+  --tool-sticky-row-height: 30px;
 
   > [data-slot="collapsible-trigger"] {
     height: auto;
@@ -350,7 +360,13 @@
   border: 1px solid var(--tool-border);
   border-radius: 8px;
   background: var(--tool-surface-card);
-  overflow: hidden;
+
+  /* `clip`, NOT `hidden`. `overflow: hidden` makes this a scroll container, and
+     a `position: sticky` descendant inside a container that cannot scroll gets
+     *pushed down* by its own `top` offset rather than pinned — which is exactly
+     how the diff's file header ended up floating in the middle of the diff.
+     `clip` still clips to the radius but creates no scrollport. */
+  overflow: clip;
 
   /* The card owns the frame, so nested output components drop theirs rather
      than stacking a second border inside the first. */
@@ -362,13 +378,12 @@
   > [data-component="write-content"],
   > [data-component="directory-output"],
   > [data-component="grep-results"],
-  > [data-component="glob-results"],
   > [data-component="git-status-list"],
   > [data-component="git-log-list"],
   > [data-component="git-summary"],
   > [data-component="git-commit-result"],
   > [data-component="git-raw"],
-  > [data-component="skill-list"],
+  > [data-component="skill-loaded-list"],
   > [data-component="skill-content-card"],
   > [data-component="typecheck-output"],
   > [data-component="sqlite-table-wrap"],
@@ -381,6 +396,11 @@
     box-shadow: none;
     margin: 0;
     width: 100%;
+  }
+
+  /* Markdown output keeps the card's own gutter rather than butting the frame. */
+  > [data-component="tool-output"] {
+    padding: 7px 10px;
   }
 
   > [data-component="tool-section"] {

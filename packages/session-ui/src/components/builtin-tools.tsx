@@ -1,4 +1,4 @@
-import { For, Show, createMemo, createSignal } from "solid-js"
+import { For, Match, Show, Switch, createMemo, createSignal } from "solid-js"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
 import { Markdown } from "./markdown"
 import { SmartToolOutput } from "./tool-output"
@@ -8,6 +8,8 @@ import {
   ToolBoundedList,
   ToolEmpty,
   ToolFields,
+  ToolLog,
+  ToolNotice,
   ToolPath,
   ToolRow,
   ToolStats,
@@ -835,5 +837,400 @@ export function JsonOutput(props: { output: string }) {
         </>
       )}
     </Show>
+  )
+}
+
+/* ── background ──────────────────────────────────────────────────────────────
+   Five shapes, one tool. `status` and `wait` wrap a `<job>` block whose body is
+   `Key: value` lines plus an optional output tail; `list` prints a fixed-width
+   table (but hands us the rows in metadata, which is far better); `read` is raw
+   log text; `send`/`kill` are one-line acknowledgements.
+
+   All of it used to go through the markdown renderer, which stripped the `<job>`
+   wrapper, glued the fields into one paragraph, and left the command — the one
+   thing you actually want to see — wrapped mid-flag with no monospace.
+   ────────────────────────────────────────────────────────────────────────── */
+
+type BackgroundJobRow = {
+  id: string
+  status: string
+  kind?: string
+  description?: string
+  command: string
+  startedAt?: number
+  logPath?: string
+  exit?: number | null
+}
+
+const BACKGROUND_TONE: Record<string, Tone> = {
+  running: "info",
+  completed: "success",
+  error: "danger",
+  cancelled: "warning",
+  stale: "warning",
+}
+
+function jobRows(metadata: Record<string, any> | undefined): BackgroundJobRow[] {
+  const rows = metadata?.jobs
+  if (!Array.isArray(rows)) return []
+  return rows.filter((row): row is BackgroundJobRow => !!row && typeof row.id === "string")
+}
+
+/** `<job id="…" status="…" kind="…">` … `</job>` — status and wait. */
+function parseJobBlock(output: string) {
+  const block = tagBlocks(output, "job")[0]
+  if (!block) return undefined
+
+  const command = tagText(block.inner, "command")
+  const fields: { key: string; value: string }[] = []
+  let tail: string[] = []
+  let inTail = false
+
+  for (const raw of block.inner.split("\n")) {
+    const line = raw.trimEnd()
+    if (/^Output tail:\s*$/.test(line.trim())) {
+      inTail = true
+      continue
+    }
+    if (inTail) {
+      tail.push(raw)
+      continue
+    }
+    if (/^<command>/.test(line.trim())) continue
+    const field = /^([A-Z][A-Za-z ]{0,20}):\s+(\S.*)$/.exec(line.trim())
+    if (field) fields.push({ key: field[1]!, value: unescapeXml(field[2]!) })
+  }
+
+  while (tail.length && !tail[0]!.trim()) tail.shift()
+  while (tail.length && !tail[tail.length - 1]!.trim()) tail.pop()
+
+  return { attrs: block.attrs, command, fields, tail: tail.join("\n") }
+}
+
+function BackgroundJobList(props: { rows: BackgroundJobRow[] }) {
+  const i18n = useI18n()
+  return (
+    <Show when={props.rows.length > 0} fallback={<ToolEmpty>{i18n.t("ui.tool.background.empty")}</ToolEmpty>}>
+      <ToolBoundedList items={props.rows} limit={8} scroll>
+        {(row) => (
+          <ToolRow
+            lead={<span data-component="tool-dot" data-tone={BACKGROUND_TONE[row.status] ?? "neutral"} />}
+            primary={row.description || row.command}
+            secondary={row.id}
+            mono={false}
+            trailing={
+              <ToolBadge tone={BACKGROUND_TONE[row.status] ?? "neutral"}>
+                {row.exit === null || row.exit === undefined ? row.status : `${row.status} · ${row.exit}`}
+              </ToolBadge>
+            }
+          />
+        )}
+      </ToolBoundedList>
+    </Show>
+  )
+}
+
+export function BackgroundOutput(props: {
+  output: string
+  input?: Record<string, any>
+  metadata?: Record<string, any>
+}) {
+  const i18n = useI18n()
+  const action = createMemo(() => (typeof props.input?.action === "string" ? props.input.action : undefined))
+  const rows = createMemo(() => jobRows(props.metadata))
+  const job = createMemo(() => parseJobBlock(props.output))
+  const logPath = createMemo(() =>
+    typeof props.metadata?.logPath === "string" ? (props.metadata.logPath as string) : undefined,
+  )
+
+  return (
+    <Switch fallback={<SmartToolOutput output={props.output} />}>
+      <Match when={action() === "list"}>
+        <BackgroundJobList rows={rows()} />
+      </Match>
+
+      <Match when={job()}>
+        {(parsed) => (
+          <>
+            <Show when={parsed().command}>
+              {(command) => <ToolLog text={`$ ${command()}`} label={i18n.t("ui.tool.background.command")} />}
+            </Show>
+            <ToolFields
+              items={parsed()
+                .fields.filter((field) => field.key !== "Log")
+                .map((field) => ({ key: field.key, value: field.value, mono: true }))}
+            />
+            <Show when={parsed().fields.find((field) => field.key === "Log")}>
+              {(log) => (
+                <ToolBlock label={i18n.t("ui.tool.background.log")}>
+                  <ToolRow primary={<ToolPath path={log().value} />} truncate="start" />
+                </ToolBlock>
+              )}
+            </Show>
+            <Show when={parsed().tail}>
+              <ToolLog text={parsed().tail} label={i18n.t("ui.tool.background.tail")} />
+            </Show>
+          </>
+        )}
+      </Match>
+
+      {/* `read` returns the log verbatim — ANSI and all. */}
+      <Match when={action() === "read"}>
+        <>
+          <Show when={logPath()}>
+            {(path) => (
+              <ToolBlock label={i18n.t("ui.tool.background.log")}>
+                <ToolRow primary={<ToolPath path={path()} />} truncate="start" />
+              </ToolBlock>
+            )}
+          </Show>
+          <ToolLog text={props.output} />
+        </>
+      </Match>
+    </Switch>
+  )
+}
+
+/* ── lsp ─────────────────────────────────────────────────────────────────────
+   The tool stringifies whatever the language server returned, so the fallback
+   showed a screen of raw LSP JSON — `uri`, zero-based `range.start.character`,
+   numeric `kind`. Every operation reduces to one of three shapes, and all three
+   are a list of places you might jump to.
+   ────────────────────────────────────────────────────────────────────────── */
+
+const SYMBOL_KIND = [
+  "file",
+  "module",
+  "namespace",
+  "package",
+  "class",
+  "method",
+  "property",
+  "field",
+  "constructor",
+  "enum",
+  "interface",
+  "function",
+  "variable",
+  "constant",
+  "string",
+  "number",
+  "boolean",
+  "array",
+  "object",
+  "key",
+  "null",
+  "enum member",
+  "struct",
+  "event",
+  "operator",
+  "type parameter",
+]
+
+type LspPlace = { name?: string; kind?: string; path: string; line?: number; character?: number; detail?: string }
+
+const fileFromUri = (uri: string) => decodeURIComponent(uri.replace(/^file:\/\/\/?/, ""))
+
+function lspRange(node: any) {
+  const start = node?.range?.start ?? node?.selectionRange?.start ?? node?.location?.range?.start
+  if (!start) return {}
+  // LSP is zero-based; editors are not.
+  return { line: (start.line ?? 0) + 1, character: (start.character ?? 0) + 1 }
+}
+
+function lspPlaces(result: unknown): LspPlace[] {
+  if (!Array.isArray(result)) return []
+  return result.flatMap((raw: any): LspPlace[] => {
+    // Call hierarchy wraps the item it is telling you about.
+    const node = raw?.from ?? raw?.to ?? raw
+    const uri = node?.uri ?? node?.location?.uri
+    if (typeof uri !== "string") return []
+    return [
+      {
+        name: typeof node.name === "string" ? node.name : undefined,
+        kind: typeof node.kind === "number" ? SYMBOL_KIND[node.kind - 1] : undefined,
+        detail: typeof node.detail === "string" ? node.detail : undefined,
+        path: fileFromUri(uri),
+        ...lspRange(node),
+      },
+    ]
+  })
+}
+
+/** `hover` returns markup rather than locations. */
+function lspHover(result: unknown) {
+  if (!Array.isArray(result)) return undefined
+  const contents = (result[0] as any)?.contents
+  if (typeof contents === "string") return contents
+  if (typeof contents?.value === "string") return contents.value
+  if (Array.isArray(contents)) {
+    return contents.map((part: any) => (typeof part === "string" ? part : (part?.value ?? ""))).join("\n\n")
+  }
+  return undefined
+}
+
+export function LspOutput(props: { output: string; input?: Record<string, any>; metadata?: Record<string, any> }) {
+  const i18n = useI18n()
+  const result = createMemo(() => {
+    if (props.metadata?.result !== undefined) return props.metadata.result
+    try {
+      return JSON.parse(props.output)
+    } catch {
+      return undefined
+    }
+  })
+  const hover = createMemo(() => lspHover(result()))
+  const places = createMemo(() => lspPlaces(result()))
+
+  return (
+    <Switch fallback={<SmartToolOutput output={props.output} />}>
+      <Match when={hover()}>{(text) => <Markdown text={text()} />}</Match>
+      <Match when={places().length > 0}>
+        <ToolBoundedList items={places()} limit={10} scroll>
+          {(place) => (
+            <ToolRow
+              lead={place.kind ? <ToolBadge>{place.kind}</ToolBadge> : undefined}
+              primary={place.name ?? place.path.split(/[\\/]/).pop()!}
+              secondary={place.detail ?? place.path}
+              mono={!place.name}
+              trailing={place.line ? `${place.line}:${place.character}` : undefined}
+            />
+          )}
+        </ToolBoundedList>
+      </Match>
+      <Match when={Array.isArray(result()) && (result() as unknown[]).length === 0}>
+        <ToolEmpty>{i18n.t("ui.tool.lsp.empty")}</ToolEmpty>
+      </Match>
+    </Switch>
+  )
+}
+
+/* ── refactor ────────────────────────────────────────────────────────────────
+   `<refactor status="…">` wrapping either a unified diff (preview) or a list of
+   changed files (applied); `<references>` and `<symbol>` for the read-only
+   modes. The diff is the whole point of a preview, so it gets diff colouring
+   rather than being flattened into prose.
+   ────────────────────────────────────────────────────────────────────────── */
+
+const REFACTOR_TONE: Record<string, Tone> = {
+  applied: "success",
+  preview: "info",
+  noop: "neutral",
+  "rolled-back": "danger",
+}
+
+function attrsOf(source: string, name: string) {
+  return [...source.matchAll(new RegExp(`<${name}([^>]*)\\/>`, "g"))].map((match) => {
+    const attrs: Record<string, string> = {}
+    for (const attr of (match[1] ?? "").matchAll(/([\w-]+)="([^"]*)"/g)) attrs[attr[1]!] = unescapeXml(attr[2]!)
+    return attrs
+  })
+}
+
+function DiffPre(props: { text: string }) {
+  const lines = createMemo(() => props.text.split("\n"))
+  const kind = (line: string) => {
+    if (/^(\+\+\+|---|diff |index |@@)/.test(line)) return "meta"
+    if (line.startsWith("+")) return "add"
+    if (line.startsWith("-")) return "del"
+    return undefined
+  }
+  return (
+    <div data-component="tool-diff">
+      <For each={lines()}>
+        {(line) => (
+          <div data-slot="tool-diff-line" data-kind={kind(line)}>
+            {line || " "}
+          </div>
+        )}
+      </For>
+    </div>
+  )
+}
+
+export function RefactorOutput(props: { output: string; metadata?: Record<string, any> }) {
+  const i18n = useI18n()
+  const block = createMemo(() => tagBlocks(props.output, "refactor")[0])
+  const references = createMemo(() => tagBlocks(props.output, "references")[0])
+  const symbol = createMemo(() => tagBlocks(props.output, "symbol")[0])
+  const changed = createMemo(() => attrsOf(block()?.inner ?? "", "changed"))
+
+  // The preview body is a raw unified diff; anything else in there is prose.
+  const diff = createMemo(() => {
+    const inner = block()?.inner
+    if (!inner) return undefined
+    const stripped = inner.replace(/<summary>[\s\S]*?<\/summary>/g, "").replace(/<changed[^>]*\/>/g, "").trim()
+    return /^(diff |--- |\+\+\+ |@@)/m.test(stripped) ? unescapeXml(stripped) : undefined
+  })
+
+  const summary = createMemo(() => {
+    const inner = block()?.inner
+    if (!inner) return undefined
+    const explicit = tagText(inner, "summary")
+    if (explicit) return explicit
+    if (diff()) return undefined
+    const rest = inner.replace(/<changed[^>]*\/>/g, "").trim()
+    return rest ? unescapeXml(rest) : undefined
+  })
+
+  return (
+    <Switch fallback={<SmartToolOutput output={props.output} />}>
+      <Match when={block()}>
+        {(entry) => (
+          <>
+            <div data-component="tool-strip">
+              <ToolBadge tone={REFACTOR_TONE[entry().attrs.status ?? ""] ?? "neutral"}>
+                {entry().attrs.status ?? "refactor"}
+              </ToolBadge>
+              <Show when={entry().attrs.mode}>{(mode) => <ToolBadge mono>{mode()}</ToolBadge>}</Show>
+            </div>
+            <Show when={summary()}>{(text) => <ToolNotice message={text()} />}</Show>
+            <Show when={changed().length > 0}>
+              <ToolBlock label={i18n.t("ui.tool.refactor.changed")} trailing={String(changed().length)}>
+                <ToolBoundedList items={changed()} limit={8} scroll>
+                  {(file) => <ToolRow primary={<ToolPath path={file.rel ?? ""} />} trailing={file.kind} />}
+                </ToolBoundedList>
+              </ToolBlock>
+            </Show>
+            <Show when={diff()}>{(text) => <DiffPre text={text()} />}</Show>
+          </>
+        )}
+      </Match>
+
+      <Match when={references()}>
+        {(entry) => (
+          <ToolBlock label={i18n.t("ui.tool.refactor.references")} trailing={entry().attrs.total}>
+            <ToolBoundedList items={attrsOf(entry().inner, "file")} limit={10} scroll>
+              {(file) => (
+                <ToolRow
+                  primary={<ToolPath path={file.path ?? ""} />}
+                  truncate="start"
+                  trailing={`${file.references ?? 0} · ${file.definitions ?? 0}`}
+                />
+              )}
+            </ToolBoundedList>
+          </ToolBlock>
+        )}
+      </Match>
+
+      <Match when={symbol()}>
+        {(entry) => (
+          <ToolFields
+            items={[
+              { key: i18n.t("ui.tool.refactor.name"), value: tagText(entry().inner, "name") ?? "", mono: true },
+              { key: i18n.t("ui.tool.refactor.kind"), value: tagText(entry().inner, "kind") ?? "" },
+              {
+                key: i18n.t("ui.tool.refactor.location"),
+                value: `${entry().attrs.file}:${entry().attrs.line}:${entry().attrs.column}`,
+                mono: true,
+              },
+              ...(tagText(entry().inner, "canRename") === "true"
+                ? [{ key: i18n.t("ui.tool.refactor.rename"), value: tagText(entry().inner, "renameDisplay") ?? "yes" }]
+                : []),
+            ]}
+          />
+        )}
+      </Match>
+    </Switch>
   )
 }

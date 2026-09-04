@@ -325,6 +325,46 @@
   color: var(--v2-text-text-faint);
 }
 
+/* ── Notice ──────────────────────────────────────────────────────────────── */
+
+[data-component="tool-notice"] {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+
+  [data-slot="tool-notice-message"] {
+    padding: 8px 10px;
+    font-family: var(--tp-sans);
+    font-size: 12px;
+    line-height: 1.5;
+    color: var(--v2-text-text-base);
+    overflow-wrap: anywhere;
+  }
+
+  /* Instructions the tool wrote for the model. Kept — they are the fastest
+     answer to "what do I type next" — but visibly subordinate. */
+  [data-slot="tool-notice-hints"] {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    margin: 6px 10px 8px;
+    padding-left: 8px;
+    border-left: 2px solid var(--tool-border);
+  }
+
+  [data-slot="tool-notice-hint"] {
+    font-family: var(--tp-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--v2-text-text-faint);
+    overflow-wrap: anywhere;
+  }
+
+  &[data-tone="warning"] [data-slot="tool-notice-hints"] {
+    border-left-color: color-mix(in srgb, var(--v2-state-fg-warning) 40%, transparent);
+  }
+}
+
 /* ── Fields ──────────────────────────────────────────────────────────────── */
 
 [data-component="tool-fields"] {
@@ -574,4 +614,289 @@
   scrollbar-width: thin;
   font-size: 12px;
   line-height: 1.6;
+}
+
+/* ── Verbatim text ─────────────────────────────────────────────────────────
+   The fallback renderer (tool-text.tsx). Output that is not JSON, not markdown
+   and not one of the recognised shapes lands here, so its job is to preserve
+   exactly what the tool wrote — indentation included — while still looking like
+   it belongs inside the card.
+   ────────────────────────────────────────────────────────────────────────── */
+
+[data-component="tool-text"] {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+
+  [data-slot="tool-text-attrs"] {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 3px 4px;
+    padding: 7px 10px;
+    border-bottom: 1px solid var(--tool-border);
+  }
+
+  [data-slot="tool-text-attr-key"] {
+    margin-right: 5px;
+    color: var(--v2-text-text-faint);
+  }
+
+  [data-slot="tool-text-scroll"] {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+
+    &[data-clamped="true"] {
+      max-height: 340px;
+      overflow: hidden;
+      mask-image: linear-gradient(to bottom, #000 calc(100% - 36px), transparent 100%);
+    }
+  }
+
+  [data-slot="tool-text-pre"] {
+    margin: 0;
+    padding: 7px 10px;
+    font-family: var(--tp-mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--v2-text-text-muted);
+    /* Wraps, but never collapses runs of spaces — alignment is often the only
+       structure the output has. */
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    tab-size: 2;
+  }
+
+  [data-component="tool-fields"] + [data-slot="tool-text-pre"],
+  [data-slot="tool-text-pre"] + [data-component="tool-fields"],
+  [data-component="tool-rows"] + [data-slot="tool-text-pre"],
+  [data-slot="tool-text-pre"] + [data-component="tool-rows"] {
+    border-top: 1px solid var(--tool-border);
+  }
+}
+
+/* ── Log ─────────────────────────────────────────────────────────────────── */
+
+[data-component="tool-log"] {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+
+  & + [data-component="tool-log"],
+  & + [data-component="tool-fields"],
+  & + [data-component="tool-block"],
+  [data-component="tool-fields"] + &,
+  [data-component="tool-block"] + & {
+    border-top: 1px solid var(--tool-border);
+  }
+
+  [data-slot="tool-log-label"] {
+    padding: 6px 10px 3px;
+    font-family: var(--tp-sans);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.5px;
+    text-transform: uppercase;
+    color: var(--v2-text-text-faint);
+  }
+
+  /* Logs scroll sideways rather than wrap: a wrapped log loses the column
+     alignment that is often the only structure it has. */
+  [data-slot="tool-log-scroll"] {
+    min-width: 0;
+    max-height: 300px;
+    overflow: auto;
+    scrollbar-width: thin;
+  }
+
+  [data-slot="tool-log-pre"] {
+    display: block;
+    margin: 0;
+    padding: 4px 10px 8px;
+    width: max-content;
+    min-width: 100%;
+    font-family: var(--tp-mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    color: var(--v2-text-text-muted);
+    white-space: pre;
+
+    code {
+      font: inherit;
+      color: inherit;
+      background: none;
+      padding: 0;
+    }
+  }
+}
+
+/* ── Status dot ──────────────────────────────────────────────────────────── */
+
+[data-component="tool-dot"] {
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--v2-text-text-faint);
+
+  &[data-tone="success"] {
+    background: var(--v2-state-fg-success);
+  }
+  &[data-tone="warning"] {
+    background: var(--v2-state-fg-warning);
+  }
+  &[data-tone="danger"] {
+    background: var(--v2-state-fg-danger);
+  }
+  &[data-tone="info"],
+  &[data-tone="accent"] {
+    background: var(--v2-text-text-accent);
+    /* Running jobs get a soft pulse — the row is otherwise static while the
+       job is not. */
+    animation: tool-dot-pulse 1.8s ease-in-out infinite;
+  }
+}
+
+@keyframes tool-dot-pulse {
+  50% {
+    opacity: 0.35;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-component="tool-dot"] {
+    animation: none;
+  }
+}
+
+/* ── Diff ────────────────────────────────────────────────────────────────
+   A unified diff that is not backed by a file on disk (a refactor preview),
+   so the real diff viewer has nothing to mount against. Colours only. */
+
+[data-component="tool-diff"] {
+  min-width: 0;
+  max-height: 340px;
+  overflow: auto;
+  scrollbar-width: thin;
+  padding: 4px 0;
+  font-family: var(--tp-mono);
+  font-size: 11px;
+  line-height: 17px;
+
+  [data-slot="tool-diff-line"] {
+    min-width: max-content;
+    padding: 0 10px;
+    white-space: pre;
+    color: var(--v2-text-text-muted);
+
+    &[data-kind="add"] {
+      color: var(--v2-state-fg-success);
+      background: color-mix(in srgb, var(--v2-state-fg-success) 10%, transparent);
+    }
+
+    &[data-kind="del"] {
+      color: var(--v2-state-fg-danger);
+      background: color-mix(in srgb, var(--v2-state-fg-danger) 10%, transparent);
+    }
+
+    &[data-kind="meta"] {
+      color: var(--v2-text-text-faint);
+    }
+  }
+}
+
+/* ── Badge strip ─────────────────────────────────────────────────────────── */
+
+[data-component="tool-strip"] {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--tool-border);
+}
+
+/* ── Preformatted block ──────────────────────────────────────────────────
+   Raw captured text inside a card (a test run's tail, a JSON excerpt). Same
+   treatment as tool-log without the ANSI parsing. */
+
+[data-component="tool-pre"] {
+  margin: 0;
+  padding: 4px 10px 8px;
+  max-height: 280px;
+  overflow: auto;
+  scrollbar-width: thin;
+  font-family: var(--tp-mono);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--v2-text-text-muted);
+  white-space: pre;
+}
+
+/* ── Test failure ────────────────────────────────────────────────────────── */
+
+[data-component="test-failure"] {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  padding-bottom: 3px;
+
+  & + [data-component="test-failure"] {
+    border-top: 1px solid var(--tool-border);
+  }
+
+  /* Both sit under the failure's own row, indented past the FAIL badge so the
+     name stays the thing you scan. */
+  [data-slot="test-failure-file"] {
+    padding: 0 10px 0 52px;
+    font-family: var(--tp-mono);
+    font-size: 11px;
+    line-height: 16px;
+    color: var(--v2-text-text-faint);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  [data-slot="test-failure-detail"] {
+    margin: 3px 10px 0 52px;
+    padding-left: 8px;
+    border-left: 2px solid color-mix(in srgb, var(--v2-state-fg-danger) 35%, transparent);
+    font-family: var(--tp-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    color: var(--v2-text-text-muted);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+}
+
+/* ── Checkpoint counts ───────────────────────────────────────────────────── */
+
+[data-slot="checkpoint-counts"] {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  font-variant-numeric: tabular-nums;
+
+  [data-slot="checkpoint-add"] {
+    color: var(--v2-state-fg-success);
+  }
+
+  [data-slot="checkpoint-del"] {
+    color: var(--v2-state-fg-danger);
+  }
+}
+
+/* ── Webfetch ────────────────────────────────────────────────────────────── */
+
+[data-slot="webfetch-scheme"] {
+  font-size: 10px;
+  line-height: 1;
+  opacity: 0.7;
+}
+
+/* Left as a plain span when the URL is not https, so the row must not reserve
+   width for a glyph that isn't there. */
+[data-slot="webfetch-scheme"]:empty {
+  display: none;
 }

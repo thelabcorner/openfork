@@ -464,156 +464,76 @@
   }
 }
 
-[data-component="grep-results"],
-[data-component="glob-results"] {
+/* ── Grep ─────────────────────────────────────────────────────────────────
+   One continuous list inside the tool card: a file row, then the matching
+   lines beneath it. No per-file frame — the card is already the frame.
+   ────────────────────────────────────────────────────────────────────────── */
+
+[data-component="grep-results"] {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  min-width: 0;
   width: 100%;
-  padding: 2px 0;
+}
 
-  &[data-scrollable] {
-    max-height: 320px;
-    overflow-y: auto;
-    scrollbar-width: none;
-    -ms-overflow-style: none;
+[data-component="grep-group"] {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
 
-    &::-webkit-scrollbar {
-      display: none;
-    }
+  & + [data-component="grep-group"] {
+    border-top: 1px solid var(--tool-border);
+  }
+
+  /* The file row is the group's header: slightly stronger, and it keeps its
+     own hover so the lines under it do not flash with it. */
+  > [data-component="tool-row"] [data-slot="tool-row-primary"] {
+    font-weight: 520;
+  }
+
+  > [data-component="tool-row"] [data-slot="tool-row-trailing"] {
+    font-variant-numeric: tabular-nums;
   }
 }
 
-[data-slot="grep-empty"],
-[data-slot="glob-empty"] {
-  font-size: 13px;
-  color: var(--text-weak);
-}
-
-[data-slot="grep-truncated"],
-[data-slot="glob-truncated"] {
-  font-size: 12px;
-  color: var(--text-weak);
-  font-style: italic;
-}
-
-[data-slot="grep-file-group"] {
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  border: 0.5px solid var(--v2-border-border-base);
-  border-radius: 8px;
-  overflow: hidden;
-  background: var(--background-stronger, color-mix(in srgb, currentColor 3%, transparent));
-}
-
-[data-slot="grep-file-header"] {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  min-width: 0;
-  padding: 6px 8px;
-  border-bottom: 0.5px solid var(--v2-border-border-muted);
-  font-size: 13px;
-}
-
-[data-slot="grep-file-name"] {
-  flex-shrink: 0;
-  font-weight: var(--font-weight-medium);
-  color: var(--text-strong);
-}
-
-[data-slot="grep-file-dir"] {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  color: var(--text-weak);
-}
-
-[data-slot="grep-match-count"] {
-  flex-shrink: 0;
-  margin-left: auto;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  min-width: 18px;
-  height: 18px;
-  padding: 0 5px;
-  border-radius: 999px;
-  background: var(--background-stronger);
-  color: var(--text-weak);
-  font-size: 11px;
-  font-variant-numeric: tabular-nums;
-}
-
-[data-slot="grep-match-row"] {
+[data-slot="grep-line"] {
   display: flex;
   align-items: baseline;
-  gap: 10px;
+  gap: 8px;
   min-width: 0;
-  padding: 2px 8px;
+  padding: 0 10px 0 27px;
+  line-height: 18px;
 
   &:hover {
-    background: var(--background-stronger);
+    background: var(--tool-hover);
   }
 }
 
-[data-slot="grep-match-line"] {
+[data-slot="grep-line-number"] {
   flex-shrink: 0;
-  width: 32px;
+  min-width: 30px;
   text-align: right;
-  font-family: var(--font-family-mono);
-  font-size: 12px;
-  color: var(--text-weaker);
+  font-family: var(--tp-mono);
+  font-size: 10.5px;
+  color: var(--v2-text-text-faint);
   font-variant-numeric: tabular-nums;
   user-select: none;
 }
 
-[data-slot="grep-match-text"] {
+[data-slot="grep-line-text"] {
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-family-mono);
-  font-size: 12.5px;
-  color: var(--text-base);
+  white-space: pre;
+  font-family: var(--tp-mono);
+  font-size: 11.5px;
+  color: var(--v2-text-text-muted);
 }
 
 [data-slot="grep-match-mark"] {
-  background: color-mix(in srgb, var(--v2-yellow-600, #f6c251) 45%, transparent);
-  color: var(--text-strong);
+  background: color-mix(in srgb, var(--v2-yellow-600, #f6c251) 32%, transparent);
+  color: var(--v2-text-text-base);
   border-radius: 2px;
-}
-
-[data-slot="glob-file-row"] {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  min-width: 0;
-  padding: 4px 8px;
-  border-radius: 6px;
-
-  &:hover {
-    background: var(--background-stronger);
-  }
-}
-
-[data-slot="glob-file-name"] {
-  flex-shrink: 0;
-  font-family: var(--font-family-mono);
-  font-size: 12.5px;
-  color: var(--text-strong);
-}
-
-[data-slot="glob-file-dir"] {
-  min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  font-family: var(--font-family-mono);
-  font-size: 12.5px;
-  color: var(--text-weak);
 }
 
 [data-component="shell-timer-group"] {
@@ -702,57 +622,63 @@
   }
 }
 
+/* Status strip at the top of an expanded background job: state, exit code and
+   elapsed time. A header row inside the card, not a card of its own. */
+
 [data-component="background-status"] {
   display: flex;
   align-items: center;
-  gap: 8px;
-  padding: 8px 10px;
-  border: 0.5px solid var(--v2-border-border-base);
-  border-radius: 8px;
-  background: var(--background-stronger, color-mix(in srgb, currentColor 3%, transparent));
-  margin-bottom: 8px;
+  gap: 7px;
+  min-height: 26px;
+  padding: 0 8px 0 10px;
+  border-bottom: 1px solid var(--tool-border);
 
   [data-slot="background-status-badge"] {
     display: inline-flex;
     align-items: center;
-    padding: 2px 7px;
-    border-radius: 5px;
-    font-size: 11px;
-    font-weight: var(--font-weight-medium);
+    padding: 0 5px;
+    border-radius: 4px;
+    font-family: var(--tp-sans);
+    font-size: 10px;
+    font-weight: 600;
+    line-height: 16px;
     text-transform: uppercase;
-    letter-spacing: 0.03em;
+    letter-spacing: 0.4px;
     color: var(--v2-text-text-muted);
-    background: var(--background-stronger);
-    border: 0.5px solid var(--v2-border-border-base);
+    background: var(--tool-surface-badge);
 
     &[data-status="running"] {
-      color: var(--icon-interactive-base);
-      border-color: color-mix(in srgb, var(--icon-interactive-base) 32%, transparent);
-      background: color-mix(in srgb, var(--icon-interactive-base) 10%, transparent);
+      color: var(--v2-text-text-accent);
+      background: color-mix(in srgb, var(--v2-text-text-accent) 14%, transparent);
     }
 
     &[data-status="completed"] {
-      color: var(--v2-green-700, #15803d);
-      border-color: color-mix(in srgb, var(--v2-green-700, #15803d) 32%, transparent);
-      background: color-mix(in srgb, var(--v2-green-700, #15803d) 10%, transparent);
+      color: var(--v2-state-fg-success);
+      background: color-mix(in srgb, var(--v2-state-fg-success) 14%, transparent);
+    }
+
+    &[data-status="stale"] {
+      color: var(--v2-state-fg-warning);
+      background: color-mix(in srgb, var(--v2-state-fg-warning) 14%, transparent);
     }
 
     &[data-status="error"],
     &[data-status="cancelled"] {
-      color: var(--icon-negative, #f1484f);
-      border-color: color-mix(in srgb, var(--icon-negative, #f1484f) 32%, transparent);
-      background: color-mix(in srgb, var(--icon-negative, #f1484f) 10%, transparent);
+      color: var(--v2-state-fg-danger);
+      background: color-mix(in srgb, var(--v2-state-fg-danger) 14%, transparent);
     }
   }
 
   [data-slot="background-status-exit"] {
-    font-size: 12px;
+    font-family: var(--tp-sans);
+    font-size: 11px;
     font-variant-numeric: tabular-nums;
-    color: var(--v2-text-text-muted);
+    color: var(--v2-text-text-faint);
   }
 
   [data-component="shell-timer-group"] {
     margin-inline-start: auto;
+    font-size: 11px;
   }
 }
 
@@ -976,131 +902,125 @@
 }
 
 [data-component="skill-empty-state"] {
-  padding: 10px 12px;
-  border: 0.5px dashed var(--v2-border-border-base);
-  border-radius: 8px;
-  font-size: 12.5px;
-  color: var(--v2-text-text-faint, var(--text-weak));
+  padding: 10px;
+  font-family: var(--tp-sans);
+  font-size: 12px;
+  color: var(--v2-text-text-faint);
 }
+
+/* ── Loaded skill ─────────────────────────────────────────────────────────
+   Flat sections inside the tool card, separated by rules. The old treatment
+   drew its own bordered card, which stacked a second frame inside the first.
+   ────────────────────────────────────────────────────────────────────────── */
 
 [data-component="skill-loaded-list"] {
   display: flex;
   flex-direction: column;
-  gap: 8px;
   width: 100%;
+  min-width: 0;
+
+  > [data-component="skill-content-card"] + [data-component="skill-content-card"] {
+    border-top: 1px solid var(--tool-border);
+  }
 }
 
 [data-component="skill-content-card"] {
   display: flex;
   flex-direction: column;
-  gap: 8px;
   width: 100%;
-  padding: 10px 12px;
-  border: 0.5px solid var(--v2-border-border-base);
-  border-radius: 10px;
-  background: var(--background-stronger, color-mix(in srgb, currentColor 3%, transparent));
+  min-width: 0;
 
   [data-slot="skill-content-header"] {
     display: flex;
-    align-items: center;
+    align-items: baseline;
     gap: 8px;
+    min-width: 0;
+    padding: 6px 10px;
   }
 
   [data-slot="skill-content-name"] {
     display: inline-flex;
     align-items: center;
-    gap: 6px;
-    font-size: 13px;
-    font-weight: var(--font-weight-medium);
-    color: var(--text-strong);
+    gap: 5px;
+    flex-shrink: 0;
+    font-family: var(--tp-sans);
+    font-size: 12px;
+    font-weight: 550;
+    color: var(--v2-text-text-base);
 
-    [data-component="icon"] {
-      width: 13px;
-      height: 13px;
-      color: var(--icon-interactive-base);
+    [data-component="icon"],
+    [data-slot="icon-svg"] {
+      width: 12px;
+      height: 12px;
+      color: var(--v2-text-text-accent);
     }
   }
 
-  [data-slot="skill-content-file-count"] {
-    margin-inline-start: auto;
-    font-size: 11px;
-    font-variant-numeric: tabular-nums;
-    color: var(--v2-text-text-faint, var(--text-weak));
-  }
-
   [data-slot="skill-content-basedir"] {
+    min-width: 0;
+    flex: 1 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
-    font-family: var(--font-family-mono);
+    direction: rtl;
+    text-align: left;
+    font-family: var(--tp-mono);
     font-size: 11px;
-    color: var(--v2-text-text-faint, var(--text-weak));
+    color: var(--v2-text-text-faint);
+  }
+
+  [data-slot="skill-content-file-count"] {
+    flex-shrink: 0;
+    margin-inline-start: auto;
+    font-family: var(--tp-sans);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    color: var(--v2-text-text-faint);
   }
 
   [data-slot="skill-content-body"] {
-    padding-top: 4px;
-    border-top: 0.5px solid var(--v2-border-border-base);
+    padding: 6px 10px 8px;
+    border-top: 1px solid var(--tool-border);
+    font-size: 12.5px;
+    max-height: 320px;
+    overflow: hidden;
+
+    /* Fades the clip so it reads as "there is more", not as a hard cut. Only
+       when something is actually cut off. */
+    &[data-clamped="true"] {
+      mask-image: linear-gradient(to bottom, #000 calc(100% - 40px), transparent 100%);
+    }
+
+    &[data-full="true"] {
+      max-height: none;
+      overflow: visible;
+      mask-image: none;
+    }
   }
 }
 
 [data-component="skill-file-list"] {
   display: flex;
   flex-wrap: wrap;
-  gap: 4px;
+  gap: 3px 4px;
+  padding: 0 10px 7px;
 
   [data-slot="skill-file-chip"] {
     display: inline-flex;
     align-items: center;
-    padding: 2px 6px;
+    padding: 1px 6px 2px;
+    border: 0;
     border-radius: 4px;
-    font-family: var(--font-family-mono);
-    font-size: 10.5px;
+    background: var(--tool-surface-badge);
+    font-family: var(--tp-mono);
+    font-size: 11px;
+    line-height: 16px;
     color: var(--v2-text-text-muted);
-    background: color-mix(in srgb, currentColor 6%, transparent);
-    border: 0.5px solid var(--v2-border-border-base);
 
     &[data-more] {
       cursor: pointer;
-      color: var(--icon-interactive-base);
-      background: color-mix(in srgb, var(--icon-interactive-base) 10%, transparent);
-      border-color: color-mix(in srgb, var(--icon-interactive-base) 26%, transparent);
+      color: var(--v2-text-text-accent);
     }
-  }
-}
-
-[data-component="skill-list"] {
-  display: flex;
-  flex-direction: column;
-  gap: 1px;
-  width: 100%;
-  border: 0.5px solid var(--v2-border-border-base);
-  border-radius: 8px;
-  overflow: hidden;
-  background: var(--background-stronger, color-mix(in srgb, currentColor 3%, transparent));
-
-  [data-slot="skill-list-row"] {
-    display: flex;
-    align-items: baseline;
-    gap: 8px;
-    padding: 6px 10px;
-    min-width: 0;
-  }
-
-  [data-slot="skill-list-name"] {
-    flex-shrink: 0;
-    font-family: var(--font-family-mono);
-    font-size: 12px;
-    font-weight: var(--font-weight-medium);
-    color: var(--icon-interactive-base);
-  }
-
-  [data-slot="skill-list-description"] {
-    min-width: 0;
-    overflow: hidden;
-    text-overflow: ellipsis;
-    white-space: nowrap;
-    font-size: 12px;
-    color: var(--v2-text-text-muted);
   }
 }
 
@@ -1766,14 +1686,13 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
 [data-component="tool-output-json"],
 [data-component="directory-output"],
 [data-component="grep-results"],
-[data-component="glob-results"],
 [data-component="git-status-list"],
 [data-component="git-log-list"],
 [data-component="git-summary"],
 [data-component="git-commit-result"],
 [data-component="git-raw"],
 [data-component="skill-content-card"],
-[data-component="skill-list"],
+[data-component="skill-loaded-list"],
 [data-component="todos"],
 [data-component="diagnostics"],
 .error-card {
@@ -2280,8 +2199,10 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
     position: sticky;
     top: var(--sticky-accordion-top, 0px);
     z-index: 20;
-    height: calc(32px + var(--tool-content-gap));
-    padding-bottom: var(--tool-content-gap);
+    /* Padding is part of the pinned box, so it also covers the card's top
+       margin — otherwise diff lines scroll through the seam below the row. */
+    height: var(--tool-sticky-row-height, 30px);
+    padding-bottom: 6px;
     background-color: var(--v2-background-bg-base);
   }
 }

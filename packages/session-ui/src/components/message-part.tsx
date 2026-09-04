@@ -15,7 +15,6 @@ import {
   type ValidComponent,
 } from "solid-js"
 import { createStore } from "solid-js/store"
-import stripAnsi from "strip-ansi"
 import { Dynamic } from "solid-js/web"
 import {
   AgentPart,
@@ -68,6 +67,7 @@ import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
 import { SmartToolOutput } from "./tool-output"
 import { ShellTimer } from "./shell-timer"
+import { parseShellOutput, ShellOutput } from "./shell-output"
 import { GitOutput } from "./git-tool"
 import { SkillOutput } from "./skill-tool"
 import { getToolResult } from "./tool-result"
@@ -76,12 +76,15 @@ import { SqliteOutput } from "./sqlite-tool"
 import { SympyOutput } from "./sympy-tool"
 import {
   ArchiveOutput,
+  BackgroundOutput,
   BrowserOutput,
   CheckpointOutput,
   JsonOutput,
+  LspOutput,
   MemoryOutput,
   MonitorOutput,
   ProjectOutput,
+  RefactorOutput,
   SessionOutput,
   SymbolsOutput,
   TestOutput,
@@ -1817,7 +1820,8 @@ export function ToolFileAccordion(props: { path: string; actions?: JSX.Element; 
     <Accordion
       multiple
       data-scope="apply-patch"
-      style={{ "--sticky-accordion-offset": "calc(32px + var(--tool-content-gap))" }}
+      // Pins directly beneath the tool row, which pins at --sticky-accordion-top.
+      style={{ "--sticky-accordion-offset": "var(--tool-sticky-row-height, 30px)" }}
       defaultValue={[value()]}
     >
       <Accordion.Item value={value()}>
@@ -2180,45 +2184,69 @@ function GrepMatchText(props: { text: string; term?: string }) {
   )
 }
 
-function GrepResults(props: { result: GrepResult; pattern?: string }) {
+/**
+ * Matches, grouped by file.
+ *
+ * The old treatment drew a bordered card per file inside the tool card, with
+ * 10px gaps between them, so a four-file result was five nested frames. This is
+ * one continuous list: a file row, then its matching lines under it.
+ *
+ * Both axes are bounded. A repo-wide grep can return hundreds of files with
+ * dozens of matches each, and an expansion that long is unusable — you scroll
+ * past the answer looking for it.
+ */
+const GREP_LINES_PER_FILE = 4
+
+function GrepGroup(props: { group: GrepFileGroup; pattern?: string }) {
   const i18n = useI18n()
+  const [full, setFull] = createSignal(false)
+  const visible = createMemo(() => (full() ? props.group.matches : props.group.matches.slice(0, GREP_LINES_PER_FILE)))
+  const hidden = createMemo(() => props.group.matches.length - visible().length)
+
   return (
-    <div
-      data-component="grep-results"
-      data-scrollable
-      tabIndex={0}
-      role="region"
-      aria-label={i18n.t("ui.scrollView.ariaLabel")}
-    >
-      <Show when={props.result.files.length === 0}>
-        <div data-slot="grep-empty">{i18n.t("ui.tool.grep.noMatches")}</div>
-      </Show>
-      <For each={props.result.files}>
-        {(group) => (
-          <div data-slot="grep-file-group">
-            <div data-slot="grep-file-header">
-              <FileIcon node={{ path: group.path, type: "file" }} />
-              <span data-slot="grep-file-name">{getFilename(group.path)}</span>
-              <span data-slot="grep-file-dir">{getDirectory(group.path)}</span>
-              <span data-slot="grep-match-count">{group.matches.length}</span>
-            </div>
-            <For each={group.matches}>
-              {(match) => (
-                <div data-slot="grep-match-row">
-                  <span data-slot="grep-match-line">{match.line}</span>
-                  <code data-slot="grep-match-text">
-                    <GrepMatchText text={match.text} term={props.pattern} />
-                  </code>
-                </div>
-              )}
-            </For>
+    <div data-component="grep-group">
+      <ToolRow
+        lead={<FileIcon node={{ path: props.group.path, type: "file" }} />}
+        primary={getFilename(props.group.path)}
+        secondary={getDirectory(props.group.path)}
+        trailing={String(props.group.matches.length)}
+        mono={false}
+      />
+      <For each={visible()}>
+        {(match) => (
+          <div data-slot="grep-line">
+            <span data-slot="grep-line-number">{match.line}</span>
+            <code data-slot="grep-line-text">
+              <GrepMatchText text={match.text} term={props.pattern} />
+            </code>
           </div>
         )}
       </For>
-      <Show when={props.result.truncated}>
-        <div data-slot="grep-truncated">{i18n.t("ui.tool.grep.truncated")}</div>
+      <Show when={hidden() > 0}>
+        <button type="button" data-component="tool-more" onClick={() => setFull(true)}>
+          {i18n.t("ui.toolParts.showMore", { count: hidden() })}
+        </button>
       </Show>
     </div>
+  )
+}
+
+function GrepResults(props: { result: GrepResult; pattern?: string }) {
+  const i18n = useI18n()
+  return (
+    <Show
+      when={props.result.files.length > 0}
+      fallback={<ToolEmpty>{i18n.t("ui.tool.grep.noMatches")}</ToolEmpty>}
+    >
+      <div data-component="grep-results">
+        <ToolBoundedList items={props.result.files} limit={6} scroll>
+          {(group) => <GrepGroup group={group} pattern={props.pattern} />}
+        </ToolBoundedList>
+        <Show when={props.result.truncated}>
+          <ToolEmpty>{i18n.t("ui.tool.grep.truncated")}</ToolEmpty>
+        </Show>
+      </div>
+    </Show>
   )
 }
 
@@ -2578,7 +2606,8 @@ ToolRegistry.register({
     const pending = () => props.status === "pending" || props.status === "running"
     const sawPending = pending()
     const command = createMemo(() => props.input.command ?? props.metadata.command ?? "")
-    const output = createMemo(() => stripAnsi(props.output || props.metadata.output || "").replace(/\r\n?/g, "\n"))
+    const parsedOutput = createMemo(() => parseShellOutput(props.output || props.metadata.output || ""))
+    const output = createMemo(() => parsedOutput().text)
     const text = createMemo(() => `$ ${command()}${output() ? "\n\n" + output() : ""}`)
     const [copied, setCopied] = createSignal(false)
     const background = createMemo(() => props.metadata.background === true)
@@ -2708,7 +2737,9 @@ ToolRegistry.register({
               aria-label={i18n.t("ui.scrollView.ariaLabel")}
             >
               <pre data-slot="bash-pre">
-                <code>{output()}</code>
+                <code>
+                  <ShellOutput parsed={parsedOutput} />
+                </code>
               </pre>
             </div>
           </Show>
@@ -2930,7 +2961,7 @@ ToolRegistry.register({
                 <Accordion
                   multiple
                   data-scope="apply-patch"
-                  style={{ "--sticky-accordion-offset": "calc(32px + var(--tool-content-gap))" }}
+                  style={{ "--sticky-accordion-offset": "var(--tool-sticky-row-height, 30px)" }}
                   value={expanded()}
                   onChange={(value) => setExpanded(Array.isArray(value) ? value : value ? [value] : [])}
                 >
@@ -3184,33 +3215,6 @@ ToolRegistry.register({
   },
 })
 
-ToolRegistry.register({
-  name: "skill",
-  render(props) {
-    const i18n = useI18n()
-    const title = createMemo(() => props.input.name || i18n.t("ui.tool.skill"))
-    const running = createMemo(() => props.status === "pending" || props.status === "running")
-
-    const titleContent = () => <TextShimmer text={title()} active={running()} />
-
-    const trigger = () => (
-      <div data-slot="basic-tool-tool-info-structured">
-        <div data-slot="basic-tool-tool-info-main">
-          <span data-slot="basic-tool-tool-title" class="capitalize agent-title">
-            {titleContent()}
-          </span>
-        </div>
-      </div>
-    )
-
-    return (
-      <BasicTool {...props} icon="brain" status={props.status} trigger={trigger()}>
-        <SmartToolOutput output={props.output} />
-      </BasicTool>
-    )
-  },
-})
-
 /**
  * Result fields for a hand-built trigger. Spread into `trigger={{ ... }}` so
  * renderers with bespoke titles still report their outcome in the collapsed row.
@@ -3318,7 +3322,9 @@ ToolRegistry.register({
             </Show>
           </div>
         </Show>
-        <SmartToolOutput output={props.output} />
+        <Show when={props.output}>
+          <BackgroundOutput output={props.output!} input={props.input} metadata={props.metadata} />
+        </Show>
       </BasicTool>
     )
   },
@@ -3445,7 +3451,38 @@ ToolRegistry.register({ name: "session", render: builtinRenderer(SessionOutput, 
 ToolRegistry.register({ name: "project", render: builtinRenderer(ProjectOutput, "action") })
 ToolRegistry.register({ name: "symbols", render: builtinRenderer(SymbolsOutput, "action") })
 
+ToolRegistry.register({
+  name: "lsp",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <ToolParams input={props.input} skip={["operation"]} />
+        <Show when={props.output}>
+          <LspOutput output={props.output!} input={props.input} metadata={props.metadata} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
+  name: "refactor",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <ToolParams input={props.input} skip={["mode"]} />
+        <Show when={props.output}>
+          <RefactorOutput output={props.output!} metadata={props.metadata} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
 for (const name of BROWSER_TOOLS) {
   ToolRegistry.register({ name, render: builtinRenderer(BrowserOutput) })
 }
-
