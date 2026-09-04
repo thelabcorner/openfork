@@ -45,6 +45,26 @@ function ensureLoopbackProxyBypass() {
 }
 ensureLoopbackProxyBypass()
 
+// ---- lightweight profiling (enabled only with WB_PROFILE=1) ----
+const WB_PROFILE = process.env.WB_PROFILE === "1"
+const wbProfileData = new Map<string, number[]>()
+function wbMark(name: string, start: number) {
+  if (!WB_PROFILE) return
+  const dur = performance.now() - start
+  const arr = wbProfileData.get(name) ?? []
+  arr.push(dur)
+  wbProfileData.set(name, arr)
+}
+export function getWorkBuddyProfile(): Record<string, { count: number; totalMs: number; meanMs: number }> {
+  const out: Record<string, any> = {}
+  for (const [k, v] of wbProfileData) {
+    const total = v.reduce((a, b) => a + b, 0)
+    out[k] = { count: v.length, totalMs: total, meanMs: v.length ? total / v.length : 0 }
+  }
+  return out
+}
+export function resetWorkBuddyProfile() { wbProfileData.clear() }
+
 /**
  * Tencent WorkBuddy / CodeBuddy provider plugin.
  *
@@ -82,6 +102,49 @@ const NPM = "@ai-sdk/openai-compatible"
 const USER_AGENT = "codebuddy2openai/2.0"
 const REQUEST_TIMEOUT_MS = 5 * 60_000
 const DISCOVERY_TTL_MS = 5 * 60_000
+
+/**
+ * Preferred loopback port for the local proxy hop.
+ *
+ * This MUST be stable rather than ephemeral. Every emitted model carries
+ * `api.url = http://127.0.0.1:<port>/v1`, and that string is baked into the
+ * model objects OpenCode keeps and dispatches chat completions against. With an
+ * ephemeral port, a proxy restart (process reload, listener crash) rebinds on a
+ * DIFFERENT port while every cached model still points at the dead one, so
+ * every request fails with ECONNREFUSED and retries forever.
+ *
+ * Falling back to an ephemeral port on EADDRINUSE keeps two concurrent
+ * OpenCode instances working; the second instance simply advertises its own
+ * ephemeral port to its own models.
+ */
+const PROXY_PORT = 19_731
+
+/** Stable bearer for the loopback hop — rotated only on process restart. */
+let cachedProxyToken: string | undefined
+function proxyToken(): string {
+  if (!cachedProxyToken) cachedProxyToken = randomBytes(32).toString("hex")
+  return cachedProxyToken
+}
+
+/** Extra listeners kept alive for stale `api.url`s left in cached models. */
+const extraServers = new Map<number, Server>()
+
+async function ensureExtraServer(port: number, token: string): Promise<void> {
+  if (extraServers.has(port)) return
+  const server = createServer(makeProxyHandler(token))
+  server.on("close", () => extraServers.delete(port))
+  server.on("error", () => {
+    extraServers.delete(port)
+    try { server.close() } catch {}
+  })
+  const bound = await listen(server, "127.0.0.1", port).catch(() => 0)
+  if (!bound) {
+    server.removeAllListeners()
+    try { server.close() } catch {}
+    return
+  }
+  extraServers.set(port, server)
+}
 
 /**
  * Product-configuration endpoint that IS the model catalog.
@@ -491,12 +554,12 @@ async function readBody(req: IncomingMessage): Promise<any> {
   return raw ? JSON.parse(raw) : {}
 }
 
-async function listen(server: Server, host: string): Promise<number> {
+async function listen(server: Server, host: string, port = 0): Promise<number> {
   return new Promise((resolve, reject) => {
     server.once("error", reject)
     // Loopback only. This proxy fronts a personal entitlement and must never
     // be reachable from another machine.
-    server.listen(0, host, () => {
+    server.listen(port, host, () => {
       const addr = server.address()
       resolve(typeof addr === "object" && addr ? addr.port : 0)
     })
@@ -558,6 +621,7 @@ export async function discoverWorkBuddyCatalog(
  * the same product schema, so one parser serves both.
  */
 function parseConfigPayload(json: any): CatalogEntry[] | null {
+  const _pcStart = WB_PROFILE ? performance.now() : 0
   const data = json?.data
   // `/v3/config` nests models under `data`; the enterprise route returns the
   // model array directly as `data`.
@@ -598,11 +662,14 @@ function parseConfigPayload(json: any): CatalogEntry[] | null {
       ...(promotions.get(id) ? { promotionLabel: promotions.get(id) } : {}),
     })
   }
-  return out.length ? out : null
+  const ret = out.length ? out : null
+  if (WB_PROFILE) wbMark("parseConfigPayload", _pcStart)
+  return ret
 }
 
 /** Extract only explicit selectable sizes; min/max bounds are not choices. */
 export function parseWorkBuddyContextWindows(raw: unknown, fallback: number): number[] {
+  const _pwcwStart = WB_PROFILE ? performance.now() : 0
   const values: number[] = []
   const add = (value: unknown) => {
     const n = typeof value === "number" ? value : typeof value === "string" && /^\d+$/.test(value) ? Number(value) : NaN
@@ -640,7 +707,9 @@ export function parseWorkBuddyContextWindows(raw: unknown, fallback: number): nu
     add(object.defaultLength)
   }
   add(fallback)
-  return [...new Set(values)].sort((a, b) => a - b)
+  const ret = [...new Set(values)].sort((a, b) => a - b)
+  if (WB_PROFILE) wbMark("parseWorkBuddyContextWindows", _pwcwStart)
+  return ret
 }
 
 /**
@@ -786,12 +855,13 @@ function mergeCatalog(staticCatalog: CatalogEntry[], live: CatalogEntry[]): Cata
 
 /** live -> cached -> static fallback. */
 async function catalogFor(account: WorkBuddyAccount | undefined): Promise<CatalogEntry[]> {
+  const _catStart = WB_PROFILE ? performance.now() : 0
   const cred = account?.credential
   const staticCatalog = cred && /codebuddy\.cn|workbuddy\.cn/.test(cred.domain) ? CN_CATALOG : GLOBAL_CATALOG
   const key = account?.id ?? `anonymous:${cred?.domain ?? "global"}`
   const cached = discoveryCache.get(key)
   const now = Date.now()
-  if (cached && now - cached.at < DISCOVERY_TTL_MS) return cached.catalog
+  if (cached && now - cached.at < DISCOVERY_TTL_MS) { if (WB_PROFILE) wbMark("catalogFor:cacheHit", _catStart); return cached.catalog }
   if (cred) {
     const live = await discoverCatalog(cred)
     if (live && live.length) {
@@ -843,6 +913,7 @@ function decodeAccountModel(requestedModel: string): { model: string; accountId?
 }
 
 async function handleCompletions(req: IncomingMessage, res: ServerResponse, payload: any) {
+  const _hcStart = WB_PROFILE ? performance.now() : 0
   const encodedModel = typeof payload?.model === "string" ? payload.model : ""
   if (!encodedModel) return sendJson(res, 400, { error: { message: "`model` is required", type: "invalid_request_error" } })
 
@@ -915,6 +986,7 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
     })
 
   let result
+  let _govStart2 = WB_PROFILE ? performance.now() : 0
   try {
     // The ACCOUNT governor owns admission, the generation-commit point, and the
     // single auth-recovery retry. handleCompletions never re-issues a generation.
@@ -929,6 +1001,7 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
       signal: cancellation.signal,
       enrollmentEpoch: cred.enrollmentEpoch,
     })
+    if (WB_PROFILE) wbMark("handleCompletions:governor", _govStart2)
   } catch (e) {
     if (e instanceof AdmissionError) {
       cleanupCancellation()
@@ -989,9 +1062,9 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
       // Credit/token accounting is per completed generation, so it is recorded
       // once here — after the body is drained — rather than per SSE chunk, and
       // only on a path that actually reached the client.
-      account.governor.recordUsage(requestedModel, acc.usage)
+      { const _ru = WB_PROFILE ? performance.now() : 0; account.governor.recordUsage(requestedModel, acc.usage); if (WB_PROFILE) wbMark("handleCompletions:recordUsage", _ru) }
       if (!cancellation.signal.aborted && !res.writableEnded && !res.destroyed) {
-        return sendJson(res, 200, completionFrom(acc, requestedModel))
+        const _js = WB_PROFILE ? performance.now() : 0; const r = sendJson(res, 200, completionFrom(acc, requestedModel)); if (WB_PROFILE) wbMark("handleCompletions:sendJson", _js); return r
       }
       return
     }
@@ -1030,7 +1103,7 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
     // Record only when the stream ran to completion: a cancelled or truncated
     // generation produced no final usage and must not be counted.
     if (!cancellation.signal.aborted && !res.destroyed) {
-      account.governor.recordUsage(requestedModel, acc.usage)
+      const _ru2 = WB_PROFILE ? performance.now() : 0; account.governor.recordUsage(requestedModel, acc.usage); if (WB_PROFILE) wbMark("handleCompletions:recordUsage", _ru2)
     }
     if (!res.writableEnded && !res.destroyed && !cancellation.signal.aborted) {
       res.write("data: [DONE]\n\n")
@@ -1040,15 +1113,32 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
     // The governor lease spans the entire SSE body, not just fetch headers.
     result.lease.release()
     cleanupCancellation()
+    if (WB_PROFILE) wbMark("handleCompletions", _hcStart)
   }
 }
 
+let ensureProxyInflight: Promise<ProxyState | undefined> | undefined
+
+/**
+ * Start (or return) the loopback proxy.
+ *
+ * Self-healing: a previous listener that died takes `state` down with it via the
+ * close/error handlers below, so this transparently re-listens on the next call
+ * instead of handing back a dead port forever.
+ */
 async function ensureProxy(): Promise<ProxyState | undefined> {
-  if (state) return state
+  if (state?.server.listening) return state
+  // Concurrent callers share one startup; otherwise two racing calls would each
+  // bind a socket and the loser's port would leak.
+  if (ensureProxyInflight) return ensureProxyInflight
+  ensureProxyInflight = startProxy().finally(() => {
+    ensureProxyInflight = undefined
+  })
+  return ensureProxyInflight
+}
 
-  const token = randomBytes(32).toString("hex")
-
-  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+function makeProxyHandler(token: string) {
+  return (req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
         const url = new URL(req.url ?? "/", "http://127.0.0.1")
@@ -1134,10 +1224,41 @@ async function ensureProxy(): Promise<ProxyState | undefined> {
         }
       }
     })()
-  })
+  }
+}
 
-  const port = await listen(server, "127.0.0.1").catch(() => 0)
-  if (!port) return undefined
+async function startProxy(): Promise<ProxyState | undefined> {
+  const token = proxyToken()
+
+  const server = createServer(makeProxyHandler(token))
+
+  // Prefer the stable port so model URLs survive a proxy restart; fall back to
+  // an ephemeral port when another OpenCode instance already holds it.
+  // Handlers are attached AFTER a successful bind so an EADDRINUSE during
+  // start-up doesn't prematurely close the server before the fallback attempt.
+  let port = await listen(server, "127.0.0.1", PROXY_PORT).catch(() => 0)
+  if (!port) {
+    port = await listen(server, "127.0.0.1", 0).catch(() => 0)
+    if (!port) {
+      server.removeAllListeners()
+      return undefined
+    }
+  }
+
+  // A listener that dies for ANY reason (socket error, loopback stack reset,
+  // dispose()) must drop `state` so the next ensureProxy() re-binds. Without
+  // this the cached port is handed out forever and every request after a crash
+  // fails with ECONNREFUSED against a port nothing is listening on.
+  server.on("close", () => {
+    if (state?.server === server) state = undefined
+  })
+  // Keep a persistent error handler: the one-shot handler inside listen() is
+  // removed after bind succeeds, and an error event with no listener would
+  // otherwise crash the process.
+  server.on("error", () => {
+    if (state?.server === server) state = undefined
+    server.close()
+  })
 
   state = { server, port, token }
   return state
@@ -1237,6 +1358,23 @@ export async function WorkBuddyPlugin(_input: PluginInput): Promise<Hooks> {
         const proxy = await ensureProxy().catch(() => undefined)
         if (!proxy) return provider.models
 
+        // Heal stale cached models (e.g. an old ephemeral 59731 from before
+        // the stable-port fix). Reviving the old listener makes the immediate
+        // retry succeed even before the provider database is overwritten with
+        // the new stable URL.
+        {
+          const stale = new Set<number>()
+          for (const m of Object.values(provider.models as Record<string, any>)) {
+            const url = m?.api?.url as string | undefined
+            if (!url || !url.includes("127.0.0.1")) continue
+            const mm = url.match(/http:\/\/127\.0\.0\.1:(\d+)\/v1/)
+            if (!mm) continue
+            const p = Number(mm[1])
+            if (Number.isSafeInteger(p) && p !== proxy.port) stale.add(p)
+          }
+          for (const p of stale) void ensureExtraServer(p, proxy.token).catch(() => {})
+        }
+
         const baseURL = `http://127.0.0.1:${proxy.port}/v1`
         // The per-process token keeps unrelated local processes off this proxy.
             const headers = { Authorization: `Bearer ${proxy.token}` }
@@ -1274,7 +1412,25 @@ export async function WorkBuddyPlugin(_input: PluginInput): Promise<Hooks> {
       // The message id is the logical-generation identity used to prevent a
       // duplicate transport attempt from being mistaken for a new request.
       output.headers["x-opencode-session"] = input.sessionID
-      if (input.message?.id) output.headers["x-opencode-request"] = input.message.id
+      if (input.message?.id) {
+        // Multiple distinct generations can be derived from the same user
+        // message in the same turn (title generation is forked in parallel
+        // with the main streamText — see SessionPrompt.prompt.ts:1425-1431).
+        // Both pass `user: firstInfo` on a fresh session, which makes their
+        // `info.id` identical; without this namespace the workbuddy
+        // governor's top-level duplicate guard would reject the second
+        // in-flight request and the session would never start. Prefixing
+        // by the agent purpose keeps the same user message id under a
+        // distinct genKey per generation.
+        const purpose = input.agent === "title" ? "title" : "main"
+        output.headers["x-opencode-request"] = `${purpose}:${input.message.id}`
+      }
+      // Heal a stale `Authorization` baked into a cached Model (old token
+      // from before the stable-token fix). `model.headers` is stale until the
+      // next provider refresh, but `chat.headers` runs per-request and can
+      // inject the live token so the immediate retry succeeds.
+      const proxy = await ensureProxy().catch(() => undefined)
+      if (proxy) output.headers["Authorization"] = `Bearer ${proxy.token}`
     },
 
     auth: {
@@ -1310,9 +1466,14 @@ export async function WorkBuddyPlugin(_input: PluginInput): Promise<Hooks> {
 
     async dispose() {
       const current = state
-      if (!current) return
-      state = undefined
-      await new Promise<void>((resolve) => current.server.close(() => resolve()))
+      if (current) {
+        state = undefined
+        await new Promise<void>((resolve) => current.server.close(() => resolve()))
+      }
+      // Close any revived stale listeners as well.
+      const extras = [...extraServers.values()]
+      extraServers.clear()
+      await Promise.all(extras.map((s) => new Promise<void>((resolve) => s.close(() => resolve()))))
     },
   }
 }

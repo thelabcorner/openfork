@@ -181,11 +181,7 @@ export const genspark = (http: HttpClient.HttpClient, auth: Auth.Interface): Ada
           }
           const body = yield* response.json
           return { ok: true as const, body }
-        }).pipe(Effect.catch((e) => Effect.succeed({ ok: false as const, error: "network" as const, message: String((e as Error)?.message ?? e) }))) as
-          | { ok: true; body: unknown }
-          | { ok: false; error: "status"; status: number; body?: string; retryAfterMs?: number }
-          | { ok: false; error: "network"; message: string }
-          | { ok: false; error: "timeout" }
+        }).pipe(Effect.catch((e) => Effect.succeed({ ok: false as const, error: "network" as const, message: String((e as Error)?.message ?? e) })))
 
         if (!outcome.ok) {
           if (outcome.error === "status" && (outcome.status === 401 || outcome.status === 403)) {
@@ -230,6 +226,19 @@ export const genspark = (http: HttpClient.HttpClient, auth: Auth.Interface): Ada
         })
         cache.store(result, key)
         return withNext(result)
-      }),
+      }).pipe(
+        Effect.catchCause(() =>
+          Effect.succeed(
+            buildResult({
+              providerId: "genspark",
+              providerName: NAME,
+              ok: false,
+              configured: true,
+              error: "Genspark request failed",
+              nextRefreshAt: NEXT_REFRESH_NOW,
+            }),
+          ),
+        ),
+      ),
   }
 }

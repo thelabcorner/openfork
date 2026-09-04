@@ -27,7 +27,9 @@ function fakeAccount(
       nickname,
     },
     governor: {
-      metrics: () => ({ state, active: load, queued: 0 }),
+      metrics: () => ({ state, active: load, queued: 0, cooldownUntil: 0 }),
+      canAdmitModel: () => state !== "WINDOW_LIMITED",
+      hasKnownCredits: () => true,
     } as unknown as WorkBuddyEntitlementGovernor,
     mtime: 0,
     source: "vault",
@@ -113,12 +115,27 @@ describe("AccountRouter.select", () => {
     // Automatic selection alone would prefer the healthy account.
     expect(router.select("ses_2", MODEL)?.account.id).toBe("wb-aaa-0001")
 
-    // But a session already pinned to the limited account must not silently
-    // drift to another one — that is the account hopping affinity prevents.
-    router.bind("ses_1", limited.id)
-    const pinned = router.select("ses_1", MODEL)
-    expect(pinned?.account.id).toBe("wb-zzz-0009")
+    // A healthy session pinned to a healthy account stays pinned — affinity
+    // prevents automatic hopping when the bound account is still eligible.
+    const healthyPinned = fakeAccount("wb-aaa-0001", "a@example.com", { state: "READY" })
+    const otherHealthy = fakeAccount("wb-bbb-0002", "b@example.com", { state: "READY" })
+    const router2 = new AccountRouter({ registry: fakeRegistry([healthyPinned, otherHealthy]) })
+    router2.bind("ses_1", healthyPinned.id)
+    const pinned = router2.select("ses_1", MODEL)
+    expect(pinned?.account.id).toBe("wb-aaa-0001")
     expect(pinned?.reason).toBe("affinity")
+  })
+
+  it("auto-rotates a blocked pinned session to a healthy account", () => {
+    const healthy = fakeAccount("wb-aaa-0001", "a@example.com", { state: "READY" })
+    const limited = fakeAccount("wb-zzz-0009", "z@example.com", { state: "WINDOW_LIMITED" })
+    const router = new AccountRouter({ registry: fakeRegistry([healthy, limited]) })
+    router.bind("ses_1", limited.id)
+    const rotated = router.select("ses_1", MODEL)
+    // Blocked pinned sessions break affinity so the session can pool-rotate
+    // to an eligible account instead of staying stuck on the failing one.
+    expect(rotated?.account.id).toBe("wb-aaa-0001")
+    expect(rotated?.reason).toBe("automatic")
   })
 
   it("lets an explicit selection land on a rate-limited account", () => {
