@@ -1,6 +1,5 @@
 import { describe, expect, test } from "bun:test"
 import { Effect } from "effect"
-import { createHash } from "crypto"
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "fs"
 import { tmpdir } from "os"
 import { join } from "path"
@@ -117,7 +116,7 @@ describe("toAnthropicMessages", () => {
     expect(messages[0].content.some((c: any) => c.type === "text")).toBe(true)
     expect(messages[0].content.some((c: any) => c.type === "tool_use" && c.name === "read")).toBe(true)
     const toolUse = messages[0].content.find((c: any) => c.type === "tool_use")
-    expect(toolUse.input).toEqual({ path: "x" })
+    expect(toolUse!.input).toEqual({ path: "x" })
   })
 
   test("assistant tool_calls only (no content)", () => {
@@ -487,7 +486,7 @@ describe("verdent toolcall round-trip", () => {
     }
     const { messages } = toAnthropicMessages(payload, "m")
     const toolUse = messages[0].content.find((c: any) => c.type === "tool_use")
-    expect(toolUse.name).toBe("read")
+    expect(toolUse!.name).toBe("read")
     // back to OpenAI
     const openai = anthropicToOpenAIChat({ content: [toolUse] }, "m")
     expect(openai.choices[0].message.tool_calls[0].function.name).toBe("read")
@@ -800,8 +799,16 @@ describe("verdent account identity and vault", () => {
     const originalBase = process.env.VERDENT_PROFILE_BASE_URL
     process.env.VERDENT_PROFILE_BASE_URL = "https://test.verdent"
     try {
-      expect(await fetchVerdentAccountProfile(token)).toEqual({ nickname: "person@example.com", teamId: undefined })
-      expect(await fetchVerdentAccountProfile(token)).toEqual({ nickname: "person@example.com", teamId: undefined })
+      expect(await fetchVerdentAccountProfile(token)).toEqual({
+        nickname: "person@example.com",
+        email: "person@example.com",
+        teamId: undefined,
+      })
+      expect(await fetchVerdentAccountProfile(token)).toEqual({
+        nickname: "person@example.com",
+        email: "person@example.com",
+        teamId: undefined,
+      })
       expect(calls).toBe(1)
     } finally {
       globalThis.fetch = originalFetch
@@ -841,67 +848,44 @@ describe("verdent account identity and vault", () => {
     }
   })
 
-  test("browser login uses Verdent PKCE callback and token exchange", async () => {
-    const root = mkdtempSync(join(tmpdir(), "verdent-oauth-test-"))
-    const originalFetch = globalThis.fetch
-    const originalAuthBase = process.env.VERDENT_AUTH_BASE_URL
-    const originalLoginBase = process.env.VERDENT_LOGIN_BASE_URL
-    const originalStage = process.env.VERDENT_STAGE
-    let exchangeBody: { code?: string; codeVerifier?: string } | undefined
-    setTestVerdentAccountStore(root)
-    globalThis.fetch = (async (input, init) => {
-      const url = String(input)
-      if (url === "https://dev-login.verdent.ai/passport/pkce/callback") {
-        expect(init?.method).toBe("POST")
-        expect(new Headers(init?.headers).get("content-type")).toBe("application/json")
-        exchangeBody = JSON.parse(String(init?.body))
-        return Response.json({ data: { token: "access-1", expireTime: 1_900_000_000 } })
-      }
-      if (url === "https://api.verdent.ai/user/center/info") return new Response("not found", { status: 404 })
-      return originalFetch(input as RequestInfo | URL, init)
-    }) as typeof fetch
+  test("switching desktop logins keeps every previously imported account", async () => {
+    const root = mkdtempSync(join(tmpdir(), "verdent-multi-desktop-test-"))
     try {
-      delete process.env.VERDENT_AUTH_BASE_URL
-      delete process.env.VERDENT_LOGIN_BASE_URL
-      process.env.VERDENT_STAGE = "dev"
-      const hooks = await VerdentPlugin({} as any)
-      const method = (hooks.auth as any).methods[1]
-      const authorization = await method.authorize()
-      const authUrl = new URL(authorization.url)
-      expect(authUrl.origin).toBe("https://test.verdent.ai")
-      expect(authUrl.pathname).toBe("/auth")
-      expect(authUrl.searchParams.get("challenge")).toMatch(/^[A-Za-z0-9_-]{43}$/)
-      expect(authUrl.searchParams.get("intent")).toBe("signin")
-      expect(authUrl.searchParams.get("ots")).toBe("deck")
-      expect(authUrl.searchParams.get("source")).toBe("deck")
-      expect(authUrl.searchParams.get("id")).toBeTruthy()
+      const registry = new VerdentRegistry({ vault: new VerdentVault(root), persistenceDir: join(root, "state") })
+      const tokenFor = (userId: string) =>
+        `header.${Buffer.from(`{"user_id":${userId}}`).toString("base64url")}.signature`
+      const tokenA = tokenFor("11111111111111111111")
+      const tokenB = tokenFor("22222222222222222222")
 
-      const callbackUrl = new URL(authUrl.searchParams.get("callback")!)
-      const state = authUrl.searchParams.get("state")!
-      expect(callbackUrl.hostname).toBe("127.0.0.1")
-      expect(callbackUrl.pathname).toBe("/auth/callback")
-      expect(callbackUrl.searchParams.get("rid")).toBeTruthy()
-      expect(callbackUrl.searchParams.get("nonce")).toBeTruthy()
-      const invalidCallbackUrl = new URL(callbackUrl)
-      invalidCallbackUrl.searchParams.set("state", "wrong-state")
-      expect((await originalFetch(invalidCallbackUrl)).status).toBe(400)
-      callbackUrl.searchParams.set("code", "authorization-code")
-      callbackUrl.searchParams.set("state", state)
-      const callback = authorization.callback()
-      expect((await originalFetch(callbackUrl)).status).toBe(200)
-      expect(await callback).toMatchObject({ type: "success", provider: "verdent" })
-      expect(exchangeBody).toEqual({ code: "authorization-code", codeVerifier: expect.any(String) })
-      expect(authUrl.searchParams.get("challenge")).toBe(
-        createHash("sha256").update(exchangeBody!.codeVerifier!).digest("base64url"),
+      const accountA = await registry.importCurrentDesktopAccount(
+        async () => tokenA,
+        async () => ({ nickname: "a@example.com", email: "a@example.com" }),
       )
+      // User logs out of A and logs into B in the desktop app, then imports again.
+      const accountB = await registry.importCurrentDesktopAccount(
+        async () => tokenB,
+        async () => ({ nickname: "b@example.com", email: "b@example.com" }),
+      )
+      expect(accountA.id).not.toBe(accountB.id)
+      expect(registry.all()).toHaveLength(2)
+
+      // Desktop logged out entirely (no keychain token): vault accounts survive.
+      const freshView = new VerdentRegistry({
+        vault: new VerdentVault(root),
+        persistenceDir: join(root, "state"),
+      })
+      expect(freshView.all()).toHaveLength(2)
+      const ids = new Set(freshView.all().map((account) => account.id))
+      expect(ids.has(accountA.id)).toBe(true)
+      expect(ids.has(accountB.id)).toBe(true)
+
+      // Re-importing A after switching back updates it instead of duplicating.
+      await registry.importCurrentDesktopAccount(
+        async () => tokenA,
+        async () => ({ nickname: "a@example.com", email: "a@example.com" }),
+      )
+      expect(registry.all()).toHaveLength(2)
     } finally {
-      globalThis.fetch = originalFetch
-      if (originalAuthBase === undefined) delete process.env.VERDENT_AUTH_BASE_URL
-      else process.env.VERDENT_AUTH_BASE_URL = originalAuthBase
-      if (originalLoginBase === undefined) delete process.env.VERDENT_LOGIN_BASE_URL
-      else process.env.VERDENT_LOGIN_BASE_URL = originalLoginBase
-      if (originalStage === undefined) delete process.env.VERDENT_STAGE
-      else process.env.VERDENT_STAGE = originalStage
       rmSync(root, { recursive: true, force: true })
     }
   })

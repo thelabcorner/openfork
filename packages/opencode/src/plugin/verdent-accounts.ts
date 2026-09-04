@@ -16,7 +16,8 @@ import { WorkBuddyEntitlementGovernor } from "./workbuddy-governor"
 //   - Auth flow is OAuth PKCE via https://www.verdent.ai/auth?challenge=...&state=...
 //     &callback=... (deep link verdent://...). For multi-account we expose the same
 //     vault pattern as WorkBuddy: vault is authoritative, desktop keytar is an
-//     additive import source, and env tokens are additive.
+//     additive import source. Logging out of the desktop app must never delete
+//     previously imported vault accounts.
 
 export type VerdentCredential = {
   path: string
@@ -39,6 +40,7 @@ export type VerdentAccount = {
   governor: WorkBuddyEntitlementGovernor
   mtime: number
   source: "vault" | "desktop-import" | "env"
+  suspended?: boolean
 }
 
 export type VerdentRegistryOptions = {
@@ -425,7 +427,9 @@ export class VerdentRegistry {
       prior.authPath = credential.path
       prior.uid = credential.uid
       prior.nickname = credential.nickname
-      ;(prior as any).email = credential.email
+      // Preserve a previously learned email when the refreshed credential
+      // carries none (e.g. profile lookup failed after a desktop relogin).
+      if (credential.email) (prior as any).email = credential.email
       prior.mtime = mtime
       prior.source = source
       return prior
@@ -498,43 +502,6 @@ export class VerdentRegistry {
       next.set(id, account)
     }
 
-    // Env tokens: VERDENT_ACCESS_TOKEN, VERDENT_ACCESS_TOKEN_2, VERDENT_TOKENS (comma), plus legacy single.
-    const envCreds: VerdentCredential[] = []
-    const pushEnvToken = (raw: string | undefined, tag: string) => {
-      if (!raw) return
-      const t = raw.trim()
-      if (!t) return
-      for (const tok of t.split(",")) {
-        const token = tok.trim().replace(/^"+|"+$/g, "")
-        if (!token) continue
-        const uid = uidFromToken(token)
-        envCreds.push({
-          path: `env:${tag}`,
-          accessToken: token,
-          uid,
-          nickname: nicknameFromToken(token, uid),
-          expiresAt: 0,
-        })
-      }
-    }
-    pushEnvToken(process.env.VERDENT_ACCESS_TOKEN, "VERDENT_ACCESS_TOKEN")
-    // Also support VERDENT_TOKENS and numbered variants for multi-account env.
-    pushEnvToken(process.env.VERDENT_TOKENS, "VERDENT_TOKENS")
-    for (let i = 2; i <= 10; i++)
-      pushEnvToken((process.env as any)[`VERDENT_ACCESS_TOKEN_${i}`], `VERDENT_ACCESS_TOKEN_${i}`)
-    // Legacy VERDENT_TOKEN (used by ASAR) — treat as env as well.
-    pushEnvToken(process.env.VERDENT_TOKEN, "VERDENT_TOKEN")
-
-    for (const cred of envCreds) {
-      const id = stableVerdentIdentity(cred)
-      if (next.has(id)) continue
-      // Env tokens are ephemeral: do not persist to vault, just add to next map via accountFrom vault-like but source env.
-      // Create a synthetic account without vault persistence.
-      const account = this.accountFrom({ ...cred, path: `env:${id}` }, "env", now)
-      // Keep env accounts distinct from vault; they live only in memory for this process.
-      next.set(id, account)
-    }
-
     // Desktop keytar import is additive if not already enrolled.
     // We import lazily via the caller (importCurrentDesktopAccount), but we also
     // scan for explicit authFiles if provided.
@@ -563,11 +530,10 @@ export class VerdentRegistry {
     getToken: () => Promise<string | null>,
     getProfile?: (
       token: string,
-    ) => Promise<{ uid?: string; nickname?: string; teamId?: string; expiresAt?: number } | undefined>,
+    ) => Promise<{ uid?: string; nickname?: string; email?: string; teamId?: string; expiresAt?: number } | undefined>,
   ): Promise<VerdentAccount> {
     const token = await getToken()
-    if (!token)
-      throw new Error("No Verdent desktop login found. Open the Verdent app and sign in, or set VERDENT_ACCESS_TOKEN.")
+    if (!token) throw new Error("No Verdent desktop login found. Open the Verdent app and sign in first.")
     const trimmed = token.trim()
     if (!trimmed) throw new Error("Verdent desktop login returned an empty token")
     const uid = uidFromToken(trimmed)
@@ -578,7 +544,8 @@ export class VerdentRegistry {
       // Keep the exact JWT-derived identity. In particular, never replace a
       // large numeric user_id with a JSON-decoded API number.
       uid,
-      nickname: profile?.nickname?.trim() || nicknameFromToken(trimmed, uid),
+      nickname: profile?.nickname?.trim() || profile?.email?.trim() || nicknameFromToken(trimmed, uid),
+      ...(profile?.email?.trim() ? { email: profile.email.trim() } : {}),
       teamId: profile?.teamId,
       expiresAt: profile?.expiresAt ?? 0,
     }
@@ -606,10 +573,10 @@ export class VerdentRegistry {
       enrollmentEpoch: randomBytes(16).toString("hex"),
     }
     const saved = this.saveCredential(cred, "manual-import")
-    const account = this.accountFrom(saved, "vault", Date.now())
+    const account = this.accountFrom(saved, "desktop-import", Date.now())
     Object.assign(account.credential, saved)
     account.authPath = saved.path
-    account.source = "vault"
+    account.source = "desktop-import"
     this.accountsById.set(account.id, account)
     this.discoveredAt = Date.now()
     return account
@@ -644,6 +611,11 @@ export class VerdentRegistry {
     return this.discover()
   }
 
+  markSuspended(accountId: string) {
+    const account = this.accountsById.get(accountId)
+    if (account) account.suspended = true
+  }
+
   get(id: string): VerdentAccount | undefined {
     this.discover()
     return this.accountsById.get(id)
@@ -652,12 +624,6 @@ export class VerdentRegistry {
   remove(id: string): boolean {
     const account = this.get(id)
     if (!account) return false
-    // Env-only accounts cannot be removed via vault.
-    if (account.source === "env") {
-      this.accountsById.delete(id)
-      this.discoveredAt = Date.now()
-      return true
-    }
     const removed = this.vault.remove(id)
     if (removed) {
       this.accountsById.delete(id)
@@ -714,7 +680,7 @@ export class VerdentRouter {
     const accounts = this.registry.all()
     if (explicitAccountId) {
       const account = accounts.find((item) => item.id === explicitAccountId)
-      if (!account) return undefined
+      if (!account || account.suspended) return undefined
       this.bindings.set(session, account.id)
       return { account, bound: true, reason: "explicit" }
     }
@@ -726,6 +692,7 @@ export class VerdentRouter {
       const now = Date.now()
       const metrics: any = account.governor.metrics()
       const blocked =
+        account.suspended ||
         metrics.state === "QUOTA_EXHAUSTED" ||
         !account.governor.canAdmitModel(requestedModel, now) ||
         !!(metrics.cooldownUntil && now < metrics.cooldownUntil) ||
@@ -738,6 +705,7 @@ export class VerdentRouter {
     }
 
     const eligible = accounts.filter((account) => {
+      if (account.suspended) return false
       const state = account.governor.metrics().state as string
       if (state === "QUOTA_EXHAUSTED") return false
       if (!account.governor.canAdmitModel(requestedModel)) return false
@@ -748,9 +716,10 @@ export class VerdentRouter {
       // — otherwise we'd return no eligible and the caller would 429. For verdent free,
       // quota exhausted means weekly window, but the other account might still be ok.
       // If none eligible, fall back to any account (let upstream return 429 and be learned).
-      if (accounts.length) {
+      const available = accounts.filter((account) => !account.suspended)
+      if (available.length) {
         // Prefer the one with earliest reset.
-        const sorted = [...accounts].sort((a, b) => {
+        const sorted = [...available].sort((a, b) => {
           const am = a.governor.metrics() as any
           const bm = b.governor.metrics() as any
           const ar = am.resetAt ?? Infinity

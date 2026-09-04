@@ -44,8 +44,7 @@ import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
  * Auth delegation: the plugin never forges tokens. It reads the current
  * Verdent desktop session from the OS credential store (keytar service
  * `ai.verdent.deck`, account `access-token`) — the same secret the app itself
- * uses — or accepts an explicitly provided token. The plaintext token is
- * never logged.
+ * uses. The plaintext token is never logged.
  *
  * Security: loopback-only listener, per-process bearer token, tokens never
  * logged, and `no_proxy`/loopback bypass so an environment HTTP(S)_PROXY does
@@ -560,18 +559,8 @@ function keytarTokenSource(): TokenSource {
   }
 }
 
-function envTokenSource(): TokenSource {
-  return {
-    label: "VERDENT_ACCESS_TOKEN",
-    async get() {
-      const v = process.env.VERDENT_ACCESS_TOKEN?.trim()
-      return v || null
-    },
-  }
-}
-
 const DESKTOP_TOKEN_SOURCE = keytarTokenSource()
-const TOKEN_SOURCES: TokenSource[] = [envTokenSource(), DESKTOP_TOKEN_SOURCE]
+const TOKEN_SOURCES: TokenSource[] = [DESKTOP_TOKEN_SOURCE]
 
 let cachedToken: { token: string; at: number } | undefined
 
@@ -593,6 +582,7 @@ async function resolveDesktopToken(): Promise<string | null> {
 
 export type VerdentAccountProfile = {
   nickname?: string
+  email?: string
   teamId?: string
   expiresAt?: number
 }
@@ -646,7 +636,7 @@ export async function fetchVerdentAccountProfile(token: string): Promise<Verdent
     const teamId = [user?.teamId, root?.teamId].find(
       (value): value is string => typeof value === "string" && value.trim().length > 0,
     )
-    const profile = nickname || teamId ? { nickname, teamId } : undefined
+    const profile = nickname || email || teamId ? { nickname, email, teamId } : undefined
     profileCache.set(token, { at: Date.now(), profile })
     return profile
   } catch {
@@ -666,25 +656,39 @@ let discoveryCache: { at: number; catalog: CatalogEntry[] } | undefined = undefi
  */
 async function discoverCatalog(): Promise<CatalogEntry[] | null> {
   if (discoveryCache && Date.now() - discoveryCache.at < DISCOVERY_TTL_MS) return discoveryCache.catalog
-  // Multi-account: try any vault/env account first, then single-token fallback.
-  let token: string | null = null
-  let catalogTeamId: string | undefined
+  // Multi-account: try each usable vault account in order, then the desktop
+  // keychain. A logged-out or suspended first account must not block catalog
+  // discovery when a second stored account is still valid.
+  const candidates: Array<{ token: string; teamId?: string }> = []
   try {
-    const accounts = verdentRegistry.all()
-    if (accounts.length) {
-      token = accounts[0]!.credential.accessToken
-      catalogTeamId = accounts[0]!.credential.teamId
+    for (const account of verdentRegistry.all()) {
+      if (account.suspended) continue
+      if (account.credential.accessToken) {
+        candidates.push({ token: account.credential.accessToken, teamId: account.credential.teamId })
+      }
     }
   } catch {}
-  token ??= await resolveToken()
-  if (!token) return null
   try {
-    const res = await fetch(`${VERDENT_PROXY_PROD_BASE_URL}/config/model_list`, {
-      method: "GET",
-      headers: clientHeaders(token, catalogTeamId),
-      signal: AbortSignal.timeout(15_000),
-    })
-    if (!res.ok) return null
+    const desktopToken = await resolveToken()
+    if (desktopToken) candidates.push({ token: desktopToken })
+  } catch {}
+  if (!candidates.length) return null
+  let res: Response | undefined
+  try {
+    for (const candidate of candidates) {
+      try {
+        const attempt = await fetch(`${VERDENT_PROXY_PROD_BASE_URL}/config/model_list`, {
+          method: "GET",
+          headers: clientHeaders(candidate.token, candidate.teamId),
+          signal: AbortSignal.timeout(15_000),
+        })
+        if (attempt.ok) {
+          res = attempt
+          break
+        }
+      } catch {}
+    }
+    if (!res) return null
     const body = (await res.json()) as any
     const models: any[] = body?.data?.model_config ?? body?.model_config ?? []
     if (!Array.isArray(models)) return null
@@ -1098,6 +1102,22 @@ function resolveOsType(): string {
  * the platform, version comes from the Verdent app package when discoverable,
  * and the rest are best-effort identity headers (no secrets).
  */
+
+/**
+ * The desktop client's User-Agent.
+ *
+ * `node` is undici's default and is an immediate "this is a script" tell on an
+ * account whose other traffic came from the real desktop app — a plausible
+ * suspension trigger alongside multi-accounting from one machine GUID. Mirror
+ * the desktop build instead, with an env override for debugging.
+ */
+function desktopUserAgent(): string {
+  return (
+    process.env.VERDENT_USER_AGENT?.trim() ||
+    `Verdent/${VERDENT_CURRENT_VERSION} (${os.type()} ${os.release()}; ${process.arch})`
+  )
+}
+
 function clientHeaders(token: string, accountTeamId?: string): Record<string, string> {
   // 1:1 with VerdentProxyProvider at 26262770: OS/CPU-Arch/agent_type + X-Version-Code/Device-Model/X-Device-ID/X-Team-ID/X-Device-Type/X-OS-Type
   // 1:1 with the captured desktop request: OS is the full `os.type() os.release()`
@@ -1118,7 +1138,7 @@ function clientHeaders(token: string, accountTeamId?: string): Record<string, st
     accept: "*/*",
     "accept-language": "*",
     "sec-fetch-mode": "cors",
-    "user-agent": "node",
+    "user-agent": desktopUserAgent(),
     "accept-encoding": "gzip, deflate, br",
     authorization: `Bearer ${token}`,
     cookie: `token=${token}`,
@@ -1200,6 +1220,21 @@ function isVerdentRateLimitHint(raw: string): boolean {
   )
     return true
   return false
+}
+
+/**
+ * Verdent blocks free-mode access at the ACCOUNT level with
+ * `{"error_code":80006,"msg":"Due to a violation of our policies, your free
+ * mode access has been suspended..."}`. That is neither a rate limit (there is
+ * no window to wait out) nor an auth failure (the token is valid) — so telling
+ * the user to sign in, or retrying, is actively misleading. Detect it so the
+ * real upstream reason is surfaced and the account stops being routed to.
+ */
+function isVerdentAccountSuspended(raw: string): boolean {
+  if (!raw) return false
+  if (/"?error_code"?\s*:\s*80006/.test(raw)) return true
+  const lower = raw.toLowerCase()
+  return /free mode access has been suspended/.test(lower) || /violation of our policies/.test(lower)
 }
 
 function isVerdentRateLimitStatus(status: number, raw: string): boolean {
@@ -1394,7 +1429,7 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
       return sendJson(res, 401, {
         error: {
           message:
-            "No Verdent session found. Open the Verdent desktop app and sign in, or set VERDENT_ACCESS_TOKEN / add an account via the vault.",
+            "No Verdent desktop session found. Open the Verdent desktop app and sign in, then import that account into OpenCode.",
           type: "authentication_error",
         },
       })
@@ -1582,15 +1617,25 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
     if (!upstream.ok) {
       const raw = await upstream.text().catch(() => "")
       const status = upstream.status === 401 || upstream.status === 403 ? 401 : upstream.status
-      const isRateLimit = isVerdentRateLimitStatus(upstream.status, raw)
+      // A suspended free-mode account (error_code 80006) is a hard, permanent
+      // block for this credential — never a rate limit to wait out. Surface
+      // Verdent's own reason so the user isn't told to re-sign-in, and park the
+      // account so the router stops handing it requests.
+      const suspended = isVerdentAccountSuspended(raw)
+      const isRateLimit = !suspended && isVerdentRateLimitStatus(upstream.status, raw)
       if (isRateLimit) account.governor.recordInBandRateLimit(model, raw)
+      if (suspended) verdentRegistry.markSuspended(account.id)
       releaseLease()
-      return sendJson(res, isRateLimit ? 429 : status, {
+      return sendJson(res, suspended ? 403 : isRateLimit ? 429 : status, {
         error: {
-          message: isRateLimit
-            ? `Verdent rate limit: ${raw.slice(0, 600)}`
-            : `Verdent session is not authorized or the model is unavailable. Open the Verdent desktop app and confirm you are signed in. ${raw.slice(0, 600)}`,
-          type: isRateLimit ? "rate_limit_error" : "upstream_error",
+          message: suspended
+            ? `Verdent suspended free-mode access for this account (${account.credential.email ?? account.credential.nickname ?? account.id}): ${
+                raw.slice(0, 600) || "free mode access has been suspended"
+              }. Use another account or a paid plan.`
+            : isRateLimit
+              ? `Verdent rate limit: ${raw.slice(0, 600)}`
+              : `Verdent session is not authorized or the model is unavailable. Open the Verdent desktop app and confirm you are signed in. ${raw.slice(0, 600)}`,
+          type: suspended ? "account_suspended" : isRateLimit ? "rate_limit_error" : "upstream_error",
         },
       })
     }
@@ -1650,7 +1695,10 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
         try {
           earlyError = await pipeVerdentStream(upstream, res, model, {
             signal: cancellation.signal,
-            onRateLimit: (detail) => account.governor.recordInBandRateLimit(model, detail),
+            onRateLimit: (detail, raw) => {
+              if (isVerdentAccountSuspended(`${detail}\n${raw}`)) verdentRegistry.markSuspended(account!.id)
+              else account!.governor.recordInBandRateLimit(model, detail)
+            },
           })
         } catch (e: any) {
           if (!res.headersSent) {
@@ -2134,7 +2182,10 @@ function pipeVerdentStream(
   upstream: Response,
   res: ServerResponse,
   model: string,
-  options: { signal?: AbortSignal; onRateLimit?: (detail: string, raw: string) => void } = {},
+  options: {
+    signal?: AbortSignal
+    onRateLimit?: (detail: string, raw: string) => void
+  } = {},
 ): Promise<string | undefined> {
   const body: any = (upstream as any).body
   if (!body) return Promise.resolve(undefined)
@@ -2663,14 +2714,6 @@ export async function VerdentPlugin(_input: PluginInput): Promise<Hooks> {
     provider: {
       id: PROVIDER_ID,
       async models(provider, context) {
-        // Provider auth is the canonical CLI/UI storage for manually pasted
-        // tokens. Mirror it into the account vault so routing and entitlement
-        // state are shared with desktop imports and env accounts.
-        if (context.auth?.type === "api" && typeof context.auth.key === "string" && context.auth.key.trim()) {
-          try {
-            verdentRegistry.importToken(context.auth.key, undefined, context.auth.metadata?.nickname)
-          } catch {}
-        }
         const proxy = await ensureProxy().catch(() => undefined)
         if (!proxy) return provider.models
 
@@ -2738,71 +2781,6 @@ export async function VerdentPlugin(_input: PluginInput): Promise<Hooks> {
               },
             }
           },
-        },
-        {
-          type: "oauth",
-          label: "Login with browser",
-          async authorize() {
-            const options: VerdentOAuthOptions = {}
-            const started = await startVerdentOAuthServer()
-            const codeVerifier = oauthCodeVerifier()
-            const state = oauthState()
-            const requestId = randomUUID()
-            const callbackNonce = randomBytes(16).toString("hex")
-            const deepLink = `verdent://auth/callback?rid=${encodeURIComponent(requestId)}&nonce=${encodeURIComponent(callbackNonce)}`
-            const callback = new URL(`http://127.0.0.1:${started.port}${VERDENT_AUTH_CALLBACK_PATH}`)
-            callback.searchParams.set("rid", requestId)
-            callback.searchParams.set("nonce", callbackNonce)
-            callback.searchParams.set("wake_callback", deepLink)
-            const authUrl = new URL(`${oauthAuthBaseURL(options)}${VERDENT_AUTH_PATH}`)
-            authUrl.search = new URLSearchParams({
-              challenge: oauthCodeChallenge(codeVerifier),
-              state,
-              intent: "signin",
-              callback: callback.toString(),
-              ots: "deck",
-              source: "deck",
-              id: resolveDeviceId() || randomUUID(),
-            }).toString()
-            const callbackPromise = waitForVerdentOAuthCallback(state, requestId, callbackNonce)
-            return {
-              url: authUrl.toString(),
-              instructions: "Complete Verdent authorization in your browser. This window will close automatically.",
-              method: "auto" as const,
-              async callback() {
-                try {
-                  const completed = await callbackPromise
-                  const tokens = await exchangeVerdentAuthorizationCode(completed.code, codeVerifier, options)
-                  const accessToken = tokenFromOAuthResponse(tokens)
-                  if (!accessToken) return { type: "failed" as const }
-                  const uid = uidFromToken(accessToken)
-                  const profile = await fetchVerdentAccountProfile(accessToken)
-                  const account = verdentRegistry.enrollCredential({
-                    path: "oauth:verdent",
-                    accessToken,
-                    uid,
-                    nickname: profile?.nickname ?? uid,
-                    teamId: profile?.teamId,
-                    expiresAt: verdentOAuthExpiresAt(tokens),
-                  })
-                  return {
-                    type: "success" as const,
-                    key: accessToken,
-                    provider: PROVIDER_ID,
-                    metadata: { accountId: account.id, uid: account.uid, source: "browser-oauth" },
-                  }
-                } catch {
-                  return { type: "failed" as const }
-                } finally {
-                  stopVerdentOAuthServer()
-                }
-              },
-            }
-          },
-        },
-        {
-          type: "api",
-          label: "Verdent access token",
         },
       ],
     },
