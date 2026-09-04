@@ -1,54 +1,44 @@
 import { For, Show, createMemo, createSignal } from "solid-js"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
+import { Icon } from "@opencode-ai/ui/icon"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
+import { parseToolError, type ErrorBlock } from "./tool-error-parse"
 
 /**
  * Body of a failed tool call.
  *
- * Errors are prose, not code — the old panel rendered the whole thing as a
- * monospace blob, which made a one-line "file not found" look like a stack
- * trace. This splits the three things an error actually contains:
- *
- *   1. a type (`SchemaError`, `ENOENT`) → badge
- *   2. the message → readable sans
- *   3. remediation the tool appended ("Please rewrite the input…") → footer
- *
- * Stack-like tails stay monospace and collapse, so a deep trace doesn't push
- * the conversation off-screen.
+ * Errors are prose, not code — rendering the whole thing as a monospace blob
+ * made a one-line "file not found" look like a stack trace. But they are not
+ * *only* prose either: `patch` and `edit` quote the source they could not
+ * match, and reflowing that as a paragraph destroys the alignment that makes it
+ * readable. So the body is split into prose paragraphs and verbatim excerpts,
+ * with remediation and any real stack trace after them.
  */
 
-/** Lines tools append to tell the *model* what to do next. */
-const REMEDIATION = /^(please |try |use |re-save |hint:|suggestion:|did you mean)/i
-
-/** `SchemaError(...)`, `ENOENT:`, `TypeError:` — a leading machine-readable type. */
-const ERROR_TYPE = /^([A-Z][A-Za-z0-9_]*(?:Error|Exception)|E[A-Z]{3,})\b[:(]?/
-
-const STACK_LINE = /^\s*(at\s+\S|\s{4,}\S)/
+function ErrorCode(props: { block: Extract<ErrorBlock, { kind: "code" }> }) {
+  return (
+    <div data-slot="tool-error-code">
+      <For each={props.block.lines}>
+        {(line) => (
+          <div data-slot="tool-error-code-line" data-marker={line.marker ? "true" : undefined}>
+            <Show when={line.number}>
+              <span data-slot="tool-error-code-gutter">{line.number}</span>
+            </Show>
+            <span data-slot="tool-error-code-text">{line.text || " "}</span>
+          </div>
+        )}
+      </For>
+    </div>
+  )
+}
 
 export function ToolErrorPanel(props: { error: string }) {
   const i18n = useI18n()
   const [copied, setCopied] = createSignal(false)
   const [showStack, setShowStack] = createSignal(false)
 
-  const parsed = createMemo(() => {
-    const raw = props.error.replace(/^Error:\s*/, "").trim()
-    const lines = raw.split("\n")
-
-    const stackAt = lines.findIndex((line) => STACK_LINE.test(line))
-    const body = stackAt >= 0 ? lines.slice(0, stackAt) : lines
-    const stack = stackAt >= 0 ? lines.slice(stackAt) : []
-
-    const hints: string[] = []
-    while (body.length > 1 && REMEDIATION.test(body[body.length - 1]!.trim())) {
-      hints.unshift(body.pop()!.trim())
-    }
-
-    const message = body.join("\n").trim()
-    const type = ERROR_TYPE.exec(message)?.[1]
-
-    return { raw, type, message, hints, stack }
-  })
+  const parsed = createMemo(() => parseToolError(props.error))
 
   const copy = async () => {
     if (!parsed().raw) return
@@ -62,6 +52,7 @@ export function ToolErrorPanel(props: { error: string }) {
   return (
     <div data-component="tool-error-panel">
       <div data-slot="tool-error-head">
+        <Icon name="warning" size="small" />
         <span data-slot="tool-error-type">{parsed().type ?? i18n.t("ui.toolErrorCard.failed")}</span>
         <Tooltip value={copyLabel()} placement="top" gutter={4}>
           <IconButton
@@ -78,9 +69,15 @@ export function ToolErrorPanel(props: { error: string }) {
         </Tooltip>
       </div>
 
-      <Show when={parsed().message}>
-        <div data-slot="tool-error-message">{parsed().message}</div>
-      </Show>
+      <div data-slot="tool-error-body">
+        <For each={parsed().blocks}>
+          {(block) => (
+            <Show when={block.kind === "code"} fallback={<div data-slot="tool-error-message">{(block as any).text}</div>}>
+              <ErrorCode block={block as Extract<ErrorBlock, { kind: "code" }>} />
+            </Show>
+          )}
+        </For>
+      </div>
 
       <Show when={parsed().hints.length > 0}>
         <div data-slot="tool-error-hints">

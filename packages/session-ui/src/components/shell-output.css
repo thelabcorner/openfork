@@ -1,0 +1,83 @@
+[data-component="bash-output"] {
+  --shell-output-default-foreground: var(--text-muted, var(--text-base));
+  --shell-output-default-background: var(--opencode-diffs-bg, var(--color-background-stronger));
+
+  /* Keep the ANSI palette readable in both app color schemes while preserving
+     the familiar terminal hues users expect from shell commands. */
+  --shell-ansi-black: light-dark(#000000, #000000);
+  --shell-ansi-red: light-dark(#a31515, #f14c4c);
+  --shell-ansi-green: light-dark(#008000, #23d18b);
+  --shell-ansi-yellow: light-dark(#795e00, #f5f543);
+  --shell-ansi-blue: light-dark(#0451a5, #3b8eea);
+  --shell-ansi-magenta: light-dark(#af00db, #d670d6);
+  --shell-ansi-cyan: light-dark(#0598bc, #29b8db);
+  --shell-ansi-white: light-dark(#555555, #e5e5e5);
+  --shell-ansi-bright-black: light-dark(#666666, #808080);
+  --shell-ansi-bright-red: light-dark(#cd3131, #f14c4c);
+  --shell-ansi-bright-green: light-dark(#14ce14, #23d18b);
+  --shell-ansi-bright-yellow: light-dark(#b5ba00, #f5f543);
+  --shell-ansi-bright-blue: light-dark(#0451a5, #3b8eea);
+  --shell-ansi-bright-magenta: light-dark(#bc05bc, #d670d6);
+  --shell-ansi-bright-cyan: light-dark(#0598bc, #29b8db);
+  --shell-ansi-bright-white: light-dark(#555555, #e5e5e5);
+}
+
+[data-slot="bash-pre"] [data-slot="shell-output-segment"] {
+  color: var(--shell-output-fg, var(--shell-output-default-foreground));
+  background-color: var(--shell-output-bg, transparent);
+  font-style: inherit;
+  font-weight: inherit;
+  text-decoration-line: var(--shell-output-decoration, none);
+}
+
+[data-slot="bash-pre"] [data-slot="shell-output-segment"][data-shell-bold] {
+  font-weight: 700;
+}
+
+[data-slot="bash-pre"] [data-slot="shell-output-segment"][data-shell-dim] {
+  opacity: 0.68;
+}
+
+[data-slot="bash-pre"] [data-slot="shell-output-segment"][data-shell-italic] {
+  font-style: italic;
+}
+
+/* Reverse video.
+ *
+ * A literal fg/bg swap is what a terminal does, but here it lands mid-sentence
+ * as a solid grey slab with dark text and reads as damage rather than emphasis
+ * — which is exactly what `Select-String`, `grep --color`, and ripgrep use it
+ * for. This is a log view, not a terminal emulator, so render it as what it
+ * means: a highlight. Text keeps its colour and gains weight; the background is
+ * a tinted wash sized to the run.
+ */
+[data-slot="bash-pre"] [data-slot="shell-output-segment"][data-shell-inverse] {
+  color: var(--shell-output-fg, var(--text-strong, var(--shell-output-default-foreground)));
+  background-color: color-mix(
+    in srgb,
+    var(--shell-output-fg, var(--shell-output-default-foreground)) 22%,
+    transparent
+  );
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--shell-output-fg, var(--shell-output-default-foreground)) 12%, transparent);
+}
+
+[data-slot="bash-pre"] [data-slot="shell-output-segment"][data-shell-hidden] {
+  color: transparent;
+}
+
+[data-slot="bash-pre"] [data-slot="shell-output-segment"][data-shell-blink] {
+  animation: shell-output-blink 1s steps(2, start) infinite;
+}
+
+@keyframes shell-output-blink {
+  50% {
+    opacity: 0;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  [data-slot="bash-pre"] [data-slot="shell-output-segment"][data-shell-blink] {
+    animation: none;
+  }
+}

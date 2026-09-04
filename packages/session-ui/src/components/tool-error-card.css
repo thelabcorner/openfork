@@ -5,43 +5,128 @@
    same target — tinted danger with `failed` in the result slot. Only the body
    is special.
 
-   Errors are prose, so the message is set in sans at a readable size. Only the
-   stack tail is monospace. The whole panel is tinted rather than boxed, so it
-   reads as part of the card instead of a second nested card.
+   The body is three things, not one blob:
+
+     ▍ ⚠ SchemaError                                            [copy]
+     ▍ the message, in prose, at reading size
+     ▍   │ remediation the tool appended for the model
+     ▍   ▸ 12 stack frames
+
+   Flat-tinting the whole panel made it read as one undifferentiated block, so
+   only the head strip carries the tint; a left rail ties the rest to it.
    =========================================================================== */
 
 [data-component="tool-error-panel"] {
+  --tool-error: var(--v2-state-fg-danger);
+
   display: flex;
   flex-direction: column;
   min-width: 0;
   width: 100%;
-  background: color-mix(in srgb, var(--v2-state-fg-danger) 5%, transparent);
+  border-left: 2px solid color-mix(in srgb, var(--tool-error) 55%, transparent);
 
   [data-slot="tool-error-head"] {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 8px;
-    padding: 5px 6px 4px 10px;
+    gap: 6px;
+    min-height: 24px;
+    padding: 0 4px 0 8px;
+    background: color-mix(in srgb, var(--tool-error) 10%, transparent);
+    border-bottom: 1px solid color-mix(in srgb, var(--tool-error) 18%, transparent);
+
+    > [data-slot="icon-svg"] {
+      flex-shrink: 0;
+      width: 12px;
+      height: 12px;
+      color: var(--tool-error);
+    }
+
+    /* The copy button is the only interactive thing here; it should not set
+       the height of the strip. */
+    [data-component="icon-button"] {
+      margin-left: auto;
+      width: 20px;
+      height: 20px;
+      flex-shrink: 0;
+    }
   }
 
   [data-slot="tool-error-type"] {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
     font-family: var(--tp-sans, "Inter", sans-serif);
     font-size: 10px;
     font-weight: 600;
     letter-spacing: 0.5px;
     text-transform: uppercase;
-    color: var(--v2-state-fg-danger);
+    color: var(--tool-error);
   }
 
+  /* Prose and verbatim excerpts alternate; the body owns the padding so the
+     two never double up on each other's margins. */
+  [data-slot="tool-error-body"] {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    padding: 7px 0 8px;
+    max-height: 420px;
+    overflow-y: auto;
+    scrollbar-width: thin;
+  }
+
+  /* Prose. Explicitly normal weight — the surrounding row styles this inherits
+     from are 500+, which made a one-line error read as a heading. */
   [data-slot="tool-error-message"] {
-    padding: 0 10px 8px;
+    padding: 0 10px;
     font-family: var(--tp-sans, "Inter", sans-serif);
-    font-size: 12px;
-    line-height: 1.55;
+    font-size: 12.5px;
+    font-weight: 400;
+    line-height: 1.5;
     color: var(--v2-text-text-base);
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+
+  /* Source the tool quoted back. Alignment is the whole point, so this never
+     wraps — it scrolls sideways like the code viewer it is standing in for. */
+  [data-slot="tool-error-code"] {
+    margin: 0 10px;
+    padding: 4px 0;
+    border-radius: 5px;
+    background: color-mix(in srgb, var(--v2-text-text-base) 5%, transparent);
+    overflow-x: auto;
+    scrollbar-width: thin;
+  }
+
+  [data-slot="tool-error-code-line"] {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: max-content;
+    padding: 0 8px;
+    font-family: var(--tp-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+    font-size: 11px;
+    line-height: 17px;
+    white-space: pre;
+    color: var(--v2-text-text-muted);
+
+    /* The line the tool was actually pointing at. */
+    &[data-marker="true"] {
+      background: color-mix(in srgb, var(--tool-error) 12%, transparent);
+      box-shadow: inset 2px 0 0 var(--tool-error);
+      color: var(--v2-text-text-base);
+    }
+  }
+
+  [data-slot="tool-error-code-gutter"] {
+    flex-shrink: 0;
+    min-width: 34px;
+    text-align: right;
+    color: var(--v2-text-text-faint);
+    font-variant-numeric: tabular-nums;
+    user-select: none;
   }
 
   /* Remediation the tool appended for the model. Still useful to a human, but
@@ -52,14 +137,16 @@
     gap: 2px;
     margin: 0 10px 8px;
     padding-left: 8px;
-    border-left: 2px solid color-mix(in srgb, var(--v2-state-fg-danger) 35%, transparent);
+    border-left: 2px solid color-mix(in srgb, var(--tool-error) 30%, transparent);
   }
 
   [data-slot="tool-error-hint"] {
     font-family: var(--tp-sans, "Inter", sans-serif);
     font-size: 11.5px;
+    font-weight: 400;
     line-height: 1.5;
     color: var(--v2-text-text-muted);
+    overflow-wrap: anywhere;
   }
 
   [data-slot="tool-error-stack"] {
@@ -83,9 +170,13 @@
   }
 }
 
-/* The panel is the card's only child, so it fills the frame. */
+/* The panel is the card's only child, so it fills the frame — and the card's
+   own border gives way to the danger rail on the left edge. */
 [data-slot="tool-content"][data-variant="card"] > [data-component="tool-error-panel"] {
-  border: 0;
   border-radius: 0;
   margin: 0;
+}
+
+[data-slot="tool-content"][data-variant="card"]:has(> [data-component="tool-error-panel"]) {
+  border-color: color-mix(in srgb, var(--v2-state-fg-danger) 22%, var(--tool-border));
 }

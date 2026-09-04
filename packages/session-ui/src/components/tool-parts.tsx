@@ -1,5 +1,6 @@
 import { For, Show, createMemo, createSignal, type JSX } from "solid-js"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
+import { ShellOutput, parseShellOutput } from "./shell-output"
 
 /**
  * Dense building blocks for tool output.
@@ -198,6 +199,48 @@ export function ToolBoundedList<T>(props: {
 
 export function ToolEmpty(props: { children: JSX.Element }) {
   return <div data-component="tool-empty">{props.children}</div>
+}
+
+/* ── Notice ──────────────────────────────────────────────────────────────
+   A tool that succeeded but has nothing to show — "skill not found",
+   "no matches", "already up to date". The message is prose, so it is set in
+   sans; the `Use tool({...})` lines tools append are addressed to the model,
+   not the reader, so they sit in a subordinate rail below it. */
+
+export function ToolNotice(props: { tone?: Tone; message: string; hints?: readonly string[]; children?: JSX.Element }) {
+  return (
+    <div data-component="tool-notice" data-tone={props.tone}>
+      <div data-slot="tool-notice-message">{props.message}</div>
+      {props.children}
+      <Show when={props.hints?.length}>
+        <div data-slot="tool-notice-hints">
+          <For each={props.hints}>{(hint) => <div data-slot="tool-notice-hint">{hint}</div>}</For>
+        </div>
+      </Show>
+    </div>
+  )
+}
+
+/* ── Log ─────────────────────────────────────────────────────────────────
+   Captured process output. Goes through the ANSI parser so colours survive,
+   and never wraps — a log's columns are load-bearing. */
+
+export function ToolLog(props: { text: string; label?: string }) {
+  const parsed = createMemo(() => parseShellOutput(props.text))
+  return (
+    <div data-component="tool-log">
+      <Show when={props.label}>
+        <div data-slot="tool-log-label">{props.label}</div>
+      </Show>
+      <div data-slot="tool-log-scroll" tabIndex={0} role="region">
+        <pre data-slot="tool-log-pre">
+          <code>
+            <ShellOutput parsed={parsed} />
+          </code>
+        </pre>
+      </div>
+    </div>
+  )
 }
 
 /* ── Key/value detail grid ───────────────────────────────────────────────── */
