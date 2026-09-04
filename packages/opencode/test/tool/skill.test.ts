@@ -1,6 +1,8 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { Effect } from "effect"
 import { afterEach, describe, expect } from "bun:test"
@@ -27,7 +29,11 @@ afterEach(async () => {
   await disposeAllInstances()
 })
 
-const it = testEffect(LayerNode.compile(LayerNode.group([ToolRegistry.node, CrossSpawnSpawner.node, Ripgrep.node])))
+const it = testEffect(
+  LayerNode.compile(
+    LayerNode.group([filesystem, FSUtil.node, CrossSpawnSpawner.node, Ripgrep.node, ToolRegistry.node]),
+  ),
+)
 
 describe("tool.skill", () => {
   it.instance("execute returns skill content block with files", () =>
@@ -172,6 +178,20 @@ Do the thing.
             requests.push(req)
           }),
       }
+
+      const fromContext = yield* tool.execute(
+        { name: "downloads-skill" },
+        {
+          ...ctx,
+          messages: [
+            {
+              parts: [{ type: "text", text: `Please use the skill at ${outside}` }],
+            },
+          ] as unknown as Tool.Context["messages"],
+        },
+      )
+      expect(fromContext.output).toContain(`<skill_content name="downloads-skill">`)
+      expect(fromContext.metadata.source).toBe("path")
 
       const fromPath = yield* tool.execute({ filePath: outside }, ctx)
       expect(fromPath.output).toContain(`<skill_content name="downloads-skill">`)

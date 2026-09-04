@@ -162,7 +162,7 @@ export function detectFormat(input: string | Uint8Array, fileHint?: string, buf?
 
 export function bsonSerialize(extended: unknown): Buffer {
   const native = EJSON.deserialize(extended as any)
-  return serialize(native as any)
+  return Buffer.from(serialize(native as any))
 }
 
 export function stringifyForFormat(value: unknown, format: string, indent?: number, sortKeys = false): string {

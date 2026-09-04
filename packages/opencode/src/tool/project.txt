@@ -5,6 +5,7 @@ landing in a new checkout, or when deciding which package to work in).
 
 Actions:
   snapshot  (default) — tier-based project snapshot (below)
+  summary   — alias for snapshot with the summary tier
   recent    — the N most recently modified files (newest first, grouped by
             directory, relative timestamps) — what is being worked on here?
   toolchain — installed runtimes + versions (bun/node/npm/pnpm/yarn/python/

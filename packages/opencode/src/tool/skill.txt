@@ -12,6 +12,11 @@ Load:
 - skill({ name: "C:/Users/me/other-project/skills/foo/SKILL.md" }) — path in name also works.
 - skill({ names: ["a", "~/Downloads/b"] }) — mix names and paths.
 
+If the user explicitly provides a filesystem path but the requested skill is
+sent by basename, a matching path from the request may be recovered;
+otherwise always pass the full path in filePath or name. Paths are never
+guessed by scanning the filesystem.
+
 A path load parses the markdown, then keeps that skill available by its frontmatter name for the rest of this session.
 
 Other modes:

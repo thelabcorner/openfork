@@ -74,6 +74,8 @@ const normalizeLike = (a: string, b: string) =>
   a.toLowerCase().includes(b.toLowerCase()) ||
   b.toLowerCase().includes(a.toLowerCase())
 
+const normalizeExact = (value: string) => value.toLowerCase().replace(/[^a-z0-9]/g, "")
+
 const looksLikePath = (value: string) => {
   const s = value.trim()
   if (!s) return false
@@ -93,6 +95,27 @@ const resolveUserPath = (raw: string, directory: string, home: string) => {
   else if (next.startsWith("~/") || next.startsWith("~\\")) next = path.join(home, next.slice(2))
   if (!path.isAbsolute(next)) next = path.join(directory, next)
   return process.platform === "win32" ? FSUtil.normalizePath(next) : next
+}
+
+// Models occasionally pass only a skill's name after the user supplied its full
+// path. Recover only explicit paths; do not search the filesystem by name or
+// guess between similarly named skills.
+const pathsMentioned = (messages: Tool.Context["messages"]) => {
+  const pattern = new RegExp(
+    `(?:[A-Za-z]:[\\\\/]|\\\\\\\\|/|~[\\\\/])[^\\r\\n"'<>|?*]*?(?:[\\\\/](?:SKILL\\.md|skill\\.md|Skill\\.md))?(?=$|[\\s,.;:!?)}\\]\\x60])`,
+    "gi",
+  )
+  const found = new Set<string>()
+  for (const message of messages) {
+    for (const part of message.parts) {
+      if (part.type !== "text") continue
+      for (const match of part.text.matchAll(pattern)) {
+        const candidate = stripQuotes(match[0]!).replace(/[.,;:!?)}\]]+$/, "")
+        if (candidate) found.add(candidate)
+      }
+    }
+  }
+  return [...found]
 }
 
 export const SkillTool = Tool.define<typeof Parameters, Metadata, Skill.Service | Ripgrep.Service>(
@@ -127,7 +150,7 @@ export const SkillTool = Tool.define<typeof Parameters, Metadata, Skill.Service 
       return { output: renderSkill(info, files, dir), dir, name: info.name, source }
     })
 
-    const loadFromFilesystem = Effect.fn("SkillTool.loadFromFilesystem")(function* (
+    const readFromFilesystem = Effect.fn("SkillTool.readFromFilesystem")(function* (
       abs: string,
       ctx: Tool.Context,
       instance: { directory: string; worktree: string },
@@ -142,7 +165,15 @@ export const SkillTool = Tool.define<typeof Parameters, Metadata, Skill.Service 
         always: [rel],
         metadata: { filepath: abs },
       })
-      const info = yield* skill.loadFromPath(abs)
+      return yield* skill.loadFromPath(abs)
+    })
+
+    const loadFromFilesystem = Effect.fn("SkillTool.loadFromFilesystem")(function* (
+      abs: string,
+      ctx: Tool.Context,
+      instance: { directory: string; worktree: string },
+    ) {
+      const info = yield* readFromFilesystem(abs, ctx, instance)
       return yield* finish(info, ctx, "path")
     })
 
@@ -160,6 +191,16 @@ export const SkillTool = Tool.define<typeof Parameters, Metadata, Skill.Service 
 
       const registered = yield* skill.get(trimmed)
       if (registered) return yield* finish(registered, ctx, "registry")
+
+      // If the request contained the path but the model supplied only its
+      // basename, use the explicit matching path before reporting NotFound.
+      for (const mentioned of pathsMentioned(ctx.messages)) {
+        const abs = resolveUserPath(mentioned, instance.directory, os.homedir())
+        const stat = yield* Effect.tryPromise(() => fs.stat(abs)).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (!stat?.isFile() && !stat?.isDirectory()) continue
+        const info = yield* readFromFilesystem(abs, ctx, instance).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (info && normalizeExact(info.name) === normalizeExact(trimmed)) return yield* finish(info, ctx, "path")
+      }
 
       const missing = yield* skill.require(trimmed)
       return yield* finish(missing, ctx, "registry")
@@ -268,7 +309,10 @@ export const SkillTool = Tool.define<typeof Parameters, Metadata, Skill.Service 
 
           if (targets.length === 0) {
             const all = yield* skill.all()
-            const avail = all.filter((info) => matchesTags(info, params.tags)).map(describe).join("\n")
+            const avail = all
+              .filter((info) => matchesTags(info, params.tags))
+              .map(describe)
+              .join("\n")
             return {
               title: "No skill name provided",
               output: `No skill name or filePath provided.\n\nAvailable skills:\n${avail || "(none)"}\n\nUse mode:"list", a registered name, or filePath to a SKILL.md / skill folder anywhere on disk.`,

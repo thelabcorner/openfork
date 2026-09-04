@@ -328,6 +328,7 @@ export const BackgroundTool = Tool.define(
               yield* askCommand(ctx, "send", {
                 id: params.id,
                 status: "running",
+                kind: (entry as any)?.kind ?? "shell",
                 command: entry.command,
                 logPath: entry.logPath,
               })
@@ -352,7 +353,13 @@ export const BackgroundTool = Tool.define(
                 throw new Error(`No such job: ${params.id}`)
               }
               const command = entry?.command ?? info?.title ?? params.id
-              yield* askCommand(ctx, "kill", { id: params.id, status: "running", command, logPath: entry?.logPath })
+              yield* askCommand(ctx, "kill", {
+                id: params.id,
+                status: "running",
+                kind: (entry as any)?.kind ?? (info?.metadata as any)?.kind ?? "shell",
+                command,
+                logPath: entry?.logPath,
+              })
               if (!info || info.status === "running") {
                 // Cancel first: sets status "cancelled" deterministically and closes the
                 // job scope (the spawn release kills the process). handle.kill after is a

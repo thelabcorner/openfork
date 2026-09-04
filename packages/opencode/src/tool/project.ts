@@ -13,9 +13,9 @@ import { which } from "@opencode-ai/core/util/which"
 import DESCRIPTION from "./project.txt"
 
 export const Parameters = Schema.Struct({
-  action: Schema.optional(Schema.Literals(["snapshot", "recent", "toolchain"])).annotate({
+  action: Schema.optional(Schema.Literals(["snapshot", "summary", "recent", "toolchain"])).annotate({
     description:
-      "What to run (default snapshot). snapshot = tier snapshot of the project; recent = N most recently modified files (what is being worked on); toolchain = installed runtimes + versions, PATH resolution, key env vars.",
+      "What to run (default snapshot). snapshot = tier snapshot of the project; summary = alias for snapshot with the summary tier; recent = N most recently modified files (what is being worked on); toolchain = installed runtimes + versions, PATH resolution, key env vars.",
   }),
   tier: Schema.optional(Schema.Literals(["summary", "structure", "full"])).annotate({
     description:
@@ -24,7 +24,9 @@ export const Parameters = Schema.Struct({
   path: Schema.optional(Schema.String).annotate({
     description: "Subdirectory to scope the snapshot to (default: project root). Relative to the working directory.",
   }),
-  depth: Schema.optional(Schema.Int).annotate({ description: "Tree depth for structure/full tiers (default 3, max 5)" }),
+  depth: Schema.optional(Schema.Int).annotate({
+    description: "Tree depth for structure/full tiers (default 3, max 5)",
+  }),
   maxEntries: Schema.optional(Schema.Int).annotate({ description: "Tree/entry cap (default 200, max 500)" }),
   recent: Schema.optional(Schema.Int).annotate({
     description:
@@ -315,10 +317,21 @@ function detectNode(text: string | undefined, files: ReadonlySet<string>): Stack
   else if (bin && typeof bin === "object") {
     entryPoints.push(...Object.values(bin).filter((v): v is string => typeof v === "string"))
   }
-  for (const rel of ["src/main.ts", "src/main.js", "src/main.tsx", "src/index.ts", "src/index.js", "index.js", "index.ts"]) {
+  for (const rel of [
+    "src/main.ts",
+    "src/main.js",
+    "src/main.tsx",
+    "src/index.ts",
+    "src/index.js",
+    "index.js",
+    "index.ts",
+  ]) {
     if (files.has(rel)) entryPoints.push(rel)
   }
-  const enginesNode = engines && typeof engines === "object" && "node" in engines && typeof engines.node === "string" ? engines.node : undefined
+  const enginesNode =
+    engines && typeof engines === "object" && "node" in engines && typeof engines.node === "string"
+      ? engines.node
+      : undefined
   return {
     ecosystem: "node",
     monorepo,
@@ -407,7 +420,7 @@ function detectGo(text: string | undefined, files: ReadonlySet<string>): StackIn
   const deps = new Set<string>()
   const requireBlock = /^require\s*\(([\s\S]*?)\)/m.exec(text)
   if (requireBlock) {
-    for (const m of requireBlock[1]!.matchAll(/^(\S+)\s+v/mg)) deps.add(m[1]!)
+    for (const m of requireBlock[1]!.matchAll(/^(\S+)\s+v/gm)) deps.add(m[1]!)
   } else {
     for (const m of text.matchAll(/^require\s+(\S+)/gm)) deps.add(m[1]!)
   }
@@ -684,8 +697,12 @@ function renderTree(
   const lines: string[] = []
   let moreFiles = 0
   let moreBytes = 0
-  const dirs = [...root.children.values()].filter((c) => c.kind === "dir").sort((a, b) => topLevelRank(a.name) - topLevelRank(b.name) || a.name.localeCompare(b.name))
-  const files = [...root.children.values()].filter((c) => c.kind === "file").sort((a, b) => a.name.localeCompare(b.name))
+  const dirs = [...root.children.values()]
+    .filter((c) => c.kind === "dir")
+    .sort((a, b) => topLevelRank(a.name) - topLevelRank(b.name) || a.name.localeCompare(b.name))
+  const files = [...root.children.values()]
+    .filter((c) => c.kind === "file")
+    .sort((a, b) => a.name.localeCompare(b.name))
   for (const dir of dirs) {
     if (budget.n <= 0) {
       moreFiles += dir.files
@@ -760,7 +777,11 @@ const CONFIG_PATTERNS: ReadonlyArray<RegExp> = [
 
 type Presence = { path: string; kind: string }
 
-export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Service | RipgrepBinary.Service | AppProcess.Service>(
+export const ProjectTool = Tool.define<
+  typeof Parameters,
+  Metadata,
+  Ripgrep.Service | RipgrepBinary.Service | AppProcess.Service
+>(
   "project",
   Effect.gen(function* () {
     const ripgrep = yield* Ripgrep.Service
@@ -900,14 +921,27 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
     const detectGit = Effect.fn("ProjectTool.detectGit")(function* (cwd: string, signal: AbortSignal) {
       const run = Effect.fnUntraced(function* (args: string[]) {
         const result = yield* app
-          .run(ChildProcess.make("git", [...GIT_ARGS, ...args], { cwd, env: GIT_SAFE_ENV, stdin: "ignore", stdout: "pipe", stderr: "pipe" }), {
-            maxOutputBytes: 300_000,
-            timeout: "10 seconds",
-            signal,
-          })
+          .run(
+            ChildProcess.make("git", [...GIT_ARGS, ...args], {
+              cwd,
+              env: GIT_SAFE_ENV,
+              stdin: "ignore",
+              stdout: "pipe",
+              stderr: "pipe",
+            }),
+            {
+              maxOutputBytes: 300_000,
+              timeout: "10 seconds",
+              signal,
+            },
+          )
           .pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!result) return undefined
-        return { exitCode: result.exitCode, stdout: result.stdout.toString("utf8"), stderr: result.stderr.toString("utf8") }
+        return {
+          exitCode: result.exitCode,
+          stdout: result.stdout.toString("utf8"),
+          stderr: result.stderr.toString("utf8"),
+        }
       })
       const top = yield* run(["rev-parse", "--show-toplevel"])
       if (!top || top.exitCode !== 0) return undefined
@@ -918,13 +952,9 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
         run(["status", "--porcelain"]),
       ])
       const commonDir = common?.stdout.trim()
-      const linkedWorktree = commonDir !== undefined && commonDir !== "" && commonDir !== ".git" && !commonDir.startsWith(root)
-      const changed = porcelain
-        ? porcelain.stdout
-            .split("\n")
-            .filter((l) => l.trim() !== "")
-            .length
-        : 0
+      const linkedWorktree =
+        commonDir !== undefined && commonDir !== "" && commonDir !== ".git" && !commonDir.startsWith(root)
+      const changed = porcelain ? porcelain.stdout.split("\n").filter((l) => l.trim() !== "").length : 0
       return {
         root,
         branch: branch?.stdout.trim() || undefined,
@@ -964,7 +994,11 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
           })
           .pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!result) return undefined
-        return { exitCode: result.exitCode, stdout: result.stdout.toString("utf8"), stderr: result.stderr.toString("utf8") }
+        return {
+          exitCode: result.exitCode,
+          stdout: result.stdout.toString("utf8"),
+          stderr: result.stderr.toString("utf8"),
+        }
       })
       const runtimes: Array<{ name: string; version?: string; path?: string }> = []
       for (const probe of RUNTIME_PROBES) {
@@ -997,9 +1031,14 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
           const instance = yield* InstanceState.context
-          const tier = params.tier ?? "summary"
-          const action = params.action ?? "snapshot"
-          const scope = params.path ? (path.isAbsolute(params.path) ? params.path : path.join(instance.directory, params.path)) : instance.directory
+          const tier = params.action === "summary" ? "summary" : (params.tier ?? "summary")
+          // Accept the natural-language action alias while keeping one snapshot path.
+          const action = params.action === "summary" ? "snapshot" : (params.action ?? "snapshot")
+          const scope = params.path
+            ? path.isAbsolute(params.path)
+              ? params.path
+              : path.join(instance.directory, params.path)
+            : instance.directory
           const normalized = process.platform === "win32" ? FSUtil.normalizePath(scope) : scope
           // Non-git projects set worktree to "/", which makes path.relative
           // drive-root-relative and meaningless — fall back to the directory.
@@ -1016,7 +1055,9 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
           })
           yield* assertExternalDirectoryEffect(ctx, normalized, { kind: "directory" })
 
-          const stat = yield* Effect.tryPromise(() => fs.stat(normalized)).pipe(Effect.catch(() => Effect.succeed(undefined)))
+          const stat = yield* Effect.tryPromise(() => fs.stat(normalized)).pipe(
+            Effect.catch(() => Effect.succeed(undefined)),
+          )
           if (!stat) throw new Error(`Path not found: ${normalized}`)
           if (!stat.isDirectory()) throw new Error(`Path is not a directory: ${normalized}`)
 
@@ -1070,8 +1111,14 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
             const { runtimes, env } = yield* probeToolchain(ctx.abort)
             const lines = [
               `<toolchain git="${git !== undefined}" root="${escapeXml(git?.root ?? base)}">`,
-              ...runtimes.map((r) => `  <runtime name="${escapeXml(r.name)}"${r.version ? ` version="${escapeXml(r.version)}"` : ""}${r.path ? ` path="${escapeXml(r.path)}"` : ""} />`),
-              ...env.map((e) => `  <env name="${escapeXml(e.name)}" value="${escapeXml(e.value ?? "")}" hint="${escapeXml(e.hint)}" />`),
+              ...runtimes.map(
+                (r) =>
+                  `  <runtime name="${escapeXml(r.name)}"${r.version ? ` version="${escapeXml(r.version)}"` : ""}${r.path ? ` path="${escapeXml(r.path)}"` : ""} />`,
+              ),
+              ...env.map(
+                (e) =>
+                  `  <env name="${escapeXml(e.name)}" value="${escapeXml(e.value ?? "")}" hint="${escapeXml(e.hint)}" />`,
+              ),
               "</toolchain>",
             ]
             const output = lines.join("\n")
@@ -1091,7 +1138,9 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
 
           // scope-relative view for the tree + stats
           const prefix = scopeRel === "." ? "" : `${scopeRel.split(path.sep).join("/")}/`
-          const scopedPaths = prefix ? rootPaths.filter((p) => p.startsWith(prefix)).map((p) => p.slice(prefix.length)) : rootPaths
+          const scopedPaths = prefix
+            ? rootPaths.filter((p) => p.startsWith(prefix)).map((p) => p.slice(prefix.length))
+            : rootPaths
 
           const { sizes: sizeMap } = yield* readSizes(normalized, scopedPaths, ctx.abort)
 
@@ -1121,7 +1170,12 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
             }
           }
 
-          const { stack, lockfile, versionPins } = yield* detectStack(normalized, new Set(scopedPaths), fileSet, manifests)
+          const { stack, lockfile, versionPins } = yield* detectStack(
+            normalized,
+            new Set(scopedPaths),
+            fileSet,
+            manifests,
+          )
 
           const pkgManifest = manifests.get("package.json")
           const scripts = annotateScripts(pkgManifest && "text" in pkgManifest ? pkgManifest.text : undefined)
@@ -1162,9 +1216,16 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
             for (const fw of stack?.frameworks ?? []) lines.push(`  <framework name="${escapeXml(fw)}" />`)
             if (entryPoints.length) lines.push(`  <entry points="${escapeXml(entryPoints.slice(0, 5).join(", "))}" />`)
             if (ci.length) lines.push(`  <ci ${ci.map((c) => `${c.kind}="${escapeXml(c.path)}"`).join(" ")} />`)
-            if (stack?.runtimeVersion) lines.push(`  <version kind="${escapeXml(stack.versionKind ?? "runtime")}" value="${escapeXml(stack.runtimeVersion)}" />`)
-            for (const [name, value] of versionPins) lines.push(`  <version kind="${escapeXml(name)}" value="${escapeXml(value)}" />`)
-            if (!stack) lines.push(`  <hint>no manifest detected (package.json/pyproject/Cargo/go.mod/…) — still showing tree + stats</hint>`)
+            if (stack?.runtimeVersion)
+              lines.push(
+                `  <version kind="${escapeXml(stack.versionKind ?? "runtime")}" value="${escapeXml(stack.runtimeVersion)}" />`,
+              )
+            for (const [name, value] of versionPins)
+              lines.push(`  <version kind="${escapeXml(name)}" value="${escapeXml(value)}" />`)
+            if (!stack)
+              lines.push(
+                `  <hint>no manifest detected (package.json/pyproject/Cargo/go.mod/…) — still showing tree + stats</hint>`,
+              )
             for (const note of notes) lines.push(`  <note>${escapeXml(note)}</note>`)
             for (const note of stack?.notes ?? []) lines.push(`  <note>${escapeXml(note)}</note>`)
             lines.push("</stack>")
@@ -1185,8 +1246,18 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
           // Logical-project initialization summary (one-glance "is this ready?"):
           // manifest, git, lockfile, deps dir, and which dev scripts exist.
           const initXml = () => {
-            const depsDir = stack?.ecosystem === "python" ? ".venv" : stack?.ecosystem === "rust" ? "target" : stack?.ecosystem === "go" ? "vendor" : "node_modules"
-            const depsPresent = depsDir === "node_modules" ? fileSet.has("node_modules") || rootPaths.some((p) => p.startsWith("node_modules/")) : undefined
+            const depsDir =
+              stack?.ecosystem === "python"
+                ? ".venv"
+                : stack?.ecosystem === "rust"
+                  ? "target"
+                  : stack?.ecosystem === "go"
+                    ? "vendor"
+                    : "node_modules"
+            const depsPresent =
+              depsDir === "node_modules"
+                ? fileSet.has("node_modules") || rootPaths.some((p) => p.startsWith("node_modules/"))
+                : undefined
             const attrs = [
               `manifest="${stack !== undefined ? "true" : "false"}"`,
               `git="${git !== undefined ? "true" : "false"}"`,
@@ -1204,7 +1275,10 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
 
           const scriptsXml = (list: Array<{ name: string; category: string; cmd: string }>) => {
             const lines = [`<scripts total="${list.length}">`]
-            for (const s of list) lines.push(`  <script name="${escapeXml(s.name)}" category="${escapeXml(s.category)}" cmd="${escapeXml(s.cmd)}" />`)
+            for (const s of list)
+              lines.push(
+                `  <script name="${escapeXml(s.name)}" category="${escapeXml(s.category)}" cmd="${escapeXml(s.cmd)}" />`,
+              )
             lines.push("</scripts>")
             return lines.join("\n")
           }
@@ -1225,7 +1299,10 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
           const statsLine = () =>
             `<stats files="${statsInfo.files}" loc="${statsInfo.loc !== undefined ? estLoc(statsInfo.loc) : "?"}${statsInfo.locEstimated ? ` (estimated, ${statsInfo.locSampled}/${statsInfo.files} sampled)` : ""}" totalBytes="${humanSize(statsInfo.totalBytes)}" />`
 
-          const treeRender = tier === "structure" || tier === "full" ? renderTree(buildTree(scopedPaths, sizeMap).root, depth, maxEntries) : undefined
+          const treeRender =
+            tier === "structure" || tier === "full"
+              ? renderTree(buildTree(scopedPaths, sizeMap).root, depth, maxEntries)
+              : undefined
 
           let output: string
           if (tier === "summary") {
@@ -1233,7 +1310,12 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
               stackXml(),
               gitXml(),
               initXml(),
-              entryPoints.length ? `<entry>${entryPoints.slice(0, 5).map((e) => escapeXml(e)).join(", ")}</entry>` : "",
+              entryPoints.length
+                ? `<entry>${entryPoints
+                    .slice(0, 5)
+                    .map((e) => escapeXml(e))
+                    .join(", ")}</entry>`
+                : "",
               ci.length ? `<ci>${ci.map((c) => `${c.kind} (${escapeXml(c.path)})`).join(" · ")}</ci>` : "",
               scripts?.length ? `<scripts-summary>${summaryScripts(scripts)}</scripts-summary>` : "",
               statsLine(),
@@ -1253,12 +1335,17 @@ export const ProjectTool = Tool.define<typeof Parameters, Metadata, Ripgrep.Serv
             ].join("\n")
           } else {
             const t = treeRender!
-            const entryXml = entryPoints.length ? `<entry>${entryPoints.map((e) => `<point>${escapeXml(e)}</point>`).join("")}</entry>` : "<entry />"
+            const entryXml = entryPoints.length
+              ? `<entry>${entryPoints.map((e) => `<point>${escapeXml(e)}</point>`).join("")}</entry>`
+              : "<entry />"
             const configXml = `<config>${configs.map((c) => `<file kind="${escapeXml(c.kind)}">${escapeXml(c.path)}</file>`).join("")}</config>`
             const ciXml = `<ci>${ci.map((c) => `<file kind="${escapeXml(c.kind)}">${escapeXml(c.path)}</file>`).join("")}</ci>`
             const statsXml = [
               `<stats files="${statsInfo.files}" loc="${statsInfo.loc !== undefined ? estLoc(statsInfo.loc) : "?"}${statsInfo.locEstimated ? ` (estimated, ${statsInfo.locSampled}/${statsInfo.files} sampled)` : ""}" totalBytes="${humanSize(statsInfo.totalBytes)}">`,
-              ...statsInfo.byExt.map((b) => `  <type ext="${escapeXml(b.ext)}" files="${b.files}"${b.loc !== undefined ? ` loc="${estLoc(b.loc)}"` : ""} />`),
+              ...statsInfo.byExt.map(
+                (b) =>
+                  `  <type ext="${escapeXml(b.ext)}" files="${b.files}"${b.loc !== undefined ? ` loc="${estLoc(b.loc)}"` : ""} />`,
+              ),
               "</stats>",
             ].join("\n")
             output = [

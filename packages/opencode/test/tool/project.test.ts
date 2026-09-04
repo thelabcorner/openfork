@@ -1,5 +1,8 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { Effect } from "effect"
 import { afterEach, describe, expect } from "bun:test"
 import path from "path"
@@ -25,7 +28,9 @@ afterEach(async () => {
   await disposeAllInstances()
 })
 
-const it = testEffect(LayerNode.compile(LayerNode.group([ToolRegistry.node])))
+const it = testEffect(
+  LayerNode.compile(LayerNode.group([filesystem, FSUtil.node, CrossSpawnSpawner.node, ToolRegistry.node])),
+)
 
 const asks = () => {
   const items: Array<Omit<PermissionV1.Request, "id" | "sessionID" | "tool">> = []
@@ -41,7 +46,8 @@ const asks = () => {
   }
 }
 
-const write = (dir: string, name: string, content: string) => Effect.promise(() => Bun.write(path.join(dir, name), content))
+const write = (dir: string, name: string, content: string) =>
+  Effect.promise(() => Bun.write(path.join(dir, name), content))
 
 const toolByID = (registry: ToolRegistry.Interface, id: string) =>
   registry
@@ -97,10 +103,18 @@ const initNodeRepo = (dir: string) =>
     yield* write(dir, ".gitignore", "node_modules/\nbuild/\n*.log")
     yield* write(dir, ".env", "SECRET=never-should-print")
     yield* write(dir, ".github/workflows/ci.yml", "name: ci\non: [push]\n")
-    yield* write(dir, "src/main.ts", "const SENTINEL_MAIN_BODY = 'project-tool-must-never-print-this'\nexport const main = () => 1\n")
+    yield* write(
+      dir,
+      "src/main.ts",
+      "const SENTINEL_MAIN_BODY = 'project-tool-must-never-print-this'\nexport const main = () => 1\n",
+    )
     yield* write(dir, "src/lib/util.ts", "export const util = () => 2\n")
     yield* write(dir, "src/components/Button.tsx", "export const Button = () => <button/>\n")
-    yield* write(dir, "tests/app.test.ts", "import { expect, test } from 'vitest'\ntest('x', () => expect(1).toBe(1))\n")
+    yield* write(
+      dir,
+      "tests/app.test.ts",
+      "import { expect, test } from 'vitest'\ntest('x', () => expect(1).toBe(1))\n",
+    )
     yield* write(dir, "node_modules/dep/index.js", "module.exports = 1\n")
     yield* write(dir, "build/out.js", "console.log(1)\n")
     yield* write(dir, "README.md", "# fixture-app\n")
@@ -108,137 +122,164 @@ const initNodeRepo = (dir: string) =>
   })
 
 describe("tool.project", () => {
-  it.instance("summary tier: stack, scripts, entry, ci, stats; never reads source bodies", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      const { items, ctx } = asks()
-      const result = yield* run({ tier: "summary" }, ctx)
+  it.instance(
+    "summary tier: stack, scripts, entry, ci, stats; never reads source bodies",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        const { items, ctx } = asks()
+        const result = yield* run({ tier: "summary" }, ctx)
 
-      // permission ask: one read ask scoped to the analyzed dir
-      expect(items.map((i) => i.permission)).toEqual(["read"])
-      expect(items[0]!.patterns).toEqual(["."])
+        // permission ask: one read ask scoped to the analyzed dir
+        expect(items.map((i) => i.permission)).toEqual(["read"])
+        expect(items[0]!.patterns).toEqual(["."])
 
-      // stack
-      expect(result.output).toContain('ecosystem="node"')
-      expect(result.output).toContain('monorepo="true"')
-      expect(result.output).toContain('packageManager="bun@1.3.14"')
-      expect(result.output).toContain('lockfile="bun"')
-      expect(result.output).toContain('<framework name="React" />')
-      expect(result.output).toContain('<framework name="Next.js" />')
-      expect(result.output).toContain('<framework name="ESLint" />')
-      // entry points
-      expect(result.output).toContain("<entry>")
-      expect(result.output).toContain("src/main.ts")
-      // CI presence (github workflows counted)
-      expect(result.output).toContain('github=".github/workflows (1 workflows)"')
-      // scripts summary: one per category, dev/build/test/lint/typecheck all present
-      expect(result.output).toContain("dev → bun run src/dev.ts")
-      expect(result.output).toContain("build → bun run build.ts")
-      expect(result.output).toContain("test → bun test")
-      expect(result.output).toContain("lint → eslint .")
-      expect(result.output).toContain("typecheck → tsc --noEmit")
-      // stats one-liner
-      expect(result.output).toContain("<stats files=")
-      expect(result.metadata.tier).toBe("summary")
-      expect(result.metadata.files).toBeGreaterThan(0)
-      // summary tier target: lean
-      expect(result.output.split("\n").length).toBeLessThanOrEqual(40)
-    }),
+        // stack
+        expect(result.output).toContain('ecosystem="node"')
+        expect(result.output).toContain('monorepo="true"')
+        expect(result.output).toContain('packageManager="bun@1.3.14"')
+        expect(result.output).toContain('lockfile="bun"')
+        expect(result.output).toContain('<framework name="React" />')
+        expect(result.output).toContain('<framework name="Next.js" />')
+        expect(result.output).toContain('<framework name="ESLint" />')
+        // entry points
+        expect(result.output).toContain("<entry>")
+        expect(result.output).toContain("src/main.ts")
+        // CI presence (github workflows counted)
+        expect(result.output).toContain('github=".github/workflows (1 workflows)"')
+        // scripts summary: one per category, dev/build/test/lint/typecheck all present
+        expect(result.output).toContain("dev → bun run src/dev.ts")
+        expect(result.output).toContain("build → bun run build.ts")
+        expect(result.output).toContain("test → bun test")
+        expect(result.output).toContain("lint → eslint .")
+        expect(result.output).toContain("typecheck → tsc --noEmit")
+        // stats one-liner
+        expect(result.output).toContain("<stats files=")
+        expect(result.metadata.tier).toBe("summary")
+        expect(result.metadata.files).toBeGreaterThan(0)
+        // summary tier target: lean
+        expect(result.output.split("\n").length).toBeLessThanOrEqual(40)
+      }),
     { git: true },
   )
 
-  it.instance("structure tier: gitignore-aware bounded tree with sizes", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      const result = yield* run({ tier: "structure", maxEntries: 500 })
-      expect(result.output).toContain("<tree ")
-      expect(result.output).toContain("src/ (")
-      expect(result.output).toContain("components/ (")
-      expect(result.output).toContain("Button.tsx")
-      expect(result.output).toContain("tests/ (")
-      // gitignore-aware: node_modules/ and build/ never appear
-      expect(result.output).not.toContain("node_modules")
-      expect(result.output).not.toContain("build/out.js")
-      expect(result.output).not.toContain("dep/index.js")
-      // sizes rendered humanized (e.g. "30 B", "38 B", "KB")
-      expect(result.output).toMatch(/(\d+ B|KB|MB)/)
-      // no body sentinel
-      expect(result.output).not.toContain("SENTINEL_MAIN_BODY")
-    }),
+  it.instance(
+    "summary action aliases the default snapshot tier",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        const result = yield* run({ action: "summary", tier: "full" })
+
+        expect(result.metadata.tier).toBe("summary")
+        expect(result.output).toContain('ecosystem="node"')
+        expect(result.output).not.toContain("<tree ")
+      }),
     { git: true },
   )
 
-  it.instance("full tier: annotated scripts + entry/config/CI lists + detailed stats", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      const result = yield* run({ tier: "full" })
-      // annotated scripts with categories
-      expect(result.output).toContain('<scripts total="')
-      expect(result.output).toContain('category="dev"')
-      expect(result.output).toContain('category="test"')
-      expect(result.output).toContain('category="lifecycle"')
-      expect(result.output).toContain('name="db:migrate"')
-      // config list
-      expect(result.output).toContain("<config>")
-      expect(result.output).toContain('kind="tsconfig"')
-      expect(result.output).toContain('kind="env"')
-      // ci list
-      expect(result.output).toContain("<ci>")
-      expect(result.output).toContain('kind="github"')
-      // stats detail: per-type buckets
-      expect(result.output).toContain("<type ext=")
-      expect(result.output).toContain('ext=".ts"')
-    }),
+  it.instance(
+    "structure tier: gitignore-aware bounded tree with sizes",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        const result = yield* run({ tier: "structure", maxEntries: 500 })
+        expect(result.output).toContain("<tree ")
+        expect(result.output).toContain("src/ (")
+        expect(result.output).toContain("components/ (")
+        expect(result.output).toContain("Button.tsx")
+        expect(result.output).toContain("tests/ (")
+        // gitignore-aware: node_modules/ and build/ never appear
+        expect(result.output).not.toContain("node_modules")
+        expect(result.output).not.toContain("build/out.js")
+        expect(result.output).not.toContain("dep/index.js")
+        // sizes rendered humanized (e.g. "30 B", "38 B", "KB")
+        expect(result.output).toMatch(/(\d+ B|KB|MB)/)
+        // no body sentinel
+        expect(result.output).not.toContain("SENTINEL_MAIN_BODY")
+      }),
     { git: true },
   )
 
-  it.instance("summary tier caps script summary to one per category", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      const result = yield* run({ tier: "summary" })
-      // 'test:e2e' shares the 'test' category; only the first test script shown
-      expect(result.output).not.toContain("test:e2e")
-      expect(result.output).not.toContain("db:migrate") // db category not in top-5 summary
-    }),
+  it.instance(
+    "full tier: annotated scripts + entry/config/CI lists + detailed stats",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        const result = yield* run({ tier: "full" })
+        // annotated scripts with categories
+        expect(result.output).toContain('<scripts total="')
+        expect(result.output).toContain('category="dev"')
+        expect(result.output).toContain('category="test"')
+        expect(result.output).toContain('category="lifecycle"')
+        expect(result.output).toContain('name="db:migrate"')
+        // config list
+        expect(result.output).toContain("<config>")
+        expect(result.output).toContain('kind="tsconfig"')
+        expect(result.output).toContain('kind="env"')
+        // ci list
+        expect(result.output).toContain("<ci>")
+        expect(result.output).toContain('kind="github"')
+        // stats detail: per-type buckets
+        expect(result.output).toContain("<type ext=")
+        expect(result.output).toContain('ext=".ts"')
+      }),
     { git: true },
   )
 
-  it.instance("tree respects maxEntries cap with 'N more files' hint", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      // add a pile of files to overflow a tiny cap
-      for (let i = 0; i < 40; i++) {
-        yield* write(test.directory, `src/generated/gen${i}.ts`, `export const g${i} = ${i}\n`)
-      }
-      const result = yield* run({ tier: "structure", maxEntries: 5 })
-      expect(result.output).toContain("more files")
-      expect(result.metadata.truncated).toBe(true)
-    }),
+  it.instance(
+    "summary tier caps script summary to one per category",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        const result = yield* run({ tier: "summary" })
+        // 'test:e2e' shares the 'test' category; only the first test script shown
+        expect(result.output).not.toContain("test:e2e")
+        expect(result.output).not.toContain("db:migrate") // db category not in top-5 summary
+      }),
     { git: true },
   )
 
-  it.instance("path param scopes to a subdirectory", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      const { items, ctx } = asks()
-      const result = yield* run({ tier: "summary", path: "src" }, ctx)
-      expect(items[0]!.patterns).toEqual(["src"])
-      expect(result.metadata.path).toBe("src")
-      // stack is detected by walking up from the scope to the worktree root
-      expect(result.output).toContain('ecosystem="node"')
-      expect(result.output).toContain('lockfile="bun"')
-      // the file list is scope-relative, so the entry is main.ts
-      expect(result.output).toContain("main.ts")
-      // tree/stats are scoped to src/ (3 files)
-      const stats = /<stats files="(\d+)"/.exec(result.output)
-      expect(stats?.[1]).toBe("3")
-    }),
+  it.instance(
+    "tree respects maxEntries cap with 'N more files' hint",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        // add a pile of files to overflow a tiny cap
+        for (let i = 0; i < 40; i++) {
+          yield* write(test.directory, `src/generated/gen${i}.ts`, `export const g${i} = ${i}\n`)
+        }
+        const result = yield* run({ tier: "structure", maxEntries: 5 })
+        expect(result.output).toContain("more files")
+        expect(result.metadata.truncated).toBe(true)
+      }),
+    { git: true },
+  )
+
+  it.instance(
+    "path param scopes to a subdirectory",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        const { items, ctx } = asks()
+        const result = yield* run({ tier: "summary", path: "src" }, ctx)
+        expect(items[0]!.patterns).toEqual(["src"])
+        expect(result.metadata.path).toBe("src")
+        // stack is detected by walking up from the scope to the worktree root
+        expect(result.output).toContain('ecosystem="node"')
+        expect(result.output).toContain('lockfile="bun"')
+        // the file list is scope-relative, so the entry is main.ts
+        expect(result.output).toContain("main.ts")
+        // tree/stats are scoped to src/ (3 files)
+        const stats = /<stats files="(\d+)"/.exec(result.output)
+        expect(stats?.[1]).toBe("3")
+      }),
     { git: true },
   )
 
@@ -253,16 +294,18 @@ describe("tool.project", () => {
     }),
   )
 
-  it.instance("no-source-body-read rail: sentinel string never appears in any tier", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      for (const tier of ["summary", "structure", "full"] as const) {
-        const result = yield* run({ tier })
-        expect(result.output).not.toContain("SENTINEL_MAIN_BODY")
-        expect(result.output).not.toContain("never-should-print")
-      }
-    }),
+  it.instance(
+    "no-source-body-read rail: sentinel string never appears in any tier",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        for (const tier of ["summary", "structure", "full"] as const) {
+          const result = yield* run({ tier })
+          expect(result.output).not.toContain("SENTINEL_MAIN_BODY")
+          expect(result.output).not.toContain("never-should-print")
+        }
+      }),
     { git: true },
   )
 
@@ -276,7 +319,7 @@ describe("tool.project", () => {
           "[project]",
           'name = "pyapp"',
           'requires-python = ">=3.11"',
-          'dependencies = [',
+          "dependencies = [",
           '  "fastapi",',
           '  "pydantic>=2",',
           '  "pytest",',
@@ -316,7 +359,11 @@ describe("tool.project", () => {
       expect(result.output).toContain('<framework name="tokio" />')
       expect(result.output).toContain('lockfile="cargo"')
 
-      yield* write(sub("go"), "go.mod", "module example.com/app\n\ngo 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.0\n)\n")
+      yield* write(
+        sub("go"),
+        "go.mod",
+        "module example.com/app\n\ngo 1.21\n\nrequire (\n\tgithub.com/gin-gonic/gin v1.9.0\n)\n",
+      )
       yield* write(sub("go"), "go.sum", "sum\n")
       yield* write(sub("go"), "main.go", "package main\nfunc main() {}\n")
       yield* write(sub("go"), "cmd/serve/main.go", "package main\nfunc main() {}\n")
@@ -329,7 +376,7 @@ describe("tool.project", () => {
       yield* write(
         sub("java"),
         "pom.xml",
-        '<project><groupId>com.x</groupId><artifactId>app</artifactId><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency></dependencies></project>',
+        "<project><groupId>com.x</groupId><artifactId>app</artifactId><dependencies><dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency></dependencies></project>",
       )
       result = yield* run({ tier: "summary", path: "java" })
       expect(result.output).toContain('ecosystem="java"')
@@ -342,7 +389,11 @@ describe("tool.project", () => {
       expect(result.output).toContain('<framework name="Rails" />')
       expect(result.output).toContain('lockfile="bundler"')
 
-      yield* write(sub("php"), "composer.json", JSON.stringify({ require: { "laravel/framework": "^10", "symfony/console": "^6" } }))
+      yield* write(
+        sub("php"),
+        "composer.json",
+        JSON.stringify({ require: { "laravel/framework": "^10", "symfony/console": "^6" } }),
+      )
       yield* write(sub("php"), "composer.lock", "{}")
       result = yield* run({ tier: "summary", path: "php" })
       expect(result.output).toContain('ecosystem="php"')
@@ -361,23 +412,25 @@ describe("tool.project", () => {
     }),
   )
 
-  it.instance("summary includes git + init blocks (worktree, branch, changed)", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      // mark one file modified so git status is non-empty
-      yield* Effect.promise(() => Bun.write(path.join(test.directory, "README.md"), "# changed\n"))
-      const result = yield* run({ tier: "summary" })
-      expect(result.output).toContain("<git ")
-      expect(result.output).toContain('branch="')
-      expect(result.output).toContain("changed=")
-      expect(result.output).toContain("<init ")
-      expect(result.output).toContain('manifest="true"')
-      expect(result.output).toContain('git="true"')
-      expect(result.output).toContain('lockfile="true"')
-      expect(result.output).toContain('<script name="dev"')
-      expect(result.output).toContain('<script name="test"')
-    }),
+  it.instance(
+    "summary includes git + init blocks (worktree, branch, changed)",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        // mark one file modified so git status is non-empty
+        yield* Effect.promise(() => Bun.write(path.join(test.directory, "README.md"), "# changed\n"))
+        const result = yield* run({ tier: "summary" })
+        expect(result.output).toContain("<git ")
+        expect(result.output).toContain('branch="')
+        expect(result.output).toContain("changed=")
+        expect(result.output).toContain("<init ")
+        expect(result.output).toContain('manifest="true"')
+        expect(result.output).toContain('git="true"')
+        expect(result.output).toContain('lockfile="true"')
+        expect(result.output).toContain('<script name="dev"')
+        expect(result.output).toContain('<script name="test"')
+      }),
     { git: true },
   )
 
@@ -387,64 +440,79 @@ describe("tool.project", () => {
       yield* write(test.directory, "package.json", JSON.stringify({ name: "x", scripts: { test: "bun test" } }))
       const result = yield* run({ tier: "summary" })
       expect(result.output).not.toContain("<git ")
-      expect(result.output).toContain('<init ')
+      expect(result.output).toContain("<init ")
       expect(result.output).toContain('git="false"')
     }),
   )
 
-  it.instance("recent action: newest files first, grouped by dir, relative times", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      // touch files with distinct mtimes: main.ts newest, util.ts old, rest older
-      yield* Effect.promise(async () => {
-        const day = new Date(Date.now() - 86_400_000)
-        const hour = new Date(Date.now() - 3_600_000)
-        const minute = new Date(Date.now() - 60_000)
-        for (const rel of ["README.md", "tsconfig.json", "bun.lockb", "tests/app.test.ts", "src/components/Button.tsx", "packages/shared/src/index.ts", ".env", ".github/workflows/ci.yml"]) {
-          await fs.utimes(path.join(test.directory, rel), day, day)
-        }
-        await fs.utimes(path.join(test.directory, "src/lib/util.ts"), hour, hour)
-        await fs.utimes(path.join(test.directory, "src/main.ts"), minute, minute)
-      })
-      const result = yield* run({ action: "recent", recent: 5 })
-      expect(result.output).toContain("<recent ")
-      expect(result.output).toContain("src/main.ts")
-      expect(result.output).toContain('modified="1m ago"')
-      expect(result.output).toContain('modified="1h ago"')
-      expect(result.metadata.recent).toBeGreaterThan(0)
-      // newest first: main.ts appears before util.ts
-      const mainIdx = result.output.indexOf("src/main.ts")
-      const utilIdx = result.output.indexOf("src/lib/util.ts")
-      expect(mainIdx).toBeGreaterThan(-1)
-      expect(mainIdx).toBeLessThan(utilIdx)
-    }),
+  it.instance(
+    "recent action: newest files first, grouped by dir, relative times",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        // touch files with distinct mtimes: main.ts newest, util.ts old, rest older
+        yield* Effect.promise(async () => {
+          const day = new Date(Date.now() - 86_400_000)
+          const hour = new Date(Date.now() - 3_600_000)
+          const minute = new Date(Date.now() - 60_000)
+          for (const rel of [
+            "README.md",
+            "tsconfig.json",
+            "bun.lockb",
+            "tests/app.test.ts",
+            "src/components/Button.tsx",
+            "packages/shared/src/index.ts",
+            ".env",
+            ".github/workflows/ci.yml",
+          ]) {
+            await fs.utimes(path.join(test.directory, rel), day, day)
+          }
+          await fs.utimes(path.join(test.directory, "src/lib/util.ts"), hour, hour)
+          await fs.utimes(path.join(test.directory, "src/main.ts"), minute, minute)
+        })
+        const result = yield* run({ action: "recent", recent: 5 })
+        expect(result.output).toContain("<recent ")
+        expect(result.output).toContain("src/main.ts")
+        expect(result.output).toContain('modified="1m ago"')
+        expect(result.output).toContain('modified="1h ago"')
+        expect(result.metadata.recent).toBeGreaterThan(0)
+        // newest first: main.ts appears before util.ts
+        const mainIdx = result.output.indexOf("src/main.ts")
+        const utilIdx = result.output.indexOf("src/lib/util.ts")
+        expect(mainIdx).toBeGreaterThan(-1)
+        expect(mainIdx).toBeLessThan(utilIdx)
+      }),
     { git: true },
   )
 
-  it.instance("recent action caps at recent param and respects gitignore", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      const result = yield* run({ action: "recent", recent: 2 })
-      expect(result.output).toContain('count="2"')
-      expect(result.output).not.toContain("node_modules")
-      expect(result.output).not.toContain("build/out.js")
-    }),
+  it.instance(
+    "recent action caps at recent param and respects gitignore",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        const result = yield* run({ action: "recent", recent: 2 })
+        expect(result.output).toContain('count="2"')
+        expect(result.output).not.toContain("node_modules")
+        expect(result.output).not.toContain("build/out.js")
+      }),
     { git: true },
   )
 
-  it.instance("toolchain action: reports installed runtimes + env", () =>
-    Effect.gen(function* () {
-      const test = yield* TestInstance
-      yield* initNodeRepo(test.directory)
-      const result = yield* run({ action: "toolchain" })
-      expect(result.output).toContain("<toolchain ")
-      expect(result.output).toContain('<runtime name="bun"')
-      expect(result.output).toContain('<runtime name="node"')
-      // env block present
-      expect(result.output).toContain('<env name="PATH"')
-    }),
+  it.instance(
+    "toolchain action: reports installed runtimes + env",
+    () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* initNodeRepo(test.directory)
+        const result = yield* run({ action: "toolchain" })
+        expect(result.output).toContain("<toolchain ")
+        expect(result.output).toContain('<runtime name="bun"')
+        expect(result.output).toContain('<runtime name="node"')
+        // env block present
+        expect(result.output).toContain('<env name="PATH"')
+      }),
     { git: true },
   )
 
