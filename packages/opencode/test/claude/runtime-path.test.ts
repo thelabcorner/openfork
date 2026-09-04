@@ -199,6 +199,57 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     expect(saved?.modelFamily).toBe("claude-sonnet-4")
   })
 
+  test("registers OpenCode tools through the Agent SDK MCP server", async () => {
+    resetSharedState()
+    const script = new SdkScript()
+    let mcpOptions: any
+    const runtime = new ClaudeAgentRuntime({
+      loader: async () =>
+        ({
+          createSdkMcpServer: (options: any) => {
+            mcpOptions = options
+            return { type: "sdk", name: options.name, instance: {} }
+          },
+          query: (request: any) => {
+            script.requests.push(request)
+            return { events: script.events, interrupt: async () => {}, close: () => script.end(), pid: 4242 }
+          },
+        }) as never,
+    })
+    const store = new BridgeStore()
+    const pending = events(ClaudeRuntimeAdapter.stream(baseInput({ runtime, store, tools: { todo_write: echoTool } })))
+
+    script.push({ type: "system", subtype: "init", session_id: "ext-mcp-1" })
+    script.push({
+      type: "assistant",
+      message: {
+        content: [{ type: "tool_use", id: "call-mcp-1", name: "mcp__opencode__todo_write", input: { text: "hi" } }],
+      },
+    })
+
+    await script.waitForRequest(1)
+    expect(mcpOptions.tools).toHaveLength(1)
+    expect(mcpOptions.tools[0].name).toBe("todo_write")
+    expect(script.requests[0].options.tools).toEqual([])
+    expect(script.requests[0].options.allowedTools).toEqual(["mcp__opencode__todo_write"])
+    expect((script.requests[0].options.toolAliases as Record<string, string>)["TodoWrite"]).toBe(
+      "mcp__opencode__todo_write",
+    )
+
+    const toolResult = await mcpOptions.tools[0].handler({ text: "hi" }, { signal: new AbortController().signal })
+    expect(toolResult.content[0].text).toBe("echo:hi")
+
+    script.push({ type: "assistant", message: { content: [{ type: "text", text: "All done." }] } })
+    script.push({ type: "result", subtype: "success", is_error: false, result: "All done.", session_id: "ext-mcp-1" })
+    script.end()
+
+    const list = await pending
+    expect(list.find((event) => event.type === "tool-call")?.name).toBe("todo_write")
+    expect(list.find((event) => event.type === "tool-result")?.result.value).toBe("echo:hi")
+    expect(store.get("call-mcp-1")?.status).toBe("completed")
+    expect(list.at(-1)?.type).toBe("finish")
+  })
+
   test("second turn resumes the bound external session with only the new user text", async () => {
     resetSharedState()
     const script = new SdkScript()
@@ -206,9 +257,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     const bindings = makeMemoryStorage()
     const shared = { bindings: bindings as BindingStorage }
 
-    const first = events(
-      ClaudeRuntimeAdapter.stream(baseInput({ runtime, bindings: shared.bindings })),
-    )
+    const first = events(ClaudeRuntimeAdapter.stream(baseInput({ runtime, bindings: shared.bindings })))
     script.push({ type: "system", subtype: "init", session_id: "ext-rt-9" })
     script.push({
       type: "assistant",

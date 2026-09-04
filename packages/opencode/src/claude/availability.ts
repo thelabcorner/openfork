@@ -17,6 +17,8 @@ export const CLAUDE_BINARY_NAME = "claude"
 /** SDK module shape the runtime relies on; validated at load time. */
 export interface ClaudeSdkModuleShape {
   query?: unknown
+  /** In-process MCP factory used to expose OpenCode's registry to Claude. */
+  createSdkMcpServer?: unknown
 }
 
 /** Minimal environment surface used for resolution (fixture-friendly). */
@@ -40,11 +42,7 @@ function joinPath(dir: string, name: string): string {
 }
 
 /** PATH entries × platform extensions, in order. */
-export function pathCandidates(
-  name: string,
-  env: AvailabilityEnv,
-  platform: string = process.platform,
-): string[] {
+export function pathCandidates(name: string, env: AvailabilityEnv, platform: string = process.platform): string[] {
   const pathEnv = typeof env.PATH === "string" ? env.PATH : ""
   const parts = pathEnv.split(isWindows(platform) ? ";" : ":")
   const exts = isWindows(platform) ? WINDOWS_EXTS : POSIX_EXTS
@@ -62,11 +60,7 @@ export function pathCandidates(
  * Install locations a managed/server PATH commonly misses: the official
  * installer's ~/.local/bin and (on POSIX) the npm global bin.
  */
-export function knownCandidates(
-  name: string,
-  env: AvailabilityEnv,
-  platform: string = process.platform,
-): string[] {
+export function knownCandidates(name: string, env: AvailabilityEnv, platform: string = process.platform): string[] {
   const home = homeDir(env)
   if (!home) return []
   const candidates = [joinPath(joinPath(joinPath(home, ".local"), "bin"), name)]
@@ -84,7 +78,10 @@ export function resolveCliPath(
   exists: PathLike = (path) => existsSync(path),
   platform: string = process.platform,
 ): string | undefined {
-  for (const candidate of [...pathCandidates(CLAUDE_BINARY_NAME, env, platform), ...knownCandidates(CLAUDE_BINARY_NAME, env, platform)]) {
+  for (const candidate of [
+    ...pathCandidates(CLAUDE_BINARY_NAME, env, platform),
+    ...knownCandidates(CLAUDE_BINARY_NAME, env, platform),
+  ]) {
     if (exists(candidate)) return candidate
   }
   return undefined
@@ -182,7 +179,10 @@ export async function checkAvailability(deps: AvailabilityDeps): Promise<Availab
 
   const childEnv = buildChildEnv(env)
   let version: string | undefined
-  const versionResult = await deps.process.exec(binaryPath, ["--version"], { env: childEnv, timeoutMs: deps.versionTimeoutMs ?? 4000 })
+  const versionResult = await deps.process.exec(binaryPath, ["--version"], {
+    env: childEnv,
+    timeoutMs: deps.versionTimeoutMs ?? 4000,
+  })
   if (!versionResult.error && versionResult.code === 0) {
     version = parseVersionOutput(versionResult.stdout)
   }

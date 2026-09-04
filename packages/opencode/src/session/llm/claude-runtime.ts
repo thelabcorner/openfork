@@ -14,13 +14,14 @@
 // fake loader/runtime/store/bindings for deterministic tests.
 
 import type { ModelMessage, Tool } from "ai"
+import z from "zod"
 import * as Stream from "effect/Stream"
 import { Effect } from "effect"
 import { LLMEvent, ToolResultValue } from "@opencode-ai/llm"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { SessionID } from "@/session/schema"
 import { shouldEnableClaudeFirstParty } from "@/plugin/shared"
-import { ClaudeAgentRuntime, type RuntimeTimeouts, type TurnOutcome } from "@/claude/runtime"
+import { ClaudeAgentRuntime, type RuntimeTimeouts, type SdkMcpToolDefinition, type TurnOutcome } from "@/claude/runtime"
 import { defaultSdkLoader } from "@/claude/availability"
 import type { AssistantEvent, ContentBlock, RuntimeEvent } from "@/claude/events"
 import { BridgeStore, completeEffect, parkEffect, validateScope, type BridgeRequest, type Scope } from "@/claude/bridge"
@@ -136,9 +137,160 @@ export interface StreamInput {
   readonly timeouts?: RuntimeTimeouts
   /** Instance scope; defaults keep scope validation self-consistent per process. */
   readonly context?: { readonly projectID: string; readonly worktree: string; readonly directory: string }
+  /** Production-only transcript probe; omitted fixtures preserve legacy behavior. */
+  readonly transcriptExists?: (claudeSessionID: string) => boolean
 }
 
 const DEFAULT_CONTEXT = { projectID: "claude", worktree: process.cwd(), directory: process.cwd() }
+const MCP_SERVER_NAME = "opencode"
+const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`
+const MCP_CALL_CLAIM_TIMEOUT_MS = 10_000
+
+type JsonSchemaNode = boolean | Record<string, unknown>
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+}
+
+function jsonSchemaOfTool(tool: Tool): JsonSchemaNode {
+  const schema = (tool as { inputSchema?: unknown }).inputSchema
+  if (isRecord(schema) && "jsonSchema" in schema) return schema.jsonSchema as JsonSchemaNode
+  if (schema === true || schema === false || isRecord(schema)) return schema
+  return { type: "object", properties: {} }
+}
+
+/**
+ * Agent SDK MCP definitions accept a Zod raw shape, while OpenCode's prepared
+ * tools carry JSON Schema through AI SDK's `jsonSchema()` wrapper. Keep this
+ * conversion deliberately permissive: unsupported JSON Schema features still
+ * register as `unknown` rather than making a tool disappear from Claude.
+ */
+function zodFromJsonSchema(schema: JsonSchemaNode): any {
+  if (schema === true) return z.unknown()
+  if (schema === false) return z.never()
+
+  if (schema.const !== undefined) return z.literal(schema.const as any)
+  if (Array.isArray(schema.enum) && schema.enum.length > 0) {
+    if (schema.enum.every((value) => typeof value === "string")) return z.enum(schema.enum as [string, ...string[]])
+    return z.union(schema.enum.map((value) => z.literal(value as any)) as [any, any, ...any[]])
+  }
+
+  const alternatives = schema.anyOf ?? schema.oneOf
+  if (Array.isArray(alternatives) && alternatives.length > 0) {
+    const values = alternatives.map((value) => zodFromJsonSchema(value as JsonSchemaNode))
+    if (values.length === 1) return values[0]
+    return z.union(values as [any, any, ...any[]])
+  }
+
+  const type = Array.isArray(schema.type) ? schema.type.find((value) => value !== "null") : schema.type
+  let result: any
+  switch (type) {
+    case "string":
+      result = z.string()
+      break
+    case "number":
+    case "integer":
+      result = z.number()
+      break
+    case "boolean":
+      result = z.boolean()
+      break
+    case "null":
+      result = z.null()
+      break
+    case "array":
+      result = z.array(schema.items ? zodFromJsonSchema(schema.items as JsonSchemaNode) : z.unknown())
+      break
+    case "object":
+    default: {
+      const properties = isRecord(schema.properties) ? schema.properties : {}
+      const required = new Set(
+        Array.isArray(schema.required) ? schema.required.filter((x): x is string => typeof x === "string") : [],
+      )
+      const shape = Object.fromEntries(
+        Object.entries(properties).map(([name, value]) => {
+          const property = zodFromJsonSchema(value as JsonSchemaNode)
+          return [name, required.has(name) ? property : z.optional(property)]
+        }),
+      )
+      result = z.object(shape)
+      if (isRecord(schema.additionalProperties))
+        result = result.catchall(zodFromJsonSchema(schema.additionalProperties as JsonSchemaNode))
+      break
+    }
+  }
+
+  if (schema.nullable === true && type !== "null") return z.nullable(result)
+  return result
+}
+
+function sdkInputShape(tool: Tool): Record<string, unknown> {
+  const schema = jsonSchemaOfTool(tool)
+  if (schema === false || schema === true || !isRecord(schema)) return {}
+  if (schema.type === "object" || isRecord(schema.properties)) {
+    const properties = isRecord(schema.properties) ? schema.properties : {}
+    const required = new Set(
+      Array.isArray(schema.required) ? schema.required.filter((x): x is string => typeof x === "string") : [],
+    )
+    return Object.fromEntries(
+      Object.entries(properties).map(([name, value]) => {
+        const property = zodFromJsonSchema(value as JsonSchemaNode)
+        return [name, required.has(name) ? property : z.optional(property)]
+      }),
+    )
+  }
+  return { input: zodFromJsonSchema(schema) }
+}
+
+function mcpToolName(name: string): string {
+  return `${MCP_TOOL_PREFIX}${name}`
+}
+
+function toolAliases(tools: Record<string, Tool>): Record<string, string> {
+  const aliases: Record<string, string> = {}
+  for (const name of Object.keys(tools).filter((name) => name !== "invalid")) {
+    const target = mcpToolName(name)
+    aliases[name] = target
+    aliases[name.toLowerCase()] = target
+    aliases[name[0]!.toUpperCase() + name.slice(1)] = target
+    const compact = name.replace(/[-_]/g, "").toLowerCase()
+    if (compact === "todoread") aliases.TodoRead = target
+    if (compact === "todowrite") aliases.TodoWrite = target
+  }
+  return aliases
+}
+
+function canonicalToolName(name: string, tools: Record<string, Tool>): string | undefined {
+  if (Object.prototype.hasOwnProperty.call(tools, name)) return name
+  if (name.startsWith(MCP_TOOL_PREFIX)) {
+    const unprefixed = name.slice(MCP_TOOL_PREFIX.length)
+    if (Object.prototype.hasOwnProperty.call(tools, unprefixed)) return unprefixed
+  }
+  const lower = name.toLowerCase()
+  return Object.keys(tools).find((candidate) => candidate.toLowerCase() === lower)
+}
+
+type SdkToolResult = {
+  readonly content: readonly [{ readonly type: "text"; readonly text: string }]
+  readonly isError?: true
+}
+
+function sdkToolResult(text: string, isError = false): SdkToolResult {
+  return {
+    content: [{ type: "text", text }],
+    ...(isError ? { isError: true as const } : {}),
+  }
+}
+
+export function toolOutput(value: unknown): string {
+  if (typeof value === "string") return value
+  if (isRecord(value) && typeof value.output === "string") return value.output
+  try {
+    return JSON.stringify(value ?? "")
+  } catch {
+    return String(value)
+  }
+}
 
 // ── Prompt assembly ──
 // Match @openchamber/opencode-claude SdkUserPrompt: the Agent SDK CLI rejects
@@ -383,6 +535,19 @@ interface ResolvedToolUse {
   readonly input: unknown
 }
 
+interface PartialTextBlock {
+  readonly type: "text" | "thinking"
+  readonly id: string
+  text: string
+  ended: boolean
+}
+
+interface PartialStreamState {
+  readonly blocks: Map<number, PartialTextBlock>
+  readonly completed: PartialTextBlock[]
+  sequence: number
+}
+
 function toolUseOf(block: ContentBlock): ResolvedToolUse | undefined {
   if (block.type !== "tool_use") return undefined
   const id = typeof block.id === "string" ? block.id : undefined
@@ -391,10 +556,71 @@ function toolUseOf(block: ContentBlock): ResolvedToolUse | undefined {
   return { id, name, input: (block as { input?: unknown }).input ?? {} }
 }
 
-function emitAssistantBlocks(out: PushChannel<LLMEvent>, blocks: readonly ContentBlock[], onToolUse: (block: ResolvedToolUse) => void): void {
+function consumeCompletedPartial(state: PartialStreamState, type: PartialTextBlock["type"], text: string): boolean {
+  const index = state.completed.findIndex((block) => block.type === type && block.text === text)
+  if (index < 0) return false
+  state.completed.splice(index, 1)
+  return true
+}
+
+function emitPartialStreamEvent(out: PushChannel<LLMEvent>, event: unknown, state: PartialStreamState): void {
+  if (!isRecord(event)) return
+  const type = event.type
+  const index = typeof event.index === "number" ? event.index : undefined
+  if (type === "content_block_start" && index !== undefined && isRecord(event.content_block)) {
+    const blockType = event.content_block.type
+    if (blockType === "text" || blockType === "thinking") {
+      const id = `stream-${blockType}-${index}-${++state.sequence}`
+      const block: PartialTextBlock = { type: blockType, id, text: "", ended: false }
+      state.blocks.set(index, block)
+      out.push(blockType === "text" ? LLMEvent.textStart({ id }) : LLMEvent.reasoningStart({ id }))
+    }
+    return
+  }
+
+  if (type === "content_block_delta" && index !== undefined && isRecord(event.delta)) {
+    const deltaType = event.delta.type
+    const text =
+      deltaType === "text_delta" ? event.delta.text : deltaType === "thinking_delta" ? event.delta.thinking : undefined
+    if (typeof text !== "string") return
+    let block = state.blocks.get(index)
+    if (!block) {
+      const blockType = deltaType === "text_delta" ? "text" : "thinking"
+      const id = `stream-${blockType}-${index}-${++state.sequence}`
+      block = { type: blockType, id, text: "", ended: false }
+      state.blocks.set(index, block)
+      out.push(blockType === "text" ? LLMEvent.textStart({ id }) : LLMEvent.reasoningStart({ id }))
+    }
+    block.text += text
+    out.push(
+      block.type === "text"
+        ? LLMEvent.textDelta({ id: block.id, text })
+        : LLMEvent.reasoningDelta({ id: block.id, text }),
+    )
+    return
+  }
+
+  if (type === "content_block_stop" && index !== undefined) {
+    const block = state.blocks.get(index)
+    if (!block || block.ended) return
+    block.ended = true
+    state.completed.push(block)
+    out.push(block.type === "text" ? LLMEvent.textEnd({ id: block.id }) : LLMEvent.reasoningEnd({ id: block.id }))
+    state.blocks.delete(index)
+  }
+}
+
+function emitAssistantBlocks(
+  out: PushChannel<LLMEvent>,
+  blocks: readonly ContentBlock[],
+  onToolUse: (block: ResolvedToolUse) => void,
+  normalizeName: (name: string) => string = (name) => name,
+  partial?: PartialStreamState,
+): void {
   let index = 0
   for (const block of blocks) {
     if (block.type === "text" && typeof block.text === "string") {
+      if (partial && consumeCompletedPartial(partial, "text", block.text)) continue
       const id = `txt-${index++}`
       out.push(LLMEvent.textStart({ id }))
       out.push(LLMEvent.textDelta({ id, text: block.text }))
@@ -402,6 +628,7 @@ function emitAssistantBlocks(out: PushChannel<LLMEvent>, blocks: readonly Conten
       continue
     }
     if (block.type === "thinking" && typeof block.thinking === "string") {
+      if (partial && consumeCompletedPartial(partial, "thinking", block.thinking)) continue
       const id = `thk-${index++}`
       out.push(LLMEvent.reasoningStart({ id }))
       out.push(LLMEvent.reasoningDelta({ id, text: block.thinking }))
@@ -411,9 +638,10 @@ function emitAssistantBlocks(out: PushChannel<LLMEvent>, blocks: readonly Conten
     if (block.type === "tool_use") {
       const toolUse = toolUseOf(block)
       if (!toolUse) continue
-      out.push(LLMEvent.toolInputStart({ id: toolUse.id, name: toolUse.name }))
-      out.push(LLMEvent.toolCall({ id: toolUse.id, name: toolUse.name, input: toolUse.input }))
-      onToolUse(toolUse)
+      const name = normalizeName(toolUse.name)
+      out.push(LLMEvent.toolInputStart({ id: toolUse.id, name }))
+      out.push(LLMEvent.toolCall({ id: toolUse.id, name, input: toolUse.input }))
+      onToolUse({ ...toolUse, name })
     }
   }
 }
@@ -422,6 +650,69 @@ function emitAssistantBlocks(out: PushChannel<LLMEvent>, blocks: readonly Conten
 
 async function runPromise<A>(effect: Effect.Effect<A, unknown, never>): Promise<A> {
   return Effect.runPromise(effect)
+}
+
+class ToolCallCorrelator {
+  private readonly observed = new Map<string, string[]>()
+  private readonly waiters = new Map<
+    string,
+    Array<{ resolve: (callID: string) => void; reject: (error: unknown) => void }>
+  >()
+
+  observe(toolUse: ResolvedToolUse): void {
+    const waiter = this.waiters.get(toolUse.name)?.shift()
+    if (waiter) {
+      waiter.resolve(toolUse.id)
+      return
+    }
+    const calls = this.observed.get(toolUse.name) ?? []
+    calls.push(toolUse.id)
+    this.observed.set(toolUse.name, calls)
+  }
+
+  claim(name: string, signal: AbortSignal): Promise<string> {
+    const calls = this.observed.get(name)
+    const callID = calls?.shift()
+    if (callID) return Promise.resolve(callID)
+
+    return new Promise((resolve, reject) => {
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const waiters = this.waiters.get(name) ?? []
+      const waiter = {
+        resolve: (id: string) => {
+          if (timer) clearTimeout(timer)
+          signal.removeEventListener("abort", onAbort)
+          resolve(id)
+        },
+        reject: (error: unknown) => {
+          if (timer) clearTimeout(timer)
+          signal.removeEventListener("abort", onAbort)
+          reject(error)
+        },
+      }
+      const onAbort = () => {
+        const current = this.waiters.get(name)
+        if (current) {
+          const index = current.indexOf(waiter)
+          if (index >= 0) current.splice(index, 1)
+          if (current.length === 0) this.waiters.delete(name)
+        }
+        waiter.reject(signal.reason ?? new Error("tool call aborted"))
+      }
+      waiters.push(waiter)
+      this.waiters.set(name, waiters)
+      timer = setTimeout(() => {
+        const current = this.waiters.get(name)
+        if (current) {
+          const index = current.indexOf(waiter)
+          if (index >= 0) current.splice(index, 1)
+          if (current.length === 0) this.waiters.delete(name)
+        }
+        waiter.reject(new Error(`timed out waiting for Claude tool call: ${name}`))
+      }, MCP_CALL_CLAIM_TIMEOUT_MS)
+      signal.addEventListener("abort", onAbort, { once: true })
+    })
+  }
 }
 
 export function stream(input: StreamInput): Stream.Stream<LLMEvent, unknown> {
@@ -435,6 +726,7 @@ export function stream(input: StreamInput): Stream.Stream<LLMEvent, unknown> {
 }
 
 async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<void> {
+  let sdkIn: PushChannel<SdkUserPrompt> | undefined
   try {
     const context = input.context ?? DEFAULT_CONTEXT
     const ownerScope: Scope = {
@@ -466,6 +758,9 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
           .filter((message) => message.role === "user" || message.role === "assistant")
           .map((message) => ({ role: message.role, content: messageText(message) }))
           .filter((message) => message.content.length > 0),
+        transcriptExists: input.transcriptExists
+          ? (binding) => Effect.succeed(input.transcriptExists!(binding.claudeSessionID))
+          : undefined,
       }).pipe(Effect.orElseSucceed((): ResumeDecision => ({ strategy: "fresh" }))),
     )
     const resumeSessionID = decision.strategy === "resume" ? decision.binding?.claudeSessionID : undefined
@@ -476,7 +771,7 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       historyTransfer: decision.historyTransfer?.messages,
     })
 
-    const sdkIn = new PushChannel<Record<string, unknown>>()
+    sdkIn = new PushChannel<SdkUserPrompt>()
     const runtime =
       input.runtime ??
       new ClaudeAgentRuntime({
@@ -487,16 +782,22 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
 
     out.push(LLMEvent.stepStart({ index: 0 }))
 
-    // Tool bridging: park → Permission.ask → execute → complete exactly once,
-    // then feed the tool_result back to the SDK so the turn continues.
+    // Tool bridging: park → Permission.ask → execute → complete exactly once.
+    // With a real Agent SDK, the MCP handler returns the result. Fixtures and
+    // older SDKs without in-process MCP use the streaming-input fallback.
+    let mcpRegistered = false
+    const correlator = new ToolCallCorrelator()
     const pending = new Set<Promise<void>>()
-    const executeToolUse = async (toolUse: ResolvedToolUse): Promise<void> => {
+    const executeToolUse = async (toolUse: ResolvedToolUse, signal = input.abort): Promise<SdkToolResult> => {
       const callID = toolUse.id
-      const name = toolUse.name
+      const name = canonicalToolName(toolUse.name, input.tools) ?? toolUse.name
       const callInput = toolUse.input
-      const failTool = (message: string) => {
+      const failTool = (message: string): SdkToolResult => {
         out.push(LLMEvent.toolError({ id: callID, name, message }))
-        sdkIn.push(sdkUserPrompt([{ type: "tool_result", tool_use_id: callID, is_error: true, content: message }]))
+        if (!mcpRegistered) {
+          sdkIn!.push(sdkUserPrompt([{ type: "tool_result", tool_use_id: callID, is_error: true, content: message }]))
+        }
+        return sdkToolResult(message, true)
       }
       if (!callID || !name) return failTool("malformed tool_use block")
       // Fence: only names from THIS request's OpenCode registry projection pass.
@@ -518,7 +819,11 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       } catch (error) {
         return failTool(error instanceof Error ? error.message : String(error))
       }
-      store.markExecuting(callID)
+      try {
+        store.markExecuting(callID)
+      } catch (error) {
+        return failTool(error instanceof Error ? error.message : String(error))
+      }
       try {
         await runPromise(
           input.permission.ask({
@@ -550,20 +855,23 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
         const raw = await tool.execute(callInput, {
           toolCallId: callID,
           messages: input.messages as ModelMessage[],
-          abortSignal: input.abort,
+          abortSignal: signal,
         })
-        outputText = typeof raw === "string" ? raw : JSON.stringify(raw ?? "")
-        await runPromise(completeEffect(store, callID, { callID, status: "success", output: outputText }))
+        outputText = toolOutput(raw)
+        const completed = await runPromise(
+          completeEffect(store, callID, { callID, status: "success", output: outputText }),
+        )
+        outputText = completed.output ?? ""
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
         try {
           await runPromise(completeEffect(store, callID, { callID, status: "error", error: message }))
         } catch {}
         out.push(LLMEvent.toolError({ id: callID, name, message }))
-        sdkIn.push(
-          sdkUserPrompt([{ type: "tool_result", tool_use_id: callID, is_error: true, content: message }]),
-        )
-        return
+        if (!mcpRegistered) {
+          sdkIn!.push(sdkUserPrompt([{ type: "tool_result", tool_use_id: callID, is_error: true, content: message }]))
+        }
+        return sdkToolResult(message, true)
       }
       out.push(
         LLMEvent.toolResult({
@@ -573,22 +881,63 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
           providerExecuted: false,
         }),
       )
-      sdkIn.push(sdkUserPrompt([{ type: "tool_result", tool_use_id: callID, content: outputText }]))
+      if (!mcpRegistered)
+        sdkIn!.push(sdkUserPrompt([{ type: "tool_result", tool_use_id: callID, content: outputText }]))
+      return sdkToolResult(outputText)
     }
 
+    const mcpTools: SdkMcpToolDefinition[] = Object.entries(input.tools)
+      .filter(([name]) => name !== "invalid")
+      .map(([name, tool]) => ({
+        name,
+        description: String(tool.description ?? `OpenCode ${name}`),
+        inputSchema: sdkInputShape(tool),
+        handler: async (args: unknown, extra: unknown) => {
+          const signal =
+            isRecord(extra) && extra.signal && typeof (extra.signal as AbortSignal).aborted === "boolean"
+              ? (extra.signal as AbortSignal)
+              : input.abort
+          const canonical = canonicalToolName(name, input.tools) ?? name
+          try {
+            const callID = await correlator.claim(canonical, signal)
+            return await executeToolUse({ id: callID, name: canonical, input: args }, signal)
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error)
+            return sdkToolResult(message, true)
+          }
+        },
+      }))
+
+    const partial: PartialStreamState = { blocks: new Map(), completed: [], sequence: 0 }
     const sink = (event: RuntimeEvent): void => {
       if (event.kind !== "transport") return
       const transport = event.event
+      if (transport.type === "stream_event" && "event" in transport) {
+        emitPartialStreamEvent(out, transport.event, partial)
+        return
+      }
       if (transport.type !== "assistant") return
-      emitAssistantBlocks(out, (transport as AssistantEvent).message?.content ?? [], (toolUse) => {
-        const task = executeToolUse(toolUse).catch(() => {})
-        pending.add(task)
-        void task.finally(() => pending.delete(task))
-      })
+      emitAssistantBlocks(
+        out,
+        (transport as AssistantEvent).message?.content ?? [],
+        (toolUse) => {
+          if (mcpRegistered) {
+            correlator.observe(toolUse)
+            return
+          }
+          const task = executeToolUse(toolUse)
+            .then(() => undefined)
+            .catch(() => {})
+          pending.add(task)
+          void task.finally(() => pending.delete(task))
+        },
+        (name) => canonicalToolName(name, input.tools) ?? name,
+        partial,
+      )
     }
 
     // Streaming-input mode: the assembled prompt is the first user message;
-    // tool_result feedback follows between assistant turns.
+    // legacy tool_result feedback follows between assistant turns.
     sdkIn.push(sdkUserPrompt(prompt))
 
     const outcome: TurnOutcome = await runtime.run({
@@ -598,7 +947,14 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       resume: resumeSessionID,
       signal: input.abort,
       sink,
+      mcpTools,
+      toolAliases: toolAliases(input.tools),
+      onMcpToolsRegistered: (registered) => {
+        mcpRegistered = registered
+      },
     })
+
+    sdkIn.end()
 
     // Settle eager tool tasks before the terminal events.
     await Promise.allSettled([...pending])
@@ -647,6 +1003,7 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
     const kind = classifyClaudeError(raw)
     out.push(LLMEvent.providerError({ message: raw + hintFor(kind) }))
   } finally {
+    sdkIn?.end()
     out.end()
   }
 }

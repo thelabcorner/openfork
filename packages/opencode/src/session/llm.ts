@@ -24,6 +24,11 @@ import { SessionID } from "@/session/schema"
 import { Auth } from "@/auth"
 import { EffectBridge } from "@/effect/bridge"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { InstanceState } from "@/effect/instance-state"
+import { Storage } from "@/storage/storage"
+import { ClaudeBindingPersistence } from "@/claude/binding-persistence"
+import { ClaudeToolBridge } from "@/claude/tool-bridge"
+import { ClaudeSessions } from "@/claude/sessions"
 import * as Option from "effect/Option"
 import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
@@ -70,6 +75,7 @@ const live: Layer.Layer<
   | EventV2Bridge.Service
   | LLMClientService
   | RuntimeFlags.Service
+  | Storage.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -81,6 +87,7 @@ const live: Layer.Layer<
     const events = yield* EventV2Bridge.Service
     const llmClient = yield* LLMClient.Service
     const flags = yield* RuntimeFlags.Service
+    const claudeBindings = yield* ClaudeBindingPersistence.bindingStorageFromService
 
     const run = Effect.fn("LLM.run")(function* (input: StreamRequest) {
       yield* Effect.logInfo("stream", {
@@ -229,6 +236,7 @@ const live: Layer.Layer<
         const { ClaudeRuntimeAdapter } = yield* Effect.promise(() => import("./llm/claude-runtime"))
         const claude = ClaudeRuntimeAdapter.status({ providerID: input.model.providerID })
         if (claude.type === "supported") {
+          const context = yield* InstanceState.context
           yield* Effect.logInfo("llm runtime selected", {
             "llm.runtime": "claude-agent-sdk",
             "llm.provider": input.model.providerID,
@@ -247,6 +255,14 @@ const live: Layer.Layer<
               abort: input.abort,
               permission: perm,
               ruleset: Permission.merge(input.agent.permission ?? [], input.permission ?? []),
+              bindings: claudeBindings,
+              store: ClaudeToolBridge.getOrCreateStore(context.directory),
+              context: {
+                projectID: context.project.id,
+                worktree: context.worktree,
+                directory: context.directory,
+              },
+              transcriptExists: ClaudeSessions.transcriptExists,
             }),
           }
         }
@@ -429,6 +445,7 @@ export const node = LayerNode.make({
     EventV2Bridge.node,
     llmClient,
     RuntimeFlags.node,
+    Storage.node,
   ],
 })
 

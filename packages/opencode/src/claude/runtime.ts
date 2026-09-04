@@ -7,16 +7,8 @@
 // The runtime never sees credentials: child envs are stripped by env.ts.
 
 import { spawnSync } from "node:child_process"
-import {
-  ClaudeDisposedError,
-  ClaudeSdkUnavailableError,
-  sanitizeDetail,
-} from "./errors"
-import {
-  decodeTransportEvent,
-  type ResultEvent,
-  type RuntimeEventSink,
-} from "./events"
+import { ClaudeDisposedError, ClaudeSdkUnavailableError, sanitizeDetail } from "./errors"
+import { decodeTransportEvent, type ResultEvent, type RuntimeEventSink } from "./events"
 import { buildChildEnv, type ChildEnv } from "./env"
 import { defaultSdkLoader, resolveCliPath, type ClaudeSdkModuleShape } from "./availability"
 import { isClaudeEffort } from "./models"
@@ -39,6 +31,18 @@ export interface SdkQueryHandle {
   interrupt(): Promise<void>
   close(): void
   readonly pid?: number | undefined
+}
+
+/**
+ * SDK-independent shape for an in-process MCP tool. The actual Agent SDK
+ * types stay behind the lazy loader so importing OpenCode never eagerly loads
+ * the optional SDK or its MCP dependency graph.
+ */
+export interface SdkMcpToolDefinition {
+  readonly name: string
+  readonly description: string
+  readonly inputSchema: unknown
+  readonly handler: (args: unknown, extra: unknown) => Promise<unknown>
 }
 
 /** Loader returns the SDK module shape; called at most once per runtime. */
@@ -157,6 +161,12 @@ export interface TurnRequest {
   readonly signal?: AbortSignal
   /** Per-turn event sink; takes precedence over the constructor sink. */
   readonly sink?: RuntimeEventSink
+  /** OpenCode-owned tools exposed through the SDK's in-process MCP server. */
+  readonly mcpTools?: readonly SdkMcpToolDefinition[]
+  /** SDK aliases for names the model may emit before MCP name resolution. */
+  readonly toolAliases?: Readonly<Record<string, string>>
+  /** Reports whether MCP registration was available for this turn. */
+  readonly onMcpToolsRegistered?: (registered: boolean) => void
 }
 
 export type TurnStatus = "completed" | "cancelled" | "timedOut" | "stalled" | "failed" | "disposed"
@@ -181,7 +191,7 @@ export interface TurnOutcome {
 }
 
 const DEFAULT_TURN_MS = 10 * 60_000
-const DEFAULT_STALL_MS = 120_000
+const DEFAULT_STALL_MS = 10 * 60_000
 
 interface Diagnostics {
   turnsStarted: number
@@ -348,7 +358,7 @@ export class ClaudeAgentRuntime {
       }
       handle = createSdkQuery(sdk, {
         prompt: request.prompt,
-        options: this.buildQueryOptions(request),
+        options: this.buildQueryOptions(request, sdk),
       })
 
       const turnTimer = setTimeout(() => requestStop("timedOut"), turnMs)
@@ -358,10 +368,7 @@ export class ClaudeAgentRuntime {
       this.activeStop = requestStop
       const pumpDone = this.pump(handle, turnID, armStallTimer)
 
-      const winner = await Promise.race([
-        pumpDone.then(() => "pump" as const),
-        stopped.then(() => "stop" as const),
-      ])
+      const winner = await Promise.race([pumpDone.then(() => "pump" as const), stopped.then(() => "stop" as const)])
 
       clearTimers()
       this.activeStop = undefined
@@ -377,22 +384,26 @@ export class ClaudeAgentRuntime {
       }
 
       const pumped = await pumpDone
+      // Streaming-input queries remain alive after a result until their input
+      // closes. This adapter owns one turn, so release the SDK process here.
+      handle.close()
       if (pumped.error) {
         return this.settle(turnID, "failed", { category: pumped.error.category, message: pumped.error.message })
       }
-      return this.settle(
-        turnID,
-        "completed",
-        undefined,
-        {
-          resultText: pumped.result?.result,
-          isError: pumped.result?.is_error,
-          sessionID: pumped.result?.session_id ?? pumped.sessionID ?? this.lastSessionID,
-          usage: pumped.result?.usage
-            ? { input_tokens: pumped.result.usage.input_tokens, output_tokens: pumped.result.usage.output_tokens }
-            : undefined,
-        },
-      )
+      if (pumped.result?.is_error) {
+        return this.settle(turnID, "failed", {
+          category: "provider-error",
+          message: sanitizeDetail(pumped.result.result || "Claude reported an error"),
+        })
+      }
+      return this.settle(turnID, "completed", undefined, {
+        resultText: pumped.result?.result,
+        isError: pumped.result?.is_error,
+        sessionID: pumped.result?.session_id ?? pumped.sessionID ?? this.lastSessionID,
+        usage: pumped.result?.usage
+          ? { input_tokens: pumped.result.usage.input_tokens, output_tokens: pumped.result.usage.output_tokens }
+          : undefined,
+      })
     } catch (error) {
       clearTimers()
       this.activeStop = undefined
@@ -464,9 +475,7 @@ export class ClaudeAgentRuntime {
   private settle(
     turnID: string,
     status: TurnStatus,
-    extra?:
-      | { category: string; message?: string }
-      | { category?: undefined; message: string },
+    extra?: { category: string; message?: string } | { category?: undefined; message: string },
     fields?: Partial<Pick<TurnOutcome, "resultText" | "isError" | "sessionID" | "usage">>,
   ): TurnOutcome {
     const category = status === "failed" ? (extra?.category ?? "unknown") : undefined
@@ -508,7 +517,7 @@ export class ClaudeAgentRuntime {
     }
   }
 
-  private buildQueryOptions(request: TurnRequest): Record<string, unknown> {
+  private buildQueryOptions(request: TurnRequest, sdk: ClaudeSdkModuleShape): Record<string, unknown> {
     // Mirror @openchamber/opencode-claude query.ts defaults: Claude Code
     // preset, project/user/local settings, auto-compact, all skills.
     const options: Record<string, unknown> = {
@@ -519,6 +528,31 @@ export class ClaudeAgentRuntime {
       autoCompactEnabled: true,
       skills: "all",
       systemPrompt: { type: "preset", preset: "claude_code" },
+      // OpenCode is the tool authority for this provider. Claude's built-in
+      // tools must stay disabled or the model can bypass OpenCode permissions.
+      tools: [],
+    }
+
+    const mcpTools = request.mcpTools ?? []
+    if (mcpTools.length === 0) {
+      request.onMcpToolsRegistered?.(false)
+    } else if (typeof sdk.createSdkMcpServer !== "function") {
+      // Older/fake SDKs can still exercise the legacy streaming-input bridge;
+      // the adapter uses that path when in-process MCP is unavailable.
+      request.onMcpToolsRegistered?.(false)
+    } else {
+      const server = (sdk.createSdkMcpServer as (options: Record<string, unknown>) => unknown)({
+        name: "opencode",
+        version: "1.0.0",
+        tools: [...mcpTools],
+        alwaysLoad: true,
+      })
+      options.mcpServers = { opencode: server }
+      options.allowedTools = mcpTools.map((tool) => `mcp__opencode__${tool.name}`)
+      if (request.toolAliases && Object.keys(request.toolAliases).length > 0) {
+        options.toolAliases = { ...request.toolAliases }
+      }
+      request.onMcpToolsRegistered?.(true)
     }
     const executable = this.options.executablePath ?? resolveCliPath(this.options.env ?? process.env)
     if (executable) options.pathToClaudeCodeExecutable = executable

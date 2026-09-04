@@ -55,7 +55,10 @@ interface FixtureQuery {
   readonly handle: SdkQueryHandle & { interruptCalls: number; closeCalls: number }
 }
 
-function fixtureSdk(streams: StreamController[], pid = 4242): {
+function fixtureSdk(
+  streams: StreamController[],
+  pid = 4242,
+): {
   module: { query: (input: SdkQueryRequest) => unknown }
   queryCalls: SdkQueryRequest[]
 } {
@@ -86,7 +89,13 @@ function fixtureSdk(streams: StreamController[], pid = 4242): {
 }
 
 const initEvent = { type: "system", subtype: "init", session_id: "ext-session-1", model: "claude-sonnet-4-5" }
-const resultEvent = { type: "result", subtype: "success", is_error: false, result: "final answer", usage: { input_tokens: 11, output_tokens: 7 } }
+const resultEvent = {
+  type: "result",
+  subtype: "success",
+  is_error: false,
+  result: "final answer",
+  usage: { input_tokens: 11, output_tokens: 7 },
+}
 
 function makeRuntime(
   module: { query: (input: SdkQueryRequest) => unknown },
@@ -138,6 +147,22 @@ describe("ClaudeAgentRuntime lifecycle", () => {
     expect(diag.turnsStarted).toBe(1)
     expect(diag.completed).toBe(1)
     expect(diag.lastFailureCategory).toBeUndefined()
+  })
+
+  test("SDK error result fails the turn instead of persisting a successful completion", async () => {
+    const stream = new StreamController()
+    const fixture = fixtureSdk([stream])
+    const { runtime } = makeRuntime(fixture.module)
+    const done = runtime.run({ prompt: "fail" })
+    stream.push(initEvent)
+    stream.push({ type: "result", subtype: "error", is_error: true, result: "provider rejected request" })
+    stream.end()
+
+    const outcome = await done
+    expect(outcome.status).toBe("failed")
+    expect(outcome.category).toBe("provider-error")
+    expect(outcome.message).toBe("provider rejected request")
+    expect(outcome.resultText).toBeUndefined()
   })
 
   test("effort variant maps to Agent SDK effort + adaptive thinking", async () => {
