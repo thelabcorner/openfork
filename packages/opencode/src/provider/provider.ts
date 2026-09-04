@@ -91,7 +91,7 @@ function wrapSSE(res: Response, ms: number, ctl: AbortController) {
         const id = setTimeout(() => {
           const err = new ProviderError.ResponseStreamError("SSE read timed out")
           ctl.abort(err)
-          void reader.cancel(err)
+          reader.cancel(err).catch(() => {})
           reject(err)
         }, ms)
 
@@ -2439,7 +2439,6 @@ export const node = LayerNode.make({
     FSUtil.node,
     Config.node,
     Auth.node,
-    ForkCredentials.node,
     Env.node,
     Plugin.node,
     ModelsDev.node,

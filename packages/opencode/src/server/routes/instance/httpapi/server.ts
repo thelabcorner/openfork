@@ -1,6 +1,13 @@
 import { Config as EffectConfig, Context, Effect, FileSystem, Layer } from "effect"
 import { HttpApiBuilder, OpenApi } from "effect/unstable/httpapi"
-import { HttpClient, HttpMiddleware, HttpRouter, HttpServer, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+import {
+  HttpClient,
+  HttpMiddleware,
+  HttpRouter,
+  HttpServer,
+  HttpServerRequest,
+  HttpServerResponse,
+} from "effect/unstable/http"
 import * as Socket from "effect/unstable/socket/Socket"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import * as Observability from "@opencode-ai/core/observability"
@@ -177,13 +184,9 @@ const deviceNodeLayer = AppNodeBuilderV1.build(Device.node)
 const authOnlyRouterLayer = authorizationRouterMiddleware.layer.pipe(
   Layer.provide([ServerAuth.Config.layer, deviceNodeLayer]),
 )
-const httpApiAuthLayer = authorizationLayer.pipe(
-  Layer.provide([ServerAuth.Config.layer, deviceNodeLayer]),
-)
+const httpApiAuthLayer = authorizationLayer.pipe(Layer.provide([ServerAuth.Config.layer, deviceNodeLayer]))
 const ptyConnectHttpApiAuthLayer = ptyConnectAuthorizationLayer.pipe(Layer.provide(ServerAuth.Config.layer))
-const serverHttpApiAuthLayer = serverAuthorizationLayer.pipe(
-  Layer.provide([ServerAuth.Config.layer, deviceNodeLayer]),
-)
+const serverHttpApiAuthLayer = serverAuthorizationLayer.pipe(Layer.provide([ServerAuth.Config.layer, deviceNodeLayer]))
 const workspaceRoutingLive = workspaceRoutingLayer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal))
 const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
   Layer.provide([controlHandlers, controlPlaneHandlers, forkCredentialHandlers, globalHandlers]),
@@ -407,7 +410,7 @@ export function createRoutes(
     // fibers (e.g. the ModelsDev background refresh) capture Effect's default stdout
     // logger and corrupt the TUI (#34730).
     Layer.provideMerge(Observability.layer),
-  )
+  ) as Layer.Layer<never, EffectConfig.ConfigError, RouteRequirements>
 }
 
 export const routes = createRoutes()
