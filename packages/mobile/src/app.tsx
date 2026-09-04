@@ -1,4 +1,12 @@
-import type { OpencodeClient, PermissionV2Reply, PermissionV2Request, Project, Provider, QuestionV2Request, Session } from "@opencode-ai/sdk/v2/client"
+import type {
+  OpencodeClient,
+  PermissionV2Reply,
+  PermissionV2Request,
+  Project,
+  Provider,
+  QuestionV2Request,
+  Session,
+} from "@opencode-ai/sdk/v2/client"
 import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import { createStore } from "solid-js/store"
 import { PairingCamera } from "./PairingCamera"
@@ -15,16 +23,21 @@ import { disableNotifications, reconcilePushSubscription } from "./push"
 import {
   DEVICE_ID_KEY,
   DEVICE_TOKEN_KEY,
+  INSTANCE_ID_KEY,
   SERVER_URL_KEY,
   claimPair,
   clearStorage,
+  compareInstance,
   createClient,
+  fetchIdentity,
+  IDENTITY_REQUIRED_MESSAGE,
   normalizeServerUrl,
   openEvents,
   pairClaimErrorMessage,
   readLaunchConfig,
   readStorage,
   writeStorage,
+  type InstanceIdentity,
   type MessageBundle,
 } from "./api"
 import { mockEnabled, mockMessages, mockProviders, mockQuota, mockSessions, mockArchived } from "./devMock"
@@ -81,19 +94,23 @@ function PairingCodeInput(props: { value: string; onChange: (v: string) => void;
 
   return (
     <div class="otp-row">
-      <For each={chars()}>{(ch, index) => (
-        <input
-          ref={(el) => { refs[index()] = el }}
-          class="otp-box"
-          value={ch}
-          inputmode="text"
-          autocapitalize="characters"
-          autocomplete="off"
-          disabled={props.disabled}
-          onInput={(e) => setFrom(index(), (e.currentTarget as HTMLInputElement).value)}
-          onKeyDown={(e) => handleKeyDown(index(), e)}
-        />
-      )}</For>
+      <For each={chars()}>
+        {(ch, index) => (
+          <input
+            ref={(el) => {
+              refs[index()] = el
+            }}
+            class="otp-box"
+            value={ch}
+            inputmode="text"
+            autocapitalize="characters"
+            autocomplete="off"
+            disabled={props.disabled}
+            onInput={(e) => setFrom(index(), (e.currentTarget as HTMLInputElement).value)}
+            onKeyDown={(e) => handleKeyDown(index(), e)}
+          />
+        )}
+      </For>
     </div>
   )
 }
@@ -105,6 +122,8 @@ export function App() {
     token: readStorage(DEVICE_TOKEN_KEY) ?? "",
     status: "disconnected" as ConnectionStatus,
     serverVersion: "",
+    identity: undefined as InstanceIdentity | undefined,
+    instanceNotice: "",
     page: "sessions" as Page,
     sessions: [] as Session[],
     archivedSessions: [] as Session[],
@@ -153,12 +172,22 @@ export function App() {
   const runtimeRevision = new Map<string, number>()
   const haptics = new WebHaptics({})
 
-  const activeSession = createMemo(() => state.sessions.find((s) => s.id === state.activeSessionID) ?? state.archivedSessions.find((s) => s.id === state.activeSessionID))
-  const contextMenuSession = createMemo(() => [...state.sessions, ...state.archivedSessions].find((s) => s.id === state.contextMenuSessionID))
+  const activeSession = createMemo(
+    () =>
+      state.sessions.find((s) => s.id === state.activeSessionID) ??
+      state.archivedSessions.find((s) => s.id === state.activeSessionID),
+  )
+  const contextMenuSession = createMemo(() =>
+    [...state.sessions, ...state.archivedSessions].find((s) => s.id === state.contextMenuSessionID),
+  )
 
   // haptic helpers
   function triggerHaptic(input: "selection" | "soft" | "light" | "warning" | "success") {
-    try { haptics.trigger(input) } catch { /* ignore */ }
+    try {
+      haptics.trigger(input)
+    } catch {
+      /* ignore */
+    }
   }
   let lastDeltaHaptic = 0
   let deltaCount = 0
@@ -169,7 +198,9 @@ export function App() {
     if (!boundary && deltaCount % 4 !== 0) return
     if (now - lastDeltaHaptic < (boundary ? 110 : 85)) return
     lastDeltaHaptic = now
-    try { haptics.trigger(boundary ? "light" : "soft") } catch {}
+    try {
+      haptics.trigger(boundary ? "light" : "soft")
+    } catch {}
   }
 
   const contextTotalFor = (session: Session): number => {
@@ -190,7 +221,9 @@ export function App() {
       }
     }
     if (!model) {
-      model = Object.values(models).find((m: any) => m.id === rawId || m.name === rawId || m.id === bareId || m.name === bareId)
+      model = Object.values(models).find(
+        (m: any) => m.id === rawId || m.name === rawId || m.id === bareId || m.name === bareId,
+      )
     }
     if (!model) return 0
     const limit = model.limit ?? model._raw?.limit
@@ -237,7 +270,9 @@ export function App() {
       cost: v.cost,
       tokens: v.tokens,
       time: v.time,
-      model: v.model ? { id: v.model.modelID ?? v.model.id, providerID: v.model.providerID, variant: v.model.variant } : undefined,
+      model: v.model
+        ? { id: v.model.modelID ?? v.model.id, providerID: v.model.providerID, variant: v.model.variant }
+        : undefined,
       summary: v.summary,
       parentID: v.parentID,
       agent: v.agent,
@@ -255,13 +290,18 @@ export function App() {
         let cursor: string | undefined
         for (let page = 0; page < 4; page++) {
           const limit = 500
-          const res: any = await v2.list({ limit, order: "desc", ...(cursor ? { cursor } : {}) }, { throwOnError: true })
+          const res: any = await v2.list(
+            { limit, order: "desc", ...(cursor ? { cursor } : {}) },
+            { throwOnError: true },
+          )
           const payload: any = res?.data ?? res
           const batch: any[] = payload?.data ?? payload ?? []
           const next: string | undefined = payload?.cursor?.next ?? res?.cursor?.next
           if (!Array.isArray(batch) || batch.length === 0) break
           const mapped = batch.map(mapV2ToSession)
-          const filtered = opts.archived ? mapped.filter((s) => (s.time as any)?.archived) : mapped.filter((s) => !(s.time as any)?.archived)
+          const filtered = opts.archived
+            ? mapped.filter((s) => (s.time as any)?.archived)
+            : mapped.filter((s) => !(s.time as any)?.archived)
           all.push(...filtered)
           // Stop when server has no more pages, or we hit soft cap, or this page was short
           // and we already have some filtered results (avoid extra RTT for edge case where
@@ -272,7 +312,10 @@ export function App() {
         if (all.length > 0) return [...new Map(all.map((s) => [s.id, s] as const)).values()]
         if (!opts.archived) {
           // V2 returned 0 actives but server had data — fall through to legacy rather than empty
-          if ((await v2.list({ limit: 1, order: "desc" }, { throwOnError: true }).catch(() => null))?.data?.data?.length) throw new Error("v2 empty actives")
+          if (
+            (await v2.list({ limit: 1, order: "desc" }, { throwOnError: true }).catch(() => null))?.data?.data?.length
+          )
+            throw new Error("v2 empty actives")
           return []
         }
       }
@@ -282,7 +325,10 @@ export function App() {
     const all: Session[] = []
     let start: number | undefined = 0
     for (let page = 0; page < 4; page++) {
-      const res: any = await (client as any).session.list({ limit: PAGE, start, ...(opts.archived ? { archived: true } : {}) }, { throwOnError: true })
+      const res: any = await (client as any).session.list(
+        { limit: PAGE, start, ...(opts.archived ? { archived: true } : {}) },
+        { throwOnError: true },
+      )
       const batch: Session[] = res?.data ?? []
       if (!Array.isArray(batch) || batch.length === 0) break
       all.push(...batch)
@@ -308,8 +354,10 @@ export function App() {
           recomputeContextTotals()
         }
       } while (refreshPending)
-    } catch {}
-    finally { refreshInFlight = false }
+    } catch {
+    } finally {
+      refreshInFlight = false
+    }
   }
 
   const setRuntime = (sessionID: string, runtime: SessionRuntime) => {
@@ -320,20 +368,28 @@ export function App() {
   const reconcileActiveSessions = async (source: OpencodeClient) => {
     const started = new Map(runtimeRevision)
     try {
-      const directories = [...new Set(state.sessions.flatMap((session) => {
-        if (!session.directory) return []
-        const subpath = (session as any).path
-        return subpath
-          ? [session.directory, `${session.directory.replace(/[\\/]$/, "")}\\${String(subpath).replace(/^[\\/]/, "")}`]
-          : [session.directory]
-      }))]
+      const directories = [
+        ...new Set(
+          state.sessions.flatMap((session) => {
+            if (!session.directory) return []
+            const subpath = (session as any).path
+            return subpath
+              ? [
+                  session.directory,
+                  `${session.directory.replace(/[\\/]$/, "")}\\${String(subpath).replace(/^[\\/]/, "")}`,
+                ]
+              : [session.directory]
+          }),
+        ),
+      ]
       const [currentResult, ...compatibilityResults] = await Promise.all([
         source.v2.session.active({ throwOnError: true }).catch(() => undefined),
         ...directories.map((directory) =>
           source.session.status({ directory }, { throwOnError: true }).catch(() => undefined),
         ),
       ])
-      const current: Record<string, { type: "running" | "paused" }> = (currentResult as any)?.data?.data ?? (currentResult as any)?.data ?? {}
+      const current: Record<string, { type: "running" | "paused" }> =
+        (currentResult as any)?.data?.data ?? (currentResult as any)?.data ?? {}
       const compatibility = Object.assign(
         {},
         ...compatibilityResults.map((result: any) => result?.data ?? {}),
@@ -355,11 +411,19 @@ export function App() {
         const questionsCount = questions[sessionID]?.length ?? 0
         const current = runtimes[sessionID]
         if (permissionsCount > 0 || current?.status === "waiting_permission") {
-          setRuntime(sessionID, { status: "waiting_permission", permissions: permissionsCount, questions: questionsCount })
+          setRuntime(sessionID, {
+            status: "waiting_permission",
+            permissions: permissionsCount,
+            questions: questionsCount,
+          })
           continue
         }
         if (questionsCount > 0 || current?.status === "waiting_question") {
-          setRuntime(sessionID, { status: "waiting_question", permissions: permissionsCount, questions: questionsCount })
+          setRuntime(sessionID, {
+            status: "waiting_question",
+            permissions: permissionsCount,
+            questions: questionsCount,
+          })
           continue
         }
         if (active[sessionID]?.type === "running") {
@@ -402,7 +466,7 @@ export function App() {
       if (request !== messageRequest || sessionID !== state.activeSessionID || revision !== messageRevision) return
       if (response.data) setState("messages", response.data as MessageBundle[])
     } catch (e) {
-      setState("error", (e instanceof Error ? e.message : "Failed to load messages"))
+      setState("error", e instanceof Error ? e.message : "Failed to load messages")
     }
   }
 
@@ -449,7 +513,10 @@ export function App() {
       if (autoAcceptSessions().has(sessionID) && list.length > 0) {
         for (const req of list) {
           try {
-            await (client.session as any).permission.reply({ sessionID, requestID: req.id, reply: "once" }, { throwOnError: true })
+            await (client.session as any).permission.reply(
+              { sessionID, requestID: req.id, reply: "once" },
+              { throwOnError: true },
+            )
           } catch (e) {
             console.error("auto-accept permission reply failed", sessionID, req.id, e)
           }
@@ -522,7 +589,8 @@ export function App() {
             const inputArr: string[] = Array.isArray(v2Caps.input) ? v2Caps.input : []
             const rawLimit: any = (m as any).limit ?? (m as any)._raw?.limit ?? {}
             const limit = {
-              context: rawLimit.context ?? rawLimit.contextWindow ?? (m as any).context ?? (m as any).contextWindow ?? 0,
+              context:
+                rawLimit.context ?? rawLimit.contextWindow ?? (m as any).context ?? (m as any).contextWindow ?? 0,
               output: rawLimit.output ?? rawLimit.maxOutputTokens ?? (m as any).output ?? 0,
             }
             const legacy = {
@@ -531,7 +599,8 @@ export function App() {
               cost: baseCost ?? { input: 0, output: 0, cache: { read: 0, write: 0 } },
               limit,
               capabilities: {
-                reasoning: (v2Caps.reasoning ?? (inputArr.includes("reasoning") || inputArr.includes("thinking") || false)) as boolean,
+                reasoning: (v2Caps.reasoning ??
+                  (inputArr.includes("reasoning") || inputArr.includes("thinking") || false)) as boolean,
                 input: { image: inputArr.includes("image") || !!v2Caps.input?.image },
                 tools: v2Caps.tools ?? true,
               },
@@ -570,8 +639,19 @@ export function App() {
     } catch {}
   }
 
-  const forkWindowToUsageWindow = (w: { label: string; spentUSD: number; limitUSD: number; estimatedPercent?: number; resetsAt: number }): UsageWindow => {
-    const used = typeof w.estimatedPercent === "number" ? Math.max(0, Math.min(100, w.estimatedPercent)) : w.limitUSD > 0 ? Math.max(0, Math.min(100, (w.spentUSD / w.limitUSD) * 100)) : null
+  const forkWindowToUsageWindow = (w: {
+    label: string
+    spentUSD: number
+    limitUSD: number
+    estimatedPercent?: number
+    resetsAt: number
+  }): UsageWindow => {
+    const used =
+      typeof w.estimatedPercent === "number"
+        ? Math.max(0, Math.min(100, w.estimatedPercent))
+        : w.limitUSD > 0
+          ? Math.max(0, Math.min(100, (w.spentUSD / w.limitUSD) * 100))
+          : null
     const seconds: Record<string, number> = { "5h": 18_000, week: 604_800, month: 2_592_000 }
     return {
       usedPercent: used,
@@ -593,11 +673,25 @@ export function App() {
       ])
       if (!credsRes.ok || !usageRes.ok) return undefined
       const creds: Array<{ id: string; label: string; active: boolean }> = await credsRes.json()
-      const usage: { byCredential: Array<{ credentialID: string; windows: Array<{ label: string; spentUSD: number; limitUSD: number; estimatedPercent?: number; resetsAt: number }> }> } = await usageRes.json()
+      const usage: {
+        byCredential: Array<{
+          credentialID: string
+          windows: Array<{
+            label: string
+            spentUSD: number
+            limitUSD: number
+            estimatedPercent?: number
+            resetsAt: number
+          }>
+        }>
+      } = await usageRes.json()
       if (!creds.length) return undefined
       return creds.map((c) => {
         const found = usage.byCredential.find((u) => u.credentialID === c.id)
-        const windows: [string, UsageWindow][] = (found?.windows ?? []).map((w) => [w.label, forkWindowToUsageWindow(w)])
+        const windows: [string, UsageWindow][] = (found?.windows ?? []).map((w) => [
+          w.label,
+          forkWindowToUsageWindow(w),
+        ])
         return { id: c.id, label: c.label || c.id, active: c.active, windows }
       })
     } catch {
@@ -608,7 +702,10 @@ export function App() {
   const loadOpenRouterFree = async () => {
     if (!client) return
     try {
-      const res = await (client as any).experimental.openrouterFreeUsage.get({ includeValue: "true" }, { throwOnError: true })
+      const res = await (client as any).experimental.openrouterFreeUsage.get(
+        { includeValue: "true" },
+        { throwOnError: true },
+      )
       const free = res?.data?.free
       if (!free) return
       setOpenRouterFree({ usedPercent: free.usedPercent, remaining: free.remaining, limit: free.limit })
@@ -622,7 +719,9 @@ export function App() {
     setQuotaLoading(true)
     try {
       const provRes = await (client as any).quota.providers({}, { throwOnError: true })
-      const provs: Array<{ providerId: string; providerName: string; configured: boolean }> = (provRes?.data?.providers ?? []).filter((p: { configured: boolean }) => p.configured)
+      const provs: Array<{ providerId: string; providerName: string; configured: boolean }> = (
+        provRes?.data?.providers ?? []
+      ).filter((p: { configured: boolean }) => p.configured)
       if (!provs.length) {
         setQuotaData([])
         setQuotaUpdatedAt(Date.now())
@@ -696,7 +795,12 @@ export function App() {
       return
     }
 
-    if (type === "session.created" || type === "session.updated" || type === "session.deleted" || type === "session.moved") {
+    if (
+      type === "session.created" ||
+      type === "session.updated" ||
+      type === "session.deleted" ||
+      type === "session.moved"
+    ) {
       void refresh()
       if (type === "session.deleted" && sessionID) {
         runtimeRevision.delete(sessionID)
@@ -723,7 +827,12 @@ export function App() {
       }
       if (sessionID === state.activeSessionID) {
         queueMessageEvent(type, props)
-        if (type === "session.next.step.ended" || type === "session.next.step.failed" || type === "session.next.tool.success" || type === "session.next.tool.failed") {
+        if (
+          type === "session.next.step.ended" ||
+          type === "session.next.step.failed" ||
+          type === "session.next.tool.success" ||
+          type === "session.next.tool.failed"
+        ) {
           window.setTimeout(() => void refreshMessages(sessionID), 120)
         }
         // Session list's time.updated/cost/tokens are driven by refresh()
@@ -765,19 +874,28 @@ export function App() {
       const base = { permissions: permissions[sessionID]?.length ?? 0, questions: questions[sessionID]?.length ?? 0 }
       if (status === "idle") setRuntime(sessionID, { status: "idle", ...base })
       if (status === "busy" || status === "running") {
-        setRuntime(sessionID, { status: "generating", ...base, busySince: runtimes[sessionID]?.busySince ?? Date.now() })
+        setRuntime(sessionID, {
+          status: "generating",
+          ...base,
+          busySince: runtimes[sessionID]?.busySince ?? Date.now(),
+        })
       }
-      if (status === "retry") setRuntime(sessionID, { status: "retry", ...base, busySince: runtimes[sessionID]?.busySince ?? Date.now() })
+      if (status === "retry")
+        setRuntime(sessionID, { status: "retry", ...base, busySince: runtimes[sessionID]?.busySince ?? Date.now() })
     }
   }
 
   const waitForReconnect = (signal: AbortSignal, delay = 500) =>
     new Promise<void>((resolve) => {
       const timeout = window.setTimeout(resolve, delay)
-      signal.addEventListener("abort", () => {
-        clearTimeout(timeout)
-        resolve()
-      }, { once: true })
+      signal.addEventListener(
+        "abort",
+        () => {
+          clearTimeout(timeout)
+          resolve()
+        },
+        { once: true },
+      )
     })
 
   const runEventLoop = async (source: OpencodeClient, signal: AbortSignal, channel: "current" | "compatibility") => {
@@ -809,22 +927,61 @@ export function App() {
     void runEventLoop(source, eventsAbort.signal, "compatibility")
   }
 
+  /** Drops everything scoped to one server process. */
+  const resetInstanceState = () => {
+    setState({ sessions: [], archivedSessions: [], messages: [], activeSessionID: undefined })
+    for (const id of Object.keys(runtimes)) setRuntimes(id, undefined!)
+    for (const id of Object.keys(permissions)) setPermissions(id, undefined!)
+    for (const id of Object.keys(questions)) setQuestions(id, undefined!)
+    setQuotaData([])
+    setOpenRouterFree(undefined)
+    setProviders([])
+    setProjectsList([])
+  }
+
   const connect = async () => {
     setState({ status: "connecting", error: "" })
     try {
       const serverUrl = normalizeServerUrl(state.serverUrl)
       const storedToken = readStorage(DEVICE_TOKEN_KEY)
       const storedServer = readStorage(SERVER_URL_KEY)
-      if (state.token && state.token === storedToken && storedServer && normalizeServerUrl(storedServer) !== serverUrl) {
+      if (
+        state.token &&
+        state.token === storedToken &&
+        storedServer &&
+        normalizeServerUrl(storedServer) !== serverUrl
+      ) {
         throw new Error("This device token is bound to another server. Forget the device before changing servers.")
       }
       const nextClient = createClient(serverUrl, state.token || undefined)
+      // Identity first, and unauthenticated: it establishes *which* opencode
+      // is at this address before the device token is sent to it.
+      const identity = await fetchIdentity(serverUrl)
+      if (!identity) throw new Error(IDENTITY_REQUIRED_MESSAGE)
+      const instance = compareInstance({ pinned: readStorage(INSTANCE_ID_KEY), observed: identity?.instanceID })
       const health = await nextClient.global.health({ throwOnError: true })
       if (!health.data) throw new Error("Server returned no health info")
+      if (instance.state === "changed") {
+        // Same address, different process. Everything cached below belongs to
+        // the instance that just went away; keeping it would blend two
+        // servers' sessions into one list.
+        resetInstanceState()
+      }
+      if (instance.state === "adopted" || instance.state === "changed")
+        writeStorage(INSTANCE_ID_KEY, instance.instanceID)
       client = nextClient
       writeStorage(SERVER_URL_KEY, serverUrl)
       if (state.token) writeStorage(DEVICE_TOKEN_KEY, state.token)
-      setState({ serverUrl, serverVersion: health.data.version, status: "connected" })
+      setState({
+        serverUrl,
+        serverVersion: health.data.version,
+        status: "connected",
+        identity,
+        instanceNotice:
+          instance.state === "changed"
+            ? "Reconnected to a different OpenCode instance at this address — cached sessions were cleared."
+            : "",
+      })
       // Archived is lazy — only fetched when the Archive tab is opened (saves 1 RTT on launch)
       await Promise.all([refresh(), loadProviders(), loadProjects(), loadLimits()])
       await reconcileActiveSessions(nextClient)
@@ -847,7 +1004,8 @@ export function App() {
     if (!state.serverUrl.trim()) {
       setState({
         status: "error",
-        error: "No server URL set — open \"Advanced: server URL & device token\" below, enter your OpenCode server address, then try again.",
+        error:
+          'No server URL set — open "Advanced: server URL & device token" below, enter your OpenCode server address, then try again.',
       })
       setAdvancedOpen(true)
       if (fromScan) setPairMode("code")
@@ -856,7 +1014,13 @@ export function App() {
     try {
       setState({ status: "connecting", error: "Claiming device..." })
       const serverUrl = normalizeServerUrl(state.serverUrl)
+      // Pairing is also a bind operation. Prove the API identity before
+      // sending the short-lived pairing credential to any address.
+      if (!(await fetchIdentity(serverUrl))) throw new Error(IDENTITY_REQUIRED_MESSAGE)
       const claimed = await claimPair(serverUrl, state.pairing)
+      // Pairing is a deliberate rebind, so the previous pin is not a mismatch
+      // to warn about — connect() below adopts whatever instance issued this token.
+      clearStorage(INSTANCE_ID_KEY)
       writeStorage(SERVER_URL_KEY, serverUrl)
       writeStorage(DEVICE_TOKEN_KEY, claimed.token)
       writeStorage(DEVICE_ID_KEY, claimed.deviceID)
@@ -867,7 +1031,11 @@ export function App() {
       setState({ status: "error", error: msg })
       // Wrong-instance 500s and network errors are always a server-URL
       // problem — surface Advanced so the user can see/correct it.
-      if (msg.includes("not an opencode server") || msg.includes("could not reach the API") || msg.includes("No server URL")) {
+      if (
+        msg.includes("not an opencode server") ||
+        msg.includes("could not reach the API") ||
+        msg.includes("No server URL")
+      ) {
         setAdvancedOpen(true)
       }
       if (fromScan) setPairMode("code")
@@ -895,7 +1063,7 @@ export function App() {
         await selectSession(res.data.id)
       }
     } catch (e) {
-      setState("error", (e instanceof Error ? e.message : "Failed to create session"))
+      setState("error", e instanceof Error ? e.message : "Failed to create session")
     }
   }
 
@@ -906,7 +1074,12 @@ export function App() {
     deltaCount = 0
     lastDeltaHaptic = 0
     const sid = state.activeSessionID!
-    setRuntime(sid, { status: "generating", permissions: permissions[sid]?.length ?? 0, questions: questions[sid]?.length ?? 0, busySince: Date.now() })
+    setRuntime(sid, {
+      status: "generating",
+      permissions: permissions[sid]?.length ?? 0,
+      questions: questions[sid]?.length ?? 0,
+      busySince: Date.now(),
+    })
     // Ensure list shows active immediately even before SSE arrives
     void refresh()
     void reconcileActiveSessions(client!)
@@ -916,7 +1089,7 @@ export function App() {
       void refreshMessages()
       triggerHaptic("soft")
     } catch (e) {
-      setState({ draft: text, error: (e instanceof Error ? e.message : "Send failed") })
+      setState({ draft: text, error: e instanceof Error ? e.message : "Send failed" })
       const sid2 = state.activeSessionID
       if (sid2) setRuntime(sid2, { status: "error", permissions: 0, questions: 0 })
       triggerHaptic("warning")
@@ -933,13 +1106,16 @@ export function App() {
     }
   }
 
-  const stopGeneration = async () => {    if (!client || !state.activeSessionID) return
+  const stopGeneration = async () => {
+    if (!client || !state.activeSessionID) return
     try {
       await (client.session as any).abort({ sessionID: state.activeSessionID }, { throwOnError: true })
       triggerHaptic("light")
       setRuntime(state.activeSessionID, { status: "idle", permissions: 0, questions: 0 })
     } catch {
-      try { await (client as any).session.abort({ sessionID: state.activeSessionID }) } catch {}
+      try {
+        await (client as any).session.abort({ sessionID: state.activeSessionID })
+      } catch {}
     }
   }
 
@@ -947,7 +1123,18 @@ export function App() {
     eventsAbort?.abort()
     eventsAbort = undefined
     client = undefined
-    setState({ status: "disconnected", sessions: [], archivedSessions: [], messages: [], activeSessionID: undefined, error: "" })
+    // The instance pin survives on purpose: reconnecting to the same address
+    // should still be able to tell you the process behind it changed.
+    setState({
+      status: "disconnected",
+      sessions: [],
+      archivedSessions: [],
+      messages: [],
+      activeSessionID: undefined,
+      error: "",
+      identity: undefined,
+      instanceNotice: "",
+    })
     setQuotaData([])
     setOpenRouterFree(undefined)
     setProviders([])
@@ -956,7 +1143,9 @@ export function App() {
 
   const forgetDevice = async () => {
     eventsAbort?.abort()
-    const source = client ?? (state.serverUrl && state.token ? createClient(normalizeServerUrl(state.serverUrl), state.token) : undefined)
+    const source =
+      client ??
+      (state.serverUrl && state.token ? createClient(normalizeServerUrl(state.serverUrl), state.token) : undefined)
     if (source) {
       try {
         await disableNotifications(source)
@@ -967,7 +1156,9 @@ export function App() {
         let deviceID = readStorage(DEVICE_ID_KEY)
         if (!deviceID && state.token) {
           const devices = await source.device.list({ throwOnError: true })
-          deviceID = devices.data?.find((device) => !device.revokedAt && device.tokenPrefix === state.token.slice(0, 8))?.id
+          deviceID = devices.data?.find(
+            (device) => !device.revokedAt && device.tokenPrefix === state.token.slice(0, 8),
+          )?.id
         }
         if (deviceID) await source.device.remove({ deviceID }, { throwOnError: true })
       } catch {
@@ -976,6 +1167,7 @@ export function App() {
     }
     clearStorage(DEVICE_ID_KEY)
     clearStorage(DEVICE_TOKEN_KEY)
+    clearStorage(INSTANCE_ID_KEY)
     setState("token", "")
     disconnect()
     triggerHaptic("light")
@@ -1001,7 +1193,7 @@ export function App() {
       await refresh()
       await refreshArchived()
     } catch (e) {
-      setState("error", (e instanceof Error ? e.message : "Delete failed"))
+      setState("error", e instanceof Error ? e.message : "Delete failed")
       triggerHaptic("warning")
     }
   }
@@ -1012,12 +1204,15 @@ export function App() {
     if (!client || !id) return
     const isArchived = state.archivedSessions.some((s) => s.id === id)
     try {
-      await (client.session as any).update({ sessionID: id, time: { archived: isArchived ? null : Date.now() } } as any, { throwOnError: true })
+      await (client.session as any).update(
+        { sessionID: id, time: { archived: isArchived ? null : Date.now() } } as any,
+        { throwOnError: true },
+      )
       triggerHaptic("soft")
       await refresh()
       await refreshArchived()
     } catch (e) {
-      setState("error", (e instanceof Error ? e.message : "Archive failed"))
+      setState("error", e instanceof Error ? e.message : "Archive failed")
       triggerHaptic("warning")
     }
   }
@@ -1028,7 +1223,10 @@ export function App() {
   const handlePermissionReply = async (requestID: string, reply: PermissionV2Reply) => {
     if (!client || !state.activeSessionID) return
     try {
-      await (client.session as any).permission.reply({ sessionID: state.activeSessionID, requestID, reply }, { throwOnError: true })
+      await (client.session as any).permission.reply(
+        { sessionID: state.activeSessionID, requestID, reply },
+        { throwOnError: true },
+      )
       setPermissionReplyError(undefined)
       triggerHaptic("success")
       await refreshPermissions(state.activeSessionID)
@@ -1043,7 +1241,10 @@ export function App() {
   const handleQuestionSubmit = async (requestID: string, answers: string[][]) => {
     if (!client || !state.activeSessionID) return
     try {
-      await (client.session as any).question.reply({ sessionID: state.activeSessionID, requestID, questionV2Reply: { answers } }, { throwOnError: true })
+      await (client.session as any).question.reply(
+        { sessionID: state.activeSessionID, requestID, questionV2Reply: { answers } },
+        { throwOnError: true },
+      )
       setQuestionReplyError(undefined)
       triggerHaptic("success")
       await refreshQuestions(state.activeSessionID)
@@ -1110,7 +1311,11 @@ export function App() {
       // Mobile browsers commonly suspend SSE while backgrounded. Restarting
       // on foreground and reconciling snapshots closes that unobservable gap.
       startEventLoop(client)
-      void Promise.all([refresh(), reconcileActiveSessions(client), state.activeSessionID ? refreshMessages(state.activeSessionID) : Promise.resolve()])
+      void Promise.all([
+        refresh(),
+        reconcileActiveSessions(client),
+        state.activeSessionID ? refreshMessages(state.activeSessionID) : Promise.resolve(),
+      ])
     }
     const pushNavigate = (e: Event) => {
       const url = (e as CustomEvent<{ url: string }>).detail?.url
@@ -1140,17 +1345,35 @@ export function App() {
     })
     if (mockEnabled) {
       // Dev visual-QA mode: render the connected UI against fake data.
-      setState({ status: "connected", serverUrl: "https://mock.local", serverVersion: "0.0.0-mock", sessions: mockSessions, archivedSessions: mockArchived })
+      setState({
+        status: "connected",
+        serverUrl: "https://mock.local",
+        serverVersion: "0.0.0-mock",
+        sessions: mockSessions,
+        archivedSessions: mockArchived,
+      })
       setProviders(mockProviders)
-      setProjectsList((mockSessions as any).projects ?? [] as any)
+      setProjectsList((mockSessions as any).projects ?? ([] as any))
       // fabricate projects from mock sessions if mock doesn't export projects
       if (!projectsList().length) {
         const byId = new Map<string, any>()
         for (const s of mockSessions as any[]) {
-          if (!byId.has(s.projectID)) byId.set(s.projectID, { id: s.projectID, worktree: s.directory, name: s.directory.split(/[\\/]/).pop() || s.projectID.slice(0, 8), sandboxes: [] })
+          if (!byId.has(s.projectID))
+            byId.set(s.projectID, {
+              id: s.projectID,
+              worktree: s.directory,
+              name: s.directory.split(/[\\/]/).pop() || s.projectID.slice(0, 8),
+              sandboxes: [],
+            })
         }
         for (const s of mockArchived as any[]) {
-          if (!byId.has(s.projectID)) byId.set(s.projectID, { id: s.projectID, worktree: s.directory, name: s.directory.split(/[\\/]/).pop() || s.projectID.slice(0, 8), sandboxes: [] })
+          if (!byId.has(s.projectID))
+            byId.set(s.projectID, {
+              id: s.projectID,
+              worktree: s.directory,
+              name: s.directory.split(/[\\/]/).pop() || s.projectID.slice(0, 8),
+              sandboxes: [],
+            })
         }
         setProjectsList([...byId.values()] as any)
       }
@@ -1176,18 +1399,37 @@ export function App() {
   const handleInstall = async () => {
     const prompt = deferredPrompt()
     if (!prompt) return
-    try { await prompt.prompt(); await prompt.userChoice } catch {}
+    try {
+      await prompt.prompt()
+      await prompt.userChoice
+    } catch {}
     setDeferredPrompt(null)
   }
 
   const activeRuntime = createMemo<SessionRuntime>(() => {
     const id = state.activeSessionID
     if (!id) return { status: "idle", permissions: 0, questions: 0 }
-    return runtimes[id] ?? { status: "idle", permissions: permissions[id]?.length ?? 0, questions: questions[id]?.length ?? 0 }
+    return (
+      runtimes[id] ?? {
+        status: "idle",
+        permissions: permissions[id]?.length ?? 0,
+        questions: questions[id]?.length ?? 0,
+      }
+    )
   })
 
   return (
     <>
+      {/* A silent rebind is the failure this guards against, so say it out
+          loud once rather than letting another instance's state look like ours. */}
+      <Show when={state.instanceNotice}>
+        <div class="instance-notice" role="status">
+          <span>{state.instanceNotice}</span>
+          <button type="button" aria-label="Dismiss" onClick={() => setState("instanceNotice", "")}>
+            <IconClose size={12} />
+          </button>
+        </div>
+      </Show>
       <Show when={state.status === "connected"}>
         <Show
           when={activeSession()}
@@ -1205,7 +1447,10 @@ export function App() {
                   onSelect={selectSession}
                   onNewSession={createSession}
                   onContextMenu={openContextMenu}
-                  onOpenLimits={() => { setState("page", "limits"); void loadLimits() }}
+                  onOpenLimits={() => {
+                    setState("page", "limits")
+                    void loadLimits()
+                  }}
                   onLoadArchived={() => void refreshArchived()}
                 />
               </Show>
@@ -1215,13 +1460,17 @@ export function App() {
                   loading={quotaLoading()}
                   updatedAt={quotaUpdatedAt()}
                   openRouterFree={openRouterFree()}
-                  onRefresh={() => { triggerHaptic("selection"); void loadLimits() }}
+                  onRefresh={() => {
+                    triggerHaptic("selection")
+                    void loadLimits()
+                  }}
                 />
               </Show>
               <Show when={state.page === "settings"}>
                 <SettingsView
                   serverUrl={state.serverUrl}
                   serverVersion={state.serverVersion}
+                  identity={state.identity}
                   token={state.token}
                   providers={providers()}
                   client={client ?? undefined}
@@ -1234,35 +1483,115 @@ export function App() {
 
               {/* bottom nav – only when not in chat */}
               <nav class="bottom-nav" aria-label="Main navigation">
-                <button class={state.page === "sessions" ? "active" : ""} onClick={() => { setState("page", "sessions"); triggerHaptic("selection") }}>
+                <button
+                  class={state.page === "sessions" ? "active" : ""}
+                  onClick={() => {
+                    setState("page", "sessions")
+                    triggerHaptic("selection")
+                  }}
+                >
                   <span class="nav-icon-wrap">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"><path d="M4 6h16"/><path d="M4 12h16"/><path d="M4 18h10"/></svg>
+                    <svg
+                      width="20"
+                      height="20"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.75"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                    >
+                      <path d="M4 6h16" />
+                      <path d="M4 12h16" />
+                      <path d="M4 18h10" />
+                    </svg>
                   </span>
                   <span>Sessions</span>
                 </button>
-                <button class={state.page === "limits" ? "active" : ""} onClick={() => { setState("page", "limits"); triggerHaptic("selection"); void loadLimits() }}>
+                <button
+                  class={state.page === "limits" ? "active" : ""}
+                  onClick={() => {
+                    setState("page", "limits")
+                    triggerHaptic("selection")
+                    void loadLimits()
+                  }}
+                >
                   <span class="nav-icon-wrap">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linecap="round"><path d="M4 20V10"/><path d="M11 20V4"/><path d="M18 20v-7"/></svg>
+                    <svg
+                      width="20"
+                      height="20"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.75"
+                      stroke-linecap="round"
+                    >
+                      <path d="M4 20V10" />
+                      <path d="M11 20V4" />
+                      <path d="M18 20v-7" />
+                    </svg>
                   </span>
                   <span>Limits</span>
                 </button>
-                <button class={state.page === "settings" ? "active" : ""} onClick={() => { setState("page", "settings"); triggerHaptic("selection") }}>
+                <button
+                  class={state.page === "settings" ? "active" : ""}
+                  onClick={() => {
+                    setState("page", "settings")
+                    triggerHaptic("selection")
+                  }}
+                >
                   <span class="nav-icon-wrap">
-                    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.36.4.66.75.85.34.2.68.24 1.09.24H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z"/></svg>
+                    <svg
+                      width="20"
+                      height="20"
+                      viewBox="0 0 24 24"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.75"
+                    >
+                      <circle cx="12" cy="12" r="3" />
+                      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.6a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9c.14.36.4.66.75.85.34.2.68.24 1.09.24H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
+                    </svg>
                   </span>
                   <span>Settings</span>
                 </button>
               </nav>
 
               <Show when={state.contextMenuOpen}>
-                <div class="context-menu-overlay" onClick={closeContextMenu} onContextMenu={(e) => { e.preventDefault(); closeContextMenu() }}>
+                <div
+                  class="context-menu-overlay"
+                  onClick={closeContextMenu}
+                  onContextMenu={(e) => {
+                    e.preventDefault()
+                    closeContextMenu()
+                  }}
+                >
                   <div class="context-menu" onClick={(e) => e.stopPropagation()}>
                     <div class="context-menu-title">{contextMenuSession()?.title || "Session"}</div>
-                    <button onClick={() => { void archiveSession(); triggerHaptic("soft") }}>
-                      <IconArchive size={16} /> {state.archivedSessions.some((s) => s.id === state.contextMenuSessionID) ? "Unarchive" : "Archive"} session
+                    <button
+                      onClick={() => {
+                        void archiveSession()
+                        triggerHaptic("soft")
+                      }}
+                    >
+                      <IconArchive size={16} />{" "}
+                      {state.archivedSessions.some((s) => s.id === state.contextMenuSessionID)
+                        ? "Unarchive"
+                        : "Archive"}{" "}
+                      session
                     </button>
-                    <button class="destructive" onClick={() => { void deleteSession(); triggerHaptic("soft") }}><IconTrash size={16} /> Delete session</button>
-                    <button onClick={closeContextMenu}><IconClose size={14} /> Cancel</button>
+                    <button
+                      class="destructive"
+                      onClick={() => {
+                        void deleteSession()
+                        triggerHaptic("soft")
+                      }}
+                    >
+                      <IconTrash size={16} /> Delete session
+                    </button>
+                    <button onClick={closeContextMenu}>
+                      <IconClose size={14} /> Cancel
+                    </button>
                   </div>
                 </div>
               </Show>
@@ -1282,7 +1611,10 @@ export function App() {
               onSend={() => void send()}
               onStop={() => void stopGeneration()}
               killShell={killShell}
-              onBack={() => { setState("activeSessionID", undefined); triggerHaptic("selection") }}
+              onBack={() => {
+                setState("activeSessionID", undefined)
+                triggerHaptic("selection")
+              }}
               permissions={state.activeSessionID ? (permissions[state.activeSessionID] ?? []) : []}
               questions={state.activeSessionID ? (questions[state.activeSessionID] ?? []) : []}
               onPermissionReply={(id, reply) => void handlePermissionReply(id, reply)}
@@ -1290,7 +1622,10 @@ export function App() {
               permissionReplyError={permissionReplyError()}
               questionReplyError={questionReplyError()}
               onModelSelect={handleModelSelect}
-              onOpenLimits={() => { setState({ page: "limits", activeSessionID: undefined }); void loadLimits() }}
+              onOpenLimits={() => {
+                setState({ page: "limits", activeSessionID: undefined })
+                void loadLimits()
+              }}
               autoAccept={autoAcceptSessions().has(sess().id)}
               onToggleAutoAccept={() => toggleAutoAccept(sess().id)}
             />
@@ -1301,8 +1636,12 @@ export function App() {
           <div class="context-menu-overlay" onClick={closeContextMenu}>
             <div class="context-menu" onClick={(e) => e.stopPropagation()}>
               <div class="context-menu-title">{contextMenuSession()?.title || "Session"}</div>
-              <button onClick={() => void archiveSession()}><IconArchive size={16} /> Archive</button>
-              <button class="destructive" onClick={() => void deleteSession()}><IconTrash size={16} /> Delete</button>
+              <button onClick={() => void archiveSession()}>
+                <IconArchive size={16} /> Archive
+              </button>
+              <button class="destructive" onClick={() => void deleteSession()}>
+                <IconTrash size={16} /> Delete
+              </button>
               <button onClick={closeContextMenu}>Cancel</button>
             </div>
           </div>
@@ -1325,19 +1664,51 @@ export function App() {
             </div>
 
             <div class="segmented" role="tablist">
-              <button role="tab" aria-selected={pairMode() === "scan"} classList={{ active: pairMode() === "scan" }} onClick={() => { setPairMode("scan"); triggerHaptic("selection") }}>Scan QR</button>
-              <button role="tab" aria-selected={pairMode() === "code"} classList={{ active: pairMode() === "code" }} onClick={() => { setPairMode("code"); triggerHaptic("selection") }}>Enter code</button>
+              <button
+                role="tab"
+                aria-selected={pairMode() === "scan"}
+                classList={{ active: pairMode() === "scan" }}
+                onClick={() => {
+                  setPairMode("scan")
+                  triggerHaptic("selection")
+                }}
+              >
+                Scan QR
+              </button>
+              <button
+                role="tab"
+                aria-selected={pairMode() === "code"}
+                classList={{ active: pairMode() === "code" }}
+                onClick={() => {
+                  setPairMode("code")
+                  triggerHaptic("selection")
+                }}
+              >
+                Enter code
+              </button>
             </div>
 
             <Show when={isReconnecting()}>
-              <div style={{ display: "flex", "flex-direction": "column", "align-items": "center", gap: "14px", padding: "32px 0 8px" }}>
+              <div
+                style={{
+                  display: "flex",
+                  "flex-direction": "column",
+                  "align-items": "center",
+                  gap: "14px",
+                  padding: "32px 0 8px",
+                }}
+              >
                 <div class="wave-bars" style={{ height: "14px" }}>
                   {[5, 9, 6, 12, 7, 9].map((h, i) => (
                     <span style={{ height: `${h}px`, "animation-delay": `${i * 0.12}s` }} />
                   ))}
                 </div>
-                <p style={{ margin: 0, "font-size": "var(--font-sm)", color: "var(--text-muted)", "font-weight": 600 }}>Reconnecting…</p>
-                <p style={{ margin: 0, "font-size": "var(--font-xs)", color: "var(--text-weakest)" }}>{state.serverUrl}</p>
+                <p style={{ margin: 0, "font-size": "var(--font-sm)", color: "var(--text-muted)", "font-weight": 600 }}>
+                  Reconnecting…
+                </p>
+                <p style={{ margin: 0, "font-size": "var(--font-xs)", color: "var(--text-weakest)" }}>
+                  {state.serverUrl}
+                </p>
               </div>
             </Show>
 
@@ -1363,8 +1734,11 @@ export function App() {
               />
               <button
                 class="primary-button"
-                style={{ "width": "100%", "margin-top": "0" }}
-                onClick={() => { triggerHaptic("soft"); void (canClaim() ? connectFromPair() : connect()) }}
+                style={{ width: "100%", "margin-top": "0" }}
+                onClick={() => {
+                  triggerHaptic("soft")
+                  void (canClaim() ? connectFromPair() : connect())
+                }}
                 disabled={submitDisabled()}
               >
                 {submitLabel()}
@@ -1378,23 +1752,40 @@ export function App() {
               <div class="pair-advanced-panel">
                 <label>
                   Server URL
-                  <input value={state.serverUrl} onInput={(e) => setState("serverUrl", (e.currentTarget as HTMLInputElement).value)} placeholder="https://your-server.dev" />
+                  <input
+                    value={state.serverUrl}
+                    onInput={(e) => setState("serverUrl", (e.currentTarget as HTMLInputElement).value)}
+                    placeholder="https://your-server.dev"
+                  />
                 </label>
                 <label>
                   Device token
-                  <input type="password" value={state.token} onInput={(e) => setState("token", (e.currentTarget as HTMLInputElement).value)} placeholder="Paste a device token" />
+                  <input
+                    type="password"
+                    value={state.token}
+                    onInput={(e) => setState("token", (e.currentTarget as HTMLInputElement).value)}
+                    placeholder="Paste a device token"
+                  />
                 </label>
               </div>
             </Show>
 
-            <Show when={state.error}><p class="error-message">{state.error}</p></Show>
+            <Show when={state.error}>
+              <p class="error-message">{state.error}</p>
+            </Show>
 
             <div class="pair-footer">
-              <p class="pair-footer-note">Pairing codes expire after 90 seconds and never touch server logs. Connecting from {pwaOrigin()}.</p>
-              <button class="text-button" onClick={() => setHowOpen((v) => !v)}>{howOpen() ? "Hide" : "How pairing works"}</button>
+              <p class="pair-footer-note">
+                Pairing codes expire after 90 seconds and never touch server logs. Connecting from {pwaOrigin()}.
+              </p>
+              <button class="text-button" onClick={() => setHowOpen((v) => !v)}>
+                {howOpen() ? "Hide" : "How pairing works"}
+              </button>
               <Show when={howOpen()}>
                 <p class="pair-footer-note">
-                  A scanned or typed code exchanges once for a persistent device token, which then authenticates every request as <code>Basic device:&lt;token&gt;</code>. No server username or password is ever accepted by the mobile client.
+                  A scanned or typed code exchanges once for a persistent device token, which then authenticates every
+                  request as <code>Basic device:&lt;token&gt;</code>. No server username or password is ever accepted by
+                  the mobile client.
                 </p>
               </Show>
             </div>
