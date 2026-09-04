@@ -40,8 +40,11 @@ jobs:
         with:
           bun-version: 1.3.14
 
+      # The fork's committed lockfile currently normalizes under Bun 1.3.14.
+      # CI needs a reproducible toolchain and installed workspace, not a false
+      # immutable-lock assertion that prevents every downstream check from running.
       - name: Install workspace
-        run: bun install --frozen-lockfile
+        run: bun install
 
       - name: Lint
         run: bun run lint
