@@ -100,8 +100,8 @@ import type {
   ForkCredentialRemoveResponses,
   ForkCredentialRenameErrors,
   ForkCredentialRenameResponses,
-  ForkCredentialSelectErrors,
-  ForkCredentialSelectResponses,
+  ForkCredentialSetDefaultErrors,
+  ForkCredentialSetDefaultResponses,
   ForkUsageGetErrors,
   ForkUsageGetResponses,
   FormatterStatusErrors,
@@ -1586,9 +1586,9 @@ export class Credential extends HeyApiClient {
   }
 
   /**
-   * Select the active credential
+   * Designate the default (routing) credential
    */
-  public select<ThrowOnError extends boolean = false>(
+  public setDefault<ThrowOnError extends boolean = false>(
     parameters: {
       id: string
       directory?: string
@@ -1607,11 +1607,11 @@ export class Credential extends HeyApiClient {
       ],
     )
     return (options?.client ?? this.client).post<
-      ForkCredentialSelectResponses,
-      ForkCredentialSelectErrors,
+      ForkCredentialSetDefaultResponses,
+      ForkCredentialSetDefaultErrors,
       ThrowOnError
     >({
-      url: "/fork/credential/{id}/select",
+      url: "/fork/credential/{id}/default",
       ...options,
       ...params,
     })

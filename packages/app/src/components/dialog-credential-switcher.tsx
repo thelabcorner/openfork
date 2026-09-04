@@ -1,4 +1,4 @@
-import { type Accessor, type Component, createSignal, For, Show } from "solid-js"
+import { type Accessor, type Component, createMemo, createSignal, For, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Dialog as DialogV2, DialogBody, DialogHeader, DialogTitleGroup } from "@opencode-ai/ui/v2/dialog-v2"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
@@ -12,7 +12,7 @@ import { useServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
 import { useNow } from "@/hooks/use-now"
 import { showToast } from "@/utils/toast"
-import { ForkClient, type ForkServer } from "@/utils/fork-client"
+import { ForkClient, type ForkCredentialInfo, type ForkServer } from "@/utils/fork-client"
 import { UsageBreakdownV2 } from "./usage-gauge-v2"
 
 export const DialogCredentialSwitcherV2: Component<{
@@ -53,8 +53,45 @@ export const DialogCredentialSwitcherV2: Component<{
     await serverSync().refreshProviders().catch(() => undefined)
   }
 
-  const select = async (credentialID: string) => {
-    await ForkClient.select(server(), credentialID, directory())
+  // The pool account a bare request routes to (env-first, else the vault
+  // designated default). The vault rows are keyed by UUID; locate the vault
+  // row whose pool identity matches so the badge is exact even when env keys
+  // outrank a vault-designated default.
+  const defaultVaultID = () => {
+    const defaultAccountID = forkUsage.usage.latest?.defaultAccountID
+    if (!defaultAccountID) return undefined
+    return forkUsage.usage.latest?.byCredential.find((entry) => entry.accountID === defaultAccountID)?.credentialID
+  }
+  // Vault rows plus a read-only synthetic row when the pool default is an env
+  // key the vault has no row for (so a bare request's real target is never
+  // invisible / mislabeled as "no keys").
+  type CredentialRow = ForkCredentialInfo & { readonly: boolean; isDefault: boolean }
+  const rows = createMemo<CredentialRow[]>(() => {
+    const vault = credentials.latest ?? []
+    const fallbackActive = () => vault.find((credential) => credential.active)?.id
+    const activeID = () => defaultVaultID() ?? fallbackActive()
+    const out: CredentialRow[] = vault.map((credential) => ({
+      ...credential,
+      readonly: false,
+      isDefault: activeID() === credential.id,
+    }))
+    const defaultAccountID = forkUsage.usage.latest?.defaultAccountID
+    const covered = out.some((row) => row.isDefault)
+    if (defaultAccountID && !covered) {
+      out.push({
+        id: defaultAccountID,
+        label: forkUsage.usage.latest?.defaultAccountLabel ?? language.t("dialog.credential.envSource"),
+        active: false,
+        timeCreated: 0,
+        readonly: true,
+        isDefault: true,
+      })
+    }
+    return out
+  })
+
+  const setDefault = async (credentialID: string) => {
+    await ForkClient.setDefault(server(), credentialID, directory())
     await refreshAll()
   }
 
@@ -97,8 +134,7 @@ export const DialogCredentialSwitcherV2: Component<{
     })
   }
 
-  const usageFor = (credentialID: string) =>
-    usage.latest?.byCredential.find((entry) => entry.credentialID === credentialID)?.windows
+  const usageFor = (credentialID: string) => forkUsage.usageWindowsFor(credentialID)
 
   return (
     <DialogV2
@@ -166,48 +202,55 @@ export const DialogCredentialSwitcherV2: Component<{
             }
           >
           <Show
-            when={credentials.latest && credentials.latest.length > 0}
+            when={rows().length > 0}
             fallback={<div class="px-1 py-3 text-[13px] text-v2-text-text-faint">{language.t("dialog.credential.empty")}</div>}
           >
             <div class="flex flex-col gap-1.5">
-              <For each={credentials.latest}>
+              <For each={rows()}>
                 {(credential) => {
                     const windows = () => usageFor(credential.id)
                     return (
                       <div
                         class="flex flex-col gap-2 rounded-[6px] border px-3 py-2.5 data-[active=true]:border-v2-border-border-muted data-[active=true]:bg-v2-overlay-simple-overlay-hover data-[active=true]:shadow-[inset_0_0_0_1px_var(--v2-border-border-muted)]"
-                        data-active={credential.active ? "true" : undefined}
+                        data-active={credential.isDefault ? "true" : undefined}
                       >
                         <Show
                           when={renaming() === credential.id}
                           fallback={
                             <div class="flex items-center gap-2">
                               <div class="flex min-w-0 flex-1 items-center gap-2">
-                                <Show when={credential.active}>
+                                <Show when={credential.isDefault}>
                                   <IconV2 name="check" size="small" class="shrink-0 text-v2-state-fg-success" />
                                 </Show>
                                 <span class="min-w-0 truncate text-[13px] font-[530] leading-5 text-v2-text-text-base">
                                   {credential.label}
                                 </span>
-                                <Show when={credential.active}>
+                                <Show when={credential.isDefault}>
                                   <span class="shrink-0 rounded-[4px] bg-v2-state-bg-success px-1.5 py-0.5 text-[10px] font-[530] leading-3 text-v2-state-fg-success">
-                                    {language.t("dialog.credential.active")}
+                                    {language.t("dialog.credential.default")}
+                                  </span>
+                                </Show>
+                                <Show when={credential.readonly}>
+                                  <span class="shrink-0 rounded-[4px] bg-v2-border-border-muted px-1.5 py-0.5 text-[10px] font-[530] leading-3 text-v2-text-text-muted">
+                                    {language.t("dialog.credential.envSource")}
                                   </span>
                                 </Show>
                               </div>
-                              <Show when={!credential.active}>
-                                <ButtonV2 size="small" variant="outline" onClick={() => void select(credential.id)}>
-                                  {language.t("dialog.credential.select")}
+                              <Show when={!credential.isDefault && !credential.readonly}>
+                                <ButtonV2 size="small" variant="outline" onClick={() => void setDefault(credential.id)}>
+                                  {language.t("dialog.credential.setDefault")}
                                 </ButtonV2>
                               </Show>
-                              <IconButtonV2
-                                type="button"
-                                size="small"
-                                variant="ghost-muted"
-                                icon={<IconV2 name="edit" size="small" />}
-                                aria-label={language.t("dialog.credential.rename")}
-                                onClick={() => startRename(credential)}
-                              />
+                              <Show when={!credential.readonly}>
+                                <IconButtonV2
+                                  type="button"
+                                  size="small"
+                                  variant="ghost-muted"
+                                  icon={<IconV2 name="edit" size="small" />}
+                                  aria-label={language.t("dialog.credential.rename")}
+                                  onClick={() => startRename(credential)}
+                                />
+                              </Show>
                               <Show
                                 when={confirmingRemove() === credential.id}
                                 fallback={

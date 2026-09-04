@@ -61,7 +61,7 @@ import { useServerSync } from "@/context/server-sync"
 import { usePersonalUsage } from "@/context/personal-usage"
 import { useLimits } from "@/hooks/use-limits"
 import { useNow } from "@/hooks/use-now"
-import { ForkClient, type ForkWindowUsage } from "@/utils/fork-client"
+import type { ForkWindowUsage } from "@/utils/fork-client"
 import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
 import type { FreeUsageReport } from "@/utils/openrouter-free-usage"
 import { percent as usagePercent, colorFor } from "./usage-gauge-v2"
@@ -717,7 +717,7 @@ function MultiAccountRow(props: {
         ref={props.rowRef}
         data-option-key={props.navKey}
         data-selected-model={props.current ? true : undefined}
-        aria-label={`${props.displayName}, ${props.variants.length} accounts`}
+        aria-label={language.t("dialog.model.account.aria", { name: props.displayName, count: props.variants.length })}
         title={props.variants.map((variant) => accountLabelForVariant(variant, props.accountLabels)).join(", ")}
         class="scroll-my-6 w-full"
         classList={{ "!bg-v2-overlay-simple-overlay-hover": props.current }}
@@ -1016,6 +1016,7 @@ export function ModelSelectorPopoverV2(props: {
       onToggleFavorite={controller.toggleFavorite}
       current={controller.current}
       currentVariant={controller.currentVariant}
+      currentAccountID={controller.currentAccountID}
       groupOf={controller.groupOf}
       variants={controller.variants}
       selectVariant={controller.selectVariant}
@@ -1676,6 +1677,7 @@ function createModelSelectorController(input: {
     toggleFavorite: (item: ModelItem) => model.favorite.toggle(key(item)),
     current,
     currentVariant,
+    currentAccountID,
     groupOf: (item: ModelItem): ModelGroup<ModelItem> | undefined => groupIndex().get(modelKey(item)),
     variants: (item: ModelItem) => groupIndex().get(modelKey(item))?.variants ?? [],
     selectVariant: (item: ModelItem, selection: string | AutoPolicy) => {
@@ -1715,6 +1717,10 @@ function ModelSelectorPopoverV2View(props: {
   onToggleFavorite: (item: ModelItem) => void
   current: () => string | undefined
   currentVariant: () => { accountID: string; item: ModelItem } | undefined
+  /** Account id parsed from the current model's transport suffix (`@zen-…`,
+   * `@vd-…`) when the pinned variant is not in the group index (e.g. a
+   * synthesized submenu for go keys the catalog cache hasn't refreshed). */
+  currentAccountID?: () => string | undefined
   groupOf: (item: ModelItem) => ModelGroup<ModelItem> | undefined
   variants: (item: ModelItem) => { accountID: string; item: ModelItem }[]
   selectVariant: (item: ModelItem, selection: string | AutoPolicy) => void
@@ -1748,15 +1754,6 @@ function ModelSelectorPopoverV2View(props: {
   }
   const forkUsage = useForkUsage()
   const sync = useSync()
-  // Fork credential activation (opencode-go account switching) needs the raw
-  // server handle. Same try/catch pattern as local/personal above so
-  // storybook/tests without the provider degrade instead of throwing.
-  let serverSDK: ReturnType<typeof useServerSDK> | undefined
-  try {
-    serverSDK = useServerSDK()
-  } catch {
-    serverSDK = undefined
-  }
   // Provider catalog refresh (see selectAccount step 2b): the Verdent/Zen
   // models hooks emit per-account ids at provider-load time, but the app
   // caches that catalog while quota reads the vault live — accounts enrolled
@@ -1767,14 +1764,6 @@ function ModelSelectorPopoverV2View(props: {
     serverSync = useServerSync()
   } catch {
     serverSync = undefined
-  }
-  const forkServer = () => serverSDK?.().server.http
-  const forkDirectory = (): string | undefined => {
-    try {
-      return local ? decode64(local.slug()) : undefined
-    } catch {
-      return undefined
-    }
   }
   let personal: ReturnType<typeof usePersonalUsage> | undefined
   try {
@@ -1823,8 +1812,11 @@ function ModelSelectorPopoverV2View(props: {
         if (acct.accountId && acct.label) map.set(acct.accountId, acct.label)
       for (const acct of usage?.zenAccounts ?? []) if (acct.keyId && acct.label) map.set(acct.keyId, acct.label)
     }
-    // OpenCode Go keys live in the fork credential store (forkUsage), not the
-    // quota adapter, so the labels map won't pick them up otherwise.
+    // opencode and opencode-go accounts (env + vault) are all reported by the
+    // pool through the `opencode` quota adapter's `zenAccounts`, so their
+    // labels resolve here for both providers. Vault UUIDs are kept for legacy
+    // synthesized rows (old servers); their pool ids (`zen-<hash>`) come from
+    // the zenAccounts rows above.
     for (const cred of forkUsage.credentials.latest ?? [])
       if (cred.id && cred.label) map.set(cred.id, cred.label)
     return map.size > 0 ? map : undefined
@@ -1897,18 +1889,15 @@ function ModelSelectorPopoverV2View(props: {
         variants,
       }) as ModelGroup<ModelItem>
 
-    if (item.provider.id === "opencode" && zenKeyLimits().size > 1)
+    // opencode and opencode-go share the Zen account pool (env + vault keys),
+    // so both synthesize from `zenKeyLimits()` — the pool's live accounts as
+    // reported by the `opencode` quota adapter. Ids are `zen-<hash>` in both
+    // cases, matching the catalog variants and the usage roster.
+    if ((item.provider.id === "opencode" || item.provider.id === "opencode-go") && zenKeyLimits().size > 1)
       return build(
         Array.from(zenKeyLimits().entries()).map(([keyId, info]) => ({
           accountID: keyId,
           item: labeledClone(keyId, info.label),
-        })),
-      )
-    if (item.provider.id === "opencode-go" && (forkUsage.credentials.latest?.length ?? 0) > 1)
-      return build(
-        (forkUsage.credentials.latest ?? []).map((cred) => ({
-          accountID: cred.id,
-          item: labeledClone(cred.id, cred.label),
         })),
       )
     // Verdent: fall back to the quota-reported account list when the catalog
@@ -1930,7 +1919,6 @@ function ModelSelectorPopoverV2View(props: {
     {
       sourceGroup: ModelGroup<ModelItem> | undefined
       zenSize: number
-      forkLen: number
       verdentLen: number
       result: ModelGroup<ModelItem> | undefined
     }
@@ -1940,19 +1928,17 @@ function ModelSelectorPopoverV2View(props: {
     const key = modelKey(item)
     const sourceGroup = props.groupOf(item)
     const zenSize = zenKeyLimits().size
-    const forkLen = forkUsage.credentials.latest?.length ?? 0
     const verdentLen = verdentAccounts().length
     const cached = accountGroupCache.get(key)
     if (
       cached &&
       cached.sourceGroup === sourceGroup &&
       cached.zenSize === zenSize &&
-      cached.forkLen === forkLen &&
       cached.verdentLen === verdentLen
     )
       return cached.result
     const result = buildAccountGroup(item, sourceGroup)
-    accountGroupCache.set(key, { sourceGroup, zenSize, forkLen, verdentLen, result })
+    accountGroupCache.set(key, { sourceGroup, zenSize, verdentLen, result })
     return result
   }
 
@@ -2391,10 +2377,8 @@ function ModelSelectorPopoverV2View(props: {
   // 100%. Without a resolved active credential's own window we simply don't
   // know, so no bar is shown rather than a misleading one.
   const activeWindow = createMemo<ForkWindowUsage | undefined>(() => {
-    const credentialID = forkUsage.activeCredentialID()
-    if (!credentialID) return undefined
-    const windows = forkUsage.usage.latest?.byCredential.find((entry) => entry.credentialID === credentialID)?.windows
-    return windows?.find((entry) => entry.label === "5h")
+    const windows = forkUsage.usageWindowsFor(forkUsage.activeCredentialID())
+    return windows.find((entry) => entry.label === "5h")
   })
   // Durable learner: personal $/request from the global persisted store
   // (deduped, 200/model, survives LRU). Falls back to an ephemeral scan
@@ -3017,16 +3001,10 @@ function ModelSelectorPopoverV2View(props: {
       } catch {
         // Fall through to the provider mechanism below.
       }
-      // 3. opencode-go routes by activating a fork credential — the model
-      // id must stay clean, never `model@<uuid>`.
-      if (item.provider.id === "opencode-go") {
-        const server = forkServer()
-        if (!server) throw new Error("no server")
-        await ForkClient.select(server, accountID, forkDirectory())
-        forkUsage.refreshAll()
-        props.select(item)
-        return
-      }
+      // 3. opencode-go (and Zen) account ids are real catalog variants with a
+      // `@zen-<id>` Pool suffix; no per-request activation is needed anymore —
+      // the request router resolves the pinned account from that suffix
+      // directly. A bare id routes to the pool default key.
       // 4. Degraded: the account can't be pinned because the provider
       // backend isn't exposing per-account models. Fall back to automatic
       // routing with an explanation instead of a silent no-op.
@@ -3070,8 +3048,7 @@ function ModelSelectorPopoverV2View(props: {
     // Go windows are USD budgets (spentUSD/limitUSD), not
     // request counts — reuse the same estimator the Go row
     // path uses instead of inventing parallel math.
-    const usage = forkUsage.usage.latest?.byCredential.find((entry) => entry.credentialID === accountID)
-    const window = usage?.windows.find((entry) => entry.label === "5h")
+    const window = forkUsage.usageWindowsFor(accountID).find((entry) => entry.label === "5h")
     if (!window) return undefined
     const remainingUSD = Math.max(0, window.limitUSD - window.spentUSD)
     const remainingPercent =
@@ -3189,14 +3166,11 @@ function ModelSelectorPopoverV2View(props: {
           current={current()}
           selectedAccountID={
             current()
-              ? (props.currentVariant()?.accountID ??
-                (item.provider.id === "opencode-go" ? forkUsage.activeCredentialID() : undefined))
+              ? (props.currentVariant()?.accountID ?? props.currentAccountID?.())
               : undefined
           }
           auto={displayGroup.auto}
-          selectedAuto={
-            current() && !props.currentVariant() && item.provider.id !== "opencode-go"
-          }
+          selectedAuto={current() && !props.currentVariant() && !props.currentAccountID?.()}
           favorited={props.isFavorite(item)}
           usage={usage()}
           priceLabel={price()}
@@ -3522,7 +3496,7 @@ function ModelSelectorPopoverV2View(props: {
                               <ProviderIcon id={row.provider!} class="size-3.5 shrink-0 opacity-70" />
                             </Show>
                             <span class="min-w-0 flex-1 truncate">{row.title}</span>
-                            <Show when={row.provider === "opencode"}>
+                            <Show when={row.provider === "opencode" || row.provider === "opencode-go"}>
                               <button
                                 type="button"
                                 class="flex size-5 shrink-0 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"

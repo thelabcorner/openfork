@@ -3,9 +3,11 @@ import { authTokenFromCredentials } from "./server"
 /**
  * Plain, hand-authenticated fetch client for the fork-owned `/fork/*`
  * routes. Deliberately bypasses the generated/vendored SDK clients (see
- * handoff notes on the vendor-tarball naming mismatch) — these routes are
- * new, fork-only additions, so there's nothing to keep in sync with a
- * generator, and a raw fetch avoids depending on the vendor tarball at all.
+ * handoff notes on the vendor-tarball naming mismatch): these routes
+ * ARE part of the unified OpenCodeHttpApi (packages/opencode
+ * httpapi/groups/fork-credential), so the generated unified SDK must be
+ * regenerated in lockstep, but the app keeps this thin fetch layer so the
+ * dialog/composer never depends on that tarball.
  */
 
 export type ForkServer = { url: string; username?: string; password?: string }
@@ -40,6 +42,10 @@ export type ForkOfficialEnvelope = {
 
 export type ForkCredentialUsage = {
   credentialID: string
+  // Routing identity in the unified Zen account pool (`zen-<hash>`), shared by
+  // env and vault keys. Per-account spend in the model picker is keyed off
+  // this; the vault UUID in `credentialID` stays the store key.
+  accountID?: string
   windows: ForkWindowUsage[]
   // Additive envelope metadata about the official snapshot served for this
   // credential (age/status of the remote OpenCode Go usage data). Absent for
@@ -50,6 +56,10 @@ export type ForkCredentialUsage = {
 export type ForkUsageResult = {
   aggregate: ForkWindowUsage[]
   byCredential: ForkCredentialUsage[]
+  // Pool account a bare opencode-go request routes to (may be an env key the
+  // vault has no row for). Absent when the pool is empty or on old servers.
+  defaultAccountID?: string
+  defaultAccountLabel?: string
 }
 
 function authHeader(server: ForkServer): Record<string, string> {
@@ -79,10 +89,10 @@ export const ForkClient = {
       `/fork/credential${input.directory ? `?directory=${encodeURIComponent(input.directory)}` : ""}`,
       { method: "POST", body: JSON.stringify({ key: input.key, label: input.label }) },
     ),
-  select: (server: ForkServer, id: string, directory?: string) =>
+  setDefault: (server: ForkServer, id: string, directory?: string) =>
     request<boolean>(
       server,
-      `/fork/credential/${encodeURIComponent(id)}/select${directory ? `?directory=${encodeURIComponent(directory)}` : ""}`,
+      `/fork/credential/${encodeURIComponent(id)}/default${directory ? `?directory=${encodeURIComponent(directory)}` : ""}`,
       { method: "POST" },
     ),
   rename: (server: ForkServer, id: string, label: string) =>

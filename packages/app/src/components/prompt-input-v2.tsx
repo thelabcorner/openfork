@@ -34,6 +34,7 @@ import { SessionUsageWarningBanner } from "@/components/session-usage-warning-ba
 import { createSessionTabs } from "@/pages/session/helpers"
 import { focusLimitsProvider } from "@/pages/session/limits-panel-state"
 import { useLimits } from "@/hooks/use-limits"
+import { splitModelIDForProvider } from "@/utils/model-account-identity"
 import { useNow } from "@/hooks/use-now"
 import { buildArcModel, type ArcModel } from "@/components/prompt-input/limit-arc"
 import { LimitArcCard, LimitArcGlyph } from "@/components/prompt-input/limit-arc-view"
@@ -238,13 +239,25 @@ function PromptInputV2UsageArc(props: { model: PromptInputV2ComposerController["
   // Deliberately does not fall back to `usage.latest.aggregate` — that spans
   // every credential the account has ever used, which pins the ring near 100%
   // regardless of the active key's real spend. See the identical note in
-  // `session-usage-warning-banner.tsx`.
-  const forkWindows = () => {
-    const credentialID = forkUsage.activeCredentialID()
-    if (!credentialID) return []
-    return forkUsage.usage.latest?.byCredential.find((entry) => entry.credentialID === credentialID)?.windows ?? []
+  // `session-usage-warning-banner.tsx`. Prefers the SELECTED model's account
+  // suffix (`@zen-<id>`), falling back to the pool default for bare ids.
+  const forkAccountID = () => {
+    const id = modelID()
+    if (!id) return forkUsage.activeCredentialID()
+    const split = splitModelIDForProvider(id, providerID() ?? "")
+    return split.accountID ?? forkUsage.activeCredentialID()
   }
-  const forkLabel = () => forkUsage.credentials.latest?.find((credential) => credential.active)?.label
+  const forkWindows = () => forkUsage.usageWindowsFor(forkAccountID())
+  const forkLabel = () => {
+    const id = forkAccountID()
+    for (const provider of limits?.providers() ?? []) {
+      const accounts = (provider as { result?: { usage?: { zenAccounts?: { keyId?: string; label?: string }[] } } })
+        .result?.usage?.zenAccounts
+      const label = accounts?.find((account) => account.keyId === id)?.label
+      if (label) return label
+    }
+    return forkUsage.activeCredentialLabel()
+  }
 
   // Already polled by `useLimits` via the shared singleton — reading it here
   // costs nothing extra and is the only limit that can stop a `:free` model.

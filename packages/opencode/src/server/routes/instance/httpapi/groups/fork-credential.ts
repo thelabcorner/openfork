@@ -28,6 +28,11 @@ export const ForkWindowUsage = Schema.Struct({
 
 export const ForkCredentialUsage = Schema.Struct({
   credentialID: Schema.String,
+  // Routing identity in the unified Zen account pool (`zen-<hash>`), shared by
+  // env and vault keys. Clients key per-account spend off this field; the
+  // vault UUID in `credentialID` remains the stable store key. Absent on old
+  // servers; always treat as optional.
+  accountID: Schema.optional(Schema.String),
   windows: Schema.Array(ForkWindowUsage),
   // Additive envelope metadata about the official snapshot served for this
   // credential (age/status of the remote OpenCode Go usage data). Absent for
@@ -44,6 +49,11 @@ export const ForkCredentialUsage = Schema.Struct({
 export const ForkUsageResult = Schema.Struct({
   aggregate: Schema.Array(ForkWindowUsage),
   byCredential: Schema.Array(ForkCredentialUsage),
+  // The pool account a bare opencode-go request will route to (env-first
+  // default, else the vault-designated default). Absent when the pool is
+  // empty or on old servers.
+  defaultAccountID: Schema.optional(Schema.String),
+  defaultAccountLabel: Schema.optional(Schema.String),
 })
 
 const root = "/fork/credential"
@@ -66,12 +76,15 @@ export const ForkCredentialApi = HttpApi.make("fork-credential").add(
       }).annotateMerge(OpenApi.annotations({ identifier: "fork.credential.add", summary: "Add an OpenCode key" })),
     )
     .add(
-      HttpApiEndpoint.post("select", `${root}/:id/select`, {
+      HttpApiEndpoint.post("setDefault", `${root}/:id/default`, {
         params: { id: Schema.String },
         query: DirectoryQuery,
-        success: described(Schema.Boolean, "Selected credential"),
+        success: described(Schema.Boolean, "Credential designated as default"),
       }).annotateMerge(
-        OpenApi.annotations({ identifier: "fork.credential.select", summary: "Select the active credential" }),
+        OpenApi.annotations({
+          identifier: "fork.credential.setDefault",
+          summary: "Designate the default (routing) credential",
+        }),
       ),
     )
     .add(

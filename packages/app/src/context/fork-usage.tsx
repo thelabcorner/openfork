@@ -1,7 +1,7 @@
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createResource, createSignal, onCleanup, onMount } from "solid-js"
 import { useServerSDK } from "@/context/server-sdk"
-import { ForkClient, type ForkServer } from "@/utils/fork-client"
+import { ForkClient, type ForkServer, type ForkWindowUsage } from "@/utils/fork-client"
 
 const HEARTBEAT_MS = 60_000
 const EVENT_DEBOUNCE_MS = 3_000
@@ -95,7 +95,23 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
         void refetchCredentials()
         void refetchUsage()
       },
-      activeCredentialID: () => credentials.latest?.find((credential) => credential.active)?.id,
+      // The account a bare opencode-go request routes to: the pool default
+      // (env-first, else the vault-designated default). Falls back to the
+      // vault UUID flagged `active` for old servers that don't report the
+      // pool envelope. Id domain is `zen-<hash>`; match spend via
+      // `usageWindowsFor` (which checks both pool id and vault UUID).
+      activeCredentialID: () =>
+        usage.latest?.defaultAccountID ?? credentials.latest?.find((credential) => credential.active)?.id,
+      activeCredentialLabel: () =>
+        usage.latest?.defaultAccountLabel ?? credentials.latest?.find((credential) => credential.active)?.label,
+      // Per-account Go spend windows matched by EITHER the pool account id or
+      // the vault UUID (old servers, or a synthesized group built from vault
+      // rows before the pool envelope arrived).
+      usageWindowsFor: (id?: string): ForkWindowUsage[] => {
+        if (!id) return []
+        const entry = usage.latest?.byCredential.find((candidate) => candidate.credentialID === id || candidate.accountID === id)
+        return entry?.windows ?? []
+      },
     }
   },
 })

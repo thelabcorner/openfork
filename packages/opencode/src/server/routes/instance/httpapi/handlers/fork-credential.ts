@@ -4,6 +4,8 @@ import { ForkCredentials } from "@/fork/credentials"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
 import { disposeInstance } from "@/effect/instance-registry"
 import { RootHttpApi } from "../api"
+import { stableZenIdentity } from "@/plugin/zen-accounts"
+import { bumpZenVaultPool, zenLimitSnapshot } from "@/plugin/zen"
 import {
   buildAggregateWindows,
   buildLocalWindows,
@@ -18,6 +20,7 @@ import {
 type ForkWindowLabel = "5h" | "week" | "month"
 type CredentialWindows = {
   readonly credentialID: string
+  readonly accountID?: string
   readonly windows: LocalWindow[]
   readonly official?: {
     readonly fetchedAt: number
@@ -39,6 +42,7 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
     // via ForkCredentials internally; remote official data stays gate-limited.)
     const bumpAfterMutation = Effect.fn("ForkCredentialHttpApi.bumpAfterMutation")(function* () {
       bumpUsageCache()
+      bumpZenVaultPool()
     })
 
     const list = Effect.fn("ForkCredentialHttpApi.list")(function* () {
@@ -56,7 +60,7 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
       return created
     })
 
-    const select = Effect.fn("ForkCredentialHttpApi.select")(function* (ctx: {
+    const setDefault = Effect.fn("ForkCredentialHttpApi.setDefault")(function* (ctx: {
       params: { id: string }
       query: { directory?: string }
     }) {
@@ -110,10 +114,23 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
     const getUsage = Effect.fn("ForkCredentialHttpApi.usage")(function* () {
       const { bounds, allCredentials, byCredential, aggregate } = yield* getLocal()
 
+      // The pool default a bare opencode-go request routes to (may be an env
+      // key the vault knows nothing about). Added so the client can label the
+      // "active" account and key per-account spend off the pool id, not just
+      // the vault UUID.
+      const snapshot = zenLimitSnapshot()
+      const poolDefault = snapshot.find((entry) => entry.isDefault) ?? snapshot[0]
+
       if (allCredentials.length === 0) {
         // Zero credentials: local aggregate + empty per-credential, and NO
         // external calls (nothing to ask the official API about).
-        return { aggregate, byCredential: [] }
+        return {
+          aggregate,
+          byCredential: [],
+          ...(poolDefault
+            ? { defaultAccountID: poolDefault.accountId, defaultAccountLabel: poolDefault.label }
+            : {}),
+        }
       }
 
       // L1: gated official snapshots per credential (>=5m per credential).
@@ -124,6 +141,9 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
         (credential): Effect.Effect<CredentialWindows> =>
           Effect.map(officialUsageCache.get(credential.id, credential.key), (official) => ({
             credentialID: credential.id,
+            ...(credential.id !== stableZenIdentity(credential.key)
+              ? { accountID: stableZenIdentity(credential.key) }
+              : {}),
             windows: mergeOfficial(byCredential.get(credential.id) ?? [], official.snapshot ?? {}),
             official: {
               fetchedAt: official.fetchedAt,
@@ -137,13 +157,16 @@ export const forkCredentialHandlers = HttpApiBuilder.group(RootHttpApi, "fork-cr
       return {
         aggregate: aggregateWindows(aggregate, officialByCredential.map((entry) => entry.windows)),
         byCredential: officialByCredential,
+        ...(poolDefault
+          ? { defaultAccountID: poolDefault.accountId, defaultAccountLabel: poolDefault.label }
+          : {}),
       }
     })
 
     return handlers
       .handle("list", list)
       .handle("add", add)
-      .handle("select", select)
+      .handle("setDefault", setDefault)
       .handle("rename", rename)
       .handle("remove", remove)
       .handle("usage", getUsage)

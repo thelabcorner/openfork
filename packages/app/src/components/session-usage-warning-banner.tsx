@@ -30,9 +30,8 @@ export function SessionUsageWarningBanner(props: { providerID: string | undefine
   // pin at ~100% regardless of actual spend. No resolved per-credential
   // window means "we don't know," not "assume the worst."
   const windows = createMemo<ForkWindowUsage[] | undefined>(() => {
-    const credentialID = forkUsage.activeCredentialID()
-    if (!credentialID) return undefined
-    return forkUsage.usage.latest?.byCredential.find((entry) => entry.credentialID === credentialID)?.windows
+    const list = forkUsage.usageWindowsFor(forkUsage.activeCredentialID())
+    return list.length > 0 ? list : undefined
   })
 
   const worst = createMemo(() => {

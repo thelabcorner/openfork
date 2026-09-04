@@ -69,24 +69,22 @@ export interface WorkBuddyAccountLimits {
 }
 
 /**
- * One configured Zen API key, mirrored from the server's quota schema. `resetAt`
- * is the same governor timestamp the failover router orders by; `queuePosition`
- * is the 1-based failover rank (used keys by resetAt ascending, never-used keys
- * last), null when the ordering is not applicable.
+ * One configured Zen account, mirrored from the server's quota schema.
+ * `keyId` is the stable pool identity (`zen-<hash>`); `isDefault` marks the
+ * user-designated default key that bare (un-suffixed) models route through.
  */
 export interface ZenKeyLimits {
   keyId: string
   label: string
   state: "ready" | "cooling" | "exhausted" | "unknown"
   exhausted: boolean
-  everUsed: boolean
+  isDefault: boolean
   resetAt: number | null
   resetAfterSeconds: number | null
   usedObserved: number | null
   limitEstimate: number | null
   remainingPercent: number | null
   estimateSource: "fallback" | "learned" | "lower-bound" | null
-  queuePosition: number | null
 }
 
 export interface ProviderResult {

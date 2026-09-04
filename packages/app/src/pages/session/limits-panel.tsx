@@ -422,7 +422,24 @@ function WorkBuddyBody(props: {
             creditRows?.[credit] ? [{ kind: "credit" as const, credit, window: creditRows[credit]! }] : [],
           ),
         ]
-        return { label, combinedRemaining, noCredits, resetAt: creditRows?.Basic?.resetAt ?? null, rows }
+        // Account-level reset = the SOONEST of (Basic credit expiry, soonest
+        // model quota reset). When hy4-preview is in a frequency-limit
+        // window, `models[].resetAt` is the actual recovery point for that
+        // account — Basic's package expiry is irrelevant if a model is hard-
+        // blocked on a sooner boundary, and vice versa. Picking the soonest
+        // matches what a the user sees in the session error ("retrying in
+        // 17230s") and avoids the header showing a countdown that the
+        // account's own model rows contradicts.
+        const basicReset = creditRows?.Basic?.resetAt ?? null
+        const soonestModelReset = models
+          .map((m) => m.resetAt)
+          .filter((v): v is number => v !== null && Number.isFinite(v))
+          .reduce<number | null>((soonest, number) => (soonest === null || number < soonest ? number : soonest), null)
+        const resetAt =
+          basicReset !== null && soonestModelReset !== null
+            ? Math.min(basicReset, soonestModelReset)
+            : (basicReset ?? soonestModelReset)
+        return { label, combinedRemaining, noCredits, resetAt, rows }
       })
       .filter((acct) => acct.rows.length > 0)
       .sort((a, b) => a.label.localeCompare(b.label))
@@ -911,13 +928,9 @@ function VerdentBody(props: {
 /**
  * OpenCode Zen per-key rows. The aggregate daily window row stays on top —
  * the same local free-tier estimate shown today. Each configured API key
- * renders underneath with its governor state, its reset countdown, and its
- * position in the failover queue: the queue orders used keys by resetAt
- * ascending and holds never-used keys in reserve, exactly how the router
- * rebinds on exhaustion, so "next up" is always the key the router would
- * actually pick. With a single key there is no queue and nothing new to
- * show, so the section only renders for more than one key and the card
- * stays identical to the generic one.
+ * (env or vault) renders underneath with its best-effort 402/429 state. With
+ * a single key there is nothing new to show, so the section only renders for
+ * more than one key and the card stays identical to the generic one.
  */
 function ZenBody(props: {
   windows: [string, UsageWindow][]
@@ -932,11 +945,7 @@ function ZenBody(props: {
   const queueVisible = () => keys().length > 1
   const sortedKeys = createMemo(() =>
     [...keys()].sort((a, b) => {
-      const pa = a.queuePosition
-      const pb = b.queuePosition
-      if (pa === null && pb !== null) return 1
-      if (pa !== null && pb === null) return -1
-      if (pa !== null && pb !== null && pa !== pb) return pa - pb
+      if (a.isDefault !== b.isDefault) return a.isDefault ? -1 : 1
       return a.label.localeCompare(b.label)
     }),
   )
@@ -950,22 +959,10 @@ function ZenBody(props: {
   }
 
   const queueTag = (key: ZenKeyLimits): JSX.Element | null => {
-    if (!queueVisible() || key.queuePosition === null) return null
-    if (!key.everUsed)
-      return (
-        <span class="text-[7px] font-[600] uppercase tracking-[0.03em] text-v2-text-text-faint opacity-60">
-          {language.t("limits.zen.queue.reserve")}
-        </span>
-      )
-    if (key.queuePosition === 1)
-      return (
-        <span class="text-[7px] font-[650] uppercase tracking-[0.03em] text-v2-text-text-accent">
-          {language.t("limits.zen.queue.next")}
-        </span>
-      )
+    if (!queueVisible() || !key.isDefault) return null
     return (
-      <span class="text-[7px] font-[600] uppercase tracking-[0.03em] text-v2-text-text-faint opacity-60">
-        {language.t("limits.zen.queue.position", { position: key.queuePosition })}
+      <span class="text-[7px] font-[650] uppercase tracking-[0.03em] text-v2-text-text-accent">
+        {language.t("limits.zen.queue.next")}
       </span>
     )
   }

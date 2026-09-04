@@ -1803,11 +1803,14 @@ export type ProviderConfig = {
      */
     timeout?: number | false
     /**
-     * Timeout in milliseconds to wait for response headers. Provider integrations may set defaults. Set to false to disable timeout.
+     * Timeout in milliseconds to wait for response headers (default: 300000). Set to false to disable timeout.
      */
     headerTimeout?: number | false
-    chunkTimeout?: number
-    [key: string]: unknown | string | boolean | number | false | number | false | number | undefined
+    /**
+     * Timeout in milliseconds between streamed SSE chunks for this provider (default: 300000). If no chunk arrives within this window, the request is aborted. Set to false to disable timeout.
+     */
+    chunkTimeout?: number | false
+    [key: string]: unknown | string | boolean | number | false | number | false | number | false | undefined
   }
   models?: {
     [key: string]: {
@@ -7984,7 +7987,7 @@ export type ForkCredentialAddResponses = {
 
 export type ForkCredentialAddResponse = ForkCredentialAddResponses[keyof ForkCredentialAddResponses]
 
-export type ForkCredentialSelectData = {
+export type ForkCredentialSetDefaultData = {
   body?: never
   path: {
     id: string
@@ -7992,26 +7995,27 @@ export type ForkCredentialSelectData = {
   query?: {
     directory?: string
   }
-  url: "/fork/credential/{id}/select"
+  url: "/fork/credential/{id}/default"
 }
 
-export type ForkCredentialSelectErrors = {
+export type ForkCredentialSetDefaultErrors = {
   /**
    * Bad request
    */
   400: BadRequestError
 }
 
-export type ForkCredentialSelectError = ForkCredentialSelectErrors[keyof ForkCredentialSelectErrors]
+export type ForkCredentialSetDefaultError = ForkCredentialSetDefaultErrors[keyof ForkCredentialSetDefaultErrors]
 
-export type ForkCredentialSelectResponses = {
+export type ForkCredentialSetDefaultResponses = {
   /**
-   * Selected credential
+   * Credential designated as default
    */
   200: boolean
 }
 
-export type ForkCredentialSelectResponse = ForkCredentialSelectResponses[keyof ForkCredentialSelectResponses]
+export type ForkCredentialSetDefaultResponse =
+  ForkCredentialSetDefaultResponses[keyof ForkCredentialSetDefaultResponses]
 
 export type ForkCredentialRemoveData = {
   body?: never
@@ -8106,6 +8110,7 @@ export type ForkUsageGetResponses = {
     }>
     byCredential: Array<{
       credentialID: string
+      accountID?: string
       windows: Array<{
         label: "5h" | "week" | "month"
         spentUSD: number
@@ -8124,6 +8129,8 @@ export type ForkUsageGetResponses = {
         status: "ok" | "stale" | "error"
       }
     }>
+    defaultAccountID?: string
+    defaultAccountLabel?: string
   }
 }
 
@@ -10911,6 +10918,19 @@ export type QuotaGetResponses = {
           coverage: "opencode-only"
         }>
       }>
+      zenAccounts?: Array<{
+        keyId: string
+        label: string
+        state: "ready" | "cooling" | "exhausted" | "unknown"
+        exhausted: boolean
+        isDefault: boolean
+        resetAt: number
+        resetAfterSeconds: number
+        usedObserved: number
+        limitEstimate: number
+        remainingPercent: number
+        estimateSource: "fallback" | "learned" | "lower-bound"
+      }>
     }
     fetchedAt: number
     nextRefreshAt?: number
@@ -13300,6 +13320,18 @@ export type UsageSummaryResponses = {
         messages: number
       },
     ]
+    providerSeries: Array<{
+      key: string
+      cost: Array<number>
+      tokens: Array<number>
+      messages: Array<number>
+    }>
+    modelSeries: Array<{
+      key: string
+      cost: Array<number>
+      tokens: Array<number>
+      messages: Array<number>
+    }>
     punchcard: Array<{
       cost: number
       tokens: number
