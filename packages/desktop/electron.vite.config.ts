@@ -6,6 +6,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 
 const OPENCODE_SERVER_DIST = fileURLToPath(new URL("../opencode/dist/node", import.meta.url))
 const OPENCODE_SERVER_FILE = fileURLToPath(new URL("../opencode/dist/node/node.js", import.meta.url))
+const APP_SRC = fileURLToPath(new URL("../app/src", import.meta.url))
 
 const channel = (() => {
   const raw = process.env.OPENCODE_CHANNEL
@@ -106,6 +107,15 @@ const require = __cjs_mod__.createRequire(import.meta.url);
     plugins: [appPlugin, sentry],
     publicDir: "../../../app/public",
     root: "src/renderer",
+    resolve: {
+      // electron-vite resolves the renderer from its nested root. Keep the
+      // workspace app package resolvable even when its workspace symlink has
+      // not been created yet (for example after a fresh checkout on Windows).
+      alias: [
+        { find: /^@opencode-ai\/app$/, replacement: `${APP_SRC}/index.ts` },
+        { find: /^@opencode-ai\/app\/(.+)$/, replacement: `${APP_SRC}/$1` },
+      ],
+    },
     build: {
       sourcemap: true,
       rollupOptions: {
