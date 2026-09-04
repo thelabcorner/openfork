@@ -1,8 +1,11 @@
-import { existsSync, readFileSync } from "node:fs"
-import { dirname, join } from "node:path"
+import type { ServerResponse } from "node:http"
+import { dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { defineConfig } from "vite"
 import solid from "vite-plugin-solid"
+import { DEV_TARGET_STATUS_PATH, ENV_PROXY_TARGET, ENV_RUN_ID } from "./dev/constants"
+import { handshakePath } from "./dev/handshake"
+import { createTargetResolver, type TargetResolution } from "./dev/target"
 
 const API_PREFIXES = [
   "agent",
@@ -41,37 +44,69 @@ const API_PREFIXES = [
   "vcs",
 ]
 
-function readDesktopSidecarUrl(): string | undefined {
-  try {
-    const candidates = [
-      join(process.cwd(), ".opencode-dev-url"),
-      join(process.cwd(), "packages/mobile/.opencode-dev-url"),
-      join(dirname(fileURLToPath(import.meta.url)), ".opencode-dev-url"),
-    ]
-    for (const p of candidates) {
-      if (existsSync(p)) {
-        const v = readFileSync(p, "utf8").trim()
-        if (v) return v
-      }
-    }
-  } catch {}
-  return undefined
+const mobileDir = dirname(fileURLToPath(import.meta.url))
+
+const override = ENV_PROXY_TARGET.map((name) => process.env[name]?.trim()).find(Boolean)
+const runID = process.env[ENV_RUN_ID]?.trim() || undefined
+
+/**
+ * The single gate between the PWA and a backend.
+ *
+ * Historically this proxied to whatever URL a well-known file contained, with
+ * no verification at all. On a machine running many opencode processes that
+ * meant a stale or recycled port silently attached the phone to an unrelated
+ * instance — you would only notice because the sessions belonged to another
+ * project. The resolver now requires the target to echo the `instanceID` the
+ * desktop minted for this launch before a single request is forwarded.
+ */
+const resolver = createTargetResolver({
+  file: handshakePath(mobileDir),
+  override,
+  runID,
+  // Verify the identity on every request. A 3-second cache is enough time for
+  // a dead sidecar's port to be recycled by another process, which is exactly
+  // the silent misbinding this proxy is responsible for making impossible.
+  revalidateMs: 0,
+  onLog: (level, message) => {
+    if (level === "warn") console.warn(`[opencode:mobile] ${message}`)
+    else console.info(`[opencode:mobile] ${message}`)
+  },
+})
+
+if (override && runID) {
+  console.warn(
+    `[opencode:mobile] ignoring proxy override ${override} because this PWA was launched by the desktop handshake (run ${runID}).`,
+  )
+} else if (override) {
+  console.warn(
+    `[opencode:mobile] proxy target overridden to ${override} — it is still identity-checked, and pinned to the first instance that answers.`,
+  )
 }
 
-const configuredProxyTarget = () =>
-  readDesktopSidecarUrl() ?? process.env.VITE_OPENCODE_SERVER_URL ?? process.env.OPENCODE_DEV_PROXY_TARGET
-const proxyTarget = configuredProxyTarget() ?? "http://127.0.0.1:1"
+function sendJson(response: ServerResponse, status: number, body: unknown) {
+  response.statusCode = status
+  response.setHeader("content-type", "application/json")
+  response.setHeader("cache-control", "no-store")
+  response.end(JSON.stringify(body))
+}
+
+function unavailable(response: ServerResponse, result: Extract<TargetResolution, { ok: false }>) {
+  // 503 with a name/data envelope so it reads like an opencode API error in
+  // the network tab, and carries the fix rather than just the symptom.
+  sendJson(response, 503, {
+    name: result.code,
+    data: { message: `${result.message} ${result.hint}`, hint: result.hint, detail: result.detail },
+  })
+}
 
 function proxyOpts() {
   return {
-    target: proxyTarget,
+    // Never used: the gate middleware below resolves and verifies before any
+    // request reaches the proxy, and `router` then returns that verified URL.
+    // A syntactically valid but unroutable target keeps http-proxy happy.
+    target: "http://127.0.0.1:1",
     changeOrigin: true,
-    // Dynamic router: `concurrently` starts vite and the desktop sidecar
-    // in parallel, so at vite startup the sidecar's ephemeral port isn't
-    // known yet and `proxyTarget` is still 4096. Reading the well-known
-    // file on every request lets the proxy follow the sidecar if it had
-    // to fall back to an ephemeral port (overlapping 4096).
-    router: () => configuredProxyTarget() ?? proxyTarget,
+    router: () => resolver.verifiedUrl() ?? "http://127.0.0.1:1",
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     configure(proxy: any) {
       proxy.on("proxyReq", (proxyReq: any) => {
@@ -86,19 +121,34 @@ function proxyOpts() {
 export default defineConfig({
   plugins: [
     {
-      name: "opencode:require-desktop-sidecar",
+      name: "opencode:verified-sidecar-binding",
       configureServer(server) {
+        // Registered inside configureServer (not in a returned thunk) so it runs
+        // *before* Vite's own proxy middleware — the whole point is that nothing
+        // reaches the proxy until the target has proven its identity.
         server.middlewares.use((request, response, next) => {
-          const prefix = new URL(request.url ?? "/", "http://localhost").pathname.split("/")[1]
-          if (!prefix || !API_PREFIXES.includes(prefix) || configuredProxyTarget()) return next()
-          response.statusCode = 503
-          response.setHeader("content-type", "application/json")
-          response.end(
-            JSON.stringify({
-              name: "DesktopSidecarUnavailableError",
-              data: { message: "The desktop sidecar is not ready. Keep OpenCode Desktop running and try again." },
-            }),
-          )
+          const pathname = new URL(request.url ?? "/", "http://localhost").pathname
+
+          if (pathname === DEV_TARGET_STATUS_PATH) {
+            void resolver.resolve().then((result) => {
+              sendJson(
+                response,
+                200,
+                result.ok
+                  ? { bound: true, instanceID: result.instanceID, identity: result.identity, source: result.source }
+                  : { bound: false, code: result.code, message: result.message, hint: result.hint },
+              )
+            })
+            return
+          }
+
+          const prefix = pathname.split("/")[1]
+          if (!prefix || !API_PREFIXES.includes(prefix)) return next()
+
+          void resolver.resolve().then((result) => {
+            if (result.ok) return next()
+            unavailable(response, result)
+          })
         })
       },
     },
@@ -107,6 +157,10 @@ export default defineConfig({
   server: {
     host: "0.0.0.0",
     port: 3301,
+    // Fail loudly instead of drifting to 3302. A second dev stack silently
+    // taking the next port is how a phone bookmarked at :3301 ends up driving
+    // a different checkout's backend.
+    strictPort: true,
     allowedHosts: true,
     proxy: Object.fromEntries(API_PREFIXES.map((p) => [`/${p}`, proxyOpts()])),
   },

@@ -137,6 +137,7 @@ import { corsVaryFix } from "./middleware/cors-vary"
 import { errorLayer } from "./middleware/error"
 import { fenceLayer } from "./middleware/fence"
 import { schemaErrorLayer } from "./middleware/schema-error"
+import { INSTANCE_IDENTITY_PATH, instanceIdentity } from "@/server/shared/instance-identity"
 
 export const context = Context.makeUnsafe<unknown>(new Map())
 
@@ -256,6 +257,21 @@ const docRoute = HttpRouter.use((router) => router.add("GET", "/doc", () => Effe
   Layer.provide(authOnlyRouterLayer),
 )
 
+// Unauthenticated on purpose, and notably NOT behind `authOnlyRouterLayer`:
+// like /pair/claim this runs *before* a client is willing to send credentials.
+// It answers one question — "which opencode process are you?" — so a client
+// can refuse to bind to a stale port that some other opencode now owns.
+// Carries no user data; see server/shared/instance-identity.ts.
+const identityRoute = HttpRouter.use((router) =>
+  router.add("GET", INSTANCE_IDENTITY_PATH, () =>
+    Effect.sync(() =>
+      HttpServerResponse.jsonUnsafe(instanceIdentity(), {
+        headers: { "cache-control": "no-store" },
+      }),
+    ),
+  ),
+)
+
 const uiRoute = HttpRouter.use((router) =>
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
@@ -360,6 +376,7 @@ export function createRoutes(
     instanceRoutes,
     serverRoutes,
     docRoute,
+    identityRoute,
     uiRoute,
   ).pipe(
     Layer.provide([

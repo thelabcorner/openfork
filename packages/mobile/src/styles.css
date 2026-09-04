@@ -1386,5 +1386,44 @@ button:active.press, .btn-solid:active, .btn-outline:active, .btn-danger:active,
 
 .error-message { color: var(--accent-red); background: rgba(248, 113, 113, 0.1); border: 1px solid rgba(248, 113, 113, 0.22); border-radius: var(--radius-sm); padding: 10px 12px; margin-top: 12px; font-size: var(--font-sm); line-height: 1.4; font-family: var(--font-body); }
 
+/* Rebind notice: pinned above everything, including the safe area, because a
+   silently swapped backend is worth interrupting for. */
+.instance-notice {
+  position: fixed;
+  top: max(8px, env(safe-area-inset-top));
+  left: 10px;
+  right: 10px;
+  z-index: 60;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  padding: 10px 10px 10px 12px;
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(245, 158, 11, 0.28);
+  background: color-mix(in srgb, var(--accent-amber) 14%, var(--surface-subtle));
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: var(--font-sm);
+  line-height: 1.4;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+}
+.instance-notice > span { flex: 1; min-width: 0; }
+.instance-notice > button {
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  margin: -2px -2px 0 0;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+}
+.instance-notice > button:hover { color: var(--text-primary); background: var(--surface-subtler); }
+
 .text-button { background: transparent; border: none; color: var(--text-muted); font-size: var(--font-xs); padding: 0; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; font-family: var(--font-body); }
 .text-button:hover { color: var(--text-secondary); }

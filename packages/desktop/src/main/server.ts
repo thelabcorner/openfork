@@ -17,6 +17,12 @@ const SIDECAR_START_STALL_TIMEOUT = 60_000
 const SIDECAR_STOP_TIMEOUT = 6_000
 type SpawnLocalServerOptions = {
   userDataPath: string
+  /**
+   * Extra environment for the sidecar only. Kept off `process.env` on purpose:
+   * per-instance values (OPENCODE_INSTANCE_ID) must not leak into WSL sidecars
+   * or any other child, or two servers would claim one identity.
+   */
+  env?: Record<string, string>
   onStdout?: (message: string) => void
   onStderr?: (message: string) => void
   onExit?: (code: number) => void
@@ -53,7 +59,7 @@ export async function spawnLocalServer(
   const sidecar = join(dirname(fileURLToPath(import.meta.url)), "sidecar.js")
   const child = utilityProcess.fork(sidecar, [], {
     cwd: process.cwd(),
-    env: createSidecarEnv(),
+    env: createSidecarEnv(options.env),
     serviceName: SIDECAR_SERVICE_NAME,
     stdio: "pipe",
   })
@@ -191,10 +197,13 @@ export async function checkHealth(url: string, password?: string | null): Promis
   }
   return false
 }
-function createSidecarEnv(): Record<string, string> {
-  const env = Object.fromEntries(
-    Object.entries(process.env).flatMap(([key, value]) => (value === undefined ? [] : [[key, String(value)]])),
-  )
+function createSidecarEnv(extra?: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {
+    ...Object.fromEntries(
+      Object.entries(process.env).flatMap(([key, value]) => (value === undefined ? [] : [[key, String(value)]])),
+    ),
+    ...extra,
+  }
   delete env.DEBUG
   if (process.platform === "linux") delete env.LD_PRELOAD
   // Don't propagate OPENCODE_PORT to the sidecar — the desktop picks its own

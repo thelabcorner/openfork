@@ -8,20 +8,21 @@ for REST calls and SSE events.
 
 ## Development
 
-Start the OpenCode API server and allow the PWA origin:
+Run the sanctioned paired development stack from this package's sibling:
 
 ```bash
-opencode serve --port 4096 --cors http://localhost:3301
-```
-
-In another terminal:
-
-```bash
+cd packages/desktop
 bun run dev
 ```
 
-Open `http://localhost:3301`. Set `VITE_OPENCODE_SERVER_URL` when the API is
-not at the default entered in the connection screen.
+This launches Electron, its ephemeral sidecar, and the PWA on `:3301` with a
+per-launch identity handshake. The PWA refuses to proxy to a stale, recycled,
+or unrelated OpenCode process, even if one happens to be listening on the old
+port. Open `http://localhost:3301` after the stack is ready.
+
+For an intentionally standalone PWA server, set `VITE_OPENCODE_SERVER_URL` or
+`OPENCODE_DEV_PROXY_TARGET`; that target is still identity-checked and pinned
+to the first instance that answers. It is not the paired desktop workflow.
 
 ## Production Shape
 

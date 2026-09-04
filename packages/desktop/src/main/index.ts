@@ -30,6 +30,7 @@ import {
   spawnLocalServer,
   type SidecarListener,
 } from "./server"
+import { createMobileHandshake } from "./mobile-handshake"
 import { setupAutoUpdater, showUpdaterDialog } from "./updater"
 import { safeWebContentsURL } from "./window-state"
 import {
@@ -64,7 +65,6 @@ const APP_IDS: Record<string, string> = {
 const TEST_ONBOARDING = process.env.OPENCODE_TEST_ONBOARDING === "1"
 const SIDECAR_VERSION = process.env.OPENCODE_SIDECAR_V2 === "1" ? "v2" : "v1"
 const jsCallStackFeature = "DocumentPolicyIncludeJSCallStacksInCrashReports"
-const mobileDevUrlFile = fileURLToPath(new URL("../../../mobile/.opencode-dev-url", import.meta.url))
 let logger: ReturnType<typeof initLogging>
 let server: SidecarListener | null = null
 let readyData: ServerReadyData | null = null
@@ -89,10 +89,6 @@ async function killSidecar() {
   const current = server
   server = null
   await current.stop()
-}
-function writeMobileDevUrl(url: string) {
-  mkdirSync(dirname(mobileDevUrlFile), { recursive: true })
-  writeFileSync(mobileDevUrlFile, url, "utf8")
 }
 function ensureLoopbackNoProxy() {
   const loopback = ["127.0.0.1", "localhost", "::1"]
@@ -142,6 +138,14 @@ const main = Effect.gen(function* () {
   initializeOldLayoutEligibility(app.getPath("userData"))
   logger = initLogging()
   initCrashReporter()
+  // Created before anything can spawn a backend: `handshake.env` has to reach
+  // the sidecar, and `handshake.revoke()` has to be reachable from every
+  // teardown path below.
+  const handshake = createMobileHandshake({
+    packaged: app.isPackaged,
+    channel: CHANNEL,
+    onLog: (message, meta) => logger.log(message, meta),
+  })
   const wslServers = createWslServersController(
     app.getVersion(),
     async (distro) => {
@@ -158,7 +162,7 @@ const main = Effect.gen(function* () {
     },
   )
   const stopSidecars = async () => {
-    rmSync(mobileDevUrlFile, { force: true })
+    handshake.revoke()
     await killSidecar()
     wslServers.stopAll()
   }
@@ -189,7 +193,10 @@ const main = Effect.gen(function* () {
     app.quit()
     return
   }
-  rmSync(mobileDevUrlFile, { force: true })
+  // Anything on disk from a previous launch names a dead instance. Clear it
+  // before the sidecar exists so the PWA proxy fails loudly for the startup
+  // window instead of proxying to whoever inherited the old port.
+  handshake.revoke()
   preferAppEnv(app.getPath("userData"))
   app.on("second-instance", (_event: Event, argv: string[]) => {
     const urls = argv.filter((arg: string) => arg.startsWith("opencode://"))
@@ -307,7 +314,9 @@ const main = Effect.gen(function* () {
   browserEngine = new BrowserEngine({
     windowId: app.isPackaged ? APP_IDS[CHANNEL] : "dev",
     sidecarProvider: () =>
-      readyData ? { url: readyData.url, username: readyData.username ?? "opencode", password: readyData.password ?? "" } : null,
+      readyData
+        ? { url: readyData.url, username: readyData.username ?? "opencode", password: readyData.password ?? "" }
+        : null,
     broadcast: (channel, payload) => {
       for (const win of BrowserWindow.getAllWindows()) {
         if (win.isDestroyed() || win.webContents.isDestroyed()) continue
@@ -363,7 +372,12 @@ const main = Effect.gen(function* () {
       logger.log("spawning v2 sidecar")
       const sidecar = yield* Effect.promise(() => startBackgroundCli(logger))
       readyData = { url: sidecar.url, username: sidecar.username, password: sidecar.password }
-      writeMobileDevUrl(sidecar.url)
+      // The v2 daemon may predate this launch, so it never received our
+      // OPENCODE_INSTANCE_ID. Pin to the identity it actually reports; if it
+      // cannot report one, publish nothing rather than an unverifiable claim.
+      const daemonInstanceID = yield* Effect.promise(() => handshake.discover(sidecar.url))
+      if (daemonInstanceID) handshake.publish(sidecar.url, daemonInstanceID)
+      else logger.warn("v2 sidecar did not report an instance identity; mobile PWA dev proxy will stay unbound")
       yield* Deferred.succeed(serverReady, readyData)
       if (process.platform === "win32") {
         void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
@@ -402,7 +416,9 @@ const main = Effect.gen(function* () {
     // independent: always use an ephemeral port. Honor an explicit desktop-only
     // override (OPENCODE_DESKTOP_PORT) if the developer needs a fixed port.
     if (process.env.OPENCODE_PORT) {
-      logger.log(`OPENCODE_PORT=${process.env.OPENCODE_PORT} ignored for desktop sidecar (using ephemeral port to avoid EADDRINUSE)`)
+      logger.log(
+        `OPENCODE_PORT=${process.env.OPENCODE_PORT} ignored for desktop sidecar (using ephemeral port to avoid EADDRINUSE)`,
+      )
     }
     const fromEnv = process.env.OPENCODE_DESKTOP_PORT
     const parsedEnvPort = fromEnv ? Number.parseInt(fromEnv, 10) : NaN
@@ -416,6 +432,7 @@ const main = Effect.gen(function* () {
         try: () =>
           spawnLocalServer(hostname, p, password, {
             userDataPath: app.getPath("userData"),
+            env: handshake.env,
             onStdout: (message) => writeLog("server", "stdout", { message }),
             onStderr: (message) => writeLog("server", "stderr", { message }, "warn"),
             onExit: (code) => writeLog("utility", "sidecar exited", { code }, "warn"),
@@ -462,7 +479,7 @@ const main = Effect.gen(function* () {
     autopsyMark("sidecar-ready-msg") // STARTUP-AUTOPSY (utility process sent {type:"ready"})
     server = listener
     readyData = { url, username: "opencode", password }
-    writeMobileDevUrl(url)
+    handshake.publish(url)
     yield* Deferred.succeed(serverReady, readyData)
     if (process.platform === "win32") {
       void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))

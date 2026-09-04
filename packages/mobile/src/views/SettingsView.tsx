@@ -3,10 +3,12 @@ import { For, Show } from "solid-js"
 import { NotificationSettings } from "../components/NotificationSettings"
 import { IconChevronRight, IconDownload, IconGlobe, IconInfo, IconKey, IconPackage } from "../icons"
 import { ProviderBadge } from "../components/ProviderBadge"
+import type { InstanceIdentity } from "../api"
 
 export function SettingsView(props: {
   serverUrl: string
   serverVersion: string
+  identity?: InstanceIdentity
   token: string
   providers: Provider[]
   client?: OpencodeClient
@@ -66,6 +68,25 @@ export function SettingsView(props: {
             <span class="label">Server version</span>
             <span class="value tnum">{props.serverVersion || "unknown"}</span>
           </div>
+          {/* Which of the machine's opencode processes this actually is.
+              Without it, two instances at the same address are indistinguishable. */}
+          <Show when={props.identity}>
+            {(identity) => (
+              <>
+                <div class="settings-static-row">
+                  <span class="label">Instance</span>
+                  <span class="value tnum">{identity().instanceID.slice(0, 8)}…</span>
+                </div>
+                <div class="settings-static-row">
+                  <span class="label">Process</span>
+                  <span class="value tnum">
+                    {identity().processID ?? "unknown"}
+                    {identity().client ? ` · ${identity().client}` : ""}
+                  </span>
+                </div>
+              </>
+            )}
+          </Show>
           <button class="settings-row" onClick={props.onForgetDevice}>
             <IconKey size={13} />
             <span class="label">Device token</span>

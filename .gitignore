@@ -28,6 +28,12 @@ target
 
 # Local dev files
 opencode-dev
+# Mobile PWA <-> desktop sidecar dev binding. Machine-local and per-launch:
+# committing it resurrects a dead port on every checkout, which is how the PWA
+# used to end up bound to an unrelated opencode instance.
+packages/mobile/.opencode-dev-handshake.json
+packages/mobile/.opencode-dev-handshake.json.*.tmp
+packages/mobile/.opencode-dev-url
 UPCOMING_CHANGELOG.md
 logs/
 *.bun-build

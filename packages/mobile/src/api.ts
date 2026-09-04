@@ -1,8 +1,60 @@
 import { createOpencodeClient, type Message, type OpencodeClient, type Part } from "@opencode-ai/sdk/v2/client"
+import { IDENTITY_PATH } from "../dev/constants"
 
 export const SERVER_URL_KEY = "opencode.mobile.serverUrl"
 export const DEVICE_TOKEN_KEY = "opencode.mobile.deviceToken"
 export const DEVICE_ID_KEY = "opencode.mobile.deviceID"
+export const INSTANCE_ID_KEY = "opencode.mobile.instanceID"
+
+export type InstanceIdentity = {
+  instanceID: string
+  processID?: number
+  startedAt?: string
+  version?: string
+  client?: string
+}
+
+/**
+ * Unauthenticated, and answered before any credential is sent — it exists so a
+ * client can find out *which* opencode process it reached. A URL and a
+ * listening port say nothing on a machine running several of them, which is
+ * how this app used to end up driving an unrelated instance's sessions.
+ *
+ * Servers older than this endpoint return the SPA's HTML from the catch-all
+ * route, so a non-JSON body means "too old", not "no server".
+ */
+export async function fetchIdentity(serverUrl: string, signal?: AbortSignal): Promise<InstanceIdentity | undefined> {
+  try {
+    const response = await fetch(new URL(IDENTITY_PATH, `${serverUrl.replace(/\/$/, "")}/`), {
+      headers: { accept: "application/json" },
+      signal,
+    })
+    if (!response.ok) return undefined
+    if (!(response.headers.get("content-type") ?? "").includes("json")) return undefined
+    const body = (await response.json()) as InstanceIdentity
+    return typeof body?.instanceID === "string" && body.instanceID ? body : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export const IDENTITY_REQUIRED_MESSAGE =
+  "This server could not prove which OpenCode instance it is. For the mobile dev PWA, start the desktop with `bun run dev` from packages/desktop."
+
+/**
+ * Decides what a freshly observed identity means for a stored pin.
+ *
+ * "changed" is not an error — restarting the desktop legitimately mints a new
+ * instance — but cached sessions, messages and runtimes belong to the old one
+ * and must be dropped rather than silently blended into the new instance's
+ * state.
+ */
+export function compareInstance(input: { pinned?: string; observed?: string }) {
+  if (!input.observed) return { state: "unknown" as const }
+  if (!input.pinned) return { state: "adopted" as const, instanceID: input.observed }
+  if (input.pinned === input.observed) return { state: "same" as const, instanceID: input.observed }
+  return { state: "changed" as const, instanceID: input.observed, previous: input.pinned }
+}
 
 export type MessageBundle = {
   info: Message
@@ -60,7 +112,12 @@ export function readLaunchConfig(): LaunchConfig {
   // stale value so the baked URL (or ?server= param) can take over.
   const baked = (import.meta.env.VITE_OPENCODE_SERVER_URL as string | undefined)?.trim()
   try {
-    if (storedServer && baked && normalizeServerUrl(storedServer) === normalizeServerUrl(location.origin) && normalizeServerUrl(baked) !== normalizeServerUrl(location.origin)) {
+    if (
+      storedServer &&
+      baked &&
+      normalizeServerUrl(storedServer) === normalizeServerUrl(location.origin) &&
+      normalizeServerUrl(baked) !== normalizeServerUrl(location.origin)
+    ) {
       try {
         localStorage.removeItem(SERVER_URL_KEY)
       } catch {}
@@ -156,7 +213,10 @@ export function pairClaimErrorMessage(error: unknown): string {
   const cause = error.cause as { body?: PairClaimErrorBody; status?: number } | undefined
   const body = cause?.body
   if (body?.name === "ClaimRateLimitedError" || cause?.status === 429) {
-    const seconds = Math.max(1, Math.ceil((typeof body?.data?.retryAfterMs === "number" ? body.data.retryAfterMs : 0) / 1000))
+    const seconds = Math.max(
+      1,
+      Math.ceil((typeof body?.data?.retryAfterMs === "number" ? body.data.retryAfterMs : 0) / 1000),
+    )
     return `Too many attempts — try again in ${seconds}s`
   }
   if (body?.name === "PairCodeError") {
@@ -190,11 +250,9 @@ export async function openEvents(
   // Current sessions publish native events through /api/event. Desktop can
   // still run compatibility sessions, whose cross-directory feed is
   // /global/event. Mobile displays both, so it must consume both feeds.
-  const response = channel === "current"
-    ? await client.v2.event.subscribe(options)
-    : await client.global.event(options)
+  const response = channel === "current" ? await client.v2.event.subscribe(options) : await client.global.event(options)
   for await (const event of response.stream) {
     if (signal.aborted) return
-    onEvent(channel === "compatibility" ? (event as any)?.payload ?? event : event)
+    onEvent(channel === "compatibility" ? ((event as any)?.payload ?? event) : event)
   }
 }

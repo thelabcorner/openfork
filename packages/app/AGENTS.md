@@ -19,11 +19,12 @@ which spawns the opencode **sidecar** backend) and `pwa` (`bun --cwd ../mobile d
 - `:3301` is the **mobile PWA pairing client**, not the desktop UI. It shows a "Pair this device"
   QR screen. Do not use it to verify desktop UI changes.
 - `:3301` proxies the `API_PREFIXES` (see `packages/mobile/vite.config.ts`) to the sidecar, whose URL
-  it reads **per request** from the well-known file `packages/mobile/.opencode-dev-url`. The sidecar
-  binds an ephemeral port, so this file — not any hardcoded number — is the single source of truth
-  for the backend address.
+  it reads from `packages/mobile/.opencode-dev-handshake.json`. The proxy first asks the candidate
+  server for `/instance/identity` and requires the exact random instance id minted by the matching
+  desktop launch; it refuses stale, recycled, foreign, outdated, or unmanaged ports.
 - If `/quota/providers` (or any API prefix) on `:3301` returns **503 `DesktopSidecarUnavailableError`**,
-  the Electron half is not running. `.opencode-dev-url` will be missing. Fix that by getting the desktop
+  the Electron half is not running or has not completed the identity handshake. The handshake file will be
+  missing or invalid. Fix that by getting the desktop
   app running — do NOT start a standalone backend to work around it.
 - `opencode dev web` proxies `https://app.opencode.ai`, so local UI/CSS changes will not show there.
 
@@ -76,8 +77,8 @@ Never infer the backend from `netstat` alone. Confirm the command line:
 # our dev runner (expect: concurrently -n desktop,pwa ... packages/desktop)
 powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { \$_.CommandLine -match 'concurrently|electron-vite' } | Select-Object ProcessId,CommandLine | Format-List"
 
-# the authoritative backend URL (missing => sidecar is down)
-cat packages/mobile/.opencode-dev-url
+# the authoritative, identity-bearing handshake (missing => sidecar is down)
+cat packages/mobile/.opencode-dev-handshake.json
 ```
 
 ## API Clients — Which SDK to Use (app is hybrid)
