@@ -103,7 +103,10 @@ check("proxy exposes hy4-preview", Boolean(entry), entry?.id)
   const headerOutput = { headers: {} as Record<string, string> }
   await hooks["chat.headers"]?.({ sessionID: "hook-session", agent: "build", model: entry, provider: {}, message: { id: "hook-message" } }, headerOutput)
   check("chat.headers injects canonical session affinity", headerOutput.headers["x-opencode-session"] === "hook-session", JSON.stringify(headerOutput))
-  check("chat.headers injects stable logical request id", headerOutput.headers["x-opencode-request"] === "hook-message", JSON.stringify(headerOutput))
+  // The request id is namespaced by agent purpose so a forked title fiber
+  // and the main turn (both `user: firstInfo === lastUser` on a fresh
+  // session) never collide on the workbuddy governor's duplicate guard.
+  check("chat.headers injects stable logical request id (main namespace)", headerOutput.headers["x-opencode-request"] === "main:hook-message", JSON.stringify(headerOutput))
 }
 
 // ---- /health observability --------------------------------------------------
