@@ -7,6 +7,8 @@ import { Effect, Context, Layer } from "effect"
 import type * as PlatformError from "effect/PlatformError"
 import type * as Scope from "effect/Scope"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
+import { FSUtil } from "@opencode-ai/core/fs-util"
+import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
 import type { Config } from "@/config/config"
@@ -22,9 +24,10 @@ const noopBootstrap = Layer.succeed(
   InstanceBootstrap.Service,
   InstanceBootstrap.Service.of({ gate: Effect.void, warmup: Effect.void }),
 )
-export const testInstanceStoreLayer = LayerNode.compile(InstanceStore.node, [
-  [InstanceStore.bootstrapNode, noopBootstrap],
-])
+export const testInstanceStoreLayer = LayerNode.compile(
+  LayerNode.group([filesystem, FSUtil.node, InstanceStore.node]),
+  [[InstanceStore.bootstrapNode, noopBootstrap]],
+)
 
 export async function provideTestInstance<R>(input: {
   directory: string

@@ -58,14 +58,14 @@ const v2ApiLayer = HttpRouter.serve(
   { disableListenLog: true, disableLogger: true },
 ).pipe(Layer.provideMerge(NodeHttpServer.layerTest))
 
-const noAuthLayer = ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode" })
+const noAuthLayer = ServerAuth.Config.configLayer({ password: Option.none(), username: "opencode", publicUrl: "" })
 const publicNoAuthLayer = ServerAuth.Config.configLayer({
   password: Option.none(),
   username: "opencode",
   publicUrl: "https://api.example.test",
 })
-const secretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "opencode" })
-const kitSecretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "kit" })
+const secretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "opencode", publicUrl: "http://localhost" })
+const kitSecretLayer = ServerAuth.Config.configLayer({ password: Option.some("secret"), username: "kit", publicUrl: "http://localhost" })
 const deviceLayer = AppNodeBuilderV1.build(Device.node)
 
 // provideMerge keeps Device.Service (and its Database) in the test environment
@@ -76,8 +76,8 @@ const it = testEffect(withDevice(apiLayer).pipe(Layer.provide(noAuthLayer)))
 const itPublic = testEffect(withDevice(apiLayer).pipe(Layer.provide(publicNoAuthLayer)))
 const itSecret = testEffect(withDevice(apiLayer).pipe(Layer.provide(secretLayer)))
 const itKitSecret = testEffect(withDevice(apiLayer).pipe(Layer.provide(kitSecretLayer)))
-const itV2Secret = testEffect(withDevice(v2ApiLayer).pipe(Layer.provide(secretLayer)))
-const itV2Public = testEffect(withDevice(v2ApiLayer).pipe(Layer.provide(publicNoAuthLayer)))
+const itV2Secret = testEffect((withDevice(v2ApiLayer).pipe(Layer.provide(secretLayer)) as unknown) as never)
+const itV2Public = testEffect((withDevice(v2ApiLayer).pipe(Layer.provide(publicNoAuthLayer)) as unknown) as never)
 
 const basic = (username: string, password: string) => ServerAuth.header({ username, password }) ?? ""
 

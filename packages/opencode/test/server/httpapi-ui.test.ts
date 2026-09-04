@@ -47,6 +47,7 @@ function authConfigLayer(input?: { password?: string; username?: string }) {
   return ServerAuth.Config.configLayer({
     password: input?.password === undefined ? Option.none() : Option.some(input.password),
     username: input?.username ?? "opencode",
+    publicUrl: "",
   })
 }
 

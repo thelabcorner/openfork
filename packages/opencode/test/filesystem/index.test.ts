@@ -57,7 +57,7 @@ describe("FileIndex", () => {
     await Effect.runPromise(
       withIndex(tmp.path, data.path, Effect.gen(function* () {
         const index = yield* FileIndex.Service
-        console.log("FI===FS:", FileIndex.Service === FileSystem.Service, "FI===W:", FileIndex.Service === Watcher.Service)
+        console.log("FI===FS:", FileIndex.Service === (FileSystem.Service as unknown), "FI===W:", FileIndex.Service === (Watcher.Service as unknown))
         const entries = yield* index.list(rp(""))
         expect(paths(entries)).toContain("a.txt")
         expect(paths(entries)).toContain("src/")
