@@ -1,6 +1,6 @@
 {
   "name": "@opencode-ai/session-ui",
-  "version": "1.18.24",
+  "version": "1.18.27",
   "private": true,
   "type": "module",
   "license": "MIT",
@@ -65,4 +65,3 @@
     "strip-ansi": "7.1.2"
   }
 }
-
