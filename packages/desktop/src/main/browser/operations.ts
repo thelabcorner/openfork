@@ -123,6 +123,8 @@ export interface BrowserOperationsOptions {
   onTabClosed: (tabId: string) => void
   /** Cursor choreography broadcast (browser-pointer-event). */
   onPointerEvent: (event: BrowserPointerEvent) => void
+  /** Optional logger (mirrors the engine's) for best-effort recovery diagnostics. */
+  logger?: { log: (message: string, meta?: unknown) => void; error: (message: string, meta?: unknown) => void }
 }
 interface SnapshotRef {
   x: number
@@ -411,10 +413,48 @@ export class BrowserOperations {
     return { muted: { tabId: tab.runtimeTabId, muted: input.muted } }
   }
   // --- host-internal browser chrome ops (D10) ----------------------------------
+  // DevTools/CDebugger handoff (ported from T3): Chromium will not peacefully
+  // share a debugger target between the engine's attached debugger session and
+  // an open DevTools. So:
+  //   - if DevTools is already open, just focus it;
+  //   - otherwise detach the engine's debugger session, open detached
+  //     DevTools, and RE-ATTACH the engine session (re-applying emulated media)
+  //     on DevTools close.
+  // Opening DevTools mid-annotation-session must DEGRADE TO DOM-ONLY CONTEXT
+  // WITHOUT CRASHING: the annotation controller's capture transaction tolerates
+  // a detached/conflicting debugger (it captures via capturePage, not CDP), and
+  // the control session simply re-attaches when DevTools closes. Any failure is
+  // swallowed and reported as a non-crashing devtools result.
   private async openDevtools(envelopeTabId: string | undefined, input: { tabId?: string }): Promise<Record<string, unknown>> {
     const tab = this.resolveTab(input.tabId ?? envelopeTabId)
-    tab.webContents.openDevTools({ mode: "detach" })
-    return { devtools: { tabId: tab.runtimeTabId, open: true } }
+    const wc = tab.webContents
+    try {
+      if (wc.isDevToolsOpened()) {
+        // Already open (detached) — there is no public API to refocus detached
+        // DevTools, so just report it as open rather than re-detaching.
+        return { devtools: { tabId: tab.runtimeTabId, open: true, focused: true } }
+      }
+      // Give the engine's control session back its debugger target before
+      // DevTools takes over, so the handoff is clean rather than a conflict.
+      this.deps.sessions.detach(wc.id)
+      wc.openDevTools({ mode: "detach" })
+      wc.once("devtools-closed", () => {
+        // Re-attach on close and re-apply emulated media (which lives in the
+        // CDP session, not the WebContents). Never let a failure here crash
+        // the host — it is best-effort recovery of a control capability.
+        this.deps.sessions
+          .reattach(wc, tab.runtimeTabId)
+          .catch((error: unknown) => {
+            this.deps.logger?.error?.("browser devtools re-attach failed", {
+              tabId: tab.runtimeTabId,
+              error: error instanceof Error ? error.message : String(error),
+            })
+          })
+      })
+      return { devtools: { tabId: tab.runtimeTabId, open: true } }
+    } catch (error) {
+      return { devtools: { tabId: tab.runtimeTabId, open: wc.isDevToolsOpened(), error: String(error) } }
+    }
   }
   private async hardReload(input: RefreshTabInput): Promise<Record<string, unknown>> {
     const tab = this.resolveTab(input.tabId)

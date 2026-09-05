@@ -168,3 +168,94 @@ test("setMuted flips the record's muted flag and syncs (O18)", async () => {
   expect(records.get("tab_a")?.muted).toBe(true)
   expect(calls).toContain("setMuted:tab_a")
 })
+
+// --- DevTools/CDP handoff (P9.2) -----------------------------------------------
+// Opening DevTools must detach the engine debugger, open detached DevTools, and
+// re-attach (re-applying appearance) when DevTools closes. It must NOT crash,
+// and must degrade cleanly when the control session is unavailable. We drive a
+// fake webContents + session manager through the open_devtools dispatch path.
+
+const makeDevtoolsHarness = () => {
+  const calls: string[] = []
+  let devtoolsOpen = false
+  let devtoolsClosedHandler: (() => void) | null = null
+  const wc = {
+    id: 1,
+    isDevToolsOpened: () => devtoolsOpen,
+    openDevTools: (_opts: unknown) => {
+      calls.push("openDevTools")
+      devtoolsOpen = true
+    },
+    focusDevTools: () => {
+      calls.push("focusDevTools")
+    },
+    once: (event: string, cb: () => void) => {
+      if (event === "devtools-closed") devtoolsClosedHandler = cb
+    },
+    isDestroyed: () => false,
+  } as unknown as GuestRecord["webContents"]
+  const record = makeRecord("tab_dt", userOwner, { webContents: wc as GuestRecord["webContents"] })
+  const records = new Map([[record.runtimeTabId, record]])
+  let reattachCount = 0
+  const sessions = {
+    detach: (id: number) => {
+      calls.push(`detach:${id}`)
+    },
+    reattach: async (_wc: unknown, tabId: string) => {
+      reattachCount += 1
+      calls.push(`reattach:${tabId}`)
+    },
+  } as unknown as ControlSessionManager
+  const registry = {
+    get: (tabId: string) => records.get(tabId),
+    requireTab: (tabId?: string) => (tabId ? records.get(tabId) : undefined),
+    list: () => [...records.values()],
+    get size() {
+      return records.size
+    },
+    setOwner: () => undefined,
+    setMuted: () => undefined,
+    activate: () => undefined,
+    unregister: (tabId: string) => records.delete(tabId),
+  } as unknown as GuestRegistry
+  const options: BrowserOperationsOptions = {
+    registry,
+    sessions,
+    recordingDirectory: ".",
+    maxResultBytes: 64_000,
+    onTabRequest: () => undefined,
+    onTabClose: () => undefined,
+    onTabClosed: () => undefined,
+    onPointerEvent: () => undefined,
+  }
+  const operations = new BrowserOperations(options)
+  return { operations, calls, fireDevtoolsClosed: () => devtoolsClosedHandler?.(), getReattachCount: () => reattachCount }
+}
+
+test("open_devtools detaches engine debugger, opens detached DevTools, re-attaches on close", async () => {
+  const { operations, calls, fireDevtoolsClosed, getReattachCount } = makeDevtoolsHarness()
+  const result = await operations.dispatch(undefined, { name: "open_devtools", input: { tabId: "tab_dt" } }, "sess-1")
+  expect((result as any).devtools.open).toBe(true)
+  // Engine session detached BEFORE DevTools opened.
+  expect(calls.indexOf("detach:1")).toBeLessThan(calls.indexOf("openDevTools"))
+  // No crash, and not yet reattached.
+  expect(getReattachCount()).toBe(0)
+
+  // DevTools closes — engine session must re-attach (and reapply appearance).
+  fireDevtoolsClosed()
+  expect(getReattachCount()).toBe(1)
+  expect(calls).toContain("reattach:tab_dt")
+})
+
+test("open_devtools on an already-open DevTools reports open without re-detaching", async () => {
+  const { operations, calls } = makeDevtoolsHarness()
+  // First open.
+  await operations.dispatch(undefined, { name: "open_devtools", input: { tabId: "tab_dt" } }, "sess-1")
+  calls.length = 0
+  // Second open while already open.
+  const result = await operations.dispatch(undefined, { name: "open_devtools", input: { tabId: "tab_dt" } }, "sess-1")
+  expect((result as any).devtools).toMatchObject({ open: true, focused: true })
+  // Must not detach/re-open a second time.
+  expect(calls).not.toContain("detach:1")
+  expect(calls).not.toContain("openDevTools")
+})

@@ -5,16 +5,28 @@ import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, statSync, wri
 import { ZipWriter, BlobWriter, BlobReader } from "@zip.js/zip.js"
 import { dirname, join } from "node:path"
 import { homedir } from "node:os"
+import { createLogThrottle } from "./log-throttle"
 const MAX_LOG_AGE_DAYS = 7
 const TAIL_LINES = 1000
 const EXPORT_WINDOW = 24 * 60 * 60 * 1000
 const MAX_EXPORT_FILE_SIZE = 50 * 1024 * 1024
 const NET_LOG_SIZE = 20 * 1024 * 1024
+const NET_LOG_ENV = "OPENCODE_NETLOG"
 let root = ""
 let run = ""
 let netLogPath: string | undefined
 let logger: MainLogger
 export const getLogger = () => logger
+/**
+ * NetLog captures every Chromium network transaction, including every SSE
+ * chunk. It is a diagnostic switch only; enabling it during normal desktop
+ * use adds disk and serialization work directly to the server↔renderer hot
+ * path. Set OPENCODE_NETLOG=1 (or pass --net-log) when collecting a trace.
+ */
+export function netLogEnabled() {
+  const value = process.env[NET_LOG_ENV]?.toLowerCase()
+  return value === "1" || value === "true" || process.argv.includes("--net-log")
+}
 export function initLogging() {
   initRunDirectory()
   log.transports.file.maxSize = 5 * 1024 * 1024
@@ -24,6 +36,7 @@ export function initLogging() {
       `${safeLogName(message?.scope ?? (message?.variables?.processType === "renderer" ? "renderer" : "main"))}.log`,
     )
   log.initialize({ preload: false, spyRendererConsole: true })
+  guardFileTransport()
   initConsoleTransport()
   cleanup()
   return (logger = log)
@@ -36,6 +49,7 @@ export function initCrashReporter() {
   write("crash", "crash reporter started", { path: dir })
 }
 export async function startNetLog() {
+  if (!netLogEnabled()) return
   if (netLog.currentlyLogging) return
   netLogPath = join(run, "network.netlog")
   await netLog.startLogging(netLogPath, { captureMode: "default", maxFileSize: NET_LOG_SIZE })
@@ -62,6 +76,32 @@ export async function exportDebugLogs() {
       await startNetLog().catch((error) => write("network", "failed to restart net log", { error }))
     }
   }
+}
+// Token-bucket guard for the synchronous file transport (fs.writeFileSync per
+// line on the main thread). Sidecar stdout/stderr lines and spied renderer
+// console output all land here; under concurrent sessions that is hundreds of
+// lines/sec. The transport's async option is deliberately NOT used — it is an
+// unbounded write queue. Shedding is lossy but bounded: bursts pass,
+// sustained floods drop info-and-below with an exact summary line, and
+// error/warn always pass. Dropped lines skip formatting AND the sync write.
+const FILE_LOG_BURST_LINES = 200
+const FILE_LOG_SUSTAINED_LINES_PER_SEC = 50
+
+function guardFileTransport() {
+  const inner = log.transports.file
+  if (!inner || (inner as unknown as { __throttled?: boolean }).__throttled) return
+  const throttle = createLogThrottle({ burst: FILE_LOG_BURST_LINES, ratePerSec: FILE_LOG_SUSTAINED_LINES_PER_SEC })
+  type FileMessage = Parameters<typeof inner>[0]
+  const guarded = (message: FileMessage) => {
+    const verdict = throttle.guard(message.level)
+    if (!verdict.pass) return
+    if (verdict.suppressed > 0) {
+      inner({ ...message, level: "warn", data: [`[log-throttle] suppressed ${verdict.suppressed} info lines`] })
+    }
+    inner(message)
+  }
+  Object.assign(guarded, inner, { __throttled: true })
+  log.transports.file = guarded as typeof inner
 }
 export function write(
   name: string,

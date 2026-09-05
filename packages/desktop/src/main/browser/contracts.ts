@@ -39,6 +39,29 @@ export const ANNOTATION_MARQUEE_MAX_ELEMENTS = 20
 export const ANNOTATION_CROP_PADDING_PX = 20
 export const ANNOTATION_MIN_MARQUEE_SIZE_PX = 3
 
+// --- annotation payload hard caps (enforced at the trust boundary) -----------
+// These bound the structured payload the guest preload may send. Every cap is a
+// deliberate ceiling on adversarial/accidental size; the validator rejects the
+// WHOLE message on breach and never coerces (see isBrowserAnnotationPayload).
+
+/** Max selected elements (marquee harvest caps at ANNOTATION_MARQUEE_MAX_ELEMENTS,
+ * this is the absolute ceiling on the assembled payload). */
+export const ANNOTATION_MAX_ELEMENTS = 64
+/** Max bytes for one element's htmlPreview (UTF-16 length cap ~ 2KB). */
+export const ANNOTATION_MAX_HTML_PREVIEW_BYTES = 2048
+/** Max bytes for one element's serialized styles (UTF-16 length cap ~ 2KB). */
+export const ANNOTATION_MAX_STYLES_BYTES = 2048
+/** Max ink strokes in one annotation. */
+export const ANNOTATION_MAX_STROKES = 16
+/** Max sample points in a single stroke (pre-decimation). */
+export const ANNOTATION_MAX_POINTS_PER_STROKE = 2000
+/** Max comment length (UTF-16 length cap). */
+export const ANNOTATION_MAX_COMMENT_LENGTH = 4000
+/** Max recorded style changes. */
+export const ANNOTATION_MAX_STYLE_CHANGES = 64
+/** Min separation (px) for stroke point decimation. */
+export const ANNOTATION_STROKE_DECIMATE_MIN_DIST_PX = 2
+
 export const AGENT_CURSOR_MOVE_MS = 160
 export const AGENT_CURSOR_CLICK_LEAD_MS = 40
 export const HUMAN_PREEMPT_WINDOW_MS = 750
@@ -1035,18 +1058,30 @@ export const isHumanInputSignal = (value: unknown): value is HumanInputSignal =>
   return false
 }
 
+/** A finite number — NaN/Infinity are never acceptable in a wire rect. */
+const isFiniteNumber = (value: unknown): value is number =>
+  typeof value === "number" && Number.isFinite(value)
+
+/** A finite, non-negative number — width/height must never be negative, and a
+ * malformed rect (NaN/Infinity/negative) is rejected wholesale, never coerced.
+ * x/y of element/region/crop rects must also be non-negative; stroke `bounds`
+ * (see isAnnotationStroke) may legitimately extend to negative coordinates
+ * near the viewport origin, so it is checked separately. */
+const isNonNegative = (value: unknown): value is number =>
+  isFiniteNumber(value) && value >= 0
+
 const isAnnotationRect = (value: unknown): value is AnnotationRect =>
   isRecord(value) &&
-  typeof value.x === "number" &&
-  typeof value.y === "number" &&
-  typeof value.width === "number" &&
-  typeof value.height === "number"
+  isNonNegative(value.x) &&
+  isNonNegative(value.y) &&
+  isNonNegative(value.width) &&
+  isNonNegative(value.height)
 
 const isAnnotationSourceFrame = (value: unknown): value is AnnotationSourceFrame =>
   isRecord(value) &&
   typeof value.file === "string" &&
-  (value.line === undefined || typeof value.line === "number") &&
-  (value.column === undefined || typeof value.column === "number")
+  (value.line === undefined || (typeof value.line === "number" && Number.isFinite(value.line))) &&
+  (value.column === undefined || (typeof value.column === "number" && Number.isFinite(value.column)))
 
 const isAnnotationElementContext = (value: unknown): value is AnnotationElementContext =>
   isRecord(value) &&
@@ -1054,9 +1089,11 @@ const isAnnotationElementContext = (value: unknown): value is AnnotationElementC
   typeof value.tagName === "string" &&
   (value.selector === null || typeof value.selector === "string") &&
   typeof value.htmlPreview === "string" &&
+  value.htmlPreview.length <= ANNOTATION_MAX_HTML_PREVIEW_BYTES &&
   (value.componentName === null || typeof value.componentName === "string") &&
   (value.source === null || isAnnotationSourceFrame(value.source)) &&
   typeof value.styles === "string" &&
+  value.styles.length <= ANNOTATION_MAX_STYLES_BYTES &&
   isAnnotationRect(value.rect)
 
 const isAnnotationRegion = (value: unknown): value is AnnotationRegion =>
@@ -1067,9 +1104,21 @@ const isAnnotationStroke = (value: unknown): value is AnnotationStroke =>
   typeof value.id === "string" &&
   typeof value.color === "string" &&
   typeof value.width === "number" &&
+  Number.isFinite(value.width) &&
+  value.width > 0 &&
   Array.isArray(value.points) &&
-  value.points.every((p) => isRecord(p) && typeof p.x === "number" && typeof p.y === "number") &&
-  isAnnotationRect(value.bounds)
+  value.points.length > 0 &&
+  value.points.length <= ANNOTATION_MAX_POINTS_PER_STROKE &&
+  value.points.every(
+    (p) => isRecord(p) && typeof p.x === "number" && Number.isFinite(p.x) && typeof p.y === "number" && Number.isFinite(p.y),
+  ) &&
+  // stroke bounds may extend to negative coords near the viewport origin, so
+  // only finiteness + non-negative dimensions are required here.
+  isRecord(value.bounds) &&
+  isFiniteNumber(value.bounds.x) &&
+  isFiniteNumber(value.bounds.y) &&
+  isNonNegative(value.bounds.width) &&
+  isNonNegative(value.bounds.height)
 
 const isAnnotationStyleChange = (value: unknown): value is AnnotationStyleChange =>
   isRecord(value) &&
@@ -1082,17 +1131,28 @@ const isAnnotationStyleChange = (value: unknown): value is AnnotationStyleChange
 /** Trust boundary: the main process does not accept the guest's JS object
  * as-is. Every nested field is checked, and — critically — `screenshot` must
  * be exactly `null`; main owns the capture, so a payload claiming to already
- * carry screenshot bytes is rejected rather than trusted. */
+ * carry screenshot bytes is rejected rather than trusted.
+ *
+ * Hard caps are enforced HERE, at the boundary, not only by the producer: an
+ * oversized/over-counted payload is rejected wholesale. The contract never
+ * coerces or truncates — a structural failure means the whole message is
+ * dropped. */
 export const isBrowserAnnotationPayload = (value: unknown): value is BrowserAnnotationPayload => {
   if (!isRecord(value)) return false
   if (typeof value.id !== "string") return false
   if (typeof value.pageUrl !== "string") return false
   if (value.pageTitle !== null && typeof value.pageTitle !== "string") return false
   if (typeof value.comment !== "string") return false
+  if (value.comment.length > ANNOTATION_MAX_COMMENT_LENGTH) return false
   if (!Array.isArray(value.elements) || !value.elements.every(isAnnotationElementContext)) return false
+  if (value.elements.length > ANNOTATION_MAX_ELEMENTS) return false
   if (!Array.isArray(value.regions) || !value.regions.every(isAnnotationRegion)) return false
   if (!Array.isArray(value.strokes) || !value.strokes.every(isAnnotationStroke)) return false
+  if (value.strokes.length > ANNOTATION_MAX_STROKES) return false
   if (!Array.isArray(value.styleChanges) || !value.styleChanges.every(isAnnotationStyleChange)) return false
+  if (value.styleChanges.length > ANNOTATION_MAX_STYLE_CHANGES) return false
+  // The invariant that must never be optimized away: the guest MUST NOT supply
+  // screenshot bytes. main owns pixel capture. Any non-null here is a spoof.
   if (value.screenshot !== null) return false
   if (value.cropRect !== null && !isAnnotationRect(value.cropRect)) return false
   if (value.submission !== "attach" && value.submission !== "send") return false

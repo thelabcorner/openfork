@@ -1,3 +1,4 @@
+import type { WebContents } from "electron"
 import { BrowserDebuggerConflictError, BrowserNotAttachedError } from "./errors"
 import { ControlArbiter, ControlEpoch, createEpochGuardedSender, type DebuggerCommand } from "./arbitration"
 import { DIAGNOSTIC_BUFFER_LIMIT } from "./types"
@@ -140,7 +141,13 @@ export function createControlSession(options: ControlSessionOptions): ControlSes
     if (wc.isDestroyed()) throw new BrowserNotAttachedError()
     if (wc.isDevToolsOpened()) throw new BrowserDebuggerConflictError()
     if (wc.debugger.isAttached()) {
-      if (attached) return
+      if (attached) {
+        // Already our session: appearance lives in the CDP SESSION, not the
+        // WebContents, so re-apply it defensively on every (re)entry — it is
+        // idempotent and cheap, and covers any debugger churn we missed.
+        await applyAppearance().catch(() => undefined)
+        return
+      }
       throw new BrowserDebuggerConflictError("The guest debugger is already attached by another client")
     }
     try {
@@ -252,6 +259,17 @@ export class ControlSessionManager {
 
   async detachAll(): Promise<void> {
     for (const id of [...this.sessions.keys()]) await this.detach(id)
+  }
+
+  /** Re-create (if detached) and re-attach the control session for a
+   * webContents after DevTools has released the debugger target. Appearance
+   * emulation belongs to the CDP SESSION, not the WebContents, so
+   * ensureAttached() re-applies the live desired scheme here — this is the
+   * only place that repairs appearance after webview replacement, DevTools
+   * open/close, or any other session churn (see operations.openDevtools). */
+  async reattach(wc: WebContents, tabId: string): Promise<void> {
+    const session = this.obtain(tabId, wc as unknown as WebContentsLike)
+    await session.reattach()
   }
 
   nextPointerSequence(): number {

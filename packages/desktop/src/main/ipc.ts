@@ -26,6 +26,7 @@ import { createUpdaterSubscriptions } from "./updater-subscriptions"
 import { createDesktopDraftStore } from "./draft-store"
 import { nativeT } from "./native-translations"
 import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
+import { RendererTrust } from "./browser/renderer-trust"
 import type { HostOwner } from "./browser/contracts"
 const pickerFilters = (ext?: string[]) => {
   if (!ext || ext.length === 0) return undefined
@@ -312,11 +313,14 @@ export function sendDeepLinks(win: BrowserWindow, urls: string[]) {
   win.webContents.send("deep-link", urls)
 }
 // --- browser engine IPC (window.api.browser) ---------------------------------
-export function registerBrowserIpcHandlers(engine: BrowserEngine) {
-  // Only the app's own renderer windows may drive the browser engine; a guest
-  // webview or any other webContents must not reach these handlers.
-  const trusted = (event: IpcMainInvokeEvent): boolean =>
-    BrowserWindow.fromWebContents(event.sender) !== null
+export function registerBrowserIpcHandlers(engine: BrowserEngine, trust: RendererTrust) {
+  // Only registered app-renderer webContents in their MAIN frame may drive the
+  // browser engine. A guest <webview> (or any other webContents) is never in
+  // the allowlist, so it cannot reach these handlers — and a sub-frame sender
+  // is rejected by the mainFrame assertion. This replaces the coarse
+  // `BrowserWindow.fromWebContents(sender) !== null` check (whose semantics
+  // for <webview> guests vary by Electron version) with a positive allowlist.
+  const trusted = (event: IpcMainInvokeEvent): boolean => trust.isTrusted(event)
   ipcMain.handle("browser-get-state", (event) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.getState()

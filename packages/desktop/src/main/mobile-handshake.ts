@@ -10,6 +10,8 @@ import {
   removeHandshake,
   writeHandshake,
 } from "../../../mobile/dev/handshake"
+import { agentTokenPath } from "../../../mobile/dev/agent-token"
+import { provisionAgentToken } from "../../../mobile/dev/agent-token-provision"
 
 /**
  * Publishes where the sidecar is listening for the mobile PWA's Vite dev
@@ -51,6 +53,12 @@ export type MobileHandshake = {
    * identity. Resolves `undefined` for anything that cannot answer.
    */
   discover(url: string): Promise<string | undefined>
+  /**
+   * Ensures a persistent device token exists for local tooling, minting one
+   * only if there is not already a working one. Never throws; the desktop does
+   * not depend on it.
+   */
+  ensureAgentToken(url: string, credentials: { username: string; password: string }): Promise<void>
   /** Idempotent; safe to call from every teardown path. */
   revoke(): void
 }
@@ -132,6 +140,33 @@ export function createMobileHandshake(options: MobileHandshakeOptions): MobileHa
       } catch (error) {
         // Never fatal: the desktop app itself does not need this file.
         log("failed to publish mobile dev handshake", { error: String(error), file })
+      }
+    },
+    async ensureAgentToken(url: string, credentials: { username: string; password: string }) {
+      // Dev-only, exactly like the handshake: a packaged build has no Vite dev
+      // server, no writable package directory, and no business minting itself
+      // a standing credential.
+      if (!enabled) return
+      if (!credentials.password) return
+      try {
+        const result = await provisionAgentToken({
+          file: agentTokenPath(mobileDir),
+          url,
+          username: credentials.username || "opencode",
+          password: credentials.password,
+          onLog: (message, meta) => log(message, meta),
+        })
+        if (result.ok) {
+          // Deliberately not revoked on exit — the point is that it survives
+          // restarts, so tooling can authenticate without a pairing dance.
+          log(result.reused ? "reusing dev tooling device token" : "provisioned dev tooling device token", {
+            deviceID: result.token.deviceID,
+          })
+        } else {
+          log("could not provision dev tooling device token", { reason: result.reason, detail: result.detail })
+        }
+      } catch (error) {
+        log("could not provision dev tooling device token", { error: String(error) })
       }
     },
     revoke,

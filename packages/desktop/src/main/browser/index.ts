@@ -95,6 +95,15 @@ export class BrowserEngine {
       supportsRecording: true,
       cdp: true,
     }
+    this.sessions = new ControlSessionManager({
+      arbiter: this.arbiter,
+      // Live appearance resolver: emulated media belongs to the CDP SESSION,
+      // not the WebContents, so the desired scheme must be read from the
+      // registry (which the renderer drives via browser-set-appearance) and
+      // REAPPLIED on every debugger re-attach — after webview replacement,
+      // after DevTools open/close, after any session churn. Never a constant.
+      colorScheme: () => this.registry.getAppearance() === "dark" ? "dark" : "light",
+    })
     this.registry = new GuestRegistry({
       windowId: options.windowId,
       arbiter: this.arbiter,
@@ -131,6 +140,7 @@ export class BrowserEngine {
       onTabClose: (tabId) => this.options.broadcast("browser-tab-close", { tabId }),
       onTabClosed: (tabId) => this.host.emitHostEvent({ type: "tab.closed", tabId, timestamp: new Date().toISOString() }),
       onPointerEvent: (event) => this.options.broadcast("browser-pointer-event", event),
+      logger: options.logger,
     })
     this.host = new BrowserHost({
       hostId: this.hostId,
@@ -358,10 +368,34 @@ export class BrowserEngine {
     startAnnotation: (tabId) => {
       const tab = this.registry.get(tabId)
       if (!tab) return Promise.resolve(null)
-      return this.annotation.start(tabId, tab.webContents, tab.colorScheme)
+      // Starting an annotation session is the human taking control of this tab.
+      // Bump the epoch so any in-flight agent automation on it aborts
+      // immediately, and pin the controller to human for the session.
+      this.arbiter.acquireHumanControl(tabId)
+      tab.controller = this.arbiter.controller(tabId)
+      this.registry.sync(tabId)
+      return this.annotation.start(tabId, tab.webContents, tab.colorScheme, {
+        generation: tab.generation,
+        webContentsId: tab.webContentsId ?? tab.webContents.id,
+        getCurrentGeneration: (id) => this.registry.get(id)?.generation,
+        getCurrentViewport: (id) => {
+          const v = this.registry.get(id)?.viewport
+          return v ? { width: v.width, height: v.height } : undefined
+        },
+      })
     },
     cancelAnnotation: (tabId) => {
       this.annotation.cancel(tabId)
+      // Release the human control taken for the session (the arbiter opened it
+      // on start; release unconditionally rather than via setControllerFor,
+      // which would refuse to clobber a human window). A newer live-input
+      // preemption window would re-pin it on the next human input anyway.
+      this.arbiter.releaseHumanControl(tabId)
+      const tab = this.registry.get(tabId)
+      if (tab) {
+        tab.controller = this.arbiter.controller(tabId)
+        this.registry.sync(tabId)
+      }
     },
   }
   /** User-authority close (D9): preempt the arbiter + detach the CDP session so

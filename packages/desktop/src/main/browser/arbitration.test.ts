@@ -100,3 +100,31 @@ test("ControlArbiter.preempt: bumps the epoch (kills in-flight send) and clears 
   expect(arbiter.controller("tab1")).toBe("none")
   expect(arbiter.getExpectedInputs().size).toBe(0)
 })
+
+test("acquireHumanControl: bumps epoch to kill in-flight agent, clears expected input, pins human", async () => {
+  const arbiter = new ControlArbiter()
+  arbiter.setAgent("tab1")
+  arbiter.expectAgentInput("tab1", pointer(50, 50))
+  expect(arbiter.controller("tab1")).toBe("agent")
+  expect(arbiter.getExpectedInputs().size).toBe(1)
+
+  // An agent action is in flight when the human starts an annotation session.
+  const { send } = createEpochGuardedSender(arbiter.getEpoch(), async () => ({ ok: true }))
+  const inFlight = send("tab1", "Input.dispatchMouseEvent")
+
+  arbiter.acquireHumanControl("tab1")
+
+  // In-flight agent send must be interrupted — human agency wins immediately.
+  await expect(inFlight).rejects.toBeInstanceOf(BrowserControlInterruptedError)
+  expect(arbiter.controller("tab1")).toBe("human")
+  expect(arbiter.getExpectedInputs().size).toBe(0)
+})
+
+test("acquireHumanControl then release leaves no controller when still human", () => {
+  const arbiter = new ControlArbiter()
+  arbiter.acquireHumanControl("tab1")
+  expect(arbiter.controller("tab1")).toBe("human")
+  // Annotation cancel releases the human control it acquired (unconditionally).
+  arbiter.releaseHumanControl("tab1")
+  expect(arbiter.controller("tab1")).toBe("none")
+})

@@ -107,6 +107,19 @@ const require = __cjs_mod__.createRequire(import.meta.url);
     plugins: [appPlugin, sentry],
     publicDir: "../../../app/public",
     root: "src/renderer",
+    // Keep Shiki's language registry out of Vite's dependency prebundle. The
+    // package's normal entrypoint references every grammar (hundreds of
+    // dynamic imports), so optimizing it turns a renderer startup into a
+    // multi-thousand-file cold build. Shiki is already loaded lazily by the
+    // markdown worker/viewer; serving that entrypoint through Vite preserves
+    // the same runtime behavior while keeping grammars on demand.
+    optimizeDeps: {
+      exclude: ["shiki"],
+      // These are reached from worker/dynamic import graphs. Declaring them
+      // here prevents Vite's late "new dependencies optimized" pass and its
+      // forced renderer reload during dev startup.
+      include: ["@shikijs/stream", "remend"],
+    },
     resolve: {
       // electron-vite resolves the renderer from its nested root. Keep the
       // workspace app package resolvable even when its workspace symlink has

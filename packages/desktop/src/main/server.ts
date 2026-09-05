@@ -6,6 +6,7 @@ import { getLogger } from "./logging"
 import { getUserShell, loadShellEnv } from "./shell-env"
 import { getStore } from "./store"
 import { DEFAULT_SERVER_URL_KEY } from "./store-keys"
+import { waitForServerHealth } from "./server-health"
 export type HealthCheck = { wait: Promise<void> }
 type SidecarMessage =
   | { type: "ready" }
@@ -105,9 +106,12 @@ export async function spawnLocalServer(
       if (message.type === "error") {
         const detail = message.error.stack ?? message.error.message
         options.onStderr?.(`sidecar startup error: ${detail} (port ${port})`)
-        const err = Object.assign(new Error(message.error.message || `Sidecar failed to start on ${hostname}:${port}`), {
-          stack: message.error.stack,
-        })
+        const err = Object.assign(
+          new Error(message.error.message || `Sidecar failed to start on ${hostname}:${port}`),
+          {
+            stack: message.error.stack,
+          },
+        )
         // Preserve EADDRINUSE code for callers that want to retry
         const code = /EADDRINUSE/.test(detail) ? "EADDRINUSE" : undefined
         if (code) (err as NodeJS.ErrnoException).code = code
@@ -136,24 +140,10 @@ export async function spawnLocalServer(
     if (!exited) child.kill()
     throw error
   })
-  const wait = (async () => {
-    const url = `http://${hostname}:${port}`
-    let healthy = false
-    const gone = exit.promise.then((code) => {
-      if (healthy) return
-      throw new Error(`Sidecar exited before health check passed with code ${code}`)
-    })
-    const ready = async () => {
-      while (true) {
-        await new Promise((resolve) => setTimeout(resolve, 100))
-        if (await checkHealth(url, password)) {
-          healthy = true
-          return
-        }
-      }
-    }
-    await Promise.race([ready(), gone])
-  })()
+  const wait = waitForServerHealth(
+    (signal) => checkHealth(`http://${hostname}:${port}`, password, signal),
+    exit.promise,
+  )
   let stopping: Promise<void> | undefined
   return {
     listener: {
@@ -173,7 +163,7 @@ export async function spawnLocalServer(
     health: { wait },
   }
 }
-export async function checkHealth(url: string, password?: string | null): Promise<boolean> {
+export async function checkHealth(url: string, password?: string | null, signal?: AbortSignal): Promise<boolean> {
   let healthUrls: URL[]
   try {
     healthUrls = [new URL("/api/health", url), new URL("/global/health", url)]
@@ -186,12 +176,14 @@ export async function checkHealth(url: string, password?: string | null): Promis
     headers.set("authorization", `Basic ${auth}`)
   }
   for (const healthUrl of healthUrls) {
+    if (signal?.aborted) return false
     try {
       const res = await fetch(healthUrl, {
         method: "GET",
         headers,
-        signal: AbortSignal.timeout(3000),
+        signal: signal ? AbortSignal.any([signal, AbortSignal.timeout(3000)]) : AbortSignal.timeout(3000),
       })
+      await res.body?.cancel()
       if (res.ok) return true
     } catch {}
   }
@@ -209,6 +201,15 @@ function createSidecarEnv(extra?: Record<string, string>): Record<string, string
   // Don't propagate OPENCODE_PORT to the sidecar — the desktop picks its own
   // ephemeral port to avoid colliding with `opencode serve` / JetBrains ACP.
   delete env.OPENCODE_PORT
+  // Server Effect logs go to a file unless OPENCODE_PRINT_LOGS=1 (see
+  // packages/core/src/observability/logging.ts). In dev (`bun run dev`) the
+  // sidecar's stderr is piped back to the main process and mirrored to the
+  // terminal (see index.ts onStdout/onStderr), so opt into stderr logs here.
+  // Without this, `bun run dev` shows [desktop]/[pwa] but never any server
+  // output. Explicit env wins; packaged builds keep file-only logging.
+  if (!app.isPackaged && env.OPENCODE_PRINT_LOGS === undefined) {
+    env.OPENCODE_PRINT_LOGS = "1"
+  }
   return env
 }
 function delay(ms: number) {

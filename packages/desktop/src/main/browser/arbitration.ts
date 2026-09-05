@@ -238,6 +238,29 @@ export class ControlArbiter {
     this.setControllerFor(tabId, "agent")
   }
 
+  /** Annotation-session start: the human is about to take over the tab to
+   * draw/select. If an agent currently holds control, bump the epoch so any
+   * in-flight agent `send` aborts (human agency wins immediately — an agent
+   * that keeps clicking while the user is drawing is the single most
+   * trust-destroying behavior a collaborative browser can exhibit). Also drop
+   * any pending expected-agent-input echoes so a queued agent click can never
+   * be mistaken for a human preemption mid-session, and pin the controller to
+   * human for the session's duration. Does NOT open a preemption window — the
+   * human keeps control until the session is cancelled or the tab closes. */
+  acquireHumanControl(tabId: string): void {
+    this.epoch.bump(tabId)
+    this.queue.clear()
+    this.controllers.set(tabId, "human")
+  }
+
+  /** Explicit end of an annotation session: release the human control taken by
+   * acquireHumanControl. Unlike setControllerFor, this ALWAYS clears — it is
+   * the deliberate teardown of a session the arbiter itself opened, so it must
+   * not be blocked by the "never clobber a human window" guard. */
+  releaseHumanControl(tabId: string): void {
+    this.controllers.delete(tabId)
+  }
+
   /** Clear per-tab state: epoch, controller, and pending expected inputs. */
   reset(tabId: string) {
     this.epoch.delete(tabId)

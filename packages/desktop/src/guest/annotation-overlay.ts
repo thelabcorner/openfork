@@ -31,12 +31,22 @@ import {
   type AnnotationSubmission,
   type BrowserAnnotationPayload,
 } from "../main/browser/contracts"
+import {
+  decimateStroke,
+  harvestMarquee,
+  REGION_COEXISTS_WITH_ELEMENTS,
+  smoothStrokePath,
+  unionCropRect,
+} from "../main/browser/annotation-geometry"
 
-const OVERLAY_ATTRIBUTE = "data-opencode-annotation-ui"
+const OVERLAY_ATTRIBUTE = "data-openfork-annotation-ui"
 const Z_INDEX_OVERLAY = 2147483646
-/** Same-origin iframe recursion cap — generous for real layouts, bounded
- * against a pathological/adversarial page nesting iframes indefinitely. */
-const MAX_FRAME_DEPTH = 4
+/** Top document only — never traverse into iframes (the isolated preload's
+ * world is per-document; an iframe has its own guest world and its own
+ * annotation session, so descending here would double-capture and corrupt
+ * offsets). Selecting documentElement/body is always a bug (see skip guards). */
+const PREFERS_REDUCED_MOTION =
+  typeof matchMedia === "function" && matchMedia("(prefers-reduced-motion: reduce)").matches
 
 type AnnotationTool = "select" | "marquee" | "draw" | "erase"
 type FrameOffset = { x: number; y: number }
@@ -50,7 +60,23 @@ type SelectedTarget = {
 
 type HoverTarget = { el: Element; offset: FrameOffset }
 
-type StyleProperty = "font-size" | "color" | "background-color" | "border-radius" | "width" | "height" | "padding" | "margin" | "gap"
+type StyleProperty =
+  | "font-family"
+  | "font-size"
+  | "font-weight"
+  | "line-height"
+  | "color"
+  | "background-color"
+  | "opacity"
+  | "border-radius"
+  | "border-color"
+  | "border-width"
+  | "border-style"
+  | "width"
+  | "height"
+  | "padding"
+  | "margin"
+  | "gap"
 
 let active = false
 let theme: "light" | "dark" = "light"
@@ -61,8 +87,14 @@ let outlineLayer: HTMLDivElement | undefined
 let drawSvg: SVGSVGElement | undefined
 let toolbarEl: HTMLDivElement | undefined
 let commentEl: HTMLTextAreaElement | undefined
+let commentBarEl: HTMLDivElement | undefined
 let stylePanelEl: HTMLDivElement | undefined
+/** True while editor chrome (toolbar, comment box, hover outline) is hidden at
+ * submit time so the capture shows only the requested marks + temporary CSS. */
+let chromeHidden = false
 let rafHandle = 0
+let domObserver: MutationObserver | undefined
+let pageHideHandler: (() => void) | undefined
 
 const selected = new Map<string, SelectedTarget>()
 const regions: AnnotationRegion[] = []
@@ -80,72 +112,30 @@ function isAnnotationNode(node: Element): boolean {
   return node.closest(`[${OVERLAY_ATTRIBUTE}]`) !== null || node.hasAttribute(OVERLAY_ATTRIBUTE)
 }
 
-/** A same-origin iframe is one whose `contentDocument` is actually reachable
- * — cross-origin access throws (older engines) or returns null (spec-current
- * behavior), either way we treat it as opaque and stop descending. */
-function sameOriginIframeDocument(el: Element): Document | null {
-  if (!(el instanceof HTMLIFrameElement)) return null
-  try {
-    return el.contentDocument
-  } catch {
-    return null
-  }
-}
-
-/**
- * Hit-test recursively through same-origin iframes, translating the point
- * into each nested document's local coordinate space and returning the
- * final element together with the accumulated TOP-viewport offset needed to
- * translate its own (frame-local) getBoundingClientRect() back into top
- * space. Cross-origin iframes are treated as an opaque leaf — annotation can
- * target the iframe element itself but never its (inaccessible) content.
- */
+/** Hit-test the TOP document only. The isolated preload world is per-document,
+ * so an iframe carries its own guest world and owns its own annotation
+ * session; descending here would double-capture and corrupt offsets.
+ * documentElement/body are skipped — selecting the body is always a bug. */
 function pickFromPoint(clientX: number, clientY: number): HoverTarget | null {
-  return pickFromPointIn(document, clientX, clientY, { x: 0, y: 0 }, 0)
-}
-
-function pickFromPointIn(doc: Document, x: number, y: number, offset: FrameOffset, depth: number): HoverTarget | null {
-  for (const candidate of doc.elementsFromPoint(x, y)) {
+  for (const candidate of document.elementsFromPoint(clientX, clientY)) {
     if (!(candidate instanceof Element)) continue
-    if (doc === document && isAnnotationNode(candidate)) continue
-    if (candidate === doc.documentElement || candidate === doc.body) continue
-
-    if (depth < MAX_FRAME_DEPTH) {
-      const innerDoc = sameOriginIframeDocument(candidate)
-      if (innerDoc) {
-        const frameRect = candidate.getBoundingClientRect()
-        const nested = pickFromPointIn(
-          innerDoc,
-          x - frameRect.left,
-          y - frameRect.top,
-          { x: offset.x + frameRect.left, y: offset.y + frameRect.top },
-          depth + 1,
-        )
-        if (nested) return nested
-        // Same-origin iframe with no deeper hit (e.g. transparent margin) —
-        // fall through and target the iframe element itself.
-      }
-    }
-    return { el: candidate, offset }
+    if (isAnnotationNode(candidate)) continue
+    if (candidate === document.documentElement || candidate === document.body) continue
+    return { el: candidate, offset: { x: 0, y: 0 } }
   }
   return null
 }
 
 type FrameCandidate = { el: Element; offset: FrameOffset }
 
-/** Same-origin-recursive candidate collection for marquee hit testing —
- * the mirror of pickFromPointIn but gathering everything instead of the
- * topmost element at a single point. */
-function collectFrameCandidates(doc: Document, offset: FrameOffset, depth: number, out: FrameCandidate[]): void {
+/** Candidate collection for marquee hit testing — everything in the top
+ * document whose center falls inside the drag rect, in the same coordinate
+ * space the renderer will use (top-viewport). */
+function collectFrameCandidates(doc: Document, offset: FrameOffset, out: FrameCandidate[]): void {
   for (const el of doc.querySelectorAll("*")) {
-    if (doc === document && isAnnotationNode(el)) continue
+    if (isAnnotationNode(el)) continue
     if (el === doc.documentElement || el === doc.body) continue
     out.push({ el, offset })
-    if (depth >= MAX_FRAME_DEPTH) continue
-    const innerDoc = sameOriginIframeDocument(el)
-    if (!innerDoc) continue
-    const frameRect = el.getBoundingClientRect()
-    collectFrameCandidates(innerDoc, { x: offset.x + frameRect.left, y: offset.y + frameRect.top }, depth + 1, out)
   }
 }
 
@@ -306,6 +296,12 @@ function ensureHost() {
   host.style.inset = "0"
   host.style.zIndex = String(Z_INDEX_OVERLAY)
   host.style.pointerEvents = "none"
+  // The whole overlay is a modal annotation dialog: give it a dialog role and
+  // accessible name so assistive tech announces it as a single interactive
+  // surface (closed shadow root keeps focus internal).
+  host.setAttribute("role", "dialog")
+  host.setAttribute("aria-label", "Browser annotation")
+  host.setAttribute("aria-modal", "false")
   document.documentElement.appendChild(host)
   shadow = host.attachShadow({ mode: "closed" })
 
@@ -321,12 +317,31 @@ function ensureHost() {
   drawSvg.setAttribute("class", "draw-layer")
   shadow.appendChild(drawSvg)
 
+  // Resilience: if the inspected page wipes documentElement's children (some
+  // SPAs replace <html> contents), the overlay host is detached. Re-append it
+  // so the annotation session survives the DOM churn.
+  if (typeof MutationObserver === "function") {
+    domObserver = new MutationObserver(() => {
+      if (host && !document.documentElement.contains(host)) {
+        document.documentElement.appendChild(host)
+      }
+    })
+    domObserver.observe(document.documentElement, { childList: true })
+  }
+
   buildToolbar()
 }
 
 function teardownHost() {
   if (rafHandle) cancelAnimationFrame(rafHandle)
   rafHandle = 0
+  domObserver?.disconnect()
+  domObserver = undefined
+  if (pageHideHandler) {
+    window.removeEventListener("pagehide", pageHideHandler, true)
+    window.removeEventListener("visibilitychange", pageHideHandler, true)
+    pageHideHandler = undefined
+  }
   host?.remove()
   host = undefined
   shadow = undefined
@@ -334,6 +349,7 @@ function teardownHost() {
   drawSvg = undefined
   toolbarEl = undefined
   commentEl = undefined
+  commentBarEl = undefined
   stylePanelEl = undefined
 }
 
@@ -351,6 +367,15 @@ function startAnnotation() {
   window.addEventListener("keydown", onKeyDown, true)
   window.addEventListener("scroll", scheduleRender, true)
   window.addEventListener("resize", scheduleRender, true)
+  // Terminal path: a navigation/unload must restore temporary CSS before the
+  // page goes away — otherwise a preview edit leaks into the next page.
+  pageHideHandler = () => {
+    if (active) cancelAnnotation()
+  }
+  window.addEventListener("pagehide", pageHideHandler, true)
+  window.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "hidden" && active) cancelAnnotation()
+  }, true)
   scheduleRender()
 }
 
@@ -430,7 +455,12 @@ function onPointerMove(event: PointerEvent) {
     return
   }
   if (tool === "draw" && drawing) {
-    drawing.points.push({ x: event.clientX, y: event.clientY })
+    const last = drawing.points[drawing.points.length - 1]
+    // Decimate: skip points closer than ~2px so strokes stay compact and the
+    // midpoint-smoothed path doesn't carry redundant samples.
+    if (!last || Math.hypot(event.clientX - last.x, event.clientY - last.y) >= 2) {
+      drawing.points.push({ x: event.clientX, y: event.clientY })
+    }
     scheduleRender()
   }
 }
@@ -466,6 +496,31 @@ function onKeyDown(event: KeyboardEvent) {
     return
   }
 
+  // Focus trap: keep Tab cycling within the dialog's interactive controls so
+  // keyboard users can't tab out into the inspected page. Documented order:
+  // tool buttons -> comment field -> style panel -> attach/send -> cancel.
+  if (event.key === "Tab" && shadow) {
+    const focusables = Array.from(
+      shadow.querySelectorAll<HTMLElement>(
+        'button, textarea, input, [tabindex]:not([tabindex="-1"])',
+      ),
+    ).filter((el) => el.offsetParent !== null || el === commentEl)
+    if (focusables.length === 0) return
+    const first = focusables[0]!
+    const last = focusables[focusables.length - 1]!
+    const activeEl = shadow.activeElement as HTMLElement | null
+    if (event.shiftKey && (activeEl === first || activeEl === null)) {
+      event.preventDefault()
+      last.focus()
+    } else if (!event.shiftKey && activeEl === last) {
+      event.preventDefault()
+      first.focus()
+    } else if (!event.shiftKey && activeEl === null) {
+      event.preventDefault()
+      first.focus()
+    }
+  }
+
   if (commentFocused) {
     if (event.key !== "Enter" || event.isComposing) return
     event.stopImmediatePropagation()
@@ -475,10 +530,16 @@ function onKeyDown(event: KeyboardEvent) {
     return
   }
 
-  if (event.key === "v" || event.key === "V") setTool("select")
-  else if (event.key === "r" || event.key === "R") setTool("marquee")
-  else if (event.key === "d" || event.key === "D") setTool("draw")
-  else if (event.key === "e" || event.key === "E") setTool("erase")
+  // Tool shortcuts are suppressed while focus is in the comment field so typing
+  // "r"/"d"/"e" in a comment doesn't switch tools (the Field/Enter block above
+  // already handled Enter). V/R/D/E only act when the chrome, not the textarea,
+  // has focus.
+  if (!commentFocused) {
+    if (event.key === "v" || event.key === "V") setTool("select")
+    else if (event.key === "r" || event.key === "R") setTool("marquee")
+    else if (event.key === "d" || event.key === "D") setTool("draw")
+    else if (event.key === "e" || event.key === "E") setTool("erase")
+  }
 }
 
 // ── select / marquee / draw / erase operations ──────────────────────────
@@ -518,56 +579,40 @@ function finishMarquee(rect: AnnotationRect) {
   if (rect.width < ANNOTATION_MIN_MARQUEE_SIZE_PX && rect.height < ANNOTATION_MIN_MARQUEE_SIZE_PX) return
 
   const all: FrameCandidate[] = []
-  collectFrameCandidates(document, { x: 0, y: 0 }, 0, all)
+  collectFrameCandidates(document, { x: 0, y: 0 }, all)
 
-  const candidates: FrameCandidate[] = []
-  const seen = new Set<Element>()
-  for (const candidate of all) {
-    if (seen.has(candidate.el)) continue
-    const r = rectOf(candidate.el, candidate.offset)
-    if (r.width === 0 || r.height === 0) continue
-    const cx = r.x + r.width / 2
-    const cy = r.y + r.height / 2
-    if (cx < rect.x || cx > rect.x + rect.width || cy < rect.y || cy > rect.y + rect.height) continue
-    seen.add(candidate.el)
-    candidates.push(candidate)
-  }
+  // De-dupe by element (an element can appear once per document tree).
+  const byEl = new Map<Element, FrameCandidate>()
+  for (const candidate of all) if (!byEl.has(candidate.el)) byEl.set(candidate.el, candidate)
 
-  candidates.sort((a, b) => {
-    const ra = rectOf(a.el, a.offset)
-    const rb = rectOf(b.el, b.offset)
-    return ra.width * ra.height - rb.width * rb.height
-  })
+  const rects = [...byEl.values()].map((c, i) => ({
+    el: c.el,
+    offset: c.offset,
+    rect: rectOf(c.el, c.offset),
+    key: `${c.el.tagName.toLowerCase()}-${i}`,
+  }))
 
-  const picked = candidates.slice(0, ANNOTATION_MARQUEE_MAX_ELEMENTS)
-  if (picked.length === 0) {
-    regions.push({ id: freshId("region"), rect })
-    return
-  }
-  for (const candidate of picked) {
+  // harvestMarquee (shared pure helper): centers-inside region, ascending area,
+  // capped at ANNOTATION_MARQUEE_MAX_ELEMENTS. MarqueeCandidate needs id/rect/area.
+  const candidates = rects.map((c) => ({ id: c.key, rect: c.rect, area: c.rect.width * c.rect.height }))
+  const picked = harvestMarquee(rect, candidates, ANNOTATION_MARQUEE_MAX_ELEMENTS)
+
+  for (const p of picked) {
+    const match = rects.find((r) => r.key === p.id)
+    if (!match) continue
     const id = freshId("el")
-    selected.set(id, { id, el: candidate.el, offset: candidate.offset, baseline: new Map() })
+    selected.set(id, { id, el: match.el, offset: match.offset, baseline: new Map() })
+  }
+
+  // REGION_COEXISTS_WITH_ELEMENTS (default true): always record a region so a
+  // blank-area drag is never a no-op. Legacy mode: only when zero candidates.
+  if (REGION_COEXISTS_WITH_ELEMENTS || picked.length === 0) {
+    regions.push({ id: freshId("region"), rect })
   }
 }
 
-/** Smooths the raw pointer trail with midpoint quadratic curves so strokes
- * don't look faceted at typical mouse sampling rates. */
-function strokePathD(points: Array<{ x: number; y: number }>): string {
-  if (points.length === 0) return ""
-  if (points.length < 3) return `M ${points[0]!.x} ${points[0]!.y} L ${points.at(-1)!.x} ${points.at(-1)!.y}`
-  let d = `M ${points[0]!.x} ${points[0]!.y}`
-  for (let i = 1; i < points.length - 1; i++) {
-    const p1 = points[i]!
-    const p2 = points[i + 1]!
-    const midX = (p1.x + p2.x) / 2
-    const midY = (p1.y + p2.y) / 2
-    d += ` Q ${p1.x} ${p1.y} ${midX} ${midY}`
-  }
-  const last = points.at(-1)!
-  d += ` L ${last.x} ${last.y}`
-  return d
-}
-
+/** Stroke bounding box (shared helper strokeBounds could also be used; kept
+ * local because it runs on every move in the live draw path). */
 function boundsOf(points: Array<{ x: number; y: number }>, strokeWidth: number): AnnotationRect {
   const xs = points.map((p) => p.x)
   const ys = points.map((p) => p.y)
@@ -584,7 +629,15 @@ const STROKE_WIDTH = 3
 
 function finishDraw(points: Array<{ x: number; y: number }>) {
   if (points.length < 2) return
-  strokes.push({ id: freshId("stroke"), color: STROKE_COLOR, width: STROKE_WIDTH, points, bounds: boundsOf(points, STROKE_WIDTH) })
+  const decimated = decimateStroke(points, 2)
+  if (decimated.length < 2) return
+  strokes.push({
+    id: freshId("stroke"),
+    color: STROKE_COLOR,
+    width: STROKE_WIDTH,
+    points: decimated,
+    bounds: boundsOf(decimated, STROKE_WIDTH),
+  })
 }
 
 function rectsIntersectPoint(rect: AnnotationRect, x: number, y: number): boolean {
@@ -675,24 +728,56 @@ function unionCrop(): AnnotationRect | null {
     ...regions.map((r) => r.rect),
     ...strokes.map((s) => s.bounds),
   ]
-  if (rects.length === 0) return null
-
-  const left = Math.min(...rects.map((r) => r.x))
-  const top = Math.min(...rects.map((r) => r.y))
-  const right = Math.max(...rects.map((r) => r.x + r.width))
-  const bottom = Math.max(...rects.map((r) => r.y + r.height))
-
-  const x = Math.max(0, left - ANNOTATION_CROP_PADDING_PX)
-  const y = Math.max(0, top - ANNOTATION_CROP_PADDING_PX)
-  const maxRight = Math.min(window.innerWidth, right + ANNOTATION_CROP_PADDING_PX)
-  const maxBottom = Math.min(window.innerHeight, bottom + ANNOTATION_CROP_PADDING_PX)
-  return { x, y, width: Math.max(1, maxRight - x), height: Math.max(1, maxBottom - y) }
+  // Shared pure helper: union + pad + clamp to viewport (host re-validates).
+  // CropTarget = { rect }, so map each rect into that shape.
+  return unionCropRect(
+    rects.map((r) => ({ rect: r })),
+    { width: window.innerWidth, height: window.innerHeight },
+    ANNOTATION_CROP_PADDING_PX,
+  )
 }
 
-function submit(submission: AnnotationSubmission) {
-  const elements = [...selected.values()].map(elementContext)
-  // Fill in the selector now that we have full element context, matching the
-  // "selector: null until element context is captured" note in the handoff.
+/** Capture ONE selected element's structured record. DOM-derived fields are
+ * built synchronously and always succeed; the enriched React/source metadata
+ * read is wrapped so a throw on one hostile target omits ONLY that target's
+ * enriched fields and keeps its DOM-derived fields — never rejects the whole
+ * session. */
+async function captureElement(target: SelectedTarget): Promise<AnnotationElementContext> {
+  const base = {
+    id: target.id,
+    tagName: target.el.tagName.toLowerCase(),
+    selector: computeSelector(target.el),
+    htmlPreview: boundedHtmlPreview(target.el),
+    styles: boundedStyles(target.el),
+    rect: rectOf(target.el, target.offset),
+  }
+  try {
+    const react = reactComponentContext(target.el)
+    return { ...base, componentName: react.componentName, source: react.source }
+  } catch {
+    return { ...base, componentName: null, source: null }
+  }
+}
+
+let submitting = false
+
+async function submit(submission: AnnotationSubmission) {
+  if (submitting) return
+  submitting = true
+
+  // CAPTURE ORDERING (per contracts/invariants #5 — DO NOT REORDER):
+  // 1. capture element records at SUBMIT time (not at click time) so hover
+  //    latency stays flat, via Promise.all(...) with per-target fault isolation;
+  // 2. hide EDITOR CHROME ONLY (toolbar, comment box, hover outline) while
+  //    LEAVING selection outlines, region boxes, ink VISIBLE and LEAVING
+  //    temporary CSS APPLIED;
+  // 3. send payload + crop;
+  // 4. WAIT for the host's capture-complete ack (ANNOTATION_CAPTURED_CHANNEL);
+  // 5. THEN (and only then) restore baselines and tear down.
+  // Restoring CSS or removing marks BEFORE the ack produces a screenshot that
+  // does not show what the user asked for.
+  const elements = await Promise.all([...selected.values()].map(captureElement))
+
   const finalStyleChanges = styleChanges.map((change) => {
     const target = selected.get(change.targetId)
     return target ? { ...change, selector: computeSelector(target.el) } : change
@@ -713,8 +798,8 @@ function submit(submission: AnnotationSubmission) {
     createdAt: new Date().toISOString(),
   }
 
-  // Hide chrome (toolbar/comment/style panel) but keep outlines/ink visible —
-  // the capture should show the annotated marks, not the tool controls.
+  // Hides ONLY the editor chrome (toolbar + comment box + hover outline) — the
+  // marks and any temporary CSS stay in place for the capture.
   setChromeVisible(false)
   ipcRenderer.send(ANNOTATION_PICKED_CHANNEL, payload)
 }
@@ -722,6 +807,8 @@ function submit(submission: AnnotationSubmission) {
 // main acks once capture has settled (success or failure) — only then is it
 // safe to restore baselines, since main may still be reading live styles.
 ipcRenderer.on(ANNOTATION_CAPTURED_CHANNEL, () => {
+  if (!active) return
+  submitting = false
   restoreAndTeardown()
 })
 
@@ -749,39 +836,66 @@ function scheduleRender() {
 }
 
 function setChromeVisible(visible: boolean) {
+  chromeHidden = !visible
   if (toolbarEl) toolbarEl.style.display = visible ? "flex" : "none"
+  if (commentBarEl) commentBarEl.style.display = visible ? "flex" : "none"
   if (stylePanelEl) stylePanelEl.style.display = visible && selected.size > 0 ? "flex" : "none"
+  // Hover outline is editor chrome too — keep it out of the crop shot, but the
+  // persistent selection/region boxes and ink stay visible (they are the mark).
+  hover = null
 }
 
 function applyThemeClass() {
   host?.classList.toggle("dark", theme === "dark")
 }
 
-function box(rect: AnnotationRect, kind: string): HTMLDivElement {
+function box(rect: AnnotationRect, kind: string, label?: string): HTMLDivElement {
   const el = document.createElement("div")
   el.className = `box ${kind}`
   el.style.left = `${rect.x}px`
   el.style.top = `${rect.y}px`
   el.style.width = `${rect.width}px`
   el.style.height = `${rect.height}px`
+  if (label) {
+    const chip = document.createElement("span")
+    chip.className = "chip"
+    chip.textContent = label
+    el.appendChild(chip)
+  }
   return el
+}
+
+/** Compact label for a hover/selection target: component name when React
+ * metadata is available (dev builds), otherwise the tag name. The annotation is
+ * fully useful with either — Phase-1 degradation (ADR-001) is acceptable. */
+function labelFor(el: Element): string {
+  const react = reactComponentContext(el)
+  return react.componentName ?? el.tagName.toLowerCase()
 }
 
 function render() {
   if (!active || !outlineLayer || !drawSvg) return
-  outlineLayer.replaceChildren()
+  const layer = outlineLayer
+  layer.replaceChildren()
 
-  if (hover && tool !== "marquee" && ![...selected.values()].some((t) => t.el === hover!.el)) {
-    outlineLayer.appendChild(box(rectOf(hover.el, hover.offset), "hover"))
+  // Hover outline + compact label chip (editor chrome; hidden at submit).
+  if (hover && tool !== "marquee" && !chromeHidden && ![...selected.values()].some((t) => t.el === hover!.el)) {
+    layer.appendChild(box(rectOf(hover.el, hover.offset), "hover", labelFor(hover.el)))
   }
-  for (const target of selected.values()) outlineLayer.appendChild(box(rectOf(target.el, target.offset), "selected"))
-  for (const region of regions) outlineLayer.appendChild(box(region.rect, "region"))
-  if (marqueeRect) outlineLayer.appendChild(box(marqueeRect, "marquee"))
+  // Persistent selection boxes carry a NUMBERED chip so selection state is
+  // conveyed by outline PLUS number, never by color alone (a11y).
+  const selectedEntries = [...selected.values()]
+  selectedEntries.forEach((target, index) => {
+    const b = box(rectOf(target.el, target.offset), "selected", String(index + 1))
+    layer.appendChild(b)
+  })
+  for (const region of regions) layer.appendChild(box(region.rect, "region"))
+  if (marqueeRect) layer.appendChild(box(marqueeRect, "marquee"))
 
   drawSvg.replaceChildren()
   const renderStroke = (points: Array<{ x: number; y: number }>) => {
     const path = document.createElementNS("http://www.w3.org/2000/svg", "path")
-    path.setAttribute("d", strokePathD(points))
+    path.setAttribute("d", smoothStrokePath(points))
     path.setAttribute("stroke", STROKE_COLOR)
     path.setAttribute("stroke-width", String(STROKE_WIDTH))
     path.setAttribute("fill", "none")
@@ -815,6 +929,8 @@ function buildToolbar() {
     button.type = "button"
     button.textContent = `${entry.label} (${entry.key})`
     button.dataset.tool = entry.tool
+    button.setAttribute("aria-pressed", entry.tool === tool ? "true" : "false")
+    button.setAttribute("aria-label", `${entry.label} tool`)
     button.onclick = () => setTool(entry.tool)
     toolGroup.appendChild(button)
   }
@@ -852,6 +968,7 @@ function buildToolbar() {
   sendButton.onclick = () => submit("send")
   commentBar.appendChild(sendButton)
 
+  commentBarEl = commentBar
   shadow.appendChild(commentBar)
 
   stylePanelEl = document.createElement("div")
@@ -868,14 +985,22 @@ function renderToolbar() {
   if (!toolbarEl) return
   for (const button of toolbarEl.querySelectorAll<HTMLButtonElement>("button[data-tool]")) {
     button.classList.toggle("active", button.dataset.tool === tool)
+    button.setAttribute("aria-pressed", button.dataset.tool === tool ? "true" : "false")
   }
 }
 
-const STYLE_FIELDS: Array<{ property: StyleProperty; label: string; kind: "text" | "color" }> = [
+const STYLE_FIELDS: Array<{ property: StyleProperty; label: string; kind: "text" | "color" | "number" }> = [
+  { property: "font-family", label: "Font family", kind: "text" },
   { property: "font-size", label: "Font size", kind: "text" },
+  { property: "font-weight", label: "Font weight", kind: "text" },
+  { property: "line-height", label: "Line height", kind: "text" },
   { property: "color", label: "Text color", kind: "color" },
   { property: "background-color", label: "Background", kind: "color" },
+  { property: "opacity", label: "Opacity", kind: "number" },
   { property: "border-radius", label: "Radius", kind: "text" },
+  { property: "border-color", label: "Border color", kind: "color" },
+  { property: "border-width", label: "Border width", kind: "text" },
+  { property: "border-style", label: "Border style", kind: "text" },
   { property: "padding", label: "Padding", kind: "text" },
   { property: "margin", label: "Margin", kind: "text" },
   { property: "gap", label: "Gap", kind: "text" },
@@ -969,4 +1094,50 @@ const STYLE_SHEET = `
   .style-panel label { flex: 1; color: #a1a1aa; }
   .style-panel input[type="text"] { width: 72px; background: rgba(255,255,255,0.06); border: 1px solid #3f3f46; border-radius: 4px; color: inherit; font: inherit; padding: 3px 6px; }
   .style-panel input[type="color"] { width: 28px; height: 20px; border: none; background: none; padding: 0; }
+
+  /* Compact label chip — component name when known, else tag name. Rendered on
+  the top-left of each box so the marked target is identified even when the box
+  border is hard to see against the page. */
+  .box .chip {
+    position: absolute;
+    left: -1px;
+    top: -18px;
+    font: 600 11px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    line-height: 1.4;
+    padding: 1px 6px;
+    border-radius: 4px;
+    background: #f97316;
+    color: #18181b;
+    white-space: nowrap;
+    max-width: 320px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .box.hover .chip { background: rgba(249, 115, 22, 0.85); }
+  /* Selection uses a NUMBERED chip (outline PLUS number — never color alone). */
+  .box.selected .chip { background: #18181b; color: #f4f4f5; border: 1px solid #f97316; }
+
+  /* Visible focus rings that survive BOTH light and dark page backgrounds:
+  a high-contrast double ring (light outer halo + dark inner) so the focused
+  control is always distinguishable from the page regardless of its color. */
+  .toolbar button:focus-visible, .comment-bar button:focus-visible, .style-panel button:focus-visible,
+  .comment-bar textarea:focus-visible, .style-panel input:focus-visible {
+    outline: 2px solid #0b0b0c;
+    outline-offset: 2px;
+    box-shadow: 0 0 0 4px rgba(255, 255, 255, 0.9);
+  }
+  :host(.dark) .toolbar button:focus-visible, :host(.dark) .comment-bar button:focus-visible,
+  :host(.dark) .style-panel button:focus-visible, :host(.dark) .comment-bar textarea:focus-visible,
+  :host(.dark) .style-panel input:focus-visible {
+    outline-color: #f4f4f5;
+    box-shadow: 0 0 0 4px rgba(0, 0, 0, 0.9);
+  }
+
+  /* Respect reduced-motion: drop transitions/animations inside the overlay. */
+  @media (prefers-reduced-motion: reduce) {
+    .box, .toolbar, .comment-bar, .style-panel, .toolbar button, .comment-bar button, .style-panel button {
+      transition: none !important;
+      animation: none !important;
+    }
+  }
 `

@@ -15,7 +15,7 @@ import { checkAppExists, resolveAppPath } from "./apps"
 import { CHANNEL } from "./constants"
 import { registerIpcHandlers, sendDeepLinks, sendMenuCommand } from "./ipc"
 import { forwardInitializationFailure } from "./initialization"
-import { exportDebugLogs, initCrashReporter, initLogging, startNetLog, write as writeLog } from "./logging"
+import { exportDebugLogs, initCrashReporter, initLogging, netLogEnabled, startNetLog, write as writeLog } from "./logging"
 import { createMenu } from "./menu"
 import {
   finishFirstLaunchOnboarding,
@@ -51,6 +51,7 @@ import { startBackgroundCli } from "./background-cli"
 import { setNativeTranslations } from "./native-translations"
 import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
 import { registerBrowserIpcHandlers } from "./ipc"
+import { RendererTrust } from "./browser/renderer-trust"
 import { wireWebviewHardening } from "./windows"
 const APP_NAMES: Record<string, string> = {
   dev: "OpenCode Dev",
@@ -330,20 +331,28 @@ const main = Effect.gen(function* () {
       error: (message, meta) => writeLog("browser", message, meta as Record<string, unknown>, "error"),
     },
   })
-  registerBrowserIpcHandlers(browserEngine)
+  const rendererTrust = new RendererTrust()
+  for (const win of BrowserWindow.getAllWindows()) rendererTrust.register(win.webContents)
+  app.on("browser-window-created", (_event, win) => {
+    rendererTrust.register(win.webContents)
+    win.webContents.once("destroyed", () => rendererTrust.unregister(win.webContents.id))
+  })
+  registerBrowserIpcHandlers(browserEngine, rendererTrust)
   if (updater) {
     void updater.start()
     const updateTimer = setInterval(() => void updater.check(), 10 * 60 * 1000)
     updateTimer.unref()
     app.once("will-quit", () => clearInterval(updateTimer))
   }
-  yield* Effect.promise(() => startNetLog()).pipe(
-    Effect.catch((error) =>
-      Effect.sync(() => {
-        logger.warn("failed to start net log", error)
-      }),
-    ),
-  )
+  if (netLogEnabled()) {
+    yield* Effect.promise(() => startNetLog()).pipe(
+      Effect.catch((error) =>
+        Effect.sync(() => {
+          logger.warn("failed to start net log", error)
+        }),
+      ),
+    )
+  }
   // Show a window as soon as we can instead of blocking on the sidecar (backend
   // process spawn + up-to-30s health-check poll below). The renderer's own
   // LoadingSplash already awaits `serverReady` via the `awaitInitialization` IPC
@@ -378,6 +387,11 @@ const main = Effect.gen(function* () {
       const daemonInstanceID = yield* Effect.promise(() => handshake.discover(sidecar.url))
       if (daemonInstanceID) handshake.publish(sidecar.url, daemonInstanceID)
       else logger.warn("v2 sidecar did not report an instance identity; mobile PWA dev proxy will stay unbound")
+      // Off the critical path: nothing the desktop does depends on this token.
+      void handshake.ensureAgentToken(sidecar.url, {
+        username: sidecar.username ?? "opencode",
+        password: sidecar.password ?? "",
+      })
       yield* Deferred.succeed(serverReady, readyData)
       if (process.platform === "win32") {
         void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
@@ -433,8 +447,24 @@ const main = Effect.gen(function* () {
           spawnLocalServer(hostname, p, password, {
             userDataPath: app.getPath("userData"),
             env: handshake.env,
-            onStdout: (message) => writeLog("server", "stdout", { message }),
-            onStderr: (message) => writeLog("server", "stderr", { message }, "warn"),
+            onStdout: (message) => {
+              // One electron-log entry per line, with the server line as the
+              // message itself. Passing it wrapped as `{ message }` meta is
+              // what produced the multi-line `> stderr { message: ... }` dump,
+              // and pairing writeLog with an extra console.log is what echoed
+              // every line twice. electron-log's console transport already
+              // prints in dev (`[desktop] ... (server) > ...`), file always.
+              for (const line of message.split("\n")) {
+                const trimmed = line.trim()
+                if (trimmed) writeLog("server", trimmed)
+              }
+            },
+            onStderr: (message) => {
+              for (const line of message.split("\n")) {
+                const trimmed = line.trim()
+                if (trimmed) writeLog("server", trimmed, undefined, "warn")
+              }
+            },
             onExit: (code) => writeLog("utility", "sidecar exited", { code }, "warn"),
           }),
         catch: (cause) => cause as unknown,
@@ -480,6 +510,8 @@ const main = Effect.gen(function* () {
     server = listener
     readyData = { url, username: "opencode", password }
     handshake.publish(url)
+    // Off the critical path: nothing the desktop does depends on this token.
+    void handshake.ensureAgentToken(url, { username: "opencode", password })
     yield* Deferred.succeed(serverReady, readyData)
     if (process.platform === "win32") {
       void wslServers.initialize().catch((error) => logger.error("wsl server initialization failed", error))
