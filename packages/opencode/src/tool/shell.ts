@@ -30,6 +30,15 @@ import { Identifier } from "@/id/id"
 import type { TaskPromptOps } from "./task"
 import { Scope } from "effect"
 import { rewriteBashHeredocsForPowerShell } from "@/util/powershell-heredoc"
+import { withShellSlot } from "./shell-concurrency"
+import { brotliCompress, brotliDecompress } from "node:zlib"
+import { promisify } from "node:util"
+
+// Async brotli for the output sidecar merge below: the sync variants block the
+// single event loop for the whole (de)compression of potentially megabytes of
+// tool output on every large tool completion.
+const brotliCompressAsync = promisify(brotliCompress)
+const brotliDecompressAsync = promisify(brotliDecompress)
 
 export { Parameters } from "./shell/prompt"
 
@@ -88,6 +97,55 @@ type Scan = {
 type Chunk = {
   text: string
   size: number
+}
+
+/**
+ * Bounded output window for streaming command output. Retains the most recent
+ * `keepBytes` (always keeping at least one chunk) so unbounded commands
+ * cannot grow memory without limit.
+ *
+ * Uses a head index instead of Array.shift(): shift() memmoves the entire
+ * backing store on every eviction, which is O(n²) over a long stream (a 10k
+ * chunk build/test log burns hundreds of ms of event-loop time in memmoves).
+ * The head index makes eviction O(1); the consumed prefix is reclaimed
+ * wholesale once it dominates the array.
+ */
+export interface ChunkWindow {
+  readonly cut: boolean
+  push(text: string): void
+  text(): string
+}
+
+export function makeChunkWindow(keepBytes: number): ChunkWindow {
+  const list: Chunk[] = []
+  let head = 0
+  let used = 0
+  let cut = false
+  return {
+    get cut() {
+      return cut
+    },
+    push(text: string) {
+      const size = Buffer.byteLength(text, "utf-8")
+      list.push({ text, size })
+      used += size
+      while (used > keepBytes && list.length - head > 1) {
+        used -= list[head]!.size
+        head++
+        cut = true
+      }
+      if (head > 1024 && head * 2 > list.length) {
+        list.splice(0, head)
+        head = 0
+      }
+    },
+    text() {
+      return list
+        .slice(head)
+        .map((item) => item.text)
+        .join("")
+    },
+  }
 }
 
 const resolveWasm = (asset: string) => {
@@ -523,11 +581,9 @@ export const ShellTool = Tool.define(
       ctx: Tool.Context,
     ) {
       const limits = yield* trunc.limits()
-      const keep = limits.maxBytes * 2
+      const window = makeChunkWindow(limits.maxBytes * 2)
       let full = ""
       let last = ""
-      const list: Chunk[] = []
-      let used = 0
       let file = ""
       let sink: ReturnType<typeof createWriteStream> | undefined
       let cut = false
@@ -576,10 +632,10 @@ export const ShellTool = Tool.define(
               let base = ""
               try {
                 const brData = await fs.readFile(target)
-                base = zlib.brotliDecompressSync(brData as unknown as Buffer).toString("utf-8")
+                base = (await brotliDecompressAsync(brData as unknown as Buffer)).toString("utf-8")
               } catch {}
               const combined = base + sidecarData
-              const compressed = zlib.brotliCompressSync(Buffer.from(combined, "utf-8"), {
+              const compressed = await brotliCompressAsync(Buffer.from(combined, "utf-8"), {
                 params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4, [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_TEXT },
               })
               await fs.writeFile(target, compressed)
@@ -598,22 +654,23 @@ export const ShellTool = Tool.define(
         },
       })
 
-      const code: number | null = yield* Effect.scoped(
-        Effect.gen(function* () {
-          yield* Effect.addFinalizer(closeSink)
-          const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
+      // Bound the number of concurrently RUNNING foreground commands
+      // process-wide (see shell-concurrency.ts): each session fans out
+      // parallel shell calls, and unbounded heavy children (tsc, test
+      // runners, builds) saturate every core until the sidecar event loop and
+      // the renderer starve. Queued commands still run; detached background
+      // launches (runBackground below) are intentionally NOT gated — they are
+      // few, long-lived, and user-visible, so they would squat slots forever.
+      const code: number | null = yield* withShellSlot(
+        Effect.scoped(
+          Effect.gen(function* () {
+            yield* Effect.addFinalizer(closeSink)
+            const handle = yield* spawner.spawn(cmd(input.shell, input.command, input.cwd, input.env))
 
           yield* Effect.forkScoped(
             Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-                cut = true
-              }
+              window.push(chunk)
+              if (window.cut) cut = true
 
               last = preview(last + chunk)
 
@@ -690,7 +747,8 @@ export const ShellTool = Tool.define(
           }
 
           return exit.kind === "exit" ? exit.code : null
-        }),
+          }),
+        ),
       ).pipe(Effect.orDie)
 
       const meta: string[] = []
@@ -700,7 +758,7 @@ export const ShellTool = Tool.define(
         )
       }
       if (aborted) meta.push("User aborted the command")
-      const raw = list.map((item) => item.text).join("")
+      const raw = window.text()
       const end = tail(raw, limits.maxLines, limits.maxBytes)
       if (end.cut) cut = true
       if (!file && end.cut) {
@@ -766,9 +824,7 @@ export const ShellTool = Tool.define(
       ctx: Tool.Context,
     ) {
       const limits = yield* trunc.limits()
-      const keep = limits.maxBytes * 2
-      const list: Chunk[] = []
-      let used = 0
+      const window = makeChunkWindow(limits.maxBytes * 2)
       let last = ""
       let sink: ReturnType<typeof createWriteStream> | undefined
       let timedOut = false
@@ -807,7 +863,7 @@ export const ShellTool = Tool.define(
       }
 
       const previewText = Effect.fnUntraced(function* () {
-        const raw = list.map((item) => item.text).join("")
+        const raw = window.text()
         const end = tail(raw, limits.maxLines, limits.maxBytes)
         return end.text || "(no output)"
       })
@@ -843,14 +899,7 @@ export const ShellTool = Tool.define(
 
           yield* Effect.forkScoped(
             Stream.runForEach(Stream.decodeText(handle.all), (chunk) => {
-              const size = Buffer.byteLength(chunk, "utf-8")
-              list.push({ text: chunk, size })
-              used += size
-              while (used > keep && list.length > 1) {
-                const item = list.shift()
-                if (!item) break
-                used -= item.size
-              }
+              window.push(chunk)
               last = preview(last + chunk)
               sink?.write(chunk)
               return Effect.void

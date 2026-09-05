@@ -475,7 +475,7 @@ const layer = Layer.effect(
             formatValidationError: tool.formatValidationError,
           }
         }),
-        { concurrency: "unbounded" },
+        { concurrency: 8 },
       )
     })
 

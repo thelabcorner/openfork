@@ -226,6 +226,23 @@ const fragmentFailureLLM = Layer.succeed(
 const fragmentFailureEnv = LayerNode.compile(root, [...replacements, [LLM.node, fragmentFailureLLM]])
 const itFragmentFailure = testEffect(fragmentFailureEnv)
 
+const coalesceLLM = Layer.succeed(
+  LLM.Service,
+  LLM.Service.of({
+    stream: () =>
+      Stream.make(
+        LLMEvent.stepStart({ index: 0 }),
+        LLMEvent.textStart({ id: "text-1" }),
+        ...Array.from({ length: 50 }, () => LLMEvent.textDelta({ id: "text-1", text: "x" })),
+        LLMEvent.textEnd({ id: "text-1" }),
+        LLMEvent.stepFinish({ index: 0, reason: "stop" }),
+        LLMEvent.finish({ reason: "stop" }),
+      ),
+  }),
+)
+const coalesceEnv = LayerNode.compile(root, [...replacements, [LLM.node, coalesceLLM]])
+const itCoalesce = testEffect(coalesceEnv)
+
 const boot = Effect.fn("test.boot")(function* () {
   const processors = yield* SessionProcessor.Service
   const session = yield* Session.Service
@@ -1165,6 +1182,58 @@ itFragmentFailure.live("session.processor effect tests retain partial legacy par
         expect(seen).toContain(MessageV2.Event.PartUpdated.type)
         expect(seen).toContain(Session.Event.Error.type)
         expect(seen.filter((type) => type.startsWith("session.next."))).toEqual([])
+      }),
+    { config: cfg },
+  ),
+)
+
+itCoalesce.live("session.processor effect tests coalesce rapid text deltas into fewer part delta events", () =>
+  provideTmpdirInstance(
+    (dir) =>
+      Effect.gen(function* () {
+        const { processors, session, provider } = yield* boot()
+        const events = yield* EventV2Bridge.Service
+
+        const chat = yield* session.create({})
+        const parent = yield* user(chat.id, "coalesce")
+        const msg = yield* assistant(chat.id, parent.id, path.resolve(dir))
+        const mdl = yield* provider.getModel(ref.providerID, ref.modelID)
+        const deltas: string[] = []
+        const off = yield* events.listen((event) => {
+          if (event.type === MessageV2.Event.PartDelta.type) {
+            deltas.push((event.data as { delta: string }).delta)
+          }
+          return Effect.void
+        })
+        const handle = yield* processors.create({ assistantMessage: msg, sessionID: chat.id, model: mdl })
+
+        const value = yield* handle.process({
+          user: {
+            id: parent.id,
+            sessionID: chat.id,
+            role: "user",
+            time: parent.time,
+            agent: parent.agent,
+            model: { providerID: ref.providerID, modelID: ref.modelID },
+          } satisfies SessionV1.User,
+          sessionID: chat.id,
+          model: mdl,
+          agent: agent(),
+          system: [],
+          messages: [{ role: "user", content: "coalesce" }],
+          tools: {},
+        })
+        yield* off
+
+        const parts = yield* MessageV2.parts(msg.id)
+        const text = parts.find((part): part is SessionV1.TextPart => part.type === "text")
+
+        expect(value).toBe("continue")
+        expect(text?.text).toBe("x".repeat(50))
+        // No content may be lost or reordered by coalescing.
+        expect(deltas.join("")).toBe("x".repeat(50))
+        // 50 provider chunks must not produce 50 publishes.
+        expect(deltas.length).toBeLessThan(50)
       }),
     { config: cfg },
   ),

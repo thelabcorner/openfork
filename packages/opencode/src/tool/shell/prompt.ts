@@ -55,13 +55,13 @@ function shellDisplayName(name: string) {
 function powershellNotes(name: string) {
   if (name === "pwsh") {
     return `# PowerShell (7+) shell notes
+- Bash heredocs (\`cmd - <<'EOF' ... EOF\`) are translated into PowerShell here-strings automatically for stdin-consuming commands (python, node, ruby, perl, bash, git, jq, and similar); the heredoc body stays literal, so escaping is not required.
 - This cross-platform shell supports pipeline chain operators (\`&&\` and \`||\`).
 - Use double quotes for interpolated strings (\`"Hello $name"\`), single quotes for verbatim strings.
 - Prefer full cmdlet names like \`Get-ChildItem\`, \`Set-Content\`, \`Remove-Item\`, and \`New-Item\` over aliases.
 - Use \`$(...)\` for subexpressions. Use \`@(...)\` for array expressions.
 - To call a native executable whose path contains spaces, use the call operator: \`& "path/to/exe" args\`.
-- Escape special characters with the PowerShell backtick character.
-- Bash-style quoted Python heredocs (\`python - <<'PY' ... PY\`) are translated automatically; use them when passing multiline scripts to Python.`
+- Escape special characters with the PowerShell backtick character.`
   }
   if (name === "powershell") {
     return `# Windows PowerShell (5.1) shell notes
@@ -71,7 +71,7 @@ function powershellNotes(name: string) {
 - Use \`$(...)\` for subexpressions. Use \`@(...)\` for array expressions.
 - To call a native executable whose path contains spaces, use the call operator: \`& "path/to/exe" args\`.
 - Escape special characters with the PowerShell backtick character.
-- Bash-style quoted Python heredocs (\`python - <<'PY' ... PY\`) are translated automatically; use them when passing multiline scripts to Python.`
+- Bash heredocs (\`cmd - <<'EOF' ... EOF\`) are translated into PowerShell here-strings automatically for stdin-consuming commands (python, node, ruby, perl, bash, git, jq, and similar); the heredoc body stays literal, so escaping is not required.`
   }
   return ""
 }

@@ -92,8 +92,25 @@ const layer = Layer.mergeAll(
             execute: (_args, ctx) =>
               Effect.gen(function* () {
                 yield* ctx.metadata({ metadata: { output: "first" } })
+                // Progress metadata is throttled (wall-clock): sleep past the
+                // window with a real timer — Effect.sleep would only advance
+                // the TestClock, not Date.now().
+                yield* Effect.promise(() => Bun.sleep(600))
                 yield* ctx.metadata({ metadata: { output: "second" } })
                 return { title: "timing", metadata: {}, output: "done" }
+              }),
+          } satisfies Tool.Def,
+          {
+            id: "burst",
+            description: "fires rapid metadata updates like a chatty shell",
+            parameters: Schema.Struct({}),
+            jsonSchema: { type: "object", properties: {} },
+            execute: (_args, ctx) =>
+              Effect.gen(function* () {
+                for (let index = 0; index < 20; index++) {
+                  yield* ctx.metadata({ metadata: { output: `chunk-${index}` } })
+                }
+                return { title: "burst", metadata: {}, output: "done" }
               }),
           } satisfies Tool.Def,
         ]),
@@ -173,5 +190,74 @@ it.effect("preserves running tool start time across metadata updates", () =>
     if (state.state.status === "running") {
       expect(state.state.time.start).toBe(100)
     }
+  }),
+)
+
+it.effect("coalesces rapid tool progress metadata updates", () =>
+  Effect.gen(function* () {
+    const seen: string[] = []
+    const running: SessionV1.ToolPart = {
+      id: partID,
+      sessionID,
+      messageID,
+      type: "tool",
+      tool: "burst",
+      callID,
+      state: { status: "running", input: {}, time: { start: 100 } },
+    }
+    const processor = {
+      message: {
+        id: messageID,
+        sessionID,
+        role: "assistant",
+        parentID: MessageID.ascending(),
+        agent: "build",
+        mode: "build",
+        path: { cwd: "/tmp", root: "/tmp" },
+        cost: 0,
+        tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+        modelID: ModelV2.ID.make("test-model"),
+        providerID: ProviderV2.ID.make("test"),
+        time: { created: 1 },
+      } satisfies SessionV1.Assistant,
+      updateToolCall: (_toolCallID: string, update: (_part: SessionV1.ToolPart) => SessionV1.ToolPart) =>
+        Effect.sync(() => {
+          const next = update(running)
+          running.state = next.state
+          if (next.state.status === "running" && "metadata" in next.state) {
+            seen.push(JSON.stringify((next.state as { metadata: unknown }).metadata))
+          }
+          return next
+        }),
+      completeToolCall: () => Effect.void,
+    } satisfies Pick<SessionProcessor.Handle, "message" | "updateToolCall" | "completeToolCall">
+
+    const tools = yield* SessionTools.resolve({
+      agent,
+      model,
+      session: { id: sessionID, permission: [] } as unknown as Session.Info,
+      processor,
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    })
+    const execute = tools.burst.execute
+    if (!execute) throw new Error("burst tool is missing execute")
+
+    yield* Effect.promise(() =>
+      execute(
+        {},
+        {
+          toolCallId: "burst-call",
+          abortSignal: new AbortController().signal,
+          messages: [],
+        },
+      ),
+    )
+
+    // 20 back-to-back progress updates on one call must not produce 20
+    // publishes; the leading update always goes through immediately.
+    expect(seen.length).toBeLessThan(20)
+    expect(seen[0]).toBe(JSON.stringify({ output: "chunk-0" }))
   }),
 )

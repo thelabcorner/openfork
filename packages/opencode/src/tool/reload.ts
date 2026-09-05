@@ -318,16 +318,25 @@ const layer = Layer.effect(
             ignoreCount: Ignore.PATTERNS.length,
           })
           const callback = bridge.bind((_error: Error | null, updates: ParcelWatcher.Event[]) => {
-            for (const update of updates) {
-              if (!isWatchedFile(dirs, update.path)) continue
-              const file = update.path
-              bridge.fork(
-                Effect.gen(function* () {
-                  yield* Ref.update(dirty, (set) => new Set(set).add(file))
-                  yield* Queue.offer(triggers, "watcher").pipe(Effect.ignore)
-                }),
-              )
-            }
+            // Parcel batches filesystem changes, but a checkout or generated
+            // tool tree can still contain thousands of entries. Fork once per
+            // native callback and update the dirty set in one pass; forking
+            // once per path turns a single watcher burst into a scheduler
+            // burst before the already-bounded trigger queue can coalesce it.
+            const files = new Set(
+              updates.filter((update) => isWatchedFile(dirs, update.path)).map((update) => update.path),
+            )
+            if (files.size === 0) return
+            bridge.fork(
+              Effect.gen(function* () {
+                yield* Ref.update(dirty, (set) => {
+                  const next = new Set(set)
+                  for (const file of files) next.add(file)
+                  return next
+                })
+                yield* Queue.offer(triggers, "watcher").pipe(Effect.ignore)
+              }),
+            )
           })
           const subscriptions: ParcelWatcher.AsyncSubscription[] = []
           yield* Effect.addFinalizer(() =>
@@ -347,7 +356,9 @@ const layer = Layer.effect(
             attempted: dirs.length,
           })
         } else {
-          yield* Effect.logWarning("tool reload watcher: native binding unavailable, falling back to poll", {
+          // Poll is a working fallback, not a failure: keep this at debug so
+          // every open project doesn't emit a warning on startup.
+          yield* Effect.logDebug("tool reload watcher: native binding unavailable, falling back to poll", {
             dirs: dirs.length,
           })
         }
