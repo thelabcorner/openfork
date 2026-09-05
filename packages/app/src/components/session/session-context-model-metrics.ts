@@ -1,4 +1,5 @@
 import type { AssistantMessage, Message, Part } from "@opencode-ai/sdk/v2/client"
+import { isFreeUsageCost, type SubsidyTokens } from "@/utils/usage-subsidy"
 
 type Provider = {
   id: string
@@ -43,6 +44,10 @@ export type ModelContextMetrics = {
   cacheWrite: number
   total: number
   cost: number
+  /** Exact $0 turns and their token bundle. Kept separate while aggregating so
+   * mixed paid/free histories never need to pro-rate tokens by message count. */
+  freeMessageCount: number
+  freeTokens: SubsidyTokens
   cacheHitPercent: number | null
   tokensPerSecond: number | null
   generatedSeconds: number
@@ -86,7 +91,14 @@ export type SessionModelBreakdown = {
   models: ModelContextMetrics[]
 }
 
-type Accumulator = ModelContextMetrics & { durationSeconds: number; durationTokens: number; ttftSum: number; ttftCount: number; upstreamTTFTSum: number; upstreamTTFTCount: number }
+type Accumulator = ModelContextMetrics & {
+  durationSeconds: number
+  durationTokens: number
+  ttftSum: number
+  ttftCount: number
+  upstreamTTFTSum: number
+  upstreamTTFTCount: number
+}
 
 const isAssistant = (msg: Message): msg is AssistantMessage => msg.role === "assistant"
 
@@ -253,7 +265,11 @@ export type LiveGenerationProgress = { generatedSeconds: number; toolSeconds: nu
  * before that the turn is still in TTFT/latency, not generation, so there's
  * nothing to report yet (both fields read 0 rather than something misleading).
  */
-export const liveGenerationProgress = (msg: AssistantMessage, parts: Part[] | undefined, now: number): LiveGenerationProgress => {
+export const liveGenerationProgress = (
+  msg: AssistantMessage,
+  parts: Part[] | undefined,
+  now: number,
+): LiveGenerationProgress => {
   const toolSeconds = toolExecutionSeconds(parts, now)
   if (msg.time.completed) return { generatedSeconds: 0, toolSeconds: 0 }
 
@@ -393,6 +409,8 @@ const emptyAccumulator = (msg: AssistantMessage, providers: Provider[]): Accumul
     cacheWrite: 0,
     total: 0,
     cost: 0,
+    freeMessageCount: 0,
+    freeTokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 },
     cacheHitPercent: null,
     tokensPerSecond: null,
     firstMessageTime: msg.time.created,
@@ -452,6 +470,14 @@ export function aggregateSessionContextByModel(
     entry.cacheWrite += msg.tokens.cache.write
     entry.total += tokenTotal(msg)
     entry.cost += msg.cost
+    if (isFreeUsageCost(msg.cost)) {
+      entry.freeMessageCount += 1
+      entry.freeTokens.input += msg.tokens.input
+      entry.freeTokens.output += msg.tokens.output
+      entry.freeTokens.reasoning += msg.tokens.reasoning
+      entry.freeTokens.cacheRead += msg.tokens.cache.read
+      entry.freeTokens.cacheWrite += msg.tokens.cache.write
+    }
     entry.firstMessageTime = Math.min(entry.firstMessageTime, msg.time.created)
     entry.lastMessageTime = Math.max(entry.lastMessageTime, msg.time.created)
 
@@ -468,7 +494,9 @@ export function aggregateSessionContextByModel(
     if (generated > 0) {
       const measured = measuredGenerationSeconds(parts[msg.id])
       const seconds =
-        measured > 0 && isPlausibleRate(generated, measured) ? measured : approximateGenerationSeconds(msg, parts[msg.id])
+        measured > 0 && isPlausibleRate(generated, measured)
+          ? measured
+          : approximateGenerationSeconds(msg, parts[msg.id])
       if (seconds > 0 && isPlausibleRate(generated, seconds)) {
         entry.durationSeconds += seconds
         entry.durationTokens += generated

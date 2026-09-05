@@ -206,6 +206,7 @@ export const dict = {
   "command.session.rename": "Rename session",
   "command.session.rename.title": "Rename session",
   "command.session.rename.placeholder": "Session name",
+  "command.session.move": "Change project",
   "command.session.pin": "Pin session",
   "command.session.unpin": "Unpin session",
   "command.session.find": "Find in session",
@@ -1187,6 +1188,8 @@ export const dict = {
   "context.metric.ttft": "Time to First Token",
   "context.metric.upstreamTTFT": "Provider TTFT",
   "context.metric.cacheSavings": "Cache Savings",
+  "context.metric.freeValue": "Free Value",
+  "context.metric.freeShare": "Free Share",
 
   "context.tooltip.cacheHit":
     "Share of prompt tokens served from cache: cache reads ÷ (cache reads + fresh input tokens). Shown as unavailable when neither value has been recorded.",
@@ -1202,6 +1205,9 @@ export const dict = {
     "Average time from provider HTTP request dispatch to first visible token arrival. Isolates provider-side latency from client-side request preparation overhead.",
   "context.tooltip.cacheSavings":
     "Estimated money saved by cache hits, compared to billing those same tokens at the fresh-input rate. Doesn't subtract the cost of writing to the cache in the first place — that's shown separately as Cache Write.",
+  "context.tooltip.freeValue":
+    "Estimated market value of turns billed at $0, using the model's published rate or the closest priced model match.",
+  "context.tooltip.freeShare": "Share of this session's total paid plus free value that was received at no charge.",
 
   "context.tokens.title": "Token Composition",
 
@@ -1215,6 +1221,7 @@ export const dict = {
   "context.cost.unavailable": "No published rate card is available for the models used in this session.",
   "context.cost.estimatedTotal": "Estimated Total",
   "context.cost.billedTotal": "Billed Total",
+  "context.cost.freeValue": "Free Value Received",
   "context.cost.partial": "Estimated for {{available}} of {{total}} models — rates unavailable for the rest.",
   "context.cost.rateCard": "Rate Card",
 
@@ -1291,6 +1298,9 @@ export const dict = {
 
   "toast.session.rename.success.title": "Session renamed",
   "toast.session.rename.failed.title": "Failed to rename session",
+
+  "toast.session.move.success.title": "Session moved",
+  "toast.session.move.failed.title": "Failed to move session",
 
   "toast.session.pin.success.title": "Session pinned",
   "toast.session.unpin.success.title": "Session unpinned",
@@ -1935,6 +1945,7 @@ export const dict = {
   "sessionGroup.ungroup": "Ungroup all sessions",
   "sessionGroup.ungroup.description": "Remove all sessions from this group",
   "sessionGroup.addTo": "Add to group",
+  "sessionGroup.addTo.description": "Choose another group for this session",
   "sessionGroup.addTo.existing": "Add to existing group",
   "sessionGroup.addTo.new": "New group with this session",
   "sessionGroup.removeFrom": "Remove from group",
@@ -1947,10 +1958,13 @@ export const dict = {
   "sessionGroup.sessions.zero": "No sessions",
   "sessionGroup.sessions.one": "1 session",
   "sessionGroup.sessions.other": "{{count}} sessions",
+  "sessionGroup.working": "Working sessions",
+  "sessionGroup.locked": "Locked membership",
 
   "groupTab.switchSessions": "Switch sessions",
   "groupTab.addSession": "Add session",
   "groupTab.removeSession": "Remove from group",
+  "groupTab.lockedMembership": "This subagent stays with its parent group so it remains reachable.",
   "groupTab.noSessions": "No sessions in this group",
   "groupTab.keyboardHint": "Use ↑↓ to switch sessions",
 

@@ -29,9 +29,11 @@ describe("server stream liveness", () => {
     try {
       markServerStreamLive("sidecar")
       expect(isServerStreamLive("sidecar")).toBe(true)
-      // The 10s SSE heartbeat re-marks within the 15s window; an un-refreshed
+      // The 10s SSE heartbeat re-marks within the 20s window; an un-refreshed
       // entry must not stay live forever.
-      now += 16_000
+      now += 19_000
+      expect(isServerStreamLive("sidecar")).toBe(true)
+      now += 2_000
       expect(isServerStreamLive("sidecar")).toBe(false)
     } finally {
       Date.now = original

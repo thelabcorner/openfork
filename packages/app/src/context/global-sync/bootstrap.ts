@@ -127,6 +127,17 @@ async function runAllLimited(
   return results
 }
 
+async function resolveSessionsLimited(ids: readonly string[], resolve: (sessionID: string) => Promise<unknown>) {
+  const unique = [...new Set(ids)].filter(Boolean)
+  if (unique.length === 0) return
+  const settled = await runAllLimited(
+    unique.map((sessionID) => () => resolve(sessionID)),
+    4,
+  )
+  const failed = settled.find((result): result is PromiseRejectedResult => result.status === "rejected")
+  if (failed) throw failed.reason
+}
+
 function showErrors(input: {
   errors: unknown[]
   title: string
@@ -264,13 +275,11 @@ function warmSessions(input: {
   const known = new Set(input.store.session.map((item) => item.id))
   const ids = [...new Set(input.ids)].filter((id) => !!id && !known.has(id))
   if (ids.length === 0) return Promise.resolve()
-  return Promise.all(
-    ids.map((sessionID) =>
-      retry(() => input.api.get({ sessionID })).then((session) =>
-        mergeSession(input.setStore, normalizeSessionInfo(session)),
-      ),
+  return resolveSessionsLimited(ids, (sessionID) =>
+    retry(() => input.api.get({ sessionID })).then((session) =>
+      mergeSession(input.setStore, normalizeSessionInfo(session)),
     ),
-  ).then(() => undefined)
+  )
 }
 
 export const loadProvidersQuery = (
@@ -480,8 +489,8 @@ export async function bootstrapDirectory(input: {
             for (const [sessionID, status] of Object.entries(statuses)) {
               input.session.set("session_status", sessionID, reconcile(status))
             }
-            await Promise.all(
-              Object.keys(statuses).map((sessionID) => input.session!.resolve(sessionID).catch(() => undefined)),
+            await resolveSessionsLimited(Object.keys(statuses), (sessionID) =>
+              input.session!.resolve(sessionID).catch(() => undefined),
             )
           })(),
         ),
@@ -529,7 +538,7 @@ export async function bootstrapDirectory(input: {
               permissions.filter((permission) => !!permission.id && !!permission.sessionID),
             )
             const warm = input.session
-              ? Promise.all(ids.map((sessionID) => input.session!.resolve(sessionID))).then(() => undefined)
+              ? resolveSessionsLimited(ids, (sessionID) => input.session!.resolve(sessionID))
               : warmSessions({ ids, store: input.store, setStore: input.setStore, api: input.api.session })
             return warm.then(() =>
               batch(() => {
@@ -565,7 +574,7 @@ export async function bootstrapDirectory(input: {
               questions.filter((question) => !!question.id && !!question.sessionID) as QuestionRequest[],
             )
             const warm = input.session
-              ? Promise.all(ids.map((sessionID) => input.session!.resolve(sessionID))).then(() => undefined)
+              ? resolveSessionsLimited(ids, (sessionID) => input.session!.resolve(sessionID))
               : warmSessions({ ids, store: input.store, setStore: input.setStore, api: input.api.session })
             return warm.then(() =>
               batch(() => {

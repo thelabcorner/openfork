@@ -15,6 +15,7 @@ import type { GroupTab } from "@/context/tabs"
 import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
 import { sessionApiOf } from "./titlebar-tab-actions"
 import { tabSessionState } from "./titlebar-tab-state"
+import { useSessionGroups } from "@/context/session-groups"
 import { TabPreviewPopover, type TabPreviewData } from "./titlebar-tab-popover"
 import "./titlebar-tab-nav.css"
 
@@ -52,11 +53,18 @@ export function TabNavItem(props: {
   }
   const global = useGlobal()
   const language = useLanguage()
+  const sessionGroups = useSessionGroups()
   const serverCtx = createMemo(() => {
     const conn = global.servers.list().find((item) => ServerConnection.key(item) === props.server)
     if (conn) return global.ensureServerCtx(conn)
   })
   const sessionID = createMemo(() => props.session()?.id)
+  const groupSessions = createMemo(() => {
+    const id = sessionID()
+    if (!id) return undefined
+    const group = sessionGroups.groupForSession(id)
+    return group?.sessions.map((session) => ({ title: session.title }))
+  })
   // Derivation lives in titlebar-tab-state: working from session_working(id),
   // paused from the session_paused sidecar (never from !session_working — the
   // interrupt-cleanup window would flicker paused -> working -> paused).
@@ -368,7 +376,7 @@ export function TabNavItem(props: {
   return (
     <TabPreviewPopover
       trigger={tab}
-      open={popoverOpen() && !previewBlocked()}
+      open={popoverOpen() && !previewBlocked() && !!groupSessions()?.length}
       onOpenChange={(value) => {
         if (value && previewBlocked()) return
         setPopoverOpen(value)
@@ -378,6 +386,7 @@ export function TabNavItem(props: {
         title: props.session()?.title,
         path: previewPath(),
         serverName: serverLabel(),
+        groupSessions: groupSessions(),
       }}
     />
   )

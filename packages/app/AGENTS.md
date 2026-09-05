@@ -18,14 +18,24 @@ which spawns the opencode **sidecar** backend) and `pwa` (`bun --cwd ../mobile d
   `TypeError: api.subscribe is not a function` because the Electron preload bridge is absent.
 - `:3301` is the **mobile PWA pairing client**, not the desktop UI. It shows a "Pair this device"
   QR screen. Do not use it to verify desktop UI changes.
-- `:3301` proxies the `API_PREFIXES` (see `packages/mobile/vite.config.ts`) to the sidecar, whose URL
+- `:3301` forwards the `API_PREFIXES` (see `packages/mobile/vite.config.ts`) to the sidecar, whose URL
   it reads from `packages/mobile/.opencode-dev-handshake.json`. The proxy first asks the candidate
   server for `/instance/identity` and requires the exact random instance id minted by the matching
-  desktop launch; it refuses stale, recycled, foreign, outdated, or unmanaged ports.
-- If `/quota/providers` (or any API prefix) on `:3301` returns **503 `DesktopSidecarUnavailableError`**,
-  the Electron half is not running or has not completed the identity handshake. The handshake file will be
-  missing or invalid. Fix that by getting the desktop
-  app running — do NOT start a standalone backend to work around it.
+  desktop launch; it refuses stale, recycled, foreign, outdated, or unmanaged ports. It then puts that
+  id in `x-opencode-expect-instance` on every forwarded request, and the server itself answers **409
+  `InstanceMismatchError`** if it is not that process — so the guarantee does not depend on the port
+  still belonging to whoever answered the probe.
+- The forwarding is `packages/mobile/dev/proxy.ts`, **not** Vite's `server.proxy`. Vite proxies with
+  `http-proxy`, which cannot choose a target per request; an earlier version passed the verified URL
+  through a `router` option that only `http-proxy-middleware` has, so it was silently ignored and every
+  API call went to the placeholder target and returned an empty `500`. `dev/proxy.test.ts` runs the real
+  middleware between two real HTTP servers so that class of failure cannot return unnoticed.
+- Check the binding directly with **`curl -s localhost:3301/__opencode/dev-target`** — it reports
+  `bound`, the instance id, and, when unbound, the reason and the fix.
+- If any API prefix on `:3301` returns **503 `DesktopSidecarUnavailableError`**, the Electron half is not
+  running or has not completed the identity handshake, and the handshake file will be missing or invalid.
+  A **502 `DesktopSidecarProxyError`** means it verified fine and then died. Fix either by getting the
+  desktop app running — do NOT start a standalone backend to work around it.
 - `opencode dev web` proxies `https://app.opencode.ai`, so local UI/CSS changes will not show there.
 
 ### NEVER do this (this has burned real debugging time)
@@ -79,7 +89,43 @@ powershell.exe -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object
 
 # the authoritative, identity-bearing handshake (missing => sidecar is down)
 cat packages/mobile/.opencode-dev-handshake.json
+
+# which backend :3301 is bound to, and why not, if it is not
+curl -s localhost:3301/__opencode/dev-target
 ```
+
+### Verifying authenticated endpoints
+
+The sidecar's master password is generated per launch and never written down, so
+without a credential every probe from outside the app returns `401` and tells you
+nothing. That is how a fully dead dev proxy once passed review: status codes
+matched, and nobody could open a session to find out otherwise.
+
+So the desktop pairs itself one device on startup and stores the token in
+**`packages/mobile/.opencode-dev-agent-token.json`** (gitignored, dev-only,
+never created in a packaged build). It is minted **once** and reused across every
+restart — it is only re-minted if the device is forgotten or the database is
+reset. Use it:
+
+```sh
+# GET through the dev proxy AND straight at the sidecar, then compare
+bun packages/mobile/dev/probe.ts "/session?limit=3"
+bun packages/mobile/dev/probe.ts "/session/<id>/message?limit=2"
+
+# or by hand
+TOKEN=$(node -p "require('./packages/mobile/.opencode-dev-agent-token.json').token")
+curl -s -H "Authorization: Basic $(printf 'device:%s' "$TOKEN" | base64 -w0)" localhost:3301/session
+```
+
+On Git Bash / MSYS, **export `MSYS_NO_PATHCONV=1` first** — otherwise a bare
+`/config` is rewritten into `C:/Program Files/Git/config` before it ever reaches
+the script, and the probe reports a connection failure for a path you never
+asked for. Arguments containing `?` happen to survive, which makes this look
+intermittent.
+
+`probe.ts` prints both responses and exits non-zero when the proxy's status
+differs from the sidecar's — same credential, same path, same process on the far
+end, so any difference is the proxy's fault by definition.
 
 ## API Clients — Which SDK to Use (app is hybrid)
 

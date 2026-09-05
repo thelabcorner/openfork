@@ -61,16 +61,14 @@ export function UsagePage() {
   // fallback maps, and the free/subsidised usage valuation derived from them.
   // Every catalog consumer on the page goes through this, so they can never
   // disagree about a model's identity or what it is worth.
-  const valuation = createUsageValuation(data)
+  const valuation = createUsageValuation(() => data()?.models ?? [])
 
   // Model *naming* shares the same catalog as model *pricing*. It previously
   // came from `useModels`, which only exposes connected providers — so on this
   // directory-agnostic route the breakdown fell back to raw provider ids
   // ("hy4-preview#ctx-1000000@wb-…") instead of canonical names.
   const catalog = createMemo<CatalogModel[]>(() =>
-    valuation
-      .catalog()
-      .map((m) => ({ providerID: m.provider.id, modelID: m.id, name: m.name, family: m.family })),
+    valuation.catalog().map((m) => ({ providerID: m.provider.id, modelID: m.id, name: m.name, family: m.family })),
   )
   const identify = createMemo(() => createCatalogIdentify(catalog()))
   const modelGroups = createMemo<ModelGroup[]>(() => groupModelsByName(data()?.models ?? [], identify()))

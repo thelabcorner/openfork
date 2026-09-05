@@ -1,5 +1,7 @@
 import { type Accessor, createMemo, createResource } from "solid-js"
 import { createStore } from "solid-js/store"
+import { createModelPreferencesSync } from "./model-preferences-sync"
+import { useServerSDK } from "./server-sdk"
 import { DateTime } from "luxon"
 import { filter, firstBy, flat, groupBy, mapValues, pipe, uniqueBy, values } from "remeda"
 import { createSimpleContext } from "@opencode-ai/ui/context"
@@ -25,6 +27,14 @@ const ALWAYS_VISIBLE_PROVIDERS = new Set(["claude"])
 
 function modelKey(model: ModelKey) {
   return `${model.providerID}:${model.modelID}`
+}
+
+// The persisted records hold `undefined` for cleared entries; the wire schema
+// does not. Drop them rather than serializing nulls the server would reject.
+function definedEntries(record: Record<string, string | undefined> | undefined): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const [key, value] of Object.entries(record ?? {})) if (value !== undefined) out[key] = value
+  return out
 }
 
 // Manual model order is persisted per selector section. Provider ids are
@@ -233,6 +243,41 @@ export const { use: useModels, provider: ModelsProvider } = createSimpleContext(
       const key = sectionKeyFor(section)
       if (store.order) (setStore as unknown as (a: string, b: string, c: string[] | undefined) => void)("order", key, undefined)
     }
+
+    // Publish this client's selector preferences so a paired PWA renders the
+    // same rail order, favorites, recents and routing pins. Read-only from the
+    // server's point of view: nothing here writes back into `store`.
+    // `useServerSDK` is not available in every tree that mounts this provider
+    // (storybook, isolated dialogs), so its absence degrades to no sync.
+    let serverSDK: ReturnType<typeof useServerSDK> | undefined
+    try {
+      serverSDK = useServerSDK()
+    } catch {
+      serverSDK = undefined
+    }
+    // Resolved per attempt, and defensively: the accessor throws while no
+    // server is connected, and this provider mounts before one exists.
+    const preferencesClient = () => {
+      try {
+        return serverSDK?.()?.client.global.preferences
+      } catch {
+        return undefined
+      }
+    }
+    createModelPreferencesSync({
+      client: preferencesClient,
+      ready: () => ready(),
+      snapshot: () => ({
+        order: { ...(store.order ?? {}) },
+        favorite: store.user.filter((item) => item.favorite).map((item) => modelKey(item)),
+        recent: store.recent.map((item) => ({ providerID: item.providerID, modelID: item.modelID })),
+        // Keyed `providerID:modelID`, matching `subProviderKey` above.
+        subProvider: definedEntries(store.subProvider),
+        // Keyed `providerID/modelID` — `variantKey` uses a slash, not a colon.
+        // Preserved verbatim so the PWA can look pins up with the same key.
+        variant: definedEntries(store.variant),
+      }),
+    })
 
     const [recentModels] = createResource(
       async () => {

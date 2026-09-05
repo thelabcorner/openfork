@@ -29,6 +29,7 @@ import { createFileTreeStore } from "./file/tree-store"
 import { invalidateFromWatcher } from "./file/watcher"
 import { createGitStatusStore } from "./file/git-status"
 import { normalizeFileTreeV2Path } from "@/components/file-tree-v2-model"
+import { perf } from "@/context/perf"
 import {
   selectionFromLines,
   type FileState,
@@ -78,6 +79,11 @@ export {
 }
 
 const WATCHER_TREE_REFRESH_DELAY_MS = 120
+const WATCHER_TREE_REFRESH_CONCURRENCY = 4
+const WATCHER_DIR_QUEUE_MAX = 512
+const WATCHER_FILE_QUEUE_MAX = 256
+const WATCHER_FILE_REFRESH_DELAY_MS = 80
+const WATCHER_FILE_REFRESH_CONCURRENCY = 2
 const DEFAULT_MAX_CONTENT_SCOPES = 5
 
 // Module-level (not per-store), mirroring tree-store's scopeCache: keeps a project's
@@ -126,8 +132,10 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     const tabs = layout.tabs(() =>
       SessionStateKey.from(serverSDK().scope, SessionRouteKey.fromRoute(base64Encode(sdk().directory), params.id)),
     )
+    const openTabPaths = createMemo(() => new Set(tabs.all().map((tab) => path.pathFromTab(tab))))
 
     const inflight = new Map<string, Promise<void>>()
+    let providerDisposed = false
     let currentContentScope = scope()
     const initialContentSnapshot = contentScopeCache.get(currentContentScope)
     const [store, setStore] = createStore<{
@@ -148,10 +156,15 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       timer: undefined as ReturnType<typeof setTimeout> | undefined,
       queue: new Set<string>(),
       stale: new Set<string>(),
+      staleAll: false,
+      fileRunning: false,
+      fileTimer: undefined as ReturnType<typeof setTimeout> | undefined,
+      fileQueue: new Set<string>(),
     }
 
     const tree = createFileTreeStore({
       scope,
+      schedulerKey: () => serverSDK().url,
       normalizeDir: path.normalizeDir,
       list: (dir) =>
         sdk()
@@ -182,6 +195,8 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       },
     })
 
+    const treeConsumerVisible = () => layout.fileTree.opened() || layout.projectExplorer.opened()
+
     const evictContent = (keep?: Set<string>) => {
       evictContentLru(keep, (target) => {
         if (!store.file[target]) return
@@ -201,6 +216,21 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       tree.switchScope()
       if (next === currentContentScope) return
 
+      // A provider can change projects while watcher/file refreshes are still
+      // queued. Those paths belong to the previous scope; carrying them into
+      // the new sidecar wastes permits and can make the first interactive
+      // expansion wait behind stale work. In-flight reads are guarded by the
+      // scope check in `load`, so only the not-yet-started queues need to be
+      // discarded here.
+      watcherRefresh.queue.clear()
+      watcherRefresh.stale.clear()
+      watcherRefresh.fileQueue.clear()
+      watcherRefresh.staleAll = false
+      if (watcherRefresh.timer) clearTimeout(watcherRefresh.timer)
+      watcherRefresh.timer = undefined
+      if (watcherRefresh.fileTimer) clearTimeout(watcherRefresh.fileTimer)
+      watcherRefresh.fileTimer = undefined
+
       contentScopeCache.set(currentContentScope, { ...store.file })
       evictContentScopes(DEFAULT_MAX_CONTENT_SCOPES)
       currentContentScope = next
@@ -218,6 +248,19 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         if (!file.content) continue
         touchFileContent(file.path, approxBytes(file.content))
       }
+    })
+
+    // Keep the status snapshot aligned with the active project. The status
+    // store itself deduplicates cached scopes and ignores completions from an
+    // old scope; this effect makes the initial load and scope switches
+    // observable instead of waiting for a consumer to remember `ensure()`.
+    createEffect(() => {
+      // A hidden session still records the boolean dirty bit, but it should
+      // not start a full git-status scan for every watcher burst. Re-entering
+      // the explorer runs this effect again; the status store sees the dirty
+      // cache and schedules one debounced refresh then.
+      scope()
+      if (treeConsumerVisible()) gitStatus.ensure()
     })
 
     const viewCache = createFileViewCache(serverSDK().scope)
@@ -269,6 +312,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     }
 
     const load = (input: string, options?: { force?: boolean }) => {
+      if (providerDisposed) return Promise.resolve()
       const file = path.normalize(input)
       if (!file) return Promise.resolve()
 
@@ -287,7 +331,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       const promise = sdk()
         .client.file.read({ path: file })
         .then((x) => {
-          if (scope() !== directory) return
+          if (providerDisposed || scope() !== directory) return
           const content = x.data
           setLoaded(file, content)
 
@@ -296,11 +340,11 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           evictContent(new Set([file]))
         })
         .catch((e) => {
-          if (scope() !== directory) return
+          if (providerDisposed || scope() !== directory) return
           setLoadError(file, errorMessage(e, language.t("error.chain.unknown")))
         })
         .finally(() => {
-          inflight.delete(key)
+          if (inflight.get(key) === promise) inflight.delete(key)
         })
 
       inflight.set(key, promise)
@@ -366,7 +410,59 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         )
     }
 
-    const treeConsumerVisible = () => layout.fileTree.opened() || layout.projectExplorer.opened()
+    const enqueueWatcherDirectory = (target: Set<string>, directory: string) => {
+      if (target.has(directory)) return
+      // A branch switch or dependency install can produce thousands of watcher
+      // notifications. Keep the set bounded and mark the loaded tree stale;
+      // the visible-pane effect re-lists those directories lazily instead of
+      // pretending that a root refresh repaired deep expanded branches.
+      if (target.size >= WATCHER_DIR_QUEUE_MAX) {
+        target.clear()
+        watcherRefresh.staleAll = true
+        return
+      }
+      target.add(directory)
+    }
+
+    const enqueueWatcherFile = (file: string) => {
+      if (watcherRefresh.disposed) return
+      if (!watcherRefresh.fileQueue.has(file) && watcherRefresh.fileQueue.size >= WATCHER_FILE_QUEUE_MAX) {
+        // Keep the newest invalidations. File events are edge-triggered by the
+        // watcher, so a later edit will requeue anything evicted here.
+        const oldest = watcherRefresh.fileQueue.values().next().value
+        if (typeof oldest === "string") watcherRefresh.fileQueue.delete(oldest)
+      }
+      watcherRefresh.fileQueue.add(file)
+    }
+
+    const drainWatcherFileQueue = () => {
+      if (watcherRefresh.disposed || watcherRefresh.fileRunning || watcherRefresh.fileTimer) return
+      if (watcherRefresh.fileQueue.size === 0) return
+
+      watcherRefresh.fileTimer = setTimeout(() => {
+        watcherRefresh.fileTimer = undefined
+        if (watcherRefresh.disposed) return
+        const next = [...watcherRefresh.fileQueue]
+        watcherRefresh.fileQueue.clear()
+        if (next.length === 0) return
+
+        watcherRefresh.fileRunning = true
+        let cursor = 0
+        const worker = async () => {
+          while (!watcherRefresh.disposed && cursor < next.length) {
+            const file = next[cursor++]
+            if (file) await load(file, { force: true })
+          }
+        }
+        const workers = Array.from({ length: Math.min(WATCHER_FILE_REFRESH_CONCURRENCY, next.length) }, () => worker())
+        void Promise.all(workers)
+          .catch(() => undefined)
+          .finally(() => {
+            watcherRefresh.fileRunning = false
+            drainWatcherFileQueue()
+          })
+      }, WATCHER_FILE_REFRESH_DELAY_MS)
+    }
 
     const drainWatcherRefreshQueue = () => {
       if (watcherRefresh.disposed || watcherRefresh.running || watcherRefresh.timer) return
@@ -376,19 +472,26 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         watcherRefresh.timer = undefined
         if (watcherRefresh.disposed) return
 
-        const next = watcherRefresh.queue.values().next().value
-        if (typeof next !== "string") return
-        watcherRefresh.queue.delete(next)
+        const next: string[] = []
+        while (next.length < WATCHER_TREE_REFRESH_CONCURRENCY && watcherRefresh.queue.size > 0) {
+          const dir = watcherRefresh.queue.values().next().value
+          if (typeof dir !== "string") break
+          watcherRefresh.queue.delete(dir)
+          next.push(dir)
+        }
+        if (next.length === 0) return
 
         if (!treeConsumerVisible()) {
-          watcherRefresh.stale.add(next)
-          watcherRefresh.queue.forEach((dir) => watcherRefresh.stale.add(dir))
+          next.forEach((dir) => enqueueWatcherDirectory(watcherRefresh.stale, dir))
+          watcherRefresh.queue.forEach((dir) => enqueueWatcherDirectory(watcherRefresh.stale, dir))
           watcherRefresh.queue.clear()
           return
         }
 
         watcherRefresh.running = true
-        void tree.listDir(next, { force: true }).finally(() => {
+        void Promise.all(
+          next.map((dir) => tree.listDir(dir, { force: true, priority: "background" })),
+        ).finally(() => {
           watcherRefresh.running = false
           drainWatcherRefreshQueue()
         })
@@ -396,39 +499,54 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     }
 
     const refreshTreeDirFromWatcher = (dir: string) => {
+      const normalized = path.normalize(dir)
       if (!treeConsumerVisible()) {
-        watcherRefresh.stale.add(dir)
+        enqueueWatcherDirectory(watcherRefresh.stale, normalized)
         return
       }
-      watcherRefresh.queue.add(dir)
+      enqueueWatcherDirectory(watcherRefresh.queue, normalized)
       drainWatcherRefreshQueue()
     }
 
     createEffect(() => {
       if (!treeConsumerVisible()) return
+      if (watcherRefresh.staleAll) {
+        // A bounded queue overflow is a loss of precise paths. Mark the whole
+        // loaded index stale and re-list lazily by directory, rather than
+        // pretending the root refresh repaired deep expanded branches.
+        const loaded = tree.loadedDirectories()
+        watcherRefresh.staleAll = false
+        tree.markAllStale()
+        for (const dir of loaded) enqueueWatcherDirectory(watcherRefresh.queue, dir)
+      }
       // Only refresh dirs still loaded in the tree. Events that landed while the
       // tree was hidden may reference dirs that were reset on a project switch;
       // refreshing those would be wasted work and a burst of listDir calls.
       for (const dir of watcherRefresh.stale) {
-        if (tree.isLoaded(dir)) watcherRefresh.queue.add(dir)
+        if (tree.isLoaded(dir)) enqueueWatcherDirectory(watcherRefresh.queue, dir)
       }
       watcherRefresh.stale.clear()
       drainWatcherRefreshQueue()
     })
 
-    const stop = sdk().event.listen((e) => {
-      invalidateFromWatcher(e.details, {
+    // Subscribe by event type so the explorer does not execute a callback for
+    // every session/tool/LSP event carried by the shared SSE stream.
+    const stop = sdk().event.on("file.watcher.updated", (event) => {
+      const watcherStarted = performance.now()
+      invalidateFromWatcher(event, {
         normalize: path.normalize,
         hasFile: (file) => treeConsumerVisible() && Boolean(store.file[file]),
-        isOpen: (file) => tabs.all().some((tab) => path.pathFromTab(tab) === file),
+        isOpen: (file) => openTabPaths().has(file),
         loadFile: (file) => {
-          void load(file, { force: true })
+          enqueueWatcherFile(file)
+          drainWatcherFileQueue()
         },
         node: tree.node,
         isDirLoaded: tree.isLoaded,
         refreshDir: refreshTreeDirFromWatcher,
-        onInvalidate: (file) => gitStatus.invalidate(file),
+        onInvalidate: (file) => gitStatus.invalidate(file, { schedule: treeConsumerVisible() }),
       })
+      perf.span("watcher", performance.now() - watcherStarted)
     })
 
     const get = (input: string) => {
@@ -456,16 +574,26 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       withPath(input, (file) => view().setSelectedLines(file, range))
 
     onCleanup(() => {
+      providerDisposed = true
       watcherRefresh.disposed = true
       if (watcherRefresh.timer) clearTimeout(watcherRefresh.timer)
+      if (watcherRefresh.fileTimer) clearTimeout(watcherRefresh.fileTimer)
+      if (watcherRefresh.staleAll || watcherRefresh.queue.size > 0 || watcherRefresh.stale.size > 0) {
+        // Persist the loss of precise watcher paths so a provider remount
+        // cannot present a silently stale cached tree as authoritative.
+        tree.markAllStale()
+      }
       watcherRefresh.queue.clear()
       watcherRefresh.stale.clear()
+      watcherRefresh.staleAll = false
+      watcherRefresh.fileQueue.clear()
       gitStatus.dispose()
       // FileProvider fully remounts on every navigation away from a session and back
       // (e.g. via Home or a draft tab -- those routes don't share this provider tree).
       // Save the current scope's tree into the module-level cache so the next mount for
       // the same directory seeds warm instead of paying a full uncached re-list.
       tree.persist()
+      tree.dispose()
       contentScopeCache.set(currentContentScope, { ...store.file })
       touchContentScope(currentContentScope)
       evictContentScopes(DEFAULT_MAX_CONTENT_SCOPES)
@@ -484,7 +612,9 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         state: tree.dirState,
         children: tree.children,
         allNodes: tree.allNodes,
+        hasNode: tree.hasNode,
         expand: tree.expandDir,
+        beginGeneration: tree.beginGeneration,
         collapse: tree.collapseDir,
         expandAll: tree.expandAll,
         collapseAll: tree.collapseAll,

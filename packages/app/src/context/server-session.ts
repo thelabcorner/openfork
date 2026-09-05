@@ -33,6 +33,25 @@ const historyMessagePageSize = 200
 const sessionInfoLimit = 2_048
 const emptyIDs: ReadonlySet<string> = new Set()
 
+async function mapAsyncLimited<A, B>(
+  items: readonly A[],
+  fn: (item: A, index: number) => Promise<B>,
+  concurrency = 8,
+): Promise<B[]> {
+  const results: B[] = []
+  results.length = items.length
+  let next = 0
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (true) {
+      const index = next++
+      if (index >= items.length) return
+      results[index] = await fn(items[index], index)
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
 function needsOlderTurnRoot(source: readonly SessionMessageInfo[]) {
   const boundary = source.find(
     (message) =>
@@ -804,19 +823,17 @@ export function createServerSession(
             ),
           ),
         ]
-        const fetchedParents = await Promise.all(
-          parentIDs.map((parentID) =>
-            fetchMessage(sessionID, parentID, () =>
-              resetMessageLoad(sessionID, load, messageLoadBaseline(load, parentID)),
-            ).catch((error) => {
-              const cause = error instanceof Error && typeof error.cause === "object" ? error.cause : undefined
-              if (cause && "status" in cause && cause.status === 404) {
-                load.removedMessages.add(parentID)
-                return undefined
-              }
-              throw error
-            }),
-          ),
+        const fetchedParents = await mapAsyncLimited(parentIDs, (parentID) =>
+          fetchMessage(sessionID, parentID, () =>
+            resetMessageLoad(sessionID, load, messageLoadBaseline(load, parentID)),
+          ).catch((error) => {
+            const cause = error instanceof Error && typeof error.cause === "object" ? error.cause : undefined
+            if (cause && "status" in cause && cause.status === 404) {
+              load.removedMessages.add(parentID)
+              return undefined
+            }
+            throw error
+          }),
         )
         for (const parent of fetchedParents) {
           if (!parent) continue
@@ -921,6 +938,30 @@ export function createServerSession(
 
   const projectV2 = (reduction: V2SessionReduction) => {
     reduction.touched.forEach((messageID) => messageLoads.get(reduction.sessionID)?.touchedSource.add(messageID))
+
+    const incremental = reduction.incremental
+    const current = data.session_message[reduction.sessionID]
+    if (
+      incremental &&
+      current?.[incremental.index]?.id === incremental.message.id
+    ) {
+      // Streaming deltas only replace one message and one normalized part.
+      // Avoid reconciling and re-normalizing the complete history on every
+      // token; the full path below remains the recovery path when hydration
+      // changed the message layout underneath us.
+      setData("session_message", reduction.sessionID, incremental.index, incremental.message)
+      if (incremental.parent && incremental.partID) {
+        const normalized = normalizeSessionMessages(reduction.sessionID, [incremental.parent, incremental.message])
+        const message = normalized.messages.find((item) => item.id === incremental.message.id)
+        const part = normalized.parts.get(incremental.message.id)?.find((item) => item.id === incremental.partID)
+        batch(() => {
+          if (message) apply({ type: "message.updated", properties: { sessionID: reduction.sessionID, info: message } })
+          if (part) apply({ type: "message.part.updated", properties: { sessionID: reduction.sessionID, part } })
+        })
+      }
+      return
+    }
+
     setData("session_message", reduction.sessionID, reconcile(reduction.messages))
     if (reduction.touched.length === 0) return
 
@@ -1061,7 +1102,12 @@ export function createServerSession(
         return
       }
       const loaded = data.message[eventID] !== undefined || data.session_message[eventID] !== undefined
-      if (content && !loaded && !messageLoads.has(eventID)) return
+      // A complete message event is a safe seed for an as-yet-unloaded
+      // session. Keeping it lets a concurrent initial load merge the event
+      // instead of silently deleting a message that arrived just before the
+      // first fetch. Part events still require a loaded parent (or an active
+      // load) so an arbitrary stream cannot accumulate unbounded orphans.
+      if (content && !loaded && !messageLoads.has(eventID) && event.type !== "message.updated") return
       if (
         !content &&
         !data.info[eventID] &&

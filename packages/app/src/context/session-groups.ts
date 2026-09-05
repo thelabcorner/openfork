@@ -1,85 +1,31 @@
-import type { Session } from "@opencode-ai/sdk/v2/client"
+import type { SessionGroupDetail, SessionGroupInfo, SessionGroupMember } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/solid-query"
-import { useLocation } from "@solidjs/router"
 import { createEffect, createMemo, createSignal } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { useGlobal } from "./global"
 import { safeQueryData } from "@/utils/safe-query-data"
 import { useServer } from "./server"
+import { useLanguage } from "./language"
+import { showToast } from "@/utils/toast"
 
 export type SessionGroupEntry = {
   id: string
   name: string
   sessionIds: string[]
   position: number
+  kind: "user" | "subagent" | "plugin"
+  ownerPlugin?: string
+  anchorSessionID?: string
+  sessions: SessionGroupMember[]
   time: {
     created: number
     updated: number
   }
 }
 
-type SessionGroupResponse = {
-  id: string
-  name: string
-  position: number
-  time: { created: number; updated: number }
-}
-
-type SessionGroupDetailResponse = {
-  group: SessionGroupResponse
-  sessions: Array<{ id: string; title: string }>
-}
-
-type GroupClient = {
-  request: (options: {
-    url: string
-    method: string
-    parseAs?: "json" | "text"
-    responseStyle?: "fields"
-    throwOnError?: boolean
-    body?: unknown
-  }) => Promise<{ data: string; response: Response }>
-}
-
 function groupListQueryKey(scope: string) {
   return [scope, "session-groups"] as const
-}
-
-// Delegates to the configured SDK transport (baseUrl + auth + response
-// interceptor) instead of hand-building URLs and Authorization headers. The
-// interceptor throws when the server responds with the HTML app shell, so a
-// missing route surfaces as an error rather than a JSON parse crash.
-async function groupCall<T>(client: GroupClient, method: string, url: string, body?: unknown): Promise<T> {
-  const result = await client.request({
-    url,
-    method,
-    parseAs: "text",
-    responseStyle: "fields",
-    throwOnError: false,
-    ...(body === undefined ? {} : { body }),
-  })
-  const response = result.response
-  const text = result.data ?? ""
-  if (!response.ok) {
-    throw new Error(`session-group ${method} ${url} -> ${response.status} ${response.headers.get("content-type") ?? ""} ${response.url}`)
-  }
-  const trimmed = text.trim()
-  if (trimmed.startsWith("<")) {
-    throw new Error(
-      `session-group ${method} ${url} -> ${response.status} ${response.headers.get("content-type") ?? ""} ${response.url}: ${trimmed.slice(0, 140)}`,
-    )
-  }
-  try {
-    const value = JSON.parse(text) as T & { data?: T }
-    return value?.data ?? value
-  } catch (cause) {
-    throw new Error(`session-group ${method} ${url} -> ${response.status} ${response.headers.get("content-type") ?? ""} ${response.url}: ${text.slice(0, 140)}`)
-  }
-}
-
-function transportOf(sdk: { client: unknown }): GroupClient {
-  return (sdk.client as { client: GroupClient }).client
 }
 
 export const { use: useSessionGroups, provider: SessionGroupsProvider } = createSimpleContext({
@@ -87,6 +33,7 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
   init: () => {
     const server = useServer()
     const global = useGlobal()
+    const language = useLanguage()
     const queryClient = useQueryClient()
     const scope = createMemo(() => `session-groups:${server.key}`)
 
@@ -95,43 +42,27 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
       if (!conn) throw new Error("No server connected")
       return global.ensureServerCtx(conn).sdk
     })
-    const client = createMemo(() => transportOf(serverSDK()))
-
-    // Server-backed group list — home-only and deferred so session/draft
-    // routes never create the query (harness counts disabled as 4s). Home
-    // still gets cache after 300ms background.
-    const location = useLocation()
-    const isHomeRoute = createMemo(() => location.pathname === "/" )
-    if (!isHomeRoute()) {
-      // No query at all on session/draft — elapses <200ms, groups empty is fine
-      const empty: SessionGroupEntry[] = []
-      const emptyList = () => empty
-      return {
-        groups: emptyList,
-        list: emptyList,
-        byID: () => undefined,
-        groupForSession: () => undefined,
-        fetchDetail: () => undefined,
-        createGroup: async () => { throw new Error("home only") },
-        renameGroup: async () => {},
-        deleteGroup: async () => {},
-        addSessionToGroup: async () => {},
-        removeSessionFromGroup: async () => {},
-      }
+    // Activate only when a rendered surface reads group state or invokes a
+    // mutation. This keeps the cold draft route cheap without making the
+    // provider return a permanently inert route-dependent stub.
+    const [active, setActive] = createSignal(false)
+    let activationQueued = false
+    const activate = () => {
+      if (active() || activationQueued) return
+      activationQueued = true
+      queueMicrotask(() => setTimeout(() => setActive(true), 300))
     }
-    const [deferred, setDeferred] = createSignal(false)
-    queueMicrotask(() => setTimeout(() => setDeferred(true), 300))
     const groupsQuery = useQuery(() =>
       queryOptions({
         queryKey: groupListQueryKey(scope()),
-        queryFn: () => groupCall<SessionGroupResponse[]>(client(), "GET", "/api/session-group"),
-        enabled: !!server.current && deferred(),
+        queryFn: async () => (await serverSDK().client.sessionGroup.list({ throwOnError: true })).data ?? [],
+        enabled: !!server.current && active(),
         staleTime: 5 * 60_000,
         gcTime: 10 * 60_000,
         refetchOnMount: false,
         refetchOnReconnect: false,
         refetchOnWindowFocus: false,
-        placeholderData: (prev) => prev ?? ([] as SessionGroupResponse[]),
+        placeholderData: (prev) => prev ?? ([] as SessionGroupInfo[]),
         retry: 1,
       }),
     )
@@ -146,9 +77,10 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
      *
      * Pattern: gate on `isPending` first, fall back to `.data ?? []` only after.
      */
-    const [details, setDetails] = createStore<Record<string, SessionGroupDetailResponse>>({})
+    const [details, setDetails] = createStore<Record<string, SessionGroupDetail>>({})
     const groupList = () => {
-      const data = safeQueryData(groupsQuery, [] as SessionGroupResponse[])
+      activate()
+      const data = safeQueryData(groupsQuery, [] as SessionGroupInfo[])
       // Servers older than the session-group feature answer unknown API paths
       // with an empty JSON object; treat any non-array payload as no groups.
       return Array.isArray(data) ? data : []
@@ -161,8 +93,11 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
     const inflightDetails = new Map<string, Promise<void>>()
     const fetchDetailDeduped = (groupId: string) => {
       if (inflightDetails.has(groupId)) return
-      const promise = groupCall<SessionGroupDetailResponse>(client(), "GET", `/api/session-group/${groupId}`)
-        .then((detail) => {
+      const promise = serverSDK()
+        .client.sessionGroup.get({ groupID: groupId }, { throwOnError: true })
+        .then((response) => {
+          const detail = response.data
+          if (!detail) return
           setDetails(groupId, detail)
         })
         .catch(() => {
@@ -174,8 +109,8 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
         })
       inflightDetails.set(groupId, promise)
     }
-    const applyDetailBatch = (payload: SessionGroupDetailResponse[]) => {
-      const next: Record<string, SessionGroupDetailResponse> = {}
+    const applyDetailBatch = (payload: SessionGroupDetail[]) => {
+      const next: Record<string, SessionGroupDetail> = {}
       for (const detail of payload) next[detail.group.id] = detail
       // reconcile keeps object identity for unchanged groups so downstream
       // memos don't churn when only one group's membership moved.
@@ -183,16 +118,21 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
     }
     const refreshDetails = (groupIds: string[]) => {
       if (groupIds.length === 0) return
-      void groupCall<SessionGroupDetailResponse[]>(client(), "GET", "/api/session-group/details").then((payload) => {
-        if (!Array.isArray(payload)) throw new Error("unexpected session-group details payload")
-        applyDetailBatch(payload)
-      }).catch(() => {
-        for (const groupId of groupIds) fetchDetailDeduped(groupId)
-      })
+      void serverSDK()
+        .client.sessionGroup.listDetails({ throwOnError: true })
+        .then((response) => {
+          const payload = response.data ?? []
+          if (!Array.isArray(payload)) throw new Error("unexpected session-group details payload")
+          applyDetailBatch(payload)
+        })
+        .catch(() => {
+          for (const groupId of groupIds) fetchDetailDeduped(groupId)
+        })
     }
 
     createEffect(() => {
-      refreshDetails(groupList().map((group) => group.id).filter((id) => !details[id]))
+      if (!active()) return
+      refreshDetails(groupList().map((group) => group.id))
     })
 
     // Build SessionGroupEntry list by merging group metadata with detail session IDs
@@ -205,7 +145,11 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
           id: group.id,
           name: group.name,
           sessionIds: detail?.sessions?.map((s) => s.id) ?? [],
-          position: group.position,
+          position: typeof group.position === "number" ? group.position : 0,
+          kind: group.kind,
+          ownerPlugin: group.ownerPlugin,
+          anchorSessionID: group.anchorSessionID,
+          sessions: detail?.sessions ?? [],
           time: group.time,
         }
       })
@@ -228,6 +172,7 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
     }
 
     const fetchDetail = (groupId: string) => {
+      activate()
       const existing = details[groupId]
       if (existing) return existing
       fetchDetailDeduped(groupId)
@@ -235,7 +180,8 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
     }
 
     const createGroupMutation = useMutation(() => ({
-      mutationFn: (name: string) => groupCall<SessionGroupResponse>(client(), "POST", "/api/session-group", { name }),
+      mutationFn: async (name: string) =>
+        (await serverSDK().client.sessionGroup.create({ name }, { throwOnError: true })).data,
       onSuccess: () => {
         invalidate()
       },
@@ -243,14 +189,14 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
 
     const renameGroupMutation = useMutation(() => ({
       mutationFn: ({ id, name }: { id: string; name: string }) =>
-        groupCall<unknown>(client(), "PATCH", `/api/session-group/${id}`, { name }),
+        serverSDK().client.sessionGroup.rename({ groupID: id, name }, { throwOnError: true }),
       onSuccess: (_, variables) => {
         invalidate(variables.id)
       },
     }))
 
     const deleteGroupMutation = useMutation(() => ({
-      mutationFn: (id: string) => groupCall<unknown>(client(), "DELETE", `/api/session-group/${id}`),
+      mutationFn: (id: string) => serverSDK().client.sessionGroup.remove({ groupID: id }, { throwOnError: true }),
       onSuccess: () => {
         invalidate()
       },
@@ -258,7 +204,7 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
 
     const addSessionToGroupMutation = useMutation(() => ({
       mutationFn: ({ groupId, sessionId }: { groupId: string; sessionId: string }) =>
-        groupCall<unknown>(client(), "POST", `/api/session-group/${groupId}/session`, { sessionId }),
+        serverSDK().client.sessionGroup.addSession({ groupID: groupId, sessionId }, { throwOnError: true }),
       onSuccess: (_, variables) => {
         invalidate(variables.groupId)
       },
@@ -266,9 +212,16 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
 
     const removeSessionFromGroupMutation = useMutation(() => ({
       mutationFn: ({ groupId, sessionId }: { groupId: string; sessionId: string }) =>
-        groupCall<unknown>(client(), "DELETE", `/api/session-group/${groupId}/session/${sessionId}`),
+        serverSDK().client.sessionGroup.removeSession(
+          { groupID: groupId, sessionID: sessionId },
+          { throwOnError: true },
+        ),
       onSuccess: (_, variables) => {
         invalidate(variables.groupId)
+      },
+      onError: (error) => {
+        const message = error instanceof Error ? error.message : language.t("groupTab.lockedMembership")
+        showToast({ title: language.t("sessionGroup.removeFrom"), description: message, variant: "error" })
       },
     }))
 

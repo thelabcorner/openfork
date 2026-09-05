@@ -41,7 +41,20 @@ export const DEFAULT_SESSION_CONTEXT_TAB: SessionContextTab = "context"
 const DEFAULT_MODELS_PANEL_OPENED = false
 const DEFAULT_LIMITS_PANEL_OPENED = false
 const DEFAULT_CHATS_PANEL_OPENED = false
+const PROJECT_SESSION_LOAD_CONCURRENCY = 4
 export type AvatarColorKey = (typeof AVATAR_COLOR_KEYS)[number]
+
+async function forEachLimited<T>(items: readonly T[], work: (item: T) => Promise<unknown>, concurrency: number) {
+  let next = 0
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (true) {
+      const index = next++
+      if (index >= items.length) return
+      await work(items[index]!)
+    }
+  })
+  await Promise.all(workers)
+}
 
 export function getAvatarColors(key?: string) {
   if (key && AVATAR_COLOR_KEYS.includes(key as AvatarColorKey)) {
@@ -656,10 +669,10 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
         sessionFrame = undefined
         sessionTimer = window.setTimeout(() => {
           sessionTimer = undefined
-          void Promise.all(
-            server.projects.list().map((project) => {
-              return serverSync().project.loadSessions(project.worktree)
-            }),
+          void forEachLimited(
+            server.projects.list(),
+            (project) => serverSync().project.loadSessions(project.worktree),
+            PROJECT_SESSION_LOAD_CONCURRENCY,
           )
         }, 0)
       })

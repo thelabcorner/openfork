@@ -47,6 +47,11 @@ function normalizeToolMetadata(name: string, metadata: Record<string, unknown>) 
 
 export function normalizeSessionMessages(sessionID: string, source: readonly SessionMessageInfo[]) {
   const messages: Message[] = []
+  // Assistant records frequently follow a long history. Keep an identity
+  // index so parent enrichment is O(1) per record instead of repeatedly
+  // scanning the already-normalized message list (which became quadratic as
+  // concurrent sessions accumulated history).
+  const messagesByID = new Map<string, Message>()
   const parts = new Map<string, Part[]>()
   let agent = ""
   let model = emptyModel
@@ -63,25 +68,31 @@ export function normalizeSessionMessages(sessionID: string, source: readonly Ses
     }
     if (message.type === "user") {
       parentID = message.id
-      messages.push(userMessage(sessionID, message, agent, model))
+      const normalized = userMessage(sessionID, message, agent, model)
+      messages.push(normalized)
+      messagesByID.set(normalized.id, normalized)
       parts.set(message.id, userParts(sessionID, message))
       return
     }
     if (message.type === "synthetic" && message.description?.trim()) {
       parentID = message.id
-      messages.push({
+      const normalized = {
         id: message.id,
         sessionID,
         role: "user",
         time: message.time,
         agent,
         model: { providerID: model.providerID, modelID: model.id, variant: model.variant },
-      })
+      } satisfies UserMessage
+      messages.push(normalized)
+      messagesByID.set(normalized.id, normalized)
       parts.set(message.id, [textPart(sessionID, message.id, 0, message.description, true)])
       return
     }
     if (message.type === "shell") {
-      messages.push(...shellMessages(sessionID, message, agent, model))
+      const normalized = shellMessages(sessionID, message, agent, model)
+      messages.push(...normalized)
+      normalized.forEach((item) => messagesByID.set(item.id, item))
       parts.set(message.id, [textPart(sessionID, message.id, 0, message.command)])
       parts.set(`${message.id}:assistant`, [shellPart(sessionID, message)])
       parentID = undefined
@@ -91,7 +102,7 @@ export function normalizeSessionMessages(sessionID: string, source: readonly Ses
       agent = message.agent
       model = message.model
       if (!parentID) return
-      const parent = messages.findLast((item) => item.id === parentID)
+      const parent = messagesByID.get(parentID)
       if (parent?.role === "user") {
         parent.agent = message.agent
         parent.model = {
@@ -100,7 +111,9 @@ export function normalizeSessionMessages(sessionID: string, source: readonly Ses
           variant: message.model.variant,
         }
       }
-      messages.push(assistantMessage(sessionID, parentID, message))
+      const normalized = assistantMessage(sessionID, parentID, message)
+      messages.push(normalized)
+      messagesByID.set(normalized.id, normalized)
       parts.set(message.id, assistantParts(sessionID, message))
       return
     }

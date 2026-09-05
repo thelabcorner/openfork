@@ -1,5 +1,6 @@
 import type { OpenCodeEvent } from "@opencode-ai/client/promise"
 import type { Event } from "@opencode-ai/sdk/v2/client"
+import { estimateEventBytes } from "@opencode-ai/core/event-replay"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createGlobalEmitter } from "@solid-primitives/event-bus"
 import { makeEventListener } from "@solid-primitives/event-listener"
@@ -28,6 +29,13 @@ type CurrentDelta = Extract<
   OpenCodeEvent,
   { type: "session.text.delta" | "session.reasoning.delta" | "session.tool.input.delta" | "session.compaction.delta" }
 >
+
+// Coalescing reduces reducer/render work while the renderer is catching up,
+// but an unbounded token string would turn a bounded event queue into an
+// unbounded memory buffer. Split a long stream into independently bounded
+// chunks; the ordered queue still preserves the exact text.
+const MAX_COALESCED_DELTA_CHARS = 64 * 1024
+const MAX_PENDING_EVENT_BYTES = 8 * 1024 * 1024
 
 export function adaptServerEvent(event: OpenCodeEvent): ServerEvent {
   if (event.type === "permission.v2.asked") {
@@ -80,41 +88,175 @@ export function enqueueServerEvent(queue: QueuedServerEvent[], event: QueuedServ
   return true
 }
 
+export function createServerEventQueue() {
+  let queue: QueuedServerEvent[] = []
+  let sizes: number[] = []
+  let head = 0
+  let bytes = 0
+  // Keep indexes into the unread portion of the queue for delta streams. A
+  // renderer pause can otherwise fill the queue with hundreds of tiny tokens
+  // that are semantically one update. Barriers clear this map so lifecycle
+  // ordering remains exact.
+  const pendingDeltas = new Map<string, number>()
+  const append = (event: QueuedServerEvent, size = estimateEventBytes(event.payload)) => {
+    const before = queue.length
+    const previousSize = sizes[before - 1] ?? 0
+    enqueueServerEvent(queue, event)
+    if (queue.length === before) {
+      sizes[before - 1] = size
+      bytes += size - previousSize
+      return
+    }
+    sizes.push(size)
+    bytes += size
+  }
+  const repair = (event: QueuedServerEvent) => {
+    queue = []
+    sizes = []
+    head = 0
+    bytes = 0
+    pendingDeltas.clear()
+    append({
+      directory: event.directory,
+      payload: { id: event.payload.id, type: "server.connected", properties: {} } as ServerEvent,
+    })
+  }
+  return {
+    get size() {
+      return queue.length - head
+    },
+    push(event: QueuedServerEvent) {
+      const key = queueDeltaKey(event)
+      if (key) {
+        const previousIndex = pendingDeltas.get(key)
+        if (previousIndex !== undefined && previousIndex >= head) {
+          const previous = queue[previousIndex]
+          if (previous) {
+            const merged = mergeDeltaEvents(previous, event)
+            if (merged) {
+              const size = estimateEventBytes(merged.payload)
+              if (bytes - (sizes[previousIndex] ?? 0) + size > MAX_PENDING_EVENT_BYTES) {
+                repair(event)
+                return
+              }
+              queue[previousIndex] = merged
+              bytes += size - (sizes[previousIndex] ?? 0)
+              sizes[previousIndex] = size
+              return
+            }
+          }
+        }
+        const size = estimateEventBytes(event.payload)
+        if (bytes + size > MAX_PENDING_EVENT_BYTES) {
+          repair(event)
+          return
+        }
+        append(event, size)
+        pendingDeltas.set(key, queue.length - 1)
+        return
+      }
+
+      const size = estimateEventBytes(event.payload)
+      if (bytes + size > MAX_PENDING_EVENT_BYTES) {
+        repair(event)
+        if (!isQueuedDelta(event.payload) && size <= MAX_PENDING_EVENT_BYTES) append(event, size)
+        return
+      }
+      append(event, size)
+      pendingDeltas.clear()
+    },
+    take(count: number) {
+      const end = Math.min(queue.length, head + count)
+      // push() already coalesces every unread key. Re-coalescing here would
+      // rescan the same batch and rebuild the same delta strings on every
+      // animation frame.
+      const result = queue.slice(head, end)
+      for (let index = head; index < end; index++) bytes -= sizes[index] ?? 0
+      head = end
+      for (const [key, index] of pendingDeltas) {
+        if (index < head) pendingDeltas.delete(key)
+      }
+      if (head === queue.length) {
+        queue = []
+        sizes = []
+        head = 0
+        bytes = 0
+        pendingDeltas.clear()
+      } else if (head >= 1024) {
+        queue = queue.slice(head)
+        sizes = sizes.slice(head)
+        for (const [key, index] of pendingDeltas) pendingDeltas.set(key, index - head)
+        head = 0
+      }
+      return result
+    },
+    dropWhere(predicate: (event: QueuedServerEvent) => boolean) {
+      if (queue.length === head) return 0
+      const retained: QueuedServerEvent[] = []
+      const retainedSizes: number[] = []
+      let dropped = 0
+      for (let index = head; index < queue.length; index++) {
+        const event = queue[index]!
+        if (predicate(event)) {
+          dropped += 1
+          continue
+        }
+        retained.push(event)
+        retainedSizes.push(sizes[index] ?? 0)
+      }
+      if (dropped === 0) return 0
+      queue = retained
+      sizes = retainedSizes
+      head = 0
+      bytes = retainedSizes.reduce((total, size) => total + size, 0)
+      pendingDeltas.clear()
+      for (let index = 0; index < queue.length; index++) {
+        const key = queueDeltaKey(queue[index]!)
+        if (key) pendingDeltas.set(key, index)
+        else pendingDeltas.clear()
+      }
+      return dropped
+    },
+  }
+}
+
+function queueDeltaKey(event: QueuedServerEvent) {
+  const current = currentDelta(event.payload.current)
+  if (current) return `current|${keyPart(event.directory)}${currentDeltaKey(current)}`
+  if (event.payload.type !== "message.part.delta") return undefined
+  const props = event.payload.properties
+  return `v1|${keyPart(event.directory)}${keyPart(props.sessionID)}${keyPart(props.messageID)}${keyPart(props.partID)}${keyPart(props.field)}`
+}
+
+function isQueuedDelta(payload: ServerEvent) {
+  const type = payload.type as string
+  return currentDelta(payload.current) !== undefined || type.endsWith(".delta")
+}
+
 export function coalesceServerEvents(events: QueuedServerEvent[]) {
   const output: QueuedServerEvent[] = []
-  // Pending V1 message.part.delta merges keyed by (directory, messageID, partID, field).
-  // Unlike the previous adjacent-only merge, deltas for the SAME part/field may be
-  // concatenated even when interleaved with deltas for OTHER parts/sessions — the
-  // final store state is identical because each part's field is an independent
-  // append-only string. Any non-delta event is a barrier (a snapshot/removal/status
-  // can change a part's base), so pending merges never cross one.
+  // Independent delta fields can merge across each other; every lifecycle or
+  // snapshot event is an ordering barrier. Tuple encoding avoids delimiter collisions.
   const pending = new Map<string, number>()
   events.forEach((event) => {
     const current = currentDelta(event.payload.current)
     if (current) {
-      const previous = output[output.length - 1]
-      const prior = currentDelta(previous?.payload.current)
-      if (
-        previous &&
-        prior &&
-        previous.directory === event.directory &&
-        currentDeltaKey(prior) === currentDeltaKey(current)
-      ) {
-        const fragment = currentDeltaFragment(prior) + currentDeltaFragment(current)
-        const data =
-          current.type === "session.compaction.delta"
-            ? { ...current.data, text: fragment }
-            : { ...current.data, delta: fragment }
-        output[output.length - 1] = {
-          directory: event.directory,
-          payload: {
-            ...event.payload,
-            properties: data,
-            current: { ...current, data } as CurrentDelta,
-          } as ServerEvent,
+      const key = `current|${keyPart(event.directory)}${currentDeltaKey(current)}`
+      const index = pending.get(key)
+      const previous = index === undefined ? undefined : output[index]
+      if (previous && index !== undefined) {
+        const merged = mergeDeltaEvents(previous, event)
+        if (merged) {
+          output[index] = merged
+          return
         }
+        // The size cap is a soft barrier for this key. Keep appending in wire
+        // order while making the newest chunk the future merge target.
+        pending.set(key, output.length)
+        output.push(event)
         return
       }
+      pending.set(key, output.length)
       output.push(event)
       return
     }
@@ -125,17 +267,16 @@ export function coalesceServerEvents(events: QueuedServerEvent[]) {
       return
     }
     const props = event.payload.properties
-    const key = `${event.directory}:${props.messageID}:${props.partID}:${props.field}`
+    const key = `v1|${keyPart(event.directory)}${keyPart(props.sessionID)}${keyPart(props.messageID)}${keyPart(props.partID)}${keyPart(props.field)}`
     const existingIndex = pending.get(key)
     if (existingIndex !== undefined) {
-      const previousProps = output[existingIndex].payload.properties as { delta: string }
-      output[existingIndex] = {
-        directory: event.directory,
-        payload: {
-          ...event.payload,
-          properties: { ...props, delta: previousProps.delta + props.delta },
-        },
+      const merged = mergeDeltaEvents(output[existingIndex], event)
+      if (merged) {
+        output[existingIndex] = merged
+        return
       }
+      pending.set(key, output.length)
+      output.push(event)
       return
     }
     output.push({
@@ -147,6 +288,46 @@ export function coalesceServerEvents(events: QueuedServerEvent[]) {
   return output
 }
 
+function mergeDeltaEvents(previous: QueuedServerEvent, event: QueuedServerEvent): QueuedServerEvent | undefined {
+  const priorCurrent = currentDelta(previous.payload.current)
+  const nextCurrent = currentDelta(event.payload.current)
+  if (priorCurrent && nextCurrent && priorCurrent.type === nextCurrent.type) {
+    const priorFragment = currentDeltaFragment(priorCurrent)
+    const nextFragment = currentDeltaFragment(nextCurrent)
+    if (priorFragment.length + nextFragment.length > MAX_COALESCED_DELTA_CHARS) return undefined
+    const fragment = priorFragment + nextFragment
+    const data =
+      nextCurrent.type === "session.compaction.delta"
+        ? { ...nextCurrent.data, text: fragment }
+        : { ...nextCurrent.data, delta: fragment }
+    return {
+      directory: event.directory,
+      payload: {
+        ...event.payload,
+        properties: data,
+        current: { ...nextCurrent, data } as CurrentDelta,
+      } as ServerEvent,
+    }
+  }
+
+  if (previous.payload.type !== "message.part.delta" || event.payload.type !== "message.part.delta") return undefined
+  const previousProps = previous.payload.properties
+  const nextProps = event.payload.properties
+  if (previousProps.delta.length + nextProps.delta.length > MAX_COALESCED_DELTA_CHARS) return undefined
+  return {
+    directory: event.directory,
+    payload: {
+      ...event.payload,
+      properties: { ...nextProps, delta: previousProps.delta + nextProps.delta },
+    },
+  }
+}
+
+function keyPart(value: string | number) {
+  const text = String(value)
+  return `${text.length}:${text}`
+}
+
 function currentDelta(event: OpenCodeEvent | undefined): CurrentDelta | undefined {
   if (
     event?.type === "session.text.delta" ||
@@ -155,13 +336,14 @@ function currentDelta(event: OpenCodeEvent | undefined): CurrentDelta | undefine
     event?.type === "session.compaction.delta"
   )
     return event
+  return undefined
 }
 
 function currentDeltaKey(event: CurrentDelta) {
   if (event.type === "session.tool.input.delta")
-    return `${event.type}:${event.data.sessionID}:${event.data.assistantMessageID}:${event.data.callID}`
-  if (event.type === "session.compaction.delta") return `${event.type}:${event.data.sessionID}`
-  return `${event.type}:${event.data.sessionID}:${event.data.assistantMessageID}:${event.data.ordinal}`
+    return `type|${keyPart(event.type)}${keyPart(event.data.sessionID)}${keyPart(event.data.assistantMessageID)}${keyPart(event.data.callID)}`
+  if (event.type === "session.compaction.delta") return `type|${keyPart(event.type)}${keyPart(event.data.sessionID)}`
+  return `type|${keyPart(event.type)}${keyPart(event.data.sessionID)}${keyPart(event.data.assistantMessageID)}${keyPart(event.data.ordinal)}`
 }
 
 function currentDeltaFragment(event: CurrentDelta) {
@@ -232,234 +414,64 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
     [key: string]: ServerEvent
   }>()
 
-  type Queued = QueuedServerEvent
   const FLUSH_FRAME_MS = 16
+  const HIDDEN_FLUSH_MS = 1_000
   const STREAM_YIELD_MS = 8
-  const RECONNECT_DELAY_MS = 250
-  // Delta accumulator tuning. Deltas that arrive for the same (session, message,
-  // part, field) are folded in place and emitted as ONE event per flush instead of
-  // one per delta, so the downstream reducer does a single large append rather than
-  // many tiny ones (the dominant per-event cost is the string copy). A key flushes
-  // early once its accumulated delta is large (burst coalescing) or has been pending
-  // past MAX_AGE (keeps streaming responsive even for slow trickles); barriers and
-  // the final flush always drain everything.
-  const ACCUMULATOR_BURST_BYTES = 2048
-  const ACCUMULATOR_MAX_AGE_MS = 100
-
-  interface AccEntry {
-    ev: Queued
-    dirtySince: number
-  }
-
-  const v2 = new Map<string, Map<string, Map<string, Map<string, AccEntry>>>>()
-  const v1 = new Map<string, Map<string, Map<string, Map<string, Map<string, AccEntry>>>>>()
-  const dirtyV2 = new Set<AccEntry>()
-  const dirtyV1 = new Set<AccEntry>()
-  let singletons: Queued[] = []
-
-  const nowMs = () => Date.now()
-
-  function appendV2(existing: AccEntry, incoming: Queued) {
-    const cur = existing.ev.payload.current as CurrentDelta
-    const inc = incoming.payload.current as CurrentDelta
-    const fragment = currentDeltaFragment(cur) + currentDeltaFragment(inc)
-    if (cur.type === "session.compaction.delta") (cur.data as { text: string }).text = fragment
-    else (cur.data as { delta: string }).delta = fragment
-  }
-
-  function v2Coords(cur: CurrentDelta): [string, string, string] {
-    if (cur.type === "session.tool.input.delta")
-      return [cur.data.sessionID, cur.data.assistantMessageID, cur.data.callID]
-    if (cur.type === "session.compaction.delta") return [cur.data.sessionID, "", ""]
-    return [cur.data.sessionID, cur.data.assistantMessageID, String(cur.data.ordinal)]
-  }
-
-  function removeV2(ev: Queued) {
-    const cur = ev.payload.current as CurrentDelta
-    const [s, m, o] = v2Coords(cur)
-    const a = v2.get(ev.directory)
-    const b = a?.get(s)
-    const mm = b?.get(m)
-    if (mm) {
-      mm.delete(o)
-      if (mm.size === 0) b?.delete(m)
-      if (b && b.size === 0) a?.delete(s)
-    }
-  }
-
-  function removeV1(ev: Queued) {
-    const p = ev.payload.properties as { sessionID: string; messageID: string; partID: string; field: string }
-    const a = v1.get(ev.directory)
-    const b = a?.get(p.sessionID)
-    const mm = b?.get(p.messageID)
-    const pt = mm?.get(p.partID)
-    if (pt) {
-      pt.delete(p.field)
-      if (pt.size === 0) mm?.delete(p.partID)
-      if (mm && mm.size === 0) b?.delete(p.messageID)
-      if (b && b.size === 0) a?.delete(p.sessionID)
-    }
-  }
-
-  function dropSession(directory: string, sessionID: string) {
-    const a = v2.get(directory)
-    if (a) {
-      const b = a.get(sessionID)
-      if (b) {
-        for (const mm of b.values()) for (const e of mm.values()) dirtyV2.delete(e)
-        a.delete(sessionID)
-      }
-    }
-    const va = v1.get(directory)
-    if (va) {
-      const vb = va.get(sessionID)
-      if (vb) {
-        for (const mm of vb.values()) for (const pt of mm.values()) for (const e of pt.values()) dirtyV1.delete(e)
-        va.delete(sessionID)
-      }
-    }
-  }
-
-  const messagePartUpdatedProps = (ev: Queued) =>
-    ev.payload.properties as unknown as { sessionID: string; messageID: string; part: { id: string } }
-  const removedProps = (ev: Queued) => ev.payload.properties as unknown as { sessionID: string }
-
-  function flushV2(directory: string, sessionID: string, messageID: string, ordinal: string) {
-    const mm = v2.get(directory)?.get(sessionID)?.get(messageID)
-    const entry = mm?.get(ordinal)
-    if (entry) {
-      singletons.push(entry.ev)
-      mm!.delete(ordinal)
-      dirtyV2.delete(entry)
-    }
-  }
-
-  function flushV1(directory: string, sessionID: string, messageID: string, partID: string) {
-    const mm = v1.get(directory)?.get(sessionID)?.get(messageID)
-    const pt = mm?.get(partID)
-    if (!pt) return
-    for (const [field, entry] of pt) {
-      singletons.push(entry.ev)
-      dirtyV1.delete(entry)
-      pt.delete(field)
-    }
-    if (pt.size === 0) mm!.delete(partID)
-  }
-
-  function handleBarrier(ev: Queued) {
-    const type = ev.payload.type as string
-    if (type === "message.part.updated") {
-      const p = messagePartUpdatedProps(ev)
-      flushV1(ev.directory, p.sessionID, p.messageID, p.part.id)
-      singletons.push(ev)
-      return
-    }
-    if (
-      type === "session.text.ended" ||
-      type === "session.reasoning.ended" ||
-      type === "session.tool.input.ended" ||
-      type === "session.compaction.ended"
-    ) {
-      const cur = ev.payload.current as CurrentDelta | undefined
-      if (cur) {
-        const [s, m, o] = v2Coords(cur)
-        flushV2(ev.directory, s, m, o)
-      }
-      singletons.push(ev)
-      return
-    }
-    if (type === "message.removed" || type === "session.deleted") {
-      dropSession(ev.directory, removedProps(ev).sessionID)
-      singletons.push(ev)
-      return
-    }
-    singletons.push(ev)
-  }
-
-  function receive(ev: Queued) {
-    const cur = currentDelta(ev.payload.current)
-    if (cur) {
-      const [s, m, o] = v2Coords(cur)
-      let a = v2.get(ev.directory)
-      if (!a) { a = new Map(); v2.set(ev.directory, a) }
-      let b = a.get(s)
-      if (!b) { b = new Map(); a.set(s, b) }
-      let mm = b.get(m)
-      if (!mm) { mm = new Map(); b.set(m, mm) }
-      const ex = mm.get(o)
-      if (ex) appendV2(ex, ev)
-      else {
-        const entry: AccEntry = { ev, dirtySince: nowMs() }
-        mm.set(o, entry)
-        dirtyV2.add(entry)
-      }
-      return
-    }
-    if (ev.payload.type === "message.part.delta") {
-      const p = ev.payload.properties as { sessionID: string; messageID: string; partID: string; field: string; delta: string }
-      let a = v1.get(ev.directory)
-      if (!a) { a = new Map(); v1.set(ev.directory, a) }
-      let b = a.get(p.sessionID)
-      if (!b) { b = new Map(); a.set(p.sessionID, b) }
-      let mm = b.get(p.messageID)
-      if (!mm) { mm = new Map(); b.set(p.messageID, mm) }
-      let pt = mm.get(p.partID)
-      if (!pt) { pt = new Map(); mm.set(p.partID, pt) }
-      const ex = pt.get(p.field)
-      if (ex) (ex.ev.payload.properties as { delta: string }).delta += p.delta
-      else {
-        const entry: AccEntry = { ev, dirtySince: nowMs() }
-        pt.set(p.field, entry)
-        dirtyV1.add(entry)
-      }
-      return
-    }
-    handleBarrier(ev)
-  }
-
+  // Reconnect backoff: a fixed 250ms retry turns every server stall into a
+  // reconnect storm (4 req/s per server) that adds listeners faster than the
+  // OS reaps half-open sockets, compounding the overload. Back off
+  // exponentially with jitter so a struggling server gets breathing room.
+  const RECONNECT_BASE_MS = 250
+  const RECONNECT_MAX_MS = 15_000
+  // Preserve lifecycle order and bound both reducer work per task and read-ahead.
+  // A slow renderer stops pulling SSE events until its backlog has drained.
+  const MAX_PENDING_EVENTS = 1024
+  const EVENTS_PER_FLUSH = 128
+  const queue = createServerEventQueue()
   let timer: ReturnType<typeof setTimeout> | undefined
   let last = 0
+  let hidden = typeof document !== "undefined" && document.visibilityState === "hidden"
+  let hiddenDirty = false
 
+  const isStreamingDelta = (payload: ServerEvent) => {
+    const type = payload.type as string
+    return (
+      currentDelta(payload.current) !== undefined ||
+      type.endsWith(".delta") ||
+      type === "message.part.updated" ||
+      type === "message.part.delta" ||
+      type === "session.text.delta" ||
+      type === "session.reasoning.delta" ||
+      type === "session.tool.input.delta" ||
+      type === "session.compaction.delta" ||
+      type === "session.next.text.delta" ||
+      type === "session.next.reasoning.delta" ||
+      type === "session.next.tool.input.delta" ||
+      type === "session.next.compaction.delta"
+    )
+  }
+
+  const receive = queue.push
   const flush = (final = false) => {
-    if (timer) { clearTimeout(timer); timer = undefined }
-    if (dirtyV2.size === 0 && dirtyV1.size === 0 && singletons.length === 0) return
-
-    const t = nowMs()
-    batch(() => {
-      for (const entry of [...dirtyV2]) {
-        const cur = entry.ev.payload.current as CurrentDelta
-        const bytes = cur.type === "session.compaction.delta"
-          ? String((cur.data as { text: string }).text).length
-          : String((cur.data as { delta: string }).delta).length
-        if (final || bytes >= ACCUMULATOR_BURST_BYTES || t - entry.dirtySince >= ACCUMULATOR_MAX_AGE_MS) {
-          emitter.emit(entry.ev.directory, entry.ev.payload)
-          removeV2(entry.ev)
-          dirtyV2.delete(entry)
-        }
-      }
-      for (const entry of [...dirtyV1]) {
-        const delta = (entry.ev.payload.properties as { delta: string }).delta
-        if (final || delta.length >= ACCUMULATOR_BURST_BYTES || t - entry.dirtySince >= ACCUMULATOR_MAX_AGE_MS) {
-          emitter.emit(entry.ev.directory, entry.ev.payload)
-          removeV1(entry.ev)
-          dirtyV1.delete(entry)
-        }
-      }
-      for (const ev of singletons) emitter.emit(ev.directory, ev.payload)
-    })
-    singletons = []
-    last = t
+    if (timer !== undefined) clearTimeout(timer)
+    timer = undefined
+    if (queue.size === 0) return
+    do {
+      const events = queue.take(EVENTS_PER_FLUSH)
+      batch(() => {
+        for (const event of events) emitter.emit(event.directory, event.payload)
+      })
+    } while (final && queue.size > 0)
+    last = performance.now()
     if (perf.enabled) perf.frame()
-    // Pending deltas that haven't reached the burst/age threshold stay retained
-    // for the next window; keep the flush cadence alive so they drain within
-    // MAX_AGE even when the stream is momentarily idle (no new receive()).
-    if (dirtyV2.size > 0 || dirtyV1.size > 0) schedule()
+    if (queue.size > 0) schedule()
   }
 
   const schedule = () => {
-    if (timer) return
-    const elapsed = nowMs() - last
-    timer = setTimeout(() => flush(false), Math.max(0, FLUSH_FRAME_MS - elapsed))
+    if (timer !== undefined) return
+    const elapsed = performance.now() - last
+    const interval = hidden ? HIDDEN_FLUSH_MS : FLUSH_FRAME_MS
+    timer = setTimeout(() => flush(), Math.max(0, interval - elapsed))
   }
 
   let streamErrorLogged = false
@@ -468,6 +480,15 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   let run: Promise<void> | undefined
   let started = false
   let generation = 0
+  let reconnectFailures = 0
+
+  const reconnectDelay = () => {
+    const capped = Math.min(reconnectFailures, 6)
+    const backoff = RECONNECT_BASE_MS * 2 ** capped
+    const delay = Math.min(backoff, RECONNECT_MAX_MS)
+    // Full jitter so N servers/clients don't retry in lockstep.
+    return delay / 2 + Math.random() * (delay / 2)
+  }
 
   const start = () => {
     if (started) return run
@@ -484,6 +505,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
           attempt?.abort()
         }
         abort.signal.addEventListener("abort", onAbort)
+        const connectedAt = performance.now()
         try {
           const kind = await protocol
           const events =
@@ -492,20 +514,49 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
               : eventApi.event.subscribe({ signal: attempt.signal })
           let yielded = Date.now()
           for await (const event of events) {
-            // Any delivered event (including the 10s server heartbeat) proves the
-            // server is up; the health poll reads this to skip its own request.
+            // Any delivered domain frame proves the server is up; transport
+            // heartbeats keep the socket alive but are not application events.
             markServerStreamLive(streamKey)
             streamErrorLogged = false
+            // Readiness alone is not recovery: overflowing streams can reconnect,
+            // deliver server.connected, and immediately fail again.
+            if (performance.now() - connectedAt >= 30_000) reconnectFailures = 0
             const legacy = "payload" in event
-            if (legacy && event.payload.type === "sync") continue
+            if (legacy && event.payload.type === "sync") {
+              if (Date.now() - yielded >= STREAM_YIELD_MS) {
+                await wait(0)
+                yielded = Date.now()
+              }
+              continue
+            }
             const directory = legacy ? (event.directory ?? "global") : (event.location?.directory ?? "global")
             const payload = legacy ? (event.payload as Event) : adaptServerEvent(event)
+            if (hidden && isStreamingDelta(payload)) {
+              hiddenDirty = true
+              if (Date.now() - yielded >= STREAM_YIELD_MS) {
+                await wait(0)
+                yielded = Date.now()
+              }
+              continue
+            }
             receive({ directory, payload })
+            // A replay cursor that fell outside the server ring is a repair
+            // signal, not a normal domain event. Keep the diagnostic frame,
+            // then enqueue a connected barrier so directory/session stores
+            // perform their existing snapshot hydration path immediately.
+            if ((payload as { type?: string }).type === "server.stream.gap") {
+              receive({ directory, payload: { id: payload.id, type: "server.connected", properties: {} } as ServerEvent })
+            }
             schedule()
+            while (queue.size >= MAX_PENDING_EVENTS && !attempt.signal.aborted) await wait(FLUSH_FRAME_MS)
 
             if (Date.now() - yielded < STREAM_YIELD_MS) continue
             yielded = Date.now()
             await wait(0)
+          }
+          if (!attempt.signal.aborted) {
+            markServerStreamDead(streamKey)
+            reconnectFailures++
           }
         } catch (error) {
           if (!isStreamClosed(error, attempt?.signal) && !streamErrorLogged) {
@@ -518,14 +569,17 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
           }
           // A genuine failure (not an intentional stop/abort) means the server is
           // unreachable: drop liveness so the health poll resumes its checks.
-          if (!isStreamClosed(error, attempt?.signal)) markServerStreamDead(streamKey)
+          if (!isStreamClosed(error, attempt?.signal)) {
+            markServerStreamDead(streamKey)
+            reconnectFailures++
+          }
         } finally {
           abort.signal.removeEventListener("abort", onAbort)
           attempt = undefined
         }
 
         if (abort.signal.aborted || !started || generation !== active) return
-        await wait(RECONNECT_DELAY_MS)
+        await wait(reconnectDelay())
       }
     })().finally(() => {
       if (run !== current) return
@@ -545,6 +599,25 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
   onMount(() => {
     makeEventListener(window, "pagehide", stop)
     makeEventListener(window, "pageshow", (event) => resumeStreamAfterPageShow(event, start))
+    makeEventListener(document, "visibilitychange", () => {
+      hidden = document.visibilityState === "hidden"
+      if (hidden) {
+        // Keep the stream alive, but do not spend renderer work reducing token
+        // fragments while Chromium has throttled the window. The next visible
+        // transition hydrates through the existing global refresh barrier.
+        if (queue.dropWhere((event) => isStreamingDelta(event.payload)) > 0) hiddenDirty = true
+        schedule()
+        return
+      }
+      if (hiddenDirty) {
+        hiddenDirty = false
+        receive({
+          directory: "global",
+          payload: { id: "evt_visibility_refresh", type: "server.connected", properties: {} } as ServerEvent,
+        })
+      }
+      flush()
+    })
   })
 
   onCleanup(() => {

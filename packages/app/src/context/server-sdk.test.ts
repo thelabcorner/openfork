@@ -1,7 +1,15 @@
 import { describe, expect, test } from "bun:test"
-import { adaptServerEvent, coalesceServerEvents, enqueueServerEvent, resumeStreamAfterPageShow } from "./server-sdk"
+import {
+  adaptServerEvent,
+  coalesceServerEvents,
+  createServerEventQueue,
+  enqueueServerEvent,
+  resumeStreamAfterPageShow,
+} from "./server-sdk"
 import type { OpenCodeEvent } from "@opencode-ai/client/promise"
+import type { SessionMessageInfo } from "@opencode-ai/client/promise"
 import type { Event } from "@opencode-ai/sdk/v2/client"
+import { createV2SessionReducer } from "./server-session-v2-reducer"
 
 describe("resumeStreamAfterPageShow", () => {
   test("restarts a stream only after a back-forward cache restore", () => {
@@ -33,6 +41,90 @@ describe("adaptServerEvent", () => {
 })
 
 describe("coalesceServerEvents", () => {
+  test("32 concurrent streaming sessions retain identical reducer state through bounded batches", () => {
+    const queue = createServerEventQueue()
+    const expected = new Map<string, SessionMessageInfo[]>()
+    const actual = new Map<string, SessionMessageInfo[]>()
+    const direct = createV2SessionReducer()
+    const batched = createV2SessionReducer()
+    let sequence = 0
+    const push = (sessionID: string, type: string, data: object) => {
+      const event = {
+        id: `evt_${sequence++}`,
+        created: 1,
+        type,
+        data: { sessionID, assistantMessageID: `msg_${sessionID}`, ...data },
+      } as OpenCodeEvent
+      const result = direct.reduce(expected.get(sessionID) ?? [], event)
+      if (result) expected.set(sessionID, result.messages)
+      queue.push({ directory: "/repo", payload: adaptServerEvent(event) })
+    }
+    for (let session = 0; session < 32; session++) {
+      const id = String(session)
+      push(id, "session.step.started", { agent: "build", model: { id: "model", providerID: "provider" } })
+      push(id, "session.text.started", { ordinal: 0 })
+      push(id, "session.reasoning.started", { ordinal: 1 })
+    }
+    for (let token = 0; token < 100; token++) {
+      for (let session = 0; session < 32; session++) {
+        push(String(session), "session.text.delta", { ordinal: 0, delta: `${token} ` })
+        push(String(session), "session.reasoning.delta", { ordinal: 1, delta: "reason " })
+      }
+    }
+    while (queue.size) {
+      for (const item of queue.take(128)) {
+        const event = item.payload.current!
+        const id = (event.data as { sessionID: string }).sessionID
+        const result = batched.reduce(actual.get(id) ?? [], event)
+        if (result) actual.set(id, result.messages)
+      }
+    }
+    expect(actual.size).toBe(32)
+    expect(actual).toEqual(expected)
+  })
+
+  const currentDelta = (sessionID: string, value: string, type = "session.text.delta") => ({
+    directory: "/repo",
+    payload: adaptServerEvent({
+      id: value,
+      created: 1,
+      type,
+      data: { sessionID, assistantMessageID: "msg", ordinal: 0, delta: value },
+    } as OpenCodeEvent),
+  })
+
+  test("coalesces concurrent sessions without mixing text and reasoning or mutating inputs", () => {
+    const events = [
+      currentDelta("a", "1"),
+      currentDelta("b", "2"),
+      currentDelta("a", "r", "session.reasoning.delta"),
+      currentDelta("a", "3"),
+    ]
+    const before = JSON.stringify(events)
+    const result = coalesceServerEvents(events)
+    expect(result.map((event) => event.payload.current?.data)).toEqual([
+      { sessionID: "a", assistantMessageID: "msg", ordinal: 0, delta: "13" },
+      { sessionID: "b", assistantMessageID: "msg", ordinal: 0, delta: "2" },
+      { sessionID: "a", assistantMessageID: "msg", ordinal: 0, delta: "r" },
+    ])
+    expect(JSON.stringify(events)).toBe(before)
+  })
+
+  test("keeps start, delta, end and deletion in wire order", () => {
+    const boundary = (type: string) => ({
+      directory: "/repo",
+      payload: adaptServerEvent({ id: type, created: 1, type, data: { sessionID: "a" } } as OpenCodeEvent),
+    })
+    const events = [
+      boundary("session.text.started"),
+      currentDelta("a", "1"),
+      boundary("session.text.ended"),
+      currentDelta("a", "2"),
+      boundary("session.deleted"),
+    ]
+    expect(coalesceServerEvents(events)).toEqual(events)
+  })
+
   const delta = (value: string, field = "text", partID = "part") => ({
     directory: "/repo",
     payload: {
@@ -141,6 +233,97 @@ describe("coalesceServerEvents", () => {
 })
 
 describe("enqueueServerEvent", () => {
+  test("compacts unread streaming deltas while the renderer is paused", () => {
+    const queue = createServerEventQueue()
+    for (let i = 0; i < 4096; i++) {
+      queue.push({
+        directory: "/repo",
+        payload: adaptServerEvent({
+          id: `evt_${i}`,
+          created: i,
+          type: "session.text.delta",
+          data: { sessionID: "session", assistantMessageID: "message", ordinal: 0, delta: "x" },
+        } as OpenCodeEvent),
+      })
+    }
+
+    expect(queue.size).toBe(1)
+    expect(queue.take(128)[0]?.payload.current?.data).toMatchObject({ delta: "x".repeat(4096) })
+    expect(queue.size).toBe(0)
+  })
+
+  test("drops queued streaming work when the renderer becomes hidden", () => {
+    const queue = createServerEventQueue()
+    queue.push({
+      directory: "/repo",
+      payload: {
+        type: "message.part.updated",
+        properties: { sessionID: "session", part: { id: "part", sessionID: "session", messageID: "message", type: "text", text: "live" } },
+      } as Event,
+    })
+    queue.push({
+      directory: "/repo",
+      payload: { type: "session.status", properties: { sessionID: "session", status: { type: "busy" } } } as Event,
+    })
+    expect(queue.dropWhere((event) => event.payload.type === "message.part.updated")).toBe(1)
+    expect(queue.size).toBe(1)
+    expect(queue.take(1)[0]?.payload.type).toBe("session.status")
+  })
+
+  test("bounds each coalesced delta chunk while preserving the full stream", () => {
+    const queue = createServerEventQueue()
+    const fragment = "x".repeat(16 * 1024)
+    for (let i = 0; i < 5; i++) {
+      queue.push({
+        directory: "/repo",
+        payload: adaptServerEvent({
+          id: `evt_${i}`,
+          created: i,
+          type: "session.text.delta",
+          data: { sessionID: "session", assistantMessageID: "message", ordinal: 0, delta: fragment },
+        } as OpenCodeEvent),
+      })
+    }
+
+    const chunks: string[] = []
+    while (queue.size) {
+      for (const event of queue.take(128)) {
+        chunks.push((event.payload.current?.data as { delta: string }).delta)
+      }
+    }
+    expect(chunks.length).toBeGreaterThan(1)
+    expect(chunks.every((chunk) => chunk.length <= 64 * 1024)).toBe(true)
+    expect(chunks.join("")).toBe(fragment.repeat(5))
+  })
+
+  test("bounded drains preserve thousands of ordered lifecycle events across compaction and refill", () => {
+    const queue = createServerEventQueue()
+    const actual: string[] = []
+    const add = (start: number, end: number) => {
+      for (let i = start; i < end; i++)
+        queue.push({
+          directory: "/repo",
+          payload: {
+            id: String(i),
+            type: "session.status",
+            properties: { sessionID: String(i % 32), status: { type: "busy" } },
+          } as Event,
+        })
+    }
+    add(0, 2048)
+    for (let i = 0; i < 10; i++) {
+      const events = queue.take(128)
+      expect(events).toHaveLength(128)
+      actual.push(...events.map((event) => event.payload.id))
+    }
+    add(2048, 4096)
+    while (queue.size) actual.push(...queue.take(128).map((event) => event.payload.id))
+    expect(actual).toEqual(Array.from({ length: 4096 }, (_, i) => String(i)))
+    add(4096, 4097)
+    expect(queue.take(128)[0]?.payload.id).toBe("4096")
+    expect(queue.size).toBe(0)
+  })
+
   const partUpdated = (text: string) =>
     ({
       type: "message.part.updated",

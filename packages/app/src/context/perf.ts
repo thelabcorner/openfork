@@ -14,7 +14,7 @@
 //   - low reducer but high `frame:` stalls -> the cost is rendering (re-highlight /
 //     re-render of message components per delta), which no SSE/reducer change fixes.
 
-type Span = "applyV2" | "apply" | "dir" | "home" | "invalid"
+type Span = "applyV2" | "apply" | "dir" | "home" | "invalid" | "list" | "watcher" | "prune"
 
 const DEV = (import.meta as { env?: { DEV?: boolean } }).env?.DEV === true
 const FLAG =
@@ -29,6 +29,9 @@ const acc = {
   dir: 0,
   home: 0,
   invalid: 0,
+  list: 0,
+  watcher: 0,
+  prune: 0,
   frameMax: 0,
   frameStalls: 0,
 }
@@ -36,15 +39,19 @@ const acc = {
 let lastSummary = ENABLED ? performance.now() : 0
 let frameLast = ENABLED ? performance.now() : 0
 const FRAME_STALL_MS = 50
+let frameMonitorStarted = false
+let frameMonitorRefs = 0
+let frameHandle: number | undefined
+let longTaskObserver: PerformanceObserver | undefined
 
 function frameLoop() {
-  if (!ENABLED) return
+  if (!ENABLED || !frameMonitorStarted) return
   const now = performance.now()
   const dt = now - frameLast
   frameLast = now
   if (dt > acc.frameMax) acc.frameMax = dt
   if (dt > FRAME_STALL_MS) acc.frameStalls++
-  requestAnimationFrame(frameLoop)
+  frameHandle = requestAnimationFrame(frameLoop)
 }
 
 // Surface the sporadic multi-hundred-ms main-thread blocks (seen even at 0
@@ -63,6 +70,7 @@ function observeLongTasks() {
       }
     })
     obs.observe({ entryTypes: ["longtask"] })
+    longTaskObserver = obs
   } catch {
     /* longtask unsupported */
   }
@@ -80,9 +88,25 @@ export const perf = {
     if (ENABLED) acc[name] += ms
   },
   startFrameMonitor() {
-    if (!ENABLED) return
-    if (typeof requestAnimationFrame === "function") frameLoop()
-    observeLongTasks()
+    if (!ENABLED) return () => undefined
+    frameMonitorRefs += 1
+    if (!frameMonitorStarted) {
+      frameMonitorStarted = true
+      if (typeof requestAnimationFrame === "function") frameLoop()
+      observeLongTasks()
+    }
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      frameMonitorRefs = Math.max(0, frameMonitorRefs - 1)
+      if (frameMonitorRefs > 0 || !frameMonitorStarted) return
+      frameMonitorStarted = false
+      if (frameHandle !== undefined && typeof cancelAnimationFrame === "function") cancelAnimationFrame(frameHandle)
+      frameHandle = undefined
+      longTaskObserver?.disconnect()
+      longTaskObserver = undefined
+    }
   },
   tick() {
     if (!ENABLED) return
@@ -95,10 +119,11 @@ export const perf = {
     console.log(
       `[perf] ${perSec(acc.events)} events/s · ${acc.frames ? (acc.events / acc.frames).toFixed(0) : "-"} ev/frame` +
         ` | reducer ms/s: applyV2 ${perSec(acc.applyV2)} apply ${perSec(acc.apply)} dir ${perSec(acc.dir)}` +
-        ` home ${perSec(acc.home)} invalid ${perSec(acc.invalid)} · applyV2 ${perEventUs.toFixed(2)}us/ev` +
+        ` home ${perSec(acc.home)} invalid ${perSec(acc.invalid)} list ${perSec(acc.list)} watcher ${perSec(acc.watcher)} prune ${perSec(acc.prune)}` +
+        ` · applyV2 ${perEventUs.toFixed(2)}us/ev` +
         ` | frame: max ${acc.frameMax.toFixed(0)}ms stalls(>50ms) ${acc.frameStalls}`,
     )
-    acc.events = acc.applyV2 = acc.apply = acc.dir = acc.home = acc.invalid = acc.frames = 0
+    acc.events = acc.applyV2 = acc.apply = acc.dir = acc.home = acc.invalid = acc.list = acc.watcher = acc.prune = acc.frames = 0
     acc.frameMax = 0
     acc.frameStalls = 0
     lastSummary = now

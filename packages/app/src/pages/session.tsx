@@ -62,6 +62,7 @@ import { ServerConnection, serverName, useServer } from "@/context/server"
 import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useTabs } from "@/context/tabs"
+import { browserHostClient } from "@/pages/session/v2/browser/browserHostClient"
 import { TerminalProvider, useTerminal } from "@/context/terminal"
 import { TextField } from "@opencode-ai/ui/text-field"
 import { PromptInput } from "@/components/prompt-input"
@@ -527,6 +528,36 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       setSearchParams({ ...searchParams, prompt: undefined })
     })
   })
+
+  // Bridge the session's persisted prompt store + selection into the browser
+  // annotation target so the Annotate control can persist annotations into this
+  // session's draft (and true-send with the selected agent/model). The target
+  // is null on home/new-session, where annotation is unavailable — that is what
+  // keeps canAnnotate() false there. Capture is a live getter so the persisted
+  // store stays authoritative; agent/model are snapshotted but refreshed by
+  // this effect whenever the local selection changes.
+  createEffect(() => {
+    const id = params.id
+    const agent = local.agent.current()?.name ?? ""
+    const model = local.model.current()
+    const variant = local.model.variant.current()
+    if (!id) {
+      browserHostClient.setAnnotationTarget(null)
+      return
+    }
+    browserHostClient.setAnnotationTarget({
+      sessionID: id,
+      directory: sdk().directory,
+      agent,
+      model: model
+        ? { providerID: model.providerID, modelID: model.id, variant: variant ?? undefined }
+        : { providerID: "", modelID: "" },
+      api: sdk().api.session,
+      sync: sync(),
+      capture: () => prompt.capture(),
+    })
+  })
+  onCleanup(() => browserHostClient.setAnnotationTarget(null))
 
   const [ui, setUi] = createStore({
     pendingMessage: undefined as string | undefined,

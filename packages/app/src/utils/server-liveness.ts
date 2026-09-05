@@ -6,7 +6,13 @@
 // every 10s per window. On a genuine stream failure the writer marks the server
 // dead and the poll resumes, keeping failure detection at the exact cadence and
 // grace period it had before.
-const STREAM_LIVE_WINDOW_MS = 15_000
+//
+// The window deliberately matches the poll's own red grace period (2
+// consecutive 10s-poll failures ≈ 20s): a heartbeat delayed by transient load
+// no longer expires liveness a full cycle before the poll would flip red
+// anyway, which was a source of red/green flapping under concurrent sessions.
+// Genuine outages still surface no later than before.
+const STREAM_LIVE_WINDOW_MS = 20_000
 const liveUntil = new Map<string, number>()
 
 export function markServerStreamLive(key: string) {

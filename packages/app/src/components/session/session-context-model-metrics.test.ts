@@ -37,10 +37,7 @@ const user = (id: string) => ({ id, role: "user", time: { created: 1 } }) as unk
 
 const toolPart = (id: string) => ({ type: "tool", id }) as unknown as Part
 
-const timedTextPart = (
-  id: string,
-  args: { start: number; end?: number; synthetic?: boolean; ignored?: boolean },
-) =>
+const timedTextPart = (id: string, args: { start: number; end?: number; synthetic?: boolean; ignored?: boolean }) =>
   ({
     type: "text",
     id,
@@ -115,10 +112,39 @@ describe("aggregateSessionContextByModel", () => {
     expect(gpt.output).toBe(70)
     expect(gpt.cacheRead).toBe(30)
     expect(gpt.cost).toBeCloseTo(0.15)
+    expect(gpt.freeMessageCount).toBe(0)
+    expect(gpt.freeTokens).toEqual({ input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0 })
 
     expect(session.messageCount).toBe(3)
     expect(session.input).toBe(340)
     expect(session.cost).toBeCloseTo(0.55)
+  })
+
+  test("accumulates free-turn tokens exactly within a mixed model history", () => {
+    const messages = [
+      assistant("free", {
+        input: 100,
+        output: 20,
+        reasoning: 5,
+        read: 80,
+        write: 10,
+        cost: 0,
+        created: 1,
+      }),
+      assistant("paid", {
+        input: 900,
+        output: 180,
+        reasoning: 45,
+        read: 720,
+        write: 90,
+        cost: 1,
+        created: 2,
+      }),
+    ]
+
+    const model = aggregateSessionContextByModel(messages, {}, []).models[0]
+    expect(model.freeMessageCount).toBe(1)
+    expect(model.freeTokens).toEqual({ input: 100, output: 20, reasoning: 5, cacheRead: 80, cacheWrite: 10 })
   })
 
   test("sorts models by total tokens descending", () => {
@@ -153,9 +179,7 @@ describe("aggregateSessionContextByModel", () => {
   })
 
   test("counts tool parts per message toward toolCallCount", () => {
-    const messages = [
-      assistant("a1", { input: 10, output: 10, reasoning: 0, read: 0, write: 0, cost: 0, created: 1 }),
-    ]
+    const messages = [assistant("a1", { input: 10, output: 10, reasoning: 0, read: 0, write: 0, cost: 0, created: 1 })]
     const parts = {
       a1: [toolPart("t1"), toolPart("t2"), timedTextPart("txt", { start: 0, end: 1 })],
     }
@@ -201,9 +225,7 @@ describe("aggregateSessionContextByModel", () => {
 
   describe("cache-hit percent", () => {
     test("is null when there is no input and no cache reads (no evidence)", () => {
-      const messages = [
-        assistant("a1", { input: 0, output: 10, reasoning: 0, read: 0, write: 0, cost: 0, created: 1 }),
-      ]
+      const messages = [assistant("a1", { input: 0, output: 10, reasoning: 0, read: 0, write: 0, cost: 0, created: 1 })]
       const { session, models } = aggregateSessionContextByModel(messages, {}, [])
       expect(session.cacheHitPercent).toBeNull()
       expect(models[0].cacheHitPercent).toBeNull()
@@ -1130,7 +1152,17 @@ describe("liveGenerationProgress", () => {
   test("also counts already-finished tool calls within the live window", () => {
     const msg = inFlight({ created: 0, firstTokenAt: 0 })
     const parts = [
-      { type: "tool", state: { status: "completed", input: {}, output: "", title: "", metadata: {}, time: { start: 1000, end: 3000 } } } as unknown as Part,
+      {
+        type: "tool",
+        state: {
+          status: "completed",
+          input: {},
+          output: "",
+          title: "",
+          metadata: {},
+          time: { start: 1000, end: 3000 },
+        },
+      } as unknown as Part,
     ]
     const progress = liveGenerationProgress(msg, parts, 5000)
     expect(progress.toolSeconds).toBeCloseTo(2)

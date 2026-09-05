@@ -28,6 +28,9 @@ import { useProviders } from "@/hooks/use-providers"
 import { useSDK } from "@/context/sdk"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { formatCostPerMillion } from "@/components/model-tooltip"
+import { formatPercent } from "@/components/usage/usage-format"
+import { createUsageValuation } from "@/components/usage/use-usage-valuation"
+import { subsidyShare, type SubsidyUsageRow } from "@/utils/usage-subsidy"
 import { getSessionContext } from "./session-context-metrics"
 import { estimateSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
 import {
@@ -44,7 +47,8 @@ import { MetricCell, Section } from "./insights-primitives"
 
 const emptyLiveProgress: LiveGenerationProgress = { generatedSeconds: 0, toolSeconds: 0 }
 const emptySessionParts: Record<string, Part[] | undefined> = {}
-const emptyProviderList: Parameters<typeof aggregateSessionContextByModel>[2] = []
+type SessionProviderList = NonNullable<Parameters<typeof aggregateSessionContextByModel>[2]>
+const emptyProviderList: SessionProviderList = []
 
 const BREAKDOWN_COLOR: Record<SessionContextBreakdownKey, string> = {
   system: "var(--syntax-info)",
@@ -71,9 +75,10 @@ const COST_COLOR = {
 
 type CategorySegment = { key: string; label: string; amount: number; color: string; display: string }
 
-
 function InfoCard(props: { children: JSX.Element }) {
-  return <div class="flex flex-col overflow-hidden rounded-md border border-v2-border-border-muted">{props.children}</div>
+  return (
+    <div class="flex flex-col overflow-hidden rounded-md border border-v2-border-border-muted">{props.children}</div>
+  )
 }
 
 function InfoRow(props: { label: JSX.Element; value: JSX.Element }) {
@@ -270,7 +275,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     return result
   }, emptySessionParts)
 
-  const providerList = createMemo<Parameters<typeof aggregateSessionContextByModel>[2]>((previous) => {
+  const providerList = createMemo<SessionProviderList>((previous) => {
     if (!active()) return previous
     return [...providers.all().values()]
   }, emptyProviderList)
@@ -472,6 +477,64 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const session = createMemo(() => aggregate().session)
   const models = createMemo(() => aggregate().models)
 
+  // Preserve the exact free-token bundle accumulated per turn, then add a
+  // paid companion row solely so the shared valuation can compute free share
+  // against actual spend. This is more precise than the Usage page's
+  // aggregate fallback, where mixed rows must sometimes be pro-rated.
+  const valuationRows = createMemo<SubsidyUsageRow[]>(() =>
+    models().flatMap((metrics) => {
+      const paidMessages = metrics.messageCount - metrics.freeMessageCount
+      const paidTokens = {
+        input: metrics.input - metrics.freeTokens.input,
+        output: metrics.output - metrics.freeTokens.output,
+        reasoning: metrics.reasoning - metrics.freeTokens.reasoning,
+        cacheRead: metrics.cacheRead - metrics.freeTokens.cacheRead,
+        cacheWrite: metrics.cacheWrite - metrics.freeTokens.cacheWrite,
+      }
+      return [
+        ...(metrics.freeMessageCount > 0
+          ? [
+              {
+                providerID: metrics.providerID,
+                modelID: metrics.modelID,
+                variant: null,
+                messages: metrics.freeMessageCount,
+                cost: 0,
+                estimatedCost: 0,
+                unpricedRecords: metrics.freeMessageCount,
+                tokens: metrics.freeTokens,
+              },
+            ]
+          : []),
+        ...(paidMessages > 0
+          ? [
+              {
+                providerID: metrics.providerID,
+                modelID: metrics.modelID,
+                variant: null,
+                messages: paidMessages,
+                cost: metrics.cost,
+                estimatedCost: 0,
+                unpricedRecords: 0,
+                tokens: paidTokens,
+              },
+            ]
+          : []),
+      ]
+    }),
+  )
+  const valuation = createUsageValuation(valuationRows, () => providerList() ?? emptyProviderList)
+  const subsidy = () => valuation.subsidy()
+  const subsidyByModel = createMemo(
+    () => new Map(subsidy().rows.map((row) => [`${row.providerID}:${row.modelID}`, row])),
+  )
+  const subsidyValue = () =>
+    valuation.catalogReady() ? formatter().currency(subsidy().total) : language.t("context.metric.unavailable")
+  const subsidyShareValue = () =>
+    valuation.catalogReady()
+      ? formatPercent(subsidyShare(subsidy()), language.intl())
+      : language.t("context.metric.unavailable")
+
   const sessionTotalsStats = [
     { label: "context.stats.totalTokens", value: () => formatter().number(session().total) },
     { label: "context.stats.userMessages", value: () => counts().user.toLocaleString(language.intl()) },
@@ -483,7 +546,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     [
       { label: "context.stats.totalTokens", value: () => formatter().number(metrics.total), live: false },
       { label: "context.stats.totalCost", value: () => formatter().currency(metrics.cost), live: false },
-      { label: "context.stats.messages", value: () => metrics.messageCount.toLocaleString(language.intl()), live: false },
+      {
+        label: "context.stats.messages",
+        value: () => metrics.messageCount.toLocaleString(language.intl()),
+        live: false,
+      },
       {
         label: "context.metric.toolCalls",
         value: () => metrics.toolCallCount.toLocaleString(language.intl()),
@@ -501,7 +568,13 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
       },
       { label: "context.metric.ttft", value: () => durationLabel(metrics.ttftSeconds), live: false },
       ...(metrics.cacheSavings !== undefined
-        ? [{ label: "context.metric.cacheSavings", value: () => formatter().currency(metrics.cacheSavings), live: false }]
+        ? [
+            {
+              label: "context.metric.cacheSavings",
+              value: () => formatter().currency(metrics.cacheSavings),
+              live: false,
+            },
+          ]
         : []),
     ] satisfies { label: string; value: () => JSX.Element; live: boolean }[]
 
@@ -597,9 +670,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const fetchLedger = async (sessionID = params.id) => {
     if (!sessionID) return
     try {
-      const res = await (sdk().client as unknown as {
-        sessionContext: { ledger: (p: Record<string, unknown>) => Promise<{ data: unknown }> }
-      }).sessionContext.ledger({ sessionID })
+      const res = await (
+        sdk().client as unknown as {
+          sessionContext: { ledger: (p: Record<string, unknown>) => Promise<{ data: unknown }> }
+        }
+      ).sessionContext.ledger({ sessionID })
       const data = (res as unknown as { data?: unknown }).data ?? res
       if (params.id === sessionID) {
         setLedger(data as ContextLedger)
@@ -636,9 +711,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     const key = `${op.type}:${op.messageID}`
     setLedgerBusy(key)
     try {
-      await (sdk().client as unknown as {
-        sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
-      }).sessionContext.applyOps({ sessionID, operations: [op] })
+      await (
+        sdk().client as unknown as {
+          sessionContext: { applyOps: (p: Record<string, unknown>) => Promise<unknown> }
+        }
+      ).sessionContext.applyOps({ sessionID, operations: [op] })
       await fetchLedger(sessionID)
       showToast({ variant: "success", title: language.t("context.ledger.applied") })
     } catch (e) {
@@ -735,66 +812,98 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     </div>
   )
 
-  const ModelUsageRow = (props: { metrics: ModelContextMetrics }) => (
-    <AccordionV2.Item value={props.metrics.key}>
-      <AccordionV2.Header>
-        <AccordionV2.Trigger>
-          <div class="flex min-w-0 flex-1 items-center gap-1.5">
-            <Tag>{props.metrics.providerLabel}</Tag>
-            <Tag variant="accent">{props.metrics.modelLabel}</Tag>
-          </div>
-          <div class="flex shrink-0 items-center gap-2 text-[10px] font-[520] tabular-nums text-v2-text-text-muted">
-            <span class="rounded bg-v2-background-bg-layer-02 px-1.5 py-0.5">{formatter().number(props.metrics.total)}</span>
-            <span class="rounded bg-v2-background-bg-layer-02 px-1.5 py-0.5">{formatter().currency(props.metrics.cost)}</span>
-          </div>
-        </AccordionV2.Trigger>
-      </AccordionV2.Header>
-      <AccordionV2.Content>
-        <div class="flex w-full flex-col gap-4">
-          <div class="grid grid-cols-2 gap-1.5">
-            <For each={modelMetricStats(props.metrics, liveDeltaFor(props.metrics))}>
-              {(stat) => (
-                <MetricCell
-                  label={language.t(stat.label as Parameters<typeof language.t>[0])}
-                  value={stat.value()}
-                  live={stat.live}
-                />
-              )}
-            </For>
-            <MetricCell
-              label={language.t("context.metric.cacheHit")}
-              tooltip={language.t("context.tooltip.cacheHit")}
-              value={
-                <div class="flex flex-col gap-1">
-                  <span>{percentLabel(props.metrics.cacheHitPercent)}</span>
-                  <RatioBar percent={props.metrics.cacheHitPercent} color="var(--syntax-success)" />
-                </div>
-              }
-            />
-            <MetricCell
-              label={language.t("context.metric.tokensPerSecond")}
-              tooltip={language.t("context.tooltip.tokensPerSecond")}
-              value={tokensPerSecondLabel(props.metrics.tokensPerSecond)}
-            />
-          </div>
-
-          <div class="flex flex-col gap-1.5">
-            <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">{language.t("context.tokens.title")}</div>
-            <CategoryBar segments={buildTokenSegments(props.metrics)} />
-          </div>
-
-          <Show when={props.metrics.costBreakdown}>
-            <div class="flex flex-col gap-1.5">
-              <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">{language.t("context.cost.title")}</div>
-              <CategoryBar segments={buildCostSegments(props.metrics.costBreakdown)} />
+  const ModelUsageRow = (props: { metrics: ModelContextMetrics }) => {
+    const free = createMemo(() => subsidyByModel().get(props.metrics.key))
+    return (
+      <AccordionV2.Item value={props.metrics.key}>
+        <AccordionV2.Header>
+          <AccordionV2.Trigger>
+            <div class="flex min-w-0 flex-1 items-center gap-1.5">
+              <Tag>{props.metrics.providerLabel}</Tag>
+              <Tag variant="accent">{props.metrics.modelLabel}</Tag>
             </div>
-          </Show>
+            <div class="flex shrink-0 items-center gap-2 text-[10px] font-[520] tabular-nums text-v2-text-text-muted">
+              <span class="rounded bg-v2-background-bg-layer-02 px-1.5 py-0.5">
+                {formatter().number(props.metrics.total)}
+              </span>
+              <span class="rounded bg-v2-background-bg-layer-02 px-1.5 py-0.5">
+                {formatter().currency(props.metrics.cost)}
+              </span>
+              <Show when={free()?.value}>
+                {(value) => (
+                  <span
+                    class="rounded bg-v2-background-bg-layer-02 px-1.5 py-0.5 text-v2-text-text-accent"
+                    title={language.t("context.tooltip.freeValue")}
+                  >
+                    +{formatter().currency(value())}
+                  </span>
+                )}
+              </Show>
+            </div>
+          </AccordionV2.Trigger>
+        </AccordionV2.Header>
+        <AccordionV2.Content>
+          <div class="flex w-full flex-col gap-4">
+            <div class="grid grid-cols-2 gap-1.5">
+              <For each={modelMetricStats(props.metrics, liveDeltaFor(props.metrics))}>
+                {(stat) => (
+                  <MetricCell
+                    label={language.t(stat.label as Parameters<typeof language.t>[0])}
+                    value={stat.value()}
+                    live={stat.live}
+                  />
+                )}
+              </For>
+              <MetricCell
+                label={language.t("context.metric.cacheHit")}
+                tooltip={language.t("context.tooltip.cacheHit")}
+                value={
+                  <div class="flex flex-col gap-1">
+                    <span>{percentLabel(props.metrics.cacheHitPercent)}</span>
+                    <RatioBar percent={props.metrics.cacheHitPercent} color="var(--syntax-success)" />
+                  </div>
+                }
+              />
+              <MetricCell
+                label={language.t("context.metric.tokensPerSecond")}
+                tooltip={language.t("context.tooltip.tokensPerSecond")}
+                value={tokensPerSecondLabel(props.metrics.tokensPerSecond)}
+              />
+              <Show when={free()}>
+                {(row) => (
+                  <MetricCell
+                    label={language.t("context.metric.freeValue")}
+                    tooltip={language.t("context.tooltip.freeValue")}
+                    value={formatter().currency(row().value)}
+                    sub={language.plural("usage.turns", row().freeMessages)}
+                    accent
+                  />
+                )}
+              </Show>
+            </div>
 
-          <Show when={props.metrics.costRate}>{(rate) => <CostRateTable rate={rate()} />}</Show>
-        </div>
-      </AccordionV2.Content>
-    </AccordionV2.Item>
-  )
+            <div class="flex flex-col gap-1.5">
+              <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">
+                {language.t("context.tokens.title")}
+              </div>
+              <CategoryBar segments={buildTokenSegments(props.metrics)} />
+            </div>
+
+            <Show when={props.metrics.costBreakdown}>
+              <div class="flex flex-col gap-1.5">
+                <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">
+                  {language.t("context.cost.title")}
+                </div>
+                <CategoryBar segments={buildCostSegments(props.metrics.costBreakdown)} />
+              </div>
+            </Show>
+
+            <Show when={props.metrics.costRate}>{(rate) => <CostRateTable rate={rate()} />}</Show>
+          </div>
+        </AccordionV2.Content>
+      </AccordionV2.Item>
+    )
+  }
 
   const ToolCallRow = (props: { part: Extract<Part, { type: "tool" }> }) => {
     const status = () => props.part.state.status
@@ -829,7 +938,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     // literally the same math, not a re-derivation of it.
     const metrics = createMemo(() => {
       if (props.message.role !== "assistant") return undefined
-      const result = aggregateSessionContextByModel([props.message], { [props.message.id]: props.parts }, providerList())
+      const result = aggregateSessionContextByModel(
+        [props.message],
+        { [props.message.id]: props.parts },
+        providerList(),
+      )
       return result.models[0]
     })
 
@@ -839,7 +952,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
     const bodyText = createMemo(() => {
       const text = props.parts
-        .filter((part): part is Extract<Part, { type: "text" }> => part.type === "text" && !part.synthetic && !part.ignored)
+        .filter(
+          (part): part is Extract<Part, { type: "text" }> => part.type === "text" && !part.synthetic && !part.ignored,
+        )
         .map((part) => part.text)
         .join("\n\n")
         .trim()
@@ -878,7 +993,10 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                   tooltip={language.t("context.tooltip.tokensPerSecond")}
                   value={tokensPerSecondLabel(m().tokensPerSecond)}
                 />
-                <MetricCell label={language.t("context.metric.generatedTime")} value={durationLabel(m().generatedSeconds)} />
+                <MetricCell
+                  label={language.t("context.metric.generatedTime")}
+                  value={durationLabel(m().generatedSeconds)}
+                />
                 <MetricCell label={language.t("context.metric.toolTime")} value={durationLabel(m().toolSeconds)} />
                 <MetricCell label={language.t("context.metric.ttft")} value={durationLabel(m().ttftSeconds)} />
                 <Show when={m().cacheSavings !== undefined}>
@@ -1034,7 +1152,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                       size="small"
                       class="!h-5 !px-1.5 !text-[10px] !leading-3"
                       disabled={ledgerBusy() === `message.include:${item().messageID}`}
-                      onClick={() => void applyLedgerOperation({ type: "message.include", messageID: item().messageID })}
+                      onClick={() =>
+                        void applyLedgerOperation({ type: "message.include", messageID: item().messageID })
+                      }
                     >
                       {language.t("context.ledger.restore")}
                     </ButtonV2>
@@ -1159,12 +1279,26 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
             />
             <MetricCell label={language.t("context.stats.totalCost")} value={formatter().currency(session().cost)} />
             <MetricCell label={language.t("context.stats.totalTokens")} value={formatter().number(session().total)} />
+            <MetricCell
+              label={language.t("context.metric.freeValue")}
+              tooltip={language.t("context.tooltip.freeValue")}
+              value={subsidyValue()}
+              sub={language.plural("usage.turns", subsidy().freeMessages)}
+              accent={valuation.catalogReady() && subsidy().total > 0}
+            />
+            <MetricCell
+              label={language.t("context.metric.freeShare")}
+              tooltip={language.t("context.tooltip.freeShare")}
+              value={subsidyShareValue()}
+            />
           </div>
 
           <Section title={language.t("context.overview.title")} tooltip={language.t("context.tooltip.overview")}>
             <InfoCard>
               <For each={overviewStats}>
-                {(stat) => <InfoRow label={language.t(stat.label as Parameters<typeof language.t>[0])} value={stat.value()} />}
+                {(stat) => (
+                  <InfoRow label={language.t(stat.label as Parameters<typeof language.t>[0])} value={stat.value()} />
+                )}
               </For>
             </InfoCard>
             <div class="flex flex-col gap-1.5 pt-0.5">
@@ -1183,11 +1317,15 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
           <Section title={language.t("context.session.title")} tooltip={language.t("context.tooltip.sessionTotals")}>
             <div class="grid grid-cols-2 gap-1.5">
               <For each={sessionTotalsStats}>
-                {(stat) => <MetricCell label={language.t(stat.label as Parameters<typeof language.t>[0])} value={stat.value()} />}
+                {(stat) => (
+                  <MetricCell label={language.t(stat.label as Parameters<typeof language.t>[0])} value={stat.value()} />
+                )}
               </For>
             </div>
             <div class="flex flex-col gap-1.5 pt-0.5">
-              <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">{language.t("context.tokens.title")}</div>
+              <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">
+                {language.t("context.tokens.title")}
+              </div>
               <CategoryBar segments={buildTokenSegments(session())} />
             </div>
           </Section>
@@ -1220,43 +1358,77 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
           </Section>
 
           <Section title={language.t("context.cost.title")} tooltip={language.t("context.tooltip.costBreakdown")}>
-            <Show
-              when={session().costBreakdown}
-              fallback={<div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">{language.t("context.cost.unavailable")}</div>}
-            >
-              {(breakdown) => (
-                <div class="flex flex-col gap-2">
-                  <CategoryBar segments={buildCostSegments(breakdown())} />
-                  <InfoCard>
-                    <InfoRow label={language.t("context.cost.estimatedTotal")} value={formatter().currency(breakdown().total)} />
-                    <InfoRow label={language.t("context.cost.billedTotal")} value={formatter().currency(session().cost)} />
-                    <Show when={session().cacheSavings !== undefined}>
-                      <InfoRow
-                        label={
-                          <span class="inline-flex items-center gap-1">
-                            <span>{language.t("context.metric.cacheSavings")}</span>
-                            <TooltipV2 value={<div class="max-w-64 text-11-regular">{language.t("context.tooltip.cacheSavings")}</div>}>
-                              <span class="inline-flex text-v2-text-text-faint hover:text-v2-text-text-muted" tabIndex={0}>
-                                <IconV2 name="help" size="small" />
-                              </span>
-                            </TooltipV2>
+            <div class="flex flex-col gap-2">
+              <Show
+                when={session().costBreakdown}
+                fallback={
+                  <div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">
+                    {language.t("context.cost.unavailable")}
+                  </div>
+                }
+              >
+                {(breakdown) => <CategoryBar segments={buildCostSegments(breakdown())} />}
+              </Show>
+              <InfoCard>
+                <Show when={session().costBreakdown}>
+                  {(breakdown) => (
+                    <InfoRow
+                      label={language.t("context.cost.estimatedTotal")}
+                      value={formatter().currency(breakdown().total)}
+                    />
+                  )}
+                </Show>
+                <InfoRow label={language.t("context.cost.billedTotal")} value={formatter().currency(session().cost)} />
+                <InfoRow
+                  label={language.t("context.cost.freeValue")}
+                  value={
+                    <span classList={{ "text-v2-text-text-accent": valuation.catalogReady() && subsidy().total > 0 }}>
+                      {subsidyValue()}
+                    </span>
+                  }
+                />
+                <Show when={session().cacheSavings !== undefined}>
+                  <InfoRow
+                    label={
+                      <span class="inline-flex items-center gap-1">
+                        <span>{language.t("context.metric.cacheSavings")}</span>
+                        <TooltipV2
+                          value={
+                            <div class="max-w-64 text-11-regular">{language.t("context.tooltip.cacheSavings")}</div>
+                          }
+                        >
+                          <span class="inline-flex text-v2-text-text-faint hover:text-v2-text-text-muted" tabIndex={0}>
+                            <IconV2 name="help" size="small" />
                           </span>
-                        }
-                        value={formatter().currency(session().cacheSavings)}
-                      />
-                    </Show>
-                  </InfoCard>
-                  <Show when={!session().costBreakdownComplete}>
-                    <div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">
-                      {language.t("context.cost.partial", {
-                        available: models().filter((m) => m.costBreakdown).length,
-                        total: models().length,
-                      })}
-                    </div>
-                  </Show>
+                        </TooltipV2>
+                      </span>
+                    }
+                    value={formatter().currency(session().cacheSavings)}
+                  />
+                </Show>
+              </InfoCard>
+              <Show when={!valuation.catalogReady()}>
+                <div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">
+                  {language.t("usage.valuation.noCatalog")}
                 </div>
-              )}
-            </Show>
+              </Show>
+              <Show when={valuation.catalogReady() && subsidy().unvalued.models > 0}>
+                <div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">
+                  {language.t("usage.subsidy.footnoteUnvalued", {
+                    models: subsidy().unvalued.models.toLocaleString(language.intl()),
+                    tokens: formatter().number(subsidy().unvalued.tokens),
+                  })}
+                </div>
+              </Show>
+              <Show when={!session().costBreakdownComplete}>
+                <div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">
+                  {language.t("context.cost.partial", {
+                    available: models().filter((m) => m.costBreakdown).length,
+                    total: models().length,
+                  })}
+                </div>
+              </Show>
+            </div>
           </Section>
 
           <Section
@@ -1266,7 +1438,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
           >
             <Show
               when={models().length > 0}
-              fallback={<div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">{language.t("context.models.empty")}</div>}
+              fallback={
+                <div class="text-[10px] font-[440] leading-3 text-v2-text-text-faint">
+                  {language.t("context.models.empty")}
+                </div>
+              }
             >
               <AccordionV2 multiple>
                 <For each={models()}>{(metrics) => <ModelUsageRow metrics={metrics} />}</For>
@@ -1278,7 +1454,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
           <Show when={breakdown().length > 0}>
             <div class="flex flex-col gap-2">
-              <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">{language.t("context.breakdown.title")}</div>
+              <div class="text-[10px] font-[440] leading-3 text-v2-text-text-muted">
+                {language.t("context.breakdown.title")}
+              </div>
               <div class="flex h-2 w-full overflow-hidden rounded-full bg-v2-background-bg-layer-03">
                 <For each={breakdown()}>
                   {(segment) => (
@@ -1330,7 +1508,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                     </span>
                   </TooltipV2>
                 </h3>
-                <p class="mt-1 text-[10px] leading-3 text-v2-text-text-faint">{language.t("context.ledger.description")}</p>
+                <p class="mt-1 text-[10px] leading-3 text-v2-text-text-faint">
+                  {language.t("context.ledger.description")}
+                </p>
               </div>
               <span class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-muted">
                 {messages().length.toLocaleString(language.intl())}
@@ -1350,11 +1530,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                   <div class="flex flex-col gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5 py-2">
                     <div class="flex items-center justify-between gap-2">
                       <div class="flex min-w-0 items-center gap-1.5">
-                        <ProgressCircleV2
-                          percentage={ledgerUsagePercent() ?? 0}
-                          size={16}
-                          strokeWidth={2}
-                        />
+                        <ProgressCircleV2 percentage={ledgerUsagePercent() ?? 0} size={16} strokeWidth={2} />
                         <span class="text-[10px] font-[560] leading-3 text-v2-text-text-base">
                           {language.t("context.ledger.effective")}
                         </span>
@@ -1363,10 +1539,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                         {formatter().number(l().totals.estimatedTokens)} {language.t("context.ledger.tokens")}
                       </span>
                     </div>
-                    <RatioBar
-                      percent={ledgerUsagePercent()}
-                      color="var(--syntax-info)"
-                    />
+                    <RatioBar percent={ledgerUsagePercent()} color="var(--syntax-info)" />
                     <div class="grid grid-cols-3 gap-1.5">
                       <MetricCell label={language.t("context.ledger.messages")} value={`${l().totals.messageCount}`} />
                       <MetricCell
@@ -1380,7 +1553,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                       />
                     </div>
                     <div class="flex flex-wrap items-center gap-x-2 gap-y-1 text-[9px] leading-3 text-v2-text-text-faint">
-                      <span>{language.t("context.ledger.occupancy", { tokens: formatter().number(l().totals.estimatedTokens) })}</span>
+                      <span>
+                        {language.t("context.ledger.occupancy", {
+                          tokens: formatter().number(l().totals.estimatedTokens),
+                        })}
+                      </span>
                       <Show when={l().totals.pinnedCount > 0}>
                         <span class="text-v2-text-text-faint/60">·</span>
                         <span>{language.t("context.ledger.pinnedCount", { count: l().totals.pinnedCount })}</span>
@@ -1396,8 +1573,12 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
               <div class="flex items-center justify-between gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-base px-2.5 py-1.5">
                 <div class="flex min-w-0 items-center gap-1.5">
-                  <span class="text-[10px] font-[560] leading-3 text-v2-text-text-base">{language.t("context.ledger.messages")}</span>
-                  <span class="text-[9px] leading-3 text-v2-text-text-faint">{language.t("context.ledger.inspectHint")}</span>
+                  <span class="text-[10px] font-[560] leading-3 text-v2-text-text-base">
+                    {language.t("context.ledger.messages")}
+                  </span>
+                  <span class="text-[9px] leading-3 text-v2-text-text-faint">
+                    {language.t("context.ledger.inspectHint")}
+                  </span>
                 </div>
                 <Show when={messages().length > 0}>
                   <div class="flex shrink-0 items-center gap-0.5">
@@ -1421,7 +1602,11 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
               <Show
                 when={messages().length > 0}
-                fallback={<div class="px-2.5 py-3 text-[10px] leading-3 text-v2-text-text-faint">{language.t("context.ledger.empty")}</div>}
+                fallback={
+                  <div class="px-2.5 py-3 text-[10px] leading-3 text-v2-text-text-faint">
+                    {language.t("context.ledger.empty")}
+                  </div>
+                }
               >
                 <Accordion
                   multiple
