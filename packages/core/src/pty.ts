@@ -12,6 +12,12 @@ import { Shell } from "./shell"
 import { lazy } from "./util/lazy"
 
 const BUFFER_LIMIT = 1024 * 1024 * 2
+// Native PTY callbacks can race the short replay/activation window. Bound the
+// per-attachment handoff so a client that never activates (or a stalled route)
+// cannot retain output indefinitely. Once the bound is exceeded, the attachment
+// is closed and the client reconnects using its last cursor.
+const SUBSCRIBER_PENDING_BYTES = 1024 * 1024 * 2
+const SUBSCRIBER_PENDING_CHUNKS = 256
 // Exited sessions stay observable (status, exit code, retained output) until removed explicitly.
 // Cap retention so abandoned terminals do not accumulate unbounded buffers.
 const EXITED_LIMIT = 25
@@ -23,6 +29,8 @@ type Subscriber = {
   active: boolean
   detached: boolean
   pending: string[]
+  pendingBytes: number
+  overflowed: boolean
   end?: { exitCode?: number }
 }
 
@@ -205,7 +213,18 @@ const layer = Layer.effect(
           session.cursor += chunk.length
           for (const [token, subscriber] of session.subscribers.entries()) {
             if (!subscriber.active) {
+              if (subscriber.overflowed) continue
+              if (
+                subscriber.pending.length >= SUBSCRIBER_PENDING_CHUNKS ||
+                subscriber.pendingBytes + chunk.length > SUBSCRIBER_PENDING_BYTES
+              ) {
+                subscriber.overflowed = true
+                subscriber.pending.length = 0
+                subscriber.pendingBytes = 0
+                continue
+              }
               subscriber.pending.push(chunk)
+              subscriber.pendingBytes += chunk.length
               continue
             }
             try {
@@ -267,6 +286,8 @@ const layer = Layer.effect(
         active: false,
         detached: false,
         pending: [],
+        pendingBytes: 0,
+        overflowed: false,
       }
       session.subscribers.set(token, subscriber)
       const start = session.bufferCursor
@@ -291,10 +312,21 @@ const layer = Layer.effect(
         },
         activate: () => {
           if (subscriber.active || subscriber.detached) return
+          if (subscriber.overflowed) {
+            subscriber.detached = true
+            session.subscribers.delete(token)
+            subscriber.pending.length = 0
+            subscriber.pendingBytes = 0
+            try {
+              subscriber.onEnd(subscriber.end ?? {})
+            } catch {}
+            return
+          }
           subscriber.active = true
           try {
             for (const chunk of subscriber.pending) subscriber.onData(chunk)
             subscriber.pending.length = 0
+            subscriber.pendingBytes = 0
             if (subscriber.end) subscriber.onEnd(subscriber.end)
           } catch {
             session.subscribers.delete(token)
@@ -303,6 +335,7 @@ const layer = Layer.effect(
         detach: () => {
           subscriber.detached = true
           subscriber.pending.length = 0
+          subscriber.pendingBytes = 0
           subscriber.end = undefined
           session.subscribers.delete(token)
         },

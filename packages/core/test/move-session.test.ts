@@ -232,4 +232,120 @@ describe("MoveSession", () => {
       expect(yield* Effect.promise(() => fs.readFile(path.join(source, "untracked.txt"), "utf8"))).toBe("unrelated\n")
     }),
   )
+
+  it.live("re-associates a session with another project without transferring changes", () =>
+    Effect.gen(function* () {
+      const sourceRoot = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      const destinationRoot = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(() => initRepo(sourceRoot.path))
+      yield* Effect.promise(() => initRepo(destinationRoot.path))
+      const source = abs(yield* Effect.promise(() => fs.realpath(sourceRoot.path)))
+      const destination = abs(yield* Effect.promise(() => fs.realpath(destinationRoot.path)))
+      // Separately initialized repositories resolve to distinct project IDs.
+      const sourceProjectID = (yield* Project.Service.use((service) => service.resolve(source))).id
+      const destinationProjectID = (yield* Project.Service.use((service) => service.resolve(destination))).id
+      expect(sourceProjectID).not.toBe(destinationProjectID)
+
+      const sessionID = SessionV2.ID.make("ses_move_cross_project")
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: sourceProjectID, worktree: source, sandboxes: [], time_created: 1, time_updated: 1 })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: sourceProjectID,
+          slug: "move-cross-project",
+          directory: source,
+          title: "move cross project",
+          version: "test",
+          time_created: 1,
+          time_updated: 1,
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      yield* Effect.promise(() => fs.writeFile(path.join(source, "tracked.txt"), "changed\n"))
+      yield* MoveSession.Service.use((service) => service.moveSession({ sessionID, destination: { directory: destination } }))
+
+      // Files stay where they were: no change transfer across projects.
+      expect(yield* Effect.promise(() => fs.readFile(path.join(source, "tracked.txt"), "utf8"))).toBe("changed\n")
+      expect(yield* Effect.promise(() => fs.readFile(path.join(destination, "tracked.txt"), "utf8"))).toBe(
+        "initial\n",
+      )
+      expect(
+        yield* db
+          .select({ directory: SessionTable.directory, path: SessionTable.path, projectID: SessionTable.project_id })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get(),
+      ).toEqual({ directory: destination, path: "", projectID: destinationProjectID })
+      // The session resolves through the store with its new project association.
+      expect((yield* SessionStore.Service.use((service) => service.get(sessionID)))?.projectID).toBe(
+        destinationProjectID,
+      )
+    }),
+  )
+
+  it.live("rejects transferring changes across projects", () =>
+    Effect.gen(function* () {
+      const sourceRoot = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      const destinationRoot = yield* Effect.acquireRelease(
+        Effect.promise(() => tmpdir()),
+        (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+      )
+      yield* Effect.promise(() => initRepo(sourceRoot.path))
+      yield* Effect.promise(() => initRepo(destinationRoot.path))
+      const source = abs(yield* Effect.promise(() => fs.realpath(sourceRoot.path)))
+      const destination = abs(yield* Effect.promise(() => fs.realpath(destinationRoot.path)))
+
+      const sourceProjectID = (yield* Project.Service.use((service) => service.resolve(source))).id
+      const sessionID = SessionV2.ID.make("ses_move_cross_project_changes")
+      const { db } = yield* Database.Service
+      yield* db
+        .insert(ProjectTable)
+        .values({ id: sourceProjectID, worktree: source, sandboxes: [], time_created: 1, time_updated: 1 })
+        .run()
+        .pipe(Effect.orDie)
+      yield* db
+        .insert(SessionTable)
+        .values({
+          id: sessionID,
+          project_id: sourceProjectID,
+          slug: "move-cross-project-changes",
+          directory: source,
+          title: "move cross project changes",
+          version: "test",
+          time_created: 1,
+          time_updated: 1,
+        })
+        .run()
+        .pipe(Effect.orDie)
+
+      const error = yield* MoveSession.Service.use((service) =>
+        service.moveSession({ sessionID, destination: { directory: destination }, moveChanges: true }),
+      ).pipe(Effect.flip)
+      expect(error).toBeInstanceOf(MoveSession.DestinationProjectMismatchError)
+      // The failed move leaves the session exactly where it was.
+      expect(
+        yield* db
+          .select({ directory: SessionTable.directory, projectID: SessionTable.project_id })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, sessionID))
+          .get(),
+      ).toEqual({ directory: source, projectID: sourceProjectID })
+    }),
+  )
 })

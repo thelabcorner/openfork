@@ -333,12 +333,69 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_context_ops\` (
+          \`id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`batch_id\` text NOT NULL,
+          \`operations\` text NOT NULL,
+          \`timestamp\` integer NOT NULL,
+          CONSTRAINT \`fk_session_context_ops_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_context_state\` (
+          \`session_id\` text NOT NULL,
+          \`message_id\` text NOT NULL,
+          \`excluded\` integer DEFAULT false NOT NULL,
+          \`pinned\` integer DEFAULT false NOT NULL,
+          \`override_data\` text,
+          \`override_search_text\` text,
+          \`modified_seq\` integer,
+          \`modified_at\` integer NOT NULL,
+          CONSTRAINT \`session_context_state_pk\` PRIMARY KEY(\`session_id\`, \`message_id\`),
+          CONSTRAINT \`fk_session_context_state_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_fork_origin\` (
+          \`session_id\` text PRIMARY KEY,
+          \`parent_session_id\` text NOT NULL,
+          \`source_message_id\` text,
+          \`source_seq\` integer,
+          \`edge\` text,
+          \`kind\` text NOT NULL,
+          \`workspace_mode\` text NOT NULL,
+          \`created_at\` integer NOT NULL,
+          CONSTRAINT \`fk_session_fork_origin_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_group_member\` (
+          \`group_id\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          \`locked\` integer DEFAULT false NOT NULL,
+          \`origin\` text DEFAULT 'user' NOT NULL,
+          \`origin_plugin\` text,
+          \`origin_ref\` text,
+          \`position\` integer DEFAULT 0 NOT NULL,
+          \`time_added\` integer NOT NULL,
+          CONSTRAINT \`session_group_member_pk\` PRIMARY KEY(\`group_id\`, \`session_id\`),
+          CONSTRAINT \`fk_session_group_member_group_id_session_group_id_fk\` FOREIGN KEY (\`group_id\`) REFERENCES \`session_group\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_session_group_member_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_group\` (
           \`id\` text PRIMARY KEY,
           \`name\` text NOT NULL,
           \`position\` integer NOT NULL,
+          \`kind\` text DEFAULT 'user' NOT NULL,
+          \`owner_plugin\` text,
+          \`anchor_session_id\` text,
+          \`policy\` text,
           \`time_created\` integer NOT NULL,
-          \`time_updated\` integer NOT NULL
+          \`time_updated\` integer NOT NULL,
+          \`time_archived\` integer
         );
       `)
       yield* tx.run(`
@@ -468,6 +525,21 @@ export default {
       )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`session_checkpoint_session_user_message_idx\` ON \`session_checkpoint\` (\`session_id\`,\`user_message_id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`session_context_ops_session_idx\` ON \`session_context_ops\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_context_ops_session_time_idx\` ON \`session_context_ops\` (\`session_id\`,\`timestamp\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`session_context_state_session_idx\` ON \`session_context_state\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_fork_origin_parent_idx\` ON \`session_fork_origin\` (\`parent_session_id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`session_group_member_session_idx\` ON \`session_group_member\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_group_member_position_idx\` ON \`session_group_member\` (\`group_id\`,\`position\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_group_anchor_idx\` ON \`session_group\` (\`kind\`,\`anchor_session_id\`);`,
       )
       yield* tx.run(
         `CREATE INDEX \`session_input_session_pending_delivery_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`,\`delivery\`,\`admitted_seq\`);`,

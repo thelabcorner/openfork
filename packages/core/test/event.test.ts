@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Schema, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
 import { Session } from "@opencode-ai/schema/session"
@@ -320,6 +320,52 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("bounds synchronous subscriber bursts and reports overflow instead of silent loss", () =>
+    Effect.gen(function* () {
+      const subscriber = yield* EventV2.makeSubscriberQueue<number>(4)
+      for (let i = 0; i < 10_000; i++) subscriber.offer(i)
+      expect(yield* Queue.size(subscriber.queue)).toBeLessThanOrEqual(4)
+      const received: number[] = []
+      const exit = yield* subscriber.stream.pipe(
+        Stream.runForEach((value) =>
+          Effect.sync(() => {
+            received.push(value)
+          }),
+        ),
+        Effect.exit,
+      )
+      expect(received).toEqual([0, 1, 2, 3])
+      expect(Exit.findErrorOption(exit).pipe(Option.getOrUndefined)).toBeInstanceOf(EventV2.SubscriberOverflowError)
+    }),
+  )
+
+  it.effect("retains events offered before a subscriber starts consuming", () =>
+    Effect.gen(function* () {
+      const subscriber = yield* EventV2.makeSubscriberQueue<string>(4)
+      subscriber.offer("before-connected")
+      subscriber.offer("after-connected")
+      expect(Array.from(yield* subscriber.stream.pipe(Stream.take(2), Stream.runCollect))).toEqual([
+        "before-connected",
+        "after-connected",
+      ])
+    }),
+  )
+
+  it.effect("releases unread subscriber queues when their scope closes", () =>
+    Effect.gen(function* () {
+      const subscriber = yield* Effect.scoped(
+        Effect.gen(function* () {
+          const subscriber = yield* EventV2.makeSubscriberQueue<string>(4)
+          subscriber.offer("unread")
+          return subscriber
+        }),
+      )
+      subscriber.offer("after-close")
+      expect(yield* Queue.size(subscriber.queue)).toBe(0)
+      expect(Exit.isFailure(yield* Queue.take(subscriber.queue).pipe(Effect.exit))).toBe(true)
+    }),
+  )
+
   it.effect("ends only an overflowing bounded subscriber without blocking other listeners", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
@@ -370,13 +416,20 @@ describe("EventV2", () => {
     }),
   )
 
-  it.effect("keeps live-only listener defects fail-fast", () =>
+  it.effect("contains live-only listener defects without failing publication", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
       const defect = new Error("listener defect")
-      yield* events.listen(() => Effect.die(defect))
+      let calls = 0
+      yield* events.listen(() => {
+        calls += 1
+        return Effect.die(defect)
+      })
 
-      expect(yield* events.publish(Message, { text: "hello" }).pipe(Effect.catchDefect(Effect.succeed))).toBe(defect)
+      const event = yield* events.publish(Message, { text: "hello" })
+      expect(event.data).toEqual({ text: "hello" })
+      yield* events.publish(Message, { text: "second" })
+      expect(calls).toBe(1)
     }),
   )
 
@@ -436,6 +489,20 @@ describe("EventV2", () => {
         [1, durableData(aggregateID, "one")],
         [2, durableData(aggregateID, "two")],
       ])
+    }),
+  )
+
+  it.effect("drains multiple historical pages without requiring a new publish", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const aggregateID = Session.ID.create()
+      for (let index = 0; index < 520; index++) {
+        yield* events.publish(DurableMessage, durableData(aggregateID, String(index)))
+      }
+      const result = yield* events.durable({ aggregateID, after: 3 }).pipe(Stream.take(516), Stream.runCollect)
+      expect(Array.from(result).map((event) => event.durable?.seq)).toEqual(
+        Array.from({ length: 516 }, (_, index) => index + 4),
+      )
     }),
   )
 

@@ -1,5 +1,5 @@
 import { $ } from "bun"
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
 import { ConfigProvider, Deferred, Duration, Effect, Fiber, Layer, Option, Stream } from "effect"
@@ -16,6 +16,20 @@ import { tmpdir } from "../fixture/tmpdir"
 import { testEffect } from "../lib/effect"
 
 const describeWatcher = Watcher.hasNativeBinding() && !process.env.CI ? describe : describe.skip
+
+test("watcher deduplication preserves create-delete-create terminal state", () => {
+  const updates = ["create", "create", "delete", "create"].map((type) => ({ path: "a", type }))
+  expect(Watcher.dedupeUpdates(updates).map((event) => event.type)).toEqual(["create", "delete", "create"])
+})
+
+test("git control allowlist excludes transient entries created after startup", () => {
+  for (const name of ["HEAD", "refs/heads/main", "refs\\heads\\new", "packed-refs"]) {
+    expect(Watcher.isGitControlPath(name)).toBe(true)
+  }
+  for (const name of ["HEAD.lock", "index.lock", "MERGE_HEAD", "ORIG_HEAD", "COMMIT_EDITMSG", "objects/a"]) {
+    expect(Watcher.isGitControlPath(name)).toBe(false)
+  }
+})
 
 type WatcherEvent = { file: string; event: "add" | "change" | "unlink" }
 
@@ -142,6 +156,40 @@ function ready(directory: string) {
     ).pipe(Effect.ensuring(fs.remove(file, { force: true }).pipe(Effect.ignore)), Effect.asVoid)
   })
 }
+
+describe("dedupeUpdates", () => {
+  test("collapses exact-duplicate path+type notifications", () => {
+    expect(
+      Watcher.dedupeUpdates([
+        { path: "/a.txt", type: "update" },
+        { path: "/a.txt", type: "update" },
+        { path: "/b.txt", type: "create" },
+        { path: "/a.txt", type: "update" },
+      ]),
+    ).toEqual([
+      { path: "/a.txt", type: "update" },
+      { path: "/b.txt", type: "create" },
+    ])
+  })
+
+  test("keeps different types for the same path", () => {
+    expect(
+      Watcher.dedupeUpdates([
+        { path: "/a.txt", type: "create" },
+        { path: "/a.txt", type: "update" },
+        { path: "/a.txt", type: "delete" },
+      ]),
+    ).toEqual([
+      { path: "/a.txt", type: "create" },
+      { path: "/a.txt", type: "update" },
+      { path: "/a.txt", type: "delete" },
+    ])
+  })
+
+  test("passes through an empty batch", () => {
+    expect(Watcher.dedupeUpdates([])).toEqual([])
+  })
+})
 
 describeWatcher("Watcher", () => {
   it.live("publishes root create, update, and delete events", () =>

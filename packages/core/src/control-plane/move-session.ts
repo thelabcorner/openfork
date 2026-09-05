@@ -2,10 +2,12 @@ export * as MoveSession from "./move-session"
 
 import { Context, DateTime, Effect, Layer, Schema } from "effect"
 import { makeGlobalNode } from "../effect/app-node"
+import { Database } from "../database/database"
 import { EventV2 } from "../event"
 import { Git } from "../git"
 import { Location } from "../location"
 import { ProjectV2 } from "../project"
+import { ProjectTable } from "../project/sql"
 import { SessionV2 } from "../session"
 import { SessionEvent } from "../session/event"
 import { SessionSchema } from "../session/schema"
@@ -73,6 +75,8 @@ const layer = Layer.effect(
     const events = yield* EventV2.Service
     const project = yield* ProjectV2.Service
     const sessions = yield* SessionStore.Service
+    const database = yield* Database.Service
+    const db = database.db
 
     const moveSession = Effect.fn("MoveSession.moveSession")(function* (input: Input) {
       const current = yield* sessions.get(input.sessionID)
@@ -82,7 +86,11 @@ const layer = Layer.effect(
 
       const source = yield* project.resolve(current.location.directory)
       const destination = yield* project.resolve(directory)
-      if (current.projectID !== destination.id) {
+      const crossProject = current.projectID !== destination.id
+      if (crossProject && input.moveChanges) {
+        // Patches captured from one repository cannot be applied safely in
+        // another: histories, roots, and worktrees differ. Re-associate
+        // without transferring changes instead.
         return yield* new DestinationProjectMismatchError({ expected: current.projectID, actual: destination.id })
       }
 
@@ -106,10 +114,22 @@ const layer = Layer.effect(
       // Event-level location metadata carries the NEW root so location-routed
       // consumers (instance SSE, plugin event hook) can observe re-roots;
       // without it the moved event only survives on the unfiltered server SSE.
+      // Cross-project moves also carry the new project ID so the projector can
+      // re-associate the session row; same-project moves omit it so historical
+      // events keep projecting unchanged.
+      if (crossProject) {
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: destination.id, worktree: destination.directory, vcs: destination.vcs?.type, sandboxes: [] })
+          .onConflictDoNothing()
+          .run()
+          .pipe(Effect.orDie)
+      }
       yield* events.publish(SessionEvent.Moved, {
         sessionID: input.sessionID,
         location: Location.Ref.make({ directory }),
         subdirectory: RelativePath.make(path.relative(destination.directory, directory).replaceAll("\\", "/")),
+        ...(crossProject ? { projectID: destination.id } : {}),
         timestamp: yield* DateTime.now,
       }, { location: Location.Ref.make({ directory }) })
 
@@ -147,5 +167,5 @@ const layer = Layer.effect(
 export const node = makeGlobalNode({
   service: Service,
   layer,
-  deps: [Git.node, EventV2.node, ProjectV2.node, SessionStore.node],
+  deps: [Git.node, EventV2.node, ProjectV2.node, SessionStore.node, Database.node],
 })

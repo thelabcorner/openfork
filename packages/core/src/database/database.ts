@@ -63,13 +63,17 @@ const layer = (filename: string) =>
       }
 
       // Periodically checkpoint the WAL so it doesn't grow unbounded during
-      // long runs. TRUNCATE actually truncates the WAL file (PASSIVE only
-      // checkpoints what it can without blocking). Runs on the shared
-      // connection, so it is serialized with live queries; a bounded WAL keeps
-      // startup replay cheap. Failures are swallowed so the loop keeps going.
+      // long runs. PASSIVE checkpoints whatever frames it can WITHOUT taking
+      // the EXCLUSIVE lock, so it can never stall live queries: the native
+      // driver calls are synchronous (they block the single event loop), and
+      // a TRUNCATE checkpoint contending with concurrent sessions' writes can
+      // hold the shared connection — bounded only by the 5s busy_timeout —
+      // long enough to starve the 10s SSE heartbeat and flip the UI red.
+      // PASSIVE still bounds WAL growth (idle moments between queries let it
+      // make progress); failures are swallowed so the loop keeps going.
       yield* Effect.forkScoped(
         db
-          .run("PRAGMA wal_checkpoint(TRUNCATE)")
+          .run("PRAGMA wal_checkpoint(PASSIVE)")
           .pipe(Effect.ignore, Effect.repeat(Schedule.spaced(Duration.minutes(5)))),
       )
 

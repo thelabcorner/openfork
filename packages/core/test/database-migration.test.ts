@@ -25,6 +25,7 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import sessionMetadataMigration from "@opencode-ai/core/database/migration/20260511173437_session-metadata"
+import sessionGroupMembershipMigration from "@opencode-ai/core/database/migration/20260904000000_add_session_group_membership"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -39,6 +40,53 @@ const run = <A, E>(effect: Effect.Effect<A, E, SqlClientService>) =>
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
 
 describe("DatabaseMigration", () => {
+  test("backfills session-group memberships and remains re-runnable", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`
+          CREATE TABLE session (
+            id text PRIMARY KEY,
+            group_id text
+          )
+        `)
+        yield* db.run(sql`
+          CREATE TABLE session_group (
+            id text PRIMARY KEY,
+            name text NOT NULL,
+            position integer NOT NULL,
+            time_created integer NOT NULL,
+            time_updated integer NOT NULL
+          )
+        `)
+        yield* db.run(sql`INSERT INTO session_group VALUES ('grp_test', 'Test', 0, 1, 1)`)
+        yield* db.run(sql`INSERT INTO session VALUES ('ses_test', 'grp_test')`)
+
+        yield* DatabaseMigration.applyOnly(db, [sessionGroupMembershipMigration])
+        yield* db.run(sql`DELETE FROM migration WHERE id = ${sessionGroupMembershipMigration.id}`)
+        yield* DatabaseMigration.applyOnly(db, [sessionGroupMembershipMigration])
+
+        expect(
+          (yield* db.all<{ name: string }>(sql`PRAGMA table_info(session_group)`)).map((column) => column.name),
+        ).toEqual([
+          "id",
+          "name",
+          "position",
+          "time_created",
+          "time_updated",
+          "kind",
+          "owner_plugin",
+          "anchor_session_id",
+          "policy",
+          "time_archived",
+        ])
+        expect(yield* db.all(sql`SELECT group_id, session_id, locked, origin FROM session_group_member`)).toEqual([
+          { group_id: "grp_test", session_id: "ses_test", locked: 0, origin: "user" },
+        ])
+      }),
+    )
+  })
+
   test("defaults missing workspace names while preserving legacy workspace data", async () => {
     await run(
       Effect.gen(function* () {

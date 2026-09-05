@@ -68,13 +68,50 @@ export const SessionTable = sqliteTable(
   ],
 )
 
-export const SessionGroupTable = sqliteTable("session_group", {
-  id: text().primaryKey(),
-  name: text().notNull(),
-  position: integer().notNull(),
-  time_created: integer().notNull(),
-  time_updated: integer().notNull(),
-})
+export const SessionGroupTable = sqliteTable(
+  "session_group",
+  {
+    id: text().primaryKey(),
+    name: text().notNull(),
+    position: integer().notNull(),
+    kind: text().$type<"user" | "subagent" | "plugin">().notNull().default("user"),
+    owner_plugin: text(),
+    anchor_session_id: text().$type<SessionSchema.ID>(),
+    policy: text({ mode: "json" }).$type<{
+      autoAddDescendants: boolean
+      lockAdded: boolean
+      autoDeleteWhenEmpty: boolean
+    }>(),
+    time_created: integer().notNull(),
+    time_updated: integer().notNull(),
+    time_archived: integer(),
+  },
+  (table) => [uniqueIndex("session_group_anchor_idx").on(table.kind, table.anchor_session_id)],
+)
+
+export const SessionGroupMemberTable = sqliteTable(
+  "session_group_member",
+  {
+    group_id: text()
+      .notNull()
+      .references(() => SessionGroupTable.id, { onDelete: "cascade" }),
+    session_id: text()
+      .$type<SessionSchema.ID>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    locked: integer({ mode: "boolean" }).notNull().default(false),
+    origin: text().$type<"user" | "auto_subagent" | "plugin">().notNull().default("user"),
+    origin_plugin: text(),
+    origin_ref: text(),
+    position: integer().notNull().default(0),
+    time_added: integer().notNull(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.group_id, table.session_id] }),
+    index("session_group_member_session_idx").on(table.session_id),
+    index("session_group_member_position_idx").on(table.group_id, table.position),
+  ],
+)
 
 export const MessageTable = sqliteTable(
   "message",

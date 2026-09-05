@@ -34,7 +34,7 @@ interface Job {
   reject: (error: unknown) => void
 }
 
-class DecompressPool {
+export class DecompressPool {
   private readonly size: number
   private workers: Worker[] = []
   private idle: Worker[] = []
@@ -42,8 +42,9 @@ class DecompressPool {
   private queue: Job[] = []
   private nextId = 1
   private started = false
+  private closed = false
 
-  constructor(size?: number) {
+  constructor(size?: number, private readonly createWorker: () => Worker = () => new Worker(workerUrl)) {
     const cpus = Math.max(1, os.cpus().length)
     this.size = size ?? Math.min(4, Math.max(2, cpus - 1))
   }
@@ -55,11 +56,12 @@ class DecompressPool {
   }
 
   private spawn() {
-    const worker = new Worker(workerUrl)
+    if (this.closed) return
+    const worker = this.createWorker()
     worker.on("message", (res: Response) => this.onMessage(worker, res))
     worker.on("error", (err) => this.onError(worker, err))
     worker.on("exit", (code) => {
-      if (code !== 0) this.onError(worker, new Error(`decompress-worker exited with code ${code}`))
+      this.onError(worker, new Error(`decompress-worker exited with code ${code}`))
     })
     this.workers.push(worker)
     this.idle.push(worker)
@@ -67,19 +69,28 @@ class DecompressPool {
 
   private onMessage(worker: Worker, res: Response) {
     const job = this.busy.get(worker)
+    if (!job) return
+    if (job.req.id !== res.id) {
+      this.onError(worker, new Error("decompress-worker response ID mismatch"))
+      return
+    }
     this.busy.delete(worker)
-    if (job && job.req.id === res.id) {
+    try {
       // The worker sends ONLY the raw bytes (transferred zero-copy). Parsing
       // happens here on the main thread: structured-cloning the parsed object
       // from the worker would serialize a large object on the main thread and
       // negate the parallelism (epoch-3 bench: 16 jumbos 628ms vs 513ms sync).
       job.resolve({ value: JSON.parse(decoder.decode(res.raw)), raw: res.raw })
+    } catch (error) {
+      job.reject(error)
     }
     this.idle.push(worker)
     this.drain()
   }
 
   private onError(worker: Worker, err: unknown) {
+    // error and exit can both fire for one worker. Retire it exactly once.
+    if (!this.workers.includes(worker)) return
     const job = this.busy.get(worker)
     this.busy.delete(worker)
     const idx = this.workers.indexOf(worker)
@@ -87,7 +98,7 @@ class DecompressPool {
     const idleIdx = this.idle.indexOf(worker)
     if (idleIdx >= 0) this.idle.splice(idleIdx, 1)
     worker.terminate().catch(() => {})
-    if (this.workers.length < this.size) this.spawn()
+    if (!this.closed && this.workers.length < this.size) this.spawn()
     if (job) job.reject(err)
     this.drain()
   }
@@ -101,11 +112,16 @@ class DecompressPool {
       // transferred. Transferring would detach the caller's buffer (the same
       // frame can be decoded again after a cache eviction), and a Node Buffer
       // view into a shared pool cannot be transferred at all (DataCloneError).
-      worker.postMessage(job.req)
+      try {
+        worker.postMessage(job.req)
+      } catch (error) {
+        this.onError(worker, error)
+      }
     }
   }
 
   submit(bytes: Uint8Array): Promise<{ value: unknown; raw: Uint8Array }> {
+    if (this.closed) return Promise.reject(new Error("Decompression pool is closed"))
     this.start()
     return new Promise<{ value: unknown; raw: Uint8Array }>((resolve, reject) => {
       const job: Job = { req: { id: this.nextId++, bytes }, resolve, reject }
@@ -116,12 +132,17 @@ class DecompressPool {
 
   /** Tear down all workers (call on shutdown / test teardown). */
   async close(): Promise<void> {
-    await Promise.all(this.workers.map((w) => w.terminate().catch(() => {})))
+    this.closed = true
+    const workers = this.workers
+    const error = new Error("Decompression pool is closed")
+    for (const job of this.busy.values()) job.reject(error)
+    for (const job of this.queue) job.reject(error)
     this.workers = []
     this.idle = []
     this.busy.clear()
     this.queue = []
     this.started = false
+    await Promise.all(workers.map((w) => w.terminate().catch(() => {})))
   }
 }
 
@@ -144,6 +165,7 @@ export function decompressValueAsync(bytes: Uint8Array): Promise<{ value: unknow
 
 /** Close the worker pool (idempotent). Exposed for shutdown / test teardown. */
 export async function decompressPoolClose(): Promise<void> {
-  if (pool) await pool.close()
+  const closing = pool
   pool = undefined
+  if (closing) await closing.close()
 }
