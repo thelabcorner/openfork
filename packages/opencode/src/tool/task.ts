@@ -150,9 +150,11 @@ export const TaskTool = Tool.define(
       }
 
       const parent = yield* sessions.get(ctx.sessionID)
-      let current = parent
       let depth = 0
-      while (current.parentID) {
+      let current = parent
+      const visited = new Set<SessionID>([parent.id])
+      while (current.parentID && depth < 64 && !visited.has(current.parentID)) {
+        visited.add(current.parentID)
         depth++
         current = yield* sessions.get(current.parentID)
       }

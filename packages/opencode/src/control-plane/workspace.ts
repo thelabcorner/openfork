@@ -735,7 +735,9 @@ const layer = Layer.effect(
               Effect.logWarning("workspace adapter list failed", { type, error }).pipe(Effect.as([])),
             ),
           ),
-        { concurrency: "unbounded" },
+        // Adapter discovery is external I/O; cap it so one project cannot
+        // fan out an arbitrary number of adapter requests at once.
+        { concurrency: 8 },
       ).pipe(Effect.map((items) => items.flat()))
 
       yield* Effect.forEach(

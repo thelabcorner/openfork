@@ -7,10 +7,15 @@ import { useGlobal } from "@/context/global"
 import { ServerConnection } from "@/context/server"
 import type { Session } from "@opencode-ai/sdk/v2"
 import { useSessionGroups } from "@/context/session-groups"
-import { DialogSessionGroupName } from "../dialog-session-group"
+import { DialogSessionGroupName, DialogSessionGroupPicker } from "../dialog-session-group"
 import { showToast } from "@/utils/toast"
 import { tabSessionState } from "../titlebar-tab-state"
-import { isTitleRegenerationPending, sessionApiOf, beginTitleRegeneration, endTitleRegeneration } from "../titlebar-tab-actions"
+import {
+  isTitleRegenerationPending,
+  sessionApiOf,
+  beginTitleRegeneration,
+  endTitleRegeneration,
+} from "../titlebar-tab-actions"
 import { createSessionMenuModel, type SessionMenuWhere } from "./session-menu-model"
 import type { MenuSectionDef } from "./menu-model"
 import { MenuSectionsRenderer } from "./menu-renderer"
@@ -26,6 +31,11 @@ import { ModelsProvider } from "@/context/models"
 import { SDKProvider } from "@/context/sdk"
 import { DirectoryDataProvider } from "@/pages/directory-layout"
 import { DialogRenameSession } from "@/components/dialog-rename-session"
+import { displayName, getProjectAvatarSource } from "@/pages/layout/helpers"
+import { useDirectoryPicker } from "@/components/directory-picker"
+import { getProjectAvatarVariant } from "@/context/layout"
+import { pathKey } from "@/utils/path-key"
+import { chatsRoot } from "@opencode-ai/core/project/chat-paths"
 import { isSessionPinned, toggleSessionPin } from "@/utils/pinned-sessions"
 import { fetchSessionExport, sessionExportFilename, downloadSessionExport } from "@/utils/session-export"
 import type { ServerScope } from "@/utils/server-scope"
@@ -93,6 +103,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
   const global = useGlobal()
   const dialog = useDialog()
   const platform = usePlatform()
+  const pickDirectory = useDirectoryPicker()
   const sessionGroups = useSessionGroups()
 
   const sessionID = createMemo(() => props.session?.id)
@@ -114,6 +125,12 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
 
   const userGroups = () => sessionGroups.groups().map((g) => ({ id: g.id, name: g.name }))
   const isInGroup = createMemo(() => !!props.inGroupId)
+  const membershipLocked = createMemo(() => {
+    const groupID = props.inGroupId
+    const sid = sessionID()
+    if (!groupID || !sid) return false
+    return sessionGroups.byID(groupID)?.sessions.find((member) => member.id === sid)?.locked ?? false
+  })
 
   // Default control actions (stop/pause/resume/regenerate) — hosts may override via props actions
   const api = createMemo(() => sessionApiOf(serverCtx()))
@@ -229,6 +246,77 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       })
   }
 
+  const changeProject = createMemo(() => {
+    const sess = props.session
+    const ctx = serverCtx()
+    if (!sess || !ctx) return undefined
+    const current = pathKey(sess.directory)
+    const moveSessionTo = (worktree: string) => {
+      const sid = sessionID()
+      if (!sid || pathKey(worktree) === pathKey(sess.directory)) return
+      void ctx.sdk.client.experimental.controlPlane
+        .moveSession({ sessionID: sid, destination: { directory: worktree }, moveChanges: false })
+        .then(() => showToast({ title: language.t("toast.session.move.success.title"), variant: "success" }))
+        .catch((err: unknown) => {
+          showToast({
+            title: language.t("toast.session.move.failed.title"),
+            description: err instanceof Error ? err.message : undefined,
+            variant: "error",
+          })
+        })
+    };
+    // Same options as the new-session project selector: the chats entry plus
+    // this server's known projects. Selecting one re-associates the session
+    // with that project without transferring uncommitted changes.
+    const projects = (
+      [{ name: "Chat", id: "chats", worktree: chatsRoot(), sandboxes: [] as string[] }, ...ctx.projects.list()] as Array<{
+        worktree: string
+        name?: string
+        id?: string
+        icon?: { color?: string; url?: string; override?: string }
+        sandboxes?: string[]
+      }>
+    ).map((project) => {
+      const label = displayName(project)
+      return {
+        worktree: project.worktree,
+        label,
+        current:
+          pathKey(project.worktree) === current ||
+          project.sandboxes?.some((sandbox) => pathKey(sandbox) === current) === true,
+        disabled: pathKey(project.worktree) === current,
+        avatar: {
+          fallback: label,
+          src: getProjectAvatarSource(project.id, project.icon),
+          variant: getProjectAvatarVariant(project.icon?.color),
+        },
+      }
+    })
+    return {
+      projects,
+      searchPlaceholder: language.t("session.new.project.search"),
+      onSelect: moveSessionTo,
+      onAddProject: () => {
+        const sid = sessionID()
+        const conn = props.server
+          ? global.servers.list().find((item) => ServerConnection.key(item) === props.server)
+          : undefined
+        if (!sid || !conn) return
+        pickDirectory({
+          server: conn,
+          title: language.t("command.project.open"),
+          onSelect: (result) => {
+            const directory = Array.isArray(result) ? result[0] : result
+            if (!directory) return
+            ctx.projects.open(directory)
+            ctx.projects.touch(directory)
+            moveSessionTo(directory)
+          },
+        })
+      },
+    }
+  })
+
   const close = () => {
     const i = tabIndex()
     if (i >= 0) tabs.closeTab(i)
@@ -248,10 +336,44 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
   const closeAll = () => tabs.closeAllTabs()
 
   const renameGroup = () => {
-    showToast({ title: language.t("sessionGroup.rename") })
+    const id = props.groupId
+    const group = id ? sessionGroups.byID(id) : undefined
+    if (!id || !group) return
+    void dialog.show(() => (
+      <DialogSessionGroupName
+        initial={group.name}
+        onSubmit={(name) => {
+          void sessionGroups.renameGroup({ id, name }).catch((error: unknown) =>
+            showToast({
+              title: language.t("sessionGroup.rename"),
+              description: error instanceof Error ? error.message : undefined,
+              variant: "error",
+            }),
+          )
+        }}
+      />
+    ))
   }
   const addSessions = () => {
-    showToast({ title: language.t("sessionGroup.addSessions") })
+    const sid = sessionID()
+    const current = props.groupId
+    if (!sid || !current) return
+    const choices = sessionGroups.groups().filter((group) => group.id !== current && group.kind === "user")
+    void dialog.show(() => (
+      <DialogSessionGroupPicker
+        groups={choices.map((group) => ({ id: group.id, name: group.name }))}
+        onSelect={(groupId) => {
+          void sessionGroups.addSessionToGroup({ groupId, sessionId: sid }).catch((error: unknown) =>
+            showToast({
+              title: language.t("sessionGroup.addSessions"),
+              description: error instanceof Error ? error.message : undefined,
+              variant: "error",
+            }),
+          )
+        }}
+        onCreate={() => onCreateGroupDialog()}
+      />
+    ))
   }
 
   // These contexts are available at different levels in the provider tree:
@@ -377,8 +499,12 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     permission.toggleAutoAccept(sid, sess.directory)
     const active = permission.isAutoAccepting(sid, sess.directory)
     showToast({
-      title: active ? language.t("toast.permissions.autoaccept.on.title") : language.t("toast.permissions.autoaccept.off.title"),
-      description: active ? language.t("toast.permissions.autoaccept.on.description") : language.t("toast.permissions.autoaccept.off.description"),
+      title: active
+        ? language.t("toast.permissions.autoaccept.on.title")
+        : language.t("toast.permissions.autoaccept.off.title"),
+      description: active
+        ? language.t("toast.permissions.autoaccept.on.description")
+        : language.t("toast.permissions.autoaccept.off.description"),
     })
   }
 
@@ -405,7 +531,9 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       sessionID: sid,
       id: messageID,
       agent: agent?.name ?? "build",
-      model: model ? { providerID: model.providerID, modelID: model.modelID, variant: model.variant ?? undefined } : undefined,
+      model: model
+        ? { providerID: model.providerID, modelID: model.modelID, variant: model.variant ?? undefined }
+        : undefined,
       text: "continue",
       legacyParts: [{ id: `prt_${messageID}`, type: "text", text: "continue" }],
     }
@@ -431,11 +559,19 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const ps = await ensurePromptSession()
     const model = ps?.model.current() ?? promptFromSession(sess) ?? promptFromLocal()
     if (!model) {
-      showToast({ title: language.t("toast.model.none.title"), description: language.t("toast.model.none.description"), variant: "error" })
+      showToast({
+        title: language.t("toast.model.none.title"),
+        description: language.t("toast.model.none.description"),
+        variant: "error",
+      })
       return
     }
     try {
-      await (ctx.sdk.api.session as unknown as { compact: (input: { sessionID: string; model: { providerID: string; modelID: string } }) => Promise<unknown> }).compact({
+      await (
+        ctx.sdk.api.session as unknown as {
+          compact: (input: { sessionID: string; model: { providerID: string; modelID: string } }) => Promise<unknown>
+        }
+      ).compact({
         sessionID: sid,
         model: { providerID: model.providerID, modelID: model.modelID },
       })
@@ -458,7 +594,13 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       return
     }
     void dialog.show(() => (
-      <DialogSessionGroupName onSubmit={(name) => void sessionGroups.createGroup(name).then((g) => sessionGroups.addSessionToGroup({ groupId: g.id, sessionId: sid }))} />
+      <DialogSessionGroupName
+        onSubmit={(name) =>
+          void sessionGroups
+            .createGroup(name)
+            .then((g) => sessionGroups.addSessionToGroup({ groupId: g.id, sessionId: sid }))
+        }
+      />
     ))
   }
 
@@ -474,6 +616,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       tabCount: tabCount(),
       userGroups: userGroups(),
       isInGroup: isInGroup(),
+      membershipLocked: membershipLocked(),
       isAutoAccepting: isAutoAccepting(),
       isPinned: isPinned(),
       currentVariant: currentVariant(),
@@ -522,12 +665,13 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
         exportJson,
         copySessionId,
         renameSession,
-         togglePin,
-         newSessionInProject: props.onNewSessionInProject,
-         openProjectInExplorer: props.onOpenProjectInExplorer,
-         copyProjectPath: props.onCopyProjectPath,
-         forkConversation: props.onForkConversation,
-       },
+        togglePin,
+        newSessionInProject: props.onNewSessionInProject,
+        openProjectInExplorer: props.onOpenProjectInExplorer,
+        copyProjectPath: props.onCopyProjectPath,
+        changeProject: changeProject(),
+        forkConversation: props.onForkConversation,
+      },
     }),
   )
 
@@ -585,12 +729,24 @@ function SessionModelPopoverHost(props: {
   }
 
   if (ambientLocal) {
-    return <ModelWrapperPopover session={props.session} promptModel={props.promptModel} anchor={props.anchor} onClose={props.onClose} />
+    return (
+      <ModelWrapperPopover
+        session={props.session}
+        promptModel={props.promptModel}
+        anchor={props.anchor}
+        onClose={props.onClose}
+      />
+    )
   }
 
   return (
     <ScopedLocalProvider session={props.session} server={props.server}>
-      <ModelWrapperPopover session={props.session} promptModel={props.promptModel} anchor={props.anchor} onClose={props.onClose} />
+      <ModelWrapperPopover
+        session={props.session}
+        promptModel={props.promptModel}
+        anchor={props.anchor}
+        onClose={props.onClose}
+      />
     </ScopedLocalProvider>
   )
 }
@@ -636,7 +792,9 @@ export function SessionModelPicker(props: SessionModelPickerRequest & { onClose:
 
 function ScopedLocalProvider(props: ParentProps<{ session: Session; server?: ServerConnection.Key }>) {
   const global = useGlobal()
-  const conn = createMemo(() => (props.server ? global.servers.list().find((item) => ServerConnection.key(item) === props.server) : undefined))
+  const conn = createMemo(() =>
+    props.server ? global.servers.list().find((item) => ServerConnection.key(item) === props.server) : undefined,
+  )
   const directory = () => props.session.directory
   const server = () => props.server
 
@@ -681,7 +839,10 @@ function ModelWrapperPopover(props: {
         localModel.current()
       )
     },
-    set: (value: { providerID: string; modelID: string; variant?: string } | undefined, opts?: { recent?: boolean }) => {
+    set: (
+      value: { providerID: string; modelID: string; variant?: string } | undefined,
+      opts?: { recent?: boolean },
+    ) => {
       props.promptModel.set(value)
       localModel.set(value, opts)
     },
@@ -719,7 +880,15 @@ function SessionModelPopover(props: {
                   const forwardRef = (triggerProps as { ref?: (el: HTMLButtonElement) => void }).ref
                   if (typeof forwardRef === "function") forwardRef(el)
                 }}
-                style={{ position: "fixed", top: `${props.anchor.top}px`, left: `${props.anchor.left}px`, width: "1px", height: "1px", opacity: 0, "pointer-events": "none" }}
+                style={{
+                  position: "fixed",
+                  top: `${props.anchor.top}px`,
+                  left: `${props.anchor.left}px`,
+                  width: "1px",
+                  height: "1px",
+                  opacity: 0,
+                  "pointer-events": "none",
+                }}
                 tabIndex={-1}
                 aria-hidden="true"
               />

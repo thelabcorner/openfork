@@ -58,6 +58,20 @@ export namespace PluginLoader {
     ) => void
   }
 
+  async function allLimited<A>(items: readonly Promise<A>[], concurrency = 8): Promise<A[]> {
+    const results = new Array<A>(items.length)
+    let next = 0
+    const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+      while (true) {
+        const index = next++
+        if (index >= items.length) return
+        results[index] = await items[index]!
+      }
+    })
+    await Promise.all(workers)
+    return results
+  }
+
   type AttemptResult<R> = {
     value?: R
     retry: boolean
@@ -219,7 +233,7 @@ export namespace PluginLoader {
     for (const candidate of candidates) {
       list.push(attempt(candidate, input.kind, false, input.finish, input.missing, input.report))
     }
-    const out = await Promise.all(list)
+    const out = await allLimited(list)
     if (input.wait) {
       let deps: Promise<void> | undefined
       for (let i = 0; i < candidates.length; i++) {

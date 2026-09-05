@@ -1,4 +1,12 @@
+import type { ProjectAvatarStyle } from "@opencode-ai/ui/v2/project-avatar-v2"
+
 export type MenuItemVariant = "default" | "danger"
+
+export type MenuItemAvatar = {
+  fallback: string
+  src?: string
+  variant?: ProjectAvatarStyle
+}
 
 export type MenuItemDef =
   | {
@@ -17,6 +25,7 @@ export type MenuItemDef =
       disabled?: boolean
       icon?: string
       items: MenuItemDef[]
+      search?: { placeholder: string }
     }
   | {
       kind: "checkbox"
@@ -34,6 +43,7 @@ export type MenuItemDef =
       checked: boolean
       disabled?: boolean
       icon?: string
+      avatar?: MenuItemAvatar
       onSelect: () => void
     }
 

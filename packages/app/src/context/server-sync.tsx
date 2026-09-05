@@ -9,7 +9,7 @@ import type {
 import { showToast } from "@/utils/toast"
 import { getFilename } from "@opencode-ai/core/util/path"
 import { type Accessor, batch, createMemo, createSignal, getOwner, onCleanup, onMount, untrack } from "solid-js"
-import { createStore, produce, reconcile } from "solid-js/store"
+import { createStore, reconcile } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import type { InitError } from "../pages/error"
 import { ServerSDK } from "./server-sdk"
@@ -44,7 +44,6 @@ import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
 import { createRefCountMap } from "@/utils/refcount"
 import { useGlobal } from "./global"
 import { ServerConnection, useServer } from "./server"
-import { retry } from "@opencode-ai/core/util/retry"
 import type { ServerScope } from "@/utils/server-scope"
 import { createHomeSessionIndexCache } from "./global-sync/home-session-index"
 import { persisted } from "@/utils/persist"
@@ -87,6 +86,41 @@ type ApiQueryOptions<T, K extends readonly unknown[]> = SolidQueryOptions<T, Err
   initialData?: undefined
   queryKey: K
 }
+
+// Native V2 session events already have a dedicated reducer. Feeding their
+// adapted payload through the legacy reducer as well only repeats session-ID
+// lookup and store bookkeeping; for stream deltas it also makes every token
+// pay that cost before the directory event reducer sees it. The durable
+// `session.next.*` family is a separate schema and must keep its legacy path
+// until the app has a reducer for that family.
+const isNativeSessionEvent = (type: string | undefined) => {
+  if (!type || type.startsWith("session.next.")) return false
+  return (
+    type.startsWith("session.input.") ||
+    type.startsWith("session.text.") ||
+    type.startsWith("session.reasoning.") ||
+    type.startsWith("session.tool.") ||
+    type.startsWith("session.shell.") ||
+    type.startsWith("session.step.") ||
+    type.startsWith("session.compaction.") ||
+    type === "session.agent.selected" ||
+    type === "session.model.selected" ||
+    type === "session.synthetic" ||
+    type === "session.skill.activated" ||
+    type === "session.retry.scheduled" ||
+    type.startsWith("session.execution.") ||
+    type === "session.renamed" ||
+    type === "session.moved" ||
+    type === "session.usage.updated" ||
+    type === "session.forked" ||
+    type.startsWith("session.revert.")
+  )
+}
+const isNativeStreamDelta = (type: string | undefined) =>
+  type === "session.text.delta" ||
+  type === "session.reasoning.delta" ||
+  type === "session.tool.input.delta" ||
+  type === "session.compaction.delta"
 
 type SessionActiveApi = {
   readonly active: () => Promise<SessionActiveOutput>
@@ -618,7 +652,16 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       const current = event.current
       time("applyV2", () => session.applyV2(current))
     }
-    time("apply", () => session.apply(event))
+    const nativeSessionEvent = isNativeSessionEvent(event.current?.type)
+    if (!nativeSessionEvent) time("apply", () => session.apply(event))
+
+    // Stream deltas have already been reduced into the shared session store.
+    // They cannot affect directory metadata, home indexing, invalidation, or
+    // any other legacy event path, so stop here after the one necessary V2
+    // reduction. This keeps concurrent sessions from multiplying per-token
+    // fan-out work across every directory store.
+    if (isNativeStreamDelta(event.current?.type)) return
+
     if (homeSessions.live()) {
       if (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") {
         time("home", () => homeSessions.apply(event))
@@ -627,22 +670,18 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     }
     if (eventType === "integration.connection.updated") void refreshProviders()
 
-    if (homeSessions.live()) {
-      const groupScope = `session-groups:${ServerConnection.key(serverSDK.server)}`
-      const isGroupEvent =
-        eventType === "session_group.created" ||
-        eventType === "session_group.updated" ||
-        eventType === "session_group.deleted" ||
-        eventType === "session_group.session.added" ||
-        eventType === "session_group.session.removed"
-      if (isGroupEvent) {
-        void queryClient.invalidateQueries({ queryKey: [groupScope, "session-groups"] })
-        if (eventType === "session_group.session.added" || eventType === "session_group.session.removed") {
-          const groupId = (event.properties as { groupId?: string } | undefined)?.groupId
-          if (groupId) {
-            void queryClient.invalidateQueries({ queryKey: [groupScope, "session-group", groupId] })
-          }
-        }
+    const groupScope = `session-groups:${ServerConnection.key(serverSDK.server)}`
+    const isGroupEvent =
+      eventType === "session_group.created" ||
+      eventType === "session_group.updated" ||
+      eventType === "session_group.deleted" ||
+      eventType === "session_group.session.added" ||
+      eventType === "session_group.session.removed"
+    if (isGroupEvent) {
+      void queryClient.invalidateQueries({ queryKey: [groupScope, "session-groups"] })
+      const groupID = (event.properties as { groupID?: string } | undefined)?.groupID
+      if (groupID) {
+        void queryClient.invalidateQueries({ queryKey: [groupScope, "session-group", groupID] })
       }
     }
 
@@ -738,7 +777,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   if (perf.enabled) {
     const id = setInterval(() => perf.tick(), 250)
     onCleanup(() => clearInterval(id))
-    perf.startFrameMonitor()
+    onCleanup(perf.startFrameMonitor())
   }
   onCleanup(() => {
     for (const directory of Object.keys(children.children)) {

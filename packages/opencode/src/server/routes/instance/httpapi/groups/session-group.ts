@@ -3,7 +3,7 @@ import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import { Authorization } from "../middleware/authorization"
 import { described } from "./metadata"
-import { ApiNotFoundError } from "../errors"
+import { ApiNotFoundError, ConflictError } from "../errors"
 
 const root = "/session-group"
 
@@ -17,10 +17,27 @@ export const SessionGroupPaths = {
   reorder: `${root}/:groupID/reorder`,
   addSession: `${root}/:groupID/session`,
   removeSession: `${root}/:groupID/session/:sessionID`,
+  capabilities: `${root}/capabilities`,
+  forSession: `${root}/for-session/:sessionID`,
+  resolve: `${root}/resolve`,
+  reorderMembers: `${root}/:groupID/members/reorder`,
+  policy: `${root}/:groupID/policy`,
 } as const
 
 export const CreatePayload = Schema.Struct({
   name: Schema.String,
+  kind: Schema.optionalKey(SessionGroup.Kind),
+  anchorSessionID: Schema.optionalKey(Schema.String),
+  ownerPlugin: Schema.optionalKey(Schema.String),
+  policy: Schema.optionalKey(SessionGroup.Policy),
+})
+
+export const ResolvePayload = Schema.Struct({
+  name: Schema.String,
+  kind: SessionGroup.Kind,
+  anchorSessionID: Schema.optionalKey(Schema.String),
+  ownerPlugin: Schema.optionalKey(Schema.String),
+  policy: Schema.optionalKey(SessionGroup.Policy),
 })
 
 export const RenamePayload = Schema.Struct({
@@ -33,12 +50,22 @@ export const ReorderPayload = Schema.Struct({
 
 export const AddSessionPayload = Schema.Struct({
   sessionId: Schema.String,
+  locked: Schema.optionalKey(Schema.Boolean),
+  origin: Schema.optionalKey(SessionGroup.MemberOrigin),
+  originPlugin: Schema.optionalKey(Schema.String),
+  originRef: Schema.optionalKey(Schema.String),
 })
 
-const Detail = Schema.Struct({
-  group: SessionGroup.Info,
-  sessions: Schema.Array(Schema.Struct({ id: Schema.String, title: Schema.String })),
+export const RemoveQuery = Schema.Struct({
+  mode: Schema.optionalKey(Schema.Literals(["unlink_unlocked", "cascade_unlink"])),
+  ownerPlugin: Schema.optionalKey(Schema.String),
 })
+
+export const RemoveSessionQuery = Schema.Struct({ ownerPlugin: Schema.optionalKey(Schema.String) })
+export const ReorderMembersPayload = Schema.Struct({ sessionIds: Schema.Array(Schema.String) })
+export const PolicyPayload = SessionGroup.Policy
+
+const Capabilities = Schema.Struct({ version: Schema.Number, features: Schema.Array(Schema.String) })
 
 export const SessionGroupApi = HttpApi.make("session-group")
   .add(
@@ -66,7 +93,7 @@ export const SessionGroupApi = HttpApi.make("session-group")
         ),
         HttpApiEndpoint.get("get", SessionGroupPaths.get, {
           params: { groupID: SessionGroup.ID },
-          success: described(Detail, "Session group with sessions"),
+          success: described(SessionGroup.Detail, "Session group with sessions"),
           error: [HttpApiError.BadRequest, ApiNotFoundError],
         }).annotateMerge(
           OpenApi.annotations({
@@ -76,7 +103,7 @@ export const SessionGroupApi = HttpApi.make("session-group")
           }),
         ),
         HttpApiEndpoint.get("listDetails", SessionGroupPaths.details, {
-          success: described(Schema.Array(Detail), "All session groups with their sessions"),
+          success: described(Schema.Array(SessionGroup.Detail), "All session groups with their sessions"),
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.listDetails",
@@ -98,14 +125,14 @@ export const SessionGroupApi = HttpApi.make("session-group")
         ),
         HttpApiEndpoint.delete("remove", SessionGroupPaths.remove, {
           params: { groupID: SessionGroup.ID },
+          query: RemoveQuery,
           success: described(HttpApiSchema.NoContent, "Successfully deleted session group"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.remove",
             summary: "Delete session group",
-            description:
-              "Delete a session group. Sessions in the group will be ungrouped.",
+            description: "Delete a session group when its membership policy permits it.",
           }),
         ),
         HttpApiEndpoint.post("reorder", SessionGroupPaths.reorder, {
@@ -134,13 +161,68 @@ export const SessionGroupApi = HttpApi.make("session-group")
         ),
         HttpApiEndpoint.delete("removeSession", SessionGroupPaths.removeSession, {
           params: { groupID: SessionGroup.ID, sessionID: Schema.String },
+          query: RemoveSessionQuery,
           success: described(HttpApiSchema.NoContent, "Successfully removed session from group"),
-          error: [HttpApiError.BadRequest, ApiNotFoundError],
+          error: [HttpApiError.BadRequest, ApiNotFoundError, ConflictError],
         }).annotateMerge(
           OpenApi.annotations({
             identifier: "session-group.removeSession",
             summary: "Remove session from group",
             description: "Remove a session from a group.",
+          }),
+        ),
+        HttpApiEndpoint.get("capabilities", SessionGroupPaths.capabilities, {
+          success: described(Capabilities, "Supported session-group capabilities"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session-group.capabilities",
+            summary: "Get session-group capabilities",
+            description: "Get the versioned feature set supported by this server.",
+          }),
+        ),
+        HttpApiEndpoint.get("forSession", SessionGroupPaths.forSession, {
+          params: { sessionID: Schema.String },
+          success: described(Schema.Array(SessionGroup.Detail), "Groups containing the session"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session-group.forSession",
+            summary: "Get groups for session",
+            description: "Get every group membership for one session.",
+          }),
+        ),
+        HttpApiEndpoint.post("resolve", SessionGroupPaths.resolve, {
+          payload: ResolvePayload,
+          success: described(SessionGroup.Info, "Resolved session group"),
+          error: HttpApiError.BadRequest,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session-group.resolve",
+            summary: "Resolve or create session group",
+            description: "Idempotently resolve a derived group or create it when absent.",
+          }),
+        ),
+        HttpApiEndpoint.post("reorderMembers", SessionGroupPaths.reorderMembers, {
+          params: { groupID: SessionGroup.ID },
+          payload: ReorderMembersPayload,
+          success: described(HttpApiSchema.NoContent, "Successfully reordered group members"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session-group.reorderMembers",
+            summary: "Reorder session-group members",
+            description: "Set the member order for a session group.",
+          }),
+        ),
+        HttpApiEndpoint.patch("setPolicy", SessionGroupPaths.policy, {
+          params: { groupID: SessionGroup.ID },
+          payload: PolicyPayload,
+          success: described(HttpApiSchema.NoContent, "Successfully updated group policy"),
+          error: [HttpApiError.BadRequest, ApiNotFoundError],
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "session-group.setPolicy",
+            summary: "Update session-group policy",
+            description: "Update the automatic membership policy for a session group.",
           }),
         ),
       )

@@ -106,7 +106,7 @@ const live: Layer.Layer<
           provider.getProvider(input.model.providerID),
           auth.get(input.model.providerID),
         ],
-        { concurrency: "unbounded" },
+        { concurrency: 4 },
       )
 
       const isWorkflow = language instanceof GitLabWorkflowLanguageModel

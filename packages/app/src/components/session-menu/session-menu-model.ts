@@ -1,6 +1,6 @@
 import type { useLanguage } from "@/context/language"
 import type { TabSessionState } from "../titlebar-tab-state"
-import type { MenuSectionDef } from "./menu-model"
+import type { MenuItemAvatar, MenuSectionDef } from "./menu-model"
 
 export type SessionMenuWhere = "tab" | "home" | "chats" | "group-tab"
 
@@ -37,6 +37,18 @@ export type SessionMenuActions = {
   newSessionInProject?: () => void
   openProjectInExplorer?: () => void
   copyProjectPath?: () => void
+  changeProject?: {
+    projects: Array<{
+      worktree: string
+      label: string
+      current: boolean
+      disabled: boolean
+      avatar?: MenuItemAvatar
+    }>
+    searchPlaceholder: string
+    onSelect: (worktree: string) => void
+    onAddProject: () => void
+  }
   forkConversation?: () => void
 }
 
@@ -53,6 +65,7 @@ export type SessionMenuModelInput = {
   // Group context for home/chats rows
   userGroups: Array<{ id: string; name: string }>
   isInGroup: boolean
+  membershipLocked?: boolean
   // Session-specific quick-action state
   isAutoAccepting?: boolean
   isPinned?: boolean
@@ -117,7 +130,9 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
         {
           kind: "item",
           id: "regenerateTitle",
-          label: input.pendingRegenerate ? t("command.session.regenerateTitle.pending") : t("command.session.regenerateTitle"),
+          label: input.pendingRegenerate
+            ? t("command.session.regenerateTitle.pending")
+            : t("command.session.regenerateTitle"),
           disabled: input.pendingRegenerate || !input.actions.regenerateTitle,
           icon: "outline-reset",
           onSelect: () => input.actions.regenerateTitle?.(),
@@ -178,7 +193,9 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
   if (hasSession && !input.isGroup && (input.actions.changeModel || input.actions.selectVariant)) {
     const modelItems: MenuSectionDef["items"] = []
     if (input.actions.changeModel) {
-      const label = input.currentModelLabel ? `${t("command.model.choose")} — ${input.currentModelLabel}` : t("command.model.choose")
+      const label = input.currentModelLabel
+        ? `${t("command.model.choose")} — ${input.currentModelLabel}`
+        : t("command.model.choose")
       modelItems.push({
         kind: "item",
         id: "changeModel",
@@ -364,8 +381,10 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
       groupItems.push({
         kind: "item",
         id: "removeFromGroup",
-        label: t("home.sessions.contextMenu.removeFromGroup"),
-        disabled: !input.actions.removeFromGroup,
+        label: input.membershipLocked
+          ? `${t("home.sessions.contextMenu.removeFromGroup")} — ${t("groupTab.lockedMembership")}`
+          : t("home.sessions.contextMenu.removeFromGroup"),
+        disabled: input.membershipLocked || !input.actions.removeFromGroup,
         icon: "close",
         onSelect: () => input.actions.removeFromGroup?.(),
       })
@@ -382,25 +401,101 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
   if (hasSession && !input.isGroup && input.actions.newSessionInProject) {
     sections.push({
       id: "newSession",
-      items: [{
-        kind: "item",
-        id: "newSessionInProject",
-        label: t("command.session.newInProject"),
-        icon: "plus",
-        onSelect: () => input.actions.newSessionInProject?.(),
-      }],
+      items: [
+        {
+          kind: "item",
+          id: "newSessionInProject",
+          label: t("command.session.newInProject"),
+          icon: "plus",
+          onSelect: () => input.actions.newSessionInProject?.(),
+        },
+      ],
     })
   }
 
-  if (hasSession && !input.isGroup && (input.actions.openProjectInExplorer || input.actions.copyProjectPath)) {
-    sections.push({ id: "project", items: [
-      ...(input.actions.openProjectInExplorer ? [{ kind: "item" as const, id: "openProjectInExplorer", label: t("session.header.reveal.fileExplorer"), icon: "folder" as const, onSelect: () => input.actions.openProjectInExplorer?.() }] : []),
-      ...(input.actions.copyProjectPath ? [{ kind: "item" as const, id: "copyProjectPath", label: t("session.header.open.copyPath"), icon: "outline-copy" as const, onSelect: () => input.actions.copyProjectPath?.() }] : []),
-    ] })
+  if (
+    hasSession &&
+    !input.isGroup &&
+    (input.actions.openProjectInExplorer || input.actions.copyProjectPath || input.actions.changeProject)
+  ) {
+    sections.push({
+      id: "project",
+      items: [
+        ...(input.actions.changeProject && input.actions.changeProject.projects.length > 0
+          ? [
+              {
+                kind: "submenu" as const,
+                id: "changeProject",
+                label: t("command.session.move"),
+                icon: "folder" as const,
+                search: { placeholder: input.actions.changeProject.searchPlaceholder },
+                items: [
+                  ...input.actions.changeProject.projects.map((project) => ({
+                    kind: "radio" as const,
+                    id: `changeProject:${project.worktree}`,
+                    label: project.label,
+                    checked: project.current,
+                    disabled: project.disabled,
+                    avatar: project.avatar,
+                    onSelect: () => input.actions.changeProject?.onSelect(project.worktree),
+                  })),
+                  {
+                    kind: "item" as const,
+                    id: "__separator",
+                    label: "__separator",
+                    disabled: true,
+                    onSelect: () => {},
+                  },
+                  {
+                    kind: "item" as const,
+                    id: "changeProject:add",
+                    label: t("session.new.project.add"),
+                    icon: "plus" as const,
+                    onSelect: () => input.actions.changeProject?.onAddProject(),
+                  },
+                ],
+              },
+            ]
+          : []),
+        ...(input.actions.openProjectInExplorer
+          ? [
+              {
+                kind: "item" as const,
+                id: "openProjectInExplorer",
+                label: t("session.header.reveal.fileExplorer"),
+                icon: "folder" as const,
+                onSelect: () => input.actions.openProjectInExplorer?.(),
+              },
+            ]
+          : []),
+        ...(input.actions.copyProjectPath
+          ? [
+              {
+                kind: "item" as const,
+                id: "copyProjectPath",
+                label: t("session.header.open.copyPath"),
+                icon: "outline-copy" as const,
+                onSelect: () => input.actions.copyProjectPath?.(),
+              },
+            ]
+          : []),
+      ],
+    })
   }
 
   if (hasSession && !input.isGroup && input.actions.forkConversation) {
-    sections.push({ id: "fork", items: [{ kind: "item", id: "forkConversation", label: t("command.session.fork"), icon: "branch", onSelect: () => input.actions.forkConversation?.() }] })
+    sections.push({
+      id: "fork",
+      items: [
+        {
+          kind: "item",
+          id: "forkConversation",
+          label: t("command.session.fork"),
+          icon: "branch",
+          onSelect: () => input.actions.forkConversation?.(),
+        },
+      ],
+    })
   }
 
   // ── Section 5: close / archive
