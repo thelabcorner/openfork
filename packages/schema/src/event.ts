@@ -21,6 +21,11 @@ export type Definition<
     readonly version: number
     readonly aggregate: string
   }
+  /** Transport hint for live fragment coalescing. It is intentionally opt-in. */
+  readonly coalesce?: {
+    readonly key: readonly string[]
+    readonly field: "delta" | "text"
+  }
   readonly data: DataSchema
 }
 
@@ -48,6 +53,10 @@ export function define<
     readonly version: number
     readonly aggregate: string
   }
+  readonly coalesce?: {
+    readonly key: readonly string[]
+    readonly field: "delta" | "text"
+  }
   readonly schema: Fields
 }) {
   const data = Schema.Struct(input.schema)
@@ -64,6 +73,7 @@ export function define<
       statics(() => ({
         type: input.type,
         ...(input.durable === undefined ? {} : { durable: input.durable }),
+        ...(input.coalesce === undefined ? {} : { coalesce: input.coalesce }),
         data,
       })),
     ) satisfies Definition<Type, typeof data>

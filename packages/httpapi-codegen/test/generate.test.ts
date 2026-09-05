@@ -542,7 +542,7 @@ describe("HttpApiCodegen.generate", () => {
             new ReadableStream({
               start(controller) {
                 controller.enqueue(encoder.encode('data: {"type":"ready","count":"1"}\r'))
-                controller.enqueue(encoder.encode("\n\r\n"))
+                controller.enqueue(encoder.encode('\n\r\ndata: {"type":"next","count":"2"}\n\n'))
                 controller.close()
               },
             }),
@@ -555,7 +555,10 @@ describe("HttpApiCodegen.generate", () => {
       expect(requests).toBe(0)
       const received = []
       for await (const event of events) received.push(event)
-      expect(received).toEqual([{ type: "ready", count: "1" }])
+      expect(received).toEqual([
+        { type: "ready", count: "1" },
+        { type: "next", count: "2" },
+      ])
       expect(requests).toBe(1)
       expect(url).toBe("https://example.com/event?after=2")
     } finally {

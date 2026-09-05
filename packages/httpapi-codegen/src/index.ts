@@ -255,7 +255,9 @@ export function emitPromise(
       },
       {
         path: "client.ts",
-        content: renderPromiseClient(groups).replace("let next: ReadableStreamReadResult<Uint8Array>", "let next"),
+        content: optimizePromiseClientSource(
+          renderPromiseClient(groups).replace("let next: ReadableStreamReadResult<Uint8Array>", "let next"),
+        ),
       },
       {
         path: "index.ts",
@@ -535,6 +537,109 @@ function renderPromiseClient(groups: ReadonlyArray<Group>) {
     return `${JSON.stringify(group.identifier)}: { ${methods.join(", ")} }`
   })
   return `import type { ${imports.join(", ")} } from "./types"\nimport { ClientError } from "./client-error"\n\nexport interface ClientOptions {\n  readonly baseUrl: string\n  readonly fetch?: typeof globalThis.fetch\n  readonly headers?: HeadersInit\n}\n\nexport interface RequestOptions {\n  readonly signal?: AbortSignal\n  readonly headers?: HeadersInit\n}\n\ninterface RequestDescriptor {\n  readonly method: string\n  readonly path: string\n  readonly query?: Record<string, unknown>\n  readonly headers?: Record<string, unknown>\n  readonly body?: unknown\n  readonly successStatus: number\n  readonly declaredStatuses: ReadonlyArray<number>\n  readonly empty: boolean\n}\n\nexport function make(options: ClientOptions) {\n  const fetch = options.fetch ?? globalThis.fetch\n\n  const prepare = (descriptor: RequestDescriptor, requestOptions?: RequestOptions) => {\n    const url = new URL(descriptor.path, options.baseUrl)\n    for (const [key, value] of Object.entries(descriptor.query ?? {})) appendQuery(url.searchParams, key, value)\n    const headers = new Headers(options.headers)\n    for (const [key, value] of Object.entries(descriptor.headers ?? {})) {\n      if (value !== undefined && value !== null) headers.set(key, String(value))\n    }\n    for (const [key, value] of new Headers(requestOptions?.headers)) headers.set(key, value)\n    if (descriptor.body !== undefined && !headers.has("content-type")) headers.set("content-type", "application/json")\n    return {\n      url,\n      init: {\n        method: descriptor.method,\n        signal: requestOptions?.signal,\n        headers,\n        body: descriptor.body === undefined ? undefined : JSON.stringify(descriptor.body),\n      } satisfies RequestInit,\n    }\n  }\n\n  const execute = async (descriptor: RequestDescriptor, requestOptions?: RequestOptions) => {\n    try {\n      const prepared = prepare(descriptor, requestOptions)\n      return await fetch(prepared.url, prepared.init)\n    } catch (cause) {\n      throw new ClientError("Transport", { cause })\n    }\n  }\n\n  const responseError = async (response: Response, descriptor: RequestDescriptor): Promise<never> => {\n    if (descriptor.declaredStatuses.includes(response.status)) throw await json(response)\n    try {\n      await response.body?.cancel()\n    } catch {}\n    throw new ClientError("UnexpectedStatus", { cause: { status: response.status } })\n  }\n\n  const request = async <A>(descriptor: RequestDescriptor, requestOptions?: RequestOptions): Promise<A> => {\n    const response = await execute(descriptor, requestOptions)\n    if (response.status !== descriptor.successStatus) return responseError(response, descriptor)\n    if (descriptor.empty) {\n      try {\n        await response.body?.cancel()\n      } catch {}\n      return undefined as A\n    }\n    return await json(response) as A\n  }\n\n  const sse = <A>(descriptor: RequestDescriptor, requestOptions?: RequestOptions): AsyncIterable<A> => ({\n    async *[Symbol.asyncIterator]() {\n      const response = await execute(descriptor, requestOptions)\n      if (response.status !== descriptor.successStatus) await responseError(response, descriptor)\n      if (!isContentType(response, "text/event-stream")) {\n        try {\n          await response.body?.cancel()\n        } catch {}\n        throw new ClientError("UnsupportedContentType")\n      }\n      if (response.body === null) throw new ClientError("MalformedResponse")\n      const reader = response.body.getReader()\n      const decoder = new TextDecoder()\n      let buffer = ""\n      try {\n        while (true) {\n          let next: ReadableStreamReadResult<Uint8Array>\n          try {\n            next = await reader.read()\n          } catch (cause) {\n            throw new ClientError("Transport", { cause })\n          }\n          buffer += decoder.decode(next.value, { stream: !next.done })\n          if (buffer.length > 1_048_576) throw new ClientError("MalformedResponse")\n          const trailingCarriageReturn = !next.done && buffer.endsWith("\\r")\n          if (trailingCarriageReturn) buffer = buffer.slice(0, -1)\n          buffer = buffer.replaceAll("\\r\\n", "\\n").replaceAll("\\r", "\\n")\n          if (trailingCarriageReturn) buffer += "\\r"\n          if (next.done && buffer !== "") buffer += "\\n\\n"\n          let boundary = buffer.indexOf("\\n\\n")\n          while (boundary >= 0) {\n            const block = buffer.slice(0, boundary)\n            buffer = buffer.slice(boundary + 2)\n            const data = block.split("\\n").flatMap((line) => line.startsWith("data:") ? [line.slice(5).trimStart()] : []).join("\\n")\n            if (data !== "") {\n              try {\n                yield JSON.parse(data) as A\n              } catch (cause) {\n                throw new ClientError("MalformedResponse", { cause })\n              }\n            }\n            boundary = buffer.indexOf("\\n\\n")\n          }\n          if (next.done) return\n        }\n      } finally {\n        try {\n          await reader.cancel()\n        } catch {}\n        reader.releaseLock()\n      }\n    },\n  })\n\n  return { ${fields.join(", ")} }\n}\n\nfunction appendQuery(params: URLSearchParams, key: string, value: unknown): void {\n  if (value === undefined || value === null) return\n  if (Array.isArray(value)) {\n    for (const item of value) appendQuery(params, key, item)\n    return\n  }\n  if (typeof value === "object") {\n    for (const [child, item] of Object.entries(value)) appendQuery(params, \`\${key}[\${child}]\`, item)\n    return\n  }\n  params.append(key, String(value))\n}\n\nasync function json(response: Response): Promise<unknown> {\n  if (!isContentType(response, "application/json") && !response.headers.get("content-type")?.includes("+json")) {\n    try {\n      await response.body?.cancel()\n    } catch {}\n    throw new ClientError("UnsupportedContentType")\n  }\n  let text: string\n  try {\n    text = await response.text()\n  } catch (cause) {\n    throw new ClientError("Transport", { cause })\n  }\n  if (text === "") throw new ClientError("MalformedResponse")\n  try {\n    return JSON.parse(text)\n  } catch (cause) {\n    throw new ClientError("MalformedResponse", { cause })\n  }\n}\n\nfunction isContentType(response: Response, expected: string) {\n  return response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() === expected\n}\n`
+}
+
+function optimizePromiseClientSource(source: string) {
+  const start = source.indexOf('      let buffer = ""')
+  const end = source.indexOf("      } finally {", start)
+  if (start === -1 || end === -1) {
+    throw new Error("Promise SSE parser shape changed; refusing to emit an unbounded parser")
+  }
+  const replacement = [
+    '      const parser: SseDataParserState = { line: "", data: undefined, skipLineFeed: false, size: 0 }',
+    "      try {",
+    "        while (true) {",
+    "          let next",
+    "          try {",
+    "            next = await reader.read()",
+    "          } catch (cause) {",
+    '            throw new ClientError("Transport", { cause })',
+    "          }",
+    '          const data = decoder.decode(next.value, { stream: !next.done })',
+    "          for (const event of parseSseDataChunk(data, parser, next.done)) {",
+    '            if (event !== "") {',
+    "              try {",
+    "                yield JSON.parse(event) as A",
+    "              } catch (cause) {",
+    '                throw new ClientError("MalformedResponse", { cause })',
+    "              }",
+    "            }",
+    "          }",
+    "          if (next.done) return",
+    "        }",
+  ].join("\n")
+  const optimized = source.slice(0, start) + replacement + "\n" + source.slice(end)
+  return (
+    optimized +
+    [
+      "",
+      "interface SseDataParserState {",
+      "  line: string",
+      "  data: string | undefined",
+      "  skipLineFeed: boolean",
+      "  size: number",
+      "}",
+      "",
+      "function parseSseDataChunk(text: string, state: SseDataParserState, done: boolean): string[] {",
+      "  const events: string[] = []",
+      "  const append = (value: string) => {",
+      '    if (value === "") return',
+      "    state.line += value",
+      "    state.size += value.length",
+      "    if (state.size > 1_048_576) throw new ClientError(\"MalformedResponse\")",
+      "  }",
+      "  const finishLine = () => {",
+      '    if (state.line === "") {',
+      '      if (state.data !== undefined && state.data !== "") events.push(state.data)',
+      "      state.data = undefined",
+      "      state.size = 0",
+      "      return",
+      "    }",
+      '    if (state.line.startsWith("data:")) {',
+      "      const value = state.line.slice(5).trimStart()",
+      '      state.data = state.data === undefined ? value : state.data + "\\n" + value',
+      "    }",
+      '    state.line = ""',
+      "  }",
+      "",
+      "  let start = 0",
+      "  while (start < text.length) {",
+      "    if (state.skipLineFeed) {",
+      "      state.skipLineFeed = false",
+      "      if (text.charCodeAt(start) === 10) {",
+      "        start++",
+      "        continue",
+      "      }",
+      "    }",
+      '    const lineFeed = text.indexOf("\\n", start)',
+      '    const carriageReturn = text.indexOf("\\r", start)',
+      "    let end = -1",
+      "    if (lineFeed === -1) end = carriageReturn",
+      "    else if (carriageReturn === -1) end = lineFeed",
+      "    else end = Math.min(lineFeed, carriageReturn)",
+      "    if (end === -1) {",
+      "      append(text.slice(start))",
+      "      break",
+      "    }",
+      "    append(text.slice(start, end))",
+      "    finishLine()",
+      "    state.skipLineFeed = text.charCodeAt(end) === 13",
+      "    start = end + 1",
+      "  }",
+      "",
+      "  if (done) {",
+      '    if (state.line !== "") finishLine()',
+      '    if (state.data !== undefined && state.data !== "") events.push(state.data)',
+      '    state.line = ""',
+      "    state.data = undefined",
+      "    state.skipLineFeed = false",
+      "    state.size = 0",
+      "  }",
+      "  return events",
+      "}",
+      "",
+    ].join("\n")
+  )
 }
 
 function promiseTypePrefix(group: string, endpoint: string) {

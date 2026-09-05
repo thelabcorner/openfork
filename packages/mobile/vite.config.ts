@@ -1,11 +1,11 @@
-import type { ServerResponse } from "node:http"
 import { dirname } from "node:path"
 import { fileURLToPath } from "node:url"
 import { defineConfig } from "vite"
 import solid from "vite-plugin-solid"
-import { DEV_TARGET_STATUS_PATH, ENV_PROXY_TARGET, ENV_RUN_ID } from "./dev/constants"
+import { ENV_PROXY_TARGET, ENV_RUN_ID } from "./dev/constants"
 import { handshakePath } from "./dev/handshake"
-import { createTargetResolver, type TargetResolution } from "./dev/target"
+import { createApiProxy } from "./dev/proxy"
+import { createTargetResolver } from "./dev/target"
 
 const API_PREFIXES = [
   "agent",
@@ -83,40 +83,20 @@ if (override && runID) {
   )
 }
 
-function sendJson(response: ServerResponse, status: number, body: unknown) {
-  response.statusCode = status
-  response.setHeader("content-type", "application/json")
-  response.setHeader("cache-control", "no-store")
-  response.end(JSON.stringify(body))
-}
-
-function unavailable(response: ServerResponse, result: Extract<TargetResolution, { ok: false }>) {
-  // 503 with a name/data envelope so it reads like an opencode API error in
-  // the network tab, and carries the fix rather than just the symptom.
-  sendJson(response, 503, {
-    name: result.code,
-    data: { message: `${result.message} ${result.hint}`, hint: result.hint, detail: result.detail },
-  })
-}
-
-function proxyOpts() {
-  return {
-    // Never used: the gate middleware below resolves and verifies before any
-    // request reaches the proxy, and `router` then returns that verified URL.
-    // A syntactically valid but unroutable target keeps http-proxy happy.
-    target: "http://127.0.0.1:1",
-    changeOrigin: true,
-    router: () => resolver.verifiedUrl() ?? "http://127.0.0.1:1",
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    configure(proxy: any) {
-      proxy.on("proxyReq", (proxyReq: any) => {
-        // Prevent the server's compression middleware from buffering SSE
-        // event-streams through the hop (node http-proxy streams fine otherwise).
-        proxyReq.setHeader("accept-encoding", "identity")
-      })
-    },
-  }
-}
+/**
+ * Owns both the verification gate and the forwarding. Deliberately not Vite's
+ * `server.proxy`: routing there is fixed at config time, so a per-request
+ * verified target cannot be expressed without an option Vite does not have.
+ * See dev/proxy.ts.
+ */
+const api = createApiProxy({
+  resolver,
+  apiPrefixes: API_PREFIXES,
+  onLog: (level, message) => {
+    if (level === "warn") console.warn(`[opencode:mobile] ${message}`)
+    else console.info(`[opencode:mobile] ${message}`)
+  },
+})
 
 export default defineConfig({
   plugins: [
@@ -124,31 +104,12 @@ export default defineConfig({
       name: "opencode:verified-sidecar-binding",
       configureServer(server) {
         // Registered inside configureServer (not in a returned thunk) so it runs
-        // *before* Vite's own proxy middleware — the whole point is that nothing
-        // reaches the proxy until the target has proven its identity.
-        server.middlewares.use((request, response, next) => {
-          const pathname = new URL(request.url ?? "/", "http://localhost").pathname
-
-          if (pathname === DEV_TARGET_STATUS_PATH) {
-            void resolver.resolve().then((result) => {
-              sendJson(
-                response,
-                200,
-                result.ok
-                  ? { bound: true, instanceID: result.instanceID, identity: result.identity, source: result.source }
-                  : { bound: false, code: result.code, message: result.message, hint: result.hint },
-              )
-            })
-            return
-          }
-
-          const prefix = pathname.split("/")[1]
-          if (!prefix || !API_PREFIXES.includes(prefix)) return next()
-
-          void resolver.resolve().then((result) => {
-            if (result.ok) return next()
-            unavailable(response, result)
-          })
+        // *before* Vite's own stack — nothing reaches the SPA fallback until the
+        // target has proven its identity, and nothing is forwarded at all until
+        // then.
+        server.middlewares.use((request, response, next) => api.handle(request, response, next))
+        server.httpServer?.on("upgrade", (request, socket, head) => {
+          api.handleUpgrade(request, socket, head)
         })
       },
     },
@@ -162,7 +123,8 @@ export default defineConfig({
     // a different checkout's backend.
     strictPort: true,
     allowedHosts: true,
-    proxy: Object.fromEntries(API_PREFIXES.map((p) => [`/${p}`, proxyOpts()])),
+    // No `proxy` key: API traffic is forwarded by the plugin above, which is
+    // the only place that knows which backend has been verified.
   },
   build: {
     target: "esnext",
