@@ -3,6 +3,7 @@ import { ConfigProvider, Layer } from "effect"
 import { HttpRouter } from "effect/unstable/http"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import {
+  INSTANCE_EXPECT_HEADER,
   INSTANCE_ID_ENV,
   INSTANCE_IDENTITY_PATH,
   instanceIdentity,
@@ -86,5 +87,39 @@ describe("GET /instance/identity", () => {
     const response = await app()(INSTANCE_IDENTITY_PATH)
     expect(response.status).toBe(200)
     expect((await response.json()).instanceID).toBeString()
+  })
+})
+
+describe("instance pinning", () => {
+  test("refuses a request addressed to a different instance", async () => {
+    const response = await withEnv(INSTANCE_ID_ENV, "desktop:mine", () =>
+      app()(INSTANCE_IDENTITY_PATH, { headers: { [INSTANCE_EXPECT_HEADER]: "desktop:someone-else" } }),
+    )
+    expect(response.status).toBe(409)
+    const body = (await response.json()) as { name: string; data: { expected: string; actual: string } }
+    expect(body.name).toBe("InstanceMismatchError")
+    expect(body.data).toMatchObject({ expected: "desktop:someone-else", actual: "desktop:mine" })
+  })
+
+  test("serves a request addressed to this instance", async () => {
+    const response = await withEnv(INSTANCE_ID_ENV, "desktop:mine", () =>
+      app()(INSTANCE_IDENTITY_PATH, { headers: { [INSTANCE_EXPECT_HEADER]: "desktop:mine" } }),
+    )
+    expect(response.status).toBe(200)
+    expect((await response.json()).instanceID).toBe("desktop:mine")
+  })
+
+  test("is invisible to clients that do not pin", async () => {
+    const response = await withEnv(INSTANCE_ID_ENV, "desktop:mine", () => app()(INSTANCE_IDENTITY_PATH))
+    expect(response.status).toBe(200)
+  })
+
+  test("guards authenticated routes too, ahead of the credential check", async () => {
+    // 409 rather than 401: the wrong process must not be given the chance to
+    // evaluate — let alone learn — a credential meant for a different one.
+    const response = await withEnv(INSTANCE_ID_ENV, "desktop:mine", () =>
+      app({ password: "secret" })("/config", { headers: { [INSTANCE_EXPECT_HEADER]: "desktop:someone-else" } }),
+    )
+    expect(response.status).toBe(409)
   })
 })

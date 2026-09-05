@@ -141,6 +141,7 @@ import { disposeMiddleware } from "./lifecycle"
 import { memoMap } from "@opencode-ai/core/effect/memo-map"
 import { compressionLayer } from "./middleware/compression"
 import { corsVaryFix } from "./middleware/cors-vary"
+import { instancePin } from "./middleware/instance-pin"
 import { errorLayer } from "./middleware/error"
 import { fenceLayer } from "./middleware/fence"
 import { schemaErrorLayer } from "./middleware/schema-error"
@@ -386,6 +387,7 @@ export function createRoutes(
       errorLayer,
       compressionLayer,
       corsVaryFix,
+      instancePin,
       fenceLayer,
       requestBodyLimit,
       cors(corsOptions),

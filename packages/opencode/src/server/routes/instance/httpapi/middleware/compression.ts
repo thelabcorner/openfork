@@ -1,6 +1,14 @@
-import { deflateSync, gzipSync } from "node:zlib"
-import { Effect } from "effect"
+import { deflate, gzip } from "node:zlib"
+import { promisify } from "node:util"
+import { Effect, Option } from "effect"
 import { HttpBody, HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
+
+// Async zlib: the sync variants block the single event loop for the whole
+// compression (10s of ms for large session/message payloads), starving SSE
+// heartbeats and concurrent requests. Same bytes-on-the-wire semantics,
+// off-thread execution.
+const gzipAsync = promisify(gzip)
+const deflateAsync = promisify(deflate)
 
 // Keep the server's compressible content-type set stable across HTTP backend changes.
 const COMPRESSIBLE_CONTENT_TYPE_REGEX =
@@ -54,9 +62,14 @@ export const compressionLayer = HttpRouter.middleware<{ handles: unknown }>()((e
     const encoding = pickEncoding(request.headers["accept-encoding"])
     if (!encoding) return response
 
-    const compressed = encoding === "gzip" ? gzipSync(body.body) : deflateSync(body.body)
+    // A compression failure must never fail the request — fall back to the
+    // uncompressed response.
+    const compressed = yield* Effect.promise(() =>
+      encoding === "gzip" ? gzipAsync(body.body) : deflateAsync(body.body),
+    ).pipe(Effect.option)
+    if (Option.isNone(compressed)) return response
     return HttpServerResponse.setHeader(
-      HttpServerResponse.setBody(response, HttpBody.uint8Array(compressed, contentType)),
+      HttpServerResponse.setBody(response, HttpBody.uint8Array(compressed.value, contentType)),
       "content-encoding",
       encoding,
     )

@@ -112,6 +112,109 @@ if (sseTypesPatched === sseTypesSource) {
 }
 await Bun.write(sseTypesPath, sseTypesPatched)
 
+const patchSseParser = async (path: string, importPath: string) => {
+  let source = await Bun.file(path).text()
+  const importLine = 'import { createSseParser } from "' + importPath + '"\n'
+  if (!source.includes(importLine)) {
+    const importMarker = source.match(/import type \{ Config \} from ['"]\.\/types\.gen\.js['"];?\r?\n/)
+    if (!importMarker) throw new Error("SSE parser import marker changed (" + path + ")")
+    source = source.replace(importMarker[0], importLine + importMarker[0])
+  }
+
+  if (!source.includes("const parser = createSseParser()")) {
+    const bufferMarker = source.match(/        let buffer = ['"]{2};?\r?\n/)
+    const start = bufferMarker?.index ?? -1
+    const end = source.indexOf("        } finally {", start)
+    if (start === -1 || end === -1) throw new Error("SSE parser shape changed (" + path + ")")
+    const replacement = [
+      "        const parser = createSseParser()",
+      "",
+      "        const abortHandler = () => {",
+      "          try {",
+      "            reader.cancel()",
+      "          } catch {",
+      "            // noop",
+      "          }",
+      "        }",
+      "",
+      "        signal.addEventListener(\"abort\", abortHandler)",
+      "",
+      "        try {",
+      "          while (true) {",
+      "            const { done, value } = await reader.read()",
+      "            for (const frame of parser.push(value ?? \"\", done)) {",
+      "              let data: unknown",
+      "              let parsedJson = false",
+      "              if (frame.hasData) {",
+      "                const rawData = frame.data ?? \"\"",
+      "                try {",
+      "                  data = JSON.parse(rawData)",
+      "                  parsedJson = true",
+      "                } catch {",
+      "                  data = rawData",
+      "                }",
+      "              }",
+      "",
+      "              if (parsedJson) {",
+      "                if (responseValidator) {",
+      "                  await responseValidator(data)",
+      "                }",
+      "",
+      "                if (responseTransformer) {",
+      "                  data = await responseTransformer(data)",
+      "                }",
+      "              }",
+      "",
+      "              if (frame.id !== undefined) lastEventId = frame.id",
+      "              if (frame.retry !== undefined) retryDelay = frame.retry",
+      "              onSseEvent?.({",
+      "                data,",
+      "                event: frame.event,",
+      "                id: lastEventId,",
+      "                retry: retryDelay,",
+      "              })",
+      "",
+      "              if (frame.hasData) {",
+      "                yield data as any",
+      "              }",
+      "            }",
+      "            if (done) break",
+      "          }",
+    ].join("\n")
+    source = source.slice(0, start) + replacement + "\n" + source.slice(end)
+  }
+  // Keep transport hardening in the generator so regeneration cannot silently
+  // remove heartbeat-based recovery, jitter or reader cancellation.
+  source = source.replace(/const reader = response\.body\s*\.pipeThrough\(new TextDecoderStream\(\)\)\s*\.getReader\(\);?/, "const reader = response.body.getReader()\n        const decoder = new TextDecoder()")
+  if (!source.includes("const decoder = new TextDecoder()")) throw new Error("SSE byte reader patch did not apply: " + path)
+  source = source.replace('parser.push(value ?? "", done)', 'parser.push(decoder.decode(value, { stream: !done }), done)')
+  if (!source.includes("let connectedAt = 0")) {
+    source = source.replace(/let attempt = 0;?/, "let attempt = 0\n    let connectedAt = 0")
+  }
+  if (!source.includes("connectedAt = Date.now()\n        const reader")) {
+    source = source.replace("const reader = response.body", "connectedAt = Date.now()\n        const reader = response.body")
+  }
+  if (!source.includes("Date.now() - connectedAt >= 30_000")) {
+    source = source.replace("if (frame.hasData) {\n                yield", [
+      "// Any complete frame, including a heartbeat, proves socket liveness.",
+      "              if (Date.now() - connectedAt >= 30_000) {",
+      "                attempt = 1",
+      "                connectedAt = Date.now()",
+      "              }",
+      "              if (frame.hasData) {",
+      "                yield",
+    ].join("\n"))
+  }
+  source = source.replace(/await sleep\(backoff(?: \/ 2 \+ Math.random\(\) \* \(backoff \/ 2\))?\)/g, "await sleep(Math.random() * backoff)")
+  source = source.replace(/(if \(Date.now\(\) - connectedAt >= 30_000\) \{\s*)attempt = 0\s*retryDelay = sseDefaultRetryDelay \?\? 3000/, "$1attempt = 1")
+  source = source.replace(/(?<!await |void )reader.cancel\(\);?/g, "void reader.cancel().catch(() => {})")
+  source = source.replace(/(?<!await reader.cancel\(\).catch\(\(\) => \{\}\)\n          )reader.releaseLock\(\);?/, "await reader.cancel().catch(() => {})\n          reader.releaseLock()")
+  await Bun.write(path, source)
+}
+
+await patchSseParser("./src/gen/core/serverSentEvents.gen.ts", "../../sse-parser.js")
+await patchSseParser("./src/v2/gen/core/serverSentEvents.gen.ts", "../../../sse-parser.js")
+
 await $`bun prettier --write src/gen`
 await $`bun prettier --write src/v2`
 await $`rm -rf dist`

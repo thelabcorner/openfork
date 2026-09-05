@@ -12,6 +12,18 @@ export const INSTANCE_ID_ENV = "OPENCODE_INSTANCE_ID"
 
 export const INSTANCE_IDENTITY_PATH = "/instance/identity"
 
+/**
+ * Sent by a client that has already decided *which* opencode it wants. If the
+ * value does not name this process, the request is refused instead of being
+ * answered with another instance's data.
+ *
+ * Probing `/instance/identity` and then sending the real request leaves a
+ * window — however small — in which the port could belong to someone else. The
+ * header closes it: the guarantee stops depending on the port and starts
+ * depending on the answer, which only the intended process can give.
+ */
+export const INSTANCE_EXPECT_HEADER = "x-opencode-expect-instance"
+
 export type InstanceIdentity = {
   instanceID: string
   processID: number

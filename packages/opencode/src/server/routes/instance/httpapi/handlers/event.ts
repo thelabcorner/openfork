@@ -1,38 +1,30 @@
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { InstanceState } from "@/effect/instance-state"
 import { GlobalBus } from "@/bus/global"
+import { estimateEventBytes, parseEventSequence } from "@opencode-ai/core/event-replay"
 import { EventV2 } from "@opencode-ai/core/event"
-import { Effect, Queue } from "effect"
+import { createEventCoalescer, eventDeltaKey, mergeEventDeltas } from "@opencode-ai/core/event-coalescer"
+import { Effect } from "effect"
 import * as Stream from "effect/Stream"
-import { HttpServerResponse } from "effect/unstable/http"
+import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { EventApi } from "../groups/event"
 
-// Bounded cache of serialized event frames keyed by event id. The SSE handler
-// stringifies each event once and reuses the string across subscribers, so the
-// per-subscriber JSON.stringify fan-out (O(subscribers) per event) becomes O(1).
-// Events are immutable once published and ids are unique, so a cached string is
-// always correct; the cache is cleared when it exceeds the bound to stay bounded.
-const MAX_SERIALIZED_CACHE = 1024
-const serializedCache = new Map<string, string>()
+import { adaptLegacyEvent, serializeLegacyEvent } from "@/server/event-serialization"
 
-function serializeEventData(data: unknown): string {
-  if (typeof data === "string") return data
-  const id = (data as { id?: string })?.id
-  if (id) {
-    const cached = serializedCache.get(id)
-    if (cached !== undefined) return cached
-  }
-  return JSON.stringify(data)
-}
+type LegacyEvent = { id: string; type: string; properties: unknown }
+type SequencedLegacyEvent = { sequence: number; event: LegacyEvent }
+type SequencedEvent = { sequence: number; event: EventV2.Payload }
 
-function eventData(data: unknown): Sse.Event {
+const MAX_REPLAY_FRAMES = 128
+
+function eventData(data: object, sequence?: string): Sse.Event {
   return {
     _tag: "Event",
     event: "message",
-    id: undefined,
-    data: serializeEventData(data),
+    id: sequence === undefined ? undefined : String(sequence),
+    data: serializeLegacyEvent(data),
   }
 }
 
@@ -40,68 +32,109 @@ function eventID() {
   return EventV2.ID.create()
 }
 
-function eventResponse(events: EventV2.Interface) {
+function eventResponse(events: EventV2Bridge.Interface) {
   return Effect.gen(function* () {
+    const request = yield* HttpServerRequest.HttpServerRequest
     const instance = yield* InstanceState.context
     const workspaceID = yield* InstanceState.workspaceID
-    // Listener registration is eager, so events published after this point cannot
-    // be lost while the HTTP body fiber is starting or emitting server.connected.
-    const queue = yield* Queue.unbounded<EventV2.Payload>()
+    const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<SequencedLegacyEvent>({
+      capacity: 256,
+      maxBytes: 8 * 1024 * 1024,
+      sizeOf: estimateEventBytes,
+    })
+    const coalescer = createEventCoalescer<SequencedEvent>(
+      (item) => subscriber.offer({ sequence: item.sequence, event: adaptLegacyEvent(item.event) }),
+      {
+        keyOf: (item) => eventDeltaKey(item.event),
+        orderBy: (item) => item.sequence,
+        merge: (previous, next) => {
+          const event = mergeEventDeltas(previous.event, next.event)
+          return event === undefined ? undefined : { sequence: next.sequence, event }
+        },
+      },
+    )
+    const matches = (event: EventV2.Payload) =>
+      event.location?.directory === instance.directory &&
+      (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID)
+    let replaying = true
+    const pendingLive: SequencedEvent[] = []
+    // Both sources subscribe before readiness, and share one bounded queue so
+    // disposal cannot race stream startup or overtake previously queued events.
     const unsubscribe = yield* events.listen((event) =>
       Effect.sync(() => {
-        if (
-          event.location?.directory !== instance.directory ||
-          (event.location.workspaceID !== undefined && event.location.workspaceID !== workspaceID)
-        )
-          return
-        const key = event.id
-        if (!serializedCache.has(key)) {
-          serializedCache.set(key, JSON.stringify({ id: event.id, type: event.type, properties: event.data }))
-          if (serializedCache.size >= MAX_SERIALIZED_CACHE) serializedCache.clear()
-        }
-        Queue.offerUnsafe(queue, event)
+        if (!matches(event)) return
+        const sequence = events.sequenceOf(event)
+        if (sequence === undefined) return
+        const item = { sequence, event }
+        if (replaying) pendingLive.push(item)
+        else coalescer.offer(item)
       }),
     )
     yield* Effect.addFinalizer(() => unsubscribe)
-    const stream = Stream.fromQueue(queue).pipe(
-      Stream.filter(
-        (event) =>
-          event.location?.directory === instance.directory &&
-          (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID),
-      ),
-      Stream.map((event) => ({ id: event.id, type: event.type, properties: event.data })),
-    )
-    const disposed = Stream.callback<{ id: string; type: string; properties: unknown }>((queue) => {
-      const listener = (event: {
-        directory?: string
-        payload: { id?: string; type?: string; properties?: unknown }
-      }) => {
-        if (event.directory !== instance.directory || event.payload.type !== "server.instance.disposed") return
-        Queue.offerUnsafe(queue, {
+    yield* Effect.addFinalizer(() => Effect.sync(coalescer.dispose))
+    const cursor = parseEventSequence(request.headers["last-event-id"], events.replayEpoch)
+    const replay = events.replaySince(cursor, matches)
+    const replayCutoff = replay.latest
+    if (replay.kind === "gap" || replay.frames.length > MAX_REPLAY_FRAMES ||
+      replay.frames.reduce((bytes, frame) => bytes + estimateEventBytes({ sequence: frame.sequence, event: adaptLegacyEvent(frame.event) }), 0) > 4 * 1024 * 1024) {
+      // A reconnect that fell behind the bounded window cannot be repaired by
+      // silently dropping old events. Emit a control event so the client can
+      // hydrate a snapshot, while keeping the stream itself healthy.
+      subscriber.offer({
+        sequence: replay.latest,
+        event: {
+          id: eventID(),
+          type: "server.stream.gap",
+          properties: {
+            requested: replay.kind === "gap" ? replay.requested : cursor ?? 0,
+            oldest: replay.kind === "gap" ? replay.oldest : undefined,
+            latest: replay.latest,
+            directory: instance.directory,
+          },
+        },
+      })
+    } else {
+      for (const frame of replay.frames) coalescer.offer({ sequence: frame.sequence, event: frame.event })
+    }
+    coalescer.flush()
+    for (const item of pendingLive) {
+      if (item.sequence > replayCutoff) coalescer.offer(item)
+    }
+    replaying = false
+    coalescer.flush()
+    const disposed = (event: { directory?: string; payload: { id?: string; type?: string; properties?: unknown } }) => {
+      if (event.directory !== instance.directory || event.payload.type !== "server.instance.disposed") return
+      coalescer.flush()
+      subscriber.offer({
+        sequence: events.replayLatest(),
+        event: {
           id: event.payload.id ?? eventID(),
           type: "server.instance.disposed",
           properties: event.payload.properties ?? {},
-        })
-      }
-      return Effect.acquireRelease(
-        Effect.sync(() => GlobalBus.on("event", listener)),
-        () => Effect.sync(() => GlobalBus.off("event", listener)),
-      )
-    })
-    const output = stream.pipe(
-      Stream.merge(disposed, { haltStrategy: "left" }),
-      Stream.takeUntil((event) => event.type === "server.instance.disposed"),
+        },
+      })
+    }
+    yield* Effect.acquireRelease(
+      Effect.sync(() => GlobalBus.on("instance.disposed", disposed)),
+      () => Effect.sync(() => GlobalBus.off("instance.disposed", disposed)),
     )
+    const output = subscriber.stream.pipe(Stream.takeUntil((item) => item.event.type === "server.instance.disposed"))
     const heartbeat = Stream.tick("10 seconds").pipe(
       Stream.drop(1),
-      Stream.map(() => ({ id: eventID(), type: "server.heartbeat", properties: {} })),
+      // Heartbeats prove liveness but must not advance Last-Event-ID; only
+      // domain frames participate in replay cursors.
+      Stream.map(() => eventData({ id: eventID(), type: "server.heartbeat", properties: {} })),
     )
 
     yield* Effect.logInfo("event connected")
     return HttpServerResponse.stream(
-      Stream.make({ id: eventID(), type: "server.connected", properties: {} }).pipe(
-        Stream.concat(output.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
-        Stream.map(eventData),
+      Stream.make(eventData({ id: eventID(), type: "server.connected", properties: { epoch: events.replayEpoch } }, cursor === undefined ? `${events.replayEpoch}:${replay.latest}` : undefined)).pipe(
+        Stream.concat(
+          output.pipe(
+            Stream.map(({ sequence, event }) => eventData(event, `${events.replayEpoch}:${sequence}`)),
+            Stream.merge(heartbeat, { haltStrategy: "left" }),
+          ),
+        ),
         Stream.pipeThroughChannel(Sse.encode()),
         Stream.encodeText,
         Stream.ensuring(Effect.logInfo("event disconnected")),
