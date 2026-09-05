@@ -6,6 +6,21 @@ import type { Adapter } from "../registry"
 import type { UsageWindow } from "../schema"
 import { createQuotaCache } from "./http"
 
+async function mapLimited<A, B>(items: readonly A[], fn: (item: A) => Promise<B>, concurrency = 4): Promise<B[]> {
+  const results: B[] = []
+  results.length = items.length
+  let next = 0
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (true) {
+      const index = next++
+      if (index >= items.length) return
+      results[index] = await fn(items[index])
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
 /**
  * WorkBuddy / CodeBuddy (Tencent) per-account credit-package quota.
  *
@@ -366,28 +381,26 @@ export const workbuddy = (fetchImpl: WorkBuddyFetch = globalThis.fetch.bind(glob
         // Each account carries its own cache (and therefore its own
         // next-refresh time); the provider as a whole can only be refreshed
         // usefully once the SLOWEST account is re-readable.
-        const settled = await Promise.all(
-          accounts.map(async (cred) => {
-            const id = stableAccountIdentity(cred)
-            const cache = cacheFor(id)
-            const fresh = cache.fresh(cred.accessToken)
-            if (fresh) return { result: fresh, nextRefreshAt: cache.nextRefreshAt() }
-            if (cache.isCoolingDown()) {
-              const cached = cache.cachedResult()
-              return {
-                result: cached ?? { packages: [], error: "Rate limited — WorkBuddy is throttling usage checks" },
-                nextRefreshAt: cache.nextRefreshAt(),
-              }
+        const settled = await mapLimited(accounts, async (cred) => {
+          const id = stableAccountIdentity(cred)
+          const cache = cacheFor(id)
+          const fresh = cache.fresh(cred.accessToken)
+          if (fresh) return { result: fresh, nextRefreshAt: cache.nextRefreshAt() }
+          if (cache.isCoolingDown()) {
+            const cached = cache.cachedResult()
+            return {
+              result: cached ?? { packages: [], error: "Rate limited — WorkBuddy is throttling usage checks" },
+              nextRefreshAt: cache.nextRefreshAt(),
             }
-            const result = await fetchAccountUsage(cred, fetchImpl)
-            if (result.error && /rate limit|429/i.test(result.error)) {
-              cache.coolDown(result, undefined, cred.accessToken)
-            } else {
-              cache.store(result, cred.accessToken)
-            }
-            return { result, nextRefreshAt: cache.nextRefreshAt() }
-          }),
-        )
+          }
+          const result = await fetchAccountUsage(cred, fetchImpl)
+          if (result.error && /rate limit|429/i.test(result.error)) {
+            cache.coolDown(result, undefined, cred.accessToken)
+          } else {
+            cache.store(result, cred.accessToken)
+          }
+          return { result, nextRefreshAt: cache.nextRefreshAt() }
+        })
         const nextRefreshAt = settled.reduce((latest, entry) => Math.max(latest, entry.nextRefreshAt), 0)
         const results = settled.map((entry) => entry.result)
 

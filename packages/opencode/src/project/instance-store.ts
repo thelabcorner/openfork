@@ -111,8 +111,8 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
       })
 
     const emitDisposed = (input: { directory: string; project?: string }) =>
-      Effect.sync(() =>
-        GlobalBus.emit("event", {
+      Effect.sync(() => {
+        const event = {
           directory: input.directory,
           project: input.project,
           workspace: WorkspaceContext.workspaceID,
@@ -122,8 +122,13 @@ const layer: Layer.Layer<Service, never, Project.Service | InstanceBootstrap.Ser
               directory: input.directory,
             },
           },
-        }),
-      )
+        } satisfies Parameters<typeof GlobalBus.emit>[1]
+        // The dedicated channel wakes V2 instance streams without making the
+        // high-frequency native-event bridge broadcast through the generic
+        // legacy channel solely for a disposal filter.
+        GlobalBus.emit("instance.disposed", event)
+        GlobalBus.emit("event", event)
+      })
 
     const disposeContext = Effect.fn("InstanceStore.disposeContext")(function* (ctx: InstanceContext) {
       yield* Effect.logInfo("disposing instance", { directory: ctx.directory })

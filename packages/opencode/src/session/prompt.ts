@@ -162,6 +162,26 @@ const layer = Layer.effect(
     const question = yield* Question.Service
     const database = yield* Database.Service
     const { db } = database
+    // Throttle for the end-of-turn compaction.prune maintenance fork below.
+    // prune re-scans the session's full message history on every turn; with
+    // several concurrent sessions on long histories that is a repeated
+    // synchronous-DB tax on the shared connection. prune is idempotent
+    // maintenance (it only marks already-completed tool parts), so running it
+    // at most once per minute per session loses nothing — the next turn's
+    // prune observes whatever this one would have.
+    const PRUNE_MIN_INTERVAL_MS = 60_000
+    const lastPruneAt = new Map<string, number>()
+    const maybePrune = (sessionID: SessionID) => {
+      const now = Date.now()
+      if (now - (lastPruneAt.get(sessionID) ?? 0) < PRUNE_MIN_INTERVAL_MS) return Effect.void
+      lastPruneAt.set(sessionID, now)
+      if (lastPruneAt.size > 1000) {
+        for (const [key, at] of lastPruneAt) {
+          if (now - at > PRUNE_MIN_INTERVAL_MS * 2) lastPruneAt.delete(key)
+        }
+      }
+      return compaction.prune({ sessionID })
+    }
     let dispatchFn: TaskPromptOps["dispatch"] | undefined
     const ops = Effect.fn("SessionPrompt.ops")(function* () {
       return {
@@ -185,12 +205,12 @@ const layer = Layer.effect(
       const parts: Types.DeepMutable<PromptInput["parts"]> = [{ type: "text", text: template }]
       const files = ConfigMarkdown.files(template)
       const seen = new Set<string>()
-      yield* Effect.forEach(
+      const resolved = yield* Effect.forEach(
         files,
         Effect.fnUntraced(function* (match) {
           const name = match[1]
-          if (!name) return
-          if (seen.has(name)) return
+          if (!name) return []
+          if (seen.has(name)) return []
           seen.add(name)
 
           const filepath = name.startsWith("~/")
@@ -200,19 +220,24 @@ const layer = Layer.effect(
           const info = yield* fsys.stat(filepath).pipe(Effect.option)
           if (Option.isNone(info)) {
             const found = yield* agents.get(name)
-            if (found) parts.push({ type: "agent", name: found.name })
-            return
+            return found ? [{ type: "agent" as const, name: found.name }] : []
           }
           const stat = info.value
-          parts.push({
-            type: "file",
-            url: pathToFileURL(filepath).href,
-            filename: name,
-            mime: stat.type === "Directory" ? "application/x-directory" : "text/plain",
-          })
+          return [
+            {
+              type: "file" as const,
+              url: pathToFileURL(filepath).href,
+              filename: name,
+              mime: stat.type === "Directory" ? "application/x-directory" : "text/plain",
+            },
+          ]
         }),
-        { concurrency: "unbounded", discard: true },
+        // Prompt templates are user-controlled; a generated template can
+        // reference hundreds of paths. Preserve template order while bounding
+        // filesystem/agent lookups per prompt.
+        { concurrency: 8 },
       )
+      parts.push(...resolved.flat())
       return parts
     })
 
@@ -1191,7 +1216,7 @@ Generate a fresh title. Do not reuse the current title.`
         return [{ ...part, messageID: info.id, sessionID: input.sessionID }]
       })
 
-      const resolvedParts = yield* Effect.forEach(input.parts, resolvePart, { concurrency: "unbounded" }).pipe(
+      const resolvedParts = yield* Effect.forEach(input.parts, resolvePart, { concurrency: 8 }).pipe(
         Effect.map((x) => x.flat().map(assign)),
       )
 
@@ -1699,7 +1724,7 @@ Generate a fresh title. Do not reuse the current title.`
         yield* turnCheckpoint.finish(turn)
         turn = undefined
 
-        yield* compaction.prune({ sessionID }).pipe(Effect.ignore, Effect.forkIn(scope))
+        yield* maybePrune(sessionID).pipe(Effect.ignore, Effect.forkIn(scope))
         return yield* lastAssistant(sessionID)
       },
     )
@@ -1835,10 +1860,10 @@ Generate a fresh title. Do not reuse the current title.`
       if (shellMatches.length > 0) {
         const cfg = yield* config.get()
         const sh = Shell.preferred(cfg.shell)
-        const results = yield* Effect.promise(() =>
-          Promise.all(
-            shellMatches.map(async ([, cmd]) => (await Process.text([cmd], { shell: sh, nothrow: true })).text),
-          ),
+        const results = yield* Effect.forEach(
+          shellMatches,
+          ([, cmd]) => Effect.promise(() => Process.text([cmd], { shell: sh, nothrow: true }).then((result) => result.text)),
+          { concurrency: 4 },
         )
         let index = 0
         template = template.replace(bashRegex, () => results[index++])

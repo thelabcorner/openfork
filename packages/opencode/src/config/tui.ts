@@ -16,7 +16,7 @@ import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CurrentWorkingDirectory } from "./tui-cwd"
 import { ConfigPlugin } from "@/config/plugin"
 import { TuiKeybind } from "@opencode-ai/tui/config/keybind"
-import { InstallationLocal, InstallationVersion } from "@opencode-ai/core/installation/version"
+import { InstallationPluginVersion } from "@opencode-ai/core/installation/version"
 import { makeRuntime } from "@opencode-ai/core/effect/runtime"
 import { Filesystem } from "@/util/filesystem"
 import { ConfigVariable } from "@/config/variable"
@@ -239,13 +239,15 @@ const layer = Layer.effect(
             add: [
               {
                 name: "@opencode-ai/plugin",
-                version: InstallationLocal ? undefined : InstallationVersion,
+                version: InstallationPluginVersion,
               },
             ],
           })
           .pipe(Effect.forkScoped),
       {
-        concurrency: "unbounded",
+        // Installing plugin dependencies invokes package managers and child
+        // processes. Bound the startup fan-out per TUI instance.
+        concurrency: 4,
       },
     )
 
@@ -253,7 +255,7 @@ const layer = Layer.effect(
     const pluginOrigins = Effect.fn("TuiConfig.pluginOrigins")(() => Effect.succeed(data.pluginOrigins))
 
     const waitForDependencies = Effect.fn("TuiConfig.waitForDependencies")(() =>
-      Effect.forEach(deps, Fiber.join, { concurrency: "unbounded" }).pipe(Effect.ignore(), Effect.asVoid),
+      Effect.forEach(deps, Fiber.join, { concurrency: 4 }).pipe(Effect.ignore(), Effect.asVoid),
     )
     return Service.of({ get, pluginOrigins, waitForDependencies })
   }).pipe(Effect.withSpan("TuiConfig.layer")),

@@ -27,7 +27,8 @@ export const ControlPlaneApi = HttpApi.make("controlPlane").add(
         OpenApi.annotations({
           identifier: "experimental.controlPlane.moveSession",
           summary: "Move session",
-          description: "Move a session to another project directory, optionally transferring local changes.",
+          description:
+            "Move a session to another directory, optionally transferring local changes within the same project. Moving without transferring changes re-associates the session with the destination's project.",
         }),
       ),
     )

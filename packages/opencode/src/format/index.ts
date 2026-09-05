@@ -28,6 +28,20 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Fo
 
 export const use = serviceUse(Service)
 
+async function allLimited<A>(items: readonly Promise<A>[], concurrency = 4): Promise<A[]> {
+  const results = new Array<A>(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (true) {
+      const index = next++
+      if (index >= items.length) return
+      results[index] = await items[index]!
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -56,7 +70,7 @@ const layer = Layer.effect(
 
         async function getFormatter(ext: string) {
           const matching = Object.values(formatters).filter((item) => item.extensions.includes(ext))
-          const checks = await Promise.all(
+          const checks = await allLimited(
             matching.map(async (item) => {
               const cmd = await getCommand(item)
               return {

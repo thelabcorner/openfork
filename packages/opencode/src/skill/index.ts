@@ -304,7 +304,7 @@ const discoverSkills = Effect.fnUntraced(function* (
 
 const loadSkills = Effect.fnUntraced(function* (state: State, discovered: DiscoveryState) {
   yield* Effect.forEach(discovered.matches, (match) => add(state, match), {
-    concurrency: "unbounded",
+    concurrency: 8,
     discard: true,
   })
 

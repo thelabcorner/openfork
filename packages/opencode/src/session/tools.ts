@@ -58,6 +58,18 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const flags = yield* RuntimeFlags.Service
   const interrupt = yield* ToolInterrupt.Service
 
+  // Throttle for per-chunk tool progress metadata below. Chatty tools (shell
+  // spewing build/test output calls ctx.metadata once per stdout chunk) each
+  // cost a DB read + conditional DB write + event publish + full SSE fan-out
+  // per call. With several concurrent sessions that is thousands of durable
+  // publishes per second on the shared sqlite connection and the event pipe.
+  // Progress previews are cosmetic — tool completion always publishes the
+  // final state via completeToolCall — so lossy coalescing here is safe:
+  // first update per call goes through immediately, the rest at most every
+  // METADATA_THROTTLE_MS.
+  const METADATA_THROTTLE_MS = 500
+  const lastMetadataAt = new Map<string, number>()
+
   const context = (args: Record<string, unknown>, options: ToolExecutionOptions, killable?: AbortSignal): Tool.Context => ({
     sessionID: input.session.id,
     abort: killable ?? options.abortSignal!,
@@ -66,8 +78,21 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     extra: { model: input.model, bypassAgentCheck: input.bypassAgentCheck, promptOps: input.promptOps },
     agent: input.agent.name,
     messages: input.messages,
-    metadata: (val) =>
-      input.processor.updateToolCall(options.toolCallId, (match) => {
+    metadata: (val) => {
+      // Lossy throttle: drop progress updates inside the window. Calls without
+      // a toolCallId bypass the throttle (no key to coalesce on).
+      const key = options.toolCallId
+      if (key !== undefined) {
+        const now = Date.now()
+        if (now - (lastMetadataAt.get(key) ?? 0) < METADATA_THROTTLE_MS) return Effect.void
+        lastMetadataAt.set(key, now)
+        if (lastMetadataAt.size > 2000) {
+          for (const [entry, at] of lastMetadataAt) {
+            if (now - at > METADATA_THROTTLE_MS * 2) lastMetadataAt.delete(entry)
+          }
+        }
+      }
+      return input.processor.updateToolCall(options.toolCallId, (match) => {
         if (!["running", "pending"].includes(match.state.status)) return match
         return {
           ...match,
@@ -79,7 +104,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
             time: match.state.status === "running" ? match.state.time : { start: Date.now() },
           },
         }
-      }),
+      })
+    },
     ask: (req) =>
       permission
         .ask({

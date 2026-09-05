@@ -1160,7 +1160,7 @@ export const ProjectTool = Tool.define<
               }
               return [name, undefined] as const
             }),
-            { concurrency: "unbounded" },
+            { concurrency: 4 },
           )
           const manifests = new Map(manifestEntries)
           const notes: string[] = []

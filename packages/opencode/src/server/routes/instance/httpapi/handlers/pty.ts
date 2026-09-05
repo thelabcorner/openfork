@@ -6,6 +6,7 @@ import { Pty } from "@opencode-ai/core/pty"
 import { PtyProtocol } from "@opencode-ai/core/pty/protocol"
 import { PtyID } from "@opencode-ai/core/pty/schema"
 import { PtyTicket } from "@opencode-ai/core/pty/ticket"
+import { EventV2 } from "@opencode-ai/core/event"
 import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -16,7 +17,7 @@ import {
   PTY_CONNECT_TOKEN_HEADER,
   PTY_CONNECT_TOKEN_HEADER_VALUE,
 } from "@/server/shared/pty-ticket"
-import { Effect, Layer, Option, Queue, Schema } from "effect"
+import { Effect, Layer, Option, Schema } from "effect"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Socket from "effect/unstable/socket/Socket"
@@ -27,6 +28,19 @@ import { WebSocketTracker } from "../websocket-tracker"
 
 function validOrigin(request: HttpServerRequest.HttpServerRequest, opts: CorsOptions | undefined) {
   return isAllowedRequestOrigin(request.headers.origin, request.headers.host, opts)
+}
+
+// A terminal writer can be slower than a PTY producing output (especially while
+// the renderer is busy). Keep the socket-local backlog finite so a stalled
+// client cannot retain an unbounded amount of terminal output. Overflow fails
+// the stream and the client reconnects with its last cursor.
+const PTY_OUTBOX_CAPACITY = 128
+const PTY_OUTBOX_MAX_BYTES = 1024 * 1024
+
+const ptyFrameBytes = (value: string | Uint8Array | Socket.CloseEvent) => {
+  if (typeof value === "string") return value.length * 4
+  if (value instanceof Uint8Array) return value.byteLength
+  return 64
 }
 
 const ticketScope = Effect.gen(function* () {
@@ -222,13 +236,17 @@ export const ptyConnectHandlers = HttpApiBuilder.group(PtyConnectApi, "pty-conne
 
         // Outbound frames flow through one queue drained by a single writer so replay, live
         // output, and the close frame keep their order.
-        const outbox = yield* Queue.unbounded<string | Uint8Array | Socket.CloseEvent>()
+        const outbox = yield* EventV2.makeByteBoundedSubscriberQueue<string | Uint8Array | Socket.CloseEvent>({
+          capacity: PTY_OUTBOX_CAPACITY,
+          maxBytes: PTY_OUTBOX_MAX_BYTES,
+          sizeOf: ptyFrameBytes,
+        })
         const attachment = yield* pty(
           Pty.Service.use((service) =>
             service.attach(ctx.params.ptyID, {
               cursor,
-              onData: (chunk) => Queue.offerUnsafe(outbox, chunk),
-              onEnd: () => Queue.offerUnsafe(outbox, new Socket.CloseEvent(1000)),
+              onData: outbox.offer,
+              onEnd: () => outbox.offer(new Socket.CloseEvent(1000)),
             }),
           ),
         ).pipe(
@@ -241,13 +259,13 @@ export const ptyConnectHandlers = HttpApiBuilder.group(PtyConnectApi, "pty-conne
         )
         if (!attachment) return HttpServerResponse.empty()
 
-        for (const chunk of PtyProtocol.chunks(attachment.replay)) Queue.offerUnsafe(outbox, chunk)
-        Queue.offerUnsafe(outbox, PtyProtocol.metaFrame(attachment.cursor))
+        for (const chunk of PtyProtocol.chunks(attachment.replay)) outbox.offer(chunk)
+        outbox.offer(PtyProtocol.metaFrame(attachment.cursor))
         attachment.activate()
 
         const drain = Effect.gen(function* () {
           while (true) {
-            const item = yield* Queue.take(outbox)
+            const item = yield* outbox.take
             yield* write(item)
             if (item instanceof Socket.CloseEvent) return
           }
@@ -262,7 +280,9 @@ export const ptyConnectHandlers = HttpApiBuilder.group(PtyConnectApi, "pty-conne
             if (decoded !== undefined) attachment.write(decoded)
           }),
         ).pipe(
-          Effect.catchReason("SocketError", "SocketCloseError", () => Effect.void),
+          // Queue overflow and socket failure both terminate this connection;
+          // the terminal client reconnects with the last cursor.
+          Effect.catch(() => Effect.void),
           Effect.ensuring(Effect.sync(() => attachment.detach())),
           Effect.orDie,
         )

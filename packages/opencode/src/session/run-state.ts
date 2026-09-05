@@ -46,7 +46,7 @@ const layer = Layer.effect(
         yield* Effect.addFinalizer(
           Effect.fnUntraced(function* () {
             yield* Effect.forEach(runners.values(), (runner) => runner.cancel, {
-              concurrency: "unbounded",
+              concurrency: 8,
               discard: true,
             })
             runners.clear()
@@ -148,7 +148,7 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
             }),
           ),
         ),
-      { concurrency: "unbounded", discard: true },
+      { concurrency: 8, discard: true },
     )
     batch = jobs.filter(matches)
   }

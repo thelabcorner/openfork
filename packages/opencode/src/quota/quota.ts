@@ -91,7 +91,7 @@ const layer: Layer.Layer<
             providerName: adapter.name,
             configured: Exit.isSuccess(exit) ? exit.value : false,
           })),
-        { concurrency: "unbounded" },
+        { concurrency: 4 },
       )
       const result = { providers: summaries }
       providersCache = { at: now, value: result }

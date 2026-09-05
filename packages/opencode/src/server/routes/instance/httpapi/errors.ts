@@ -27,6 +27,7 @@ export class ConflictError extends Schema.TaggedErrorClass<ConflictError>()(
   {
     message: Schema.String,
     resource: Schema.optional(Schema.String),
+    code: Schema.optional(Schema.String),
   },
   { httpApiStatus: 409 },
 ) {}

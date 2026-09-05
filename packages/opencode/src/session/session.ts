@@ -38,12 +38,14 @@ import { SessionID, MessageID, PartID } from "./schema"
 
 import type { Provider } from "@/provider/provider"
 import { Global } from "@opencode-ai/core/global"
-import { Effect, Layer, Option, Context, Schema, Types } from "effect"
+import { Effect, Layer, Option, Context, Schema, Types, Scope } from "effect"
 import { NonNegativeInt, optional } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
+import { SessionGroup } from "./group"
+import { Plugin } from "@/plugin"
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -501,7 +503,12 @@ export type Patch = Omit<Partial<Info>, "time" | "share" | "summary" | "revert" 
 const layer: Layer.Layer<
   Service,
   never,
-  BackgroundJob.Service | RuntimeFlags.Service | Database.Service | EventV2Bridge.Service
+  | BackgroundJob.Service
+  | RuntimeFlags.Service
+  | Database.Service
+  | EventV2Bridge.Service
+  | SessionGroup.Service
+  | Plugin.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -510,6 +517,67 @@ const layer: Layer.Layer<
     const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
+    const scope = yield* Scope.Scope
+
+    const groupSession = (session: Info) =>
+      Effect.gen(function* () {
+        const groups = Option.getOrUndefined(yield* Effect.serviceOption(SessionGroup.Service))
+        if (!groups) return
+        const plugin = Option.getOrUndefined(yield* Effect.serviceOption(Plugin.Service))
+        const assigned = {} as { groupID?: string; locked?: boolean; origin?: "user" | "auto_subagent" | "plugin" }
+        if (plugin) {
+          yield* plugin
+            .trigger(
+              "experimental.session.group.assign",
+              {
+                sessionID: session.id,
+                parentID: session.parentID,
+                agent: session.agent,
+                title: session.title,
+              },
+              assigned,
+            )
+            .pipe(Effect.catchCause(() => Effect.succeed(assigned)))
+        }
+        if (assigned.groupID) {
+          yield* groups.addSession({
+            groupId: SessionGroup.ID.make(assigned.groupID),
+            sessionId: session.id,
+            locked: assigned.locked,
+            origin: assigned.origin ?? "plugin",
+          })
+          return
+        }
+        if (!session.parentID) return
+        const visited = new Set<string>([session.id])
+        let anchor = session.parentID
+        let depth = 0
+        while (depth < 64) {
+          if (visited.has(anchor)) return
+          visited.add(anchor)
+          const parent = yield* db
+            .select()
+            .from(SessionTable)
+            .where(eq(SessionTable.id, anchor))
+            .get()
+            .pipe(Effect.orDie)
+          if (!parent) return
+          if (!parent.parent_id) break
+          anchor = parent.parent_id
+          depth++
+        }
+        if (depth >= 64) return
+        const root = yield* db.select().from(SessionTable).where(eq(SessionTable.id, anchor)).get().pipe(Effect.orDie)
+        if (!root) return
+        const group = yield* groups.resolveOrCreate({
+          name: root.title || "Subagents",
+          kind: "subagent",
+          anchorSessionId: anchor,
+          policy: { autoAddDescendants: true, lockAdded: true, autoDeleteWhenEmpty: true },
+        })
+        yield* groups.addSession({ groupId: group.id, sessionId: anchor, origin: "auto_subagent" })
+        yield* groups.addSession({ groupId: group.id, sessionId: session.id, locked: true, origin: "auto_subagent" })
+      }).pipe(Effect.catchCause((cause) => Effect.logError("failed to group session", { cause })))
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
@@ -548,6 +616,7 @@ const layer: Layer.Layer<
       yield* Effect.logInfo("created", result)
 
       yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
+      yield* groupSession(result).pipe(Effect.forkIn(scope, { startImmediately: true }))
 
       return result
     })
@@ -736,10 +805,16 @@ const layer: Layer.Layer<
         for (let i = msgs.length - 1; i >= 0; i--) {
           const m = msgs[i]
           if (!m) continue
-          if (m.info.role === "user") { lastCompleted = i + 1; break }
+          if (m.info.role === "user") {
+            lastCompleted = i + 1
+            break
+          }
           if (m.info.role === "assistant") {
             const a = m.info as SessionV1.Assistant
-            if (a.time.completed || a.error) { lastCompleted = i + 1; break }
+            if (a.time.completed || a.error) {
+              lastCompleted = i + 1
+              break
+            }
           }
         }
         target = lastCompleted
@@ -755,8 +830,17 @@ const layer: Layer.Layer<
               let lastCompleted = 0
               for (let i = idx - 1; i >= 0; i--) {
                 const mm = msgs[i]!
-                if (mm.info.role === "user") { lastCompleted = i + 1; break }
-                if (mm.info.role === "assistant" && ((mm.info as SessionV1.Assistant).time.completed || (mm.info as SessionV1.Assistant).error)) { lastCompleted = i + 1; break }
+                if (mm.info.role === "user") {
+                  lastCompleted = i + 1
+                  break
+                }
+                if (
+                  mm.info.role === "assistant" &&
+                  ((mm.info as SessionV1.Assistant).time.completed || (mm.info as SessionV1.Assistant).error)
+                ) {
+                  lastCompleted = i + 1
+                  break
+                }
               }
               target = lastCompleted
             } else {
@@ -858,7 +942,11 @@ const layer: Layer.Layer<
           // Direct update: set group_id on the forked session row to match original's group
           // This is best-effort; failure doesn't break the fork.
           yield* Effect.tryPromise(() =>
-            (db as any).update(SessionTable).set({ group_id: (original as any).groupID }).where((eq as any)(SessionTable.id, session.id)).run(),
+            (db as any)
+              .update(SessionTable)
+              .set({ group_id: (original as any).groupID })
+              .where((eq as any)(SessionTable.id, session.id))
+              .run(),
           ).pipe(Effect.catch(() => Effect.void))
         } catch {}
       }
@@ -899,7 +987,10 @@ const layer: Layer.Layer<
     // `time: null` clears the archive timestamp. The patch normalizes null to
     // undefined so the published Info stays schema-honest; the projector maps
     // the cleared field back to a NULL column write.
-    const setArchived = Effect.fn("Session.setArchived")(function* (input: { sessionID: SessionID; time?: number | null }) {
+    const setArchived = Effect.fn("Session.setArchived")(function* (input: {
+      sessionID: SessionID
+      time?: number | null
+    }) {
       yield* patch(input.sessionID, { time: { archived: input.time ?? undefined } }).pipe(Effect.orDie)
     })
 
@@ -1094,7 +1185,7 @@ const cancelBackgroundJobs = Effect.fn("Session.cancelBackgroundJobs")(function*
       return job.metadata?.parentSessionId === sessionID
     }),
     (job) => background.cancel(job.id),
-    { concurrency: "unbounded", discard: true },
+    { concurrency: 8, discard: true },
   )
 })
 
@@ -1159,7 +1250,7 @@ function listByProject(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node],
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node, SessionGroup.node, Plugin.node],
 })
 
 export * as Session from "./session"

@@ -194,13 +194,19 @@ async function permissionContent(toolName: string, input: ToolInput): Promise<To
 }
 
 async function diffContentForFiles(files: PermissionFileMetadata[]) {
-  const content = await Promise.all(
-    files.map(async (file) => {
-      if (!file.patch) return []
-      const content = await diffContentForPatch(file.filePath, file.patch, file.movePath)
-      return content ? [content] : []
-    }),
-  )
+  const content: ToolCallContent[][] = []
+  for (let offset = 0; offset < files.length; offset += 4) {
+    const batch = files.slice(offset, offset + 4)
+    content.push(
+      ...(await Promise.all(
+        batch.map(async (file) => {
+          if (!file.patch) return []
+          const content = await diffContentForPatch(file.filePath, file.patch, file.movePath)
+          return content ? [content] : []
+        }),
+      )),
+    )
+  }
   return content.flat()
 }
 

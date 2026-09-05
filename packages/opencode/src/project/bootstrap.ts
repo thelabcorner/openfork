@@ -79,7 +79,7 @@ const layer = Layer.effect(
           timed(ctx.directory, name, service.init()).pipe(
             Effect.catchCause((cause) => Effect.logWarning("init failed", { cause })),
           ),
-        { concurrency: "unbounded", discard: true },
+        { concurrency: 4, discard: true },
       ).pipe(Effect.withSpan("InstanceBootstrap.warmup"))
     })
 

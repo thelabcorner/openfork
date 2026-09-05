@@ -507,7 +507,9 @@ const layer: Layer.Layer<
             if (!target.startsWith(`${base}${pathSvc.sep}`)) return
             yield* fs.remove(target, { recursive: true }).pipe(Effect.ignore)
           }),
-        { concurrency: "unbounded" },
+        // Removing worktrees is recursive filesystem I/O. Keep cleanup from
+        // monopolizing the runtime when git reports a large failed batch.
+        { concurrency: 4 },
       )
     })
 

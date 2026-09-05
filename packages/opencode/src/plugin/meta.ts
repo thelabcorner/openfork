@@ -45,6 +45,20 @@ type Store = Record<string, Entry>
 type Core = Omit<Entry, "first_time" | "last_time" | "time_changed" | "load_count" | "fingerprint" | "themes">
 type Row = Touch & { core: Core }
 
+async function mapLimited<A, B>(items: readonly A[], fn: (item: A) => Promise<B>, concurrency = 8): Promise<B[]> {
+  const results = new Array<B>(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (true) {
+      const index = next++
+      if (index >= items.length) return
+      results[index] = await fn(items[index]!)
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
 function storePath() {
   return Flag.OPENCODE_PLUGIN_META_FILE ?? path.join(Global.Path.state, "plugin-meta.json")
 }
@@ -142,7 +156,7 @@ function next(prev: Entry | undefined, core: Core, now: number): { state: State;
 export async function touchMany(items: Touch[]): Promise<Array<{ state: State; entry: Entry }>> {
   if (!items.length) return []
   const file = storePath()
-  const rows = await Promise.all(items.map((item) => row(item)))
+  const rows = await mapLimited(items, row)
 
   return Flock.withLock(lock(file), async () => {
     const store = await read(file)

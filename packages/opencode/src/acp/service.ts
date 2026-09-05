@@ -993,7 +993,9 @@ function registerMcpServers(
           Effect.ignore,
         ),
       ),
-    { concurrency: "unbounded" },
+    // A workspace can expose many MCP servers. Keep registration fan-out
+    // bounded so one ACP session cannot monopolize the HTTP client/runtime.
+    { concurrency: 4 },
   ).pipe(
     Effect.tap(() =>
       Effect.sync(() =>

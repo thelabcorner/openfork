@@ -17,6 +17,20 @@ import { LspEvent } from "@opencode-ai/schema/lsp-event"
 
 export const Event = LspEvent
 
+async function mapLimited<A, B>(items: readonly A[], fn: (item: A) => Promise<B>, concurrency = 8): Promise<B[]> {
+  const results = new Array<B>(items.length)
+  let next = 0
+  const workers = Array.from({ length: Math.min(Math.max(1, concurrency), items.length) }, async () => {
+    while (true) {
+      const index = next++
+      if (index >= items.length) return
+      results[index] = await fn(items[index]!)
+    }
+  })
+  await Promise.all(workers)
+  return results
+}
+
 const Position = Schema.Struct({
   line: NonNegativeInt,
   character: NonNegativeInt,
@@ -298,12 +312,12 @@ const layer = Layer.effect(
 
     const run = Effect.fnUntraced(function* <T>(file: string, fn: (client: LSPClient.Info) => Promise<T>) {
       const clients = yield* getClients(file)
-      return yield* Effect.promise(() => Promise.all(clients.map((x) => fn(x))))
+      return yield* Effect.promise(() => mapLimited(clients, fn))
     })
 
     const runAll = Effect.fnUntraced(function* <T>(fn: (client: LSPClient.Info) => Promise<T>) {
       const s = yield* InstanceState.get(state)
-      return yield* Effect.promise(() => Promise.all(s.clients.map((x) => fn(x))))
+      return yield* Effect.promise(() => mapLimited(s.clients, fn))
     })
 
     const init = Effect.fn("LSP.init")(function* () {
@@ -345,8 +359,9 @@ const layer = Layer.effect(
       yield* Effect.logInfo("touching file", { file: input })
       const clients = yield* getClients(input)
       yield* Effect.promise(() =>
-        Promise.all(
-          clients.map(async (client) => {
+        mapLimited(
+          clients,
+          async (client) => {
             const after = Date.now()
             const version = await client.notify.open({ path: input })
             if (!diagnostics) return
@@ -356,7 +371,7 @@ const layer = Layer.effect(
               mode: diagnostics,
               after,
             })
-          }),
+          },
         ).catch(() => {}),
       )
     })
