@@ -26,6 +26,7 @@ import { makeGlobalNode } from "./effect/app-node"
 import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
+import { estimateEventBytes } from "./event-replay"
 
 const streamingDecoder = new TextDecoder()
 
@@ -72,14 +73,11 @@ export class InvalidDurableEventError extends Schema.TaggedErrorClass<InvalidDur
  * value — surfacing the break is safer than returning a plausible-but-wrong
  * payload.
  */
-export class CdbRehydrateError extends Schema.TaggedErrorClass<CdbRehydrateError>()(
-  "EventV2.CdbRehydrateError",
-  {
-    aggregateID: Schema.String,
-    valueID: Schema.String,
-    reason: Schema.String,
-  },
-) {}
+export class CdbRehydrateError extends Schema.TaggedErrorClass<CdbRehydrateError>()("EventV2.CdbRehydrateError", {
+  aggregateID: Schema.String,
+  valueID: Schema.String,
+  reason: Schema.String,
+}) {}
 
 const CDB_REF = "$cdbRef"
 
@@ -211,80 +209,84 @@ export const rehydrateCacheStats = (db: object) => {
  *   instead of throwing, so the caller can regenerate from event history.
  * - Cached per-db (refs-weighted) like the event.data path.
  */
-export const resolveCdbRef = Effect.fn("EventV2.resolveCdbRef")(
-  function* (db: DatabaseShape, aggregateID: string, valueID: string, opts?: { readonly failSoft?: boolean }) {
-    const failSoft = opts?.failSoft ?? false
-    let cache = rehydrateCache.get(db)
-    if (cache === undefined) {
-      cache = new RehydrateCache(REHYDRATE_CACHE_MAX_ENTRIES, REHYDRATE_CACHE_MAX_BYTES)
-      rehydrateCache.set(db, cache)
-    }
-    const cacheKey = rehydrateCacheKey(aggregateID, valueID)
-    const cached = cache.get(cacheKey)
-    if (cached !== undefined) {
-      cache.hits++
-      return cached
-    }
-    cache.misses++
-    const stored = yield* db
-      .select({
-        bytes: EventValueTable.bytes,
-        sha256: EventValueTable.sha256,
-        rawLen: EventValueTable.raw_len,
-        refs: EventValueTable.refs,
-      })
+export const resolveCdbRef = Effect.fn("EventV2.resolveCdbRef")(function* (
+  db: DatabaseShape,
+  aggregateID: string,
+  valueID: string,
+  opts?: { readonly failSoft?: boolean },
+) {
+  const failSoft = opts?.failSoft ?? false
+  let cache = rehydrateCache.get(db)
+  if (cache === undefined) {
+    cache = new RehydrateCache(REHYDRATE_CACHE_MAX_ENTRIES, REHYDRATE_CACHE_MAX_BYTES)
+    rehydrateCache.set(db, cache)
+  }
+  const cacheKey = rehydrateCacheKey(aggregateID, valueID)
+  const cached = cache.get(cacheKey)
+  if (cached !== undefined) {
+    cache.hits++
+    return cached
+  }
+  cache.misses++
+  const stored = yield* db
+    .select({
+      bytes: EventValueTable.bytes,
+      sha256: EventValueTable.sha256,
+      rawLen: EventValueTable.raw_len,
+      refs: EventValueTable.refs,
+    })
+    .from(EventValueTable)
+    .where(eq(EventValueTable.value_id, valueID))
+    .all()
+    .pipe(Effect.orDie)
+  if (stored.length === 0) {
+    if (failSoft) return undefined
+    throw new CdbRehydrateError({ aggregateID, valueID, reason: "no event_value row for $cdbRef" })
+  }
+  const row = stored[0]
+  const bytes = row.bytes as Uint8Array
+  // v5 delta_ref frame (epoch-4 #10): the stored bytes are a sparse correction
+  // against a base value in event_value. Load the base, apply the correction,
+  // and SHA-validate the reconstructed payload. Fail-closed on a missing base
+  // (quarantined by the ops-v2 repair path) — never silent degrade.
+  if (isV5Frame(bytes)) {
+    const header = parseV5Header(bytes)
+    const baseRow = yield* db
+      .select({ bytes: EventValueTable.bytes })
       .from(EventValueTable)
-      .where(eq(EventValueTable.value_id, valueID))
+      .where(and(eq(EventValueTable.aggregate_id, aggregateID), eq(EventValueTable.value_id, header.baseValueId)))
       .all()
       .pipe(Effect.orDie)
-    if (stored.length === 0) {
+    if (baseRow.length === 0) {
       if (failSoft) return undefined
-      throw new CdbRehydrateError({ aggregateID, valueID, reason: "no event_value row for $cdbRef" })
+      throw new CdbRehydrateError({ aggregateID, valueID, reason: "delta_ref base missing" })
     }
-    const row = stored[0]
-    const bytes = row.bytes as Uint8Array
-    // v5 delta_ref frame (epoch-4 #10): the stored bytes are a sparse correction
-    // against a base value in event_value. Load the base, apply the correction,
-    // and SHA-validate the reconstructed payload. Fail-closed on a missing base
-    // (quarantined by the ops-v2 repair path) — never silent degrade.
-    if (isV5Frame(bytes)) {
-      const header = parseV5Header(bytes)
-      const baseRow = yield* db
-        .select({ bytes: EventValueTable.bytes })
-        .from(EventValueTable)
-        .where(and(eq(EventValueTable.aggregate_id, aggregateID), eq(EventValueTable.value_id, header.baseValueId)))
-        .all()
-        .pipe(Effect.orDie)
-      if (baseRow.length === 0) {
-        if (failSoft) return undefined
-        throw new CdbRehydrateError({ aggregateID, valueID, reason: "delta_ref base missing" })
-      }
-      const baseRaw = decodeValueBytesRaw(baseRow[0].bytes as Uint8Array)
-      const correction = decodeV5Correction(header.correction, header.codec, header.storedCrc)
-      const raw = applyV5Correction(baseRaw, correction, header.totalRawLen)
-      const actualSha = createHash("sha256").update(raw).digest("hex")
-      if (actualSha !== row.sha256) {
-        if (failSoft) return undefined
-        throw new CdbRehydrateError({ aggregateID, valueID, reason: "sha256 mismatch for delta_ref payload" })
-      }
-      const value = JSON.parse(streamingDecoder.decode(raw))
-      cache.set(cacheKey, value, header.totalRawLen, row.refs)
-      return value
-    }
-    const useWorkers = Flag.OPENCODE_SEAL_WORKERS
-    const decoded = useWorkers && bytes.length >= DECOMPRESS_POOL_THRESHOLD
-      ? yield* Effect.promise(() => decompressValueAsync(bytes))
-      : yield* decodeValueBytesObjectStreaming(bytes)
-    const { value, raw } = decoded
+    const baseRaw = decodeValueBytesRaw(baseRow[0].bytes as Uint8Array)
+    const correction = decodeV5Correction(header.correction, header.codec, header.storedCrc)
+    const raw = applyV5Correction(baseRaw, correction, header.totalRawLen)
     const actualSha = createHash("sha256").update(raw).digest("hex")
     if (actualSha !== row.sha256) {
       if (failSoft) return undefined
-      throw new CdbRehydrateError({ aggregateID, valueID, reason: "sha256 mismatch for event_value payload" })
+      throw new CdbRehydrateError({ aggregateID, valueID, reason: "sha256 mismatch for delta_ref payload" })
     }
-    cache.set(cacheKey, value, row.rawLen, row.refs)
+    const value = JSON.parse(streamingDecoder.decode(raw))
+    cache.set(cacheKey, value, header.totalRawLen, row.refs)
     return value
-  },
-)
+  }
+  const useWorkers = Flag.OPENCODE_SEAL_WORKERS
+  const decoded =
+    useWorkers && bytes.length >= DECOMPRESS_POOL_THRESHOLD
+      ? yield* Effect.promise(() => decompressValueAsync(bytes))
+      : yield* decodeValueBytesObjectStreaming(bytes)
+  const { value, raw } = decoded
+  const actualSha = createHash("sha256").update(raw).digest("hex")
+  if (actualSha !== row.sha256) {
+    if (failSoft) return undefined
+    throw new CdbRehydrateError({ aggregateID, valueID, reason: "sha256 mismatch for event_value payload" })
+  }
+  cache.set(cacheKey, value, row.rawLen, row.refs)
+  return value
+})
 
 /**
  * #8 OPCL read path: resolve a `$cdbRef` in a collapsed projection column back
@@ -296,29 +298,27 @@ export const resolveCdbRef = Effect.fn("EventV2.resolveCdbRef")(
  * - `session.summary_diffs`: FAIL-SOFT (Q4) — a dangling ref returns `undefined`
  *   so the caller regenerates from event history instead of throwing.
  */
-export const resolveProjectionRef = Effect.fn("EventV2.resolveProjectionRef")(
-  function* (
-    db: DatabaseShape,
-    aggregateID: string,
-    column: "session_message.data" | "message.data" | "session.summary_diffs" | "part.data",
-    value: unknown,
-  ) {
-    if (!Flag.OPENCODE_OPCL) return value
-    if (value === null || typeof value !== "object" || !isCdbRef(value)) return value
-    const valueID = (value as Record<string, string>)[CDB_REF]
-    if (column === "session.summary_diffs") {
-      const resolved = yield* resolveCdbRef(db, aggregateID, valueID, { failSoft: true })
-      if (resolved !== undefined) return resolved
-      // Q4 fail-soft: regenerate from event history. A dangling/missing ref
-      // returns `undefined` (caller sees no diffs) rather than throwing,
-      // because summary_diffs are regenerable from git/snapshot. Log a
-      // warning with the session id so the miss is observable.
-      yield* Effect.logWarning(`session.summary_diffs ref unresolved for session ${aggregateID} (value_id=${valueID})`)
-      return undefined
-    }
-    return yield* resolveCdbRef(db, aggregateID, valueID, { failSoft: false })
-  },
-)
+export const resolveProjectionRef = Effect.fn("EventV2.resolveProjectionRef")(function* (
+  db: DatabaseShape,
+  aggregateID: string,
+  column: "session_message.data" | "message.data" | "session.summary_diffs" | "part.data",
+  value: unknown,
+) {
+  if (!Flag.OPENCODE_OPCL) return value
+  if (value === null || typeof value !== "object" || !isCdbRef(value)) return value
+  const valueID = (value as Record<string, string>)[CDB_REF]
+  if (column === "session.summary_diffs") {
+    const resolved = yield* resolveCdbRef(db, aggregateID, valueID, { failSoft: true })
+    if (resolved !== undefined) return resolved
+    // Q4 fail-soft: regenerate from event history. A dangling/missing ref
+    // returns `undefined` (caller sees no diffs) rather than throwing,
+    // because summary_diffs are regenerable from git/snapshot. Log a
+    // warning with the session id so the miss is observable.
+    yield* Effect.logWarning(`session.summary_diffs ref unresolved for session ${aggregateID} (value_id=${valueID})`)
+    return undefined
+  }
+  return yield* resolveCdbRef(db, aggregateID, valueID, { failSoft: false })
+})
 
 /** Test helper: reset the hit/miss counters for a specific db's cache. */
 export const resetRehydrateCacheStats = (db: object) => {
@@ -416,106 +416,106 @@ export const decodeValueBytesObjectStreaming = (bytes: Uint8Array) =>
  *   fail sha256 validation, throws CdbRehydrateError rather than returning a
  *   fabricated value.
  */
-export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(
-  function* <R extends { readonly data: Record<string, unknown> }>(
-    db: DatabaseShape,
-    aggregateID: string,
-    rows: ReadonlyArray<R>,
-  ) {
-    if (!Flag.OPENCODE_SEAL_DEDUP) return rows
+export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
+  R extends { readonly data: Record<string, unknown> },
+>(db: DatabaseShape, aggregateID: string, rows: ReadonlyArray<R>) {
+  if (!Flag.OPENCODE_SEAL_DEDUP) return rows
 
-    const refs: Array<{ row: R; valueID: string }> = []
-    for (const row of rows) {
-      if (isCdbRef(row.data)) refs.push({ row, valueID: row.data[CDB_REF] })
+  const refs: Array<{ row: R; valueID: string }> = []
+  for (const row of rows) {
+    if (isCdbRef(row.data)) refs.push({ row, valueID: row.data[CDB_REF] })
+  }
+  if (refs.length === 0) return rows
+
+  const valueIDs = Array.from(new Set(refs.map((ref) => ref.valueID)))
+  const stored = yield* db
+    .select({
+      valueID: EventValueTable.value_id,
+      bytes: EventValueTable.bytes,
+      sha256: EventValueTable.sha256,
+      rawLen: EventValueTable.raw_len,
+      refs: EventValueTable.refs,
+    })
+    .from(EventValueTable)
+    .where(and(eq(EventValueTable.aggregate_id, aggregateID), inArray(EventValueTable.value_id, valueIDs)))
+    .all()
+    .pipe(Effect.orDie)
+
+  const byID = new Map(stored.map((row) => [row.valueID, row] as const))
+
+  let cache = rehydrateCache.get(db)
+  if (cache === undefined) {
+    cache = new RehydrateCache(REHYDRATE_CACHE_ENTRIES, REHYDRATE_CACHE_BYTES)
+    rehydrateCache.set(db, cache)
+  }
+
+  // Split references into cache hits (served inline) and misses (need decode).
+  // Misses are deduped by value_id: under dedup many events share one payload,
+  // so we decode each unique payload ONCE (also avoids transferring the same
+  // underlying buffer to the worker pool more than once, which would detach it).
+  const missSet = new Set<string>()
+  const resolved = new Map<string, unknown>()
+  for (const row of rows) {
+    if (!isCdbRef(row.data)) continue
+    const valueID = row.data[CDB_REF]
+    const cached = cache.get(rehydrateCacheKey(aggregateID, valueID))
+    if (cached !== undefined) {
+      cache.hits++
+      resolved.set(valueID, cached)
+    } else {
+      missSet.add(valueID)
     }
-    if (refs.length === 0) return rows
+  }
+  cache.misses += missSet.size
+  const misses = Array.from(missSet, (valueID) => ({ valueID }))
 
-    const valueIDs = Array.from(new Set(refs.map((ref) => ref.valueID)))
-    const stored = yield* db
-      .select({
-        valueID: EventValueTable.value_id,
-        bytes: EventValueTable.bytes,
-        sha256: EventValueTable.sha256,
-        rawLen: EventValueTable.raw_len,
-        refs: EventValueTable.refs,
-      })
-      .from(EventValueTable)
-      .where(and(eq(EventValueTable.aggregate_id, aggregateID), inArray(EventValueTable.value_id, valueIDs)))
-      .all()
-      .pipe(Effect.orDie)
-
-    const byID = new Map(stored.map((row) => [row.valueID, row] as const))
-
-    let cache = rehydrateCache.get(db)
-    if (cache === undefined) {
-      cache = new RehydrateCache(REHYDRATE_CACHE_ENTRIES, REHYDRATE_CACHE_BYTES)
-      rehydrateCache.set(db, cache)
-    }
-
-    // Split references into cache hits (served inline) and misses (need decode).
-    // Misses are deduped by value_id: under dedup many events share one payload,
-    // so we decode each unique payload ONCE (also avoids transferring the same
-    // underlying buffer to the worker pool more than once, which would detach it).
-    const missSet = new Set<string>()
-    const resolved = new Map<string, unknown>()
-    for (const row of rows) {
-      if (!isCdbRef(row.data)) continue
-      const valueID = row.data[CDB_REF]
-      const cached = cache.get(rehydrateCacheKey(aggregateID, valueID))
-      if (cached !== undefined) {
-        cache.hits++
-        resolved.set(valueID, cached)
-      } else {
-        missSet.add(valueID)
+  // Decompress misses. When `OPENCODE_SEAL_WORKERS` is on, payloads at/above
+  // DECOMPRESS_POOL_THRESHOLD (and any batch of them) decompress IN PARALLEL
+  // on the worker pool, so a jumbo row (~32MiB / ~120ms sync) or a wide batch
+  // never blocks the read fiber on the main thread — the clog the sync path
+  // would cause on cold replay. Small payloads decode inline to avoid the
+  // worker round-trip overhead. sha256 is validated on the main thread over
+  // the returned raw bytes (cheap, ~5–65us) before the value is trusted.
+  const useWorkers = Flag.OPENCODE_SEAL_WORKERS
+  const decodeOne = (valueID: string) =>
+    Effect.gen(function* () {
+      const storedRow = byID.get(valueID)
+      // FAIL-CLOSED: a dangling/corrupt $cdbRef resolves to no event_value row.
+      if (storedRow === undefined) {
+        throw new CdbRehydrateError({ aggregateID, valueID, reason: "no event_value row for $cdbRef" })
       }
-    }
-    cache.misses += missSet.size
-    const misses = Array.from(missSet, (valueID) => ({ valueID }))
-
-    // Decompress misses. When `OPENCODE_SEAL_WORKERS` is on, payloads at/above
-    // DECOMPRESS_POOL_THRESHOLD (and any batch of them) decompress IN PARALLEL
-    // on the worker pool, so a jumbo row (~32MiB / ~120ms sync) or a wide batch
-    // never blocks the read fiber on the main thread — the clog the sync path
-    // would cause on cold replay. Small payloads decode inline to avoid the
-    // worker round-trip overhead. sha256 is validated on the main thread over
-    // the returned raw bytes (cheap, ~5–65us) before the value is trusted.
-    const useWorkers = Flag.OPENCODE_SEAL_WORKERS
-    const decodeOne = (valueID: string) =>
-      Effect.gen(function* () {
-        const storedRow = byID.get(valueID)
-        // FAIL-CLOSED: a dangling/corrupt $cdbRef resolves to no event_value row.
-        if (storedRow === undefined) {
-          throw new CdbRehydrateError({ aggregateID, valueID, reason: "no event_value row for $cdbRef" })
-        }
-        const bytes = storedRow.bytes as Uint8Array
-        const decodedBytes = useWorkers && bytes.length >= DECOMPRESS_POOL_THRESHOLD
+      const bytes = storedRow.bytes as Uint8Array
+      const decodedBytes =
+        useWorkers && bytes.length >= DECOMPRESS_POOL_THRESHOLD
           ? yield* Effect.promise(() => decompressValueAsync(bytes))
           : yield* decodeValueBytesObjectStreaming(bytes)
-        const { value, raw } = decodedBytes
-        const actualSha = createHash("sha256").update(raw).digest("hex")
-        if (actualSha !== storedRow.sha256) {
-          throw new CdbRehydrateError({ aggregateID, valueID, reason: "sha256 mismatch for event_value payload" })
-        }
-        return { valueID, value, rawLen: storedRow.rawLen, refs: storedRow.refs }
-      })
-    const decoded = yield* Effect.all(misses.map((m) => decodeOne(m.valueID)), {
+      const { value, raw } = decodedBytes
+      const actualSha = createHash("sha256").update(raw).digest("hex")
+      if (actualSha !== storedRow.sha256) {
+        throw new CdbRehydrateError({ aggregateID, valueID, reason: "sha256 mismatch for event_value payload" })
+      }
+      return { valueID, value, rawLen: storedRow.rawLen, refs: storedRow.refs }
+    })
+  const decoded = yield* Effect.all(
+    misses.map((m) => decodeOne(m.valueID)),
+    {
       concurrency: useWorkers ? 16 : 1,
-    })
-    for (const d of decoded) {
-      const key = rehydrateCacheKey(aggregateID, d.valueID)
-      cache.set(key, d.value, d.rawLen, d.refs)
-      resolved.set(d.valueID, d.value)
-    }
+    },
+  )
+  for (const d of decoded) {
+    const key = rehydrateCacheKey(aggregateID, d.valueID)
+    cache.set(key, d.value, d.rawLen, d.refs)
+    resolved.set(d.valueID, d.value)
+  }
 
-    // Splice resolved payloads back into their rows, byte-exact.
-    return rows.map((row) => {
-      if (!isCdbRef(row.data)) return row
-      const value = resolved.get(row.data[CDB_REF])
-      if (value === undefined) return row
-      return { ...row, data: value as Record<string, unknown> }
-    })
-  },
-)
+  // Splice resolved payloads back into their rows, byte-exact.
+  return rows.map((row) => {
+    if (!isCdbRef(row.data)) return row
+    const value = resolved.get(row.data[CDB_REF])
+    if (value === undefined) return row
+    return { ...row, data: value as Record<string, unknown> }
+  })
+})
 
 const decodeSerializedEvent = (event: SerializedEvent): Payload => {
   const definition = Durable.get(event.type)
@@ -620,18 +620,88 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Event") {}
 
-export const allBounded = (events: Interface, capacity: number) =>
+// For synchronous event emitters: never suspend a producer behind a slow
+// subscriber, and never silently discard an append-only event on overflow.
+export const makeSubscriberQueue = <A>(capacity: number) =>
   Effect.gen(function* () {
-    const queue = yield* Queue.dropping<Payload, SubscriberOverflowError>(capacity)
-    const unsubscribe = yield* events.listen((event) =>
-      Queue.offer(queue, event).pipe(
-        Effect.flatMap((accepted) =>
-          accepted ? Effect.void : Queue.fail(queue, new SubscriberOverflowError({ capacity })).pipe(Effect.asVoid),
-        ),
-      ),
-    )
-    yield* Effect.addFinalizer(() => unsubscribe.pipe(Effect.andThen(Queue.shutdown(queue)), Effect.asVoid))
-    return Stream.fromQueue(queue)
+    const queue = yield* Queue.dropping<A, SubscriberOverflowError>(capacity)
+    yield* Effect.addFinalizer(() => Queue.shutdown(queue).pipe(Effect.asVoid))
+    let failed = false
+    const offer = (event: A) => {
+      if (failed) return false
+      if (Queue.offerUnsafe(queue, event)) return true
+      failed = true
+      Queue.failCauseUnsafe(queue, Cause.fail(new SubscriberOverflowError({ capacity })))
+      return false
+    }
+    return { queue, offer, stream: Stream.fromQueue(queue) }
+  })
+
+/**
+ * A subscriber queue with both item and byte bounds.
+ *
+ * Item counts alone are insufficient for transports such as PTY sockets: one
+ * read can be megabytes even when it is only one queued item. `take` is the
+ * only supported drain operation so the retained-byte counter is released as
+ * soon as a frame is handed to the writer.
+ */
+export const makeByteBoundedSubscriberQueue = <A>(options: {
+  readonly capacity: number
+  readonly maxBytes: number
+  readonly sizeOf: (value: A) => number
+}) =>
+  Effect.gen(function* () {
+    if (!Number.isSafeInteger(options.capacity) || options.capacity < 1) {
+      throw new Error("Subscriber queue capacity must be positive")
+    }
+    if (!Number.isFinite(options.maxBytes) || options.maxBytes <= 0) {
+      throw new Error("Subscriber queue byte capacity must be positive")
+    }
+    const queue = yield* Queue.dropping<A, SubscriberOverflowError>(options.capacity)
+    yield* Effect.addFinalizer(() => Queue.shutdown(queue).pipe(Effect.asVoid))
+    let failed = false
+    let pendingBytes = 0
+    const offer = (event: A) => {
+      if (failed) return false
+      const rawSize = options.sizeOf(event)
+      const size = Number.isFinite(rawSize) ? Math.max(0, rawSize) : Number.POSITIVE_INFINITY
+      if (size > options.maxBytes || pendingBytes > options.maxBytes - size) {
+        failed = true
+        Queue.failCauseUnsafe(queue, Cause.fail(new SubscriberOverflowError({ capacity: options.capacity })))
+        return false
+      }
+      if (Queue.offerUnsafe(queue, event)) {
+        pendingBytes += size
+        return true
+      }
+      failed = true
+      Queue.failCauseUnsafe(queue, Cause.fail(new SubscriberOverflowError({ capacity: options.capacity })))
+      return false
+    }
+    const release = (event: A) =>
+      Effect.sync(() => {
+        const rawSize = options.sizeOf(event)
+        const size = Number.isFinite(rawSize) ? Math.max(0, rawSize) : Number.POSITIVE_INFINITY
+        pendingBytes = Math.max(0, pendingBytes - size)
+      })
+    const take = Queue.take(queue).pipe(Effect.tap(release))
+    // Do not expose the raw queue stream: consumers of `stream` do not call
+    // the custom `take` effect, so using Stream.fromQueue directly would leak
+    // retained-byte accounting after every successful read.
+    const stream = Stream.fromQueue(queue).pipe(Stream.tap(release))
+    return { queue, offer, take, stream, pendingBytes: () => pendingBytes }
+  })
+
+export const allBounded = (events: Interface, capacity: number, maxBytes = 8 * 1024 * 1024) =>
+  Effect.gen(function* () {
+    const subscriber = yield* makeByteBoundedSubscriberQueue<Payload>({
+      capacity,
+      maxBytes,
+      sizeOf: estimateEventBytes,
+    })
+    const unsubscribe = yield* events.listen((event) => Effect.sync(() => subscriber.offer(event)))
+    yield* Effect.addFinalizer(() => unsubscribe)
+    return subscriber.stream
   })
 
 export interface LayerOptions {
@@ -870,19 +940,49 @@ export const layerWith = (options?: LayerOptions) =>
         Effect.suspend(() => observer(event)).pipe(
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterrupts(cause),
-            (cause) => Effect.logError("Event listener failed", { eventID: event.id, eventType: event.type, cause }),
+            (cause) =>
+              Effect.sync(() => {
+                // A defective listener would otherwise be invoked and logged
+                // for every subsequent token. Detach it after the first
+                // failure; interruption remains observable and is not treated
+                // as a subscriber defect.
+                const index = listeners.indexOf(observer)
+                if (index >= 0) listeners.splice(index, 1)
+              }).pipe(
+                Effect.andThen(
+                  Effect.logError("Event listener failed", { eventID: event.id, eventType: event.type, cause }),
+                ),
+              ),
           ),
         )
 
       function notify(event: Payload, isolateListeners: boolean) {
         return Effect.gen(function* () {
-          const snapshot = listeners.slice()
-          if (snapshot.length > 0) {
-            yield* Effect.forEach(
-              snapshot,
-              (listener) => (isolateListeners ? observe(event, listener) : listener(event)),
-              { concurrency: 20, discard: true },
-            )
+          // The common streaming case has zero or one listener. Avoid a
+          // per-event slice/allocation there while retaining a snapshot for
+          // the multi-listener case, where a callback may unsubscribe itself.
+          if (listeners.length === 1) {
+            const listener = listeners[0]!
+            // A live subscriber is outside the transaction boundary. Keep the
+            // hot path inline, but still contain defects so a renderer/socket
+            // listener can never make the producer's publish fail.
+            yield* observe(event, listener)
+          } else if (listeners.length > 1) {
+            const snapshot = listeners.slice()
+            if (!isolateListeners) {
+              // Hot path (streaming deltas): listeners are cheap synchronous
+              // filter + Queue.offerUnsafe fan-out. Running them sequentially
+              // preserves publish order and avoids spawning fibers per event;
+              // `observe` contains a bad subscriber without forking a fiber.
+              for (const listener of snapshot) yield* observe(event, listener)
+            } else {
+              // Durable path: isolate listener failures so one bad subscriber
+              // cannot fail the publish, with bounded parallelism.
+              yield* Effect.forEach(snapshot, (listener) => observe(event, listener), {
+                concurrency: 8,
+                discard: true,
+              })
+            }
           }
           const typed = pubsub.typed.get(event.type)
           if (typed) yield* PubSub.publish(typed, event)
@@ -1012,6 +1112,7 @@ export const layerWith = (options?: LayerOptions) =>
 
       const streamAll = (): Stream.Stream<Payload> => Stream.fromPubSub(pubsub.all)
 
+      const replayPageSize = 256
       const readAfter = (aggregateID: string, after: number) =>
         (options?.beforeAggregateRead?.(aggregateID) ?? Effect.void).pipe(
           Effect.andThen(
@@ -1020,6 +1121,7 @@ export const layerWith = (options?: LayerOptions) =>
               .from(EventTable)
               .where(and(eq(EventTable.aggregate_id, aggregateID), gt(EventTable.seq, after)))
               .orderBy(asc(EventTable.seq))
+              .limit(replayPageSize)
               .all(),
           ),
           Effect.orDie,
@@ -1069,12 +1171,15 @@ export const layerWith = (options?: LayerOptions) =>
                 }),
               ),
             )
-            const historical = yield* read
-            const live = Stream.fromSubscription(wakes).pipe(
-              Stream.mapEffect(() => read),
+            // A wake represents "there is work", not one page. Drain until a
+            // short page so coalesced wakes cannot strand historical events.
+            // Subscription precedes every read, preserving the replay/live handoff.
+            const drain = Stream.fromEffectRepeat(read).pipe(
+              Stream.takeUntil((events) => events.length < replayPageSize),
               Stream.flattenIterable,
             )
-            return Stream.concat(Stream.fromIterable(historical), live)
+            const live = Stream.fromSubscription(wakes).pipe(Stream.flatMap(() => drain))
+            return Stream.concat(drain, live)
           }),
         )
 
@@ -1082,7 +1187,9 @@ export const layerWith = (options?: LayerOptions) =>
         Effect.sync(() => {
           listeners.push(listener)
           if (listeners.length > 0 && listeners.length % 50 === 0) {
-            void Effect.runFork(Effect.logWarning("Event listener count is unusually high", { count: listeners.length }))
+            void Effect.runFork(
+              Effect.logWarning("Event listener count is unusually high", { count: listeners.length }),
+            )
           }
           return Effect.sync(() => {
             const index = listeners.indexOf(listener)
