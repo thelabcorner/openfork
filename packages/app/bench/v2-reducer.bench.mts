@@ -1,7 +1,7 @@
-// Bench: does the v2 session reducer do O(messages) work per delta?
-// Mirrors the real consumer path: server-sync.tsx calls session.applyV2(event.current)
-// -> v2.reduce(source, event) -> updateAssistant -> update() = source.map(...) over the
-// WHOLE session message list, for EVERY text/reasoning/tool delta.
+// Bench: measure hot streaming-delta reduction across long concurrent histories.
+// The reducer keeps a bounded per-session index for message/content lookup; this
+// makes the target lookup independent of the number of historical messages while
+// preserving immutable arrays for Solid's store projection.
 //
 // Run: bun "C:/Users/slooshied/WebstormProjects/opencode/packages/app/bench/v2-reducer.bench.mts"
 
@@ -50,7 +50,7 @@ function bench(messageCount: number, deltas: number) {
   return { ms, perDeltaUs: (ms / deltas) * 1000 }
 }
 
-console.log("v2 session.text.delta reduce cost (full session re-scan per delta)")
+console.log("v2 session.text.delta reduce cost (indexed message/content lookup)")
 console.log(`${"messages".padEnd(10)} ${"deltas".padEnd(10)} ${"total ms".padStart(12)} ${"us/delta".padStart(12)}`)
 for (const n of [10, 50, 100, 200, 500, 1000, 2000]) {
   const r = bench(n, 2000)

@@ -4,15 +4,50 @@ type Assistant = Extract<SessionMessageInfo, { type: "assistant" }>
 type Compaction = Extract<SessionMessageInfo, { type: "compaction" }>
 type Shell = Extract<SessionMessageInfo, { type: "shell" }>
 
+type StreamIndex = {
+  source: readonly SessionMessageInfo[]
+  byID: Map<string, number>
+  parentByID: Map<string, number | undefined>
+  content: Map<
+    string,
+    {
+      signature: string
+      text: number[]
+      reasoning: number[]
+      tools: Map<string, number>
+    }
+  >
+  runningCompaction?: number
+}
+
+const MAX_STREAM_INDEXES = 256
+
 export type V2SessionReduction = {
   sessionID: string
   messages: SessionMessageInfo[]
   touched: string[]
   missing?: string
+  incremental?: {
+    index: number
+    message: SessionMessageInfo
+    partID?: string
+    parent?: SessionMessageInfo
+  }
 }
 
 export function createV2SessionReducer() {
   const pending = new Map<string, SessionPendingMessage>()
+  const indexes = new Map<string, StreamIndex>()
+
+  const rememberIndex = (sessionID: string, index: StreamIndex) => {
+    indexes.delete(sessionID)
+    indexes.set(sessionID, index)
+    while (indexes.size > MAX_STREAM_INDEXES) {
+      const oldest = indexes.keys().next().value
+      if (oldest === undefined) break
+      indexes.delete(oldest)
+    }
+  }
 
   const reduce = (source: readonly SessionMessageInfo[], event: OpenCodeEvent): V2SessionReduction | undefined => {
     if (!("data" in event) || !("sessionID" in event.data) || typeof event.data.sessionID !== "string") return
@@ -193,10 +228,16 @@ export function createV2SessionReducer() {
           content: insertOrdinal(item.content, "text", event.data.ordinal, { type: "text", text: "" }),
         }))
       case "session.text.delta":
-        return updateContent(source, event.data.assistantMessageID, sessionID, "text", event.data.ordinal, (item) => ({
-          ...item,
-          text: item.text + event.data.delta,
-        }))
+        return updateIndexedContent(
+          indexes,
+          rememberIndex,
+          source,
+          sessionID,
+          event.data.assistantMessageID,
+          "text",
+          event.data.ordinal,
+          (item) => ({ ...item, text: item.text + event.data.delta }),
+        )
       case "session.text.ended":
         return updateContent(source, event.data.assistantMessageID, sessionID, "text", event.data.ordinal, (item) => ({
           ...item,
@@ -213,16 +254,15 @@ export function createV2SessionReducer() {
           }),
         }))
       case "session.reasoning.delta":
-        return updateContent(
+        return updateIndexedContent(
+          indexes,
+          rememberIndex,
           source,
-          event.data.assistantMessageID,
           sessionID,
+          event.data.assistantMessageID,
           "reasoning",
           event.data.ordinal,
-          (item) => ({
-            ...item,
-            text: item.text + event.data.delta,
-          }),
+          (item) => ({ ...item, text: item.text + event.data.delta }),
         )
       case "session.reasoning.ended":
         return updateContent(
@@ -255,10 +295,17 @@ export function createV2SessionReducer() {
               ],
         }))
       case "session.tool.input.delta":
-        return updateTool(source, event.data.assistantMessageID, event.data.callID, sessionID, (tool) =>
-          tool.state.status === "streaming"
-            ? { ...tool, state: { ...tool.state, input: tool.state.input + event.data.delta } }
-            : tool,
+        return updateIndexedTool(
+          indexes,
+          rememberIndex,
+          source,
+          sessionID,
+          event.data.assistantMessageID,
+          event.data.callID,
+          (tool) =>
+            tool.state.status === "streaming"
+              ? { ...tool, state: { ...tool.state, input: tool.state.input + event.data.delta } }
+              : tool,
         )
       case "session.tool.input.ended":
         return updateTool(source, event.data.assistantMessageID, event.data.callID, sessionID, (tool) =>
@@ -344,15 +391,12 @@ export function createV2SessionReducer() {
           time: { created: event.created },
         })
       case "session.compaction.delta":
-        return updateMessage<Extract<Compaction, { status: "running" }>>(
+        return updateIndexedCompaction(
+          indexes,
+          rememberIndex,
           source,
-          (item): item is Extract<Compaction, { status: "running" }> =>
-            item.type === "compaction" && item.status === "running",
-          (item) => ({
-            ...item,
-            summary: item.summary + event.data.text,
-          }),
           sessionID,
+          (item) => ({ ...item, summary: item.summary + event.data.text }),
         )
       case "session.compaction.ended": {
         const current = source.findLast(
@@ -412,6 +456,7 @@ export function createV2SessionReducer() {
       for (const id of pending.keys()) {
         if (id.startsWith(`${sessionID}:`)) pending.delete(id)
       }
+      indexes.delete(sessionID)
     },
   }
 }
@@ -495,6 +540,219 @@ function updateTool(
     ...assistant,
     content: assistant.content.map((item) => (item.type === "tool" && item.id === callID ? apply(item) : item)),
   }))
+}
+
+function buildStreamIndex(source: readonly SessionMessageInfo[]): StreamIndex {
+  const byID = new Map<string, number>()
+  const parentByID = new Map<string, number | undefined>()
+  const content = new Map<
+    string,
+    { signature: string; text: number[]; reasoning: number[]; tools: Map<string, number> }
+  >()
+  let runningCompaction: number | undefined
+  let parentID: string | undefined
+
+  source.forEach((message, messageIndex) => {
+    byID.set(message.id, messageIndex)
+    if (message.type === "user" || (message.type === "synthetic" && message.description?.trim())) parentID = message.id
+    if (message.type === "shell") parentID = undefined
+    if (message.type === "assistant") {
+      parentByID.set(message.id, parentID === undefined ? undefined : byID.get(parentID))
+      const text: number[] = []
+      const reasoning: number[] = []
+      const tools = new Map<string, number>()
+      message.content.forEach((part, partIndex) => {
+        if (part.type === "text") text.push(partIndex)
+        if (part.type === "reasoning") reasoning.push(partIndex)
+        if (part.type === "tool") tools.set(part.id, partIndex)
+      })
+      content.set(message.id, {
+        signature: contentSignature(message.content),
+        text,
+        reasoning,
+        tools,
+      })
+    }
+    if (message.type === "compaction" && message.status === "running") runningCompaction = messageIndex
+  })
+
+  return { source, byID, parentByID, content, runningCompaction }
+}
+
+function streamIndex(
+  indexes: Map<string, StreamIndex>,
+  rememberIndex: (sessionID: string, index: StreamIndex) => void,
+  sessionID: string,
+  source: readonly SessionMessageInfo[],
+) {
+  const existing = indexes.get(sessionID)
+  if (existing && existing.byID.size === source.length) {
+    existing.source = source
+    return existing
+  }
+  const created = buildStreamIndex(source)
+  rememberIndex(sessionID, created)
+  return created
+}
+
+function contentSignature(content: Assistant["content"]) {
+  return content
+    .map((part) => (part.type === "tool" ? `tool:${part.id}` : part.type))
+    .join("\u0000")
+}
+
+function assistantAt(
+  index: StreamIndex,
+  source: readonly SessionMessageInfo[],
+  messageID: string,
+): { messageIndex: number; assistant: Assistant } | undefined {
+  const messageIndex = index.byID.get(messageID)
+  if (messageIndex === undefined) return undefined
+  const message = source[messageIndex]
+  if (!message || message.id !== messageID || message.type !== "assistant") return undefined
+  return { messageIndex, assistant: message }
+}
+
+function refreshStreamIndex(
+  indexes: Map<string, StreamIndex>,
+  rememberIndex: (sessionID: string, index: StreamIndex) => void,
+  sessionID: string,
+  source: readonly SessionMessageInfo[],
+) {
+  const created = buildStreamIndex(source)
+  rememberIndex(sessionID, created)
+  return created
+}
+
+function updateIndexedContent<T extends "text" | "reasoning">(
+  indexes: Map<string, StreamIndex>,
+  rememberIndex: (sessionID: string, index: StreamIndex) => void,
+  source: readonly SessionMessageInfo[],
+  sessionID: string,
+  messageID: string,
+  type: T,
+  ordinal: number,
+  apply: (
+    item: Extract<Assistant["content"][number], { type: T }>,
+  ) => Extract<Assistant["content"][number], { type: T }>,
+): V2SessionReduction | undefined {
+  let index = streamIndex(indexes, rememberIndex, sessionID, source)
+  let target = assistantAt(index, source, messageID)
+  if (!target) {
+    index = refreshStreamIndex(indexes, rememberIndex, sessionID, source)
+    target = assistantAt(index, source, messageID)
+  }
+  if (!target) return undefined
+
+  let content = index.content.get(messageID)
+  if (!content || content.signature !== contentSignature(target.assistant.content)) {
+    index = refreshStreamIndex(indexes, rememberIndex, sessionID, source)
+    target = assistantAt(index, source, messageID)
+    content = index.content.get(messageID)
+  }
+  if (!target || !content) return undefined
+  const partIndex = content[type][ordinal]
+  const part = partIndex === undefined ? undefined : target.assistant.content[partIndex]
+  if (!part || part.type !== type) return undefined
+
+  const nextPart = apply(part as Extract<Assistant["content"][number], { type: T }>)
+  const nextContent = target.assistant.content.slice()
+  nextContent[partIndex] = nextPart
+  const message = { ...target.assistant, content: nextContent }
+  const nextMessages = source.slice()
+  nextMessages[target.messageIndex] = message
+  index.source = nextMessages
+  const parentIndex = index.parentByID.get(messageID)
+  return {
+    sessionID,
+    messages: nextMessages,
+    touched: [messageID],
+    incremental: {
+      index: target.messageIndex,
+      message,
+      partID: `${messageID}:${type}:${ordinal}`,
+      parent: parentIndex === undefined ? undefined : source[parentIndex],
+    },
+  }
+}
+
+function updateIndexedTool(
+  indexes: Map<string, StreamIndex>,
+  rememberIndex: (sessionID: string, index: StreamIndex) => void,
+  source: readonly SessionMessageInfo[],
+  sessionID: string,
+  messageID: string,
+  callID: string,
+  apply: (item: Extract<Assistant["content"][number], { type: "tool" }>) => Extract<Assistant["content"][number], { type: "tool" }>,
+): V2SessionReduction | undefined {
+  let index = streamIndex(indexes, rememberIndex, sessionID, source)
+  let target = assistantAt(index, source, messageID)
+  if (!target) {
+    index = refreshStreamIndex(indexes, rememberIndex, sessionID, source)
+    target = assistantAt(index, source, messageID)
+  }
+  if (!target) return undefined
+
+  let content = index.content.get(messageID)
+  if (!content || content.signature !== contentSignature(target.assistant.content)) {
+    index = refreshStreamIndex(indexes, rememberIndex, sessionID, source)
+    target = assistantAt(index, source, messageID)
+    content = index.content.get(messageID)
+  }
+  if (!target || !content) return undefined
+  const partIndex = content.tools.get(callID)
+  if (partIndex === undefined) return undefined
+  const part = target.assistant.content[partIndex]
+  if (!part || part.type !== "tool") return undefined
+
+  const nextPart = apply(part)
+  const nextContent = target.assistant.content.slice()
+  nextContent[partIndex] = nextPart
+  const message = { ...target.assistant, content: nextContent }
+  const nextMessages = source.slice()
+  nextMessages[target.messageIndex] = message
+  index.source = nextMessages
+  const parentIndex = index.parentByID.get(messageID)
+  return {
+    sessionID,
+    messages: nextMessages,
+    touched: [messageID],
+    incremental: {
+      index: target.messageIndex,
+      message,
+      partID: callID,
+      parent: parentIndex === undefined ? undefined : source[parentIndex],
+    },
+  }
+}
+
+function updateIndexedCompaction(
+  indexes: Map<string, StreamIndex>,
+  rememberIndex: (sessionID: string, index: StreamIndex) => void,
+  source: readonly SessionMessageInfo[],
+  sessionID: string,
+  apply: (item: Extract<Compaction, { status: "running" }>) => Extract<Compaction, { status: "running" }>,
+): V2SessionReduction | undefined {
+  let index = streamIndex(indexes, rememberIndex, sessionID, source)
+  let messageIndex = index.runningCompaction
+  let message = messageIndex === undefined ? undefined : source[messageIndex]
+  if (!message || message.type !== "compaction" || message.status !== "running") {
+    index = refreshStreamIndex(indexes, rememberIndex, sessionID, source)
+    messageIndex = index.runningCompaction
+    message = messageIndex === undefined ? undefined : source[messageIndex]
+  }
+  if (!message || messageIndex === undefined || message.type !== "compaction" || message.status !== "running") return undefined
+
+  const nextMessages = source.slice()
+  const nextMessage = apply(message)
+  nextMessages[messageIndex] = nextMessage
+  index.source = nextMessages
+  return {
+    sessionID,
+    messages: nextMessages,
+    touched: [message.id],
+    incremental: { index: messageIndex, message: nextMessage },
+  }
 }
 
 function insertOrdinal<T extends Assistant["content"][number]["type"]>(
