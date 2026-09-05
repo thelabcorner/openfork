@@ -3,6 +3,7 @@ import type { JSX } from "solid-js"
 import type { ToolPart } from "@opencode-ai/sdk/v2/client"
 import { fileDir as dirName, fileName as fileNameOf } from "../../format"
 import { stripAnsi } from "./shared"
+import { ToolText } from "./text"
 
 type GrepFileGroup = { path: string; matches: { line: number; text: string }[] }
 export type GrepResult = { total: number; truncated: boolean; files: GrepFileGroup[] }
@@ -72,7 +73,7 @@ function HighlightedText(props: { text: string; term?: string }) {
 export function GrepToolBody(props: { part: ToolPart }) {
   const result = createMemo(() => parseGrepOutput(toolOutput(props.part)))
   return (
-    <Show when={result()} fallback={<pre class="tool-output-pre">{toolOutput(props.part)}</pre>}>
+    <Show when={result()} fallback={<ToolText output={toolOutput(props.part)} />}>
       {(value) => (
         <div class="grep-results">
           <Show when={value().files.length === 0}>

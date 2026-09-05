@@ -38,9 +38,6 @@ export async function fetchIdentity(serverUrl: string, signal?: AbortSignal): Pr
   }
 }
 
-export const IDENTITY_REQUIRED_MESSAGE =
-  "This server could not prove which OpenCode instance it is. For the mobile dev PWA, start the desktop with `bun run dev` from packages/desktop."
-
 /**
  * Decides what a freshly observed identity means for a stored pin.
  *
@@ -186,6 +183,16 @@ function authorization(token?: string) {
   return `Basic ${btoa(`device:${token}`)}`
 }
 
+/**
+ * No instance pin here on purpose. `x-opencode-expect-instance` names a single
+ * desktop *launch*, and this client is long-lived: pinning it meant every
+ * request started failing with 409 as soon as the desktop restarted, so the
+ * session list would render and then refuse to open anything.
+ *
+ * The pin is applied by whoever can keep it fresh — `dev/proxy.ts` re-resolves
+ * and re-verifies per request — not by a client that cannot notice it went
+ * stale. See INSTANCE_EXPECT_HEADER in dev/constants.ts.
+ */
 export function createClient(serverUrl: string, token?: string): OpencodeClient {
   return createOpencodeClient({
     baseUrl: serverUrl,

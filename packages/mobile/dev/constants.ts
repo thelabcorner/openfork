@@ -21,6 +21,27 @@ export const LEGACY_HANDSHAKE_FILENAMES = [".opencode-dev-url"]
 /** Unauthenticated identity echo, served by every opencode built after this change. */
 export const IDENTITY_PATH = "/instance/identity"
 
+/**
+ * Set on every proxied request to name the instance it is addressed to. The
+ * server answers 409 rather than serving another instance's data, so the
+ * guarantee survives a port changing hands between the probe and the request.
+ */
+export const INSTANCE_EXPECT_HEADER = "x-opencode-expect-instance"
+
+/**
+ * A long-lived device token for local tooling, minted once and reused across
+ * every desktop restart. Dev-only and gitignored: it is a real credential for
+ * the loopback sidecar, and it exists so a human or an agent can actually
+ * exercise authenticated endpoints instead of inferring behaviour from 401s.
+ */
+export const AGENT_TOKEN_FILENAME = ".opencode-dev-agent-token.json"
+
+/** Bumped if the agent token file's shape changes. */
+export const AGENT_TOKEN_VERSION = 1
+
+/** Device name the token is registered under, so it is obvious in Settings. */
+export const AGENT_DEVICE_NAME = "opencode dev tooling (local)"
+
 /** Served by the Vite dev server: which backend, if any, it is bound to. */
 export const DEV_TARGET_STATUS_PATH = "/__opencode/dev-target"
 

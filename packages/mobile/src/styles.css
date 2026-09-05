@@ -775,14 +775,83 @@ a, button, [role="button"] { touch-action: manipulation; }
 .path-label.grow { min-width: 0; flex: 1; overflow: hidden; }
 .path-label.dim { opacity: 0.7; }
 
-/* Shell */
+/* ============ Shell ============
+   Terminal output is the one place this app relaxes its "one type face" rule
+   in spirit: shell colour is information — it is how a test runner separates a
+   pass from a fail. So the ANSI palette is kept, retuned to the zinc ramp so
+   it sits inside the card instead of shouting over it. */
+
+.shell-body {
+  --shell-ansi-black: #3f3f46;
+  --shell-ansi-red: #f87171;
+  --shell-ansi-green: #4ade80;
+  --shell-ansi-yellow: #eab308;
+  --shell-ansi-blue: #5b8dff;
+  --shell-ansi-magenta: #d670d6;
+  --shell-ansi-cyan: #29b8db;
+  --shell-ansi-white: #d4d4d8;
+  --shell-ansi-bright-black: #71717a;
+  --shell-ansi-bright-red: #fca5a5;
+  --shell-ansi-bright-green: #86efac;
+  --shell-ansi-bright-yellow: #fde047;
+  --shell-ansi-bright-blue: #93b4ff;
+  --shell-ansi-bright-magenta: #e9a6e9;
+  --shell-ansi-bright-cyan: #67d3ee;
+  --shell-ansi-bright-white: #fafafa;
+}
+
 .tool-shell .tool-row-head { padding: 4px 6px 4px 8px; }
 .shell-body { display: flex; flex-direction: column; gap: 8px; }
-.shell-command { display: flex; align-items: flex-start; gap: 6px; }
-.shell-prompt { color: var(--accent-green); font-weight: 800; user-select: none; padding-top: 8px; }
+
+.shell-command { display: flex; align-items: flex-start; gap: 6px; padding: 6px 8px; border-radius: var(--radius-xs); background: rgba(0,0,0,0.30); border: 1px solid var(--surface-border-weak); }
+.shell-prompt { color: var(--accent-green); font-weight: 800; user-select: none; }
+.shell-command-code { flex: 1 1 auto; min-width: 0; font-size: var(--font-xs); line-height: 1.6; color: var(--text-secondary); white-space: pre-wrap; word-break: break-word; }
+
+/* Command tokens — deliberately restrained. The program is the anchor, the
+   subcommand is the verb, and everything else stays quiet so the eye lands on
+   those two first. */
+.cmd-plain { color: var(--text-secondary); }
+.cmd-program { color: #93b4ff; font-weight: 700; }
+.cmd-subcommand { color: var(--accent-violet); font-weight: 650; }
+.cmd-flag { color: var(--text-weakest); }
+.cmd-string { color: var(--accent-green); }
+.cmd-comment { color: var(--text-weakest); font-style: italic; }
+.cmd-operator { color: var(--accent-amber); font-weight: 700; }
+.cmd-redirect { color: var(--accent-amber); }
+.cmd-number { color: #f0abfc; }
+.cmd-path { color: var(--text-secondary); text-decoration: underline; text-decoration-color: rgba(255,255,255,0.12); text-underline-offset: 2px; }
+
 .shell-bg-banner { display: flex; align-items: center; gap: 6px; font-size: var(--font-2xs); color: var(--accent-amber); background: rgba(245,158,11,0.07); border: 1px solid rgba(245,158,11,0.14); border-radius: 6px; padding: 4px 8px; }
-.shell-output { border-left: 2px solid var(--surface-border); padding-left: 0; }
+.shell-bg-banner .live-timer { margin-left: auto; }
 .shell-running-note { display: flex; align-items: center; gap: 6px; font-size: var(--font-2xs); color: var(--text-muted); padding: 2px 0; }
+
+.shell-scroll { overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; border-radius: var(--radius-xs); background: rgba(0,0,0,0.30); border: 1px solid var(--surface-border-weak); }
+/* Fades the clip so it reads as "there is more", not as a hard cut. */
+.shell-scroll.clamped { max-height: 190px; overflow: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent 100%); mask-image: linear-gradient(to bottom, #000 calc(100% - 28px), transparent 100%); }
+.shell-pre { margin: 0; padding: 7px 8px; }
+.shell-output-code { font-size: var(--font-2xs); line-height: 1.6; color: var(--text-muted); white-space: pre-wrap; word-break: break-word; }
+.shell-more { width: 100%; border: none; background: var(--surface-subtler); color: var(--text-muted); font-size: 10px; font-weight: 650; border-radius: 0 0 var(--radius-xs) var(--radius-xs); padding: 5px; cursor: pointer; }
+.shell-more:active { color: var(--text-primary); }
+
+.shell-seg { color: var(--shell-fg, inherit); background-color: var(--shell-bg, transparent); text-decoration-line: var(--shell-decoration, none); }
+.shell-seg.shell-bold { font-weight: 700; }
+.shell-seg.shell-dim { opacity: 0.62; }
+.shell-seg.shell-italic { font-style: italic; }
+.shell-seg.shell-hidden { color: transparent; }
+
+/* Reverse video.
+   A literal fg/bg swap is what a terminal does, but mid-sentence it lands as a
+   solid slab and reads as damage rather than emphasis — which is exactly what
+   `grep --color` and ripgrep use it for. This is a log view, not a terminal
+   emulator, so render it as what it means: a highlight. */
+.shell-seg.shell-inverse { color: var(--shell-fg, var(--text-primary)); background-color: color-mix(in srgb, var(--shell-fg, var(--text-muted)) 22%, transparent); border-radius: 3px; box-shadow: 0 0 0 1px color-mix(in srgb, var(--shell-fg, var(--text-muted)) 12%, transparent); font-weight: 650; }
+
+.shell-seg.shell-blink { animation: shell-blink 1s steps(2, start) infinite; }
+@keyframes shell-blink { 50% { opacity: 0; } }
+@media (prefers-reduced-motion: reduce) {
+  .shell-seg.shell-blink { animation: none; }
+  .bg-dot.pulse { animation: none; }
+}
 
 .tool-stop-btn { width: 18px; height: 18px; border-radius: 999px; border: 1px solid rgba(248,113,113,0.35); background: transparent; display: flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0; transition: background var(--motion-fast) var(--ease-standard), border-color var(--motion-fast) var(--ease-standard); }
 .tool-stop-btn .stop-square { width: 7px; height: 7px; border-radius: 1.5px; background: var(--accent-red); display: block; }
@@ -895,9 +964,210 @@ a, button, [role="button"] { touch-action: manipulation; }
 .qa-row .q { font-size: var(--font-xs); color: var(--text-secondary); font-weight: 650; }
 .qa-row .a { font-size: var(--font-xs); color: var(--accent-green); }
 
-/* Error body */
-.tool-error-box .tool-body-label { display: flex; align-items: center; gap: 4px; color: var(--accent-red); margin-bottom: 3px; }
-.tool-output-pre.error { color: var(--accent-red); background: rgba(248,113,113,0.06); box-shadow: inset 2px 0 0 rgba(248,113,113,0.4); }
+
+/* ============ Tool primitives (shared by every built-in body) ============
+   Mirrors the desktop client's tool vocabulary so the same call reads the same
+   way on both surfaces — but sized for this app: 22px rows, --font-2xs/xs, one
+   type face (styles.css deliberately renders everything in --font-body and
+   relies on .tnum for column alignment), taps instead of hovers. */
+
+.trows { display: flex; flex-direction: column; min-width: 0; }
+.trows.scroll { max-height: 260px; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; }
+
+.trow { display: flex; align-items: center; gap: 7px; min-height: 22px; padding: 2px 0; min-width: 0; }
+.trow + .trow { border-top: 1px solid rgba(255,255,255,0.02); }
+.trow.tappable { cursor: pointer; }
+.trow.tappable:active { background: var(--surface-subtler); }
+.trow.bad { background: rgba(248,113,113,0.05); }
+.trow-lead { flex-shrink: 0; display: inline-flex; align-items: center; }
+.trow-primary { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-xs); color: var(--text-secondary); line-height: 1.5; }
+/* Paths truncate from the left so the filename — the part you scan for — survives. */
+.trow-primary.rtl { direction: rtl; text-align: left; }
+.trow-primary.rtl > span { direction: ltr; unicode-bidi: plaintext; }
+.trow-secondary { flex: 0 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: var(--font-2xs); color: var(--text-weakest); }
+.trow-trailing { flex-shrink: 0; margin-left: auto; padding-left: 6px; font-size: var(--font-2xs); color: var(--text-weakest); font-variant-numeric: tabular-nums; display: inline-flex; align-items: center; gap: 5px; }
+
+.tchip {
+  display: inline-flex; align-items: center; flex-shrink: 0; padding: 0 5px; border-radius: 4px;
+  font-size: 9.5px; font-weight: 800; letter-spacing: 0.03em; line-height: 15px; white-space: nowrap;
+  color: var(--accent-blue); background: rgba(91,141,255,0.12);
+}
+.tchip.neutral { color: var(--text-muted); background: var(--surface-subtle); }
+.tchip.ok { color: var(--accent-green); background: rgba(74,222,128,0.10); }
+.tchip.warn { color: var(--accent-amber); background: rgba(245,158,11,0.12); }
+.tchip.bad { color: var(--accent-red); background: rgba(248,113,113,0.12); }
+.tchip.accent { color: var(--accent-blue); background: rgba(91,141,255,0.12); }
+/* `soft` is for values rather than states — a topic, a file kind, an attribute. */
+.tchip.soft { font-weight: 650; letter-spacing: 0; color: var(--text-muted); background: var(--surface-subtle); }
+
+.tmore {
+  align-self: flex-start; margin: 3px 0 0; padding: 3px 9px; border: none; border-radius: var(--radius-xs);
+  background: var(--surface-subtler); color: var(--text-muted); font-size: 10px; font-weight: 650; cursor: pointer;
+}
+.tmore:active { color: var(--text-primary); background: var(--surface-subtle); }
+
+.tstats { display: flex; flex-wrap: wrap; gap: 0 18px; padding: 2px 0 7px; }
+.tstat { display: flex; flex-direction: column; gap: 0; min-width: 0; }
+.tstat-value { font-size: var(--font-md); font-weight: 700; line-height: 1.2; color: var(--text-primary); letter-spacing: -0.01em; }
+.tstat-value.ok { color: var(--accent-green); }
+.tstat-value.warn { color: var(--accent-amber); }
+.tstat-value.bad { color: var(--accent-red); }
+.tstat-value.accent { color: var(--accent-blue); }
+.tstat-label { font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-weakest); }
+
+.tfields { display: grid; grid-template-columns: minmax(0, max-content) minmax(0, 1fr); gap: 2px 12px; margin: 0; padding: 2px 0 6px; }
+.tfield-key { font-size: var(--font-2xs); color: var(--text-weakest); line-height: 1.55; }
+.tfield-value { margin: 0; min-width: 0; font-size: var(--font-xs); color: var(--text-secondary); line-height: 1.55; overflow-wrap: anywhere; }
+
+.tnotice { display: flex; flex-direction: column; min-width: 0; }
+.tnotice-msg { font-size: var(--font-xs); line-height: 1.5; color: var(--text-secondary); padding: 2px 0 6px; overflow-wrap: anywhere; }
+/* Instructions the tool wrote for the model. Kept — they answer "what do I type
+   next" — but visibly subordinate. */
+.tnotice-hints { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; padding-left: 7px; border-left: 2px solid var(--surface-border); }
+.tnotice.warn .tnotice-hints { border-left-color: rgba(245,158,11,0.35); }
+.tnotice-hint { font-size: var(--font-2xs); line-height: 1.5; color: var(--text-weakest); overflow-wrap: anywhere; }
+
+.tdot { width: 6px; height: 6px; border-radius: 999px; background: var(--text-weakest); flex-shrink: 0; display: block; }
+.tdot.ok { background: var(--accent-green); }
+.tdot.warn { background: var(--accent-amber); }
+.tdot.bad { background: var(--accent-red); }
+.tdot.accent { background: var(--accent-blue); }
+.tdot.pulse { animation: pulseDot 1.6s ease-in-out infinite; }
+
+.tpath { min-width: 0; }
+.tpath-dir { color: var(--text-weakest); }
+.tpath-name { color: var(--text-secondary); font-weight: 600; }
+
+.tstrip { display: flex; align-items: center; gap: 5px; padding: 2px 0 6px; }
+
+.tdifflines { max-height: 260px; overflow: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; background: rgba(0,0,0,0.30); border-radius: var(--radius-xs); border: 1px solid var(--surface-border-weak); padding: 4px 0; }
+.tdiffline { padding: 0 7px; font-size: var(--font-2xs); line-height: 1.6; color: var(--text-muted); white-space: pre-wrap; word-break: break-all; }
+.tdiffline.add { color: #b5ecc7; background: rgba(74,222,128,0.09); }
+.tdiffline.del { color: #f3bcbc; background: rgba(248,113,113,0.09); }
+.tdiffline.meta { color: var(--text-weakest); }
+
+/* ============ Call arguments ============ */
+
+.tparams { display: flex; flex-wrap: wrap; gap: 3px 4px; padding: 0 0 6px; }
+.tparam { display: inline-flex; align-items: baseline; gap: 5px; min-width: 0; max-width: 100%; padding: 1px 6px 2px; border-radius: 4px; background: var(--surface-subtler); font-size: 10px; line-height: 1.5; }
+.tparam.long { flex-basis: 100%; }
+.tparam-key { flex-shrink: 0; color: var(--text-weakest); }
+.tparam-value { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-muted); }
+
+/* ============ Verbatim output (the fallback renderer) ============ */
+
+.ttext { display: flex; flex-direction: column; min-width: 0; }
+.ttext-attrs { display: flex; flex-wrap: wrap; gap: 3px 4px; padding-bottom: 6px; }
+.ttext-attr-key { margin-right: 5px; color: var(--text-weakest); }
+.ttext-scroll { display: flex; flex-direction: column; min-width: 0; }
+/* Fades the clip so it reads as "there is more", not as a hard cut. */
+.ttext-scroll.clamped { max-height: 300px; overflow: hidden; -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 32px), transparent 100%); mask-image: linear-gradient(to bottom, #000 calc(100% - 32px), transparent 100%); }
+.ttext-pre {
+  margin: 0; padding: 4px 0; font-size: var(--font-2xs); line-height: 1.6; color: var(--text-muted);
+  /* Wraps, but never collapses runs of spaces — alignment is often the only
+     structure the output has. */
+  white-space: pre-wrap; word-break: break-word; tab-size: 2;
+}
+
+/* ============ Failed tool call ============
+   Three things, not one blob: a type strip, the message as prose, and any
+   source the tool quoted back kept verbatim (reflowing a patch excerpt as a
+   paragraph destroys the alignment that makes it readable). */
+
+.terr { display: flex; flex-direction: column; min-width: 0; margin: -8px -9px 8px; border-left: 2px solid rgba(248,113,113,0.5); }
+.terr:last-child { margin-bottom: -8px; }
+.terr-head { display: flex; align-items: center; gap: 5px; min-height: 20px; padding: 2px 6px 2px 8px; background: rgba(248,113,113,0.10); color: var(--accent-red); }
+.terr-head .tool-copy-chip { margin-left: auto; }
+.terr-type { font-size: 9.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.06em; color: var(--accent-red); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terr-body { display: flex; flex-direction: column; gap: 6px; padding: 6px 9px; max-height: 340px; overflow-y: auto; overscroll-behavior: contain; }
+/* Prose, at reading size and normal weight — a one-line error should not read
+   as a heading. */
+.terr-msg { font-size: var(--font-xs); font-weight: 400; line-height: 1.5; color: var(--text-secondary); white-space: pre-wrap; overflow-wrap: anywhere; }
+.terr-code { border-radius: var(--radius-xs); background: rgba(0,0,0,0.32); padding: 4px 0; overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }
+.terr-code-line { display: flex; align-items: baseline; gap: 8px; min-width: max-content; padding: 0 7px; font-size: 10px; line-height: 1.6; white-space: pre; color: var(--text-muted); }
+/* The line the tool was actually pointing at. */
+.terr-code-line.marker { background: rgba(248,113,113,0.12); box-shadow: inset 2px 0 0 var(--accent-red); color: var(--text-secondary); }
+.terr-code-gutter { flex-shrink: 0; min-width: 30px; text-align: right; color: var(--text-weakest); user-select: none; }
+.terr-hints { display: flex; flex-direction: column; gap: 2px; margin: 0 9px 7px; padding-left: 7px; border-left: 2px solid rgba(248,113,113,0.3); }
+.terr-hint { font-size: var(--font-2xs); line-height: 1.5; color: var(--text-muted); overflow-wrap: anywhere; }
+.terr-stack { margin: 0 9px 7px; padding: 0; max-height: 200px; overflow: auto; font-size: 10px; line-height: 1.55; color: var(--text-weakest); white-space: pre; }
+
+.tool-row.error .tool-body { border-top-color: rgba(248,113,113,0.14); }
+
+/* ============ Built-in tool bodies ============ */
+
+/* Skill */
+.skill-card { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+.skill-card + .skill-card { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--surface-border-weak); }
+.skill-card-head { display: flex; align-items: baseline; gap: 8px; }
+.skill-card-name { font-size: var(--font-xs); font-weight: 700; color: var(--accent-violet); }
+.skill-card-count { margin-left: auto; font-size: 10px; color: var(--text-weakest); }
+.skill-card-base { font-size: 10px; color: var(--text-weakest); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.skill-files { display: flex; flex-wrap: wrap; gap: 3px 4px; }
+.skill-file { padding: 1px 6px 2px; border-radius: 4px; background: var(--surface-subtler); font-size: 10px; color: var(--text-muted); }
+.skill-file.more { color: var(--accent-blue); }
+.skill-body { margin: 0; padding: 6px 8px; border-radius: var(--radius-xs); background: rgba(0,0,0,0.28); font-size: var(--font-2xs); line-height: 1.6; color: var(--text-muted); white-space: pre-wrap; word-break: break-word; }
+
+/* Typecheck */
+.tc-file + .tc-file { border-top: 1px solid var(--surface-border-weak); }
+.tc-file.open { background: rgba(255,255,255,0.015); }
+.tc-caret { font-size: 8px; color: var(--text-weakest); width: 8px; }
+.tc-file-body { border-top: 1px solid var(--surface-border-weak); }
+.tc-loc { font-size: 9px; color: var(--text-weakest); min-width: 34px; text-align: left; }
+.tc-code { font-size: 9px; color: var(--text-weakest); }
+.tc-diag + .tc-diag { border-top: 1px solid rgba(255,255,255,0.02); }
+.tc-detail { padding: 2px 0 6px 41px; display: flex; flex-direction: column; gap: 3px; }
+.tc-detail-msg { font-size: var(--font-2xs); line-height: 1.5; color: var(--text-secondary); white-space: pre-wrap; }
+.tc-detail-hint { font-size: var(--font-2xs); line-height: 1.5; color: var(--text-weakest); padding-left: 7px; border-left: 2px solid var(--surface-border); }
+
+/* Test */
+.test-failure { display: flex; flex-direction: column; padding-bottom: 3px; }
+.test-failure + .test-failure { border-top: 1px solid var(--surface-border-weak); }
+.test-failure-file { padding: 0 0 0 38px; font-size: 10px; color: var(--text-weakest); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.test-failure-detail { margin: 3px 0 0 38px; padding-left: 7px; border-left: 2px solid rgba(248,113,113,0.35); font-size: 10px; line-height: 1.5; color: var(--text-muted); white-space: pre-wrap; overflow-wrap: anywhere; }
+.test-meta { display: inline-flex; gap: 5px; font-size: 10px; font-weight: 700; }
+.test-meta .ok { color: var(--accent-green); }
+.test-meta .bad { color: var(--accent-red); }
+
+/* Memory */
+.mem-entry { display: flex; flex-direction: column; gap: 3px; padding: 4px 0; }
+.mem-entry + .mem-entry { border-top: 1px solid var(--surface-border-weak); }
+.mem-entry-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.mem-entry-title { font-size: var(--font-xs); font-weight: 650; color: var(--text-primary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mem-entry-summary { font-size: var(--font-2xs); line-height: 1.5; color: var(--text-muted); }
+.mem-entry-meta { display: flex; flex-wrap: wrap; gap: 3px 4px; }
+
+/* Session */
+.sess-msg { display: flex; flex-direction: column; gap: 3px; padding: 4px 0; }
+.sess-msg + .sess-msg { border-top: 1px solid var(--surface-border-weak); }
+.sess-msg-head { display: flex; align-items: center; gap: 5px; min-width: 0; }
+.sess-msg-model { font-size: 10px; color: var(--text-weakest); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sess-msg-time { margin-left: auto; font-size: 10px; color: var(--text-weakest); }
+.sess-msg-text { font-size: var(--font-2xs); line-height: 1.5; color: var(--text-muted); display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+
+/* Project */
+.proj-node { color: var(--text-muted); }
+.proj-node.dir { color: var(--text-secondary); font-weight: 650; }
+
+/* Checkpoint */
+.cp-counts { display: inline-flex; gap: 6px; }
+.cp-counts .add { color: var(--accent-green); }
+.cp-counts .del { color: var(--accent-red); }
+
+/* Background */
+.job-log { font-size: 10px; color: var(--text-weakest); padding: 2px 0 6px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+
+/* Git */
+.git-branch { padding: 0 0 6px; }
+.git-hash { font-size: var(--font-2xs); font-weight: 700; color: var(--accent-amber); font-variant-numeric: tabular-nums; }
+
+/* Webfetch */
+.fetch-body { display: flex; flex-direction: column; gap: 6px; }
+.fetch-host { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.fetch-host-name { font-size: var(--font-xs); font-weight: 650; color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fetch-open { margin-left: auto; flex-shrink: 0; display: inline-flex; align-items: center; gap: 3px; font-size: 10px; font-weight: 650; color: var(--accent-blue); text-decoration: none; }
+.fetch-content { max-height: 340px; overflow-y: auto; overscroll-behavior: contain; -webkit-overflow-scrolling: touch; font-size: var(--font-xs); }
+.fetch-content p { margin: 0 0 6px; }
 
 /* ============ Generation status ============ */
 .gen-status { flex-shrink: 0; display: flex; align-items: center; justify-content: space-between; padding: 8px 14px; border-top: 1px solid var(--surface-border-weak); gap: 10px; }
@@ -1045,16 +1315,25 @@ a, button, [role="button"] { touch-action: manipulation; }
   width: 2px; height: 16px; border-radius: 999px; background: var(--accent-blue);
 }
 .model-rail-btn.favorites { color: var(--accent-amber); }
+.model-rail-btn.recent { color: var(--accent-violet); }
 .model-rail [data-slot="radio-group-item"][data-checked] .model-rail-btn.favorites { color: var(--accent-amber); }
+.model-rail [data-slot="radio-group-item"][data-checked] .model-rail-btn.recent { color: var(--accent-violet); }
 .model-rail-btn .provider-icon { opacity: 0.85; }
 
 .model-list-pane { flex: 1; min-width: 0; overflow-y: auto; -webkit-overflow-scrolling: touch; }
 .model-group-head { display: flex; align-items: center; gap: 6px; padding: 10px 14px 6px; position: sticky; top: 0; background: var(--bg-elevated); z-index: 1; }
 .model-group-head .name { font-size: var(--font-xs); color: var(--text-muted); font-weight: 650; }
 .model-group-head .count { font-size: var(--font-2xs); color: var(--text-weakest); }
-.model-row { width: 100%; display: flex; align-items: center; gap: 8px; padding: 10px 14px; background: transparent; border: none; cursor: pointer; text-align: left; }
+.model-row { width: 100%; display: flex; align-items: center; gap: 6px; padding: 9px 10px 9px 14px; background: transparent; border: none; text-align: left; }
 .model-row:active { background: var(--surface-subtler); }
 .model-row.selected { background: rgba(91,141,255,0.08); }
+/* The selectable area is its own button so the account/upstream/favorite
+   affordances beside it are individually tappable targets, not nested inside
+   the row's own hit area. */
+.model-row-hit {
+  flex: 1; min-width: 0; display: flex; align-items: center;
+  background: transparent; border: none; padding: 0; margin: 0; cursor: pointer; text-align: left;
+}
 .model-row-main { flex: 1; min-width: 0; }
 .model-row-name { display: flex; align-items: center; gap: 5px; margin-bottom: 3px; flex-wrap: wrap; }
 .model-row-name .name { font-size: var(--font-sm); font-weight: 650; color: var(--text-secondary); }
@@ -1073,6 +1352,10 @@ a, button, [role="button"] { touch-action: manipulation; }
 .model-tag.free { color: var(--accent-green); background: rgba(74,222,128,0.12); }
 .model-tag.new { color: var(--accent-blue); background: rgba(91,141,255,0.12); }
 .model-tag.status { color: var(--accent-amber); background: rgba(245,158,11,0.12); }
+.model-tag.latest { color: var(--text-muted); background: rgba(148,163,184,0.14); }
+/* Marks a headroom figure that describes the whole account rather than the
+   model being picked - see AccountPickerSheet's title text. */
+.account-usage-scope { margin-left: 1px; opacity: 0.6; }
 .model-fav-btn {
   flex-shrink: 0; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center;
   background: transparent; border: none; color: var(--surface-border); cursor: pointer;
@@ -1080,6 +1363,99 @@ a, button, [role="button"] { touch-action: manipulation; }
 .model-fav-btn:active { color: var(--text-weakest); }
 .model-fav-btn.active { color: var(--accent-amber); }
 .model-fav-btn.active svg { fill: currentColor; }
+
+/* Pinned account / upstream chips. A model can have several accounts or
+   upstreams behind it, so the row shows which one is currently pinned rather
+   than making the user open the picker to find out. */
+.model-account-chip, .model-upstream-chip {
+  flex-shrink: 0; max-width: 68px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 9px; font-weight: 650; line-height: 1.5; padding: 1px 5px;
+  border-radius: var(--radius-xs); color: var(--text-muted);
+  background: var(--surface-subtle); border: 1px solid var(--surface-border-weak);
+}
+.model-upstream-chip { color: var(--accent-violet); background: rgba(167,139,250,0.1); border-color: transparent; }
+
+/* Opens the account or upstream picker for this row. */
+.model-variant-btn {
+  flex-shrink: 0; height: 26px; min-width: 26px; padding: 0 4px;
+  display: flex; align-items: center; justify-content: center; gap: 2px;
+  background: transparent; border: 1px solid var(--surface-border-weak); border-radius: var(--radius-xs);
+  color: var(--text-weakest); cursor: pointer; font-size: 9px; font-weight: 650;
+}
+.model-variant-btn:active { background: var(--surface-subtle); color: var(--text-secondary); }
+.model-variant-btn .count { font-variant-numeric: tabular-nums; }
+
+/* ============ Account / upstream picker sheets ============ */
+.account-sheet, .endpoint-sheet { display: flex; flex-direction: column; min-height: 0; }
+.account-sheet-section { padding-bottom: 4px; }
+.account-sheet-head {
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 14px 5px; font-size: var(--font-2xs); font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.07em; color: var(--text-weakest);
+}
+.account-sheet-head .count { font-variant-numeric: tabular-nums; }
+.account-list { display: flex; flex-direction: column; }
+.account-opt {
+  display: flex; align-items: center; gap: 8px; width: 100%;
+  padding: 10px 14px; background: transparent; border: none; cursor: pointer; text-align: left;
+  border-bottom: 1px solid var(--surface-border-weak);
+}
+.account-opt:last-child { border-bottom: none; }
+.account-opt:active { background: var(--surface-subtler); }
+.account-opt.selected { background: rgba(91,141,255,0.08); }
+.account-dot { width: 3px; height: 3px; border-radius: 999px; background: var(--text-muted); flex-shrink: 0; }
+.account-dot.auto { width: 5px; height: 5px; background: transparent; border: 1px solid var(--text-muted); }
+.account-opt-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: var(--font-base); font-weight: 500; color: var(--text-secondary);
+}
+.account-opt.selected .account-opt-name { color: var(--text-primary); }
+.account-opt-note { flex-shrink: 0; font-size: var(--font-2xs); color: var(--text-weakest); }
+.account-opt-check { flex-shrink: 0; color: var(--accent-blue); }
+.account-opt-warn { flex-shrink: 0; color: var(--accent-amber); }
+
+/* Remaining-budget pill. Fixed width so the numbers line up down the list. */
+.account-usage-bar {
+  flex-shrink: 0; width: 28px; height: 3px; border-radius: 999px;
+  background: var(--surface-subtle); overflow: hidden;
+}
+.account-usage-fill { display: block; height: 100%; border-radius: 999px; }
+.account-usage-fill.tone-success { background: var(--accent-green); }
+.account-usage-fill.tone-warning { background: var(--accent-amber); }
+.account-usage-fill.tone-danger { background: var(--accent-red); }
+.account-usage-fill.tone-muted { background: var(--text-weakest); }
+.account-usage-fill.exhausted { background: var(--accent-red); }
+.account-usage-value {
+  flex-shrink: 0; width: 34px; text-align: right;
+  font-size: var(--font-2xs); font-weight: 650; color: var(--text-weakest);
+}
+.account-usage-value.exhausted { color: var(--accent-red); }
+
+.endpoint-opt {
+  display: flex; flex-direction: column; gap: 3px; width: 100%;
+  padding: 9px 14px; background: transparent; border: none; cursor: pointer; text-align: left;
+  border-bottom: 1px solid var(--surface-border-weak);
+}
+.endpoint-opt:last-child { border-bottom: none; }
+.endpoint-opt:active { background: var(--surface-subtler); }
+.endpoint-opt.selected { background: rgba(91,141,255,0.08); }
+.endpoint-opt-top { display: flex; align-items: center; gap: 6px; width: 100%; }
+.endpoint-opt-name {
+  flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: var(--font-base); font-weight: 500; color: var(--text-secondary);
+}
+.endpoint-opt.selected .endpoint-opt-name { color: var(--text-primary); }
+.endpoint-price { flex-shrink: 0; font-size: var(--font-2xs); color: var(--text-weakest); }
+.model-tag.best { color: var(--accent-green); background: rgba(74,222,128,0.12); }
+.endpoint-opt-sub { display: flex; align-items: center; gap: 6px; padding-left: 1px; }
+.endpoint-tag {
+  font-size: var(--font-2xs); color: var(--text-weakest);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 60%;
+}
+.endpoint-uptime { flex-shrink: 0; font-size: var(--font-2xs); font-weight: 650; }
+.endpoint-uptime.tone-success { color: var(--accent-green); }
+.endpoint-uptime.tone-warning { color: var(--accent-amber); }
+.endpoint-uptime.tone-danger { color: var(--accent-red); }
 
 /* ============ Telemetry / stat rows ============ */
 .tele-section { padding: 0 14px; margin-bottom: 14px; }
@@ -1238,10 +1614,17 @@ button:active.press, .btn-solid:active, .btn-outline:active, .btn-danger:active,
 .provider-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--accent-green); flex-shrink: 0; }
 .provider-dot.dim { background: var(--text-weakest); }
 
-.tier-row { display: grid; grid-template-columns: 84px 1fr 44px 90px; align-items: center; gap: 8px; padding: 8px 10px; font-size: var(--font-xs); color: var(--text-muted); border-bottom: 1px solid var(--surface-border-weak); }
+/* `minmax(0, …)` on the label, not a fixed width: a fixed track does not
+   constrain an oversized child, so long window keys used to render straight
+   across the meter in the next column. */
+.tier-row { display: grid; grid-template-columns: minmax(0, 1.35fr) minmax(44px, 1fr) 46px auto; align-items: center; gap: 8px; padding: 8px 10px; font-size: var(--font-xs); color: var(--text-muted); border-bottom: 1px solid var(--surface-border-weak); min-height: 34px; }
 .provider-section .tier-row:last-child { border-bottom: none; }
 .tier-row.dim { opacity: 0.5; }
-.tier-label { color: var(--text-muted); font-weight: 600; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.tier-label { color: var(--text-muted); font-weight: 600; display: flex; align-items: center; gap: 6px; min-width: 0; overflow: hidden; }
+.tier-label-text { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* Qualifiers and badges keep their size; only the name gives way. */
+.tier-label > .badge, .tier-label > .tier-tag { flex: 0 0 auto; }
+.tier-tag { font-size: var(--font-2xs); font-weight: 600; color: var(--text-weakest); background: var(--bg-base); border-radius: var(--radius-sm); padding: 1px 5px; letter-spacing: 0.01em; }
 
 .level-bar-track { height: 5px; background: var(--bg-base); border-radius: var(--radius-pill); overflow: hidden; position: relative; }
 .level-bar-fill { height: 100%; border-radius: var(--radius-pill); transition: width var(--motion-base) var(--ease-standard); background: var(--accent-green); }
@@ -1267,9 +1650,9 @@ button:active.press, .btn-solid:active, .btn-outline:active, .btn-danger:active,
 .per-key-item { margin-bottom: 4px; }
 .per-key-item:last-child { margin-bottom: 0; }
 .per-key-header { display: flex; align-items: center; gap: 8px; padding: 6px 0; font-size: var(--font-xs); font-weight: 650; color: var(--text-primary); }
-.per-key-header .key-name { flex: 1; }
+.per-key-header .key-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .per-key-header .key-pct { font-weight: 700; }
-.per-key-item .tier-row { grid-template-columns: 70px 1fr 40px 80px; padding: 5px 0 5px 6px; }
+.per-key-item .tier-row { grid-template-columns: minmax(0, 1.15fr) minmax(40px, 1fr) 44px auto; padding: 5px 0 5px 6px; }
 
 .limits-footer { margin-top: 6px; font-size: var(--font-2xs); color: var(--text-weakest); text-align: right; }
 
@@ -1388,42 +1771,6 @@ button:active.press, .btn-solid:active, .btn-outline:active, .btn-danger:active,
 
 /* Rebind notice: pinned above everything, including the safe area, because a
    silently swapped backend is worth interrupting for. */
-.instance-notice {
-  position: fixed;
-  top: max(8px, env(safe-area-inset-top));
-  left: 10px;
-  right: 10px;
-  z-index: 60;
-  display: flex;
-  align-items: flex-start;
-  gap: 10px;
-  padding: 10px 10px 10px 12px;
-  border-radius: var(--radius-sm);
-  border: 1px solid rgba(245, 158, 11, 0.28);
-  background: color-mix(in srgb, var(--accent-amber) 14%, var(--surface-subtle));
-  color: var(--text-primary);
-  font-family: var(--font-body);
-  font-size: var(--font-sm);
-  line-height: 1.4;
-  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
-}
-.instance-notice > span { flex: 1; min-width: 0; }
-.instance-notice > button {
-  flex-shrink: 0;
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  width: 22px;
-  height: 22px;
-  margin: -2px -2px 0 0;
-  padding: 0;
-  border: none;
-  border-radius: var(--radius-sm);
-  background: transparent;
-  color: var(--text-muted);
-  cursor: pointer;
-}
-.instance-notice > button:hover { color: var(--text-primary); background: var(--surface-subtler); }
 
 .text-button { background: transparent; border: none; color: var(--text-muted); font-size: var(--font-xs); padding: 0; cursor: pointer; text-decoration: underline; text-underline-offset: 2px; font-family: var(--font-body); }
 .text-button:hover { color: var(--text-secondary); }

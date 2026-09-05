@@ -9,6 +9,7 @@ import type {
 import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
 import type { MessageBundle } from "../api"
 import type { KillShellFn } from "../components/tools/registry"
+import type { ModelPickerExtras } from "../components/ModelPicker"
 import { AgentActivitySheet, type AgentEntry } from "../components/AgentActivitySheet"
 import { Composer } from "../components/Composer"
 import { DiffViewer } from "../components/DiffViewer"
@@ -56,6 +57,8 @@ export function ChatView(props: {
   permissionReplyError?: string
   questionReplyError?: string
   onModelSelect: (providerID: string, modelID: string, variant?: string) => Promise<boolean>
+  /** Everything the model picker needs beyond the catalog, supplied by the app. */
+  modelPicker?: ModelPickerExtras
   onOpenLimits: () => void
   autoAccept: boolean
   onToggleAutoAccept: () => void
@@ -368,8 +371,12 @@ export function ChatView(props: {
         onClose={() => setSheet(null)}
         providers={props.providers}
         current={props.session.model ? { providerID: props.session.model.providerID, modelID: props.session.model.id } : undefined}
-        onSelect={async (providerID, modelID) => {
-          if (await props.onModelSelect(providerID, modelID)) setSheet(null)
+        extras={props.modelPicker}
+        onSelect={async (selection) => {
+          // The upstream pin is not passed along here: `switchModel` has no
+          // field for it, so the picker persists it in the shared preferences
+          // document and `send()` reads it back for the next prompt.
+          if (await props.onModelSelect(selection.providerID, selection.modelID)) setSheet(null)
         }}
       />
       <TelemetrySheet

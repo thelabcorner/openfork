@@ -3,7 +3,7 @@ import { ProviderBadge } from "../components/ProviderBadge"
 import { IconChevronDown, IconRefresh } from "../icons"
 import { formatRelativeTime } from "../format"
 import {
-  displayWindowLabel,
+  describeWindow,
   formatCountdownSeconds,
   formatPercent,
   resolveTierGate,
@@ -47,20 +47,45 @@ function windowRemaining(w: UsageWindow): number | null {
   return w.remainingPercent ?? (w.usedPercent !== null ? 100 - w.usedPercent : null)
 }
 
-function WindowRow(props: { label: string; window: UsageWindow; gateState: "binding" | "gated" | "normal" }) {
+function WindowRow(props: { windowKey: string; window: UsageWindow; gateState: "binding" | "gated" | "normal" }) {
   const remaining = () => windowRemaining(props.window)
   const tone = () => toneForRemaining(remaining())
+  const described = () => describeWindow(props.windowKey)
   return (
     <div class="tier-row" classList={{ dim: props.gateState === "gated" }}>
       <span class="tier-label">
-        {props.label}
-        <Show when={props.gateState === "binding"}><span class="badge badge-limiting">Limiting</span></Show>
+        {/* Truncates rather than wrapping: account-scoped keys are long enough
+            to overrun the column and used to render straight across the meter. */}
+        <span class="tier-label-text" title={described().label}>
+          {described().label}
+        </span>
+        <Show when={described().tag}>
+          <span class="tier-tag">{described().tag}</span>
+        </Show>
+        <Show when={props.gateState === "binding"}>
+          <span class="badge badge-limiting">Limiting</span>
+        </Show>
       </span>
-      <Show when={remaining() !== null} fallback={<span class="tier-amount" style={{ "grid-column": "span 2" }}>{props.window.valueLabel ?? "—"}</span>}>
-        <div class="level-bar-track"><div class={`level-bar-fill ${levelClass(tone(), "fill")}`} style={{ width: `${Math.min(100, 100 - (remaining() ?? 0))}%` }} /></div>
+      <Show
+        when={remaining() !== null}
+        fallback={
+          <span class="tier-amount" style={{ "grid-column": "span 2" }}>
+            {props.window.valueLabel ?? "—"}
+          </span>
+        }
+      >
+        <div class="level-bar-track">
+          <div
+            class={`level-bar-fill ${levelClass(tone(), "fill")}`}
+            style={{ width: `${Math.min(100, 100 - (remaining() ?? 0))}%` }}
+          />
+        </div>
         <span class={`tier-value tnum ${levelClass(tone(), "text")}`}>{formatPercent(remaining())}</span>
       </Show>
-      <span class="tier-reset">{props.window.resetAfterSeconds !== null ? formatCountdownSeconds(props.window.resetAfterSeconds) : "No reset"}</span>
+      {/* "No reset" repeated down fifty rows is noise, not information. */}
+      <span class="tier-reset">
+        {props.window.resetAfterSeconds !== null ? formatCountdownSeconds(props.window.resetAfterSeconds) : ""}
+      </span>
     </div>
   )
 }
@@ -72,7 +97,6 @@ function ProviderSection(props: { data: LimitsProviderData }) {
   const gate = () => resolveTierGate(windows())
   const worst = () => gate().effectiveRemaining ?? worstRemainingFromWindows(windows())
   const errored = () => !result().ok && windows().length === 0
-
   return (
     <div class="provider-section">
       <div class="provider-header">
@@ -85,7 +109,7 @@ function ProviderSection(props: { data: LimitsProviderData }) {
       </div>
       <Show when={windows().length > 0} fallback={<div class="tier-row"><span class="tier-label">No usage data</span></div>}>
         <For each={windows()}>
-          {([key, w]) => <WindowRow label={displayWindowLabel(key)} window={w} gateState={tierGateState(key, windowRemaining(w), gate())} />}
+          {([key, w]) => <WindowRow windowKey={key} window={w} gateState={tierGateState(key, windowRemaining(w), gate())} />}
         </For>
       </Show>
       <Show when={props.data.perKey && props.data.perKey.length > 0}>
@@ -105,7 +129,9 @@ function ProviderSection(props: { data: LimitsProviderData }) {
                       <Show when={key.active}><span class="badge badge-active">Active</span></Show>
                     </div>
                     <For each={key.windows}>
-                      {([wkey, w]) => <WindowRow label={displayWindowLabel(wkey)} window={w} gateState={tierGateState(wkey, windowRemaining(w), keyGate())} />}
+                      {([wkey, w]) => (
+                        <WindowRow windowKey={wkey} window={w} gateState={tierGateState(wkey, windowRemaining(w), keyGate())} />
+                      )}
                     </For>
                   </div>
                 )

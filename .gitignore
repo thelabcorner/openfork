@@ -34,6 +34,11 @@ opencode-dev
 packages/mobile/.opencode-dev-handshake.json
 packages/mobile/.opencode-dev-handshake.json.*.tmp
 packages/mobile/.opencode-dev-url
+# A real (if loopback-scoped) device credential, minted once and reused across
+# restarts. Machine-local; committing it would hand every checkout a standing
+# token for someone else's sidecar.
+packages/mobile/.opencode-dev-agent-token.json
+packages/mobile/.opencode-dev-agent-token.json.*.tmp
 UPCOMING_CHANGELOG.md
 logs/
 *.bun-build

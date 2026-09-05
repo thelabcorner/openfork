@@ -6,7 +6,6 @@ import { For, Show, createMemo } from "solid-js"
 import { formatDuration } from "../format"
 
 import {
-  IconAlertTriangle,
   IconCheckCircle,
   IconChevronRight,
   IconClock,
@@ -16,6 +15,9 @@ import {
 import type { KillShellFn } from "./tools/registry"
 import { labelFor, resolveDescriptor } from "./tools/registry"
 import { StopButton } from "./tools/shell"
+import { ToolErrorPanel } from "./tools/error"
+import { ToolText } from "./tools/text"
+import { ToolParams } from "./tools/params"
 
 function genericDetail(part: ToolPart): string {
   const state = part.state
@@ -60,10 +62,10 @@ export function ToolCallRow(props: {
     return status() === "completed" || status() === "error" ? state.output ?? "" : ""
   }
 
-  const inputJSON = () => {
+  const inputRecord = () => {
     const raw = part().state.input as Record<string, unknown> | undefined
     if (!raw || Object.keys(raw).length === 0) return undefined
-    return JSON.stringify(raw, null, 2)
+    return raw
   }
 
   const genericContent = () => expandable() && !hasCustomBody()
@@ -140,7 +142,7 @@ export function ToolCallRow(props: {
               <Show when={canStop()}>
                 <StopButton running={() => status() === "running"} onStop={handleStop} />
               </Show>
-              <Show when={expandable() && (!!inputJSON() || !!outputText() || hasCustomBody())}>
+              <Show when={expandable() && (!!inputRecord() || !!outputText() || !!errorText() || hasCustomBody())}>
                 <IconChevronRight size={10} class={`tool-chevron ${expanded() ? "open" : ""}`} />
               </Show>
             </span>
@@ -149,30 +151,15 @@ export function ToolCallRow(props: {
         <Accordion.Content class="tool-body-content">
           <div class="tool-body">
             <Show when={errorText()}>
-              <div class="tool-error-box">
-                <div class="tool-body-label"><IconAlertTriangle size={9} /><span>Error</span></div>
-                <pre class="tool-output-pre error">{errorText()}</pre>
-              </div>
+              {(error) => <ToolErrorPanel error={error()} />}
             </Show>
             <Show when={descriptor?.body}>
               {(body) => <Dynamic component={body()} part={part()} killShell={props.killShell} />}
             </Show>
             <Show when={genericContent()}>
-              <Show when={inputJSON()} keyed>
-                {(json) => (
-                  <div class="tool-section">
-                    <div class="tool-section-head"><span class="tool-section-label">Input</span></div>
-                    <pre class="tool-output-pre">{json}</pre>
-                  </div>
-                )}
-              </Show>
-              <Show when={outputText()} keyed>
-                {(out) => (
-                  <div class="tool-section">
-                    <div class="tool-section-head"><span class="tool-section-label">{errorText() ? "Error" : "Output"}</span></div>
-                    <pre class="tool-output-pre">{out}</pre>
-                  </div>
-                )}
+              <ToolParams input={inputRecord()} />
+              <Show when={!errorText() && outputText()} keyed>
+                {(out) => <ToolText output={out} />}
               </Show>
             </Show>
           </div>

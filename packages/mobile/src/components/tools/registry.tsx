@@ -3,13 +3,21 @@ import { Show } from "solid-js"
 import type { JSX } from "solid-js"
 import type { ToolPart } from "@opencode-ai/sdk/v2/client"
 import {
+  IconArchive,
   IconBot,
+  IconBrain,
+  IconCheckCircle,
   IconDatabase,
   IconEye,
   IconFileEdit,
+  IconFolder,
   IconGitBranch,
   IconGlobe,
+  IconGrid,
+  IconPackage,
+  IconRotateCcw,
   IconSearch,
+  IconShieldCheck,
   IconTerminal,
   IconWrench,
   IconZap,
@@ -22,6 +30,29 @@ import { PatchToolBody, patchFilesOf } from "./patch"
 import { GlobToolBody, GrepToolBody, ReadToolBody, parseGlobOutput, parseGrepOutput } from "./search"
 import { FetchDetail, TaskSummary, TodoToolBody, WebSearchBody, webSearchLabel } from "./misc"
 import { ShellExitBadge, ShellHeadTimer, ShellToolBody } from "./shell"
+import {
+  ArchiveBody,
+  BackgroundBody,
+  CheckpointBody,
+  GenericBody,
+  GitBody,
+  JsonBody,
+  LspBody,
+  MemoryBody,
+  MonitorBody,
+  ProjectBody,
+  RefactorBody,
+  SessionBody,
+  SkillBody,
+  SymbolsBody,
+  TestBody,
+  TypecheckBody,
+  partMetadata,
+  partOutput,
+} from "./builtins"
+import { WebfetchBody } from "./webfetch"
+import { Chip } from "./primitives"
+import { parseCheckpoints, parseGit, parseJsonValidate, parseSymbols, parseTest, parseTypecheck } from "./parse"
 
 export type KillShellFn = (input: {
   sessionID: string
@@ -71,6 +102,17 @@ const LABELS: Record<string, string> = {
   background: "Background",
   skill: "Skill",
   question: "Asked",
+  typecheck: "Types",
+  test: "Test",
+  memory: "Memory",
+  session: "Session",
+  project: "Project",
+  symbols: "Symbols",
+  monitor: "Monitor",
+  checkpoint: "Checkpoint",
+  lsp: "LSP",
+  refactor: "Refactor",
+  websearch: "Search",
 }
 
 // Server-side tool names fold onto their primary renderer wherever they differ.
@@ -203,6 +245,104 @@ function ShellMeta(props: RowContext) {
   )
 }
 
+// --- outcome chips ---------------------------------------------------------------------
+// The collapsed row reports what a call *returned*, not just what it was asked
+// to do: 3 errors, 12 symbols, valid, +4 -1. Without this you have to expand a
+// row to learn it did nothing.
+
+function CountMeta(props: { value: () => string | undefined; tone?: "ok" | "warn" | "bad" | "accent" }) {
+  return <Show when={props.value()}>{(text) => <Chip tone={props.tone ?? "accent"}>{text()}</Chip>}</Show>
+}
+
+function ReadMeta(props: RowContext) {
+  const total = () => {
+    const display = partMetadata(props.part).display as { totalLines?: unknown } | undefined
+    const value = display?.totalLines
+    return typeof value === "number" ? `${value} lines` : undefined
+  }
+  return <CountMeta value={total} tone="accent" />
+}
+
+function TypecheckMeta(props: RowContext) {
+  const parsed = () => parseTypecheck(partOutput(props.part))
+  return (
+    <Show when={parsed()}>
+      {(result) => (
+        <Chip tone={result().diagnostics.length ? "bad" : "ok"}>
+          {result().diagnostics.length ? `${result().diagnostics.length} errors` : "clean"}
+        </Chip>
+      )}
+    </Show>
+  )
+}
+
+function TestMeta(props: RowContext) {
+  const meta = () => partMetadata(props.part)
+  const num = (key: string) => {
+    const value = meta()[key]
+    return typeof value === "number" ? value : undefined
+  }
+  return (
+    <Show when={num("passed") !== undefined || num("failed") !== undefined}>
+      <span class="test-meta tnum">
+        <Show when={num("passed")}>
+          <span class="ok">{num("passed")}</span>
+        </Show>
+        <Show when={num("failed")}>
+          <span class="bad">{num("failed")}</span>
+        </Show>
+      </span>
+    </Show>
+  )
+}
+
+function SymbolsMeta(props: RowContext) {
+  const count = () => {
+    const n = parseSymbols(partOutput(props.part)).length
+    return n ? String(n) : undefined
+  }
+  return <CountMeta value={count} />
+}
+
+function JsonMeta(props: RowContext) {
+  const parsed = () => parseJsonValidate(partOutput(props.part))
+  return (
+    <Show when={parsed()}>{(result) => <Chip tone={result().ok ? "ok" : "bad"}>{result().ok ? "valid" : "invalid"}</Chip>}</Show>
+  )
+}
+
+function GitMeta(props: RowContext) {
+  const mode = () => {
+    const input = props.part.state.input as Record<string, unknown> | undefined
+    return typeof input?.mode === "string" ? input.mode : "status"
+  }
+  const count = () => {
+    const parsed = parseGit(mode(), partOutput(props.part))
+    if (!parsed) return undefined
+    if (parsed.mode === "status") return parsed.entries.length ? `${parsed.entries.length} changed` : "clean"
+    if (parsed.mode === "summary") return parsed.entries.length ? `${parsed.entries.length} changed` : "clean"
+    if (parsed.mode === "log") return `${parsed.commits.length} commits`
+    return undefined
+  }
+  return <CountMeta value={count} />
+}
+
+function CheckpointMeta(props: RowContext) {
+  const count = () => {
+    const parsed = parseCheckpoints(partOutput(props.part))
+    return parsed && parsed.list.length ? String(parsed.list.length) : undefined
+  }
+  return <CountMeta value={count} />
+}
+
+function TestFilesMeta(props: RowContext) {
+  const count = () => {
+    const parsed = parseTest(partOutput(props.part))
+    return parsed?.kind === "list" && parsed.files.length ? `${parsed.files.length} files` : undefined
+  }
+  return <CountMeta value={count} />
+}
+
 // --- background jobs -------------------------------------------------------------------
 
 function BackgroundMeta(props: RowContext) {
@@ -276,12 +416,8 @@ const DESCRIPTORS: Record<string, ToolDescriptor> = {
     icon: IconEye,
     title: labelFor,
     detail: (part) => <FilePathDetail part={part} />,
+    meta: ReadMeta,
     body: (ctx) => <ReadToolBody part={ctx.part} />,
-  },
-  list: {
-    icon: IconSearch,
-    title: labelFor,
-    detail: (part) => <PatternDetail part={part} />,
   },
   glob: {
     icon: IconSearch,
@@ -346,7 +482,7 @@ const DESCRIPTORS: Record<string, ToolDescriptor> = {
     icon: IconGlobe,
     title: labelFor,
     detail: (part) => <FetchDetail part={part} />,
-    hideDetails: true,
+    body: (ctx) => <WebfetchBody part={ctx.part} />,
   },
   websearch: {
     icon: IconGlobe,
@@ -359,6 +495,7 @@ const DESCRIPTORS: Record<string, ToolDescriptor> = {
     title: labelFor,
     detail: (part) => <PatternDetail part={part} />,
     meta: BackgroundMeta,
+    body: (ctx) => <BackgroundBody part={ctx.part} />,
   },
   question: {
     icon: IconBot,
@@ -371,16 +508,114 @@ const DESCRIPTORS: Record<string, ToolDescriptor> = {
     icon: IconGitBranch,
     title: labelFor,
     detail: (part) => <PatternDetail part={part} />,
+    meta: GitMeta,
+    body: (ctx) => <GitBody part={ctx.part} />,
   },
   sqlite: {
     icon: IconDatabase,
     title: labelFor,
     detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <GenericBody part={ctx.part} />,
   },
   sympy: {
     icon: IconWrench,
     title: labelFor,
     detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <GenericBody part={ctx.part} />,
+  },
+  skill: {
+    icon: IconBrain,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <SkillBody part={ctx.part} />,
+  },
+  typecheck: {
+    icon: IconShieldCheck,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    meta: TypecheckMeta,
+    body: (ctx) => <TypecheckBody part={ctx.part} />,
+  },
+  test: {
+    icon: IconCheckCircle,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    meta: (ctx) => (
+      <>
+        <TestMeta part={ctx.part} />
+        <TestFilesMeta part={ctx.part} />
+      </>
+    ),
+    body: (ctx) => <TestBody part={ctx.part} />,
+  },
+  memory: {
+    icon: IconBrain,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <MemoryBody part={ctx.part} />,
+  },
+  session: {
+    icon: IconBot,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <SessionBody part={ctx.part} />,
+  },
+  project: {
+    icon: IconFolder,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <ProjectBody part={ctx.part} />,
+  },
+  symbols: {
+    icon: IconGrid,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    meta: SymbolsMeta,
+    body: (ctx) => <SymbolsBody part={ctx.part} />,
+  },
+  monitor: {
+    icon: IconEye,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <MonitorBody part={ctx.part} />,
+  },
+  checkpoint: {
+    icon: IconRotateCcw,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    meta: CheckpointMeta,
+    body: (ctx) => <CheckpointBody part={ctx.part} />,
+  },
+  archive: {
+    icon: IconArchive,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <ArchiveBody part={ctx.part} />,
+  },
+  json: {
+    icon: IconPackage,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    meta: JsonMeta,
+    body: (ctx) => <JsonBody part={ctx.part} />,
+  },
+  lsp: {
+    icon: IconSearch,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <LspBody part={ctx.part} />,
+  },
+  refactor: {
+    icon: IconWrench,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <RefactorBody part={ctx.part} />,
+  },
+  list: {
+    icon: IconSearch,
+    title: labelFor,
+    detail: (part) => <PatternDetail part={part} />,
+    body: (ctx) => <GenericBody part={ctx.part} />,
   },
 }
 

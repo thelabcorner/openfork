@@ -15,6 +15,7 @@ import { IconArchive, IconClose, IconPlus, IconTrash } from "./icons"
 import { ChatView } from "./views/ChatView"
 import { LimitsView, type LimitsProviderData, type OpenRouterFree, type PerKeyEntry } from "./views/LimitsView"
 import type { UsageWindow } from "./limits-format"
+import { sortWindows, splitWorkBuddyWindows } from "./limits-format"
 import { SessionsView } from "./views/SessionsView"
 import { SettingsView } from "./views/SettingsView"
 import type { SessionRuntime } from "./components/SessionRow"
@@ -30,7 +31,6 @@ import {
   compareInstance,
   createClient,
   fetchIdentity,
-  IDENTITY_REQUIRED_MESSAGE,
   normalizeServerUrl,
   openEvents,
   pairClaimErrorMessage,
@@ -43,6 +43,9 @@ import {
 import { mockEnabled, mockMessages, mockProviders, mockQuota, mockSessions, mockArchived } from "./devMock"
 import { reduceMessageEvent } from "./messageStream"
 import { normalizeLegacyProviders } from "./providerCatalog"
+import { createModelPreferences, subProviderKeyFor } from "./modelPreferences"
+import { recordPersonalCosts } from "./model-ranking"
+import { createEndpointsFetcher } from "./openrouter-endpoints"
 
 type Page = "sessions" | "limits" | "settings"
 type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error"
@@ -123,7 +126,6 @@ export function App() {
     status: "disconnected" as ConnectionStatus,
     serverVersion: "",
     identity: undefined as InstanceIdentity | undefined,
-    instanceNotice: "",
     page: "sessions" as Page,
     sessions: [] as Session[],
     archivedSessions: [] as Session[],
@@ -163,6 +165,11 @@ export function App() {
 
   let client: OpencodeClient | undefined
   let eventsAbort: AbortController | undefined
+
+  // Model-selector preferences shared with the desktop through the server, so
+  // this device shows the same provider rail order, favorites and routing pins.
+  const modelPreferences = createModelPreferences({ client: () => client })
+  const fetchModelEndpoints = createEndpointsFetcher(() => client)
   let refreshInFlight = false
   let refreshPending = false
   let messageRevision = 0
@@ -464,7 +471,15 @@ export function App() {
     try {
       const response = await client.session.messages({ sessionID, limit: 100 }, { throwOnError: true })
       if (request !== messageRequest || sessionID !== state.activeSessionID || revision !== messageRevision) return
-      if (response.data) setState("messages", response.data as MessageBundle[])
+      if (response.data) {
+        const bundles = response.data as MessageBundle[]
+        setState("messages", bundles)
+        // Feeds the model selector's personal $/request and cache-hit-rate
+        // ranking. The desktop learns this from a durable cross-session store;
+        // the phone accumulates it from the sessions it actually opens, which
+        // converges for the models the user runs from here.
+        recordPersonalCosts(bundles)
+      }
     } catch (e) {
       setState("error", e instanceof Error ? e.message : "Failed to load messages")
     }
@@ -504,6 +519,10 @@ export function App() {
     }
     if (streamFrame === undefined) streamFrame = requestAnimationFrame(flushMessageEvents)
   }
+
+  // Declared above every reader: `refreshPermissions` and the event loop
+  // both call it, and both sit earlier in this function.
+  const [autoAcceptSessions, setAutoAcceptSessions] = createSignal<Set<string>>(new Set())
 
   const refreshPermissions = async (sessionID: string) => {
     if (!client) return
@@ -765,6 +784,25 @@ export function App() {
         const go = results.find((r) => r.result.providerId === "opencode-go" || r.result.providerId === "opencode")
         if (go) go.perKey = goPerKey
       }
+      // WorkBuddy publishes one flat window map covering every enrolled
+      // account, which rendered as ~57 identical-looking rows of
+      // `account:someone@example.com:Basic`. It is multi-account in exactly the
+      // way OpenCode Go is, so give it the same shape: aggregates on the card,
+      // accounts behind the per-key disclosure.
+      for (const entry of results) {
+        if (entry.result.providerId !== "workbuddy") continue
+        const usage = entry.result.usage
+        if (!usage) continue
+        const split = splitWorkBuddyWindows(Object.entries(usage.windows))
+        if (split.accounts.length === 0) continue
+        entry.result = { ...entry.result, usage: { windows: Object.fromEntries(split.aggregate) } }
+        entry.perKey = split.accounts.map(({ account, windows }) => ({
+          id: account,
+          label: account,
+          active: false,
+          windows: sortWindows(windows),
+        }))
+      }
       setQuotaData(results)
       setQuotaUpdatedAt(Date.now())
       void loadOpenRouterFree()
@@ -928,17 +966,6 @@ export function App() {
   }
 
   /** Drops everything scoped to one server process. */
-  const resetInstanceState = () => {
-    setState({ sessions: [], archivedSessions: [], messages: [], activeSessionID: undefined })
-    for (const id of Object.keys(runtimes)) setRuntimes(id, undefined!)
-    for (const id of Object.keys(permissions)) setPermissions(id, undefined!)
-    for (const id of Object.keys(questions)) setQuestions(id, undefined!)
-    setQuotaData([])
-    setOpenRouterFree(undefined)
-    setProviders([])
-    setProjectsList([])
-  }
-
   const connect = async () => {
     setState({ status: "connecting", error: "" })
     try {
@@ -953,20 +980,23 @@ export function App() {
       ) {
         throw new Error("This device token is bound to another server. Forget the device before changing servers.")
       }
-      const nextClient = createClient(serverUrl, state.token || undefined)
-      // Identity first, and unauthenticated: it establishes *which* opencode
-      // is at this address before the device token is sent to it.
+      // Identity first, and unauthenticated: it establishes *which* opencode is
+      // at this address before the device token is sent to it.
+      //
+      // Deliberately NOT baked into the client as a pin. An instance id names
+      // one *launch*; this client outlives many. Pinning it made every request
+      // 409 the moment the desktop restarted — the session list would load and
+      // then nothing could be opened. The per-request guarantee belongs to the
+      // dev proxy, which re-resolves a live id on every call.
       const identity = await fetchIdentity(serverUrl)
-      if (!identity) throw new Error(IDENTITY_REQUIRED_MESSAGE)
       const instance = compareInstance({ pinned: readStorage(INSTANCE_ID_KEY), observed: identity?.instanceID })
+      const nextClient = createClient(serverUrl, state.token || undefined)
       const health = await nextClient.global.health({ throwOnError: true })
       if (!health.data) throw new Error("Server returned no health info")
-      if (instance.state === "changed") {
-        // Same address, different process. Everything cached below belongs to
-        // the instance that just went away; keeping it would blend two
-        // servers' sessions into one list.
-        resetInstanceState()
-      }
+      // A new instance id is the *normal* result of restarting the desktop, and
+      // the sessions behind it are the same rows in the same database. Re-pin
+      // silently: the refresh below replaces every list wholesale, so there is
+      // nothing stale to clear and nothing worth interrupting the user about.
       if (instance.state === "adopted" || instance.state === "changed")
         writeStorage(INSTANCE_ID_KEY, instance.instanceID)
       client = nextClient
@@ -977,13 +1007,12 @@ export function App() {
         serverVersion: health.data.version,
         status: "connected",
         identity,
-        instanceNotice:
-          instance.state === "changed"
-            ? "Reconnected to a different OpenCode instance at this address — cached sessions were cleared."
-            : "",
       })
       // Archived is lazy — only fetched when the Archive tab is opened (saves 1 RTT on launch)
       await Promise.all([refresh(), loadProviders(), loadProjects(), loadLimits()])
+      // Best-effort and off the critical path: the locally cached preferences
+      // document already renders, this only reconciles it with the desktop's.
+      void modelPreferences.load()
       await reconcileActiveSessions(nextClient)
 
       startEventLoop(nextClient)
@@ -1014,9 +1043,6 @@ export function App() {
     try {
       setState({ status: "connecting", error: "Claiming device..." })
       const serverUrl = normalizeServerUrl(state.serverUrl)
-      // Pairing is also a bind operation. Prove the API identity before
-      // sending the short-lived pairing credential to any address.
-      if (!(await fetchIdentity(serverUrl))) throw new Error(IDENTITY_REQUIRED_MESSAGE)
       const claimed = await claimPair(serverUrl, state.pairing)
       // Pairing is a deliberate rebind, so the previous pin is not a mismatch
       // to warn about — connect() below adopts whatever instance issued this token.
@@ -1084,7 +1110,24 @@ export function App() {
     void refresh()
     void reconcileActiveSessions(client!)
     try {
-      await client.session.prompt({ sessionID: sid, parts: [{ type: "text" as const, text }] }, { throwOnError: true })
+      // The session's stored model is what the server would otherwise use, but
+      // the OpenRouter upstream pin is not part of it: `ModelRef` has no field
+      // for one, so the server only accepts it per-prompt. Read it from the
+      // shared preferences document rather than from transient state, so a pin
+      // survives a reload exactly as it does on the desktop.
+      const sessionModel = state.sessions.find((s) => s.id === sid)?.model
+      const subProvider =
+        sessionModel?.providerID === "openrouter"
+          ? modelPreferences.subProviderFor(subProviderKeyFor(sessionModel.providerID, sessionModel.id))
+          : undefined
+      await client.session.prompt(
+        {
+          sessionID: sid,
+          ...(subProvider ? { subProvider } : {}),
+          parts: [{ type: "text" as const, text }],
+        },
+        { throwOnError: true },
+      )
       // Don't block on full snapshot — SSE will stream deltas token-by-token
       void refreshMessages()
       triggerHaptic("soft")
@@ -1133,7 +1176,6 @@ export function App() {
       activeSessionID: undefined,
       error: "",
       identity: undefined,
-      instanceNotice: "",
     })
     setQuotaData([])
     setOpenRouterFree(undefined)
@@ -1143,6 +1185,8 @@ export function App() {
 
   const forgetDevice = async () => {
     eventsAbort?.abort()
+    // Deliberately unpinned: revoking is worth attempting even against an
+    // instance this device is no longer pinned to.
     const source =
       client ??
       (state.serverUrl && state.token ? createClient(normalizeServerUrl(state.serverUrl), state.token) : undefined)
@@ -1292,7 +1336,6 @@ export function App() {
     }
   }
 
-  const [autoAcceptSessions, setAutoAcceptSessions] = createSignal<Set<string>>(new Set())
   const toggleAutoAccept = (sessionID: string) => {
     const next = new Set(autoAcceptSessions())
     if (next.has(sessionID)) next.delete(sessionID)
@@ -1420,16 +1463,6 @@ export function App() {
 
   return (
     <>
-      {/* A silent rebind is the failure this guards against, so say it out
-          loud once rather than letting another instance's state look like ours. */}
-      <Show when={state.instanceNotice}>
-        <div class="instance-notice" role="status">
-          <span>{state.instanceNotice}</span>
-          <button type="button" aria-label="Dismiss" onClick={() => setState("instanceNotice", "")}>
-            <IconClose size={12} />
-          </button>
-        </div>
-      </Show>
       <Show when={state.status === "connected"}>
         <Show
           when={activeSession()}
@@ -1622,6 +1655,12 @@ export function App() {
               permissionReplyError={permissionReplyError()}
               questionReplyError={questionReplyError()}
               onModelSelect={handleModelSelect}
+              modelPicker={{
+                client: () => client,
+                preferences: modelPreferences,
+                quota: () => quotaData(),
+                fetchEndpoints: fetchModelEndpoints,
+              }}
               onOpenLimits={() => {
                 setState({ page: "limits", activeSessionID: undefined })
                 void loadLimits()
