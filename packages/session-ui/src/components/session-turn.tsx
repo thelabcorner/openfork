@@ -10,8 +10,10 @@ import { useData } from "../context"
 import { useFileComponent } from "@opencode-ai/ui/context/file"
 
 import { Binary } from "@opencode-ai/core/util/binary"
+import { SessionThroughput } from "@opencode-ai/core/session/throughput"
+import { toThroughputMessage } from "./message-part"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
-import { createEffect, createMemo, createSignal, For, on, ParentProps, Show } from "solid-js"
+import { createEffect, createMemo, createRoot, createSignal, For, on, onCleanup, ParentProps, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Dynamic } from "solid-js/web"
 import { AssistantParts, Message, MessageDivider, PART_MAPPING, type UserActions } from "./message-part"
@@ -298,21 +300,71 @@ export function SessionTurn(
   const error = createMemo(
     () => assistantMessages().find((m) => m.error && m.error.name !== "MessageAbortedError")?.error,
   )
+  type AssistantPartSummary = { visible: number; reason?: string; lastTextID?: string }
+  type AssistantPartSummaryEntry = { read: () => AssistantPartSummary; dispose: () => void }
+  const assistantPartSummaries = new Map<string, AssistantPartSummaryEntry>()
+  const reasoningHeadings = new WeakMap<object, { text: string; value?: string }>()
+
+  const partSummary = (messageID: string) => {
+    const existing = assistantPartSummaries.get(messageID)
+    if (existing) return existing.read()
+
+    let read!: () => AssistantPartSummary
+    let dispose!: () => void
+    createRoot((rootDispose) => {
+      dispose = rootDispose
+      read = createMemo(() => {
+        const parts = list(data.store.part?.[messageID], emptyParts)
+        const show = showReasoningSummaries()
+        let visible = 0
+        let reason: string | undefined
+        let lastTextID: string | undefined
+
+        for (const part of parts) {
+          if (partState(part, show) === "visible") visible++
+          if (!show && part.type === "reasoning" && part.text) {
+            const cached = reasoningHeadings.get(part)
+            const headingValue = cached?.text === part.text ? cached.value : heading(part.text)
+            if (!cached || cached.text !== part.text) reasoningHeadings.set(part, { text: part.text, value: headingValue })
+            if (headingValue) reason = headingValue
+          }
+        }
+
+        for (let index = parts.length - 1; index >= 0; index--) {
+          const part = parts[index]
+          if (part?.type === "text" && part.text?.trim()) {
+            lastTextID = part.id
+            break
+          }
+        }
+
+        return { visible, reason, lastTextID }
+      })
+    })
+    const entry = { read, dispose }
+    assistantPartSummaries.set(messageID, entry)
+    return read()
+  }
+
+  const pruneAssistantPartSummaries = (activeIDs: Set<string>) => {
+    for (const [id, entry] of assistantPartSummaries) {
+      if (activeIDs.has(id)) continue
+      entry.dispose()
+      assistantPartSummaries.delete(id)
+    }
+  }
+
   const showAssistantCopyPartID = createMemo(() => {
     const messages = assistantMessages()
+    const active = new Set(messages.map((message) => message.id))
+    pruneAssistantPartSummaries(active)
 
     for (let i = messages.length - 1; i >= 0; i--) {
       const message = messages[i]
       if (!message) continue
-
-      const parts = list(data.store.part?.[message.id], emptyParts)
-      for (let j = parts.length - 1; j >= 0; j--) {
-        const part = parts[j]
-        if (!part || part.type !== "text" || !part.text?.trim()) continue
-        return part.id
-      }
+      const summary = partSummary(message.id)
+      if (summary.lastTextID) return summary.lastTextID
     }
-
     return undefined
   })
   const errorText = createMemo(() => {
@@ -350,22 +402,38 @@ export function SessionTurn(
     if (end < start) return undefined
     return end - start
   })
+  // Request throughput for the turn, from persisted sidecar timestamps only
+  // (never the renderer clock). Recomputes when the message list identity
+  // changes — step boundaries, not token deltas — so streaming stays cheap.
+  const turnThroughputResult = createMemo(() => {
+    const msg = message()
+    if (!msg) return undefined
+    const messages = allMessages() ?? emptyMessages
+    return SessionThroughput.turnThroughput(messages.map(toThroughputMessage), msg.id)
+  })
+  const turnThroughputRate = createMemo(() => turnThroughputResult()?.requestRate)
   const assistantDerived = createMemo(() => {
     let visible = 0
     let reason: string | undefined
     const show = showReasoningSummaries()
+    const activeIDs = new Set<string>()
     for (const message of assistantMessages()) {
-      for (const part of list(data.store.part?.[message.id], emptyParts)) {
-        if (partState(part, show) === "visible") {
-          visible++
-        }
-        if (part.type === "reasoning" && part.text) {
-          const h = heading(part.text)
-          if (h) reason = h
-        }
-      }
+      activeIDs.add(message.id)
+      const summary = partSummary(message.id)
+      visible += summary.visible
+      if (summary.reason) reason = summary.reason
     }
+    // `show` is intentionally read above so toggling summaries invalidates the
+    // outer memo even when no part changed; each per-message memo tracks its
+    // own nested part fields and does the actual bounded recomputation.
+    void show
+    pruneAssistantPartSummaries(activeIDs)
     return { visible, reason }
+  })
+
+  onCleanup(() => {
+    for (const entry of assistantPartSummaries.values()) entry.dispose()
+    assistantPartSummaries.clear()
   })
   const assistantVisible = createMemo(() => assistantDerived().visible)
   const reasoningHeading = createMemo(() => assistantDerived().reason)
@@ -412,6 +480,7 @@ export function SessionTurn(
                     messages={assistantMessages()}
                     showAssistantCopyPartID={assistantCopyPartID()}
                     turnDurationMs={turnDurationMs()}
+                    turnThroughputRate={turnThroughputRate()}
                     working={working()}
                     showReasoningSummaries={showReasoningSummaries()}
                     shellToolDefaultOpen={props.shellToolDefaultOpen}

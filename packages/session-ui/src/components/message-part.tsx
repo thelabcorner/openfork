@@ -2,6 +2,7 @@ import {
   Component,
   createEffect,
   createMemo,
+  createRoot,
   createSignal,
   For,
   Match,
@@ -48,6 +49,7 @@ import { DiffChanges } from "@opencode-ai/ui/diff-changes"
 import { Markdown } from "./markdown"
 import { ImagePreview } from "@opencode-ai/ui/image-preview"
 import { getDirectory as _getDirectory, getFilename } from "@opencode-ai/core/util/path"
+import { SessionThroughput } from "@opencode-ai/core/session/throughput"
 import { AttachmentCardV2 } from "../v2/components/attachment-card-v2"
 import { CommentCardV2 } from "../v2/components/comment-card-v2"
 import { checksum } from "@opencode-ai/core/util/encode"
@@ -231,6 +233,7 @@ export interface MessagePartProps {
   onContentRendered?: () => void
   showAssistantCopyPartID?: string | null
   turnDurationMs?: number
+  turnThroughputRate?: number
   useV2Actions?: boolean
 }
 
@@ -346,12 +349,11 @@ function createPacedValue(getValue: () => string, live?: () => boolean) {
       sync(text)
       return
     }
-    if (text.length - shown.length <= TEXT_RENDER_IMMEDIATE) {
-      clear()
-      sync(text)
-      return
-    }
     if (text.length === shown.length || timeout) return
+    // Even small live fragments go through the pacing window. Rendering a
+    // markdown tree and morphing its DOM once per provider token defeats the
+    // transport coalescer when several sessions are active; the latest text
+    // is still rendered exactly, just at a bounded cadence.
     timeout = setTimeout(run, TEXT_RENDER_PACE_MS)
   })
 
@@ -857,10 +859,32 @@ export function renderable(part: PartType, showReasoningSummaries = true) {
 
 export { partDefaultOpen } from "./part-default-open"
 
+/**
+ * Thin adapter from UI messages to the pure throughput calculator's input.
+ * Single definition shared by every footer call site so the field mapping
+ * cannot drift between them.
+ */
+export function toThroughputMessage(message: MessageType): SessionThroughput.ThroughputMessage {
+  if (message.role !== "assistant") return { id: message.id, role: message.role }
+  const served = message.servedModel
+  return {
+    id: message.id,
+    role: "assistant",
+    modelKey: served ? `${served.providerID ?? message.providerID}:${served.modelID}` : `${message.providerID}:${message.modelID}`,
+    output: message.tokens.output,
+    reasoning: message.tokens.reasoning,
+    requestSentAt: message.time.requestSentAt,
+    firstTokenAt: message.time.firstTokenAt,
+    streamedAt: message.time.streamedAt,
+    failed: message.error !== undefined,
+  }
+}
+
 export function AssistantParts(props: {
   messages: AssistantMessage[]
   showAssistantCopyPartID?: string | null
   turnDurationMs?: number
+  turnThroughputRate?: number
   useV2Actions?: boolean
   working?: boolean
   showReasoningSummaries?: boolean
@@ -871,28 +895,71 @@ export function AssistantParts(props: {
   const emptyParts: PartType[] = []
   const emptyTools: ToolPart[] = []
   const msgs = createMemo(() => index(props.messages))
-  const part = createMemo(
-    () =>
-      new Map(
-        props.messages.map((message) => [message.id, index(list(data.store.part?.[message.id], emptyParts))] as const),
-      ),
-  )
+  type MessagePartView = {
+    index: Map<string, PartType>
+    items: { messageID: string; part: PartType }[]
+  }
+  type MessagePartViewEntry = { read: () => MessagePartView; dispose: () => void }
+  const messagePartViews = new Map<string, MessagePartViewEntry>()
+  const messagePartView = (messageID: string) => {
+    const existing = messagePartViews.get(messageID)
+    if (existing) return existing.read()
+
+    let read!: () => MessagePartView
+    let dispose!: () => void
+    createRoot((rootDispose) => {
+      dispose = rootDispose
+      read = createMemo(() => {
+        const parts = list(data.store.part?.[messageID], emptyParts)
+        const showReasoning = props.showReasoningSummaries ?? true
+        const partIndex = index(parts)
+        const items = parts
+          .filter((part) => renderable(part, showReasoning))
+          .map((part) => ({ messageID, part }))
+        return { index: partIndex, items }
+      })
+    })
+    const entry = { read, dispose }
+    messagePartViews.set(messageID, entry)
+    return read()
+  }
+  const pruneMessagePartViews = (active: Set<string>) => {
+    for (const [id, entry] of messagePartViews) {
+      if (active.has(id)) continue
+      entry.dispose()
+      messagePartViews.delete(id)
+    }
+  }
+
+  const part = createMemo(() => {
+    const result = new Map<string, Map<string, PartType>>()
+    const active = new Set<string>()
+    for (const message of props.messages) {
+      active.add(message.id)
+      result.set(message.id, messagePartView(message.id).index)
+    }
+    pruneMessagePartViews(active)
+    return result
+  })
 
   const grouped = createMemo(
-    () =>
-      groupParts(
-        props.messages.flatMap((message) =>
-          list(data.store.part?.[message.id], emptyParts)
-            .filter((part) => renderable(part, props.showReasoningSummaries ?? true))
-            .map((part) => ({
-              messageID: message.id,
-              part,
-            })),
-        ),
-      ),
+    () => {
+      const active = new Set<string>()
+      const items = props.messages.flatMap((message) => {
+        active.add(message.id)
+        return messagePartView(message.id).items
+      })
+      pruneMessagePartViews(active)
+      return groupParts(items)
+    },
     [] as PartGroup[],
     { equals: sameGroups },
   )
+
+  onCleanup(() => {
+    for (const entry of messagePartViews.values()) entry.dispose()
+    messagePartViews.clear()
+  })
 
   const last = createMemo(() => grouped().at(-1)?.key)
 
@@ -946,6 +1013,7 @@ export function AssistantParts(props: {
                         message={message()!}
                         showAssistantCopyPartID={props.showAssistantCopyPartID}
                         turnDurationMs={props.turnDurationMs}
+                        turnThroughputRate={props.turnThroughputRate}
                         useV2Actions={props.useV2Actions}
                         defaultOpen={partDefaultOpen(item()!, props.shellToolDefaultOpen, props.editToolDefaultOpen)}
                       />
@@ -1764,6 +1832,7 @@ export function Part(props: MessagePartProps) {
         onContentRendered={props.onContentRendered}
         showAssistantCopyPartID={props.showAssistantCopyPartID}
         turnDurationMs={props.turnDurationMs}
+        turnThroughputRate={props.turnThroughputRate}
         useV2Actions={props.useV2Actions}
       />
     </Show>
@@ -2016,6 +2085,12 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
     })
   })
 
+  const throughput = createMemo(() => {
+    const rate = props.turnThroughputRate
+    if (!(rate !== undefined && Number.isFinite(rate))) return ""
+    return i18n.t("ui.message.throughput", { rate: numfmt().format(Math.round(rate * 10) / 10) })
+  })
+
   const meta = createMemo(() => {
     if (props.message.role !== "assistant") return ""
     const agent = (props.message as AssistantMessage).agent
@@ -2026,6 +2101,7 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
       model(),
       variant ? variant : "",
       duration(),
+      throughput(),
       interrupted() ? i18n.t("ui.message.interrupted") : "",
     ]
     return items.filter((x) => !!x).join(" \u00B7 ")

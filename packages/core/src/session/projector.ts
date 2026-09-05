@@ -257,6 +257,9 @@ const layer = Layer.effectDiscard(
         yield* db
           .update(SessionTable)
           .set({
+            // projectID is present only on cross-project moves; drizzle skips
+            // undefined fields so historical same-project moves keep the row.
+            project_id: event.data.projectID,
             directory: event.data.location.directory,
             path: event.data.subdirectory,
             workspace_id: event.data.location.workspaceID ? WorkspaceV2.ID.make(event.data.location.workspaceID) : null,
@@ -401,6 +404,7 @@ const layer = Layer.effectDiscard(
     yield* events.project(SessionEvent.Shell.Started, (event) => run(db, event))
     yield* events.project(SessionEvent.Shell.Ended, (event) => run(db, event))
     yield* events.project(SessionEvent.Step.Started, (event) => run(db, event))
+    yield* events.project(SessionEvent.Step.Streamed, (event) => run(db, event))
     yield* events.project(SessionEvent.Step.Ended, (event) => run(db, event))
     yield* events.project(SessionEvent.Step.Failed, (event) => run(db, event))
     yield* events.project(SessionEvent.Text.Started, (event) => run(db, event))

@@ -72,6 +72,24 @@ type ToolCall = {
   done: Deferred.Deferred<void>
 }
 
+/**
+ * Streaming delta coalescing. Each provider chunk used to publish one
+ * `message.part.delta` event, which fans out to every SSE listener and every
+ * GlobalBus subscriber. With N concurrent sessions the event rate is
+ * N x tokens/sec, which saturates the single-threaded notify loop and starves
+ * the 10s SSE heartbeat past the frontend's 15s liveness window (red blip).
+ * Buffering deltas per part and flushing on a time/size threshold cuts publish
+ * volume ~10x with no visible change (the frontend already coalesces at
+ * 16ms/100ms/2KB).
+ */
+const DELTA_FLUSH_MS = 32
+const DELTA_FLUSH_BYTES = 2048
+
+interface PendingDelta {
+  text: string
+  since: number
+}
+
 interface ProcessorContext extends Input {
   toolcalls: Record<string, ToolCall>
   shouldBreak: boolean
@@ -84,6 +102,10 @@ interface ProcessorContext extends Input {
   reasoningMap: Record<string, SessionV1.ReasoningPart>
   /** Whether we have already recorded the first-token timestamp on the message. */
   firstTokenRecorded: boolean
+  /** Buffered, not-yet-published text delta for the active text part. */
+  pendingTextDelta: PendingDelta | undefined
+  /** Buffered deltas keyed by provider reasoning id. */
+  pendingReasoningDelta: Record<string, PendingDelta>
 }
 
 type StreamEvent = LLMEvent
@@ -128,6 +150,8 @@ const layer = Layer.effect(
         currentText: undefined,
         reasoningMap: {},
         firstTokenRecorded: false,
+        pendingTextDelta: undefined,
+        pendingReasoningDelta: {},
       }
       let aborted = false
 
@@ -221,8 +245,71 @@ const layer = Layer.effect(
         return true
       })
 
+      const flushTextDelta = Effect.fnUntraced(function* () {
+        const pending = ctx.pendingTextDelta
+        if (!pending || !ctx.currentText) {
+          ctx.pendingTextDelta = undefined
+          return
+        }
+        ctx.pendingTextDelta = undefined
+        yield* session.updatePartDelta({
+          sessionID: ctx.currentText.sessionID,
+          messageID: ctx.currentText.messageID,
+          partID: ctx.currentText.id,
+          field: "text",
+          delta: pending.text,
+        })
+      })
+
+      const flushReasoningDelta = Effect.fnUntraced(function* (reasoningID: string) {
+        const pending = ctx.pendingReasoningDelta[reasoningID]
+        const part = ctx.reasoningMap[reasoningID]
+        if (!pending || !part) {
+          delete ctx.pendingReasoningDelta[reasoningID]
+          return
+        }
+        delete ctx.pendingReasoningDelta[reasoningID]
+        yield* session.updatePartDelta({
+          sessionID: part.sessionID,
+          messageID: part.messageID,
+          partID: part.id,
+          field: "text",
+          delta: pending.text,
+        })
+      })
+
+      const flushAllDeltas = Effect.fnUntraced(function* () {
+        yield* flushTextDelta()
+        for (const id of Object.keys(ctx.pendingReasoningDelta)) yield* flushReasoningDelta(id)
+      })
+
+      const bufferTextDelta = Effect.fnUntraced(function* (text: string) {
+        if (!ctx.currentText) return
+        const now = Date.now()
+        const pending = ctx.pendingTextDelta
+        if (!pending) {
+          ctx.pendingTextDelta = { text, since: now }
+          return
+        }
+        pending.text += text
+        if (pending.text.length >= DELTA_FLUSH_BYTES || now - pending.since >= DELTA_FLUSH_MS) yield* flushTextDelta()
+      })
+
+      const bufferReasoningDelta = Effect.fnUntraced(function* (reasoningID: string, text: string) {
+        const now = Date.now()
+        const pending = ctx.pendingReasoningDelta[reasoningID]
+        if (!pending) {
+          ctx.pendingReasoningDelta[reasoningID] = { text, since: now }
+          return
+        }
+        pending.text += text
+        if (pending.text.length >= DELTA_FLUSH_BYTES || now - pending.since >= DELTA_FLUSH_MS)
+          yield* flushReasoningDelta(reasoningID)
+      })
+
       const finishReasoning = Effect.fn("SessionProcessor.finishReasoning")(function* (reasoningID: string) {
         if (!(reasoningID in ctx.reasoningMap)) return
+        yield* flushReasoningDelta(reasoningID)
         // oxlint-disable-next-line no-self-assign -- reactivity trigger
         ctx.reasoningMap[reasoningID].text = ctx.reasoningMap[reasoningID].text
         ctx.reasoningMap[reasoningID].time = { ...ctx.reasoningMap[reasoningID].time, end: Date.now() }
@@ -321,6 +408,11 @@ const layer = Layer.effect(
           : Effect.void
 
       const handleEvent = Effect.fnUntraced(function* (value: StreamEvent) {
+        // Flush coalesced deltas at block boundaries so text is visible before
+        // tool execution starts and a stalled stream never holds the trailing
+        // chunk indefinitely. Delta events themselves batch via the
+        // time/size thresholds in bufferTextDelta/bufferReasoningDelta.
+        if (value.type !== "text-delta" && value.type !== "reasoning-delta") yield* flushAllDeltas()
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
@@ -368,6 +460,9 @@ const layer = Layer.effect(
                   const full = ctx.reasoningMap[value.id].text + value.text
                   const cut = action.noTruncate ? full.length : Math.max(0, Math.min(full.length, action.quarantineFrom))
                   ctx.reasoningMap[value.id].text = full.slice(0, cut)
+                  // A recovery rewrite supersedes buffered deltas; drop them so
+                  // the full-part update below is the single source of truth.
+                  delete ctx.pendingReasoningDelta[value.id]
                   yield* session.updatePart(ctx.reasoningMap[value.id])
                   ctx.needsRecovery = { prompt: action.recoveryPrompt }
                   return
@@ -376,13 +471,7 @@ const layer = Layer.effect(
             }
             ctx.reasoningMap[value.id].text += value.text
             if (value.providerMetadata) ctx.reasoningMap[value.id].metadata = value.providerMetadata
-            yield* session.updatePartDelta({
-              sessionID: ctx.reasoningMap[value.id].sessionID,
-              messageID: ctx.reasoningMap[value.id].messageID,
-              partID: ctx.reasoningMap[value.id].id,
-              field: "text",
-              delta: value.text,
-            })
+            yield* bufferReasoningDelta(value.id, value.text)
             return
 
           case "reasoning-end":
@@ -648,23 +737,21 @@ const layer = Layer.effect(
               const full = ctx.currentText.text + value.text
               const cut = action.noTruncate ? full.length : Math.max(0, Math.min(full.length, action.quarantineFrom))
               ctx.currentText.text = full.slice(0, cut)
+              // Recovery rewrite supersedes buffered deltas; drop them so the
+              // full-part update below is the single source of truth.
+              ctx.pendingTextDelta = undefined
               yield* session.updatePart(ctx.currentText)
               ctx.needsRecovery = { prompt: action.recoveryPrompt }
               return
             }
             ctx.currentText.text += value.text
             if (value.providerMetadata) ctx.currentText.metadata = value.providerMetadata
-            yield* session.updatePartDelta({
-              sessionID: ctx.currentText.sessionID,
-              messageID: ctx.currentText.messageID,
-              partID: ctx.currentText.id,
-              field: "text",
-              delta: value.text,
-            })
+            yield* bufferTextDelta(value.text)
             return
 
           case "text-end":
             if (!ctx.currentText) return
+            yield* flushTextDelta()
             // oxlint-disable-next-line no-self-assign -- reactivity trigger
             ctx.currentText.text = ctx.currentText.text
             ctx.currentText.text = (yield* plugin.trigger(
@@ -706,6 +793,11 @@ const layer = Layer.effect(
           ctx.snapshot = undefined
         }
 
+        // Flush coalesced deltas before the full-part writes below so an
+        // interrupted stream still delivers its trailing text as deltas; the
+        // full updates then supersede them via the barrier path.
+        yield* flushAllDeltas()
+
         if (ctx.currentText) {
           const end = Date.now()
           ctx.currentText.time = { start: ctx.currentText.time?.start ?? end, end }
@@ -721,11 +813,12 @@ const layer = Layer.effect(
           })
         }
         ctx.reasoningMap = {}
+        ctx.pendingReasoningDelta = {}
 
         yield* Effect.forEach(
           Object.values(ctx.toolcalls),
           (call) => Deferred.await(call.done).pipe(Effect.timeout("250 millis"), Effect.ignore),
-          { concurrency: "unbounded" },
+          { concurrency: 8 },
         )
 
         for (const toolCallID of Object.keys(ctx.toolcalls)) {
@@ -795,13 +888,17 @@ const layer = Layer.effect(
             ctx.reasoningMap = {}
             yield* status.set(ctx.sessionID, { type: "busy" })
 
-            // Record when the request is dispatched to the provider. The stream
-            // starts producing events only after the HTTP request is sent, so
-            // this timestamp is a close approximation of the actual wire send.
-            if (ctx.assistantMessage.time.requestSentAt === undefined) {
-              ctx.assistantMessage.time.requestSentAt = Date.now()
-              yield* session.updateMessage(ctx.assistantMessage)
-            }
+            // Per-attempt dispatch origin, captured before the provider stream
+            // is consumed. Physical retries reset all three stamps so failed
+            // attempts and backoff never enter the successful attempt's
+            // throughput window. The stream starts producing events only
+            // after the HTTP request is sent, so this timestamp is a close
+            // approximation of the actual wire send.
+            ctx.firstTokenRecorded = false
+            ctx.assistantMessage.time.requestSentAt = Date.now()
+            ctx.assistantMessage.time.firstTokenAt = undefined
+            ctx.assistantMessage.time.streamedAt = undefined
+            yield* session.updateMessage(ctx.assistantMessage)
 
             const stream = llm.stream(streamInput)
 
@@ -812,6 +909,15 @@ const layer = Layer.effect(
               ),
               Stream.runDrain,
             )
+
+            // Response-body boundary for the throughput denominator: the
+            // provider stream is exhausted here, before local tool settlement
+            // in cleanup(). Only stamped for a step that actually streamed;
+            // aborted turns stay unstamped and render no rate.
+            if (ctx.firstTokenRecorded && ctx.assistantMessage.time.streamedAt === undefined) {
+              ctx.assistantMessage.time.streamedAt = Date.now()
+              yield* session.updateMessage(ctx.assistantMessage)
+            }
           }).pipe(
             Effect.onInterrupt(() =>
               Effect.gen(function* () {

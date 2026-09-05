@@ -69,7 +69,13 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
   let assistantActive = false
   let assistantFailed = false
   let providerFailed = false
+  let stepStreamed = false
+  let requestSentAt: DateTime.Utc | undefined
   let stepSettlement: { readonly finish: string; readonly tokens: ReturnType<typeof tokens> } | undefined
+
+  const setRequestSentAt = (value: DateTime.Utc) => {
+    requestSentAt = value
+  }
 
   const startAssistant = Effect.fnUntraced(function* () {
     if (assistantMessageID !== undefined) return assistantMessageID
@@ -80,8 +86,27 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
       assistantMessageID,
       timestamp: yield* timestamp,
       snapshot: input.snapshot,
+      ...(requestSentAt === undefined ? {} : { requestSentAt }),
     })
     return assistantMessageID
+  })
+
+  /**
+   * Response-body boundary for the throughput denominator. Publish exactly
+   * once per step, after the provider stream is exhausted and before local
+   * tool settlement. The caller guards on stream success, no overflow, and
+   * no provider error; the started check here re-derives upstream's
+   * `hasStarted()` intent against assistant state (only stamp a boundary
+   * for a step that actually began streaming).
+   */
+  const streamed = Effect.fnUntraced(function* () {
+    if (stepStreamed || assistantMessageID === undefined || assistantFailed) return
+    stepStreamed = true
+    yield* events.publish(SessionEvent.Step.Streamed, {
+      sessionID: input.sessionID,
+      timestamp: yield* timestamp,
+      assistantMessageID,
+    })
   })
   const currentAssistantMessageID = () =>
     assistantMessageID === undefined
@@ -413,6 +438,8 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
     flush,
     failAssistant,
     failUnsettledTools,
+    streamed,
+    setRequestSentAt,
     hasActiveAssistant: () => assistantActive,
     hasAssistantStarted: () => assistantMessageID !== undefined,
     hasProviderError: () => providerFailed,

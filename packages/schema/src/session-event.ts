@@ -10,6 +10,7 @@ import { DateTimeUtcFromMillis, NonNegativeInt, RelativePath } from "./schema"
 import { FileAttachment, Prompt } from "./prompt"
 import { SessionID } from "./session-id"
 import { Location } from "./location"
+import { ProjectID } from "./project-id"
 import { SessionMessage } from "./session-message"
 import { Revert } from "./revert"
 
@@ -80,6 +81,9 @@ export const Moved = Event.define({
     ...Base,
     location: Location.Ref,
     subdirectory: RelativePath.pipe(optional),
+    // Present when the move re-associates the session with a different
+    // project (cross-project move). Absent on historical same-project moves.
+    projectID: optional(ProjectID),
   },
 })
 export type Moved = typeof Moved.Type
@@ -155,9 +159,33 @@ export namespace Step {
       agent: Schema.String,
       model: Model.Ref,
       snapshot: Schema.String.pipe(optional),
+      /**
+       * Explicit request-dispatch timestamp captured before the provider
+       * stream is consumed. `timestamp` (the lazily published step-start
+       * event) can arrive after the provider spent most of the request
+       * generating, so it must not anchor throughput windows.
+       */
+      requestSentAt: DateTimeUtcFromMillis.pipe(optional),
     },
   })
   export type Started = typeof Started.Type
+
+  /**
+   * Response-body boundary for one assistant step, published exactly once per
+   * step when the provider stream is exhausted and before local tool
+   * settlement begins. Fork-owned throughput surface: together with
+   * `requestSentAt` on Step.Started it brackets the provider request window
+   * (`completed` lands after tool execution and must not enter the rate).
+   */
+  export const Streamed = Event.define({
+    type: "session.next.step.streamed",
+    ...options,
+    schema: {
+      ...Base,
+      assistantMessageID: SessionMessage.ID,
+    },
+  })
+  export type Streamed = typeof Streamed.Type
 
   export const Ended = Event.define({
     type: "session.next.step.ended",
@@ -209,6 +237,7 @@ export namespace Text {
   // Stream fragments are live-only; Text.Ended is the replayable full-value boundary.
   export const Delta = Event.define({
     type: "session.next.text.delta",
+    coalesce: { key: ["sessionID", "assistantMessageID", "textID"], field: "delta" },
     schema: {
       ...Base,
       assistantMessageID: SessionMessage.ID,
@@ -247,6 +276,7 @@ export namespace Reasoning {
   // Stream fragments are live-only; Reasoning.Ended is the replayable full-value boundary.
   export const Delta = Event.define({
     type: "session.next.reasoning.delta",
+    coalesce: { key: ["sessionID", "assistantMessageID", "reasoningID"], field: "delta" },
     schema: {
       ...Base,
       assistantMessageID: SessionMessage.ID,
@@ -291,6 +321,7 @@ export namespace Tool {
     // Stream fragments are live-only; Input.Ended is the replayable raw-input boundary.
     export const Delta = Event.define({
       type: "session.next.tool.input.delta",
+      coalesce: { key: ["sessionID", "assistantMessageID", "callID"], field: "delta" },
       schema: {
         ...ToolBase,
         delta: Schema.String,
@@ -409,6 +440,7 @@ export namespace Compaction {
 
   export const Delta = Event.define({
     type: "session.next.compaction.delta",
+    coalesce: { key: ["sessionID", "messageID"], field: "text" },
     schema: {
       ...Base,
       messageID: SessionMessage.ID,
@@ -480,6 +512,7 @@ export const DurableDefinitions = Event.inventory(
   Shell.Started,
   Shell.Ended,
   Step.Started,
+  Step.Streamed,
   Step.Ended,
   Step.Failed,
   Text.Started,
@@ -514,6 +547,7 @@ export const Definitions = Event.inventory(
   Shell.Started,
   Shell.Ended,
   Step.Started,
+  Step.Streamed,
   Step.Ended,
   Step.Failed,
   Text.Started,

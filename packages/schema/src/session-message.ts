@@ -189,6 +189,8 @@ export const Assistant = Schema.Struct({
     requestSentAt: DateTimeUtcFromMillis.pipe(optional),
     /** Timestamp when the first visible text or reasoning token arrived. */
     firstTokenAt: DateTimeUtcFromMillis.pipe(optional),
+    /** Timestamp when the provider response body ended, before tool settlement. */
+    streamedAt: DateTimeUtcFromMillis.pipe(optional),
   }),
 }).annotate({ identifier: "Session.Message.Assistant" })
 

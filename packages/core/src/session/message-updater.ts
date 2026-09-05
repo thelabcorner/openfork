@@ -199,7 +199,10 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
               type: "assistant",
               agent: event.data.agent,
               model: event.data.model,
-              time: { created: event.data.timestamp },
+              time: {
+                created: event.data.timestamp,
+                ...(event.data.requestSentAt === undefined ? {} : { requestSentAt: event.data.requestSentAt }),
+              },
               content: [],
               snapshot: event.data.snapshot ? { start: event.data.snapshot } : undefined,
             }),
@@ -227,8 +230,14 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
           draft.error = event.data.error
         })
       },
+      "session.next.step.streamed": (event) => {
+        return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+          draft.time.streamedAt ??= event.data.timestamp
+        })
+      },
       "session.next.text.started": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+          draft.time.firstTokenAt ??= event.data.timestamp
           draft.content.push(
             castDraft(SessionMessage.AssistantText.make({ type: "text", id: event.data.textID, text: "" })),
           )
@@ -342,6 +351,7 @@ export function update(adapter: Adapter, event: SessionEvent.Event) {
       },
       "session.next.reasoning.started": (event) => {
         return updateOwnedAssistant(event.data.assistantMessageID, (draft) => {
+          draft.time.firstTokenAt ??= event.data.timestamp
           draft.content.push(
             castDraft(
               SessionMessage.AssistantReasoning.make({

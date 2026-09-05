@@ -322,6 +322,7 @@ export const dict: Record<string, string> = {
   "ui.message.copied": "Copied",
   "ui.message.duration.seconds": "{{count}}s",
   "ui.message.duration.minutesSeconds": "{{minutes}}m {{seconds}}s",
+  "ui.message.throughput": "{{rate}} tok/s",
   "ui.message.interrupted": "Interrupted",
   "ui.message.queued": "Queued",
   "ui.message.attachment.alt": "attachment",

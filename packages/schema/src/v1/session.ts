@@ -462,6 +462,8 @@ export const Assistant = Schema.Struct({
     requestSentAt: optional(NonNegativeInt),
     /** Timestamp when the first visible text or reasoning token arrived from the provider. */
     firstTokenAt: optional(NonNegativeInt),
+    /** Timestamp when the provider response body ended, before tool settlement. */
+    streamedAt: optional(NonNegativeInt),
   }),
   error: Schema.optional(AssistantErrorSchema),
   parentID: MessageID,
@@ -651,6 +653,7 @@ const events = {
 
 export const PartDelta = define({
   type: "message.part.delta",
+  coalesce: { key: ["sessionID", "messageID", "partID", "field"], field: "delta" },
   schema: {
     sessionID: SessionID,
     messageID: MessageID,

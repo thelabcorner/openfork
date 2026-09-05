@@ -25,8 +25,10 @@ import {
   MessageDivider,
   Part as MessagePart,
   partDefaultOpen,
+  toThroughputMessage,
   type UserActions,
 } from "@opencode-ai/session-ui/message-part"
+import { SessionThroughput } from "@opencode-ai/core/session/throughput"
 import { DiffChanges } from "@opencode-ai/ui/diff-changes"
 import { FileIcon } from "@opencode-ai/ui/file-icon"
 import { Icon } from "@opencode-ai/ui/icon"
@@ -1131,6 +1133,20 @@ export function MessageTimeline(props: {
   })
   const turnDurationMs = (userMessageID: string) => turnDurationByMessage().get(userMessageID)
 
+  // Request throughput per turn, from persisted sidecar timestamps only.
+  // One O(N) adapter pass plus one bounded walk per turn; recomputes on
+  // message-list identity (step boundaries), never per token delta.
+  const turnThroughputByMessage = createMemo(() => {
+    const flat = sessionMessages().map(toThroughputMessage)
+    const result = new Map<string, number>()
+    for (const [userMessageID] of assistantMessagesByParent()) {
+      const value = SessionThroughput.turnThroughput(flat, userMessageID)
+      if (value) result.set(userMessageID, value.requestRate)
+    }
+    return result
+  })
+  const turnThroughputRate = (userMessageID: string) => turnThroughputByMessage().get(userMessageID)
+
   const assistantCopyPartByMessage = createMemo(() => {
     const result = new Map<string, string>()
     for (const [userMessageID, messages] of assistantMessagesByParent()) {
@@ -1200,6 +1216,7 @@ export function MessageTimeline(props: {
                 message={message()}
                 showAssistantCopyPartID={assistantCopyPartID(row().userMessageID)}
                 turnDurationMs={turnDurationMs(row().userMessageID)}
+                turnThroughputRate={turnThroughputRate(row().userMessageID)}
                 useV2Actions={settings.general.newLayoutDesigns()}
                 defaultOpen={defaultOpen()}
                 toolOpen={toolOpen[part().id] ?? defaultOpen()}

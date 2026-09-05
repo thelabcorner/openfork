@@ -290,6 +290,12 @@ const layer = Layer.effect(
 
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
+          // Explicit dispatch origin for throughput windows, captured after
+          // snapshot preparation and before the provider stream is consumed.
+          // The lazily published Step.Started event can arrive after the
+          // provider spent most of the request generating, so it must not
+          // anchor rate denominators.
+          publisher.setRequestSentAt(yield* DateTime.now)
           const stream = yield* restore(providerStream).pipe(Effect.exit)
           const failure =
             stream._tag === "Failure" ? Option.getOrUndefined(Cause.findErrorOption(stream.cause)) : undefined
@@ -305,6 +311,17 @@ const layer = Layer.effect(
           if (llmFailure && !publisher.hasProviderError()) {
             yield* withPublication(publisher.failUnsettledTools("Provider did not return a tool result", true))
             yield* withPublication(publisher.failAssistant(llmFailure.reason.message))
+          }
+          // Response-body boundary: the provider stream is exhausted here
+          // while local tool fibers may still be settling below, so this
+          // stamp brackets provider time without absorbing tool execution.
+          if (
+            stream._tag === "Success" &&
+            !overflowFailure &&
+            !publisher.hasProviderError() &&
+            publisher.hasAssistantStarted()
+          ) {
+            yield* withPublication(publisher.streamed())
           }
           if (stream._tag === "Failure" && Cause.hasInterrupts(stream.cause)) yield* FiberSet.clear(toolFibers)
           const settled = yield* restore(awaitToolFibers(toolFibers)).pipe(Effect.exit)
