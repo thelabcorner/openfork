@@ -143,6 +143,11 @@ import type {
   ProjectCopiesRemoveOutput,
   ProjectCopiesRefreshInput,
   ProjectCopiesRefreshOutput,
+  ServerPushGetOutput,
+  ServerPushCreateInput,
+  ServerPushCreateOutput,
+  ServerPushDeleteInput,
+  ServerPushDeleteOutput,
 } from "./types"
 import { ClientError } from "./client-error"
 
@@ -233,7 +238,7 @@ export function make(options: ClientOptions) {
       if (response.body === null) throw new ClientError("MalformedResponse")
       const reader = response.body.getReader()
       const decoder = new TextDecoder()
-      let buffer = ""
+      const parser: SseDataParserState = { line: "", data: undefined, skipLineFeed: false, size: 0 }
       try {
         while (true) {
           let next
@@ -242,29 +247,15 @@ export function make(options: ClientOptions) {
           } catch (cause) {
             throw new ClientError("Transport", { cause })
           }
-          buffer += decoder.decode(next.value, { stream: !next.done })
-          if (buffer.length > 1_048_576) throw new ClientError("MalformedResponse")
-          const trailingCarriageReturn = !next.done && buffer.endsWith("\r")
-          if (trailingCarriageReturn) buffer = buffer.slice(0, -1)
-          buffer = buffer.replaceAll("\r\n", "\n").replaceAll("\r", "\n")
-          if (trailingCarriageReturn) buffer += "\r"
-          if (next.done && buffer !== "") buffer += "\n\n"
-          let boundary = buffer.indexOf("\n\n")
-          while (boundary >= 0) {
-            const block = buffer.slice(0, boundary)
-            buffer = buffer.slice(boundary + 2)
-            const data = block
-              .split("\n")
-              .flatMap((line) => (line.startsWith("data:") ? [line.slice(5).trimStart()] : []))
-              .join("\n")
-            if (data !== "") {
+          const data = decoder.decode(next.value, { stream: !next.done })
+          for (const event of parseSseDataChunk(data, parser, next.done)) {
+            if (event !== "") {
               try {
-                yield JSON.parse(data) as A
+                yield JSON.parse(event) as A
               } catch (cause) {
                 throw new ClientError("MalformedResponse", { cause })
               }
             }
-            boundary = buffer.indexOf("\n\n")
           }
           if (next.done) return
         }
@@ -1208,6 +1199,48 @@ export function make(options: ClientOptions) {
           requestOptions,
         ),
     },
+    "server.push": {
+      get: (requestOptions?: RequestOptions) =>
+        request<{ readonly data: ServerPushGetOutput }>(
+          {
+            method: "GET",
+            path: `/api/push/public-key`,
+            successStatus: 200,
+            declaredStatuses: [401, 400],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      create: (input: ServerPushCreateInput, requestOptions?: RequestOptions) =>
+        request<{ readonly data: ServerPushCreateOutput }>(
+          {
+            method: "POST",
+            path: `/api/push/subscription`,
+            body: {
+              endpoint: input["endpoint"],
+              keys: input["keys"],
+              expirationTime: input["expirationTime"],
+              userAgentHint: input["userAgentHint"],
+            },
+            successStatus: 200,
+            declaredStatuses: [401, 400],
+            empty: false,
+          },
+          requestOptions,
+        ).then((value) => value.data),
+      delete: (input: ServerPushDeleteInput, requestOptions?: RequestOptions) =>
+        request<ServerPushDeleteOutput>(
+          {
+            method: "DELETE",
+            path: `/api/push/subscription`,
+            query: { endpoint: input["endpoint"] },
+            successStatus: 204,
+            declaredStatuses: [401, 400],
+            empty: true,
+          },
+          requestOptions,
+        ),
+    },
   }
 }
 
@@ -1247,4 +1280,69 @@ async function json(response: Response): Promise<unknown> {
 
 function isContentType(response: Response, expected: string) {
   return response.headers.get("content-type")?.split(";", 1)[0]?.trim().toLowerCase() === expected
+}
+
+interface SseDataParserState {
+  line: string
+  data: string | undefined
+  skipLineFeed: boolean
+  size: number
+}
+
+function parseSseDataChunk(text: string, state: SseDataParserState, done: boolean): string[] {
+  const events: string[] = []
+  const append = (value: string) => {
+    if (value === "") return
+    state.line += value
+    state.size += value.length
+    if (state.size > 1_048_576) throw new ClientError("MalformedResponse")
+  }
+  const finishLine = () => {
+    if (state.line === "") {
+      if (state.data !== undefined && state.data !== "") events.push(state.data)
+      state.data = undefined
+      state.size = 0
+      return
+    }
+    if (state.line.startsWith("data:")) {
+      const value = state.line.slice(5).trimStart()
+      state.data = state.data === undefined ? value : state.data + "\n" + value
+    }
+    state.line = ""
+  }
+
+  let start = 0
+  while (start < text.length) {
+    if (state.skipLineFeed) {
+      state.skipLineFeed = false
+      if (text.charCodeAt(start) === 10) {
+        start++
+        continue
+      }
+    }
+    const lineFeed = text.indexOf("\n", start)
+    const carriageReturn = text.indexOf("\r", start)
+    let end = -1
+    if (lineFeed === -1) end = carriageReturn
+    else if (carriageReturn === -1) end = lineFeed
+    else end = Math.min(lineFeed, carriageReturn)
+    if (end === -1) {
+      append(text.slice(start))
+      break
+    }
+    append(text.slice(start, end))
+    finishLine()
+    state.skipLineFeed = text.charCodeAt(end) === 13
+    start = end + 1
+  }
+
+  if (done) {
+    if (state.line !== "") finishLine()
+    if (state.data !== undefined && state.data !== "") events.push(state.data)
+    state.line = ""
+    state.data = undefined
+    state.skipLineFeed = false
+    state.size = 0
+  }
+  return events
 }

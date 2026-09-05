@@ -867,6 +867,43 @@ const adaptGroup18 = (raw: RawClient["server.projectCopy"]) => ({
   refresh: Endpoint18_2(raw),
 })
 
+const Endpoint19_0 = (raw: RawClient["server.push"]) => () =>
+  raw["push.publicKey.get"]({}).pipe(
+    Effect.mapError(mapClientError),
+    Effect.map((value) => value.data),
+  )
+
+type Endpoint19_1Request = Parameters<RawClient["server.push"]["push.subscription.create"]>[0]
+type Endpoint19_1Input = {
+  readonly endpoint: Endpoint19_1Request["payload"]["endpoint"]
+  readonly keys: Endpoint19_1Request["payload"]["keys"]
+  readonly expirationTime?: Endpoint19_1Request["payload"]["expirationTime"]
+  readonly userAgentHint?: Endpoint19_1Request["payload"]["userAgentHint"]
+}
+const Endpoint19_1 = (raw: RawClient["server.push"]) => (input: Endpoint19_1Input) =>
+  raw["push.subscription.create"]({
+    payload: {
+      endpoint: input["endpoint"],
+      keys: input["keys"],
+      expirationTime: input["expirationTime"],
+      userAgentHint: input["userAgentHint"],
+    },
+  }).pipe(
+    Effect.mapError(mapClientError),
+    Effect.map((value) => value.data),
+  )
+
+type Endpoint19_2Request = Parameters<RawClient["server.push"]["push.subscription.delete"]>[0]
+type Endpoint19_2Input = { readonly endpoint: Endpoint19_2Request["query"]["endpoint"] }
+const Endpoint19_2 = (raw: RawClient["server.push"]) => (input: Endpoint19_2Input) =>
+  raw["push.subscription.delete"]({ query: { endpoint: input["endpoint"] } }).pipe(Effect.mapError(mapClientError))
+
+const adaptGroup19 = (raw: RawClient["server.push"]) => ({
+  get: Endpoint19_0(raw),
+  create: Endpoint19_1(raw),
+  delete: Endpoint19_2(raw),
+})
+
 const adaptClient = (raw: RawClient) => ({
   health: adaptGroup0(raw["server.health"]),
   location: adaptGroup1(raw["server.location"]),
@@ -887,6 +924,7 @@ const adaptClient = (raw: RawClient) => ({
   questions: adaptGroup16(raw["server.question"]),
   references: adaptGroup17(raw["server.reference"]),
   projectCopies: adaptGroup18(raw["server.projectCopy"]),
+  "server.push": adaptGroup19(raw["server.push"]),
 })
 
 export const make = (options?: { readonly baseUrl?: URL | string }) =>

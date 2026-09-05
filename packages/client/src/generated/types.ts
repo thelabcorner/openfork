@@ -276,6 +276,7 @@ export type SessionsListOutput = {
     }
     readonly time: { readonly created: number; readonly updated: number; readonly archived?: number }
     readonly title: string
+    readonly pausedAt?: number
     readonly location: { readonly directory: string; readonly workspaceID?: string }
     readonly subpath?: string
     readonly revert?: {
@@ -350,6 +351,7 @@ export type SessionsSearchOutput = {
       }
       readonly time: { readonly created: number; readonly updated: number; readonly archived?: number }
       readonly title: string
+      readonly pausedAt?: number
       readonly location: { readonly directory: string; readonly workspaceID?: string }
       readonly subpath?: string
       readonly revert?: {
@@ -431,6 +433,7 @@ export type SessionsCreateOutput = {
     }
     readonly time: { readonly created: number; readonly updated: number; readonly archived?: number }
     readonly title: string
+    readonly pausedAt?: number
     readonly location: { readonly directory: string; readonly workspaceID?: string }
     readonly subpath?: string
     readonly revert?: {
@@ -471,6 +474,7 @@ export type SessionsGetOutput = {
     }
     readonly time: { readonly created: number; readonly updated: number; readonly archived?: number }
     readonly title: string
+    readonly pausedAt?: number
     readonly location: { readonly directory: string; readonly workspaceID?: string }
     readonly subpath?: string
     readonly revert?: {
@@ -712,6 +716,7 @@ export type SessionsContextOutput = {
           readonly completed?: number
           readonly requestSentAt?: number
           readonly firstTokenAt?: number
+          readonly streamedAt?: number
         }
         readonly type: "assistant"
         readonly agent: string
@@ -850,6 +855,7 @@ export type SessionsHistoryOutput = {
           readonly sessionID: string
           readonly location: { readonly directory: string; readonly workspaceID?: string }
           readonly subdirectory?: string
+          readonly projectID?: string
         }
       }
     | {
@@ -972,7 +978,16 @@ export type SessionsHistoryOutput = {
           readonly agent: string
           readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
           readonly snapshot?: string
+          readonly requestSentAt?: number
         }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.step.streamed"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: { readonly timestamp: number; readonly sessionID: string; readonly assistantMessageID: string }
       }
     | {
         readonly id: string
@@ -1261,6 +1276,30 @@ export type SessionsHistoryOutput = {
         readonly location?: { readonly directory: string; readonly workspaceID?: string }
         readonly data: { readonly timestamp: number; readonly sessionID: string; readonly messageID: string }
       }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.paused"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: { readonly timestamp: number; readonly sessionID: string }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.resumed"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: { readonly timestamp: number; readonly sessionID: string }
+      }
+    | {
+        readonly id: string
+        readonly metadata?: { readonly [x: string]: JsonValue }
+        readonly type: "session.next.renamed"
+        readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+        readonly location?: { readonly directory: string; readonly workspaceID?: string }
+        readonly data: { readonly timestamp: number; readonly sessionID: string; readonly title: string }
+      }
   >
   readonly hasMore: boolean
 }
@@ -1308,6 +1347,7 @@ export type SessionsEventsOutput =
         readonly sessionID: string
         readonly location: { readonly directory: string; readonly workspaceID?: string }
         readonly subdirectory?: string
+        readonly projectID?: string
       }
     }
   | {
@@ -1430,7 +1470,16 @@ export type SessionsEventsOutput =
         readonly agent: string
         readonly model: { readonly id: string; readonly providerID: string; readonly variant?: string }
         readonly snapshot?: string
+        readonly requestSentAt?: number
       }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.step.streamed"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: { readonly timestamp: number; readonly sessionID: string; readonly assistantMessageID: string }
     }
   | {
       readonly id: string
@@ -1719,6 +1768,30 @@ export type SessionsEventsOutput =
       readonly location?: { readonly directory: string; readonly workspaceID?: string }
       readonly data: { readonly timestamp: number; readonly sessionID: string; readonly messageID: string }
     }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.paused"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: { readonly timestamp: number; readonly sessionID: string }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.resumed"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: { readonly timestamp: number; readonly sessionID: string }
+    }
+  | {
+      readonly id: string
+      readonly metadata?: { readonly [x: string]: unknown }
+      readonly type: "session.next.renamed"
+      readonly durable?: { readonly aggregateID: string; readonly seq: number; readonly version: number }
+      readonly location?: { readonly directory: string; readonly workspaceID?: string }
+      readonly data: { readonly timestamp: number; readonly sessionID: string; readonly title: string }
+    }
 
 export type SessionsInterruptInput = { readonly sessionID: { readonly sessionID: string }["sessionID"] }
 
@@ -1817,6 +1890,7 @@ export type SessionsMessageOutput = {
           readonly completed?: number
           readonly requestSentAt?: number
           readonly firstTokenAt?: number
+          readonly streamedAt?: number
         }
         readonly type: "assistant"
         readonly agent: string
@@ -1913,17 +1987,17 @@ export type SessionsListCheckpointsInput = {
   readonly sessionID: { readonly sessionID: string }["sessionID"]
   readonly limit?: {
     readonly limit?: number | undefined
-    readonly status?: "capturing" | "ready" | "partial" | "error" | undefined
+    readonly status?: "capturing" | "ready" | "partial" | "error" | "aborted" | undefined
     readonly kind?: "baseline" | "turn" | "manual" | "pre-revert" | undefined
   }["limit"]
   readonly status?: {
     readonly limit?: number | undefined
-    readonly status?: "capturing" | "ready" | "partial" | "error" | undefined
+    readonly status?: "capturing" | "ready" | "partial" | "error" | "aborted" | undefined
     readonly kind?: "baseline" | "turn" | "manual" | "pre-revert" | undefined
   }["status"]
   readonly kind?: {
     readonly limit?: number | undefined
-    readonly status?: "capturing" | "ready" | "partial" | "error" | undefined
+    readonly status?: "capturing" | "ready" | "partial" | "error" | "aborted" | undefined
     readonly kind?: "baseline" | "turn" | "manual" | "pre-revert" | undefined
   }["kind"]
 }
@@ -1934,7 +2008,7 @@ export type SessionsListCheckpointsOutput = {
     readonly sessionID: string
     readonly ordinal: number
     readonly kind: "baseline" | "turn" | "manual" | "pre-revert"
-    readonly status: "capturing" | "ready" | "partial" | "error"
+    readonly status: "capturing" | "ready" | "partial" | "error" | "aborted"
     readonly userMessageID?: string | undefined
     readonly assistantMessageID?: string | undefined
     readonly beforeSnapshot: string
@@ -1959,7 +2033,7 @@ export type SessionsGetCheckpointOutput = {
   readonly sessionID: string
   readonly ordinal: number
   readonly kind: "baseline" | "turn" | "manual" | "pre-revert"
-  readonly status: "capturing" | "ready" | "partial" | "error"
+  readonly status: "capturing" | "ready" | "partial" | "error" | "aborted"
   readonly userMessageID?: string | undefined
   readonly assistantMessageID?: string | undefined
   readonly beforeSnapshot: string
@@ -2015,7 +2089,7 @@ export type SessionsRevertCheckpointOutput = {
   readonly sessionID: string
   readonly ordinal: number
   readonly kind: "baseline" | "turn" | "manual" | "pre-revert"
-  readonly status: "capturing" | "ready" | "partial" | "error"
+  readonly status: "capturing" | "ready" | "partial" | "error" | "aborted"
   readonly userMessageID?: string | undefined
   readonly assistantMessageID?: string | undefined
   readonly beforeSnapshot: string
@@ -2040,7 +2114,7 @@ export type SessionsCreateCheckpointOutput = {
   readonly sessionID: string
   readonly ordinal: number
   readonly kind: "baseline" | "turn" | "manual" | "pre-revert"
-  readonly status: "capturing" | "ready" | "partial" | "error"
+  readonly status: "capturing" | "ready" | "partial" | "error" | "aborted"
   readonly userMessageID?: string | undefined
   readonly assistantMessageID?: string | undefined
   readonly beforeSnapshot: string
@@ -2139,6 +2213,7 @@ export type MessagesListOutput = {
           readonly completed?: number
           readonly requestSentAt?: number
           readonly firstTokenAt?: number
+          readonly streamedAt?: number
         }
         readonly type: "assistant"
         readonly agent: string
@@ -2779,7 +2854,13 @@ export type FilesListOutput = {
     readonly workspaceID?: string
     readonly project: { readonly id: string; readonly directory: string }
   }
-  readonly data: ReadonlyArray<{ readonly path: string; readonly type: "file" | "directory" }>
+  readonly data: ReadonlyArray<{
+    readonly path: string
+    readonly type: "file" | "directory"
+    readonly size?: number | "Infinity" | "-Infinity" | "NaN"
+    readonly mtime?: number | "Infinity" | "-Infinity" | "NaN"
+    readonly lineCount?: number | "Infinity" | "-Infinity" | "NaN"
+  }>
 }
 
 export type FilesFindInput = {
@@ -2815,7 +2896,13 @@ export type FilesFindOutput = {
     readonly workspaceID?: string
     readonly project: { readonly id: string; readonly directory: string }
   }
-  readonly data: ReadonlyArray<{ readonly path: string; readonly type: "file" | "directory" }>
+  readonly data: ReadonlyArray<{
+    readonly path: string
+    readonly type: "file" | "directory"
+    readonly size?: number | "Infinity" | "-Infinity" | "NaN"
+    readonly mtime?: number | "Infinity" | "-Infinity" | "NaN"
+    readonly lineCount?: number | "Infinity" | "-Infinity" | "NaN"
+  }>
 }
 
 export type FilesWriteInput = {
@@ -3190,3 +3277,45 @@ export type ProjectCopiesRefreshInput = {
 }
 
 export type ProjectCopiesRefreshOutput = void
+
+export type ServerPushGetOutput = { readonly data: { readonly publicKey: string } }["data"]
+
+export type ServerPushCreateInput = {
+  readonly endpoint: {
+    readonly endpoint: string
+    readonly keys: { readonly p256dh: string; readonly auth: string }
+    readonly expirationTime?: number | null | undefined
+    readonly userAgentHint?: string | undefined
+  }["endpoint"]
+  readonly keys: {
+    readonly endpoint: string
+    readonly keys: { readonly p256dh: string; readonly auth: string }
+    readonly expirationTime?: number | null | undefined
+    readonly userAgentHint?: string | undefined
+  }["keys"]
+  readonly expirationTime?: {
+    readonly endpoint: string
+    readonly keys: { readonly p256dh: string; readonly auth: string }
+    readonly expirationTime?: number | null | undefined
+    readonly userAgentHint?: string | undefined
+  }["expirationTime"]
+  readonly userAgentHint?: {
+    readonly endpoint: string
+    readonly keys: { readonly p256dh: string; readonly auth: string }
+    readonly expirationTime?: number | null | undefined
+    readonly userAgentHint?: string | undefined
+  }["userAgentHint"]
+}
+
+export type ServerPushCreateOutput = {
+  readonly data: {
+    readonly id: string
+    readonly createdAt: string
+    readonly lastSeenAt: string
+    readonly userAgentHint?: string | undefined
+  }
+}["data"]
+
+export type ServerPushDeleteInput = { readonly endpoint: { readonly endpoint: string }["endpoint"] }
+
+export type ServerPushDeleteOutput = void

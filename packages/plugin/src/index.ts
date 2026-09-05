@@ -263,6 +263,14 @@ export interface Hooks {
     input: { command: string; sessionID: string; arguments: string },
     output: { parts: Part[] },
   ) => Promise<void>
+  /**
+   * Optionally assign a newly-created session to a host-managed group.
+   * This hook is additive and failures are ignored by the host.
+   */
+  "experimental.session.group.assign"?: (
+    input: { sessionID: string; parentID?: string; agent?: string; title?: string },
+    output: { groupID?: string; locked?: boolean; origin?: "user" | "auto_subagent" | "plugin" },
+  ) => Promise<void>
   "tool.execute.before"?: (
     input: { tool: string; sessionID: string; callID: string },
     output: { args: any },
