@@ -42,7 +42,7 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 | Project explorer | `packages/app/src/components/project-explorer*`, `packages/app/src/pages/session/v2/project-explorer*` |
 | Models / usage | `packages/app/src/pages/session/models-panel*`, `packages/app/src/components/models/`, `packages/app/src/context/fork-usage.tsx`, `packages/app/src/utils/fork-client.ts` |
 | Hosted browser | `packages/desktop/src/main/browser/**`, `packages/app/src/pages/session/v2/browser*` |
-| Session groups | `packages/schema/src/session-group*`, `packages/core/src/session/group-id.ts`, `packages/opencode/src/session/group.ts`, `httpapi/**/session-group.ts`, `packages/app/**/session-group*` |
+| Session groups | `packages/schema/src/session-group*`, `packages/schema/src/event-manifest.ts` (group events), `packages/core/src/session/{group-id,sql}.ts`, `packages/core/src/database/migration/*session_group*`, `packages/opencode/src/session/group.ts`, `packages/opencode/src/tool/task.ts` (subagent auto-grouping), `httpapi/**/session-group.ts`, `packages/app/**/session-group*`, `packages/app/src/context/server-sync.tsx` (group-event coherence) |
 | Pause / retitle | V1 pause/resume/regenerate-title handlers, `packages/core/src/session/title.ts` |
 | SPAD | `packages/opencode/src/session/spad/**` |
 | Quota | `packages/opencode/src/quota/**`, `httpapi/**/quota.ts` |
@@ -51,6 +51,7 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 | Search extras | `packages/core/src/search/**` |
 | Checkpoints | `packages/core/src/checkpoint.ts`, `packages/opencode/src/session/checkpoint.ts` |
 | Conversation Control | `packages/schema/src/session-context.ts`, `packages/core/src/session/sql.ts` (context tables), `packages/core/src/database/migration/*conversation_control*`, `packages/opencode/src/session/context/**`, `packages/opencode/src/session/fork/**`, `httpapi/**/session-context.ts`, `packages/opencode/src/session/message-v2.ts` (context seam), `packages/app/src/components/context-ledger/**`, `packages/app/src/components/context-history/**` |
+| Throughput | `packages/schema/src/session-message.ts` + `v1/session.ts` (`streamedAt`), `packages/schema/src/session-event.ts` (`Step.Streamed`, `requestSentAt` on `Step.Started`), `packages/core/src/session/{throughput,message-updater,projector,runner}` (boundary + projection + pure calc), `packages/opencode/src/session/processor.ts` (V1 stamps — the path that serves the desktop timeline), `packages/session-ui/src/components/message-part.tsx` (`toThroughputMessage`, footer meta) + `session-turn.tsx`, `packages/app/src/pages/session/timeline/message-timeline.tsx` (the chip the desktop actually renders), `packages/ui/src/i18n/en.ts` (`ui.message.throughput`) |
 | Meta | `docs/handoff/AGENTS.md`, `FORK.md`, `.github/workflows/**`, root `README.md`, `packages/desktop/src/main/updater.ts` |
 
 ### Union — combine both sides
@@ -99,6 +100,9 @@ Unit tests carrying both fork and upstream assertions (`test/tool/websearch.test
 - Fork credentials / Go usage cache wired
 - Pause / resume / regenerate-title on V1 HttpApi
 - Session groups listed
+- Subagent auto-grouping intact
+- Locked session-group memberships enforced
+- Session-group plugin hooks registered
 - Quota routes registered
 - Extra tools present **and** new upstream tools present
 - Websearch = fork engines ∪ upstream additions
@@ -107,6 +111,7 @@ Unit tests carrying both fork and upstream assertions (`test/tool/websearch.test
 - `bun run --cwd packages/desktop dev` boots
 - Channel DB still fork-specific
 - Updater still disabled or still this repo
+- Throughput boundary stamped, `streamedAt` projected, footer chip renders a value on a live turn
 
 ## License
 

@@ -47,5 +47,24 @@
   "options": {
     "typeAware": true
   },
-  "ignorePatterns": ["**/node_modules", "**/dist", "**/.build", "**/.sst", "**/*.d.ts", "**/sdk.gen.ts"]
+  "ignorePatterns": ["**/node_modules", "**/dist", "**/.build", "**/.sst", "**/*.d.ts", "**/sdk.gen.ts"],
+  "overrides": [
+    {
+      // SolidJS runs a `createMemo` body immediately, so a memo that reads a
+      // `const` declared below it throws a temporal-dead-zone ReferenceError.
+      // That throw escapes Solid's update queue and leaves it wedged: the store
+      // keeps updating but nothing re-renders, so the whole PWA freezes on its
+      // last painted frame and every tap appears to do nothing. TypeScript
+      // cannot see it — the reference sits inside a closure — and it shipped
+      // once already in ModelPicker.tsx.
+      //
+      // Scoped to this package: `functions: false` keeps hoisted declarations
+      // legal, and the rest of the monorepo has ~670 pre-existing hits that are
+      // not worth blocking on here.
+      "files": ["packages/mobile/**/*.ts", "packages/mobile/**/*.tsx"],
+      "rules": {
+        "no-use-before-define": ["error", { "functions": false, "classes": false, "variables": true }]
+      }
+    }
+  ]
 }

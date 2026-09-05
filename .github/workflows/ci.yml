@@ -51,3 +51,14 @@ jobs:
 
       - name: App utility tests
         run: bun test packages/app/test/utils
+
+      # The model-selector logic the desktop and the PWA now share, plus the
+      # PWA's own selector wiring. Typecheck alone cannot catch a reordering
+      # regression in either.
+      - name: Shared model-select tests
+        run: bun test test/model-select.test.ts
+        working-directory: packages/schema
+
+      - name: Mobile tests
+        run: bun test src
+        working-directory: packages/mobile
