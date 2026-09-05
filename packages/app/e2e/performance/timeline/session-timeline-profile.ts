@@ -1,4 +1,4 @@
-import type { CDPSession, Page } from "@playwright/test"
+import { test, type Page } from "@playwright/test"
 
 export async function startTimelineProfile(page: Page, options: { cpuThrottle: number; profileCPU: boolean }) {
   const cdp = await page.context().newCDPSession(page)
@@ -12,6 +12,10 @@ export async function startTimelineProfile(page: Page, options: { cpuThrottle: n
     async stop() {
       if (!options.profileCPU) return
       const result = await cdp.send("Profiler.stop")
+      await test.info().attach("timeline-cpu-profile", {
+        body: Buffer.from(JSON.stringify(result.profile)),
+        contentType: "application/json",
+      })
       const self = new Map<number, number>()
       result.profile.samples?.forEach((id, index) => {
         const duration = (result.profile.timeDeltas?.[index] ?? 0) / 1_000
@@ -25,6 +29,7 @@ export async function startTimelineProfile(page: Page, options: { cpuThrottle: n
               function: node.callFrame.functionName || "(anonymous)",
               url: node.callFrame.url,
               line: node.callFrame.lineNumber + 1,
+              column: node.callFrame.columnNumber + 1,
               selfMs: self.get(node.id) ?? 0,
             }))
             .filter((node) => node.selfMs > 1)

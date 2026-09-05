@@ -1,6 +1,17 @@
 import type { Page, Route } from "@playwright/test"
+import { createEventStreamServer } from "./event-stream-server"
 
-const emptyList = new Set(["/skill", "/command", "/lsp", "/formatter", "/vcs/status", "/vcs/diff", "/fork/credential", "/api/session-group", "/session-group"])
+const emptyList = new Set([
+  "/skill",
+  "/command",
+  "/lsp",
+  "/formatter",
+  "/vcs/status",
+  "/vcs/diff",
+  "/fork/credential",
+  "/api/session-group",
+  "/session-group",
+])
 const emptyObject = new Set(["/global/config", "/config", "/provider/auth", "/mcp", "/experimental/resource"])
 
 export interface MockServerConfig {
@@ -21,6 +32,7 @@ export interface MockServerConfig {
   onMessage?: (input: { sessionID: string; messageID: string }) => void
   events?: () => unknown[]
   eventRetry?: number
+  persistentEvents?: boolean
   todos?: (sessionID: string) => unknown[]
   permissions?: unknown[] | (() => unknown[])
   questions?: unknown[] | (() => unknown[])
@@ -31,6 +43,20 @@ export interface MockServerConfig {
 }
 
 export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
+  const stream = config.persistentEvents
+    ? await createEventStreamServer({
+        interval: config.eventRetry ?? 16,
+        connected: (path) =>
+          path === "/api/event"
+            ? { id: "evt_mock_connected", type: "server.connected", data: {} }
+            : { payload: { id: "evt_mock_connected", type: "server.connected", properties: {} } },
+        events: (path) => {
+          const events = config.events?.() ?? []
+          return path === "/api/event" ? events.map(currentEvent) : events
+        },
+      })
+    : undefined
+  if (stream) page.once("close", () => stream.close())
   const cursors = new Map<string, string>()
   let nextCursor = 0
   const staticRoutes: Record<string, unknown> = {
@@ -64,6 +90,7 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
 
     const path = url.pathname
     if (path === "/global/event" || path === "/event" || path === "/api/event") {
+      if (stream) return route.continue({ url: `${stream.url}${path}` })
       const events = config.events?.()
       return sse(
         route,
@@ -78,12 +105,31 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
         config.eventRetry,
       )
     }
-    if (path === "/fork/usage")
-      return json(route, { aggregate: [], byCredential: [] })
+    if (path === "/fork/usage") return json(route, { aggregate: [], byCredential: [] })
     if (path === "/global/health")
       return config.protocol === "v2" ? json(route, {}, undefined, 404) : json(route, { healthy: true })
-    if (path === "/api/health" && config.protocol === "v2")
-      return json(route, { healthy: true, version: "2.0.0", pid: 1 })
+    if (path === "/api/health")
+      return config.protocol === "v2"
+        ? json(route, { healthy: true, version: "2.0.0", pid: 1 })
+        : json(route, {}, undefined, 404)
+    if (path === "/global/preferences") return json(route, {})
+    if (path === "/api/skill") return json(route, { location: location(config), data: [] })
+    if (path === "/quota/providers") return json(route, { providers: [] })
+    // Per-provider quota reads (e.g. /quota/claude, /quota/opencode-zen) come
+    // from usage hooks mounted by the app shell. Answer "not configured" so
+    // they degrade gracefully instead of falling through to the HTML shell.
+    const quotaProvider = path.match(/^\/quota\/([^/]+)$/)?.[1]
+    if (quotaProvider && quotaProvider !== "providers") {
+      return json(route, {
+        providerId: quotaProvider,
+        providerName: quotaProvider,
+        ok: false,
+        configured: false,
+        usage: null,
+        fetchedAt: Date.now(),
+      })
+    }
+    if (path === "/experimental/openrouter-free-usage") return json(route, { error: "Not configured" }, undefined, 404)
     if (path === "/experimental/capabilities") return json(route, { backgroundSubagents: true })
     if (path === "/provider")
       return json(route, typeof config.provider === "function" ? config.provider() : config.provider)
@@ -107,8 +153,8 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
         typeof config.sessionStatus === "function" ? config.sessionStatus() : (config.sessionStatus ?? {}),
       )
     if (path === "/vcs/diff" && config.vcsDiff) return json(route, config.vcsDiff)
-    if (path === "/file" && config.fileList)
-      return json(route, await config.fileList(url.searchParams.get("path") ?? ""))
+    if (path === "/file")
+      return json(route, config.fileList ? await config.fileList(url.searchParams.get("path") ?? "") : [])
     if (path === "/file/content" && config.fileContent)
       return json(route, await config.fileContent(url.searchParams.get("path") ?? ""))
     if (path === "/find/file" && config.findFiles)
@@ -321,6 +367,8 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
     }
 
     if (url.port === targetPort && targetPort !== appPort) return json(route, {})
+    if (process.env.OPENCODE_MOCK_DIAGNOSTICS === "1" && ["fetch", "xhr"].includes(route.request().resourceType()))
+      console.warn("[mock-server] unhandled request", route.request().method(), path)
     return route.fallback()
   })
 }

@@ -123,6 +123,7 @@ export async function setupTimelineBenchmark(
     }),
     events: () => events.splice(0, eventBatch),
     eventRetry: 16,
+    persistentEvents: true,
   })
   await page.addInitScript(
     (input) => {
