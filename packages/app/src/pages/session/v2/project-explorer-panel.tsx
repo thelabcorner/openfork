@@ -1,4 +1,4 @@
-import { createSignal, Show } from "solid-js"
+import { createSignal, onCleanup, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { debounce } from "@solid-primitives/scheduled"
 import { ResizeHandle, type ResizeHandlePairSide } from "@opencode-ai/ui/resize-handle"
@@ -55,6 +55,7 @@ export function ProjectExplorerPanel(props: {
   // filters on, so typing never blocks the main thread.
   const [search, setSearch] = createStore({ input: "", query: "" })
   const applySearch = debounce((value: string) => setSearch("query", value), 120)
+  onCleanup(() => applySearch.clear())
   const clearSearch = () => {
     applySearch.clear()
     setSearch({ input: "", query: "" })
@@ -79,6 +80,54 @@ export function ProjectExplorerPanel(props: {
     })
   }
 
+  // Rename/delete/create callbacks can arrive as a synchronous burst from a
+  // multi-selection or a drag operation. Keep a small amount of parallelism
+  // for real backends while preventing one gesture from opening an unbounded
+  // set of requests and promise continuations on the renderer's event loop.
+  const MAX_MUTATION_QUEUE = 512
+  const mutationQueue: Array<() => Promise<unknown>> = []
+  let activeMutations = 0
+  let disposed = false
+  let mutationOverflowNotified = false
+  const pumpMutations = () => {
+    while (activeMutations < 2 && mutationQueue.length > 0) {
+      const operation = mutationQueue.shift()!
+      activeMutations += 1
+      void Promise.resolve()
+        .then(operation)
+        .catch((error) => {
+          // Active filesystem operations cannot be force-cancelled by every
+          // backend, but a panel that has unmounted must not enqueue a late
+          // toast or another renderer update when they settle.
+          if (!disposed) notImplementedToast(error)
+        })
+        .finally(() => {
+          activeMutations -= 1
+          if (mutationQueue.length < MAX_MUTATION_QUEUE / 2) mutationOverflowNotified = false
+          pumpMutations()
+        })
+    }
+  }
+  const enqueueMutation = (operation: () => Promise<unknown>) => {
+    if (disposed) return
+    if (mutationQueue.length >= MAX_MUTATION_QUEUE) {
+      if (mutationOverflowNotified) return
+      mutationOverflowNotified = true
+      showToast({
+        variant: "error",
+        title: language.t("common.requestFailed"),
+        description: "Too many file operations are queued; wait for the current batch to finish.",
+      })
+      return
+    }
+    mutationQueue.push(operation)
+    pumpMutations()
+  }
+  onCleanup(() => {
+    disposed = true
+    mutationQueue.length = 0
+  })
+
   const openFile = (path: string) => {
     props.state.openEditor()
     void editorHandle?.openFile(path)
@@ -99,7 +148,16 @@ export function ProjectExplorerPanel(props: {
       showToast({ variant: "error", title: language.t("projectExplorer.contextMenu.noActiveChat") })
       return
     }
-    for (const p of paths) props.onAddToChat(p)
+    void (async () => {
+      for (let index = 0; index < paths.length; index++) {
+        if (disposed) return
+        props.onAddToChat?.(paths[index])
+        // Prompt/context updates are synchronous Solid store writes. Yield
+        // between small chunks so a huge selection cannot monopolize the
+        // renderer task that handled the click.
+        if ((index + 1) % 32 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      }
+    })()
     showToast({
       title: language.t("projectExplorer.contextMenu.addedToChat", { name: `${paths.length} files` }),
     })
@@ -270,9 +328,9 @@ export function ProjectExplorerPanel(props: {
               if (node.type === "file") openFile(node.path)
             }}
             onMention={addToChat}
-            onRename={(from, to) => void fileOps().rename({ from, to }).catch(notImplementedToast)}
-            onDelete={(path) => void fileOps().delete({ path }).catch(notImplementedToast)}
-            onCreate={(path, kind) => void fileOps().mkdir({ path, kind }).catch(notImplementedToast)}
+            onRename={(from, to) => enqueueMutation(() => fileOps().rename({ from, to }).catch(notImplementedToast))}
+            onDelete={(path) => enqueueMutation(() => fileOps().delete({ path }).catch(notImplementedToast))}
+            onCreate={(path, kind) => enqueueMutation(() => fileOps().mkdir({ path, kind }).catch(notImplementedToast))}
           />
         </ScrollView>
         {/* Divider on the tree's right edge: tree|editor, or tree|session. */}

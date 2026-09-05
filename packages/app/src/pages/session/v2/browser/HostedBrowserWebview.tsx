@@ -460,39 +460,50 @@ export function HostedBrowserWebview(props: {
     if (annotating()) void browserHostClient.cancelAnnotation(props.tabId)
   })
 
-  /** Converts a resolved annotation into composer content parts: the
-   * structured prompt block as a trailing text part, plus the screenshot
-   * crop (if capture succeeded) as an image attachment — same shape a
-   * pasted/dropped image takes (see prompt-input/attachments.ts). Screenshot
-   * failure never blocks the text context from landing. */
-  async function buildAnnotationParts(annotation: BrowserAnnotationResult): Promise<Array<TextPart | ImageAttachmentPart>> {
-    const parts: Array<TextPart | ImageAttachmentPart> = [
-      { type: "text", content: buildBrowserAnnotationPrompt(annotation), start: 0, end: 0 },
-    ]
-    if (!annotation.screenshot) return parts
+  /** The structured prompt block for a resolved annotation — a plain text
+   * part. Built synchronously so it can be committed to the persisted draft
+   * BEFORE any async screenshot work (invariant #7: persist the annotation into
+   * the composer draft first, then do image conversion). */
+  function buildAnnotationTextPart(annotation: BrowserAnnotationResult): TextPart {
+    return { type: "text", content: buildBrowserAnnotationPrompt(annotation), start: 0, end: 0 }
+  }
+
+  /** Converts the annotation screenshot crop into an image attachment — the
+   * same shape a pasted/dropped image takes (see prompt-input/attachments.ts),
+   * with the bytes already blob-handled by platform.draftStore (line 482).
+   * Screenshot failure returns null; it must not discard the text part already
+   * committed to the draft. */
+  async function buildAnnotationImagePart(annotation: BrowserAnnotationResult): Promise<ImageAttachmentPart | null> {
+    if (!annotation.screenshot) return null
     try {
       const response = await fetch(annotation.screenshot.dataUrl)
       const blob = await response.blob()
       const file = new File([blob], `browser-annotation-${annotation.id}.png`, { type: annotation.screenshot.mime })
-      parts.push({
+      return {
         type: "image",
         id: uuid(),
         filename: file.name,
         mime: annotation.screenshot.mime,
         blob: platform.draftStore ? await platform.draftStore.putBlob(file) : await createBlobReference(file),
-      })
+      }
     } catch {
-      // Attachment conversion failure must not discard the structured
-      // annotation text already queued above.
+      return null
     }
-    return parts
   }
 
-  function attachAnnotation(parts: Array<TextPart | ImageAttachmentPart>) {
+  /** Persists the annotation text into the composer draft FIRST (synchronously,
+   * before any async screenshot conversion), then appends the screenshot crop
+   * once it resolves. Ordering matters: a reload mid-conversion must still find
+   * the annotation document, not a half-written draft. */
+  async function attachAnnotation(annotation: BrowserAnnotationResult) {
     const target = browserHostClient.annotationTarget()
     if (!target) return
     const capture = target.capture()
-    capture.set([...capture.current(), ...parts], capture.cursor())
+    capture.set([...capture.current(), buildAnnotationTextPart(annotation)], capture.cursor())
+    const image = await buildAnnotationImagePart(annotation)
+    if (!image) return
+    const after = target.capture()
+    after.set([...after.current(), image], after.cursor())
   }
 
   /** True send (not just attach-to-draft): builds a minimal FollowupDraft and
@@ -505,11 +516,14 @@ export function HostedBrowserWebview(props: {
    * first" branch to handle. Falls back to attaching if there's no live
    * session or no model/agent selected, rather than silently dropping the
    * annotation. */
-  async function sendAnnotation(parts: Array<TextPart | ImageAttachmentPart>) {
+  async function sendAnnotation(annotation: BrowserAnnotationResult) {
     const target = browserHostClient.annotationTarget()
     if (!target) return
+    const parts: Array<TextPart | ImageAttachmentPart> = [buildAnnotationTextPart(annotation)]
+    const image = await buildAnnotationImagePart(annotation)
+    if (image) parts.push(image)
     if (!target.agent || !target.model.providerID) {
-      attachAnnotation(parts)
+      attachAnnotation(annotation)
       showToast({ title: language.t("browser.annotate.toast.attached.title") })
       return
     }
@@ -545,12 +559,11 @@ export function HostedBrowserWebview(props: {
     const result = await browserHostClient.startAnnotation(props.tabId)
     setAnnotating(false)
     if (!result) return
-    const parts = await buildAnnotationParts(result)
     if (result.submission === "send") {
-      await sendAnnotation(parts)
+      await sendAnnotation(result)
       return
     }
-    attachAnnotation(parts)
+    await attachAnnotation(result)
     showToast({ title: language.t("browser.annotate.toast.attached.title") })
   }
 

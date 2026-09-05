@@ -1,0 +1,88 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`buildBrowserAnnotationPrompt — snapshot fixtures element-only 1`] = `
+"<browser_annotation>
+Browser annotation:
+Id: annotation-1
+Page: https://example.com (Example)
+Targets: 1 selected element.
+<element_context>
+- <SaveButton> (src/SaveButton.tsx:12):
+  source: src/SaveButton.tsx:12:3
+  selector: #save
+  html:
+    <button id="save">Save</button>
+  styles:
+    color: red; padding: 8px;
+</element_context>
+</browser_annotation>"
+`;
+
+exports[`buildBrowserAnnotationPrompt — snapshot fixtures region-only 1`] = `
+"<browser_annotation>
+Browser annotation:
+Id: annotation-1
+Page: https://example.com (Example)
+Targets: 1 marked region.
+</browser_annotation>"
+`;
+
+exports[`buildBrowserAnnotationPrompt — snapshot fixtures drawing-only 1`] = `
+"<browser_annotation>
+Browser annotation:
+Id: annotation-1
+Page: https://example.com (Example)
+Targets: 1 drawing.
+</browser_annotation>"
+`;
+
+exports[`buildBrowserAnnotationPrompt — snapshot fixtures comment-only 1`] = `
+"<browser_annotation>
+Browser annotation:
+Id: annotation-1
+Page: https://example.com (Example)
+Comment: why is this misaligned on Safari?
+Targets: no targets selected.
+</browser_annotation>"
+`;
+
+exports[`buildBrowserAnnotationPrompt — snapshot fixtures style-only 1`] = `
+"<browser_annotation>
+Browser annotation:
+Id: annotation-1
+Page: https://example.com (Example)
+Targets: no targets selected.
+Requested visual changes:
+- border-radius: 4px -> 12px
+- background: #fff -> #0f0
+</browser_annotation>"
+`;
+
+exports[`buildBrowserAnnotationPrompt — snapshot fixtures maximal 1`] = `
+"<browser_annotation>
+Browser annotation:
+Id: annotation-1
+Page: https://example.com (Example)
+Comment: nudge this card and recolor the button
+Targets: 2 selected elements, 1 marked region, 2 drawings.
+Requested visual changes:
+- border-radius: 4px -> 12px
+The attached screenshot is the annotated preview crop.
+<element_context>
+- <SaveButton> (src/SaveButton.tsx:12):
+  source: src/SaveButton.tsx:12:3
+  selector: #save
+  html:
+    <button id="save">Save</button>
+  styles:
+    color: red; padding: 8px;
+- <Card> (src/Card.tsx:40):
+  source: src/Card.tsx:40
+  selector: .card
+  html:
+    <div class="card"><h2>Title</h2></div>
+  styles:
+    display: flex; gap: 12px;
+</element_context>
+</browser_annotation>"
+`;

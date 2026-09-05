@@ -20,7 +20,18 @@ import { browserSnapshotStore } from "./browserSnapshotStore"
 import { browserSurfaceStore } from "./browserSurfaceStore"
 import type { DirectorySDK } from "@/context/sdk"
 import type { DirectorySync } from "@/context/sync"
-import type { PromptStore } from "@/context/prompt"
+import type { Accessor } from "solid-js"
+import type { SetStoreFunction } from "solid-js/store"
+import type { Prompt, PromptStore } from "@/context/prompt-state"
+
+/** The slice of the prompt session the annotation flow needs: append parts and
+ * read the current prompt. `prompt.capture()` returns exactly this shape. */
+export type AnnotationPromptTarget = {
+  set: (prompt: Prompt, cursor?: number) => void
+  current: () => Prompt
+  cursor: () => number | undefined
+  store: [Accessor<PromptStore>, SetStoreFunction<PromptStore>]
+}
 import type { BrowserAppearance, BrowserController, BrowserGuestState, BrowserHostState } from "./types"
 
 export type { BrowserAppearance }
@@ -179,7 +190,7 @@ export type BrowserAnnotationTarget = {
   model: { providerID: string; modelID: string; variant?: string | null }
   api: DirectorySDK["api"]["session"]
   sync: DirectorySync
-  capture: () => PromptStore
+  capture: () => AnnotationPromptTarget
 }
 
 const [annotationTarget, setAnnotationTarget] = createSignal<BrowserAnnotationTarget | null>(null)

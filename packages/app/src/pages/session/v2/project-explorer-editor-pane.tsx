@@ -203,6 +203,7 @@ export function ProjectExplorerEditorPane(props: {
   let editorFrame: HTMLDivElement | undefined
   let tabBar: HTMLDivElement | undefined
   let view: EditorView | undefined
+  let disposed = false
   const [editorView, setEditorView] = createSignal<EditorView>()
   const languageCompartment = new Compartment()
   const viewsByPath = new Map<string, { state: EditorState }>()
@@ -276,6 +277,7 @@ export function ProjectExplorerEditorPane(props: {
 
   onMount(mountEditor)
   onCleanup(() => {
+    disposed = true
     view?.destroy()
     setEditorView(undefined)
   })
@@ -365,8 +367,13 @@ export function ProjectExplorerEditorPane(props: {
     setActivePath(path)
     if (!buffers().some((buffer) => buffer.path === path)) {
       await file.load(path)
-      setBuffers((list) => [...list, bufferFromFileState(path)])
+      if (disposed) return
+      // Two rapid opens of the same file can share the read promise. Check
+      // again after the await so both continuations cannot append duplicate
+      // buffers, and do not let an older open overwrite the newer active tab.
+      if (!buffers().some((buffer) => buffer.path === path)) setBuffers((list) => [...list, bufferFromFileState(path)])
     }
+    if (disposed || activePath() !== path) return
     swapToBuffer(path)
   }
 
@@ -379,16 +386,72 @@ export function ProjectExplorerEditorPane(props: {
     }
 
     await file.load(path, { force: true })
+    if (disposed) return
     const next = bufferFromFileState(path, buffer.savedHash)
     setBuffers((list) => list.map((entry) => (entry.path === path ? next : entry)))
     if (activePath() === path) swapToBuffer(path)
   }
 
+  // File watcher events can arrive once per write chunk (and a formatter or
+  // branch switch can produce a burst for several open files). Coalesce by
+  // path and refresh at most two buffers concurrently so each event does not
+  // enqueue a separate read, state replacement, and editor redraw.
+  const pendingExternalReloads = new Set<string>()
+  const MAX_PENDING_EXTERNAL_RELOADS = 256
+  let externalReloadTimer: ReturnType<typeof setTimeout> | undefined
+  let externalReloadRunning = false
+  let externalReloadDisposed = false
+  const drainExternalReloads = () => {
+    if (externalReloadDisposed || externalReloadRunning || externalReloadTimer || pendingExternalReloads.size === 0)
+      return
+    externalReloadTimer = setTimeout(() => {
+      externalReloadTimer = undefined
+      if (externalReloadDisposed) return
+      const paths = [...pendingExternalReloads]
+      pendingExternalReloads.clear()
+      if (paths.length === 0) return
+
+      externalReloadRunning = true
+      let cursor = 0
+      const worker = async () => {
+        while (cursor < paths.length) {
+          if (externalReloadDisposed) return
+          const path = paths[cursor++]
+          if (path) await reloadCleanBuffer(path)
+        }
+      }
+      const workers = Array.from({ length: Math.min(2, paths.length) }, () => worker())
+      void Promise.all(workers)
+        .catch(() => undefined)
+        .finally(() => {
+          externalReloadRunning = false
+          drainExternalReloads()
+        })
+    }, 80)
+  }
+
   createEffect(() => {
+    externalReloadDisposed = false
     const stop = sdk().event.on("file.edited", (event) => {
-      void reloadCleanBuffer(file.normalize(event.properties.file))
+      const path = file.normalize(event.properties.file)
+      // Only open buffers can be redrawn, and a bounded newest window keeps a
+      // formatter/patch burst from retaining arbitrary path strings until the
+      // debounce timer fires.
+      if (!buffers().some((buffer) => buffer.path === path)) return
+      if (!pendingExternalReloads.has(path) && pendingExternalReloads.size >= MAX_PENDING_EXTERNAL_RELOADS) {
+        const oldest = pendingExternalReloads.values().next().value
+        if (typeof oldest === "string") pendingExternalReloads.delete(oldest)
+      }
+      pendingExternalReloads.add(path)
+      drainExternalReloads()
     })
-    onCleanup(stop)
+    onCleanup(() => {
+      externalReloadDisposed = true
+      if (externalReloadTimer) clearTimeout(externalReloadTimer)
+      externalReloadTimer = undefined
+      pendingExternalReloads.clear()
+      stop()
+    })
   })
 
   const swapToBuffer = (path: string) => {
@@ -539,120 +602,120 @@ export function ProjectExplorerEditorPane(props: {
           data-slot="project-explorer-editor-tabbar"
           class="flex h-8 items-center gap-0.5 overflow-x-auto px-1"
         >
-        <For each={buffers()}>
-          {(buffer) => (
-            <MenuV2.Context>
-              {/* display:contents so the wrapper doesn't disturb the flex tab bar */}
-              <MenuV2.Context.Trigger class="contents" as="div">
-                <button
-                  type="button"
-                  data-slot="project-explorer-editor-tab"
-                  data-active={activePath() === buffer.path ? "" : undefined}
-                  onClick={() => setActivePath(buffer.path)}
-                >
-                  <FileIcon
-                    node={{ path: buffer.path, type: "file" }}
-                    class="size-4 shrink-0"
-                    data-slot="project-explorer-editor-tab-icon"
-                  />
-                  <span class="truncate">{buffer.path.split("/").pop()}</span>
-                  <span data-slot="project-explorer-editor-tab-dot" data-dirty={buffer.dirty ? "" : undefined} />
-                  <span
-                    data-slot="project-explorer-editor-tab-close"
-                    onClick={(event) => {
-                      event.stopPropagation()
-                      closeBuffer(buffer.path)
-                    }}
+          <For each={buffers()}>
+            {(buffer) => (
+              <MenuV2.Context>
+                {/* display:contents so the wrapper doesn't disturb the flex tab bar */}
+                <MenuV2.Context.Trigger class="contents" as="div">
+                  <button
+                    type="button"
+                    data-slot="project-explorer-editor-tab"
+                    data-active={activePath() === buffer.path ? "" : undefined}
+                    onClick={() => setActivePath(buffer.path)}
                   >
-                    <Icon name="close" size="small" />
-                  </span>
-                </button>
-              </MenuV2.Context.Trigger>
-              <MenuV2.Context.Portal>
-                <MenuV2.Context.Content>
-                  <MenuV2.Item onSelect={() => props.tree?.reveal(buffer.path)}>
-                    {language.t("projectExplorer.contextMenu.reveal")}
-                  </MenuV2.Item>
-                  <MenuV2.Item onSelect={() => void revealInOs(buffer.path)}>
-                    {language.t("session.header.reveal.fileExplorer")}
-                  </MenuV2.Item>
-                  <MenuV2.Separator />
-                  <MenuV2.Item onSelect={() => addToChat(buffer.path)}>
-                    {language.t("projectExplorer.contextMenu.addToChat")}
-                  </MenuV2.Item>
-                  <MenuV2.Item onSelect={() => props.onToggleFavorite?.(buffer.path)}>
-                    {props.isFavorite?.(buffer.path)
-                      ? language.t("model.favorite.remove")
-                      : language.t("model.favorite.add")}
-                  </MenuV2.Item>
-                  <MenuV2.Separator />
-                  <MenuV2.Item onSelect={() => props.tree?.startCreate(parentDirOf(buffer.path), "file")}>
-                    {language.t("projectExplorer.contextMenu.newFile")}
-                  </MenuV2.Item>
-                  <MenuV2.Item onSelect={() => props.tree?.startCreate(parentDirOf(buffer.path), "directory")}>
-                    {language.t("projectExplorer.contextMenu.newFolder")}
-                  </MenuV2.Item>
-                  <MenuV2.Item onSelect={() => revealThen(buffer.path, (path) => props.tree?.startRename(path))}>
-                    {language.t("projectExplorer.contextMenu.rename")}
-                  </MenuV2.Item>
-                  <MenuV2.Item onSelect={() => revealThen(buffer.path, (path) => props.tree?.startDelete(path))}>
-                    {language.t("projectExplorer.contextMenu.delete")}
-                  </MenuV2.Item>
-                  <MenuV2.Separator />
-                  <MenuV2.Item onSelect={() => void copyTabPath(buffer.path, false)}>
-                    {language.t("projectExplorer.contextMenu.copyPath")}
-                  </MenuV2.Item>
-                  <MenuV2.Item onSelect={() => void copyTabPath(buffer.path, true)}>
-                    {language.t("projectExplorer.contextMenu.copyAbsolutePath")}
-                  </MenuV2.Item>
-                  <MenuV2.Separator />
-                  <MenuV2.Item onSelect={() => closeRange(buffer.path, "left")}>
-                    {language.t("command.tab.closeLeft")}
-                  </MenuV2.Item>
-                  <MenuV2.Item onSelect={() => closeRange(buffer.path, "right")}>
-                    {language.t("command.tab.closeRight")}
-                  </MenuV2.Item>
-                  <MenuV2.Item onSelect={() => closeRange(buffer.path, "others")}>
-                    {language.t("command.tab.closeOthers")}
-                  </MenuV2.Item>
-                </MenuV2.Context.Content>
-              </MenuV2.Context.Portal>
-            </MenuV2.Context>
-          )}
-        </For>
-        <Show when={activeBuffer() && activeKind() !== "image" && activeKind() !== "pdf"}>
-          <div class="ml-auto flex shrink-0 items-center gap-1 pr-1">
-            <Show when={activeKind() === "markdown" || activeKind() === "svg"}>
-              <div class="flex items-center" data-slot="project-explorer-editor-view-toggle">
-                <button
+                    <FileIcon
+                      node={{ path: buffer.path, type: "file" }}
+                      class="size-4 shrink-0"
+                      data-slot="project-explorer-editor-tab-icon"
+                    />
+                    <span class="truncate">{buffer.path.split("/").pop()}</span>
+                    <span data-slot="project-explorer-editor-tab-dot" data-dirty={buffer.dirty ? "" : undefined} />
+                    <span
+                      data-slot="project-explorer-editor-tab-close"
+                      onClick={(event) => {
+                        event.stopPropagation()
+                        closeBuffer(buffer.path)
+                      }}
+                    >
+                      <Icon name="close" size="small" />
+                    </span>
+                  </button>
+                </MenuV2.Context.Trigger>
+                <MenuV2.Context.Portal>
+                  <MenuV2.Context.Content>
+                    <MenuV2.Item onSelect={() => props.tree?.reveal(buffer.path)}>
+                      {language.t("projectExplorer.contextMenu.reveal")}
+                    </MenuV2.Item>
+                    <MenuV2.Item onSelect={() => void revealInOs(buffer.path)}>
+                      {language.t("session.header.reveal.fileExplorer")}
+                    </MenuV2.Item>
+                    <MenuV2.Separator />
+                    <MenuV2.Item onSelect={() => addToChat(buffer.path)}>
+                      {language.t("projectExplorer.contextMenu.addToChat")}
+                    </MenuV2.Item>
+                    <MenuV2.Item onSelect={() => props.onToggleFavorite?.(buffer.path)}>
+                      {props.isFavorite?.(buffer.path)
+                        ? language.t("model.favorite.remove")
+                        : language.t("model.favorite.add")}
+                    </MenuV2.Item>
+                    <MenuV2.Separator />
+                    <MenuV2.Item onSelect={() => props.tree?.startCreate(parentDirOf(buffer.path), "file")}>
+                      {language.t("projectExplorer.contextMenu.newFile")}
+                    </MenuV2.Item>
+                    <MenuV2.Item onSelect={() => props.tree?.startCreate(parentDirOf(buffer.path), "directory")}>
+                      {language.t("projectExplorer.contextMenu.newFolder")}
+                    </MenuV2.Item>
+                    <MenuV2.Item onSelect={() => revealThen(buffer.path, (path) => props.tree?.startRename(path))}>
+                      {language.t("projectExplorer.contextMenu.rename")}
+                    </MenuV2.Item>
+                    <MenuV2.Item onSelect={() => revealThen(buffer.path, (path) => props.tree?.startDelete(path))}>
+                      {language.t("projectExplorer.contextMenu.delete")}
+                    </MenuV2.Item>
+                    <MenuV2.Separator />
+                    <MenuV2.Item onSelect={() => void copyTabPath(buffer.path, false)}>
+                      {language.t("projectExplorer.contextMenu.copyPath")}
+                    </MenuV2.Item>
+                    <MenuV2.Item onSelect={() => void copyTabPath(buffer.path, true)}>
+                      {language.t("projectExplorer.contextMenu.copyAbsolutePath")}
+                    </MenuV2.Item>
+                    <MenuV2.Separator />
+                    <MenuV2.Item onSelect={() => closeRange(buffer.path, "left")}>
+                      {language.t("command.tab.closeLeft")}
+                    </MenuV2.Item>
+                    <MenuV2.Item onSelect={() => closeRange(buffer.path, "right")}>
+                      {language.t("command.tab.closeRight")}
+                    </MenuV2.Item>
+                    <MenuV2.Item onSelect={() => closeRange(buffer.path, "others")}>
+                      {language.t("command.tab.closeOthers")}
+                    </MenuV2.Item>
+                  </MenuV2.Context.Content>
+                </MenuV2.Context.Portal>
+              </MenuV2.Context>
+            )}
+          </For>
+          <Show when={activeBuffer() && activeKind() !== "image" && activeKind() !== "pdf"}>
+            <div class="ml-auto flex shrink-0 items-center gap-1 pr-1">
+              <Show when={activeKind() === "markdown" || activeKind() === "svg"}>
+                <div class="flex items-center" data-slot="project-explorer-editor-view-toggle">
+                  <button
+                    type="button"
+                    data-active={activeViewMode() === "render" ? "" : undefined}
+                    onClick={() => setViewMode("render")}
+                  >
+                    {language.t("projectExplorer.editor.viewRender")}
+                  </button>
+                  <button
+                    type="button"
+                    data-active={activeViewMode() === "source" ? "" : undefined}
+                    onClick={() => setViewMode("source")}
+                  >
+                    {language.t("projectExplorer.editor.viewSource")}
+                  </button>
+                </div>
+              </Show>
+              <TooltipV2 value={language.t("projectExplorer.editor.save")}>
+                <IconButtonV2
                   type="button"
-                  data-active={activeViewMode() === "render" ? "" : undefined}
-                  onClick={() => setViewMode("render")}
-                >
-                  {language.t("projectExplorer.editor.viewRender")}
-                </button>
-                <button
-                  type="button"
-                  data-active={activeViewMode() === "source" ? "" : undefined}
-                  onClick={() => setViewMode("source")}
-                >
-                  {language.t("projectExplorer.editor.viewSource")}
-                </button>
-              </div>
-            </Show>
-            <TooltipV2 value={language.t("projectExplorer.editor.save")}>
-              <IconButtonV2
-                type="button"
-                variant="ghost-muted"
-                size="small"
-                disabled={!activeBuffer()?.dirty}
-                onClick={() => void save()}
-                aria-label={language.t("projectExplorer.editor.save")}
-                icon={<Icon name="check" />}
-              />
-            </TooltipV2>
-          </div>
-        </Show>
+                  variant="ghost-muted"
+                  size="small"
+                  disabled={!activeBuffer()?.dirty}
+                  onClick={() => void save()}
+                  aria-label={language.t("projectExplorer.editor.save")}
+                  icon={<Icon name="check" />}
+                />
+              </TooltipV2>
+            </div>
+          </Show>
         </div>
         <ProjectExplorerScrollbar viewport={() => tabBar} axes="horizontal" />
       </div>
