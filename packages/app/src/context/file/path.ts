@@ -102,22 +102,43 @@ export function encodeFilePath(filepath: string): string {
 }
 
 export function createPathHelpers(scope: () => string) {
-  const normalize = (input: string) => {
+  const MAX_NORMALIZE_CACHE = 4096
+  let cachedScope: string | undefined
+  let cachedWindows = false
+  let cachedCanonicalRoot = ""
+  const normalizeCache = new Map<string, string>()
+  const rootInfo = () => {
     const root = scope()
+    if (root === cachedScope) return { root, windows: cachedWindows, canonical: cachedCanonicalRoot }
+    cachedScope = root
+    normalizeCache.clear()
+    cachedWindows = /^[A-Za-z]:/.test(root) || root.startsWith("\\\\")
+    cachedCanonicalRoot = cachedWindows ? root.replace(/\\/g, "/").toLowerCase() : root.replace(/\\/g, "/")
+    return { root, windows: cachedWindows, canonical: cachedCanonicalRoot }
+  }
+
+  const normalize = (input: string) => {
+    const info = rootInfo()
+    const cached = normalizeCache.get(input)
+    if (cached !== undefined) {
+      // Touch the entry so repeated watcher events retain their hot paths while
+      // the bounded map sheds old paths from a large branch switch.
+      normalizeCache.delete(input)
+      normalizeCache.set(input, cached)
+      return cached
+    }
 
     let path = unquoteGitPath(decodeFilePath(stripQueryAndHash(stripFileProtocol(input))))
 
     // Separator-agnostic prefix stripping for Cygwin/native Windows compatibility
     // Only case-insensitive on Windows (drive letter or UNC paths)
-    const windows = /^[A-Za-z]:/.test(root) || root.startsWith("\\\\")
-    const canonRoot = windows ? root.replace(/\\/g, "/").toLowerCase() : root.replace(/\\/g, "/")
-    const canonPath = windows ? path.replace(/\\/g, "/").toLowerCase() : path.replace(/\\/g, "/")
+    const canonPath = info.windows ? path.replace(/\\/g, "/").toLowerCase() : path.replace(/\\/g, "/")
     if (
-      canonPath.startsWith(canonRoot) &&
-      (canonRoot.endsWith("/") || canonPath === canonRoot || canonPath[canonRoot.length] === "/")
+      canonPath.startsWith(info.canonical) &&
+      (info.canonical.endsWith("/") || canonPath === info.canonical || canonPath[info.canonical.length] === "/")
     ) {
       // Slice from original path to preserve native separators
-      path = path.slice(root.length)
+      path = path.slice(info.root.length)
     }
 
     if (path.startsWith("./") || path.startsWith(".\\")) {
@@ -126,6 +147,12 @@ export function createPathHelpers(scope: () => string) {
 
     if (path.startsWith("/") || path.startsWith("\\")) {
       path = path.slice(1)
+    }
+    normalizeCache.set(input, path)
+    while (normalizeCache.size > MAX_NORMALIZE_CACHE) {
+      const oldest = normalizeCache.keys().next().value
+      if (oldest === undefined) break
+      normalizeCache.delete(oldest)
     }
     return path
   }
@@ -142,9 +169,7 @@ export function createPathHelpers(scope: () => string) {
 
   const normalizeDir = (input: string) => {
     const path = normalize(input)
-    const root = scope()
-    const windows = /^[A-Za-z]:/.test(root) || root.startsWith("\\\\")
-    return (windows ? path.replace(/\\/g, "/") : path).replace(/\/+$/, "")
+    return (rootInfo().windows ? path.replace(/\\/g, "/") : path).replace(/\/+$/, "")
   }
 
   return {

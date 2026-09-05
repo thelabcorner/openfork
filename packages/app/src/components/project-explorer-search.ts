@@ -1,7 +1,8 @@
 export type ProjectExplorerSearchTree = {
   isExpanded: (path: string) => boolean
-  expand: (path: string) => void
+  expand: (path: string, options?: { generation?: number; priority?: "interactive" | "background" }) => void
   collapse: (path: string) => void
+  beginGeneration?: () => number
 }
 
 /**
@@ -24,11 +25,17 @@ export function createProjectExplorerSearchExpansion(tree: ProjectExplorerSearch
   }
 
   let suppressedQuery: string | undefined
+  let lastQuery: string | undefined
 
   const sync = (ancestors: ReadonlySet<string> | undefined, query = "") => {
     if (!ancestors) {
+      // Clearing a query invalidates queued search expansions. Avoid bumping
+      // the generation for every reactive refresh while the tree is already
+      // clear; unrelated watcher/index updates must not cancel valid work.
+      if (lastQuery !== undefined || owned.size > 0) tree.beginGeneration?.()
       release()
       suppressedQuery = undefined
+      lastQuery = undefined
       return
     }
 
@@ -36,7 +43,9 @@ export function createProjectExplorerSearchExpansion(tree: ProjectExplorerSearch
     // Keep that decision through async directory listing updates; a new query
     // starts a fresh search-expansion lifecycle.
     if (suppressedQuery === query) return
+    const generation = lastQuery === query ? undefined : tree.beginGeneration?.()
     suppressedQuery = undefined
+    lastQuery = query
 
     // Query changes can make previously revealed branches irrelevant. Release
     // only those branches; unrelated user-controlled expansion is untouched.
@@ -47,9 +56,16 @@ export function createProjectExplorerSearchExpansion(tree: ProjectExplorerSearch
     // The search renderer needs every matching ancestor visible. Record only
     // transitions from collapsed to expanded so cleanup stays lossless.
     for (const path of ancestors) {
+      // A new query cancelled the preceding generation, including requests
+      // for ancestors that remain expanded. Re-enqueue those listings too;
+      // the store deduplicates loaded directories without another HTTP call.
+      if (generation !== undefined && (owned.has(path) || tree.isExpanded(path))) {
+        tree.expand(path, { generation, priority: "interactive" })
+        continue
+      }
       if (owned.has(path) || tree.isExpanded(path)) continue
       owned.add(path)
-      tree.expand(path)
+      tree.expand(path, generation === undefined ? undefined : { generation, priority: "interactive" })
     }
   }
 
@@ -59,6 +75,7 @@ export function createProjectExplorerSearchExpansion(tree: ProjectExplorerSearch
     userToggled: (path: string) => owned.delete(path),
     /** Manual expand/collapse-all actions supersede search ownership. */
     releaseAll: (query = "") => {
+      tree.beginGeneration?.()
       owned.clear()
       suppressedQuery = query
     },

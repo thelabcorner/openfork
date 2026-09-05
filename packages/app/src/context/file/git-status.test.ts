@@ -76,6 +76,27 @@ describe("createGitStatusStore", () => {
     expect(fetches).toBe(2)
   })
 
+  test("can record hidden invalidations without scheduling until visible", async () => {
+    let fetches = 0
+    const { store } = makeStore({
+      fetch: () => {
+        fetches++
+        return Promise.resolve([{ path: "a.ts", status: "modified" }])
+      },
+    })
+    store.ensure()
+    await flush()
+    expect(fetches).toBe(1)
+
+    store.invalidate("a.ts", { schedule: false })
+    await flush()
+    expect(fetches).toBe(1)
+
+    store.ensure()
+    await flush()
+    expect(fetches).toBe(2)
+  })
+
   test("drops a dirty path that is no longer dirty after refresh", async () => {
     let dirty = true
     const { store } = makeStore({

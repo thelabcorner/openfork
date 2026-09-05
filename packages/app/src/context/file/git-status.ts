@@ -29,17 +29,18 @@ const toKind = (status: LegacyStatus["status"]): Kind =>
  *
  * - Per-project-scope LRU cache: switching back to a project reuses its map
  *   instead of running a fresh `git status` scan.
- * - Watcher events mark a single path dirty; a debounced refresh coalesces
- *   bursts into one re-query (a dirty-path scan) instead of rescanning on
- *   every event or on every project switch.
+ * - Watcher events mark the status snapshot dirty; a debounced refresh
+ *   coalesces bursts into one full status query. The endpoint currently only
+ *   accepts a full query, so retaining every changed path would be pure memory
+ *   overhead rather than an incremental scan.
  */
 export function createGitStatusStore(options: GitStatusStoreOptions) {
   const cache = new Map<string, ReadonlyMap<string, Kind>>()
   const [status, setStatus] = createSignal<ReadonlyMap<string, Kind>>()
 
-  let dirty = new Set<string>()
+  let dirty = false
   let timer: ReturnType<typeof setTimeout> | undefined
-  let inflight: Promise<void> | undefined
+  let inflight: { scope: string; promise: Promise<void> } | undefined
   let disposed = false
 
   const touch = (scope: string) => {
@@ -63,8 +64,7 @@ export function createGitStatusStore(options: GitStatusStoreOptions) {
     if (options.scope() === scope) setStatus(map)
   }
 
-  const fetch = async () => {
-    const scope = options.scope()
+  const fetch = async (scope: string) => {
     try {
       const list = await options.fetchStatus()
       if (disposed || options.scope() !== scope) return
@@ -75,17 +75,27 @@ export function createGitStatusStore(options: GitStatusStoreOptions) {
     }
   }
 
+  const startFetch = (scope: string) => {
+    if (disposed) return
+    if (inflight?.scope === scope) return
+    const promise = fetch(scope)
+    inflight = { scope, promise }
+    void promise.finally(() => {
+      if (inflight?.promise !== promise) return
+      inflight = undefined
+      refresh()
+    })
+  }
+
   const refresh = () => {
-    if (disposed || timer || inflight) return
-    if (dirty.size === 0) return
+    const scope = options.scope()
+    if (disposed || timer || inflight?.scope === scope) return
+    if (!dirty) return
     timer = setTimeout(() => {
       timer = undefined
       if (disposed) return
-      dirty = new Set()
-      inflight = fetch().finally(() => {
-        inflight = undefined
-        refresh()
-      })
+      dirty = false
+      startFetch(options.scope())
     }, options.refreshDelayMs ?? DEFAULT_REFRESH_DELAY_MS)
   }
 
@@ -96,23 +106,24 @@ export function createGitStatusStore(options: GitStatusStoreOptions) {
     if (cached) {
       touch(scope)
       setStatus(cached)
+      if (dirty) refresh()
       return
     }
-    void fetch()
+    startFetch(scope)
   }
 
   /** Mark a single changed path dirty and schedule a debounced re-query. */
-  const invalidate = (path: string) => {
-    const normalized = options.normalize(path)
-    if (!normalized) return
-    dirty.add(normalized)
-    refresh()
+  const invalidate = (path: string, options?: { schedule?: boolean }) => {
+    if (!path) return
+    dirty = true
+    if (options?.schedule !== false) refresh()
   }
 
   const dispose = () => {
     disposed = true
     if (timer) clearTimeout(timer)
-    dirty.clear()
+    timer = undefined
+    dirty = false
   }
 
   return { status, ensure, invalidate, dispose }

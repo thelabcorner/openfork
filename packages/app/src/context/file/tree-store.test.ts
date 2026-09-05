@@ -15,7 +15,7 @@ const fs: Record<string, { name: string; type: "file" | "directory" }[]> = {
   "src/lib": [{ name: "util.ts", type: "file" }],
 }
 
-function makeStore(opts?: { cache?: { maxScopes?: number; maxNodes?: number } }) {
+function makeStore(opts?: { cache?: { maxScopes?: number; maxNodes?: number; maxLiveNodes?: number } }) {
   return createRoot(() => {
     const [scope, setScope] = createSignal("/repo")
     const store = createFileTreeStore({
@@ -49,6 +49,120 @@ function makeStore(opts?: { cache?: { maxScopes?: number; maxNodes?: number } })
 }
 
 describe("file tree store search + expand/collapse helpers", () => {
+  test("queue overflow preserves cached children instead of applying an empty response", async () => {
+    let blocked = false
+    let release!: () => void
+    const barrier = new Promise<void>((resolve) => { release = resolve })
+    const store = createRoot(() => createFileTreeStore({
+      scope: () => "/overflow",
+      schedulerKey: () => "overflow-regression",
+      normalizeDir: (input) => input,
+      list: async () => {
+        if (blocked) await barrier
+        return [{ path: "keep", name: "keep", absolute: "/overflow/keep", type: "file", ignored: false }]
+      },
+      onError: () => {},
+      cache: { store: new Map() },
+    }))
+    await store.listDir("")
+    blocked = true
+    const pending = Array.from({ length: 1028 }, (_, index) => store.listDir(`queued-${index}`))
+    await store.listDir("", { force: true })
+    expect(store.children("").map((node) => node.path)).toEqual(["keep"])
+    expect(store.dirState("")?.loading).toBe(false)
+    store.dispose()
+    release()
+    await Promise.all(pending)
+  })
+
+  test("an invalidation during listing remains stale until a subsequent listing", async () => {
+    let release!: () => void
+    const barrier = new Promise<void>((resolve) => { release = resolve })
+    const store = createRoot(() => createFileTreeStore({
+      scope: () => "/stale-race", normalizeDir: (input) => input,
+      list: async () => { await barrier; return [] },
+      onError: () => {}, cache: { store: new Map() },
+    }))
+    const first = store.listDir("")
+    store.markAllStale()
+    release()
+    await first
+    expect(store.isLoaded("")).toBe(false)
+    await store.listDir("")
+    expect(store.isLoaded("")).toBe(true)
+    store.dispose()
+  })
+  test("limits concurrent directory listings while preserving each caller", async () => {
+    let active = 0
+    let peak = 0
+    const store = createRoot(() =>
+      createFileTreeStore({
+        scope: () => "/repo",
+        normalizeDir: (input: string) => input,
+        list: async (dir: string) => {
+          active += 1
+          peak = Math.max(peak, active)
+          await new Promise((resolve) => setTimeout(resolve, 1))
+          active -= 1
+          return [
+            {
+              path: `${dir}/file.ts`,
+              name: "file.ts",
+              absolute: `/repo/${dir}/file.ts`,
+              type: "file",
+              ignored: false,
+            },
+          ]
+        },
+        onError: () => {},
+        cache: { store: new Map<string, TreeSnapshot>() },
+      }),
+    )
+
+    await Promise.all(Array.from({ length: 12 }, (_, index) => store.listDir(`dir-${index}`)))
+    expect(peak).toBe(4)
+    expect(store.dirState("dir-11")?.loaded).toBe(true)
+  })
+
+  test("preserves unchanged node identity across forced watcher refreshes", async () => {
+    const { store } = makeStore()
+    await store.listDir("")
+    const before = store.node("src")
+    await store.listDir("", { force: true })
+    expect(store.node("src")).toBe(before)
+  })
+
+  test("bounds the live tree by dropping the coldest collapsed subtree", async () => {
+    const { store } = makeStore({ cache: { maxLiveNodes: 2 } })
+    await store.listDir("")
+    await store.listDir("src")
+
+    expect(store.allNodes().length).toBeLessThanOrEqual(2)
+    expect(store.dirState("src")?.loaded).toBe(false)
+  })
+
+  test("disposes queued listings without starting stale work", async () => {
+    let calls = 0
+    const store = createRoot(() =>
+      createFileTreeStore({
+        scope: () => "/repo",
+        normalizeDir: (input: string) => input,
+        list: async () => {
+          calls += 1
+          await new Promise((resolve) => setTimeout(resolve, 1))
+          return []
+        },
+        onError: () => {},
+        cache: { store: new Map<string, TreeSnapshot>() },
+      }),
+    )
+
+    const pending = Array.from({ length: 8 }, (_, index) => store.listDir(`stale-${index}`))
+    store.dispose()
+    await Promise.all(pending)
+    expect(calls).toBe(0)
+  })
+
   test("allNodes returns every loaded node", async () => {
     const { store } = makeStore()
     await store.listDir("")

@@ -207,7 +207,7 @@ export default function FileTree(props: {
   _marks?: Set<string>
   _deeps?: Map<string, number>
   _kinds?: ReadonlyMap<string, Kind>
-  _chain?: readonly string[]
+  _chain?: ReadonlySet<string>
 }) {
   const file = useFile()
   const level = props.level ?? 0
@@ -218,7 +218,8 @@ export default function FileTree(props: {
       .normalize(p)
       .replace(/[\\/]+$/, "")
       .replaceAll("\\", "/")
-  const chain = props._chain ? [...props._chain, key(props.path)] : [key(props.path)]
+  const chain = new Set(props._chain)
+  chain.add(key(props.path))
 
   const filter = createMemo(() => {
     if (props._filter) return props._filter
@@ -256,62 +257,31 @@ export default function FileTree(props: {
     return props.kinds
   })
 
+  // The depth map only drives the opacity of a cosmetic hover guide. Walking
+  // every expanded descendant here made any tree mutation trigger a full DFS
+  // in the root component. Keep the inherited map when a caller supplies one
+  // and use the current level as a cheap local fallback; structural expansion
+  // and list scheduling remain owned by the tree store.
   const deeps = createMemo(() => {
-    if (props._deeps) return props._deeps
-
-    const out = new Map<string, number>()
-
-    const root = props.path
-    if (!(file.tree.state(root)?.expanded ?? false)) return out
-
-    const seen = new Set<string>()
-    const stack: { dir: string; lvl: number; i: number; kids: string[]; max: number }[] = []
-
-    const push = (dir: string, lvl: number) => {
-      const id = key(dir)
-      if (seen.has(id)) return
-      seen.add(id)
-
-      const kids = file.tree
-        .children(dir)
-        .filter((node) => node.type === "directory" && (file.tree.state(node.path)?.expanded ?? false))
-        .map((node) => node.path)
-
-      stack.push({ dir, lvl, i: 0, kids, max: lvl })
-    }
-
-    push(root, level - 1)
-
-    while (stack.length > 0) {
-      const top = stack[stack.length - 1]!
-
-      if (top.i < top.kids.length) {
-        const next = top.kids[top.i]!
-        top.i++
-        push(next, top.lvl + 1)
-        continue
-      }
-
-      out.set(top.dir, top.max)
-      stack.pop()
-
-      const parent = stack[stack.length - 1]
-      if (!parent) continue
-      parent.max = Math.max(parent.max, top.max)
-    }
-
-    return out
+    return props._deeps ?? new Map([[key(props.path), level]])
   })
 
-  createEffect(() => {
-    const current = filter()
-    const dirs = dirsToExpand({
-      level,
-      filter: current,
-      expanded: (dir) => untrack(() => file.tree.state(dir)?.expanded) ?? false,
-    })
-    for (const dir of dirs) file.tree.expand(dir)
-  })
+  createEffect(
+    on(
+      filter,
+      (current) => {
+        if (level !== 0) return
+        const generation = file.tree.beginGeneration?.()
+        const dirs = dirsToExpand({
+          level,
+          filter: current,
+          expanded: (dir) => untrack(() => file.tree.state(dir)?.expanded) ?? false,
+        })
+        for (const dir of dirs) file.tree.expand(dir, generation === undefined ? undefined : { generation })
+      },
+      { defer: false },
+    ),
+  )
 
   createEffect(
     on(
@@ -389,7 +359,7 @@ export default function FileTree(props: {
       <For each={nodes()}>
         {(node) => {
           const expanded = () => file.tree.state(node.path)?.expanded ?? false
-          const deep = () => deeps().get(node.path) ?? -1
+          const deep = () => deeps().get(node.path) ?? level
           const kind = () => visibleKind(node, kinds(), marks())
           const active = () => !!kind() && !node.ignored
 
@@ -429,7 +399,7 @@ export default function FileTree(props: {
                       style={`left: ${Math.max(0, 8 + level * 12 - 4) + 8}px`}
                     />
                     <Show
-                      when={level < MAX_DEPTH && !chain.includes(key(node.path))}
+                      when={level < MAX_DEPTH && !chain.has(key(node.path))}
                       fallback={<div class="px-2 py-1 text-12-regular text-text-weak">...</div>}
                     >
                       <FileTree

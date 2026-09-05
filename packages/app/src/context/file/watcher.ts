@@ -33,7 +33,10 @@ export function invalidateFromWatcher(event: WatcherEvent, ops: WatcherOps) {
 
   ops.onInvalidate?.(path)
 
-  if (ops.hasFile(path) || ops.isOpen?.(path)) {
+  // An unlink is already repaired by the parent directory refresh. Trying to
+  // read it first creates a guaranteed 404/error-toast race during atomic
+  // save/add-then-unlink bursts.
+  if (kind !== "unlink" && (ops.hasFile(path) || ops.isOpen?.(path))) {
     ops.loadFile(path)
   }
 

@@ -95,7 +95,10 @@ export function ProjectExplorerTree(props: {
           {(r) => (
             <div class="flex items-center gap-2" style={{ "padding-inline-start": `${r.indent}px` }}>
               <div class="size-3.5 shrink-0 rounded-[3px] bg-v2-background-bg-layer-02 animate-pulse" />
-              <div class="h-3.5 shrink-0 rounded-[5px] bg-v2-background-bg-layer-02 animate-pulse" style={{ width: r.w }} />
+              <div
+                class="h-3.5 shrink-0 rounded-[5px] bg-v2-background-bg-layer-02 animate-pulse"
+                style={{ width: r.w }}
+              />
             </div>
           )}
         </For>
@@ -131,7 +134,9 @@ export function ProjectExplorerTree(props: {
   // without re-allocating huge arrays on every click.
   const initialSelected = props.active ? new Set([normalizeFileTreeV2Path(props.active)]) : new Set<string>()
   const [selectedSet, setSelectedSet] = createSignal<Set<string>>(initialSelected)
-  const [anchor, setAnchor] = createSignal<string | undefined>(props.active ? normalizeFileTreeV2Path(props.active) : undefined)
+  const [anchor, setAnchor] = createSignal<string | undefined>(
+    props.active ? normalizeFileTreeV2Path(props.active) : undefined,
+  )
   const isSelected = (path: string) => selectedSet().has(path)
   const selectedArray = () => [...selectedSet()]
   const selectedCount = () => selectedSet().size
@@ -185,6 +190,25 @@ export function ProjectExplorerTree(props: {
     setSelectedSet(new Set(all))
     if (all.length > 0) setAnchor(all[0]!)
   }
+
+  // Bulk actions eventually call network-backed parent callbacks. Dispatch a
+  // small synchronous slice, then yield with a timer so a 10k-file selection
+  // cannot monopolize the renderer while still preserving action order.
+  let disposed = false
+  onCleanup(() => {
+    disposed = true
+  })
+  const dispatchInChunks = <A,>(items: readonly A[], dispatch: (item: A) => void) => {
+    let cursor = 0
+    const drain = () => {
+      if (disposed) return
+      const end = Math.min(items.length, cursor + 32)
+      while (cursor < end) dispatch(items[cursor++])
+      if (cursor < items.length) setTimeout(drain, 0)
+    }
+    drain()
+  }
+
   // Provide project-explorer-tree equivalent of `select(path)` for backwards-compat
   const select = selectSingle
 
@@ -205,7 +229,8 @@ export function ProjectExplorerTree(props: {
     const pending = creating()
     if (!pending) return base
     const insertAt = pending.parentDir === "" ? 0 : base.findIndex((row) => row.node.path === pending.parentDir) + 1
-    const level = pending.parentDir === "" ? 0 : (base.find((row) => row.node.path === pending.parentDir)?.level ?? 0) + 1
+    const level =
+      pending.parentDir === "" ? 0 : (base.find((row) => row.node.path === pending.parentDir)?.level ?? 0) + 1
     const synthetic = {
       node: {
         name: "",
@@ -234,8 +259,9 @@ export function ProjectExplorerTree(props: {
 
   const searchExpansion = createProjectExplorerSearchExpansion({
     isExpanded: (path) => file.tree.state(path)?.expanded ?? false,
-    expand: (path) => file.tree.expand(path),
+    expand: (path, options) => file.tree.expand(path, options),
     collapse: (path) => file.tree.collapse(path),
+    beginGeneration: file.tree.beginGeneration,
   })
 
   const searchMatches = createMemo(() => {
@@ -318,7 +344,7 @@ export function ProjectExplorerTree(props: {
     rangeExtractor: (range) => {
       const indexes = defaultRangeExtractor(range)
       const path = focused()
-      const index = path ? visibleIndex().get(path) ?? -1 : -1
+      const index = path ? (visibleIndex().get(path) ?? -1) : -1
       if (index < 0 || indexes.includes(index)) return indexes
       return [...indexes, index].sort((a, b) => a - b)
     },
@@ -453,8 +479,7 @@ export function ProjectExplorerTree(props: {
   const handleRowDragStart = (event: DragEvent, node: FileTreeV2Node) => {
     const path = node.path
     const selected = selectedSet()
-    const dragPaths =
-      selected.has(path) && selected.size > 1 ? [...selected] : [node.originalPath || path]
+    const dragPaths = selected.has(path) && selected.size > 1 ? [...selected] : [node.originalPath || path]
     const first = dragPaths[0] ?? node.originalPath
     setIsDragging(true)
     pendingSinglePath = null
@@ -500,6 +525,7 @@ export function ProjectExplorerTree(props: {
       sources = lines.length > 0 ? lines : sel.length === 1 ? sel : []
     }
     if (sources.length === 0) return
+    const moves: Array<{ from: string; to: string }> = []
     for (const src of sources) {
       if (!src || src === targetDir) continue
       // Don't move a parent into its own child
@@ -511,15 +537,17 @@ export function ProjectExplorerTree(props: {
       // normalized; map back via rowByKey when possible
       const srcNode = rowByKey().get(src)?.node ?? ({ originalPath: src } as FileTreeV2Node)
       const from = (srcNode as FileTreeV2Node).originalPath || src
-      props.onRename(from, dest)
+      moves.push({ from, to: dest })
     }
+    dispatchInChunks(moves, (move) => props.onRename(move.from, move.to))
   }
 
   const moveSelection = (delta: number, extend: boolean) => {
     const list = visibleRows()
     if (list.length === 0) return
     // `focused` is the keyboard cursor; if nothing focused, anchor or first item.
-    const cursor = focused() ?? anchor() ?? (selectedSet().size === 1 ? [...selectedSet()][0] : undefined) ?? list[0]!.node.path
+    const cursor =
+      focused() ?? anchor() ?? (selectedSet().size === 1 ? [...selectedSet()][0] : undefined) ?? list[0]!.node.path
     const curIdx = visibleIndex().get(cursor) ?? 0
     const nextIdx = Math.min(list.length - 1, Math.max(0, curIdx + delta))
     const path = list[nextIdx]!.node.path
@@ -572,21 +600,20 @@ export function ProjectExplorerTree(props: {
   })
 
   // Prune stale selections only when files actually vanish from the *filesystem*
-  // (not when a collapsed folder hides them). Using `allNodes` preserves selection
-  // through expand/collapse so Shift/Ctrl state doesn't flicker on key-up or
-  // while dragging — a hidden but still-existing file stays selected.
+  // (not when a collapsed folder hides them). Check the maintained tree index
+  // for each selected path instead of rebuilding a Set of every loaded node on
+  // every watcher refresh; a 50k-node tree now costs O(selected) here.
   createEffect(() => {
-    const all = new Set(file.tree.allNodes().map((n) => normalizeFileTreeV2Path(n.path)))
     const current = selectedSet()
     let changed = false
     const pruned = new Set<string>()
     for (const p of current) {
-      if (all.has(p) || p.startsWith("__creating__:")) pruned.add(p)
+      if (file.tree.hasNode(p) || p.startsWith("__creating__:")) pruned.add(p)
       else changed = true
     }
     if (changed) setSelectedSet(pruned)
     const a = anchor()
-    if (a && !all.has(a)) setAnchor([...pruned][0])
+    if (a && !file.tree.hasNode(a)) setAnchor([...pruned][0])
   })
 
   props.ref?.({
@@ -674,10 +701,12 @@ export function ProjectExplorerTree(props: {
       event.preventDefault()
       // Enter on multi-selection opens all files (bulk add to chat / open)
       if (selectedSet().size > 1) {
+        const files: Array<{ path: string; type: "file" }> = []
         for (const p of selectedSet()) {
           const n = rowByKey().get(p)?.node
-          if (n?.type === "file") props.onOpen({ path: n.originalPath, type: "file" })
+          if (n?.type === "file") files.push({ path: n.originalPath, type: "file" })
         }
+        dispatchInChunks(files, (file) => props.onOpen(file))
       } else openRow(current.node)
       return
     }
@@ -725,6 +754,7 @@ export function ProjectExplorerTree(props: {
           sources = lines.length > 0 ? lines : sel.length === 1 ? sel : []
         }
         if (sources.length === 0) return
+        const moves: Array<{ from: string; to: string }> = []
         for (const src of sources) {
           if (!src) continue
           const base = src.includes("/") ? src.slice(src.lastIndexOf("/") + 1) : src
@@ -734,8 +764,9 @@ export function ProjectExplorerTree(props: {
           const from = (srcNode as FileTreeV2Node).originalPath || src
           // Skip if already at root
           if (from === base) continue
-          props.onRename(from, base)
+          moves.push({ from, to: base })
         }
+        dispatchInChunks(moves, (move) => props.onRename(move.from, move.to))
       }}
       style={{
         position: "relative",
@@ -745,7 +776,10 @@ export function ProjectExplorerTree(props: {
       <Show
         when={!(rootError() && empty() && !searching())}
         fallback={
-          <div data-slot="project-explorer-error" class="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center">
+          <div
+            data-slot="project-explorer-error"
+            class="absolute inset-0 flex flex-col items-center justify-center gap-2 p-4 text-center"
+          >
             <span class="text-12-regular text-v2-text-text-muted">{language.t("toast.file.listFailed.title")}</span>
             <span class="max-w-48 truncate text-11-regular text-v2-text-text-faint">{rootError()}</span>
             <button
@@ -777,129 +811,139 @@ export function ProjectExplorerTree(props: {
             <For each={virtualItems()}>
               {(item) => (
                 <div
-                      style={{
-                        position: "absolute",
-                        top: "0",
-                        "inset-inline-start": "0",
-                        width: "100%",
-                        height: `${item.size}px`,
-                        transform: `translateY(${item.start}px)`,
-                        overflow: "hidden",
-                      }}
-                    >
-                      <Show when={visibleRows()[item.index]}>
-                        {(row) => {
-                          const isBulkDelete = () => deleting() === "__bulk__" && isSelected(row().node.path)
-                          const rowElement = (
-                            <ProjectExplorerRow
-                              row={row}
-                              selected={isSelected(row().node.path)}
-                              focused={focused() === row().node.path}
-                              expanded={expanded(row().node.path)}
-                              dragOver={dragOverPath() === row().node.path}
-                              status={props.gitStatus?.get(row().node.path)}
-                              favorited={row().node.originalPath ? props.favorites.isFavorite(row().node.originalPath) : false}
-                              renaming={renaming() === row().node.path}
-                              deleting={deleting() === row().node.path || isBulkDelete()}
-                              creating={creating()}
-                              now={now()}
-                              onFocus={() => setFocused(row().node.path)}
-                              onBlur={() => setFocused(undefined)}
-                              onMouseDown={(e: MouseEvent) => handleRowMouseDown(e, row().node.path)}
-                              onMouseUp={(e: MouseEvent) => handleRowMouseUp(e, row().node.path)}
-                              onClick={(e: MouseEvent) => {
-                                if (isDragging()) {
-                                  e.preventDefault()
-                                  e.stopPropagation()
-                                  return
+                  style={{
+                    position: "absolute",
+                    top: "0",
+                    "inset-inline-start": "0",
+                    width: "100%",
+                    height: `${item.size}px`,
+                    transform: `translateY(${item.start}px)`,
+                    overflow: "hidden",
+                  }}
+                >
+                  <Show when={visibleRows()[item.index]}>
+                    {(row) => {
+                      const isBulkDelete = () => deleting() === "__bulk__" && isSelected(row().node.path)
+                      const rowElement = (
+                        <ProjectExplorerRow
+                          row={row}
+                          selected={isSelected(row().node.path)}
+                          focused={focused() === row().node.path}
+                          expanded={expanded(row().node.path)}
+                          dragOver={dragOverPath() === row().node.path}
+                          status={props.gitStatus?.get(row().node.path)}
+                          favorited={
+                            row().node.originalPath ? props.favorites.isFavorite(row().node.originalPath) : false
+                          }
+                          renaming={renaming() === row().node.path}
+                          deleting={deleting() === row().node.path || isBulkDelete()}
+                          creating={creating()}
+                          now={now()}
+                          onFocus={() => setFocused(row().node.path)}
+                          onBlur={() => setFocused(undefined)}
+                          onMouseDown={(e: MouseEvent) => handleRowMouseDown(e, row().node.path)}
+                          onMouseUp={(e: MouseEvent) => handleRowMouseUp(e, row().node.path)}
+                          onClick={(e: MouseEvent) => {
+                            if (isDragging()) {
+                              e.preventDefault()
+                              e.stopPropagation()
+                              return
+                            }
+                            if (pendingSinglePath === row().node.path) {
+                              // Deferred plain collapse (mousedown on multi-selected)
+                              pendingSinglePath = null
+                              handleRowClick(e, row().node.path)
+                              return
+                            }
+                            handleRowClick(e, row().node.path)
+                          }}
+                          onContextMenu={() => handleRowContextMenu(row().node.path)}
+                          onDragStart={(e: DragEvent) => handleRowDragStart(e, row().node)}
+                          onDragEnd={handleRowDragEnd}
+                          onDragOver={(e: DragEvent) =>
+                            handleRowDragOver(e, row().node.path, row().node.type === "directory")
+                          }
+                          onDragLeave={() => {
+                            if (dragOverPath() === row().node.path) setDragOverPath(undefined)
+                          }}
+                          onDrop={(e: DragEvent) => handleRowDrop(e, row().node)}
+                          onToggle={() => toggleDir(row().node)}
+                          onDoubleClick={() => openRow(row().node)}
+                          onFavorite={() => props.favorites.toggle(row().node.originalPath)}
+                          onCommitRename={(value) => commitRename(row().node, value)}
+                          onCancelRename={() => setRenaming(undefined)}
+                          onCommitDelete={() => {
+                            if (deleting() === "__bulk__") {
+                              const paths = [...selectedSet()]
+                              setDeleting(undefined)
+                              const deletions = paths.map((p) => {
+                                // `onDelete` expects originalPath; map back via rowByKey
+                                const n = rowByKey().get(p)?.node ?? ({ originalPath: p } as FileTreeV2Node)
+                                return (n as FileTreeV2Node).originalPath || p
+                              })
+                              dispatchInChunks(deletions, (path) => props.onDelete(path))
+                              clearSelection()
+                            } else {
+                              setDeleting(undefined)
+                              props.onDelete(row().node.originalPath)
+                            }
+                          }}
+                          onCancelDelete={() => setDeleting(undefined)}
+                          onCommitCreate={(value) => {
+                            const pending = creating()
+                            if (pending) commitCreate(pending, value)
+                          }}
+                          onCancelCreate={() => setCreating(undefined)}
+                          language={language}
+                        />
+                      )
+                      if (row().node.path.startsWith("__creating__:")) return rowElement
+                      const node = row().node
+                      const parentDirFor =
+                        node.type === "directory"
+                          ? node.path
+                          : node.path.includes("/")
+                            ? node.path.slice(0, node.path.lastIndexOf("/"))
+                            : ""
+                      return (
+                        <ProjectExplorerTreeContextMenu
+                          node={node}
+                          actions={{
+                            favorited: node.originalPath ? props.favorites.isFavorite(node.originalPath) : false,
+                            onOpen: () => openRow(node),
+                            onMention: () => {
+                              // Bulk: if node is part of multi-selection, mention all
+                              if (isSelected(node.path) && selectedSet().size > 1) {
+                                const mentions: string[] = []
+                                for (const p of selectedSet()) {
+                                  const n = rowByKey().get(p)?.node
+                                  if (n) mentions.push(n.originalPath)
                                 }
-                                if (pendingSinglePath === row().node.path) {
-                                  // Deferred plain collapse (mousedown on multi-selected)
-                                  pendingSinglePath = null
-                                  handleRowClick(e, row().node.path)
-                                  return
-                                }
-                                handleRowClick(e, row().node.path)
-                              }}
-                              onContextMenu={() => handleRowContextMenu(row().node.path)}
-                              onDragStart={(e: DragEvent) => handleRowDragStart(e, row().node)}
-                              onDragEnd={handleRowDragEnd}
-                              onDragOver={(e: DragEvent) =>
-                                handleRowDragOver(e, row().node.path, row().node.type === "directory")
-                              }
-                              onDragLeave={() => {
-                                if (dragOverPath() === row().node.path) setDragOverPath(undefined)
-                              }}
-                              onDrop={(e: DragEvent) => handleRowDrop(e, row().node)}
-                              onToggle={() => toggleDir(row().node)}
-                              onDoubleClick={() => openRow(row().node)}
-                              onFavorite={() => props.favorites.toggle(row().node.originalPath)}
-                              onCommitRename={(value) => commitRename(row().node, value)}
-                              onCancelRename={() => setRenaming(undefined)}
-                              onCommitDelete={() => {
-                                if (deleting() === "__bulk__") {
-                                  const paths = [...selectedSet()]
-                                  setDeleting(undefined)
-                                  for (const p of paths) {
-                                    // `onDelete` expects originalPath; map back via rowByKey
-                                    const n = rowByKey().get(p)?.node ?? ({ originalPath: p } as FileTreeV2Node)
-                                    props.onDelete((n as FileTreeV2Node).originalPath || p)
-                                  }
-                                  clearSelection()
-                                } else {
-                                  setDeleting(undefined)
-                                  props.onDelete(row().node.originalPath)
-                                }
-                              }}
-                              onCancelDelete={() => setDeleting(undefined)}
-                              onCommitCreate={(value) => {
-                                const pending = creating()
-                                if (pending) commitCreate(pending, value)
-                              }}
-                              onCancelCreate={() => setCreating(undefined)}
-                              language={language}
-                            />
-                          )
-                          if (row().node.path.startsWith("__creating__:")) return rowElement
-                          const node = row().node
-                          const parentDirFor = node.type === "directory" ? node.path : node.path.includes("/") ? node.path.slice(0, node.path.lastIndexOf("/")) : ""
-                          return (
-                            <ProjectExplorerTreeContextMenu
-                              node={node}
-                              actions={{
-                                favorited: node.originalPath ? props.favorites.isFavorite(node.originalPath) : false,
-                                onOpen: () => openRow(node),
-                                onMention: () => {
-                                  // Bulk: if node is part of multi-selection, mention all
-                                  if (isSelected(node.path) && selectedSet().size > 1) {
-                                    for (const p of selectedSet()) {
-                                      const n = rowByKey().get(p)?.node
-                                      if (n) props.onMention(n.originalPath)
-                                    }
-                                  } else props.onMention(node.originalPath)
-                                },
-                                onFavoriteToggle: () => props.favorites.toggle(node.originalPath),
-                                onRename: () => setRenaming(node.path),
-                                onDelete: () => {
-                                  if (isSelected(node.path) && selectedSet().size > 1) setDeleting("__bulk__")
-                                  else setDeleting(node.path)
-                                },
-                                onNewFile: () => {
-                                  if (node.type === "directory") file.tree.expand(node.originalPath)
-                                  setCreating({ parentDir: parentDirFor, kind: "file" })
-                                },
-                                onNewFolder: () => {
-                                  if (node.type === "directory") file.tree.expand(node.originalPath)
-                                  setCreating({ parentDir: parentDirFor, kind: "directory" })
-                                },
-                              }}
-                            >
-                              {rowElement}
-                            </ProjectExplorerTreeContextMenu>
-                          )
-                        }}
-                      </Show>
-                    </div>
+                                dispatchInChunks(mentions, (path) => props.onMention(path))
+                              } else props.onMention(node.originalPath)
+                            },
+                            onFavoriteToggle: () => props.favorites.toggle(node.originalPath),
+                            onRename: () => setRenaming(node.path),
+                            onDelete: () => {
+                              if (isSelected(node.path) && selectedSet().size > 1) setDeleting("__bulk__")
+                              else setDeleting(node.path)
+                            },
+                            onNewFile: () => {
+                              if (node.type === "directory") file.tree.expand(node.originalPath)
+                              setCreating({ parentDir: parentDirFor, kind: "file" })
+                            },
+                            onNewFolder: () => {
+                              if (node.type === "directory") file.tree.expand(node.originalPath)
+                              setCreating({ parentDir: parentDirFor, kind: "directory" })
+                            },
+                          }}
+                        >
+                          {rowElement}
+                        </ProjectExplorerTreeContextMenu>
+                      )
+                    }}
+                  </Show>
+                </div>
               )}
             </For>
             <Show when={loading() && visibleRows().length > 0 && !searching()}>
@@ -916,12 +960,21 @@ export function ProjectExplorerTree(props: {
 }
 
 function toLive(node: FileNode): FileTreeV2Node {
-  return {
+  const cached = liveNodeCache.get(node)
+  if (cached) return cached
+  const live = {
     ...node,
     path: normalizeFileTreeV2Path(node.path),
     originalPath: node.path,
   }
+  liveNodeCache.set(node, live)
+  return live
 }
+
+// FileTreeV2Node is a derived view of a FileNode. File watcher refreshes often
+// return fresh directory arrays containing the same store node identities; a
+// WeakMap keeps those refreshes from allocating one spread object per row.
+const liveNodeCache = new WeakMap<FileNode, FileTreeV2Node>()
 
 function ProjectExplorerRow(props: {
   row: Accessor<{ node: FileTreeV2Node; level: number }>
@@ -1090,8 +1143,15 @@ function ProjectExplorerRow(props: {
         </div>
       </Show>
 
-      <Show when={!isSynthetic()} fallback={<Icon name={props.creating?.kind === "directory" ? "folder" : "edit"} size="small" />}>
-        <FileIcon node={{ path: node().path, type: node().type }} expanded={props.expanded} data-slot="project-explorer-icon" />
+      <Show
+        when={!isSynthetic()}
+        fallback={<Icon name={props.creating?.kind === "directory" ? "folder" : "edit"} size="small" />}
+      >
+        <FileIcon
+          node={{ path: node().path, type: node().type }}
+          expanded={props.expanded}
+          data-slot="project-explorer-icon"
+        />
       </Show>
 
       <Show
@@ -1153,7 +1213,14 @@ function ProjectExplorerRow(props: {
         </span>
       </Show>
 
-      <Show when={!isSynthetic() && !props.renaming && !props.deleting && (folderCount() !== undefined || size() !== undefined || lineCount() !== undefined || relativeTime() !== "")}>
+      <Show
+        when={
+          !isSynthetic() &&
+          !props.renaming &&
+          !props.deleting &&
+          (folderCount() !== undefined || size() !== undefined || lineCount() !== undefined || relativeTime() !== "")
+        }
+      >
         <span data-slot="project-explorer-meta">
           <Show when={folderCount() !== undefined}>
             <span
@@ -1176,7 +1243,10 @@ function ProjectExplorerRow(props: {
             </span>
           </Show>
           <Show when={size() !== undefined}>
-            <span data-slot="project-explorer-size" title={size() !== undefined ? `${formatFileSize(size()!)}` : undefined}>
+            <span
+              data-slot="project-explorer-size"
+              title={size() !== undefined ? `${formatFileSize(size()!)}` : undefined}
+            >
               {formatFileSize(size()!)}
             </span>
           </Show>
@@ -1189,7 +1259,9 @@ function ProjectExplorerRow(props: {
             <span
               data-slot="project-explorer-time"
               title={absoluteTime() || relativeTime()}
-              aria-label={props.language.t("projectExplorer.meta.modifiedAbsolute", { date: absoluteTime() || relativeTime() })}
+              aria-label={props.language.t("projectExplorer.meta.modifiedAbsolute", {
+                date: absoluteTime() || relativeTime(),
+              })}
             >
               {relativeTime()}
             </span>
@@ -1202,7 +1274,9 @@ function ProjectExplorerRow(props: {
           type="button"
           data-slot="project-explorer-favorite"
           data-favorited={props.favorited ? "" : undefined}
-          aria-label={props.favorited ? props.language.t("model.favorite.remove") : props.language.t("model.favorite.add")}
+          aria-label={
+            props.favorited ? props.language.t("model.favorite.remove") : props.language.t("model.favorite.add")
+          }
           onClick={(event) => {
             event.stopPropagation()
             props.onFavorite()
