@@ -275,12 +275,16 @@ function markInlineCode(root: HTMLDivElement) {
   }
 }
 
-function decorate(root: HTMLDivElement, labels: CopyLabels) {
+let newLayout: boolean | undefined
+
+function decorate(root: HTMLDivElement, labels: CopyLabels, live = false) {
   const blocks = Array.from(root.querySelectorAll("pre"))
   for (const block of blocks) {
     ensureCodeWrapper(block, labels)
   }
-  if (!document.body.hasAttribute("data-new-layout")) return
+  if (live) return
+  if (newLayout === undefined) newLayout = document.body.hasAttribute("data-new-layout")
+  if (!newLayout) return
   markInlineCode(root)
   markCodeLinks(root)
 }
@@ -376,6 +380,33 @@ export function Markdown(
   const owner = createUniqueId()
   const activeCodeKeys = new Set<string>()
   const completedCode = new Map<string, Extract<RenderedBlock, { mode: "code" }>>()
+  const COMPLETED_CODE_MAX = 200
+  const COMPLETED_CODE_BYTES = 8 * 1024 * 1024
+  const completedCodeSizes = new Map<string, number>()
+  let completedCodeBytes = 0
+  const codeBytes = (value: Extract<RenderedBlock, { mode: "code" }>) => {
+    let total = value.raw.length * 2 + value.language.length * 2
+    for (const token of [...value.stable, ...value.unstable]) total += token[0].length * 2 + token[1].length * 2
+    return total
+  }
+  const cacheCompletedCode = (key: string, value: Extract<RenderedBlock, { mode: "code" }>) => {
+    const size = codeBytes(value)
+    const previous = completedCodeSizes.get(key)
+    if (previous !== undefined) completedCodeBytes -= previous
+    completedCode.delete(key)
+    completedCodeSizes.delete(key)
+    if (size > COMPLETED_CODE_BYTES) return
+    completedCode.set(key, value)
+    completedCodeSizes.set(key, size)
+    completedCodeBytes += size
+    while (completedCode.size > COMPLETED_CODE_MAX || completedCodeBytes > COMPLETED_CODE_BYTES) {
+      const oldest = completedCode.keys().next().value
+      if (oldest === undefined) break
+      completedCode.delete(oldest)
+      completedCodeBytes -= completedCodeSizes.get(oldest) ?? 0
+      completedCodeSizes.delete(oldest)
+    }
+  }
   let streamed = false
   const [projection] = createResource(
     () => {
@@ -438,7 +469,11 @@ export function Markdown(
         } satisfies RenderResult
       if (!src.text) return { text: src.text, blocks: [] } satisfies RenderResult
 
-      const base = src.key ?? checksum(src.text)
+      const hasLiveBlock = src.projection.blocks.some((block) => block.mode === "live")
+      // A live message changes on every token. Avoid hashing its entire
+      // accumulated text and avoid populating the durable HTML cache with a
+      // value that will be invalidated on the next token.
+      const base = src.key ?? (hasLiveBlock ? undefined : checksum(src.text))
       return Promise.all(
         src.projection.blocks.map(async (block, index) => {
           const key = base ? `${base}:${index}:${block.mode}` : undefined
@@ -446,7 +481,11 @@ export function Markdown(
 
           if (block.mode === "code") {
             const cached = completedCode.get(blockKey)
-            if (block.complete && cached?.raw === block.raw) return cached
+            if (block.complete && cached?.raw === block.raw) {
+              completedCode.delete(blockKey)
+              completedCode.set(blockKey, cached)
+              return cached
+            }
             const result = await code(block.src, block.language, blockKey, block.complete)
             const rendered = {
               key: blockKey,
@@ -456,7 +495,7 @@ export function Markdown(
               complete: !!block.complete,
               ...result,
             }
-            if (block.complete) completedCode.set(blockKey, rendered)
+            if (block.complete) cacheCompletedCode(blockKey, rendered)
             return rendered
           }
 
@@ -468,9 +507,9 @@ export function Markdown(
             }
           }
 
-          const hash = checksum(block.raw)
-          const safe = sanitizeMarkdown(await parseMarkdown(block.src))
-          if (key && hash) touchCachedMarkdown(key, { raw: block.raw, hash, html: safe })
+          const hash = block.mode === "live" ? String(block.raw.length) : checksum(block.raw)
+          const safe = sanitizeMarkdown(await parseMarkdown(block.src, blockKey))
+          if (key && hash && block.mode !== "live") touchCachedMarkdown(key, { raw: block.raw, hash, html: safe })
           return { key: blockKey, mode: block.mode, raw: block.raw, hash: hash ?? "", html: safe }
         }),
       )
@@ -548,6 +587,8 @@ export function Markdown(
     disposeMarkdownProjection(owner)
     activeCodeKeys.forEach(disposeCode)
     completedCode.clear()
+    completedCodeSizes.clear()
+    completedCodeBytes = 0
   })
 
   return (
@@ -616,7 +657,7 @@ function updateBlock(container: HTMLDivElement, index: number, block: RenderedBl
   next.dataset.markdownHash = block.hash
   next.style.display = "contents"
   next.innerHTML = block.html
-  decorate(next, labels)
+  decorate(next, labels, block.mode === "live")
 
   if (!(current instanceof HTMLDivElement)) {
     container.appendChild(next)
@@ -720,9 +761,36 @@ function sameToken(left: MarkdownToken, right: MarkdownToken | undefined) {
   return !!right && left[0] === right[0] && left[1] === right[1]
 }
 
+// Shiki reuses a small vocabulary of declarations. Parsing the same inline
+// style string for every token makes Blink do redundant CSS work and inflates
+// the DOM payload. Intern the vocabulary once per renderer and attach a class
+// backed by one bounded stylesheet; unusual/overflow styles retain the safe
+// inline fallback.
+const TOKEN_STYLE_LIMIT = 256
+const tokenStyleClasses = new Map<string, string>()
+let tokenStyleSheet: HTMLStyleElement | undefined
+function internTokenStyle(style: string) {
+  if (!style || typeof document === "undefined") return
+  const cached = tokenStyleClasses.get(style)
+  if (cached) return cached
+  if (tokenStyleClasses.size >= TOKEN_STYLE_LIMIT) return
+  const className = `oc-md-token-${tokenStyleClasses.size}`
+  tokenStyleClasses.set(style, className)
+  tokenStyleSheet ??= (() => {
+    const element = document.createElement("style")
+    element.dataset.markdownTokenStyles = ""
+    document.head.appendChild(element)
+    return element
+  })()
+  tokenStyleSheet.append(document.createTextNode(`.${className}{${style}}`))
+  return className
+}
+
 function createTokenSpan(token: MarkdownToken) {
   const span = document.createElement("span")
-  span.setAttribute("style", token[1])
+  const className = internTokenStyle(token[1])
+  if (className) span.className = className
+  else if (token[1]) span.style.cssText = token[1]
   span.textContent = token[0]
   return span
 }

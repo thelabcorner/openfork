@@ -106,6 +106,33 @@ export function project(previous: Projection | undefined, text: string, live: bo
   if (!previous || !text.startsWith(previous.text)) return { text, blocks: stream(text, live) }
   const tail = previous.blocks.at(-1)
   const suffix = text.slice(previous.text.length)
+  if (tail?.mode === "live" && suffix) {
+    const appended = tail.raw + suffix
+    // Plain prose cannot change token boundaries or remend's interpretation.
+    // Keep the previous projection and append the fragment directly; the
+    // structural-marker path below still heals links/emphasis/fences exactly
+    // when syntax arrives. This removes a full lexer + remend pass from the
+    // hottest ordinary-token path.
+    if (!/[`*_~[\]()<>{}]/.test(suffix) && !suffix.includes("\n")) {
+      return {
+        text,
+        blocks: [...previous.blocks.slice(0, -1), { ...tail, raw: appended, src: tail.src + suffix }],
+      }
+    }
+    // Once a blank-line boundary is present, every paragraph before it is
+    // immutable. Parse that bounded tail once and keep the still-growing
+    // suffix live; this prevents ordinary prose from re-lexing the entire
+    // message on every token.
+    const boundary = appended.lastIndexOf("\n\n")
+    if (boundary > 0 && boundary < appended.length - 2) {
+      const stable = completedProjection(appended.slice(0, boundary + 2)).blocks
+      const open = stream(appended.slice(boundary + 2), true)
+      return {
+        text,
+        blocks: [...previous.blocks.slice(0, -1), ...stable, ...open],
+      }
+    }
+  }
   if (!suffix || tail?.mode !== "code" || tail.complete || closesFence(tail.raw, suffix))
     return { text, blocks: stream(text, live) }
   return {

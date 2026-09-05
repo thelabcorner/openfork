@@ -1,56 +1,62 @@
 import { expect, test } from "bun:test"
 import { createWorkerTransport } from "./markdown-worker-transport"
 
-test("posts one request and retains only the latest queued snapshot per key", () => {
+test("bounds worker messages and preserves latest queued keys", () => {
   const posted: number[] = []
   const superseded: number[] = []
   const transport = createWorkerTransport<{ id: number; key: string }>({
+    maxActive: 1,
+    maxQueued: 2,
     post: (request) => posted.push(request.id),
     supersede: (request) => superseded.push(request.id),
   })
 
-  transport.send({ id: 1, key: "code" })
-  transport.send({ id: 2, key: "code" })
-  transport.send({ id: 3, key: "code" })
-
+  transport.send({ id: 1, key: "a" })
+  transport.send({ id: 2, key: "b" })
+  transport.send({ id: 3, key: "c" })
+  transport.send({ id: 4, key: "d" })
   expect(posted).toEqual([1])
   expect(superseded).toEqual([2])
-  expect(transport.queued()).toBe(1)
-  transport.complete("code", 1)
+
+  transport.complete("a", 1)
   expect(posted).toEqual([1, 3])
-  expect(transport.queued()).toBe(0)
+  transport.complete("c", 3)
+  expect(posted).toEqual([1, 3, 4])
 })
 
-test("ignores a disposed request response after the key is reused", () => {
+test("replacing an active key supersedes only its queued predecessor", () => {
   const posted: number[] = []
-  const transport = createWorkerTransport<{ id: number; key: string }>({
-    post: (request) => posted.push(request.id),
-    supersede: () => {},
-  })
-
-  transport.send({ id: 1, key: "code" })
-  transport.dispose("code")
-  transport.send({ id: 2, key: "code" })
-  transport.send({ id: 3, key: "code" })
-  transport.complete("code", 1)
-
-  expect(posted).toEqual([1, 2])
-  expect(transport.queued()).toBe(1)
-  transport.complete("code", 2)
-  expect(posted).toEqual([1, 2, 3])
-})
-
-test("drops queued snapshots when a key is disposed", () => {
   const superseded: number[] = []
   const transport = createWorkerTransport<{ id: number; key: string }>({
-    post: () => {},
+    maxActive: 1,
+    post: (request) => posted.push(request.id),
     supersede: (request) => superseded.push(request.id),
   })
 
-  transport.send({ id: 1, key: "code" })
-  transport.send({ id: 2, key: "code" })
-  transport.dispose("code")
-
+  transport.send({ id: 1, key: "a" })
+  transport.send({ id: 2, key: "a" })
+  transport.send({ id: 3, key: "a" })
   expect(superseded).toEqual([2])
-  expect(transport.queued()).toBe(0)
+  transport.complete("a", 1)
+  expect(posted).toEqual([1, 3])
+})
+
+test("replacing a waiting key rejects the old request instead of orphaning it", () => {
+  const posted: number[] = []
+  const superseded: number[] = []
+  const transport = createWorkerTransport<{ id: number; key: string }>({
+    maxActive: 1,
+    maxQueued: 2,
+    post: (request) => posted.push(request.id),
+    supersede: (request) => superseded.push(request.id),
+  })
+
+  transport.send({ id: 1, key: "active" })
+  transport.send({ id: 2, key: "same" })
+  transport.send({ id: 3, key: "same" })
+  expect(superseded).toEqual([2])
+  expect(transport.queued()).toBe(1)
+
+  transport.complete("active", 1)
+  expect(posted).toEqual([1, 3])
 })

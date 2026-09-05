@@ -47,3 +47,32 @@ test("serializes disposal before a later request for the same key", async () => 
 
   expect(events).toEqual(["supersede:1", "dispose:code", "highlight:2"])
 })
+
+test("drops the oldest queued key when the worker backlog reaches its cap", async () => {
+  const processed: number[] = []
+  const superseded: number[] = []
+  let release = () => {}
+  const blocked = new Promise<void>((resolve) => {
+    release = resolve
+  })
+  const queue = createLatestWorkerQueue<{ id: number; key: string }>({
+    maxPendingJobs: 2,
+    run: async (request) => {
+      processed.push(request.id)
+      if (request.id === 1) await blocked
+    },
+    supersede: (request) => superseded.push(request.id),
+    dispose: () => {},
+  })
+
+  queue.highlight({ id: 1, key: "one" })
+  await Promise.resolve()
+  queue.highlight({ id: 2, key: "two" })
+  queue.highlight({ id: 3, key: "three" })
+  queue.highlight({ id: 4, key: "four" })
+  release()
+  await queue.idle()
+
+  expect(processed).toEqual([1, 3, 4])
+  expect(superseded).toEqual([2])
+})
