@@ -12,9 +12,21 @@ upstream  https://github.com/anomalyco/opencode.git
 Default branch: `main`. Fetch `upstream/dev` for curiosity. Merge **tags**.
 
 ```powershell
-git fetch upstream --tags --prune
-git merge v1.18.22
+bun run fork:sync preflight v1.18.29
+git merge v1.18.29
+bun run fork:sync resolve
+# ... handle MANUAL items, re-run resolve until clean ...
+bun install
+git commit  # union-listing message, see a747d51764
+bun run fork:sync verify --tag v1.18.29
 ```
+
+`script/fork-sync.ts` owns the mechanical resolutions (DROP auto-prune,
+`bun.lock` theirs+regen, canonical `package.json` union, generated
+theirs+regen, fork-owned/meta ours) and enforces the semantic checklist as
+failing checks. Never hand-roll an ad-hoc union script: v1.18.29 lost the
+`@opencode-ai/core` `./memory` export that way. Extend `mergePackageJson`
+and add a regression test in `script/fork-sync.test.ts` instead.
 
 ## KEEP workspace
 
@@ -65,7 +77,7 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 | `packages/opencode/src/provider/provider.ts` | Take upstream provider fixes; keep fork credential/usage hooks |
 | `packages/opencode/src/server/routes/instance/httpapi/api.ts` | Re-register fork groups after upstream edits |
 | `packages/opencode/src/server/routes/instance/httpapi/server.ts` | Same |
-| root / package `package.json` | **Upstream versions.** Union fork deps. |
+| root / package `package.json` | Canonical union in `mergePackageJson` (`script/fork-sync.ts`): **upstream versions**; union deps (upstream wins overlaps); union scripts minus `dev:console/dev:stats/dev:storybook/sso` (fork wins `dev`); union `exports`/`imports` (fork wins overlaps, reported); union `files`; **curated explicit `workspaces.packages`** — never upstream `packages/*` globs (v1.18.29 broke `bun install` via pruned `packages/slack`). |
 | `bun.lock` | Regenerate with `bun install`. Never hand-merge. |
 | i18n `en.ts` | Keep fork keys. Do not drop English source. |
 
@@ -96,6 +108,11 @@ Keep the fork stub. Do not restore `#review-panel` because an upstream e2e wants
 Unit tests carrying both fork and upstream assertions (`test/tool/websearch.test.ts`, `test/session/prompt.test.ts`, `test/session/compaction.test.ts`, `test/provider/provider.test.ts`): union the suites — fold upstream renames and new cases into the expanded fork test instead of dropping either side.
 
 ## Semantic checklist (every tag merge)
+
+`bun run fork:sync verify` enforces the machine-checkable subset (quota
+routes, fork tools, pause/regenerate-title, session groups, updater pin,
+core `./memory` export, websearch union, workspaces installability, no DROP
+tracked, no conflict markers). The rest still needs eyes:
 
 - Fork credentials / Go usage cache wired
 - Pause / resume / regenerate-title on V1 HttpApi

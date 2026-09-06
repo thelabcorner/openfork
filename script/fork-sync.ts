@@ -83,11 +83,12 @@ const REPO_ROOT = join(import.meta.dir, "..")
 // paths never glob-expand the way they do under PowerShell)
 // ---------------------------------------------------------------------------
 
-function git(...args: string[]): { ok: boolean; out: string } {
+function git(...args: string[]): { ok: boolean; out: string; errout: string } {
   const out = Bun.spawnSync(["git", ...args], { stdout: "pipe", stderr: "pipe", cwd: REPO_ROOT })
   return {
     ok: out.exitCode === 0,
-    out: (out.stdout.toString() + out.stderr.toString()).trim(),
+    out: out.stdout.toString().trim(),
+    errout: out.stderr.toString().trim(),
   }
 }
 
@@ -637,9 +638,11 @@ function cmdVerify(tag?: string): number {
   if (dropTracked.length > 0)
     failures.push(`DROP paths still tracked (${dropTracked.length}): ${dropTracked.slice(0, 8).join(", ")}${dropTracked.length > 8 ? " …" : ""}`)
 
-  // conflict markers anywhere outside DROP trees
+  // conflict markers anywhere outside DROP trees. The needle is built
+  // dynamically so this file does not itself contain the literal.
   {
-    const args = ["grep", "-l", "<<<<<<< HEAD", "--", ".", ...manifest.pruneFromMain.map((p) => `:(exclude)${p}`)]
+    const needle = "<".repeat(7) + " HEAD"
+    const args = ["grep", "-l", needle, "--", ".", ...manifest.pruneFromMain.map((p) => `:(exclude)${p}`)]
     const r = Bun.spawnSync(["git", ...args], { stdout: "pipe", stderr: "pipe", cwd: REPO_ROOT })
     const hits = r.stdout.toString().trim()
     if (hits) failures.push(`conflict markers remain in:\n${hits}`)
