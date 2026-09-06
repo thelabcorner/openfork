@@ -46,8 +46,34 @@ function closesFence(raw: string, suffix: string) {
   return `${raw.slice(-(mark.length - 1))}${suffix}`.includes(mark)
 }
 
+// remend's setext-heading guard treats a trailing `-`/`=` line as a pending
+// setext underline and appends U+200B to keep it from being consumed. A bullet
+// list marker mid-stream looks exactly like that: "- item\n-" becomes
+// "- item\n-\u200b", so the new list item collapses into a lazy continuation of
+// the previous one and re-splits a token later. That flicker is the list the
+// user sees jumping. Only a line that follows a real paragraph can be a setext
+// underline, so skip the guard when the previous line is a list marker.
+const SETEXT_GUARD_LINE = /^[ \t]{0,3}-{1,2}[ \t]*$/
+const LIST_MARKER_LINE = /^[ \t]{0,3}(?:[-*+]|\d{1,9}[.)])[ \t]/
+
 function heal(text: string) {
-  return remend(text, { linkMode: "text-only" })
+  const healed = remend(text, { linkMode: "text-only" })
+  if (!healed.endsWith("​")) return healed
+  if (healed.length !== text.replace(/[ \t]+$/, "").length + 1) return healed
+  const newline = healed.lastIndexOf("\n")
+  if (newline < 0) return healed
+  const line = healed.slice(newline + 1, -1)
+  if (!SETEXT_GUARD_LINE.test(line)) return healed
+  // Only suppress the guard when the marker starts a new list item: it must sit
+  // at the same indent as the list item above it. A deeper indent is a nested
+  // list or setext underline, and a shallower one is genuinely ambiguous, so
+  // both keep remend's original behaviour.
+  const before = healed.slice(0, newline)
+  const previous = before.slice(before.lastIndexOf("\n") + 1)
+  const marker = line.match(/^[ \t]{0,3}/)?.[0] ?? ""
+  if (!previous.startsWith(marker)) return healed
+  if (!LIST_MARKER_LINE.test(previous.slice(marker.length))) return healed
+  return text
 }
 
 export function stream(text: string, live: boolean): Block[] {

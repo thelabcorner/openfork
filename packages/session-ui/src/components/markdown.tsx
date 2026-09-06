@@ -32,6 +32,7 @@ import { markdownBlockKey, type MarkdownToken } from "./markdown-worker-protocol
 import { shouldResetCodeTokens, type RenderedCodeState } from "./markdown-code-state"
 import { getCachedMarkdown, sanitizeMarkdown, touchCachedMarkdown, type MarkdownCacheEntry } from "./markdown-cache"
 import { inlineCodeKind } from "./markdown-inline-code-kind"
+import { markdownTraceEnabled, traceMarkdown } from "./markdown-trace"
 
 type RenderedBlock =
   | (MarkdownCacheEntry & { key: string; mode: Exclude<Block["mode"], "code"> })
@@ -508,7 +509,16 @@ export function Markdown(
           }
 
           const hash = block.mode === "live" ? String(block.raw.length) : checksum(block.raw)
-          const safe = sanitizeMarkdown(await parseMarkdown(block.src, blockKey))
+          const parsed = await parseMarkdown(block.src, blockKey)
+          const sanitizeStarted = markdownTraceEnabled() ? performance.now() : 0
+          const safe = sanitizeMarkdown(parsed)
+          if (sanitizeStarted !== 0)
+            traceMarkdown({
+              phase: "sanitize",
+              ms: performance.now() - sanitizeStarted,
+              chars: block.src.length,
+              htmlChars: parsed.length,
+            })
           if (key && hash && block.mode !== "live") touchCachedMarkdown(key, { raw: block.raw, hash, html: safe })
           return { key: blockKey, mode: block.mode, raw: block.raw, hash: hash ?? "", html: safe }
         }),
@@ -543,6 +553,8 @@ export function Markdown(
   let copyCleanup: (() => void) | undefined
 
   createEffect(() => {
+    const tracing = markdownTraceEnabled()
+    const effectStarted = tracing ? performance.now() : 0
     const container = root()
     const result = html.latest ?? html()
     const projected = currentProjection()
@@ -552,6 +564,14 @@ export function Markdown(
     if (content.length === 0) {
       disposeCopyButtons(container)
       container.innerHTML = ""
+      if (tracing)
+        traceMarkdown({
+          phase: "effect",
+          ms: performance.now() - effectStarted,
+          textChars: local.text.length,
+          blockCount: 0,
+          streaming: local.streaming ?? false,
+        })
       return
     }
 
@@ -565,7 +585,7 @@ export function Markdown(
     })
     activeCodeKeys.clear()
     nextCodeKeys.forEach((key) => activeCodeKeys.add(key))
-    content.forEach((block, index) => updateBlock(container, index, block, labels))
+    content.forEach((block, index) => updateBlock(container, index, block, labels, tracing))
     while (container.children.length > content.length) {
       const child = container.lastElementChild
       if (!child) break
@@ -580,6 +600,14 @@ export function Markdown(
         copy: i18n.t("ui.message.copy"),
         copied: i18n.t("ui.message.copied"),
       }))
+    if (tracing)
+      traceMarkdown({
+        phase: "effect",
+        ms: performance.now() - effectStarted,
+        textChars: local.text.length,
+        blockCount: content.length,
+        streaming: local.streaming ?? false,
+      })
   })
 
   onCleanup(() => {
@@ -638,32 +666,65 @@ function disposeCode(key: string) {
   disposeStreamingCode(key)
 }
 
-function updateBlock(container: HTMLDivElement, index: number, block: RenderedBlock, labels: CopyLabels) {
+function updateBlock(
+  container: HTMLDivElement,
+  index: number,
+  block: RenderedBlock,
+  labels: CopyLabels,
+  tracing: boolean,
+) {
+  const started = tracing ? performance.now() : 0
   const current = container.children[index]
   if (block.mode === "code") {
-    updateCodeBlock(container, current, block, labels)
+    updateCodeBlock(container, current, block, labels, tracing, started)
     return
   }
   if (
     current instanceof HTMLDivElement &&
     current.dataset.markdownKey === block.key &&
     current.dataset.markdownHash === block.hash
-  )
+  ) {
+    if (tracing)
+      traceMarkdown({
+        phase: "block",
+        ms: performance.now() - started,
+        action: "skip",
+        mode: block.mode,
+        chars: block.raw.length,
+        htmlChars: block.html.length,
+      })
     return
+  }
 
   const next = document.createElement("div")
   next.dataset.markdownBlock = ""
   next.dataset.markdownKey = block.key
   next.dataset.markdownHash = block.hash
   next.style.display = "contents"
+  const innerHTMLStarted = tracing ? performance.now() : 0
   next.innerHTML = block.html
+  const innerHTMLMs = tracing ? performance.now() - innerHTMLStarted : undefined
+  const decorateStarted = tracing ? performance.now() : 0
   decorate(next, labels, block.mode === "live")
+  const decorateMs = tracing ? performance.now() - decorateStarted : undefined
 
   if (!(current instanceof HTMLDivElement)) {
     container.appendChild(next)
+    if (tracing)
+      traceMarkdown({
+        phase: "block",
+        ms: performance.now() - started,
+        action: "append",
+        mode: block.mode,
+        chars: block.raw.length,
+        htmlChars: block.html.length,
+        innerHTMLMs,
+        decorateMs,
+      })
     return
   }
 
+  const morphStarted = tracing ? performance.now() : 0
   morphdom(current, next, {
     onBeforeElUpdated: (fromEl, toEl) => {
       if (
@@ -682,6 +743,18 @@ function updateBlock(container: HTMLDivElement, index: number, block: RenderedBl
       return true
     },
   })
+  if (tracing)
+    traceMarkdown({
+      phase: "block",
+      ms: performance.now() - started,
+      action: "morph",
+      mode: block.mode,
+      chars: block.raw.length,
+      htmlChars: block.html.length,
+      innerHTMLMs,
+      decorateMs,
+      morphMs: performance.now() - morphStarted,
+    })
 }
 
 function updateCodeBlock(
@@ -689,6 +762,8 @@ function updateCodeBlock(
   current: Element | undefined,
   block: Extract<RenderedBlock, { mode: "code" }>,
   labels: CopyLabels,
+  tracing: boolean,
+  started: number,
 ) {
   const existing = current instanceof HTMLDivElement && current.dataset.markdownKey === block.key ? current : undefined
   const next = existing ?? document.createElement("div")
@@ -716,10 +791,21 @@ function updateCodeBlock(
     const prefix = prior.findIndex((token, index) => !sameToken(token, tail[index]))
     const keep = stableCount + (prefix < 0 ? Math.min(prior.length, tail.length) : prefix)
     while (code.children.length > keep) code.lastElementChild?.remove()
+    const codeStarted = tracing ? performance.now() : 0
     tail
       .slice(keep - stableCount)
       .map(createTokenSpan)
       .forEach((span) => code.appendChild(span))
+    if (tracing)
+      traceMarkdown({
+        phase: "block",
+        ms: performance.now() - started,
+        action: "code-update",
+        mode: block.mode,
+        chars: block.raw.length,
+        codeMs: performance.now() - codeStarted,
+        tokenCount: tail.length - (keep - stableCount),
+      })
     renderedCodeTokens.set(next, {
       language: block.language,
       generation: block.generation,
@@ -752,9 +838,29 @@ function updateCodeBlock(
   if (current) {
     disposeCopyButtons(current)
     current.replaceWith(next)
+    if (tracing)
+      traceMarkdown({
+        phase: "block",
+        ms: performance.now() - started,
+        action: "code-replace",
+        mode: block.mode,
+        chars: block.raw.length,
+        codeMs: performance.now() - started,
+        tokenCount: block.stable.length + block.unstable.length,
+      })
     return
   }
   container.appendChild(next)
+  if (tracing)
+    traceMarkdown({
+      phase: "block",
+      ms: performance.now() - started,
+      action: "code-mount",
+      mode: block.mode,
+      chars: block.raw.length,
+      codeMs: performance.now() - started,
+      tokenCount: block.stable.length + block.unstable.length,
+    })
 }
 
 function sameToken(left: MarkdownToken, right: MarkdownToken | undefined) {

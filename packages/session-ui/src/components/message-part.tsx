@@ -93,6 +93,7 @@ import {
   WebfetchOutput,
 } from "./builtin-tools"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
+import { traceMarkdown } from "./markdown-trace"
 
 async function writeClipboard(text: string): Promise<boolean> {
   const body = typeof document === "undefined" ? undefined : document.body
@@ -313,8 +314,10 @@ function createPacedValue(getValue: () => string, live?: () => boolean) {
   }
 
   const sync = (text: string) => {
+    if (text === shown) return
     shown = text
     setValue(text)
+    traceMarkdown({ phase: "paced", chars: text.length, streaming: live?.() ?? false })
   }
 
   const run = () => {

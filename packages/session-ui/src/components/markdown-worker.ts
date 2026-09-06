@@ -8,6 +8,7 @@ import {
 } from "./markdown-worker-protocol"
 import { createWorkerTransport } from "./markdown-worker-transport"
 import type { Projection } from "./markdown-stream"
+import { markdownTraceEnabled, traceMarkdown } from "./markdown-trace"
 
 type HighlightPending = {
   key: string
@@ -41,6 +42,47 @@ const latest = new Map<string, number>()
 const stateSizes = new Map<string, number>()
 let stateBytesTotal = 0
 const MAX_STATE_BYTES = 32 * 1024 * 1024
+export const MARKDOWN_PARSE_MAX_ACTIVE = 16
+const workerStarted = new Map<
+  number,
+  { kind: "parse" | "project" | "highlight"; chars: number; started: number; posted?: number }
+>()
+
+function traceWorkerStart(kind: "parse" | "project" | "highlight", id: number, chars: number) {
+  if (!markdownTraceEnabled()) return
+  workerStarted.set(id, { kind, chars, started: performance.now() })
+}
+
+function traceWorkerPosted(id: number) {
+  const request = workerStarted.get(id)
+  if (request) request.posted = performance.now()
+}
+
+function traceWorkerFinish(
+  id: number,
+  status: "ok" | "superseded" | "error" | "disposed",
+  workerMs?: number,
+  workerQueueMs?: number,
+) {
+  const request = workerStarted.get(id)
+  if (!request) return
+  workerStarted.delete(id)
+  const finished = performance.now()
+  const dispatchWaitMs = request.posted === undefined ? finished - request.started : request.posted - request.started
+  const responseWaitMs = request.posted === undefined ? 0 : finished - request.posted
+  traceMarkdown({
+    phase: "worker",
+    kind: request.kind,
+    status,
+    ms: finished - request.started,
+    chars: request.chars,
+    workerMs,
+    workerQueueMs,
+    dispatchWaitMs,
+    responseWaitMs,
+  })
+}
+
 function stateBytes(state: MarkdownWorkerState) {
   return (
     state.stable.reduce((total, token) => total + token[0].length * 2 + token[1].length * 2, 0) +
@@ -53,8 +95,12 @@ function deleteState(key: string) {
   stateSizes.delete(key)
 }
 const transport = createWorkerTransport<Extract<MarkdownWorkerRequest, { type: "highlight" }>>({
-  post: (request) => worker!.postMessage(request),
+  post: (request) => {
+    traceWorkerPosted(request.id)
+    worker!.postMessage(request)
+  },
   supersede: (request) => {
+    traceWorkerFinish(request.id, "superseded")
     const result = pending.get(request.id)
     if (!result) return
     pending.delete(request.id)
@@ -62,8 +108,12 @@ const transport = createWorkerTransport<Extract<MarkdownWorkerRequest, { type: "
   },
 })
 const projectTransport = createWorkerTransport<Extract<MarkdownWorkerRequest, { type: "project" }>>({
-  post: (request) => worker!.postMessage(request),
+  post: (request) => {
+    traceWorkerPosted(request.id)
+    worker!.postMessage(request)
+  },
   supersede: (request) => {
+    traceWorkerFinish(request.id, "superseded")
     const result = projects.get(request.id)
     if (!result) return
     projects.delete(request.id)
@@ -71,8 +121,13 @@ const projectTransport = createWorkerTransport<Extract<MarkdownWorkerRequest, { 
   },
 })
 const parseTransport = createWorkerTransport<Extract<MarkdownWorkerRequest, { type: "parse" }>>({
-  post: (request) => worker!.postMessage(request),
+  maxActive: MARKDOWN_PARSE_MAX_ACTIVE,
+  post: (request) => {
+    traceWorkerPosted(request.id)
+    worker!.postMessage(request)
+  },
   supersede: (request) => {
+    traceWorkerFinish(request.id, "superseded")
     if (latestParse.get(request.key) === request.id) latestParse.delete(request.key)
     const result = parses.get(request.id)
     if (!result) return
@@ -90,11 +145,13 @@ export function parseMarkdown(text: string, key = `parse:${text.length}:${text.s
       const pending = parses.get(previous)
       if (pending) {
         parses.delete(previous)
+        traceWorkerFinish(previous, "superseded")
         pending.reject(new MarkdownWorkerSupersededError())
       }
     }
     latestParse.set(key, id)
     parses.set(id, { key, resolve, reject })
+    traceWorkerStart("parse", id, text.length)
     parseTransport.send({ type: "parse", id, key, text })
   })
 }
@@ -104,6 +161,7 @@ export function projectMarkdown(key: string, text: string, live: boolean) {
   const id = ++nextID
   return new Promise<Projection>((resolve, reject) => {
     projects.set(id, { key, resolve, reject })
+    traceWorkerStart("project", id, text.length)
     projectTransport.send({ type: "project", id, key, text, live })
   })
 }
@@ -113,6 +171,7 @@ export function disposeMarkdownProjection(key: string) {
   parses.forEach((request, id) => {
     if (request.key !== key) return
     parses.delete(id)
+    traceWorkerFinish(id, "disposed")
     request.reject(new MarkdownWorkerDisposedError())
   })
   latestParse.delete(key)
@@ -120,6 +179,7 @@ export function disposeMarkdownProjection(key: string) {
   projects.forEach((request, id) => {
     if (request.key !== key) return
     projects.delete(id)
+    traceWorkerFinish(id, "disposed")
     request.reject(new MarkdownWorkerDisposedError())
   })
   worker?.postMessage({ type: "dispose", key } satisfies MarkdownWorkerRequest)
@@ -134,6 +194,7 @@ export function highlightStreamingCode(key: string, text: string, language: stri
   if (keys.size > 200) disposeStreamingCode(keys.values().next().value!)
   return new Promise<MarkdownWorkerState>((resolve, reject) => {
     pending.set(id, { key, complete, resolve, reject })
+    traceWorkerStart("highlight", id, text.length)
     transport.send({ type: "highlight", id, key, text, language, complete })
   })
 }
@@ -146,6 +207,7 @@ export function disposeStreamingCode(key: string) {
   pending.forEach((request, id) => {
     if (request.key !== key) return
     pending.delete(id)
+    traceWorkerFinish(id, "disposed")
     request.reject(new MarkdownWorkerDisposedError())
   })
   worker?.postMessage({ type: "dispose", key } satisfies MarkdownWorkerRequest)
@@ -165,6 +227,12 @@ function getWorker() {
     throw new MarkdownWorkerUnavailableError(disabled.message)
   }
   worker.onmessage = (event: MessageEvent<MarkdownWorkerResponse>) => {
+    traceWorkerFinish(
+      event.data.id,
+      event.data.type === "error" ? "error" : event.data.type === "superseded" ? "superseded" : "ok",
+      "workerMs" in event.data ? event.data.workerMs : undefined,
+      "workerQueueMs" in event.data ? event.data.workerQueueMs : undefined,
+    )
     if (event.data.type === "parse") {
       const result = parses.get(event.data.id)
       if (!result) {
@@ -292,9 +360,11 @@ function getWorker() {
     pending.forEach((request) => request.reject(error))
     projects.forEach((request) => request.reject(error))
     parses.forEach((request) => request.reject(error))
+    workerStarted.forEach((_, id) => traceWorkerFinish(id, "error"))
     pending.clear()
     projects.clear()
     parses.clear()
+    workerStarted.clear()
     latestParse.clear()
     states.clear()
     stateSizes.clear()

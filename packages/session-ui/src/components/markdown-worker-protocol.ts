@@ -9,8 +9,8 @@ export type MarkdownWorkerRequest =
   | { type: "dispose"; key: string }
 
 export type MarkdownWorkerResponse =
-  | { type: "parse"; id: number; key: string; html: string }
-  | { type: "project"; id: number; key: string; projection: Projection }
+  | { type: "parse"; id: number; key: string; html: string; workerMs?: number; workerQueueMs?: number }
+  | { type: "project"; id: number; key: string; projection: Projection; workerMs?: number; workerQueueMs?: number }
   | {
       type: "highlight"
       id: number
@@ -19,8 +19,10 @@ export type MarkdownWorkerResponse =
       reset: boolean
       stable: MarkdownToken[]
       unstable: MarkdownToken[]
+      workerMs?: number
+      workerQueueMs?: number
     }
-  | { type: "error"; id: number; key?: string; message: string }
+  | { type: "error"; id: number; key?: string; message: string; workerMs?: number; workerQueueMs?: number }
   | { type: "superseded"; id: number; key: string }
 
 export type MarkdownWorkerState = {

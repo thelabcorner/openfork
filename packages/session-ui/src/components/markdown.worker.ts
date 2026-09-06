@@ -31,6 +31,7 @@ const MAX_PROJECTIONS = 512
 const MAX_PROJECTION_BYTES = 16 * 1024 * 1024
 const MAX_STREAM_BYTES = 16 * 1024 * 1024
 let highlighter: ReturnType<typeof createHighlighter> | undefined
+const workerReceived = new Map<number, number>()
 function disposeStream(key: string) {
   streams.delete(key)
   streamBytesTotal -= streamSizes.get(key) ?? 0
@@ -43,17 +44,26 @@ function disposeProjection(key: string) {
 }
 const highlightQueue = createLatestWorkerQueue<Extract<MarkdownWorkerRequest, { type: "highlight" }>>({
   run: highlight,
-  supersede: (request) => post({ type: "superseded", id: request.id, key: request.key }),
+  supersede: (request) => {
+    workerReceived.delete(request.id)
+    post({ type: "superseded", id: request.id, key: request.key })
+  },
   dispose: disposeStream,
 })
 const projectQueue = createLatestWorkerQueue<Extract<MarkdownWorkerRequest, { type: "project" }>>({
   run: runProject,
-  supersede: (request) => post({ type: "superseded", id: request.id, key: request.key }),
+  supersede: (request) => {
+    workerReceived.delete(request.id)
+    post({ type: "superseded", id: request.id, key: request.key })
+  },
   dispose: disposeProjection,
 })
 const parseQueue = createLatestWorkerQueue<Extract<MarkdownWorkerRequest, { type: "parse" }>>({
   run: parse,
-  supersede: (request) => post({ type: "superseded", id: request.id, key: request.key }),
+  supersede: (request) => {
+    workerReceived.delete(request.id)
+    post({ type: "superseded", id: request.id, key: request.key })
+  },
   dispose: () => undefined,
 })
 const parser = createMarkdownParser(async (code, language) => {
@@ -72,31 +82,51 @@ self.onmessage = (event: MessageEvent<MarkdownWorkerRequest>) => {
     return
   }
   if (event.data.type === "parse") {
+    workerReceived.set(event.data.id, performance.now())
     parseQueue.highlight(event.data)
     return
   }
   if (event.data.type === "project") {
+    workerReceived.set(event.data.id, performance.now())
     projectQueue.highlight(event.data)
     return
   }
 
+  workerReceived.set(event.data.id, performance.now())
   highlightQueue.highlight(event.data)
 }
 
 async function parse(request: Extract<MarkdownWorkerRequest, { type: "parse" }>) {
+  const started = performance.now()
+  const received = workerReceived.get(request.id) ?? started
+  workerReceived.delete(request.id)
+  const workerQueueMs = started - received
   try {
-    post({ type: "parse", id: request.id, key: request.key, html: await parser.parse(request.text) })
+    post({
+      type: "parse",
+      id: request.id,
+      key: request.key,
+      html: await parser.parse(request.text),
+      workerMs: performance.now() - started,
+      workerQueueMs,
+    })
   } catch (error) {
     post({
       type: "error",
       id: request.id,
       key: request.key,
       message: error instanceof Error ? error.message : String(error),
+      workerMs: performance.now() - started,
+      workerQueueMs,
     })
   }
 }
 
 async function runProject(request: Extract<MarkdownWorkerRequest, { type: "project" }>) {
+  const started = performance.now()
+  const received = workerReceived.get(request.id) ?? started
+  workerReceived.delete(request.id)
+  const workerQueueMs = started - received
   try {
     const projection = project(projections.get(request.key), request.text, request.live)
     const size = projection.text.length * 2 + projection.blocks.reduce((total, block) => total + block.raw.length * 2 + block.src.length * 2, 0)
@@ -118,18 +148,31 @@ async function runProject(request: Extract<MarkdownWorkerRequest, { type: "proje
       projectionBytesTotal -= projectionSizes.get(oldest) ?? 0
       projectionSizes.delete(oldest)
     }
-    post({ type: "project", id: request.id, key: request.key, projection })
+    post({
+      type: "project",
+      id: request.id,
+      key: request.key,
+      projection,
+      workerMs: performance.now() - started,
+      workerQueueMs,
+    })
   } catch (error) {
     post({
       type: "error",
       id: request.id,
       key: request.key,
       message: error instanceof Error ? error.message : String(error),
+      workerMs: performance.now() - started,
+      workerQueueMs,
     })
   }
 }
 
 async function highlight(request: Extract<MarkdownWorkerRequest, { type: "highlight" }>) {
+  const started = performance.now()
+  const received = workerReceived.get(request.id) ?? started
+  workerReceived.delete(request.id)
+  const workerQueueMs = started - received
   try {
     const instance = await getHighlighter()
     const language = request.language in bundledLanguages ? request.language : "text"
@@ -151,6 +194,8 @@ async function highlight(request: Extract<MarkdownWorkerRequest, { type: "highli
           )
           .map(token),
         unstable: [],
+        workerMs: performance.now() - started,
+        workerQueueMs,
       })
       return
     }
@@ -186,6 +231,8 @@ async function highlight(request: Extract<MarkdownWorkerRequest, { type: "highli
       reset,
       stable: result.stable.filter((token) => token.content.length > 0).map(token),
       unstable: result.unstable.filter((token) => token.content.length > 0).map(token),
+      workerMs: performance.now() - started,
+      workerQueueMs,
     })
   } catch (error) {
     post({
@@ -193,6 +240,8 @@ async function highlight(request: Extract<MarkdownWorkerRequest, { type: "highli
       id: request.id,
       key: request.key,
       message: error instanceof Error ? error.message : String(error),
+      workerMs: performance.now() - started,
+      workerQueueMs,
     })
   }
 }

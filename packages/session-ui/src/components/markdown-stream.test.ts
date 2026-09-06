@@ -8,6 +8,28 @@ describe("markdown stream", () => {
     expect(stream("say `code", true)).toEqual([{ raw: "say `code", src: "say `code`", mode: "live" }])
   })
 
+  test("does not collapse a pending bullet marker into the previous item", () => {
+    // remend appends U+200B to a trailing `-` to protect a pending setext
+    // underline. Mid-list that turns the marker into a lazy continuation, so
+    // "first item" absorbs the marker and re-splits on the next token, which is
+    // the list visibly jumping while it streams.
+    expect(stream("- first item\n-", true)).toEqual([
+      { raw: "- first item\n-", src: "- first item\n-", mode: "live" },
+    ])
+    expect(stream("- a\n- b\n-", true)).toEqual([{ raw: "- a\n- b\n-", src: "- a\n- b\n-", mode: "live" }])
+  })
+
+  test("keeps remend's setext guard for non-list text", () => {
+    expect(stream("real paragraph\n-", true)).toEqual([
+      { raw: "real paragraph\n-", src: "real paragraph\n-​", mode: "live" },
+    ])
+    expect(stream("real paragraph\n=", true)).toEqual([
+      { raw: "real paragraph\n=", src: "real paragraph\n=​", mode: "live" },
+    ])
+    // A deeper indent is a nested list or setext underline, not a sibling item.
+    expect(stream("- a\n  -", true)).toEqual([{ raw: "- a\n  -", src: "- a\n  -​", mode: "live" }])
+  })
+
   test("keeps incomplete links non-clickable until they finish", () => {
     expect(stream("see [docs](https://example.com/gu", true)).toEqual([
       { raw: "see [docs](https://example.com/gu", src: "see docs", mode: "live" },
