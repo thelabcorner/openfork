@@ -18,6 +18,7 @@ import { markServerStreamDead, markServerStreamLive } from "@/utils/server-liven
 import { eventStreamFetch } from "@/utils/event-stream-auth"
 import { trackPending } from "@/utils/pending-work"
 import { perf } from "./perf"
+import { phaseTrace } from "./phase-trace"
 
 const isAbortError = (error: unknown) =>
   error !== null && typeof error === "object" && "name" in error && error.name === "AbortError"
@@ -518,6 +519,19 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
             // heartbeats keep the socket alive but are not application events.
             markServerStreamLive(streamKey)
             streamErrorLogged = false
+            const frameKind =
+              "payload" in event
+                ? String((event.payload as { type?: unknown }).type ?? "unknown")
+                : String((event as { type?: unknown }).type ?? "unknown")
+            const frameProps =
+              "payload" in event
+                ? (event.payload as { properties?: unknown }).properties
+                : (event as { data?: unknown }).data
+            const frameSession =
+              frameProps !== null && typeof frameProps === "object"
+                ? (frameProps as Record<string, unknown>).sessionID
+                : undefined
+            phaseTrace.frame(frameKind, typeof frameSession === "string" ? frameSession : undefined)
             // Readiness alone is not recovery: overflowing streams can reconnect,
             // deliver server.connected, and immediately fail again.
             if (performance.now() - connectedAt >= 30_000) reconnectFailures = 0
@@ -539,12 +553,19 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
               }
               continue
             }
+            const dispatchedAt = performance.now()
             receive({ directory, payload })
+            phaseTrace.dispatch(performance.now() - dispatchedAt)
             // A replay cursor that fell outside the server ring is a repair
             // signal, not a normal domain event. Keep the diagnostic frame,
             // then enqueue a connected barrier so directory/session stores
             // perform their existing snapshot hydration path immediately.
             if ((payload as { type?: string }).type === "server.stream.gap") {
+              const gapProps =
+                "properties" in payload
+                  ? (payload.properties as Record<string, unknown> | undefined)
+                  : (payload as { data?: Record<string, unknown> }).data
+              phaseTrace.gap({ requested: gapProps?.requested, latest: gapProps?.latest })
               receive({ directory, payload: { id: payload.id, type: "server.connected", properties: {} } as ServerEvent })
             }
             schedule()
@@ -557,6 +578,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
           if (!attempt.signal.aborted) {
             markServerStreamDead(streamKey)
             reconnectFailures++
+            phaseTrace.reconnect({ failures: reconnectFailures })
           }
         } catch (error) {
           if (!isStreamClosed(error, attempt?.signal) && !streamErrorLogged) {
@@ -572,6 +594,7 @@ function createServerSdkContextBase(server: ServerConnection.Any, scope: ServerS
           if (!isStreamClosed(error, attempt?.signal)) {
             markServerStreamDead(streamKey)
             reconnectFailures++
+            phaseTrace.reconnect({ failures: reconnectFailures })
           }
         } finally {
           abort.signal.removeEventListener("abort", onAbort)

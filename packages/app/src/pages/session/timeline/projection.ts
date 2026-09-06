@@ -1,6 +1,7 @@
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
 import type { AssistantMessage, Message, Part, SessionStatus, UserMessage } from "@opencode-ai/sdk/v2"
 import { createMemo, mapArray, type Accessor } from "solid-js"
+import { phaseTrace } from "@/context/phase-trace"
 import { reuseTimelineRows } from "./row-reconciliation"
 import { Timeline, TimelineRow } from "./rows"
 
@@ -49,13 +50,16 @@ export function createTimelineProjection(input: {
   // `getMessageDirect`/`input.parts`, not through a derived Map that gets rebuilt -- and
   // therefore looks "changed" by reference -- on every message-list event), so Solid's
   // own fine-grained dependency tracking decides which turn actually needs to recompute.
-  const grouped = createMemo(() =>
-    Timeline.groupTurns(
+  const grouped = createMemo(() => {
+    const started = phaseTrace.enabled ? performance.now() : 0
+    const turns = Timeline.groupTurns(
       input.sessionMessages(),
       (messageID) => messageByID().get(messageID) as UserMessage | AssistantMessage | undefined,
       input.userMessages(),
-    ),
-  )
+    )
+    if (phaseTrace.enabled) phaseTrace.projection(performance.now() - started, turns.turns.length)
+    return turns
+  })
   const activeMessageID = createMemo(() => grouped().activeMessageID)
   const turnOrder = createMemo(() => grouped().turns.map((turn) => turn.user.id), emptyIDs, {
     equals: arraysShallowEqual,
@@ -77,12 +81,13 @@ export function createTimelineProjection(input: {
     const assistantMessages = mapArray(assistantIDs, (assistantID) => createMemo(() => getMessageDirect(assistantID)))
     const isFirstTurn = createMemo(() => turnOrder()[0] === userMessageID)
     return createMemo<TimelineRow.TimelineRow[]>(() => {
+      const started = phaseTrace.enabled ? performance.now() : 0
       const user = userMessage()
       if (user?.role !== "user") return emptyRows
       const assistants = assistantMessages()
         .map((get) => get())
         .filter((message): message is AssistantMessage => message?.role === "assistant")
-      return Timeline.constructMessageRows(
+      const rows = Timeline.constructMessageRows(
         user,
         input.parts,
         assistants,
@@ -92,6 +97,8 @@ export function createTimelineProjection(input: {
         userMessageID === activeMessageID(),
         input.inlineComments(),
       )
+      if (phaseTrace.enabled) phaseTrace.row(userMessageID, performance.now() - started)
+      return rows
     })
   })
   const rows = createMemo((previous: TimelineRow.TimelineRow[] | undefined) =>

@@ -1,9 +1,8 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
-import { preloadMarkdown } from "@opencode-ai/session-ui/markdown-cache"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type InfiniteData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/solid-query"
 import { DateTime } from "luxon"
-import { type Accessor, createEffect, createMemo, createRoot, type JSX, startTransition } from "solid-js"
+import { type Accessor, createEffect, createMemo, type JSX, startTransition } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { useCommand } from "@/context/command"
 import {
@@ -190,41 +189,6 @@ export function createHomeSessionsController(home: HomeController) {
     if (ids.length === 0) return
     void dialog.show(() => <DialogSessionGroupName onSubmit={(name) => void createGroup(name, ids)} />)
   }
-  const prefetched = new Set<string>()
-
-  createEffect(() => {
-    const ctx = home.server.focusedContext()
-    const conn = home.server.focused()
-    if (!ctx || !conn) return
-    records()
-      .slice(0, 2)
-      .forEach((record) => {
-        const key = `${ServerConnection.key(conn)}\0${record.session.id}`
-        if (prefetched.has(key)) return
-        prefetched.add(key)
-        createRoot((dispose) => {
-          try {
-            void ctx.sync.session
-              .sync(record.session.id)
-              .then(() =>
-                Promise.all(
-                  (ctx.sync.session.data.message[record.session.id] ?? []).flatMap((message) =>
-                    (ctx.sync.session.data.part[message.id] ?? []).flatMap((part) => {
-                      if (part.type !== "text" || !part.text) return []
-                      return preloadMarkdown(part.text, part.id)
-                    }),
-                  ),
-                ),
-              )
-              .catch(() => {})
-              .finally(dispose)
-          } catch {
-            dispose()
-          }
-        })
-      })
-  })
-
   command.register("home.palette", () => [
     {
       id: "command.palette",

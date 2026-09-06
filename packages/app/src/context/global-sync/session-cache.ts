@@ -20,19 +20,46 @@ export function dropSessionCaches(store: SessionCache, sessionIDs: Iterable<stri
   const stale = new Set(Array.from(sessionIDs).filter(Boolean))
   if (stale.size === 0) return
 
-  // Evict only the parts owned by the sessions being dropped, keyed via each
-  // session's own message list. Scanning every key in store.part here would be
-  // O(all cached messages across every session visited this run), which turned
-  // an occasional cache trim into a full-store sweep on every tab sync once
-  // SESSION_CACHE_LIMIT was exceeded.
+  // Fast path: evict only the parts owned by the sessions being dropped, keyed
+  // via each session's own message list. Scanning every key in store.part here
+  // would be O(all cached messages across every session visited this run),
+  // which turned an occasional cache trim into a full-store sweep on every tab
+  // sync once SESSION_CACHE_LIMIT was exceeded.
+  //
+  // Orphan path: a session whose message list is already gone cannot be walked,
+  // so its parts and text accumulators would stay in the store for the life of
+  // the process. Those sessions are collected here and resolved by a single
+  // pass over store.part, which runs only when such a session is present — so
+  // the common trim keeps its cheap message-walk.
+  const orphan = new Set<string>()
   for (const sessionID of stale) {
-    for (const message of store.message[sessionID] ?? []) {
+    const messages = store.message[sessionID]
+    if (!messages || messages.length === 0) {
+      orphan.add(sessionID)
+      continue
+    }
+    for (const message of messages) {
       const parts = store.part[message.id]
       if (!parts) continue
       for (const part of parts) {
         delete store.part_text_accum_delta[part.id]
       }
       delete store.part[message.id]
+    }
+  }
+
+  if (orphan.size > 0) {
+    // Object.entries snapshots the key list, so deleting during the loop is safe.
+    for (const [messageID, parts] of Object.entries(store.part)) {
+      if (!parts || parts.length === 0) continue
+      // Parts carry their own sessionID, so ownership does not depend on the
+      // message list still being present.
+      const owner = parts.find((part) => !!part?.sessionID)?.sessionID
+      if (!owner || !orphan.has(owner)) continue
+      for (const part of parts) {
+        delete store.part_text_accum_delta[part.id]
+      }
+      delete store.part[messageID]
     }
   }
 

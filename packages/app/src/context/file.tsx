@@ -1,4 +1,4 @@
-import { createEffect, createMemo, onCleanup } from "solid-js"
+import { createEffect, createMemo, createSignal, onCleanup, untrack } from "solid-js"
 import { createStore, produce, reconcile } from "solid-js/store"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { showToast } from "@/utils/toast"
@@ -27,6 +27,7 @@ import { useServerSDK } from "./server-sdk"
 import { SessionRouteKey, SessionStateKey } from "@/utils/server-scope"
 import { createFileTreeStore } from "./file/tree-store"
 import { invalidateFromWatcher } from "./file/watcher"
+import { createStaleDrain, WATCHER_DIR_QUEUE_MAX } from "./file/stale-drain"
 import { createGitStatusStore } from "./file/git-status"
 import { normalizeFileTreeV2Path } from "@/components/file-tree-v2-model"
 import { perf } from "@/context/perf"
@@ -80,7 +81,6 @@ export {
 
 const WATCHER_TREE_REFRESH_DELAY_MS = 120
 const WATCHER_TREE_REFRESH_CONCURRENCY = 4
-const WATCHER_DIR_QUEUE_MAX = 512
 const WATCHER_FILE_QUEUE_MAX = 256
 const WATCHER_FILE_REFRESH_DELAY_MS = 80
 const WATCHER_FILE_REFRESH_CONCURRENCY = 2
@@ -156,12 +156,23 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       timer: undefined as ReturnType<typeof setTimeout> | undefined,
       queue: new Set<string>(),
       stale: new Set<string>(),
-      staleAll: false,
       fileRunning: false,
       fileTimer: undefined as ReturnType<typeof setTimeout> | undefined,
       fileQueue: new Set<string>(),
     }
 
+    // Reactive watcher-stale flags. These used to be plain object fields, so
+    // arming them never scheduled the recovery effect: with the pane already
+    // visible and no tree write to piggyback on, the tree stayed silently
+    // stale until an unrelated reactivity ping happened to re-run it.
+    const [staleAll, setStaleAll] = createSignal(false)
+    const [staleVersion, setStaleVersion] = createSignal(0)
+
+    // Cursor over the loaded-directory snapshot captured when a queue overflow
+    // reports loss of precise paths. Draining it in bounded batches keeps the
+    // live queue far below WATCHER_DIR_QUEUE_MAX, so the recovery path can
+    // never re-arm the overflow it is servicing -- which is exactly what made
+    // the old recovery self-sustaining.
     const tree = createFileTreeStore({
       scope,
       schedulerKey: () => serverSDK().url,
@@ -225,7 +236,9 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       watcherRefresh.queue.clear()
       watcherRefresh.stale.clear()
       watcherRefresh.fileQueue.clear()
-      watcherRefresh.staleAll = false
+      setStaleAll(false)
+      // The recovered directory list belongs to the outgoing project.
+      staleDrain.reset()
       if (watcherRefresh.timer) clearTimeout(watcherRefresh.timer)
       watcherRefresh.timer = undefined
       if (watcherRefresh.fileTimer) clearTimeout(watcherRefresh.fileTimer)
@@ -410,6 +423,11 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         )
     }
 
+    const markAllStale = () => {
+      if (staleAll()) return
+      setStaleAll(true)
+    }
+
     const enqueueWatcherDirectory = (target: Set<string>, directory: string) => {
       if (target.has(directory)) return
       // A branch switch or dependency install can produce thousands of watcher
@@ -418,7 +436,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       // pretending that a root refresh repaired deep expanded branches.
       if (target.size >= WATCHER_DIR_QUEUE_MAX) {
         target.clear()
-        watcherRefresh.staleAll = true
+        markAllStale()
         return
       }
       target.add(directory)
@@ -485,6 +503,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           next.forEach((dir) => enqueueWatcherDirectory(watcherRefresh.stale, dir))
           watcherRefresh.queue.forEach((dir) => enqueueWatcherDirectory(watcherRefresh.stale, dir))
           watcherRefresh.queue.clear()
+          setStaleVersion((value) => value + 1)
           return
         }
 
@@ -493,6 +512,9 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           next.map((dir) => tree.listDir(dir, { force: true, priority: "background" })),
         ).finally(() => {
           watcherRefresh.running = false
+          // A completed batch frees queue capacity; top it back up from the
+          // recovery cursor before falling back to the ordinary queue drain.
+          if (staleDrain.continuePump()) return
           drainWatcherRefreshQueue()
         })
       }, WATCHER_TREE_REFRESH_DELAY_MS)
@@ -502,31 +524,47 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       const normalized = path.normalize(dir)
       if (!treeConsumerVisible()) {
         enqueueWatcherDirectory(watcherRefresh.stale, normalized)
+        // Reactive ping: `stale` is a plain Set, so without this a hidden pane
+        // that accumulated invalidations stays stale after it becomes visible
+        // until some unrelated tree write re-runs the recovery effect.
+        setStaleVersion((value) => value + 1)
         return
       }
       enqueueWatcherDirectory(watcherRefresh.queue, normalized)
       drainWatcherRefreshQueue()
     }
 
+    const staleDrain = createStaleDrain({
+      visible: treeConsumerVisible,
+      disposed: () => watcherRefresh.disposed,
+      staleAll,
+      setStaleAll,
+      loadedDirectories: tree.loadedDirectories,
+      isLoaded: tree.isLoaded,
+      markTreeStale: tree.markAllStale,
+      enqueue: (dir) => enqueueWatcherDirectory(watcherRefresh.queue, dir),
+      queueSize: () => watcherRefresh.queue.size,
+      drain: () => drainWatcherRefreshQueue(),
+      stale: watcherRefresh.stale,
+    })
+
     createEffect(() => {
       if (!treeConsumerVisible()) return
-      if (watcherRefresh.staleAll) {
+      // Track the recovery flags so arming them schedules this effect. Reads
+      // that must NOT subscribe (the tree store, the queue, the cursor) are
+      // untracked: every listDir the drain performs writes the tree store, and
+      // subscribing to those writes made the drain re-trigger itself forever.
+      staleAll()
+      staleVersion()
+
+      untrack(() => {
         // A bounded queue overflow is a loss of precise paths. Mark the whole
         // loaded index stale and re-list lazily by directory, rather than
         // pretending the root refresh repaired deep expanded branches.
-        const loaded = tree.loadedDirectories()
-        watcherRefresh.staleAll = false
-        tree.markAllStale()
-        for (const dir of loaded) enqueueWatcherDirectory(watcherRefresh.queue, dir)
-      }
-      // Only refresh dirs still loaded in the tree. Events that landed while the
-      // tree was hidden may reference dirs that were reset on a project switch;
-      // refreshing those would be wasted work and a burst of listDir calls.
-      for (const dir of watcherRefresh.stale) {
-        if (tree.isLoaded(dir)) enqueueWatcherDirectory(watcherRefresh.queue, dir)
-      }
-      watcherRefresh.stale.clear()
-      drainWatcherRefreshQueue()
+        staleDrain.beginRecovery()
+        if (!staleDrain.pump()) return
+        drainWatcherRefreshQueue()
+      })
     })
 
     // Subscribe by event type so the explorer does not execute a callback for
@@ -578,14 +616,14 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       watcherRefresh.disposed = true
       if (watcherRefresh.timer) clearTimeout(watcherRefresh.timer)
       if (watcherRefresh.fileTimer) clearTimeout(watcherRefresh.fileTimer)
-      if (watcherRefresh.staleAll || watcherRefresh.queue.size > 0 || watcherRefresh.stale.size > 0) {
+      if (staleAll() || staleDrain.pending() || watcherRefresh.queue.size > 0 || watcherRefresh.stale.size > 0) {
         // Persist the loss of precise watcher paths so a provider remount
         // cannot present a silently stale cached tree as authoritative.
         tree.markAllStale()
       }
       watcherRefresh.queue.clear()
       watcherRefresh.stale.clear()
-      watcherRefresh.staleAll = false
+      staleDrain.reset()
       watcherRefresh.fileQueue.clear()
       gitStatus.dispose()
       // FileProvider fully remounts on every navigation away from a session and back

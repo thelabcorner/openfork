@@ -60,6 +60,7 @@ import type {
 import { toggleMcp } from "./global-sync/mcp"
 import { createServerSession, type ServerSession } from "./server-session"
 import { perf } from "./perf"
+import { phaseTrace } from "./phase-trace"
 
 type GlobalStore = {
   ready: boolean
@@ -381,14 +382,32 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   let eventFrame: number | undefined
   let eventTimer: ReturnType<typeof setTimeout> | undefined
 
-  const time = (name: "applyV2" | "apply" | "dir" | "home" | "invalid", fn: () => void) => {
+  const sessionOf = (value: unknown): string | undefined => {
+    if (value === null || typeof value !== "object") return undefined
+    const data = (value as { data?: unknown }).data
+    const props = (value as { properties?: unknown }).properties
+    const candidate =
+      data !== null && typeof data === "object"
+        ? (data as Record<string, unknown>).sessionID
+        : props !== null && typeof props === "object"
+          ? (props as Record<string, unknown>).sessionID
+          : undefined
+    return typeof candidate === "string" ? candidate : undefined
+  }
+
+  const time = (name: "applyV2" | "apply" | "dir" | "home" | "invalid", fn: () => void, sessionID?: string) => {
+    const started = phaseTrace.enabled ? performance.now() : 0
     if (!perf.enabled) {
       fn()
+      if (phaseTrace.enabled && (name === "applyV2" || name === "apply")) {
+        phaseTrace.reducer(name, performance.now() - started, sessionID)
+      }
       return
     }
     const t = performance.now()
     fn()
     perf.span(name, performance.now() - t)
+    if (name === "applyV2" || name === "apply") phaseTrace.reducer(name, performance.now() - started, sessionID)
   }
 
   onCleanup(() => {
@@ -650,10 +669,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
     if (event.current) {
       const current = event.current
-      time("applyV2", () => session.applyV2(current))
+      time("applyV2", () => session.applyV2(current), sessionOf(current))
     }
     const nativeSessionEvent = isNativeSessionEvent(event.current?.type)
-    if (!nativeSessionEvent) time("apply", () => session.apply(event))
+    if (!nativeSessionEvent) time("apply", () => session.apply(event), sessionOf(event))
 
     // Stream deltas have already been reduced into the shared session store.
     // They cannot affect directory metadata, home indexing, invalidation, or

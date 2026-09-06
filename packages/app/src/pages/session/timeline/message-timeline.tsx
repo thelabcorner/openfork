@@ -65,6 +65,7 @@ import { shouldMarkBoundaryGesture, normalizeWheelDelta } from "@/pages/session/
 import { SessionContextUsage } from "@/components/session-context-usage"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useLanguage } from "@/context/language"
+import { phaseTrace } from "@/context/phase-trace"
 import { useSessionKey } from "@/pages/session/session-layout"
 import { useSessionArchive } from "@/pages/session/session-archive"
 import { useServerSDK } from "@/context/server-sdk"
@@ -406,6 +407,7 @@ export function MessageTimeline(props: {
     sessionMessages()
     sessionStatus().type
     estimateInputCache = new WeakMap()
+    phaseTrace.counter("estimateCacheResets")
   })
 
   let prependAnchor: { key: string; offset: number } | undefined

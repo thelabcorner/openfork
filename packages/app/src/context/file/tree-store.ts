@@ -19,6 +19,16 @@ export type TreeSnapshot = {
   nodeCount?: number
   /** Preserve watcher-loss staleness across provider remounts. */
   stale?: boolean
+  /**
+   * The `loadedEpoch` value the saved `dir` entries were loaded at. Persisted
+   * alongside the snapshot because every directory's freshness is the pair
+   * (`loaded`, `loadedEpoch === staleEpoch()`). Saving only `stale` and
+   * re-deriving the epoch as `stale ? 1 : 0` compared directory epochs from the
+   * previous store against a counter that had restarted at 0 -- so a snapshot
+   * taken at epoch 3 restored as entirely not-loaded and the whole tree
+   * re-listed on switch-back, silently defeating the scope cache.
+   */
+  loadedEpoch?: number
 }
 
 type TreeStoreOptions = {
@@ -47,6 +57,23 @@ const MAX_QUEUED_LIST_REQUESTS = 1024
 const MAX_QUEUED_BACKGROUND_REQUESTS = 256
 const MAX_SHARED_QUEUED_LIST_REQUESTS = 2048
 const MAX_CHILD_CACHE_ENTRIES = 8192
+
+/**
+ * Outcome of an expandAll run. `truncated` is the signal that used to be
+ * missing: when the scheduler queue overflows, requests are dropped without an
+ * answer, and the affected branches must be reported rather than silently
+ * excluded from the expansion.
+ */
+export type ExpandAllResult = {
+  /** True when at least one directory could not be listed. */
+  truncated: boolean
+  /** Directories this run could not list -- retryable, and user-reportable. */
+  droppedDirectories: string[]
+  /** Directories this run visited. */
+  expanded: number
+  /** Directories this run actually listed (expanded - dropped). */
+  reached: number
+}
 // Cancellation is not an authoritative empty directory response.
 const CANCELLED_LIST: FileNode[] = []
 
@@ -64,17 +91,62 @@ type SharedListGate = {
   activeBackground: number
   queue: SharedListJob[]
   pump: () => void
+  /** Clock stamp of the last lookup, so eviction can prefer the coldest gate. */
+  lastUsed: number
 }
 
 const sharedListGates = new Map<string, SharedListGate>()
+const MAX_SHARED_GATES = 32
+let sharedGateClock = 0
+
+/**
+ * Live size of the scheduler gate identity map. Exported so tests can assert
+ * the map stays bounded; it is a diagnostic, not part of the store's behaviour.
+ */
+export const sharedListGateCount = () => sharedListGates.size
+
+/**
+ * Bound the identity map. Keys are sidecar URLs, so cycling sidecars would
+ * otherwise accumulate entries forever.
+ *
+ * Eviction prefers gates that own no work. The old loop scanned for a single
+ * `active === 0 && queue.length === 0` candidate and gave up when every gate
+ * was busy, so the map grew without bound exactly when it was under load.
+ * Idle gates go oldest-first; if none is idle we still evict the coldest
+ * rather than grow unboundedly. An evicted gate's in-flight jobs keep running
+ * against the object they closed over, so the only cost of a forced eviction
+ * is a brief window where a fresh gate for the same URL runs alongside the old
+ * one (momentary over-concurrency for that URL, never a lost or dropped job).
+ */
+const evictSharedListGates = (protectedKey: string) => {
+  let excess = sharedListGates.size - MAX_SHARED_GATES
+  if (excess <= 0) return
+  const idle = (gate: SharedListGate) => (gate.active === 0 && gate.queue.length === 0 ? 0 : 1)
+  const ordered = [...sharedListGates.entries()]
+    .filter(([key]) => key !== protectedKey)
+    .sort((left, right) => {
+      const byIdle = idle(left[1]) - idle(right[1])
+      if (byIdle !== 0) return byIdle
+      return left[1].lastUsed - right[1].lastUsed
+    })
+  for (const [key] of ordered) {
+    if (excess <= 0) break
+    sharedListGates.delete(key)
+    excess -= 1
+  }
+}
 
 const sharedListGate = (key: string) => {
   const existing = sharedListGates.get(key)
-  if (existing) return existing
+  if (existing) {
+    existing.lastUsed = ++sharedGateClock
+    return existing
+  }
   const gate: SharedListGate = {
     active: 0,
     activeBackground: 0,
     queue: [],
+    lastUsed: ++sharedGateClock,
     pump() {
       // Drop superseded jobs before looking for a permit. This keeps a search
       // keystroke from leaving thousands of cancelled directories in the
@@ -107,17 +179,10 @@ job.resolve(CANCELLED_LIST)
       }
     },
   }
-  sharedListGates.set(key, gate)
   // A renderer can briefly connect to many sidecars. Keep the identity map
-  // bounded without evicting a gate that still owns work.
-  if (sharedListGates.size > 32) {
-    for (const [candidateKey, candidate] of sharedListGates) {
-      if (candidateKey !== key && candidate.active === 0 && candidate.queue.length === 0) {
-        sharedListGates.delete(candidateKey)
-        break
-      }
-    }
-  }
+  // bounded, preferring gates that own no work.
+  sharedListGates.set(key, gate)
+  evictSharedListGates(key)
   return gate
 }
 
@@ -179,7 +244,10 @@ export function createFileTreeStore(options: TreeStoreOptions) {
   const directoryTouches = new Map<string, number>()
   let touchClock = 0
   const [nodeVersion, bumpNodeVersion] = createSignal(0)
-  const [staleEpoch, setStaleEpoch] = createSignal(initialSnapshot?.stale ? 1 : 0)
+  // Resume the persisted epoch rather than restarting at 0/1. Directory
+  // freshness is (`loaded`, `loadedEpoch === staleEpoch()`), so the restored
+  // epoch must be the same one the restored `loadedEpoch`s were written under.
+  const [staleEpoch, setStaleEpoch] = createSignal(initialSnapshot?.loadedEpoch ?? (initialSnapshot?.stale ? 1 : 0))
   let nodeIndex: FileNode[] = initialSnapshot ? Object.values(initialSnapshot.node) : []
   const nodePositions = new Map<string, number>(nodeIndex.map((node, index) => [node.path, index]))
 
@@ -217,6 +285,62 @@ export function createFileTreeStore(options: TreeStoreOptions) {
   }
 
   /**
+   * Number of nodes reachable below each directory, excluding the directory's
+   * own node. Maintained incrementally so trimLiveTree can pick victims by the
+   * size of the subtree it is about to drop, instead of walking each candidate
+   * subtree in turn to discover that number.
+   *
+   * Only directories that have ever had `children` carry an entry; absence
+   * means 0. The map is authoritative at the entry points that matter (after a
+   * listing commit and after a trim), and trimLiveTree treats it as advisory
+   * input for victim ORDERING only -- correctness never depends on it.
+   */
+  const subtreeSizes = new Map<string, number>()
+  const subtreeSize = (directory: string) => subtreeSizes.get(directory) ?? 0
+
+  /** Recompute `directory`'s own subtree size from its current children. */
+  const refreshSubtreeSize = (directory: string) => {
+    let size = 0
+    for (const child of tree.dir[directory]?.children ?? []) {
+      size += 1 + (tree.node[child]?.type === "directory" ? subtreeSize(child) : 0)
+    }
+    if (size === 0) subtreeSizes.delete(directory)
+    else subtreeSizes.set(directory, size)
+  }
+
+  /**
+   * A directory's children changed: recompute it, then fold the delta into every
+   * ancestor so the ancestor sizes stay consistent without a full recompute.
+   * Ancestors are derived by walking the path, which is bounded by tree depth,
+   * not by tree size.
+   */
+  const propagateSubtreeSize = (directory: string, previous: number) => {
+    refreshSubtreeSize(directory)
+    const next = subtreeSize(directory)
+    const delta = next - previous
+    if (delta === 0 || directory === "") return
+    // Walk every strict ancestor up to and including the root "". A top-level
+    // directory like "src" has no "/" but still belongs to the root, so the
+    // loop is prefix-driven rather than cut-driven.
+    let prefix = directory
+    for (;;) {
+      const cut = prefix.lastIndexOf("/")
+      prefix = cut < 0 ? "" : prefix.slice(0, cut)
+      const updated = subtreeSize(prefix) + delta
+      if (updated <= 0) subtreeSizes.delete(prefix)
+      else subtreeSizes.set(prefix, updated)
+      if (prefix === "") break
+    }
+  }
+
+  /** Rebuild every size from the live tree. Used after a restore/reset. */
+  const rebuildSubtreeSizes = () => {
+    subtreeSizes.clear()
+    const directories = Object.keys(tree.dir).sort((left, right) => right.length - left.length)
+    for (const directory of directories) refreshSubtreeSize(directory)
+  }
+
+  /**
    * Keep the live store bounded independently of the persisted LRU. A large
    * expand-all can otherwise retain every node until the next scope switch.
    * Collapsed, least-recently-used subtrees are discarded first; if every
@@ -226,28 +350,41 @@ export function createFileTreeStore(options: TreeStoreOptions) {
    */
   const trimLiveTree = () => {
     if (nodeIndex.length <= maxLiveNodes) return
-    // Rank once per trim pass. Re-scanning and sorting the complete directory
-    // map after every dropped subtree turns a large expand-all overage into an
-    // avoidable quadratic main-thread task.
+    // Victims are ordered by the size of the subtree each one would free, so a
+    // pass removes the fewest, largest subtrees that get us under the ceiling.
+    // Sizes come from `subtreeSizes`, maintained incrementally on listing
+    // commits -- walking each candidate's subtree here instead would cost
+    // O(subtree) per candidate and make a large overage quadratic on the
+    // critical path of every directory listing.
+    //
+    // Bigger first, then the same LRU preference as before among equals:
+    // collapsed before expanded, least-recently-used first, deepest first.
     const candidates = Object.keys(tree.dir)
       .filter((directory) => directory !== "" && (tree.dir[directory]?.children?.length ?? 0) > 0)
       .map((directory) => ({
         directory,
+        size: subtreeSize(directory),
         expanded: tree.dir[directory]?.expanded ? 1 : 0,
         touch: directoryTouches.get(directory) ?? 0,
         depth: directory.split("/").length,
       }))
       .sort((left, right) => {
+        if (left.size !== right.size) return right.size - left.size
         if (left.expanded !== right.expanded) return left.expanded - right.expanded
         if (left.touch !== right.touch) return left.touch - right.touch
         return right.depth - left.depth
       })
 
+    // One descending sweep. Each removal frees `size` nodes, so the running
+    // overage tells us when to stop without re-measuring the index.
+    let overage = nodeIndex.length - maxLiveNodes
     for (const candidate of candidates) {
+      if (overage <= 0) break
       const directory = candidate.directory
-      if (nodeIndex.length <= maxLiveNodes) break
+      const children = tree.dir[directory]?.children
       // A parent candidate may have removed this subtree in an earlier pass.
-      if (!(tree.dir[directory]?.children?.length ?? 0)) continue
+      if (!children || children.length === 0) continue
+
       const removed = new Set<string>()
       const collect = (path: string) => {
         if (removed.has(path)) return
@@ -255,9 +392,12 @@ export function createFileTreeStore(options: TreeStoreOptions) {
         if (tree.node[path]?.type !== "directory") return
         for (const child of tree.dir[path]?.children ?? []) collect(child)
       }
-      for (const child of tree.dir[directory]?.children ?? []) collect(child)
+      for (const child of children) collect(child)
       if (removed.size === 0) continue
 
+      // The directory's own node stays (it remains visible); its children and
+      // everything below them go.
+      const before = subtreeSize(directory)
       batch(() => {
         setTree(
           "node",
@@ -283,10 +423,13 @@ export function createFileTreeStore(options: TreeStoreOptions) {
         for (const path of removed) {
           childCache.delete(path)
           directoryTouches.delete(path)
+          subtreeSizes.delete(path)
         }
         for (const path of removed) removeNodeIndex(path)
         bumpNodeVersion((value) => value + 1)
       })
+      propagateSubtreeSize(directory, before)
+      overage -= removed.size
     }
   }
 
@@ -400,6 +543,10 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
       dir: { ...tree.dir },
       nodeCount: Object.keys(tree.node).length,
       stale: staleEpoch() > 0,
+      // Persisted so restore() can resume the SAME epoch the saved `loadedEpoch`s
+      // were written under. Without it, a snapshot taken at epoch N restores at
+      // 0/1 and every directory compares unequal, so the entire tree re-lists.
+      loadedEpoch: staleEpoch(),
     }))
 
   const restore = (snap: TreeSnapshot) => {
@@ -410,7 +557,12 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
     setTree("node", reconcile(snap.node))
     setTree("dir", reconcile(snap.dir))
     if (!tree.dir[""]) setTree("dir", "", { expanded: true })
-    setStaleEpoch(snap.stale ? 1 : 0)
+    rebuildSubtreeSizes()
+    // Resume the persisted epoch. `snap.stale ? 1 : 0` is only the fallback for
+    // a snapshot written before `loadedEpoch` existed; it is deliberately
+    // conservative (everything re-lists) so an old snapshot can never be
+    // mistaken for fresh.
+    setStaleEpoch(snap.loadedEpoch ?? (snap.stale ? 1 : 0))
     bumpNodeVersion((value) => value + 1)
     trimLiveTree()
   }
@@ -449,6 +601,7 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
     directoryTouches.clear()
     nodeIndex = []
     nodePositions.clear()
+    subtreeSizes.clear()
     setTree("node", reconcile({}))
     setTree("dir", reconcile({}))
     setTree("dir", "", { expanded: true })
@@ -492,13 +645,27 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
       // semaphore.  Avoid starting stale network work in that case; the
       // completion path below also ignores stale results from requests that
       // were already in flight when the switch happened.
-      if (disposed || options.scope() !== directory || requestGeneration !== generation) return Promise.resolve([])
+      //
+      // This must resolve CANCELLED_LIST, never a fresh `[]`: the sentinel is
+      // the ONE chokepoint that distinguishes "no answer" from "an empty
+      // directory". Returning `[]` here is indistinguishable from a real
+      // empty listing, so a future edit that removed the redundant guard in
+      // the completion path would silently wipe a directory's children.
+      if (disposed || options.scope() !== directory || requestGeneration !== generation) return Promise.resolve(CANCELLED_LIST)
       return options.list(dir)
     }, { generation: requestGeneration, priority: opts?.priority ?? "interactive" })
       .then((nodes) => {
-        if (nodes === CANCELLED_LIST) return
+        if (nodes === CANCELLED_LIST) {
+          // Dropped without an answer. This is NOT an empty directory: leave
+          // `loaded`/`children` untouched so expandAll cannot mistake it for a
+          // listed-and-empty branch and silently truncate its frontier.
+          return
+        }
         if (disposed || options.scope() !== directory || requestGeneration !== generation) return
         const prevChildren = tree.dir[dir]?.children ?? []
+        // Captured before the children are rewritten; propagateSubtreeSize folds
+        // the difference into `dir` and its ancestors.
+        const sizeBefore = subtreeSize(dir)
         const nextChildren = nodes.map((node) => node.path)
         const nextSet = new Set(nextChildren)
         if (
@@ -596,6 +763,11 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
           // search consumer would observe a new identity on every refresh.
           for (const node of nodes) upsertNodeIndex(tree.node[node.path] ?? node)
           bumpNodeVersion((value) => value + 1)
+          // The whole subtree below every removed path is gone, so its cached
+          // sizes are garbage: drop them before the ancestor fold, or a later
+          // recompute could resurrect a stale child size.
+          for (const path of removedPaths) subtreeSizes.delete(path)
+          propagateSubtreeSize(dir, sizeBefore)
           trimLiveTree()
           if (pruneStarted > 0) perf.span("prune", performance.now() - pruneStarted)
         })
@@ -720,9 +892,10 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
     return generation
   }
 
-  const expandAll = async () => {
+  const expandAll = async (): Promise<ExpandAllResult> => {
     const runGeneration = beginGeneration()
     const seen = new Set<string>()
+    const dropped: string[] = []
     let frontier: string[] = [options.normalizeDir("")]
     while (frontier.length > 0) {
       const next = await mapLimited(frontier, async (dir) => {
@@ -734,7 +907,16 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
         await listDir(dir, { generation: runGeneration, priority: "interactive" })
         if (disposed || runGeneration !== generation) return []
         const ids = tree.dir[dir]?.children
-        if (!ids) return []
+        // A directory with no `children` was never listed: its request was
+        // dropped (queue overflow) rather than answered. A genuine empty
+        // listing commits `children: []`, which is truthy -- so `!ids` isolates
+        // "no answer" from "empty" exactly as CANCELLED_LIST does in listDir.
+        // Reporting it is the point: previously this read as undefined and the
+        // branch was silently dropped, truncating the expansion with no signal.
+        if (!ids) {
+          dropped.push(dir)
+          return []
+        }
         const subdirs: string[] = []
         for (const id of ids) {
           const node = tree.node[id]
@@ -743,6 +925,14 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
         return subdirs
       })
       frontier = next.flat()
+    }
+    // `expanded` counts directories this run claimed; `reached` those it could
+    // actually list. Any gap is truncation the caller must be able to see.
+    return {
+      truncated: dropped.length > 0,
+      droppedDirectories: dropped,
+      expanded: seen.size,
+      reached: seen.size - dropped.length,
     }
   }
 
@@ -832,7 +1022,12 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
   // previously only happened on scope *switches* — a fresh FileProvider mount
   // left the cold path un-pre-warmed, so the panel opened empty and every
   // first expand paid a round trip.
-  if (initialSnapshot) trimLiveTree()
+  // A restored snapshot carries `dir` entries whose subtree sizes were never
+  // computed for this store, so seed them before anything can trim.
+  if (initialSnapshot) {
+    rebuildSubtreeSizes()
+    trimLiveTree()
+  }
   if (!initialSnapshot) schedulePrewarm()
 
   return {
