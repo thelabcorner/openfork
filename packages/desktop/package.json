@@ -1,12 +1,13 @@
 {
   "name": "@opencode-ai/desktop",
   "private": true,
-  "version": "1.18.27",
+  "version": "1.18.29",
   "type": "module",
   "license": "MIT",
-  "homepage": "https://github.com/thelabcorner/openfork",
+  "homepage": "https://opencode.ai",
   "author": {
-    "name": "thelabcorner"
+    "name": "OpenCode",
+    "email": "hello@opencode.ai"
   },
   "scripts": {
     "typecheck": "tsgo -b",
@@ -25,6 +26,7 @@
   "dependencies": {
     "@zip.js/zip.js": "2.7.62",
     "effect": "catalog:",
+    "electron-context-menu": "4.1.2",
     "electron-log": "^5",
     "electron-store": "11.0.2",
     "electron-updater": "6.8.9",
@@ -36,7 +38,6 @@
     "@lydell/node-pty": "catalog:",
     "@opencode-ai/app": "workspace:*",
     "@opencode-ai/ui": "workspace:*",
-    "@shikijs/stream": "catalog:",
     "@sentry/solid": "catalog:",
     "@sentry/vite-plugin": "catalog:",
     "@solid-primitives/i18n": "2.2.1",
@@ -47,17 +48,18 @@
     "@types/node": "catalog:",
     "@typescript/native-preview": "catalog:",
     "@valibot/to-json-schema": "1.6.0",
-    "concurrently": "^9.1.2",
     "electron": "42.3.3",
     "electron-builder": "26.15.2",
     "electron-vite": "^5",
-    "remend": "catalog:",
-    "shiki": "catalog:",
     "solid-js": "catalog:",
     "sury": "11.0.0-alpha.4",
     "typescript": "~5.6.2",
     "vite": "catalog:",
-    "zod-openapi": "5.4.6"
+    "zod-openapi": "5.4.6",
+    "@shikijs/stream": "catalog:",
+    "concurrently": "^9.1.2",
+    "remend": "catalog:",
+    "shiki": "catalog:"
   },
   "optionalDependencies": {
     "@lydell/node-pty-darwin-arm64": "1.2.0-beta.12",

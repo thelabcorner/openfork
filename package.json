@@ -21,27 +21,11 @@
   },
   "workspaces": {
     "packages": [
-      "packages/app",
-      "packages/mobile",
-      "packages/client",
-      "packages/codemode",
-      "packages/core",
-      "packages/desktop",
-      "packages/effect-drizzle-sqlite",
-      "packages/effect-sqlite-node",
-      "packages/http-recorder",
-      "packages/httpapi-codegen",
-      "packages/llm",
-      "packages/opencode",
-      "packages/plugin",
-      "packages/protocol",
-      "packages/schema",
-      "packages/script",
+      "packages/*",
+      "packages/console/*",
+      "packages/stats/*",
       "packages/sdk/js",
-      "packages/server",
-      "packages/session-ui",
-      "packages/tui",
-      "packages/ui"
+      "packages/slack"
     ],
     "catalog": {
       "@effect/opentelemetry": "4.0.0-beta.83",
@@ -123,6 +107,7 @@
     "turbo": "2.10.2"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "3.933.0",
     "@opencode-ai/plugin": "workspace:*",
     "@opencode-ai/script": "workspace:*",
     "@opencode-ai/sdk": "workspace:*",
@@ -131,7 +116,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/thelabcorner/openfork"
+    "url": "https://github.com/anomalyco/opencode"
   },
   "license": "MIT",
   "prettier": {
