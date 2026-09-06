@@ -30,9 +30,13 @@ type Response = { id: number; raw: Uint8Array }
 
 interface Job {
   req: Request
+  retainedBytes: number
+  settled?: boolean
   resolve: (value: { value: unknown; raw: Uint8Array }) => void
   reject: (error: unknown) => void
 }
+
+const DEFAULT_MAX_RETAINED_BYTES = 64 * 1024 * 1024
 
 export class DecompressPool {
   private readonly size: number
@@ -43,10 +47,22 @@ export class DecompressPool {
   private nextId = 1
   private started = false
   private closed = false
+  private retainedBytes = 0
 
-  constructor(size?: number, private readonly createWorker: () => Worker = () => new Worker(workerUrl)) {
+  constructor(
+    size?: number,
+    private readonly createWorker: () => Worker = () => new Worker(workerUrl),
+    private readonly maxRetainedBytes = DEFAULT_MAX_RETAINED_BYTES,
+  ) {
     const cpus = Math.max(1, os.cpus().length)
     this.size = size ?? Math.min(4, Math.max(2, cpus - 1))
+  }
+
+  private settle(job: Job, callback: () => void) {
+    if (job.settled) return
+    job.settled = true
+    this.retainedBytes = Math.max(0, this.retainedBytes - job.retainedBytes)
+    callback()
   }
 
   private start() {
@@ -75,15 +91,17 @@ export class DecompressPool {
       return
     }
     this.busy.delete(worker)
-    try {
-      // The worker sends ONLY the raw bytes (transferred zero-copy). Parsing
-      // happens here on the main thread: structured-cloning the parsed object
-      // from the worker would serialize a large object on the main thread and
-      // negate the parallelism (epoch-3 bench: 16 jumbos 628ms vs 513ms sync).
-      job.resolve({ value: JSON.parse(decoder.decode(res.raw)), raw: res.raw })
-    } catch (error) {
-      job.reject(error)
-    }
+    this.settle(job, () => {
+      try {
+        // The worker sends ONLY the raw bytes (transferred zero-copy). Parsing
+        // happens here on the main thread: structured-cloning the parsed object
+        // from the worker would serialize a large object on the main thread and
+        // negate the parallelism (epoch-3 bench: 16 jumbos 628ms vs 513ms sync).
+        job.resolve({ value: JSON.parse(decoder.decode(res.raw)), raw: res.raw })
+      } catch (error) {
+        job.reject(error)
+      }
+    })
     this.idle.push(worker)
     this.drain()
   }
@@ -99,7 +117,7 @@ export class DecompressPool {
     if (idleIdx >= 0) this.idle.splice(idleIdx, 1)
     worker.terminate().catch(() => {})
     if (!this.closed && this.workers.length < this.size) this.spawn()
-    if (job) job.reject(err)
+    if (job) this.settle(job, () => job.reject(err))
     this.drain()
   }
 
@@ -122,9 +140,14 @@ export class DecompressPool {
 
   submit(bytes: Uint8Array): Promise<{ value: unknown; raw: Uint8Array }> {
     if (this.closed) return Promise.reject(new Error("Decompression pool is closed"))
+    const retainedBytes = bytes.byteLength
+    if (retainedBytes > this.maxRetainedBytes || this.retainedBytes + retainedBytes > this.maxRetainedBytes) {
+      return Promise.reject(new Error("Decompression pool byte budget is full"))
+    }
     this.start()
     return new Promise<{ value: unknown; raw: Uint8Array }>((resolve, reject) => {
-      const job: Job = { req: { id: this.nextId++, bytes }, resolve, reject }
+      this.retainedBytes += retainedBytes
+      const job: Job = { req: { id: this.nextId++, bytes }, retainedBytes, resolve, reject }
       this.queue.push(job)
       this.drain()
     })
@@ -135,12 +158,13 @@ export class DecompressPool {
     this.closed = true
     const workers = this.workers
     const error = new Error("Decompression pool is closed")
-    for (const job of this.busy.values()) job.reject(error)
-    for (const job of this.queue) job.reject(error)
+    for (const job of this.busy.values()) this.settle(job, () => job.reject(error))
+    for (const job of this.queue) this.settle(job, () => job.reject(error))
     this.workers = []
     this.idle = []
     this.busy.clear()
     this.queue = []
+    this.retainedBytes = 0
     this.started = false
     await Promise.all(workers.map((w) => w.terminate().catch(() => {})))
   }

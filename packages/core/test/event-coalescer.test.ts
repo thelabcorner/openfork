@@ -109,8 +109,208 @@ describe("event coalescer", () => {
     coalescer.offer(make(2, "b", "b1"))
     coalescer.offer(make(3, "a", "a2"))
     coalescer.flush()
-    expect(output.map((event) => event.sequence)).toEqual([1, 2, 3])
-    expect(output.map((event) => event.data.delta)).toEqual(["a1", "b1", "a2"])
+    // a1 and a2 merge across the interleaved b1, so b1 is delivered first.
+    expect(output.map((event) => event.data.delta)).toEqual(["b1", "a1a2"])
+    // b1 is delivered while a1 (order 1) is still buffered, so the only safe
+    // cursor for it is 0; the merged frame then completes the prefix.
+    expect(output.map((event) => event.sequence)).toEqual([0, 3])
+    expect(coalescer.ackWatermark).toBe(3)
     coalescer.dispose()
+  })
+
+  test("does not under-ack across successive flush boundaries", () => {
+    type Sequenced = TestEvent & { sequence: number }
+    const cursors: number[] = []
+    const make = (sequence: number, sessionID: string): Sequenced => ({
+      sequence,
+      id: String(sequence),
+      type: "session.text.delta",
+      data: { sessionID, assistantMessageID: "m", ordinal: 0, delta: "x" },
+    })
+    const coalescer = createEventCoalescer<Sequenced>(
+      (event) => {
+        cursors.push(event.sequence)
+      },
+      {
+        keyOf: eventDeltaKey,
+        orderBy: (event) => event.sequence,
+        merge: (previous, next) => {
+          const merged = mergeEventDeltas(previous, next)
+          return merged ? { ...merged, sequence: next.sequence } : undefined
+        },
+      },
+    )
+    // Interleave, flush, then interleave again. The second flush must not
+    // inherit a watermark pinned by the first one's retained runs.
+    coalescer.offer(make(1, "a"))
+    coalescer.offer(make(2, "b"))
+    coalescer.offer(make(3, "a"))
+    coalescer.flush()
+    expect(coalescer.ackWatermark).toBe(3)
+    coalescer.offer(make(4, "a"))
+    coalescer.offer(make(5, "b"))
+    coalescer.offer(make(6, "a"))
+    coalescer.flush()
+    expect(coalescer.ackWatermark).toBe(6)
+    // A barrier after a flush is a safe cursor immediately.
+    coalescer.offer({ sequence: 7, id: "7", type: "session.text.ended", data: { sessionID: "a" } })
+    expect(cursors.at(-1)).toBe(7)
+    expect(coalescer.ackWatermark).toBe(7)
+    coalescer.dispose()
+  })
+
+  test("stamps the watermark onto the cursor field the SSE handlers read", () => {
+    // Mirror of packages/server/src/handlers/event.ts: the coalescer's T is
+    // {sequence, event}, the handler offers {sequence: item.sequence, ...} and
+    // eventData() turns that sequence into the SSE `id`. Verifies the default
+    // `withOrder` reaches the wire cursor without a handler change.
+    type Payload = { id: string; type: string; data: Record<string, unknown> }
+    type SequencedEvent = { sequence: number; event: Payload }
+    type WireEvent = { sequence?: number; event: { id: string; type: string; data: unknown } }
+    const wire: WireEvent[] = []
+    const subscriber = { offer: (item: WireEvent) => wire.push(item) }
+    const coalescer = createEventCoalescer<SequencedEvent>(
+      (item) =>
+        subscriber.offer({
+          sequence: item.sequence,
+          event: { id: item.event.id, type: item.event.type, data: item.event.data },
+        }),
+      {
+        keyOf: (item) => eventDeltaKey(item.event),
+        orderBy: (item) => item.sequence,
+        merge: (previous, next) => {
+          const event = mergeEventDeltas(previous.event, next.event)
+          return event === undefined ? undefined : { sequence: next.sequence, event }
+        },
+      },
+    )
+    const make = (sequence: number, sessionID: string): SequencedEvent => ({
+      sequence,
+      event: {
+        id: String(sequence),
+        type: "session.text.delta",
+        data: { sessionID, assistantMessageID: "m", ordinal: 0, delta: "x" },
+      },
+    })
+    coalescer.offer(make(1, "a"))
+    coalescer.offer(make(2, "b"))
+    coalescer.offer(make(3, "a"))
+    coalescer.flush()
+    // b1 is delivered while a1 is still buffered, so its cursor is 0 -- not 2.
+    expect(wire.map((item) => item.sequence)).toEqual([0, 3])
+    expect(wire.map((item) => item.event.data.sessionID)).toEqual(["b", "a"])
+    coalescer.dispose()
+  })
+
+  test("merges interleaved sessions instead of flushing on every new key", () => {
+    type Sequenced = TestEvent & { sequence: number }
+    const output: Sequenced[] = []
+    const make = (sequence: number, sessionID: string, value: string): Sequenced => ({
+      sequence,
+      id: String(sequence),
+      type: "session.text.delta",
+      data: { sessionID, assistantMessageID: "m", ordinal: 0, delta: value },
+    })
+    const coalescer = createEventCoalescer<Sequenced>(
+      (event) => {
+        output.push(event)
+      },
+      {
+        keyOf: eventDeltaKey,
+        orderBy: (event) => event.sequence,
+        merge: (previous, next) => {
+          const merged = mergeEventDeltas(previous, next)
+          return merged ? { ...merged, sequence: next.sequence } : undefined
+        },
+      },
+    )
+    // 8 concurrent sessions round-robin, 6 rounds: consecutive frames never
+    // share a key, which is the saturation case the coalescer exists for.
+    let sequence = 0
+    for (let round = 0; round < 6; round++) {
+      for (let session = 0; session < 8; session++) {
+        coalescer.offer(make(++sequence, `s${session}`, "x"))
+      }
+    }
+    coalescer.flush()
+    expect(sequence).toBe(48)
+    // Before: every event flushed its predecessor -> 48 frames, no merging.
+    expect(output).toHaveLength(8)
+    expect(output.every((event) => (event.data.delta as string).length === 6)).toBe(true)
+    expect(coalescer.ackWatermark).toBe(48)
+    coalescer.dispose()
+  })
+
+  test("never acknowledges a prefix beyond what has been delivered", () => {
+    type Sequenced = TestEvent & { sequence: number }
+    const make = (sequence: number, sessionID: string, value: string): Sequenced => ({
+      sequence,
+      id: String(sequence),
+      type: "session.text.delta",
+      data: { sessionID, assistantMessageID: "m", ordinal: 0, delta: value },
+    })
+    const check = (sessionCount: number, rounds: number, seed: number) => {
+      // Deterministic PRNG so a failure is reproducible.
+      let state = seed
+      const next = () => (state = (state * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff
+      /**
+       * Orders whose text has actually reached the subscriber, reconstructed
+       * without trusting the coalescer: a frame for session S carrying L chars
+       * accounts for the oldest L orders still pending for S.
+       */
+      const visible = new Set<number>()
+      const queues = new Map<string, number[]>()
+      let sequence = 0
+      const coalescer = createEventCoalescer<Sequenced>(
+        (event) => {
+          const sessionID = event.data.sessionID as string
+          const length = (event.data.delta as string).length
+          const queue = queues.get(sessionID) ?? []
+          for (let i = 0; i < length; i++) {
+            const order = queue.shift()
+            if (order === undefined) throw new Error("frame claims more fragments than were offered")
+            visible.add(order)
+          }
+          queues.set(sessionID, queue)
+          // Replaying from the published cursor must never skip content.
+          for (let order = 1; order <= event.sequence; order++) {
+            if (!visible.has(order)) throw new Error(`cursor ${event.sequence} acknowledges undelivered ${order}`)
+          }
+        },
+        {
+          keyOf: eventDeltaKey,
+          orderBy: (event) => event.sequence,
+          merge: (previous, next) => {
+            const merged = mergeEventDeltas(previous, next)
+            return merged ? { ...merged, sequence: next.sequence } : undefined
+          },
+          flushMs: 1,
+        },
+      )
+      for (let round = 0; round < rounds; round++) {
+        for (let i = 0; i < sessionCount; i++) {
+          // Shuffle the session order each round so keys interleave hard.
+          const order = [...Array(sessionCount).keys()].sort(() => next() - 0.5)
+          for (const session of order) {
+            sequence++
+            const id = `s${session}`
+            coalescer.offer(make(sequence, id, "x"))
+            const queue = queues.get(id) ?? []
+            queue.push(sequence)
+            queues.set(id, queue)
+          }
+        }
+        // Barriers at random points force mid-stream flushes.
+        if (next() < 0.3) coalescer.flush()
+      }
+      coalescer.flush()
+      expect(coalescer.ackWatermark).toBe(sequence)
+      // Everything was delivered, so the final cursor covers every order.
+      expect(visible.size).toBe(sequence)
+      coalescer.dispose()
+    }
+    for (const seed of [1, 7, 42, 1234, 98765]) check(8, 6, seed)
+    check(1, 20, 3)
+    check(32, 4, 11)
   })
 })

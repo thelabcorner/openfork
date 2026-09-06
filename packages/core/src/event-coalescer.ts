@@ -110,6 +110,13 @@ export type EventCoalescer<T> = {
   offer: (event: T) => void
   flush: () => void
   dispose: () => void
+  /**
+   * Highest input sequence such that every sequence at or below it has been
+   * delivered to the subscriber. Monotonic. Only meaningful when `orderBy` is
+   * supplied; for unsequenced transports the coalescer delivers in retention
+   * order and this tracks delivered count semantics instead.
+   */
+  readonly ackWatermark: number | undefined
 }
 
 /**
@@ -117,6 +124,12 @@ export type EventCoalescer<T> = {
  * barriers: pending fragments flush before them, preserving wire order. A
  * short timer keeps latency frame-sized even when a stream has no lifecycle
  * event for a long time. The pending map and fragment size are both bounded.
+ *
+ * Cursor-bearing streams (`orderBy`) merge across interleaved keys. Because a
+ * merged frame carries fragments of *older* sequences, the frame's own order is
+ * not a safe resumption cursor: acknowledging it would claim delivery of
+ * fragments still buffered in a later frame. Every frame is therefore stamped
+ * with an explicit ack watermark rather than its own order. See `ackWatermark`.
  */
 export function createEventCoalescer<T>(
   offer: (event: T) => boolean | void,
@@ -125,15 +138,29 @@ export function createEventCoalescer<T>(
     readonly merge: (previous: T, next: T) => T | undefined
     /** Optional wire-order key for transports that attach monotonic cursors. */
     readonly orderBy?: (event: T) => number
+    /**
+     * Rewrite the cursor field of a frame before delivery. Defaults to
+     * overriding `sequence`, the cursor field every current SSE handler reads
+     * when it stamps the SSE `id`. A transport that names its cursor field
+     * differently must supply this or it silently loses watermark stamping.
+     */
+    readonly withOrder?: (event: T, order: number) => T
     readonly flushMs?: number
     readonly maxPendingKeys?: number
   },
 ): EventCoalescer<T> {
   const flushMs = options.flushMs ?? DEFAULT_FLUSH_MS
   const maxPendingKeys = options.maxPendingKeys ?? DEFAULT_MAX_PENDING_KEYS
-  let pending = new Map<string, T>()
+  const orderBy = options.orderBy
+  /** A retained key plus the inclusive order range its value covers. */
+  type Entry = { min: number; max: number; event: T }
+  let pending = new Map<string, Entry>()
   let timer: ReturnType<typeof setTimeout> | undefined
   let disposed = false
+  /** Highest input order handed to `offer`. */
+  let highest: number | undefined
+  /** Largest S such that every input of order <= S has been delivered. */
+  let watermark: number | undefined
 
   const clearTimer = () => {
     if (timer === undefined) return
@@ -141,9 +168,20 @@ export function createEventCoalescer<T>(
     timer = undefined
   }
 
-  const deliver = (event: T) => {
+  const stamp = (event: T, order: number): T => {
+    if (options.withOrder) return options.withOrder(event, order)
+    return { ...(event as object), sequence: order } as T
+  }
+
+  /**
+   * `order` is the cursor to publish (the watermark); `own` is the frame's own
+   * order. They differ for merged frames and coincide for barriers.
+   */
+  const deliver = (event: T, order?: number, own?: number) => {
     if (disposed) return false
-    if (offer(event) === false) {
+    if (own !== undefined) highest = highest === undefined ? own : Math.max(highest, own)
+    if (order !== undefined) watermark = order
+    if (offer(order === undefined ? event : stamp(event, order)) === false) {
       disposed = true
       clearTimer()
       pending.clear()
@@ -155,11 +193,27 @@ export function createEventCoalescer<T>(
   const flush = () => {
     clearTimer()
     if (disposed || pending.size === 0) return
-    const values = [...pending.values()]
-    if (options.orderBy) values.sort((left, right) => options.orderBy!(left) - options.orderBy!(right))
+    const entries = [...pending.values()]
     pending = new Map()
-    for (const event of values) {
-      if (!deliver(event)) break
+    if (!orderBy) {
+      for (const entry of entries) {
+        if (!deliver(entry.event)) break
+      }
+      return
+    }
+    entries.sort((left, right) => left.max - right.max)
+    // Deliver in order and publish, with each frame, the largest prefix of the
+    // input that is delivered *at that moment*. Everything not yet handed to
+    // `offer` is still in `remaining`, so the oldest undelivered order is the
+    // minimum `min` over it; the prefix strictly below that is complete.
+    const remaining = entries.slice()
+    while (remaining.length > 0) {
+      const entry = remaining.shift()!
+      const own = entry.max
+      highest = highest === undefined ? own : Math.max(highest, own)
+      const base = remaining.length === 0 ? highest : Math.min(...remaining.map((item) => item.min)) - 1
+      const ack = watermark === undefined ? base : Math.max(watermark, base)
+      if (!deliver(entry.event, ack, own)) break
     }
   }
 
@@ -171,21 +225,20 @@ export function createEventCoalescer<T>(
   const push = (event: T) => {
     if (disposed) return
     const key = options.keyOf(event)
+    const order = orderBy?.(event)
     if (key === undefined) {
+      // Barriers flush first, so the prefix below them is complete by the time
+      // they are delivered and their own order is a safe cursor.
       flush()
-      deliver(event)
+      deliver(event, order, order)
       return
     }
 
-    // A resumable transport may acknowledge only a delivered prefix. Merging
-    // A1, B2, A3 into B2, A1+A3 would acknowledge A1 before delivering it.
-    // Restrict cursor-bearing streams to adjacent runs of one key.
-    if (options.orderBy && pending.size > 0 && !pending.has(key)) flush()
     const previous = pending.get(key)
     if (previous !== undefined) {
-      const merged = options.merge(previous, event)
+      const merged = options.merge(previous.event, event)
       if (merged !== undefined) {
-        pending.set(key, merged)
+        pending.set(key, { min: previous.min, max: order ?? previous.max, event: merged })
         arm()
         return
       }
@@ -194,7 +247,7 @@ export function createEventCoalescer<T>(
       flush()
     }
     if (pending.size >= maxPendingKeys) flush()
-    pending.set(key, event)
+    pending.set(key, { min: order ?? 0, max: order ?? 0, event })
     arm()
   }
 
@@ -204,5 +257,12 @@ export function createEventCoalescer<T>(
     pending.clear()
   }
 
-  return { offer: push, flush, dispose }
+  return {
+    offer: push,
+    flush,
+    dispose,
+    get ackWatermark() {
+      return watermark
+    },
+  }
 }

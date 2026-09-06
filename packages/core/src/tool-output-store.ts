@@ -1,7 +1,8 @@
 export * as ToolOutputStore from "./tool-output-store"
 
 import path from "path"
-import { brotliCompressSync, constants } from "node:zlib"
+import { brotliCompress, constants } from "node:zlib"
+import { promisify } from "node:util"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { Config } from "./config"
 import { FSUtil } from "./fs-util"
@@ -16,6 +17,13 @@ export const MAX_BYTES = 50 * 1024
 export const RETENTION = Duration.days(7)
 
 export const MANAGED_DIRECTORY = "tool-output"
+
+// Callback-based zlib runs on the libuv threadpool, so compressing a large tool
+// output never blocks the server event loop. A synchronous quality-4 pass over a
+// multi-megabyte payload costs hundreds of milliseconds, which stalls every SSE
+// subscriber and HTTP route for the duration and invalidates transport latency
+// measurements. The same lesson is documented in the desktop main process.
+const brotliCompressAsync = promisify(brotliCompress)
 
 export interface BoundInput {
   readonly sessionID: SessionSchema.ID
@@ -130,9 +138,9 @@ const layer = Layer.effect(
     const write = Effect.fn("ToolOutputStore.write")(function* (content: string) {
       const file = path.join(directory, `tool_${Identifier.ascending()}.br`)
       yield* fs.ensureDir(directory).pipe(Effect.mapError((cause) => new StorageError({ operation: "write", cause })))
-      const compressed = yield* Effect.try({
+      const compressed = yield* Effect.tryPromise({
         try: () =>
-          brotliCompressSync(Buffer.from(content, "utf-8"), {
+          brotliCompressAsync(Buffer.from(content, "utf-8"), {
             params: {
               [constants.BROTLI_PARAM_MODE]: constants.BROTLI_MODE_TEXT,
               [constants.BROTLI_PARAM_QUALITY]: 4,
@@ -193,9 +201,13 @@ const layer = Layer.effect(
         const info = yield* fs.stat(file).pipe(Effect.catch(() => Effect.void))
         const modified = info?.mtime.pipe(
           Option.map((date) => date.getTime()),
-          Option.getOrElse(() => 0),
+          Option.getOrUndefined,
         )
-        if (modified !== undefined && modified < cutoff) yield* fs.remove(file).pipe(Effect.catch(() => Effect.void))
+        // An unavailable mtime is not evidence that a file is old. Skipping is
+        // the safe direction: deleting on `0 < cutoff` removes a freshly written
+        // output, and the removal is unrecoverable.
+        if (modified === undefined) continue
+        if (modified < cutoff) yield* fs.remove(file).pipe(Effect.catch(() => Effect.void))
       }
     })
 

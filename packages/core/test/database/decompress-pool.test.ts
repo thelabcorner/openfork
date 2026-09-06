@@ -69,4 +69,21 @@ describe("decompression pool settlement", () => {
     expect((await next).value).toEqual({ ok: true })
     await pool.close()
   })
+
+  test("rejects admission when retained input bytes would exceed the pool budget", async () => {
+    const { pool, workers } = (() => {
+      const workers: FakeWorker[] = []
+      const pool = new DecompressPool(1, () => {
+        const worker = new FakeWorker()
+        workers.push(worker)
+        return worker as unknown as Worker
+      }, 4)
+      return { pool, workers }
+    })()
+    const first = pool.submit(new Uint8Array(3))
+    await expect(pool.submit(new Uint8Array(2))).rejects.toThrow("byte budget")
+    workers[0]!.reply()
+    await first
+    await pool.close()
+  })
 })

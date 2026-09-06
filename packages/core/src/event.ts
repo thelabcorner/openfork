@@ -21,6 +21,7 @@ import { decompressValueAsync } from "./database/decompress-pool"
 import { EventSequenceTable, EventTable } from "./event/sql"
 import { EventValueTable } from "./event/sql"
 import { Flag } from "./flag/flag"
+import { EventTrace } from "./event-trace"
 import { Location } from "./location"
 import { makeGlobalNode } from "./effect/app-node"
 import { createHash } from "node:crypto"
@@ -667,14 +668,20 @@ export const makeByteBoundedSubscriberQueue = <A>(options: {
       const size = Number.isFinite(rawSize) ? Math.max(0, rawSize) : Number.POSITIVE_INFINITY
       if (size > options.maxBytes || pendingBytes > options.maxBytes - size) {
         failed = true
+        EventTrace.count("queue.overflow")
+        EventTrace.event({ phase: "queue.overflow", capacity: options.capacity, size })
         Queue.failCauseUnsafe(queue, Cause.fail(new SubscriberOverflowError({ capacity: options.capacity })))
         return false
       }
       if (Queue.offerUnsafe(queue, event)) {
         pendingBytes += size
+        EventTrace.count("queue.offered")
+        EventTrace.sum("queue.offeredBytes", size)
         return true
       }
       failed = true
+      EventTrace.count("queue.overflow")
+      EventTrace.event({ phase: "queue.overflow", capacity: options.capacity, size })
       Queue.failCauseUnsafe(queue, Cause.fail(new SubscriberOverflowError({ capacity: options.capacity })))
       return false
     }
