@@ -122,11 +122,16 @@ const patchSseParser = async (path: string, importPath: string) => {
   }
 
   if (!source.includes("const parser = createSseParser()")) {
-    const bufferMarker = source.match(/        let buffer = ['"]{2};?\r?\n/)
-    const start = bufferMarker?.index ?? -1
+    // hey-api has emitted both a one-line reader and a prettier-wrapped
+    // reader. Anchor on the reader itself so either generated shape gets the
+    // same bounded parser and cancellation path.
+    const start = source.indexOf("        const reader = response.body")
     const end = source.indexOf("        } finally {", start)
     if (start === -1 || end === -1) throw new Error("SSE parser shape changed (" + path + ")")
     const replacement = [
+      "        const reader = response.body.getReader()",
+      "        const decoder = new TextDecoder()",
+      "",
       "        const parser = createSseParser()",
       "",
       "        const abortHandler = () => {",
@@ -185,7 +190,12 @@ const patchSseParser = async (path: string, importPath: string) => {
   }
   // Keep transport hardening in the generator so regeneration cannot silently
   // remove heartbeat-based recovery, jitter or reader cancellation.
-  source = source.replace(/const reader = response\.body\s*\.pipeThrough\(new TextDecoderStream\(\)\)\s*\.getReader\(\);?/, "const reader = response.body.getReader()\n        const decoder = new TextDecoder()")
+  if (!source.includes("const decoder = new TextDecoder()")) {
+    source = source.replace(
+      /const reader = response\.body[\s\S]{0,240}?\.getReader\(\);?/,
+      "const reader = response.body.getReader()\n        const decoder = new TextDecoder()",
+    )
+  }
   if (!source.includes("const decoder = new TextDecoder()")) throw new Error("SSE byte reader patch did not apply: " + path)
   source = source.replace('parser.push(value ?? "", done)', 'parser.push(decoder.decode(value, { stream: !done }), done)')
   if (!source.includes("let connectedAt = 0")) {
