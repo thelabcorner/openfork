@@ -60,6 +60,10 @@ import { SessionProjector } from "@opencode-ai/core/session/projector"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { filesystem } from "@opencode-ai/core/effect/app-node-platform"
+import { Goal } from "@opencode-ai/core/goal"
+import { GoalContext } from "@opencode-ai/core/goal/context"
+import { GoalAutomation } from "@opencode-ai/core/goal/automation"
+import { GoalAgent } from "@opencode-ai/core/goal/agent"
 
 export const AppLayer = AppNodeBuilderV1.build(
   LayerNode.group([
@@ -68,6 +72,10 @@ export const AppLayer = AppNodeBuilderV1.build(
     Npm.node,
     FSUtil.node,
     Database.node,
+    Goal.node,
+    GoalContext.node,
+    GoalAutomation.node,
+    GoalAgent.node,
     Auth.node,
     ForkCredentials.node,
     Account.node,

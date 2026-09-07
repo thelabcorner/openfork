@@ -71,7 +71,7 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
 
     const history = Effect.fn("SyncHttpApi.history")(function* (ctx: { payload: typeof HistoryPayload.Type }) {
       const exclude = Object.entries(ctx.payload)
-      return yield* db
+      const rows = yield* db
         .select()
         .from(EventTable)
         .where(
@@ -82,6 +82,18 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
         .orderBy(asc(EventTable.seq))
         .all()
         .pipe(Effect.orDie)
+      const byAggregate = new Map<string, typeof rows>()
+      for (const row of rows) {
+        const group = byAggregate.get(row.aggregate_id)
+        if (group) group.push(row)
+        else byAggregate.set(row.aggregate_id, [row])
+      }
+      const hydratedByID = new Map<string, (typeof rows)[number]>()
+      for (const [aggregateID, group] of byAggregate) {
+        const hydrated = yield* EventV2.rehydrateEvents(db, aggregateID, group)
+        for (const row of hydrated) hydratedByID.set(row.id, row)
+      }
+      return rows.map((row) => hydratedByID.get(row.id) ?? row)
     })
 
     return handlers.handle("start", start).handle("replay", replay).handle("steal", steal).handle("history", history)

@@ -64,6 +64,7 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 | Checkpoints | `packages/core/src/checkpoint.ts`, `packages/opencode/src/session/checkpoint.ts` |
 | Conversation Control | `packages/schema/src/session-context.ts`, `packages/core/src/session/sql.ts` (context tables), `packages/core/src/database/migration/*conversation_control*`, `packages/opencode/src/session/context/**`, `packages/opencode/src/session/fork/**`, `httpapi/**/session-context.ts`, `packages/opencode/src/session/message-v2.ts` (context seam), `packages/app/src/components/context-ledger/**`, `packages/app/src/components/context-history/**` |
 | Throughput | `packages/schema/src/session-message.ts` + `v1/session.ts` (`streamedAt`), `packages/schema/src/session-event.ts` (`Step.Streamed`, `requestSentAt` on `Step.Started`), `packages/core/src/session/{throughput,message-updater,projector,runner}` (boundary + projection + pure calc), `packages/opencode/src/session/processor.ts` (V1 stamps — the path that serves the desktop timeline), `packages/session-ui/src/components/message-part.tsx` (`toThroughputMessage`, footer meta) + `session-turn.tsx`, `packages/app/src/pages/session/timeline/message-timeline.tsx` (the chip the desktop actually renders), `packages/ui/src/i18n/en.ts` (`ui.message.throughput`) |
+| Goal Mode | `packages/schema/src/goal*`, `packages/core/src/goal/**`, `packages/core/src/goal.ts`, `packages/core/src/tool/goal.ts`, `packages/core/test/goal/**`, `packages/core/src/database/migration/*goal*`, `packages/opencode/src/tool/goal.ts`, `httpapi/**/goal.ts`, `packages/app/src/context/goals.ts`, `packages/app/src/components/goal-composer-shelf*`. Shared seams are union-owned: V1 `session/{prompt,session}.ts`, V1 `tool/registry.ts`, V2 `core/session/{runner/llm,execution/local}.ts`, `core/tool/builtins.ts`, `app/{app,components/prompt-input-v2}.tsx`, and `session-ui/v2/components/prompt-input/index.tsx`. Preserve durable CAS state, reservation recovery, Goal-context injection, worker focus inheritance, and the zinc composer shelf when taking upstream changes. |
 | Meta | `docs/handoff/AGENTS.md`, `FORK.md`, `.github/workflows/**`, root `README.md`, `packages/desktop/src/main/updater.ts` |
 
 ### Union — combine both sides
@@ -72,7 +73,7 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 |---|---|
 | `packages/opencode/src/tool/registry.ts` | Fork tools **plus** every new upstream tool |
 | `packages/opencode/src/plugin/index.ts` | Union provider/plugin hooks |
-| `packages/opencode/src/session/prompt.ts` | Take upstream loop/safety fixes; keep fork hooks (SPAD, quota, pause, **conversation-control compiler**) |
+| `packages/opencode/src/session/prompt.ts` | Take upstream loop/safety fixes; keep fork hooks (SPAD, quota, pause, **conversation-control compiler**, **Goal context + durable continuation**) |
 | `packages/opencode/src/session/message-v2.ts` | Keep fork hook (effective-context compiler) — upstream has no context overlay |
 | `packages/opencode/src/provider/provider.ts` | Take upstream provider fixes; keep fork credential/usage hooks |
 | `packages/opencode/src/server/routes/instance/httpapi/api.ts` | Re-register fork groups after upstream edits |
@@ -88,6 +89,8 @@ Worked example: `git show a747d51764` (v1.18.21).
 These KEEP-path files had real conflicts in v1.18.21 but follow no blanket rule: keep fork feature hunks, take upstream bugfixes, and let `git show a747d51764` decide.
 
 `packages/app/src/pages/session/timeline/message-timeline.tsx`, `packages/app/src/pages/session/use-session-commands.tsx`, `packages/app/src/pages/session/v2/session-file-browser-tab.tsx`, `packages/app/e2e/utils/mock-server.ts`, `packages/core/src/session/projector.ts`, `packages/core/src/session/runner/llm.ts`, `packages/opencode/src/session/llm/ai-sdk.ts`, `packages/opencode/src/session/session.ts`, `packages/core/src/session/sql.ts`
+
+For Goal Mode specifically, `packages/core/src/session/runner/llm.ts` and `packages/opencode/src/session/prompt.ts` must continue to use the same `GoalAutomation` service. `packages/opencode/src/session/session.ts` must inherit a parent's focused Goal synchronously before returning a new child Session; Session Group decoration may remain asynchronous.
 
 ### Generated — do not hand-merge
 
@@ -129,6 +132,11 @@ tracked, no conflict markers). The rest still needs eyes:
 - Channel DB still fork-specific
 - Updater still disabled or still this repo
 - Throughput boundary stamped, `streamedAt` projected, footer chip renders a value on a live turn
+- Goal API + single discriminated Goal tool registered on V1/V2
+- Goal context remains request-only on both runners; no synthetic transcript Goal messages
+- Durable Goal continuation reservations survive restart and user input supersedes them
+- Goal child workers inherit focus before first prompt and remain in normal Session Groups
+- Goal composer shelf remains an absolute V2 zinc surface below the existing mention/command popover z-layer
 
 ## License
 

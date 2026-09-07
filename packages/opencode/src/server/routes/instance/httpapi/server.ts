@@ -46,6 +46,10 @@ import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { Session } from "@/session/session"
 import { SessionGroup } from "@/session/group"
+import { Goal } from "@opencode-ai/core/goal"
+import { GoalContext } from "@opencode-ai/core/goal/context"
+import { GoalAutomation } from "@opencode-ai/core/goal/automation"
+import { GoalAgent } from "@opencode-ai/core/goal/agent"
 import * as SessionContextProjector from "@/session/context/projector"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
@@ -124,6 +128,7 @@ import { quotaHandlers } from "./handlers/quota"
 import { sessionHandlers } from "./handlers/session"
 import { sessionContextHandlers } from "./handlers/session-context"
 import { sessionGroupHandlers } from "./handlers/session-group"
+import { goalHandlers } from "./handlers/goal"
 import { syncHandlers } from "./handlers/sync"
 import { toolHandlers } from "./handlers/tool"
 import { tuiHandlers } from "./handlers/tui"
@@ -233,6 +238,7 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     sessionHandlers,
     sessionContextHandlers,
     sessionGroupHandlers,
+    goalHandlers,
     syncHandlers,
     toolHandlers,
     tuiHandlers,
@@ -322,6 +328,10 @@ const app = LayerNode.group([
   Todo.node,
   Session.node,
   SessionGroup.node,
+  Goal.node,
+  GoalContext.node,
+  GoalAutomation.node,
+  GoalAgent.node,
   SessionProjector.node,
   SessionContextProjector.node,
   SessionStatus.node,

@@ -166,6 +166,14 @@ const FORK_OWNED = [
   /^packages\/opencode\/src\/session\/checkpoint\.ts$/,
   /^packages\/core\/src\/session\/title\.ts$/,
   /^packages\/opencode\/src\/session\/spad\//,
+  /^packages\/schema\/src\/goal(?:-id)?\.ts$/,
+  /^packages\/core\/src\/goal(?:\.ts|\/)/,
+  /^packages\/core\/test\/goal\//,
+  /^packages\/core\/src\/database\/migration\/.*goal/,
+  /^packages\/opencode\/src\/tool\/goal\.ts$/,
+  /^packages\/opencode\/src\/server\/routes\/instance\/httpapi\/(?:groups|handlers)\/goal\.ts$/,
+  /^packages\/app\/src\/components\/goal-composer-shelf/,
+  /^packages\/app\/src\/context\/goals\.ts$/,
 ]
 const META = [/^FORK\.md$/, /\/AGENTS\.md$/, /^\.github\/workflows\//, /^README\.md$/, /^packages\/desktop\/src\/main\/updater\.ts$/]
 const UNION_MANUAL = [
@@ -674,6 +682,35 @@ function cmdVerify(tag?: string): number {
     {
       name: "session groups",
       run: () => (trackedFiles("packages/schema/src/session-group*").length > 0 ? undefined : "packages/schema/src/session-group* missing"),
+    },
+    {
+      name: "goal mode native control plane",
+      run: () => {
+        const missing: string[] = []
+        if (!fileContains("packages/opencode/src/server/routes/instance/httpapi/api.ts", "GoalApi")) missing.push("GoalApi")
+        if (!fileContains("packages/opencode/src/tool/registry.ts", "GoalTool")) missing.push("V1 GoalTool")
+        if (!fileContains("packages/core/src/tool/builtins.ts", "GoalTool")) missing.push("V2 GoalTool")
+        if (!fileContains("packages/opencode/src/session/prompt.ts", "GoalAutomation")) missing.push("V1 automation seam")
+        if (!fileContains("packages/core/src/session/runner/llm.ts", "GoalAutomation")) missing.push("V2 automation seam")
+        if (!fileContains("packages/core/src/goal/automation.ts", "GoalAutomationTable")) missing.push("durable reservation service")
+        try {
+          const migrations = readdirSync(join(REPO_ROOT, "packages/core/src/database/migration"))
+          if (!migrations.some((name) => name.includes("goal") && name.endsWith(".ts"))) missing.push("Goal migrations")
+        } catch {
+          missing.push("Goal migrations")
+        }
+        return missing.length > 0 ? `Goal Mode missing: ${missing.join(", ")}` : undefined
+      },
+    },
+    {
+      name: "goal mode composer shelf",
+      run: () => {
+        const missing: string[] = []
+        if (!fileContains("packages/app/src/app.tsx", "GoalsProvider")) missing.push("GoalsProvider")
+        if (!fileContains("packages/app/src/components/prompt-input-v2.tsx", "GoalComposerShelf")) missing.push("GoalComposerShelf")
+        if (!fileContains("packages/session-ui/src/v2/components/prompt-input/index.tsx", "goalControl")) missing.push("goalControl slot")
+        return missing.length > 0 ? `Goal composer integration missing: ${missing.join(", ")}` : undefined
+      },
     },
     {
       name: "updater stays fork-pinned",

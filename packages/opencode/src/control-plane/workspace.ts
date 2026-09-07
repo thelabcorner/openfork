@@ -642,19 +642,21 @@ const layer = Layer.effect(
           return
         }
 
-        const rows = yield* db
-          .select({
-            id: EventTable.id,
-            aggregateID: EventTable.aggregate_id,
-            seq: EventTable.seq,
-            type: EventTable.type,
-            data: EventTable.data,
-          })
+        const storedRows = yield* db
+          .select()
           .from(EventTable)
           .where(eq(EventTable.aggregate_id, input.sessionID))
           .orderBy(asc(EventTable.seq))
           .all()
           .pipe(Effect.orDie)
+        const hydratedRows = yield* EventV2.rehydrateEvents(db, input.sessionID, storedRows)
+        const rows = hydratedRows.map((row) => ({
+          id: row.id,
+          aggregateID: row.aggregate_id,
+          seq: row.seq,
+          type: row.type,
+          data: row.data,
+        }))
         if (rows.length === 0)
           return yield* new SessionEventsNotFoundError({
             message: `No events found for session: ${input.sessionID}`,

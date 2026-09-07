@@ -347,6 +347,13 @@ function runWebfetch(p: ToolProps<typeof WebFetchTool>): ToolInline {
 }
 
 function runEdit(p: ToolProps<typeof EditTool>): ToolInline {
+  if (p.input.patchText) {
+    const files = list(p.frame.meta.files).length
+    return {
+      icon: "%",
+      title: files > 0 ? `Edit ${files} file${files === 1 ? "" : "s"}` : "Edit",
+    }
+  }
   return {
     icon: "←",
     title: `Edit ${toolPath(p.input.filePath)}`,
@@ -513,6 +520,9 @@ function snapWrite(p: ToolProps<typeof WriteTool>): ToolSnapshot | undefined {
 }
 
 function snapEdit(p: ToolProps<typeof EditTool>): ToolSnapshot | undefined {
+  if (p.input.patchText) {
+    return snapPatch(p as unknown as ToolProps<typeof ApplyPatchTool>)
+  }
   const file = p.input.filePath || ""
   const diff = p.metadata.diff || ""
   if (!file || !diff.trim()) {
@@ -918,7 +928,17 @@ function scrollWebSearchStart(p: ToolProps<typeof WebSearchTool>): string {
 }
 
 function permEdit(p: ToolPermissionProps<typeof EditTool>): ToolPermissionInfo {
-  const input = p.input as { filePath?: string; filepath?: string; diff?: string }
+  const input = p.input as { filePath?: string; filepath?: string; diff?: string; patchText?: string }
+  if (input.patchText) {
+    const files = p.patterns
+    return {
+      icon: "→",
+      title: files.length > 1 ? `Edit ${files.length} files` : `Edit ${toolPath(files[0] || "", { home: true })}`,
+      lines: files.map((file) => `- ${toolPath(file, { home: true })}`),
+      diff: p.metadata.diff ?? input.diff,
+      file: files[0] || "",
+    }
+  }
   const file = input.filePath || input.filepath || p.patterns[0] || ""
   return {
     icon: "→",

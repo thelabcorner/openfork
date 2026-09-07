@@ -28,6 +28,7 @@ import { QuestionApi } from "./groups/question"
 import { SessionApi } from "./groups/session"
 import { SessionContextApi } from "./groups/session-context"
 import { SessionGroupApi } from "./groups/session-group"
+import { GoalApi } from "./groups/goal"
 import { SyncApi } from "./groups/sync"
 import { ToolApi } from "./groups/tool"
 import { TuiApi } from "./groups/tui"
@@ -83,6 +84,7 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
   .addHttpApi(SessionApi)
   .addHttpApi(SessionContextApi)
   .addHttpApi(SessionGroupApi)
+  .addHttpApi(GoalApi)
   .addHttpApi(SyncApi)
   .addHttpApi(ToolApi)
   .addHttpApi(TuiApi)
