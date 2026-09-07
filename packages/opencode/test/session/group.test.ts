@@ -13,6 +13,7 @@ import { InstanceStore } from "@/project/instance-store"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Session } from "@/session/session"
 import { SessionGroup } from "@/session/group"
+import { Goal } from "@opencode-ai/core/goal"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(
@@ -20,6 +21,7 @@ const it = testEffect(
     LayerNode.group([
       Session.node,
       SessionGroup.node,
+      Goal.node,
       Database.node,
       EventV2Bridge.node,
       SessionProjector.node,
@@ -99,5 +101,44 @@ it.instance("enforces subagent and plugin membership ownership", () =>
     yield* sessions.remove(session.id)
     yield* groups.remove(subagents.id)
     yield* groups.remove(plugin.id)
+  }),
+)
+
+it.instance("inherits focused Goal into a child before first use and annotates its subagent membership", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const groups = yield* SessionGroup.Service
+    const goals = yield* Goal.Service
+    const parent = yield* sessions.create({ title: "Goal owner" })
+    const created = yield* goals
+      .create({
+        projectID: parent.projectID,
+        workspaceID: parent.workspaceID,
+        title: "Delegated Goal",
+        objective: "Delegate one unit of work",
+        criteria: ["Worker receives Goal context"],
+      })
+      .pipe(Effect.orDie)
+    const active = yield* goals
+      .transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      .pipe(Effect.orDie)
+    yield* goals.focus({ goalID: active.goal.id, sessionID: parent.id }).pipe(Effect.orDie)
+
+    const child = yield* sessions.create({ parentID: parent.id, title: "Goal worker" })
+    expect(yield* goals.focused(child.id)).toMatchObject({
+      focus: { goalID: created.goal.id, role: "worker" },
+    })
+
+    // Group placement is intentionally off the create() critical path. Give the
+    // already-started fork one scheduler turn, then prove it records the Goal
+    // association without inventing a second grouping subsystem.
+    yield* Effect.sleep("25 millis")
+    const memberships = yield* groups.membershipsFor(child.id)
+    const worker = memberships.flatMap((detail) => detail.sessions).find((member) => member.id === child.id)
+    expect(worker).toMatchObject({
+      locked: true,
+      origin: "auto_subagent",
+      originRef: `goal:${created.goal.id}`,
+    })
   }),
 )

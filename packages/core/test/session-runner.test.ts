@@ -20,6 +20,8 @@ import { PermissionV2 } from "@opencode-ai/core/permission"
 import { EventTable } from "@opencode-ai/core/event/sql"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { GoalV2 } from "@opencode-ai/core/goal"
+import { CONTINUATION_PROMPT } from "@opencode-ai/core/goal/automation"
 import { QuestionV2 } from "@opencode-ai/core/question"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -261,6 +263,7 @@ const it = testEffect(
       QuestionV2.node,
       SessionProjector.node,
       SessionStore.node,
+      GoalV2.node,
       ApplicationTools.node,
       AgentV2.node,
       ToolRegistry.node,
@@ -378,6 +381,7 @@ const messageTexts = (request: LLMRequest, role: "user" | "system") =>
   )
 const userTexts = (request: LLMRequest) => messageTexts(request, "user")
 const systemTexts = (request: LLMRequest) => messageTexts(request, "system")
+const requestSystemTexts = (request: LLMRequest) => request.system.map((part) => part.text)
 
 const replaySessionProjection = (id: SessionV2.ID) =>
   Effect.gen(function* () {
@@ -567,6 +571,61 @@ const verifyPartialFlushOnInterruption = (kind: FragmentKind) =>
   })
 
 describe("SessionRunnerLLM", () => {
+  it.effect("runs multiple provider-backed autonomous Goal cycles before the no-progress guardrail stops the chain", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const session = yield* SessionV2.Service
+      const created = yield* goals
+        .create({
+          projectID: Project.ID.global,
+          title: "Autonomous runner integration",
+          objective: "Keep working without another user prompt",
+          criteria: ["Complete the autonomous work"],
+          continuationPolicy: {
+            mode: "auto_continue",
+            maxNoProgressTurns: 2,
+            maxConsecutiveTurns: 8,
+          },
+        })
+        .pipe(Effect.orDie)
+      const active = yield* goals
+        .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+        .pipe(Effect.orDie)
+      yield* goals.focus({ goalID: active.goal.id, sessionID }).pipe(Effect.orDie)
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "Begin the Goal" }), resume: false })
+
+      requests.length = 0
+      responses = [
+        fragmentFixture("text", "goal-user-cycle", ["Initial work complete."]).completeEvents,
+        fragmentFixture("text", "goal-auto-cycle-1", ["Continuing autonomously once."]).completeEvents,
+        fragmentFixture("text", "goal-auto-cycle-2", ["Continuing autonomously twice."]).completeEvents,
+      ]
+
+      yield* drainSession(sessionID)
+
+      expect(requests).toHaveLength(3)
+      expect(userTexts(requests[0]!)).toEqual(["Begin the Goal"])
+      expect(userTexts(requests[1]!)).toEqual(["Begin the Goal"])
+      expect(userTexts(requests[2]!)).toEqual(["Begin the Goal"])
+      expect(requestSystemTexts(requests[0]!)).not.toContain(CONTINUATION_PROMPT)
+      expect(requestSystemTexts(requests[1]!)).toContain(CONTINUATION_PROMPT)
+      expect(requestSystemTexts(requests[2]!)).toContain(CONTINUATION_PROMPT)
+
+      const stopped = yield* goals.get(created.goal.id).pipe(Effect.orDie)
+      expect(stopped.goal).toMatchObject({
+        status: "blocked",
+        blocker: "Automation guardrail: no Goal-state progress for 2 automatic turns",
+      })
+      expect(yield* session.context(sessionID)).toMatchObject([
+        { type: "user", text: "Begin the Goal" },
+        { type: "assistant" },
+        { type: "assistant" },
+        { type: "assistant" },
+      ])
+    }),
+  )
+
   it.effect("advertises and executes a globally attached application tool", () =>
     Effect.gen(function* () {
       yield* setup

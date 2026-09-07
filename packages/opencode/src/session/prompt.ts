@@ -62,6 +62,8 @@ import { SessionTools } from "./tools"
 import { LLMEvent } from "@opencode-ai/llm"
 import { SpadSupervisor } from "./spad/supervisor"
 import { makeTurnPolicy } from "./spad/intent"
+import { GoalContext } from "@opencode-ai/core/goal/context"
+import { GoalAutomation } from "@opencode-ai/core/goal/automation"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -92,6 +94,10 @@ const STRUCTURED_OUTPUT_SYSTEM_PROMPT = `IMPORTANT: The user has requested struc
 // stop reason. Without this the model is asked to produce another assistant
 // turn with no new input, which it experiences as a blank/phantom user message.
 const UNKNOWN_FINISH_CONTINUATION_PROMPT = `[AUTOMATIC CONTINUATION ΓÇö system, not the user] Your previous response was cut off mid-stream: the provider connection dropped before a completion signal arrived (finish reason "unknown"). Nothing new was asked and there is no new user request. Resume exactly where you stopped: continue the same task or sentence WITHOUT repeating output you already produced, without apologizing, and without asking the user anything. If you genuinely cannot continue, state in one short line what you were doing, then immediately proceed with the next concrete step.`
+
+function goalTokenCount(tokens: SessionV1.Assistant["tokens"]) {
+  return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+}
 
 function mcpResourceBase64Size(value: string) {
   const trimmed = value.replace(/\s/g, "")
@@ -160,6 +166,8 @@ const layer = Layer.effect(
     const flags = yield* RuntimeFlags.Service
     const ingress = yield* SessionIngress.Service
     const question = yield* Question.Service
+    const goalContext = yield* GoalContext.Service
+    const goalAutomation = yield* GoalAutomation.Service
     const database = yield* Database.Service
     const { db } = database
     // Throttle for the end-of-turn compaction.prune maintenance fork below.
@@ -1277,6 +1285,10 @@ Generate a fresh title. Do not reuse the current title.`
       "SessionPrompt.prompt",
     )(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+      // A genuine user prompt always supersedes a reserved autonomous cycle.
+      // If an automatic provider request is already in flight, its eventual
+      // settlement observes the missing reservation and cannot resurrect it.
+      yield* goalAutomation.cancel(input.sessionID)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)
@@ -1312,6 +1324,9 @@ Generate a fresh title. Do not reuse the current title.`
         let spad: SpadSupervisor | undefined
         let spadStarted = false
         let turn: TurnCheckpoint.Turn | undefined
+        let titleStarted = false
+        let goalReservation = yield* goalAutomation.claim(sessionID)
+        let goalCycleTokens = 0
         const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
         // Hard pause gate (V1): a paused session must not start any provider
         // work. Prompt admission already gates, but direct loop callers (resume,
@@ -1376,7 +1391,7 @@ Generate a fresh title. Do not reuse the current title.`
            // Per-turn checkpoint: capture a pre-turn tree and insert a `capturing`
            // row on the first step of this runLoop invocation (one logical turn).
            // On resume of an interrupted turn, begin() reconciles the existing row.
-           if (step === 0) {
+           if (step === 0 && turn === undefined) {
              turn = yield* turnCheckpoint.begin({ sessionID, userMessageID: lastUser.id }).pipe(
                Effect.catch((err) =>
                  Effect.logWarning("turn checkpoint begin failed", {
@@ -1414,7 +1429,8 @@ Generate a fresh title. Do not reuse the current title.`
             lastAssistant?.finish &&
             !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
             !hasToolCalls &&
-            lastAssistant.parentID === lastUser.id
+            lastAssistant.parentID === lastUser.id &&
+            !goalReservation
           ) {
             const hasPendingIngress = yield* ingress.hasPending(sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
             let gated = false
@@ -1447,13 +1463,15 @@ Generate a fresh title. Do not reuse the current title.`
           }
 
           step++
-          if (step === 1)
+          if (step === 1 && !titleStarted) {
+            titleStarted = true
             yield* title({
               session,
               modelID: lastUser.model.modelID,
               providerID: lastUser.model.providerID,
               history: msgs,
             }).pipe(Effect.ignore, Effect.forkIn(scope))
+          }
 
           const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
           const task = tasks.pop()
@@ -1556,7 +1574,7 @@ Generate a fresh title. Do not reuse the current title.`
           const continuingAfterUnknown =
             lastAssistant?.finish === "unknown" && lastAssistant.parentID === lastUser.id
 
-          const outcome: "break" | "continue" = yield* Effect.gen(function* () {
+          const outcome: "break" | "continue" | "goal-stop" = yield* Effect.gen(function* () {
             const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
             const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
             const promptOps = yield* ops()
@@ -1608,11 +1626,12 @@ Generate a fresh title. Do not reuse the current title.`
               }
             }
 
-            const [skills, env, instructions, mcpInstructions, modelMsgs] = yield* Effect.all([
+            const [skills, env, instructions, mcpInstructions, goalSystem, modelMsgs] = yield* Effect.all([
               sys.skills(agent),
               sys.environment(model),
               instruction.system().pipe(Effect.orDie),
               sys.mcp(agent, session.permission),
+              goalContext.render(sessionID),
               MessageV2.toModelMessagesEffect(msgs, model),
             ])
             const system = [
@@ -1620,35 +1639,46 @@ Generate a fresh title. Do not reuse the current title.`
               ...instructions,
               ...(mcpInstructions ? [mcpInstructions] : []),
               ...(skills ? [skills] : []),
+              ...(goalSystem ? [goalSystem] : []),
+              ...(goalReservation ? [goalReservation.prompt] : []),
               ...(monitorContext ? [monitorContext] : []),
             ]
             const format = lastUser.format ?? { type: "text" as const }
             if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle.process({
-              user: lastUser,
-              agent,
-              permission: session.permission,
-              sessionID,
-              parentSessionID: session.parentID,
-              system,
-              messages: [
-                ...modelMsgs,
-                // #43892 continuation context: when the previous generation
-                // ended with finish "unknown" (provider stream dropped before
-                // a stop reason), the loop starts ANOTHER generation with no
-                // new user input. Left unexplained, models experience this as
-                // a blank prompt / phantom user turn and may restart, ask the
-                // user what happened, or freeze. Tell it why ΓÇö REQUEST-ONLY,
-                // never persisted into the session.
-                ...(continuingAfterUnknown
-                  ? [{ role: "user" as const, content: UNKNOWN_FINISH_CONTINUATION_PROMPT }]
-                  : []),
-                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-              ],
-              tools,
-              model,
-              toolChoice: format.type === "json_schema" ? "required" : undefined,
-            })
+            const result = yield* handle
+              .process({
+                user: lastUser,
+                agent,
+                permission: session.permission,
+                sessionID,
+                parentSessionID: session.parentID,
+                system,
+                messages: [
+                  ...modelMsgs,
+                  // #43892 continuation context: when the previous generation
+                  // ended with finish "unknown" (provider stream dropped before
+                  // a stop reason), the loop starts ANOTHER generation with no
+                  // new user input. Left unexplained, models experience this as
+                  // a blank prompt / phantom user turn and may restart, ask the
+                  // user what happened, or freeze. Tell it why ΓÇö REQUEST-ONLY,
+                  // never persisted into the session.
+                  ...(continuingAfterUnknown
+                    ? [{ role: "user" as const, content: UNKNOWN_FINISH_CONTINUATION_PROMPT }]
+                    : []),
+                  ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+                ],
+                tools,
+                model,
+                toolChoice: format.type === "json_schema" ? "required" : undefined,
+              })
+              .pipe(
+                Effect.onError(() =>
+                  goalReservation
+                    ? goalAutomation.release({ sessionID, reservationID: goalReservation.id })
+                    : Effect.void,
+                ),
+              )
+            goalCycleTokens += goalTokenCount(handle.message.tokens)
 
             if (structured !== undefined) {
               handle.message.structured = structured
@@ -1699,7 +1729,7 @@ Generate a fresh title. Do not reuse the current title.`
               }
             }
 
-            if (result === "stop") return "break" as const
+            if (result === "stop") return "goal-stop" as const
             if (result === "compact") {
               yield* compaction.create({
                 sessionID,
@@ -1714,7 +1744,35 @@ Generate a fresh title. Do not reuse the current title.`
             Effect.ensuring(instruction.clear(handle.message.id)),
             Effect.onInterrupt(() => finalizeInterruptedAssistant),
           )
-          if (outcome === "break") break
+          if (outcome === "goal-stop") {
+            const completedReservation = goalReservation
+            const decision = yield* goalAutomation.afterTurn({
+              sessionID,
+              origin: completedReservation ? "automatic" : "user",
+              ...(completedReservation ? { reservationID: completedReservation.id } : {}),
+              tokens: goalCycleTokens,
+            })
+            goalReservation = undefined
+            if (decision.reservation) {
+              goalReservation = yield* goalAutomation.claim(sessionID)
+              if (goalReservation) {
+                // A Goal continuation is a fresh bounded logical cycle. Reset
+                // the agent step budget, but retain the same user-turn
+                // checkpoint and transcript because no fake user message exists.
+                step = 0
+                goalCycleTokens = 0
+                continue
+              }
+            }
+            break
+          }
+          if (outcome === "break") {
+            if (goalReservation) {
+              yield* goalAutomation.cancel(sessionID)
+              goalReservation = undefined
+            }
+            break
+          }
           continue
         }
 
@@ -2092,6 +2150,8 @@ export const node = LayerNode.make({
     Database.node,
     SessionIngress.node,
     Question.node,
+    GoalContext.node,
+    GoalAutomation.node,
   ],
 })
 

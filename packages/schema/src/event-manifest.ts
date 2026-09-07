@@ -5,6 +5,7 @@ import { Durable } from "./durable-event-manifest"
 import { Event } from "./event"
 import { FileSystem } from "./filesystem"
 import { FileSystemWatcher } from "./filesystem-watcher"
+import { Goal } from "./goal"
 import { InstallationEvent } from "./installation-event"
 import { Integration } from "./integration"
 import { LegacyEvent } from "./legacy-event"
@@ -47,6 +48,7 @@ const foundationDefinitions = Event.inventory(
 
 const featureDefinitions = Event.inventory(
   ...FileSystem.Event.Definitions,
+  ...Goal.Event.Definitions,
   ...Reference.Event.Definitions,
   ...Permission.Event.Definitions,
   ...Plugin.Event.Definitions,

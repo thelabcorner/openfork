@@ -46,6 +46,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { SessionGroup } from "./group"
 import { Plugin } from "@/plugin"
+import { Goal } from "@opencode-ai/core/goal"
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -509,6 +510,7 @@ const layer: Layer.Layer<
   | EventV2Bridge.Service
   | SessionGroup.Service
   | Plugin.Service
+  | Goal.Service
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -518,6 +520,7 @@ const layer: Layer.Layer<
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const scope = yield* Scope.Scope
+    const goals = yield* Goal.Service
 
     const groupSession = (session: Info) =>
       Effect.gen(function* () {
@@ -549,6 +552,7 @@ const layer: Layer.Layer<
           return
         }
         if (!session.parentID) return
+        const inheritedGoal = yield* goals.focused(session.parentID).pipe(Effect.catch(() => Effect.succeed(undefined)))
         const visited = new Set<string>([session.id])
         let anchor = session.parentID
         let depth = 0
@@ -576,7 +580,13 @@ const layer: Layer.Layer<
           policy: { autoAddDescendants: true, lockAdded: true, autoDeleteWhenEmpty: true },
         })
         yield* groups.addSession({ groupId: group.id, sessionId: anchor, origin: "auto_subagent" })
-        yield* groups.addSession({ groupId: group.id, sessionId: session.id, locked: true, origin: "auto_subagent" })
+        yield* groups.addSession({
+          groupId: group.id,
+          sessionId: session.id,
+          locked: true,
+          origin: "auto_subagent",
+          ...(inheritedGoal ? { originRef: `goal:${inheritedGoal.detail.goal.id}` } : {}),
+        })
       }).pipe(Effect.catchCause((cause) => Effect.logError("failed to group session", { cause })))
 
     const createNext = Effect.fn("Session.createNext")(function* (input: {
@@ -616,6 +626,26 @@ const layer: Layer.Layer<
       yield* Effect.logInfo("created", result)
 
       yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
+      // Inherit Goal focus synchronously before create() returns. TaskTool can
+      // prompt a new child immediately, so deferring this alongside cosmetic
+      // Session Group placement would create a real first-request context race.
+      if (result.parentID) {
+        const inherited = yield* goals.focused(result.parentID).pipe(Effect.catch(() => Effect.succeed(undefined)))
+        if (inherited) {
+          yield* goals
+            .focus({ goalID: inherited.detail.goal.id, sessionID: result.id, role: "worker", actor: "system" })
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("failed to inherit Goal focus for child session", {
+                  sessionID: result.id,
+                  parentID: result.parentID,
+                  goalID: inherited.detail.goal.id,
+                  error: String(error),
+                }),
+              ),
+            )
+        }
+      }
       yield* groupSession(result).pipe(Effect.forkIn(scope, { startImmediately: true }))
 
       return result
@@ -1250,7 +1280,7 @@ function listByProject(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node, SessionGroup.node, Plugin.node],
+  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node, SessionGroup.node, Plugin.node, Goal.node],
 })
 
 export * as Session from "./session"

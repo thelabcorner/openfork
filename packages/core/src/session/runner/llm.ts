@@ -38,8 +38,22 @@ import { createLLMEventPublisher } from "./publish-llm-event"
 import { toLLMMessages } from "./to-llm-message"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
+import { GoalContext } from "../../goal/context"
+import { GoalAutomation } from "../../goal/automation"
 import { makeLocationNode } from "../../effect/app-node"
 import { llmClient } from "../../effect/app-node-platform"
+
+function tokenCount(tokens: {
+  readonly input: number
+  readonly output: number
+  readonly reasoning: number
+  readonly cache: { readonly read: number; readonly write: number }
+}) {
+  // Goal token budgets are safety ceilings rather than billing estimates. Count
+  // every provider-reported token class so caching cannot accidentally make an
+  // unattended run appear cheaper than the context it is actually consuming.
+  return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+}
 
 /**
  * Runs one durable coding-agent Session until it settles.
@@ -107,6 +121,8 @@ const layer = Layer.effect(
     const referenceGuidance = yield* ReferenceGuidance.Service
     const config = yield* Config.Service
     const snapshots = yield* Snapshot.Service
+    const goalContext = yield* GoalContext.Service
+    const goalAutomation = yield* GoalAutomation.Service
     const db = (yield* Database.Service).db
     const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
@@ -167,8 +183,8 @@ const layer = Layer.effect(
     const continueAfterOverflowCompaction = (step: number) =>
       new TurnTransitionError({ _tag: "ContinueAfterOverflowCompaction", step })
 
-    const loadSystemContext = (agent: AgentV2.Selection) =>
-      Effect.all([systemContext.load(), skillGuidance.load(agent), referenceGuidance.load()], {
+    const loadSystemContext = (sessionID: SessionSchema.ID, agent: AgentV2.Selection) =>
+      Effect.all([systemContext.load(), skillGuidance.load(agent), referenceGuidance.load(), goalContext.forSession(sessionID)], {
         concurrency: "unbounded",
       }).pipe(Effect.map(SystemContext.combine))
 
@@ -177,12 +193,13 @@ const layer = Layer.effect(
       promotion: SessionInput.Delivery | undefined,
       step: number,
       recoverOverflow?: typeof compaction.compactAfterOverflow,
+      goalContinuation?: string,
     ) {
       const session = yield* getSession(sessionID)
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
       const agent = yield* agents.select(session.agent)
-      const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(agent), session.id)
+      const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(session.id, agent), session.id)
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
       let needsContinuation = false
       let currentStep = step
@@ -197,7 +214,7 @@ const layer = Layer.effect(
         if (promoted > 0) currentStep = 1
       }
       const system =
-        initialized ?? (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(agent), session.id))
+        initialized ?? (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(session.id, agent), session.id))
       const model = yield* models.resolve(session)
       const entries = yield* SessionHistory.entriesForRunner(db, session.id, system.baselineSeq)
       const context = entries.map((entry) => entry.message)
@@ -214,7 +231,7 @@ const layer = Layer.effect(
           },
         },
         providerOptions: { openai: { promptCacheKey } },
-        system: [agent.info?.system, system.baseline]
+        system: [agent.info?.system, system.baseline, goalContinuation]
           .filter((part): part is string => part !== undefined && part.length > 0)
           .map(SystemPart.make),
         messages: [...toLLMMessages(context, model), ...(isLastStep ? [Message.assistant(MAX_STEPS_PROMPT)] : [])],
@@ -373,7 +390,11 @@ const layer = Layer.effect(
           if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
           if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
             return yield* Effect.failCause(settled.cause)
-          return { needsContinuation: !publisher.hasProviderError() && needsContinuation, step: currentStep }
+          return {
+            needsContinuation: !publisher.hasProviderError() && needsContinuation,
+            step: currentStep,
+            tokens: stepSettlement ? tokenCount(stepSettlement.tokens) : 0,
+          }
         }),
       )
     }, Effect.scoped)
@@ -381,31 +402,32 @@ const layer = Layer.effect(
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
-    ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number }, RunError>
+      goalContinuation?: string,
+    ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number; readonly tokens: number }, RunError>
 
-    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step).pipe(
+    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, goalContinuation) {
+      return yield* runTurnAttempt(sessionID, promotion, step, undefined, goalContinuation).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
               return yield* Effect.die("Post-compaction provider attempt cannot recover another overflow")
             yield* Effect.yieldNow
-            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
+            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, goalContinuation)
           }),
         ),
       )
     })
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step) {
-      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow).pipe(
+    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, goalContinuation) {
+      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow, goalContinuation).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             yield* Effect.yieldNow
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
-              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step)
-            return yield* runTurn(sessionID, undefined, defect.transition.step)
+              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, goalContinuation)
+            return yield* runTurn(sessionID, undefined, defect.transition.step, goalContinuation)
           }),
         ),
       )
@@ -423,22 +445,71 @@ const layer = Layer.effect(
       if (session.pausedAt !== undefined) return
       const hasSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
       const hasQueue = hasSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
-      if (!input.force && !hasSteer && !hasQueue) return
+      if (hasSteer || hasQueue) yield* goalAutomation.cancel(input.sessionID)
+      let automatic = !hasSteer && !hasQueue ? yield* goalAutomation.claim(input.sessionID) : undefined
+      if (!input.force && !hasSteer && !hasQueue && !automatic) return
       yield* failInterruptedTools(input.sessionID)
       let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
-      let shouldRun = input.force || hasSteer || hasQueue
+      let shouldRun = input.force || hasSteer || hasQueue || automatic !== undefined
       while (shouldRun) {
+        let cycleAutomatic = automatic
+        automatic = undefined
+        let cycleTokens = 0
         let needsContinuation = true
         let step = 1
         while (needsContinuation) {
-          const result = yield* runTurn(input.sessionID, promotion, step)
+          const result = yield* runTurn(input.sessionID, promotion, step, cycleAutomatic?.prompt).pipe(
+            Effect.onError(() =>
+              cycleAutomatic
+                ? goalAutomation.release({ sessionID: input.sessionID, reservationID: cycleAutomatic.id })
+                : Effect.void,
+            ),
+          )
+          cycleTokens += result.tokens
           needsContinuation = result.needsContinuation
           step = result.step + 1
           promotion = "steer"
-          if (!needsContinuation) needsContinuation = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+          if (!needsContinuation) {
+            const pendingSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+            if (pendingSteer && cycleAutomatic) {
+              // A real user steer supersedes the autonomous reservation even if
+              // it arrived while the provider was streaming.
+              yield* goalAutomation.cancel(input.sessionID)
+              cycleAutomatic = undefined
+            }
+            needsContinuation = pendingSteer
+          }
         }
-        shouldRun = yield* SessionInput.hasPending(db, input.sessionID, "queue")
-        promotion = shouldRun ? "queue" : undefined
+
+        // User work always outranks another automatic cycle. Check queue first,
+        // then re-check both lanes after reserving to close the arrival race.
+        const pendingQueue = yield* SessionInput.hasPending(db, input.sessionID, "queue")
+        if (pendingQueue) {
+          if (cycleAutomatic) yield* goalAutomation.cancel(input.sessionID)
+          shouldRun = true
+          promotion = "queue"
+          continue
+        }
+
+        const decision = yield* goalAutomation.afterTurn({
+          sessionID: input.sessionID,
+          origin: cycleAutomatic ? "automatic" : "user",
+          ...(cycleAutomatic ? { reservationID: cycleAutomatic.id } : {}),
+          tokens: cycleTokens,
+        })
+
+        const lateSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+        const lateQueue = lateSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
+        if (lateSteer || lateQueue) {
+          yield* goalAutomation.cancel(input.sessionID)
+          shouldRun = true
+          promotion = lateSteer ? "steer" : "queue"
+          continue
+        }
+
+        automatic = decision.reservation ? yield* goalAutomation.claim(input.sessionID) : undefined
+        shouldRun = automatic !== undefined
+        promotion = undefined
       }
       // Post-run maintenance (S6 auto-title parity): runs only on non-interrupted
       // drain completion. An interrupt-driven exit (exactly what pause triggers)
@@ -473,6 +544,8 @@ export const node = makeLocationNode({
     ReferenceGuidance.node,
     Config.node,
     Snapshot.node,
+    GoalContext.node,
+    GoalAutomation.node,
     Database.node,
     SessionTitle.node,
   ],

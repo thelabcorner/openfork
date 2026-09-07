@@ -115,7 +115,7 @@ function isCdbRef(data: unknown): data is { readonly [CDB_REF]: string } {
  *   never share entries and the cache is GC'd with the connection.
  */
 const REHYDRATE_CACHE_MAX_ENTRIES = 1024
-const REHYDRATE_CACHE_MAX_BYTES = 32 * 1024 * 1024 // 32 MiB of raw payload bytes
+const REHYDRATE_CACHE_MAX_BYTES = 64 * 1024 * 1024 // 64 MiB of raw payload bytes
 
 interface RehydrateEntry {
   readonly value: unknown
@@ -201,9 +201,8 @@ export const rehydrateCacheStats = (db: object) => {
  * decode (frame or raw), SHA-256-validate against the stored hash, and return
  * the canonical payload. Shared by `rehydrateEvents` (event.data) and the #8
  * OPCL projection columns (session_message.data / message.data /
- * session.summary_diffs). The write side stores `value_id` as globally unique
- * (`aggregate_id:seq:sha8`), so the lookup keys on `value_id` alone — matching
- * chunk-rebuild.ts's verification.
+ * session.summary_diffs). Lookups use the table's real composite identity
+ * `(aggregate_id, value_id)` instead of relying on a value-id naming convention.
  *
  * - FAIL-CLOSED by default: a dangling/corrupt ref throws `CdbRehydrateError`.
  * - `failSoft` (used for `session.summary_diffs`, Q4): returns `undefined`
@@ -237,7 +236,7 @@ export const resolveCdbRef = Effect.fn("EventV2.resolveCdbRef")(function* (
       refs: EventValueTable.refs,
     })
     .from(EventValueTable)
-    .where(eq(EventValueTable.value_id, valueID))
+    .where(and(eq(EventValueTable.aggregate_id, aggregateID), eq(EventValueTable.value_id, valueID)))
     .all()
     .pipe(Effect.orDie)
   if (stored.length === 0) {
@@ -346,7 +345,7 @@ const REHYDRATE_CACHE_ENTRIES = Math.max(
 )
 const REHYDRATE_CACHE_BYTES = Math.max(
   1024 * 1024,
-  (Number(process.env.OPENCODE_SEAL_CACHE_BYTES_MB) || 32) * 1024 * 1024,
+  (Number(process.env.OPENCODE_SEAL_CACHE_BYTES_MB) || REHYDRATE_CACHE_MAX_BYTES / (1024 * 1024)) * 1024 * 1024,
 )
 
 /**
@@ -486,6 +485,36 @@ export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
         throw new CdbRehydrateError({ aggregateID, valueID, reason: "no event_value row for $cdbRef" })
       }
       const bytes = storedRow.bytes as Uint8Array
+      if (isV5Frame(bytes)) {
+        const header = parseV5Header(bytes)
+        const baseRow = yield* db
+          .select({ bytes: EventValueTable.bytes })
+          .from(EventValueTable)
+          .where(
+            and(
+              eq(EventValueTable.aggregate_id, aggregateID),
+              eq(EventValueTable.value_id, header.baseValueId),
+            ),
+          )
+          .all()
+          .pipe(Effect.orDie)
+        if (baseRow.length === 0) {
+          throw new CdbRehydrateError({ aggregateID, valueID, reason: "delta_ref base missing" })
+        }
+        const baseRaw = decodeValueBytesRaw(baseRow[0].bytes as Uint8Array)
+        const correction = decodeV5Correction(header.correction, header.codec, header.storedCrc)
+        const raw = applyV5Correction(baseRaw, correction, header.totalRawLen)
+        const actualSha = createHash("sha256").update(raw).digest("hex")
+        if (actualSha !== storedRow.sha256) {
+          throw new CdbRehydrateError({ aggregateID, valueID, reason: "sha256 mismatch for delta_ref payload" })
+        }
+        return {
+          valueID,
+          value: JSON.parse(streamingDecoder.decode(raw)),
+          rawLen: storedRow.rawLen,
+          refs: storedRow.refs,
+        }
+      }
       const decodedBytes =
         useWorkers && bytes.length >= DECOMPRESS_POOL_THRESHOLD
           ? yield* Effect.promise(() => decompressValueAsync(bytes))
@@ -814,10 +843,13 @@ export const layerWith = (options?: LayerOptions) =>
                               .where(and(eq(EventTable.aggregate_id, aggregateID), eq(EventTable.seq, input.seq)))
                               .get()
                               .pipe(Effect.orDie)
+                            const canonicalStored = stored
+                              ? (yield* rehydrateEvents(db, aggregateID, [stored]))[0]
+                              : undefined
                             if (
-                              stored?.id === event.id &&
-                              stored.type === versionedType(definition.type, durable.version) &&
-                              isDeepStrictEqual(stored.data, encoded)
+                              canonicalStored?.id === event.id &&
+                              canonicalStored.type === versionedType(definition.type, durable.version) &&
+                              isDeepStrictEqual(canonicalStored.data, encoded)
                             ) {
                               if (input.ownerID && row?.ownerID == null) {
                                 yield* db
