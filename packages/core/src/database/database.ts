@@ -106,7 +106,12 @@ export function withBackfillDb<A, E, R>(
     const db = yield* makeDatabase
     yield* db.run("PRAGMA journal_mode = WAL")
     yield* db.run("PRAGMA synchronous = NORMAL")
-    yield* db.run("PRAGMA busy_timeout = 5000")
+    // Background maintenance is lower priority than interactive writes. The
+    // primary connection is willing to wait up to 5s for a writer; the sealer
+    // must do the opposite and get out of the way quickly when the foreground
+    // owns SQLite's single-writer slot. Busy slices are retried by the sealer
+    // after a short yield instead of monopolizing the lock queue.
+    yield* db.run("PRAGMA busy_timeout = 100")
     yield* db.run("PRAGMA foreign_keys = ON")
     return yield* body(db)
   }).pipe(Effect.provide(sqliteLayer({ filename })))

@@ -9,7 +9,9 @@ import { compressTextAsync } from "./compress-pool"
 import { Flag } from "../flag/flag"
 import {
   CHUNKDB_BATCH_SIZE,
+  CHUNKDB_COOLING_MS,
   CHUNKDB_EXTERNALIZE_MIN_AGGREGATE_BYTES,
+  CHUNKDB_HOT_TAIL_EVENTS,
   CHUNKDB_SEAL_JOURNAL_RETENTION_DAYS,
   CHUNKDB_VACUUM_MAX_ITERATIONS,
   CHUNKDB_VACUUM_PAGES_PER_PASS,
@@ -38,10 +40,13 @@ const encoder = new TextEncoder()
  *
  * Eligibility (per row (aggregate_id, seq)):
  *   seq <= event_sequence.seq                    (settled frontier)
- *   AND event_sequence.owner_id IS NULL          (not claimed/running)
- *   AND session.time_updated <= cooling cutoff   (dormant; event has no ts)
+ *   AND (session is cooled OR row is outside the live hot tail OR session row
+ *        no longer exists)
  *   AND typeof(event.data) = 'text'              (idempotent: skip framed/ref)
  *   AND length(event.data) >= 4096               (code units; see threshold)
+ * `event_sequence.owner_id` is intentionally NOT an activity gate: it is durable
+ * workspace/sync ownership and can remain populated for the lifetime of a
+ * session. Treating it as "running" permanently excluded normal synced history.
  *
  * Epoch-1: `event.data` becomes an inline OCDB frame; the seal is journaled in
  * `ocdb_seal`. Epoch-2: `event.data` becomes a small `{"$cdbRef": "<id>"}`
@@ -59,10 +64,9 @@ const encoder = new TextEncoder()
  *   - batch size is parameterized (default `CHUNKDB_BATCH_SIZE`); median-3 bench
  *     showed 128 gives best/equal promote throughput with the shortest write
  *     lock, so larger batches only starve reads.
- *   - `runPassV2` applies an aggregate-size externalization gate (only promotes
- *     aggregates whose total externalizable bytes exceed
- *     `CHUNKDB_EXTERNALIZE_MIN_AGGREGATE_BYTES`) to avoid tiny-session ref
- *     overhead.
+ *   - `runPassV2` externalizes large aggregates for dedup, while small aggregates
+ *     are compressed inline to avoid tiny-session ref/index overhead without
+ *     giving up compression coverage.
  *   - after each pass, `reclaimSpace` runs a BOUNDED `PRAGMA incremental_vacuum`
  *     (only on fresh DBs with `auto_vacuum = INCREMENTAL`, set create-time in
  *     chunkdb.ts) instead of a blocking VACUUM — reclaiming ~63% of the file in
@@ -72,7 +76,6 @@ const encoder = new TextEncoder()
  *     existing DBs keep their format.
  */
 
-const COOLING_MS = 48 * 60 * 60 * 1000
 const MAX_ROWS_PER_PASS = 5_000
 // #6 adaptive drain (investigate-v4 scope): when a pass hits its cap (backlog
 // remains) the loop switches to BACKFILL mode — back-to-back passes at this
@@ -86,10 +89,65 @@ const DRAIN_SLEEP_MS = 250
 // broken DB isn't hammered; reset on success.
 const BACKOFF_BASE_MS = 10 * 60 * 1000
 const BACKOFF_CAP_MS = 60 * 60 * 1000
-// Pacing: if a single batch's write-lock exceeds this, sleep briefly so live
-// reads interleave (the sealer holds a dedicated connection).
-const WRITE_LOCK_BACKOFF_MS = 250
-const PACING_SLEEP_MS = 50
+// Compression batches stay large enough to keep worker threads busy, but SQLite
+// writes are deliberately sliced much smaller. WAL still permits only one writer
+// at a time, and a 128-row transaction can hold that slot long enough for a
+// foreground 5s busy_timeout to expire on a multi-gigabyte DB.
+const CHUNKDB_WRITE_SLICE_ROWS = 8
+const CHUNKDB_WRITE_SLICE_BYTES = 512 * 1024
+const CHUNKDB_WRITE_SLICE_PAUSE_MS = 15
+const CHUNKDB_BUSY_RETRY_MS = 35
+const BACKLOG_SAMPLE_ROWS = 2_048
+
+// A Database layer can be materialized more than once inside one server process
+// (for example by independently-built service graphs). Starting one infinite
+// maintenance loop per materialization races duplicate sealers against the same
+// SQLite file. Keep exactly one sealer per physical filename in this JS realm.
+const ACTIVE_SEALERS = Symbol.for("opencode.chunkdb.active-sealers")
+const activeSealers = (() => {
+  // `process` is shared across duplicated module/VM realms in one Node sidecar,
+  // unlike a realm-local globalThis. This is the correct singleton boundary for
+  // a database maintenance loop owned by one OS process.
+  const root = process as unknown as Record<PropertyKey, unknown>
+  const existing = root[ACTIVE_SEALERS]
+  if (existing instanceof Set) return existing as Set<string>
+  const created = new Set<string>()
+  root[ACTIVE_SEALERS] = created
+  return created
+})()
+
+function sealerKey(filename: string): string {
+  const normalized = filename.replaceAll("\\", "/")
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized
+}
+
+function isSqliteBusy(error: unknown): boolean {
+  const seen = new Set<object>()
+  const stack: unknown[] = [error]
+  while (stack.length > 0) {
+    const value = stack.pop()
+    if (typeof value === "string") {
+      const text = value.toLowerCase()
+      if (text.includes("database is locked") || text.includes("database table is locked") || text.includes("sqlite_busy")) {
+        return true
+      }
+      continue
+    }
+    if (!value || typeof value !== "object" || seen.has(value)) continue
+    seen.add(value)
+    // EffectDrizzleQueryError wraps SqlError inside Effect.Cause. Cause does not
+    // expose the nested failure through a normal `.cause` field; its own
+    // `reasons` property contains Fail(error). Walk all OWN values (including
+    // non-enumerable/symbol-backed wrappers) so SQLITE_BUSY survives arbitrary
+    // Effect/Drizzle error layers without coupling to one library version.
+    for (const key of Reflect.ownKeys(value)) {
+      try {
+        stack.push((value as Record<PropertyKey, unknown>)[key])
+      } catch {}
+    }
+  }
+  return false
+}
 
 /** Optional tuning knobs for a sealer pass (epoch-3 storage-frontier-v3). */
 interface SealerOptions {
@@ -151,12 +209,13 @@ function pruneSealJournal(db: DatabaseShape): Effect.Effect<void> {
 export function runPass(
   db: DatabaseShape,
   options?: SealerOptions,
-): Effect.Effect<{ promoted: number; bytes: number }, EffectDrizzleQueryError | SqlError> {
+): Effect.Effect<{ promoted: number; bytes: number; processed: number }, EffectDrizzleQueryError | SqlError> {
   return Effect.gen(function* () {
-    const cutoff = Date.now() - COOLING_MS
+    const cutoff = Date.now() - CHUNKDB_COOLING_MS
     const batchSize = options?.batchSize ?? CHUNKDB_BATCH_SIZE
     let promoted = 0
     let bytes = 0
+    let processed = 0
 
     for (;;) {
       const candidates = yield* db.all<{ id: string; data: string }>(sql`
@@ -165,10 +224,20 @@ export function runPass(
         JOIN event_sequence es ON es.aggregate_id = e.aggregate_id
         LEFT JOIN session se ON se.id = e.aggregate_id
         WHERE e.seq <= es.seq
-          AND es.owner_id IS NULL
-          AND (se.time_updated IS NULL OR se.time_updated <= ${cutoff})
+          AND (
+            se.id IS NULL
+            OR se.time_updated <= ${cutoff}
+            OR e.seq <= es.seq - ${CHUNKDB_HOT_TAIL_EVENTS}
+          )
           AND typeof(e.data) = 'text'
           AND length(e.data) >= 4096
+          AND NOT EXISTS (
+            SELECT 1 FROM ocdb_seal os
+            WHERE os.table_name = 'event'
+              AND os.row_id = e.id
+              AND os.column_name = 'data'
+              AND os.reseal_needed = 0
+          )
         ORDER BY e.aggregate_id, e.seq
         LIMIT ${batchSize}
       `)
@@ -176,14 +245,26 @@ export function runPass(
       if (candidates.length === 0) break
 
       for (const candidate of candidates) {
+        const rawLen = encoder.encode(candidate.data).byteLength
         const frame = compressText(candidate.data)
-        if (typeof frame === "string") continue
+        processed += 1
+        if (typeof frame === "string") {
+          yield* db.run(sql`
+            INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
+            VALUES ('event', ${candidate.id}, 'data', ${rawLen}, ${rawLen}, 0, 0, ${Date.now()}, 0)
+            ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
+              raw_bytes = excluded.raw_bytes,
+              stored_bytes = excluded.stored_bytes,
+              time_sealed = excluded.time_sealed
+          `)
+          continue
+        }
         yield* db.transaction((tx) =>
           Effect.gen(function* () {
             yield* tx.run(sql`UPDATE event SET data = ${frame} WHERE id = ${candidate.id}`)
             yield* tx.run(sql`
               INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
-              VALUES ('event', ${candidate.id}, 'data', ${candidate.data.length}, ${frame.byteLength}, ${frame[5]}, ${frame[4]}, ${Date.now()}, 0)
+              VALUES ('event', ${candidate.id}, 'data', ${rawLen}, ${frame.byteLength}, ${frame[5]}, ${frame[4]}, ${Date.now()}, 0)
               ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
                 raw_bytes = excluded.raw_bytes,
                 stored_bytes = excluded.stored_bytes,
@@ -192,11 +273,11 @@ export function runPass(
           }),
         )
         promoted += 1
-        bytes += candidate.data.length
+        bytes += rawLen
       }
 
       yield* Effect.yieldNow
-      if (promoted >= (options?.maxRowsPerPass ?? MAX_ROWS_PER_PASS)) break
+      if (processed >= (options?.maxRowsPerPass ?? MAX_ROWS_PER_PASS)) break
     }
 
     // Reclaim freed pages (bounded) so the file does not grow unbounded.
@@ -205,7 +286,7 @@ export function runPass(
     // every sealed event over the DB's lifetime.
     yield* pruneSealJournal(db)
 
-    return { promoted, bytes }
+    return { promoted, bytes, processed }
   })
 }
 
@@ -232,11 +313,11 @@ export function runPassV2(
   db: DatabaseShape,
   options?: SealerOptions,
 ): Effect.Effect<
-  { promoted: number; repeated: number; bytes: number },
+  { promoted: number; repeated: number; bytes: number; processed: number },
   EffectDrizzleQueryError | SqlError
 > {
   return Effect.gen(function* () {
-    const cutoff = Date.now() - COOLING_MS
+    const cutoff = Date.now() - CHUNKDB_COOLING_MS
     const batchSize = options?.batchSize ?? CHUNKDB_BATCH_SIZE
     const maxRowsPerPass = options?.maxRowsPerPass ?? MAX_ROWS_PER_PASS
     // Epoch-3: when OPENCODE_SEAL_WORKERS is on, compression runs on the
@@ -245,6 +326,7 @@ export function runPassV2(
     let promoted = 0
     let repeated = 0
     let bytes = 0
+    let processed = 0
     // Epoch-4 #10: track the last NON-delta (full-frame) promoted value per
     // aggregate so subsequent candidates can be stored as a sparse correction
     // (v5 delta_ref) against it. Only non-delta bases are tracked — a delta_ref
@@ -253,31 +335,39 @@ export function runPassV2(
     const lastBaseByAggregate = new Map<string, { valueId: string; raw: Uint8Array }>()
 
     for (;;) {
-      // Epoch-3 externalization gate: only promote aggregates whose TOTAL
-      // externalizable bytes exceed the threshold, so tiny sessions don't pay
-      // the `{"$cdbRef":...}` indirection + event_value row overhead for a
-      // negligible space win. Implemented as a per-aggregate SUM(length) HAVING
-      // filter over the eligible set (the `agg_total` CTE) joined back to rows.
-      const candidates = yield* db.all<{ id: string; aggregate_id: string; seq: number; data: string }>(sql`
-        WITH eligible AS (
-          SELECT e.id, e.aggregate_id, e.seq, e.data
-          FROM event e
-          JOIN event_sequence es ON es.aggregate_id = e.aggregate_id
-          LEFT JOIN session se ON se.id = e.aggregate_id
-          WHERE e.seq <= es.seq
-            AND es.owner_id IS NULL
-            AND (se.time_updated IS NULL OR se.time_updated <= ${cutoff})
-            AND typeof(e.data) = 'text'
-            AND length(e.data) >= 4096
-        ), agg_total AS (
-          SELECT aggregate_id, SUM(length(data)) AS total
-          FROM eligible
-          GROUP BY aggregate_id
-          HAVING total > ${CHUNKDB_EXTERNALIZE_MIN_AGGREGATE_BYTES}
-        )
+      // IMPORTANT: candidate discovery MUST stay bounded. The previous
+      // `agg_total` CTE evaluated SUM(length(data)) over the entire eligible
+      // history before SQLite could return the first 128 rows. On a 10+ GiB
+      // production DB that turned an 8 ms indexed candidate seek into a
+      // minutes-long/full-history scan, so the sealer logged "started" but never
+      // reached its first transaction. Aggregate sizing is now computed from the
+      // already-fetched batch below; aggregates that have ever externalized stay
+      // externalized, preserving a stable representation across later batches.
+      const candidates = yield* db.all<{
+        id: string
+        aggregate_id: string
+        seq: number
+        data: string
+      }>(sql`
         SELECT e.id, e.aggregate_id, e.seq, e.data
-        FROM eligible e
-        JOIN agg_total a ON a.aggregate_id = e.aggregate_id
+        FROM event e
+        JOIN event_sequence es ON es.aggregate_id = e.aggregate_id
+        LEFT JOIN session se ON se.id = e.aggregate_id
+        WHERE e.seq <= es.seq
+          AND (
+            se.id IS NULL
+            OR se.time_updated <= ${cutoff}
+            OR e.seq <= es.seq - ${CHUNKDB_HOT_TAIL_EVENTS}
+          )
+          AND typeof(e.data) = 'text'
+          AND length(e.data) >= 4096
+          AND NOT EXISTS (
+            SELECT 1 FROM ocdb_seal os
+            WHERE os.table_name = 'event'
+              AND os.row_id = e.id
+              AND os.column_name = 'data'
+              AND os.reseal_needed = 0
+          )
         ORDER BY e.aggregate_id, e.seq
         LIMIT ${batchSize}
       `)
@@ -289,11 +379,19 @@ export function runPassV2(
       // path. With workers, compression runs in parallel on the pool; the
       // transaction below only applies the precomputed writes (crash-consistent
       // as before — either the whole batch commits or none of it).
+      type Candidate = (typeof candidates)[number]
+      type Prepared = { candidate: Candidate; rawBytes: Uint8Array; externalize: boolean; sha?: string }
+      type PendingPlan =
+        | { kind: "skip" }
+        | { kind: "inline"; prepared: Prepared }
+        | { kind: "repeat"; prepared: Prepared; valueId: string }
+        | { kind: "first"; prepared: Prepared; sha: string; valueId: string }
       type Plan =
         | { kind: "skip" }
-        | { kind: "repeat"; candidate: (typeof candidates)[number]; valueId: string }
-        | { kind: "first"; candidate: (typeof candidates)[number]; sha: string; frame: string | Uint8Array; valueId: string }
-      const plans: Plan[] = []
+        | { kind: "inline"; candidate: Candidate; frame: string | Uint8Array; rawLen: number }
+        | { kind: "repeat"; candidate: Candidate; valueId: string; rawLen: number }
+        | { kind: "first"; candidate: Candidate; sha: string; frame: string | Uint8Array; valueId: string; rawLen: number }
+      const pending: PendingPlan[] = []
       // Batch-aware dedup: the event_value lookup below only sees rows committed
       // by PREVIOUS passes. Two candidates in THIS batch with the same
       // (aggregate_id, sha256) would both plan as "first" and the transaction
@@ -301,16 +399,94 @@ export function runPassV2(
       // batch already plans to promote so the second occurrence becomes a
       // "repeat" pointing at the first's value_id.
       const batchSeen = new Map<string, string>()
-      const shaByCandidate = candidates.map((c) => ({
-        candidate: c,
-        sha: createHash("sha256").update(c.data).digest("hex"),
-      }))
+      const rawPrepared = candidates.map((candidate) => ({ candidate, rawBytes: encoder.encode(candidate.data) }))
+      const batchBytesByAggregate = new Map<string, number>()
+      for (const { candidate, rawBytes } of rawPrepared) {
+        batchBytesByAggregate.set(
+          candidate.aggregate_id,
+          (batchBytesByAggregate.get(candidate.aggregate_id) ?? 0) + rawBytes.byteLength,
+        )
+      }
+
+      // One tiny metadata query for the aggregates represented in this batch.
+      // Once an aggregate has event_value rows, keep externalizing subsequent
+      // batches even if the remaining tail alone is below the size threshold.
+      const aggregatesWithValues = new Set<string>()
+      const aggregateIDs = [...new Set(candidates.map((candidate) => candidate.aggregate_id))]
+      if (aggregateIDs.length > 0) {
+        const ids = sql.join(aggregateIDs.map((id) => sql`${id}`), sql`, `)
+        const rows = yield* db.all<{ aggregate_id: string }>(sql`
+          SELECT DISTINCT aggregate_id FROM event_value WHERE aggregate_id IN (${ids})
+        `).pipe(Effect.orDie)
+        for (const row of rows) aggregatesWithValues.add(row.aggregate_id)
+      }
+
+      const externalizeAggregates = new Set<string>()
+      for (const [aggregateID, batchBytes] of batchBytesByAggregate) {
+        if (batchBytes > CHUNKDB_EXTERNALIZE_MIN_AGGREGATE_BYTES) externalizeAggregates.add(aggregateID)
+      }
+
+      // ORDER BY (aggregate_id, seq) means only the final aggregate can be cut
+      // by LIMIT. If its visible slice is below the 64 KiB externalization gate,
+      // probe only enough of that aggregate to decide the threshold exactly.
+      // Every candidate is >=4 KiB, so 17 rows are sufficient to prove >64 KiB;
+      // this stays O(1) and never reintroduces a full-history SUM(length(data)).
+      if (candidates.length === batchSize) {
+        const trailingAggregate = candidates.at(-1)?.aggregate_id
+        if (
+          trailingAggregate !== undefined &&
+          !aggregatesWithValues.has(trailingAggregate) &&
+          !externalizeAggregates.has(trailingAggregate)
+        ) {
+          const thresholdRows = yield* db.all<{ bytes: number }>(sql`
+            SELECT length(CAST(e.data AS BLOB)) AS bytes
+            FROM event e
+            JOIN event_sequence es ON es.aggregate_id = e.aggregate_id
+            LEFT JOIN session se ON se.id = e.aggregate_id
+            WHERE e.aggregate_id = ${trailingAggregate}
+              AND e.seq <= es.seq
+              AND (
+                se.id IS NULL
+                OR se.time_updated <= ${cutoff}
+                OR e.seq <= es.seq - ${CHUNKDB_HOT_TAIL_EVENTS}
+              )
+              AND typeof(e.data) = 'text'
+              AND length(e.data) >= 4096
+              AND NOT EXISTS (
+                SELECT 1 FROM ocdb_seal os
+                WHERE os.table_name = 'event'
+                  AND os.row_id = e.id
+                  AND os.column_name = 'data'
+                  AND os.reseal_needed = 0
+              )
+            ORDER BY e.seq
+            LIMIT 17
+          `).pipe(Effect.orDie)
+          const aggregateBytes = thresholdRows.reduce((total, row) => total + row.bytes, 0)
+          if (aggregateBytes > CHUNKDB_EXTERNALIZE_MIN_AGGREGATE_BYTES) {
+            externalizeAggregates.add(trailingAggregate)
+          }
+        }
+      }
+
+      const prepared: Prepared[] = rawPrepared.map(({ candidate, rawBytes }) => {
+        const externalize =
+          externalizeAggregates.has(candidate.aggregate_id) ||
+          aggregatesWithValues.has(candidate.aggregate_id)
+        return {
+          candidate,
+          rawBytes,
+          externalize,
+          sha: externalize ? createHash("sha256").update(rawBytes).digest("hex") : undefined,
+        }
+      })
+      const external = prepared.filter((entry): entry is Prepared & { sha: string } => entry.externalize && entry.sha !== undefined)
       // ONE batched dedup lookup for the whole batch (row-value IN) instead of a
       // per-candidate SELECT — a bulk promote does 2000 round-trips otherwise.
       const committed = new Map<string, string>()
-      if (shaByCandidate.length > 0) {
+      if (external.length > 0) {
         const pairs = sql.join(
-          shaByCandidate.map(({ candidate, sha }) => sql`(${candidate.aggregate_id}, ${sha})`),
+          external.map(({ candidate, sha }) => sql`(${candidate.aggregate_id}, ${sha})`),
           sql`, `,
         )
         const rows = yield* db.all<{ aggregate_id: string; value_id: string; sha256: string }>(sql`
@@ -319,22 +495,28 @@ export function runPassV2(
         `).pipe(Effect.orDie)
         for (const r of rows) committed.set(`${r.aggregate_id}:${r.sha256}`, r.value_id)
       }
-      for (const { candidate, sha } of shaByCandidate) {
+      for (const item of prepared) {
+        const { candidate } = item
         // Idempotency: a row already promoted to a reference is short TEXT, so
         // the length >= 4096 filter already excludes it; bail early if one
         // slips through (defensive, never re-promote a ref).
         if (candidate.data.startsWith(`{"${CDB_REF}"`)) {
-          plans.push({ kind: "skip" })
+          pending.push({ kind: "skip" })
           continue
         }
 
-        const raw = candidate.data
+        if (!item.externalize) {
+          pending.push({ kind: "inline", prepared: item })
+          continue
+        }
+
+        const sha = item.sha!
 
         const existingValueId = committed.get(`${candidate.aggregate_id}:${sha}`)
         if (existingValueId) {
           // REPEAT — the dedup win. Point this event at the existing row and
           // bump its refcount; the payload is NOT stored again.
-          plans.push({ kind: "repeat", candidate, valueId: existingValueId })
+          pending.push({ kind: "repeat", prepared: item, valueId: existingValueId })
           continue
         }
 
@@ -344,22 +526,52 @@ export function runPassV2(
           // REPEAT within this batch — the identical payload is already planned
           // for promotion below; point at its value_id instead of inserting a
           // duplicate row (which would violate UNIQUE(aggregate_id, sha256)).
-          plans.push({ kind: "repeat", candidate, valueId: batchHit })
+          pending.push({ kind: "repeat", prepared: item, valueId: batchHit })
           continue
         }
 
-        // FIRST occurrence — compress once and store the canonical bytes.
-        const rawBytes = encoder.encode(raw)
-        const frame = useWorkers
-          ? yield* Effect.promise(() => compressTextAsync(raw))
-          : compressText(raw)
         const valueId = `${candidate.aggregate_id}:${candidate.seq}`
+        batchSeen.set(batchKey, valueId)
+        pending.push({ kind: "first", prepared: item, sha, valueId })
+      }
 
-        // Epoch-4 #10: delta_ref framing. If enabled and a non-delta base exists
-        // in the same aggregate, store this value as a sparse correction against
-        // the base when the correction is materially smaller than a full frame
-        // (the 0.7x margin guards against regressions on non-record-structured
-        // payloads). The correction is computed synchronously — it is small.
+      // Fill the worker pool instead of awaiting one compression job at a time.
+      // The pool itself caps CPU concurrency; Effect concurrency only keeps its
+      // queue fed. Sync mode intentionally remains serial.
+      const compressionTargets = pending.filter(
+        (plan): plan is Extract<PendingPlan, { kind: "inline" | "first" }> =>
+          plan.kind === "inline" || plan.kind === "first",
+      )
+      const compressed = yield* Effect.all(
+        compressionTargets.map((plan) => {
+          const raw = plan.prepared.candidate.data
+          const effect = useWorkers
+            ? Effect.promise(() => compressTextAsync(raw))
+            : Effect.sync(() => compressText(raw))
+          return effect.pipe(Effect.map((frame) => [plan.prepared.candidate.id, frame] as const))
+        }),
+        { concurrency: useWorkers ? 16 : 1 },
+      )
+      const frameByID = new Map(compressed)
+
+      const plans: Plan[] = []
+      for (const plan of pending) {
+        if (plan.kind === "skip") {
+          plans.push(plan)
+          continue
+        }
+        const { candidate, rawBytes } = plan.prepared
+        const rawLen = rawBytes.byteLength
+        if (plan.kind === "inline") {
+          plans.push({ kind: "inline", candidate, frame: frameByID.get(candidate.id) ?? candidate.data, rawLen })
+          continue
+        }
+        if (plan.kind === "repeat") {
+          plans.push({ kind: "repeat", candidate, valueId: plan.valueId, rawLen })
+          continue
+        }
+
+        const frame = frameByID.get(candidate.id) ?? candidate.data
         let finalFrame: string | Uint8Array = frame
         if (Flag.OPENCODE_SEAL_DELTA && typeof frame !== "string") {
           const base = lastBaseByAggregate.get(candidate.aggregate_id)
@@ -369,76 +581,149 @@ export function runPassV2(
             if (delta.byteLength < frame.byteLength * 0.7) finalFrame = delta
           }
         }
-        // Track the base for FUTURE candidates only when THIS value is stored as a
-        // full frame (not a delta) — a delta_ref value is never a base.
-        if (finalFrame === frame) {
-          lastBaseByAggregate.set(candidate.aggregate_id, { valueId, raw: rawBytes })
+        if (finalFrame === frame) lastBaseByAggregate.set(candidate.aggregate_id, { valueId: plan.valueId, raw: rawBytes })
+        plans.push({ kind: "first", candidate, sha: plan.sha, frame: finalFrame, valueId: plan.valueId, rawLen })
+      }
+
+      const writePlans = plans.filter((plan): plan is Exclude<Plan, { kind: "skip" }> => plan.kind !== "skip")
+      const slices: Array<Array<Exclude<Plan, { kind: "skip" }>>> = []
+      let slice: Array<Exclude<Plan, { kind: "skip" }>> = []
+      let sliceBytes = 0
+      const weight = (plan: Exclude<Plan, { kind: "skip" }>) => {
+        if (plan.kind === "repeat") return 256
+        if (plan.kind === "inline") return typeof plan.frame === "string" ? 256 : plan.frame.byteLength
+        return typeof plan.frame === "string" ? plan.rawLen : plan.frame.byteLength
+      }
+      for (const plan of writePlans) {
+        const bytesForPlan = weight(plan)
+        if (
+          slice.length > 0 &&
+          (slice.length >= CHUNKDB_WRITE_SLICE_ROWS || sliceBytes + bytesForPlan > CHUNKDB_WRITE_SLICE_BYTES)
+        ) {
+          slices.push(slice)
+          slice = []
+          sliceBytes = 0
         }
-        batchSeen.set(batchKey, valueId)
-        plans.push({ kind: "first", candidate, sha, frame: finalFrame, valueId })
+        slice.push(plan)
+        sliceBytes += bytesForPlan
       }
+      if (slice.length > 0) slices.push(slice)
 
-      const txStart = Date.now()
-      yield* db.transaction((tx) =>
-        Effect.gen(function* () {
-          for (const plan of plans) {
-            if (plan.kind === "skip") continue
-            const candidate = plan.candidate
-            const raw = candidate.data
+      for (const writeSlice of slices) {
+        for (;;) {
+          const outcome = yield* db
+            .transaction((tx) =>
+              Effect.gen(function* () {
+                let committedPromoted = 0
+                let committedRepeated = 0
+                let committedBytes = 0
+                let committedProcessed = 0
+                for (const plan of writeSlice) {
+                  const candidate = plan.candidate
+                  const raw = candidate.data
+                  committedProcessed += 1
 
-            if (plan.kind === "repeat") {
-              const ref = toCdbRef(plan.valueId)
-              yield* tx.run(sql`UPDATE event SET data = ${ref} WHERE id = ${candidate.id}`)
-              yield* tx.run(sql`
-                UPDATE event_value SET refs = refs + 1
-                WHERE aggregate_id = ${candidate.aggregate_id} AND value_id = ${plan.valueId}
-              `)
-              yield* tx.run(sql`
-                INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
-                VALUES ('event', ${candidate.id}, 'data', ${raw.length}, ${ref.length}, 0, 0, ${Date.now()}, 0)
-                ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
-                  raw_bytes = excluded.raw_bytes,
-                  stored_bytes = excluded.stored_bytes,
-                  time_sealed = excluded.time_sealed
-              `)
-              repeated += 1
-              bytes += raw.length
-              continue
-            }
+                  if (plan.kind === "inline") {
+                    if (typeof plan.frame === "string") {
+                      // Incompressible small row: remember the decision so it is
+                      // not recompressed every ten minutes. It remains ordinary TEXT.
+                      yield* tx.run(sql`
+                        INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
+                        VALUES ('event', ${candidate.id}, 'data', ${plan.rawLen}, ${plan.rawLen}, 0, 0, ${Date.now()}, 0)
+                        ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
+                          raw_bytes = excluded.raw_bytes,
+                          stored_bytes = excluded.stored_bytes,
+                          time_sealed = excluded.time_sealed
+                      `)
+                      continue
+                    }
+                    yield* tx.run(sql`UPDATE event SET data = ${plan.frame} WHERE id = ${candidate.id}`)
+                    yield* tx.run(sql`
+                      INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
+                      VALUES ('event', ${candidate.id}, 'data', ${plan.rawLen}, ${plan.frame.byteLength}, ${plan.frame[5]}, ${plan.frame[4]}, ${Date.now()}, 0)
+                      ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
+                        raw_bytes = excluded.raw_bytes,
+                        stored_bytes = excluded.stored_bytes,
+                        codec = excluded.codec,
+                        frame_version = excluded.frame_version,
+                        time_sealed = excluded.time_sealed
+                    `)
+                    committedPromoted += 1
+                    committedBytes += plan.rawLen
+                    continue
+                  }
 
-            // FIRST occurrence — store the canonical bytes computed above.
-            const frame = plan.frame
-            const stored = typeof frame === "string" ? encoder.encode(raw) : frame
-            const codec = typeof frame === "string" ? 0 : frame[5]
-            const ref = toCdbRef(plan.valueId)
-            yield* tx.run(sql`UPDATE event SET data = ${ref} WHERE id = ${candidate.id}`)
-            yield* tx.run(sql`
-              INSERT INTO event_value (aggregate_id, value_id, sha256, raw_len, bytes, refs, time_promoted)
-              VALUES (${candidate.aggregate_id}, ${plan.valueId}, ${plan.sha}, ${raw.length}, ${stored}, 1, ${Date.now()})
-            `)
-            yield* tx.run(sql`
-              INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
-                VALUES ('event', ${candidate.id}, 'data', ${raw.length}, ${stored.byteLength}, ${codec}, ${typeof frame === "string" ? 0 : frame[4]}, ${Date.now()}, 0)
-              ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
-                raw_bytes = excluded.raw_bytes,
-                stored_bytes = excluded.stored_bytes,
-                time_sealed = excluded.time_sealed
-            `)
-            promoted += 1
-            bytes += raw.length
+                  if (plan.kind === "repeat") {
+                    const ref = toCdbRef(plan.valueId)
+                    yield* tx.run(sql`UPDATE event SET data = ${ref} WHERE id = ${candidate.id}`)
+                    yield* tx.run(sql`
+                      UPDATE event_value SET refs = refs + 1
+                      WHERE aggregate_id = ${candidate.aggregate_id} AND value_id = ${plan.valueId}
+                    `)
+                    yield* tx.run(sql`
+                      INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
+                      VALUES ('event', ${candidate.id}, 'data', ${plan.rawLen}, ${ref.length}, 0, 0, ${Date.now()}, 0)
+                      ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
+                        raw_bytes = excluded.raw_bytes,
+                        stored_bytes = excluded.stored_bytes,
+                        time_sealed = excluded.time_sealed
+                    `)
+                    committedRepeated += 1
+                    committedBytes += plan.rawLen
+                    continue
+                  }
+
+                  // FIRST occurrence — store the canonical bytes computed above.
+                  const frame = plan.frame
+                  const stored = typeof frame === "string" ? encoder.encode(raw) : frame
+                  const codec = typeof frame === "string" ? 0 : frame[5]
+                  const ref = toCdbRef(plan.valueId)
+                  yield* tx.run(sql`UPDATE event SET data = ${ref} WHERE id = ${candidate.id}`)
+                  yield* tx.run(sql`
+                    INSERT INTO event_value (aggregate_id, value_id, sha256, raw_len, bytes, refs, time_promoted)
+                    VALUES (${candidate.aggregate_id}, ${plan.valueId}, ${plan.sha}, ${plan.rawLen}, ${stored}, 1, ${Date.now()})
+                  `)
+                  yield* tx.run(sql`
+                    INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
+                      VALUES ('event', ${candidate.id}, 'data', ${plan.rawLen}, ${stored.byteLength}, ${codec}, ${typeof frame === "string" ? 0 : frame[4]}, ${Date.now()}, 0)
+                    ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
+                      raw_bytes = excluded.raw_bytes,
+                      stored_bytes = excluded.stored_bytes,
+                      time_sealed = excluded.time_sealed
+                  `)
+                  committedPromoted += 1
+                  committedBytes += plan.rawLen
+                }
+                return {
+                  promoted: committedPromoted,
+                  repeated: committedRepeated,
+                  bytes: committedBytes,
+                  processed: committedProcessed,
+                }
+              }),
+            )
+            .pipe(
+              Effect.map((stats) => ({ kind: "ok" as const, stats })),
+              Effect.catch((error) => Effect.succeed({ kind: "error" as const, error })),
+            )
+
+          if (outcome.kind === "ok") {
+            promoted += outcome.stats.promoted
+            repeated += outcome.stats.repeated
+            bytes += outcome.stats.bytes
+            processed += outcome.stats.processed
+            break
           }
-        }),
-      )
+          if (!isSqliteBusy(outcome.error)) return yield* Effect.fail(outcome.error)
+          // Foreground owns the SQLite writer slot. Do not queue behind it for
+          // seconds; yield and retry this exact atomic slice later.
+          yield* Effect.sleep(Duration.millis(CHUNKDB_BUSY_RETRY_MS))
+        }
 
-      const txMs = Date.now() - txStart
-
-      yield* Effect.yieldNow
-      // Pacing: if this batch's write-lock was unusually long, sleep briefly so
-      // live reads interleave (the sealer holds a dedicated connection).
-      if (txMs > WRITE_LOCK_BACKOFF_MS) {
-        yield* Effect.sleep(Duration.millis(PACING_SLEEP_MS))
+        yield* Effect.yieldNow
+        yield* Effect.sleep(Duration.millis(CHUNKDB_WRITE_SLICE_PAUSE_MS))
       }
-      if (promoted + repeated >= maxRowsPerPass) break
+      if (processed >= maxRowsPerPass) break
     }
 
     // Reclaim freed pages (bounded) so the file does not grow unbounded.
@@ -447,7 +732,7 @@ export function runPassV2(
     // every sealed event over the DB's lifetime.
     yield* pruneSealJournal(db)
 
-    return { promoted, repeated, bytes }
+    return { promoted, repeated, bytes, processed }
   })
 }
 
@@ -463,8 +748,9 @@ export function runPassV2(
  * Adaptive drain (#6, investigate-v4 scope): when a pass hits its cap (backlog
  * remains), the loop switches to BACKFILL mode — back-to-back passes at
  * `CHUNKDB_BACKFILL_MAX_ROWS_PER_PASS` with a short 250ms interleave so live
- * reads aren't starved (batches are 128-row short write-locks on the dedicated
- * connection). When a pass no longer hits the cap (backlog drained) it settles
+ * reads aren't starved. Compression is planned in 128-row batches, but writes
+ * are committed in foreground-priority microtransactions (<=8 rows / <=512KiB)
+ * with a yield between slices. When a pass no longer hits the cap it settles
  * to MAINTENANCE mode: 10-min spaced passes at `MAX_ROWS_PER_PASS`. Mode is
  * derived from the previous pass result — no extra state, no cursor.
  * `Flag.OPENCODE_SEAL_BACKFILL` set to 0 forces maintenance-only. A failed pass
@@ -472,35 +758,174 @@ export function runPassV2(
  * isn't hammered; the loop survives and resets on success.
  */
 type SealerPassOutcome =
-  | { kind: "ok"; promoted: number; repeated: number }
-  | { kind: "failed"; promoted: number; repeated: number }
+  | { kind: "ok"; promoted: number; repeated: number; processed: number; bytes: number }
+  | { kind: "failed"; promoted: number; repeated: number; processed: number; bytes: number }
+
+export interface SealerBacklog {
+  /** Sampled large TEXT rows still awaiting a seal decision. */
+  pending: number
+  /** Sampled pending rows that are eligible on this pass. */
+  eligible: number
+  /** Sampled pending rows deliberately retained in an active session's hot tail. */
+  hotDeferred: number
+  /** Informational only: sampled rows belonging to a sync-owned aggregate. */
+  syncOwned: number
+  /** Approximate bytes for eligible rows in the bounded sample. */
+  eligibleBytes: number
+  /** True when more pending rows exist beyond the bounded diagnostic sample. */
+  truncated: boolean
+}
+
+/** Bounded operator probe used by the loop. Diagnostics must never turn an idle
+ * maintenance pass into a full-history scan, so this inspects at most
+ * `BACKLOG_SAMPLE_ROWS + 1` candidate rows and reports whether it truncated. */
+export function inspectSealerBacklog(
+  db: DatabaseShape,
+): Effect.Effect<SealerBacklog, EffectDrizzleQueryError | SqlError> {
+  return Effect.gen(function* () {
+    const cutoff = Date.now() - CHUNKDB_COOLING_MS
+    const rows = yield* db.all<{
+      pending: number
+      eligible: number
+      sync_owned: number
+      eligible_bytes: number
+    }>(sql`
+      WITH sample AS (
+        SELECT
+          e.seq AS event_seq,
+          es.seq AS frontier_seq,
+          es.owner_id AS owner_id,
+          se.id AS session_id,
+          se.time_updated AS session_time_updated,
+          length(CAST(e.data AS BLOB)) AS bytes
+        FROM event e
+        JOIN event_sequence es ON es.aggregate_id = e.aggregate_id
+        LEFT JOIN session se ON se.id = e.aggregate_id
+        WHERE e.seq <= es.seq
+          AND typeof(e.data) = 'text'
+          AND length(e.data) >= 4096
+          AND NOT EXISTS (
+            SELECT 1 FROM ocdb_seal os
+            WHERE os.table_name = 'event'
+              AND os.row_id = e.id
+              AND os.column_name = 'data'
+              AND os.reseal_needed = 0
+          )
+        ORDER BY e.aggregate_id, e.seq
+        LIMIT ${BACKLOG_SAMPLE_ROWS + 1}
+      )
+      SELECT
+        COUNT(*) AS pending,
+        COALESCE(SUM(CASE WHEN (
+          session_id IS NULL
+          OR session_time_updated <= ${cutoff}
+          OR event_seq <= frontier_seq - ${CHUNKDB_HOT_TAIL_EVENTS}
+        ) THEN 1 ELSE 0 END), 0) AS eligible,
+        COALESCE(SUM(CASE WHEN owner_id IS NOT NULL THEN 1 ELSE 0 END), 0) AS sync_owned,
+        COALESCE(SUM(CASE WHEN (
+          session_id IS NULL
+          OR session_time_updated <= ${cutoff}
+          OR event_seq <= frontier_seq - ${CHUNKDB_HOT_TAIL_EVENTS}
+        ) THEN bytes ELSE 0 END), 0) AS eligible_bytes
+      FROM sample
+    `)
+    const row = rows[0]
+    const pending = row?.pending ?? 0
+    const eligible = row?.eligible ?? 0
+    return {
+      pending,
+      eligible,
+      hotDeferred: Math.max(0, pending - eligible),
+      syncOwned: row?.sync_owned ?? 0,
+      eligibleBytes: row?.eligible_bytes ?? 0,
+      truncated: pending > BACKLOG_SAMPLE_ROWS,
+    }
+  })
+}
 
 export function runSealerLoop(filename: string): Effect.Effect<void> {
   if (!Flag.OPENCODE_SEAL_ENABLED) return Effect.void
   const backfillAllowed = Flag.OPENCODE_SEAL_BACKFILL
-  return withBackfillDb(filename, (db) =>
-    Effect.gen(function* () {
-      let previousHitCap: boolean = false
-      let backoffMs = BACKOFF_BASE_MS
-      for (;;) {
-        const draining: boolean = previousHitCap && backfillAllowed
-        const cap: number = draining ? CHUNKDB_BACKFILL_MAX_ROWS_PER_PASS : MAX_ROWS_PER_PASS
-        const outcome: SealerPassOutcome = yield* runSealerPass(db, { maxRowsPerPass: cap }).pipe(
-          Effect.catch(() => Effect.succeed({ kind: "failed" as const, promoted: 0, repeated: 0 })),
-        )
-        if (outcome.kind === "failed") {
-          yield* Effect.logError("ChunkDB sealer pass failed; backing off")
-          yield* Effect.sleep(Duration.millis(backoffMs))
-          backoffMs = Math.min(backoffMs * 2, BACKOFF_CAP_MS)
-          previousHitCap = false
-          continue
-        }
-        backoffMs = BACKOFF_BASE_MS
-        previousHitCap = outcome.promoted + outcome.repeated >= cap
-        const wait = previousHitCap && backfillAllowed ? DRAIN_SLEEP_MS : MAINTENANCE_INTERVAL_MS
-        yield* Effect.sleep(Duration.millis(wait))
-      }
+  const key = sealerKey(filename)
+  return Effect.acquireUseRelease(
+    Effect.sync(() => {
+      if (activeSealers.has(key)) return false
+      activeSealers.add(key)
+      return true
     }),
+    (acquired) => {
+      if (!acquired) return Effect.logDebug("ChunkDB sealer already active", { filename, pid: process.pid })
+      return withBackfillDb(filename, (db) =>
+        Effect.gen(function* () {
+          yield* Effect.logInfo("ChunkDB sealer started", {
+            filename,
+            pid: process.pid,
+            dedup: Flag.OPENCODE_SEAL_DEDUP,
+            workers: Flag.OPENCODE_SEAL_WORKERS,
+            delta: Flag.OPENCODE_SEAL_DELTA,
+            backfill: backfillAllowed,
+            coolingMs: CHUNKDB_COOLING_MS,
+            hotTailEvents: CHUNKDB_HOT_TAIL_EVENTS,
+          })
+          let previousHitCap: boolean = false
+          let backoffMs = BACKOFF_BASE_MS
+          for (;;) {
+            const draining: boolean = previousHitCap && backfillAllowed
+            const cap: number = draining ? CHUNKDB_BACKFILL_MAX_ROWS_PER_PASS : MAX_ROWS_PER_PASS
+            const started = Date.now()
+            const outcome: SealerPassOutcome = yield* runSealerPass(db, { maxRowsPerPass: cap }).pipe(
+              Effect.catch((error) =>
+                Effect.logError("ChunkDB sealer pass failed; backing off", { filename, error }).pipe(
+                  Effect.as({ kind: "failed" as const, promoted: 0, repeated: 0, processed: 0, bytes: 0 }),
+                ),
+              ),
+            )
+            if (outcome.kind === "failed") {
+              yield* Effect.sleep(Duration.millis(backoffMs))
+              backoffMs = Math.min(backoffMs * 2, BACKOFF_CAP_MS)
+              previousHitCap = false
+              continue
+            }
+            backoffMs = BACKOFF_BASE_MS
+            previousHitCap = outcome.processed >= cap
+            if (outcome.processed > 0) {
+              yield* Effect.logInfo("ChunkDB sealer pass complete", {
+                filename,
+                mode: draining ? "backfill" : "maintenance",
+                processed: outcome.processed,
+                promoted: outcome.promoted,
+                repeated: outcome.repeated,
+                rawBytes: outcome.bytes,
+                durationMs: Date.now() - started,
+                hitCap: previousHitCap,
+              })
+            } else {
+              const backlog = yield* inspectSealerBacklog(db).pipe(
+                Effect.catch(() =>
+                  Effect.succeed<SealerBacklog>({
+                    pending: 0,
+                    eligible: 0,
+                    hotDeferred: 0,
+                    syncOwned: 0,
+                    eligibleBytes: 0,
+                    truncated: false,
+                  }),
+                ),
+              )
+              yield* Effect.logDebug("ChunkDB sealer idle", { filename, ...backlog })
+            }
+            const wait = previousHitCap && backfillAllowed ? DRAIN_SLEEP_MS : MAINTENANCE_INTERVAL_MS
+            yield* Effect.sleep(Duration.millis(wait))
+          }
+        }),
+      )
+    },
+    (acquired) =>
+      acquired
+        ? Effect.sync(() => {
+            activeSealers.delete(key)
+          })
+        : Effect.void,
   ).pipe(
     Effect.catch((error) => Effect.logError("ChunkDB sealer loop stopped", { error })),
   )
@@ -514,13 +939,16 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
 function runSealerPass(
   db: DatabaseShape,
   options: SealerOptions,
-): Effect.Effect<{ kind: "ok"; promoted: number; repeated: number }, EffectDrizzleQueryError | SqlError> {
+): Effect.Effect<
+  { kind: "ok"; promoted: number; repeated: number; processed: number; bytes: number },
+  EffectDrizzleQueryError | SqlError
+> {
   if (Flag.OPENCODE_SEAL_DEDUP) {
     return runPassV2(db, options).pipe(
-      Effect.map((result) => ({ kind: "ok" as const, promoted: result.promoted, repeated: result.repeated })),
+      Effect.map((result) => ({ kind: "ok" as const, ...result })),
     )
   }
   return runPass(db, options).pipe(
-    Effect.map((result) => ({ kind: "ok" as const, promoted: result.promoted, repeated: 0 })),
+    Effect.map((result) => ({ kind: "ok" as const, promoted: result.promoted, repeated: 0, processed: result.processed, bytes: result.bytes })),
   )
 }

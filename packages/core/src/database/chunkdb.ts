@@ -28,6 +28,15 @@ export const CHUNKDB_VACUUM_PAGES_PER_PASS = 100
 export const CHUNKDB_VACUUM_MAX_ITERATIONS = 200
 /** Promotion batch size. Median-3 bench: 128 gives best/equal promote throughput AND the shortest write-lock window (110ms vs 170ms@256, 209ms@512); larger batches regress slightly and starve reads longer. Kept at 128; tunable via runPass/runPassV2 options. */
 export const CHUNKDB_BATCH_SIZE = 128
+/** Keep the newest events of a live session inline. Older immutable prefixes may
+ * be sealed even while the session remains active; this bounds hot-path replay
+ * amplification without waiting for the whole session to become dormant. */
+export const CHUNKDB_HOT_TAIL_EVENTS = 256
+/** Once a session has been idle this long, its remaining hot tail becomes
+ * eligible too. Sealing is lossless and sync/replay paths rehydrate references,
+ * so a one-hour cooling window is sufficient while still avoiding churn around
+ * immediately active sessions. */
+export const CHUNKDB_COOLING_MS = 60 * 60 * 1000
 /** Externalization gate: only promote aggregates whose total externalizable bytes exceed this, so tiny sessions don't pay the $cdbRef indirection + event_value row overhead. */
 export const CHUNKDB_EXTERNALIZE_MIN_AGGREGATE_BYTES = 64 * 1024
 /** `ocdb_seal` is a write-only audit journal (the candidate filter keys off the

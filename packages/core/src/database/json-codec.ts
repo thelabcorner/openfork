@@ -113,11 +113,42 @@ function compressWith(
   }
 }
 
+type CodecChoice = { readonly codec: 1 | 2 | 3; readonly level: number }
+
+const ZSTD_RATIO_LEVELS = [1, 9, 15, 19] as const
+const SMALL_RATIO_CANDIDATES: readonly CodecChoice[] = [
+  { codec: CODEC_BROTLI, level: 11 },
+  { codec: CODEC_BROTLI, level: 9 },
+  { codec: CODEC_ZSTD, level: 19 },
+  { codec: CODEC_ZSTD, level: 9 },
+  { codec: CODEC_ZSTD, level: 1 },
+]
+const LARGE_RATIO_CANDIDATES: readonly CodecChoice[] = ZSTD_RATIO_LEVELS.map((level) => ({
+  codec: CODEC_ZSTD,
+  level,
+}))
+const BROTLI_RATIO_MAX_RAW = 64 * 1024
+
+function compressBest(raw: Uint8Array, candidates: readonly CodecChoice[]): { payload: Uint8Array; codec: number } {
+  let best: { payload: Uint8Array; codec: number } | undefined
+  for (const candidate of candidates) {
+    const compressed = compressWith(raw, candidate.codec, candidate.level)
+    if (best === undefined || compressed.payload.byteLength < best.payload.byteLength) best = compressed
+  }
+  return best ?? compressWith(raw, CODEC_ZSTD, 1)
+}
+
 function decompressWith(payload: Uint8Array, codec: number): Uint8Array {
   if (codec === CODEC_BROTLI) return brotliDecompressSync(payload)
   if (codec === CODEC_DEFLATE) return inflateRawSync(payload)
   if (codec === CODEC_ZSTD) return zstdDecompressSync(payload)
   throw new OCDBFrameError(`unsupported codec ${codec} — ${restoreHint}`)
+}
+
+function assertCodec(codec: number): void {
+  if (codec !== CODEC_ZSTD && codec !== CODEC_BROTLI && codec !== CODEC_DEFLATE) {
+    throw new OCDBFrameError(`unsupported codec ${codec} — ${restoreHint}`)
+  }
 }
 
 /**
@@ -146,8 +177,8 @@ function decompressWith(payload: Uint8Array, codec: number): Uint8Array {
  * 221 MB/s explicit). One compress per payload is the pareto frontier.
  */
 export function chooseCodec(rawLen: number): { codec: 1 | 2 | 3; level: number } {
-  if (rawLen < 16 * 1024) return { codec: CODEC_BROTLI, level: 1 }
-  return { codec: CODEC_ZSTD, level: 1 }
+  if (rawLen <= BROTLI_RATIO_MAX_RAW) return { codec: CODEC_BROTLI, level: 11 }
+  return { codec: CODEC_ZSTD, level: 19 }
 }
 
 /**
@@ -184,13 +215,19 @@ export function compressText(json: string, options?: { codec?: 1 | 2 | 3; level?
   // payloads — ANVIL G3, ~727x encode speedup on random data at identical bytes.
   if (options === undefined && !isCompressible(raw)) return json
 
-  const { codec, level } = options?.codec !== undefined
-    ? { codec: options.codec, level: options.level ?? 1 }
-    : chooseCodec(raw.byteLength)
   // Jumbo rows: store as a v4 SEGMENTED frame so decompression is chunkable
   // (the read path can stream/yield per segment instead of one 120ms block).
-  if (raw.byteLength > JUMBO_THRESHOLD) return compressSegmented(raw, codec, level)
-  const { payload } = compressWith(raw, codec, level)
+  if (raw.byteLength > JUMBO_THRESHOLD) {
+    const frame = options?.codec !== undefined
+      ? compressSegmented(raw, options.codec, options.level ?? 1)
+      : compressSegmentedAdaptive(raw)
+    if (frame.byteLength + 24 >= raw.byteLength) return json
+    return frame
+  }
+  const compressed = options?.codec !== undefined
+    ? compressWith(raw, options.codec, options.level ?? 1)
+    : compressBest(raw, raw.byteLength <= BROTLI_RATIO_MAX_RAW ? SMALL_RATIO_CANDIDATES : LARGE_RATIO_CANDIDATES)
+  const { payload, codec } = compressed
   // Header + payload must beat raw bytes by at least 24 to be worth framing.
   if (payload.byteLength + HEADER + 24 >= raw.byteLength) return json
 
@@ -251,6 +288,46 @@ function compressSegmented(raw: Uint8Array, codec: number, level: number): Uint8
 }
 
 /**
+ * Ratio-first v4 builder. Every segment remains codec=Zstd, but each segment
+ * independently races several Zstd levels. Compression level is not part of the
+ * frame format, so decode remains the same single fast Zstd operation per segment.
+ */
+function compressSegmentedAdaptive(raw: Uint8Array): Uint8Array {
+  const segLens: number[] = []
+  const segments: Uint8Array[] = []
+  let offset = 0
+  while (offset < raw.byteLength) {
+    const end = Math.min(offset + SEGMENT_SIZE, raw.byteLength)
+    const { payload } = compressBest(raw.subarray(offset, end), LARGE_RATIO_CANDIDATES)
+    segments.push(payload)
+    segLens.push(payload.byteLength)
+    offset = end
+  }
+  const segCount = segments.length
+  let size = 4 + 1 + 1 + 4 + 2 + segCount * 4
+  for (const s of segments) size += 4 + s.byteLength
+  const out = new Uint8Array(size)
+  out.set(MAGIC)
+  out[4] = VERSION_V4
+  out[5] = CODEC_ZSTD
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength)
+  view.setUint32(6, raw.byteLength, true)
+  view.setUint16(10, segCount, true)
+  let p = 12
+  for (const len of segLens) {
+    view.setUint32(p, len, true)
+    p += 4
+  }
+  for (const s of segments) {
+    view.setUint32(p, crc32(s), true)
+    p += 4
+    out.set(s, p)
+    p += s.byteLength
+  }
+  return out
+}
+
+/**
  * Parses a v4 SEGMENTED frame header and returns a list of per-segment
  * decompressor closures (each verifies its segment's CRC over compressed bytes,
  * v3-style, then decompresses). Lets the caller decompress segment-by-segment
@@ -265,28 +342,39 @@ export function v4SegmentDecompressors(
   bytes: Uint8Array,
   codec: number,
 ): { totalRawLen: number; decompressors: Array<() => Uint8Array> } {
+  if (bytes.byteLength < 12) throw new OCDBFrameError(`truncated v4 header — ${restoreHint}`)
+  assertCodec(codec)
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const totalRawLen = view.getUint32(6, true)
   if (totalRawLen > RAWLEN_PRE_CAP) throw new OCDBFrameError(`rawLen ${totalRawLen} exceeds pre-cap — ${restoreHint}`)
   const segCount = view.getUint16(10, true)
+  if (segCount === 0) throw new OCDBFrameError(`v4 frame has no segments — ${restoreHint}`)
+  const tableEnd = 12 + segCount * 4
+  if (tableEnd > bytes.byteLength) throw new OCDBFrameError(`truncated v4 segment table — ${restoreHint}`)
   let p = 12
   const segLens: number[] = []
   for (let i = 0; i < segCount; i++) {
-    segLens.push(view.getUint32(p, true))
+    const len = view.getUint32(p, true)
+    if (len === 0) throw new OCDBFrameError(`v4 segment ${i} has zero length — ${restoreHint}`)
+    segLens.push(len)
     p += 4
   }
   const decompressors: Array<() => Uint8Array> = []
   for (let i = 0; i < segCount; i++) {
+    if (p + 4 > bytes.byteLength) throw new OCDBFrameError(`truncated v4 segment CRC — ${restoreHint}`)
     const storedCrc = view.getUint32(p, true)
     p += 4
-    const compressed = bytes.subarray(p, p + segLens[i])
-    p += segLens[i]
+    const len = segLens[i]
+    if (p + len > bytes.byteLength) throw new OCDBFrameError(`truncated v4 segment payload — ${restoreHint}`)
+    const compressed = bytes.subarray(p, p + len)
+    p += len
     const crc = storedCrc
     decompressors.push(() => {
       if (crc32(compressed) !== crc) throw new OCDBFrameError(`CRC mismatch — ${restoreHint}`)
       return decompressWith(compressed, codec)
     })
   }
+  if (p !== bytes.byteLength) throw new OCDBFrameError(`trailing bytes in v4 frame — ${restoreHint}`)
   return { totalRawLen, decompressors }
 }
 
@@ -423,26 +511,39 @@ export function applyV5Correction(
   correction: Uint8Array,
   totalRawLen: number,
 ): Uint8Array {
-  const out: number[] = []
+  if (totalRawLen > RAWLEN_PRE_CAP) throw new OCDBFrameError(`rawLen ${totalRawLen} exceeds pre-cap — ${restoreHint}`)
+  const out = new Uint8Array(totalRawLen)
+  let outOffset = 0
   let p = 0
   while (p < correction.length) {
     const tag = correction[p++]
     if (tag === DELTA_TAG_LITERAL) {
+      if (p + 2 > correction.length) throw new OCDBFrameError(`truncated delta literal header — ${restoreHint}`)
       const len = (correction[p++] << 8) | correction[p++]
-      for (let k = 0; k < len; k++) out.push(correction[p++])
+      if (p + len > correction.length) throw new OCDBFrameError(`truncated delta literal — ${restoreHint}`)
+      if (outOffset + len > totalRawLen) throw new OCDBFrameError(`delta output exceeds rawLen — ${restoreHint}`)
+      out.set(correction.subarray(p, p + len), outOffset)
+      p += len
+      outOffset += len
     } else if (tag === DELTA_TAG_COPY) {
+      if (p + 6 > correction.length) throw new OCDBFrameError(`truncated delta copy header — ${restoreHint}`)
       const off = (correction[p++] << 24) | (correction[p++] << 16) | (correction[p++] << 8) | correction[p++]
       const len = (correction[p++] << 8) | correction[p++]
-      for (let k = 0; k < len; k++) out.push(base[off + k])
+      const unsignedOff = off >>> 0
+      if (unsignedOff > base.length || len > base.length - unsignedOff) {
+        throw new OCDBFrameError(`delta copy is outside base — ${restoreHint}`)
+      }
+      if (outOffset + len > totalRawLen) throw new OCDBFrameError(`delta output exceeds rawLen — ${restoreHint}`)
+      out.set(base.subarray(unsignedOff, unsignedOff + len), outOffset)
+      outOffset += len
     } else {
       throw new OCDBFrameError(`bad delta op tag ${tag} — ${restoreHint}`)
     }
   }
-  const raw = new Uint8Array(out)
-  if (raw.length !== totalRawLen) {
-    throw new OCDBFrameError(`delta length mismatch: expected ${totalRawLen}, got ${raw.length} — ${restoreHint}`)
+  if (outOffset !== totalRawLen) {
+    throw new OCDBFrameError(`delta length mismatch: expected ${totalRawLen}, got ${outOffset} — ${restoreHint}`)
   }
-  return raw
+  return out
 }
 
 /** Parses a v5 delta_ref frame header (pure). */
@@ -453,16 +554,24 @@ export function parseV5Header(bytes: Uint8Array): {
   correction: Uint8Array
   storedCrc: number
 } {
+  if (bytes.byteLength < 18) throw new OCDBFrameError(`truncated v5 header — ${restoreHint}`)
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const codec = bytes[5]
+  assertCodec(codec)
   const totalRawLen = view.getUint32(6, true)
+  if (totalRawLen > RAWLEN_PRE_CAP) throw new OCDBFrameError(`rawLen ${totalRawLen} exceeds pre-cap — ${restoreHint}`)
   const baseValueIdLen = view.getUint32(10, true)
+  if (baseValueIdLen === 0 || baseValueIdLen > bytes.byteLength - 18) {
+    throw new OCDBFrameError(`invalid delta base id length ${baseValueIdLen} — ${restoreHint}`)
+  }
   let p = 14
   const baseValueId = decoder.decode(bytes.subarray(p, p + baseValueIdLen))
   p += baseValueIdLen
+  if (p + 4 > bytes.byteLength) throw new OCDBFrameError(`truncated delta CRC — ${restoreHint}`)
   const storedCrc = view.getUint32(p, true)
   p += 4
   const correction = bytes.subarray(p)
+  if (correction.byteLength === 0) throw new OCDBFrameError(`empty delta correction — ${restoreHint}`)
   return { codec, totalRawLen, baseValueId, correction, storedCrc }
 }
 
@@ -514,9 +623,11 @@ function decompressFrameRaw(bytes: Uint8Array): Uint8Array {
   ) {
     throw new OCDBFrameError(`bad magic — ${restoreHint}`)
   }
+  if (bytes.byteLength < 10) throw new OCDBFrameError(`truncated frame header — ${restoreHint}`)
   const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength)
   const version = bytes[4]
   const codec = bytes[5]
+  assertCodec(codec)
   if (version === 1) {
     // v1: 10-byte header, no CRC.
     const expected = view.getUint32(6, true)
@@ -526,6 +637,7 @@ function decompressFrameRaw(bytes: Uint8Array): Uint8Array {
     return raw
   }
   if (version === VERSION_V2 || version === VERSION) {
+    if (bytes.byteLength < HEADER) throw new OCDBFrameError(`truncated frame header — ${restoreHint}`)
     const expected = view.getUint32(6, true)
     if (expected > RAWLEN_PRE_CAP) throw new OCDBFrameError(`rawLen ${expected} exceeds pre-cap — ${restoreHint}`)
     const storedCrc = view.getUint32(10, true)

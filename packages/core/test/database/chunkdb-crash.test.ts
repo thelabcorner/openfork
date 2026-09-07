@@ -20,6 +20,7 @@
  * bench-chunkdb.ts). Workers are off for determinism.
  */
 import { describe, expect, test } from "bun:test"
+import { Database as BunDatabase } from "bun:sqlite"
 import { Effect, Layer, Schema } from "effect"
 import { mkdtempSync, rmSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -27,11 +28,11 @@ import { join } from "node:path"
 import { deepStrictEqual } from "node:assert"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "#sqlite"
-import { Database as CoreDatabase, Service as DatabaseService } from "../../src/database/database"
+import { Database as CoreDatabase, Service as DatabaseService, withBackfillDb } from "../../src/database/database"
 import type { DatabaseShape } from "../../src/database/database"
 import { DatabaseMigration } from "../../src/database/migration"
-import { ensureChunkDB } from "../../src/database/chunkdb"
-import { runPassV2 } from "../../src/database/chunk-sealer"
+import { CHUNKDB_COOLING_MS, CHUNKDB_HOT_TAIL_EVENTS, ensureChunkDB } from "../../src/database/chunkdb"
+import { inspectSealerBacklog, runPassV2 } from "../../src/database/chunk-sealer"
 import { rehydrateEvents, CdbRehydrateError } from "../../src/event"
 import { EventV2 } from "../../src/event"
 import { Event } from "@opencode-ai/schema/event"
@@ -178,6 +179,236 @@ function tmpDb() {
 }
 
 describe("ChunkDB crash recovery", () => {
+  test("FOREGROUND PRIORITY: backfill yields on SQLITE_BUSY and resumes after the writer lock is released", async () => {
+    const { dir, path } = tmpDb()
+    let locker: BunDatabase | undefined
+    try {
+      const agg = "agg_busy_retry"
+      await runWith(path, (db) =>
+        Effect.gen(function* () {
+          const data = { aggregateID: agg, payload: makePayload(77) }
+          const events = Array.from({ length: 16 }, (_, index) => ({
+            id: `${agg}:${index + 1}` as never,
+            aggregate_id: agg,
+            seq: index + 1,
+            type: "test.crash",
+            data,
+          }))
+          yield* db.insert(EventSequenceTable).values({ aggregate_id: agg, seq: events.length, owner_id: null }).run().pipe(Effect.orDie)
+          yield* db.insert(EventTable).values(events).run().pipe(Effect.orDie)
+        }),
+      )
+
+      locker = new BunDatabase(path)
+      locker.run("PRAGMA journal_mode = WAL")
+      locker.run("PRAGMA busy_timeout = 0")
+      locker.run("BEGIN IMMEDIATE")
+
+      const started = Date.now()
+      const sealing = Effect.runPromise(
+        withBackfillDb(path, (db) => runPassV2(db, { batchSize: 16, maxRowsPerPass: 16 })),
+      )
+
+      // Keep the foreground writer slot long enough for the background connection
+      // to encounter its 100 ms busy_timeout at least once. Repeats compress only
+      // one canonical payload, so planning reaches SQLite quickly.
+      await Bun.sleep(400)
+      locker.run("ROLLBACK")
+      locker.close()
+      locker = undefined
+
+      const result = await sealing
+      expect(result.processed).toBe(16)
+      expect(Date.now() - started).toBeLessThan(3_000)
+
+      await runWith(path, (db) =>
+        Effect.gen(function* () {
+          const refs = yield* db.all<{ c: number }>(sql`
+            SELECT COUNT(*) AS c FROM event
+            WHERE aggregate_id = ${agg} AND data LIKE '{"$cdbRef"%'
+          `).pipe(Effect.orDie)
+          expect(refs[0]?.c ?? 0).toBe(16)
+        }),
+      )
+    } finally {
+      try {
+        locker?.run("ROLLBACK")
+      } catch {}
+      try {
+        locker?.close()
+      } catch {}
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("BATCH BOUNDARY: bounded threshold probe externalizes an aggregate before a small first slice is inlined", async () => {
+    const { dir, path } = tmpDb()
+    try {
+      await runWith(path, (db) =>
+        Effect.gen(function* () {
+          const agg = "agg_batch_boundary"
+          const events = Array.from({ length: 4 }, (_, index) => ({
+            id: `${agg}:${index + 1}`,
+            agg,
+            seq: index + 1,
+            data: { aggregateID: agg, payload: makePayload(index + 10) },
+          }))
+          yield* db
+            .insert(EventSequenceTable)
+            .values({ aggregate_id: agg, seq: events.length, owner_id: null })
+            .run()
+            .pipe(Effect.orDie)
+          yield* db
+            .insert(EventTable)
+            .values(
+              events.map((event) => ({
+                id: event.id as never,
+                aggregate_id: agg,
+                seq: event.seq,
+                type: "test.crash",
+                data: event.data,
+              })),
+            )
+            .run()
+            .pipe(Effect.orDie)
+
+          // Two rows alone are below the 64 KiB aggregate gate. The bounded
+          // trailing-aggregate probe must look just far enough ahead to see that
+          // the aggregate as a whole crosses the gate, so the first slice starts
+          // in event_value rather than being permanently inlined.
+          const first = yield* runPassV2(db, { batchSize: 2, maxRowsPerPass: 2 }).pipe(Effect.orDie)
+          expect(first.processed).toBe(2)
+          const firstRefs = yield* db.all<{ c: number }>(sql`
+            SELECT COUNT(*) AS c FROM event
+            WHERE aggregate_id = ${agg} AND seq <= 2 AND data LIKE '{"$cdbRef"%'
+          `).pipe(Effect.orDie)
+          expect(firstRefs[0]?.c ?? 0).toBe(2)
+
+          yield* runPassV2(db, { batchSize: 2, maxRowsPerPass: 2 }).pipe(Effect.orDie)
+          const allRefs = yield* db.all<{ c: number }>(sql`
+            SELECT COUNT(*) AS c FROM event
+            WHERE aggregate_id = ${agg} AND data LIKE '{"$cdbRef"%'
+          `).pipe(Effect.orDie)
+          expect(allRefs[0]?.c ?? 0).toBe(4)
+        }),
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("SYNC OWNERSHIP: non-null event_sequence.owner_id does not permanently block sealing", async () => {
+    const { dir, path } = tmpDb()
+    try {
+      await runWith(path, (db) =>
+        Effect.gen(function* () {
+          const agg = "agg_owned"
+          const events = Array.from({ length: 6 }, (_, index) => ({
+            id: `${agg}:${index + 1}`,
+            agg,
+            seq: index + 1,
+            data: { aggregateID: agg, payload: makePayload(index) },
+          }))
+          yield* db
+            .insert(EventSequenceTable)
+            .values({ aggregate_id: agg, seq: events.length, owner_id: "workspace_sync_owner" })
+            .run()
+            .pipe(Effect.orDie)
+          yield* db
+            .insert(EventTable)
+            .values(
+              events.map((event) => ({
+                id: event.id as never,
+                aggregate_id: agg,
+                seq: event.seq,
+                type: "test.crash",
+                data: event.data,
+              })),
+            )
+            .run()
+            .pipe(Effect.orDie)
+
+          const result = yield* runPassV2(db).pipe(Effect.orDie)
+          expect(result.promoted + result.repeated).toBeGreaterThan(0)
+          const values = yield* db.all<{ c: number }>(sql`
+            SELECT COUNT(*) AS c FROM event_value WHERE aggregate_id = ${agg}
+          `).pipe(Effect.orDie)
+          expect(values[0]?.c ?? 0).toBeGreaterThan(0)
+        }),
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("ACTIVE PREFIX: seals immutable history while retaining a 256-event hot tail, then seals tail after cooling", async () => {
+    const { dir, path } = tmpDb()
+    try {
+      await runWith(path, (db) =>
+        Effect.gen(function* () {
+          const agg = "ses_active_prefix"
+          const total = CHUNKDB_HOT_TAIL_EVENTS + 4
+          const now = Date.now()
+          yield* db.run(sql`
+            INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
+            VALUES ('proj_chunkdb_active', 'C:/chunkdb-test', ${now}, ${now}, '[]')
+          `).pipe(Effect.orDie)
+          yield* db.run(sql`
+            INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+            VALUES (${agg}, 'proj_chunkdb_active', 'chunkdb-active', 'C:/chunkdb-test', 'ChunkDB active', 'test', ${now}, ${now})
+          `).pipe(Effect.orDie)
+          yield* db
+            .insert(EventSequenceTable)
+            .values({ aggregate_id: agg, seq: total, owner_id: "workspace_sync_owner" })
+            .run()
+            .pipe(Effect.orDie)
+          yield* db
+            .insert(EventTable)
+            .values(
+              Array.from({ length: total }, (_, index) => ({
+                id: `${agg}:${index + 1}` as never,
+                aggregate_id: agg,
+                seq: index + 1,
+                type: "test.crash",
+                data: { aggregateID: agg, payload: makePayload(index % 4) },
+              })),
+            )
+            .run()
+            .pipe(Effect.orDie)
+
+          const backlog = yield* inspectSealerBacklog(db).pipe(Effect.orDie)
+          expect(backlog.pending).toBeGreaterThan(0)
+          expect(backlog.eligible).toBe(4)
+          expect(backlog.truncated).toBe(false)
+
+          yield* runPassV2(db).pipe(Effect.orDie)
+          const prefixRefs = yield* db.all<{ c: number }>(sql`
+            SELECT COUNT(*) AS c FROM event
+            WHERE aggregate_id = ${agg} AND seq <= 4 AND length(data) < 4096
+          `).pipe(Effect.orDie)
+          const hotTail = yield* db.all<{ c: number }>(sql`
+            SELECT COUNT(*) AS c FROM event
+            WHERE aggregate_id = ${agg} AND seq > 4 AND typeof(data) = 'text' AND length(data) >= 4096
+          `).pipe(Effect.orDie)
+          expect(prefixRefs[0]?.c ?? 0).toBe(4)
+          expect(hotTail[0]?.c ?? 0).toBe(CHUNKDB_HOT_TAIL_EVENTS)
+
+          yield* db.run(sql`
+            UPDATE session SET time_updated = ${now - CHUNKDB_COOLING_MS - 1} WHERE id = ${agg}
+          `).pipe(Effect.orDie)
+          yield* runPassV2(db).pipe(Effect.orDie)
+          const remainingHot = yield* db.all<{ c: number }>(sql`
+            SELECT COUNT(*) AS c FROM event
+            WHERE aggregate_id = ${agg} AND typeof(data) = 'text' AND length(data) >= 4096
+          `).pipe(Effect.orDie)
+          expect(remainingHot[0]?.c ?? 0).toBe(0)
+        }),
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test("ATOMICITY: a batch transaction that fails mid-way leaves zero partial rows", async () => {
     const { dir, path } = tmpDb()
     try {

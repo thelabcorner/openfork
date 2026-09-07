@@ -21,8 +21,15 @@
  */
 import { Worker } from "node:worker_threads"
 import os from "node:os"
+import { decodeValueBytesRaw } from "./json-codec"
 
-const workerUrl = new URL("./decompress-worker.ts", import.meta.url)
+declare const OPENCODE_CHUNKDB_DECOMPRESS_WORKER_PATH: string | undefined
+const workerUrl = new URL(
+  typeof OPENCODE_CHUNKDB_DECOMPRESS_WORKER_PATH === "string"
+    ? OPENCODE_CHUNKDB_DECOMPRESS_WORKER_PATH
+    : "./decompress-worker.ts",
+  import.meta.url,
+)
 const decoder = new TextDecoder()
 
 type Request = { id: number; bytes: Uint8Array }
@@ -171,10 +178,25 @@ export class DecompressPool {
 }
 
 let pool: DecompressPool | undefined
+let poolDisabled = false
+let poolClosing: Promise<void> | undefined
 
 function getPool(): DecompressPool {
   if (!pool) pool = new DecompressPool()
   return pool
+}
+
+function decodeSynchronously(bytes: Uint8Array) {
+  const raw = decodeValueBytesRaw(bytes)
+  return { value: JSON.parse(decoder.decode(raw)), raw }
+}
+
+function disablePool() {
+  if (poolDisabled) return
+  poolDisabled = true
+  const closing = pool
+  pool = undefined
+  if (closing) poolClosing = closing.close().catch(() => {})
 }
 
 /**
@@ -183,8 +205,17 @@ function getPool(): DecompressPool {
  * `OPENCODE_SEAL_WORKERS` is on and the payload is large enough that the
  * worker round-trip beats a main-thread decompress.
  */
-export function decompressValueAsync(bytes: Uint8Array): Promise<{ value: unknown; raw: Uint8Array }> {
-  return getPool().submit(bytes)
+export async function decompressValueAsync(bytes: Uint8Array): Promise<{ value: unknown; raw: Uint8Array }> {
+  if (poolDisabled) return decodeSynchronously(bytes)
+  try {
+    return await getPool().submit(bytes)
+  } catch {
+    // Retrieval correctness cannot depend on worker packaging. If a production
+    // worker fails, permanently retire the pool for this process and decode on
+    // the caller rather than surfacing a false data-corruption error.
+    disablePool()
+    return decodeSynchronously(bytes)
+  }
 }
 
 /** Close the worker pool (idempotent). Exposed for shutdown / test teardown. */
@@ -192,4 +223,7 @@ export async function decompressPoolClose(): Promise<void> {
   const closing = pool
   pool = undefined
   if (closing) await closing.close()
+  if (poolClosing) await poolClosing
+  poolClosing = undefined
+  poolDisabled = false
 }
