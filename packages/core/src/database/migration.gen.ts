@@ -50,5 +50,7 @@ export const migrations = (
     import("./migration/20260830011549_memory_subsystem"),
     import("./migration/20260831000000_conversation_control"),
     import("./migration/20260904000000_add_session_group_membership"),
+    import("./migration/20260907015557_goal_mode"),
+    import("./migration/20260907024640_goal_automation_recovery"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]
