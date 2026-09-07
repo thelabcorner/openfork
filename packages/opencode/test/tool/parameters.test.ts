@@ -89,6 +89,24 @@ describe("tool parameters", () => {
       })
       expect(toJsonSchema(WebFetch).properties?.format).not.toHaveProperty("anyOf")
     })
+
+    describe("depth bound (D50)", () => {
+      test("rejects pathologically deep schemas with a named error", () => {
+        let deep: Schema.Top = Schema.String
+        for (let i = 0; i < 200; i++) deep = Schema.Struct({ nested: deep })
+        expect(() => toJsonSchema(deep)).toThrow(/deeper than 50 levels/)
+      })
+      test("still converts legitimate recursive schemas", () => {
+        interface Category {
+          name: string
+          subs: ReadonlyArray<Category>
+        }
+        const Category: Schema.Schema<Category> = Schema.suspend(() =>
+          Schema.Struct({ name: Schema.String, subs: Schema.Array(Category) }),
+        )
+        expect(() => toJsonSchema(Category)).not.toThrow()
+      })
+    })
   })
 
   describe("apply_patch", () => {
@@ -132,8 +150,8 @@ describe("tool parameters", () => {
       const parsed = parse(Edit, { filePath: "/a", oldString: "x", newString: "y" })
       expect(parsed.replaceAll).toBeUndefined()
     })
-    test("rejects missing filePath", () => {
-      expect(accepts(Edit, { oldString: "x", newString: "y" })).toBe(false)
+    test("filePath is optional at the schema (file_path alias); the tool requires one at runtime", () => {
+      expect(accepts(Edit, { oldString: "x", newString: "y" })).toBe(true)
     })
   })
 

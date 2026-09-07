@@ -9,20 +9,60 @@ type JsonObject = Record<string, unknown>
 // is simply unreachable. Builtins are built once and never reloaded (P0).
 const cache = new WeakMap<Schema.Top, JSONSchema7>()
 
+// D50: bound the depth of every recursive walk below. A malformed schema once
+// sent conversion recursing until the test runner segfaulted with no
+// diagnostic; now it fails fast with a named error instead. The limit sits
+// far above legitimate tool schemas (which nest ~6 deep); recursive schemas
+// terminate via $ref/seen bookkeeping and never reach it.
+const MAX_JSON_SCHEMA_DEPTH = 50
+
+export class ToolJsonSchemaDepthError extends Error {
+  constructor(reason: string) {
+    super(`tool JSON Schema conversion refused: ${reason}`)
+    this.name = "ToolJsonSchemaDepthError"
+  }
+}
+
+function assertJsonSchemaDepth(value: unknown): void {
+  // Iterative on purpose: a recursive check could itself overflow on exactly
+  // the input it is meant to guard.
+  const stack: Array<{ value: unknown; depth: number }> = [{ value, depth: 0 }]
+  while (stack.length > 0) {
+    const next = stack.pop()!
+    if (next.depth > MAX_JSON_SCHEMA_DEPTH) {
+      throw new ToolJsonSchemaDepthError(`schema nests deeper than ${MAX_JSON_SCHEMA_DEPTH} levels`)
+    }
+    if (Array.isArray(next.value)) {
+      for (const item of next.value) stack.push({ value: item, depth: next.depth + 1 })
+    } else if (isRecord(next.value)) {
+      for (const item of Object.values(next.value)) stack.push({ value: item, depth: next.depth + 1 })
+    }
+  }
+}
+
 export function fromSchema(schema: Schema.Top): JSONSchema7 {
   const cached = cache.get(schema)
   if (cached) return cached
 
-  const document = Schema.toJsonSchemaDocument(schema, { additionalProperties: true })
-  const result = normalize({
-    $schema: JsonSchema.META_SCHEMA_URI_DRAFT_2020_12,
-    ...document.schema,
-    ...(Object.keys(document.definitions).length > 0 ? { $defs: document.definitions } : {}),
-  })
-  const inlined = dropDefinitionsIfResolved(inlineLocalReferences(result))
-  if (!isJsonSchema(inlined)) throw new Error("tool JSON Schema helper produced a non-schema value")
-  cache.set(schema, inlined)
-  return inlined
+  try {
+    const document = Schema.toJsonSchemaDocument(schema, { additionalProperties: true })
+    assertJsonSchemaDepth(document.schema)
+    assertJsonSchemaDepth(document.definitions)
+    const result = normalize({
+      $schema: JsonSchema.META_SCHEMA_URI_DRAFT_2020_12,
+      ...document.schema,
+      ...(Object.keys(document.definitions).length > 0 ? { $defs: document.definitions } : {}),
+    })
+    const inlined = dropDefinitionsIfResolved(inlineLocalReferences(result))
+    if (!isJsonSchema(inlined)) throw new Error("tool JSON Schema helper produced a non-schema value")
+    cache.set(schema, inlined)
+    return inlined
+  } catch (error) {
+    if (error instanceof RangeError) {
+      throw new ToolJsonSchemaDepthError("stack exhausted during conversion (pathologically deep or cyclic schema)")
+    }
+    throw error
+  }
 }
 
 export function fromTool(tool: Tool.Def): JSONSchema7 {

@@ -25,6 +25,7 @@ import { MemoryTool } from "./memory"
 import { SqliteTool } from "./sqlite"
 import { GitTool } from "./git"
 import { CheckpointTool } from "./checkpoint"
+import { GoalTool } from "./goal"
 import { SessionTool } from "./session"
 import { TurnCheckpoint } from "@/session/checkpoint"
 import { Snapshot } from "@/snapshot"
@@ -100,6 +101,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { AppProcess } from "@opencode-ai/core/process"
 import { McpCatalog } from "@/mcp/catalog"
 import { Memory } from "@opencode-ai/core/memory"
+import { GoalAgent } from "@opencode-ai/core/goal/agent"
 
 export function webSearchEnabled(
   providerID: ProviderV2.ID,
@@ -182,6 +184,7 @@ const layer = Layer.effect(
     const sqlitetool = yield* SqliteTool
     const gittool = yield* GitTool
     const checkpointtool = yield* CheckpointTool
+    const goaltool = yield* GoalTool
     const sessiontool = yield* SessionTool
     const typechecktool = yield* TypecheckTool
     const projecttool = yield* ProjectTool
@@ -254,6 +257,7 @@ const layer = Layer.effect(
           sqlite: Tool.init(sqlitetool),
           git: Tool.init(gittool),
           checkpoint: Tool.init(checkpointtool),
+          goal: Tool.init(goaltool),
           session: Tool.init(sessiontool),
           typecheck: Tool.init(typechecktool),
           project: Tool.init(projecttool),
@@ -318,6 +322,7 @@ const layer = Layer.effect(
             tool.sqlite,
             tool.git,
             tool.checkpoint,
+            tool.goal,
             tool.session,
             tool.typecheck,
             tool.project,
@@ -521,6 +526,7 @@ export const node = LayerNode.make({
     Database.node,
     Snapshot.node,
     TurnCheckpoint.node,
+    GoalAgent.node,
     Ripgrep.node,
     RipgrepBinary.node,
     BrokerClient.node,

@@ -6,6 +6,7 @@
 // layer owns files, permissions, and dispatch.
 
 import { parsePatch as parseUnifiedDiff } from "diff"
+import { seekSequence } from "../../patch"
 import type { Hunk, UpdateFileChunk } from "../../patch"
 
 export type PatchFormat = "opencode" | "git"
@@ -172,11 +173,12 @@ export function formatPlan(input: {
   files: PlanFile[]
   showDiff: boolean
   diffs: string[]
+  mode: "dry-run" | "if-clean"
 }): string {
   const n = input.files.length
   const c = input.files.filter((f) => f.conflict).length
   const lines = [
-    `patch: dry-run plan (format: ${input.format}, ${n} file${n === 1 ? "" : "s"}, ${c} conflict${c === 1 ? "" : "s"})`,
+    `patch: ${input.mode === "dry-run" ? "dry-run plan" : "plan"} (mode: ${input.mode}, format: ${input.format}, ${n} file${n === 1 ? "" : "s"}, ${c} conflict${c === 1 ? "" : "s"})`,
   ]
   for (const f of input.files) lines.push(renderFileLine(f))
 
@@ -196,14 +198,14 @@ export function formatPlan(input: {
   lines.push(
     c > 0
       ? "next: fix the conflicted files above and resubmit (nothing was written)"
-      : "next: re-run with apply:true to write these changes (nothing was written)",
+      : "next: re-run with apply:true to write these changes, or resubmit bare for if-clean apply (nothing was written)",
   )
   return lines.join("\n")
 }
 
-export function formatApplySummary(input: { format: PatchFormat; files: PlanFile[] }): string {
+export function formatApplySummary(input: { format: PatchFormat; files: PlanFile[]; mode: "apply" | "if-clean" }): string {
   const n = input.files.length
-  const lines = [`patch: applied ${n} change${n === 1 ? "" : "s"} (format: ${input.format})`]
+  const lines = [`patch: applied ${n} change${n === 1 ? "" : "s"} (mode: ${input.mode}, format: ${input.format})`]
   for (const f of input.files) {
     const op = opLetter(f.type)
     const target = f.movePath && f.movePath !== f.path ? ` -> ${f.movePath}` : ""
@@ -254,8 +256,106 @@ export function instructiveParseError(format: PatchFormat | null, underlying: un
   return parts.join("\n")
 }
 
+// ── Diff trimming (shared with the edit tool) ─────────────────────────────────
+// Strips the common leading indentation from diff content lines so permission
+// prompts and metadata stay compact. Pure; lives here so both the edit tool
+// and the patch executor can import it without an edit<->patch import cycle.
+export function trimDiff(diff: string): string {
+  const lines = diff.split("\n")
+  const contentLines = lines.filter(
+    (line) =>
+      (line.startsWith("+") || line.startsWith("-") || line.startsWith(" ")) &&
+      !line.startsWith("---") &&
+      !line.startsWith("+++"),
+  )
+
+  if (contentLines.length === 0) return diff
+
+  let min = Infinity
+  for (const line of contentLines) {
+    const content = line.slice(1)
+    if (content.trim().length > 0) {
+      const match = content.match(/^(\s*)/)
+      if (match) min = Math.min(min, match[1].length)
+    }
+  }
+  if (min === Infinity || min === 0) return diff
+  const trimmedLines = lines.map((line) => {
+    if (
+      (line.startsWith("+") || line.startsWith("-") || line.startsWith(" ")) &&
+      !line.startsWith("---") &&
+      !line.startsWith("+++")
+    ) {
+      const prefix = line[0]
+      const content = line.slice(1)
+      return prefix + content.slice(min)
+    }
+    return line
+  })
+
+  return trimmedLines.join("\n")
+}
+
 export function noOpsError(format: PatchFormat): string {
   return format === "opencode"
     ? "No file operations found in the patch. Expected *** Add File: / *** Update File: / *** Delete File: headers between the Begin and End markers."
     : "No file operations found in the git-style diff (no translatable file hunks)."
+}
+
+// Refuse to treat binary files as text. A NUL byte in the first 512
+// characters also catches UTF-16, where ASCII-range text interleaves NULs.
+export function assertTextContent(content: string, filePath: string): void {
+  if (content.slice(0, 512).includes("\0") === false) return
+  throw new Error(
+    `Refusing to edit binary file ${filePath}: NUL byte detected in the first 512 characters. This tool only edits text files.`,
+  )
+}
+
+// Order-independent chunk resolution (shared with the batch-edit path): every
+// chunk's position is resolved against the ORIGINAL content first (using the
+// identical seek the cursor resolver uses, so anything unresolvable here is
+// unresolvable there and is left for it to report as a proper conflict), then
+// chunks are sorted by offset and overlaps are rejected. Position-free (pure
+// addition) chunks trail in encounter order; they never interact with the
+// cursor. Single-chunk callers skip this entirely (no extra reads).
+export function orderChunksByPosition(
+  content: string,
+  filePath: string,
+  chunks: UpdateFileChunk[],
+): UpdateFileChunk[] {
+  const lines = content.split("\n")
+  if (lines.length > 0 && lines[lines.length - 1] === "") lines.pop()
+  const positioned: Array<{ chunk: UpdateFileChunk; start: number; len: number }> = []
+  const floating: UpdateFileChunk[] = []
+  const unresolved: UpdateFileChunk[] = []
+  for (const chunk of chunks) {
+    if (chunk.old_lines.length === 0) {
+      floating.push(chunk)
+      continue
+    }
+    let pattern = chunk.old_lines
+    let found = seekSequence(lines, pattern, 0, chunk.is_end_of_file ?? false)
+    let length = pattern.length
+    if (found === -1 && length > 0 && pattern[length - 1] === "") {
+      pattern = pattern.slice(0, -1)
+      found = seekSequence(lines, pattern, 0, chunk.is_end_of_file ?? false)
+      length = pattern.length
+    }
+    if (found === -1) {
+      unresolved.push(chunk)
+      continue
+    }
+    positioned.push({ chunk, start: found, len: length })
+  }
+  positioned.sort((a, b) => a.start - b.start)
+  for (let i = 1; i < positioned.length; i++) {
+    const prev = positioned[i - 1]
+    const next = positioned[i]
+    if (prev && next && next.start < prev.start + prev.len) {
+      throw new Error(
+        `overlapping chunks in ${filePath} (lines ${next.start + 1}..${next.start + next.len} overlap lines ${prev.start + 1}..${prev.start + prev.len}): split them into separate non-overlapping sections`,
+      )
+    }
+  }
+  return [...positioned.map((p) => p.chunk), ...floating, ...unresolved]
 }

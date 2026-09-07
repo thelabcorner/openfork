@@ -63,8 +63,26 @@ exports[`tool parameters JSON Schema (wire shape) edit 1`] = `
       "description": "Append newText at the end of the file (appendFile strategy)",
       "type": "boolean",
     },
+    "apply": {
+      "anyOf": [
+        {
+          "type": "boolean",
+        },
+        {
+          "enum": [
+            "if-clean",
+          ],
+          "type": "string",
+        },
+      ],
+      "description": "Bulk pathway only: true = apply (fail hard on conflicts), false = dry-run plan only (never writes or asks), 'if-clean' (default) = ask once with the full diff and apply when zero conflicts, else return the plan.",
+    },
+    "delete": {
+      "description": "With startLine+endLine: remove the range instead of replacing it (no newText)",
+      "type": "boolean",
+    },
     "edits": {
-      "description": "Batch of edits applied atomically: [{line,newText,oldText?}] or [{oldString,newString}]. Fully validated before any write.",
+      "description": "Batch of edits applied atomically: [{line,newText,oldText?}], [{startLine,endLine,newText?,oldText?,delete?}], or [{oldString,newString}]. Every op is validated against the file as read, overlaps are rejected, and ops apply against original coordinates so earlier edits never shift later targets. Single-file only — for multi-file/bulk work use the patchText bulk pathway.",
       "items": {
         "anyOf": [
           {
@@ -87,6 +105,38 @@ exports[`tool parameters JSON Schema (wire shape) edit 1`] = `
             "required": [
               "line",
               "newText",
+            ],
+            "type": "object",
+          },
+          {
+            "properties": {
+              "delete": {
+                "type": "boolean",
+              },
+              "endLine": {
+                "description": "Range replace end (1-based, inclusive)",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer",
+              },
+              "newText": {
+                "type": "string",
+              },
+              "oldText": {
+                "type": "string",
+              },
+              "startLine": {
+                "description": "Range replace start (1-based, inclusive)",
+                "exclusiveMinimum": 0,
+                "maximum": 9007199254740991,
+                "minimum": -9007199254740991,
+                "type": "integer",
+              },
+            },
+            "required": [
+              "startLine",
+              "endLine",
             ],
             "type": "object",
           },
@@ -119,18 +169,37 @@ exports[`tool parameters JSON Schema (wire shape) edit 1`] = `
       "type": "integer",
     },
     "filePath": {
-      "description": "The absolute path to the file to modify",
+      "description": "The absolute path to the file to modify (alias: file_path)",
+      "type": "string",
+    },
+    "file_path": {
+      "description": "Alias for filePath",
+      "type": "string",
+    },
+    "format": {
+      "description": "Bulk pathway only: patch format hint. 'auto' detects from the patch text (default).",
+      "enum": [
+        "auto",
+        "opencode",
+        "git",
+      ],
       "type": "string",
     },
     "insertAfter": {
-      "description": "Insert newText after this 1-based line (insertAfter strategy)",
+      "description": "Deprecated alias for insertAt (identical semantics).",
       "exclusiveMinimum": 0,
       "maximum": 9007199254740991,
       "minimum": -9007199254740991,
       "type": "integer",
     },
+    "insertAt": {
+      "description": "Insert newText after this line (0 = prepend before line 1; N > 0 requires oldText confirming line N)",
+      "maximum": 9007199254740991,
+      "minimum": 0,
+      "type": "integer",
+    },
     "line": {
-      "description": "1-based line to replace with newText (line strategy)",
+      "description": "1-based line to replace with newText (line strategy; oldText with the line's current text is required)",
       "exclusiveMinimum": 0,
       "maximum": 9007199254740991,
       "minimum": -9007199254740991,
@@ -145,15 +214,26 @@ exports[`tool parameters JSON Schema (wire shape) edit 1`] = `
       "type": "string",
     },
     "newText": {
-      "description": "Replacement text for the line/range/insertAfter/appendFile/nearText strategies",
+      "description": "Replacement text for the line/range/insertAt/appendFile/nearText strategies",
       "type": "string",
     },
+    "occurrence": {
+      "description": "nearText strategy: select the Nth anchor occurrence (1-based) when the anchor repeats",
+      "exclusiveMinimum": 0,
+      "maximum": 9007199254740991,
+      "minimum": -9007199254740991,
+      "type": "integer",
+    },
     "oldString": {
-      "description": "The text to replace",
+      "description": "The text to replace. Single-hunk only — for 2+ locations/files use the patchText bulk pathway instead of looping this tool.",
       "type": "string",
     },
     "oldText": {
-      "description": "Verification for line/range/nearText strategies: target must contain this text",
+      "description": "Verification for line/range/insertAt/nearText strategies: target must contain this text",
+      "type": "string",
+    },
+    "patchText": {
+      "description": "Bulk pathway: multi-file / multi-hunk patch text (opencode format or git-style unified diff, auto-detected). Batch ALL known edits into ONE call: one context processing instead of n sequential edit calls, one permission prompt, atomic all-or-nothing apply. Validates every hunk first ('if-clean' default: asks once and applies when zero conflicts, else returns the plan; apply:false = plan only; apply:true = fail on conflicts). Cannot be combined with filePath/oldString/line-style params (paths live INSIDE the patch, relative to the project directory).",
       "type": "string",
     },
     "replaceAll": {
@@ -161,20 +241,21 @@ exports[`tool parameters JSON Schema (wire shape) edit 1`] = `
       "type": "boolean",
     },
     "runTypecheck": {
-      "description": "After applying, run a scoped tsgo/tsc check on this file and append the result (default false)",
+      "description": "After applying, run a scoped tsgo/tsc check on this file and append the result (default false). Single-edit pathway only — cannot be combined with patchText.",
+      "type": "boolean",
+    },
+    "showDiff": {
+      "description": "Bulk pathway only: include the per-file diffs in the dry-run plan (default false — the plan is intentionally token-lean).",
       "type": "boolean",
     },
     "startLine": {
-      "description": "Range replace start (1-based, inclusive). Ranges over 5 lines require oldText or startAnchor.",
+      "description": "Range replace start (1-based, inclusive). Ranges over 5 lines require oldText spanning the endpoints.",
       "exclusiveMinimum": 0,
       "maximum": 9007199254740991,
       "minimum": -9007199254740991,
       "type": "integer",
     },
   },
-  "required": [
-    "filePath",
-  ],
   "type": "object",
 }
 `;
@@ -363,16 +444,38 @@ exports[`tool parameters JSON Schema (wire shape) read 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "action": {
+      "description": "read = file window (default). outline = symbol TOC. grep = search this file. around = jump to symbol. tail = last N lines.",
+      "enum": [
+        "read",
+        "outline",
+        "grep",
+        "around",
+        "tail",
+      ],
+      "type": "string",
+    },
     "filePath": {
       "description": "The absolute path to the file or directory to read",
       "type": "string",
     },
     "filePaths": {
-      "description": "Bulk read: up to 8 files in one call, each rendered as its own <file> block. Mutually exclusive with filePath.",
-      "items": {
-        "type": "string",
-      },
-      "type": "array",
+      "anyOf": [
+        {
+          "items": {
+            "type": "string",
+          },
+          "type": "array",
+        },
+        {
+          "type": "string",
+        },
+      ],
+      "description": "Bulk read: up to 8 files in one call, each rendered as its own <file> block. Mutually exclusive with filePath. JSON array, not a string.",
+    },
+    "file_path": {
+      "description": "Alias for filePath",
+      "type": "string",
     },
     "limit": {
       "description": "The maximum number of lines to read (defaults to 2000)",
@@ -381,10 +484,18 @@ exports[`tool parameters JSON Schema (wire shape) read 1`] = `
       "type": "integer",
     },
     "offset": {
-      "description": "The line number to start reading from (1-indexed)",
+      "description": "The line number to start reading from (1-indexed). Past EOF clamps to the last page.",
       "maximum": 9007199254740991,
       "minimum": 0,
       "type": "integer",
+    },
+    "pattern": {
+      "description": "Regex to search inside this file (implies action=grep unless action is set). Prefer this over paging.",
+      "type": "string",
+    },
+    "symbol": {
+      "description": "Symbol name to jump to (implies action=around unless action is set).",
+      "type": "string",
     },
   },
   "type": "object",
@@ -395,8 +506,12 @@ exports[`tool parameters JSON Schema (wire shape) skill 1`] = `
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "properties": {
+    "filePath": {
+      "description": "Load a skill that is not in this project's skill folders. File or directory (SKILL.md is resolved inside directories). Absolute, ~, or relative to the working directory.",
+      "type": "string",
+    },
     "mode": {
-      "description": "What to do (default: load by name)",
+      "description": "What to do (default: load by name or filePath)",
       "enum": [
         "load",
         "list",
@@ -405,11 +520,11 @@ exports[`tool parameters JSON Schema (wire shape) skill 1`] = `
       "type": "string",
     },
     "name": {
-      "description": "The name of the skill from available_skills",
+      "description": "Skill name from available_skills, OR a filesystem path to a SKILL.md / skill folder (Downloads, another repo, absolute or ~ paths).",
       "type": "string",
     },
     "names": {
-      "description": "Load several registered skills in one call",
+      "description": "Load several skills in one call. Each entry may be a registered name or a filesystem path.",
       "items": {
         "type": "string",
       },
@@ -444,15 +559,15 @@ exports[`tool parameters JSON Schema (wire shape) task 1`] = `
       "type": "string",
     },
     "description": {
-      "description": "A short (3-5 words) description of the task",
+      "description": "A short (3-5 words) description. Use a distinct description for each parallel subagent.",
       "type": "string",
     },
     "prompt": {
-      "description": "The task for the agent to perform",
+      "description": "A complete standalone task for this subagent, including scope, constraints, and exactly what it must return. It cannot see the parent conversation.",
       "type": "string",
     },
     "subagent_type": {
-      "description": "The type of specialized agent to use for this task",
+      "description": "The specialized agent type. For independent work, call this tool multiple times in the same assistant message, once per subagent, so they run in parallel.",
       "type": "string",
     },
     "task_id": {

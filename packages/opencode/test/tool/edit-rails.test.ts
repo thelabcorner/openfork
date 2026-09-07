@@ -2,8 +2,25 @@ import { afterEach, describe, expect, test } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Cause, Effect, Exit } from "effect"
-import { EditTool, applyEditStrategy, replaceLine, replaceLines, replaceNear, applyBatch, insertAfterLine, appendToFile } from "../../src/tool/edit"
+import { Cause, Effect, Exit, Option } from "effect"
+import { EditTool } from "../../src/tool/edit"
+import {
+  applyBatch,
+  appendToFile,
+  applyEditStrategy,
+  deleteLines,
+  insertAt,
+  replaceLine,
+  replaceLines,
+  replaceNear,
+  type StrategyResult,
+} from "../../src/tool/edit/strategy"
+import { applySpans } from "../../src/tool/edit/span"
+import { assertSpansExplain } from "../../src/tool/edit/invariant"
+import { resolveMatch } from "../../src/tool/edit/match"
+import { absorbDeletionNewline, healInput, stripCodeFence, stripReadPrefix } from "../../src/tool/edit/heal"
+import { enforce as enforcePriorRead, ReadCache } from "../../src/tool/edit/prior-read"
+import { withRollback } from "../../src/tool/patch/rollback"
 import { applyTextEdits } from "../../src/tool/refactor"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { LSP } from "@/lsp/lsp"
@@ -15,7 +32,6 @@ import { Truncate } from "@/tool/truncate"
 import { SessionID, MessageID } from "../../src/session/schema"
 import * as Tool from "../../src/tool/tool"
 import { testEffect } from "../lib/effect"
-import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 
 const ctx = {
   sessionID: SessionID.make("ses_test-edit-session"),
@@ -51,8 +67,11 @@ const run = Effect.fn("EditRailTest.run")(function* (
   return yield* tool.execute(args, next)
 })
 
-const fail = Effect.fn("EditRailTest.fail")(function* (args: Tool.InferParameters<typeof EditTool>) {
-  const exit = yield* run(args).pipe(Effect.exit)
+const fail = Effect.fn("EditRailTest.fail")(function* (
+  args: Tool.InferParameters<typeof EditTool>,
+  next: Tool.Context = ctx,
+) {
+  const exit = yield* run(args, next).pipe(Effect.exit)
   if (Exit.isFailure(exit)) {
     const err = Cause.squash(exit.cause)
     return err instanceof Error ? err : new Error(String(err))
@@ -70,25 +89,35 @@ const load = Effect.fn("EditRailTest.load")(function* (p: string) {
   return yield* fs.readFileString(p)
 })
 
-// ---- pure helper unit tests (no runtime needed) ----------------------------
+// The invariant harness runs inside every strategy test, not as its own
+// suite: bytes outside the reported spans must be byte-identical to the
+// input, and the spans must fully explain the output.
+const check = (before: string, result: StrategyResult): string => {
+  const after = applySpans(before, result.spans)
+  assertSpansExplain(before, after, result.spans)
+  return after
+}
+
+// ---- pure strategy unit tests (no runtime needed) ---------------------------
 
 describe("edit strategy helpers (pure)", () => {
   test("replaceLine replaces the target line and echoes oldPreview", () => {
-    const result = replaceLine("a\nb\nc", 2, "B")
-    expect(result.content).toBe("a\nB\nc")
+    const result = replaceLine("a\nb\nc", 2, "B", "b")
+    expect(check("a\nb\nc", result)).toBe("a\nB\nc")
     expect(result.applied).toBe(1)
     expect(result.oldPreview).toBe("b")
   })
 
-  test("replaceLine verifies oldText and rejects with the snippet", () => {
+  test("replaceLine requires oldText and verifies it", () => {
+    expect(() => replaceLine("a\nb\nc", 2, "B")).toThrow(/requires oldText/)
     expect(() => replaceLine("alpha\nbeta", 1, "x", "omega")).toThrow(/does not contain the expected text/)
-    expect(() => replaceLine("alpha", 2, "x")).toThrow(/out of range/)
+    expect(() => replaceLine("alpha", 2, "x", "y")).toThrow(/out of range/)
   })
 
   test("replaceLine is a no-op when the line already matches", () => {
-    const result = replaceLine("a\nb\nc", 2, "b")
+    const result = replaceLine("a\nb\nc", 2, "b", "b")
     expect(result.applied).toBe(0)
-    expect(result.content).toBe("a\nb\nc")
+    expect(result.spans).toHaveLength(0)
   })
 
   test("replaceLines rejects a >5-line range without oldText (R5)", () => {
@@ -96,29 +125,55 @@ describe("edit strategy helpers (pure)", () => {
     expect(() => replaceLines(content, 1, 10, "replacement")).toThrow(/requires oldText/)
   })
 
-  test("replaceLines accepts a >5-line range with oldText contained in it", () => {
+  test("replaceLines accepts a >5-line range with endpoint-spanning oldText", () => {
     const content = Array.from({ length: 10 }, (_, i) => `line${i + 1}`).join("\n")
-    const result = replaceLines(content, 1, 10, "replacement", "line5")
-    expect(result.content).toBe("replacement")
+    // Middles are not compared — only the endpoints must match (D14).
+    const endpoints = ["line1", "CHANGED", "line10"].join("\n")
+    const result = replaceLines(content, 1, 10, "replacement", endpoints)
+    expect(check(content, result)).toBe("replacement")
     expect(result.applied).toBe(1)
   })
 
-  test("replaceLines rejects a wide range whose oldText is not contained", () => {
+  test("replaceLines rejects a wide range whose oldText skips the endpoints (D14)", () => {
     const content = "a\nb\nc\nd\ne\nf"
-    expect(() => replaceLines(content, 1, 6, "x", "not-there")).toThrow(/does not contain the expected text/)
+    expect(() => replaceLines(content, 1, 6, "x", "c")).toThrow(/verification failed/)
   })
 
-  test("insertAfterLine bounds-checks and inserts", () => {
-    expect(() => insertAfterLine("a\nb", 5, "x")).toThrow(/out of range/)
-    const result = insertAfterLine("a\nb\nc", 1, "inserted")
-    expect(result.content).toBe("a\ninserted\nb\nc")
+  test("deleteLines removes the range and consumes its terminators (D11)", () => {
+    const before = "a\nb\nc\nd\n"
+    const result = deleteLines(before, 2, 3, "b")
+    expect(check(before, result)).toBe("a\nd\n")
+  })
+
+  test("deleteLines through a final unterminated line leaves no trailing blank", () => {
+    const before = "a\nb"
+    const result = deleteLines(before, 2, 2, "b")
+    expect(check(before, result)).toBe("a")
+  })
+
+  test("deleteLines requires oldText", () => {
+    expect(() => deleteLines("a\nb", 1, 1)).toThrow(/requires oldText/)
+  })
+
+  test("insertAt bounds-checks and inserts after the anchor", () => {
+    expect(() => insertAt("a\nb", 5, "x", "b")).toThrow(/out of range/)
+    const result = insertAt("a\nb\nc", 1, "inserted", "a")
+    expect(check("a\nb\nc", result)).toBe("a\ninserted\nb\nc")
+  })
+
+  test("insertAt requires oldText for non-boundary insertions (D13)", () => {
+    expect(() => insertAt("a\nb", 1, "x")).toThrow(/requires oldText/)
+  })
+
+  test("insertAt:0 prepends without an anchor (D12)", () => {
+    const result = insertAt("a\nb", 0, "first")
+    expect(check("a\nb", result)).toBe("first\na\nb")
   })
 
   test("appendToFile appends at EOF (R7 — never prepends)", () => {
-    const result = appendToFile("first", "second")
-    expect(result.content).toBe("first\nsecond")
-    const atEnd = appendToFile("first\n", "second")
-    expect(atEnd.content).toBe("first\nsecond")
+    expect(check("first", appendToFile("first", "second"))).toBe("first\nsecond")
+    expect(check("first\n", appendToFile("first\n", "second"))).toBe("first\nsecond")
+    expect(appendToFile("first", "").applied).toBe(0)
   })
 
   test("replaceNear rejects a missing anchor (R6)", () => {
@@ -133,8 +188,19 @@ describe("edit strategy helpers (pure)", () => {
   test("replaceNear replaces a unique oldText near the anchor", () => {
     const content = ["anchor", "keep me", "old value here", "tail"].join("\n")
     const result = replaceNear(content, "anchor", "old value", "new value")
-    expect(result.content).toContain("new value here")
+    expect(check(content, result)).toContain("new value here")
     expect(result.applied).toBe(1)
+  })
+
+  test("replaceNear selects a repeated anchor by occurrence", () => {
+    const content = ["mark", "v1", "mark", "v2"].join("\n")
+    const result = replaceNear(content, "mark", "v2", "V2", 2)
+    expect(check(content, result)).toBe(["mark", "v1", "mark", "V2"].join("\n"))
+  })
+
+  test("replaceNear refuses an oldText that repeats on the target line", () => {
+    const content = ["anchor", "x x", "tail"].join("\n")
+    expect(() => replaceNear(content, "anchor", "x", "y")).toThrow(/more than once on line/)
   })
 
   test("replaceNear rejects when oldText is absent from the window", () => {
@@ -142,21 +208,36 @@ describe("edit strategy helpers (pure)", () => {
     expect(() => replaceNear(content, "anchor", "missing", "x")).toThrow(/not found within/)
   })
 
-  test("applyBatch applies line and exact ops atomically", () => {
+  test("applyBatch applies line and exact ops against original coordinates (D4)", () => {
+    // The exact op changes the line count; line targets still resolve against
+    // the original content, so no drift.
     const edits = [
-      { line: 2, newText: "line2-new" },
-      { oldString: "line3", newString: "line3-new" },
+      { line: 2, newText: "line2-new", oldText: "line2" },
+      { oldString: "line3", newString: "a\nb\nc" },
     ]
     const result = applyBatch("line1\nline2\nline3", edits)
-    expect(result.content).toBe("line1\nline2-new\nline3-new")
+    expect(check("line1\nline2\nline3", result)).toBe("line1\nline2-new\na\nb\nc")
   })
 
   test("applyBatch rejects the whole batch when one op fails (R9)", () => {
     const edits = [
-      { line: 2, newText: "ok" },
+      { line: 2, newText: "ok", oldText: "line2" },
       { oldString: "not present anywhere", newString: "x" },
     ]
     expect(() => applyBatch("line1\nline2\nline3", edits)).toThrow()
+  })
+
+  test("applyBatch rejects overlapping ops (D5)", () => {
+    expect(() =>
+      applyBatch("a\nb", [
+        { line: 1, newText: "x", oldText: "a" },
+        { line: 1, newText: "y", oldText: "a" },
+      ]),
+    ).toThrow(/overlapping edits/)
+  })
+
+  test("applyBatch rejects key mixing (D28)", () => {
+    expect(() => applyBatch("a", [{ oldString: "a", newString: "b", line: 1 } as never])).toThrow(/cannot combine/)
   })
 
   test("applyTextEdits rejects overlapping spans", () => {
@@ -169,18 +250,147 @@ describe("edit strategy helpers (pure)", () => {
   })
 
   test("applyEditStrategy rejects multiple strategy groups (ambiguity guard)", () => {
-    expect(() => applyEditStrategy("a\nb", { line: 1, insertAfter: 1, newText: "x" })).toThrow(/multiple strategies/)
+    expect(() => applyEditStrategy("a\nb", { line: 1, insertAt: 1, newText: "x", oldText: "a" })).toThrow(/multiple strategies/)
   })
 
   test("applyEditStrategy rejects when no strategy is present", () => {
     expect(() => applyEditStrategy("a\nb", {})).toThrow(/No edit strategy detected/)
   })
 
-  test("applyEditStrategy: oldString priority means cheap params are ignored", () => {
-    // exact path handled in the tool; the helper itself never sees oldString
-    const result = applyEditStrategy("a\nb", { line: 1, newText: "x" })
-    expect(result.strategy).toBe("line")
-    expect(result.content).toBe("x\nb")
+  test("applyEditStrategy keeps insertAfter as a deprecated alias", () => {
+    const result = applyEditStrategy("a\nb", { insertAfter: 1, newText: "x", oldText: "a" })
+    expect(result.strategy).toBe("insertAt")
+    expect(check("a\nb", result)).toBe("a\nx\nb")
+  })
+
+  test("applyEditStrategy dispatches delete:true to range removal", () => {
+    const result = applyEditStrategy("a\nb\nc", { startLine: 2, endLine: 2, delete: true, oldText: "b" })
+    expect(result.strategy).toBe("delete")
+    expect(check("a\nb\nc", result)).toBe("a\nc")
+  })
+
+  test("replacement adopts the LAST replaced line's terminator", () => {
+    const before = "one\ntwo\nthree\r\nfour\n"
+    const result = replaceLines(before, 2, 3, "TWO\nTHREE", "two")
+    const after = check(before, result)
+    // Line 3 ended CRLF, so the whole replacement is CRLF; lines 1 and 4 keep
+    // their exact bytes.
+    expect(after).toBe("one\nTWO\r\nTHREE\r\nfour\n")
+  })
+
+  test("unicode-equivalent needles resolve with a warning", () => {
+    const before = "const name = \"value\"\n"
+    const resolution = resolveMatch(before, "const name = \u201cvalue\u201d")
+    expect(resolution.match.via).toBe("unicode-equivalent")
+    expect(resolution.warnings).toHaveLength(1)
+    expect(resolution.match.start).toBe(0)
+  })
+})
+
+describe("edit input rails (pure)", () => {
+  test("stripReadPrefix fires only when every line carries a prefix", () => {
+    const healed = stripReadPrefix("12: const a = 1\n13: const b = 2")
+    expect(healed.value).toBe("const a = 1\nconst b = 2")
+    expect(healed.warnings).toHaveLength(1)
+    expect(stripReadPrefix("const a = 1\n42: not a prefix").value).toBe("const a = 1\n42: not a prefix")
+    expect(stripReadPrefix("").warnings).toHaveLength(0)
+  })
+
+  test("stripCodeFence removes a wrapping fence", () => {
+    const healed = stripCodeFence("```ts\nconst a = 1\n```")
+    expect(healed.value).toBe("const a = 1")
+    expect(healed.warnings).toHaveLength(1)
+    expect(stripCodeFence("const a = 1").value).toBe("const a = 1")
+  })
+
+  test("healInput strips fences and prefixes with kind labels", () => {
+    const healed = healInput("```ts\n1: const a = 1\n2: const b = 2\n```", "newString")
+    expect(healed.value).toBe("const a = 1\nconst b = 2")
+    expect(healed.warnings.join("\n")).toContain("newString")
+  })
+
+  test("absorbDeletionNewline extends a deletion over the following terminator", () => {
+    expect(absorbDeletionNewline("a\nb\n", { start: 0, end: 1, replacement: "" }).value).toEqual({
+      start: 0,
+      end: 2,
+      replacement: "",
+    })
+    expect(absorbDeletionNewline("a\r\nb\r\n", { start: 0, end: 1, replacement: "" }).value.end).toBe(3)
+    // Already ends with a newline, or a non-deletion: untouched.
+    expect(absorbDeletionNewline("a\nb\n", { start: 0, end: 2, replacement: "" }).value.end).toBe(2)
+    expect(absorbDeletionNewline("a\nb\n", { start: 0, end: 1, replacement: "x" }).value.end).toBe(1)
+  })
+})
+
+describe("prior-read enforcement (pure)", () => {
+  const staleAfs = {
+    stat: () => Effect.succeed({ type: "File", mtime: Option.some(new Date(5000)), size: 5 }),
+  } as never
+
+  test("refuses files changed after they were read", async () => {
+    const cache = new ReadCache()
+    cache.record("/f.txt", 1000, 5)
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, "/f.txt", "line"))
+    expect(outcome.refusal).toContain("changed on disk")
+  })
+
+  test("warns (not refuses) on missing records for line-targeted strategies", async () => {
+    const cache = new ReadCache()
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, "/never.txt", "line"))
+    expect(outcome.refusal).toBeUndefined()
+    expect(outcome.warning).toContain("no read record")
+  })
+
+  test("stays silent on missing records for the exact path", async () => {
+    const cache = new ReadCache()
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, "/never.txt", "exact"))
+    expect(outcome).toEqual({})
+  })
+
+  test("degrades to silence without a cache", async () => {
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.none(), staleAfs, "/f.txt", "line"))
+    expect(outcome).toEqual({})
+  })
+})
+
+describe("patch rollback (pure)", () => {
+  test("withRollback restores the journal in reverse on failure", async () => {
+    const writes: Array<[string, string]> = []
+    const removed: string[] = []
+    const stub = {
+      writeWithDirs: (p: string, c: string) =>
+        Effect.sync(() => {
+          writes.push([p, c])
+        }),
+      remove: (p: string) =>
+        Effect.sync(() => {
+          removed.push(p)
+        }),
+    } as never
+    const error = await Effect.runPromise(
+      Effect.flip(
+        withRollback(
+          stub,
+          [
+            { filePath: "/a.txt", existedBefore: true, contentBefore: "old-a", bom: false },
+            { filePath: "/b.txt", existedBefore: false, contentBefore: "", bom: false },
+          ],
+          Effect.fail(new Error("boom")),
+        ),
+      ),
+    )
+    expect(error.message).toBe("boom")
+    expect(removed).toEqual(["/b.txt"])
+    expect(writes).toEqual([["/a.txt", "old-a"]])
+  })
+
+  test("withRollback passes success through untouched", async () => {
+    const stub = {
+      writeWithDirs: () => Effect.void,
+      remove: () => Effect.void,
+    } as never
+    const result = await Effect.runPromise(withRollback(stub, [], Effect.succeed("ok")))
+    expect(result).toBe("ok")
   })
 })
 
@@ -194,7 +404,7 @@ describe("tool.edit safety rails (integration)", () => {
       yield* put(filepath, "line1\nline2\nline3")
       let asked = 0
       const result = yield* run(
-        { filePath: filepath, line: 2, newText: "line2" },
+        { filePath: filepath, line: 2, newText: "line2", oldText: "line2" },
         { ...ctx, ask: () => Effect.sync(() => { asked++ }) },
       )
       expect(result.metadata.applied).toBe(0)
@@ -208,11 +418,22 @@ describe("tool.edit safety rails (integration)", () => {
       const test = yield* TestInstance
       const filepath = path.join(test.directory, "file.txt")
       yield* put(filepath, "alpha\nbeta\ngamma")
-      const result = yield* run({ filePath: filepath, line: 2, newText: "BETA" })
+      const result = yield* run({ filePath: filepath, line: 2, newText: "BETA", oldText: "beta" })
       expect(result.output).toContain("strategy=line")
       expect(result.metadata.strategy).toBe("line")
       expect(result.metadata.oldPreview).toBe("beta")
       expect(yield* load(filepath)).toBe("alpha\nBETA\ngamma")
+    }),
+  )
+
+  it.instance("line strategy requires oldText", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "file.txt")
+      yield* put(filepath, "alpha\nbeta\ngamma")
+      const err = yield* fail({ filePath: filepath, line: 2, newText: "x" })
+      expect(err.message).toContain("requires oldText")
+      expect(yield* load(filepath)).toBe("alpha\nbeta\ngamma")
     }),
   )
 
@@ -245,8 +466,40 @@ describe("tool.edit safety rails (integration)", () => {
       const test = yield* TestInstance
       const filepath = path.join(test.directory, "file.txt")
       yield* put(filepath, Array.from({ length: 8 }, (_, i) => `line${i + 1}`).join("\n"))
-      yield* run({ filePath: filepath, startLine: 2, endLine: 7, newText: "middle", oldText: "line4" })
+      const endpoints = ["line2", "line3", "line4", "line5", "line6", "line7"].join("\n")
+      yield* run({ filePath: filepath, startLine: 2, endLine: 7, newText: "middle", oldText: endpoints })
       expect(yield* load(filepath)).toBe("line1\nmiddle\nline8")
+    }),
+  )
+
+  it.instance("delete strategy removes the range", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "file.txt")
+      yield* put(filepath, "keep\nremove me\nalso keep\n")
+      yield* run({ filePath: filepath, startLine: 2, endLine: 2, delete: true, oldText: "remove me" })
+      expect(yield* load(filepath)).toBe("keep\nalso keep\n")
+    }),
+  )
+
+  it.instance("insertAt:0 prepends a file", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "file.txt")
+      yield* put(filepath, "body\n")
+      yield* run({ filePath: filepath, insertAt: 0, newText: "header" })
+      expect(yield* load(filepath)).toBe("header\nbody\n")
+    }),
+  )
+
+  it.instance("insertAt requires oldText for non-zero lines", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "file.txt")
+      yield* put(filepath, "a\nb\n")
+      const err = yield* fail({ filePath: filepath, insertAt: 1, newText: "x" })
+      expect(err.message).toContain("requires oldText")
+      expect(yield* load(filepath)).toBe("a\nb\n")
     }),
   )
 
@@ -290,10 +543,7 @@ describe("tool.edit safety rails (integration)", () => {
       yield* put(filepath, original)
       const err = yield* fail({
         filePath: filepath,
-        edits: [
-          { line: 1, newText: "ONE" },
-          { oldString: "not in file", newString: "x" },
-        ],
+        edits: [{ line: 1, newText: "ONE", oldText: "one" }, { oldString: "not in file", newString: "x" }],
       })
       expect(err).toBeInstanceOf(Error)
       expect(yield* load(filepath)).toBe(original)
@@ -308,7 +558,7 @@ describe("tool.edit safety rails (integration)", () => {
       yield* run({
         filePath: filepath,
         edits: [
-          { line: 1, newText: "ONE" },
+          { line: 1, newText: "ONE", oldText: "one" },
           { oldString: "three", newString: "THREE" },
         ],
       })
@@ -322,7 +572,7 @@ describe("tool.edit safety rails (integration)", () => {
       const filepath = path.join(test.directory, "file.cs")
       const bom = String.fromCharCode(0xfeff)
       yield* put(filepath, `${bom}line1\r\nline2\r\nline3`)
-      yield* run({ filePath: filepath, line: 2, newText: "LINE2" })
+      yield* run({ filePath: filepath, line: 2, newText: "LINE2", oldText: "line2" })
       const raw = yield* Effect.promise(() => fs.readFile(filepath, "utf-8"))
       expect(raw.charCodeAt(0)).toBe(0xfeff)
       expect(raw).toBe(`${bom}line1\r\nLINE2\r\nline3`)
@@ -341,13 +591,44 @@ describe("tool.edit safety rails (integration)", () => {
     }),
   )
 
-  it.instance("rejects an empty oldText nearText and line out-of-range", () =>
+  it.instance("rejects line out-of-range with the file's line count", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       const filepath = path.join(test.directory, "file.txt")
       yield* put(filepath, "a\nb")
-      const err = yield* fail({ filePath: filepath, line: 99, newText: "x" })
+      const err = yield* fail({ filePath: filepath, line: 99, newText: "x", oldText: "y" })
       expect(err.message).toContain("out of range")
+    }),
+  )
+
+  it.instance("re-validates when the file changes during approval", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "file.txt")
+      yield* put(filepath, "target = 1\nother = 2\n")
+      const mutatingAsk = () =>
+        Effect.promise(() => fs.appendFile(filepath, "unrelated = 3\n")).pipe(Effect.asVoid)
+      const result = yield* run({ filePath: filepath, oldString: "target = 1", newString: "target = 9" }, { ...ctx, ask: mutatingAsk })
+      expect(result.output).toContain("re-validated")
+      expect(yield* load(filepath)).toBe("target = 9\nother = 2\nunrelated = 3\n")
+    }),
+  )
+
+  it.instance("refuses when the target itself changed during approval", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "file.txt")
+      yield* put(filepath, "target = 1\nother = 2\n")
+      // Note: the mutation must not contain the needle even as a substring —
+      // "target = 100" still contains "target = 1" and would exactly match.
+      const mutatingAsk = () => Effect.promise(() => fs.writeFile(filepath, "target = 200\nother = 2\n")).pipe(Effect.asVoid)
+      const err = yield* fail(
+        { filePath: filepath, oldString: "target = 1", newString: "target = 9" },
+        { ...ctx, ask: mutatingAsk },
+      )
+      expect(err.message).toContain("Could not find oldString")
+      // Nothing was discarded: the external change stands, ours was refused.
+      expect(yield* load(filepath)).toBe("target = 200\nother = 2\n")
     }),
   )
 })

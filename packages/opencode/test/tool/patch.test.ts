@@ -38,6 +38,7 @@ type AskInput = {
     diff: string
     filepath: string
     files: Array<Record<string, unknown>>
+    mode: string
   }
 }
 
@@ -146,7 +147,7 @@ describe("tool.patch", () => {
       yield* writeText(path.join(test.directory, "modify.txt"), "line1\nline2\n")
       yield* writeText(path.join(test.directory, "delete.txt"), "obsolete\n")
 
-      const result = yield* execute({ patchText: OPENCODE_PATCH }, ctx)
+      const result = yield* execute({ patchText: OPENCODE_PATCH, apply: false }, ctx)
 
       expect(result.output).toContain("dry-run plan")
       expect(result.output).toContain("format: opencode")
@@ -170,17 +171,131 @@ describe("tool.patch", () => {
       const patch = "*** Begin Patch\n*** Update File: modify.txt\n@@\n-line2\n+changed\n*** End Patch"
 
       // Default dry-run: token-lean plan, no diff content leaks into the output.
-      const lean = yield* execute({ patchText: patch }, ctx)
+      const lean = yield* execute({ patchText: patch, apply: false }, ctx)
       expect(lean.output).toContain("M modify.txt (+1/-1) clean")
       expect(lean.output).not.toContain("--- diff")
       expect(lean.output).not.toContain("-line2")
 
       // showDiff:true appends the per-file diff.
-      const verbose = yield* execute({ patchText: patch, showDiff: true }, ctx)
+      const verbose = yield* execute({ patchText: patch, showDiff: true, apply: false }, ctx)
       expect(verbose.output).toContain("--- diff modify.txt")
       expect(verbose.output).toContain("-line2")
       expect(verbose.output).toContain("+changed")
       expect(verbose.output).toContain("--- end diff")
+    }),
+    { git: true },
+  )
+  it.instance("merges repeated Update File sections for one path instead of dropping the first", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      yield* writeText(path.join(test.directory, "same.txt"), "one\ntwo\nthree\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: same.txt",
+        "@@",
+        "-one",
+        "+ONE",
+        "*** Update File: same.txt",
+        "@@",
+        "-three",
+        "+THREE",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: patch, apply: false }, ctx)
+      expect(plan.output).toContain("M same.txt (+2/-2) clean")
+      yield* execute({ patchText: patch, apply: true }, ctx)
+      expect(yield* readText(path.join(test.directory, "same.txt"))).toBe("ONE\ntwo\nTHREE\n")
+    }),
+    { git: true },
+  )
+  it.instance("applies update sections onto added files in the same patch", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const patch = [
+        "*** Begin Patch",
+        "*** Add File: fresh.txt",
+        "+hello",
+        "*** Update File: fresh.txt",
+        "@@",
+        "-hello",
+        "+hello world",
+        "*** End Patch",
+      ].join("\n")
+      yield* execute({ patchText: patch, apply: true }, ctx)
+      expect(yield* readText(path.join(test.directory, "fresh.txt"))).toBe("hello world\n")
+    }),
+    { git: true },
+  )
+  it.instance("reports delete-plus-update collisions as conflicts instead of losing writes", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      yield* writeText(path.join(test.directory, "gone.txt"), "bye\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: gone.txt",
+        "@@",
+        "-bye",
+        "+hi",
+        "*** Delete File: gone.txt",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: patch }, ctx)
+      expect(plan.output).toContain("CONFLICT")
+      yield* expectFailure(execute({ patchText: patch, apply: true }, ctx), "verification failed")
+      expect(yield* readText(path.join(test.directory, "gone.txt"))).toBe("bye\n")
+    }),
+    { git: true },
+  )
+  it.instance("merges out-of-order sections by resolved position", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      yield* writeText(path.join(test.directory, "ooo.txt"), "one\ntwo\nthree\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: ooo.txt",
+        "@@",
+        "-three",
+        "+THREE",
+        "*** Update File: ooo.txt",
+        "@@",
+        "-one",
+        "+ONE",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: patch, apply: false }, ctx)
+      expect(plan.output).toContain("M ooo.txt (+2/-2) clean")
+      yield* execute({ patchText: patch, apply: true }, ctx)
+      expect(yield* readText(path.join(test.directory, "ooo.txt"))).toBe("ONE\ntwo\nTHREE\n")
+    }),
+    { git: true },
+  )
+  it.instance("rejects overlapping chunks across merged sections", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx, calls } = makeCtx()
+      yield* writeText(path.join(test.directory, "ov.txt"), "one\ntwo\nthree\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: ov.txt",
+        "@@",
+        "-two",
+        "+TWO",
+        "*** Update File: ov.txt",
+        "@@",
+        "-two",
+        "+2",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: patch, apply: false }, ctx)
+      expect(plan.output).toContain("CONFLICT")
+      expect(plan.output).toContain("overlapping chunks")
+      yield* expectFailure(execute({ patchText: patch, apply: true }, ctx), "verification failed")
+      expect(calls.length).toBe(0)
+      expect(yield* readText(path.join(test.directory, "ov.txt"))).toBe("one\ntwo\nthree\n")
     }),
     { git: true },
   )
@@ -191,7 +306,7 @@ describe("tool.patch", () => {
       const { ctx, calls } = makeCtx()
       yield* writeText(path.join(test.directory, "modify.txt"), "line1\nline2\n")
 
-      const result = yield* execute({ patchText: GIT_PATCH }, ctx)
+      const result = yield* execute({ patchText: GIT_PATCH, apply: false }, ctx)
 
       expect(result.output).toContain("dry-run plan")
       expect(result.output).toContain("format: git")
@@ -222,6 +337,7 @@ describe("tool.patch", () => {
       const ask = calls[0]
       expect(ask.permission).toBe("edit")
       expect(ask.metadata.files).toHaveLength(3)
+      expect(ask.metadata.mode).toBe("apply")
       expect(ask.metadata.diff).toContain("+created")
 
       expect(yield* readText(path.join(test.directory, "nested", "new.txt"))).toBe("created\n")
@@ -259,7 +375,7 @@ describe("tool.patch", () => {
       const patch =
         "--- a/old/name.txt\n+++ b/renamed/name.txt\n@@ -1,1 +1,1 @@\n-old content\n+new content\n"
 
-      const plan = yield* execute({ patchText: patch }, ctx)
+      const plan = yield* execute({ patchText: patch, apply: false }, ctx)
       expect(plan.output).toContain("R old/name.txt -> renamed/name.txt")
       expect(plan.output).toContain("clean")
 
@@ -361,5 +477,208 @@ describe("tool.patch", () => {
       const info = yield* PatchTool
       expect(info.id).toBe("patch")
     }),
+  )
+  it.instance("if-clean applies without a separate dry-run when nothing conflicts", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx, calls } = makeCtx()
+      yield* writeText(path.join(test.directory, "same.txt"), "one\ntwo\n")
+      const patch = "*** Begin Patch\n*** Update File: same.txt\n@@\n-one\n+ONE\n*** End Patch"
+      const result = yield* execute({ patchText: patch }, ctx)
+      expect(result.output).toContain("applied 1 change")
+      expect(result.output).toContain("mode: if-clean")
+      expect(calls.length).toBe(1)
+      expect(calls[0].metadata.mode).toBe("if-clean-apply")
+      expect(yield* readText(path.join(test.directory, "same.txt"))).toBe("ONE\ntwo\n")
+    }),
+    { git: true },
+  )
+  it.instance("if-clean returns the plan without asking when conflicts exist", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx, calls } = makeCtx()
+      yield* writeText(path.join(test.directory, "same.txt"), "one\ntwo\n")
+      const patch = "*** Begin Patch\n*** Update File: same.txt\n@@\n-missing\n+changed\n*** End Patch"
+      const result = yield* execute({ patchText: patch }, ctx)
+      expect(result.output).toContain("mode: if-clean")
+      expect(result.output).toContain("CONFLICT")
+      expect(calls.length).toBe(0)
+      expect(yield* readText(path.join(test.directory, "same.txt"))).toBe("one\ntwo\n")
+    }),
+    { git: true },
+  )
+  it.instance("D49: duplicate-candidate hunk is refused with candidate lines", () =>
+    Effect.gen(function* () {
+      // Three identical blocks; the hunk equals all three. A cursor-only
+      // design lands it on the first silently; the shared uniqueness rule
+      // refuses with every candidate line number instead.
+      const test = yield* TestInstance
+      const { ctx, calls } = makeCtx()
+      yield* writeText(path.join(test.directory, "dup.txt"), "header\nbody\nfooter\nheader\nbody\nfooter\nheader\nbody\nfooter\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: dup.txt",
+        "@@",
+        "-header",
+        "-body",
+        "-footer",
+        "+HEADER",
+        "+body",
+        "+footer",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: patch, apply: false }, ctx)
+      expect(plan.output).toContain("CONFLICT")
+      expect(plan.output).toContain("1, 4, 7")
+      yield* expectFailure(execute({ patchText: patch, apply: true }, ctx), "verification failed")
+      expect(calls.length).toBe(0)
+      expect(yield* readText(path.join(test.directory, "dup.txt"))).toBe(
+        "header\nbody\nfooter\nheader\nbody\nfooter\nheader\nbody\nfooter\n",
+      )
+    }),
+    { git: true },
+  )
+  it.instance("two-pass disambiguation resolves a duplicate candidate between anchored hunks", () =>
+    Effect.gen(function* () {
+      // Blocks 1 and 3 are uniquely anchored; the middle hunk is ambiguous
+      // file-wide but unique inside the window they bound.
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      yield* writeText(path.join(test.directory, "tri.txt"), "one\nh\nb\nf\ntwo\nh\nb\nf\nthree\nh\nb\nf\n")
+      const forward = [
+        "*** Begin Patch",
+        "*** Update File: tri.txt",
+        "@@",
+        "-one",
+        "-h",
+        "-b",
+        "-f",
+        "+ONE",
+        "+h",
+        "+b",
+        "+f",
+        "@@",
+        "-h",
+        "-b",
+        "-f",
+        "+H",
+        "+B",
+        "+F",
+        "@@",
+        "-three",
+        "-h",
+        "-b",
+        "-f",
+        "+THREE",
+        "+h",
+        "+b",
+        "+f",
+        "*** End Patch",
+      ].join("\n")
+      const expected = "ONE\nh\nb\nf\ntwo\nH\nB\nF\nTHREE\nh\nb\nf\n"
+      const plan = yield* execute({ patchText: forward, apply: false }, ctx)
+      expect(plan.output).toContain("M tri.txt (+5/-5) clean")
+      yield* execute({ patchText: forward, apply: true }, ctx)
+      expect(yield* readText(path.join(test.directory, "tri.txt"))).toBe(expected)
+    }),
+    { git: true },
+  )
+  it.instance("reversed authoring resolves identically (D3 composition)", () =>
+    Effect.gen(function* () {
+      // Same three hunks, authored last-to-first. Gap probing (not patch-order
+      // neighbours) makes resolution order-independent.
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      yield* writeText(path.join(test.directory, "tri.txt"), "one\nh\nb\nf\ntwo\nh\nb\nf\nthree\nh\nb\nf\n")
+      const reversed = [
+        "*** Begin Patch",
+        "*** Update File: tri.txt",
+        "@@",
+        "-three",
+        "-h",
+        "-b",
+        "-f",
+        "+THREE",
+        "+h",
+        "+b",
+        "+f",
+        "@@",
+        "-h",
+        "-b",
+        "-f",
+        "+H",
+        "+B",
+        "+F",
+        "@@",
+        "-one",
+        "-h",
+        "-b",
+        "-f",
+        "+ONE",
+        "+h",
+        "+b",
+        "+f",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: reversed, apply: false }, ctx)
+      expect(plan.output).toContain("M tri.txt (+5/-5) clean")
+      yield* execute({ patchText: reversed, apply: true }, ctx)
+      expect(yield* readText(path.join(test.directory, "tri.txt"))).toBe("ONE\nh\nb\nf\ntwo\nH\nB\nF\nTHREE\nh\nb\nf\n")
+    }),
+    { git: true },
+  )
+  it.instance("orders out-of-order chunks within a single section", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      yield* writeText(path.join(test.directory, "rev.txt"), "one\ntwo\nthree\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: rev.txt",
+        "@@",
+        "-three",
+        "+THREE",
+        "@@",
+        "-one",
+        "+ONE",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: patch, apply: false }, ctx)
+      expect(plan.output).toContain("M rev.txt (+2/-2) clean")
+      yield* execute({ patchText: patch, apply: true }, ctx)
+      expect(yield* readText(path.join(test.directory, "rev.txt"))).toBe("ONE\ntwo\nTHREE\n")
+    }),
+    { git: true },
+  )
+  it.instance("resolves chunks by full pattern, not first line", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      yield* writeText(path.join(test.directory, "dbl.txt"), "a\nb1\nc\na\nb2\nc\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: dbl.txt",
+        "@@",
+        "-a",
+        "-b1",
+        "-c",
+        "+a",
+        "+B1",
+        "+c",
+        "@@",
+        "-a",
+        "-b2",
+        "-c",
+        "+a",
+        "+B2",
+        "+c",
+        "*** End Patch",
+      ].join("\n")
+      const plan = yield* execute({ patchText: patch, apply: false }, ctx)
+      expect(plan.output).toContain("M dbl.txt (+2/-2) clean")
+      yield* execute({ patchText: patch, apply: true }, ctx)
+      expect(yield* readText(path.join(test.directory, "dbl.txt"))).toBe("a\nB1\nc\na\nB2\nc\n")
+    }),
+    { git: true },
   )
 })

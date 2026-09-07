@@ -21,6 +21,7 @@ import {
   type GlobSearch,
 } from "./read/path"
 import { AROUND_MAX, compilePattern, GREP_MAX, renderGrep, renderHeal, renderOutline, aroundWindow } from "./read/inspect"
+import { globalReadCache } from "./edit/prior-read"
 
 const DEFAULT_READ_LIMIT = 2000
 const MAX_LINE_LENGTH = 2000
@@ -35,6 +36,17 @@ const HINT =
   'Tip: action="outline" for a symbol TOC, pattern="name" to search this file, symbol="name" to jump to a definition.'
 
 class ReadStop extends Schema.TaggedErrorClass<ReadStop>()("ReadStop", {}) {}
+
+// Prior-read grounding (D47): every successful file-content read records
+// mtime+size so edit/patch can refuse targets that moved under the model.
+// Directory listings are not recorded — they ground no edit.
+const noteRead = (
+  filepath: string,
+  stat: { type: string; mtime: Option.Option<Date>; size: unknown } | undefined,
+) => {
+  if (!stat || stat.type === "Directory") return
+  globalReadCache.record(filepath, Option.getOrElse(stat.mtime, () => new Date(0)).getTime(), Number(stat.size))
+}
 
 export const Parameters = Schema.Struct({
   filePath: Schema.optional(Schema.String).annotate({
@@ -467,6 +479,7 @@ export const ReadTool = Tool.define<
             continue
           }
           const file = yield* clampRead(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
+          noteRead(filepath, resolved.stat)
           const heal = resolved.repaired ? renderHeal(input, filepath, resolved.repaired) : ""
           const block = [
             heal,
@@ -619,6 +632,8 @@ export const ReadTool = Tool.define<
       if (path.extname(filepath).toLowerCase() !== ".br" && isBinaryFile(filepath, sample)) {
         return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
       }
+
+      noteRead(filepath, stat)
 
       if (action === "outline") {
         const cache = yield* InstanceState.get(cacheState)

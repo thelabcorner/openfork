@@ -457,7 +457,7 @@ function tryMatch(lines: string[], pattern: string[], startIndex: number, compar
   return -1
 }
 
-function seekSequence(lines: string[], pattern: string[], startIndex: number, eof = false): number {
+export function seekSequence(lines: string[], pattern: string[], startIndex: number, eof = false): number {
   if (pattern.length === 0) return -1
 
   // Pass 1: exact match

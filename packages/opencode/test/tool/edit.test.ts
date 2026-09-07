@@ -4,6 +4,7 @@ import fs from "fs/promises"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Deferred, Effect, Exit, Fiber, Layer } from "effect"
 import { EditTool } from "../../src/tool/edit"
+import { buildLineIndex } from "../../src/tool/edit/line-index"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { LSP } from "@/lsp/lsp"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -330,8 +331,8 @@ describe("tool.edit", () => {
         const result = yield* run({ filePath: filepath, oldString: "line2", newString: "new line a\nnew line b" })
 
         expect(result.metadata.filediff).toBeDefined()
-        expect(result.metadata.filediff.file).toBe(filepath)
-        expect(result.metadata.filediff.additions).toBeGreaterThan(0)
+        expect(result.metadata.filediff!.file).toBe(filepath)
+        expect(result.metadata.filediff!.additions).toBeGreaterThan(0)
       }),
     )
   })
@@ -568,6 +569,163 @@ describe("tool.edit", () => {
         ])
 
         expect(yield* load(filepath)).toBe("top = 1\nmiddle = keep\nbottom = 2\n")
+      }),
+    )
+  })
+  describe("unified bulk pathway (patchText)", () => {
+    const patchText = [
+      "*** Begin Patch",
+      "*** Update File: a.txt",
+      "@@",
+      "-old a",
+      "+new a",
+      "*** Update File: b.txt",
+      "@@",
+      "-old b",
+      "+new b",
+      "*** End Patch",
+      "",
+    ].join("\n")
+    it.instance("dry-runs a multi-file patch in one call without writing", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* put(path.join(test.directory, "a.txt"), "old a\n")
+        yield* put(path.join(test.directory, "b.txt"), "old b\n")
+        const result = yield* run({ patchText, apply: false })
+        expect(result.output).toContain("dry-run plan")
+        expect(result.output).toContain("a.txt (+1/-1) clean")
+        expect(result.output).toContain("b.txt (+1/-1) clean")
+        expect(result.metadata.fileCount).toBe(2)
+        expect(yield* load(path.join(test.directory, "a.txt"))).toBe("old a\n")
+        expect(yield* load(path.join(test.directory, "b.txt"))).toBe("old b\n")
+      }),
+    )
+    it.instance("applies a multi-file patch with apply:true in one call", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        yield* put(path.join(test.directory, "a.txt"), "old a\n")
+        yield* put(path.join(test.directory, "b.txt"), "old b\n")
+        yield* run({ patchText, apply: true })
+        expect(yield* load(path.join(test.directory, "a.txt"))).toBe("new a\n")
+        expect(yield* load(path.join(test.directory, "b.txt"))).toBe("new b\n")
+      }),
+    )
+    it.instance("rejects patchText combined with single-edit params", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const err = yield* fail({
+          patchText,
+          filePath: path.join(test.directory, "a.txt"),
+          oldString: "old a",
+          newString: "new a",
+        })
+        expect(err.message).toContain("cannot be combined")
+      }),
+    )
+  })
+  describe("phase-1 hardening", () => {
+    it.instance("replaceAll treats $ sequences in newString literally", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "script.sh")
+        yield* put(filepath, "echo ONE\necho ONE\n")
+        const result = yield* run({ filePath: filepath, oldString: "ONE", newString: "$1-$&-$$", replaceAll: true })
+        expect(result.output).toContain("Edit applied successfully")
+        expect(yield* load(filepath)).toBe("echo $1-$&-$$\necho $1-$&-$$\n")
+      }),
+    )
+    it.instance("strategy edit preserves untouched lines byte-for-byte in mixed-ending files", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "mixed.txt")
+        yield* Effect.promise(() => fs.writeFile(filepath, "aaa\nbbb\r\nccc\n", "utf-8"))
+        const result = yield* run({ filePath: filepath, line: 1, newText: "AAA", oldText: "aaa" })
+        expect(result.output).toContain("strategy=line")
+        expect(yield* loadRaw(filepath)).toBe("AAA\nbbb\r\nccc\n")
+      }),
+    )
+    it.instance("refuses binary files instead of corrupting them", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "blob.bin")
+        yield* Effect.promise(() => fs.writeFile(filepath, Buffer.from([0x89, 0x50, 0x00, 0x41])))
+        const err = yield* fail({ filePath: filepath, oldString: "A", newString: "B" })
+        expect(err.message).toContain("binary")
+      }),
+    )
+    it.instance("rejects apply without patchText", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const err = yield* fail({
+          filePath: path.join(test.directory, "a.txt"),
+          oldString: "x",
+          newString: "y",
+          apply: true,
+        })
+        expect(err.message).toContain("require patchText")
+      }),
+    )
+    it.instance("rejects conflicting filePath and file_path", () =>
+      Effect.gen(function* () {
+        const err = yield* fail({ filePath: "/a.txt", file_path: "/b.txt", oldString: "x", newString: "y" })
+        expect(err.message).toContain("Conflicting paths")
+      }),
+    )
+    it.instance("block-anchor matching rejects instead of hanging on huge lines", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "huge.ts")
+        const giant = "x".repeat(200_000)
+        yield* put(filepath, `const a = 1\nconst giant = "${giant}"\nconst b = 2\n`)
+        const err = yield* fail({
+          filePath: filepath,
+          oldString: `const a = 1\nconst giant = "${giant}y"\nconst b = 2`,
+          newString: `const a = 1\nconst giant = "z"\nconst b = 2`,
+        })
+        expect(err.message).toContain("Could not find oldString")
+      }),
+    )
+    it.instance("line index round-trips byte-for-byte", () =>
+      Effect.gen(function* () {
+        const cases = ["", "a", "a\n", "a\nb", "a\nb\n", "a\r\nb\r\n", "a\nb\r\nc\n", "a\rb", "x\n\n\ny\n"]
+        for (const raw of cases) {
+          const lines = buildLineIndex(raw)
+          expect(lines.map((l) => l.text + l.terminator).join("")).toBe(raw)
+          // Texts carry no terminators, so joining drops the file's single
+          // trailing newline (there is no phantom final line).
+          const normalized = raw.replaceAll("\r\n", "\n").replaceAll("\r", "\n")
+          expect(lines.map((l) => l.text).join("\n")).toBe(normalized.replace(/\n$/, ""))
+        }
+      }),
+    )
+    it.instance("a file ending in a newline has no phantom final line", () =>
+      Effect.gen(function* () {
+        expect(buildLineIndex("a\n")).toHaveLength(1)
+        expect(buildLineIndex("a\nb\n")).toHaveLength(2)
+        expect(buildLineIndex("")).toHaveLength(1)
+      }),
+    )
+    it.instance("mixed exact+line batches preserve untouched bytes on mixed-ending files", () =>
+      Effect.gen(function* () {
+        // The interim mixed-batch gate is gone: per-span tracking keeps every
+        // untouched byte (including foreign terminators) intact.
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "mixed2.txt")
+        yield* Effect.promise(() => fs.writeFile(filepath, "aaa\nbbb\r\nccc\n", "utf-8"))
+        yield* run({
+          filePath: filepath,
+          edits: [
+            { line: 1, newText: "AAA", oldText: "aaa" },
+            { oldString: "ccc", newString: "CCC" },
+          ],
+        })
+        expect(yield* loadRaw(filepath)).toBe("AAA\nbbb\r\nCCC\n")
+      }),
+    )
+    it.instance("requires filePath or file_path at runtime", () =>
+      Effect.gen(function* () {
+        const err = yield* fail({ oldString: "x", newString: "y" })
+        expect(err.message).toContain("filePath (or file_path alias) is required")
       }),
     )
   })

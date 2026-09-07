@@ -1,21 +1,34 @@
-Performs exact string replacements in files. 
+Edit files — single precise changes AND bulk multi-file/multi-hunk changes in ONE tool. Pick the pathway BEFORE calling.
 
-Usage:
-- You must use your `Read` tool at least once in the conversation before editing. This tool will error if you attempt an edit without reading the file. 
-- When editing text from Read tool output, ensure you preserve the exact indentation (tabs/spaces) as it appears AFTER the line number prefix. The line number prefix format is: line number + colon + space (e.g., `1: `). Everything after that space is the actual file content to match. Never include any part of the line number prefix in the oldString or newString.
-- ALWAYS prefer editing existing files in the codebase. NEVER write new files unless explicitly required.
-- Only use emojis if the user explicitly requests it. Avoid adding emojis to files unless asked.
-- The edit will FAIL if `oldString` is not found in the file with an error "oldString not found in content".
-- The edit will FAIL if `oldString` is found multiple times in the file with an error "Found multiple matches for oldString. Provide more surrounding lines in oldString to identify the correct match." Either provide a larger string with more surrounding context to make it unique or use `replaceAll` to change every instance of `oldString`. 
-- Failure errors embed the current file content near the failed target (with line numbers, or the line numbers of every match). Prefer fixing oldString/newString from that excerpt instead of re-reading; re-read only when the excerpt genuinely is not enough to reconstruct the target.
-- Use `replaceAll` for replacing and renaming strings across the file. This parameter is useful if you want to rename a variable for instance.
+COST MODEL: every tool call reprocesses the full context window, so n sequential edit calls cost ~n times the input tokens of ONE bulk call carrying the same n edits. Single precise edits cost nothing extra — but the moment you know 2+ edits upfront, BATCH THEM. Bulk calls apply in ONE call when every hunk validates cleanly (apply defaults to "if-clean"); only conflicted patches cost a second round trip.
 
-Token-efficient strategies (use when repeating the full old text is wasteful; exact oldString/newString still has priority and is always the safest):
-- line + newText: replace one 1-based line. Optional oldText verifies the line contains it; the old line is echoed back in the output.
-- startLine + endLine + newText: replace a line range. Ranges over 5 lines require oldText verification.
-- insertAfter + newText: insert newText after a 1-based line.
-- appendFile:true + newText: append newText at the end of the file.
-- nearText + oldText + newText: find oldText within ±5 lines of a unique anchor line and replace it.
-- edits: [{line,newText,oldText?}] or [{oldString,newString}] — apply a batch atomically; fully validated before any write.
+ROUTING — how many locations do you already know?
+- ONE file, ONE contiguous hunk, no create/delete/rename -> single-edit params. Applies immediately.
+- 2+ files; 2+ hunks in one file; any create/delete/rename/move; a refactor spanning locations -> patchText. Collect reads/greps first, then emit ONE patchText call.
+- patchText MUST NOT be combined with single-edit params. A single brand-new file with no other changes -> `write`.
 
-Safety rails: empty/ambiguous targets are rejected (never guessed); a no-op edit returns applied=0 without writing; the unified diff is always surfaced. Optional runTypecheck:true runs a scoped tsgo/tsc check on the file after applying.
+SINGLE-EDIT PATHWAY (filePath, plus exactly one of):
+- oldString/newString: exact replacement; safest for small blocks. replaceAll:true renames every occurrence (exact matches only).
+- line + oldText + newText: replace line N. oldText is REQUIRED and must be text currently on that line.
+- startLine + endLine + newText (+ oldText): replace a range. Ranges over 5 lines require oldText whose first and last lines match the range's endpoints. Add delete:true (no newText) to REMOVE the range.
+- insertAt + newText: insert after line N. insertAt:0 prepends. Any N>0 requires oldText confirming line N.
+- appendFile:true + newText: append at EOF.
+- nearText + oldText + newText (+ occurrence): replace oldText within ±5 lines of a unique anchor.
+- edits:[...]: single-file atomic batch of the above shapes. Every op is validated against the file as read, overlaps are rejected, and ops apply against original coordinates so earlier edits never shift later targets.
+
+RULES
+- You MUST Read the file first; edits to files that changed after they were read are rejected, and line-targeted edits to unread files carry a warning. Re-read on either signal.
+- Preserve exact indentation as it appears AFTER the `N: ` read prefix; never include the prefix (it is stripped with a warning if detected).
+- Ambiguous targets are REFUSED, never guessed: if text matches more than one location the error lists every candidate line number. Add context, or use replaceAll for a deliberate rename.
+- If a match is resolved by anything other than exact text, the result says so — send exact text next time.
+- A no-op returns applied=0 without writing. applied reflects the TRUE number of changes.
+- If the formatter reshapes the file after your edit, the result says so; re-read before further line-targeted edits.
+- runTypecheck:true runs a scoped tsgo/tsc check (single-edit pathway only).
+- AVOID emojis unless explicitly requested.
+
+BULK PATHWAY (patchText + optional apply/format/showDiff)
+- apply defaults to "if-clean": validate everything, then apply in the same call if there are zero conflicts, or return a plan and write nothing if there are any. apply:false forces a plan; apply:true forces application.
+- EVERY hunk is validated BEFORE ANY write, hunks are positioned by unique content match (an ambiguous hunk is refused with candidate line numbers, not applied to the first match), and the write loop unwinds completely on failure — never a half-applied refactor.
+- Repeated `*** Update File:` sections for one path are merged; contradictory operations on one path are reported as conflicts, never silently dropped.
+- Two formats, auto-detected (pass format to force): the opencode format (*** Begin Patch / *** Add File: / *** Update File: + @@ hunks / *** Move to: / *** Delete File: / *** End Patch), or a git-style unified diff pasted directly.
+- Every hunk needs at least one context or removed line; a hunk of pure additions has no determinable position and is refused (use insertAt/appendFile instead).
