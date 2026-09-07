@@ -32,7 +32,7 @@ import { Database as CoreDatabase, Service as DatabaseService, withBackfillDb } 
 import type { DatabaseShape } from "../../src/database/database"
 import { DatabaseMigration } from "../../src/database/migration"
 import { CHUNKDB_COOLING_MS, CHUNKDB_HOT_TAIL_EVENTS, ensureChunkDB } from "../../src/database/chunkdb"
-import { inspectSealerBacklog, runPassV2 } from "../../src/database/chunk-sealer"
+import { inspectSealerBacklog, runPassV2, shouldDrainFreelist } from "../../src/database/chunk-sealer"
 import { rehydrateEvents, CdbRehydrateError } from "../../src/event"
 import { EventV2 } from "../../src/event"
 import { Event } from "@opencode-ai/schema/event"
@@ -179,6 +179,15 @@ function tmpDb() {
 }
 
 describe("ChunkDB crash recovery", () => {
+  test("RECLAIM POLICY: large freelists stay in accelerated drain while normal slack does not", () => {
+    // Production incident shape: ~813k free pages out of ~1.265M total must
+    // remain in accelerated reclaim rather than falling back to 10-minute idle.
+    expect(shouldDrainFreelist(813_377, 1_264_872)).toBe(true)
+    // Stop once physical slack is <=5% or too small to justify churn.
+    expect(shouldDrainFreelist(50_000, 1_100_000)).toBe(false)
+    expect(shouldDrainFreelist(1_000, 1_000_000)).toBe(false)
+  })
+
   test("FOREGROUND PRIORITY: backfill yields on SQLITE_BUSY and resumes after the writer lock is released", async () => {
     const { dir, path } = tmpDb()
     let locker: BunDatabase | undefined

@@ -418,6 +418,13 @@ const DELTA_TAG_COPY = 0x01
 const DELTA_MIN_COPY = 4
 const DELTA_MAX_COPY = 65535
 const DELTA_MAX_LITERAL = 65535
+// A 4-byte key can occur millions of times in repetitive JSON/diff payloads.
+// Keeping every occurrence turns the matcher below from its intended bounded
+// average-case behavior into catastrophic O(n^2) work and unbounded index
+// memory. Retain a small rolling sample of recent positions per key instead.
+// 64 candidates is enough to preserve useful long-span matches while placing a
+// hard ceiling on work performed at each new-value position.
+const DELTA_MAX_MATCH_CANDIDATES = 64
 
 /** True when `bytes` is an OCDB v5 (delta_ref) frame. */
 export function isV5Frame(bytes: Uint8Array): boolean {
@@ -440,7 +447,8 @@ export function encodeV5Correction(base: Uint8Array, newValue: Uint8Array): Uint
       list = []
       index.set(w, list)
     }
-    list.push(p)
+    if (list.length < DELTA_MAX_MATCH_CANDIDATES) list.push(p)
+    else list[p & (DELTA_MAX_MATCH_CANDIDATES - 1)] = p
   }
   const out: number[] = []
   let lit: number[] = []

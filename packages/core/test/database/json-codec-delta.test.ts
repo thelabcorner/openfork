@@ -80,6 +80,19 @@ describe("ChunkDB epoch-4 v5 delta_ref frame", () => {
     expect(JSON.parse(decoder.decode(reconstructed))).toEqual(newObj)
   })
 
+  test("highly repetitive inputs stay bounded and round-trip", () => {
+    // Regression: retaining every position for a common 4-byte key made the
+    // matcher effectively O(n^2) on large repetitive JSON/diff payloads. This
+    // shape deliberately creates hundreds of thousands of identical windows.
+    const baseRaw = encoder.encode(`{"text":"${"A".repeat(512 * 1024)}"}`)
+    const newRaw = encoder.encode(`{"text":"${"A".repeat(512 * 1024 - 1)}B"}`)
+    const v5 = compressDeltaRef(newRaw, baseRaw, "agg:repetitive", 1, 1)
+    const header = parseV5Header(v5)
+    const correction = decodeV5Correction(header.correction, header.codec, header.storedCrc)
+    const reconstructed = applyV5Correction(baseRaw, correction, header.totalRawLen)
+    expect(reconstructed).toEqual(newRaw)
+  })
+
   test("fail-closed on corrupt correction CRC", () => {
     const baseRaw = encoder.encode(JSON.stringify(makeBase()))
     const newRaw = encoder.encode(JSON.stringify(makeNew()))

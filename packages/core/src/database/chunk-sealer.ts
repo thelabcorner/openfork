@@ -98,6 +98,16 @@ const CHUNKDB_WRITE_SLICE_BYTES = 512 * 1024
 const CHUNKDB_WRITE_SLICE_PAUSE_MS = 15
 const CHUNKDB_BUSY_RETRY_MS = 35
 const BACKLOG_SAMPLE_ROWS = 2_048
+// Once a historical backfill drains, a giant freelist can remain inside the
+// SQLite file even though the logical payload has already shrunk dramatically.
+// Keep normal maintenance conservative, but enter a dedicated low-priority
+// reclaim drain until the freelist falls below this ratio. Vacuum work remains
+// split into small statements with yields so foreground writers keep priority.
+const CHUNKDB_RECLAIM_DRAIN_FREE_RATIO = 0.05
+const CHUNKDB_RECLAIM_DRAIN_MIN_FREE_PAGES = 8_192 // 64 MiB at the tuned 8 KiB page size
+const CHUNKDB_RECLAIM_DRAIN_MAX_MS = 15_000
+const CHUNKDB_RECLAIM_DRAIN_PAUSE_MS = 10
+const CHUNKDB_RECLAIM_DRAIN_SLEEP_MS = 250
 
 // A Database layer can be materialized more than once inside one server process
 // (for example by independently-built service graphs). Starting one infinite
@@ -171,14 +181,91 @@ interface SealerOptions {
  * statement. On DBs without INCREMENTAL auto_vacuum (existing files) this is a
  * cheap no-op. Must run OUTSIDE a transaction.
  */
-function reclaimSpace(db: DatabaseShape): Effect.Effect<void> {
+type ReclaimMode = "maintenance" | "drain"
+
+interface ReclaimStats {
+  readonly attempted: boolean
+  readonly reclaimedPages: number
+  readonly freePages: number
+  readonly pageCount: number
+  readonly needsMore: boolean
+}
+
+export function shouldDrainFreelist(freePages: number, pageCount: number): boolean {
+  if (freePages < CHUNKDB_RECLAIM_DRAIN_MIN_FREE_PAGES || pageCount <= 0) return false
+  return freePages / pageCount > CHUNKDB_RECLAIM_DRAIN_FREE_RATIO
+}
+
+function reclaimSpace(db: DatabaseShape, mode: ReclaimMode = "maintenance"): Effect.Effect<ReclaimStats> {
   return Effect.gen(function* () {
     const rows = yield* db.all<{ auto_vacuum: number }>(`PRAGMA auto_vacuum`).pipe(Effect.orDie)
-    if ((rows[0]?.auto_vacuum ?? 0) !== 2) return
-    for (let i = 0; i < CHUNKDB_VACUUM_MAX_ITERATIONS; i++) {
-      const free = yield* db.all<{ freelist_count: number }>(`PRAGMA freelist_count`).pipe(Effect.orDie)
-      if ((free[0]?.freelist_count ?? 0) === 0) break
-      yield* db.run(`PRAGMA incremental_vacuum(${CHUNKDB_VACUUM_PAGES_PER_PASS})`).pipe(Effect.orDie)
+    if ((rows[0]?.auto_vacuum ?? 0) !== 2) {
+      return { attempted: false, reclaimedPages: 0, freePages: 0, pageCount: 0, needsMore: false }
+    }
+
+    const initialFreeRows = yield* db.all<{ freelist_count: number }>(`PRAGMA freelist_count`).pipe(Effect.orDie)
+    const initialPageRows = yield* db.all<{ page_count: number }>(`PRAGMA page_count`).pipe(Effect.orDie)
+    const initialFree = initialFreeRows[0]?.freelist_count ?? 0
+    const initialPageCount = initialPageRows[0]?.page_count ?? 0
+    if (initialFree === 0) {
+      return { attempted: true, reclaimedPages: 0, freePages: 0, pageCount: initialPageCount, needsMore: false }
+    }
+
+    const started = Date.now()
+    const maxIterations = mode === "maintenance" ? CHUNKDB_VACUUM_MAX_ITERATIONS : Number.POSITIVE_INFINITY
+    let iterations = 0
+    let currentFree = initialFree
+    let currentPageCount = initialPageCount
+
+    while (iterations < maxIterations) {
+      if (mode === "drain") {
+        if (!shouldDrainFreelist(currentFree, currentPageCount)) break
+        if (Date.now() - started >= CHUNKDB_RECLAIM_DRAIN_MAX_MS) break
+      } else if (currentFree === 0) {
+        break
+      }
+
+      const vacuum = yield* db.run(`PRAGMA incremental_vacuum(${CHUNKDB_VACUUM_PAGES_PER_PASS})`).pipe(
+        Effect.map(() => true),
+        Effect.catch((error) => {
+          if (isSqliteBusy(error)) return Effect.succeed(false)
+          return Effect.die(error)
+        }),
+      )
+      if (!vacuum) {
+        // Foreground owns the single SQLite writer slot. Background reclaim does
+        // not queue behind it; yield immediately and let the next drain slice try.
+        break
+      }
+
+      iterations += 1
+      const freeRows = yield* db.all<{ freelist_count: number }>(`PRAGMA freelist_count`).pipe(Effect.orDie)
+      const pageRows = yield* db.all<{ page_count: number }>(`PRAGMA page_count`).pipe(Effect.orDie)
+      const nextFree = freeRows[0]?.freelist_count ?? 0
+      const nextPageCount = pageRows[0]?.page_count ?? currentPageCount
+
+      // Defensive escape hatch: a driver/SQLite combination that reports no
+      // reclaim progress must never turn the background loop into a CPU spin.
+      if (nextFree >= currentFree && nextPageCount >= currentPageCount) {
+        currentFree = nextFree
+        currentPageCount = nextPageCount
+        break
+      }
+
+      currentFree = nextFree
+      currentPageCount = nextPageCount
+      yield* Effect.yieldNow
+      if (mode === "drain") yield* Effect.sleep(Duration.millis(CHUNKDB_RECLAIM_DRAIN_PAUSE_MS))
+    }
+
+    const needsMore = mode === "drain" && shouldDrainFreelist(currentFree, currentPageCount)
+
+    return {
+      attempted: true,
+      reclaimedPages: Math.max(0, initialFree - currentFree),
+      freePages: currentFree,
+      pageCount: currentPageCount,
+      needsMore,
     }
   })
 }
@@ -555,6 +642,13 @@ export function runPassV2(
       const frameByID = new Map(compressed)
 
       const plans: Plan[] = []
+      // Delta matching is useful for modest record-shaped values, but it is the
+      // wrong representation for jumbo rows. Besides adding read amplification,
+      // building a correction requires indexing/comparing both raw values. Keep
+      // jumbo payloads on the independently-decodable v4 segmented frame path.
+      // This also makes a corrupted/hostile giant event incapable of monopolizing
+      // a background sealing pass when delta mode is explicitly enabled.
+      const deltaMaxRawBytes = 4 * 1024 * 1024
       for (const plan of pending) {
         if (plan.kind === "skip") {
           plans.push(plan)
@@ -573,9 +667,13 @@ export function runPassV2(
 
         const frame = frameByID.get(candidate.id) ?? candidate.data
         let finalFrame: string | Uint8Array = frame
-        if (Flag.OPENCODE_SEAL_DELTA && typeof frame !== "string") {
+        if (
+          Flag.OPENCODE_SEAL_DELTA &&
+          typeof frame !== "string" &&
+          rawBytes.byteLength <= deltaMaxRawBytes
+        ) {
           const base = lastBaseByAggregate.get(candidate.aggregate_id)
-          if (base !== undefined) {
+          if (base !== undefined && base.raw.byteLength <= deltaMaxRawBytes) {
             const { codec, level } = chooseCodec(rawBytes.byteLength)
             const delta = compressDeltaRef(rawBytes, base.raw, base.valueId, codec, level)
             if (delta.byteLength < frame.byteLength * 0.7) finalFrame = delta
@@ -868,6 +966,7 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
             hotTailEvents: CHUNKDB_HOT_TAIL_EVENTS,
           })
           let previousHitCap: boolean = false
+          let reclaimDraining = false
           let backoffMs = BACKOFF_BASE_MS
           for (;;) {
             const draining: boolean = previousHitCap && backfillAllowed
@@ -914,7 +1013,36 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               )
               yield* Effect.logDebug("ChunkDB sealer idle", { filename, ...backlog })
             }
-            const wait = previousHitCap && backfillAllowed ? DRAIN_SLEEP_MS : MAINTENANCE_INTERVAL_MS
+
+            // When sealing no longer has a capped backlog, immediately inspect
+            // the physical freelist. A multi-GB historical backfill can leave the
+            // logical DB tiny while SQLite still owns gigabytes of free pages.
+            // Drain those pages in low-priority 15s slices until the free-space
+            // ratio is sane instead of waiting ten minutes between ~160MB
+            // maintenance reclaims. This also repairs a DB that finished its
+            // backfill in a previous process before this policy existed.
+            if (!previousHitCap) {
+              const reclaim = yield* reclaimSpace(db, "drain")
+              reclaimDraining = reclaim.needsMore
+              if (reclaim.reclaimedPages > 0) {
+                yield* Effect.logInfo("ChunkDB space reclaim progress", {
+                  filename,
+                  reclaimedPages: reclaim.reclaimedPages,
+                  freePages: reclaim.freePages,
+                  pageCount: reclaim.pageCount,
+                  freeRatio: reclaim.pageCount > 0 ? reclaim.freePages / reclaim.pageCount : 0,
+                  draining: reclaim.needsMore,
+                })
+              }
+            } else {
+              reclaimDraining = false
+            }
+
+            const wait = previousHitCap && backfillAllowed
+              ? DRAIN_SLEEP_MS
+              : reclaimDraining
+                ? CHUNKDB_RECLAIM_DRAIN_SLEEP_MS
+                : MAINTENANCE_INTERVAL_MS
             yield* Effect.sleep(Duration.millis(wait))
           }
         }),
