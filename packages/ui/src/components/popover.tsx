@@ -17,6 +17,7 @@ export interface PopoverProps<T extends ValidComponent = "div">
   classList?: ComponentProps<"div">["classList"]
   style?: ComponentProps<"div">["style"]
   portal?: boolean
+  onOpenAutoFocus?: ComponentProps<typeof Kobalte.Content>["onOpenAutoFocus"]
 }
 
 export function Popover<T extends ValidComponent = "div">(props: PopoverProps<T>) {
@@ -32,6 +33,7 @@ export function Popover<T extends ValidComponent = "div">(props: PopoverProps<T>
     "style",
     "children",
     "portal",
+    "onOpenAutoFocus",
     "open",
     "defaultOpen",
     "onOpenChange",
@@ -110,6 +112,7 @@ export function Popover<T extends ValidComponent = "div">(props: PopoverProps<T>
         [local.class ?? ""]: !!local.class,
       }}
       style={local.style}
+      onOpenAutoFocus={local.onOpenAutoFocus}
       onCloseAutoFocus={(event: Event) => {
         if (state.dismiss === "outside") event.preventDefault()
         setState("dismiss", null)

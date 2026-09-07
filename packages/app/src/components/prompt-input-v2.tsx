@@ -8,6 +8,7 @@ import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
 import { createEffect, createMemo, createResource, createSignal, lazy, on, onCleanup, Show, Suspense } from "solid-js"
+import { useParams } from "@solidjs/router"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
 const ModelSelectorPopoverV2 = lazy(async () => {
   const mod = await import("@/components/dialog-select-model")
@@ -40,6 +41,7 @@ import { buildArcModel, type ArcModel } from "@/components/prompt-input/limit-ar
 import { LimitArcCard, LimitArcGlyph } from "@/components/prompt-input/limit-arc-view"
 import { showToast } from "@/utils/toast"
 import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
+import { GoalComposerShelf } from "@/components/goal-composer-shelf"
 import {
   createPromptInputV2Controller,
   createPromptInputV2State,
@@ -63,6 +65,8 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
   const dialog = useDialog()
   const command = useCommand()
   const language = useLanguage()
+  const params = useParams<{ id?: string }>()
+  const sessionID = () => params.id
 
   return (
     <div class="flex flex-col gap-3">
@@ -81,6 +85,7 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
             onToggle={props.controller.autoAccept.toggle}
           />
         }
+        goalControl={<Show when={sessionID()}>{(id) => <GoalComposerShelf sessionID={id()} />}</Show>}
         footerControl={<PromptInputV2LiveRate value={props.controller.liveRate()} />}
         modelControl={
           <PromptInputV2ModelControl

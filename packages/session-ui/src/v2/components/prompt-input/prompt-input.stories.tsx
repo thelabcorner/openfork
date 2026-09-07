@@ -4,6 +4,7 @@ import { PromptInputV2, type PromptInputV2PersistedState, type PromptInputV2Sugg
 import { createPromptInputV2Controller } from "./interaction"
 import { createPromptInputV2Store } from "./store"
 import { createEffect } from "solid-js"
+import { Icon } from "@opencode-ai/ui/v2/icon"
 
 const agents = [
   { id: "build", label: "Build" },
@@ -104,7 +105,7 @@ const commandSuggestions: PromptInputV2Suggestion[] = [
   },
 ]
 
-function ControlledPromptInput() {
+function ControlledPromptInput(props: { goalControl?: unknown } = {}) {
   // Agent choice is a persisted user/workspace preference in v1, not part of PromptStore.
   const [preferences, setPreferences] = createStore({ agent: "build" })
 
@@ -205,7 +206,31 @@ function ControlledPromptInput() {
 
   return (
     <div class="mx-auto flex max-w-[760px] flex-col gap-4 pt-32">
-      <PromptInputV2 controller={controller} />
+      <PromptInputV2 controller={controller} goalControl={props.goalControl} />
+    </div>
+  )
+}
+
+function GoalShelfVisualFixture() {
+  return (
+    <div class="mx-auto flex h-9 w-[min(100%,680px)] items-center gap-1 rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-base px-1.5 shadow-[var(--v2-elevation-floating)]">
+      <span class="grid size-4 shrink-0 place-items-center rounded-full border border-v2-border-border-muted text-v2-icon-icon-muted">
+        <Icon name="star" size="small" class="size-3" />
+      </span>
+      <div class="flex min-w-0 flex-1 items-center gap-2 px-1.5">
+        <span class="min-w-0 flex-1 truncate text-[12px] font-[560] leading-4 tracking-[-0.02em] text-v2-text-text-base">
+          Ship Goal Mode production hardening
+        </span>
+        <span class="shrink-0 text-[10px] font-[520] tabular-nums text-v2-text-text-faint">5/8</span>
+        <span class="h-1.5 w-16 overflow-hidden rounded-full bg-v2-overlay-simple-overlay-hover">
+          <span class="block h-full w-[62%] rounded-full bg-v2-icon-icon-base" />
+        </span>
+        <span class="shrink-0 text-[10px] tabular-nums text-v2-text-text-faint">18m</span>
+        <Icon name="chevron-down" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
+      </div>
+      <span class="grid size-6 place-items-center rounded-md text-v2-icon-icon-muted">
+        <Icon name="pause" size="small" />
+      </span>
     </div>
   )
 }
@@ -218,4 +243,13 @@ export default {
 
 export const ControlledComposition = {
   render: () => <ControlledPromptInput />,
+}
+
+/**
+ * Visual contract for Goal Mode's persistent composer shelf. This intentionally
+ * renders through PromptInputV2's app-owned slot so Storybook catches changes
+ * to the absolute anchor, width, z-order and surrounding composer geometry.
+ */
+export const GoalShelfComposition = {
+  render: () => <ControlledPromptInput goalControl={<GoalShelfVisualFixture />} />,
 }

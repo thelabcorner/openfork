@@ -44,6 +44,7 @@ import { CommentsProvider } from "@/context/comments"
 import { FileProvider } from "@/context/file"
 import { ForkUsageProvider } from "@/context/fork-usage"
 import { SessionGroupsProvider } from "@/context/session-groups"
+import { GoalsProvider } from "@/context/goals"
 import { ServerSDKProvider } from "@/context/server-sdk"
 import { ServerSyncProvider, useServerSync } from "@/context/server-sync"
 import { GlobalProvider, useGlobal } from "@/context/global"
@@ -128,10 +129,12 @@ function TargetServerRoute(props: ParentProps) {
     <Show when={serverKey()} keyed fallback={<ErrorPage error={new Error("Invalid server route")} />}>
       <ServerSDKProvider server={conn}>
         <ServerSyncProvider server={conn}>
-          <ForkUsageProvider>
-            <PersonalUsageIngest />
-            {props.children}
-          </ForkUsageProvider>
+          <GoalsProvider>
+            <ForkUsageProvider>
+              <PersonalUsageIngest />
+              {props.children}
+            </ForkUsageProvider>
+          </GoalsProvider>
         </ServerSyncProvider>
       </ServerSDKProvider>
     </Show>
@@ -185,12 +188,14 @@ function SelectedServerProviders(props: ParentProps) {
     <ServerKey>
       <ServerSDKProvider>
         <ServerSyncProvider>
-          <SessionGroupsProvider>
-            <ForkUsageProvider>
-              <PersonalUsageIngest />
-              {props.children}
-            </ForkUsageProvider>
-          </SessionGroupsProvider>
+          <GoalsProvider>
+            <SessionGroupsProvider>
+              <ForkUsageProvider>
+                <PersonalUsageIngest />
+                {props.children}
+              </ForkUsageProvider>
+            </SessionGroupsProvider>
+          </GoalsProvider>
         </ServerSyncProvider>
       </ServerSDKProvider>
     </ServerKey>

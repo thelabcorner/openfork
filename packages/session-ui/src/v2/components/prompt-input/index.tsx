@@ -46,6 +46,8 @@ export type PromptInputV2Props = {
   usageControl?: JSX.Element
   autoAcceptControl?: JSX.Element
   footerControl?: JSX.Element
+  /** Persistent app-owned control rendered above the composer, independent of the prompt popover machine. */
+  goalControl?: JSX.Element
   variantControlVisible?: boolean
   attachKeybind?: string[]
   attachShortcut?: string
@@ -115,6 +117,11 @@ export function PromptInputV2(props: PromptInputV2Props) {
           event.currentTarget.value = ""
         }}
       />
+      <Show when={props.goalControl}>
+        <div data-slot="goal-control" class="absolute inset-x-0 -top-2 z-30 -translate-y-full">
+          {props.goalControl}
+        </div>
+      </Show>
       <Show when={state.popover.type !== "closed"}>
         <PromptInputV2Popover
           emptyLabel={i18n.t("ui.promptInput.noMatchingItems")}
