@@ -124,6 +124,38 @@ import type {
   GlobalPreferencesUpdateResponses,
   GlobalUpgradeErrors,
   GlobalUpgradeResponses,
+  GoalAddEvidenceErrors,
+  GoalAddEvidenceResponses,
+  GoalAuditErrors,
+  GoalAuditResponses,
+  GoalContinuationPolicy,
+  GoalCreateErrors,
+  GoalCreateResponses,
+  GoalCriterionErrors,
+  GoalCriterionResponses,
+  GoalCriterionStatus,
+  GoalEvidenceErrors,
+  GoalEvidenceResponses,
+  GoalFocusedErrors,
+  GoalFocusedResponses,
+  GoalFocusErrors,
+  GoalFocusesErrors,
+  GoalFocusesResponses,
+  GoalFocusResponses,
+  GoalFocusRole,
+  GoalGetErrors,
+  GoalGetResponses,
+  GoalListErrors,
+  GoalListResponses,
+  GoalStepErrors,
+  GoalStepResponses,
+  GoalStepStatus,
+  GoalTransitionErrors,
+  GoalTransitionResponses,
+  GoalUnfocusErrors,
+  GoalUnfocusResponses,
+  GoalUpdateErrors,
+  GoalUpdateResponses,
   InstanceDisposeErrors,
   InstanceDisposeResponses,
   LocationRef,
@@ -6074,6 +6106,444 @@ export class SessionGroup extends HeyApiClient {
   }
 }
 
+export class Goal extends HeyApiClient {
+  /**
+   * List Goals
+   */
+  public list<ThrowOnError extends boolean = false>(
+    parameters: {
+      projectID: string
+      workspaceID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "projectID" },
+            { in: "query", key: "workspaceID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<GoalListResponses, GoalListErrors, ThrowOnError>({
+      url: "/goal",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Create Goal
+   */
+  public create<ThrowOnError extends boolean = false>(
+    parameters?: {
+      projectID?: string
+      workspaceID?: string
+      title?: string
+      objective?: string
+      constraints?: Array<string>
+      criteria?: Array<string>
+      steps?: Array<{
+        title: string
+        description?: string
+      }>
+      continuationPolicy?: GoalContinuationPolicy
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "body", key: "projectID" },
+            { in: "body", key: "workspaceID" },
+            { in: "body", key: "title" },
+            { in: "body", key: "objective" },
+            { in: "body", key: "constraints" },
+            { in: "body", key: "criteria" },
+            { in: "body", key: "steps" },
+            { in: "body", key: "continuationPolicy" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<GoalCreateResponses, GoalCreateErrors, ThrowOnError>({
+      url: "/goal",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get Goal
+   */
+  public get<ThrowOnError extends boolean = false>(
+    parameters: {
+      goalID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "goalID" }] }])
+    return (options?.client ?? this.client).get<GoalGetResponses, GoalGetErrors, ThrowOnError>({
+      url: "/goal/{goalID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Update Goal specification
+   */
+  public update<ThrowOnError extends boolean = false>(
+    parameters: {
+      goalID: string
+      expectedRevision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      title?: string
+      objective?: string
+      constraints?: Array<string>
+      criteria?: Array<string>
+      steps?: Array<{
+        title: string
+        description?: string
+      }>
+      continuationPolicy?: GoalContinuationPolicy
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "goalID" },
+            { in: "body", key: "expectedRevision" },
+            { in: "body", key: "title" },
+            { in: "body", key: "objective" },
+            { in: "body", key: "constraints" },
+            { in: "body", key: "criteria" },
+            { in: "body", key: "steps" },
+            { in: "body", key: "continuationPolicy" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<GoalUpdateResponses, GoalUpdateErrors, ThrowOnError>({
+      url: "/goal/{goalID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Transition Goal lifecycle
+   */
+  public transition<ThrowOnError extends boolean = false>(
+    parameters: {
+      goalID: string
+      expectedRevision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      action?:
+        | "start"
+        | "pause"
+        | "resume"
+        | "block"
+        | "request_verification"
+        | "verification_pass"
+        | "verification_fail"
+        | "cancel"
+        | "fail"
+      blocker?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "goalID" },
+            { in: "body", key: "expectedRevision" },
+            { in: "body", key: "action" },
+            { in: "body", key: "blocker" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<GoalTransitionResponses, GoalTransitionErrors, ThrowOnError>({
+      url: "/goal/{goalID}/transition",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Update Goal criterion
+   */
+  public criterion<ThrowOnError extends boolean = false>(
+    parameters: {
+      goalID: string
+      criterionID: string
+      expectedRevision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      status?: GoalCriterionStatus
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "goalID" },
+            { in: "path", key: "criterionID" },
+            { in: "body", key: "expectedRevision" },
+            { in: "body", key: "status" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<GoalCriterionResponses, GoalCriterionErrors, ThrowOnError>({
+      url: "/goal/{goalID}/criterion/{criterionID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Update or assign Goal step
+   */
+  public step<ThrowOnError extends boolean = false>(
+    parameters: {
+      goalID: string
+      stepID: string
+      expectedRevision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      status?: GoalStepStatus
+      assignedSessionID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "goalID" },
+            { in: "path", key: "stepID" },
+            { in: "body", key: "expectedRevision" },
+            { in: "body", key: "status" },
+            { in: "body", key: "assignedSessionID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<GoalStepResponses, GoalStepErrors, ThrowOnError>({
+      url: "/goal/{goalID}/step/{stepID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * List Goal evidence
+   */
+  public evidence<ThrowOnError extends boolean = false>(
+    parameters: {
+      goalID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "goalID" }] }])
+    return (options?.client ?? this.client).get<GoalEvidenceResponses, GoalEvidenceErrors, ThrowOnError>({
+      url: "/goal/{goalID}/evidence",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Add Goal evidence
+   */
+  public addEvidence<ThrowOnError extends boolean = false>(
+    parameters: {
+      goalID: string
+      expectedRevision?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      criterionID?: string
+      stepID?: string
+      type?: string
+      sessionID?: string
+      messageID?: string
+      checkpointID?: string
+      path?: string
+      commitSHA?: string
+      summary?: string
+      verdict?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "goalID" },
+            { in: "body", key: "expectedRevision" },
+            { in: "body", key: "criterionID" },
+            { in: "body", key: "stepID" },
+            { in: "body", key: "type" },
+            { in: "body", key: "sessionID" },
+            { in: "body", key: "messageID" },
+            { in: "body", key: "checkpointID" },
+            { in: "body", key: "path" },
+            { in: "body", key: "commitSHA" },
+            { in: "body", key: "summary" },
+            { in: "body", key: "verdict" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<GoalAddEvidenceResponses, GoalAddEvidenceErrors, ThrowOnError>({
+      url: "/goal/{goalID}/evidence",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Get Goal audit history
+   */
+  public audit<ThrowOnError extends boolean = false>(
+    parameters: {
+      goalID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "goalID" }] }])
+    return (options?.client ?? this.client).get<GoalAuditResponses, GoalAuditErrors, ThrowOnError>({
+      url: "/goal/{goalID}/audit",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * List Goal Session focus bindings
+   */
+  public focuses<ThrowOnError extends boolean = false>(
+    parameters: {
+      goalID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "goalID" }] }])
+    return (options?.client ?? this.client).get<GoalFocusesResponses, GoalFocusesErrors, ThrowOnError>({
+      url: "/goal/{goalID}/focus",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Unfocus Goal for Session
+   */
+  public unfocus<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).delete<GoalUnfocusResponses, GoalUnfocusErrors, ThrowOnError>({
+      url: "/session/{sessionID}/goal",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get focused Goal for Session
+   */
+  public focused<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "sessionID" }] }])
+    return (options?.client ?? this.client).get<GoalFocusedResponses, GoalFocusedErrors, ThrowOnError>({
+      url: "/session/{sessionID}/goal",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Focus Goal for Session
+   */
+  public focus<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      goalID?: string
+      role?: GoalFocusRole
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "goalID" },
+            { in: "body", key: "role" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).put<GoalFocusResponses, GoalFocusErrors, ThrowOnError>({
+      url: "/session/{sessionID}/goal",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+}
+
 export class History extends HeyApiClient {
   /**
    * List sync events
@@ -9749,6 +10219,11 @@ export class OpencodeClient extends HeyApiClient {
   private _sessionGroup?: SessionGroup
   get sessionGroup(): SessionGroup {
     return (this._sessionGroup ??= new SessionGroup({ client: this.client }))
+  }
+
+  private _goal?: Goal
+  get goal(): Goal {
+    return (this._goal ??= new Goal({ client: this.client }))
   }
 
   private _sync?: Sync

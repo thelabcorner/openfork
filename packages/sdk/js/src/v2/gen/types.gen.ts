@@ -58,6 +58,10 @@ export type Event =
   | EventInstallationUpdated
   | EventInstallationUpdateAvailable
   | EventFileEdited
+  | EventGoalCreated
+  | EventGoalUpdated
+  | EventGoalFocused
+  | EventGoalUnfocused
   | EventReferenceUpdated
   | EventPermissionV2Asked
   | EventPermissionV2Replied
@@ -1300,6 +1304,39 @@ export type GlobalEvent = {
         type: "file.edited"
         properties: {
           file: string
+        }
+      }
+    | {
+        id: string
+        type: "goal.created"
+        properties: {
+          goalID: string
+          info: GoalInfo
+        }
+      }
+    | {
+        id: string
+        type: "goal.updated"
+        properties: {
+          goalID: string
+          info: GoalInfo
+        }
+      }
+    | {
+        id: string
+        type: "goal.focused"
+        properties: {
+          goalID: string
+          sessionID: string
+          role: GoalFocusRole
+        }
+      }
+    | {
+        id: string
+        type: "goal.unfocused"
+        properties: {
+          goalID: string
+          sessionID: string
         }
       }
     | {
@@ -3482,6 +3519,10 @@ export type V2Event =
   | InstallationUpdated
   | InstallationUpdateAvailable
   | FileEdited
+  | GoalCreated
+  | GoalUpdated
+  | GoalFocused
+  | GoalUnfocused
   | ReferenceUpdated
   | PermissionV2Asked
   | PermissionV2Replied
@@ -3704,6 +3745,38 @@ export type RevertState = {
   diff?: string
   files?: Array<FileDiff>
 }
+
+export type GoalStatus = "draft" | "active" | "paused" | "blocked" | "verifying" | "completed" | "cancelled" | "failed"
+
+export type GoalAutomationMode = "manual" | "auto_continue" | "unattended"
+
+export type GoalContinuationPolicy = {
+  mode: GoalAutomationMode
+  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
+export type GoalInfo = {
+  id: string
+  projectID: string
+  workspaceID?: string
+  title: string
+  objective: string
+  constraints: Array<string>
+  status: GoalStatus
+  revision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  continuationPolicy: GoalContinuationPolicy
+  blocker?: string
+  time: {
+    created: number
+    updated: number
+    completed?: number
+  }
+}
+
+export type GoalFocusRole = "owner" | "worker" | "verifier"
 
 export type PermissionV2Source = {
   type: "tool"
@@ -4559,6 +4632,84 @@ export type SessionGroupMember = {
 export type SessionGroupDetail = {
   group: SessionGroupInfo
   sessions: Array<SessionGroupMember>
+}
+
+export type GoalCriterionStatus = "pending" | "passed" | "failed"
+
+export type GoalCriterion = {
+  id: string
+  position: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  description: string
+  status: GoalCriterionStatus
+}
+
+export type GoalStepStatus = "pending" | "active" | "blocked" | "completed" | "cancelled"
+
+export type GoalStep = {
+  id: string
+  position: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  title: string
+  description: string
+  status: GoalStepStatus
+  assignedSessionID?: string
+  attempts: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  time: {
+    started?: number
+    completed?: number
+  }
+}
+
+export type GoalDetail = {
+  goal: GoalInfo
+  criteria: Array<GoalCriterion>
+  steps: Array<GoalStep>
+}
+
+export type GoalEvidence = {
+  id: string
+  goalID: string
+  criterionID?: string
+  stepID?: string
+  type: string
+  sessionID?: string
+  messageID?: string
+  checkpointID?: string
+  path?: string
+  commitSHA?: string
+  summary: string
+  verdict?: string
+  createdAt: number
+}
+
+export type GoalAuditEventType =
+  | "created"
+  | "specification_updated"
+  | "transitioned"
+  | "criterion_updated"
+  | "step_updated"
+  | "evidence_added"
+  | "focused"
+  | "unfocused"
+
+export type GoalAuditActor = "user" | "agent" | "system"
+
+export type GoalAuditEvent = {
+  id: string
+  goalID: string
+  seq: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  type: GoalAuditEventType
+  actor: GoalAuditActor
+  payload: {
+    [key: string]: unknown
+  }
+  createdAt: number
+}
+
+export type GoalFocus = {
+  sessionID: string
+  goalID: string
+  role: GoalFocusRole
+  focusedAt: number
 }
 
 export type WorkspaceEventConnectionStatus = {
@@ -6215,6 +6366,105 @@ export type FileEdited = {
   }
 }
 
+export type GoalContinuationPolicy3 = {
+  mode: GoalAutomationMode
+  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
+  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
+  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
+  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
+}
+
+export type GoalInfo1 = {
+  id: string
+  projectID: string
+  workspaceID?: string
+  title: string
+  objective: string
+  constraints: Array<string>
+  status: GoalStatus
+  revision: number | "NaN" | "Infinity" | "-Infinity"
+  continuationPolicy: GoalContinuationPolicy3
+  blocker?: string
+  time: {
+    created: number
+    updated: number
+    completed?: number
+  }
+}
+
+export type GoalCreated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "goal.created"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    goalID: string
+    info: GoalInfo1
+  }
+}
+
+export type GoalUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "goal.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    goalID: string
+    info: GoalInfo1
+  }
+}
+
+export type GoalFocused = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "goal.focused"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    goalID: string
+    sessionID: string
+    role: GoalFocusRole
+  }
+}
+
+export type GoalUnfocused = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "goal.unfocused"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    goalID: string
+    sessionID: string
+  }
+}
+
 export type ReferenceUpdated = {
   id: string
   metadata?: {
@@ -7694,6 +7944,69 @@ export type EventFileEdited = {
   type: "file.edited"
   properties: {
     file: string
+  }
+}
+
+export type GoalContinuationPolicy4 = {
+  mode: GoalAutomationMode
+  maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
+  maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
+  maxDurationMs?: number | "NaN" | "Infinity" | "-Infinity"
+  tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
+}
+
+export type GoalInfo2 = {
+  id: string
+  projectID: string
+  workspaceID?: string
+  title: string
+  objective: string
+  constraints: Array<string>
+  status: GoalStatus
+  revision: number | "NaN" | "Infinity" | "-Infinity"
+  continuationPolicy: GoalContinuationPolicy4
+  blocker?: string
+  time: {
+    created: number
+    updated: number
+    completed?: number
+  }
+}
+
+export type EventGoalCreated = {
+  id: string
+  type: "goal.created"
+  properties: {
+    goalID: string
+    info: GoalInfo2
+  }
+}
+
+export type EventGoalUpdated = {
+  id: string
+  type: "goal.updated"
+  properties: {
+    goalID: string
+    info: GoalInfo2
+  }
+}
+
+export type EventGoalFocused = {
+  id: string
+  type: "goal.focused"
+  properties: {
+    goalID: string
+    sessionID: string
+    role: GoalFocusRole
+  }
+}
+
+export type EventGoalUnfocused = {
+  id: string
+  type: "goal.unfocused"
+  properties: {
+    goalID: string
+    sessionID: string
   }
 }
 
@@ -13138,6 +13451,558 @@ export type SessionGroupSetPolicyResponses = {
 }
 
 export type SessionGroupSetPolicyResponse = SessionGroupSetPolicyResponses[keyof SessionGroupSetPolicyResponses]
+
+export type GoalListData = {
+  body?: never
+  path?: never
+  query: {
+    projectID: string
+    workspaceID?: string
+  }
+  url: "/goal"
+}
+
+export type GoalListErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalListError = GoalListErrors[keyof GoalListErrors]
+
+export type GoalListResponses = {
+  /**
+   * Goals in project scope
+   */
+  200: Array<GoalInfo>
+}
+
+export type GoalListResponse = GoalListResponses[keyof GoalListResponses]
+
+export type GoalCreateData = {
+  body?: {
+    projectID: string
+    workspaceID?: string
+    title: string
+    objective: string
+    constraints?: Array<string>
+    criteria?: Array<string>
+    steps?: Array<{
+      title: string
+      description?: string
+    }>
+    continuationPolicy?: GoalContinuationPolicy
+  }
+  path?: never
+  query?: never
+  url: "/goal"
+}
+
+export type GoalCreateErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalCreateError = GoalCreateErrors[keyof GoalCreateErrors]
+
+export type GoalCreateResponses = {
+  /**
+   * Created Goal
+   */
+  200: GoalDetail
+}
+
+export type GoalCreateResponse = GoalCreateResponses[keyof GoalCreateResponses]
+
+export type GoalGetData = {
+  body?: never
+  path: {
+    goalID: string
+  }
+  query?: never
+  url: "/goal/{goalID}"
+}
+
+export type GoalGetErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalGetError = GoalGetErrors[keyof GoalGetErrors]
+
+export type GoalGetResponses = {
+  /**
+   * Goal detail
+   */
+  200: GoalDetail
+}
+
+export type GoalGetResponse = GoalGetResponses[keyof GoalGetResponses]
+
+export type GoalUpdateData = {
+  body?: {
+    expectedRevision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    title?: string
+    objective?: string
+    constraints?: Array<string>
+    criteria?: Array<string>
+    steps?: Array<{
+      title: string
+      description?: string
+    }>
+    continuationPolicy?: GoalContinuationPolicy
+  }
+  path: {
+    goalID: string
+  }
+  query?: never
+  url: "/goal/{goalID}"
+}
+
+export type GoalUpdateErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalUpdateError = GoalUpdateErrors[keyof GoalUpdateErrors]
+
+export type GoalUpdateResponses = {
+  /**
+   * Updated Goal
+   */
+  200: GoalDetail
+}
+
+export type GoalUpdateResponse = GoalUpdateResponses[keyof GoalUpdateResponses]
+
+export type GoalTransitionData = {
+  body?: {
+    expectedRevision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    action:
+      | "start"
+      | "pause"
+      | "resume"
+      | "block"
+      | "request_verification"
+      | "verification_pass"
+      | "verification_fail"
+      | "cancel"
+      | "fail"
+    blocker?: string
+  }
+  path: {
+    goalID: string
+  }
+  query?: never
+  url: "/goal/{goalID}/transition"
+}
+
+export type GoalTransitionErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalTransitionError = GoalTransitionErrors[keyof GoalTransitionErrors]
+
+export type GoalTransitionResponses = {
+  /**
+   * Transitioned Goal
+   */
+  200: GoalDetail
+}
+
+export type GoalTransitionResponse = GoalTransitionResponses[keyof GoalTransitionResponses]
+
+export type GoalCriterionData = {
+  body?: {
+    expectedRevision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    status: GoalCriterionStatus
+  }
+  path: {
+    goalID: string
+    criterionID: string
+  }
+  query?: never
+  url: "/goal/{goalID}/criterion/{criterionID}"
+}
+
+export type GoalCriterionErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalCriterionError = GoalCriterionErrors[keyof GoalCriterionErrors]
+
+export type GoalCriterionResponses = {
+  /**
+   * Updated acceptance criterion
+   */
+  200: GoalDetail
+}
+
+export type GoalCriterionResponse = GoalCriterionResponses[keyof GoalCriterionResponses]
+
+export type GoalStepData = {
+  body?: {
+    expectedRevision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    status?: GoalStepStatus
+    assignedSessionID?: string
+  }
+  path: {
+    goalID: string
+    stepID: string
+  }
+  query?: never
+  url: "/goal/{goalID}/step/{stepID}"
+}
+
+export type GoalStepErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalStepError = GoalStepErrors[keyof GoalStepErrors]
+
+export type GoalStepResponses = {
+  /**
+   * Updated Goal step
+   */
+  200: GoalDetail
+}
+
+export type GoalStepResponse = GoalStepResponses[keyof GoalStepResponses]
+
+export type GoalEvidenceData = {
+  body?: never
+  path: {
+    goalID: string
+  }
+  query?: never
+  url: "/goal/{goalID}/evidence"
+}
+
+export type GoalEvidenceErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalEvidenceError = GoalEvidenceErrors[keyof GoalEvidenceErrors]
+
+export type GoalEvidenceResponses = {
+  /**
+   * Goal evidence
+   */
+  200: Array<GoalEvidence>
+}
+
+export type GoalEvidenceResponse = GoalEvidenceResponses[keyof GoalEvidenceResponses]
+
+export type GoalAddEvidenceData = {
+  body?: {
+    expectedRevision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    criterionID?: string
+    stepID?: string
+    type: string
+    sessionID?: string
+    messageID?: string
+    checkpointID?: string
+    path?: string
+    commitSHA?: string
+    summary: string
+    verdict?: string
+  }
+  path: {
+    goalID: string
+  }
+  query?: never
+  url: "/goal/{goalID}/evidence"
+}
+
+export type GoalAddEvidenceErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalAddEvidenceError = GoalAddEvidenceErrors[keyof GoalAddEvidenceErrors]
+
+export type GoalAddEvidenceResponses = {
+  /**
+   * Added Goal evidence
+   */
+  200: GoalEvidence
+}
+
+export type GoalAddEvidenceResponse = GoalAddEvidenceResponses[keyof GoalAddEvidenceResponses]
+
+export type GoalAuditData = {
+  body?: never
+  path: {
+    goalID: string
+  }
+  query?: never
+  url: "/goal/{goalID}/audit"
+}
+
+export type GoalAuditErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalAuditError = GoalAuditErrors[keyof GoalAuditErrors]
+
+export type GoalAuditResponses = {
+  /**
+   * Goal audit history
+   */
+  200: Array<GoalAuditEvent>
+}
+
+export type GoalAuditResponse = GoalAuditResponses[keyof GoalAuditResponses]
+
+export type GoalFocusesData = {
+  body?: never
+  path: {
+    goalID: string
+  }
+  query?: never
+  url: "/goal/{goalID}/focus"
+}
+
+export type GoalFocusesErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalFocusesError = GoalFocusesErrors[keyof GoalFocusesErrors]
+
+export type GoalFocusesResponses = {
+  /**
+   * Sessions focused on Goal
+   */
+  200: Array<GoalFocus>
+}
+
+export type GoalFocusesResponse = GoalFocusesResponses[keyof GoalFocusesResponses]
+
+export type GoalUnfocusData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/goal"
+}
+
+export type GoalUnfocusErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalUnfocusError = GoalUnfocusErrors[keyof GoalUnfocusErrors]
+
+export type GoalUnfocusResponses = {
+  /**
+   * Removed Goal focus
+   */
+  204: void
+}
+
+export type GoalUnfocusResponse = GoalUnfocusResponses[keyof GoalUnfocusResponses]
+
+export type GoalFocusedData = {
+  body?: never
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/goal"
+}
+
+export type GoalFocusedErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalFocusedError = GoalFocusedErrors[keyof GoalFocusedErrors]
+
+export type GoalFocusedResponses = {
+  /**
+   * Focused Goal
+   */
+  200: {
+    focus: GoalFocus
+    detail: GoalDetail
+  }
+}
+
+export type GoalFocusedResponse = GoalFocusedResponses[keyof GoalFocusedResponses]
+
+export type GoalFocusData = {
+  body?: {
+    goalID: string
+    role?: GoalFocusRole
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/goal"
+}
+
+export type GoalFocusErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalFocusError = GoalFocusErrors[keyof GoalFocusErrors]
+
+export type GoalFocusResponses = {
+  /**
+   * Focused Goal
+   */
+  200: GoalFocus
+}
+
+export type GoalFocusResponse = GoalFocusResponses[keyof GoalFocusResponses]
 
 export type SyncStartData = {
   body?: never
