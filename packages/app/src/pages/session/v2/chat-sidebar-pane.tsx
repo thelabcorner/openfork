@@ -44,9 +44,11 @@ import {
 import type { HomeSessionRecord, OpenSessionOptions } from "@/pages/home/home-sessions-controller"
 import { getRelativeTime } from "@/utils/time"
 import { useProviders } from "@/hooks/use-providers"
-import { useSessionGroups, type SessionGroupEntry } from "@/context/session-groups"
+import { useSessionGroups } from "@/context/session-groups"
 import { sessionTitle } from "@/utils/session-title"
 import { pathKey } from "@/utils/path-key"
+import { createRequestGate } from "@/utils/request-gate"
+import { buildChatSidebarSessionTreeRows } from "./chat-sidebar-session-tree"
 import {
   compareSessionTime,
   getProjectAvatarSource,
@@ -70,7 +72,8 @@ import {
   CHAT_SIDEBAR_RECENT_LIMIT_MIN,
   type ChatSidebarPaneState,
 } from "./chat-sidebar-pane-state"
-import { chatsRoot } from "@opencode-ai/core/project/chat-paths"
+import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
+import { findChatProject, isChatProjectAlias, isReservedChatProjectPath } from "@/utils/chat-project"
 import type { AssistantMessage, Session } from "@opencode-ai/sdk/v2/client"
 
 type ProviderList = ReturnType<ReturnType<typeof useProviders>["all"]> extends Map<string, infer P> ? P[] : never
@@ -242,7 +245,20 @@ export function ChatSidebarPane(props: {
   // computed once per run and shared by both the recent merge and the project
   // group — previously the worktree slice was filtered + sorted a second time.
   const baseGroups = createMemo(() => {
-    const projects = layout.projects.list()
+    const opened = layout.projects.list()
+    const canonicalChat = findChatProject(serverSync().data.project)
+    const projects: LocalProject[] = canonicalChat
+      ? [
+          {
+            ...(opened.find((project) => isChatProjectAlias(project, canonicalChat)) ?? {}),
+            ...canonicalChat,
+            name: canonicalChat.name ?? CHAT_PROJECT_NAME,
+            worktree: canonicalChat.worktree,
+            expanded: true,
+          },
+          ...opened.filter((project) => !isChatProjectAlias(project, canonicalChat)),
+        ]
+      : opened.filter((project) => project.id !== "chats" && !isReservedChatProjectPath(project.worktree))
     const now = Date.now()
     const slices = new Map<string, Session[]>()
     const sliceOf = (dir: string) => {
@@ -267,8 +283,44 @@ export function ChatSidebarPane(props: {
       for (const dir of [project.worktree, ...(project.sandboxes ?? [])]) recentPool.push(...sliceOf(dir))
     }
     const projectRows = new Map<string, Session[]>()
-    for (const project of projects) projectRows.set(project.worktree, sliceOf(project.worktree))
+    for (const project of projects) {
+      const rows = [project.worktree, ...(project.sandboxes ?? [])].flatMap((dir) => sliceOf(dir))
+      projectRows.set(project.worktree, rows.sort(compareSessionTime))
+    }
     return { projects, recentPool: [...recentPool].sort(compareSessionTime), projectRows }
+  })
+
+  // Root-session queries are intentionally cheap. Anchored structural groups
+  // (native subagents and plugin-owned worker trees) are the explicit signal
+  // that missing member info is useful in navigation, so hydrate only the small
+  // amount of missing Session *info* for groups whose anchor is visible. `resolve` does not
+  // fetch message history, and the gate prevents a restored workspace with many
+  // historical subagents from turning one render into a request burst.
+  const treeInfoGate = createRequestGate(4)
+  const treeInfoPending = new Set<string>()
+  const treeInfoFailedAt = new Map<string, number>()
+  createEffect(() => {
+    const visibleRoots = new Set(baseGroups().recentPool.map((session) => session.id))
+    for (const group of sessionGroups.list()) {
+      if (
+        (group.kind !== "subagent" && group.kind !== "plugin") ||
+        !group.anchorSessionID ||
+        !visibleRoots.has(group.anchorSessionID)
+      )
+        continue
+      for (const member of group.sessions) {
+        if (serverSync().session.peek(member.id) || treeInfoPending.has(member.id)) continue
+        const failedAt = treeInfoFailedAt.get(member.id)
+        if (failedAt !== undefined && Date.now() - failedAt < 30_000) continue
+        treeInfoPending.add(member.id)
+        void treeInfoGate(() => serverSync().session.resolve(member.id))
+          .then(
+            () => treeInfoFailedAt.delete(member.id),
+            () => treeInfoFailedAt.set(member.id, Date.now()),
+          )
+          .finally(() => treeInfoPending.delete(member.id))
+      }
+    }
   })
 
   // Stage 2 — pinning + assembly. The only stage that reads working state, so
@@ -307,23 +359,6 @@ export function ChatSidebarPane(props: {
       })
     }
 
-    // Dedicated Chats group — sessions with the dummy "chats" project.
-    const chatRoot = chatsRoot()
-    const chatRows = pinWorkingFirst(projectRows.get(chatRoot) ?? [])
-    const chatProject = projects.find((p) => p.id === "chats" || p.worktree === chatRoot)
-    if (chatProject || chatRows.length > 0) {
-      const [store] = serverSync().child(chatRoot, { bootstrap: false })
-      result.push({
-        key: "chats",
-        label: language.t("chats.title"),
-        directory: chatRoot,
-        project: chatProject
-          ? ((chatRows[0] ? projectForSession(chatRows[0], projects) : undefined) ?? chatProject)
-          : undefined,
-        sessions: chatRows,
-        total: store.sessionTotal > 0 ? store.sessionTotal : chatRows.length,
-      })
-    }
     return result
   })
 
@@ -355,26 +390,12 @@ export function ChatSidebarPane(props: {
     })
   })
 
-  type SessionTreeRow = { session: Session; group?: SessionGroupEntry; first?: boolean }
-  const sessionTreeRows = (rows: Session[]): SessionTreeRow[] => {
-    const ids = new Set(rows.map((session) => session.id))
-    const memberships = sessionGroups
-      .list()
-      .filter((group) => group.sessions.some((member) => ids.has(member.id)))
-      .sort((a, b) => a.position - b.position)
-    const result: SessionTreeRow[] = []
-    const grouped = new Set<string>()
-    for (const group of memberships) {
-      const members = rows.filter((session) => group.sessions.some((member) => member.id === session.id))
-      if (members.length === 0) continue
-      for (const session of members) {
-        grouped.add(session.id)
-        result.push({ session, group, first: session.id === members[0]?.id })
-      }
-    }
-    for (const session of rows) if (!grouped.has(session.id)) result.push({ session })
-    return result
-  }
+  const sessionTreeRows = (rows: Session[]) =>
+    buildChatSidebarSessionTreeRows({
+      roots: rows,
+      groups: sessionGroups.list(),
+      sessionByID: (sessionID) => serverSync().session.peek(sessionID),
+    })
 
   // Footer counts server-known roots per directory (sessionTotal estimates),
   // not loaded rows — loaded rows are capped per store and would undercount.
@@ -384,10 +405,22 @@ export function ChatSidebarPane(props: {
 
   const workingCount = createMemo(() => {
     const seen = new Set<string>()
+    const visibleRoots = new Set(baseGroups().recentPool.map((session) => session.id))
     for (const group of groups()) {
       for (const session of group.sessions) {
         if (isWorking(session)) seen.add(session.id)
       }
+    }
+    // Structural members may be absent from the loaded root slices. Once their
+    // anchor is part of this pane, include their work state in the global badge.
+    for (const group of sessionGroups.list()) {
+      if (
+        (group.kind !== "subagent" && group.kind !== "plugin") ||
+        !group.anchorSessionID ||
+        !visibleRoots.has(group.anchorSessionID)
+      )
+        continue
+      for (const member of group.sessions) if (isWorking(member)) seen.add(member.id)
     }
     return seen.size
   })
@@ -435,12 +468,17 @@ export function ChatSidebarPane(props: {
     const id = params.id
     if (!id || revealedFor === id) return
     const current = stableGroups()
+    const memberships = sessionGroups.list().filter((group) => group.sessionIds.includes(id))
+    const membership = memberships.find((group) => !!group.anchorSessionID) ?? memberships[0]
+    const anchorID = membership?.anchorSessionID
     const target =
-      current.find((group) => group.sessions.some((session) => session.id === id))?.key ??
+      current.find((group) => group.sessions.some((session) => session.id === id || session.id === anchorID))?.key ??
       current.find((group) => group.directory && base64Encode(group.directory) === params.dir)?.key
     if (!target) return
     revealedFor = id
     props.state.revealGroup(target)
+    if (anchorID) props.state.revealGroup(`session-tree:${anchorID}`)
+    else if (membership) props.state.revealGroup(`session-group:${membership.id}`)
   })
 
   const resizePair = createMemo(() => {
@@ -971,48 +1009,81 @@ export function ChatSidebarPane(props: {
                         {(item) => {
                           const session = () => item.session
                           const groupEntry = () => item.group
-                          const collapseKey = () => (groupEntry() ? `session-group:${groupEntry()!.id}` : "")
+                          const collapseKey = () => item.treeKey ?? (groupEntry() ? `session-group:${groupEntry()!.id}` : "")
+                          const isStructuralTree = () => !!item.treeKey
+                          const isStructuralAnchor = () => !!item.first && isStructuralTree()
                           const working = () => !!groupEntry()?.sessions.some((member) => isWorking(member))
                           const locked = () => !!groupEntry()?.sessions.some((member) => member.locked)
+                          const visibleCount = () => item.visibleCount ?? groupEntry()?.sessions.length ?? 0
                           return (
                             <>
-                              <Show when={item.first && groupEntry()}>
+                              {/* Anchored subagent/plugin groups are structural
+                                  lineage, not a second folder above the parent. Their
+                                  anchor row owns disclosure directly. This
+                                  removes the duplicate "group title → same
+                                  session title" layer and leaves the useful
+                                  parent → indented-child hierarchy intact. */}
+                              <Show when={item.first && groupEntry() && !isStructuralTree()}>
                                 {(entry) => (
                                   <button
                                     type="button"
-                                    class="ms-2 flex h-7 items-center gap-1.5 rounded-md px-2 text-start text-[10px] text-v2-text-text-muted hover:bg-v2-background-bg-layer-01 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
+                                    class="group/session-collection flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-start text-[10px] text-v2-text-text-muted transition-colors hover:bg-v2-background-bg-layer-01 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
                                     aria-expanded={isExpanded(collapseKey())}
-                                    aria-label={`${entry().name}, ${entry().sessions.length} sessions`}
+                                    aria-label={`${entry().name}, ${visibleCount()} sessions`}
                                     onClick={() => toggleExpanded(collapseKey())}
                                   >
-                                    <span
+                                    <IconV2
+                                      name="chevron-down"
+                                      size="small"
                                       aria-hidden="true"
-                                      class={`transition-transform ${isExpanded(collapseKey()) ? "" : "-rotate-90"}`}
-                                    >
-                                      ⌄
+                                      class={`size-3 shrink-0 text-v2-icon-icon-muted transition-transform duration-150 ${isExpanded(collapseKey()) ? "" : "-rotate-90"}`}
+                                    />
+                                    <IconV2 name="layers" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted opacity-70" />
+                                    <span class="min-w-0 flex-1 truncate font-[560] text-v2-text-text-muted transition-colors group-hover/session-collection:text-v2-text-text-base">
+                                      {entry().name}
                                     </span>
-                                    <span class="min-w-0 flex-1 truncate font-[560]">{entry().name}</span>
                                     <Show when={working()}>
-                                      <span class="shrink-0" aria-label={language.t("sessionGroup.working")}>
-                                        ●
+                                      <span
+                                        class="flex size-3 shrink-0 items-center justify-center"
+                                        aria-label={language.t("sessionGroup.working")}
+                                      >
+                                        <span class="size-1.5 animate-pulse rounded-full bg-v2-state-fg-success" />
                                       </span>
                                     </Show>
                                     <Show when={locked()}>
-                                      <span class="shrink-0" aria-label={language.t("sessionGroup.locked")}>
-                                        🔒
+                                      <span
+                                        class="flex size-4 shrink-0 items-center justify-center rounded-[4px] bg-v2-background-bg-layer-02 text-v2-icon-icon-muted"
+                                        aria-label={language.t("sessionGroup.locked")}
+                                      >
+                                        <IconV2 name="shield" size="small" class="size-2.5" />
                                       </span>
                                     </Show>
                                     <span class="shrink-0 tabular-nums text-v2-text-text-faint">
-                                      {entry().sessions.length}
+                                      {visibleCount()}
                                     </span>
                                   </button>
                                 )}
                               </Show>
-                              <Show when={!groupEntry() || isExpanded(collapseKey())}>
+                              <Show
+                                when={
+                                  !groupEntry() ||
+                                  (isStructuralTree()
+                                    ? isStructuralAnchor() || isExpanded(collapseKey())
+                                    : isExpanded(collapseKey()))
+                                }
+                              >
                                 <ChatRow
                                   session={session()}
                                   directory={group.directory}
                                   inGroupId={groupEntry()?.id}
+                                  depth={item.depth}
+                                  treeExpanded={isStructuralAnchor() ? isExpanded(collapseKey()) : undefined}
+                                  treeCount={isStructuralAnchor() ? visibleCount() : undefined}
+                                  onToggleTree={
+                                    isStructuralAnchor()
+                                      ? () => toggleExpanded(collapseKey())
+                                      : undefined
+                                  }
                                   selected={activeSessionId() === session().id}
                                   now={now}
                                   minuteNow={minuteNow}
@@ -1441,6 +1512,10 @@ function ChatRow(props: {
   session: Session
   directory: string
   inGroupId?: string
+  depth?: number
+  treeExpanded?: boolean
+  treeCount?: number
+  onToggleTree?: () => void
   selected?: boolean
   now: () => number
   minuteNow: () => number
@@ -1465,7 +1540,10 @@ function ChatRow(props: {
   const platform = usePlatform()
 
   const title = () => sessionTitle(props.session.title)
-  const currentDir = props.directory || props.session.directory || ""
+  // A group may legitimately contain sessions from more than one project.
+  // Always route/actions against the member's own directory; the containing
+  // project group is only a fallback for legacy rows that lack one.
+  const currentDir = props.session.directory || props.directory || ""
   const sessionData = () => serverSync().session.data
   const isWorking = createMemo(() => sessionData().session_working(props.session.id))
   const unseenCount = createMemo(() => notification.session.unseenCount(props.session.id))
@@ -1480,6 +1558,7 @@ function ChatRow(props: {
   const hasPermissions = createMemo(() => pendingPermissions().length > 0)
   const hasQuestions = createMemo(() => pendingQuestions().length > 0)
   const needsAttention = createMemo(() => hasPermissions() || hasQuestions())
+  const hasTreeDisclosure = createMemo(() => props.treeExpanded !== undefined && !!props.onToggleTree)
   const isAutoAccepting = createMemo(() => {
     try {
       return permissionState().isAutoAccepting(props.session.id, currentDir)
@@ -1711,7 +1790,20 @@ function ChatRow(props: {
         <div
           ref={rowEl}
           class="group/session relative min-w-0 rounded-md transition-colors hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 has-[data-selected]:bg-v2-background-bg-layer-02 [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
+          style={{ "margin-inline-start": `${Math.min(Math.max(props.depth ?? 0, 0), 8) * 14}px` }}
         >
+          <Show when={(props.depth ?? 0) > 0}>
+            <span
+              aria-hidden="true"
+              class="pointer-events-none absolute inset-y-0 w-px bg-v2-border-border-muted opacity-60"
+              style={{ "inset-inline-start": "-6px" }}
+            />
+            <span
+              aria-hidden="true"
+              class="pointer-events-none absolute top-[15px] h-px w-[6px] bg-v2-border-border-muted opacity-60"
+              style={{ "inset-inline-start": "-6px" }}
+            />
+          </Show>
           <A
             href={`/${slug()}/session/${props.session.id}`}
             class="relative flex min-w-0 flex-col gap-[3px] rounded-md py-[5px] pe-1.5 ps-2 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[5px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:content-[''] data-[selected]:text-v2-text-text-base data-[selected]:before:absolute data-[selected]:before:inset-y-[5px] data-[selected]:before:start-0 data-[selected]:before:w-[2px] data-[selected]:before:rounded-full data-[selected]:before:bg-v2-background-bg-accent data-[selected]:before:content-['']"
@@ -1727,18 +1819,78 @@ function ChatRow(props: {
             {/* Line 1 — status, title, attention, hover actions */}
             <div class="flex min-w-0 items-center gap-1.5">
               <span class="flex size-3 shrink-0 items-center justify-center">
-                <Show
-                  when={props.pending}
-                  fallback={
-                    <Show
-                      when={isWorking()}
-                      fallback={
-                        <Show
-                          when={needsAttention() || hasError() || unseenCount() > 0}
-                          fallback={
-                            <span class="size-1.5 rounded-full border border-v2-border-border-strong group-hover/session:border-v2-icon-icon-muted" />
-                          }
-                        >
+                <Show when={hasTreeDisclosure()} fallback={
+                  <Show
+                    when={props.pending}
+                    fallback={
+                      <Show
+                        when={isWorking()}
+                        fallback={
+                          <Show
+                            when={needsAttention() || hasError() || unseenCount() > 0}
+                            fallback={
+                              <span class="size-1.5 rounded-full border border-v2-border-border-strong group-hover/session:border-v2-icon-icon-muted" />
+                            }
+                          >
+                            <span
+                              class={`size-1.5 rounded-full ${
+                                hasError()
+                                  ? "bg-v2-state-fg-danger"
+                                  : needsAttention()
+                                    ? "bg-v2-state-fg-warning"
+                                    : "bg-v2-background-bg-accent"
+                              }`}
+                            />
+                          </Show>
+                        }
+                      >
+                        <Spinner class="size-3 text-v2-icon-icon-base" />
+                      </Show>
+                    }
+                  >
+                    <LoaderV2 class="size-3" aria-hidden="true" />
+                  </Show>
+                }>
+                  <button
+                    type="button"
+                    class="flex size-4 -m-0.5 items-center justify-center rounded-[4px] text-v2-icon-icon-muted transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-icon-icon-base focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
+                    aria-expanded={props.treeExpanded}
+                    aria-label={props.treeExpanded ? language.t("home.server.collapse") : language.t("home.server.expand")}
+                    onClick={(event) => {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      props.onToggleTree?.()
+                    }}
+                  >
+                    <IconV2
+                      name="chevron-down"
+                      size="small"
+                      class={`size-3 transition-transform duration-150 ${props.treeExpanded ? "" : "-rotate-90"}`}
+                    />
+                  </button>
+                </Show>
+              </span>
+
+              <span class="min-w-0 flex-1 truncate text-[12px] leading-[16px]">{title()}</span>
+
+              <Show when={hasTreeDisclosure() && (props.treeCount ?? 0) > 1}>
+                <span
+                  aria-label={language.plural("sessionGroup.sessions", Math.max((props.treeCount ?? 1) - 1, 0))}
+                  class="flex shrink-0 items-center gap-0.5 rounded-[4px] bg-v2-background-bg-layer-02 px-1 py-[1px] text-[9px] font-[520] leading-none tabular-nums text-v2-text-text-faint"
+                >
+                  <IconV2 name="branch" size="small" class="size-2.5 opacity-70" />
+                  {Math.max((props.treeCount ?? 1) - 1, 0)}
+                </span>
+              </Show>
+
+              <Show when={hasTreeDisclosure() && (props.pending || isWorking() || needsAttention() || hasError() || unseenCount() > 0)}>
+                <span class="flex size-2.5 shrink-0 items-center justify-center" aria-hidden="true">
+                  <Show
+                    when={props.pending}
+                    fallback={
+                      <Show
+                        when={isWorking()}
+                        fallback={
                           <span
                             class={`size-1.5 rounded-full ${
                               hasError()
@@ -1748,18 +1900,16 @@ function ChatRow(props: {
                                   : "bg-v2-background-bg-accent"
                             }`}
                           />
-                        </Show>
-                      }
-                    >
-                      <Spinner class="size-3 text-v2-icon-icon-base" />
-                    </Show>
-                  }
-                >
-                  <LoaderV2 class="size-3" aria-hidden="true" />
-                </Show>
-              </span>
-
-              <span class="min-w-0 flex-1 truncate text-[12px] leading-[16px]">{title()}</span>
+                        }
+                      >
+                        <Spinner class="size-2.5 text-v2-icon-icon-base" />
+                      </Show>
+                    }
+                  >
+                    <LoaderV2 class="size-2.5" />
+                  </Show>
+                </span>
+              </Show>
 
               <Show when={hasPermissions()}>
                 <TooltipV2 value={language.t("chats.badge.permission")} placement="top">

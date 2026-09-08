@@ -16,7 +16,8 @@ import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
 import { sessionApiOf } from "./titlebar-tab-actions"
 import { tabSessionState } from "./titlebar-tab-state"
 import { useSessionGroups } from "@/context/session-groups"
-import { TabPreviewPopover, type TabPreviewData } from "./titlebar-tab-popover"
+import { TabPreviewPopover, type TabPreviewGroupSession } from "./titlebar-tab-popover"
+import { groupedSessionsForTabPreview } from "./titlebar-tab-group-preview"
 import "./titlebar-tab-nav.css"
 
 // MouseEvent.button uses 1 for the middle/wheel button.
@@ -59,12 +60,7 @@ export function TabNavItem(props: {
     if (conn) return global.ensureServerCtx(conn)
   })
   const sessionID = createMemo(() => props.session()?.id)
-  const groupSessions = createMemo(() => {
-    const id = sessionID()
-    if (!id) return undefined
-    const group = sessionGroups.groupForSession(id)
-    return group?.sessions.map((session) => ({ title: session.title }))
-  })
+  const groupSessions = createMemo(() => groupedSessionsForTabPreview(sessionGroups.list(), sessionID()))
   // Derivation lives in titlebar-tab-state: working from session_working(id),
   // paused from the session_paused sidecar (never from !session_working — the
   // interrupt-cleanup window would flicker paused -> working -> paused).
@@ -388,6 +384,8 @@ export function TabNavItem(props: {
         serverName: serverLabel(),
         groupSessions: groupSessions(),
       }}
+      server={props.server}
+      currentSessionID={sessionID()}
     />
   )
 }
@@ -495,8 +493,8 @@ export function GroupTabNavItem(props: {
   href: string
   tab: GroupTab
   title: string
-  sessionCount: number
-  sessions?: { title: string; project?: string }[]
+  sessionCount?: number
+  sessions?: TabPreviewGroupSession[]
   onClose: () => void
   onNavigate: () => void
   active?: boolean
@@ -569,9 +567,11 @@ export function GroupTabNavItem(props: {
         >
           {props.title}
         </span>
-        <span class="rounded-full bg-v2-background-bg-layer-03 px-1.5 py-px text-[10px] text-v2-text-text-faint">
-          {props.sessionCount}
-        </span>
+        <Show when={props.sessionCount !== undefined}>
+          <span class="rounded-full bg-v2-background-bg-layer-03 px-1.5 py-px text-[10px] text-v2-text-text-faint">
+            {props.sessionCount}
+          </span>
+        </Show>
       </a>
       <div data-slot="tab-close">
         <IconButtonV2
@@ -606,6 +606,7 @@ export function GroupTabNavItem(props: {
         title: props.title,
         groupSessions: props.sessions,
       }}
+      server={props.tab.server}
     />
   )
 }

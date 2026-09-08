@@ -1,7 +1,7 @@
 export * as SessionV2 from "./session"
 export * from "./session/schema"
 
-import { DateTime, Effect, Layer, Schema, Context, Stream } from "effect"
+import { DateTime, Effect, Layer, Schema, Context, Scope, Stream } from "effect"
 import { ListAnchor } from "@opencode-ai/schema/session"
 import { and, asc, desc, eq, gt, isNotNull, isNull, like, lt, or, type SQL } from "drizzle-orm"
 import { ProjectV2 } from "./project"
@@ -210,6 +210,7 @@ const layer = Layer.effect(
     const execution = yield* SessionExecution.Service
     const store = yield* SessionStore.Service
     const locations = yield* LocationServiceMap.Service
+    const scope = yield* Scope.Scope
     const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
     const isDurableSessionEvent = Schema.is(SessionEvent.Durable)
     const decode = (row: typeof SessionMessageTable.$inferSelect) =>
@@ -534,11 +535,19 @@ const layer = Layer.effect(
       ),
       regenerateTitle: Effect.fn("V2Session.regenerateTitle")(function* (input) {
         const session = yield* result.get(input.sessionID)
-        // SessionTitle is Location-scoped; provide the session's Location services
-        // per call (same pattern as revert.stage).
+        // Keep the entire Location-provided effect alive inside the global
+        // Session service scope. Forking from inside SessionTitle itself would
+        // let this provider scope close before the title request completes.
         yield* SessionTitle.Service.use((title) =>
           title.regenerate({ session, prompt: input.prompt, model: input.model }),
-        ).pipe(Effect.provide(locations.get(session.location)))
+        ).pipe(
+          Effect.provide(locations.get(session.location)),
+          Effect.catch((error) =>
+            Effect.logError("Failed to regenerate session title", { sessionID: session.id, error }),
+          ),
+          Effect.forkIn(scope, { startImmediately: true }),
+          Effect.asVoid,
+        )
       }),
       revert: {
         stage: Effect.fn("V2Session.revert.stage")(function* (input) {

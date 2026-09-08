@@ -10,12 +10,14 @@ import { arrayMove } from "@dnd-kit/helpers"
 import { tabHref, tabKey, type GroupTab, type SessionTab, type Tab } from "@/context/tabs"
 import { ServerConnection } from "@/context/server"
 import { DraftTabItem, GroupTabNavItem, TabNavItem } from "@/components/titlebar-tab-nav"
+import type { TabPreviewGroupSession } from "@/components/titlebar-tab-popover"
 import { TitlebarTabContextMenu } from "@/components/titlebar-tab-context-menu"
 import { useGlobal, type ServerCtx } from "@/context/global"
 import { useLanguage } from "@/context/language"
 import { useCommand } from "@/context/command"
 import { useTabs } from "@/context/tabs"
 import { showToast } from "@/utils/toast"
+import { useSessionGroups } from "@/context/session-groups"
 import { canStartTabDrag, isTabActionTarget } from "./titlebar-tab-gesture"
 import { adjacentTabKey, mergeVisibleTabOrder } from "./titlebar-tab-order"
 import type { Session } from "@opencode-ai/sdk/v2"
@@ -228,8 +230,8 @@ function GroupTabSlot(props: {
   active: () => boolean
   pending: boolean
   title: string
-  sessionCount: number
-  sessions?: { title: string; project?: string }[]
+  sessionCount?: number
+  sessions?: TabPreviewGroupSession[]
   onNavigate: (element: HTMLDivElement) => void
   onClose: () => void
 }) {
@@ -285,14 +287,22 @@ function GroupTabEntry(props: {
 }) {
   const tabs = useTabs()
   const language = useLanguage()
+  const sessionGroups = useSessionGroups()
+
+  const group = createMemo(() => sessionGroups.byID(props.tab.groupId))
 
   const title = createMemo(() => {
     const key = tabKey(props.tab)
-    return tabs.info[key]?.title ?? language.t("sessionGroup.name.placeholder")
+    return group()?.name ?? tabs.info[key]?.title ?? language.t("sessionGroup.name.placeholder")
   })
 
-  const sessionCount = createMemo(() => 0)
-  const sessions = createMemo(() => undefined as { title: string; project?: string }[] | undefined)
+  const sessions = createMemo<TabPreviewGroupSession[] | undefined>(() =>
+    group()?.sessions.map((session) => ({ id: session.id, title: session.title })),
+  )
+  // Membership-empty groups are invalid at the data layer. An unresolved group
+  // tab is therefore loading, not a real "0 sessions" group; keep the count
+  // absent until detail hydration completes instead of flashing misleading 0.
+  const sessionCount = createMemo(() => sessions()?.length)
 
   createEffect(() => props.onVisibleChange(true))
 
@@ -466,7 +476,6 @@ export function TitlebarTabStrip(props: {
                 const visibleIndex = () => visibleIndexMap().get(id) ?? -1
                 const pending = () => props.pendingTabKey?.() === id
                 const serverCtx = createMemo(() => {
-                  if (tab.type !== "session") return
                   const conn = global.servers.list().find((item) => ServerConnection.key(item) === tab.server)
                   if (conn) return global.ensureServerCtx(conn)
                 })

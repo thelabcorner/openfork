@@ -19,6 +19,7 @@ export function TitlebarTabContextMenu(
     isGroup?: boolean
     groupId?: string
     groupName?: string
+    onOpenChange?: (open: boolean) => void
   }>,
 ) {
   const navigate = useNavigate()
@@ -32,6 +33,7 @@ export function TitlebarTabContextMenu(
       tabId={props.id}
       session={props.session?.()}
       server={props.server}
+      onOpenChange={props.onOpenChange}
       isGroup={props.isGroup}
       groupId={props.groupId}
       onNewSessionInProject={() => {

@@ -4,7 +4,7 @@ import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionGroupMemberTable, SessionGroupTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionGroup } from "@opencode-ai/schema/session-group"
 import { DateTime } from "effect"
-import { and, asc, eq, ne, sql } from "drizzle-orm"
+import { and, asc, eq, isNull, ne, sql } from "drizzle-orm"
 import { Effect, Layer, Context, Schema, Types } from "effect"
 import { NotFoundError } from "@/storage/storage"
 import { SessionID } from "@/session/schema"
@@ -68,6 +68,8 @@ export interface Interface {
   readonly reorder: (input: { id: ID; position: number }) => Effect.Effect<void, NotFoundError>
   readonly addSession: (input: AddSessionInput) => Effect.Effect<void, NotFoundError>
   readonly removeSession: (input: RemoveSessionInput) => Effect.Effect<void, MembershipError>
+  /** Internal lifecycle hook: detach a session that is being permanently deleted. */
+  readonly detachDeletedSession: (sessionId: string) => Effect.Effect<void>
   readonly membershipsFor: (sessionId: string) => Effect.Effect<Detail[]>
   readonly getWithSessions: (id: ID) => Effect.Effect<Detail, NotFoundError>
   readonly setPolicy: (input: { id: ID; policy: GroupPolicy }) => Effect.Effect<void, NotFoundError>
@@ -80,6 +82,7 @@ interface CreateInput {
   kind?: SessionGroup.Kind
   anchorSessionId?: string
   ownerPlugin?: string
+  ownerRef?: string
   policy?: GroupPolicy
 }
 
@@ -126,7 +129,17 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
       const now = Date.now()
       if (listCache && now - listCache.at < LIST_TTL) return listCache.value
       const read = (backfill: Database.DatabaseShape) =>
-        backfill.select().from(SessionGroupTable).orderBy(asc(SessionGroupTable.position)).all()
+        backfill
+          .select()
+          .from(SessionGroupTable)
+          .where(
+            sql`EXISTS (
+              SELECT 1 FROM ${SessionGroupMemberTable}
+              WHERE ${SessionGroupMemberTable.group_id} = ${SessionGroupTable.id}
+            )`,
+          )
+          .orderBy(asc(SessionGroupTable.position))
+          .all()
       const rows = yield* (filename === ":memory:" ? read(database.db) : Database.withBackfillDb(filename, read)).pipe(
         Effect.orDie,
       )
@@ -143,6 +156,12 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
           const groupRows = yield* backfill
             .select()
             .from(SessionGroupTable)
+            .where(
+              sql`EXISTS (
+                SELECT 1 FROM ${SessionGroupMemberTable}
+                WHERE ${SessionGroupMemberTable.group_id} = ${SessionGroupTable.id}
+              )`,
+            )
             .orderBy(asc(SessionGroupTable.position))
             .all()
           const memberRows = yield* backfill
@@ -178,6 +197,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         position: now,
         kind: input.kind ?? "user",
         owner_plugin: input.ownerPlugin,
+        owner_ref: input.ownerRef,
         anchor_session_id: input.anchorSessionId ? SessionID.make(input.anchorSessionId) : null,
         policy: input.policy,
         time_created: now,
@@ -191,6 +211,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         position: row.position,
         kind: row.kind ?? "user",
         owner_plugin: row.owner_plugin ?? null,
+        owner_ref: row.owner_ref ?? null,
         anchor_session_id: row.anchor_session_id ?? null,
         policy: row.policy ?? null,
         time_created: row.time_created,
@@ -202,8 +223,91 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
     })
 
     const resolveOrCreate = Effect.fn("SessionGroup.resolveOrCreate")(function* (input: ResolveInput) {
-      if (!input.anchorSessionId) return yield* create(input)
-      const anchorSessionID = SessionID.make(input.anchorSessionId)
+      const anchorSessionID = input.anchorSessionId ? SessionID.make(input.anchorSessionId) : undefined
+
+      // Plugin-owned groups use a stable ownerRef instead of their anchor as
+      // identity. A single coordinator may own multiple plugin groups, and the
+      // coordinator session itself can be re-rooted/rebound over time. Resolve
+      // the stable logical group first and update its presentation anchor
+      // in-place so clients keep the same group id across those transitions.
+      if (input.kind === "plugin" && input.ownerPlugin && input.ownerRef) {
+        let existing = yield* database.db
+          .select()
+          .from(SessionGroupTable)
+          .where(
+            and(
+              eq(SessionGroupTable.kind, "plugin"),
+              eq(SessionGroupTable.owner_plugin, input.ownerPlugin),
+              eq(SessionGroupTable.owner_ref, input.ownerRef),
+            ),
+          )
+          .get()
+          .pipe(Effect.orDie)
+        // Upgrade the pre-ownerRef representation in place when it is
+        // unambiguous. This preserves existing plugin group ids across the
+        // migration instead of flashing a duplicate group on first startup.
+        if (!existing && anchorSessionID) {
+          const legacy = yield* database.db
+            .select()
+            .from(SessionGroupTable)
+            .where(
+              and(
+                eq(SessionGroupTable.kind, "plugin"),
+                eq(SessionGroupTable.owner_plugin, input.ownerPlugin),
+                eq(SessionGroupTable.name, input.name),
+                eq(SessionGroupTable.anchor_session_id, anchorSessionID),
+                isNull(SessionGroupTable.owner_ref),
+              ),
+            )
+            .get()
+            .pipe(Effect.orDie)
+          if (legacy) {
+            const now = Date.now()
+            yield* database.db
+              .update(SessionGroupTable)
+              .set({ owner_ref: input.ownerRef, time_updated: now })
+              .where(eq(SessionGroupTable.id, legacy.id))
+              .run()
+              .pipe(Effect.orDie)
+            existing = { ...legacy, owner_ref: input.ownerRef, time_updated: now }
+            invalidate()
+          }
+        }
+        if (existing) {
+          const now = Date.now()
+          const next = {
+            ...existing,
+            name: input.name,
+            anchor_session_id: anchorSessionID ?? null,
+            policy: input.policy ?? existing.policy,
+            time_updated: now,
+          }
+          const changed =
+            existing.name !== next.name ||
+            existing.anchor_session_id !== next.anchor_session_id ||
+            (input.policy !== undefined && JSON.stringify(existing.policy) !== JSON.stringify(input.policy))
+          if (changed) {
+            yield* database.db
+              .update(SessionGroupTable)
+              .set({
+                name: next.name,
+                anchor_session_id: next.anchor_session_id,
+                policy: next.policy,
+                time_updated: next.time_updated,
+              })
+              .where(eq(SessionGroupTable.id, existing.id))
+              .run()
+              .pipe(Effect.orDie)
+            invalidate()
+            const info = fromGroupRow(next)
+            yield* events.publish(Event.Updated, { groupID: info.id, info })
+            return info
+          }
+          return fromGroupRow(existing)
+        }
+      }
+
+      if (!anchorSessionID) return yield* create(input)
       const id = SessionGroup.ID.create()
       const now = Date.now()
       const inserted = yield* database.db
@@ -214,6 +318,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
           position: now,
           kind: input.kind,
           owner_plugin: input.ownerPlugin,
+          owner_ref: input.ownerRef,
           anchor_session_id: anchorSessionID,
           policy: input.policy,
           time_created: now,
@@ -428,8 +533,71 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         .where(and(eq(SessionTable.id, sessionID), eq(SessionTable.group_id, input.groupId)))
         .run()
         .pipe(Effect.orDie)
+      const remaining = yield* database.db
+        .select({ session_id: SessionGroupMemberTable.session_id })
+        .from(SessionGroupMemberTable)
+        .where(eq(SessionGroupMemberTable.group_id, input.groupId))
+        .limit(1)
+        .get()
+        .pipe(Effect.orDie)
+      if (!remaining) {
+        // Groups are useful only as a relationship between sessions. Removing
+        // the final explicit membership therefore removes the container too,
+        // instead of leaving a permanently empty row for every abandoned
+        // manual/plugin group. The list APIs also hide membership-empty rows so
+        // a create-then-add transaction can never flash a "0 sessions" group.
+        yield* database.db.delete(SessionGroupTable).where(eq(SessionGroupTable.id, input.groupId)).run().pipe(Effect.orDie)
+      }
       invalidate(input.sessionId)
       yield* events.publish(Event.SessionRemoved, { groupID: input.groupId, sessionID: input.sessionId })
+      if (!remaining) yield* events.publish(Event.Deleted, { groupID: input.groupId })
+    })
+
+    const detachDeletedSession = Effect.fn("SessionGroup.detachDeletedSession")(function* (sessionId: string) {
+      const sessionID = SessionID.make(sessionId)
+      const memberships = yield* database.db
+        .select({ group_id: SessionGroupMemberTable.group_id })
+        .from(SessionGroupMemberTable)
+        .where(eq(SessionGroupMemberTable.session_id, sessionID))
+        .all()
+        .pipe(Effect.orDie)
+      if (memberships.length === 0) return
+
+      // Deletion is not a user-requested ungroup operation, so locked/owner
+      // policies do not apply. Remove every edge first; this also prevents the
+      // FK cascade from silently changing membership behind the group's cache.
+      yield* database.db
+        .delete(SessionGroupMemberTable)
+        .where(eq(SessionGroupMemberTable.session_id, sessionID))
+        .run()
+        .pipe(Effect.orDie)
+
+      const deletedGroups: ID[] = []
+      for (const membership of memberships) {
+        const remaining = yield* database.db
+          .select({ session_id: SessionGroupMemberTable.session_id })
+          .from(SessionGroupMemberTable)
+          .where(eq(SessionGroupMemberTable.group_id, membership.group_id))
+          .limit(1)
+          .get()
+          .pipe(Effect.orDie)
+        if (remaining) continue
+        yield* database.db
+          .delete(SessionGroupTable)
+          .where(eq(SessionGroupTable.id, membership.group_id))
+          .run()
+          .pipe(Effect.orDie)
+        deletedGroups.push(SessionGroup.ID.make(membership.group_id))
+      }
+
+      invalidate(sessionId)
+      for (const membership of memberships) {
+        yield* events.publish(Event.SessionRemoved, {
+          groupID: SessionGroup.ID.make(membership.group_id),
+          sessionID: sessionId,
+        })
+      }
+      for (const groupID of deletedGroups) yield* events.publish(Event.Deleted, { groupID })
     })
 
     const membershipsFor = Effect.fn("SessionGroup.membershipsFor")(function* (sessionId: string) {
@@ -497,6 +665,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
           "member-reordering",
           "subagent-auto-grouping",
           "session-group-assign-hook",
+          "plugin-stable-identity",
         ],
       }
     })
@@ -563,6 +732,7 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
       reorder,
       addSession,
       removeSession,
+      detachDeletedSession,
       membershipsFor,
       getWithSessions,
       setPolicy,
@@ -579,6 +749,7 @@ function fromGroupRow(row: typeof SessionGroupTable.$inferSelect): Info {
     position: row.position,
     kind: row.kind,
     ownerPlugin: row.owner_plugin ?? undefined,
+    ownerRef: row.owner_ref ?? undefined,
     anchorSessionID: row.anchor_session_id ?? undefined,
     policy: row.policy ?? undefined,
     time: {

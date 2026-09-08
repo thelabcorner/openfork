@@ -13,6 +13,7 @@ import { WorkspaceV2 } from "../workspace"
 import { Timestamps } from "../database/schema.sql"
 import type { SystemContext } from "../system-context/index"
 import { AgentV2 } from "../agent"
+import { sql } from "drizzle-orm"
 import type { Revert } from "@opencode-ai/schema/revert"
 
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
@@ -76,6 +77,7 @@ export const SessionGroupTable = sqliteTable(
     position: integer().notNull(),
     kind: text().$type<"user" | "subagent" | "plugin">().notNull().default("user"),
     owner_plugin: text(),
+    owner_ref: text(),
     anchor_session_id: text().$type<SessionSchema.ID>(),
     policy: text({ mode: "json" }).$type<{
       autoAddDescendants: boolean
@@ -86,7 +88,17 @@ export const SessionGroupTable = sqliteTable(
     time_updated: integer().notNull(),
     time_archived: integer(),
   },
-  (table) => [uniqueIndex("session_group_anchor_idx").on(table.kind, table.anchor_session_id)],
+  (table) => [
+    // A root session has one automatic subagent tree. Plugin groups need a
+    // different identity: a coordinator may own several independent plugin
+    // groups (for example, several OpenSwarm swarms) at the same time.
+    uniqueIndex("session_group_subagent_anchor_idx")
+      .on(table.kind, table.anchor_session_id)
+      .where(sql`${table.kind} = 'subagent' AND ${table.anchor_session_id} IS NOT NULL`),
+    uniqueIndex("session_group_plugin_owner_ref_idx")
+      .on(table.kind, table.owner_plugin, table.owner_ref)
+      .where(sql`${table.kind} = 'plugin' AND ${table.owner_plugin} IS NOT NULL AND ${table.owner_ref} IS NOT NULL`),
+  ],
 )
 
 export const SessionGroupMemberTable = sqliteTable(

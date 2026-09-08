@@ -1,17 +1,26 @@
 export * as MoveSession from "./move-session"
 
 import { Context, DateTime, Effect, Layer, Schema } from "effect"
+import { eq } from "drizzle-orm"
 import { makeGlobalNode } from "../effect/app-node"
 import { Database } from "../database/database"
 import { EventV2 } from "../event"
 import { Git } from "../git"
 import { Location } from "../location"
 import { ProjectV2 } from "../project"
+import { CHAT_PROJECT_ID } from "../project/chat"
+import {
+  chatSessionDirectoryKey,
+  chatSessionDirectoryMutex,
+  generateChatSessionDirectory,
+  removeChatSessionDirectory,
+} from "../project/chat-directory"
 import { ProjectTable } from "../project/sql"
 import { SessionV2 } from "../session"
 import { SessionEvent } from "../session/event"
 import { SessionSchema } from "../session/schema"
 import { SessionStore } from "../session/store"
+import { SessionTable } from "../session/sql"
 import { AbsolutePath, RelativePath } from "../schema"
 import path from "path"
 
@@ -81,11 +90,11 @@ const layer = Layer.effect(
     const moveSession = Effect.fn("MoveSession.moveSession")(function* (input: Input) {
       const current = yield* sessions.get(input.sessionID)
       if (!current) return yield* new SessionV2.NotFoundError({ sessionID: input.sessionID })
-      const directory = AbsolutePath.make(input.destination.directory)
-      if (current.location.directory === directory) return
+      const requestedDirectory = AbsolutePath.make(input.destination.directory)
+      if (current.location.directory === requestedDirectory) return
 
       const source = yield* project.resolve(current.location.directory)
-      const destination = yield* project.resolve(directory)
+      const destination = yield* project.resolve(requestedDirectory)
       const crossProject = current.projectID !== destination.id
       if (crossProject && input.moveChanges) {
         // Patches captured from one repository cannot be applied safely in
@@ -93,6 +102,50 @@ const layer = Layer.effect(
         // without transferring changes instead.
         return yield* new DestinationProjectMismatchError({ expected: current.projectID, actual: destination.id })
       }
+
+      // The Chat project root is a routing/catalog identity, not a conversation
+      // working directory. Moving a session to Chat gets the same isolated
+      // scratch semantics as creating a new root Chat session. Existing managed
+      // Chat scratch destinations are preserved verbatim for internal callers.
+      const destinationIsChat = destination.id === ProjectV2.ID.make(CHAT_PROJECT_ID)
+      const requestedChatKey = destinationIsChat
+        ? chatSessionDirectoryKey(requestedDirectory, destination.directory)
+        : undefined
+      const allocatedDirectory =
+        destinationIsChat && !requestedChatKey
+          ? AbsolutePath.make(yield* Effect.promise(() => generateChatSessionDirectory(destination.directory)))
+          : requestedDirectory
+      const allocatedChatKey =
+        destinationIsChat && !requestedChatKey
+          ? chatSessionDirectoryKey(allocatedDirectory, destination.directory)
+          : undefined
+      let moveCommitted = false
+
+      const cleanupAllocatedDestination = Effect.suspend(() => {
+        if (!allocatedChatKey || moveCommitted) return Effect.void
+        return chatSessionDirectoryMutex.withLock(allocatedChatKey)(
+          Effect.gen(function* () {
+            const referenced = yield* db
+              .select({ id: SessionTable.id })
+              .from(SessionTable)
+              .where(eq(SessionTable.directory, allocatedDirectory))
+              .limit(1)
+              .get()
+              .pipe(Effect.orDie)
+            if (referenced) return
+            yield* Effect.promise(() => removeChatSessionDirectory(allocatedDirectory, destination.directory)).pipe(
+              Effect.catchCause((cause) =>
+                Effect.logWarning("failed to reclaim uncommitted Chat move directory", {
+                  directory: allocatedDirectory,
+                  cause,
+                }),
+              ),
+            )
+          }),
+        )
+      })
+
+      const directory = allocatedDirectory
 
       const moveChanges = input.moveChanges && source.directory !== destination.directory
       const sourceRepository = moveChanges ? yield* git.repo.discover(current.location.directory) : undefined
@@ -125,13 +178,52 @@ const layer = Layer.effect(
           .run()
           .pipe(Effect.orDie)
       }
-      yield* events.publish(SessionEvent.Moved, {
-        sessionID: input.sessionID,
-        location: Location.Ref.make({ directory }),
-        subdirectory: RelativePath.make(path.relative(destination.directory, directory).replaceAll("\\", "/")),
-        ...(crossProject ? { projectID: destination.id } : {}),
-        timestamp: yield* DateTime.now,
-      }, { location: Location.Ref.make({ directory }) })
+      const publishMove = events.publish(
+        SessionEvent.Moved,
+        {
+          sessionID: input.sessionID,
+          location: Location.Ref.make({ directory }),
+          subdirectory: RelativePath.make(path.relative(destination.directory, directory).replaceAll("\\", "/")),
+          ...(crossProject ? { projectID: destination.id } : {}),
+          timestamp: yield* DateTime.now,
+        },
+        { location: Location.Ref.make({ directory }) },
+      )
+      yield* (allocatedChatKey ? chatSessionDirectoryMutex.withLock(allocatedChatKey)(publishMove) : publishMove).pipe(
+        Effect.tap(() => Effect.sync(() => (moveCommitted = true))),
+        Effect.ensuring(cleanupAllocatedDestination),
+      )
+
+      // A session leaving Chat can make its old scratch directory unreachable.
+      // Reclaim it only after the moved event has synchronously updated the
+      // projection, and only when no fork/child/other session still references
+      // that exact directory. The shared per-directory mutex closes the race
+      // with concurrent Chat create/delete operations.
+      if (source.id === ProjectV2.ID.make(CHAT_PROJECT_ID)) {
+        const sourceKey = chatSessionDirectoryKey(current.location.directory, source.directory)
+        if (sourceKey) {
+          yield* chatSessionDirectoryMutex.withLock(sourceKey)(
+            Effect.gen(function* () {
+              const referenced = yield* db
+                .select({ id: SessionTable.id })
+                .from(SessionTable)
+                .where(eq(SessionTable.directory, current.location.directory))
+                .limit(1)
+                .get()
+                .pipe(Effect.orDie)
+              if (referenced) return
+              yield* Effect.promise(() => removeChatSessionDirectory(current.location.directory, source.directory)).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logWarning("failed to reclaim moved Chat session directory", {
+                    directory: current.location.directory,
+                    cause,
+                  }),
+                ),
+              )
+            }),
+          )
+        }
+      }
 
       if (patch) {
         const repository = yield* git.repo.discover(current.location.directory)

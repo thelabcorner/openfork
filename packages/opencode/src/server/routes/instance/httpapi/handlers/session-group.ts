@@ -34,6 +34,7 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
         kind: ctx.payload.kind,
         anchorSessionId: ctx.payload.anchorSessionID,
         ownerPlugin: ctx.payload.ownerPlugin,
+        ownerRef: ctx.payload.ownerRef,
         policy: ctx.payload.policy,
       })
     })
@@ -127,6 +128,7 @@ export const sessionGroupHandlers = HttpApiBuilder.group(InstanceHttpApi, "sessi
         kind: ctx.payload.kind,
         anchorSessionId: ctx.payload.anchorSessionID,
         ownerPlugin: ctx.payload.ownerPlugin,
+        ownerRef: ctx.payload.ownerRef,
         policy: ctx.payload.policy,
       })
     })

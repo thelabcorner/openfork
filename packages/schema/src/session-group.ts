@@ -28,6 +28,9 @@ export const Info = Schema.Struct({
   position: Schema.Number,
   kind: Kind,
   ownerPlugin: optional(Schema.String),
+  /** Stable identity supplied by a plugin for one logical group. Unlike the
+   * anchor session, this survives coordinator/session re-rooting. */
+  ownerRef: optional(Schema.String),
   anchorSessionID: optional(Schema.String),
   policy: optional(Policy),
   time: Schema.Struct({

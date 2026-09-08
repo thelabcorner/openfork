@@ -16,6 +16,7 @@ export type SessionGroupEntry = {
   position: number
   kind: "user" | "subagent" | "plugin"
   ownerPlugin?: string
+  ownerRef?: string
   anchorSessionID?: string
   sessions: SessionGroupMember[]
   time: {
@@ -148,6 +149,7 @@ export const { use: useSessionGroups, provider: SessionGroupsProvider } = create
           position: typeof group.position === "number" ? group.position : 0,
           kind: group.kind,
           ownerPlugin: group.ownerPlugin,
+          ownerRef: group.ownerRef,
           anchorSessionID: group.anchorSessionID,
           sessions: detail?.sessions ?? [],
           time: group.time,

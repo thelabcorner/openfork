@@ -29,6 +29,7 @@ export const CreatePayload = Schema.Struct({
   kind: Schema.optionalKey(SessionGroup.Kind),
   anchorSessionID: Schema.optionalKey(Schema.String),
   ownerPlugin: Schema.optionalKey(Schema.String),
+  ownerRef: Schema.optionalKey(Schema.String),
   policy: Schema.optionalKey(SessionGroup.Policy),
 })
 
@@ -37,6 +38,7 @@ export const ResolvePayload = Schema.Struct({
   kind: SessionGroup.Kind,
   anchorSessionID: Schema.optionalKey(Schema.String),
   ownerPlugin: Schema.optionalKey(Schema.String),
+  ownerRef: Schema.optionalKey(Schema.String),
   policy: Schema.optionalKey(SessionGroup.Policy),
 })
 

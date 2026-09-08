@@ -1,45 +1,187 @@
 import { HoverCard as Kobalte } from "@kobalte/core/hover-card"
-import { createSignal, For, Show, type JSXElement } from "solid-js"
+import { createMemo, createSignal, For, Show, startTransition, type JSXElement } from "solid-js"
+import { useGlobal } from "@/context/global"
+import { useLanguage } from "@/context/language"
+import { ServerConnection } from "@/context/server"
+import { tabKey, useTabs } from "@/context/tabs"
+import { displayName, projectForSession } from "@/pages/layout/helpers"
+import { createRequestGate } from "@/utils/request-gate"
+import { tabSessionState } from "./titlebar-tab-state"
+import { TitlebarTabContextMenu } from "./titlebar-tab-context-menu"
 import "./titlebar-tab-popover.css"
 
 // Initial hover delay before the preview appears, per design.
 const OPEN_DELAY = 450
-// Mouse-out delay: begin closing immediately (a brief exit animation plays).
-const CLOSE_DELAY = 120
+// Interactive previews need enough grace to cross the small trigger/content
+// gutter without feeling sticky after the pointer genuinely leaves.
+const CLOSE_DELAY = 140
 // After a preview closes, hovering a neighbouring tab within this window skips
 // the open delay — mirrors the tooltip's skipDelayDuration so moving across
 // tabs doesn't re-wait the full delay each time.
 const SKIP_WINDOW = 500
 let lastClosedAt = 0
 
+export interface TabPreviewGroupSession {
+  id: string
+  title: string
+  project?: string
+  /** Optional owning-group label. Useful when one coordinator anchors several
+   * plugin groups (for example multiple OpenSwarm swarms). */
+  group?: string
+}
+
 export interface TabPreviewData {
   projectName?: string
   title?: string
   path?: string
   serverName?: string
-  groupSessions?: { title: string; project?: string }[]
+  groupSessions?: TabPreviewGroupSession[]
 }
 
+/**
+ * Browser-style tab preview with an interactive grouped-session navigator.
+ *
+ * Grouped rows are real navigation affordances, not decorative text:
+ * - left click selects/opens the session tab;
+ * - ctrl/cmd-click and middle-click open it in the background;
+ * - right click delegates to the exact same TitlebarTabContextMenu used by the
+ *   actual tab strip;
+ * - session info is hydrated lazily on hover, bounded to four concurrent
+ *   requests, so hidden/subagent sessions get the full menu without making the
+ *   titlebar eager-load every historical group.
+ */
 export function TabPreviewPopover(props: {
   trigger: JSXElement
   open: boolean
   onOpenChange: (open: boolean) => void
   data: TabPreviewData
+  server?: ServerConnection.Key
+  currentSessionID?: string
 }) {
+  const global = useGlobal()
+  const language = useLanguage()
+  const tabs = useTabs()
   let triggerEl: HTMLDivElement | undefined
+  let contentEl: HTMLDivElement | undefined
+
   // When opened during a rapid tab-hopping streak, this preview appears and
   // disappears instantly (no repeated enter/exit animation) — only the first,
   // "cold" preview animates. Mirrors how browsers reuse one tab tooltip.
   const [instant, setInstant] = createSignal(false)
+  const [contextMenuOpen, setContextMenuOpen] = createSignal(false)
+
+  const serverCtx = createMemo(() => {
+    if (!props.server) return undefined
+    const conn = global.servers.list().find((item) => ServerConnection.key(item) === props.server)
+    return conn ? global.ensureServerCtx(conn) : undefined
+  })
+
+  const interactive = createMemo(() => !!props.server && (props.data.groupSessions?.length ?? 0) > 0)
+  const resolveGate = createRequestGate(4)
+  const resolving = new Set<string>()
+  const resolveFailedAt = new Map<string, number>()
+
+  const hydrateGroupSessions = () => {
+    const ctx = serverCtx()
+    if (!ctx) return
+    for (const member of props.data.groupSessions ?? []) {
+      if (ctx.sync.session.peek(member.id) || resolving.has(member.id)) continue
+      const failedAt = resolveFailedAt.get(member.id)
+      if (failedAt !== undefined && Date.now() - failedAt < 30_000) continue
+      resolving.add(member.id)
+      void resolveGate(() => ctx.sync.session.resolve(member.id))
+        .then(
+          () => resolveFailedAt.delete(member.id),
+          () => resolveFailedAt.set(member.id, Date.now()),
+        )
+        .finally(() => resolving.delete(member.id))
+    }
+  }
 
   const warm = () => Date.now() - lastClosedAt < SKIP_WINDOW
   // Kobalte reads openDelay lazily when the pointer enters the trigger, so this
   // resolves the skip window per-hover.
   const resolveOpenDelay = () => (warm() ? 0 : OPEN_DELAY)
   const handleOpenChange = (open: boolean) => {
-    if (open) setInstant(warm())
-    else lastClosedAt = Date.now()
+    // A context menu is portalled outside the hover-card subtree. Keep this
+    // owner mounted while that menu is open or moving the pointer into the menu
+    // would dispose the row (and therefore the menu) underneath the user.
+    if (!open && contextMenuOpen()) return
+    if (open) {
+      setInstant(warm())
+      hydrateGroupSessions()
+    } else {
+      lastClosedAt = Date.now()
+    }
     props.onOpenChange(open)
+  }
+
+  const handleContextMenuOpenChange = (open: boolean) => {
+    setContextMenuOpen(open)
+    if (open) {
+      props.onOpenChange(true)
+      return
+    }
+    // If the pointer returned to the preview while the menu was open, let the
+    // normal hover lifecycle retain it. Otherwise close immediately after the
+    // menu is dismissed instead of leaving an orphaned preview on screen.
+    requestAnimationFrame(() => {
+      if (triggerEl?.matches(":hover") || contentEl?.matches(":hover")) return
+      lastClosedAt = Date.now()
+      props.onOpenChange(false)
+    })
+  }
+
+  const openSession = (sessionID: string, background = false) => {
+    const server = props.server
+    if (!server) return
+    if (background) {
+      tabs.addSessionTab({ server, sessionId: sessionID })
+      return
+    }
+    // Keep insertion + route selection in one transition. This mirrors the
+    // home/session opener and prevents the route from observing a tab that has
+    // not reached the persisted tab store yet.
+    void startTransition(() => {
+      const tab = tabs.addSessionTab({ server, sessionId: sessionID })
+      tabs.select(tab)
+    })
+    props.onOpenChange(false)
+  }
+
+  const fullSession = (sessionID: string) => serverCtx()?.sync.session.peek(sessionID)
+  const memberProject = (sessionID: string, fallback?: string) => {
+    const session = fullSession(sessionID)
+    const ctx = serverCtx()
+    if (!session || !ctx) return fallback
+    const project = projectForSession(session, ctx.projects.list())
+    return project ? displayName(project) : displayName({ worktree: session.directory })
+  }
+  const memberTabID = (sessionID: string) => {
+    const server = props.server
+    if (!server) return ""
+    return tabKey({ type: "session", server, sessionId: sessionID })
+  }
+  const memberTabOpen = (sessionID: string) => {
+    const server = props.server
+    if (!server) return false
+    return tabs.store.some((tab) => tab.type === "session" && tab.server === server && tab.sessionId === sessionID)
+  }
+
+  const moveGroupFocus = (event: KeyboardEvent & { currentTarget: HTMLButtonElement }) => {
+    if (!contentEl) return
+    const rows = [...contentEl.querySelectorAll<HTMLButtonElement>('[data-slot="group-session"]')]
+    if (rows.length === 0) return
+    const current = rows.indexOf(event.currentTarget)
+    let next = current
+    if (event.key === "ArrowDown") next = current < 0 ? 0 : (current + 1) % rows.length
+    else if (event.key === "ArrowUp") next = current <= 0 ? rows.length - 1 : current - 1
+    else if (event.key === "Home") next = 0
+    else if (event.key === "End") next = rows.length - 1
+    else return
+    event.preventDefault()
+    event.stopPropagation()
+    rows[next]?.focus()
   }
 
   return (
@@ -48,24 +190,33 @@ export function TabPreviewPopover(props: {
       onOpenChange={handleOpenChange}
       openDelay={resolveOpenDelay()}
       closeDelay={CLOSE_DELAY}
-      // The preview is non-interactive (pointer-events: none), so there is no
-      // safe area to traverse — leaving the tab hides it immediately.
-      ignoreSafeArea
+      // Decorative previews can disappear as soon as the trigger is left.
+      // Group previews are interactive, so preserve Kobalte's safe-area bridge
+      // between the tab and the portalled card.
+      ignoreSafeArea={!interactive()}
       placement="bottom-start"
       gutter={6}
     >
-      <Kobalte.Trigger ref={triggerEl} as="div" data-component="session-tab-popover-trigger" tabIndex={-1}>
+      <Kobalte.Trigger
+        ref={triggerEl}
+        as="div"
+        data-component="session-tab-popover-trigger"
+        tabIndex={-1}
+        onPointerEnter={hydrateGroupSessions}
+      >
         {props.trigger}
       </Kobalte.Trigger>
       <Kobalte.Portal>
         <Kobalte.Content
           ref={(el) => {
+            contentEl = el
             // Portalled content lives outside the themed subtree, so mirror the
             // active theme like the v2 tooltip does.
             const theme = triggerEl?.closest("[data-theme]")?.getAttribute("data-theme")
             if (theme) el.setAttribute("data-theme", theme)
           }}
           data-component="session-tab-popover"
+          data-interactive={interactive() || undefined}
           data-instant={instant() || undefined}
         >
           <div data-slot="header">
@@ -87,19 +238,79 @@ export function TabPreviewPopover(props: {
             <div data-slot="server">{props.data.serverName}</div>
           </Show>
 
-          <Show when={props.data.groupSessions}>
-            <div data-slot="group-sessions" class="flex flex-col gap-1">
+          <Show when={props.data.groupSessions?.length}>
+            <div data-slot="group-sessions" role="group" aria-label={language.t("groupTab.switchSessions")}>
               <For each={props.data.groupSessions}>
-                {(session) => (
-                  <div class="flex items-center gap-2">
-                    <span class="text-[12px] text-v2-text-text-base [font-weight:530]">{session.title}</span>
-                    <Show when={session.project}>
-                      <span class="text-[11px] text-v2-text-text-muted">{session.project}</span>
+                {(member) => {
+                  const session = () => fullSession(member.id)
+                  const state = () => tabSessionState(serverCtx(), member.id)
+                  const current = () => props.currentSessionID === member.id
+                  const project = () => memberProject(member.id, member.project)
+
+                  const row = (
+                    <button
+                      type="button"
+                      data-slot="group-session"
+                      data-current={current() || undefined}
+                      data-open-tab={memberTabOpen(member.id) || undefined}
+                      data-session-state={state()}
+                      aria-current={current() ? "page" : undefined}
+                      title={member.title}
+                      onPointerEnter={hydrateGroupSessions}
+                      onClick={(event) => {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        openSession(member.id, event.metaKey || event.ctrlKey)
+                      }}
+                      onAuxClick={(event) => {
+                        if (event.button !== 1) return
+                        event.preventDefault()
+                        event.stopPropagation()
+                        openSession(member.id, true)
+                      }}
+                      onKeyDown={moveGroupFocus}
+                    >
+                      <span data-slot="group-session-state" aria-hidden="true" />
+                      <span data-slot="group-session-copy">
+                        <span data-slot="group-session-title">{session()?.title ?? member.title}</span>
+                        <Show when={member.group || project()}>
+                          <span data-slot="group-session-meta">
+                            <Show when={member.group}>
+                              <span>{member.group}</span>
+                            </Show>
+                            <Show when={member.group && project()}>
+                              <span aria-hidden="true">·</span>
+                            </Show>
+                            <Show when={project()}>{(label) => <span>{label()}</span>}</Show>
+                          </span>
+                        </Show>
+                      </span>
+                      <Show when={current() || memberTabOpen(member.id)}>
+                        <span data-slot="group-session-presence" aria-hidden="true" />
+                      </Show>
+                    </button>
+                  )
+
+                  return (
+                    <Show when={props.server} fallback={row}>
+                      {(server) => (
+                        <TitlebarTabContextMenu
+                          id={memberTabID(member.id)}
+                          session={session}
+                          server={server()}
+                          onOpenChange={handleContextMenuOpenChange}
+                        >
+                          {row}
+                        </TitlebarTabContextMenu>
+                      )}
                     </Show>
-                  </div>
-                )}
+                  )
+                }}
               </For>
             </div>
+            <Show when={(props.data.groupSessions?.length ?? 0) > 1}>
+              <div data-slot="group-session-hint">{language.t("groupTab.keyboardHint")}</div>
+            </Show>
           </Show>
         </Kobalte.Content>
       </Kobalte.Portal>

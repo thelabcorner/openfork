@@ -25,6 +25,7 @@ import { DialogSessionGroupName } from "@/components/dialog-session-group"
 import { Binary } from "@opencode-ai/core/util/binary"
 import { archiveHomeSession, loadArchivedHomeSessions, type HomeArchivedPage, unarchiveHomeSession } from "../home-session-archive"
 import type { HomeController } from "./home-controller"
+import { projectPersistentSessionGroups } from "./home-session-grouping"
 
 const HOME_SESSION_LIMIT = 64
 export type HomeSessionRecord = {
@@ -38,6 +39,7 @@ export type HomeSessionGroup = {
   title: string
   sessions: HomeSessionRecord[]
   isUserGroup: boolean
+  kind?: "user" | "subagent" | "plugin"
 }
 
 export type OpenSessionOptions = { background?: boolean }
@@ -379,7 +381,14 @@ export function createHomeSessionsController(home: HomeController) {
         setCollapsed(id, (prev) => !prev)
       },
       isCollapsed: (id: string) => !!collapsed[id],
-      userGroups: () => sessionGroups.groups().map((g) => ({ id: g.id, name: g.name })),
+      // Managed groups (subagent/plugin) are structural ownership boundaries,
+      // not destinations the user should be able to manually append sessions
+      // to. Keep the picker honest by exposing only user-owned groups.
+      userGroups: () =>
+        sessionGroups
+          .groups()
+          .filter((g) => g.kind === "user")
+          .map((g) => ({ id: g.id, name: g.name })),
       groupForSession: (sessionId: string) => sessionGroups.groupForSession(sessionId)?.id,
       openTab: (groupId: string) => {
         const conn = home.server.focused()
@@ -468,24 +477,17 @@ function mergeGroupSessions(
   language: ReturnType<typeof useLanguage>,
   sessionGroups: ReturnType<typeof useSessionGroups>,
 ): HomeSessionGroup[] {
-  const userGroups = sessionGroups.groups()
-  const sessionByID = new Map(records.map((r) => [r.session.id, r]))
-  const groupedSessionIDs = new Set<string>()
+  const persistentGroups = sessionGroups.groups()
+  const projection = projectPersistentSessionGroups(records, persistentGroups)
+  const persistentGroupResults: HomeSessionGroup[] = projection.groups.map((entry) => ({
+    ...entry,
+    isUserGroup: true,
+  }))
 
-  const userGroupResults: HomeSessionGroup[] = userGroups
-    .map((entry) => {
-      const sessions = entry.sessionIds
-        .map((id) => sessionByID.get(id))
-        .filter((r): r is HomeSessionRecord => r !== undefined)
-      for (const session of sessions) groupedSessionIDs.add(session.session.id)
-      return { id: entry.id, title: entry.name, sessions, isUserGroup: true as const }
-    })
-    .filter((g) => g.sessions.length > 0 || userGroups.some((u) => u.id === g.id))
-
-  const remaining = records.filter((r) => !groupedSessionIDs.has(r.session.id))
+  const remaining = records.filter((r) => !projection.groupedSessionIDs.has(r.session.id))
   const timeGroups = groupSessions(remaining, language)
 
-  return [...userGroupResults, ...timeGroups]
+  return [...persistentGroupResults, ...timeGroups]
 }
 
 export type HomeSessionsController = ReturnType<typeof createHomeSessionsController>

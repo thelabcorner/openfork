@@ -103,7 +103,25 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
       aria-label={props.language.t("sidebar.project.recentSessions")}
     >
       <div class="sticky top-0 z-30 shrink-0 bg-v2-background-bg-base pb-3 pt-6 lg:pt-12" onWheel={props.onWheel}>
-        <HomeSessionSearch {...props} />
+        <div class="flex min-w-0 items-center gap-2">
+          <div class="min-w-0 flex-1">
+            <HomeSessionSearch {...props} />
+          </div>
+          <Suspense>
+            <Show when={props.groups().length > 0 && props.canCreateSession()}>
+              <ButtonV2
+                data-action="home-new-session"
+                variant="ghost-muted"
+                size="normal"
+                icon="edit"
+                class="h-7 shrink-0 px-2 [font-weight:530]"
+                onClick={props.onCreateSession}
+              >
+                {props.language.t("command.session.new")}
+              </ButtonV2>
+            </Show>
+          </Suspense>
+        </div>
         <Show when={props.selectedCount() > 0}>
           <div class="mt-2 flex items-center gap-2 rounded-[8px] bg-v2-background-bg-layer-02 px-2 py-1.5">
             <span class="px-1 text-12-medium text-v2-text-text-base">
@@ -126,22 +144,6 @@ export function HomeSessionsView(props: HomeSessionsViewProps) {
             />
           </div>
         </Show>
-        <Suspense>
-          <Show when={props.groups().length > 0 && props.canCreateSession()}>
-            <div class="pointer-events-none absolute right-0 top-[84px] z-20 flex lg:top-[108px]">
-              <ButtonV2
-                data-action="home-new-session"
-                variant="ghost-muted"
-                size="normal"
-                icon="edit"
-                class="pointer-events-auto h-7 px-2 [font-weight:530]"
-                onClick={props.onCreateSession}
-              >
-                {props.language.t("command.session.new")}
-              </ButtonV2>
-            </div>
-          </Show>
-        </Suspense>
       </div>
       <div class="pointer-events-none sticky top-[84px] z-40 h-0 -mr-3 lg:top-[108px]">
         <div
@@ -843,21 +845,21 @@ function HomeSessionGroupHeaderRow(props: {
               <MenuV2.Item onSelect={props.onOpenTab}>
                 {props.language.t("sessionGroup.openGroup")}
               </MenuV2.Item>
-              <MenuV2.Separator />
-               <MenuV2.Item
-                 onSelect={() => {
-                   void dialog.show(() => (
-                     <DialogSessionGroupName initial={props.group.title} onSubmit={props.onRename} />
-                   ))
-                 }}
-              >
-                {props.language.t("common.rename")}
-              </MenuV2.Item>
-               <MenuV2.Item
-                 onSelect={props.onDelete}
-              >
-                <span class="text-v2-state-text-danger">{props.language.t("common.delete")}</span>
-              </MenuV2.Item>
+              <Show when={props.group.kind === "user"}>
+                <MenuV2.Separator />
+                <MenuV2.Item
+                  onSelect={() => {
+                    void dialog.show(() => (
+                      <DialogSessionGroupName initial={props.group.title} onSubmit={props.onRename} />
+                    ))
+                  }}
+                >
+                  {props.language.t("common.rename")}
+                </MenuV2.Item>
+                <MenuV2.Item onSelect={props.onDelete}>
+                  <span class="text-v2-state-text-danger">{props.language.t("common.delete")}</span>
+                </MenuV2.Item>
+              </Show>
             </MenuV2.Content>
           </MenuV2.Portal>
         </MenuV2>

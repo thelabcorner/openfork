@@ -61,10 +61,10 @@ it.instance("supports multiple memberships and preserves a replacement primary g
       .where(eq(SessionTable.id, session.id))
       .get()
     expect(row?.group_id).toBe(second.id)
+    expect((yield* groups.list()).some((group) => group.id === first.id)).toBe(false)
 
     yield* sessions.remove(session.id)
-    yield* groups.remove(first.id)
-    yield* groups.remove(second.id)
+    expect((yield* groups.list()).some((group) => group.id === second.id)).toBe(false)
   }),
 )
 
@@ -97,10 +97,80 @@ it.instance("enforces subagent and plugin membership ownership", () =>
       .pipe(Effect.flip)
     expect(foreign._tag).toBe("SessionGroupOwnerMismatchError")
     yield* groups.removeSession({ groupId: plugin.id, sessionId: session.id, ownerPlugin: "openswarm" })
+    expect((yield* groups.list()).some((group) => group.id === plugin.id)).toBe(false)
 
     yield* sessions.remove(session.id)
-    yield* groups.remove(subagents.id)
-    yield* groups.remove(plugin.id)
+    expect((yield* groups.list()).some((group) => group.id === subagents.id)).toBe(false)
+  }),
+)
+
+it.instance("never exposes membership-empty groups", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const groups = yield* SessionGroup.Service
+    const session = yield* sessions.create({ title: "Visible member" })
+    const group = yield* groups.create({ name: "No empty flash" })
+
+    expect((yield* groups.list()).some((item) => item.id === group.id)).toBe(false)
+    expect((yield* groups.listWithSessions()).some((item) => item.group.id === group.id)).toBe(false)
+
+    yield* groups.addSession({ groupId: group.id, sessionId: session.id })
+    expect((yield* groups.list()).some((item) => item.id === group.id)).toBe(true)
+    expect((yield* groups.listWithSessions()).find((item) => item.group.id === group.id)?.sessions).toHaveLength(1)
+
+    yield* groups.removeSession({ groupId: group.id, sessionId: session.id })
+    expect((yield* groups.list()).some((item) => item.id === group.id)).toBe(false)
+    expect((yield* groups.listWithSessions()).some((item) => item.group.id === group.id)).toBe(false)
+  }),
+)
+
+it.instance("keeps plugin groups distinct by stable owner ref and can re-anchor one in place", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const groups = yield* SessionGroup.Service
+    const firstCoordinator = yield* sessions.create({ title: "Coordinator A" })
+    const secondCoordinator = yield* sessions.create({ title: "Coordinator B" })
+
+    const first = yield* groups.resolveOrCreate({
+      name: "Swarm A",
+      kind: "plugin",
+      ownerPlugin: "openswarm",
+      ownerRef: "swarm-a",
+      anchorSessionId: firstCoordinator.id,
+    })
+    const second = yield* groups.resolveOrCreate({
+      name: "Swarm B",
+      kind: "plugin",
+      ownerPlugin: "openswarm",
+      ownerRef: "swarm-b",
+      anchorSessionId: firstCoordinator.id,
+    })
+    expect(first.id).not.toBe(second.id)
+
+    yield* groups.addSession({
+      groupId: first.id,
+      sessionId: firstCoordinator.id,
+      origin: "plugin",
+      originPlugin: "openswarm",
+    })
+    yield* groups.addSession({
+      groupId: second.id,
+      sessionId: firstCoordinator.id,
+      origin: "plugin",
+      originPlugin: "openswarm",
+    })
+
+    const rebound = yield* groups.resolveOrCreate({
+      name: "Swarm A renamed",
+      kind: "plugin",
+      ownerPlugin: "openswarm",
+      ownerRef: "swarm-a",
+      anchorSessionId: secondCoordinator.id,
+    })
+    expect(rebound.id).toBe(first.id)
+    expect(rebound.anchorSessionID).toBe(secondCoordinator.id)
+    expect(rebound.name).toBe("Swarm A renamed")
+    expect(rebound.ownerRef).toBe("swarm-a")
   }),
 )
 
