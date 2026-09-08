@@ -14,13 +14,32 @@ import type { Agent } from "./agent"
 export function deriveSubagentSessionPermission(input: {
   parentSessionPermission: PermissionV1.Ruleset
   subagent: Agent.Info
+  autoApproveAsks?: boolean
 }): PermissionV1.Ruleset {
   const canTask = input.subagent.permission.some((rule) => rule.permission === "task")
   const canTodo = input.subagent.permission.some((rule) => rule.permission === "todowrite")
+  const inherited = input.parentSessionPermission.filter(
+    (rule) => rule.permission === "external_directory" || rule.action === "deny",
+  )
+
+  const sessionRules = input.autoApproveAsks
+    ? [
+        // A leading wildcard handles the implicit default-ask case. Replaying
+        // the subagent rules after it preserves explicit allow/deny ordering
+        // while turning only modal `ask` decisions into autonomous allows.
+        { permission: "*", pattern: "*", action: "allow" as const },
+        ...input.subagent.permission.map((rule) =>
+          rule.action === "ask" ? { ...rule, action: "allow" as const } : rule,
+        ),
+        // Parent session rules remain a hard ceiling. A parent-session deny
+        // still wins; inherited asks become allow so YOLO does not reintroduce
+        // permission dialogs in child sessions.
+        ...inherited.map((rule) => (rule.action === "ask" ? { ...rule, action: "allow" as const } : rule)),
+      ]
+    : inherited
+
   return [
-    ...input.parentSessionPermission.filter(
-      (rule) => rule.permission === "external_directory" || rule.action === "deny",
-    ),
+    ...sessionRules,
     ...(canTodo ? [] : [{ permission: "todowrite" as const, pattern: "*" as const, action: "deny" as const }]),
     ...(canTask ? [] : [{ permission: "task" as const, pattern: "*" as const, action: "deny" as const }]),
   ]

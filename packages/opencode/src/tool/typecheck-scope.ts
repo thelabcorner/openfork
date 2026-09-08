@@ -3,6 +3,7 @@ import path from "path"
 import fs from "node:fs/promises"
 import { AppProcess } from "@opencode-ai/core/process"
 import { ChildProcess } from "effect/unstable/process"
+import { withHeavyProcessSlot } from "./heavy-process-concurrency"
 
 // Shared scoped-typecheck machinery used by the `typecheck` tool and by the
 // opt-in `runTypecheck` on edit/write. Scoped modes are fast because they run
@@ -144,7 +145,10 @@ export function parseDiagnostics(output: string, maxErrors: number): Diagnostic[
 // which failure class to fix first, ordered P0 -> P3.
 export function clusterDiagnostics(diagnostics: Diagnostic[]) {
   const order: Record<string, number> = { P0: 0, P1: 1, P2: 2, P3: 3 }
-  const map = new Map<string, { code: number; severity: Diagnostic["severity"]; category: string; files: Set<string>; count: number }>()
+  const map = new Map<
+    string,
+    { code: number; severity: Diagnostic["severity"]; category: string; files: Set<string>; count: number }
+  >()
   for (const diag of diagnostics) {
     const key = `${diag.code}::${diag.message.replace(/\s+/g, " ").trim()}`
     const hit = map.get(key)
@@ -153,7 +157,13 @@ export function clusterDiagnostics(diagnostics: Diagnostic[]) {
       hit.files.add(diag.file)
       continue
     }
-    map.set(key, { code: diag.code, severity: diag.severity, category: diag.category, files: new Set([diag.file]), count: 1 })
+    map.set(key, {
+      code: diag.code,
+      severity: diag.severity,
+      category: diag.category,
+      files: new Set([diag.file]),
+      count: 1,
+    })
   }
   return [...map.values()]
     .toSorted((a, b) => order[a.severity] - order[b.severity] || b.count - a.count)
@@ -190,8 +200,20 @@ async function resolveCompiler(tsconfigDir: string, worktree: string): Promise<{
     while (true) {
       const tsgo = path.join(dir, "node_modules", "@typescript", "native-preview", "bin", "tsgo.js")
       const tsc = path.join(dir, "node_modules", "typescript", "lib", "tsc.js")
-      if (await fs.stat(tsgo).then(() => true).catch(() => false)) return { bin: "tsgo", path: tsgo }
-      if (await fs.stat(tsc).then(() => true).catch(() => false)) return { bin: "tsc", path: tsc }
+      if (
+        await fs
+          .stat(tsgo)
+          .then(() => true)
+          .catch(() => false)
+      )
+        return { bin: "tsgo", path: tsgo }
+      if (
+        await fs
+          .stat(tsc)
+          .then(() => true)
+          .catch(() => false)
+      )
+        return { bin: "tsc", path: tsc }
       if (dir === root || dir === path.dirname(dir)) return undefined
       dir = path.dirname(dir)
     }
@@ -249,18 +271,26 @@ export const runScopedTypecheck = Effect.fn("TypecheckScope.runScoped")(function
       stderr: "pipe",
     })
 
-    const result = yield* app.run(command, {
-      timeout: input.timeoutMs,
-      signal: input.signal,
-      maxOutputBytes: 3_000_000,
-    }).pipe(Effect.catch((error) => Effect.succeed({
-      command: error.command,
-      exitCode: 1,
-      stdout: Buffer.alloc(0),
-      stderr: Buffer.from(error.stderr ?? error.message),
-      stdoutTruncated: false,
-      stderrTruncated: false,
-    })))
+    const result = yield* withHeavyProcessSlot(
+      app
+        .run(command, {
+          timeout: input.timeoutMs,
+          signal: input.signal,
+          maxOutputBytes: 3_000_000,
+        })
+        .pipe(
+          Effect.catch((error) =>
+            Effect.succeed({
+              command: error.command,
+              exitCode: 1,
+              stdout: Buffer.alloc(0),
+              stderr: Buffer.from(error.stderr ?? error.message),
+              stdoutTruncated: false,
+              stderrTruncated: false,
+            }),
+          ),
+        ),
+    )
 
     const stdout = result.stdout.toString("utf8")
     const stderr = result.stderr.toString("utf8")
@@ -296,7 +326,10 @@ export const runFullTypecheck = Effect.fn("TypecheckScope.runFull")(function* (i
     const root = path.resolve(input.worktree)
     while (true) {
       const pkg = path.join(dir, "package.json")
-      const parsed = await fs.readFile(pkg, "utf8").then((text) => JSON.parse(text) as { scripts?: Record<string, string> }).catch(() => undefined)
+      const parsed = await fs
+        .readFile(pkg, "utf8")
+        .then((text) => JSON.parse(text) as { scripts?: Record<string, string> })
+        .catch(() => undefined)
       if (parsed?.scripts?.typecheck) return dir
       if (dir === root || dir === path.dirname(dir)) return input.worktree
       dir = path.dirname(dir)
@@ -308,18 +341,26 @@ export const runFullTypecheck = Effect.fn("TypecheckScope.runFull")(function* (i
     stdout: "pipe",
     stderr: "pipe",
   })
-  const result = yield* app.run(command, {
-    timeout: input.timeoutMs,
-    signal: input.signal,
-    maxOutputBytes: 5_000_000,
-  }).pipe(Effect.catch((error) => Effect.succeed({
-    command: error.command,
-    exitCode: 1,
-    stdout: Buffer.alloc(0),
-    stderr: Buffer.from(error.stderr ?? error.message),
-    stdoutTruncated: false,
-    stderrTruncated: false,
-  })))
+  const result = yield* withHeavyProcessSlot(
+    app
+      .run(command, {
+        timeout: input.timeoutMs,
+        signal: input.signal,
+        maxOutputBytes: 5_000_000,
+      })
+      .pipe(
+        Effect.catch((error) =>
+          Effect.succeed({
+            command: error.command,
+            exitCode: 1,
+            stdout: Buffer.alloc(0),
+            stderr: Buffer.from(error.stderr ?? error.message),
+            stdoutTruncated: false,
+            stderrTruncated: false,
+          }),
+        ),
+      ),
+  )
   const stdout = result.stdout.toString("utf8")
   const stderr = result.stderr.toString("utf8")
   const combined = stdout || stderr

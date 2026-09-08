@@ -15,6 +15,7 @@ import { Config } from "@/config/config"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { Shell } from "@opencode-ai/core/shell"
 import { ShellID } from "./shell/id"
+import { catastrophicDeleteReason } from "./shell-safety"
 
 import * as Truncate from "./truncate"
 import { TRUNCATION_DIR } from "./truncation-dir"
@@ -25,7 +26,14 @@ import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner
 import { ShellPrompt, type Parameters } from "./shell/prompt"
 import { BashArity } from "@/permission/arity"
 import { BackgroundJob } from "@/background/job"
-import { ShellJobs, jobLogPath, jobMetaPath } from "@/background/shell-jobs"
+import {
+  ShellJobs,
+  jobLogPath,
+  jobMetaPath,
+  jobLogPathLegacy,
+  jobMetaPathLegacy,
+} from "@/background/shell-jobs"
+import { withBackgroundProcessSlot } from "@/background/process-concurrency"
 import { Identifier } from "@/id/id"
 import type { TaskPromptOps } from "./task"
 import { Scope } from "effect"
@@ -33,6 +41,7 @@ import { rewriteBashHeredocsForPowerShell } from "@/util/powershell-heredoc"
 import { withShellSlot } from "./shell-concurrency"
 import { brotliCompress, brotliDecompress } from "node:zlib"
 import { promisify } from "node:util"
+import { userChildEnvironment } from "@/util/javascript-runtime"
 
 // Async brotli for the output sidecar merge below: the sync variants block the
 // single event loop for the whole (de)compression of potentially megabytes of
@@ -342,9 +351,7 @@ function renderRunning(meta: BackgroundMeta) {
     `<background_shell job="${meta.jobId}" state="running">`,
     `<summary>Background command started: ${escapeXML(meta.command)}</summary>`,
     `<command>${escapeXML(meta.command)}</command>`,
-    meta.notify
-      ? "You will be notified when it finishes."
-      : "Notify is off; check on it with the `background` tool.",
+    meta.notify ? "You will be notified when it finishes." : "Notify is off; check on it with the `background` tool.",
     `Use the \`background\` tool with id \`${meta.jobId}\` to: status, read, wait, send, kill.`,
     `Full output streams to: ${meta.logPath}`,
     "</background_shell>",
@@ -564,10 +571,7 @@ export const ShellTool = Tool.define(
         { cwd, sessionID: ctx.sessionID, callID: ctx.callID },
         { env: {} },
       )
-      return {
-        ...process.env,
-        ...extra.env,
-      }
+      return userChildEnvironment(process.env, extra.env)
     })
 
     const run = Effect.fn("ShellTool.run")(function* (
@@ -636,7 +640,10 @@ export const ShellTool = Tool.define(
               } catch {}
               const combined = base + sidecarData
               const compressed = await brotliCompressAsync(Buffer.from(combined, "utf-8"), {
-                params: { [zlib.constants.BROTLI_PARAM_QUALITY]: 4, [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_TEXT },
+                params: {
+                  [zlib.constants.BROTLI_PARAM_QUALITY]: 4,
+                  [zlib.constants.BROTLI_PARAM_MODE]: zlib.constants.BROTLI_MODE_TEXT,
+                },
               })
               await fs.writeFile(target, compressed)
               await fs.rm(sidecar, { force: true }).catch(() => {})
@@ -873,9 +880,16 @@ export const ShellTool = Tool.define(
           yield* Effect.addFinalizer(closeSink)
           sink = createWriteStream(input.logPath, { flags: "a" })
           const handle = yield* spawner.spawn(
-            cmd(input.shell, input.command, input.cwd, input.env, { stream: "pipe", endOnDone: false }, {
+            cmd(
+              input.shell,
+              input.command,
+              input.cwd,
+              input.env,
+              { stream: "pipe", endOnDone: false },
+              {
               forceKillAfter: "3 seconds",
-            }),
+              },
+            ),
           )
           const shellDelivery = input.notify
             ? { mode: "completion" as const, ownerSessionID: ctx.sessionID as unknown as string }
@@ -1007,6 +1021,14 @@ export const ShellTool = Tool.define(
                     const tree = yield* Effect.acquireRelease(parse(params.command, ps), (tree) =>
                       Effect.sync(() => tree.delete()),
                     )
+                  const safetyKind = ps ? "powershell" : ShellID.toKind(name) === "cmd" ? "cmd" : "bash"
+                  for (const node of commands(tree.rootNode)) {
+                    const reason = catastrophicDeleteReason(
+                      parts(node).map((item) => item.text),
+                      { kind: safetyKind, home: os.homedir(), cwd },
+                    )
+                    if (reason) throw new Error(reason)
+                  }
                     const scan = yield* collect(tree.rootNode, cwd, ps, shell, instanceCtx)
                     if (!containsPath(cwd, instanceCtx)) scan.dirs.add(cwd)
                     yield* ask(ctx, scan, params)
@@ -1029,7 +1051,9 @@ export const ShellTool = Tool.define(
                     }
                     const logExists = yield* fs.existsSafe(jobLogPath(params.id))
                     const metaExists = yield* fs.existsSafe(jobMetaPath(params.id))
-                    if (logExists || metaExists) {
+                  const legacyLogExists = yield* fs.existsSafe(jobLogPathLegacy(params.id))
+                  const legacyMetaExists = yield* fs.existsSafe(jobMetaPathLegacy(params.id))
+                  if (logExists || metaExists || legacyLogExists || legacyMetaExists) {
                       throw new Error(
                         `job id "${params.id}" is already in use (a stale log exists on disk; pick a new id)`,
                       )
@@ -1047,14 +1071,12 @@ export const ShellTool = Tool.define(
                     logPath,
                     notify: wantsNotify,
                     kind: "shell",
-                    delivery: wantsNotify
-                      ? { mode: "completion", ownerSessionID: ctx.sessionID }
-                      : { mode: "none" },
+                  delivery: wantsNotify ? { mode: "completion", ownerSessionID: ctx.sessionID } : { mode: "none" },
                     startedAt,
                     ...(timeoutMs !== undefined ? { timeoutMs } : {}),
                   }
 
-                  yield* fs.ensureDir(TRUNCATION_DIR)
+                yield* fs.ensureDir(path.dirname(logPath))
                   yield* fs.writeFileString(logPath, "")
                   const shellMetaDelivery = wantsNotify
                     ? { mode: "completion" as const, ownerSessionID: ctx.sessionID as unknown as string }
@@ -1076,10 +1098,22 @@ export const ShellTool = Tool.define(
                     type: "shell",
                     title: params.command,
                     metadata,
-                    run: runBackground(
-                      { shell, command: params.command, cwd, env, jobId, logPath, metaPath, notify: wantsNotify, timeoutMs },
+                  run: withBackgroundProcessSlot(
+                    runBackground(
+                      {
+                        shell,
+                        command: params.command,
+                        cwd,
+                        env,
+                        jobId,
+                        logPath,
+                        metaPath,
+                        notify: wantsNotify,
+                        timeoutMs,
+                      },
                       ctx,
                     ),
+                  ),
                   })
                   // The run effect (forked by start) registers the handle in
                   // ShellJobs; wait briefly so the manager tool's kill/send can

@@ -2,10 +2,10 @@ export * as Database from "./database"
 
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "#sqlite"
-import { Context, Duration, Effect, Layer, Schedule } from "effect"
+import { Context, Duration, Effect, Layer } from "effect"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
-import { isAbsolute, join } from "path"
+import { dirname, isAbsolute, join } from "path"
 import { DatabaseMigration } from "./migration"
 import { ensureChunkDB, CHUNKDB_PAGE_SIZE, CHUNKDB_AUTO_VACUUM } from "./chunkdb"
 import { runSealerLoop } from "./chunk-sealer"
@@ -14,6 +14,7 @@ import { rebuildDatabase } from "./chunk-rebuild"
 import { InstallationChannel } from "../installation/version"
 import { makeGlobalNode } from "../effect/app-node"
 import { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
+import { Flock } from "../util/flock"
 
 const makeDatabase = EffectDrizzleSqlite.makeWithDefaults()
 export type DatabaseShape = Effect.Success<typeof makeDatabase>
@@ -70,11 +71,30 @@ const layer = (filename: string) =>
       // hold the shared connection — bounded only by the 5s busy_timeout —
       // long enough to starve the 10s SSE heartbeat and flip the UI red.
       // PASSIVE still bounds WAL growth (idle moments between queries let it
-      // make progress); failures are swallowed so the loop keeps going.
+      // make progress). Multiple ACP/Desktop hosts can share this exact DB, so
+      // elect one checkpoint owner per pass instead of multiplying identical
+      // housekeeping by host count. The DB-local lock path deliberately avoids
+      // XDG_STATE_HOME because Desktop and ACP may use different state roots.
+      const checkpointLockDir = join(dirname(filename), ".opencode-runtime-locks")
+      const checkpoint = Effect.scoped(
+        Effect.gen(function* () {
+          yield* Flock.effect(`wal-checkpoint:${filename}`, {
+            dir: checkpointLockDir,
+            staleMs: 30_000,
+            timeoutMs: 100,
+            baseDelayMs: 25,
+            maxDelayMs: 50,
+          })
+          yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
+        }),
+      ).pipe(Effect.ignore)
       yield* Effect.forkScoped(
-        db
-          .run("PRAGMA wal_checkpoint(PASSIVE)")
-          .pipe(Effect.ignore, Effect.repeat(Schedule.spaced(Duration.minutes(5)))),
+        Effect.gen(function* () {
+          for (;;) {
+            yield* Effect.sleep(Duration.minutes(5))
+            yield* checkpoint
+          }
+        }),
       )
 
       return { db, filename }

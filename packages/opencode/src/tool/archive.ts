@@ -13,6 +13,7 @@ import { ZipFile } from "./archive/zipfile"
 import { TarFile } from "./archive/tarfile"
 import { ArchiveDecompress } from "./archive/decompress"
 import { ArchiveSystem } from "./archive/system"
+import { withHeavyProcessSlot } from "./heavy-process-concurrency"
 import DESCRIPTION from "./archive.txt"
 
 const MAX_LIST_ENTRIES = 200
@@ -68,7 +69,13 @@ type Metadata = {
   preview: string
 }
 
-function meta(action: Metadata["action"], format: string, count: number, truncated: boolean, preview: string): Metadata {
+function meta(
+  action: Metadata["action"],
+  format: string,
+  count: number,
+  truncated: boolean,
+  preview: string,
+): Metadata {
   return { action, format, count, truncated, preview }
 }
 
@@ -221,12 +228,19 @@ function renderList(
   const shown = entries.slice(0, MAX_LIST_ENTRIES)
   for (const entry of shown) {
     const marker = entry.unsafe ? "[!]" : entry.dir ? "[D]" : "   "
-    const size = entry.stored !== undefined ? `${ArchiveFormat.humanSize(entry.size)} (${ArchiveFormat.humanSize(entry.stored)} stored)` : ArchiveFormat.humanSize(entry.size)
-    lines.push(`  ${marker} ${entry.name}${entry.dir ? "/" : ""}${entry.unsafe ? " — unsafe path, will not extract" : ` — ${size}`}`)
+    const size =
+      entry.stored !== undefined
+        ? `${ArchiveFormat.humanSize(entry.size)} (${ArchiveFormat.humanSize(entry.stored)} stored)`
+        : ArchiveFormat.humanSize(entry.size)
+    lines.push(
+      `  ${marker} ${entry.name}${entry.dir ? "/" : ""}${entry.unsafe ? " — unsafe path, will not extract" : ` — ${size}`}`,
+    )
   }
   if (entries.length > shown.length) {
     lines.push("")
-    lines.push(`(Showing ${shown.length} of ${entries.length} entries. Use entries=["pattern"] to narrow, or a more specific filter.)`)
+    lines.push(
+      `(Showing ${shown.length} of ${entries.length} entries. Use entries=["pattern"] to narrow, or a more specific filter.)`,
+    )
   } else if (filtered) {
     lines.push(`(Matches ${entries.length} entries. Use a broader entries filter to see more.)`)
   }
@@ -244,15 +258,27 @@ async function extractPure(
   selection: DisplayEntry[],
   overwrite: boolean,
   signal: AbortSignal,
-): Promise<{ extracted: number; dirs: number; skipped: number; links: number; blocked: number; errors: string[]; totalBytes: number }> {
+): Promise<{
+  extracted: number
+  dirs: number
+  skipped: number
+  links: number
+  blocked: number
+  errors: string[]
+  totalBytes: number
+}> {
   const result = { extracted: 0, dirs: 0, skipped: 0, links: 0, blocked: 0, errors: [] as string[], totalBytes: 0 }
 
   if (selection.length > MAX_EXTRACT_ENTRIES) {
-    throw new Error(`Too many entries to extract (${selection.length} > ${MAX_EXTRACT_ENTRIES}). Use the entries filter to narrow the selection.`)
+    throw new Error(
+      `Too many entries to extract (${selection.length} > ${MAX_EXTRACT_ENTRIES}). Use the entries filter to narrow the selection.`,
+    )
   }
   const totalSize = selection.reduce((sum, e) => sum + e.size, 0)
   if (totalSize > MAX_EXTRACT_TOTAL) {
-    throw new Error(`Extraction would expand to ${ArchiveFormat.humanSize(totalSize)}, over the ${ArchiveFormat.humanSize(MAX_EXTRACT_TOTAL)} safety cap. Use the entries filter or extract in parts.`)
+    throw new Error(
+      `Extraction would expand to ${ArchiveFormat.humanSize(totalSize)}, over the ${ArchiveFormat.humanSize(MAX_EXTRACT_TOTAL)} safety cap. Use the entries filter or extract in parts.`,
+    )
   }
 
   if (format.kind === "zip") {
@@ -276,7 +302,9 @@ async function extractPure(
           continue
         }
         if (zipEntry.size > MAX_EXTRACT_ENTRY) {
-          result.errors.push(`${entry.name}: over ${ArchiveFormat.humanSize(MAX_EXTRACT_ENTRY)} in-process limit; extract with the bash tool instead`)
+          result.errors.push(
+            `${entry.name}: over ${ArchiveFormat.humanSize(MAX_EXTRACT_ENTRY)} in-process limit; extract with the bash tool instead`,
+          )
           continue
         }
         if (zipEntry.flags & 0x0001) {
@@ -319,7 +347,8 @@ async function extractPure(
         throw new Error(`Expected exactly one output file, got ${selection.length}`)
       }
       const data = tarBytes
-      if (data.length > MAX_EXTRACT_ENTRY) throw new Error(`Decompressed size ${ArchiveFormat.humanSize(data.length)} exceeds the in-process limit`)
+      if (data.length > MAX_EXTRACT_ENTRY)
+        throw new Error(`Decompressed size ${ArchiveFormat.humanSize(data.length)} exceeds the in-process limit`)
       const target = dest
       if (!(await exists(target)) || overwrite) {
         await writeOut(target, data, new Date())
@@ -371,7 +400,9 @@ async function extractPure(
       continue
     }
     if (tarEntry.size > MAX_EXTRACT_ENTRY) {
-      result.errors.push(`${entry.name}: over ${ArchiveFormat.humanSize(MAX_EXTRACT_ENTRY)} in-process limit; extract with the bash tool instead`)
+      result.errors.push(
+        `${entry.name}: over ${ArchiveFormat.humanSize(MAX_EXTRACT_ENTRY)} in-process limit; extract with the bash tool instead`,
+      )
       continue
     }
     const target = await safeJoin(dest, entry.name)
@@ -454,7 +485,13 @@ function renderExtract(filepath: string, dest: string, result: Awaited<ReturnTyp
     lines.push(`${result.errors.length} entries could not be extracted:`)
     lines.push(...result.errors.slice(0, 5).map((e) => `  - ${e}`))
   }
-  if (result.errors.length === 0 && result.extracted === 0 && result.skipped === 0 && result.blocked === 0 && result.links === 0) {
+  if (
+    result.errors.length === 0 &&
+    result.extracted === 0 &&
+    result.skipped === 0 &&
+    result.blocked === 0 &&
+    result.links === 0
+  ) {
     lines.push("Nothing matched. Check the entries filter against the archive's listing.")
   }
   return lines.join("\n")
@@ -471,7 +508,9 @@ async function readEntryData(
       const entry = await findZipEntry(reader, pattern)
       if (entry.dir) throw new Error(`"${pattern}" is a directory`)
       if (entry.size > MAX_READ_ENTRY) {
-        throw new Error(`Entry is ${ArchiveFormat.humanSize(entry.size)}; too large to read in-process. Extract it instead.`)
+        throw new Error(
+          `Entry is ${ArchiveFormat.humanSize(entry.size)}; too large to read in-process. Extract it instead.`,
+        )
       }
       if (entry.flags & 0x0001) throw new Error(`"${entry.name}" is encrypted and cannot be read`)
       const data = await ZipFile.readZipEntry(reader, entry)
@@ -493,7 +532,9 @@ async function readEntryData(
       return tarEntryRead(filepath, data, pattern)
     }
     if (data.length > MAX_READ_ENTRY) {
-      throw new Error(`Decompressed size ${ArchiveFormat.humanSize(data.length)} is too large to read in-process. Extract it instead.`)
+      throw new Error(
+        `Decompressed size ${ArchiveFormat.humanSize(data.length)} is too large to read in-process. Extract it instead.`,
+      )
     }
     return { name: stripCompressionExt(filepath), data, size: data.length }
   }
@@ -505,7 +546,9 @@ async function tarEntryRead(filepath: string, tarBytes: Uint8Array, pattern: str
   const entry = findTarEntry(TarFile.readTar(tarBytes), pattern)
   if (entry.dir) throw new Error(`"${pattern}" is a directory`)
   if (entry.size > MAX_READ_ENTRY) {
-    throw new Error(`Entry is ${ArchiveFormat.humanSize(entry.size)}; too large to read in-process. Extract it instead.`)
+    throw new Error(
+      `Entry is ${ArchiveFormat.humanSize(entry.size)}; too large to read in-process. Extract it instead.`,
+    )
   }
   return { name: entry.name, data: TarFile.entryData(tarBytes, entry), size: entry.size }
 }
@@ -517,9 +560,17 @@ async function findZipEntry(reader: ZipFile.Reader, pattern: string): Promise<Zi
   const matches = entries.filter((e) => Glob.match(pattern, e.name))
   if (matches.length === 1) return matches[0]
   if (matches.length > 1) {
-    throw new Error(`"${pattern}" matches ${matches.length} entries; be more specific:\n${matches.slice(0, 10).map((e) => "  " + e.name).join("\n")}`)
+    throw new Error(
+      `"${pattern}" matches ${matches.length} entries; be more specific:\n${matches
+        .slice(0, 10)
+        .map((e) => "  " + e.name)
+        .join("\n")}`,
+    )
   }
-  return missingEntry(pattern, entries.map((e) => e.name))
+  return missingEntry(
+    pattern,
+    entries.map((e) => e.name),
+  )
 }
 
 function findTarEntry(entries: TarFile.TarEntry[], pattern: string): TarFile.TarEntry {
@@ -528,23 +579,43 @@ function findTarEntry(entries: TarFile.TarEntry[], pattern: string): TarFile.Tar
   const matches = entries.filter((e) => Glob.match(pattern, e.name))
   if (matches.length === 1) return matches[0]
   if (matches.length > 1) {
-    throw new Error(`"${pattern}" matches ${matches.length} entries; be more specific:\n${matches.slice(0, 10).map((e) => "  " + e.name).join("\n")}`)
+    throw new Error(
+      `"${pattern}" matches ${matches.length} entries; be more specific:\n${matches
+        .slice(0, 10)
+        .map((e) => "  " + e.name)
+        .join("\n")}`,
+    )
   }
-  return missingEntry(pattern, entries.map((e) => e.name))
+  return missingEntry(
+    pattern,
+    entries.map((e) => e.name),
+  )
 }
 
 function missingEntry(pattern: string, names: string[]): never {
   const base = path.basename(pattern)
   const suggestions = names
-    .filter((name) => name.toLowerCase().includes(base.toLowerCase()) || base.toLowerCase().includes(name.split("/").pop()?.toLowerCase() ?? ""))
+    .filter(
+      (name) =>
+        name.toLowerCase().includes(base.toLowerCase()) ||
+        base.toLowerCase().includes(name.split("/").pop()?.toLowerCase() ?? ""),
+    )
     .slice(0, 3)
   const hint = suggestions.length ? `\nDid you mean one of these?\n${suggestions.map((s) => "  " + s).join("\n")}` : ""
   throw new Error(`Entry not found: ${pattern}${hint}`)
 }
 
-function renderRead(filepath: string, name: string, data: Uint8Array, offset: number, limit?: number): { output: string; truncated: boolean } {
+function renderRead(
+  filepath: string,
+  name: string,
+  data: Uint8Array,
+  offset: number,
+  limit?: number,
+): { output: string; truncated: boolean } {
   if (isBinary(data)) {
-    throw new Error(`Cannot read binary file entry: ${name} (${ArchiveFormat.humanSize(data.length)}). Extract it or list the archive instead.`)
+    throw new Error(
+      `Cannot read binary file entry: ${name} (${ArchiveFormat.humanSize(data.length)}). Extract it or list the archive instead.`,
+    )
   }
   const text = new TextDecoder("utf-8", { fatal: false }).decode(data)
   const lines = text.replace(/\n$/, "").split("\n")
@@ -566,7 +637,10 @@ function renderRead(filepath: string, name: string, data: Uint8Array, offset: nu
   const truncated = rendered.length < shown.length || start + shown.length < lines.length
   const last = start + rendered.length
   if (truncated) {
-    out.push("", `\n(Output capped at ${MAX_READ_BYTES / 1024} KB. Showing lines ${start + 1}-${last}. Use offset=${last + 1} to continue.)`)
+    out.push(
+      "",
+      `\n(Output capped at ${MAX_READ_BYTES / 1024} KB. Showing lines ${start + 1}-${last}. Use offset=${last + 1} to continue.)`,
+    )
   } else {
     out.push("", `\n(End of entry - total ${lines.length} lines)`)
   }
@@ -609,10 +683,13 @@ async function collectSources(sources: string[]): Promise<SourceEntry[]> {
 
 async function addFile(collected: SourceEntry[], acc: { total: number }, name: string, file: string, stat: Stats) {
   if (stat.size > MAX_CREATE_FILE) {
-    throw new Error(`${file} is ${ArchiveFormat.humanSize(stat.size)}; the create action caps files at ${ArchiveFormat.humanSize(MAX_CREATE_FILE)}`)
+    throw new Error(
+      `${file} is ${ArchiveFormat.humanSize(stat.size)}; the create action caps files at ${ArchiveFormat.humanSize(MAX_CREATE_FILE)}`,
+    )
   }
   acc.total += stat.size
-  if (acc.total > MAX_CREATE_TOTAL) throw new Error(`Sources exceed the ${ArchiveFormat.humanSize(MAX_CREATE_TOTAL)} create cap`)
+  if (acc.total > MAX_CREATE_TOTAL)
+    throw new Error(`Sources exceed the ${ArchiveFormat.humanSize(MAX_CREATE_TOTAL)} create cap`)
   collected.push({ name, data: new Uint8Array(await fs.readFile(file)), date: stat.mtime })
 }
 
@@ -637,7 +714,10 @@ async function createPure(dest: string, format: ArchiveFormat.ArchiveFormat, sou
   const fileCount = files.filter((f) => !f.dir).length
 
   if (format.kind === "zip") {
-    const result = await ZipFile.writeZip(dest, files.map((f) => ({ name: f.name, data: f.data, date: f.date, dir: f.dir })))
+    const result = await ZipFile.writeZip(
+      dest,
+      files.map((f) => ({ name: f.name, data: f.data, date: f.date, dir: f.dir })),
+    )
     return `Created ${dest} (ZIP, ${fileCount} files, ${ArchiveFormat.humanSize(result.bytes)}).`
   }
 
@@ -656,7 +736,9 @@ async function createPure(dest: string, format: ArchiveFormat.ArchiveFormat, sou
 
   if (format.kind === "compressed" && format.container === "single") {
     if (files.length !== 1 || files[0].dir) {
-      throw new Error(`Single-file ${format.compression} archives need exactly one source file. Use a zip/tar archive for directories or multiple files.`)
+      throw new Error(
+        `Single-file ${format.compression} archives need exactly one source file. Use a zip/tar archive for directories or multiple files.`,
+      )
     }
     const payload = ArchiveDecompress.compress(format.compression, files[0].data)
     await fs.writeFile(dest, payload)
@@ -675,7 +757,13 @@ function toTarSource(files: SourceEntry[]) {
   }))
 }
 
-function renderAsk(ctx: Tool.Context, permission: string, pattern: string, always: string, metadata: Record<string, unknown>) {
+function renderAsk(
+  ctx: Tool.Context,
+  permission: string,
+  pattern: string,
+  always: string,
+  metadata: Record<string, unknown>,
+) {
   return ctx.ask({
     permission,
     patterns: [pattern],
@@ -705,10 +793,12 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
           if (params.action === "list") {
             const format = yield* Effect.promise(() => detectArchive(normalized))
             if (format.kind === "unknown") {
-              throw new Error("Unrecognized file format. Expected a zip, tar, gzip/brotli/zstd/bzip2 stream, 7z, or rar archive.")
+              throw new Error(
+                "Unrecognized file format. Expected a zip, tar, gzip/brotli/zstd/bzip2 stream, 7z, or rar archive.",
+              )
             }
             if (isSystemFormat(format)) {
-              const entries = yield* Effect.promise(() => ArchiveSystem.systemList(format, normalized))
+              const entries = yield* Effect.promise(() => ArchiveSystem.systemList(format, normalized, ctx.abort))
               const filtered = filterEntries(
                 entries.map((e) => ({ name: e.name, dir: e.dir, unsafe: false, size: e.size })),
                 params.entries ?? [],
@@ -717,7 +807,13 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
               const output = renderList(normalized, format, sorted, Boolean(params.entries?.length))
               return {
                 title: archiveRel,
-                metadata: meta("list", formatLabel(format), sorted.length, sorted.length > MAX_LIST_ENTRIES, output.slice(0, 500)),
+                metadata: meta(
+                  "list",
+                  formatLabel(format),
+                  sorted.length,
+                  sorted.length > MAX_LIST_ENTRIES,
+                  output.slice(0, 500),
+                ),
                 output,
               }
             }
@@ -732,7 +828,13 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
             const output = renderList(normalized, resolved.format, sorted, Boolean(params.entries?.length))
             return {
               title: archiveRel,
-              metadata: meta("list", formatLabel(resolved.format), sorted.length, sorted.length > MAX_LIST_ENTRIES, output.slice(0, 500)),
+              metadata: meta(
+                "list",
+                formatLabel(resolved.format),
+                sorted.length,
+                sorted.length > MAX_LIST_ENTRIES,
+                output.slice(0, 500),
+              ),
               output,
             }
           }
@@ -740,18 +842,36 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
           if (params.action === "read") {
             const format = yield* Effect.promise(() => detectArchive(normalized))
             if (format.kind === "unknown") {
-              throw new Error("Unrecognized file format. Expected a zip, tar, gzip/brotli/zstd/bzip2 stream, 7z, or rar archive.")
+              throw new Error(
+                "Unrecognized file format. Expected a zip, tar, gzip/brotli/zstd/bzip2 stream, 7z, or rar archive.",
+              )
             }
             const entry = params.entry
             if (!entry && !(format.kind === "compressed" && format.container === "single")) {
-              throw new Error("The read action requires an 'entry' path or glob pattern (except for single-file compressed archives).")
+              throw new Error(
+                "The read action requires an 'entry' path or glob pattern (except for single-file compressed archives).",
+              )
             }
             if (isSystemFormat(format)) {
-              const data = yield* Effect.promise(() => ArchiveSystem.systemRead(format, normalized, format.kind === "compressed" ? "" : entry!))
-              const rendered = renderRead(normalized, entry ?? stripCompressionExt(normalized), data, params.offset ?? 1, params.limit)
+              const data = yield* Effect.promise(() =>
+                ArchiveSystem.systemRead(format, normalized, format.kind === "compressed" ? "" : entry!, ctx.abort),
+              )
+              const rendered = renderRead(
+                normalized,
+                entry ?? stripCompressionExt(normalized),
+                data,
+                params.offset ?? 1,
+                params.limit,
+              )
               return {
                 title: `${archiveRel}:${entry ?? stripCompressionExt(normalized)}`,
-                metadata: meta("read", formatLabel(format), data.length, rendered.truncated, rendered.output.slice(0, 500)),
+                metadata: meta(
+                  "read",
+                  formatLabel(format),
+                  data.length,
+                  rendered.truncated,
+                  rendered.output.slice(0, 500),
+                ),
                 output: rendered.output,
               }
             }
@@ -759,7 +879,13 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
             const rendered = renderRead(normalized, resolved.name, resolved.data, params.offset ?? 1, params.limit)
             return {
               title: `${archiveRel}:${resolved.name}`,
-              metadata: meta("read", formatLabel(format), resolved.size, rendered.truncated, rendered.output.slice(0, 500)),
+              metadata: meta(
+                "read",
+                formatLabel(format),
+                resolved.size,
+                rendered.truncated,
+                rendered.output.slice(0, 500),
+              ),
               output: rendered.output,
             }
           }
@@ -767,13 +893,17 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
           if (params.action === "extract") {
             const format = yield* Effect.promise(() => detectArchive(normalized))
             if (format.kind === "unknown") {
-              throw new Error("Unrecognized file format. Expected a zip, tar, gzip/brotli/zstd/bzip2 stream, 7z, or rar archive.")
+              throw new Error(
+                "Unrecognized file format. Expected a zip, tar, gzip/brotli/zstd/bzip2 stream, 7z, or rar archive.",
+              )
             }
             const singleByExt = format.kind === "compressed" && format.container === "single"
             const pureSingle = singleByExt && ArchiveFormat.PURE_COMPRESSIONS.has(format.compression)
             let dest: string
             if (params.destination) {
-              dest = path.isAbsolute(params.destination) ? params.destination : path.join(instance.directory, params.destination)
+              dest = path.isAbsolute(params.destination)
+                ? params.destination
+                : path.join(instance.directory, params.destination)
               if (pureSingle && (yield* Effect.promise(() => isDirectory(dest)))) {
                 dest = path.join(dest, stripCompressionExt(normalized))
               }
@@ -791,7 +921,9 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
 
             if (isSystemFormat(format)) {
               if (format.kind === "compressed" && format.container === "single") {
-                const data = yield* Effect.promise(() => ArchiveSystem.systemRead(format, normalized, ""))
+                const data = yield* withHeavyProcessSlot(
+                  Effect.promise(() => ArchiveSystem.systemRead(format, normalized, "", ctx.abort)),
+                )
                 yield* Effect.promise(() => writeOut(dest, data, new Date()))
                 const summary = `Decompressed ${normalized} to ${dest} (${ArchiveFormat.humanSize(data.length)}).`
                 return {
@@ -801,7 +933,9 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
                 }
               }
               yield* Effect.promise(() => fs.mkdir(dest, { recursive: true }))
-              const summary = yield* Effect.promise(() => ArchiveSystem.systemExtract(format, normalized, dest))
+              const summary = yield* withHeavyProcessSlot(
+                Effect.promise(() => ArchiveSystem.systemExtract(format, normalized, dest, ctx.abort)),
+              )
               return {
                 title: archiveRel,
                 metadata: meta("extract", formatLabel(format), 0, false, summary.slice(0, 500)),
@@ -811,10 +945,12 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
 
             const resolved = yield* Effect.promise(() => resolveEntries(normalized, format))
             const isSingleFile = resolved.format.kind === "compressed" && resolved.format.container === "single"
-            const selection = isSingleFile
-              ? resolved.entries
-              : filterEntries(resolved.entries, params.entries ?? [])
-            const result = yield* Effect.promise(() => extractPure(normalized, resolved.format, dest, selection, params.overwrite ?? false, ctx.abort))
+            const selection = isSingleFile ? resolved.entries : filterEntries(resolved.entries, params.entries ?? [])
+            const result = yield* withHeavyProcessSlot(
+              Effect.promise(() =>
+                extractPure(normalized, resolved.format, dest, selection, params.overwrite ?? false, ctx.abort),
+              ),
+            )
             const output = renderExtract(normalized, dest, result)
             return {
               title: archiveRel,
@@ -828,15 +964,29 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
           const sources = params.source.map((s) => (path.isAbsolute(s) ? s : path.join(instance.directory, s)))
           const destPath = path.isAbsolute(params.path) ? params.path : path.join(instance.directory, params.path)
           const destNorm = process.platform === "win32" ? FSUtil.normalizePath(destPath) : destPath
-          yield* renderAsk(ctx, "edit", path.relative(instance.worktree, destNorm), path.relative(instance.worktree, destNorm), { destination: destNorm })
+          yield* renderAsk(
+            ctx,
+            "edit",
+            path.relative(instance.worktree, destNorm),
+            path.relative(instance.worktree, destNorm),
+            { destination: destNorm },
+          )
           yield* assertExternalDirectoryEffect(ctx, destNorm, { kind: "file" })
           for (const source of sources) {
             const sourceKind = (yield* Effect.promise(() => isDirectory(source))) ? "directory" : "file"
-            yield* renderAsk(ctx, "read", path.relative(instance.worktree, source), path.relative(instance.worktree, source), { source })
+            yield* renderAsk(
+              ctx,
+              "read",
+              path.relative(instance.worktree, source),
+              path.relative(instance.worktree, source),
+              { source },
+            )
             yield* assertExternalDirectoryEffect(ctx, source, { kind: sourceKind })
           }
           if (yield* Effect.promise(() => isDirectory(destNorm))) {
-            throw new Error(`Destination looks like a directory; give the create action a full archive path: ${destNorm}`)
+            throw new Error(
+              `Destination looks like a directory; give the create action a full archive path: ${destNorm}`,
+            )
           }
           const format = ArchiveFormat.createFormatForExt(destNorm)
           if (!format) {
@@ -845,16 +995,26 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
             )
           }
           if (format.kind === "7z") {
-            const summary = yield* Effect.promise(() => ArchiveSystem.systemCreate(destNorm, sources))
-            return { title: destNorm, metadata: meta("create", "7z", sources.length, false, summary.slice(0, 500)), output: summary }
+            const summary = yield* withHeavyProcessSlot(
+              Effect.promise(() => ArchiveSystem.systemCreate(destNorm, sources, ctx.abort)),
+            )
+            return {
+              title: destNorm,
+              metadata: meta("create", "7z", sources.length, false, summary.slice(0, 500)),
+              output: summary,
+            }
           }
           if (format.kind === "compressed" && !ArchiveFormat.PURE_COMPRESSIONS.has(format.compression)) {
             throw new Error(
               `Creating ${format.compression} archives in-process is not supported. Use the bash tool instead, e.g.:\n  tar -caf ${destNorm} ${sources.join(" ")}`,
             )
           }
-          const summary = yield* Effect.promise(() => createPure(destNorm, format, sources))
-          return { title: destNorm, metadata: meta("create", formatLabel(format), sources.length, false, summary.slice(0, 500)), output: summary }
+          const summary = yield* withHeavyProcessSlot(Effect.promise(() => createPure(destNorm, format, sources)))
+          return {
+            title: destNorm,
+            metadata: meta("create", formatLabel(format), sources.length, false, summary.slice(0, 500)),
+            output: summary,
+          }
         }).pipe(Effect.orDie),
     }
   }),

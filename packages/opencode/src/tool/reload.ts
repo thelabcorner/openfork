@@ -52,7 +52,11 @@ import type ParcelWatcher from "@parcel/watcher"
 declare const OPENCODE_LIBC: string | undefined
 
 const DEBOUNCE_MS = 250
-const POLL_INTERVAL_MS = 2_000
+// Polling is a FALLBACK for hosts where native subscriptions are unavailable or
+// incomplete. Do not content-hash every custom tool/plugin in every ACP/Desktop
+// host every two seconds when the native watcher is already healthy.
+const POLL_INTERVAL_MS = 10_000
+const SUBSCRIBE_TIMEOUT_MS = 5_000
 const BACKOFF_MS = 500
 
 export type ReloadReason = "watcher" | "poll" | "manual"
@@ -73,7 +77,7 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ToolReload") {}
 
-type Fingerprint = { readonly size: number; readonly hash: string }
+export type Fingerprint = { readonly size: number; readonly hash: string }
 
 type ReloadState = {
   readonly run: (reason: ReloadReason) => Effect.Effect<ReloadResult>
@@ -217,15 +221,11 @@ const layer = Layer.effect(
             entry[source] += 1
             counts.set(def.id, entry)
             if (entry[source] > 1) {
-              return yield* Effect.fail(
-                `duplicate tool id "${def.id}" within ${source} tools; reload aborted`,
-              )
+              return yield* Effect.fail(`duplicate tool id "${def.id}" within ${source} tools; reload aborted`)
             }
             if (entry.file > 0 && entry.plugin > 0 && !warned.has(def.id)) {
               warned.add(def.id)
-              warnings.push(
-                `tool "${def.id}" is defined by both a file and a plugin; keeping existing precedence`,
-              )
+              warnings.push(`tool "${def.id}" is defined by both a file and a plugin; keeping existing precedence`)
             }
           }
           return sourced.map((item) => item.def)
@@ -302,6 +302,11 @@ const layer = Layer.effect(
         )
         yield* Effect.addFinalizer(() => unsubscribe)
 
+        // Seed the polling baseline once. The old empty baseline treated every
+        // existing file as "changed" on the first 2s poll, forcing one needless
+        // full custom-tool rebuild in every OpenCode host after startup.
+        yield* Ref.set(fingerprints, yield* scanFingerprints(dirs))
+
         // Watcher detection (2/2): ToolReload's OWN @parcel/watcher subscription over each
         // config dir, deliberately NOT git-gated and independent of
         // OPENCODE_EXPERIMENTAL_FILEWATCHER — tool/plugin files must hot-reload in ANY
@@ -309,6 +314,8 @@ const layer = Layer.effect(
         // subscriptions are unsubscribed when the instance scope is disposed. If the native
         // binding is unavailable or a dir cannot be subscribed, we degrade to the poll.
         const nativeWatcher = nativeWatcherBinding()
+        let nativeCoverage = false
+        let nativeSubscribed = 0
         if (nativeWatcher) {
           const bridge = yield* EffectBridge.make()
           const backend = watcherBackend()
@@ -346,14 +353,24 @@ const layer = Layer.effect(
             const pending = nativeWatcher.subscribe(dir, callback, { ignore: Ignore.PATTERNS, backend })
             yield* Effect.promise(() => pending).pipe(
               Effect.tap((subscription) => Effect.sync(() => subscriptions.push(subscription))),
+              Effect.timeout(`${SUBSCRIBE_TIMEOUT_MS} millis`),
               Effect.catch((error) =>
-                Effect.logWarning("tool reload watcher: failed to subscribe", { dir, error: errorMessage(error) }),
+                Effect.gen(function* () {
+                  pending.then((subscription) => subscription.unsubscribe()).catch(() => {})
+                  yield* Effect.logWarning("tool reload watcher: failed to subscribe", {
+                    dir,
+                    error: errorMessage(error),
+                  })
+                }),
               ),
             )
           }
+          nativeSubscribed = subscriptions.length
+          nativeCoverage = nativeSubscribed === dirs.length
           yield* Effect.logInfo("tool reload watcher: subscribed", {
-            subscribed: subscriptions.length,
+            subscribed: nativeSubscribed,
             attempted: dirs.length,
+            fallbackPoll: !nativeCoverage,
           })
         } else {
           // Poll is a working fallback, not a failure: keep this at debug so
@@ -363,17 +380,20 @@ const layer = Layer.effect(
           })
         }
 
-        // Poll detection: fingerprint every watched file across all config dirs. Catches
-        // changes the watchers miss (global config dir on the core side, newly-created
-        // .opencode dirs, half-written saves) and self-heals after the debounce/backoff
-        // windows.
-        yield* Effect.gen(function* () {
-          while (true) {
-            yield* Effect.sleep(POLL_INTERVAL_MS)
-            const changed = yield* pollChanged()
-            if (changed) yield* Queue.offer(triggers, "poll").pipe(Effect.ignore)
-          }
-        }).pipe(Effect.forkScoped)
+        // Poll detection is intentionally fallback-only. Native @parcel/watcher
+        // already covers both project and global config dirs; running a permanent
+        // content-hash poll alongside it just multiplies idle work by the number
+        // of ACP/Desktop hosts. Partial/native failures still self-heal via a
+        // low-frequency poll.
+        if (toolReloadNeedsPolling(Boolean(nativeWatcher), dirs.length, nativeSubscribed)) {
+          yield* Effect.gen(function* () {
+            while (true) {
+              yield* Effect.sleep(POLL_INTERVAL_MS)
+              const changed = yield* pollChanged()
+              if (changed) yield* Queue.offer(triggers, "poll").pipe(Effect.ignore)
+            }
+          }).pipe(Effect.forkScoped)
+        }
 
         // Debounced consumer: wait for a trigger, let the write settle, drain any burst,
         // then run the gated reload once.
@@ -387,18 +407,9 @@ const layer = Layer.effect(
         }).pipe(Effect.forkScoped)
 
         const pollChanged = Effect.fn("ToolReload.pollChanged")(function* () {
-          const files = [...scanToolFiles(dirs), ...scanPluginFiles(dirs)]
-          const current = new Map<string, Fingerprint>()
-          for (const file of files) current.set(file, yield* fingerprint(file))
+          const current = yield* scanFingerprints(dirs)
           const previous = yield* Ref.get(fingerprints)
-          const changed = files.filter((file) => {
-            const next = current.get(file)!
-            const prev = previous.get(file)
-            return !prev || prev.size !== next.size || prev.hash !== next.hash
-          })
-          for (const file of previous.keys()) {
-            if (!current.has(file)) changed.push(file)
-          }
+          const changed = changedFingerprints(previous, current)
           if (changed.length) yield* Ref.update(dirty, (set) => new Set([...set, ...changed]))
           yield* Ref.set(fingerprints, current)
           return changed.length > 0
@@ -428,6 +439,32 @@ export const node = LayerNode.make({
 
 // ---- pure helpers ----
 
+/**
+ * Polling is permitted only when native watcher coverage is unavailable or
+ * incomplete. Keep this decision pure so a regression cannot accidentally
+ * restore the old "native + permanent 2s poll" behavior.
+ */
+export function toolReloadNeedsPolling(nativeAvailable: boolean, attempted: number, subscribed: number): boolean {
+  if (!nativeAvailable) return true
+  return attempted <= 0 || subscribed < attempted
+}
+
+/** Returns changed, added, and removed paths between two content fingerprints. */
+export function changedFingerprints(
+  previous: ReadonlyMap<string, Fingerprint>,
+  current: ReadonlyMap<string, Fingerprint>,
+): string[] {
+  const changed: string[] = []
+  for (const [file, next] of current) {
+    const prev = previous.get(file)
+    if (!prev || prev.size !== next.size || prev.hash !== next.hash) changed.push(file)
+  }
+  for (const file of previous.keys()) {
+    if (!current.has(file)) changed.push(file)
+  }
+  return changed
+}
+
 function eventData(result: ReloadResult): {
   added: string[]
   updated: string[]
@@ -450,6 +487,13 @@ function scanPluginFiles(dirs: string[]) {
     Glob.scanSync("{plugin,plugins}/*.{ts,js}", { cwd: dir, absolute: true, dot: true, symlink: true }),
   )
 }
+
+const scanFingerprints = Effect.fnUntraced(function* (dirs: string[]) {
+  const files = [...scanToolFiles(dirs), ...scanPluginFiles(dirs)]
+  const current = new Map<string, Fingerprint>()
+  for (const file of files) current.set(file, yield* fingerprint(file))
+  return current
+})
 
 // A file is "watched" iff it is a direct child of a config dir's tool/tools/plugin/plugins
 // folder. The watcher emits absolute paths with OS-native separators.
@@ -522,9 +566,7 @@ function watcherBackend() {
 }
 
 const fingerprint = Effect.fnUntraced(function* (file: string) {
-  const source = yield* Effect.promise(() => Bun.file(file).text()).pipe(
-    Effect.catch(() => Effect.succeed("")),
-  )
+  const source = yield* Effect.promise(() => Bun.file(file).text()).pipe(Effect.catch(() => Effect.succeed("")))
   return { size: source.length, hash: createHash("sha1").update(source, "utf8").digest("hex") }
 })
 

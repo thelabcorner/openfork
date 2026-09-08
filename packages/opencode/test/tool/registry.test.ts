@@ -94,6 +94,12 @@ const withEmptyCodeMode = testEffect(
   ]),
 )
 const withBrokenPlugin = testEffect(LayerNode.compile(root, [...replacements, [Plugin.node, brokenPluginLayer]]))
+const withAcp = testEffect(
+  LayerNode.compile(root, [
+    [Config.node, configLayer],
+    [RuntimeFlags.node, RuntimeFlags.layer({ client: "acp" })],
+  ]),
+)
 
 afterEach(async () => {
   await disposeAllInstances()
@@ -115,6 +121,18 @@ describe("tool.registry", () => {
       const ids = yield* registry.ids()
 
       expect(ids).toContain("checkpoint")
+    }),
+  )
+
+  withAcp.instance("keeps fork tools exposed through the ACP runtime", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const ids = yield* registry.ids()
+      for (const id of ["checkpoint", "project", "symbols", "test", "git", "goal", "session"]) {
+        expect(ids).toContain(id)
+      }
+      // Question remains intentionally gated until ACP elicitation is bridged.
+      expect(ids).not.toContain("question")
     }),
   )
 

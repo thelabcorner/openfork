@@ -43,6 +43,50 @@ describe("util.process", () => {
     expect(Date.now() - started).toBeLessThan(1000)
   }, 3000)
 
+  test("Windows abort tears down the descendant process tree", async () => {
+    if (process.platform !== "win32") return
+
+    await using tmp = await tmpdir()
+    const pidFile = path.join(tmp.path, "grandchild.pid")
+    const script = [
+      'const { spawn } = require("child_process")',
+      'const fs = require("fs")',
+      `const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" })`,
+      `fs.writeFileSync(${JSON.stringify(pidFile)}, String(child.pid))`,
+      "setInterval(() => {}, 1000)",
+    ].join(";")
+    const abort = new AbortController()
+    const parent = Process.spawn(node(script), { abort: abort.signal })
+
+    let childPid = 0
+    const deadline = Date.now() + 2_000
+    while (Date.now() < deadline && childPid === 0) {
+      const raw = await fs.readFile(pidFile, "utf8").catch(() => "")
+      childPid = Number(raw) || 0
+      if (!childPid) await Bun.sleep(20)
+    }
+    expect(childPid).toBeGreaterThan(0)
+
+    abort.abort()
+    await parent.exited.catch(() => 1)
+
+    const alive = () => {
+      try {
+        process.kill(childPid, 0)
+        return true
+      } catch {
+        return false
+      }
+    }
+    const stoppedBy = Date.now() + 2_000
+    while (alive() && Date.now() < stoppedBy) await Bun.sleep(25)
+
+    if (alive()) {
+      await Process.run(["taskkill", "/pid", String(childPid), "/T", "/F"], { nothrow: true })
+    }
+    expect(alive()).toBe(false)
+  }, 5000)
+
   test("kills after timeout when process ignores terminate signal", async () => {
     if (process.platform === "win32") return
 

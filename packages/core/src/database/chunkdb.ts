@@ -47,6 +47,15 @@ export const CHUNKDB_EXTERNALIZE_MIN_AGGREGATE_BYTES = 64 * 1024
 export const CHUNKDB_SEAL_JOURNAL_RETENTION_DAYS = 30
 
 /**
+ * Highest durable ChunkDB representation epoch this source tree can read.
+ *
+ * Keep this as the single source of truth for both the runtime fail-closed gate
+ * and production build/install capability probes. A binary must prove it can
+ * open a database stamped at this epoch before it is considered deployable.
+ */
+export const CHUNKDB_MAX_USER_VERSION = 4
+
+/**
  * Epoch-1/2 ChunkDB schema wiring + epoch gate + DB-open integration.
  *
  * Idempotent. Creates the seal journal (`ocdb_seal`), the seal-candidate
@@ -81,13 +90,13 @@ export const CHUNKDB_SEAL_JOURNAL_RETENTION_DAYS = 30
  *   0            -> claim as the highest enabled representation epoch
  *   <target      -> upgrade in place (e.g. an epoch-1 DB reopened with DEDUP on:
  *                   1 -> 2). Safe because the new schema is a strict superset.
- *   >maxAllowed  -> FAIL CLOSED (a future/newer binary owns a schema this one
- *                   cannot understand). `maxAllowed` is 1 when only
- *                   OPENCODE_SEAL_ENABLED is set, and 2 when OPENCODE_SEAL_DEDUP
- *                   is on. An epoch-1-only binary reading a `$cdbRef` DB
- *                   (user_version=2) therefore refuses, because it would
- *                   otherwise surface nonsense `{$cdbRef}` objects to consumers
- *                   instead of the real payload.
+ *   >maxAllowed  -> FAIL CLOSED (a future/newer binary owns a representation
+ *                   this source tree cannot understand). `maxAllowed` comes
+ *                   from CHUNKDB_MAX_USER_VERSION and is intentionally separate
+ *                   from the currently enabled writer target: disabling a newer
+ *                   writer must never make already-written durable data unreadable.
+ *                   Older binaries therefore refuse newer user_version values
+ *                   instead of surfacing partial or nonsensical payloads.
  *
  * All of this is FLAG-GATED behind `Flag.OPENCODE_SEAL_ENABLED`; when the flag
  * is off the function is a no-op so existing users are unaffected.
@@ -371,7 +380,7 @@ export function ensureChunkDB(db: DatabaseShape): Effect.Effect<void> {
     // reads are compiled in unconditionally, so a v4 DB remains readable if the
     // pruning writer is later disabled. Older binaries fail closed on user_version.
     const target = semantic ? 4 : framingEpoch >= 2 ? 2 : 1
-    const maxAllowed = 4
+    const maxAllowed = CHUNKDB_MAX_USER_VERSION
     if (framingEpoch >= 2 && !dedup) {
       throw new Error(
         "OpenCode ChunkDB: this database contains epoch-2 reference framing, but OPENCODE_SEAL_DEDUP is disabled. Refusing to open.",

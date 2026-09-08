@@ -1,6 +1,7 @@
 import fs from "node:fs/promises"
 import path from "path"
 import type { ArchiveFormat } from "./format"
+import { Process } from "@/util/process"
 
 // System-tool backend for formats the pure parser cannot handle in-process
 // (.7z, .rar, xz/lz4/lzma). Prefers 7-Zip, then bsdtar/GNU tar, then unrar.
@@ -65,20 +66,29 @@ function missingBackend(format: ArchiveFormat): never {
   )
 }
 
-export async function systemList(format: ArchiveFormat, archive: string): Promise<ListedEntry[]> {
+export async function systemList(format: ArchiveFormat, archive: string, signal?: AbortSignal): Promise<ListedEntry[]> {
   const backend = await resolveBackend(format)
   if (backend.kind === "7z") {
-    const { code, stdout, stderr } = await run(backend.tool, ["l", "-slt", archive])
-    if (code !== 0) throw new Error(`7z could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`)
+    const { code, stdout, stderr } = await run(backend.tool, ["l", "-slt", archive], signal)
+    if (code !== 0)
+      throw new Error(
+        `7z could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`,
+      )
     return parse7zListing(stdout)
   }
   if (backend.kind === "tar") {
-    const { code, stdout, stderr } = await run(backend.tool, ["-tvf", archive])
-    if (code !== 0) throw new Error(`tar could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`)
+    const { code, stdout, stderr } = await run(backend.tool, ["-tvf", archive], signal)
+    if (code !== 0)
+      throw new Error(
+        `tar could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`,
+      )
     return parseTarListing(stdout)
   }
-  const { code, stdout, stderr } = await run(backend.tool, ["lb", archive])
-  if (code !== 0) throw new Error(`unrar could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`)
+  const { code, stdout, stderr } = await run(backend.tool, ["lb", archive], signal)
+  if (code !== 0)
+    throw new Error(
+      `unrar could not read the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 200)}`,
+    )
   return new TextDecoder()
     .decode(stdout)
     .split("\n")
@@ -86,53 +96,74 @@ export async function systemList(format: ArchiveFormat, archive: string): Promis
     .map((line) => ({ name: line.trim(), dir: line.trim().endsWith("/"), size: 0 }))
 }
 
-export async function systemExtract(format: ArchiveFormat, archive: string, dest: string): Promise<string> {
+export async function systemExtract(
+  format: ArchiveFormat,
+  archive: string,
+  dest: string,
+  signal?: AbortSignal,
+): Promise<string> {
   const backend = await resolveBackend(format)
   let args: string[]
   if (backend.kind === "7z") args = ["x", archive, `-o${dest}`, "-y"]
   else if (backend.kind === "tar") args = ["-xf", archive, "-C", dest]
   else args = ["x", "-y", archive, dest + path.sep]
-  const { code, stdout, stderr } = await run(backend.tool, args)
+  const { code, stdout, stderr } = await run(backend.tool, args, signal)
   if (code !== 0) {
-    throw new Error(`Extraction failed (${path.basename(backend.tool)}): ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 300)}`)
+    throw new Error(
+      `Extraction failed (${path.basename(backend.tool)}): ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 300)}`,
+    )
   }
   return backend.kind === "7z" ? summarize7z(stdout) : `Extracted with ${path.basename(backend.tool)}.`
 }
 
-export async function systemRead(format: ArchiveFormat, archive: string, entry: string): Promise<Uint8Array> {
+export async function systemRead(
+  format: ArchiveFormat,
+  archive: string,
+  entry: string,
+  signal?: AbortSignal,
+): Promise<Uint8Array> {
   const backend = await resolveBackend(format)
   if (backend.kind === "7z") {
     const args = entry ? ["e", archive, entry, "-so"] : ["e", archive, "-so"]
-    const { code, stdout, stderr } = await run(backend.tool, args)
+    const { code, stdout, stderr } = await run(backend.tool, args, signal)
     if (code !== 0 || stdout.length === 0) {
       throw new Error(`Could not read "${entry}" from the archive: ${stderr.trim() || "entry not found"}`)
     }
     return stdout
   }
-  const { code, stdout, stderr } = await run(backend.tool, ["-xOf", archive, entry])
+  const { code, stdout, stderr } = await run(backend.tool, ["-xOf", archive, entry], signal)
   if (code !== 0) {
     throw new Error(`Could not read "${entry}" from the archive: ${stderr.trim() || "entry not found"}`)
   }
   return stdout
 }
 
-export async function systemCreate(dest: string, sources: string[]): Promise<string> {
+export async function systemCreate(dest: string, sources: string[], signal?: AbortSignal): Promise<string> {
   const sevenZip = (await findTool("7z")) ?? (await findTool("7za")) ?? (await findTool("7zr"))
   if (!sevenZip) {
     throw new Error(
       "Creating 7-Zip archives requires the '7z' command. Install 7-Zip or use the bash tool: 7z a <dest> <sources>",
     )
   }
-  const { code, stdout, stderr } = await run(sevenZip, ["a", "-y", dest, ...sources])
-  if (code !== 0) throw new Error(`7z could not create the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 300)}`)
+  const { code, stdout, stderr } = await run(sevenZip, ["a", "-y", dest, ...sources], signal)
+  if (code !== 0)
+    throw new Error(
+      `7z could not create the archive: ${stderr.trim() || new TextDecoder().decode(stdout).slice(0, 300)}`,
+    )
   return `Created ${path.basename(dest)} with 7-Zip.`
 }
 
-async function run(tool: string, args: string[]): Promise<{ code: number; stdout: Uint8Array; stderr: string }> {
-  const proc = Bun.spawn([tool, ...args], { stdout: "pipe", stderr: "pipe" })
-  const [out, err] = await Promise.all([new Response(proc.stdout).arrayBuffer(), new Response(proc.stderr).text()])
-  const code = await proc.exited
-  return { code, stdout: new Uint8Array(out), stderr: err }
+async function run(
+  tool: string,
+  args: string[],
+  signal?: AbortSignal,
+): Promise<{ code: number; stdout: Uint8Array; stderr: string }> {
+  const result = await Process.run([tool, ...args], { abort: signal, nothrow: true })
+  return {
+    code: result.code,
+    stdout: new Uint8Array(result.stdout),
+    stderr: result.stderr.toString("utf8"),
+  }
 }
 
 function parse7zListing(stdout: Uint8Array): ListedEntry[] {
@@ -182,10 +213,13 @@ function parseTarListing(stdout: Uint8Array): ListedEntry[] {
 }
 
 function summarize7z(stdout: Uint8Array): string {
-  const tail = new TextDecoder().decode(stdout).split("\n").filter((line) => line.trim()).slice(-6).join("\n")
+  const tail = new TextDecoder()
+    .decode(stdout)
+    .split("\n")
+    .filter((line) => line.trim())
+    .slice(-6)
+    .join("\n")
   return `Extracted with 7-Zip.\n${tail}`
 }
 
-
 export * as ArchiveSystem from "./system"
-

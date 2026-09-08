@@ -2,7 +2,16 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Shell } from "@opencode-ai/core/shell"
 import { Identifier } from "@/id/id"
 import { BackgroundJob } from "@/background/job"
-import { ShellJobs, jobLogPath, jobMetaPath, type ShellJobDelivery, type ShellJobKind } from "@/background/shell-jobs"
+import {
+  ShellJobs,
+  jobLogPath,
+  jobMetaPath,
+  jobLogPathLegacy,
+  jobMetaPathLegacy,
+  type ShellJobDelivery,
+  type ShellJobKind,
+} from "@/background/shell-jobs"
+import { withBackgroundProcessSlot } from "./process-concurrency"
 import { MonitorDelivery } from "@/background/monitor-delivery"
 import { TRUNCATION_DIR } from "@/tool/truncation-dir"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -11,6 +20,7 @@ import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
 import { Effect, Layer, Context, Stream, Scope } from "effect"
 import { createWriteStream } from "node:fs"
+import path from "node:path"
 import * as Truncate from "@/tool/truncate"
 import type { SessionID } from "@/session/schema"
 import { rewriteBashHeredocsForPowerShell } from "@/util/powershell-heredoc"
@@ -44,7 +54,14 @@ function escapeXML(text: string) {
   return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 }
 
-function cmd(shell: string, command: string, cwd: string, env: NodeJS.ProcessEnv, stdin: any = "ignore", options: any = {}) {
+function cmd(
+  shell: string,
+  command: string,
+  cwd: string,
+  env: NodeJS.ProcessEnv,
+  stdin: any = "ignore",
+  options: any = {},
+) {
   if (process.platform === "win32" && Shell.ps(shell)) {
     const powershellCommand = rewriteBashHeredocsForPowerShell(command)
     return ChildProcess.make(shell, ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", powershellCommand], {
@@ -84,7 +101,10 @@ export type LaunchResult = {
 }
 
 export interface Interface {
-  readonly launch: (input: LaunchInput, ctx: { sessionID: SessionID; callID: string; extra?: any; abort?: AbortSignal }) => Effect.Effect<LaunchResult, Error, unknown>
+  readonly launch: (
+    input: LaunchInput,
+    ctx: { sessionID: SessionID; callID: string; extra?: any; abort?: AbortSignal },
+  ) => Effect.Effect<LaunchResult, Error, unknown>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/ShellJobService") {}
@@ -108,7 +128,10 @@ const layer = Layer.effect(
       if (existing) throw new Error(`job id "${id}" is already in use`)
       const logExists = yield* fs.existsSafe(jobLogPath(id))
       const metaExists = yield* fs.existsSafe(jobMetaPath(id))
-      if (logExists || metaExists) throw new Error(`job id "${id}" is already in use (a stale log exists on disk; pick a new id)`)
+      const legacyLogExists = yield* fs.existsSafe(jobLogPathLegacy(id))
+      const legacyMetaExists = yield* fs.existsSafe(jobMetaPathLegacy(id))
+      if (logExists || metaExists || legacyLogExists || legacyMetaExists)
+        throw new Error(`job id "${id}" is already in use (a stale log exists on disk; pick a new id)`)
       return id
     })
 
@@ -124,7 +147,12 @@ const layer = Layer.effect(
       }
     })
 
-    const injectCompletion = Effect.fn("ShellJob.injectCompletion")(function* (jobId: string, command: string, logPath: string, ctx: any) {
+    const injectCompletion = Effect.fn("ShellJob.injectCompletion")(function* (
+      jobId: string,
+      command: string,
+      logPath: string,
+      ctx: any,
+    ) {
       const ops = ctx.extra?.promptOps
       if (!ops) return
       const limits = yield* trunc.limits()
@@ -143,7 +171,7 @@ const layer = Layer.effect(
       const delivery = input.delivery
       const description = input.description
 
-      yield* fs.ensureDir(TRUNCATION_DIR)
+      yield* fs.ensureDir(path.dirname(logPath))
       yield* fs.writeFileString(logPath, "")
       const meta: Record<string, unknown> = {
         id: jobId,
@@ -162,7 +190,12 @@ const layer = Layer.effect(
 
       // For monitor kind, attach delivery pipeline before spawn so ingest is ready
       if (delivery.mode === "events") {
-        yield* monitor.attach({ jobID: jobId, ownerSessionID: delivery.ownerSessionID as any as SessionID, description: delivery.description, debounceMs: delivery.debounceMs })
+        yield* monitor.attach({
+          jobID: jobId,
+          ownerSessionID: delivery.ownerSessionID as any as SessionID,
+          description: delivery.description,
+          debounceMs: delivery.debounceMs,
+        })
       }
 
       const metadata: Record<string, unknown> = {
@@ -225,7 +258,14 @@ const layer = Layer.effect(
             yield* Effect.addFinalizer(closeSink)
             sink = createWriteStream(logPath, { flags: "a" })
             const handle = yield* spawner.spawn(
-              cmd(input.shell, input.command, input.cwd, input.env, { stream: "pipe", endOnDone: false }, { forceKillAfter: "3 seconds" }),
+              cmd(
+                input.shell,
+                input.command,
+                input.cwd,
+                input.env,
+                { stream: "pipe", endOnDone: false },
+                { forceKillAfter: "3 seconds" },
+              ),
             )
             // register live handle
             yield* jobs.register({
@@ -277,7 +317,9 @@ const layer = Layer.effect(
             const exit = yield* timeoutMs !== undefined
               ? Effect.raceAll([
                   handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-                  Effect.sleep(`${timeoutMs + 100} millis`).pipe(Effect.map(() => ({ kind: "timeout" as const, code: null }))),
+                  Effect.sleep(`${timeoutMs + 100} millis`).pipe(
+                    Effect.map(() => ({ kind: "timeout" as const, code: null })),
+                  ),
                 ])
               : handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code })))
 
@@ -310,7 +352,7 @@ const layer = Layer.effect(
         type: "shell",
         title: input.command,
         metadata,
-        run,
+        run: withBackgroundProcessSlot(run),
       })
 
       yield* pollUntilRegistered(jobId)
@@ -343,14 +385,22 @@ const layer = Layer.effect(
               ].join("\n")
             let injection: string | undefined
             if (info?.status === "completed") injection = render("completed", `<preview>\n${preview}\n</preview>`)
-            else if (info?.status === "error") injection = render("error", `<error>${escapeXML(info.error ?? "Command failed")}</error>\n<preview>\n${preview}\n</preview>`)
+            else if (info?.status === "error")
+              injection = render(
+                "error",
+                `<error>${escapeXML(info.error ?? "Command failed")}</error>\n<preview>\n${preview}\n</preview>`,
+              )
             else if (info?.status === "cancelled") {
               // explicit kill — no wake per spec §52
               injection = undefined
             }
             if (injection) {
               yield* ops
-                .prompt({ sessionID: ctx.sessionID as any, agent: (ctx as any).agent ?? "build", parts: [{ type: "text", synthetic: true, text: injection }] } as any)
+                .prompt({
+                  sessionID: ctx.sessionID as any,
+                  agent: (ctx as any).agent ?? "build",
+                  parts: [{ type: "text", synthetic: true, text: injection }],
+                } as any)
                 .pipe(Effect.ignore, Effect.forkIn(scope, { startImmediately: true }))
             }
           }).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.ignore)

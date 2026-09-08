@@ -841,6 +841,7 @@ function scrollQuestionStart(_: ToolProps<typeof QuestionTool>): string {
 function scrollQuestionFinal(p: ToolProps<typeof QuestionTool>): string {
   const q = p.input.questions ?? []
   const a = p.metadata.answers ?? []
+  const d = p.metadata.details ?? []
   const time = span(p.frame.state)
   if (q.length === 0) {
     if (!time) {
@@ -854,8 +855,11 @@ function scrollQuestionFinal(p: ToolProps<typeof QuestionTool>): string {
   for (const [i, item] of q.slice(0, 4).entries()) {
     const prompt = item.question
     const reply = a[i] ?? []
+    const detail = d[i]?.trim()
     rows.push(`? ${prompt || `Question ${i + 1}`}`)
-    rows.push(`  ${reply.length > 0 ? reply.join(", ") : "(no answer)"}`)
+    if (reply.length > 0) rows.push(`  ${reply.join(", ")}`)
+    if (detail) rows.push(`  Details: ${detail}`)
+    if (reply.length === 0 && !detail) rows.push("  (no answer)")
   }
 
   if (q.length > 4) {

@@ -17,10 +17,17 @@ export const AcpCommand = effectCmd({
     })
   },
   handler: Effect.fn("Cli.acp")(function* (args) {
+    // src/index.ts reserves stdout before importing the CLI/plugin graph. Keep a
+    // fallback for direct command-module tests, but normal ACP execution must
+    // use the captured pre-bootstrap writer for protocol frames.
+    const protocolWrite =
+      (globalThis as typeof globalThis & { __OPENCODE_ACP_PROTOCOL_WRITE__?: typeof process.stdout.write })
+        .__OPENCODE_ACP_PROTOCOL_WRITE__ ?? process.stdout.write.bind(process.stdout)
+    process.env.OPENCODE_CLIENT = "acp"
+
     const { Server } = yield* Effect.promise(() => import("@/server/server"))
     const { ACP } = yield* Effect.promise(() => import("@/acp/agent"))
     ACPProfile.mark("cli.acp.handler")
-    process.env.OPENCODE_CLIENT = "acp"
     const opts = yield* resolveNetworkOptions(args)
     const server = yield* Effect.promise(() => ACPProfile.measure("cli.acp.server.listen", () => Server.listen(opts)))
 
@@ -32,7 +39,7 @@ export const AcpCommand = effectCmd({
     const input = new WritableStream<Uint8Array>({
       write(chunk) {
         return new Promise<void>((resolve, reject) => {
-          process.stdout.write(chunk, (err) => {
+          protocolWrite(chunk, (err) => {
             if (err) {
               reject(err)
             } else {

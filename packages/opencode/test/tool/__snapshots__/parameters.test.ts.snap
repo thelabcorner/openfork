@@ -389,6 +389,10 @@ exports[`tool parameters JSON Schema (wire shape) question 1`] = `
       "description": "Questions to ask",
       "items": {
         "properties": {
+          "custom": {
+            "description": "Allow an optional free-form response in addition to any selected choices (default: true)",
+            "type": "boolean",
+          },
           "header": {
             "description": "Very short label (max 30 chars)",
             "type": "string",

@@ -121,6 +121,7 @@ export function traceSubagentState(state: FooterSubagentState) {
         question: question.question,
         options: question.options.length,
         multiple: question.multiple,
+        custom: question.custom,
       })),
     })),
   }

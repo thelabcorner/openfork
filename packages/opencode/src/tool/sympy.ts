@@ -3,6 +3,7 @@ import path from "path"
 import fs from "node:fs/promises"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+import { withHeavyProcessSlot } from "./heavy-process-concurrency"
 import * as Tool from "./tool"
 import { InstanceState } from "@/effect/instance-state"
 import { TRUNCATION_DIR } from "./truncation-dir"
@@ -36,7 +37,8 @@ export const Parameters = Schema.Struct({
       "Operation to apply to expr (default simplify): simplify|expand|factor|solve|diff|integrate|limit|series|evalf|nroots|factorint|primefactors|gcd|lcm|apart|together|trigsimp|cancel",
   }),
   symbols: Schema.optional(Schema.String).annotate({
-    description: "Symbols to declare, space or comma separated, e.g. \"x y\" or \"a b c\". Auto-detected from expr when omitted.",
+    description:
+      'Symbols to declare, space or comma separated, e.g. "x y" or "a b c". Auto-detected from expr when omitted.',
   }),
   variable: Schema.optional(Schema.String).annotate({
     description: "Variable for solve/diff/integrate/limit/series (default: first free symbol).",
@@ -45,7 +47,7 @@ export const Parameters = Schema.Struct({
     description: "limit/series: the value the variable approaches (e.g. 0, oo, -oo) / expansion point.",
   }),
   direction: Schema.optional(Schema.Literals(["+", "-"])).annotate({
-    description: "limit: one-sided direction (\"+\" from above, \"-\" from below).",
+    description: 'limit: one-sided direction ("+" from above, "-" from below).',
   }),
   order: Schema.optional(NonNegativeInt).annotate({
     description: "diff: derivative order; series: number of terms.",
@@ -73,8 +75,7 @@ type Metadata = {
   result?: string
 }
 
-const escapeXml = (text: string) =>
-  text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+const escapeXml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 
 // Candidates for the python interpreter, in preference order.
 const PYTHON_CANDIDATES = ["python", "python3", "py"]
@@ -88,10 +89,7 @@ type Probe = {
 }
 
 // Detect python + sympy by running a tiny probe through the spawner.
-const probePython = Effect.fn("SympyTool.probe")(function* (
-  spawner: ChildProcessSpawner["Service"],
-  cwd: string,
-) {
+const probePython = Effect.fn("SympyTool.probe")(function* (spawner: ChildProcessSpawner["Service"], cwd: string) {
   for (const candidate of PYTHON_CANDIDATES) {
     const probe = [
       "import sys",
@@ -114,7 +112,10 @@ const probePython = Effect.fn("SympyTool.probe")(function* (
     ).pipe(Effect.catch(() => Effect.succeed({ out: "", code: 1 })))
 
     if (result.code === 0) {
-      const lines = result.out.split(/\r?\n/).map((l) => l.trim()).filter(Boolean)
+      const lines = result.out
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter(Boolean)
       const sympyLine = lines.find((l) => l !== "NO_SYMPY" && /^\d+\.\d+/.test(l))
       const version = lines.find((l) => /^\d+\.\d+\.\d+/.test(l))
       const sympy = lines.find((l) => /^\d+\.\d+\.\d+$/.test(l))
@@ -157,22 +158,25 @@ export const SympyTool = Tool.define<typeof Parameters, Metadata, ChildProcessSp
             throw new Error("Provide either expr (structured) or code (advanced), not both.")
           }
           if (params.expr === undefined && params.code === undefined) {
-            throw new Error("Provide expr (structured path) or code (advanced path). See the tool description for examples.")
+            throw new Error(
+              "Provide expr (structured path) or code (advanced path). See the tool description for examples.",
+            )
           }
 
           const symbols = parseSymbols(params.symbols)
-          const built = params.code !== undefined
-            ? buildCodeCall({ code: params.code, symbols })
-            : buildExprCall({
-                expr: params.expr!,
-                operation: params.operation,
-                symbols,
-                variable: params.variable,
-                point: params.point,
-                direction: params.direction,
-                order: params.order,
-                precision: params.precision,
-              })
+          const built =
+            params.code !== undefined
+              ? buildCodeCall({ code: params.code, symbols })
+              : buildExprCall({
+                  expr: params.expr!,
+                  operation: params.operation,
+                  symbols,
+                  variable: params.variable,
+                  point: params.point,
+                  direction: params.direction,
+                  order: params.order,
+                  precision: params.precision,
+                })
           if (!built.ok) throw new Error(built.error)
           const kind = built.kind
 
@@ -207,56 +211,58 @@ export const SympyTool = Tool.define<typeof Parameters, Metadata, ChildProcessSp
 
           const script = built.code
 
-          exitCode = yield* Effect.scoped(
-            Effect.gen(function* () {
-              const handle = yield* spawner.spawn(
-                ChildProcess.make(probe.interpreter!, ["-c", script], {
-                  cwd: instance.directory,
-                  env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUNBUFFERED: "1" },
-                  stdin: "ignore",
-                  stdout: "pipe",
-                  stderr: "pipe",
-                }),
-              )
-
-              const streamFiber = yield* Effect.forkScoped(
-                Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
-                  Effect.promise(async () => {
-                    if (full.length < OUTPUT_CAP_BYTES) full += chunk
-                    await fs.appendFile(spill, chunk, "utf8").catch(() => undefined)
-                    fileBytes += Buffer.byteLength(chunk, "utf-8")
+          exitCode = yield* withHeavyProcessSlot(
+            Effect.scoped(
+              Effect.gen(function* () {
+                const handle = yield* spawner.spawn(
+                  ChildProcess.make(probe.interpreter!, ["-c", script], {
+                    cwd: instance.directory,
+                    env: { ...process.env, PYTHONIOENCODING: "utf-8", PYTHONUNBUFFERED: "1" },
+                    stdin: "ignore",
+                    stdout: "pipe",
+                    stderr: "pipe",
                   }),
-                ),
-              )
+                )
 
-              const abort = Effect.callback<void>((resume) => {
-                if (ctx.abort.aborted) return resume(Effect.void)
-                const handler = () => resume(Effect.void)
-                ctx.abort.addEventListener("abort", handler, { once: true })
-                return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
-              })
+                const streamFiber = yield* Effect.forkScoped(
+                  Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+                    Effect.promise(async () => {
+                      if (full.length < OUTPUT_CAP_BYTES) full += chunk
+                      await fs.appendFile(spill, chunk, "utf8").catch(() => undefined)
+                      fileBytes += Buffer.byteLength(chunk, "utf-8")
+                    }),
+                  ),
+                )
 
-              const exit = yield* Effect.raceAll([
-                handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-                abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-                Effect.sleep(`${timeoutMs + 100} millis`).pipe(
-                  Effect.map(() => ({ kind: "timeout" as const, code: null })),
-                ),
-              ])
+                const abort = Effect.callback<void>((resume) => {
+                  if (ctx.abort.aborted) return resume(Effect.void)
+                  const handler = () => resume(Effect.void)
+                  ctx.abort.addEventListener("abort", handler, { once: true })
+                  return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
+                })
 
-              if (exit.kind === "abort") {
-                aborted = true
-                yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-              }
-              if (exit.kind === "timeout") {
-                expired = true
-                yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-              }
+                const exit = yield* Effect.raceAll([
+                  handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+                  abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
+                  Effect.sleep(`${timeoutMs + 100} millis`).pipe(
+                    Effect.map(() => ({ kind: "timeout" as const, code: null })),
+                  ),
+                ])
 
-              yield* Fiber.join(streamFiber).pipe(Effect.timeout("2 seconds")).pipe(Effect.ignore)
-              return exit.kind === "exit" ? exit.code : null
-            }),
-          ).pipe(Effect.orDie)
+                if (exit.kind === "abort") {
+                  aborted = true
+                  yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+                }
+                if (exit.kind === "timeout") {
+                  expired = true
+                  yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+                }
+
+                yield* Fiber.join(streamFiber).pipe(Effect.timeout("2 seconds")).pipe(Effect.ignore)
+                return exit.kind === "exit" ? exit.code : null
+              }),
+            ).pipe(Effect.orDie),
+          )
 
           const durationMs = Date.now() - started
 
@@ -270,7 +276,9 @@ export const SympyTool = Tool.define<typeof Parameters, Metadata, ChildProcessSp
           // Keep the spill only when the result is huge or there was a failure.
           const resultBytes = Buffer.byteLength(parsed.result, "utf8")
           const keepSpill = fileBytes > RESULT_CAP_BYTES || status !== "ok"
-          const spillPath = keepSpill ? spill : (yield* Effect.promise(() => fs.rm(spill, { force: true })).pipe(Effect.as(undefined)))
+          const spillPath = keepSpill
+            ? spill
+            : yield* Effect.promise(() => fs.rm(spill, { force: true })).pipe(Effect.as(undefined))
 
           let output = ""
           if (status === "timed-out") {
@@ -294,7 +302,9 @@ export const SympyTool = Tool.define<typeof Parameters, Metadata, ChildProcessSp
               `<sympy status="ok" kind="${kind}" duration="${humanizeMs(durationMs)}">`,
               `  <call>${escapeXml(built.display)}</call>`,
               `  <result>${escapeXml(truncated ? result.slice(0, RESULT_CAP_BYTES) + "…" : result)}</result>`,
-              ...(parsed.diagnostics ? [`  <diagnostics>${escapeXml(parsed.diagnostics.slice(0, 2000))}</diagnostics>`] : []),
+              ...(parsed.diagnostics
+                ? [`  <diagnostics>${escapeXml(parsed.diagnostics.slice(0, 2000))}</diagnostics>`]
+                : []),
               ...(spillPath ? [`  <fullOutput path="${escapeXml(spillPath)}" />`] : []),
               `</sympy>`,
             ].join("\n")

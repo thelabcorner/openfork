@@ -14,6 +14,7 @@ import { containsPath } from "@/project/instance-context"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { LspEvent } from "@opencode-ai/schema/lsp-event"
+import { withLspStartupSlot } from "./startup-concurrency"
 
 export const Event = LspEvent
 
@@ -229,40 +230,42 @@ const layer = Layer.effect(
         let updated = 0
 
         async function schedule(server: LSPServer.Info, root: string, key: string) {
-          const handle = await server
-            .spawn(root, ctx, flags)
-            .then((value) => {
-              if (!value) s.broken.add(key)
-              return value
-            })
-            .catch(() => {
+          return withLspStartupSlot(async () => {
+            const handle = await server
+              .spawn(root, ctx, flags)
+              .then((value) => {
+                if (!value) s.broken.add(key)
+                return value
+              })
+              .catch(() => {
+                s.broken.add(key)
+                return undefined
+              })
+
+            if (!handle) return undefined
+            const client = await LSPClient.create({
+              serverID: server.id,
+              server: handle,
+              root,
+              directory: ctx.directory,
+              instance: ctx,
+            }).catch(async () => {
               s.broken.add(key)
+              await Process.stop(handle.process)
               return undefined
             })
 
-          if (!handle) return undefined
-          const client = await LSPClient.create({
-            serverID: server.id,
-            server: handle,
-            root,
-            directory: ctx.directory,
-            instance: ctx,
-          }).catch(async () => {
-            s.broken.add(key)
-            await Process.stop(handle.process)
-            return undefined
+            if (!client) return undefined
+
+            const existing = s.clients.find((x) => x.root === root && x.serverID === server.id)
+            if (existing) {
+              await Process.stop(handle.process)
+              return existing
+            }
+
+            s.clients.push(client)
+            return client
           })
-
-          if (!client) return undefined
-
-          const existing = s.clients.find((x) => x.root === root && x.serverID === server.id)
-          if (existing) {
-            await Process.stop(handle.process)
-            return existing
-          }
-
-          s.clients.push(client)
-          return client
         }
 
         for (const server of Object.values(s.servers)) {
@@ -359,20 +362,17 @@ const layer = Layer.effect(
       yield* Effect.logInfo("touching file", { file: input })
       const clients = yield* getClients(input)
       yield* Effect.promise(() =>
-        mapLimited(
-          clients,
-          async (client) => {
-            const after = Date.now()
-            const version = await client.notify.open({ path: input })
-            if (!diagnostics) return
-            return client.waitForDiagnostics({
-              path: input,
-              version,
-              mode: diagnostics,
-              after,
-            })
-          },
-        ).catch(() => {}),
+        mapLimited(clients, async (client) => {
+          const after = Date.now()
+          const version = await client.notify.open({ path: input })
+          if (!diagnostics) return
+          return client.waitForDiagnostics({
+            path: input,
+            version,
+            mode: diagnostics,
+            after,
+          })
+        }).catch(() => {}),
       )
     })
 

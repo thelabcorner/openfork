@@ -4,6 +4,7 @@ import { $ } from "bun"
 import path from "path"
 import { fileURLToPath } from "url"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
+import { validateChunkDbCapability } from "./chunkdb-capability"
 
 const __filename = fileURLToPath(import.meta.url)
 const __dirname = path.dirname(__filename)
@@ -208,6 +209,8 @@ for (const item of targets) {
     try {
       const versionOutput = await $`${binaryPath} --version`.text()
       console.log(`Smoke test passed: ${versionOutput.trim()}`)
+      const chunkDb = await validateChunkDbCapability(path.resolve(binaryPath))
+      console.log(`ChunkDB capability smoke passed: user_version ${chunkDb.userVersion}`)
     } catch (e) {
       console.error(`Smoke test failed for ${name}:`, e)
       process.exit(1)

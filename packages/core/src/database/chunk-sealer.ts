@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto"
+import path from "node:path"
 import { Cause, Effect, Duration } from "effect"
 import type { SqlError } from "effect/unstable/sql/SqlError"
 import { sql } from "drizzle-orm"
@@ -9,6 +10,7 @@ import { compressTextAsync } from "./compress-pool"
 import { runSemanticPrunePass, type SemanticPruneOutcome } from "./chunk-prune"
 import { isSqliteBusy } from "./sqlite-busy"
 import { Flag } from "../flag/flag"
+import { Flock } from "../util/flock"
 import {
   CHUNKDB_BATCH_SIZE,
   CHUNKDB_COOLING_MS,
@@ -86,7 +88,12 @@ const MAX_ROWS_PER_PASS = 5_000
 // unchanged.
 const CHUNKDB_BACKFILL_MAX_ROWS_PER_PASS = 50_000
 const MAINTENANCE_INTERVAL_MS = 10 * 60 * 1000
-const DRAIN_SLEEP_MS = 250
+// A backfill pass is deliberately followed by a proportional cool-off. The
+// sealer is background maintenance, not a benchmark loop: even one correctly
+// elected owner should leave sustained CPU/IO headroom for interactive work.
+const CHUNKDB_BACKFILL_COOLDOWN_RATIO = 0.5
+const CHUNKDB_BACKFILL_COOLDOWN_MIN_MS = 1_000
+const CHUNKDB_BACKFILL_COOLDOWN_MAX_MS = 30_000
 // Failure backoff: a failed pass doubles the wait (exponential, capped) so a
 // broken DB isn't hammered; reset on success.
 const BACKOFF_BASE_MS = 10 * 60 * 1000
@@ -109,7 +116,14 @@ const CHUNKDB_RECLAIM_DRAIN_FREE_RATIO = 0.05
 const CHUNKDB_RECLAIM_DRAIN_MIN_FREE_PAGES = 8_192 // 64 MiB at the tuned 8 KiB page size
 const CHUNKDB_RECLAIM_DRAIN_MAX_MS = 15_000
 const CHUNKDB_RECLAIM_DRAIN_PAUSE_MS = 10
-const CHUNKDB_RECLAIM_DRAIN_SLEEP_MS = 250
+const CHUNKDB_RECLAIM_DRAIN_SLEEP_MS = 1_000
+// Cross-process sealer ownership. Multiple ACP processes and the desktop sidecar
+// can all open the same physical database. Only one of them may perform
+// background sealing/compression at a time; non-owners retry at maintenance
+// cadence instead of running duplicate scans/workers or spinning on the lock.
+const CHUNKDB_SEALER_LOCK_TIMEOUT_MS = 750
+const CHUNKDB_SEALER_LOCK_STALE_MS = 60_000
+const CHUNKDB_SEALER_STANDBY_RETRY_MS = MAINTENANCE_INTERVAL_MS
 
 // A Database layer can be materialized more than once inside one server process
 // (for example by independently-built service graphs). Starting one infinite
@@ -130,6 +144,14 @@ const activeSealers = (() => {
 function sealerKey(filename: string): string {
   const normalized = filename.replaceAll("\\", "/")
   return process.platform === "win32" ? normalized.toLowerCase() : normalized
+}
+
+export function backfillCooldownMs(passDurationMs: number): number {
+  if (!Number.isFinite(passDurationMs) || passDurationMs <= 0) return CHUNKDB_BACKFILL_COOLDOWN_MIN_MS
+  return Math.max(
+    CHUNKDB_BACKFILL_COOLDOWN_MIN_MS,
+    Math.min(CHUNKDB_BACKFILL_COOLDOWN_MAX_MS, Math.ceil(passDurationMs * CHUNKDB_BACKFILL_COOLDOWN_RATIO)),
+  )
 }
 
 /** Optional tuning knobs for a sealer pass (epoch-3 storage-frontier-v3). */
@@ -935,8 +957,33 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
     }),
     (acquired) => {
       if (!acquired) return Effect.logDebug("ChunkDB sealer already active", { filename, pid: process.pid })
-      return withBackfillDb(filename, (db) =>
-        Effect.gen(function* () {
+      return Effect.gen(function* () {
+        for (;;) {
+          const owned = yield* Effect.scoped(
+            Effect.gen(function* () {
+              const lock = yield* Flock.effect(`chunkdb-sealer:${key}`, {
+                // Tie ownership to the physical DB location. Desktop may use a
+                // different XDG_STATE_HOME than ACP, but hosts opening this same
+                // file necessarily share its parent directory.
+                dir: path.join(path.dirname(filename), ".opencode-runtime-locks"),
+                staleMs: CHUNKDB_SEALER_LOCK_STALE_MS,
+                timeoutMs: CHUNKDB_SEALER_LOCK_TIMEOUT_MS,
+                baseDelayMs: 75,
+                maxDelayMs: 200,
+              }).pipe(
+                Effect.as(true),
+                Effect.catch((error) =>
+                  Effect.logDebug("ChunkDB sealer owned by another process", {
+                    filename,
+                    pid: process.pid,
+                    error: String(error),
+                  }).pipe(Effect.as(false)),
+                ),
+              )
+              if (!lock) return false
+
+              yield* withBackfillDb(filename, (db) =>
+                Effect.gen(function* () {
           yield* Effect.logInfo("ChunkDB sealer started", {
             filename,
             pid: process.pid,
@@ -970,7 +1017,7 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
                 // Interruptions are lifecycle signals, not maintenance errors;
                 // preserve them exactly so scope shutdown remains prompt.
                 Effect.catchCause((cause): Effect.Effect<SemanticLoopOutcome> => {
-                  if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+                  if (Cause.hasInterrupts(cause)) return Effect.failCause(cause).pipe(Effect.orDie)
                   if (isSqliteBusy(cause)) return Effect.succeed({ kind: "busy" })
                   return Effect.logWarning("ChunkDB semantic prune pass failed; backing off", {
                     filename,
@@ -1003,7 +1050,7 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               // another semantic pass before the normal sealer can frame/ref the
               // remaining JSON and hide its entity key from candidate discovery.
               if (pruned.compacted > 0 || pruned.hasMore) {
-                yield* Effect.sleep(Duration.millis(DRAIN_SLEEP_MS))
+                yield* Effect.sleep(Duration.millis(backfillCooldownMs(Date.now() - started)))
                 continue
               }
             }
@@ -1074,14 +1121,26 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
             }
 
             const wait = previousHitCap && backfillAllowed
-              ? DRAIN_SLEEP_MS
+              ? backfillCooldownMs(Date.now() - started)
               : reclaimDraining
                 ? CHUNKDB_RECLAIM_DRAIN_SLEEP_MS
                 : MAINTENANCE_INTERVAL_MS
             yield* Effect.sleep(Duration.millis(wait))
           }
-        }),
-      )
+                }),
+              )
+              return true
+            }),
+          )
+
+          // The owner path is normally infinite. If it ever returns cleanly,
+          // reacquire rather than leaving maintenance permanently disabled. A
+          // non-owner sleeps for minutes, so N ACP/Desktop hosts add negligible
+          // standby CPU while still providing crash/restart failover.
+          if (!owned) yield* Effect.sleep(Duration.millis(CHUNKDB_SEALER_STANDBY_RETRY_MS))
+          else yield* Effect.yieldNow
+        }
+      })
     },
     (acquired) =>
       acquired

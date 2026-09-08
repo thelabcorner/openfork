@@ -32,7 +32,12 @@ import { Database as CoreDatabase, Service as DatabaseService, withBackfillDb } 
 import type { DatabaseShape } from "../../src/database/database"
 import { DatabaseMigration } from "../../src/database/migration"
 import { CHUNKDB_COOLING_MS, CHUNKDB_HOT_TAIL_EVENTS, ensureChunkDB } from "../../src/database/chunkdb"
-import { inspectSealerBacklog, runPassV2, shouldDrainFreelist } from "../../src/database/chunk-sealer"
+import {
+  backfillCooldownMs,
+  inspectSealerBacklog,
+  runPassV2,
+  shouldDrainFreelist,
+} from "../../src/database/chunk-sealer"
 import { rehydrateEvents, CdbRehydrateError } from "../../src/event"
 import { EventV2 } from "../../src/event"
 import { Event } from "@opencode-ai/schema/event"
@@ -145,18 +150,27 @@ const seed = (db: DatabaseShape, events: ReturnType<typeof makeEvents>) =>
   Effect.gen(function* () {
     const aggSeq = new Map<string, number>()
     for (const e of events) aggSeq.set(e.agg, Math.max(aggSeq.get(e.agg) ?? 0, e.seq))
-    yield* db.insert(EventSequenceTable).values(
-      Array.from(aggSeq, ([aggregate_id, seq]) => ({ aggregate_id, seq, owner_id: null })),
-    ).onConflictDoNothing().run().pipe(Effect.orDie)
-    yield* db.insert(EventTable).values(
-      events.map((e) => ({ id: e.id as never, aggregate_id: e.agg, seq: e.seq, type: "test.crash", data: e.data })),
-    ).run().pipe(Effect.orDie)
+    yield* db
+      .insert(EventSequenceTable)
+      .values(Array.from(aggSeq, ([aggregate_id, seq]) => ({ aggregate_id, seq, owner_id: null })))
+      .onConflictDoNothing()
+      .run()
+      .pipe(Effect.orDie)
+    yield* db
+      .insert(EventTable)
+      .values(
+        events.map((e) => ({ id: e.id as never, aggregate_id: e.agg, seq: e.seq, type: "test.crash", data: e.data })),
+      )
+      .run()
+      .pipe(Effect.orDie)
   })
 
 const snapshot = (db: DatabaseShape) =>
   Effect.gen(function* () {
     const valueRows = yield* db.all<{ c: number }>(sql`SELECT COUNT(*) as c FROM event_value`).pipe(Effect.orDie)
-    const refs = yield* db.all<{ s: number }>(sql`SELECT COALESCE(SUM(refs), 0) as s FROM event_value`).pipe(Effect.orDie)
+    const refs = yield* db
+      .all<{ s: number }>(sql`SELECT COALESCE(SUM(refs), 0) as s FROM event_value`)
+      .pipe(Effect.orDie)
     const sealRows = yield* db.all<{ c: number }>(sql`SELECT COUNT(*) as c FROM ocdb_seal`).pipe(Effect.orDie)
     return { valueRows: valueRows[0]?.c ?? 0, refs: refs[0]?.s ?? 0, sealRows: sealRows[0]?.c ?? 0 }
   })
@@ -164,7 +178,12 @@ const snapshot = (db: DatabaseShape) =>
 const verifyByteExact = (db: DatabaseShape, events: ReturnType<typeof makeEvents>) =>
   Effect.gen(function* () {
     for (const agg of ["agg_a", "agg_b"]) {
-      const rows = yield* db.select().from(EventTable).where(sql`aggregate_id = ${agg}`).all().pipe(Effect.orDie)
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(sql`aggregate_id = ${agg}`)
+        .all()
+        .pipe(Effect.orDie)
       const hydrated = yield* rehydrateEvents(db, agg, rows as never)
       for (let i = 0; i < rows.length; i++) {
         const orig = events.find((e) => e.id === (rows[i] as { id: string }).id)!
@@ -179,6 +198,14 @@ function tmpDb() {
 }
 
 describe("ChunkDB crash recovery", () => {
+  test("THERMAL BUDGET: backfill cool-off scales with CPU pass duration and stays bounded", () => {
+    expect(backfillCooldownMs(0)).toBe(1_000)
+    expect(backfillCooldownMs(500)).toBe(1_000)
+    expect(backfillCooldownMs(10_000)).toBe(5_000)
+    expect(backfillCooldownMs(60_000)).toBe(30_000)
+    expect(backfillCooldownMs(600_000)).toBe(30_000)
+  })
+
   test("RECLAIM POLICY: large freelists stay in accelerated drain while normal slack does not", () => {
     // Production incident shape: ~813k free pages out of ~1.265M total must
     // remain in accelerated reclaim rather than falling back to 10-minute idle.
@@ -203,7 +230,11 @@ describe("ChunkDB crash recovery", () => {
             type: "test.crash",
             data,
           }))
-          yield* db.insert(EventSequenceTable).values({ aggregate_id: agg, seq: events.length, owner_id: null }).run().pipe(Effect.orDie)
+          yield* db
+            .insert(EventSequenceTable)
+            .values({ aggregate_id: agg, seq: events.length, owner_id: null })
+            .run()
+            .pipe(Effect.orDie)
           yield* db.insert(EventTable).values(events).run().pipe(Effect.orDie)
         }),
       )
@@ -232,10 +263,14 @@ describe("ChunkDB crash recovery", () => {
 
       await runWith(path, (db) =>
         Effect.gen(function* () {
-          const refs = yield* db.all<{ c: number }>(sql`
+          const refs = yield* db
+            .all<{ c: number }>(
+              sql`
             SELECT COUNT(*) AS c FROM event
             WHERE aggregate_id = ${agg} AND data LIKE '{"$cdbRef"%'
-          `).pipe(Effect.orDie)
+          `,
+            )
+            .pipe(Effect.orDie)
           expect(refs[0]?.c ?? 0).toBe(16)
         }),
       )
@@ -287,17 +322,25 @@ describe("ChunkDB crash recovery", () => {
           // in event_value rather than being permanently inlined.
           const first = yield* runPassV2(db, { batchSize: 2, maxRowsPerPass: 2 }).pipe(Effect.orDie)
           expect(first.processed).toBe(2)
-          const firstRefs = yield* db.all<{ c: number }>(sql`
+          const firstRefs = yield* db
+            .all<{ c: number }>(
+              sql`
             SELECT COUNT(*) AS c FROM event
             WHERE aggregate_id = ${agg} AND seq <= 2 AND data LIKE '{"$cdbRef"%'
-          `).pipe(Effect.orDie)
+          `,
+            )
+            .pipe(Effect.orDie)
           expect(firstRefs[0]?.c ?? 0).toBe(2)
 
           yield* runPassV2(db, { batchSize: 2, maxRowsPerPass: 2 }).pipe(Effect.orDie)
-          const allRefs = yield* db.all<{ c: number }>(sql`
+          const allRefs = yield* db
+            .all<{ c: number }>(
+              sql`
             SELECT COUNT(*) AS c FROM event
             WHERE aggregate_id = ${agg} AND data LIKE '{"$cdbRef"%'
-          `).pipe(Effect.orDie)
+          `,
+            )
+            .pipe(Effect.orDie)
           expect(allRefs[0]?.c ?? 0).toBe(4)
         }),
       )
@@ -339,9 +382,13 @@ describe("ChunkDB crash recovery", () => {
 
           const result = yield* runPassV2(db).pipe(Effect.orDie)
           expect(result.promoted + result.repeated).toBeGreaterThan(0)
-          const values = yield* db.all<{ c: number }>(sql`
+          const values = yield* db
+            .all<{ c: number }>(
+              sql`
             SELECT COUNT(*) AS c FROM event_value WHERE aggregate_id = ${agg}
-          `).pipe(Effect.orDie)
+          `,
+            )
+            .pipe(Effect.orDie)
           expect(values[0]?.c ?? 0).toBeGreaterThan(0)
         }),
       )
@@ -358,14 +405,22 @@ describe("ChunkDB crash recovery", () => {
           const agg = "ses_active_prefix"
           const total = CHUNKDB_HOT_TAIL_EVENTS + 4
           const now = Date.now()
-          yield* db.run(sql`
+          yield* db
+            .run(
+              sql`
             INSERT INTO project (id, worktree, time_created, time_updated, sandboxes)
             VALUES ('proj_chunkdb_active', 'C:/chunkdb-test', ${now}, ${now}, '[]')
-          `).pipe(Effect.orDie)
-          yield* db.run(sql`
+          `,
+            )
+            .pipe(Effect.orDie)
+          yield* db
+            .run(
+              sql`
             INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
             VALUES (${agg}, 'proj_chunkdb_active', 'chunkdb-active', 'C:/chunkdb-test', 'ChunkDB active', 'test', ${now}, ${now})
-          `).pipe(Effect.orDie)
+          `,
+            )
+            .pipe(Effect.orDie)
           yield* db
             .insert(EventSequenceTable)
             .values({ aggregate_id: agg, seq: total, owner_id: "workspace_sync_owner" })
@@ -391,25 +446,41 @@ describe("ChunkDB crash recovery", () => {
           expect(backlog.truncated).toBe(false)
 
           yield* runPassV2(db).pipe(Effect.orDie)
-          const prefixRefs = yield* db.all<{ c: number }>(sql`
+          const prefixRefs = yield* db
+            .all<{ c: number }>(
+              sql`
             SELECT COUNT(*) AS c FROM event
             WHERE aggregate_id = ${agg} AND seq <= 4 AND length(data) < 4096
-          `).pipe(Effect.orDie)
-          const hotTail = yield* db.all<{ c: number }>(sql`
+          `,
+            )
+            .pipe(Effect.orDie)
+          const hotTail = yield* db
+            .all<{ c: number }>(
+              sql`
             SELECT COUNT(*) AS c FROM event
             WHERE aggregate_id = ${agg} AND seq > 4 AND typeof(data) = 'text' AND length(data) >= 4096
-          `).pipe(Effect.orDie)
+          `,
+            )
+            .pipe(Effect.orDie)
           expect(prefixRefs[0]?.c ?? 0).toBe(4)
           expect(hotTail[0]?.c ?? 0).toBe(CHUNKDB_HOT_TAIL_EVENTS)
 
-          yield* db.run(sql`
+          yield* db
+            .run(
+              sql`
             UPDATE session SET time_updated = ${now - CHUNKDB_COOLING_MS - 1} WHERE id = ${agg}
-          `).pipe(Effect.orDie)
+          `,
+            )
+            .pipe(Effect.orDie)
           yield* runPassV2(db).pipe(Effect.orDie)
-          const remainingHot = yield* db.all<{ c: number }>(sql`
+          const remainingHot = yield* db
+            .all<{ c: number }>(
+              sql`
             SELECT COUNT(*) AS c FROM event
             WHERE aggregate_id = ${agg} AND typeof(data) = 'text' AND length(data) >= 4096
-          `).pipe(Effect.orDie)
+          `,
+            )
+            .pipe(Effect.orDie)
           expect(remainingHot[0]?.c ?? 0).toBe(0)
         }),
       )
@@ -430,16 +501,22 @@ describe("ChunkDB crash recovery", () => {
           // value_id) the sealer will use for the first candidate (agg:seq) but a
           // DIFFERENT sha256, so the dedup lookup misses it and the batch's
           // INSERT violates PRIMARY KEY (aggregate_id, value_id) mid-transaction.
-          yield* db.run(sql`
+          yield* db
+            .run(
+              sql`
             INSERT INTO event_value (aggregate_id, value_id, sha256, raw_len, bytes, refs, time_promoted)
             VALUES ('agg_a', 'agg_a:1', ${"0".repeat(64)}, 1, X'00', 1, 0)
-          `).pipe(Effect.orDie)
+          `,
+            )
+            .pipe(Effect.orDie)
 
           const outcome = yield* runPassV2(db).pipe(Effect.exit)
           expect(outcome._tag).toBe("Failure") // the batch transaction failed
 
           // The whole batch rolled back: no refs, no journal rows, no orphans.
-          const refs = yield* db.all<{ c: number }>(sql`SELECT COUNT(*) as c FROM event WHERE data LIKE '{"$cdbRef"%'`).pipe(Effect.orDie)
+          const refs = yield* db
+            .all<{ c: number }>(sql`SELECT COUNT(*) as c FROM event WHERE data LIKE '{"$cdbRef"%'`)
+            .pipe(Effect.orDie)
           expect(refs[0]?.c ?? 0).toBe(0)
           const seals = yield* db.all<{ c: number }>(sql`SELECT COUNT(*) as c FROM ocdb_seal`).pipe(Effect.orDie)
           expect(seals[0]?.c ?? 0).toBe(0)
@@ -515,7 +592,14 @@ describe("ChunkDB crash recovery", () => {
           // Crash after agg_a's batch committed, before agg_b's: revert ONLY b.
           const bEvents = events.filter((e) => e.agg === "agg_b")
           yield* db.run(sql`DELETE FROM event_value WHERE aggregate_id = 'agg_b'`).pipe(Effect.orDie)
-          yield* db.run(sql`DELETE FROM ocdb_seal WHERE row_id IN (${sql.join(bEvents.map((e) => sql`${e.id}`), sql`, `)})`).pipe(Effect.orDie)
+          yield* db
+            .run(
+              sql`DELETE FROM ocdb_seal WHERE row_id IN (${sql.join(
+                bEvents.map((e) => sql`${e.id}`),
+                sql`, `,
+              )})`,
+            )
+            .pipe(Effect.orDie)
           for (const e of bEvents) {
             yield* db.run(sql`UPDATE event SET data = ${JSON.stringify(e.data)} WHERE id = ${e.id}`).pipe(Effect.orDie)
           }
@@ -586,16 +670,29 @@ describe("ChunkDB crash recovery", () => {
     try {
       await runWith(path, (db) =>
         Effect.gen(function* () {
-          yield* db.insert(EventSequenceTable).values({ aggregate_id: "agg_dangling", seq: 1, owner_id: null }).run().pipe(Effect.orDie)
-          yield* db.insert(EventTable).values({
-            id: "agg_dangling:1" as never,
-            aggregate_id: "agg_dangling",
-            seq: 1,
-            type: "test.crash",
-            data: { $cdbRef: "agg_dangling:1" },
-          }).run().pipe(Effect.orDie)
+          yield* db
+            .insert(EventSequenceTable)
+            .values({ aggregate_id: "agg_dangling", seq: 1, owner_id: null })
+            .run()
+            .pipe(Effect.orDie)
+          yield* db
+            .insert(EventTable)
+            .values({
+              id: "agg_dangling:1" as never,
+              aggregate_id: "agg_dangling",
+              seq: 1,
+              type: "test.crash",
+              data: { $cdbRef: "agg_dangling:1" },
+            })
+            .run()
+            .pipe(Effect.orDie)
 
-          const rows = yield* db.select().from(EventTable).where(sql`aggregate_id = 'agg_dangling'`).all().pipe(Effect.orDie)
+          const rows = yield* db
+            .select()
+            .from(EventTable)
+            .where(sql`aggregate_id = 'agg_dangling'`)
+            .all()
+            .pipe(Effect.orDie)
           const outcome = yield* rehydrateEvents(db, "agg_dangling", rows as never).pipe(Effect.exit)
           expect(outcome._tag).toBe("Failure")
           if (outcome._tag === "Failure") {
@@ -624,7 +721,9 @@ describe("ChunkDB crash recovery", () => {
         Effect.gen(function* () {
           const events = makeEvents()
           yield* seed(db, events)
-          const seal = yield* db.all<{ c: number }>(sql`SELECT COUNT(*) as c FROM sqlite_master WHERE name = 'ocdb_seal'`).pipe(Effect.orDie)
+          const seal = yield* db
+            .all<{ c: number }>(sql`SELECT COUNT(*) as c FROM sqlite_master WHERE name = 'ocdb_seal'`)
+            .pipe(Effect.orDie)
           expect(seal[0]?.c ?? 0).toBe(0) // no chunk schema yet
         }),
       )
@@ -634,7 +733,9 @@ describe("ChunkDB crash recovery", () => {
       await runWith(path, (db) =>
         Effect.gen(function* () {
           const events = makeEvents()
-          const seal = yield* db.all<{ c: number }>(sql`SELECT COUNT(*) as c FROM sqlite_master WHERE name = 'ocdb_seal'`).pipe(Effect.orDie)
+          const seal = yield* db
+            .all<{ c: number }>(sql`SELECT COUNT(*) as c FROM sqlite_master WHERE name = 'ocdb_seal'`)
+            .pipe(Effect.orDie)
           expect(seal[0]?.c ?? 0).toBe(1) // chunk schema created on reopen
           const rerun = yield* runPassV2(db).pipe(Effect.exit)
           expect(rerun._tag).toBe("Success")

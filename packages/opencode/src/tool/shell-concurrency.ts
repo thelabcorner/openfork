@@ -1,8 +1,14 @@
-import { Effect, Semaphore } from "effect"
-import { availableParallelism } from "node:os"
+import { Effect } from "effect"
+import {
+  LEGACY_SHELL_ENV,
+  resetHeavyProcessConcurrencyForTesting,
+  withHeavyProcessSlot,
+} from "./heavy-process-concurrency"
 
 /**
- * Process-wide bound on concurrently RUNNING foreground agent shell commands.
+ * Backward-compatible shell-specific facade over the process-wide heavy-tool
+ * budget. Shell, test, typecheck, and other CPU-heavy agent tools must share one
+ * admission controller so independent "reasonable" limits cannot multiply.
  *
  * Each concurrent session fans out parallel tool calls, and every shell tool
  * call is a child process tree (tsc, eslint, test runners, builds). With N
@@ -19,54 +25,20 @@ import { availableParallelism } from "node:os"
  *   snapshots, and detached background jobs are NOT gated: the former are
  *   millisecond-scale, the latter are few/long-lived/user-visible and would
  *   permanently occupy permits.
- * - Queue, never fail: exceeding the bound waits for a slot. Nesting is
- *   shallow (a waiting parent never holds a shell slot while polling a
- *   subagent), so the generous default cannot deadlock real workloads.
- * - Override with OPENCODE_MAX_CONCURRENT_SHELL_COMMANDS (positive int);
- *   0 or negative disables the bound entirely.
+ * - Queue, never fail: exceeding the bound waits for a slot.
+ * - OPENCODE_MAX_CONCURRENT_SHELL_COMMANDS remains supported as a legacy
+ *   fallback, but the shared heavy-tool budget owns the actual semaphore.
  */
-
-const ENV_KEY = "OPENCODE_MAX_CONCURRENT_SHELL_COMMANDS"
-
-function defaultPermits(): number {
-  try {
-    return Math.max(12, availableParallelism() * 3)
-  } catch {
-    return 24
-  }
-}
-
-function configuredPermits(): number {
-  const raw = process.env[ENV_KEY]
-  if (raw === undefined || raw.trim() === "") return defaultPermits()
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return defaultPermits()
-  return parsed
-}
-
-let semaphore: Semaphore.Semaphore | undefined
-let semaphorePermits: number | undefined
-
-const getSemaphore = (): Semaphore.Semaphore | undefined => {
-  const permits = configuredPermits()
-  if (permits <= 0) return undefined
-  if (!semaphore || semaphorePermits !== permits) {
-    semaphore = Semaphore.makeUnsafe(permits)
-    semaphorePermits = permits
-  }
-  return semaphore
-}
 
 /** Test escape hatch: drop the cached semaphore so env changes take effect. */
 export const resetForTesting = (): void => {
-  semaphore = undefined
-  semaphorePermits = undefined
+  resetHeavyProcessConcurrencyForTesting()
 }
 
 export const withShellSlot = <A, E, R>(effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> => {
-  const current = getSemaphore()
-  if (!current) return effect
-  return current.withPermit(effect)
+  return withHeavyProcessSlot(effect)
 }
+
+export { LEGACY_SHELL_ENV }
 
 export * as ShellConcurrency from "./shell-concurrency"

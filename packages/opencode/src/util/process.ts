@@ -76,6 +76,26 @@ export function spawn(cmd: string[], opts: Options = {}): Child {
     if (proc.exitCode !== null || proc.signalCode !== null) return
     closed = true
 
+    // A child process often owns its own compiler/test/helper descendants. On
+    // Windows, ChildProcess.kill() only targets the immediate process and can
+    // strand that descendant tree after the owning tool/session is cancelled.
+    // Use taskkill /T for ownership-preserving teardown, with direct SIGKILL as
+    // a bounded fallback if taskkill itself cannot be launched or does not
+    // complete promptly.
+    if (process.platform === "win32" && proc.pid) {
+      const force = () => {
+        if (proc.exitCode === null && proc.signalCode === null) proc.kill("SIGKILL")
+      }
+      const killer = launch("taskkill", ["/pid", String(proc.pid), "/T", "/F"], {
+        stdio: "ignore",
+        windowsHide: true,
+      })
+      killer.once("error", force)
+      const ms = opts.timeout ?? 5_000
+      if (ms > 0) timer = setTimeout(force, ms)
+      return
+    }
+
     proc.kill(opts.kill ?? "SIGTERM")
 
     const ms = opts.timeout ?? 5_000

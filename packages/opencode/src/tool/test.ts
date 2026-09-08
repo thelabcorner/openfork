@@ -3,6 +3,7 @@ import path from "path"
 import fs from "node:fs/promises"
 import { ChildProcess } from "effect/unstable/process"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
+import { withHeavyProcessSlot } from "./heavy-process-concurrency"
 import * as Tool from "./tool"
 import { InstanceState } from "@/effect/instance-state"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
@@ -32,7 +33,8 @@ export const Parameters = Schema.Struct({
     description: "Hard timeout for the run (default 120000; max 600000). On expiry the child is killed.",
   }),
   full: Schema.optional(Schema.Boolean).annotate({
-    description: "Always spill the full output to a file and report the path (default: spill only on truncation/failure).",
+    description:
+      "Always spill the full output to a file and report the path (default: spill only on truncation/failure).",
   }),
 })
 
@@ -53,8 +55,7 @@ type Metadata = {
   files?: number
 }
 
-const escapeXml = (text: string) =>
-  text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+const escapeXml = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
 
 // Bounded tail ring (last TAIL_LINES / TAIL_BYTES) for the output tail render.
 const TAIL_LINES = 400
@@ -180,8 +181,7 @@ export const TestTool = Tool.define<
     const renderFailures = (failures: TestScope.TestCase[], worktree: string, directory: string) => {
       const capped = failures.slice(0, MAX_FAILURES)
       const rows = capped.map((f) => {
-        const relFile =
-          f.file && path.isAbsolute(f.file) ? displayRel(f.file, worktree, directory) : f.file
+        const relFile = f.file && path.isAbsolute(f.file) ? displayRel(f.file, worktree, directory) : f.file
         const attrs = [
           relFile ? `file="${escapeXml(relFile)}"` : "",
           f.line ? `line="${f.line}"` : "",
@@ -260,58 +260,60 @@ export const TestTool = Tool.define<
       let exitCode: number | null = null
       let fileBytes = 0
 
-      const code = yield* Effect.scoped(
-        Effect.gen(function* () {
-          const handle = yield* spawner.spawn(
-            ChildProcess.make(command.bin, command.args, {
-              cwd: command.cwd,
-              env: { ...process.env, ...command.env },
-              stdin: "ignore",
-              stdout: "pipe",
-              stderr: "pipe",
-            }),
-          )
-
-          const streamFiber = yield* Effect.forkScoped(
-            Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
-              Effect.promise(async () => {
-                if (full.length < FULL_CAP) full += chunk
-                await fs.appendFile(spill, chunk, "utf8").catch(() => undefined)
-                fileBytes += Buffer.byteLength(chunk, "utf-8")
+      const code = yield* withHeavyProcessSlot(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const handle = yield* spawner.spawn(
+              ChildProcess.make(command.bin, command.args, {
+                cwd: command.cwd,
+                env: { ...process.env, ...command.env },
+                stdin: "ignore",
+                stdout: "pipe",
+                stderr: "pipe",
               }),
-            ),
-          )
+            )
 
-          const abort = Effect.callback<void>((resume) => {
-            if (ctx.abort.aborted) return resume(Effect.void)
-            const handler = () => resume(Effect.void)
-            ctx.abort.addEventListener("abort", handler, { once: true })
-            return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
-          })
+            const streamFiber = yield* Effect.forkScoped(
+              Stream.runForEach(Stream.decodeText(handle.all), (chunk) =>
+                Effect.promise(async () => {
+                  if (full.length < FULL_CAP) full += chunk
+                  await fs.appendFile(spill, chunk, "utf8").catch(() => undefined)
+                  fileBytes += Buffer.byteLength(chunk, "utf-8")
+                }),
+              ),
+            )
 
-          const exit = yield* Effect.raceAll([
-            handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
-            abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
-            Effect.sleep(`${timeoutMs + 100} millis`).pipe(
-              Effect.map(() => ({ kind: "timeout" as const, code: null })),
-            ),
-          ])
+            const abort = Effect.callback<void>((resume) => {
+              if (ctx.abort.aborted) return resume(Effect.void)
+              const handler = () => resume(Effect.void)
+              ctx.abort.addEventListener("abort", handler, { once: true })
+              return Effect.sync(() => ctx.abort.removeEventListener("abort", handler))
+            })
 
-          if (exit.kind === "abort") {
-            aborted = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
-          if (exit.kind === "timeout") {
-            expired = true
-            yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
-          }
+            const exit = yield* Effect.raceAll([
+              handle.exitCode.pipe(Effect.map((code) => ({ kind: "exit" as const, code }))),
+              abort.pipe(Effect.map(() => ({ kind: "abort" as const, code: null }))),
+              Effect.sleep(`${timeoutMs + 100} millis`).pipe(
+                Effect.map(() => ({ kind: "timeout" as const, code: null })),
+              ),
+            ])
 
-          // The stream fiber may still be draining buffered output when
-          // exitCode resolves — join it (bounded) so nothing is lost.
-          yield* Fiber.join(streamFiber).pipe(Effect.timeout("2 seconds")).pipe(Effect.ignore)
-          return exit.kind === "exit" ? exit.code : null
-        }),
-      ).pipe(Effect.orDie)
+            if (exit.kind === "abort") {
+              aborted = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
+            if (exit.kind === "timeout") {
+              expired = true
+              yield* handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.orDie)
+            }
+
+            // The stream fiber may still be draining buffered output when
+            // exitCode resolves — join it (bounded) so nothing is lost.
+            yield* Fiber.join(streamFiber).pipe(Effect.timeout("2 seconds")).pipe(Effect.ignore)
+            return exit.kind === "exit" ? exit.code : null
+          }),
+        ).pipe(Effect.orDie),
+      )
       exitCode = code
 
       const durationMs = Date.now() - started
@@ -319,16 +321,12 @@ export const TestTool = Tool.define<
       // Parse from the in-memory capture when it fits, else read the spill
       // file back (it always holds the complete output).
       const raw =
-        full.length < FULL_CAP
-          ? full
-          : (yield* Effect.promise(() => fs.readFile(spill, "utf8").catch(() => "")))
+        full.length < FULL_CAP ? full : yield* Effect.promise(() => fs.readFile(spill, "utf8").catch(() => ""))
 
       // vitest/playwright probe: reporter JSON may have gone to --outputFile.
       let parseSource = raw
       if (command.outputFile) {
-        const fileText = yield* Effect.promise(() =>
-          fs.readFile(command.outputFile!, "utf8").catch(() => undefined),
-        )
+        const fileText = yield* Effect.promise(() => fs.readFile(command.outputFile!, "utf8").catch(() => undefined))
         if (fileText !== undefined) {
           parseSource = fileText
           yield* Effect.promise(() => fs.rm(command.outputFile!, { force: true })).pipe(Effect.catch(() => Effect.void))
@@ -339,11 +337,7 @@ export const TestTool = Tool.define<
       const failedSignal = summary.failed > 0 || (summary.parsed === false && (exitCode ?? 1) !== 0)
       const status = expired ? "timed-out" : aborted ? "aborted" : failedSignal ? "failed" : "passed"
 
-      const keepSpill =
-        params.full ||
-        status !== "passed" ||
-        summary.parsed === false ||
-        fileBytes > limits.maxBytes
+      const keepSpill = params.full || status !== "passed" || summary.parsed === false || fileBytes > limits.maxBytes
 
       const spillPath = keepSpill ? spill : yield* removeSpill(spill).pipe(Effect.as(undefined))
 
@@ -352,7 +346,9 @@ export const TestTool = Tool.define<
 
       const failuresXml = summary.failures.length > 0 ? renderFailures(summary.failures, worktree, directory) : ""
 
-      const relPathNote = relPath ? ` Re-run with path=${relPath}${params.testNamePattern ? ` -t ${params.testNamePattern}` : ""} to narrow.` : ""
+      const relPathNote = relPath
+        ? ` Re-run with path=${relPath}${params.testNamePattern ? ` -t ${params.testNamePattern}` : ""} to narrow.`
+        : ""
       const next =
         status === "passed"
           ? "All tests passed."
