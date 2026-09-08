@@ -5,10 +5,11 @@
 // owns only the in-memory + localStorage cache and in-flight dedup, and never
 // blocks model selection on fetch failure.
 //
-// Response shape (verified live): `{ data: { ..., endpoints: [...] } }` where
-// each endpoint carries `provider_name`, `tag` (e.g. "novita/fp8"), string
-// `pricing.{prompt,completion,input_cache_read}` and `uptime_last_30m`. The
-// model id in the URL must keep its slashes UNencoded or OpenRouter 404s.
+// Response shape (verified against OpenRouter's endpoint API):
+// `{ data: { ..., endpoints: [...] } }`. Besides provider/tag/pricing it carries
+// per-endpoint quantization, token limits, supported parameters, implicit-cache
+// support, 30m latency/throughput P50, and 5m/30m/1d uptime. The model id in the
+// URL must keep its slashes UNencoded or OpenRouter 404s.
 
 export type OpenRouterEndpoint = {
   providerName: string
@@ -16,6 +17,19 @@ export type OpenRouterEndpoint = {
   provider: string
   pricing: { prompt: number; completion: number; cacheRead: number }
   uptime: number | undefined
+  /** OpenRouter's endpoint-level serving precision, e.g. fp16/fp8/int8/fp4. */
+  quantization?: string
+  contextLength?: number
+  maxCompletionTokens?: number
+  maxPromptTokens?: number
+  supportedParameters?: string[]
+  supportsImplicitCaching?: boolean
+  /** P50 endpoint metrics from the public endpoints API (30 minute window). */
+  latencyP50?: number
+  throughputP50?: number
+  uptime5m?: number
+  uptime1d?: number
+  status?: number
   telemetry?: {
     cacheHitPercent: number
     throughputTps?: number
@@ -26,17 +40,17 @@ type CacheEntry = { version: number; fetchedAt: number; endpoints: OpenRouterEnd
 
 const CACHE_TTL_MS = 60 * 60 * 1000
 
-// Bump the key whenever the stored payload's units/schema change so stale
-// localStorage entries can't be replayed. v4 invalidates v3 entries that were
-// written by pre-normalization builds holding per-token prices.
-const CACHE_VERSION = 1
+// Bump both the payload version and storage namespace whenever the persisted
+// endpoint schema changes. v5 adds endpoint capabilities/quantization and the
+// public 30m performance fields, so v4 rows should be refreshed immediately.
+const CACHE_VERSION = 2
 
 const memoryCache = new Map<string, CacheEntry>()
 const inflight = new Map<string, Promise<OpenRouterEndpoint[] | undefined>>()
 const pendingWrites = new Map<string, CacheEntry>()
 let persistHandle: number | ReturnType<typeof setTimeout> | undefined
 
-const cacheKey = (id: string) => `opencode.openrouter-endpoints.v4.${id}`
+const cacheKey = (id: string) => `opencode.openrouter-endpoints.v5.${id}`
 
 function readCache(id: string): CacheEntry | undefined {
   const mem = memoryCache.get(id)
@@ -79,9 +93,7 @@ function schedulePersist() {
     schedulePersist()
   }
   persistHandle =
-    typeof requestIdleCallback === "function"
-      ? requestIdleCallback(flush, { timeout: 1_000 })
-      : setTimeout(flush, 100)
+    typeof requestIdleCallback === "function" ? requestIdleCallback(flush, { timeout: 1_000 }) : setTimeout(flush, 100)
 }
 
 // Returns the endpoint list for a model, `[]` when the model has no upstream

@@ -6,6 +6,7 @@ import type {
   FilePartInput,
   MentionSearchPage,
   OpencodeClient,
+  PromptReviseData,
   Session,
   TextPartInput,
 } from "@opencode-ai/sdk/v2/client"
@@ -50,6 +51,11 @@ type CompatiblePermissionApi = Omit<ServerApi["permission"], "reply"> & {
     input: Parameters<ServerApi["permission"]["reply"]>[0] & { location?: { directory?: string } },
   ) => ReturnType<ServerApi["permission"]["reply"]>
 }
+type CompatibleQuestionApi = Omit<ServerApi["question"], "reply"> & {
+  reply: (
+    input: Parameters<ServerApi["question"]["reply"]>[0] & { details?: string[] },
+  ) => ReturnType<ServerApi["question"]["reply"]>
+}
 type CompatibleFindSearchInput = {
   query: string
   limit?: number
@@ -64,10 +70,83 @@ type CompatibleFindApi = {
     data: MentionSearchPage
   }>
 }
-export type CompatibleApi = Omit<ServerApi, "session" | "permission"> & {
+type CompatiblePromptRevisorInput = {
+  prompt: string
+  draft?: {
+    mentions: (
+      | {
+          id: string
+          type: "file"
+          token: string
+          path: string
+          selection?: { startLine: number; startChar: number; endLine: number; endChar: number }
+        }
+      | { id: string; type: "agent" | "skill"; token: string; name: string }
+      | { id: string; type: "reference"; token: string; name: string; path: string }
+      | { id: string; type: "resource"; token: string; name: string; clientName: string; uri: string }
+    )[]
+    attachments: { id: string; type: "image"; filename: string; mime: string }[]
+  }
+  sessionID?: string
+  guidance?: string
+  model?: { providerID: string; id: string; variant?: string }
+  fallbackModel?: { providerID: string; id: string; variant?: string }
+  clarifications?: { question: string; answers: string[]; detail?: string }[]
+  clarificationRound?: number
+  location?: { directory?: string }
+}
+type CompatiblePromptRevisorApi = {
+  revise: (input: CompatiblePromptRevisorInput) => Promise<
+    | {
+        type: "revision"
+        prompt: string
+        references: (
+          | {
+              type: "file"
+              content: string
+              start: number
+              end: number
+              path: string
+              selection?: { startLine: number; startChar: number; endLine: number; endChar: number }
+            }
+          | { type: "agent" | "skill"; content: string; start: number; end: number; name: string }
+          | { type: "reference"; content: string; start: number; end: number; name: string; path: string }
+          | {
+              type: "resource"
+              content: string
+              start: number
+              end: number
+              name: string
+              clientName: string
+              uri: string
+              mimeType?: string
+            }
+        )[]
+        tools: string[]
+        rounds: number
+      }
+    | {
+        type: "question"
+        questions: {
+          question: string
+          header: string
+          options: { label: string; description: string }[]
+          multiple?: boolean
+          custom?: boolean
+        }[]
+        clarificationRound: number
+        tools: string[]
+        rounds: number
+      }
+  >
+}
+type PromptRevisorWireBody = NonNullable<PromptReviseData["body"]>
+export type CompatibleApi = Omit<ServerApi, "session" | "permission" | "question"> & {
   readonly session: CompatibleSessionApi
   readonly permission: CompatiblePermissionApi
+  readonly question: CompatibleQuestionApi
   readonly find: CompatibleFindApi
+  readonly promptRevisor: CompatiblePromptRevisorApi
 }
 type LegacyPrompt = {
   agent?: string
@@ -89,6 +168,11 @@ type CompatibleInput = {
 function mime(uri: string) {
   const match = /^data:([^;,]+)/.exec(uri)
   return match?.[1] ?? "application/octet-stream"
+}
+
+function promptRevisorBody(value: CompatiblePromptRevisorInput): PromptRevisorWireBody {
+  const { location: _location, ...body } = value
+  return body satisfies PromptRevisorWireBody
 }
 
 function sessionInfo(session: Session): SessionInfo {
@@ -174,9 +258,25 @@ function createCurrentApi(input: CompatibleInput): CompatibleApi {
         })
       },
     },
+    question: {
+      ...input.current.question,
+      async reply(value) {
+        const path = `/question/${encodeURIComponent(value.requestID)}/reply${
+          input.directory ? `?directory=${encodeURIComponent(input.directory)}` : ""
+        }`
+        await post(input, path, { answers: value.answers, details: value.details })
+      },
+    },
     find: {
       search() {
         return Promise.reject(new Error("find.search requires a v1 protocol server"))
+      },
+    },
+    promptRevisor: {
+      revise(value) {
+        const directory = value.location?.directory ?? input.directory
+        const path = `/prompt/revise${directory ? `?directory=${encodeURIComponent(directory)}` : ""}`
+        return postJSON(input, path, promptRevisorBody(value))
       },
     },
   }
@@ -200,6 +300,27 @@ async function post(input: CompatibleInput, path: string, body?: unknown) {
   try {
     await response.body?.cancel()
   } catch {}
+}
+
+async function postJSON<T>(input: CompatibleInput, path: string, body?: unknown): Promise<T> {
+  const headers = new Headers()
+  if (body !== undefined) headers.set("content-type", "application/json")
+  if (input.server.password) {
+    headers.set(
+      "authorization",
+      `Basic ${authTokenFromCredentials({ username: input.server.username, password: input.server.password })}`,
+    )
+  }
+  const response = await (input.fetch ?? globalThis.fetch)(new URL(path, input.server.url), {
+    method: "POST",
+    headers,
+    body: body === undefined ? undefined : JSON.stringify(body),
+  })
+  if (!response.ok) {
+    const detail = await response.text().catch(() => "")
+    throw new Error(`POST ${path} failed: ${response.status}${detail ? ` — ${detail.slice(0, 500)}` : ""}`)
+  }
+  return (await response.json()) as T
 }
 
 function createV1Api(input: CompatibleInput): CompatibleApi {
@@ -389,6 +510,13 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           await legacy().session.unrevert(value)
         },
         commit: input.current.session.revert.commit,
+      },
+    },
+    promptRevisor: {
+      revise(value) {
+        const target = directory(value.location)
+        const path = `/prompt/revise${target ? `?directory=${encodeURIComponent(target)}` : ""}`
+        return postJSON(input, path, promptRevisorBody(value))
       },
     },
     project: {
@@ -611,10 +739,14 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
     },
     question: {
       ...input.current.question,
-      async reply(value: Parameters<ServerApi["question"]["reply"]>[0]) {
+      async reply(value: Parameters<ServerApi["question"]["reply"]>[0] & { details?: string[] }) {
+        const details = value.details ?? []
         await legacy().question.reply({
           requestID: value.requestID,
-          answers: value.answers.map((answer) => [...answer]),
+          answers: value.answers.map((answer, index) => {
+            const detail = details[index]?.trim()
+            return detail ? [...answer, detail] : [...answer]
+          }),
         })
       },
       async reject(value: Parameters<ServerApi["question"]["reject"]>[0]) {

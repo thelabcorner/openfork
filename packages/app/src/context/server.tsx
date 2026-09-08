@@ -85,10 +85,11 @@ export function createServerProjects<T extends ServerProjectState>(input: {
   const current = () => input.store.projects[input.scope()] ?? []
   const currentClosed = () => input.store.recentlyClosed?.[input.scope()] ?? []
   const remove = (directory: string) => {
+    const key = pathKey(directory)
     setStore(
       "projects",
       input.scope(),
-      current().filter((project) => project.worktree !== directory),
+      current().filter((project) => pathKey(project.worktree) !== key),
     )
   }
   return {
@@ -106,7 +107,7 @@ export function createServerProjects<T extends ServerProjectState>(input: {
           closed.filter((worktree) => pathKey(worktree) !== key),
         )
       }
-      if (current().some((project) => project.worktree === directory)) return
+      if (current().some((project) => pathKey(project.worktree) === key)) return
       setStore("projects", scope, [{ worktree: directory, expanded: true }, ...current()])
     },
     // User-initiated close: removes the project and records it in recently closed.
@@ -121,15 +122,18 @@ export function createServerProjects<T extends ServerProjectState>(input: {
       setStore("recentlyClosed", input.scope(), closed)
     },
     expand(directory: string) {
-      const index = current().findIndex((project) => project.worktree === directory)
+      const key = pathKey(directory)
+      const index = current().findIndex((project) => pathKey(project.worktree) === key)
       if (index !== -1) setStore("projects", input.scope(), index, "expanded", true)
     },
     collapse(directory: string) {
-      const index = current().findIndex((project) => project.worktree === directory)
+      const key = pathKey(directory)
+      const index = current().findIndex((project) => pathKey(project.worktree) === key)
       if (index !== -1) setStore("projects", input.scope(), index, "expanded", false)
     },
     move(directory: string, toIndex: number) {
-      const fromIndex = current().findIndex((project) => project.worktree === directory)
+      const key = pathKey(directory)
+      const fromIndex = current().findIndex((project) => pathKey(project.worktree) === key)
       if (fromIndex === -1 || fromIndex === toIndex) return
       const next = [...current()]
       const [item] = next.splice(fromIndex, 1)

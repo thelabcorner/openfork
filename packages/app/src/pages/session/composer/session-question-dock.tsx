@@ -1,4 +1,4 @@
-import { For, Show, createEffect, createMemo, onCleanup, onMount, type Component } from "solid-js"
+import { For, Show, createEffect, createMemo, createSignal, onCleanup, onMount, type Component } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useMutation } from "@tanstack/solid-query"
 import { Button } from "@opencode-ai/ui/button"
@@ -7,14 +7,36 @@ import { Icon } from "@opencode-ai/ui/icon"
 import { useSpring } from "@opencode-ai/ui/motion-spring"
 import { showToast } from "@/utils/toast"
 import type { QuestionAnswer, QuestionRequest } from "@opencode-ai/sdk/v2"
+import { normalizeReply } from "@opencode-ai/core/question-normalize"
 import { useLanguage } from "@/context/language"
 import { useSDK } from "@/context/sdk"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { useServerSDK } from "@/context/server-sdk"
 import { ScopedKey } from "@/utils/server-scope"
+import { useFile } from "@/context/file"
+import { PromptInputV2Popover, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
+import {
+  applyQuestionMention,
+  questionMentionToken,
+  type QuestionMentionToken,
+} from "./question-custom-mention"
 
-const cache = new Map<string, { tab: number; answers: QuestionAnswer[]; custom: string[]; customOn: boolean[] }>()
+const QUESTION_CACHE_MAX = 100
+const QUESTION_DETAIL_MAX_CHARS = 16_384
+const QUESTION_MENTION_QUERY_MAX_CHARS = 64
+const QUESTION_MENTION_RESULT_LIMIT = 50
+const cache = new Map<string, { tab: number; answers: QuestionAnswer[]; custom: string[] }>()
+
+function cacheQuestionState(key: string, value: { tab: number; answers: QuestionAnswer[]; custom: string[] }) {
+  cache.delete(key)
+  cache.set(key, value)
+  while (cache.size > QUESTION_CACHE_MAX) {
+    const oldest = cache.keys().next().value
+    if (typeof oldest !== "string") break
+    cache.delete(oldest)
+  }
+}
 
 function Mark(props: { multi: boolean; picked: boolean; onClick?: (event: MouseEvent) => void }) {
   return (
@@ -65,6 +87,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
   const sdk = useSDK()
   const serverSDK = useServerSDK()
   const language = useLanguage()
+  const files = useFile()
   const cacheKey = ScopedKey.from(serverSDK().scope, props.request.id)
 
   const questions = createMemo(() => props.request.questions)
@@ -75,7 +98,6 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
     tab: cached?.tab ?? 0,
     answers: cached?.answers ?? ([] as QuestionAnswer[]),
     custom: cached?.custom ?? ([] as string[]),
-    customOn: cached?.customOn ?? ([] as boolean[]),
     editing: false,
     focus: 0,
     minimized: false,
@@ -84,23 +106,38 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
 
   let root: HTMLDivElement | undefined
   let optionsRef: HTMLDivElement | undefined
-  let customRef: HTMLButtonElement | undefined
+  let customRef: HTMLTextAreaElement | undefined
   let optsRef: HTMLButtonElement[] = []
   let replied = false
   let focusFrame: number | undefined
+  let mentionTimer: ReturnType<typeof setTimeout> | undefined
+  let mentionController: AbortController | undefined
+  let mentionGeneration = 0
+
+  const [mention, setMention] = createSignal<QuestionMentionToken>()
+  const [mentionItems, setMentionItems] = createSignal<PromptInputV2Suggestion[]>([])
+  const [mentionActive, setMentionActive] = createSignal(0)
 
   const question = createMemo(() => questions()[store.tab])
-  const options = createMemo(() => question()?.options ?? [])
+  const options = createMemo(() => {
+    const seen = new Set<string>()
+    return (question()?.options ?? []).filter((option) => {
+      if (!option.label.trim() || seen.has(option.label)) return false
+      seen.add(option.label)
+      return true
+    })
+  })
   const input = createMemo(() => store.custom[store.tab] ?? "")
-  const on = createMemo(() => store.customOn[store.tab] === true)
   const multi = createMemo(() => question()?.multiple === true)
-  const count = createMemo(() => options().length + 1)
+  const customAllowed = createMemo(() => question()?.custom !== false || options().length === 0)
+  const count = createMemo(() => options().length + (customAllowed() ? 1 : 0))
 
   const summary = createMemo(() => {
     const n = Math.min(store.tab + 1, total())
     return language.t("session.question.progress", { current: n, total: total() })
   })
-  const customLabel = () => language.t("ui.messagePart.option.typeOwnAnswer")
+  const customLabel = () =>
+    options().length > 0 ? language.t("ui.question.custom.addDetails") : language.t("ui.messagePart.option.typeOwnAnswer")
   const customPlaceholder = () => language.t("ui.question.custom.placeholder")
 
   const last = createMemo(() => store.tab >= total() - 1)
@@ -108,24 +145,97 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
   const hidden = createMemo(() => Math.max(0, Math.min(1, collapse())))
   const optionsOff = createMemo(() => hidden() > 0.98)
 
-  const customUpdate = (value: string, selected: boolean = on()) => {
-    const prev = input().trim()
-    const next = value.trim()
+  const customUpdate = (value: string) => setStore("custom", store.tab, value.slice(0, QUESTION_DETAIL_MAX_CHARS))
 
-    setStore("custom", store.tab, value)
-    if (!selected) return
+  const closeMention = () => {
+    if (!mentionTimer && !mentionController && mention() === undefined && mentionItems().length === 0) return
+    mentionGeneration++
+    if (mentionTimer) clearTimeout(mentionTimer)
+    mentionTimer = undefined
+    mentionController?.abort()
+    mentionController = undefined
+    setMention(undefined)
+    setMentionItems([])
+    setMentionActive(0)
+  }
 
-    if (multi()) {
-      setStore("answers", store.tab, (current = []) => {
-        const removed = prev ? current.filter((item) => item.trim() !== prev) : current
-        if (!next) return removed
-        if (removed.some((item) => item.trim() === next)) return removed
-        return [...removed, next]
-      })
+  const searchMention = (token: QuestionMentionToken) => {
+    if (mentionTimer) clearTimeout(mentionTimer)
+    mentionController?.abort()
+    const generation = ++mentionGeneration
+    setMention(token)
+    setMentionItems([])
+    setMentionActive(0)
+    mentionTimer = setTimeout(() => {
+      mentionTimer = undefined
+      const controller = new AbortController()
+      mentionController = controller
+      void files
+        .searchMentions(token.query, { limit: QUESTION_MENTION_RESULT_LIMIT, signal: controller.signal, symbols: false })
+        .then((page) => {
+          if (generation !== mentionGeneration || controller.signal.aborted) return
+          const rows = page.results.flatMap((entry): PromptInputV2Suggestion[] => {
+            if (entry.kind !== "file") return []
+            const offset = entry.baseOffset !== undefined && entry.baseOffset > 0 ? entry.baseOffset : 0
+            return [
+              {
+                id: `question-file:${entry.path}`,
+                kind: "file",
+                label: entry.path,
+                path: entry.path,
+                positions: entry.positions?.map((position) => position + offset),
+                size: entry.size,
+                mtime: entry.mtime,
+                lineCount: entry.lineCount,
+              },
+            ]
+          })
+          setMentionItems(rows)
+          setMentionActive((current) => Math.max(0, Math.min(current, rows.length - 1)))
+        })
+        .catch(() => {
+          if (generation !== mentionGeneration || controller.signal.aborted) return
+          setMentionItems([])
+          setMentionActive(0)
+        })
+    }, 30)
+  }
+
+  const syncMention = (value: string, cursor: number) => {
+    const token = questionMentionToken(value, cursor)
+    if (!token) {
+      closeMention()
       return
     }
+    const searchToken = { ...token, query: token.query.slice(0, QUESTION_MENTION_QUERY_MAX_CHARS) }
+    const current = mention()
+    if (current?.query === searchToken.query) {
+      if (current.start !== searchToken.start || current.end !== searchToken.end) setMention(searchToken)
+      return
+    }
+    searchMention(searchToken)
+  }
 
-    setStore("answers", store.tab, next ? [next] : [])
+  const selectMention = (item: PromptInputV2Suggestion) => {
+    const token = mention()
+    const path = item.path
+    if (!token || !path) return
+    const next = applyQuestionMention(input(), token, path)
+    const value = next.value.slice(0, QUESTION_DETAIL_MAX_CHARS)
+    customUpdate(value)
+    closeMention()
+    requestAnimationFrame(() => {
+      customRef?.focus()
+      const cursor = Math.min(next.cursor, value.length)
+      customRef?.setSelectionRange(cursor, cursor)
+      if (customRef) resizeInput(customRef)
+    })
+  }
+
+  const moveMention = (step: number) => {
+    const items = mentionItems()
+    if (items.length === 0) return
+    setMentionActive((current) => (current + step + items.length) % items.length)
   }
 
   const measure = () => {
@@ -150,15 +260,14 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
     root.style.setProperty("--question-prompt-max-height", `${max}px`)
   }
 
-  const clamp = (i: number) => Math.max(0, Math.min(count() - 1, i))
+  const clamp = (i: number) => Math.max(0, Math.min(Math.max(0, count() - 1), i))
 
   const pickFocus = (tab: number = store.tab) => {
     const list = questions()[tab]?.options ?? []
-    if (store.customOn[tab] === true) return list.length
-    return Math.max(
-      0,
-      list.findIndex((item) => store.answers[tab]?.includes(item.label) ?? false),
-    )
+    const selected = list.findIndex((item) => store.answers[tab]?.includes(item.label) ?? false)
+    if (selected >= 0) return selected
+    if (list.length === 0 && questions()[tab]?.custom !== false) return 0
+    return 0
   }
 
   const focus = (i: number) => {
@@ -168,7 +277,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
     if (focusFrame !== undefined) cancelAnimationFrame(focusFrame)
     focusFrame = requestAnimationFrame(() => {
       focusFrame = undefined
-      const el = next === options().length ? customRef : optsRef[next]
+      const el = customAllowed() && next === options().length ? customRef : optsRef[next]
       el?.focus()
     })
   }
@@ -208,12 +317,12 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
 
   onCleanup(() => {
     if (focusFrame !== undefined) cancelAnimationFrame(focusFrame)
+    closeMention()
     if (replied) return
-    cache.set(cacheKey, {
+    cacheQuestionState(cacheKey, {
       tab: store.tab,
       answers: store.answers.map((a) => (a ? [...a] : [])),
       custom: store.custom.map((s) => s ?? ""),
-      customOn: store.customOn.map((b) => b ?? false),
     })
   })
 
@@ -223,8 +332,13 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
   }
 
   const replyMutation = useMutation(() => ({
-    mutationFn: (answers: QuestionAnswer[]) =>
-      sdk().api.question.reply({ sessionID: props.request.sessionID, requestID: props.request.id, answers }),
+    mutationFn: (response: { answers: QuestionAnswer[]; details: string[] }) =>
+      sdk().api.question.reply({
+        sessionID: props.request.sessionID,
+        requestID: props.request.id,
+        answers: response.answers,
+        details: response.details,
+      }),
     onMutate: () => {
       props.onSubmit()
     },
@@ -249,9 +363,9 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
 
   const sending = createMemo(() => replyMutation.isPending || rejectMutation.isPending)
 
-  const reply = async (answers: QuestionAnswer[]) => {
+  const reply = async (response: { answers: QuestionAnswer[]; details: string[] }) => {
     if (sending()) return
-    await replyMutation.mutateAsync(answers)
+    await replyMutation.mutateAsync(response)
   }
 
   const reject = async () => {
@@ -259,19 +373,28 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
     await rejectMutation.mutateAsync()
   }
 
-  const submit = () => void reply(questions().map((_, i) => store.answers[i] ?? []))
+  const normalizedResponse = createMemo(() =>
+    normalizeReply(questions(), {
+      answers: store.answers,
+      details: store.custom,
+    }),
+  )
+
+  const submit = () =>
+    void reply({
+      answers: normalizedResponse().answers.map((answer) => [...answer]),
+      details: [...normalizedResponse().details],
+    })
 
   const answered = (i: number) => {
-    if ((store.answers[i]?.length ?? 0) > 0) return true
-    return store.customOn[i] === true && (store.custom[i] ?? "").trim().length > 0
+    if ((normalizedResponse().answers[i]?.length ?? 0) > 0) return true
+    return (normalizedResponse().details[i]?.length ?? 0) > 0
   }
 
   const picked = (answer: string) => store.answers[store.tab]?.includes(answer) ?? false
 
-  const pick = (answer: string, custom: boolean = false) => {
+  const pick = (answer: string) => {
     setStore("answers", store.tab, [answer])
-    if (custom) setStore("custom", store.tab, answer)
-    if (!custom) setStore("customOn", store.tab, false)
     setStore("editing", false)
   }
 
@@ -282,37 +405,11 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
     })
   }
 
-  const customToggle = () => {
-    if (sending()) return
-    setStore("focus", options().length)
-
-    if (!multi()) {
-      setStore("customOn", store.tab, true)
-      setStore("editing", true)
-      customUpdate(input(), true)
-      return
-    }
-
-    const next = !on()
-    setStore("customOn", store.tab, next)
-    if (next) {
-      setStore("editing", true)
-      customUpdate(input(), true)
-      return
-    }
-
-    const value = input().trim()
-    if (value) setStore("answers", store.tab, (current = []) => current.filter((item) => item.trim() !== value))
-    setStore("editing", false)
-    focus(options().length)
-  }
-
   const customOpen = () => {
-    if (sending()) return
+    if (sending() || !customAllowed()) return
     setStore("focus", options().length)
-    if (!on()) setStore("customOn", store.tab, true)
     setStore("editing", true)
-    customUpdate(input(), true)
+    customRef?.focus()
   }
 
   const move = (step: number) => {
@@ -384,33 +481,15 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
     pick(opt.label)
   }
 
-  const commitCustom = () => {
-    setStore("editing", false)
-    customUpdate(input())
-    focus(options().length)
-  }
-
   const resizeInput = (el: HTMLTextAreaElement) => {
     el.style.height = "0px"
     el.style.height = `${el.scrollHeight}px`
   }
 
-  const focusCustom = (el: HTMLTextAreaElement) => {
-    setTimeout(() => {
-      el.focus()
-      resizeInput(el)
-    }, 0)
-  }
-
-  const toggleCustomMark = (event: MouseEvent) => {
-    event.preventDefault()
-    event.stopPropagation()
-    customToggle()
-  }
-
   const next = () => {
     if (sending()) return
-    if (store.editing) commitCustom()
+    closeMention()
+    setStore("editing", false)
 
     if (store.tab >= total() - 1) {
       submit()
@@ -426,6 +505,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
   const back = () => {
     if (sending()) return
     if (store.tab <= 0) return
+    closeMention()
     const tab = store.tab - 1
     setStore("tab", tab)
     setStore("editing", false)
@@ -434,6 +514,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
 
   const jump = (tab: number) => {
     if (sending()) return
+    closeMention()
     setStore("tab", tab)
     setStore("editing", false)
     if (!store.minimized) focus(pickFocus(tab))
@@ -441,6 +522,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
 
   const minimize = () => {
     if (sending()) return
+    closeMention()
     setStore("editing", false)
     setStore("minimized", true)
   }
@@ -529,7 +611,7 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
         >
           {question()?.question}
         </div>
-        <Show when={!store.minimized}>
+        <Show when={!store.minimized && options().length > 0}>
           <Show when={multi()} fallback={<div data-slot="question-hint">{language.t("ui.question.singleHint")}</div>}>
             <div data-slot="question-hint">{language.t("ui.question.multiHint")}</div>
           </Show>
@@ -560,78 +642,95 @@ export const SessionQuestionDock: Component<{ request: QuestionRequest; onSubmit
             )}
           </For>
 
-          <Show
-            when={store.editing}
-            fallback={
-              <button
-                type="button"
-                ref={customRef}
-                data-slot="question-option"
-                data-custom="true"
-                data-picked={on()}
-                role={multi() ? "checkbox" : "radio"}
-                aria-checked={on()}
-                disabled={sending()}
-                onFocus={() => setStore("focus", options().length)}
-                onClick={customOpen}
-              >
-                <Mark multi={multi()} picked={on()} onClick={toggleCustomMark} />
-                <span data-slot="question-option-main">
-                  <span data-slot="option-label">{customLabel()}</span>
-                  <span data-slot="option-description">{input() || customPlaceholder()}</span>
-                </span>
-              </button>
-            }
-          >
-            <form
-              data-slot="question-option"
-              data-custom="true"
-              data-picked={on()}
-              role={multi() ? "checkbox" : "radio"}
-              aria-checked={on()}
-              onMouseDown={(e) => {
-                if (sending()) {
-                  e.preventDefault()
-                  return
-                }
-                if (e.target instanceof HTMLTextAreaElement) return
-                const input = e.currentTarget.querySelector('[data-slot="question-custom-input"]')
-                if (input instanceof HTMLTextAreaElement) input.focus()
-              }}
-              onSubmit={(e) => {
-                e.preventDefault()
-                commitCustom()
-              }}
-            >
-              <Mark multi={multi()} picked={on()} onClick={toggleCustomMark} />
-              <span data-slot="question-option-main">
+          <Show when={customAllowed()}>
+            <div data-slot="question-custom" data-active={store.editing} data-filled={input().trim().length > 0}>
+              <div data-slot="question-custom-heading">
                 <span data-slot="option-label">{customLabel()}</span>
+                <Show when={options().length > 0}>
+                  <span data-slot="question-custom-optional">{language.t("ui.question.custom.optional")}</span>
+                </Show>
+              </div>
+              <div data-slot="question-custom-composer">
                 <textarea
-                  ref={focusCustom}
+                  ref={(el) => {
+                    customRef = el
+                    resizeInput(el)
+                  }}
                   data-slot="question-custom-input"
+                  aria-label={customLabel()}
                   placeholder={customPlaceholder()}
                   value={input()}
                   rows={1}
+                  maxlength={QUESTION_DETAIL_MAX_CHARS}
                   disabled={sending()}
+                  onFocus={() => {
+                    setStore("focus", options().length)
+                    setStore("editing", true)
+                    syncMention(input(), customRef?.selectionStart ?? input().length)
+                  }}
+                  onBlur={() => {
+                    setStore("editing", false)
+                    closeMention()
+                  }}
+                  onClick={(e) => syncMention(e.currentTarget.value, e.currentTarget.selectionStart)}
+                  onKeyUp={(e) => {
+                    if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(e.key)) return
+                    syncMention(e.currentTarget.value, e.currentTarget.selectionStart)
+                  }}
                   onKeyDown={(e) => {
-                    if (e.key === "Escape") {
+                    if (mention() && mentionItems().length > 0) {
+                      const plain = !e.altKey && !e.ctrlKey && !e.metaKey && !e.shiftKey
+                      if (plain && e.key === "ArrowDown") {
+                        e.preventDefault()
+                        moveMention(1)
+                        return
+                      }
+                      if (plain && e.key === "ArrowUp") {
+                        e.preventDefault()
+                        moveMention(-1)
+                        return
+                      }
+                      if (plain && (e.key === "Enter" || e.key === "Tab")) {
+                        const item = mentionItems()[mentionActive()]
+                        if (item) {
+                          e.preventDefault()
+                          selectMention(item)
+                          return
+                        }
+                      }
+                    }
+                    if (mention() && e.key === "Escape") {
                       e.preventDefault()
-                      setStore("editing", false)
-                      focus(options().length)
+                      closeMention()
                       return
                     }
-                    if ((e.metaKey || e.ctrlKey) && !e.altKey) return
-                    if (e.key !== "Enter" || e.shiftKey) return
-                    e.preventDefault()
-                    commitCustom()
+                    if ((e.metaKey || e.ctrlKey) && !e.altKey && e.key === "Enter") return
                   }}
                   onInput={(e) => {
                     customUpdate(e.currentTarget.value)
                     resizeInput(e.currentTarget)
+                    syncMention(e.currentTarget.value, e.currentTarget.selectionStart)
                   }}
                 />
-              </span>
-            </form>
+              </div>
+              <Show when={mention()}>
+                {(token) => (
+                  <PromptInputV2Popover
+                    inline
+                    emptyLabel={language.t("prompt.popover.emptyResults")}
+                    items={mentionItems()}
+                    activeID={mentionItems()[mentionActive()]?.id}
+                    query={token().query}
+                    onActiveChange={(item) => {
+                      const index = mentionItems().findIndex((candidate) => candidate.id === item.id)
+                      if (index >= 0) setMentionActive(index)
+                    }}
+                    onSelect={selectMention}
+                  />
+                )}
+              </Show>
+              <div data-slot="question-custom-hint">{language.t("ui.question.custom.mentionHint")}</div>
+            </div>
           </Show>
         </div>
       </DockPrompt>

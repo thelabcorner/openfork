@@ -66,6 +66,7 @@ const APP_IDS: Record<string, string> = {
 const TEST_ONBOARDING = process.env.OPENCODE_TEST_ONBOARDING === "1"
 const SIDECAR_VERSION = process.env.OPENCODE_SIDECAR_V2 === "1" ? "v2" : "v1"
 const jsCallStackFeature = "DocumentPolicyIncludeJSCallStacksInCrashReports"
+const rendererHeapLimitMb = 16 * 1024
 let logger: ReturnType<typeof initLogging>
 let server: SidecarListener | null = null
 let readyData: ServerReadyData | null = null
@@ -187,6 +188,11 @@ const main = Effect.gen(function* () {
   ensureLoopbackNoProxy()
   useEnvProxy()
   app.commandLine.appendSwitch("proxy-bypass-list", "<-loopback>")
+  const jsFlags = app.commandLine.getSwitchValue("js-flags")
+  if (!/(?:^|\s)--max-old-space-size(?:=|\s)\S+/.test(jsFlags)) {
+    const heapFlag = `--max-old-space-size=${rendererHeapLimitMb}`
+    app.commandLine.appendSwitch("js-flags", jsFlags ? `${jsFlags} ${heapFlag}` : heapFlag)
+  }
   const features = app.commandLine.getSwitchValue("enable-features")
   app.commandLine.appendSwitch("enable-features", features ? `${jsCallStackFeature},${features}` : jsCallStackFeature)
   if (!app.isPackaged) app.commandLine.appendSwitch("remote-debugging-port", "9222")

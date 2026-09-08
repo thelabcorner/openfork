@@ -338,4 +338,8 @@ export const dict: Record<string, string> = {
   "ui.question.multiHint": "Select all answers that apply",
   "ui.question.singleHint": "Select one answer",
   "ui.question.custom.placeholder": "Type your answer...",
+  "ui.question.custom.addDetails": "Add details",
+  "ui.question.custom.optional": "optional",
+  "ui.question.custom.mentionHint": "Type @ to mention a project file",
+  "ui.question.answer.details": "Details",
 }

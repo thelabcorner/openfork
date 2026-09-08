@@ -9,6 +9,7 @@ import { createServerSyncContext } from "./server-sync"
 import { getOwner } from "solid-js/web"
 import { QueryClient } from "@tanstack/solid-query"
 import type { ServerScope } from "@/utils/server-scope"
+import { findChatProject, isChatProjectAlias } from "@/utils/chat-project"
 
 export const { use: useGlobal, provider: GlobalProvider } = createSimpleContext({
   name: "Global",
@@ -149,6 +150,26 @@ function createServerCtx(
   }
 
   const projectsList = createMemo(() => projects.list().map(enrich))
+
+  // One-time migration for the original browser-side Chat faux-project. Older
+  // builds persisted `/.local/share/opencode/chats` because the renderer tried
+  // to infer HOME itself. Once the server advertises its canonical Chat
+  // project, replace only that reserved alias and preserve whether it was the
+  // user's last/open project.
+  createEffect(() => {
+    const canonical = findChatProject(sync.data.project)
+    if (!canonical) return
+    const canonicalKey = pathKey(canonical.worktree)
+    const stale = projects
+      .list()
+      .filter((project) => pathKey(project.worktree) !== canonicalKey && isChatProjectAlias(project, canonical))
+    if (stale.length === 0) return
+    const last = projects.last()
+    const wasLast = !!last && stale.some((project) => pathKey(project.worktree) === pathKey(last))
+    stale.forEach((project) => projects.remove(project.worktree))
+    projects.open(canonical.worktree)
+    if (wasLast) projects.touch(canonical.worktree)
+  })
   const recentlyClosedList = createMemo(() => {
     const known = projectMeta().byWorktree
     return projects

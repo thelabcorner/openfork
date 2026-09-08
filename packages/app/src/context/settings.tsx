@@ -24,6 +24,15 @@ export interface TitleGenerationSettings {
   prompt?: string
 }
 
+export interface PromptRevisionSettings {
+  model?: { providerID: string; modelID: string }
+  prompt?: string
+}
+
+export interface AuditorSettings {
+  prompt?: string
+}
+
 export interface CompactionModelRef {
   providerID: string
   modelID: string
@@ -57,6 +66,8 @@ export interface Settings {
     newInterfaceNoticeDismissed?: boolean
     shouldDisplayTabsToast?: boolean
     titleGeneration?: TitleGenerationSettings
+    promptRevision?: PromptRevisionSettings
+    auditor?: AuditorSettings
     compaction?: CompactionSettings
   }
   appearance: {
@@ -474,6 +485,14 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         titleGeneration: withFallback(() => store.general?.titleGeneration, undefined),
         setTitleGeneration(value: TitleGenerationSettings | undefined) {
           setStore("general", "titleGeneration", value)
+        },
+        promptRevision: withFallback(() => store.general?.promptRevision, undefined),
+        setPromptRevision(value: PromptRevisionSettings | undefined) {
+          setStore("general", "promptRevision", value)
+        },
+        auditor: withFallback(() => store.general?.auditor, undefined),
+        setAuditor(value: AuditorSettings | undefined) {
+          setStore("general", "auditor", value)
         },
         compaction: withFallback(() => store.general?.compaction, undefined),
         setCompaction(value: CompactionSettings | undefined) {

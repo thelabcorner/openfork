@@ -1,4 +1,4 @@
-import { Component, Show, createMemo, createResource, createSignal } from "solid-js"
+import { Component, For, Show, createMemo, createResource, createSignal } from "solid-js"
 import { createMediaQuery } from "@solid-primitives/media"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitle } from "@opencode-ai/ui/v2/dialog-v2"
@@ -23,6 +23,12 @@ import { SettingsLocalScope } from "./parts/local-scope"
 import { SettingsModelPickerV2 } from "./parts/model-picker"
 import { SettingsRowV2 } from "./parts/row"
 import { LayoutRetirementNotice, LayoutTransitionToggle } from "./interface-transition"
+import { DEFAULT_PROMPT as DEFAULT_PROMPT_REVISOR } from "@opencode-ai/core/prompt-revisor-prompt"
+import { DEFAULT_PROMPT as DEFAULT_AUDITOR_PROMPT } from "@opencode-ai/core/goal/auditor-prompt"
+import {
+  DEFAULT_PROMPT as DEFAULT_TITLE_PROMPT,
+  GENERATED_TITLE_TOOL,
+} from "@opencode-ai/core/session/title-prompt"
 import {
   createAppearanceSettingsController,
   createPermissionScopeController,
@@ -38,14 +44,6 @@ import {
 import "./settings-v2.css"
 
 const schemeOptions: ("system" | "light" | "dark")[] = ["system", "light", "dark"]
-const DEFAULT_TITLE_PROMPT = `Generate a brief title that would help the user find this conversation later.
-
-Follow all rules in <rules>
-Use the <examples> so you know what a good title looks like.
-Your output must be:
-- A single line
-- <=50 characters
-- No explanations`
 const DEFAULT_COMPACTION_PROMPT = `Output exactly the Markdown structure shown inside <template> and keep the section order unchanged. Do not include the <template> tags in your response.
 <template>
 ## Objective
@@ -363,7 +361,7 @@ const TitlePromptDialog: Component<{ onClose: () => void }> = (props) => {
                 {language.t("dialog.titlePrompt.default")}
               </span>
               <span class="text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
-                {usesDefaultPrompt() ? language.t("settings.general.row.titleModel.default") : "Custom"}
+                {usesDefaultPrompt() ? language.t("dialog.titlePrompt.builtin") : language.t("dialog.titlePrompt.custom")}
               </span>
             </div>
 
@@ -383,42 +381,20 @@ const TitlePromptDialog: Component<{ onClose: () => void }> = (props) => {
           </div>
 
           <aside class="flex min-h-0 flex-col gap-3 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 p-3">
-            <div class="flex flex-col gap-2">
-              <div class="select-none text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-base">
-                Tokens
-              </div>
-              <div class="flex flex-col gap-2 text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
-                <span class="flex items-start gap-2">
-                  <code class="mt-[-1px] rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">
-                    {"{previousTitle}"}
-                  </code>
-                  <span>{language.t("dialog.titlePrompt.token.previousTitle")}</span>
-                </span>
-                <span class="flex items-start gap-2">
-                  <code class="mt-[-1px] rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">
-                    {"{conversation}"}
-                  </code>
-                  <span>{language.t("dialog.titlePrompt.token.conversation")}</span>
-                </span>
-              </div>
+            <div class="select-none text-[12px] font-[530] leading-none text-v2-text-text-base">
+              {language.t("dialog.titlePrompt.protocol")}
             </div>
-
+            <div class="text-[12px] leading-5 text-v2-text-text-muted">
+              {language.t("dialog.titlePrompt.protocolDescription")}
+            </div>
             <DividerV2 />
-
-            <div class="flex min-h-0 flex-1 flex-col gap-2">
-              <div class="select-none text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-base">
-                {language.t("dialog.titlePrompt.default")}
-              </div>
-              <div class="min-h-0 flex-1 overflow-hidden rounded-md border border-v2-border-border-muted bg-v2-background-bg-base">
-                <ScrollView class="h-full">
-                  <pre
-                    class="whitespace-pre-wrap p-3 font-mono text-[12px] leading-5 tracking-normal text-v2-text-text-muted select-none"
-                    aria-label={language.t("dialog.titlePrompt.default")}
-                  >
-                    {DEFAULT_TITLE_PROMPT}
-                  </pre>
-                </ScrollView>
-              </div>
+            <div class="flex flex-wrap gap-1.5">
+              <code class="rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">
+                {GENERATED_TITLE_TOOL}
+              </code>
+            </div>
+            <div class="mt-auto text-[11px] leading-4 text-v2-text-text-faint">
+              {language.t("dialog.titlePrompt.contextNote")}
             </div>
           </aside>
         </div>
@@ -601,6 +577,259 @@ const TitleGenerationSection: Component = () => {
               />
             </TooltipV2>
           </div>
+        </SettingsRowV2>
+      </SettingsListV2>
+    </div>
+  )
+}
+
+const AuditorPromptDialog: Component<{ onClose: () => void }> = (props) => {
+  const language = useLanguage()
+  const settings = useSettings()
+  const serverSync = useServerSync()
+  const savedPrompt = () => settings.general.auditor()?.prompt?.trim()
+  const [prompt, setPrompt] = createSignal(savedPrompt() || DEFAULT_AUDITOR_PROMPT)
+  const usesDefaultPrompt = createMemo(() => prompt().trim() === DEFAULT_AUDITOR_PROMPT.trim())
+
+  const save = () => {
+    const value = prompt().trim()
+    const promptValue = value && value !== DEFAULT_AUDITOR_PROMPT.trim() ? value : undefined
+    settings.general.setAuditor(promptValue ? { prompt: promptValue } : undefined)
+    void serverSync().updateConfig({ auditor_prompt: promptValue })
+    props.onClose()
+  }
+
+  return (
+    <Dialog size="x-large" containerClass="!w-[min(calc(100vw-40px),1040px)] !h-[min(calc(100vh-64px),760px)]">
+      <DialogHeader>
+        <div class="flex min-w-0 flex-1 flex-col gap-1">
+          <DialogTitle>{language.t("dialog.auditorPrompt.title")}</DialogTitle>
+          <p data-slot="dialog-description" class="max-w-[720px]">
+            {language.t("dialog.auditorPrompt.description")}
+          </p>
+        </div>
+      </DialogHeader>
+      <DividerV2 />
+      <DialogBody class="flex w-full flex-1 flex-col gap-4 overflow-hidden px-5 pt-5 pb-2">
+        <div class="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+          <div class="flex min-h-0 flex-col gap-3">
+            <div class="flex flex-wrap items-center gap-2">
+              <span
+                class="inline-flex h-6 select-none items-center rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-02 px-2 text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-muted"
+                data-current={usesDefaultPrompt() ? "" : undefined}
+              >
+                {language.t("dialog.auditorPrompt.default")}
+              </span>
+              <span class="text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
+                {usesDefaultPrompt() ? language.t("dialog.auditorPrompt.builtin") : language.t("dialog.auditorPrompt.custom")}
+              </span>
+            </div>
+            <TextareaV2
+              autofocus
+              rows={18}
+              class="!min-h-0 !w-full !flex-1"
+              value={prompt()}
+              placeholder={language.t("dialog.auditorPrompt.placeholder")}
+              spellcheck={false}
+              autocorrect="off"
+              autocomplete="off"
+              autocapitalize="off"
+              aria-label={language.t("dialog.auditorPrompt.title")}
+              onInput={(event) => setPrompt(event.currentTarget.value)}
+            />
+          </div>
+          <aside class="flex min-h-0 flex-col gap-3 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 p-3">
+            <div class="select-none text-[12px] font-[530] leading-none text-v2-text-text-base">
+              {language.t("dialog.auditorPrompt.capabilities")}
+            </div>
+            <div class="text-[12px] leading-5 text-v2-text-text-muted">
+              {language.t("dialog.auditorPrompt.capabilitiesDescription")}
+            </div>
+            <DividerV2 />
+            <div class="flex flex-wrap gap-1.5">
+              <For each={["read", "grep", "glob", "audit_verdict"]}>
+                {(name) => <code class="rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">{name}</code>}
+              </For>
+            </div>
+            <div class="mt-auto text-[11px] leading-4 text-v2-text-text-faint">
+              {language.t("dialog.auditorPrompt.modelNote")}
+            </div>
+          </aside>
+        </div>
+      </DialogBody>
+      <DialogFooter>
+        <ButtonV2 type="button" variant="ghost" class="mr-auto" onClick={() => setPrompt(DEFAULT_AUDITOR_PROMPT)}>
+          {language.t("dialog.auditorPrompt.reset")}
+        </ButtonV2>
+        <ButtonV2 type="button" variant="neutral" onClick={props.onClose}>{language.t("common.cancel")}</ButtonV2>
+        <ButtonV2 type="button" variant="contrast" onClick={save}>{language.t("common.save")}</ButtonV2>
+      </DialogFooter>
+    </Dialog>
+  )
+}
+
+const PromptRevisionPromptDialog: Component<{ onClose: () => void }> = (props) => {
+  const language = useLanguage()
+  const settings = useSettings()
+  const serverSync = useServerSync()
+  const savedPrompt = () => settings.general.promptRevision()?.prompt?.trim()
+  const [prompt, setPrompt] = createSignal(savedPrompt() || DEFAULT_PROMPT_REVISOR)
+  const usesDefaultPrompt = createMemo(() => prompt().trim() === DEFAULT_PROMPT_REVISOR.trim())
+
+  const save = () => {
+    const next = settings.general.promptRevision() ?? {}
+    const value = prompt().trim()
+    const promptValue = value && value !== DEFAULT_PROMPT_REVISOR.trim() ? value : undefined
+    if (!promptValue && !next.model) settings.general.setPromptRevision(undefined)
+    else settings.general.setPromptRevision({ ...next, prompt: promptValue })
+    void serverSync().updateConfig({ prompt_revisor_prompt: promptValue })
+    props.onClose()
+  }
+
+  return (
+    <Dialog size="x-large" containerClass="!w-[min(calc(100vw-40px),1040px)] !h-[min(calc(100vh-64px),760px)]">
+      <DialogHeader>
+        <div class="flex min-w-0 flex-1 flex-col gap-1">
+          <DialogTitle>{language.t("dialog.promptRevisionPrompt.title")}</DialogTitle>
+          <p data-slot="dialog-description" class="max-w-[720px]">
+            {language.t("dialog.promptRevisionPrompt.description")}
+          </p>
+        </div>
+      </DialogHeader>
+      <DividerV2 />
+      <DialogBody class="flex w-full flex-1 flex-col gap-4 overflow-hidden px-5 pt-5 pb-2">
+        <div class="grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-[minmax(0,1fr)_320px]">
+          <div class="flex min-h-0 flex-col gap-3">
+            <div class="flex flex-wrap items-center gap-2">
+              <span
+                class="inline-flex h-6 select-none items-center rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-02 px-2 text-[12px] font-[530] leading-none tracking-normal text-v2-text-text-muted"
+                data-current={usesDefaultPrompt() ? "" : undefined}
+              >
+                {language.t("dialog.promptRevisionPrompt.default")}
+              </span>
+              <span class="text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
+                {usesDefaultPrompt()
+                  ? language.t("dialog.promptRevisionPrompt.builtin")
+                  : language.t("dialog.promptRevisionPrompt.custom")}
+              </span>
+            </div>
+            <TextareaV2
+              autofocus
+              rows={18}
+              class="!min-h-0 !w-full !flex-1"
+              value={prompt()}
+              placeholder={language.t("dialog.promptRevisionPrompt.placeholder")}
+              spellcheck={false}
+              autocorrect="off"
+              autocomplete="off"
+              autocapitalize="off"
+              aria-label={language.t("dialog.promptRevisionPrompt.title")}
+              onInput={(event) => setPrompt(event.currentTarget.value)}
+            />
+          </div>
+          <aside class="flex min-h-0 flex-col gap-3 rounded-md border border-v2-border-border-muted bg-v2-background-bg-layer-01 p-3">
+            <div class="select-none text-[12px] font-[530] leading-none text-v2-text-text-base">
+              {language.t("dialog.promptRevisionPrompt.capabilities")}
+            </div>
+            <div class="text-[12px] leading-5 text-v2-text-text-muted">
+              {language.t("dialog.promptRevisionPrompt.capabilitiesDescription")}
+            </div>
+            <DividerV2 />
+            <div class="flex flex-wrap gap-1.5">
+              <For each={["read", "grep", "glob", "question", "revised_prompt"]}>
+                {(name) => (
+                  <code class="rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">
+                    {name}
+                  </code>
+                )}
+              </For>
+            </div>
+            <div class="mt-auto text-[11px] leading-4 text-v2-text-text-faint">
+              {language.t("dialog.promptRevisionPrompt.contextNote")}
+            </div>
+          </aside>
+        </div>
+      </DialogBody>
+      <DialogFooter>
+        <ButtonV2 type="button" variant="ghost" class="mr-auto" onClick={() => setPrompt(DEFAULT_PROMPT_REVISOR)}>
+          {language.t("dialog.promptRevisionPrompt.reset")}
+        </ButtonV2>
+        <ButtonV2 type="button" variant="neutral" onClick={props.onClose}>
+          {language.t("common.cancel")}
+        </ButtonV2>
+        <ButtonV2 type="button" variant="contrast" onClick={save}>
+          {language.t("common.save")}
+        </ButtonV2>
+      </DialogFooter>
+    </Dialog>
+  )
+}
+
+const PromptRevisionSection: Component = () => {
+  const language = useLanguage()
+  const dialog = useDialog()
+  const settings = useSettings()
+  const selectModel = (model: { providerID: string; modelID: string } | undefined) => {
+    const next = settings.general.promptRevision() ?? {}
+    if (!model && !next.prompt) settings.general.setPromptRevision(undefined)
+    else settings.general.setPromptRevision({ ...next, model })
+  }
+
+  return (
+    <div class="settings-v2-section">
+      <h3 class="settings-v2-section-title">{language.t("settings.general.section.promptRevision")}</h3>
+      <SettingsListV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.promptRevisionModel.title")}
+          description={language.t("settings.general.row.promptRevisionModel.description")}
+        >
+          <div class="flex items-center gap-1.5">
+            <SettingsModelPickerV2
+              action="settings-prompt-revision-model"
+              value={settings.general.promptRevision()?.model}
+              defaultLabel={language.t("settings.general.row.promptRevisionModel.default")}
+              onChange={selectModel}
+            />
+            <TooltipV2 placement="top" gutter={4} value={language.t("settings.general.row.promptRevisionPrompt.edit")}>
+              <IconButtonV2
+                type="button"
+                variant="ghost-muted"
+                size="small"
+                data-action="settings-prompt-revision-prompt-edit"
+                icon={<Icon name="edit" />}
+                aria-label={language.t("settings.general.row.promptRevisionPrompt.edit")}
+                onClick={() => dialog.show(() => <PromptRevisionPromptDialog onClose={() => dialog.close()} />)}
+              />
+            </TooltipV2>
+          </div>
+        </SettingsRowV2>
+      </SettingsListV2>
+    </div>
+  )
+}
+
+const AuditorSection: Component = () => {
+  const language = useLanguage()
+  const dialog = useDialog()
+  return (
+    <div class="settings-v2-section">
+      <h3 class="settings-v2-section-title">{language.t("settings.general.section.goalAuditor")}</h3>
+      <SettingsListV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.auditorPrompt.title")}
+          description={language.t("settings.general.row.auditorPrompt.description")}
+        >
+          <TooltipV2 placement="top" gutter={4} value={language.t("settings.general.row.auditorPrompt.edit")}>
+            <IconButtonV2
+              type="button"
+              variant="ghost-muted"
+              size="small"
+              data-action="settings-auditor-prompt-edit"
+              icon={<Icon name="edit" />}
+              aria-label={language.t("settings.general.row.auditorPrompt.edit")}
+              onClick={() => dialog.show(() => <AuditorPromptDialog onClose={() => dialog.close()} />)}
+            />
+          </TooltipV2>
         </SettingsRowV2>
       </SettingsListV2>
     </div>
@@ -973,6 +1202,8 @@ export const SettingsGeneralV2: Component<{
 
         <SettingsLocalScope>
           <TitleGenerationSection />
+          <PromptRevisionSection />
+          <AuditorSection />
           <CompactionSection />
         </SettingsLocalScope>
 

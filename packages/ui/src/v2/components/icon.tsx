@@ -21,6 +21,10 @@ const icons = {
     viewBox: "0 0 16 16",
     body: `<path d="M13.5555 8.21534V13.5556H2.44434L2.44434 2.4445H7.78462M6.88878 9.11119C6.88878 9.11119 8.96327 9.0367 9.69678 8.3032L14.0301 3.96986C14.5824 3.4176 14.5824 2.52213 14.0301 1.96986C13.4778 1.4176 12.5824 1.4176 12.0301 1.96986L7.69678 6.3032C7.00513 6.99484 6.88878 9.11119 6.88878 9.11119Z" stroke="currentColor"/>`,
   },
+  "pencil-sparkles": {
+    viewBox: "0 0 24 24",
+    body: `<g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 3H8"/><path d="m15.007 5.008 3.987 3.986"/><path d="M20 15v4"/><path d="M21.174 6.813a2.82 2.82 0 0 0-3.986-3.987L3.842 16.175a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z"/><path d="M22 17h-4"/><path d="M4 5v4"/><path d="M6 7H2"/><path d="M9 2v2"/></g>`,
+  },
   "folder-add-left": {
     viewBox: "0 0 16 16",
     body: `<path d="M7.5 13.3333H1.5V2H6.83333L8.83333 4H14.8333V6M10.1667 11.3333H15.5M12.8333 8.66667V14" stroke="currentColor" stroke-miterlimit="10" stroke-linecap="square"/>`,
@@ -246,7 +250,7 @@ const icons = {
     viewBox: "0 0 16 16",
     body: `<path d="M2.5 13.5V9.5M6.5 13.5V6.5M10.5 13.5V4M14 13.5V8" stroke="currentColor" stroke-linecap="square"/>`,
   },
-};
+}
 
 const spriteID = "opencode-v2-icon-sprite"
 const symbol = (name: keyof typeof icons) => `opencode-v2-icon-${name}`

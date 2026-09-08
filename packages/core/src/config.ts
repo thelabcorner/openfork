@@ -41,7 +41,15 @@ export class Info extends Schema.Class<Info>("Config.Info")({
   }),
   title_prompt: Schema.String.pipe(Schema.optional).annotate({
     description:
-      "Custom instructions for the title generation model. Replaces the built-in default task prompt; {previousTitle} and {conversation} are available as placeholders.",
+      "Custom policy prompt for title generation. Replaces the built-in title policy while the current title, conversation context, host protocol, and structured completion contract remain injected separately.",
+  }),
+  prompt_revisor_prompt: Schema.String.pipe(Schema.optional).annotate({
+    description:
+      "Custom policy prompt for Prompt Revisor. Replaces the built-in revision policy while workspace/session context, the host protocol, and the revised_prompt structured completion contract remain injected separately.",
+  }),
+  auditor_prompt: Schema.String.pipe(Schema.optional).annotate({
+    description:
+      "Custom judgment policy for the Goal auditor. Replaces the built-in audit policy while live Goal state, the host protocol, and the audit_verdict structured completion contract remain injected separately.",
   }),
   default_agent: Schema.String.pipe(Schema.optional).annotate({
     description: "Default primary agent to use when no session agent is selected",

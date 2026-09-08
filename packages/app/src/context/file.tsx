@@ -390,7 +390,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
 
     const searchMentionsFallback = (
       query: string,
-      options?: { limit?: number; offset?: number; signal?: AbortSignal },
+      options?: { limit?: number; offset?: number; signal?: AbortSignal; symbols?: boolean },
     ): Promise<MentionSearchPage> =>
       search(query, "true", options).then((paths) => ({
         results: paths.map((path): MentionResult => {
@@ -402,7 +402,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
 
     const searchMentions = (
       query: string,
-      options?: { limit?: number; offset?: number; signal?: AbortSignal },
+      options?: { limit?: number; offset?: number; signal?: AbortSignal; symbols?: boolean },
     ): Promise<MentionSearchPage> => {
       if (mentionsIndexUnavailable) return searchMentionsFallback(query, options)
       return serverSDK()
@@ -411,6 +411,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           query,
           limit: options?.limit,
           offset: options?.offset,
+          symbols: options?.symbols,
           signal: options?.signal,
         })
         .then(

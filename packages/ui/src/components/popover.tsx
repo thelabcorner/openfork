@@ -18,6 +18,8 @@ export interface PopoverProps<T extends ValidComponent = "div">
   style?: ComponentProps<"div">["style"]
   portal?: boolean
   onOpenAutoFocus?: ComponentProps<typeof Kobalte.Content>["onOpenAutoFocus"]
+  /** Treat matching portalled descendants as part of this popover for outside-dismiss semantics. */
+  ownedPortalSelector?: string
 }
 
 export function Popover<T extends ValidComponent = "div">(props: PopoverProps<T>) {
@@ -34,6 +36,7 @@ export function Popover<T extends ValidComponent = "div">(props: PopoverProps<T>
     "children",
     "portal",
     "onOpenAutoFocus",
+    "ownedPortalSelector",
     "open",
     "defaultOpen",
     "onOpenChange",
@@ -69,6 +72,7 @@ export function Popover<T extends ValidComponent = "div">(props: PopoverProps<T>
       if (content && content.contains(node)) return true
       const trigger = state.triggerRef
       if (trigger && trigger.contains(node)) return true
+      if (local.ownedPortalSelector && node instanceof Element && node.closest(local.ownedPortalSelector)) return true
       return false
     }
 

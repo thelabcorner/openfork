@@ -40,6 +40,8 @@ import { ReadToolFileSystem } from "./tool/read-filesystem"
 import { ToolRegistry } from "./tool/registry"
 import { ToolOutputStore } from "./tool-output-store"
 import { Checkpoint } from "./checkpoint"
+import { PromptRevisor } from "./prompt-revisor"
+import { GoalAuditor } from "./goal/auditor"
 
 export { LocationServiceMap } from "./location-service-map"
 
@@ -80,14 +82,25 @@ export const locationServices = LayerNode.group([
   ReadToolFileSystem.node,
   BuiltInTools.node,
   SessionRunnerModel.node,
+  GoalAuditor.node,
   Snapshot.node,
   Checkpoint.node,
   SessionRunnerLLM.node,
   SessionTitle.node,
+  PromptRevisor.node,
 ])
 
 export type LocationServices = LayerNode.Output<typeof locationServices>
 export type LocationError = LayerNode.Error<typeof locationServices>
+
+const locationServiceNodeNames = [
+  "Location", "Policy", "Config", "AgentV2", "CommandV2", "Reference", "Integration", "Catalog", "AISDK",
+  "PluginV2", "PluginInternal", "ProjectCopy", "ProjectCopy.refresh", "FileSystemSearch", "FileSystem", "FileIndex",
+  "FileIndexWatcher", "Watcher", "Pty", "SkillV2", "SystemContextRegistry", "SystemContextBuiltIns", "LocationMutation",
+  "FileMutation", "PermissionV2", "ToolOutputStore", "ToolRegistry", "ToolRegistry.tools", "Image", "SkillGuidance",
+  "ReferenceGuidance", "SessionTodo", "QuestionV2", "ReadToolFileSystem", "BuiltInTools", "SessionRunnerModel",
+  "GoalAuditor", "Snapshot", "Checkpoint", "SessionRunnerLLM", "SessionTitle", "PromptRevisor",
+] as const
 
 export function buildLocationServiceMap(
   replacements: LayerNode.Replacements = [],
@@ -96,6 +109,25 @@ export function buildLocationServiceMap(
     LocationServiceMap.Service,
     LayerMap.make(
       (ref: Location.Ref) => {
+        const missing = locationServices.dependencies.flatMap((node, index) =>
+          node ? [] : [locationServiceNodeNames[index] ?? `index:${index}`],
+        )
+        if (missing.length > 0) {
+          throw new Error(`Location service graph contains uninitialized nodes: ${missing.join(", ")}`)
+        }
+        const seen = new Set<LayerNode.Node<unknown, unknown, any>>()
+        const inspect = (node: LayerNode.Node<unknown, unknown, any>, trail: string[]) => {
+          if (seen.has(node)) return
+          seen.add(node)
+          for (let index = 0; index < node.dependencies.length; index++) {
+            const dependency = node.dependencies[index]
+            if (!dependency) {
+              throw new Error(`Location service graph has undefined dependency: ${[...trail, node.name, `deps[${index}]`].join(" -> ")}`)
+            }
+            inspect(dependency, [...trail, node.name])
+          }
+        }
+        inspect(locationServices, [])
         const allReplacements = replacements.concat([[Location.node, Location.boundNode(ref)]])
         // Apply replacements during hoist, not afterward: replacements can
         // introduce new tagged dependencies (Location.boundNode depends on

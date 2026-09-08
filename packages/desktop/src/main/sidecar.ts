@@ -3,6 +3,7 @@ import * as http from "node:http"
 import * as tls from "node:tls"
 import { pathToFileURL } from "node:url"
 import { autopsyMark } from "./autopsy-timing" // STARTUP-AUTOPSY: temporary probe, see 02-main-process.md
+import { childRuntimeEnvPatch } from "./child-runtime-env"
 
 enableCompileCache()
 
@@ -105,6 +106,7 @@ function prepareSidecarEnv(password: string, userDataPath: string) {
     OPENCODE_SERVER_USERNAME: "opencode",
     OPENCODE_SERVER_PASSWORD: password,
     XDG_STATE_HOME: userDataPath,
+    ...childRuntimeEnvPatch(),
   })
 }
 

@@ -10,7 +10,7 @@ import { makeGlobalNode } from "./effect/app-node"
 import { Hash } from "./util/hash"
 import { ProjectDirectories } from "./project/directories"
 import { ProjectSchema } from "./project/schema"
-import { chatsRoot, isChatDirectory } from "./project/chat-paths"
+import { chatsRoot, isChatDirectoryWithin } from "./project/chat-paths"
 
 export const ID = ProjectSchema.ID
 export type ID = ProjectSchema.ID
@@ -110,11 +110,15 @@ const layer = Layer.effect(
 
     const resolve = Effect.fn("Project.resolve")(function* (input: AbsolutePath) {
       // Chat sessions: no worktree/repo inheritance; dedicated dummy project.
-      if (isChatDirectory(input)) {
-        const root = chatsRoot()
+      // Canonicalize both sides before comparing. This matters on Windows where
+      // USERPROFILE/XDG may contain an 8.3 short path while InstanceStore has
+      // already realpathed the same directory to its long form.
+      const opened = FSUtil.resolve(input)
+      const chatRoot = FSUtil.resolve(chatsRoot())
+      if (isChatDirectoryWithin(opened, chatRoot)) {
         return {
           id: ID.make("chats"),
-          directory: AbsolutePath.make(root),
+          directory: AbsolutePath.make(chatRoot),
           vcs: undefined,
         }
       }

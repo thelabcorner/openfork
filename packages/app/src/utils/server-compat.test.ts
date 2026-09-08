@@ -35,6 +35,15 @@ function setup(
           delivery: "steer",
         })
       }
+      if (request.method === "POST" && new URL(request.url).pathname === "/prompt/revise") {
+        return Response.json({
+          type: "revision",
+          prompt: "Revised prompt",
+          references: [],
+          tools: ["question", "revised_prompt"],
+          rounds: 1,
+        })
+      }
       if (request.method === "GET" && new URL(request.url).pathname === "/vcs")
         return Response.json(responses?.vcs ?? {})
       if (request.method === "GET") return Response.json([])
@@ -55,6 +64,83 @@ function setup(
 }
 
 describe("createCompatibleApi", () => {
+  test("preserves structured question details on current protocol", async () => {
+    const { api, requests } = setup("v2")
+    await api.question.reply({
+      sessionID: "ses_1",
+      requestID: "que_1",
+      answers: [["Build"]],
+      details: ["Focus @packages/app"],
+    })
+
+    const request = requests.at(-1)!
+    const url = new URL(request.url)
+    expect(url.pathname).toBe("/question/que_1/reply")
+    expect(url.searchParams.get("directory")).toBe("/repo")
+    expect(await request.json()).toEqual({ answers: [["Build"]], details: ["Focus @packages/app"] })
+  })
+
+  test("flattens question details for V1 compatibility", async () => {
+    const { api, requests } = setup("v1")
+    await api.question.reply({
+      sessionID: "ses_1",
+      requestID: "que_1",
+      answers: [["Build"]],
+      details: ["Focus @packages/app"],
+    })
+
+    const request = requests.at(-1)!
+    expect(new URL(request.url).pathname).toBe("/question/que_1/reply")
+    expect(await request.json()).toEqual({ answers: [["Build", "Focus @packages/app"]] })
+  })
+
+  test("routes Prompt Revisor to the selected workspace and preserves structured clarification details", async () => {
+    const { api, requests } = setup("v2")
+    const result = await api.promptRevisor.revise({
+      prompt: "Improve this parser.",
+      draft: {
+        mentions: [{ id: "m1", type: "file", token: "@src/parser.ts", path: "src/parser.ts" }],
+        attachments: [{ id: "img1", type: "image", filename: "bug.png", mime: "image/png" }],
+      },
+      clarificationRound: 1,
+      clarifications: [
+        {
+          question: "Compatibility?",
+          answers: ["Preserve API"],
+          detail: "Keep deprecated aliases for one release",
+        },
+      ],
+      location: { directory: "/other" },
+    })
+
+    const request = requests.at(-1)!
+    const url = new URL(request.url)
+    expect(url.pathname).toBe("/prompt/revise")
+    expect(url.searchParams.get("directory")).toBe("/other")
+    expect(await request.json()).toEqual({
+      prompt: "Improve this parser.",
+      draft: {
+        mentions: [{ id: "m1", type: "file", token: "@src/parser.ts", path: "src/parser.ts" }],
+        attachments: [{ id: "img1", type: "image", filename: "bug.png", mime: "image/png" }],
+      },
+      clarificationRound: 1,
+      clarifications: [
+        {
+          question: "Compatibility?",
+          answers: ["Preserve API"],
+          detail: "Keep deprecated aliases for one release",
+        },
+      ],
+    })
+    expect(result).toEqual({
+      type: "revision",
+      prompt: "Revised prompt",
+      references: [],
+      tools: ["question", "revised_prompt"],
+      rounds: 1,
+    })
+  })
+
   /*
   test("routes V1 archive through the legacy session update", async () => {
     const { api, requests } = setup("v1")

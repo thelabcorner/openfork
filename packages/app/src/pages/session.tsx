@@ -62,6 +62,7 @@ import { ServerConnection, serverName, useServer } from "@/context/server"
 import { useSettings } from "@/context/settings"
 import { useSync } from "@/context/sync"
 import { useTabs } from "@/context/tabs"
+import { useGoals } from "@/context/goals"
 import { browserHostClient } from "@/pages/session/v2/browser/browserHostClient"
 import { TerminalProvider, useTerminal } from "@/context/terminal"
 import { TextField } from "@opencode-ai/ui/text-field"
@@ -508,6 +509,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   const settings = useSettings()
   const platform = usePlatform()
   const prompt = usePrompt()
+  const goals = useGoals()
   const comments = useComments()
   const command = useCommand()
   const terminal = useTerminal()
@@ -1833,6 +1835,15 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
         serverSync: serverSync(),
         draft: item,
         optimisticBusy: item.sessionDirectory === sdk().directory,
+        prepare: async (next) => {
+          if (!next.goal) return
+          await goals.quickStart(next.sessionID, {
+            projectID: next.goal.projectID,
+            workspaceID: next.goal.workspaceID,
+            objective: next.goal.objective,
+            mode: next.goal.mode,
+          })
+        },
       }).catch((err) => {
         setFollowup("failed", input.sessionID, input.id)
         fail(err)

@@ -1,4 +1,4 @@
-import { createMemo, createSignal, getOwner, onCleanup, runWithOwner, Show, type ParentProps } from "solid-js"
+import { createEffect, createMemo, createSignal, getOwner, onCleanup, runWithOwner, Show, type ParentProps } from "solid-js"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { useLanguage } from "@/context/language"
@@ -35,7 +35,8 @@ import { displayName, getProjectAvatarSource } from "@/pages/layout/helpers"
 import { useDirectoryPicker } from "@/components/directory-picker"
 import { getProjectAvatarVariant } from "@/context/layout"
 import { pathKey } from "@/utils/path-key"
-import { chatsRoot } from "@opencode-ai/core/project/chat-paths"
+import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
+import { findChatProject, isChatProjectAlias, isReservedChatProjectPath } from "@/utils/chat-project"
 import { isSessionPinned, toggleSessionPin } from "@/utils/pinned-sessions"
 import { fetchSessionExport, sessionExportFilename, downloadSessionExport } from "@/utils/session-export"
 import type { ServerScope } from "@/utils/server-scope"
@@ -65,6 +66,9 @@ export type SessionContextMenuProps = ParentProps<{
   where: SessionMenuWhere
   session?: Session | undefined
   server?: ServerConnection.Key
+  /** Optional lifecycle hook for hosts that need to keep an enclosing hover
+   * surface mounted while the portalled context menu is open. */
+  onOpenChange?: (open: boolean) => void
   // Tab-specific
   tabId?: string
   isGroup?: boolean
@@ -123,13 +127,24 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
   })
   const tabCount = createMemo(() => tabs.store.length)
 
-  const userGroups = () => sessionGroups.groups().map((g) => ({ id: g.id, name: g.name }))
+  const userGroups = () =>
+    sessionGroups
+      .groups()
+      .filter((g) => g.kind === "user")
+      .map((g) => ({ id: g.id, name: g.name }))
   const isInGroup = createMemo(() => !!props.inGroupId)
   const membershipLocked = createMemo(() => {
     const groupID = props.inGroupId
     const sid = sessionID()
     if (!groupID || !sid) return false
-    return sessionGroups.byID(groupID)?.sessions.find((member) => member.id === sid)?.locked ?? false
+    const group = sessionGroups.byID(groupID)
+    // A managed group is an ownership boundary even when its anchor membership
+    // itself is not marked locked. In particular, removing the root of an
+    // auto-subagent group strands its locked descendants under a structure the
+    // UI can no longer explain. Treat the entire managed group as immutable
+    // from generic session menus; its owning subsystem remains free to mutate it.
+    if (group && group.kind !== "user") return true
+    return group?.sessions.find((member) => member.id === sid)?.locked ?? false
   })
 
   // Default control actions (stop/pause/resume/regenerate) — hosts may override via props actions
@@ -265,18 +280,30 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
           })
         })
     };
-    // Same options as the new-session project selector: the chats entry plus
-    // this server's known projects. Selecting one re-associates the session
-    // with that project without transferring uncommitted changes.
-    const projects = (
-      [{ name: "Chat", id: "chats", worktree: chatsRoot(), sandboxes: [] as string[] }, ...ctx.projects.list()] as Array<{
+    // Same options as the new-session project selector. Chat is resolved from
+    // the server project catalog so a renderer never manufactures a local path
+    // for a remote server (or guesses USERPROFILE on Windows).
+    type ProjectOption = {
         worktree: string
         name?: string
         id?: string
         icon?: { color?: string; url?: string; override?: string }
         sandboxes?: string[]
-      }>
-    ).map((project) => {
+      }
+    const known = ctx.projects.list() as ProjectOption[]
+    const canonical = findChatProject(ctx.sync.data.project as ProjectOption[])
+    const source: ProjectOption[] = canonical
+      ? [
+          {
+            ...(known.find((project) => isChatProjectAlias(project, canonical)) ?? canonical),
+            ...canonical,
+            name: canonical.name ?? CHAT_PROJECT_NAME,
+            worktree: canonical.worktree,
+          },
+          ...known.filter((project) => !isChatProjectAlias(project, canonical)),
+        ]
+      : known.filter((project) => project.id !== "chats" && !isReservedChatProjectPath(project.worktree))
+    const projects = source.map((project) => {
       const label = displayName(project)
       return {
         worktree: project.worktree,
@@ -400,6 +427,28 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     promptModel: PromptSession["model"]
     anchor: { top: number; left: number }
   } | null>(null)
+  const [contextOpen, setContextOpen] = createSignal(false)
+  const [surfaceHolds, setSurfaceHolds] = createSignal(0)
+  let reportedOpen = false
+
+  createEffect(() => {
+    const active = contextOpen() || surfaceHolds() > 0 || !!modelPicker()
+    if (active === reportedOpen) return
+    reportedOpen = active
+    props.onOpenChange?.(active)
+  })
+  onCleanup(() => {
+    if (reportedOpen) props.onOpenChange?.(false)
+  })
+
+  const holdSurface = async <T,>(work: () => Promise<T>): Promise<T> => {
+    setSurfaceHolds((value) => value + 1)
+    try {
+      return await work()
+    } finally {
+      setSurfaceHolds((value) => Math.max(0, value - 1))
+    }
+  }
 
   const isAutoAccepting = createMemo(() => {
     const sid = sessionID()
@@ -460,7 +509,8 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       props.onChangeModel({ session: sess, server: props.server, serverScope: ctx.sdk.scope, anchor })
       return
     }
-    void ensurePromptSession().then((ps) => {
+    void holdSurface(async () => {
+      const ps = await ensurePromptSession()
       const model = ps?.model
       if (!model) return
       // Same picker the composer footer uses (ModelSelectorPopoverV2), always —
@@ -481,7 +531,8 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
   }
 
   const selectVariant = (variant: string | undefined) => {
-    void ensurePromptSession().then((ps) => {
+    void holdSurface(async () => {
+      const ps = await ensurePromptSession()
       const m = ps?.model
       if (!m) return
       const current = m.current() ?? promptFromSession(props.session) ?? promptFromLocal()
@@ -523,8 +574,10 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const conn = global.servers.list().find((c) => ServerConnection.key(c) === props.server)
     if (!conn) return
     const ctx = global.ensureServerCtx(conn)
-    const ps = await ensurePromptSession()
-    const model = ps?.model.current() ?? promptFromSession(sess) ?? promptFromLocal()
+    const model = await holdSurface(async () => {
+      const ps = await ensurePromptSession()
+      return ps?.model.current() ?? promptFromSession(sess) ?? promptFromLocal()
+    })
     const agent = local?.agent.current()
     const messageID = Identifier.ascending("message")
     const input: PokePromptInput = {
@@ -556,8 +609,10 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const conn = global.servers.list().find((c) => ServerConnection.key(c) === props.server)
     if (!conn) return
     const ctx = global.ensureServerCtx(conn)
-    const ps = await ensurePromptSession()
-    const model = ps?.model.current() ?? promptFromSession(sess) ?? promptFromLocal()
+    const model = await holdSurface(async () => {
+      const ps = await ensurePromptSession()
+      return ps?.model.current() ?? promptFromSession(sess) ?? promptFromLocal()
+    })
     if (!model) {
       showToast({
         title: language.t("toast.model.none.title"),
@@ -677,7 +732,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
 
   return (
     <>
-      <MenuV2.Context>
+      <MenuV2.Context onOpenChange={setContextOpen}>
         <MenuV2.Context.Trigger
           class="block h-full w-full min-w-0"
           as="div"

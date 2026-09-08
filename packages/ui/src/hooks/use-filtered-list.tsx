@@ -129,18 +129,6 @@ function tokenScore(needle: string, haystack: string): number {
   return score
 }
 
-function recencyBonus(item: any): number {
-  // Small UX tweak: recently-modified files rank slightly higher.
-  // Uses the `mtime` field from PromptInputV2Suggestion (file search results).
-  // 7-day window, linear decay, capped at +30 points so it never overrides
-  // a strong token match.
-  const mtime = (item as any)?.mtime
-  if (typeof mtime !== "number" || !Number.isFinite(mtime) || mtime <= 0) return 0
-  const daysSince = (Date.now() - mtime) / (1000 * 60 * 60 * 24)
-  if (daysSince >= 7) return 0
-  return Math.min(30, Math.max(0, (7 - daysSince) * 5))
-}
-
 function filterWithTokens<T>(needle: string, items: T[], keys?: string[]): T[] {
   if (!needle) return items
   const needleTokens = needle
@@ -152,7 +140,7 @@ function filterWithTokens<T>(needle: string, items: T[], keys?: string[]): T[] {
   const results = items
     .map((item) => {
       const text = keys ? keys.map((k) => String(getNestedValue(item, k))).join(" ") : String(item)
-      const score = tokenScore(needle, text) + recencyBonus(item)
+      const score = tokenScore(needle, text)
       return { item, score }
     })
     .filter(({ score }) => score > 0)

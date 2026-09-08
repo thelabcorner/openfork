@@ -33,6 +33,12 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { ModelTooltip, formatCostPerMillion } from "./model-tooltip"
 import { getOpenRouterEndpoints, type OpenRouterEndpoint } from "@/utils/openrouter-endpoints"
+import {
+  endpointCacheHit,
+  endpointHeadlinePrice,
+  endpointThroughput,
+  rankOpenRouterEndpoints,
+} from "@/utils/openrouter-endpoint-ranking"
 import { showToast } from "@/utils/toast"
 import { useLanguage } from "@/context/language"
 import { decode64 } from "@/utils/base64"
@@ -102,7 +108,7 @@ import {
   sortByCheapness,
   isFreeModel,
 } from "@/utils/model-cost"
-import { buildStandardWorkloadCorpus, FALLBACK_WORKLOAD_CORPUS, type CorpusBands, type Workload } from "@/utils/model-usage-yield"
+import { buildStandardWorkloadCorpus, type CorpusBands } from "@/utils/model-usage-yield"
 
 type ModelState = ReturnType<typeof useLocal>["model"]
 type ModelItem = ReturnType<ModelState["list"]>[number]
@@ -136,7 +142,7 @@ const openRouterFreeUsageTone = (status: FreeUsageReport["free"]["status"]): Usa
   return "success"
 }
 
-// Sentinel for "let OpenRouter pick the upstream provider" ΓÇö the first,
+// Sentinel for "let OpenRouter pick the upstream provider" — the first,
 // default-selected entry of the sub-provider picker. Storing it is never
 // persisted; choosing it clears the pinned preference so nothing reaches the
 // request (`request.ts` additionally guards against it defensively).
@@ -144,24 +150,24 @@ const favoritesRailKey = "favorites"
 const recentRailKey = "recent"
 
 // ---------------------------------------------------------------------------
-//  Cheapness V2: Usage Yield ranking (┬º5-6, ┬º19, ┬º31 of
+//  Cheapness V2: Usage Yield ranking (§5-6, §19, §31 of
 //  cheapness-v2-usage-yield-proposal). See utils/model-usage-yield.ts for the
 //  full derivation. Summary:
 //  - Every PAID model is priced against the SAME standardized workload corpus
 //    (16 deduped Go tuples, not its own idiosyncratic profile), via
-//    priceWorkload = (I┬╖P_I + K┬╖P_K + O┬╖P_O)/1M (┬º5.2).
-//  - Primary cost is the median corpus cost (┬º6); Light/Typical/Heavy bands
-//    (┬º7) are derived from context quartiles for diagnostics.
-//  - Context-threshold tiers (┬º8: Qwen Γëñ/ >256K, Grok Γëñ/ >200K, GPT Luna Γëñ/ >272K)
-//    select the tier the workload actually activates ΓÇö not just the cheapest row.
-//  - Time regimes (┬º9: DeepSeek Peak/Off-Peak) blend to expected yield with the
+//    priceWorkload = (I·P_I + K·P_K + O·P_O)/1M (§5.2).
+//  - Primary cost is the median corpus cost (§6); Light/Typical/Heavy bands
+//    (§7) are derived from context quartiles for diagnostics.
+//  - Context-threshold tiers (§8: Qwen ≤/ >256K, Grok ≤/ >200K, GPT Luna ≤/ >272K)
+//    select the tier the workload actually activates — not just the cheapest row.
+//  - Time regimes (§9: DeepSeek Peak/Off-Peak) blend to expected yield with the
 //    documented 20.83% peak fraction (35/168 weekly hours).
-//  - Free taxonomy (┬º10, ┬º19): quota-exempt (Unlimited) ΓåÆ free-limited-known ΓåÆ
-//    free-limited-unknown ΓåÆ paid-by-yield. Free models never divide by zero;
-//    their rank is tier-ordered (┬º19) and capacity is shown separately.
-//  - Personal measured yield (┬º31): your own $/request (averageCostPerRequest
-//    from buildModelCostIndex, ΓëÑ3 samples) is blended heavily ΓÇö 70% personal
-//    vs 30% corpus, extrapolated across *all* providers (┬º32-33). Your history
+//  - Free taxonomy (§10, §19): quota-exempt (Unlimited) → free-limited-known →
+//    free-limited-unknown → paid-by-yield. Free models never divide by zero;
+//    their rank is tier-ordered (§19) and capacity is shown separately.
+//  - Personal measured yield (§31): your own $/request (averageCostPerRequest
+//    from buildModelCostIndex, ≥3 samples) is blended heavily — 70% personal
+//    vs 30% corpus, extrapolated across *all* providers (§32-33). Your history
 //    is more relevant than the generic workload, but the corpus remains a 30%
 //    prior to avoid overfitting early samples.
 //  - Cross-provider pricing fallback: same model id across providers is ~same
@@ -172,7 +178,7 @@ const recentRailKey = "recent"
 //    shape. If you used claude-sonnet via anthropic but not via openrouter,
 //    borrow that personal $/request (70% weight) to value the openrouter
 //    variant instead of falling back to the generic corpus.
-//  - Unpriced models with no sibling pricing (┬º25) sort last; ┬º28 deterministic tiebreakers: yield ΓåÆ name ΓåÆ id.
+//  - Unpriced models with no sibling pricing (§25) sort last; §28 deterministic tiebreakers: yield → name → id.
 // ---------------------------------------------------------------------------
 const providerDisplayName = (id: string, fallback: string) => {
   if (id === "claude") return "Claude Subscription"
@@ -292,8 +298,8 @@ const ModelList: Component<{
                           }}
                           title={
                             usage().creditsExhausted
-                              ? `${usage().account} ┬╖ ${language.t("model.tooltip.workbuddy.noCredits")}`
-                              : `${usage().account} ┬╖ ${usage().free ? `~${usage().estimatedRequests} promo requests left (24h) ┬╖ ${usage().remainingPercent?.toFixed(1) ?? "ΓÇö"}%` : `x${usage().rate} credits/request`}`
+                              ? `${usage().account} · ${language.t("model.tooltip.workbuddy.noCredits")}`
+                              : `${usage().account} · ${usage().free ? `~${usage().estimatedRequests} promo requests left (24h) · ${usage().remainingPercent?.toFixed(1) ?? "—"}%` : `x${usage().rate} credits/request`}`
                           }
                         >
                           {usage().creditsExhausted
@@ -304,7 +310,7 @@ const ModelList: Component<{
                               ? `~${Math.round(usage().estimatedRequests).toLocaleString()}`
                               : usage().free
                                 ? "Free"
-                                : `~${Number.isFinite(usage().estimatedRequests) ? Math.round(usage().estimatedRequests).toLocaleString() : "Γê₧"}`}
+                                : `~${Number.isFinite(usage().estimatedRequests) ? Math.round(usage().estimatedRequests).toLocaleString() : "∞"}`}
                         </span>
                       </>
                     )}
@@ -351,15 +357,15 @@ function ModelRowMeta(props: { item: ModelItem; usage?: ModelUsage; price: JSX.E
             }}
             title={
               workbuddy().creditsExhausted
-                ? `${workbuddy().account} ┬╖ ${language.t("model.tooltip.workbuddy.noCredits")}`
-                : `${workbuddy().account} ┬╖ ${workbuddy().rate > 0 ? `x${workbuddy().rate} credits/request` : "Free now"}`
+                ? `${workbuddy().account} · ${language.t("model.tooltip.workbuddy.noCredits")}`
+                : `${workbuddy().account} · ${workbuddy().rate > 0 ? `x${workbuddy().rate} credits/request` : "Free now"}`
             }
           >
             {workbuddy().creditsExhausted
               ? language.t("model.tag.noCredits")
               : workbuddy().free
                 ? "Free"
-                : `~${Number.isFinite(workbuddy().estimatedRequests) ? Math.round(workbuddy().estimatedRequests).toLocaleString() : "Γê₧"}`}
+                : `~${Number.isFinite(workbuddy().estimatedRequests) ? Math.round(workbuddy().estimatedRequests).toLocaleString() : "∞"}`}
           </span>
         )}
       </Show>
@@ -367,9 +373,8 @@ function ModelRowMeta(props: { item: ModelItem; usage?: ModelUsage; price: JSX.E
   )
 }
 
-// Tiers on *uptime* ΓÇö the closest honest "which upstream should I trust"
-// signal OpenRouter's public API actually populates (its throughput/latency
-// fields are null for every provider). Same color language as the usage bar.
+// Same color language as the usage bar. Endpoint rows also carry throughput,
+// latency, cache hit, and quantization; uptime remains a compact reliability cue.
 const uptimeTone = (uptime: number) => {
   if (uptime >= 99) return "success"
   if (uptime >= 95) return "warning"
@@ -377,6 +382,37 @@ const uptimeTone = (uptime: number) => {
 }
 
 const formatPricePerM = (cost: number) => `${formatCostPerMillion(cost)}/M`
+
+const endpointCompactNumber = new Intl.NumberFormat(undefined, {
+  notation: "compact",
+  maximumFractionDigits: 1,
+})
+
+const formatEndpointTokens = (value: number) => endpointCompactNumber.format(value)
+const formatEndpointThroughput = (value: number) =>
+  value >= 100 ? Math.round(value).toLocaleString() : value.toLocaleString(undefined, { maximumFractionDigits: 1 })
+const formatEndpointLatency = (value: number) =>
+  `${value.toLocaleString(undefined, { minimumFractionDigits: value < 1 ? 2 : 1, maximumFractionDigits: 2 })}s`
+
+const endpointQuantization = (entry: OpenRouterEndpoint) => {
+  if (entry.quantization?.trim()) return entry.quantization.trim().toUpperCase()
+  // Older cached/server payloads may predate the explicit field. OpenRouter's
+  // endpoint tag commonly carries the same precision suffix (`novita/fp8`).
+  const suffix = entry.tag.split("/").at(-1)?.trim()
+  return suffix && /^(?:b?f|fp|int|q)\d+(?:[_-].+)?$/i.test(suffix) ? suffix.toUpperCase() : undefined
+}
+
+const endpointUptimeTitle = (entry: OpenRouterEndpoint, language: ReturnType<typeof useLanguage>) => {
+  const thirty = entry.uptime
+  if (thirty === undefined) return language.t("dialog.model.subprovider.uptime")
+  if (entry.uptime5m === undefined && entry.uptime1d === undefined)
+    return language.t("dialog.model.subprovider.uptime30m", { value: `${thirty.toFixed(1)}%` })
+  return language.t("dialog.model.subprovider.uptime.windows", {
+    five: entry.uptime5m === undefined ? "—" : `${entry.uptime5m.toFixed(1)}%`,
+    thirty: `${thirty.toFixed(1)}%`,
+    day: entry.uptime1d === undefined ? "—" : `${entry.uptime1d.toFixed(1)}%`,
+  })
+}
 
 const providerIconId = (provider: string, providerName: string) => {
   const value = `${provider} ${providerName}`.toLowerCase()
@@ -419,17 +455,18 @@ function OpenRouterEndpointList(props: {
   const language = useLanguage()
   const [scrollRoot, setScrollRoot] = createSignal<HTMLDivElement>()
   const [focusedIndex, setFocusedIndex] = createSignal(-1)
+  const ranked = createMemo(() => rankOpenRouterEndpoints(props.endpoints))
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
     get count() {
-      return props.endpoints.length
+      return ranked().length
     },
     getScrollElement: () => scrollRoot() ?? null,
-    initialRect: { width: 256, height: 336 },
-    estimateSize: () => 42,
+    initialRect: { width: 340, height: 360 },
+    estimateSize: () => 60,
     overscan: 4,
     get getItemKey() {
-      const endpoints = props.endpoints
-      return (index: number) => endpoints[index]?.tag ?? index
+      const snapshot = ranked()
+      return (index: number) => snapshot[index]?.endpoint.tag ?? index
     },
     get rangeExtractor() {
       const focused = focusedIndex()
@@ -441,7 +478,7 @@ function OpenRouterEndpointList(props: {
     },
   })
   const focusIndex = (index: number) => {
-    if (index < 0 || index >= props.endpoints.length) return
+    if (index < 0 || index >= ranked().length) return
     setFocusedIndex(index)
     virtualizer.scrollToIndex(index, { align: "auto" })
     requestAnimationFrame(() => {
@@ -450,23 +487,30 @@ function OpenRouterEndpointList(props: {
   }
 
   return (
-    <ScrollView class="max-h-[336px] w-full [&_.scroll-view__viewport]:overscroll-contain" viewportRef={setScrollRoot}>
+    <ScrollView class="max-h-[360px] w-full [&_.scroll-view__viewport]:overscroll-contain" viewportRef={setScrollRoot}>
       <div class="relative" style={{ height: `${virtualizer.getTotalSize()}px` }}>
         <For each={virtualizer.getVirtualItems()}>
           {(virtualRow) => {
-            const entry = props.endpoints[virtualRow.index]
-            if (!entry) return null
-            const price = formatPricePerM(entry.pricing.prompt + entry.pricing.completion)
+            const rankedEntry = ranked()[virtualRow.index]
+            if (!rankedEntry) return null
+            const entry = rankedEntry.endpoint
+            const price = formatPricePerM(endpointHeadlinePrice(entry))
             const isSelected = props.pinned === entry.provider
-            const isCheapest = virtualRow.index === 0
+            const isBest = virtualRow.index === 0
             const uptime = entry.uptime
-            const cacheHit = entry.telemetry?.cacheHitPercent
-            const throughput = entry.telemetry?.throughputTps
+            const cacheHit = endpointCacheHit(entry)
+            const throughput = endpointThroughput(entry)
+            const quantization = endpointQuantization(entry)
+            const supportedParameters = entry.supportedParameters ?? []
+            const maxPrompt =
+              entry.maxPromptTokens !== undefined && entry.maxPromptTokens !== entry.contextLength
+                ? entry.maxPromptTokens
+                : undefined
             return (
               <div class="absolute inset-x-0 top-0" style={{ transform: `translateY(${virtualRow.start}px)` }}>
                 <MenuV2.Item
                   data-endpoint-index={virtualRow.index}
-                  class="w-full !h-auto !min-h-[42px] !items-stretch !gap-0 !p-0 [&_[data-slot=menu-v2-item-content]]:!flex [&_[data-slot=menu-v2-item-content]]:!flex-col [&_[data-slot=menu-v2-item-content]]:!items-stretch [&_[data-slot=menu-v2-item-content]]:!gap-0 [&_[data-slot=menu-v2-item-content]]:!p-0 [&_[data-slot=menu-v2-item-content]]:!flex-1"
+                  class="w-full !h-auto !min-h-[60px] !items-stretch !gap-0 !p-0 [&_[data-slot=menu-v2-item-content]]:!flex [&_[data-slot=menu-v2-item-content]]:!flex-col [&_[data-slot=menu-v2-item-content]]:!items-stretch [&_[data-slot=menu-v2-item-content]]:!gap-0 [&_[data-slot=menu-v2-item-content]]:!p-0 [&_[data-slot=menu-v2-item-content]]:!flex-1"
                   data-selected={isSelected ? true : undefined}
                   tabIndex={
                     focusedIndex() === virtualRow.index || (focusedIndex() < 0 && virtualRow.index === 0) ? 0 : -1
@@ -480,7 +524,7 @@ function OpenRouterEndpointList(props: {
                   }}
                   onSelect={() => props.onPickProvider(entry.provider)}
                 >
-                  <div class="flex w-full flex-col justify-center gap-[2px] px-2 py-1.5">
+                  <div class="flex w-full flex-col justify-center gap-1 px-2 py-1.5">
                     <div class="flex w-full items-center gap-1.5">
                       <ProviderIcon
                         id={providerIconId(entry.provider, entry.providerName)}
@@ -489,12 +533,37 @@ function OpenRouterEndpointList(props: {
                       <span class="min-w-0 flex-1 truncate text-[12px] font-[450] leading-none tracking-[-0.02px] text-v2-text-text-base">
                         {entry.providerName}
                       </span>
-                      <Show when={isCheapest}>
-                        <span class="shrink-0 rounded-[3px] bg-v2-state-bg-success/10 px-1 py-0 text-[9px] font-[600] leading-3 tracking-[0.04px] text-v2-state-fg-success">
+                      <Show when={quantization}>
+                        {(value) => (
+                          <TagV2
+                            variant="accent"
+                            class="!h-3.5 shrink-0 !px-1 !text-[9px] !font-[600] !leading-3"
+                            title={language.t("dialog.model.subprovider.quantization", { value: value() })}
+                          >
+                            {value()}
+                          </TagV2>
+                        )}
+                      </Show>
+                      <Show when={isBest}>
+                        <span
+                          class="shrink-0 rounded-[3px] bg-v2-state-bg-success/10 px-1 py-0 text-[9px] font-[600] leading-3 tracking-[0.04px] text-v2-state-fg-success"
+                          title={language.t("dialog.model.subprovider.score", { score: Math.round(rankedEntry.score) })}
+                        >
                           {language.t("dialog.model.subprovider.best")}
                         </span>
                       </Show>
-                      <span class="shrink-0 text-[11px] font-[500] tabular-nums leading-none text-v2-text-text-muted">
+                      <span
+                        class="shrink-0 text-[11px] font-[500] tabular-nums leading-none"
+                        classList={{
+                          "text-v2-state-fg-success": rankedEntry.cheapest,
+                          "text-v2-text-text-muted": !rankedEntry.cheapest,
+                        }}
+                        title={language.t("dialog.model.subprovider.priceBreakdown", {
+                          input: formatPricePerM(entry.pricing.prompt),
+                          output: formatPricePerM(entry.pricing.completion),
+                          cache: formatPricePerM(entry.pricing.cacheRead),
+                        })}
+                      >
                         {price}
                       </span>
                       <Show when={isSelected}>
@@ -506,7 +575,7 @@ function OpenRouterEndpointList(props: {
                       <Show when={uptime !== undefined}>
                         <span
                           class="inline-flex shrink-0 items-center gap-1 tabular-nums"
-                          title={language.t("dialog.model.subprovider.uptime")}
+                          title={endpointUptimeTitle(entry, language)}
                         >
                           <span
                             class="size-1 shrink-0 rounded-full"
@@ -516,16 +585,98 @@ function OpenRouterEndpointList(props: {
                         </span>
                       </Show>
                       <Show when={throughput !== undefined}>
-                        <span class="shrink-0 tabular-nums" title="Throughput (tokens/s)">
-                          ┬╖ {throughput} tok/s
+                        <span
+                          class="shrink-0 tabular-nums"
+                          classList={{ "text-v2-state-fg-success": rankedEntry.fastest }}
+                          title={
+                            rankedEntry.fastest
+                              ? language.t("dialog.model.subprovider.fastest")
+                              : language.t("dialog.model.subprovider.throughput", {
+                                  value: formatEndpointThroughput(throughput!),
+                                })
+                          }
+                        >
+                          ·{" "}
+                          {language.t("dialog.model.subprovider.throughput", {
+                            value: formatEndpointThroughput(throughput!),
+                          })}
                         </span>
                       </Show>
                       <Show when={cacheHit !== undefined}>
-                        <span class="shrink-0 tabular-nums" title="Cache hit rate">
-                          ┬╖ ~{cacheHit}%
+                        <span
+                          class="shrink-0 tabular-nums"
+                          classList={{ "text-v2-state-fg-success": rankedEntry.bestCache }}
+                          title={
+                            rankedEntry.bestCache
+                              ? language.t("dialog.model.subprovider.bestCache")
+                              : language.t("dialog.model.subprovider.cacheHit", { value: `${cacheHit!.toFixed(1)}%` })
+                          }
+                        >
+                          · {language.t("dialog.model.subprovider.cacheHit", { value: `${cacheHit!.toFixed(1)}%` })}
                         </span>
                       </Show>
                     </div>
+                    <Show
+                      when={
+                        entry.contextLength !== undefined ||
+                        maxPrompt !== undefined ||
+                        entry.maxCompletionTokens !== undefined ||
+                        entry.latencyP50 !== undefined ||
+                        entry.supportsImplicitCaching ||
+                        supportedParameters.length > 0
+                      }
+                    >
+                      <div class="flex min-w-0 items-center gap-1 pl-5 text-[9px] font-[440] leading-none text-v2-text-text-faint">
+                        <Show when={entry.contextLength !== undefined}>
+                          <span class="shrink-0 tabular-nums">
+                            {language.t("dialog.model.subprovider.context", {
+                              value: formatEndpointTokens(entry.contextLength!),
+                            })}
+                          </span>
+                        </Show>
+                        <Show when={maxPrompt !== undefined}>
+                          <span class="shrink-0 tabular-nums">
+                            ·{" "}
+                            {language.t("dialog.model.subprovider.maxPrompt", {
+                              value: formatEndpointTokens(maxPrompt!),
+                            })}
+                          </span>
+                        </Show>
+                        <Show when={entry.maxCompletionTokens !== undefined}>
+                          <span class="shrink-0 tabular-nums">
+                            ·{" "}
+                            {language.t("dialog.model.subprovider.maxOutput", {
+                              value: formatEndpointTokens(entry.maxCompletionTokens!),
+                            })}
+                          </span>
+                        </Show>
+                        <Show when={entry.latencyP50 !== undefined}>
+                          <span
+                            class="shrink-0 tabular-nums"
+                            title={language.t("dialog.model.subprovider.latency", {
+                              value: formatEndpointLatency(entry.latencyP50!),
+                            })}
+                          >
+                            · {formatEndpointLatency(entry.latencyP50!)}
+                          </span>
+                        </Show>
+                        <Show when={entry.supportsImplicitCaching}>
+                          <span class="shrink-0" title={language.t("dialog.model.subprovider.implicitCache")}>
+                            · {language.t("dialog.model.subprovider.implicitCache")}
+                          </span>
+                        </Show>
+                        <Show when={supportedParameters.length > 0}>
+                          <span
+                            class="min-w-0 truncate"
+                            title={language.t("dialog.model.subprovider.parameters.title", {
+                              list: supportedParameters.join(", "),
+                            })}
+                          >
+                            · {language.t("dialog.model.subprovider.parameters", { count: supportedParameters.length })}
+                          </span>
+                        </Show>
+                      </div>
+                    </Show>
                   </div>
                 </MenuV2.Item>
               </div>
@@ -541,7 +692,7 @@ function OpenRouterEndpointList(props: {
 // whose header shows the model's full `ModelTooltip` (so the tooltip is part
 // of the submenu, not a separate floating element competing with its hover-
 // open) followed by the upstream-provider picker. The Sub is rendered outside
-// the RadioGroup ΓÇö see `rowList`. Best-effort endpoints fetch; failure
+// the RadioGroup — see `rowList`. Best-effort endpoints fetch; failure
 // degrades to Auto-only with no entry list.
 function OpenRouterRow(props: {
   item: ModelItem
@@ -625,7 +776,8 @@ function OpenRouterRow(props: {
         <MenuV2.Portal>
           <MenuV2.SubContent
             data-model-selector-submenu
-            class="w-64 rounded-md border-0 bg-v2-background-bg-layer-01 p-1 shadow-[var(--v2-elevation-floating)] focus:outline-none"
+            class="overflow-hidden rounded-md border-0 bg-v2-background-bg-layer-01 p-1 shadow-[var(--v2-elevation-floating)] focus:outline-none"
+            style={{ width: "348px", "min-width": "348px", "max-width": "calc(100vw - 24px)" }}
           >
             <div
               class="mb-1 border-b border-v2-border-border-muted px-3 pb-1.5"
@@ -646,12 +798,28 @@ function OpenRouterRow(props: {
               data-selected={!props.pinned ? true : undefined}
               onSelect={() => props.onPickProvider(undefined)}
             >
-              <span class="min-w-0 flex-1 truncate">{language.t("dialog.model.subprovider.auto")}</span>
+              <div class="min-w-0 flex-1">
+                <div class="truncate">{language.t("dialog.model.subprovider.auto")}</div>
+                <div class="truncate text-[9px] leading-3 text-v2-text-text-faint">
+                  {language.t("dialog.model.subprovider.auto.hint")}
+                </div>
+              </div>
               <Show when={!props.pinned}>
                 <Icon name="check" size="small" class="shrink-0 text-v2-text-text-accent" />
               </Show>
             </MenuV2.Item>
             <MenuV2.Separator class="my-0.5" />
+            <Show when={props.endpoints && props.endpoints.length > 0}>
+              <div
+                class="flex h-5 items-center gap-1.5 px-2 text-[9px] font-[550] uppercase tracking-[0.055em] text-v2-text-text-faint"
+                title={language.t("dialog.model.subprovider.balanced.hint")}
+              >
+                <span>{language.t("dialog.model.subprovider.balanced")}</span>
+                <span class="ml-auto normal-case tabular-nums tracking-normal">
+                  {language.t("dialog.model.subprovider.balanced.metrics")}
+                </span>
+              </div>
+            </Show>
             <Show
               when={props.loading}
               fallback={
@@ -815,7 +983,7 @@ function ModelFavoriteToggle(props: { favorited: boolean; onToggle: () => void }
       aria-pressed={props.favorited}
       onPointerDown={(event) => {
         // Kobalte's selectable items select on pointerdown (mousedown), not
-        // click ΓÇö preventDefault alone doesn't stop it from bubbling to the
+        // click — preventDefault alone doesn't stop it from bubbling to the
         // RadioItem's own pointerdown handler and selecting the model.
         event.preventDefault()
         event.stopPropagation()
@@ -840,7 +1008,7 @@ function ModelFavoriteToggle(props: { favorited: boolean; onToggle: () => void }
 function DeepSeekRateBadge(props: { model: ModelItem; v2?: boolean; period?: ReturnType<typeof deepSeekRatePeriod> }) {
   const language = useLanguage()
   // Only create a fallback timer when the caller didn't provide a shared period
-  // and this row is actually a DeepSeek peak-priced model ΓÇö avoids N timers for
+  // and this row is actually a DeepSeek peak-priced model — avoids N timers for
   // N rows (previously every row created a 60s interval unconditionally).
   let fallbackNow: (() => Date) | undefined
   if (props.period === undefined && isDeepSeekPeakPricedModel(props.model)) {
@@ -979,6 +1147,20 @@ export function ModelSelectorPopoverV2(props: {
   placement?: ComponentProps<typeof MenuV2>["placement"]
   onClose?: () => void
   defaultOpen?: boolean
+  /**
+   * Nested/portalled embeddings (settings rows, Goal popovers) can be unmounted
+   * by an ancestor outside-click before the selector's normal after-close
+   * callback fires. Commit the selected model first in those surfaces so a
+   * visual close can never discard the user's choice.
+   */
+  commitSelectionBeforeClose?: boolean
+  /**
+   * Lightweight embedded surfaces still use the full model-selector UI and
+   * catalog, but skip session-history ranking, quota hydration, and usage
+   * telemetry that are presentation-only. This keeps a nested picker from
+   * blocking the frame that opens its parent popover/menu.
+   */
+  lightweight?: boolean
 }) {
   const dialog = useDialog()
   const layout = useLayout()
@@ -990,7 +1172,7 @@ export function ModelSelectorPopoverV2(props: {
   }
   const directory = () => (local ? decode64(local.slug()) : undefined)
   // Lift open state so the controller's heavy memos (message scans, yield sorts)
-  // are gated while the popover is closed ΓÇö otherwise every `message.updated`
+  // are gated while the popover is closed — otherwise every `message.updated`
   // token during streaming re-sorts the full catalog idle.
   const [isOpen, setIsOpen] = createSignal(props.defaultOpen ?? false)
   const controller = createModelSelectorController({
@@ -998,6 +1180,7 @@ export function ModelSelectorPopoverV2(props: {
     provider: () => props.provider,
     onSelect: () => props.onClose?.(),
     open: isOpen,
+    lightweight: props.lightweight,
   })
 
   const handleCompare = () => {
@@ -1042,6 +1225,8 @@ export function ModelSelectorPopoverV2(props: {
       onClose={() => props.onClose?.()}
       model={props.model}
       defaultOpen={props.defaultOpen}
+      commitSelectionBeforeClose={props.commitSelectionBeforeClose}
+      lightweight={props.lightweight}
     />
   )
 }
@@ -1051,10 +1236,12 @@ function createModelSelectorController(input: {
   model?: ModelState
   onSelect: () => void
   open?: () => boolean
+  lightweight?: boolean
 }) {
   const model = input.model ?? useLocal().model
+  const lightweight = input.lightweight === true
   // Personal measured $/request is more relevant than the generic corpus
-  // (┬º31). Build the per-model personal index once per sync-change and blend
+  // (§31). Build the per-model personal index once per sync-change and blend
   // it heavily (70%) with the standardized corpus when ranking.
   let sync: ReturnType<typeof useSync> | undefined
   try {
@@ -1071,6 +1258,10 @@ function createModelSelectorController(input: {
   const isOpen = () => input.open?.() ?? true
   const [rankReady, setRankReady] = createSignal(false)
   createEffect(() => {
+    if (lightweight) {
+      setRankReady(false)
+      return
+    }
     if (!isOpen()) {
       setRankReady(false)
       return
@@ -1083,7 +1274,8 @@ function createModelSelectorController(input: {
         ? requestIdleCallback(() => setRankReady(true), { timeout: 80 })
         : setTimeout(() => setRankReady(true), 16)
     onCleanup(() => {
-      if (typeof cancelIdleCallback !== "undefined" && typeof (handle as unknown as number) === "number") cancelIdleCallback(handle as unknown as number)
+      if (typeof cancelIdleCallback !== "undefined" && typeof (handle as unknown as number) === "number")
+        cancelIdleCallback(handle as unknown as number)
       else clearTimeout(handle as unknown as ReturnType<typeof setTimeout>)
     })
   })
@@ -1093,6 +1285,7 @@ function createModelSelectorController(input: {
   // and debounced globally via PersonalUsageIngest; this local ingest ensures
   // the open selector's sort reflects very recent messages within <1s.
   createEffect(() => {
+    if (lightweight) return
     if (!isOpen()) return
     if (!sync || !personal || !personal.ready()) return
     const msgMap = sync().data.message
@@ -1113,11 +1306,11 @@ function createModelSelectorController(input: {
     for (const [k, entry] of idx.entries()) map.set(k, { cost: entry.sum / entry.count, count: entry.count })
     return map.size > 0 ? map : undefined
   })
-  // ┬º21.4, ┬º28: the ranking corpus upgrades from the pinned fallback to the
-  // live Go workload when the tables fetch succeeds ΓÇö deterministic either way.
+  // §21.4, §28: the ranking corpus upgrades from the pinned fallback to the
+  // live Go workload when the tables fetch succeeds — deterministic either way.
   // Gated on open: avoid fetching+parsing while the picker is closed and idle.
   const [tables] = createResource(
-    () => (isOpen() ? true : undefined),
+    () => (!lightweight && isOpen() ? true : undefined),
     () => getUsageTables(),
   )
   // Cross-open in-memory cache (IndexedDB explicitly rejected: async +
@@ -1127,14 +1320,16 @@ function createModelSelectorController(input: {
   // with an unchanged catalog reuses them instead of rebuilding.
   let cachedMergedPricing: Map<string, import("@/utils/model-cost").ModelCost> | undefined
   let cachedMergedCatalogFp = ""
-  let cachedThreshold: Map<
-    string,
-    Array<{
-      thresholdTokens: number
-      operator: "<=" | ">"
-      cost: { input: number; output: number; cache: { read: number; write: number } }
-    }>
-  > | undefined
+  let cachedThreshold:
+    | Map<
+        string,
+        Array<{
+          thresholdTokens: number
+          operator: "<=" | ">"
+          cost: { input: number; output: number; cache: { read: number; write: number } }
+        }>
+      >
+    | undefined
   let cachedThresholdFp = ""
   let cachedBands: CorpusBands | undefined
   let cachedBandsTablesFp = ""
@@ -1175,7 +1370,7 @@ function createModelSelectorController(input: {
     if (hr) {
       mix(`h${hr.size}`)
       for (const k of [...hr.keys()].sort()) {
-        mix(`${k}=${(hr.get(k)!).toPrecision(10)}`)
+        mix(`${k}=${hr.get(k)!.toPrecision(10)}`)
       }
     } else mix("h-")
     return (h >>> 0).toString(16).padStart(8, "0")
@@ -1254,7 +1449,7 @@ function createModelSelectorController(input: {
     if (!isOpen() || !rankReady()) return undefined
     const pricing = tables.latest?.pricing
     if (!pricing || pricing.length === 0) return undefined
-    // Build threshold-tier map for Qwen/Grok/GPT-Luna style dual rows (┬º8).
+    // Build threshold-tier map for Qwen/Grok/GPT-Luna style dual rows (§8).
     // Use the full model list (not just visible/filtered) so that a model
     // hidden via visibility still contributes its threshold tiers for fallback.
     const map = new Map<
@@ -1311,7 +1506,7 @@ function createModelSelectorController(input: {
   })
   // Fuzzy sibling of the exact-id fallback above: catches free-tier variants
   // that ship under a different id than their paid counterpart (any provider,
-  // ΓëÑ75% name-similarity confidence ΓÇö see string-similarity.ts). Merged with,
+  // ≥75% name-similarity confidence — see string-similarity.ts). Merged with,
   // never replacing, the exact map (exact always wins on a shared id).
   const fuzzyPricingFallback = createMemo(() => {
     if (!isOpen() || !rankReady()) return undefined
@@ -1340,6 +1535,7 @@ function createModelSelectorController(input: {
   // catalog/tables are already available, so the first open hits warm caches.
   // Identical builders → identical scores; no ranking behavior change.
   onMount(() => {
+    if (lightweight) return
     const warm = () => {
       try {
         const cfp = catalogIdsFp()
@@ -1349,7 +1545,10 @@ function createModelSelectorController(input: {
             if ((list as unknown as Array<unknown>).length > 0) {
               const exact = buildPricingFallbackMap(list)
               const fuzzy = buildFuzzyPricingFallbackMap(list)
-              const merged = mergePricingFallbacks(exact.size > 0 ? exact : undefined, fuzzy.size > 0 ? fuzzy : undefined)
+              const merged = mergePricingFallbacks(
+                exact.size > 0 ? exact : undefined,
+                fuzzy.size > 0 ? fuzzy : undefined,
+              )
               if (merged) {
                 cachedMergedPricing = merged
                 cachedMergedCatalogFp = cfp
@@ -1428,7 +1627,7 @@ function createModelSelectorController(input: {
     return map.size > 0 ? map : undefined
   })
   // Hit rate: personal cache hit rate per provider:model, with cross-provider
-  // fallback by model id. When available (ΓëÑ3 samples), the workload's prompt
+  // fallback by model id. When available (≥3 samples), the workload's prompt
   // is re-split as K'=T*h, I'=T*(1-h) so a provider/model that actually hits
   // cache 80% of the time is correctly seen as cheaper than one that hits 20%.
   const hitRates = createMemo(() => {
@@ -1734,6 +1933,8 @@ function ModelSelectorPopoverV2View(props: {
   model?: ModelState
   onExternalOpenChange?: (open: boolean) => void
   defaultOpen?: boolean
+  commitSelectionBeforeClose?: boolean
+  lightweight?: boolean
   pricingFallback?: () => Map<string, import("@/utils/model-cost").ModelCost> | undefined
   tables?: () => import("@/utils/model-usage-profile").UsageTables | undefined
 }) {
@@ -1766,14 +1967,17 @@ function ModelSelectorPopoverV2View(props: {
     serverSync = undefined
   }
   let personal: ReturnType<typeof usePersonalUsage> | undefined
-  try {
-    personal = usePersonalUsage()
-  } catch {
-    personal = undefined
+  if (!props.lightweight) {
+    try {
+      personal = usePersonalUsage()
+    } catch {
+      personal = undefined
+    }
   }
   // Ingest live messages into durable store while open - ensures very recent
   // samples (post-debounce window) still affect the tooltip/stretch bars.
   createEffect(() => {
+    if (props.lightweight) return
     if (!store.open) return
     if (!personal || !personal.ready()) return
     const msgMap = sync().data.message
@@ -1783,11 +1987,28 @@ function ModelSelectorPopoverV2View(props: {
   })
   // WorkBuddy bills credits-per-request across several independent accounts, so
   // its stretch estimate cannot ride the OpenCode-Go USD-window path. This is a
-  // pure projection of the quota result `useLimits` already polls ΓÇö no extra
+  // pure projection of the quota result `useLimits` already polls — no extra
   // network traffic.
-  const workbuddy = useWorkBuddyUsage()
-  const verdent = useVerdentUsage()
-  const genspark = useGensparkUsage()
+  const workbuddy = props.lightweight
+    ? ({
+        accounts: () => [],
+        forModel: () => undefined,
+        rateFor: () => undefined,
+        modelVariants: () => [],
+        result: () => undefined,
+      } as ReturnType<typeof useWorkBuddyUsage>)
+    : useWorkBuddyUsage()
+  const verdent = props.lightweight
+    ? ({ forModel: () => undefined, result: () => undefined } as ReturnType<typeof useVerdentUsage>)
+    : useVerdentUsage()
+  const genspark = props.lightweight
+    ? ({
+        remainingCredits: () => undefined,
+        forModel: () => undefined,
+        rateFor: () => undefined,
+        result: () => undefined,
+      } as unknown as ReturnType<typeof useGensparkUsage>)
+    : useGensparkUsage()
   const [store, setStore] = createStore({
     open: props.defaultOpen ?? false,
     search: persistedModelSearch,
@@ -1796,12 +2017,14 @@ function ModelSelectorPopoverV2View(props: {
     rail: "",
     submenu: "",
   })
-  // Account labels for the model picker ΓÇö the server's model names are cached
+  // Account labels for the model picker — the server's model names are cached
   // in Provider.list() and still carry the old numeric label until the cache is
   // invalidated after a vault edit. Quota's `verdentAccounts`/`workbuddyAccounts`
   // are live (read directly from the vault on every poll), so prefer those.
-  const limitsNow = useNow(() => store.open)
-  const limits = useLimits({ now: limitsNow } as any)
+  const limitsNow = props.lightweight ? () => Date.now() : useNow(() => store.open)
+  const limits = props.lightweight
+    ? ({ providers: () => [] } as unknown as ReturnType<typeof useLimits>)
+    : useLimits({ now: limitsNow } as any)
   const accountLabels = createMemo(() => {
     const map = new Map<string, string>()
     for (const p of limits.providers() ?? []) {
@@ -1817,8 +2040,7 @@ function ModelSelectorPopoverV2View(props: {
     // labels resolve here for both providers. Vault UUIDs are kept for legacy
     // synthesized rows (old servers); their pool ids (`zen-<hash>`) come from
     // the zenAccounts rows above.
-    for (const cred of forkUsage.credentials.latest ?? [])
-      if (cred.id && cred.label) map.set(cred.id, cred.label)
+    for (const cred of forkUsage.credentials.latest ?? []) if (cred.id && cred.label) map.set(cred.id, cred.label)
     return map.size > 0 ? map : undefined
   })
   // Verdent accounts as reported live by the quota adapter (`verdentAccounts`),
@@ -1930,12 +2152,7 @@ function ModelSelectorPopoverV2View(props: {
     const zenSize = zenKeyLimits().size
     const verdentLen = verdentAccounts().length
     const cached = accountGroupCache.get(key)
-    if (
-      cached &&
-      cached.sourceGroup === sourceGroup &&
-      cached.zenSize === zenSize &&
-      cached.verdentLen === verdentLen
-    )
+    if (cached && cached.sourceGroup === sourceGroup && cached.zenSize === zenSize && cached.verdentLen === verdentLen)
       return cached.result
     const result = buildAccountGroup(item, sourceGroup)
     accountGroupCache.set(key, { sourceGroup, zenSize, verdentLen, result })
@@ -1943,23 +2160,31 @@ function ModelSelectorPopoverV2View(props: {
   }
 
   const [localTables] = createResource(
-    () => (store.open && !props.tables ? true : undefined),
+    () => (!props.lightweight && store.open && !props.tables ? true : undefined),
     () => getUsageTables(),
   )
   const tablesLatest = () => props.tables?.() ?? localTables.latest
   const profileTable = () => tablesLatest()?.profile ?? []
   const pricingTable = () => tablesLatest()?.pricing ?? []
   const sdk = useSDK()
-  const freeUsage = useOpenRouterFreeUsage()
+  const freeUsage = props.lightweight
+    ? ({
+        data: () => undefined,
+        refetch: () => undefined,
+        refresh: () => undefined,
+        loading: () => false,
+      } as ReturnType<typeof useOpenRouterFreeUsage>)
+    : useOpenRouterFreeUsage()
   // Pricing fallback for display: same model id across providers is ~same cost
   // (except openrouter). Build from the full catalog so that an unpriced
-  // variant can show a borrowed sibling price instead of "ΓÇö".
+  // variant can show a borrowed sibling price instead of "—".
   // Y2 dedup: reuse controller's mergedPricingFallback when available to avoid
   // building the same two maps twice per open. The controller's maps are built
   // from model.list() (full catalog); the view's fallback to props.models("")
   // is preserved only for the empty-local-list edge case where the controller
   // has no data.
   const pricingFallbackForDisplay = createMemo(() => {
+    if (props.lightweight) return undefined
     if (props.pricingFallback?.()) return undefined
     if (!store.open) return undefined
     let list: ModelItem[] = []
@@ -1976,9 +2201,10 @@ function ModelSelectorPopoverV2View(props: {
     const map = buildPricingFallbackMap(list as never)
     return map.size > 0 ? map : undefined
   })
-  // Fuzzy sibling of the exact-id display fallback above ΓÇö see the matching
+  // Fuzzy sibling of the exact-id display fallback above — see the matching
   // comment on the controller-scoped `fuzzyPricingFallback` memo above.
   const fuzzyPricingFallbackForDisplay = createMemo(() => {
+    if (props.lightweight) return undefined
     if (props.pricingFallback?.()) return undefined
     if (!store.open) return undefined
     let list: ModelItem[] = []
@@ -2006,6 +2232,7 @@ function ModelSelectorPopoverV2View(props: {
   // Both are per provider:model and also aggregated by model id for cross-provider fallback.
   // Gated on store.open: map derivation is cheap but still gated.
   const personalHitRates = createMemo(() => {
+    if (props.lightweight) return undefined
     if (!store.open) return undefined
     const durable = personal?.hitRates()
     if (durable && durable.size > 0) return durable
@@ -2104,49 +2331,15 @@ function ModelSelectorPopoverV2View(props: {
   const deepSeekNow = createPolled(() => new Date(), 60_000)
   const deepSeekPeriod = createMemo(() => deepSeekRatePeriod(deepSeekNow()))
 
-  // Centralized OpenRouter endpoint cache: one store + ring prefetcher instead of
-  // per-row signals + per-hover fetches that each hit localStorage + network.
-  // V2 Usage Yield helpers for endpoint sorting (┬º5-6, corpus ┬º5.1, median ┬º6).
-  // Same standardized workload used for model ranking so endpoint order is
-  // yield-consistent with the model selector (┬º32). Corpus upgrades to live
-  // when Go profiles have been fetched; otherwise the pinned 16-tuple fallback.
-  const getEndpointCorpus = (): Workload[] => {
-    const live = tablesLatest()?.profile ?? []
-    if (live.length > 0) {
-      try {
-        const bands = buildStandardWorkloadCorpus(live.map((entry) => entry.profile))
-        if (bands.corpus.length > 0) return bands.corpus
-      } catch {}
-    }
-    return [...FALLBACK_WORKLOAD_CORPUS] as Workload[]
-  }
-  const medianCost = (values: number[]): number => {
-    if (values.length === 0) return 0
-    const sorted = [...values].sort((a, b) => a - b)
-    const mid = Math.floor(sorted.length / 2)
-    return sorted.length % 2 === 0 ? (sorted[mid - 1] + sorted[mid]) / 2 : sorted[mid]
-  }
-  // ┬º5.2 tokenCost with cache-hit blending. When telemetry provides hit rate,
-  // the missed portion of cachedReadTokens is priced at prompt (cache miss ΓåÆ fresh input).
-  // effectiveCache = hit*cacheRead + (1-hit)*prompt. Undefined hit ΓåÆ assume 1 (no penalty for unknown).
-  const endpointMedianCost = (endpoint: OpenRouterEndpoint, corpus: Workload[]): number => {
-    const hit = endpoint.telemetry?.cacheHitPercent !== undefined ? endpoint.telemetry.cacheHitPercent / 100 : 1
-    const effectiveCacheRead = Number.isFinite(hit)
-      ? endpoint.pricing.cacheRead * hit + endpoint.pricing.prompt * (1 - hit)
-      : endpoint.pricing.cacheRead
-    const costs = corpus.map(
-      (workload) =>
-        (workload.freshInputTokens * endpoint.pricing.prompt +
-          workload.cachedReadTokens * effectiveCacheRead +
-          workload.outputTokens * endpoint.pricing.completion) /
-        1_000_000,
-    )
-    return medianCost(costs)
-  }
+  // Centralized OpenRouter endpoint cache: one store + one telemetry enrichment
+  // path instead of per-row signals/fetches. Upstream ranking is deliberately
+  // separate from the model-level Usage Yield sort: providers serving the same
+  // model are tri-ranked by equal-weight speed, displayed $/M, and cache-hit
+  // percentile. See openrouter-endpoint-ranking.ts for the scale-free fusion.
   const fetchOpenRouterEndpoints = async (model: string): Promise<OpenRouterEndpoint[]> => {
     const endpointsResponse = await sdk().client.experimental.openrouterEndpoints.get({ model }, { throwOnError: true })
     const perMillion = (value: number) => (Math.abs(value) > 0 && Math.abs(value) < 1e-4 ? value * 1_000_000 : value)
-    const endpoints = endpointsResponse.data.map((entry) => {
+    const endpoints: OpenRouterEndpoint[] = endpointsResponse.data.map((entry) => {
       return {
         providerName: entry.providerName,
         tag: entry.tag,
@@ -2157,24 +2350,23 @@ function ModelSelectorPopoverV2View(props: {
           cacheRead: perMillion(Number(entry.pricing.cacheRead)),
         },
         uptime: entry.uptime === undefined ? undefined : Number(entry.uptime),
+        quantization: entry.quantization,
+        contextLength: entry.contextLength === undefined ? undefined : Number(entry.contextLength),
+        maxCompletionTokens: entry.maxCompletionTokens === undefined ? undefined : Number(entry.maxCompletionTokens),
+        maxPromptTokens: entry.maxPromptTokens === undefined ? undefined : Number(entry.maxPromptTokens),
+        supportedParameters: entry.supportedParameters ? [...entry.supportedParameters] : undefined,
+        supportsImplicitCaching: entry.supportsImplicitCaching,
+        latencyP50: entry.latencyP50 === undefined ? undefined : Number(entry.latencyP50),
+        throughputP50: entry.throughputP50 === undefined ? undefined : Number(entry.throughputP50),
+        uptime5m: entry.uptime5m === undefined ? undefined : Number(entry.uptime5m),
+        uptime1d: entry.uptime1d === undefined ? undefined : Number(entry.uptime1d),
+        status: entry.status === undefined ? undefined : Number(entry.status),
       }
     })
-    // Cheapest ΓåÆ most expensive via V2 Usage Yield (┬º5-6): median cost across
-    // the same standardized workload corpus used for model ranking. Every
-    // paid upstream is priced against the SAME 16 workloads (deduped Go profiles,
-    // ┬º5.1), median of per-workload costs is the comparison (┬º6). This replaces
-    // ad-hoc 800/65k/220 weighting with corpus-true economics.
-    const corpus = getEndpointCorpus()
-    endpoints.sort((a, b) => {
-      const costA = endpointMedianCost(a as OpenRouterEndpoint, corpus)
-      const costB = endpointMedianCost(b as OpenRouterEndpoint, corpus)
-      if (costA !== costB) return costA - costB
-      const uA = a.uptime ?? 0
-      const uB = b.uptime ?? 0
-      if (uA !== uB) return uB - uA
-      return a.providerName.localeCompare(b.providerName)
-    })
-    return endpoints
+    // Before the slower historical telemetry arrives, 30m endpoint throughput
+    // can already participate in ranking; missing cache-hit simply removes that
+    // dimension until enrichment rather than inventing a value.
+    return rankOpenRouterEndpoints(endpoints).map((entry) => entry.endpoint)
   }
   const addOpenRouterTelemetry = async (model: string, endpoints: OpenRouterEndpoint[]) => {
     // Best-effort: telemetry augments uptime/price but must never break the submenu.
@@ -2187,9 +2379,13 @@ function ModelSelectorPopoverV2View(props: {
       const telemetry = response.data ?? []
       if (telemetry.length === 0) return endpoints
       const enriched = endpoints.map((entry) => {
-        const value = telemetry.find(
-          (item) => item.providerName === entry.providerName || item.providerSlug === entry.provider,
-        )
+        // providerSlug is not globally unique across endpoint variants (for
+        // example a provider can expose standard + fast rows under one slug).
+        // Prefer the exact display identity; only accept a slug fallback when
+        // it resolves to exactly one telemetry row, otherwise leave it unknown.
+        const exact = telemetry.find((item) => item.providerName === entry.providerName)
+        const slugMatches = exact ? [] : telemetry.filter((item) => item.providerSlug === entry.provider)
+        const value = exact ?? (slugMatches.length === 1 ? slugMatches[0] : undefined)
         const cacheHitPercent =
           value && Number.isFinite(Number(value.cacheHitPercent)) ? Number(value.cacheHitPercent) : undefined
         const throughputTps =
@@ -2204,24 +2400,11 @@ function ModelSelectorPopoverV2View(props: {
             }
           : entry
       })
-      // Re-sort with cache-hit blended yield (┬º5.2 + cache-miss as prompt). A
-      // low hit rate materially raises effective cost (missed cache ΓåÆ prompt),
-      // so a superficially cheap cacheRead with 60% hit can sort behind a
-      // slightly pricier but 95% hit provider ΓÇö exactly the correction V2 wants
-      // when hit data is available. Falls back to hit=1 for unknowns (no penalty).
-      const corpus = getEndpointCorpus()
-      enriched.sort((a, b) => {
-        const costA = endpointMedianCost(a, corpus)
-        const costB = endpointMedianCost(b, corpus)
-        if (costA !== costB) return costA - costB
-        const uA = a.uptime ?? 0
-        const uB = b.uptime ?? 0
-        if (uA !== uB) return uB - uA
-        return a.providerName.localeCompare(b.providerName)
-      })
-      return enriched
+      // Final tri-sort after 1w telemetry: highest tok/s + cheapest headline
+      // $/M + highest cache-hit rate, fused by equal-weight percentile rank.
+      return rankOpenRouterEndpoints(enriched).map((entry) => entry.endpoint)
     } catch (error) {
-      // Silent best-effort ΓÇö log for diagnostics, do not toast (would spam for ~ models).
+      // Silent best-effort — log for diagnostics, do not toast (would spam for ~ models).
       console.warn("[openrouter-telemetry] best-effort fetch failed", { model, error: String(error) })
       return endpoints
     }
@@ -2313,7 +2496,7 @@ function ModelSelectorPopoverV2View(props: {
   // after every response and moved virtual rows underneath the pointer.
   const models = createMemo(() => props.models(store.search))
   // The provider rail is derived from the full (search-filtered) model list so
-  // it never collapses when one provider is selected ΓÇö filtering happens below.
+  // it never collapses when one provider is selected — filtering happens below.
   const railProviders = createMemo(() => {
     const seen = new Map<string, string>()
     for (const item of models()) {
@@ -2384,6 +2567,7 @@ function ModelSelectorPopoverV2View(props: {
   // (deduped, 200/model, survives LRU). Falls back to an ephemeral scan
   // while the store is hydrating or on first run after upgrade.
   const durableCosts = createMemo(() => {
+    if (props.lightweight) return undefined
     if (!store.open) return undefined
     const durable = personal?.personalCosts()
     if (durable && durable.size > 0) return durable
@@ -2396,7 +2580,7 @@ function ModelSelectorPopoverV2View(props: {
   const usageFor = (item: ModelItem) => {
     // WorkBuddy: credits-per-request funded by one account's remaining balance.
     // Checked first because these models carry no USD cost at all, so the
-    // token-priced path below would render "ΓÇö" and no bar.
+    // token-priced path below would render "—" and no bar.
     if (item.provider.id === "workbuddy") {
       // Pass the full (possibly account-qualified) id: `hy4-preview@wb-<id>`
       // must be funded by that account, not by the best account overall.
@@ -2847,6 +3031,11 @@ function ModelSelectorPopoverV2View(props: {
   }
   const selectModel = (item: ModelItem) => {
     dismiss.preventTriggerRestore()
+    if (props.commitSelectionBeforeClose) {
+      props.select(item)
+      closeWith(props.onClose)
+      return
+    }
     closeWith(() => props.select(item))
   }
   const manage = () => {
@@ -2955,11 +3144,7 @@ function ModelSelectorPopoverV2View(props: {
   // View-level (defined once, not once per row): `renderRow` runs for every
   // mounted virtual row, so a per-row `async` closure here would allocate the
   // whole resolve chain per row per render. Rows pass a tiny wrapper instead.
-  const selectAccountFor = async (
-    item: ModelItem,
-    group: ModelGroup<ModelItem> | undefined,
-    accountID: string,
-  ) => {
+  const selectAccountFor = async (item: ModelItem, group: ModelGroup<ModelItem> | undefined, accountID: string) => {
     try {
       // 1. Real catalog variant — always routable.
       if (group?.variants.some((variant) => variant.accountID === accountID)) {
@@ -3028,8 +3213,7 @@ function ModelSelectorPopoverV2View(props: {
   // per-item cached picker cut per-render allocation to an O(1) map hit.
   const usageForWorkbuddyAccount = (item: ModelItem) => (accountID: string) =>
     workbuddy.forModel(`${item.id}@${accountID}`)
-  const usageForVerdentAccount = (item: ModelItem) => (accountID: string) =>
-    verdent.forModel(`${item.id}@${accountID}`)
+  const usageForVerdentAccount = (item: ModelItem) => (accountID: string) => verdent.forModel(`${item.id}@${accountID}`)
   const usageForZenAccount = (_item: ModelItem) => (accountID: string) => {
     const key = zenKeyLimits().get(accountID)
     if (!key) return undefined
@@ -3065,7 +3249,10 @@ function ModelSelectorPopoverV2View(props: {
       creditsExhausted: remainingUSD <= 0,
     }
   }
-  const usageForAccountCache = new Map<string, { item: ModelItem; fn: ((accountID: string) => AccountOptionUsage | undefined) | undefined }>()
+  const usageForAccountCache = new Map<
+    string,
+    { item: ModelItem; fn: ((accountID: string) => AccountOptionUsage | undefined) | undefined }
+  >()
   onCleanup(() => usageForAccountCache.clear())
   const usageForAccountFor = (item: ModelItem) => {
     const key = modelKey(item)
@@ -3092,7 +3279,7 @@ function ModelSelectorPopoverV2View(props: {
     // Cross-provider + fuzzy-name pricing fallback for display: if this
     // provider's variant is unpriced but a sibling provider offers the same
     // (or a name-matched free/paid variant) model with pricing, show the
-    // borrowed price (with "~" to hint it's inferred) instead of "ΓÇö" so the
+    // borrowed price (with "~" to hint it's inferred) instead of "—" so the
     // user sees why it's sorted where it is. Sorting already uses the same
     // fallback (see mergedPricingFallback in the controller).
     const effective = () => resolveEffectiveCost(item, mergedPricingFallbackForDisplay())
@@ -3106,25 +3293,25 @@ function ModelSelectorPopoverV2View(props: {
     // virtual row. See the comment on `selectAccountFor` for the guarantees.
     const selectAccount = (accountID: string) => void selectAccountFor(item, group, accountID)
     const price = () => {
-      // WorkBuddy publishes no token price ΓÇö it charges credits per request.
-      // Showing "ΓÇö" would waste the slot and hide the single most useful
+      // WorkBuddy publishes no token price — it charges credits per request.
+      // Showing "—" would waste the slot and hide the single most useful
       // number, so show the actual consumption rate instead.
       if (item.provider.id === "workbuddy") {
         const rate = workbuddy.rateFor(item.id)
-        if (!rate) return "ΓÇö"
+        if (!rate) return "—"
         if (rate.free) return rate.promotion ?? language.t("model.tag.free")
-        return rate.rate > 0 ? `x${rate.rate}` : "ΓÇö"
+        return rate.rate > 0 ? `x${rate.rate}` : "—"
       }
       if (item.provider.id === "genspark") {
         const cost = effectiveCost()
         const dollarPerM = hasPublishedPricing(cost) ? cost.input + cost.output : undefined
         const rate = genspark.rateFor(dollarPerM)
-        if (!rate) return "ΓÇö"
+        if (!rate) return "—"
         return `${isBorrowed() ? "~" : ""}${formatCreditsPerMillion(rate.creditsPerM)}`
       }
       return hasPublishedPricing(effectiveCost())
         ? `${isBorrowed() ? "~" : ""}${formatPricePerM(effectiveCost().input + effectiveCost().output)}`
-        : "ΓÇö"
+        : "—"
     }
     if (item.provider.id === "openrouter") {
       const cached = () => openRouterStore[item.id]
@@ -3164,11 +3351,7 @@ function ModelSelectorPopoverV2View(props: {
           variants={displayGroup.variants}
           navKey={navKey}
           current={current()}
-          selectedAccountID={
-            current()
-              ? (props.currentVariant()?.accountID ?? props.currentAccountID?.())
-              : undefined
-          }
+          selectedAccountID={current() ? (props.currentVariant()?.accountID ?? props.currentAccountID?.()) : undefined}
           auto={displayGroup.auto}
           selectedAuto={current() && !props.currentVariant() && !props.currentAccountID?.()}
           favorited={props.isFavorite(item)}
@@ -3251,13 +3434,19 @@ function ModelSelectorPopoverV2View(props: {
       modal={false}
       placement={props.placement ?? "top-start"}
       gutter={6}
+      flip
+      slide
+      fitViewport
+      shift={2}
+      overflowPadding={8}
       onOpenChange={onOpenChange}
     >
       <MenuV2.Trigger as={props.trigger} />
       <MenuV2.Portal>
         <MenuV2.Content
           ref={(element: HTMLDivElement) => (contentRef = element)}
-          class="w-[316px] overflow-hidden rounded-md border-0 bg-v2-background-bg-layer-01 !p-0 shadow-[var(--v2-elevation-floating)] focus:outline-none"
+          class="w-[316px] max-w-[calc(100vw-16px)] overflow-hidden rounded-md border-0 bg-v2-background-bg-layer-01 !p-0 shadow-[var(--v2-elevation-floating)] focus:outline-none"
+          style={{ "max-height": "var(--kb-popper-content-available-height, calc(100dvh - 16px))" }}
           onPointerDownOutside={dismiss.preventTriggerRestore}
           onFocusOutside={dismiss.preventTriggerRestore}
           onCloseAutoFocus={dismiss.onCloseAutoFocus}
@@ -3327,7 +3516,7 @@ function ModelSelectorPopoverV2View(props: {
             </div>
           </div>
           <div class="h-px bg-v2-border-border-muted" />
-          <div class="flex min-h-0 max-h-[320px]">
+          <div class="flex min-h-0 max-h-[320px] flex-1">
             <div class="flex min-h-0 max-h-full w-8 shrink-0 flex-col items-stretch gap-0.5 overflow-y-auto border-r border-v2-border-border-muted p-0.5 py-1 no-scrollbar">
               <TooltipV2
                 placement="right-start"

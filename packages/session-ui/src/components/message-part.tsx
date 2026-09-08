@@ -3255,7 +3255,12 @@ ToolRegistry.register({
     const i18n = useI18n()
     const questions = createMemo(() => (props.input.questions ?? []) as QuestionInfo[])
     const answers = createMemo(() => (props.metadata.answers ?? []) as QuestionAnswer[])
-    const completed = createMemo(() => answers().length > 0)
+    const structuredDetails = createMemo(() =>
+      Array.isArray(props.metadata.details) ? (props.metadata.details as string[]) : undefined,
+    )
+    const completed = createMemo(
+      () => answers().length > 0 || (structuredDetails()?.some((detail) => detail.trim().length > 0) ?? false),
+    )
 
     const subtitle = createMemo(() => {
       const count = questions().length
@@ -3279,10 +3284,29 @@ ToolRegistry.register({
             <For each={questions()}>
               {(q, i) => {
                 const answer = () => answers()[i()] ?? []
+                const optionLabels = new Set((q.options ?? []).map((option) => option.label))
+                const selections = createMemo(() => answer().filter((item) => optionLabels.has(item)))
+                const details = createMemo(() => {
+                  const explicit = structuredDetails()?.[i()]?.trim()
+                  if (structuredDetails()) return explicit ? [explicit] : []
+                  return answer().filter((item) => !optionLabels.has(item))
+                })
+                const empty = createMemo(() => selections().length === 0 && details().length === 0)
                 return (
                   <div data-slot="question-answer-item">
                     <div data-slot="question-text">{q.question}</div>
-                    <div data-slot="answer-text">{answer().join(", ") || i18n.t("ui.question.answer.none")}</div>
+                    <Show when={selections().length > 0}>
+                      <div data-slot="answer-text">{selections().join(", ")}</div>
+                    </Show>
+                    <Show when={details().length > 0}>
+                      <div data-slot="answer-detail">
+                        <span data-slot="answer-detail-label">{i18n.t("ui.question.answer.details")}: </span>
+                        {details().join("\n")}
+                      </div>
+                    </Show>
+                    <Show when={empty()}>
+                      <div data-slot="answer-text">{i18n.t("ui.question.answer.none")}</div>
+                    </Show>
                   </div>
                 )
               }}

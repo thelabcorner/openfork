@@ -15,6 +15,9 @@ export const SettingsModelPickerV2: Component<{
   defaultLabel: string
   action: string
   onChange: (value: SettingsModelRef | undefined) => void
+  compact?: boolean
+  /** Use the catalog/search selector without session-history/quota analytics. */
+  lightweightSelector?: boolean
 }> = (props) => {
   const language = useLanguage()
   const local = useLocal()
@@ -43,20 +46,36 @@ export const SettingsModelPickerV2: Component<{
       <ModelSelectorPopoverV2
         model={model}
         placement="bottom-end"
+        commitSelectionBeforeClose
+        lightweight={props.lightweightSelector}
         trigger={(triggerProps) => (
           <button
             {...triggerProps}
             type="button"
             data-action={props.action}
-            class="inline-flex h-6 max-w-[220px] items-center gap-1 rounded-sm px-2 pe-1 text-[13px] font-[530] leading-4 text-v2-text-text-base hover:bg-v2-overlay-simple-overlay-hover"
+            class={
+              props.compact
+                ? "inline-flex h-5 max-w-[180px] items-center gap-1 rounded-sm px-1.5 pe-1 text-[10px] font-[540] leading-3 text-v2-text-text-muted hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
+                : "inline-flex h-6 max-w-[220px] items-center gap-1 rounded-sm px-2 pe-1 text-[13px] font-[530] leading-4 text-v2-text-text-base hover:bg-v2-overlay-simple-overlay-hover"
+            }
           >
             <Show when={selected()?.provider.id ?? props.value?.providerID}>
-              {(providerID) => <ProviderIcon id={providerID()} class="size-3.5 shrink-0 opacity-70" />}
+              {(providerID) => (
+                <ProviderIcon
+                  id={providerID()}
+                  class={props.compact ? "size-3 shrink-0 opacity-70" : "size-3.5 shrink-0 opacity-70"}
+                />
+              )}
             </Show>
             <span class="min-w-0 truncate" dir="auto">
               {label()}
             </span>
-            <Icon name="chevron-down" class="size-4 shrink-0 text-v2-icon-icon-muted" />
+            <Icon
+              name="chevron-down"
+              class={
+                props.compact ? "size-3 shrink-0 text-v2-icon-icon-muted" : "size-4 shrink-0 text-v2-icon-icon-muted"
+              }
+            />
           </button>
         )}
       />

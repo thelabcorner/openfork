@@ -22,6 +22,8 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Project } from "@opencode-ai/schema/project"
+import { CHAT_PROJECT_ID, CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
+import { chatsRoot } from "@opencode-ai/core/project/chat-paths"
 
 export const Info = Project.Info
 export type Info = Types.DeepMutable<Schema.Schema.Type<typeof Info>>
@@ -214,10 +216,12 @@ const layer = Layer.effect(
       yield* Effect.logInfo("fromDirectory", { directory })
 
       const data = yield* projectV2.resolve(AbsolutePath.make(directory))
-      const worktree = data.id === ProjectV2.ID.make("global") && !data.vcs ? "/" : data.directory
+      const projectID = ProjectV2.ID.make(data.id)
+      const isChat = projectID === ProjectV2.ID.make(CHAT_PROJECT_ID)
+      const resolvedWorktree = data.id === ProjectV2.ID.make("global") && !data.vcs ? "/" : data.directory
+      const worktree = isChat ? AbsolutePath.make(FSUtil.resolve(resolvedWorktree)) : resolvedWorktree
 
       // Phase 2: upsert
-      const projectID = ProjectV2.ID.make(data.id)
       yield* migrateProjectId(data.previous ? ProjectV2.ID.make(data.previous) : undefined, projectID)
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
       const existing = row
@@ -234,7 +238,8 @@ const layer = Layer.effect(
 
       const result: Info = {
         ...existing,
-        worktree: projectID === ProjectV2.ID.global ? worktree : existing.worktree,
+        worktree: projectID === ProjectV2.ID.global || isChat ? worktree : existing.worktree,
+        name: isChat ? CHAT_PROJECT_NAME : existing.name,
         vcs: data.vcs?.type ?? fakeVcs,
         time: { ...existing.time, updated: Date.now() },
       }
@@ -333,11 +338,58 @@ const layer = Layer.effect(
       )
     })
 
+    const ensureChatProject = Effect.fn("Project.ensureChatProject")(function* () {
+      const projectID = ProjectV2.ID.make(CHAT_PROJECT_ID)
+      const root = AbsolutePath.make(FSUtil.resolve(chatsRoot()))
+      yield* fs.ensureDir(root).pipe(Effect.orDie)
+
+      const existing = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
+      const now = Date.now()
+      const changed = !existing || existing.worktree !== root || existing.name !== CHAT_PROJECT_NAME
+
+      const row = changed
+        ? yield* db
+            .insert(ProjectTable)
+            .values({
+              id: projectID,
+              worktree: root,
+              vcs: existing?.vcs ?? null,
+              name: CHAT_PROJECT_NAME,
+              icon_url: existing?.icon_url ?? null,
+              icon_url_override: existing?.icon_url_override ?? null,
+              icon_color: existing?.icon_color ?? null,
+              time_created: existing?.time_created ?? now,
+              time_updated: now,
+              time_initialized: existing?.time_initialized ?? null,
+              sandboxes: existing?.sandboxes ?? [],
+              commands: existing?.commands ?? null,
+            })
+            .onConflictDoUpdate({
+              target: ProjectTable.id,
+              set: {
+                worktree: root,
+                name: CHAT_PROJECT_NAME,
+                time_updated: now,
+              },
+            })
+            .returning()
+            .get()
+            .pipe(Effect.orDie)
+        : existing
+
+      yield* saveProjectDirectory({ projectID, directory: root })
+      const info = fromRow(row)
+      if (changed) yield* emitUpdated(info)
+      return info
+    })
+
     const list = Effect.fn("Project.list")(function* () {
+      yield* ensureChatProject()
       return (yield* db.select().from(ProjectTable).all().pipe(Effect.orDie)).map(fromRow)
     })
 
     const get = Effect.fn("Project.get")(function* (id: ProjectV2.ID) {
+      if (id === ProjectV2.ID.make(CHAT_PROJECT_ID)) return yield* ensureChatProject()
       const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get().pipe(Effect.orDie)
       return row ? fromRow(row) : undefined
     })
@@ -346,7 +398,7 @@ const layer = Layer.effect(
       const result = yield* db
         .update(ProjectTable)
         .set({
-          name: input.name,
+          name: input.projectID === ProjectV2.ID.make(CHAT_PROJECT_ID) ? CHAT_PROJECT_NAME : input.name,
           icon_url: input.icon?.url,
           icon_url_override: input.icon?.override,
           icon_color: input.icon?.color,
