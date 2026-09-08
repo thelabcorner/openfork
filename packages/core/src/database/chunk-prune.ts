@@ -1121,7 +1121,17 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
 
   // Keep draining an aggregate while it makes progress; skip mismatch-only
   // aggregates so one bad projection cannot starve every later session.
-  if (compacted === 0) yield* writeCursor(db, aggregateID)
+  // IMPORTANT: `hasMore` is consumed by the outer sealer as "more semantic
+  // work exists anywhere", not merely "this aggregate has another candidate
+  // page". When an aggregate is exhausted we therefore probe the NEXT
+  // aggregate before returning. Otherwise the sealer falls through to its
+  // normal 10-minute maintenance sleep between every session, turning a
+  // minutes-long backfill into a multi-day migration.
+  let hasLaterAggregate = false
+  if (compacted === 0) {
+    yield* writeCursor(db, aggregateID)
+    hasLaterAggregate = (yield* nextAggregate(db, cutoff, aggregateID)) !== undefined
+  }
 
   return {
     inspected: inspected.length,
@@ -1131,7 +1141,7 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
     projectionMismatches,
     compatibilityRejected,
     aggregateID,
-    hasMore: hasMore || checkpointMigration.hasMore,
+    hasMore: hasMore || checkpointMigration.hasMore || hasLaterAggregate,
     indexBackfilled: backfill.indexed,
     indexComplete: true,
     canonicalValuesDeleted: gc.values,

@@ -271,6 +271,81 @@ describe("ChunkDB semantic prune", () => {
     }
   })
 
+  test("keeps semantic drain mode active after a mismatch-only aggregate advances the cursor", async () => {
+    const { dir, path } = tempDb()
+    try {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const db = yield* makeDatabase
+          yield* db.run("PRAGMA journal_mode=WAL").pipe(Effect.orDie)
+          yield* db.run("PRAGMA foreign_keys=ON").pipe(Effect.orDie)
+          yield* DatabaseMigration.apply(db)
+          yield* ensureChunkDB(db)
+
+          const now = Date.now()
+          yield* db.run(sql`
+            INSERT INTO project (id, worktree, sandboxes, time_created, time_updated)
+            VALUES ('global', '/tmp', '[]', ${now}, ${now})
+          `).pipe(Effect.orDie)
+
+          for (const suffix of ["a", "b"] as const) {
+            const sessionID = `ses_drain_${suffix}`
+            const messageID = `msg_drain_${suffix}`
+            yield* db.run(sql`
+              INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+              VALUES (${sessionID}, 'global', ${suffix}, '/tmp', ${suffix}, 'test', 1, 1)
+            `).pipe(Effect.orDie)
+            yield* db.run(sql`
+              INSERT INTO event_sequence (aggregate_id, seq, owner_id)
+              VALUES (${sessionID}, 1, NULL)
+            `).pipe(Effect.orDie)
+            const projectedAgent = suffix === "a" ? "stale" : "after"
+            yield* db.run(sql`
+              INSERT INTO message (id, session_id, time_created, time_updated, data)
+              VALUES (
+                ${messageID},
+                ${sessionID},
+                1,
+                1,
+                ${JSON.stringify({
+                  role: "user",
+                  time: { created: 1 },
+                  agent: projectedAgent,
+                  model: { providerID: "provider", modelID: "model" },
+                })}
+              )
+            `).pipe(Effect.orDie)
+            yield* db.run(sql`
+              INSERT INTO event (id, aggregate_id, seq, type, data)
+              VALUES
+                (${`evt_drain_${suffix}_old`}, ${sessionID}, 0, 'message.updated.1', ${message(messageID, sessionID, "before")}),
+                (${`evt_drain_${suffix}_new`}, ${sessionID}, 1, 'message.updated.1', ${message(messageID, sessionID, "after")})
+            `).pipe(Effect.orDie)
+          }
+
+          // Aggregate A is deliberately fail-closed: its latest event does not
+          // match the materialized projection. The semantic cursor must advance
+          // past A so it cannot starve later sessions.
+          const first = yield* runSemanticPrunePass(db, { limit: 16, now })
+          expect(first.aggregateID).toBe("ses_drain_a")
+          expect(first.compacted).toBe(0)
+          expect(first.projectionMismatches).toBe(1)
+
+          // This is the critical scheduler boundary: hasMore MUST stay true
+          // because aggregate B still has provable work. Before this regression,
+          // the outer sealer fell through to its 10-minute maintenance sleep here.
+          expect(first.hasMore).toBe(true)
+
+          const next = yield* runSemanticPrunePass(db, { limit: 16, now })
+          expect(next.aggregateID).toBe("ses_drain_b")
+          expect(next.compacted).toBe(1)
+        }).pipe(Effect.provide(sqliteLayer({ filename: path }))),
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test("fails closed on projection mismatch", async () => {
     const { dir, path } = tempDb()
     try {
