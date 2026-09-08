@@ -1,5 +1,6 @@
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { EventV2 } from "@opencode-ai/core/event"
+import { Event } from "@opencode-ai/schema/event"
 import { SessionID } from "@/session/schema"
 import { Schema } from "effect"
 import { HttpApi, HttpApiEndpoint, HttpApiError, HttpApiGroup, OpenApi } from "effect/unstable/httpapi"
@@ -9,6 +10,11 @@ import { WorkspaceRoutingMiddleware, WorkspaceRoutingQuery } from "../middleware
 import { described } from "./metadata"
 
 const root = "/sync"
+export const SemanticCompactionFeature = EventV2.versionedType(Event.Compacted.type, Event.Compacted.durable!.version)
+export const SyncCapabilities = Schema.Struct({
+  version: Schema.Literal(1),
+  features: Schema.Array(Schema.String),
+})
 export const ReplayEvent = Schema.Struct({
   id: EventV2.ID,
   aggregateID: Schema.String,
@@ -36,6 +42,7 @@ export const HistoryEvent = Schema.Struct({
 })
 
 export const SyncPaths = {
+  capabilities: `${root}/capabilities`,
   start: `${root}/start`,
   replay: `${root}/replay`,
   steal: `${root}/steal`,
@@ -46,6 +53,16 @@ export const SyncApi = HttpApi.make("sync")
   .add(
     HttpApiGroup.make("sync")
       .add(
+        HttpApiEndpoint.get("capabilities", SyncPaths.capabilities, {
+          query: WorkspaceRoutingQuery,
+          success: described(SyncCapabilities, "Sync protocol capabilities"),
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "sync.capabilities",
+            summary: "Get sync capabilities",
+            description: "Get versioned durable-history representations supported by this sync peer.",
+          }),
+        ),
         HttpApiEndpoint.post("start", SyncPaths.start, {
           query: WorkspaceRoutingQuery,
           success: described(Schema.Boolean, "Workspace sync started"),

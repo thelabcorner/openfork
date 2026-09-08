@@ -2,6 +2,11 @@ import { afterEach, describe, expect, mock } from "bun:test"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Context, Effect, Layer } from "effect"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { recordCompactedSequences } from "@opencode-ai/core/database/chunk-compaction"
+import { eq } from "drizzle-orm"
 import { SyncPaths } from "../../src/server/routes/instance/httpapi/groups/sync"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { Session } from "@/session/session"
@@ -12,7 +17,7 @@ import { httpApiLayer, requestInDirectory } from "./httpapi-layer"
 
 const originalWorkspaces = Flag.OPENCODE_EXPERIMENTAL_WORKSPACES
 const context = Context.empty() as Context.Context<unknown>
-const it = testEffect(Layer.mergeAll(LayerNode.compile(Session.node), httpApiLayer))
+const it = testEffect(Layer.mergeAll(LayerNode.compile(LayerNode.group([Session.node, Database.node])), httpApiLayer))
 
 afterEach(async () => {
   mock.restore()
@@ -118,6 +123,56 @@ describe("sync HttpApi", () => {
           })
           expect(response.status).toBe(400)
         }
+      }),
+    { git: true, config: { formatter: false, lsp: false } },
+  )
+
+  it.instance(
+    "history inflates sparse compacted positions into contiguous wire markers",
+    () =>
+      Effect.gen(function* () {
+        const tmp = yield* TestInstance
+        const headers = { "x-opencode-directory": tmp.directory, "content-type": "application/json" }
+        const session = yield* Session.use.create({ title: "sparse-sync" })
+        const { db } = yield* Database.Service
+        const base = yield* EventV2.latestSequence(db, session.id)
+        const hole = base + 1
+        const actual = hole + 1
+
+        yield* recordCompactedSequences(db, session.id, [hole])
+        yield* db
+          .insert(EventTable)
+          .values({
+            id: EventV2.ID.make("evt_sparse_sync_after"),
+            aggregate_id: session.id,
+            seq: actual,
+            type: "session.updated.1",
+            data: { sessionID: session.id, info: { ...session, title: "after sparse hole" } },
+          })
+          .run()
+          .pipe(Effect.orDie)
+        yield* db
+          .update(EventSequenceTable)
+          .set({ seq: actual })
+          .where(eq(EventSequenceTable.aggregate_id, session.id))
+          .run()
+          .pipe(Effect.orDie)
+
+        const history = yield* requestInDirectory(SyncPaths.history, tmp.directory, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ [session.id]: base }),
+        })
+        expect(history.status).toBe(200)
+        const rows = ((yield* history.json) as Array<{
+          id: string
+          aggregate_id: string
+          seq: number
+          type: string
+        }>).filter((row) => row.aggregate_id === session.id)
+        expect(rows.map((row) => row.seq)).toEqual([hole, actual])
+        expect(rows.map((row) => row.type)).toEqual(["event.compacted.1", "session.updated.1"])
+        expect(rows[0]?.id.startsWith("evt_compacted_")).toBe(true)
       }),
     { git: true, config: { formatter: false, lsp: false } },
   )

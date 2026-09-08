@@ -186,6 +186,28 @@ JSON UTF-8 BLOBs). Byte-exact rehydration is required
 
 > **value_id scheme:** epoch-2 dedup (this section) uses 2-part `"<aggregate_id>:<seq>"`. The epoch-3 (#8) collapse uses 3-part `"<aggregate_id>:<seq>:<sha8>"` (globally unique). Both coexist in `event_value`; resolution is PK-scoped `(aggregate_id, value_id)` and scheme-agnostic, so a v5 delta_ref base may reference either scheme.
 
+## Semantic compaction (storage epoch 4)
+
+When ChunkDB sealing is enabled, semantic elimination runs before ordinary
+dedup/compression for the full-snapshot event classes currently covered by the
+projection proof policy. It is enabled by default; set
+`OPENCODE_SEAL_PRUNE=0`/`false` as an emergency writer kill switch. A superseded
+snapshot is deleted only after the latest snapshot for the same entity is proven
+to match the authoritative materialized projection and the aggregate is
+local/unowned and outside the hot tail.
+
+Deleted durable positions are not stored as physical event rows. One dense BLOB
+in `event_compaction` records one bit per compacted aggregate sequence. Local
+readers naturally traverse sparse physical sequences. Boundaries that require a
+contiguous durable stream (`/sync/history`, remote session warp/replay) synthesize
+deterministic `event.compacted.1` no-op fillers from the bitmap. New receivers
+consume those fillers back into the bitmap without inserting an event row.
+
+Legacy storage-epoch-3 databases that contain physical `event.compacted.1` rows
+are migrated in bounded, idempotent batches into `event_compaction`, then the
+physical marker rows are deleted. `PRAGMA user_version=4` is the compatibility
+fence for sparse durable sequences.
+
 ## Epoch gate
 
 `PRAGMA user_version` enforces the epoch gate (schema layer, independent of
@@ -194,12 +216,13 @@ frame is readable by any binary that uses this codec module.
 
 ## Ops runbook
 
-All ChunkDB behavior is FLAG-GATED and OFF by default:
+ChunkDB behavior is controlled by the following flags and defaults:
 
 | flag / env | effect |
 |---|---|
 | `OPENCODE_SEAL_ENABLED` | on: sealer loop runs (immediate pass, then every 10 min); create-time `page_size=8192` + `auto_vacuum=INCREMENTAL` on FRESH DBs |
 | `OPENCODE_SEAL_DEDUP` | on: epoch-2 dedup promotion (`event_value` + `$cdbRef` refs) |
+| `OPENCODE_SEAL_PRUNE` | default ON when sealing runs; `0`/`false` disables new semantic writes. Obsolete snapshot rows become bits in `event_compaction`, with deterministic wire-only `event.compacted.1` fillers. Sparse read/replay support remains available when the writer is disabled. |
 | `OPENCODE_SEAL_WORKERS` | on: compression/decompression run on worker-thread pools (2–4 workers) |
 | `OPENCODE_SEAL_DELTA` | on: epoch-4 delta_ref framing — record-structured values stored as a sparse correction against a base value in `event_value` when smaller (default OFF) |
 | `OPENCODE_SEAL_BACKFILL` | on (1): epoch-3 (#6) BACKFILL mode — back-to-back passes at 50k cap when a backlog exists; `0` forces maintenance-only (default ON) |

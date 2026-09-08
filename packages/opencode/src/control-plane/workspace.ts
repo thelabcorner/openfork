@@ -34,6 +34,12 @@ import { InstanceStore } from "@/project/instance-store"
 import { WorkspaceAdapterRuntime } from "./workspace-adapter-runtime"
 import { AppNodeBuilderV1 } from "@/effect/app-node-builder-v1"
 import { WorkspaceEvent } from "@opencode-ai/schema/workspace-event"
+import {
+  hasCompactedSequences,
+  inflateCompactedHistory,
+  loadCompaction,
+} from "@opencode-ai/core/database/chunk-compaction"
+import { Event as EventSchema } from "@opencode-ai/schema/event"
 
 export const Info = Schema.Struct({
   ...WorkspaceInfoSchema.fields,
@@ -45,6 +51,10 @@ export const ConnectionStatus = WorkspaceEvent.ConnectionStatus
 export type ConnectionStatus = WorkspaceEvent.ConnectionStatus
 
 export const Event = WorkspaceEvent
+const SemanticCompactionFeature = EventV2.versionedType(
+  EventSchema.Compacted.type,
+  EventSchema.Compacted.durable!.version,
+)
 
 function fromRow(row: typeof WorkspaceTable.$inferSelect): Info {
   return {
@@ -649,8 +659,51 @@ const layer = Layer.effect(
           .orderBy(asc(EventTable.seq))
           .all()
           .pipe(Effect.orDie)
+        const compaction = yield* loadCompaction(db, input.sessionID)
+        if (hasCompactedSequences(compaction?.bitmap) || storedRows.some((row) => row.type === SemanticCompactionFeature)) {
+          // A semantically-pruned log contains durable sequence fillers that did
+          // not exist in older peers. Probe BEFORE sending the first replay batch
+          // so an incompatible warp fails atomically instead of leaving a remote
+          // workspace with a partially-replayed session.
+          const capabilityResponse = yield* http.execute(
+            HttpClientRequest.get(route(target.url, "/sync/capabilities"), {
+              headers: new Headers(target.headers),
+            }),
+          )
+          if (capabilityResponse.status < 200 || capabilityResponse.status >= 300) {
+            const body = yield* capabilityResponse.text
+            return yield* new SessionWarpHttpError({
+              message: `Remote workspace does not advertise semantic event compaction support: HTTP ${capabilityResponse.status}`,
+              workspaceID,
+              sessionID: input.sessionID,
+              status: capabilityResponse.status,
+              body,
+            })
+          }
+          const capabilityBody = (yield* capabilityResponse.json) as { version?: unknown; features?: unknown }
+          if (
+            capabilityBody.version !== 1 ||
+            !Array.isArray(capabilityBody.features) ||
+            !capabilityBody.features.includes(SemanticCompactionFeature)
+          ) {
+            return yield* new SessionWarpHttpError({
+              message: `Remote workspace does not support ${SemanticCompactionFeature}`,
+              workspaceID,
+              sessionID: input.sessionID,
+              status: 412,
+              body: JSON.stringify(capabilityBody),
+            })
+          }
+        }
         const hydratedRows = yield* EventV2.rehydrateEvents(db, input.sessionID, storedRows)
-        const rows = hydratedRows.map((row) => ({
+        const frontier = yield* EventV2.latestSequence(db, input.sessionID)
+        const contiguousRows = inflateCompactedHistory({
+          aggregateID: input.sessionID,
+          rows: hydratedRows,
+          bitmap: compaction?.bitmap,
+          through: frontier,
+        })
+        const rows = contiguousRows.map((row) => ({
           id: row.id,
           aggregateID: row.aggregate_id,
           seq: row.seq,

@@ -9,6 +9,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { isCompactedSequence, loadCompaction } from "@opencode-ai/core/database/chunk-compaction"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
@@ -650,6 +651,54 @@ describe("EventV2", () => {
 
       expect(rows).toHaveLength(1)
       expect(rows[0]?.aggregate_id).toBe(aggregateID)
+    }),
+  )
+
+  it.effect("replay consumes semantic wire fillers sparsely even when the pruning writer is disabled", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const marker = {
+        id: EventV2.ID.create(),
+        type: EventV2.versionedType(Event.Compacted.type, Event.Compacted.durable!.version),
+        seq: 0,
+        aggregateID,
+        data: {
+          aggregateID,
+          supersededType: "message.updated.1",
+          supersededBy: EventV2.ID.create(),
+        },
+      }
+      const previous = process.env.OPENCODE_SEAL_PRUNE
+      const restore = Effect.sync(() => {
+        if (previous === undefined) delete process.env.OPENCODE_SEAL_PRUNE
+        else process.env.OPENCODE_SEAL_PRUNE = previous
+      })
+      yield* Effect.gen(function* () {
+        process.env.OPENCODE_SEAL_PRUNE = "0"
+        yield* events.replay(marker)
+        yield* events.replay(marker)
+      }).pipe(Effect.ensuring(restore))
+
+      const rows = yield* db
+        .select()
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, aggregateID))
+        .all()
+        .pipe(Effect.orDie)
+      const sequence = yield* db
+        .select({ seq: EventSequenceTable.seq })
+        .from(EventSequenceTable)
+        .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+        .get()
+        .pipe(Effect.orDie)
+      const compaction = yield* loadCompaction(db, aggregateID)
+
+      expect(rows).toHaveLength(0)
+      expect(sequence).toEqual({ seq: 0 })
+      expect(compaction?.count).toBe(1)
+      expect(isCompactedSequence(compaction?.bitmap, 0)).toBe(true)
     }),
   )
 

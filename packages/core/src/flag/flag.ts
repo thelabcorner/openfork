@@ -45,6 +45,18 @@ export const Flag = {
   get OPENCODE_SEAL_DEDUP() {
     return truthy("OPENCODE_SEAL_DEDUP")
   },
+  // Semantic compaction runs before ordinary ChunkDB compression. When ON, a
+  // superseded full-snapshot event may be physically deleted after its latest
+  // snapshot is proven equal to the authoritative materialized projection. Its
+  // durable sequence is retained as one bit in event_compaction; wire/export
+  // boundaries synthesize event.compacted.1 fillers when contiguity is required.
+  // Production default ON. Set OPENCODE_SEAL_PRUNE=0/false as an emergency
+  // writer kill switch. Sparse read/replay support remains available even when
+  // the writer is disabled, so already-compacted databases stay readable.
+  get OPENCODE_SEAL_PRUNE() {
+    const value = process.env["OPENCODE_SEAL_PRUNE"]?.toLowerCase()
+    return value !== "0" && value !== "false"
+  },
   // Epoch-3: offload `compressText` to a worker-thread pool so the sealer's
   // main thread stays free for sha256 + SQL while workers compress in parallel.
   // Getter so it can be toggled at runtime (tests / CLI). When off, the sealer

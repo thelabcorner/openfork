@@ -10,6 +10,7 @@ import { eq } from "drizzle-orm"
 import { GlobalBus, type GlobalEvent } from "@/bus/global"
 import { Project } from "@/project/project"
 import { Database } from "@opencode-ai/core/database/database"
+import { EventV2 } from "@opencode-ai/core/event"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { AbsolutePath } from "@opencode-ai/core/schema"
@@ -17,7 +18,8 @@ import { Session as SessionNs } from "@/session/session"
 import { SessionID } from "@/session/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { EventSequenceTable } from "@opencode-ai/core/event/sql"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { recordCompactedSequences } from "@opencode-ai/core/database/chunk-compaction"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, provideTmpdirInstance, requireInstance, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -1077,6 +1079,145 @@ describe("workspace CRUD", () => {
             expect(calls[4].json).toEqual({ sessionID: session.id })
             expect((yield* sessionSvc.get(session.id)).title).toBe("from source history")
             expect(yield* sessionSequenceOwner(session.id)).toBe(target.id)
+          }),
+        { git: true },
+      )
+    })
+  })
+
+  it.live("sessionWarp rejects sparse-compacted history before replay when the remote lacks semantic compaction support", () => {
+    const calls: FetchCall[] = []
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          const call = {
+            url: new URL(req.url, "http://localhost"),
+            method: req.method,
+            headers: new Headers(req.headers),
+            bodyText,
+            json: bodyText ? JSON.parse(bodyText) : undefined,
+          }
+          calls.push(call)
+          if (call.url.pathname === "/warp-target/sync/capabilities") {
+            return HttpServerResponse.text("not supported", { status: 404 })
+          }
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const { db } = yield* Database.Service
+            const instance = yield* requireInstance
+            const targetType = unique("warp-marker-unsupported")
+            const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+            yield* insertWorkspace(target)
+            registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+
+            const session = yield* sessionSvc.create({})
+            const seq = ((yield* sessionSequence(session.id)) ?? -1) + 1
+            yield* recordCompactedSequences(db, session.id, [seq])
+            yield* db
+              .update(EventSequenceTable)
+              .set({ seq })
+              .where(eq(EventSequenceTable.aggregate_id, session.id))
+              .run()
+              .pipe(Effect.orDie)
+
+            const exit = yield* Effect.exit(workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id }))
+            expectExitContains(exit, "semantic event compaction", "404")
+            expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+              "GET /warp-target/sync/capabilities",
+            ])
+            expect((yield* sessionSvc.get(session.id)).workspaceID).toBeUndefined()
+          }),
+        { git: true },
+      )
+    })
+  })
+
+  it.live("sessionWarp inflates sparse compacted positions into deterministic wire fillers for a capable remote", () => {
+    const calls: FetchCall[] = []
+    return Effect.gen(function* () {
+      yield* HttpServer.serveEffect()(
+        Effect.gen(function* () {
+          const req = yield* HttpServerRequest.HttpServerRequest
+          const bodyText = yield* req.text
+          const call = {
+            url: new URL(req.url, "http://localhost"),
+            method: req.method,
+            headers: new Headers(req.headers),
+            bodyText,
+            json: bodyText ? JSON.parse(bodyText) : undefined,
+          }
+          calls.push(call)
+          if (call.url.pathname === "/warp-target/sync/capabilities") {
+            return yield* HttpServerResponse.json({ version: 1, features: ["event.compacted.1"] })
+          }
+          if (call.url.pathname === "/warp-target/sync/replay") {
+            return yield* HttpServerResponse.json({ sessionID: "ok" })
+          }
+          if (call.url.pathname === "/warp-target/sync/steal") {
+            return yield* HttpServerResponse.json({ sessionID: "ok" })
+          }
+          return HttpServerResponse.text("unexpected", { status: 500 })
+        }),
+      )
+      const url = yield* serverUrl()
+      yield* provideTmpdirInstance(
+        () =>
+          Effect.gen(function* () {
+            const workspace = yield* Workspace.Service
+            const sessionSvc = yield* SessionNs.Service
+            const { db } = yield* Database.Service
+            const instance = yield* requireInstance
+            const targetType = unique("warp-sparse-supported")
+            const target = workspaceInfo(instance.project.id, targetType, { directory: "remote-target-dir" })
+            yield* insertWorkspace(target)
+            registerAdapter(instance.project.id, targetType, remoteAdapter(`${url}/warp-target`).adapter)
+
+            const session = yield* sessionSvc.create({})
+            const hole = ((yield* sessionSequence(session.id)) ?? -1) + 1
+            const actualSeq = hole + 1
+            yield* recordCompactedSequences(db, session.id, [hole])
+            yield* db
+              .insert(EventTable)
+              .values({
+                id: EventV2.ID.make(`evt_${unique("sparse-after")}`),
+                aggregate_id: session.id,
+                seq: actualSeq,
+                type: "session.updated.1",
+                data: { sessionID: session.id, info: { ...session, title: "after sparse hole" } },
+              })
+              .run()
+              .pipe(Effect.orDie)
+            yield* db
+              .update(EventSequenceTable)
+              .set({ seq: actualSeq })
+              .where(eq(EventSequenceTable.aggregate_id, session.id))
+              .run()
+              .pipe(Effect.orDie)
+
+            yield* workspace.sessionWarp({ workspaceID: target.id, sessionID: session.id })
+
+            expect(calls.map((call) => `${call.method} ${call.url.pathname}`)).toEqual([
+              "GET /warp-target/sync/capabilities",
+              "POST /warp-target/sync/replay",
+              "POST /warp-target/sync/steal",
+            ])
+            const replay = calls[1]?.json as { events?: Array<{ id: string; seq: number; type: string }> }
+            expect(replay.events?.map((event) => event.seq)).toEqual([0, hole, actualSeq])
+            expect(replay.events?.map((event) => event.type)).toEqual([
+              "session.created.1",
+              "event.compacted.1",
+              "session.updated.1",
+            ])
+            expect(replay.events?.[1]?.id.startsWith("evt_compacted_")).toBe(true)
           }),
         { git: true },
       )

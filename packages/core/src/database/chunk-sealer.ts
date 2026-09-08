@@ -1,11 +1,13 @@
 import { createHash } from "node:crypto"
-import { Effect, Duration } from "effect"
+import { Cause, Effect, Duration } from "effect"
 import type { SqlError } from "effect/unstable/sql/SqlError"
 import { sql } from "drizzle-orm"
 import type { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { withBackfillDb, type DatabaseShape } from "./database"
-import { compressText, chooseCodec, compressDeltaRef } from "./json-codec"
+import { compressText, chooseCodec, compressDeltaRef, isV5Frame, parseV5Header } from "./json-codec"
 import { compressTextAsync } from "./compress-pool"
+import { runSemanticPrunePass, type SemanticPruneOutcome } from "./chunk-prune"
+import { isSqliteBusy } from "./sqlite-busy"
 import { Flag } from "../flag/flag"
 import {
   CHUNKDB_BATCH_SIZE,
@@ -118,45 +120,16 @@ const activeSealers = (() => {
   // `process` is shared across duplicated module/VM realms in one Node sidecar,
   // unlike a realm-local globalThis. This is the correct singleton boundary for
   // a database maintenance loop owned by one OS process.
-  const root = process as unknown as Record<PropertyKey, unknown>
-  const existing = root[ACTIVE_SEALERS]
-  if (existing instanceof Set) return existing as Set<string>
+  const existing: unknown = Reflect.get(process, ACTIVE_SEALERS)
+  if (existing instanceof Set) return existing
   const created = new Set<string>()
-  root[ACTIVE_SEALERS] = created
+  Reflect.set(process, ACTIVE_SEALERS, created)
   return created
 })()
 
 function sealerKey(filename: string): string {
   const normalized = filename.replaceAll("\\", "/")
   return process.platform === "win32" ? normalized.toLowerCase() : normalized
-}
-
-function isSqliteBusy(error: unknown): boolean {
-  const seen = new Set<object>()
-  const stack: unknown[] = [error]
-  while (stack.length > 0) {
-    const value = stack.pop()
-    if (typeof value === "string") {
-      const text = value.toLowerCase()
-      if (text.includes("database is locked") || text.includes("database table is locked") || text.includes("sqlite_busy")) {
-        return true
-      }
-      continue
-    }
-    if (!value || typeof value !== "object" || seen.has(value)) continue
-    seen.add(value)
-    // EffectDrizzleQueryError wraps SqlError inside Effect.Cause. Cause does not
-    // expose the nested failure through a normal `.cause` field; its own
-    // `reasons` property contains Fail(error). Walk all OWN values (including
-    // non-enumerable/symbol-backed wrappers) so SQLITE_BUSY survives arbitrary
-    // Effect/Drizzle error layers without coupling to one library version.
-    for (const key of Reflect.ownKeys(value)) {
-      try {
-        stack.push((value as Record<PropertyKey, unknown>)[key])
-      } catch {}
-    }
-  }
-  return false
 }
 
 /** Optional tuning knobs for a sealer pass (epoch-3 storage-frontier-v3). */
@@ -781,6 +754,15 @@ export function runPassV2(
                     INSERT INTO event_value (aggregate_id, value_id, sha256, raw_len, bytes, refs, time_promoted)
                     VALUES (${candidate.aggregate_id}, ${plan.valueId}, ${plan.sha}, ${plan.rawLen}, ${stored}, 1, ${Date.now()})
                   `)
+                  if (stored instanceof Uint8Array && isV5Frame(stored)) {
+                    const dependency = parseV5Header(stored)
+                    yield* tx.run(sql`
+                      INSERT INTO event_value_dependency (aggregate_id, value_id, base_value_id)
+                      VALUES (${candidate.aggregate_id}, ${plan.valueId}, ${dependency.baseValueId})
+                      ON CONFLICT(aggregate_id, value_id) DO UPDATE SET
+                        base_value_id = excluded.base_value_id
+                    `)
+                  }
                   yield* tx.run(sql`
                     INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
                       VALUES ('event', ${candidate.id}, 'data', ${plan.rawLen}, ${stored.byteLength}, ${codec}, ${typeof frame === "string" ? 0 : frame[4]}, ${Date.now()}, 0)
@@ -961,6 +943,7 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
             dedup: Flag.OPENCODE_SEAL_DEDUP,
             workers: Flag.OPENCODE_SEAL_WORKERS,
             delta: Flag.OPENCODE_SEAL_DELTA,
+            semanticPrune: Flag.OPENCODE_SEAL_PRUNE,
             backfill: backfillAllowed,
             coolingMs: CHUNKDB_COOLING_MS,
             hotTailEvents: CHUNKDB_HOT_TAIL_EVENTS,
@@ -972,6 +955,58 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
             const draining: boolean = previousHitCap && backfillAllowed
             const cap: number = draining ? CHUNKDB_BACKFILL_MAX_ROWS_PER_PASS : MAX_ROWS_PER_PASS
             const started = Date.now()
+            if (Flag.OPENCODE_SEAL_PRUNE) {
+              type SemanticLoopOutcome =
+                | { readonly kind: "ok"; readonly value: SemanticPruneOutcome }
+                | { readonly kind: "busy" }
+                | { readonly kind: "failed" }
+              const semanticOutcome: SemanticLoopOutcome = yield* runSemanticPrunePass(db, {
+                limit: Math.min(cap, 8_192),
+              }).pipe(
+                Effect.map((value): SemanticLoopOutcome => ({ kind: "ok", value })),
+                // Some migration/backfill helpers intentionally fail closed via
+                // Effect.orDie. Catch at the Cause boundary so SQLITE_BUSY is
+                // still recognized even when Drizzle wrapped it as a defect.
+                // Interruptions are lifecycle signals, not maintenance errors;
+                // preserve them exactly so scope shutdown remains prompt.
+                Effect.catchCause((cause): Effect.Effect<SemanticLoopOutcome> => {
+                  if (Cause.hasInterrupts(cause)) return Effect.failCause(cause)
+                  if (isSqliteBusy(cause)) return Effect.succeed({ kind: "busy" })
+                  return Effect.logWarning("ChunkDB semantic prune pass failed; backing off", {
+                    filename,
+                    cause: Cause.pretty(cause),
+                  }).pipe(Effect.as<SemanticLoopOutcome>({ kind: "failed" }))
+                }),
+              )
+              if (semanticOutcome.kind === "busy") {
+                // Every semantic write unit is atomic + idempotent. If a
+                // foreground writer owns SQLite, abandon the current maintenance
+                // pass immediately and retry later rather than queueing behind it
+                // or killing the infinite sealer loop.
+                yield* Effect.sleep(Duration.millis(CHUNKDB_BUSY_RETRY_MS))
+                previousHitCap = false
+                continue
+              }
+              if (semanticOutcome.kind === "failed") {
+                yield* Effect.sleep(Duration.millis(backoffMs))
+                backoffMs = Math.min(backoffMs * 2, BACKOFF_CAP_MS)
+                previousHitCap = false
+                continue
+              }
+              const pruned = semanticOutcome.value
+              backoffMs = BACKOFF_BASE_MS
+              if (pruned.inspected > 0) {
+                yield* Effect.logInfo("ChunkDB semantic prune pass complete", { filename, ...pruned })
+              }
+              // Semantic elimination has priority over representation-level
+              // compression. If we just proved and compacted snapshots, start
+              // another semantic pass before the normal sealer can frame/ref the
+              // remaining JSON and hide its entity key from candidate discovery.
+              if (pruned.compacted > 0 || pruned.hasMore) {
+                yield* Effect.sleep(Duration.millis(DRAIN_SLEEP_MS))
+                continue
+              }
+            }
             const outcome: SealerPassOutcome = yield* runSealerPass(db, { maxRowsPerPass: cap }).pipe(
               Effect.catch((error) =>
                 Effect.logError("ChunkDB sealer pass failed; backing off", { filename, error }).pipe(

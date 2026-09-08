@@ -28,6 +28,8 @@ import { createHash } from "node:crypto"
 import { isDeepStrictEqual } from "node:util"
 import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import { estimateEventBytes } from "./event-replay"
+import { indexSemanticEvent } from "./database/chunk-semantic"
+import { isCompactedSequence, loadCompaction, recordCompactedSequences } from "./database/chunk-compaction"
 
 const streamingDecoder = new TextDecoder()
 
@@ -824,6 +826,7 @@ export const layerWith = (options?: LayerOptions) =>
                             .get()
                             .pipe(Effect.orDie)
                           const latest = row?.seq ?? -1
+                          const sparseCheckpoint = definition.type === Event.Compacted.type
                           const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<
                             string,
                             unknown
@@ -837,6 +840,20 @@ export const layerWith = (options?: LayerOptions) =>
                             )
                           }
                           if (input && input.seq <= latest) {
+                            if (sparseCheckpoint) {
+                              const compaction = yield* loadCompaction(db, aggregateID)
+                              if (isCompactedSequence(compaction?.bitmap, input.seq)) {
+                                if (input.ownerID && row?.ownerID == null) {
+                                  yield* db
+                                    .update(EventSequenceTable)
+                                    .set({ owner_id: input.ownerID })
+                                    .where(eq(EventSequenceTable.aggregate_id, aggregateID))
+                                    .run()
+                                    .pipe(Effect.orDie)
+                                }
+                                return
+                              }
+                            }
                             const stored = yield* db
                               .select()
                               .from(EventTable)
@@ -913,6 +930,15 @@ export const layerWith = (options?: LayerOptions) =>
                             })
                             .run()
                             .pipe(Effect.orDie)
+                          if (sparseCheckpoint) {
+                            // `event.compacted.1` is a wire-level no-op in epoch
+                            // 4. Advance the durable frontier, but persist only a
+                            // single bit for this sequence instead of inserting a
+                            // physical event row. Replays remain idempotent via
+                            // the bitmap check above.
+                            yield* recordCompactedSequences(db, aggregateID, [seq])
+                            return { aggregateID, seq }
+                          }
                           yield* db
                             .insert(EventTable)
                             .values([
@@ -926,6 +952,14 @@ export const layerWith = (options?: LayerOptions) =>
                             ])
                             .run()
                             .pipe(Effect.orDie)
+                          if (Flag.OPENCODE_SEAL_PRUNE) {
+                            yield* indexSemanticEvent(db, {
+                              aggregateID,
+                              seq,
+                              type: definition.type,
+                              data: encoded,
+                            })
+                          }
                           return { aggregateID, seq }
                         }),
                       { behavior: "immediate" },

@@ -12,6 +12,26 @@ export const ID = Schema.String.check(Schema.isStartsWith("evt_")).pipe(
 )
 export type ID = typeof ID.Type
 
+/**
+ * Wire-level no-op used to preserve contiguous durable sequence semantics when
+ * semantic compaction has removed a physical event row. Epoch-4 storage keeps
+ * only the compacted sequence bit; transport reconstructs a deterministic
+ * synthetic marker on demand and replay consumes it back into the bitmap.
+ *
+ * This definition stays generic so sync/replay can decode the filler without an
+ * application manifest entry. The payload fields are compatibility metadata;
+ * they are not a retained copy of the deleted event identity or payload.
+ */
+export const Compacted = define({
+  type: "event.compacted",
+  durable: { version: 1, aggregate: "aggregateID" },
+  schema: {
+    aggregateID: Schema.String,
+    supersededType: Schema.String,
+    supersededBy: ID,
+  },
+})
+
 export type Definition<
   Type extends string = string,
   DataSchema extends Schema.Codec<unknown, unknown> = Schema.Codec<unknown, unknown>,

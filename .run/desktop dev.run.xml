@@ -7,20 +7,22 @@
     </scripts>
     <node-interpreter value="project" />
     <envs>
-      <!-- TEMPORARY: opencode-openfork.db and opencode.db are both corrupted
-           ("database disk image is malformed") and currently locked by something
-           unidentified, blocking a fresh start. Point at a new file to unblock
-           immediately; revert once the lock is resolved and the old files can be
-           inspected/cleaned up. -->
-      <env name="OPENCODE_DB" value="C:\Users\slooshied\.local\share\opencode\opencode-openfork-recovered.db" />
-      <!-- ChunkDB epoch-1 background sealer: brotli-compresses cold (48h+ write-idle),
-           large (>=4KB) event rows in place. Fully tested read-path round-trip
-           (packages/core/test/database/chunkdb.test.ts), fail-closed on corruption.
-           Do NOT set OPENCODE_SEAL_DEDUP -- epoch-2 (cross-row dedup via $cdbRef)
-           has no implemented read-side rehydration; the epoch gate (chunkdb.ts)
-           would make an epoch-1 binary refuse to open a DB touched by it, but it's
-           simplest to just never turn it on. -->
+      <!-- Do not override OPENCODE_DB here. The openfork/main installation channel
+           resolves to opencode-main.db; hard-coding a recovery filename silently
+           sends the desktop to a different database than the rest of openfork. -->
+      <!-- ChunkDB production posture: hot writes remain plain TEXT; semantic pruning
+           is default-on (set OPENCODE_SEAL_PRUNE=0/false as an emergency kill switch),
+           then the background sealer keeps a 256-event live tail and applies
+           aggregate-scoped exact-value dedup + ratio-first cold compression. Worker
+           compression keeps seal CPU off the main thread. Delta-ref remains
+           experimental/default-off: real-corpus research found exact-value dedup
+           dominates semantic deltas, while delta adds a base lookup/reconstruction
+           to the interactive read path. -->
       <env name="OPENCODE_SEAL_ENABLED" value="true" />
+      <env name="OPENCODE_SEAL_DEDUP" value="true" />
+      <env name="OPENCODE_SEAL_WORKERS" value="true" />
+      <env name="OPENCODE_SEAL_BACKFILL" value="true" />
+      <env name="OPENCODE_SEAL_DELTA" value="false" />
     </envs>
     <method v="2" />
   </configuration>

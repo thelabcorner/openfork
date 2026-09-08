@@ -4,7 +4,8 @@ import { Session } from "@/session/session"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventV2Bridge } from "@/event-v2-bridge"
-import { EventTable } from "@opencode-ai/core/event/sql"
+import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import { inflateCompactedHistory, loadCompaction } from "@opencode-ai/core/database/chunk-compaction"
 import { asc } from "drizzle-orm"
 import { and } from "drizzle-orm"
 import { eq } from "drizzle-orm"
@@ -14,7 +15,7 @@ import { or } from "drizzle-orm"
 import { Effect, Scope } from "effect"
 import { HttpApiBuilder, HttpApiError } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
-import { HistoryPayload, ReplayPayload, SessionPayload } from "../groups/sync"
+import { HistoryPayload, ReplayPayload, SemanticCompactionFeature, SessionPayload } from "../groups/sync"
 
 export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handlers) =>
   Effect.gen(function* () {
@@ -23,6 +24,10 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
     const scope = yield* Scope.Scope
     const events = yield* EventV2Bridge.Service
     const { db } = yield* Database.Service
+
+    const capabilities = Effect.fn("SyncHttpApi.capabilities")(function* () {
+      return { version: 1 as const, features: [SemanticCompactionFeature] }
+    })
 
     const start = Effect.fn("SyncHttpApi.start")(function* () {
       yield* workspace
@@ -88,14 +93,34 @@ export const syncHandlers = HttpApiBuilder.group(InstanceHttpApi, "sync", (handl
         if (group) group.push(row)
         else byAggregate.set(row.aggregate_id, [row])
       }
-      const hydratedByID = new Map<string, (typeof rows)[number]>()
+      const hydratedByAggregate = new Map<string, typeof rows>()
       for (const [aggregateID, group] of byAggregate) {
         const hydrated = yield* EventV2.rehydrateEvents(db, aggregateID, group)
-        for (const row of hydrated) hydratedByID.set(row.id, row)
+        hydratedByAggregate.set(aggregateID, hydrated)
       }
-      return rows.map((row) => hydratedByID.get(row.id) ?? row)
+      const frontiers = yield* db.select().from(EventSequenceTable).all().pipe(Effect.orDie)
+      const output: Array<(typeof rows)[number]> = []
+      for (const frontier of frontiers) {
+        const after = ctx.payload[frontier.aggregate_id] ?? -1
+        if (frontier.seq <= after) continue
+        const compaction = yield* loadCompaction(db, frontier.aggregate_id)
+        const contiguous = inflateCompactedHistory({
+          aggregateID: frontier.aggregate_id,
+          rows: hydratedByAggregate.get(frontier.aggregate_id) ?? [],
+          bitmap: compaction?.bitmap,
+          after,
+          through: frontier.seq,
+        })
+        output.push(...(contiguous as Array<(typeof rows)[number]>))
+      }
+      return output
     })
 
-    return handlers.handle("start", start).handle("replay", replay).handle("steal", steal).handle("history", history)
+    return handlers
+      .handle("capabilities", capabilities)
+      .handle("start", start)
+      .handle("replay", replay)
+      .handle("steal", steal)
+      .handle("history", history)
   }),
 )
