@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "eab0e682-7d4f-4cc8-9084-a3df3e7dfe0a",
+  "id": "19f816ec-1c4d-46a6-a2d6-14d1f3a7d4b3",
   "prevIds": [
-    "20aa65f0-5f67-4e64-bc5a-85b41347c2eb"
+    "a7f305fc-abad-407d-ac9b-f5c02e3ec9be"
   ],
   "ddl": [
     {
@@ -838,7 +838,37 @@
       "autoincrement": false,
       "default": "0",
       "generated": null,
+      "name": "auditor_blocked_streak",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
       "name": "consumed_tokens",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_auditor_decision",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_auditor_rationale",
       "entityType": "columns",
       "table": "goal_automation"
     },
@@ -879,6 +909,16 @@
       "default": null,
       "generated": null,
       "name": "reservation_created_at",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "continuation_prompt",
       "entityType": "columns",
       "table": "goal_automation"
     },
@@ -1369,6 +1409,16 @@
       "default": "'{\"mode\":\"manual\"}'",
       "generated": null,
       "name": "continuation_policy",
+      "entityType": "columns",
+      "table": "goal"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'{}'",
+      "generated": null,
+      "name": "auditor_policy",
       "entityType": "columns",
       "table": "goal"
     },
@@ -3199,6 +3249,16 @@
       "default": null,
       "generated": null,
       "name": "owner_plugin",
+      "entityType": "columns",
+      "table": "session_group"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_ref",
       "entityType": "columns",
       "table": "session_group"
     },
@@ -5563,9 +5623,31 @@
         }
       ],
       "isUnique": true,
-      "where": null,
+      "where": "\"session_group\".\"kind\" = 'subagent' AND \"session_group\".\"anchor_session_id\" IS NOT NULL",
       "origin": "manual",
-      "name": "session_group_anchor_idx",
+      "name": "session_group_subagent_anchor_idx",
+      "entityType": "indexes",
+      "table": "session_group"
+    },
+    {
+      "columns": [
+        {
+          "value": "kind",
+          "isExpression": false
+        },
+        {
+          "value": "owner_plugin",
+          "isExpression": false
+        },
+        {
+          "value": "owner_ref",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": "\"session_group\".\"kind\" = 'plugin' AND \"session_group\".\"owner_plugin\" IS NOT NULL AND \"session_group\".\"owner_ref\" IS NOT NULL",
+      "origin": "manual",
+      "name": "session_group_plugin_owner_ref_idx",
       "entityType": "indexes",
       "table": "session_group"
     },

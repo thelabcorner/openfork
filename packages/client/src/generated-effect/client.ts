@@ -790,11 +790,12 @@ type Endpoint16_2Input = {
   readonly sessionID: Endpoint16_2Request["params"]["sessionID"]
   readonly requestID: Endpoint16_2Request["params"]["requestID"]
   readonly answers: Endpoint16_2Request["payload"]["answers"]
+  readonly details?: Endpoint16_2Request["payload"]["details"]
 }
 const Endpoint16_2 = (raw: RawClient["server.question"]) => (input: Endpoint16_2Input) =>
   raw["session.question.reply"]({
     params: { sessionID: input["sessionID"], requestID: input["requestID"] },
-    payload: { answers: input["answers"] },
+    payload: { answers: input["answers"], details: input["details"] },
   }).pipe(Effect.mapError(mapClientError))
 
 type Endpoint16_3Request = Parameters<RawClient["server.question"]["session.question.reject"]>[0]

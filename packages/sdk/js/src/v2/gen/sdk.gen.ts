@@ -127,6 +127,7 @@ import type {
   GoalAddEvidenceErrors,
   GoalAddEvidenceResponses,
   GoalAuditErrors,
+  GoalAuditorPolicy,
   GoalAuditResponses,
   GoalContinuationPolicy,
   GoalCreateErrors,
@@ -215,6 +216,8 @@ import type {
   ProjectUpdateErrors,
   ProjectUpdateResponses,
   PromptInput,
+  PromptReviseErrors,
+  PromptReviseResponses,
   ProviderAuthErrors,
   ProviderAuthResponses,
   ProviderListErrors,
@@ -348,6 +351,8 @@ import type {
   SessionUpdateErrors,
   SessionUpdateResponses,
   SubtaskPartInput,
+  SyncCapabilitiesErrors,
+  SyncCapabilitiesResponses,
   SyncHistoryListErrors,
   SyncHistoryListResponses,
   SyncReplayErrors,
@@ -3949,6 +3954,7 @@ export class Question extends HeyApiClient {
       directory?: string
       workspace?: string
       answers?: Array<QuestionAnswer>
+      details?: Array<string>
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -3961,6 +3967,7 @@ export class Question extends HeyApiClient {
             { in: "query", key: "directory" },
             { in: "query", key: "workspace" },
             { in: "body", key: "answers" },
+            { in: "body", key: "details" },
           ],
         },
       ],
@@ -5697,6 +5704,7 @@ export class SessionGroup extends HeyApiClient {
       kind?: "user" | "subagent" | "plugin"
       anchorSessionID?: string
       ownerPlugin?: string
+      ownerRef?: string
       policy?: SessionGroupPolicy
     },
     options?: Options<never, ThrowOnError>,
@@ -5710,6 +5718,7 @@ export class SessionGroup extends HeyApiClient {
             { in: "body", key: "kind" },
             { in: "body", key: "anchorSessionID" },
             { in: "body", key: "ownerPlugin" },
+            { in: "body", key: "ownerRef" },
             { in: "body", key: "policy" },
           ],
         },
@@ -5995,6 +6004,7 @@ export class SessionGroup extends HeyApiClient {
       kind?: "user" | "subagent" | "plugin"
       anchorSessionID?: string
       ownerPlugin?: string
+      ownerRef?: string
       policy?: SessionGroupPolicy
     },
     options?: Options<never, ThrowOnError>,
@@ -6008,6 +6018,7 @@ export class SessionGroup extends HeyApiClient {
             { in: "body", key: "kind" },
             { in: "body", key: "anchorSessionID" },
             { in: "body", key: "ownerPlugin" },
+            { in: "body", key: "ownerRef" },
             { in: "body", key: "policy" },
           ],
         },
@@ -6151,6 +6162,7 @@ export class Goal extends HeyApiClient {
         description?: string
       }>
       continuationPolicy?: GoalContinuationPolicy
+      auditorPolicy?: GoalAuditorPolicy
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -6167,6 +6179,7 @@ export class Goal extends HeyApiClient {
             { in: "body", key: "criteria" },
             { in: "body", key: "steps" },
             { in: "body", key: "continuationPolicy" },
+            { in: "body", key: "auditorPolicy" },
           ],
         },
       ],
@@ -6216,6 +6229,7 @@ export class Goal extends HeyApiClient {
         description?: string
       }>
       continuationPolicy?: GoalContinuationPolicy
+      auditorPolicy?: GoalAuditorPolicy
     },
     options?: Options<never, ThrowOnError>,
   ) {
@@ -6232,6 +6246,7 @@ export class Goal extends HeyApiClient {
             { in: "body", key: "criteria" },
             { in: "body", key: "steps" },
             { in: "body", key: "continuationPolicy" },
+            { in: "body", key: "auditorPolicy" },
           ],
         },
       ],
@@ -6586,6 +6601,36 @@ export class History extends HeyApiClient {
 }
 
 export class Sync extends HeyApiClient {
+  /**
+   * Get sync capabilities
+   *
+   * Get versioned durable-history representations supported by this sync peer.
+   */
+  public capabilities<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<SyncCapabilitiesResponses, SyncCapabilitiesErrors, ThrowOnError>({
+      url: "/sync/capabilities",
+      ...options,
+      ...params,
+    })
+  }
+
   /**
    * Start workspace sync
    *
@@ -7193,6 +7238,111 @@ export class Usage2 extends HeyApiClient {
       url: "/usage/summary",
       ...options,
       ...params,
+    })
+  }
+}
+
+export class Prompt extends HeyApiClient {
+  /**
+   * Revise a draft prompt
+   *
+   * Rewrite a draft prompt with an optional dedicated model, bounded read-only workspace reconnaissance, and stateless clarification interrupts.
+   */
+  public revise<ThrowOnError extends boolean = false>(
+    parameters?: {
+      directory?: string
+      workspace?: string
+      prompt?: string
+      draft?: {
+        mentions: Array<
+          | {
+              id: string
+              type: "file"
+              token: string
+              path: string
+              selection?: {
+                startLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+                startChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+                endLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+                endChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              }
+            }
+          | {
+              id: string
+              type: "agent"
+              token: string
+              name: string
+            }
+          | {
+              id: string
+              type: "skill"
+              token: string
+              name: string
+            }
+          | {
+              id: string
+              type: "reference"
+              token: string
+              name: string
+              path: string
+            }
+          | {
+              id: string
+              type: "resource"
+              token: string
+              name: string
+              clientName: string
+              uri: string
+            }
+        >
+        attachments: Array<{
+          id: string
+          type: "image"
+          filename: string
+          mime: string
+        }>
+      }
+      sessionID?: string
+      guidance?: string
+      model?: ModelRef
+      fallbackModel?: ModelRef
+      clarifications?: Array<{
+        question: string
+        answers: Array<string>
+        detail?: string
+      }>
+      clarificationRound?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "body", key: "prompt" },
+            { in: "body", key: "draft" },
+            { in: "body", key: "sessionID" },
+            { in: "body", key: "guidance" },
+            { in: "body", key: "model" },
+            { in: "body", key: "fallbackModel" },
+            { in: "body", key: "clarifications" },
+            { in: "body", key: "clarificationRound" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<PromptReviseResponses, PromptReviseErrors, ThrowOnError>({
+      url: "/prompt/revise",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 }
@@ -10239,6 +10389,11 @@ export class OpencodeClient extends HeyApiClient {
   private _usage?: Usage2
   get usage(): Usage2 {
     return (this._usage ??= new Usage2({ client: this.client }))
+  }
+
+  private _prompt?: Prompt
+  get prompt(): Prompt {
+    return (this._prompt ??= new Prompt({ client: this.client }))
   }
 
   private _v2?: V2

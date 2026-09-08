@@ -3205,7 +3205,14 @@ export type QuestionsListOutput = {
 export type QuestionsReplyInput = {
   readonly sessionID: { readonly sessionID: string; readonly requestID: string }["sessionID"]
   readonly requestID: { readonly sessionID: string; readonly requestID: string }["requestID"]
-  readonly answers: { readonly answers: ReadonlyArray<ReadonlyArray<string>> }["answers"]
+  readonly answers: {
+    readonly answers: ReadonlyArray<ReadonlyArray<string>>
+    readonly details?: ReadonlyArray<string>
+  }["answers"]
+  readonly details?: {
+    readonly answers: ReadonlyArray<ReadonlyArray<string>>
+    readonly details?: ReadonlyArray<string>
+  }["details"]
 }
 
 export type QuestionsReplyOutput = void

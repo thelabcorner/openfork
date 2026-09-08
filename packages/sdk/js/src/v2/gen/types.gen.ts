@@ -113,6 +113,7 @@ export type QuestionReplied = {
   sessionID: string
   requestID: string
   answers: Array<QuestionAnswer>
+  details?: Array<string>
 }
 
 export type QuestionRejected = {
@@ -1441,6 +1442,7 @@ export type GlobalEvent = {
           sessionID: string
           requestID: string
           answers: Array<QuestionV2Answer>
+          details?: Array<string>
         }
       }
     | {
@@ -1668,6 +1670,7 @@ export type GlobalEvent = {
           sessionID: string
           requestID: string
           answers: Array<QuestionAnswer>
+          details?: Array<string>
         }
       }
     | {
@@ -2082,6 +2085,8 @@ export type Config = {
   model?: string
   small_model?: string
   title_prompt?: string
+  prompt_revisor_prompt?: string
+  auditor_prompt?: string
   default_agent?: string
   subagent_depth?: number
   username?: string
@@ -2512,6 +2517,17 @@ export type OpenRouterEndpoint = {
     cacheRead: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   }
   uptime?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  quantization?: string
+  contextLength?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxCompletionTokens?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxPromptTokens?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  supportedParameters?: Array<string>
+  supportsImplicitCaching?: boolean
+  latencyP50?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  throughputP50?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  uptime5m?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  uptime1d?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  status?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
 export type OpenRouterEndpoints = Array<OpenRouterEndpoint>
@@ -3444,6 +3460,7 @@ export type QuestionReplied2 = {
     sessionID: string
     requestID: string
     answers: Array<QuestionAnswer>
+    details?: Array<string>
   }
 }
 
@@ -3758,6 +3775,12 @@ export type GoalContinuationPolicy = {
   tokenBudget?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
 }
 
+export type GoalAuditorPolicy = {
+  model?: ModelRef
+  blockedThreshold?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  maxAttempts?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+}
+
 export type GoalInfo = {
   id: string
   projectID: string
@@ -3768,6 +3791,7 @@ export type GoalInfo = {
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   continuationPolicy: GoalContinuationPolicy
+  auditorPolicy: GoalAuditorPolicy
   blocker?: string
   time: {
     created: number
@@ -3833,6 +3857,7 @@ export type SessionGroupInfo = {
   position: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
   kind: "user" | "subagent" | "plugin"
   ownerPlugin?: string
+  ownerRef?: string
   anchorSessionID?: string
   policy?: SessionGroupPolicy
   time: {
@@ -4688,10 +4713,11 @@ export type GoalAuditEventType =
   | "criterion_updated"
   | "step_updated"
   | "evidence_added"
+  | "audited"
   | "focused"
   | "unfocused"
 
-export type GoalAuditActor = "user" | "agent" | "system"
+export type GoalAuditActor = "user" | "agent" | "auditor" | "system"
 
 export type GoalAuditEvent = {
   id: string
@@ -4715,6 +4741,23 @@ export type GoalFocus = {
 export type WorkspaceEventConnectionStatus = {
   workspaceID: string
   status: "connected" | "connecting" | "disconnected" | "error"
+}
+
+export type QuestionV2Prompt = {
+  /**
+   * Complete question
+   */
+  question: string
+  /**
+   * Very short label (max 30 chars)
+   */
+  header: string
+  /**
+   * Available choices
+   */
+  options: Array<QuestionV2Option>
+  multiple?: boolean
+  custom?: boolean
 }
 
 export type LocationInfo = {
@@ -6374,6 +6417,12 @@ export type GoalContinuationPolicy3 = {
   tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
 }
 
+export type GoalAuditorPolicy3 = {
+  model?: ModelRef
+  blockedThreshold?: number | "NaN" | "Infinity" | "-Infinity"
+  maxAttempts?: number | "NaN" | "Infinity" | "-Infinity"
+}
+
 export type GoalInfo1 = {
   id: string
   projectID: string
@@ -6384,6 +6433,7 @@ export type GoalInfo1 = {
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity"
   continuationPolicy: GoalContinuationPolicy3
+  auditorPolicy: GoalAuditorPolicy3
   blocker?: string
   time: {
     created: number
@@ -6686,6 +6736,7 @@ export type QuestionV2Replied = {
     sessionID: string
     requestID: string
     answers: Array<QuestionV2Answer>
+    details?: Array<string>
   }
 }
 
@@ -6731,6 +6782,7 @@ export type SessionGroupInfo3 = {
   position: number | "NaN" | "Infinity" | "-Infinity"
   kind: "user" | "subagent" | "plugin"
   ownerPlugin?: string
+  ownerRef?: string
   anchorSessionID?: string
   policy?: SessionGroupPolicy
   time: {
@@ -7291,9 +7343,10 @@ export type QuestionV2Request = {
 
 export type QuestionV2Reply = {
   /**
-   * User answers in order of questions (each answer is an array of selected labels)
+   * Selected option labels in question order
    */
   answers: Array<QuestionV2Answer>
+  details?: Array<string>
 }
 
 export type ReferenceLocalSource = {
@@ -7955,6 +8008,12 @@ export type GoalContinuationPolicy4 = {
   tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
 }
 
+export type GoalAuditorPolicy4 = {
+  model?: ModelRef
+  blockedThreshold?: number | "NaN" | "Infinity" | "-Infinity"
+  maxAttempts?: number | "NaN" | "Infinity" | "-Infinity"
+}
+
 export type GoalInfo2 = {
   id: string
   projectID: string
@@ -7965,6 +8024,7 @@ export type GoalInfo2 = {
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity"
   continuationPolicy: GoalContinuationPolicy4
+  auditorPolicy: GoalAuditorPolicy4
   blocker?: string
   time: {
     created: number
@@ -8123,6 +8183,7 @@ export type EventQuestionV2Replied = {
     sessionID: string
     requestID: string
     answers: Array<QuestionV2Answer>
+    details?: Array<string>
   }
 }
 
@@ -8150,6 +8211,7 @@ export type SessionGroupInfo4 = {
   position: number | "NaN" | "Infinity" | "-Infinity"
   kind: "user" | "subagent" | "plugin"
   ownerPlugin?: string
+  ownerRef?: string
   anchorSessionID?: string
   policy?: SessionGroupPolicy
   time: {
@@ -8333,6 +8395,7 @@ export type EventQuestionReplied = {
     sessionID: string
     requestID: string
     answers: Array<QuestionAnswer>
+    details?: Array<string>
   }
 }
 
@@ -11199,9 +11262,10 @@ export type QuestionListResponse = QuestionListResponses[keyof QuestionListRespo
 export type QuestionReplyData = {
   body?: {
     /**
-     * User answers in order of questions (each answer is an array of selected labels)
+     * Selected option labels in question order
      */
     answers: Array<QuestionAnswer>
+    details?: Array<string>
   }
   path: {
     requestID: string
@@ -13039,6 +13103,7 @@ export type SessionGroupCreateData = {
     kind?: "user" | "subagent" | "plugin"
     anchorSessionID?: string
     ownerPlugin?: string
+    ownerRef?: string
     policy?: SessionGroupPolicy
   }
   path?: never
@@ -13362,6 +13427,7 @@ export type SessionGroupResolveData = {
     kind: "user" | "subagent" | "plugin"
     anchorSessionID?: string
     ownerPlugin?: string
+    ownerRef?: string
     policy?: SessionGroupPolicy
   }
   path?: never
@@ -13501,6 +13567,7 @@ export type GoalCreateData = {
       description?: string
     }>
     continuationPolicy?: GoalContinuationPolicy
+    auditorPolicy?: GoalAuditorPolicy
   }
   path?: never
   query?: never
@@ -13580,6 +13647,7 @@ export type GoalUpdateData = {
       description?: string
     }>
     continuationPolicy?: GoalContinuationPolicy
+    auditorPolicy?: GoalAuditorPolicy
   }
   path: {
     goalID: string
@@ -14003,6 +14071,37 @@ export type GoalFocusResponses = {
 }
 
 export type GoalFocusResponse = GoalFocusResponses[keyof GoalFocusResponses]
+
+export type SyncCapabilitiesData = {
+  body?: never
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/sync/capabilities"
+}
+
+export type SyncCapabilitiesErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type SyncCapabilitiesError = SyncCapabilitiesErrors[keyof SyncCapabilitiesErrors]
+
+export type SyncCapabilitiesResponses = {
+  /**
+   * Sync protocol capabilities
+   */
+  200: {
+    version: 1
+    features: Array<string>
+  }
+}
+
+export type SyncCapabilitiesResponse = SyncCapabilitiesResponses[keyof SyncCapabilitiesResponses]
 
 export type SyncStartData = {
   body?: never
@@ -15137,6 +15236,159 @@ export type ExperimentalWorkspaceWarpResponses = {
 
 export type ExperimentalWorkspaceWarpResponse =
   ExperimentalWorkspaceWarpResponses[keyof ExperimentalWorkspaceWarpResponses]
+
+export type PromptReviseData = {
+  body?: {
+    prompt: string
+    draft?: {
+      mentions: Array<
+        | {
+            id: string
+            type: "file"
+            token: string
+            path: string
+            selection?: {
+              startLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              startChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              endLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              endChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+            }
+          }
+        | {
+            id: string
+            type: "agent"
+            token: string
+            name: string
+          }
+        | {
+            id: string
+            type: "skill"
+            token: string
+            name: string
+          }
+        | {
+            id: string
+            type: "reference"
+            token: string
+            name: string
+            path: string
+          }
+        | {
+            id: string
+            type: "resource"
+            token: string
+            name: string
+            clientName: string
+            uri: string
+          }
+      >
+      attachments: Array<{
+        id: string
+        type: "image"
+        filename: string
+        mime: string
+      }>
+    }
+    sessionID?: string
+    guidance?: string
+    model?: ModelRef
+    fallbackModel?: ModelRef
+    clarifications?: Array<{
+      question: string
+      answers: Array<string>
+      detail?: string
+    }>
+    clarificationRound?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+  }
+  path?: never
+  query?: {
+    directory?: string
+    workspace?: string
+  }
+  url: "/prompt/revise"
+}
+
+export type PromptReviseErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * ServiceUnavailableError
+   */
+  503: ServiceUnavailableError
+}
+
+export type PromptReviseError = PromptReviseErrors[keyof PromptReviseErrors]
+
+export type PromptReviseResponses = {
+  /**
+   * Prompt revision result
+   */
+  200:
+    | {
+        type: "revision"
+        prompt: string
+        references: Array<
+          | {
+              type: "file"
+              content: string
+              start: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              end: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              path: string
+              selection?: {
+                startLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+                startChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+                endLine: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+                endChar: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              }
+            }
+          | {
+              type: "agent"
+              content: string
+              start: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              end: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              name: string
+            }
+          | {
+              type: "skill"
+              content: string
+              start: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              end: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              name: string
+            }
+          | {
+              type: "reference"
+              content: string
+              start: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              end: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              name: string
+              path: string
+            }
+          | {
+              type: "resource"
+              content: string
+              start: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              end: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+              name: string
+              clientName: string
+              uri: string
+              mimeType?: string
+            }
+        >
+        tools: Array<string>
+        rounds: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      }
+    | {
+        type: "question"
+        questions: Array<QuestionV2Prompt>
+        clarificationRound: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        tools: Array<string>
+        rounds: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+      }
+}
+
+export type PromptReviseResponse = PromptReviseResponses[keyof PromptReviseResponses]
 
 export type V2HealthGetData = {
   body?: never

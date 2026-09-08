@@ -52,6 +52,9 @@ export const migrations = (
     import("./migration/20260904000000_add_session_group_membership"),
     import("./migration/20260907015557_goal_mode"),
     import("./migration/20260907024640_goal_automation_recovery"),
+    import("./migration/20260907230547_goal_auditor"),
     import("./migration/20260908003500_event_compaction"),
+    import("./migration/20260908065422_goal_auditor_continuation"),
+    import("./migration/20260908070820_session_group_plugin_identity"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

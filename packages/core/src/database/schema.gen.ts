@@ -116,11 +116,15 @@ export default {
           \`started_at\` integer NOT NULL,
           \`consecutive_turns\` integer DEFAULT 0 NOT NULL,
           \`no_progress_turns\` integer DEFAULT 0 NOT NULL,
+          \`auditor_blocked_streak\` integer DEFAULT 0 NOT NULL,
           \`consumed_tokens\` integer DEFAULT 0 NOT NULL,
+          \`last_auditor_decision\` text,
+          \`last_auditor_rationale\` text,
           \`previous_revision\` integer,
           \`reservation_id\` text,
           \`reservation_owner\` text,
           \`reservation_created_at\` integer,
+          \`continuation_prompt\` text,
           \`time_updated\` integer NOT NULL,
           CONSTRAINT \`fk_goal_automation_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
           CONSTRAINT \`fk_goal_automation_goal_id_goal_id_fk\` FOREIGN KEY (\`goal_id\`) REFERENCES \`goal\`(\`id\`) ON DELETE CASCADE
@@ -203,6 +207,7 @@ export default {
           \`status\` text DEFAULT 'draft' NOT NULL,
           \`revision\` integer DEFAULT 0 NOT NULL,
           \`continuation_policy\` text DEFAULT '{"mode":"manual"}' NOT NULL,
+          \`auditor_policy\` text DEFAULT '{}' NOT NULL,
           \`blocker\` text,
           \`time_created\` integer NOT NULL,
           \`time_updated\` integer NOT NULL,
@@ -493,6 +498,7 @@ export default {
           \`position\` integer NOT NULL,
           \`kind\` text DEFAULT 'user' NOT NULL,
           \`owner_plugin\` text,
+          \`owner_ref\` text,
           \`anchor_session_id\` text,
           \`policy\` text,
           \`time_created\` integer NOT NULL,
@@ -666,7 +672,10 @@ export default {
         `CREATE INDEX \`session_group_member_position_idx\` ON \`session_group_member\` (\`group_id\`,\`position\`);`,
       )
       yield* tx.run(
-        `CREATE UNIQUE INDEX \`session_group_anchor_idx\` ON \`session_group\` (\`kind\`,\`anchor_session_id\`);`,
+        `CREATE UNIQUE INDEX \`session_group_subagent_anchor_idx\` ON \`session_group\` (\`kind\`,\`anchor_session_id\`) WHERE "session_group"."kind" = 'subagent' AND "session_group"."anchor_session_id" IS NOT NULL;`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`session_group_plugin_owner_ref_idx\` ON \`session_group\` (\`kind\`,\`owner_plugin\`,\`owner_ref\`) WHERE "session_group"."kind" = 'plugin' AND "session_group"."owner_plugin" IS NOT NULL AND "session_group"."owner_ref" IS NOT NULL;`,
       )
       yield* tx.run(
         `CREATE INDEX \`session_input_session_pending_delivery_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`,\`delivery\`,\`admitted_seq\`);`,
