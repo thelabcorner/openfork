@@ -5,6 +5,8 @@ Use this tool when you need to ask the user questions during execution. This all
 4. Offer choices to the user about what direction to take.
 
 Usage notes:
-- When `custom` is enabled (default), a "Type your own answer" option is added automatically; don't include "Other" or catch-all options
-- Answers are returned as arrays of labels; set `multiple: true` to allow selecting more than one
+- `multiple: false` (default) allows one provided option; `multiple: true` allows selecting any number of provided options
+- `custom: true` (default) adds a free-form response field that is independent of the provided options. The user may select option(s), type a custom response, or do both. Set `custom: false` only when free-form context would not be useful
+- Selected option labels are returned in `answers`; independent free-form text is returned in the parallel `details` array
+- Option labels must be unique within a question
 - If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label

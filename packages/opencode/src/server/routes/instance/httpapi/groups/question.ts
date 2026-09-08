@@ -11,7 +11,10 @@ import { described } from "./metadata"
 const root = "/question"
 const ReplyPayload = Schema.Struct({
   answers: Schema.Array(Question.Answer).annotate({
-    description: "User answers in order of questions (each answer is an array of selected labels)",
+    description: "Selected option labels in question order",
+  }),
+  details: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description: "Optional free-form response text in question order; empty string means no details",
   }),
 })
 

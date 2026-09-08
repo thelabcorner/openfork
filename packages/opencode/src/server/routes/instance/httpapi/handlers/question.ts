@@ -21,6 +21,7 @@ export const questionHandlers = HttpApiBuilder.group(InstanceHttpApi, "question"
         .reply({
           requestID: ctx.params.requestID,
           answers: ctx.payload.answers,
+          details: ctx.payload.details,
         })
         .pipe(
           Effect.catchTag("Question.NotFoundError", (error) =>

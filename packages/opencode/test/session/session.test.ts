@@ -16,6 +16,9 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { InstanceStore } from "@/project/instance-store"
 import { InstanceBootstrap } from "@/project/bootstrap"
+import fs from "fs/promises"
+import { chatsRoot } from "@opencode-ai/core/project/chat-paths"
+import { CHAT_PROJECT_ID } from "@opencode-ai/core/project/chat"
 
 const it = testEffect(
   AppNodeBuilder.build(
@@ -43,6 +46,10 @@ const awaitDeferred = <T>(deferred: Deferred.Deferred<T>, message: string) =>
   )
 
 const remove = (id: SessionID) => SessionNs.use.remove(id)
+const exists = (target: string) => fs.stat(target).then(
+  () => true,
+  () => false,
+)
 
 describe("session.created event", () => {
   it.instance("should emit session.created event when session is created", () =>
@@ -206,6 +213,48 @@ describe("step-finish token propagation via event", () => {
 })
 
 describe("Session", () => {
+  it.live("isolates root Chat sessions and reclaims scratch directories after the final reference", () =>
+    Effect.gen(function* () {
+      const session = yield* SessionNs.Service
+      const root = chatsRoot()
+      yield* Effect.promise(() => fs.mkdir(root, { recursive: true }))
+
+      const first = yield* provideInstance(root)(session.create({ title: "chat-root-a" }))
+      const second = yield* provideInstance(root)(session.create({ title: "chat-root-b" }))
+
+      expect(first.projectID).toBe(CHAT_PROJECT_ID)
+      expect(second.projectID).toBe(CHAT_PROJECT_ID)
+      expect(first.directory).not.toBe(root)
+      expect(second.directory).not.toBe(root)
+      expect(first.directory).not.toBe(second.directory)
+      expect(yield* Effect.promise(() => exists(first.directory))).toBe(true)
+      expect(yield* Effect.promise(() => exists(second.directory))).toBe(true)
+
+      // Children and forks intentionally share the root conversation's scratch
+      // directory. Deleting the original tree must therefore keep the directory
+      // alive while the independent fork still references it.
+      const child = yield* provideInstance(first.directory)(
+        session.create({ parentID: first.id, title: "chat-child" }),
+      )
+      const fork = yield* provideInstance(first.directory)(session.fork({ sessionID: first.id }))
+      expect(child.directory).toBe(first.directory)
+      expect(fork.directory).toBe(first.directory)
+
+      yield* session.remove(first.id)
+      expect(yield* Effect.promise(() => exists(first.directory))).toBe(true)
+      expect(Exit.isFailure(yield* session.get(child.id).pipe(Effect.exit))).toBe(true)
+      expect((yield* session.get(fork.id)).directory).toBe(first.directory)
+
+      yield* session.remove(fork.id)
+      expect(yield* Effect.promise(() => exists(first.directory))).toBe(false)
+      expect(yield* Effect.promise(() => exists(root))).toBe(true)
+
+      yield* session.remove(second.id)
+      expect(yield* Effect.promise(() => exists(second.directory))).toBe(false)
+      expect(yield* Effect.promise(() => exists(root))).toBe(true)
+    }),
+  )
+
   it.live("remove works without an instance", () =>
     Effect.gen(function* () {
       const session = yield* SessionNs.Service

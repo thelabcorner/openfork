@@ -40,6 +40,7 @@ let selected = "/repo/worktree-a"
 let variant: string | undefined
 let permissionServer = "server-a"
 let createSessionGate: Promise<void> | undefined
+let createSessionDirectory: ((requested: string) => string) | undefined
 
 let promptValue: Prompt = [{ type: "text", content: "ls", start: 0, end: 2 }]
 const [promptStore, setPromptStore] = createStore<PromptStore>({
@@ -77,7 +78,8 @@ const clientFor = (directory: string) => {
       session: {
         create: async (input: (typeof sessionCreateInputs)[number]) => {
           await createSessionGate
-          const location = input.location?.directory ?? directory
+          const requested = input.location?.directory ?? directory
+          const location = createSessionDirectory?.(requested) ?? requested
           createdSessions.push(location)
           sessionCreateInputs.push(input)
           return {
@@ -300,11 +302,45 @@ beforeEach(() => {
   variant = undefined
   permissionServer = "server-a"
   createSessionGate = undefined
+  createSessionDirectory = undefined
   serverSessionSyncs = 0
   for (const key of Object.keys(storedSessions)) delete storedSessions[key]
 })
 
 describe("prompt submit worktree selection", () => {
+  test("retargets a new session to the authoritative directory returned by the server", async () => {
+    createSessionDirectory = () => "/server-owned/chats/session-1"
+    const submit = createPromptSubmit({
+      prompt,
+      info: () => undefined,
+      imageAttachments: () => [],
+      commentCount: () => 0,
+      autoAccept: () => false,
+      mode: () => "shell",
+      working: () => false,
+      editor: () => undefined,
+      queueScroll: () => undefined,
+      promptLength: (value) => value.reduce((sum, part) => sum + ("content" in part ? part.content.length : 0), 0),
+      addToHistory: () => undefined,
+      resetHistoryNavigation: () => undefined,
+      setMode: () => undefined,
+      setPopover: () => undefined,
+      newSessionWorktree: () => "main",
+      onNewSessionWorktreeReset: () => undefined,
+      onSubmit: () => undefined,
+    })
+
+    await submit.handleSubmit({ preventDefault: () => undefined } as unknown as Event)
+
+    expect(sessionCreateInputs[0]?.location).toEqual({ directory: "/repo/main" })
+    expect(createdClients).toContain("/server-owned/chats/session-1")
+    expect(createdSessions).toEqual(["/server-owned/chats/session-1"])
+    expect(promoted).toEqual([{ directory: "/server-owned/chats/session-1", sessionID: "session-1" }])
+    expect(sentShell).toEqual([
+      expect.objectContaining({ sessionID: "session-1", id: expect.stringMatching(/^evt_/), command: "ls" }),
+    ])
+  })
+
   test("reads the latest worktree accessor value per submit", async () => {
     const submit = createPromptSubmit({
       prompt,

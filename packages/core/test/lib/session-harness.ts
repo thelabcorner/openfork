@@ -4,7 +4,7 @@
 
 import { LLMClient, LLMError, LLMEvent, LLMResponse, Model, TransportReason, type LLMRequest } from "@opencode-ai/llm"
 import * as OpenAIChat from "@opencode-ai/llm/protocols/openai-chat"
-import { Deferred, Effect, Layer, Stream } from "effect"
+import { DateTime, Deferred, Effect, Layer, Schema, Stream } from "effect"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
@@ -39,12 +39,14 @@ import { SkillGuidance } from "@opencode-ai/core/skill/guidance"
 import { ReferenceGuidance } from "@opencode-ai/core/reference/guidance"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { SystemContext } from "@opencode-ai/core/system-context"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionMessage } from "@opencode-ai/core/session/message"
 import { eq } from "drizzle-orm"
 import { testEffect } from "./effect"
 
 /** A runnable fake model used by the drain and the session-model cascade fallback. */
 export const sessionModel = Model.make({ id: "fake-model", provider: "fake", route: OpenAIChat.route })
+const projectDirectory = AbsolutePath.make(process.cwd())
 
 export const transportFailure = (message = "Provider unavailable") =>
   new LLMError({ module: "test", method: "stream", reason: new TransportReason({ message }) })
@@ -62,6 +64,14 @@ export const textCompletion = (chunks: readonly string[]): LLMEvent[] => {
   ]
 }
 
+/** Provider events for one structured session-title completion. */
+export const generatedTitleCompletion = (title: string): LLMEvent[] => [
+  LLMEvent.toolCall({ id: "generated-title", name: SessionTitle.GENERATED_TITLE_TOOL, input: { title } }),
+  LLMEvent.finish({ reason: "tool-calls" }),
+]
+
+export const generatedTitleResponse = (title: string) => LLMResponse.fromEvents(generatedTitleCompletion(title))!
+
 /** A fake catalog model record resolvable by the model cascade. */
 export const catalogModel = (providerID: string, id: string): ModelV2.Info =>
   ModelV2.Info.make({
@@ -70,11 +80,11 @@ export const catalogModel = (providerID: string, id: string): ModelV2.Info =>
     family: ModelV2.Family.make("fake"),
     name: id,
     api: { id: ModelV2.ID.make(id), type: "aisdk", package: "@ai-sdk/openai" },
-    capabilities: { tools: false, input: ["text"], output: ["text"] },
+    capabilities: { tools: true, input: ["text"], output: ["text"] },
     request: { headers: {}, body: {} },
     variants: [],
     time: { released: 0 },
-    cost: [{ input: 1, output: 1 }],
+    cost: [{ input: 1, output: 1, cache: { read: 0, write: 0 } }],
     status: "active",
     enabled: true,
     limit: { context: 10_000, output: 1_000 },
@@ -88,8 +98,10 @@ export type Harness = {
   readonly titleRequests: LLMRequest[]
   /** Push the next provider-turn event list (drain). */
   readonly enqueueCompletion: (events: LLMEvent[]) => void
-  /** Push the next title-generation response (must include a terminal finish). */
+  /** Push the next title-generation response (normally generated_title + terminal finish). */
   readonly enqueueTitle: (events: LLMEvent[]) => void
+  /** Push an arbitrary title-generation effect (used for race/failure tests). */
+  readonly enqueueTitleEffect: (effect: Effect.Effect<LLMResponse, LLMError>) => void
   /** Fail the next title-generation call. */
   readonly failNextTitle: (error: LLMError) => void
   /** Set config entries (small_model / title_prompt) for the current test. */
@@ -186,7 +198,7 @@ export const makeHarness = (): Harness => {
   const catalog = Layer.succeed(
     Catalog.Service,
     Catalog.Service.of({
-      transform: () => Effect.void,
+      transform: () => Effect.succeed({ dispose: Effect.void }),
       reload: () => Effect.void,
       provider: {
         get: () => Effect.succeed(undefined),
@@ -206,7 +218,7 @@ export const makeHarness = (): Harness => {
   const integration = Layer.succeed(
     Integration.Service,
     Integration.Service.of({
-      transform: () => Effect.void,
+      transform: () => Effect.succeed({ dispose: Effect.void }),
       reload: () => Effect.void,
       get: () => Effect.succeed(undefined),
       list: () => Effect.succeed([]),
@@ -233,7 +245,7 @@ export const makeHarness = (): Harness => {
     [SystemContextRegistry.node, systemContext],
     [SkillGuidance.node, skillGuidance],
     [ReferenceGuidance.node, referenceGuidance],
-    [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
+    [Location.node, Location.boundNode({ directory: projectDirectory })],
     [PermissionV2.node, permission],
     [Config.node, config],
     [Catalog.node, catalog],
@@ -300,6 +312,7 @@ export const makeHarness = (): Harness => {
     titleRequests,
     enqueueCompletion: (events) => completions.push(events),
     enqueueTitle: (events) => titleQueue.push(Effect.succeed(LLMResponse.fromEvents(events)!)),
+    enqueueTitleEffect: (effect) => titleQueue.push(effect),
     failNextTitle: (error) => titleQueue.push(Effect.fail(error)),
     setConfig: (patch) => {
       for (const entry of configEntries) {
@@ -339,12 +352,15 @@ export const makeHarness = (): Harness => {
   }
 }
 
-export const insertSession = (id: SessionV2.ID) =>
+export const insertSession = (
+  id: SessionV2.ID,
+  options?: { readonly model?: { readonly providerID: string; readonly id: string; readonly variant?: string } },
+) =>
   Effect.gen(function* () {
     const { db } = yield* Database.Service
     yield* db
       .insert(ProjectTable)
-      .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+      .values({ id: Project.ID.global, worktree: projectDirectory, sandboxes: [] })
       .onConflictDoNothing()
       .run()
       .pipe(Effect.orDie)
@@ -354,13 +370,43 @@ export const insertSession = (id: SessionV2.ID) =>
         id,
         project_id: Project.ID.global,
         slug: id,
-        directory: "/project",
+        directory: projectDirectory,
         title: `New session - ${new Date(0).toISOString()}`,
         version: "test",
+        model: options?.model,
       })
       .onConflictDoNothing()
       .run()
       .pipe(Effect.orDie)
+  })
+
+const encodeMessage = Schema.encodeSync(SessionMessage.Message)
+
+export const insertUserMessage = (sessionID: SessionV2.ID, text: string, seq = 1) =>
+  Effect.gen(function* () {
+    const { db } = yield* Database.Service
+    const message = SessionMessage.User.make({
+      id: SessionMessage.ID.create(),
+      type: "user",
+      text,
+      time: { created: DateTime.makeUnsafe(seq) },
+    })
+    const encoded = encodeMessage(message)
+    const { id, type, ...data } = encoded
+    yield* db
+      .insert(SessionMessageTable)
+      .values({
+        id: SessionMessage.ID.make(id),
+        session_id: sessionID,
+        type,
+        seq,
+        time_created: DateTime.toEpochMillis(message.time.created),
+        data,
+        search_text: text,
+      })
+      .run()
+      .pipe(Effect.orDie)
+    return message
   })
 
 export const setTitle = (id: SessionV2.ID, title: string) =>

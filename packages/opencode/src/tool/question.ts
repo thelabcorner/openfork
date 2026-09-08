@@ -9,6 +9,7 @@ export const Parameters = Schema.Struct({
 
 type Metadata = {
   answers: ReadonlyArray<Question.Answer>
+  details: ReadonlyArray<string>
 }
 
 export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Service>(
@@ -21,14 +22,32 @@ export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Se
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
         Effect.gen(function* () {
-          const answers = yield* question.ask({
+          const { answers, details } = yield* question.askDetailed({
             sessionID: ctx.sessionID,
             questions: params.questions,
             tool: ctx.callID ? { messageID: ctx.messageID, callID: ctx.callID } : undefined,
           })
 
+          if (params.questions.length === 0) {
+            return {
+              title: "Asked 0 questions",
+              output: "The question tool was called without any questions. Continue without user input.",
+              metadata: { answers, details },
+            }
+          }
+
           const formatted = params.questions
-            .map((q, i) => `"${q.question}"="${answers[i]?.length ? answers[i].join(", ") : "Unanswered"}"`)
+            .map((q, i) => {
+              const answer = answers[i] ?? []
+              const detail = details[i]?.trim() ?? ""
+              const prompt = JSON.stringify(q.question)
+              if (answer.length === 0 && !detail) return `${prompt}: Unanswered`
+              const parts = [
+                answer.length > 0 ? `selected=${JSON.stringify(answer)}` : undefined,
+                detail ? `details=${JSON.stringify(detail)}` : undefined,
+              ].filter(Boolean)
+              return `${prompt}: ${parts.join(" ")}`
+            })
             .join(", ")
 
           return {
@@ -36,6 +55,7 @@ export const QuestionTool = Tool.define<typeof Parameters, Metadata, Question.Se
             output: `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`,
             metadata: {
               answers,
+              details,
             },
           }
         }).pipe(Effect.orDie),

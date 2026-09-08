@@ -3,6 +3,7 @@ import {
   LLMClient,
   LLMError,
   LLMEvent,
+  LLMResponse,
   Model,
   TransportReason,
   InvalidRequestReason,
@@ -21,7 +22,7 @@ import { EventTable } from "@opencode-ai/core/event/sql"
 import { Project } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { GoalV2 } from "@opencode-ai/core/goal"
-import { CONTINUATION_PROMPT } from "@opencode-ai/core/goal/automation"
+import { Goal } from "@opencode-ai/schema/goal"
 import { QuestionV2 } from "@opencode-ai/core/question"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
@@ -63,8 +64,10 @@ import { asc, eq } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 
 const requests: LLMRequest[] = []
+const generateRequests: LLMRequest[] = []
 let response: LLMEvent[] = []
 let responses: LLMEvent[][] | undefined
+let generateResponses: LLMResponse[] = []
 let responseStream: Stream.Stream<LLMEvent, LLMError> | undefined
 let streamGate: Deferred.Deferred<void> | undefined
 let streamStarted: Deferred.Deferred<void> | undefined
@@ -96,7 +99,11 @@ const client = Layer.succeed(
         ),
       )
     }) as unknown as LLMClientShape["stream"],
-    generate: () => Effect.die("unused"),
+    generate: (request: LLMRequest) => {
+      generateRequests.push(request)
+      const next = generateResponses.shift()
+      return next ? Effect.succeed(next) : Effect.die("unexpected generate() call in session-runner test")
+    },
   }),
 )
 const model = Model.make({ id: "fake-model", provider: "fake", route: OpenAIChat.route })
@@ -161,6 +168,7 @@ const models = SessionRunnerModel.layerWith((session) =>
   modelResolveHook.pipe(Effect.as(session.model?.id === "replacement" ? replacementModel : currentModel)),
 )
 const systemContextKey = SystemContext.Key.make("test/context")
+const TEST_DIRECTORY = AbsolutePath.make(process.cwd())
 let systemBaseline = "Initial context"
 let systemRemoved = false
 let systemUnavailable = false
@@ -233,7 +241,7 @@ const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
   [LayerNodePlatform.llmClient, client],
   [SessionRunnerModel.node, models],
   [SystemContextRegistry.node, systemContext],
-  [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
+  [Location.node, Location.boundNode({ directory: TEST_DIRECTORY })],
   [SkillGuidance.node, skillGuidance],
   [ReferenceGuidance.node, referenceGuidance],
   [PermissionV2.node, permission],
@@ -284,7 +292,7 @@ const it = testEffect(
       [PermissionV2.node, permission],
       [SessionRunnerModel.node, models],
       [SystemContextRegistry.node, systemContext],
-      [Location.node, Location.boundNode({ directory: AbsolutePath.make("/project") })],
+      [Location.node, Location.boundNode({ directory: TEST_DIRECTORY })],
       [SkillGuidance.node, skillGuidance],
       [ReferenceGuidance.node, referenceGuidance],
       [Snapshot.node, Snapshot.noopLayer],
@@ -315,7 +323,7 @@ const insertSession = (id: SessionV2.ID) =>
         id,
         project_id: Project.ID.global,
         slug: id,
-        directory: "/project",
+        directory: TEST_DIRECTORY,
         title: "test",
         version: "test",
       })
@@ -335,6 +343,8 @@ const setup = Effect.gen(function* () {
   currentModel = model
   skillBaselines.clear()
   responses = undefined
+  generateResponses = []
+  generateRequests.length = 0
   streamFailure = undefined
   responseStream = undefined
   streamGate = undefined
@@ -346,7 +356,7 @@ const setup = Effect.gen(function* () {
   maxActiveToolExecutions = 0
   yield* db
     .insert(ProjectTable)
-    .values({ id: Project.ID.global, worktree: AbsolutePath.make("/project"), sandboxes: [] })
+    .values({ id: Project.ID.global, worktree: TEST_DIRECTORY, sandboxes: [] })
     .onConflictDoNothing()
     .run()
     .pipe(Effect.orDie)
@@ -484,6 +494,12 @@ const fragmentFixture = (kind: FragmentKind, id: string, chunks: readonly string
   }
 }
 
+const auditResponse = (id: string, verdict: Goal.AuditorVerdict) =>
+  LLMResponse.fromEvents([
+    LLMEvent.toolCall({ id, name: "audit_verdict", input: verdict }),
+    LLMEvent.finish({ reason: "tool-calls" }),
+  ])!
+
 const verifyEphemeralDeltas = (kind: FragmentKind) =>
   Effect.gen(function* () {
     yield* setup
@@ -601,6 +617,26 @@ describe("SessionRunnerLLM", () => {
         fragmentFixture("text", "goal-auto-cycle-1", ["Continuing autonomously once."]).completeEvents,
         fragmentFixture("text", "goal-auto-cycle-2", ["Continuing autonomously twice."]).completeEvents,
       ]
+      generateResponses = [
+        auditResponse("audit-goal-1", {
+          decision: "continue",
+          rationale: "The objective is not yet complete; continue implementation.",
+          progressMade: false,
+          continuationPrompt: "Implement the first remaining autonomous Goal task, then verify the affected behavior.",
+        }),
+        auditResponse("audit-goal-2", {
+          decision: "continue",
+          rationale: "Work remains after the first autonomous cycle.",
+          progressMade: false,
+          continuationPrompt: "Finish the second remaining Goal task without repeating the previous cycle, then capture evidence.",
+        }),
+        auditResponse("audit-goal-3", {
+          decision: "continue",
+          rationale: "The worker still has unfinished work, but no durable progress was recorded.",
+          progressMade: false,
+          continuationPrompt: "Investigate why progress is not being recorded before attempting additional implementation.",
+        }),
+      ]
 
       yield* drainSession(sessionID)
 
@@ -608,9 +644,18 @@ describe("SessionRunnerLLM", () => {
       expect(userTexts(requests[0]!)).toEqual(["Begin the Goal"])
       expect(userTexts(requests[1]!)).toEqual(["Begin the Goal"])
       expect(userTexts(requests[2]!)).toEqual(["Begin the Goal"])
-      expect(requestSystemTexts(requests[0]!)).not.toContain(CONTINUATION_PROMPT)
-      expect(requestSystemTexts(requests[1]!)).toContain(CONTINUATION_PROMPT)
-      expect(requestSystemTexts(requests[2]!)).toContain(CONTINUATION_PROMPT)
+      expect(requestSystemTexts(requests[0]!)).not.toContain("[GOAL CONTINUATION — system, not the user]")
+      expect(requestSystemTexts(requests[1]!).join("\n")).toContain(
+        "Implement the first remaining autonomous Goal task, then verify the affected behavior.",
+      )
+      expect(requestSystemTexts(requests[2]!).join("\n")).toContain(
+        "Finish the second remaining Goal task without repeating the previous cycle, then capture evidence.",
+      )
+      expect(generateRequests).toHaveLength(3)
+      for (const request of generateRequests) {
+        expect(request.tools.map((tool) => tool.name).sort()).toEqual(["audit_verdict", "glob", "grep", "read"])
+        expect(request.toolChoice).toMatchObject({ type: "required" })
+      }
 
       const stopped = yield* goals.get(created.goal.id).pipe(Effect.orDie)
       expect(stopped.goal).toMatchObject({

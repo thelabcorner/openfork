@@ -5,6 +5,7 @@ import { SessionID } from "@/session/schema"
 import { QuestionID } from "./schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { QuestionV1 } from "@opencode-ai/schema/question-v1"
+import { QuestionV2 } from "@opencode-ai/core/question"
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -23,6 +24,7 @@ export type Reply = typeof Reply.Type
 export const Replied = QuestionV1.Replied
 export const Rejected = QuestionV1.Rejected
 export const Event = QuestionV1.Event
+export type Resolved = QuestionV2.Resolved
 
 export class RejectedError extends Schema.TaggedErrorClass<RejectedError>()("QuestionRejectedError", {}) {
   override get message() {
@@ -36,7 +38,7 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Que
 
 interface PendingEntry {
   info: Request
-  deferred: Deferred.Deferred<ReadonlyArray<Answer>, RejectedError>
+  deferred: Deferred.Deferred<Resolved, RejectedError>
 }
 
 interface State {
@@ -51,9 +53,15 @@ export interface Interface {
     questions: ReadonlyArray<Info>
     tool?: Tool
   }) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
+  readonly askDetailed: (input: {
+    sessionID: SessionID
+    questions: ReadonlyArray<Info>
+    tool?: Tool
+  }) => Effect.Effect<Resolved, RejectedError>
   readonly reply: (input: {
     requestID: QuestionID
     answers: ReadonlyArray<Answer>
+    details?: ReadonlyArray<string>
   }) => Effect.Effect<void, NotFoundError>
   readonly reject: (requestID: QuestionID) => Effect.Effect<void, NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
@@ -84,16 +92,17 @@ const layer = Layer.effect(
       }),
     )
 
-    const ask = Effect.fn("Question.ask")(function* (input: {
+    const askDetailed = Effect.fn("Question.askDetailed")(function* (input: {
       sessionID: SessionID
       questions: ReadonlyArray<Info>
       tool?: Tool
     }) {
+      if (input.questions.length === 0) return { answers: [], details: [] } satisfies Resolved
       const pending = (yield* InstanceState.get(state)).pending
       const id = QuestionID.ascending()
       yield* Effect.logInfo("asking", { id, questions: input.questions.length })
 
-      const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
+      const deferred = yield* Deferred.make<Resolved, RejectedError>()
       const info: Request = {
         id,
         sessionID: input.sessionID,
@@ -111,9 +120,16 @@ const layer = Layer.effect(
       )
     })
 
+    const ask = Effect.fn("Question.ask")((input: {
+      sessionID: SessionID
+      questions: ReadonlyArray<Info>
+      tool?: Tool
+    }) => askDetailed(input).pipe(Effect.map(QuestionV2.flattenResolved)))
+
     const reply = Effect.fn("Question.reply")(function* (input: {
       requestID: QuestionID
       answers: ReadonlyArray<Answer>
+      details?: ReadonlyArray<string>
     }) {
       const pending = (yield* InstanceState.get(state)).pending
       const existing = pending.get(input.requestID)
@@ -122,13 +138,15 @@ const layer = Layer.effect(
         return yield* new NotFoundError({ requestID: input.requestID })
       }
       pending.delete(input.requestID)
-      yield* Effect.logInfo("replied", { requestID: input.requestID, answers: input.answers })
+      const resolved = QuestionV2.normalizeReply(existing.info.questions, input)
+      yield* Effect.logInfo("replied", { requestID: input.requestID, answers: resolved.answers, details: resolved.details })
       yield* events.publish(Event.Replied, {
         sessionID: existing.info.sessionID,
         requestID: existing.info.id,
-        answers: input.answers.map((a) => [...a]),
+        answers: QuestionV2.flattenResolved(resolved).map((answer) => [...answer]),
+        details: [...resolved.details],
       })
-      yield* Deferred.succeed(existing.deferred, input.answers)
+      yield* Deferred.succeed(existing.deferred, resolved)
     })
 
     const reject = Effect.fn("Question.reject")(function* (requestID: QuestionID) {
@@ -152,7 +170,7 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (x) => x.info)
     })
 
-    return Service.of({ ask, reply, reject, list })
+    return Service.of({ ask, askDetailed, reply, reject, list })
   }),
 )
 

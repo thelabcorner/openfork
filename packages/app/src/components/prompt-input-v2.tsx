@@ -6,9 +6,23 @@ import { Icon } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
+import { Popover } from "@opencode-ai/ui/popover"
+import { ScrollView, ScrollViewOverlayScrollbar } from "@opencode-ai/ui/scroll-view"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
-import { createEffect, createMemo, createResource, createSignal, lazy, on, onCleanup, Show, Suspense } from "solid-js"
-import { useParams } from "@solidjs/router"
+import {
+  createEffect,
+  createMemo,
+  createResource,
+  createSignal,
+  For,
+  lazy,
+  on,
+  onCleanup,
+  Show,
+  Suspense,
+} from "solid-js"
+import { createStore } from "solid-js/store"
+import { useParams, useSearchParams } from "@solidjs/router"
 import { DialogSelectModelUnpaidV2 } from "@/components/dialog-select-model-unpaid-v2"
 const ModelSelectorPopoverV2 = lazy(async () => {
   const mod = await import("@/components/dialog-select-model")
@@ -20,6 +34,18 @@ import { createPersistedPromptInputHistory } from "@/components/prompt-input/his
 import { promptDesignPlaceholder, promptPlaceholder } from "@/components/prompt-input/placeholder"
 import { createPromptSubmit } from "@/components/prompt-input/submit"
 import { createLiveGenerationRate, type LiveGenerationRateState } from "@/components/prompt-input/live-generation-rate"
+import {
+  promptRevisionClarifications,
+  promptRevisionDraftContext,
+  promptRevisionFingerprint,
+  promptRevisionPrefix,
+  promptRevisionRevealBoundaries,
+  promptRevisionResponse,
+  promptRevisionText,
+  revisedPromptParts,
+  type PromptRevisionClarification,
+  type PromptRevisionResponse,
+} from "@/components/prompt-input/prompt-revision"
 import { selectionFromLines, type SelectedLineRange, useFile } from "@/context/file"
 import { useComments } from "@/context/comments"
 import { useCommand } from "@/context/command"
@@ -31,6 +57,7 @@ import { usePlatform } from "@/context/platform"
 import { useSDK } from "@/context/sdk"
 import { useForkUsage } from "@/context/fork-usage"
 import { useSync } from "@/context/sync"
+import { useSettings } from "@/context/settings"
 import { SessionUsageWarningBanner } from "@/components/session-usage-warning-banner"
 import { createSessionTabs } from "@/pages/session/helpers"
 import { focusLimitsProvider } from "@/pages/session/limits-panel-state"
@@ -41,7 +68,9 @@ import { buildArcModel, type ArcModel } from "@/components/prompt-input/limit-ar
 import { LimitArcCard, LimitArcGlyph } from "@/components/prompt-input/limit-arc-view"
 import { showToast } from "@/utils/toast"
 import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
-import { GoalComposerShelf } from "@/components/goal-composer-shelf"
+import { GoalComposerLauncher, GoalComposerShelf } from "@/components/goal-composer-shelf"
+import { goalArmKey, useGoals } from "@/context/goals"
+import { SettingsModelPickerV2, type SettingsModelRef } from "@/components/settings-v2/parts/model-picker"
 import {
   createPromptInputV2Controller,
   createPromptInputV2State,
@@ -65,8 +94,11 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
   const dialog = useDialog()
   const command = useCommand()
   const language = useLanguage()
+  const sdk = useSDK()
   const params = useParams<{ id?: string }>()
+  const [search] = useSearchParams<{ draftId?: string }>()
   const sessionID = () => params.id
+  const armKey = () => goalArmKey({ sessionID: sessionID(), draftID: search.draftId, directory: sdk().directory })
 
   return (
     <div class="flex flex-col gap-3">
@@ -85,7 +117,9 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
             onToggle={props.controller.autoAccept.toggle}
           />
         }
-        goalControl={<Show when={sessionID()}>{(id) => <GoalComposerShelf sessionID={id()} />}</Show>}
+        goalControl={<GoalComposerLauncher sessionID={sessionID()} armKey={armKey()} />}
+        revisionControl={<PromptInputV2RevisionControl controller={props.controller} sessionID={sessionID()} />}
+        goalShelf={<Show when={sessionID()}>{(id) => <GoalComposerShelf sessionID={id()} />}</Show>}
         footerControl={<PromptInputV2LiveRate value={props.controller.liveRate()} />}
         modelControl={
           <PromptInputV2ModelControl
@@ -103,6 +137,669 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
           />
         }
       />
+    </div>
+  )
+}
+
+type PromptRevisionQuestion = {
+  question: string
+  header: string
+  options: { label: string; description: string }[]
+  multiple?: boolean
+  custom?: boolean
+}
+
+type PromptRevisionFlow = {
+  token: number
+  draft: string
+  before: ReturnType<PromptInputV2ComposerController["parts"]>
+  beforeFingerprint: string
+  restoreBefore: ReturnType<PromptInputV2ComposerController["parts"]>
+  restoreDraft: string
+  guidance?: string
+  model?: { providerID: string; id: string; variant?: string }
+  fallbackModel?: { providerID: string; id: string; variant?: string }
+  directory: string
+  sessionID?: string
+  clarifications: PromptRevisionClarification[]
+  clarificationRound: number
+}
+
+function PromptRevisionQuestions(props: {
+  questions: PromptRevisionQuestion[]
+  busy: boolean
+  onSubmit: (response: PromptRevisionResponse) => void
+  onCancel: () => void
+}) {
+  const language = useLanguage()
+  const [state, setState] = createStore({
+    selected: [] as string[][],
+    custom: [] as string[],
+  })
+
+  createEffect(
+    on(
+      () => props.questions,
+      (questions) => {
+        setState(
+          "selected",
+          questions.map(() => []),
+        )
+        setState(
+          "custom",
+          questions.map(() => ""),
+        )
+      },
+      { defer: false },
+    ),
+  )
+
+  const toggle = (index: number, label: string, multiple: boolean) => {
+    if (props.busy) return
+    if (!multiple) {
+      setState("selected", index, [label])
+      return
+    }
+    setState("selected", index, (current = []) =>
+      current.includes(label) ? current.filter((item) => item !== label) : [...current, label],
+    )
+  }
+
+  const setCustom = (index: number, value: string) => {
+    setState("custom", index, value)
+  }
+
+  const response = () => promptRevisionResponse(props.questions, state.selected, state.custom)
+
+  const complete = () =>
+    props.questions.every(
+      (_, index) => (response().answers[index]?.length ?? 0) > 0 || (response().details[index]?.length ?? 0) > 0,
+    )
+
+  return (
+    <div class="flex max-h-[min(440px,64vh)] flex-col overflow-hidden bg-v2-background-bg-base">
+      <div class="flex h-8 shrink-0 items-center justify-between gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5">
+        <div class="flex min-w-0 items-center gap-1.5">
+          <Icon name="pencil-sparkles" size="small" class="size-3.5 shrink-0 text-v2-icon-icon-muted" />
+          <span class="truncate text-[11px] font-[600] leading-4 text-v2-text-text-base">
+            {language.t("prompt.revision.question.title")}
+          </span>
+        </div>
+        <Show when={props.questions.length > 1}>
+          <span class="shrink-0 text-[9px] font-[540] tabular-nums text-v2-text-text-faint">
+            {props.questions.length} questions
+          </span>
+        </Show>
+      </div>
+
+      <ScrollView class="min-h-0 flex-1 bg-v2-background-bg-base">
+        <div class="flex flex-col divide-y divide-v2-border-border-muted">
+          <For each={props.questions}>
+            {(question, index) => {
+              const multi = () => question.multiple === true
+              const selected = (label: string) => state.selected[index()]?.includes(label) ?? false
+              return (
+                <section class="bg-v2-background-bg-base px-2.5 py-1.5">
+                  <div class="flex items-start justify-between gap-2">
+                    <div class="min-w-0">
+                      <div class="text-[9px] font-[620] uppercase tracking-[0.055em] text-v2-text-text-faint">
+                        {question.header}
+                      </div>
+                      <div class="mt-0.5 text-[11px] font-[500] leading-[15px] text-v2-text-text-base">
+                        {question.question}
+                      </div>
+                    </div>
+                    <Show when={multi()}>
+                      <span class="mt-px shrink-0 rounded-sm bg-v2-overlay-simple-overlay-hover px-1 py-0.5 text-[8px] font-[560] uppercase tracking-[0.04em] leading-3 text-v2-text-text-faint">
+                        {language.t("prompt.revision.question.multiple")}
+                      </span>
+                    </Show>
+                  </div>
+
+                  <Show when={question.options.length > 0}>
+                    <div class="mt-1 flex flex-col gap-0.5" role={multi() ? "group" : "radiogroup"}>
+                      <For each={question.options}>
+                        {(option) => (
+                          <button
+                            type="button"
+                            disabled={props.busy}
+                            role={multi() ? "checkbox" : "radio"}
+                            aria-checked={selected(option.label)}
+                            onClick={() => toggle(index(), option.label, multi())}
+                            class="group flex min-h-7 w-full items-start gap-1.5 rounded-[4px] border px-1.5 py-1 text-left transition-colors disabled:opacity-50"
+                            classList={{
+                              "border-v2-border-border-strong bg-v2-overlay-simple-overlay-pressed": selected(
+                                option.label,
+                              ),
+                              "border-v2-border-border-muted bg-transparent hover:border-v2-border-border-strong hover:bg-v2-overlay-simple-overlay-hover":
+                                !selected(option.label),
+                            }}
+                          >
+                            <span
+                              class="mt-[2px] flex size-3 shrink-0 items-center justify-center border border-v2-border-border-strong"
+                              classList={{ "rounded-[3px]": multi(), "rounded-full": !multi() }}
+                            >
+                              <Show when={selected(option.label)}>
+                                <Show
+                                  when={multi()}
+                                  fallback={<span class="size-1.5 rounded-full bg-v2-icon-icon-base" />}
+                                >
+                                  <Icon name="check" size="small" class="size-2 text-v2-icon-icon-base" />
+                                </Show>
+                              </Show>
+                            </span>
+                            <span class="min-w-0 flex-1">
+                              <span class="block text-[10.5px] font-[540] leading-[14px] text-v2-text-text-base">
+                                {option.label}
+                              </span>
+                              <Show when={option.description}>
+                                <span class="block text-[9px] leading-3.5 text-v2-text-text-muted">
+                                  {option.description}
+                                </span>
+                              </Show>
+                            </span>
+                          </button>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+
+                  <Show when={question.custom !== false}>
+                    <div class="mt-1.5 overflow-hidden rounded-[5px] border border-v2-border-border-muted bg-v2-background-bg-base focus-within:border-v2-border-border-strong">
+                      <div class="flex h-5 items-center border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-1.5">
+                        <span class="text-[8px] font-[600] uppercase tracking-[0.045em] text-v2-text-text-faint">
+                          {question.options.length === 0
+                            ? language.t("prompt.revision.question.customOnly")
+                            : multi()
+                              ? language.t("prompt.revision.question.customMultiple")
+                              : language.t("prompt.revision.question.custom")}
+                        </span>
+                      </div>
+                      <textarea
+                        rows={1}
+                        maxlength={800}
+                        disabled={props.busy}
+                        value={state.custom[index()] ?? ""}
+                        placeholder={language.t("prompt.revision.question.customPlaceholder")}
+                        class="min-h-8 w-full resize-none border-0 bg-v2-background-bg-base px-1.5 py-1.5 text-[10.5px] leading-[14px] text-v2-text-text-base outline-none placeholder:text-v2-text-text-faint disabled:opacity-50"
+                        onInput={(event) => setCustom(index(), event.currentTarget.value)}
+                        onKeyDown={(event) => {
+                          if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && complete()) {
+                            event.preventDefault()
+                            props.onSubmit(response())
+                          }
+                        }}
+                      />
+                    </div>
+                  </Show>
+                </section>
+              )
+            }}
+          </For>
+        </div>
+      </ScrollView>
+
+      <div class="flex min-h-8 shrink-0 items-center justify-between gap-2 border-t border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2 py-1">
+        <ButtonV2 type="button" size="small" variant="ghost-muted" disabled={props.busy} onClick={props.onCancel}>
+          {language.t("prompt.revision.question.cancel")}
+        </ButtonV2>
+        <ButtonV2
+          type="button"
+          size="small"
+          variant="contrast"
+          disabled={props.busy || !complete()}
+          onClick={() => props.onSubmit(response())}
+        >
+          {language.t("prompt.revision.question.continue")}
+        </ButtonV2>
+      </div>
+    </div>
+  )
+}
+
+function PromptRevisionBusyIcon() {
+  // Re-seed each revision run (this component only mounts while busy). The
+  // pencil has a restrained breath while each sparkle gets its own irregular
+  // cadence, so the motion feels organic instead of like three synchronized
+  // loading dots.
+  const sparkle = () => ({
+    duration: `${(2.4 + Math.random() * 1.8).toFixed(2)}s`,
+    begin: `-${(Math.random() * 3.2).toFixed(2)}s`,
+  })
+  const top = sparkle()
+  const right = sparkle()
+  const left = sparkle()
+
+  return (
+    <svg
+      data-slot="icon-svg"
+      width="14"
+      height="14"
+      viewBox="0 0 24 24"
+      fill="none"
+      xmlns="http://www.w3.org/2000/svg"
+      aria-hidden="true"
+      class="text-v2-icon-icon-accent"
+    >
+      <g stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+        <g>
+          <path d="m15.007 5.008 3.987 3.986" />
+          <path d="M21.174 6.813a2.82 2.82 0 0 0-3.986-3.987L3.842 16.175a2 2 0 0 0-.5.83l-1.321 4.352a.5.5 0 0 0 .623.622l4.353-1.32a2 2 0 0 0 .83-.497z" />
+          <animate attributeName="opacity" values="0.78;1;0.9;1;0.78" dur="2.8s" repeatCount="indefinite" />
+        </g>
+
+        <g>
+          <path d="M10 3H8" />
+          <path d="M9 2v2" />
+          <animate
+            attributeName="opacity"
+            values="0.34;0.78;0.52;1;0.42;0.7;0.34"
+            dur={top.duration}
+            begin={top.begin}
+            repeatCount="indefinite"
+          />
+        </g>
+
+        <g>
+          <path d="M20 15v4" />
+          <path d="M22 17h-4" />
+          <animate
+            attributeName="opacity"
+            values="0.42;0.86;0.36;0.72;0.5;1;0.42"
+            dur={right.duration}
+            begin={right.begin}
+            repeatCount="indefinite"
+          />
+        </g>
+
+        <g>
+          <path d="M4 5v4" />
+          <path d="M6 7H2" />
+          <animate
+            attributeName="opacity"
+            values="0.38;0.66;0.94;0.46;0.8;0.54;0.38"
+            dur={left.duration}
+            begin={left.begin}
+            repeatCount="indefinite"
+          />
+        </g>
+      </g>
+    </svg>
+  )
+}
+
+function PromptInputV2RevisionControl(props: { controller: PromptInputV2ComposerController; sessionID?: string }) {
+  const sdk = useSDK()
+  const language = useLanguage()
+  const settings = useSettings()
+  const [busy, setBusy] = createSignal(false)
+  const [open, setOpen] = createSignal(false)
+  const [guidance, setGuidance] = createSignal("")
+  const [modelOverride, setModelOverride] = createSignal<SettingsModelRef | undefined>()
+  const [restoreState, setRestoreState] = createSignal<{
+    before: ReturnType<PromptInputV2ComposerController["parts"]>
+    text: string
+    afterFingerprint: string
+  }>()
+  const [questionState, setQuestionState] = createSignal<{
+    flow: PromptRevisionFlow
+    questions: PromptRevisionQuestion[]
+    clarificationRound: number
+  }>()
+  let guidanceTextarea: HTMLTextAreaElement | undefined
+  let guidanceEditorArea: HTMLDivElement | undefined
+  let request = 0
+  onCleanup(() => {
+    request += 1
+  })
+
+  const changed = (flow: PromptRevisionFlow) =>
+    promptRevisionFingerprint(props.controller.parts()) !== flow.beforeFingerprint ||
+    sdk().directory !== flow.directory ||
+    props.sessionID !== flow.sessionID
+
+  const changedToast = () =>
+    showToast({
+      title: language.t("prompt.revision.error.title"),
+      description: language.t("prompt.revision.changedDuringRequest"),
+    })
+
+  const restorable = createMemo(() => {
+    const state = restoreState()
+    if (!state) return undefined
+    return promptRevisionFingerprint(props.controller.parts()) === state.afterFingerprint ? state : undefined
+  })
+
+  createEffect(() => {
+    const state = restoreState()
+    if (!state || busy()) return
+    if (promptRevisionFingerprint(props.controller.parts()) === state.afterFingerprint) return
+    setRestoreState(undefined)
+  })
+
+  const restoreOriginal = (state = restorable()) => {
+    if (!state || busy()) return
+    if (promptRevisionFingerprint(props.controller.parts()) !== state.afterFingerprint) {
+      setRestoreState(undefined)
+      return
+    }
+    const revised = props.controller.parts().map((part) => ({ ...part })) as ReturnType<
+      PromptInputV2ComposerController["parts"]
+    >
+    props.controller.addHistory(revised, "normal")
+    setRestoreState(undefined)
+    props.controller.onInput(state.text, state.before, state.text.length)
+    props.controller.restoreFocus()
+  }
+
+  const wait = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
+
+  const apply = async (
+    flow: PromptRevisionFlow,
+    prompt: string,
+    references: Parameters<typeof revisedPromptParts>[2] = [],
+  ) => {
+    const next = revisedPromptParts(prompt, flow.before, references)
+    const appliedFingerprint = promptRevisionFingerprint(next)
+    props.controller.addHistory(flow.before, "normal")
+    setQuestionState(undefined)
+    setOpen(false)
+    props.controller.restoreFocus()
+
+    const reducedMotion =
+      typeof window !== "undefined" && window.matchMedia?.("(prefers-reduced-motion: reduce)").matches === true
+    if (reducedMotion) {
+      props.controller.onInput(prompt, next, prompt.length)
+    } else {
+      const boundaries = promptRevisionRevealBoundaries(next)
+      const empty = promptRevisionPrefix(next, 0)
+      let expectedFingerprint = flow.beforeFingerprint
+      if (flow.token !== request || promptRevisionFingerprint(props.controller.parts()) !== expectedFingerprint)
+        return false
+
+      props.controller.onInput("", empty, 0)
+      expectedFingerprint = promptRevisionFingerprint(empty)
+
+      const frameCount = Math.max(1, boundaries.length)
+      const targetDuration = Math.min(2600, Math.max(700, frameCount * 36))
+      const baseDelay = Math.min(70, Math.max(24, targetDuration / frameCount))
+      let previous = 0
+
+      for (const boundary of boundaries) {
+        const segment = prompt.slice(previous, boundary)
+        const punctuationPause = /\n\s*$/u.test(segment) ? 42 : /[.!?;:]\s*$/u.test(segment) ? 16 : 0
+        await wait(baseDelay + punctuationPause)
+        if (flow.token !== request) return false
+        if (promptRevisionFingerprint(props.controller.parts()) !== expectedFingerprint) return false
+
+        const partial = promptRevisionPrefix(next, boundary)
+        const partialText = promptRevisionText(partial)
+        props.controller.onInput(partialText, partial, partialText.length)
+        expectedFingerprint = promptRevisionFingerprint(partial)
+        previous = boundary
+      }
+    }
+
+    if (flow.token !== request || promptRevisionFingerprint(props.controller.parts()) !== appliedFingerprint)
+      return false
+    const restored = {
+      before: flow.restoreBefore,
+      text: flow.restoreDraft,
+      afterFingerprint: appliedFingerprint,
+    }
+    setRestoreState(restored)
+    showToast({
+      variant: "success",
+      title: language.t("prompt.revision.success.title"),
+      description: language.t("prompt.revision.success.description"),
+      actions: [
+        {
+          label: language.t("prompt.revision.restore"),
+          onClick: () => restoreOriginal(restored),
+        },
+      ],
+    })
+    setGuidance("")
+    setModelOverride(undefined)
+    props.controller.restoreFocus()
+    return true
+  }
+
+  const send = async (flow: PromptRevisionFlow) => {
+    if (flow.token !== request) return
+    if (changed(flow)) {
+      changedToast()
+      setQuestionState(undefined)
+      setOpen(false)
+      return
+    }
+    setBusy(true)
+    try {
+      const result = await sdk().api.promptRevisor.revise({
+        prompt: flow.draft,
+        draft: promptRevisionDraftContext(flow.before),
+        sessionID: flow.sessionID,
+        guidance: flow.guidance,
+        model: flow.model,
+        fallbackModel: flow.fallbackModel,
+        clarifications: flow.clarifications,
+        clarificationRound: flow.clarificationRound,
+        location: { directory: flow.directory },
+      })
+      if (flow.token !== request) return
+      if (changed(flow)) {
+        changedToast()
+        setQuestionState(undefined)
+        setOpen(false)
+        return
+      }
+      if (result.type === "question") {
+        setQuestionState({
+          flow,
+          questions: result.questions,
+          clarificationRound: result.clarificationRound,
+        })
+        setOpen(true)
+        return
+      }
+      await apply(flow, result.prompt, result.references ?? [])
+    } catch (error) {
+      if (flow.token !== request) return
+      showToast({
+        variant: "error",
+        title: language.t("prompt.revision.error.title"),
+        description: error instanceof Error ? error.message : String(error),
+      })
+    } finally {
+      if (flow.token === request) setBusy(false)
+    }
+  }
+
+  const run = (extra?: string) => {
+    const draft = props.controller.value()
+    if (busy() || !draft.trim()) return
+    const token = ++request
+    const before = props.controller.parts().map((part) => ({ ...part })) as ReturnType<
+      PromptInputV2ComposerController["parts"]
+    >
+    const beforeFingerprint = promptRevisionFingerprint(before)
+    const priorRestore = restorable()
+    const configured = modelOverride() ?? settings.general.promptRevision()?.model
+    const current = props.controller.model.selection.current()
+    const variant = props.controller.model.selection.variant.current()
+    setQuestionState(undefined)
+    void send({
+      token,
+      draft,
+      before,
+      beforeFingerprint,
+      restoreBefore: priorRestore?.before ?? before,
+      restoreDraft: priorRestore?.text ?? draft,
+      guidance: extra?.trim() || undefined,
+      model: configured ? { providerID: configured.providerID, id: configured.modelID } : undefined,
+      fallbackModel: current ? { providerID: current.provider.id, id: current.id, variant } : undefined,
+      directory: sdk().directory,
+      sessionID: props.sessionID,
+      clarifications: [],
+      clarificationRound: 0,
+    })
+  }
+
+  const answerQuestions = (response: PromptRevisionResponse) => {
+    const pending = questionState()
+    if (!pending || busy()) return
+    if (changed(pending.flow)) {
+      changedToast()
+      setQuestionState(undefined)
+      setOpen(false)
+      return
+    }
+    const clarifications = promptRevisionClarifications(pending.questions, response)
+    const next: PromptRevisionFlow = {
+      ...pending.flow,
+      clarifications: [...pending.flow.clarifications, ...clarifications],
+      clarificationRound: pending.clarificationRound,
+    }
+    void send(next)
+  }
+
+  const cancelQuestions = () => {
+    request += 1
+    setBusy(false)
+    setQuestionState(undefined)
+    setOpen(false)
+    setModelOverride(undefined)
+    props.controller.restoreFocus()
+  }
+
+  const hasDraft = () => props.controller.state.mode === "normal" && props.controller.value().trim().length > 0
+
+  return (
+    <div data-prompt-revision-split-control="" class="flex shrink-0 items-center">
+      <TooltipV2 placement="top" gutter={4} value={language.t("prompt.revision.description")}>
+        <IconButtonV2
+          type="button"
+          size="large"
+          variant="ghost-muted"
+          class={`shrink-0 !rounded-r-[3px] ${
+            busy()
+              ? "!text-v2-icon-icon-accent !opacity-100"
+              : questionState()
+                ? "!text-v2-icon-icon-accent bg-v2-overlay-simple-overlay-hover"
+                : ""
+          }`}
+          disabled={busy() || !hasDraft()}
+          aria-label={language.t("prompt.revision.title")}
+          icon={
+            <Show when={busy()} fallback={<Icon name="pencil-sparkles" size="small" />}>
+              <PromptRevisionBusyIcon />
+            </Show>
+          }
+          onClick={() => (questionState() ? setOpen(true) : run())}
+        />
+      </TooltipV2>
+      <Show when={restorable()}>
+        {(state) => (
+          <TooltipV2 placement="top" gutter={4} value={language.t("prompt.revision.restore")}>
+            <IconButtonV2
+              type="button"
+              size="large"
+              variant="ghost-muted"
+              class="shrink-0 !w-5 !rounded-[3px]"
+              aria-label={language.t("prompt.revision.restore")}
+              icon={<Icon name="reset" size="small" class="size-3" />}
+              onClick={() => restoreOriginal(state())}
+            />
+          </TooltipV2>
+        )}
+      </Show>
+      <Popover
+        open={open()}
+        onOpenChange={setOpen}
+        placement="top-start"
+        gutter={6}
+        onOpenAutoFocus={(event) => event.preventDefault()}
+        ownedPortalSelector='[data-component="menu-v2-content"]'
+        triggerAs={IconButtonV2}
+        triggerProps={{
+          type: "button",
+          size: "large",
+          variant: "ghost-muted",
+          disabled: busy(),
+          "aria-label": language.t("prompt.revision.guidance.open"),
+          class: "shrink-0 !w-5 !rounded-l-[3px]",
+        }}
+        trigger={<Icon name="chevron-down" size="small" class="size-3" />}
+        class="w-[min(370px,calc(100vw-16px))] overflow-hidden rounded-[8px] border border-v2-border-border-muted bg-v2-background-bg-base shadow-[var(--v2-elevation-floating)] [&_[data-slot=popover-body]]:p-0"
+      >
+        <Show
+          when={questionState()}
+          fallback={
+            <div class="flex flex-col bg-v2-background-bg-base">
+              <div class="flex h-8 items-center justify-between gap-2 border-b border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2.5">
+                <div class="flex min-w-0 items-center gap-1.5">
+                  <Icon name="pencil-sparkles" size="small" class="size-3.5 shrink-0 text-v2-icon-icon-muted" />
+                  <span class="truncate text-[11px] font-[600] text-v2-text-text-base">
+                    {language.t("prompt.revision.title")}
+                  </span>
+                </div>
+                <div class="flex min-w-0 items-center gap-1">
+                  <span class="text-[8px] font-[600] uppercase tracking-[0.05em] text-v2-text-text-faint">
+                    {language.t("prompt.revision.model")}
+                  </span>
+                  <SettingsModelPickerV2
+                    action="prompt-revision-run-model"
+                    value={modelOverride()}
+                    defaultLabel={language.t("prompt.revision.model.inherit")}
+                    compact
+                    lightweightSelector
+                    onChange={setModelOverride}
+                  />
+                </div>
+              </div>
+              <div ref={(element) => (guidanceEditorArea = element)} class="relative bg-v2-background-bg-base">
+                <textarea
+                  ref={(element) => (guidanceTextarea = element)}
+                  value={guidance()}
+                  rows={2}
+                  maxlength={1000}
+                  placeholder={language.t("prompt.revision.guidance.placeholder")}
+                  class="block h-[66px] min-h-[54px] max-h-[min(260px,40vh)] w-full resize-y overflow-y-auto border-0 bg-v2-background-bg-base px-2.5 py-2 pr-4 text-[11px] leading-[15px] text-v2-text-text-base outline-none no-scrollbar placeholder:text-v2-text-text-faint"
+                  onInput={(event) => setGuidance(event.currentTarget.value)}
+                  onKeyDown={(event) => {
+                    if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+                      event.preventDefault()
+                      run(guidance())
+                    }
+                  }}
+                />
+                <ScrollViewOverlayScrollbar viewport={() => guidanceTextarea} hoverTarget={() => guidanceEditorArea} />
+              </div>
+              <div class="flex min-h-9 items-center justify-between gap-2 border-t border-v2-border-border-muted bg-v2-background-bg-layer-01 px-2 py-1.5">
+                <span class="px-0.5 text-[9px] text-v2-text-text-faint">⌘/Ctrl + Enter</span>
+                <ButtonV2
+                  type="button"
+                  size="small"
+                  variant="contrast"
+                  disabled={busy() || !hasDraft()}
+                  onClick={() => run(guidance())}
+                >
+                  {language.t("prompt.revision.guidance.run")}
+                </ButtonV2>
+              </div>
+            </div>
+          }
+        >
+          {(pending) => (
+            <PromptRevisionQuestions
+              questions={pending().questions}
+              busy={busy()}
+              onSubmit={answerQuestions}
+              onCancel={cancelQuestions}
+            />
+          )}
+        </Show>
+      </Popover>
     </div>
   )
 }
@@ -151,10 +848,7 @@ function PromptInputV2LiveRate(props: { value: LiveGenerationRateState }) {
   return (
     <div class="flex items-center gap-1.5 px-1 text-[11px] leading-4 text-text-weaker tabular-nums select-none">
       <Show when={hasRate()}>
-        <Show
-          when={isLive()}
-          fallback={<span class="size-1.5 rounded-full bg-current" />}
-        >
+        <Show when={isLive()} fallback={<span class="size-1.5 rounded-full bg-current" />}>
           <span class="relative flex size-1.5 shrink-0">
             <span class="absolute inline-flex size-full animate-ping rounded-full bg-current opacity-60" />
             <span class="relative inline-flex size-1.5 rounded-full bg-current" />
@@ -316,9 +1010,7 @@ function PromptInputV2UsageArc(props: { model: PromptInputV2ComposerController["
   }
 
   const hint = () =>
-    arc().switchable
-      ? language.t("prompt.limits.hint.openAndSwitch")
-      : language.t("prompt.limits.hint.open")
+    arc().switchable ? language.t("prompt.limits.hint.openAndSwitch") : language.t("prompt.limits.hint.open")
 
   const ariaLabel = () => {
     const model = arc()
@@ -372,6 +1064,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   const dialog = useDialog()
   const command = useCommand()
   const permission = usePermission()
+  const goals = useGoals()
   const language = useLanguage()
   const platform = usePlatform()
   const prompt = props.state ?? usePrompt()
@@ -516,6 +1209,14 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     onAbort: props.onAbort,
     onSubmit: props.onSubmit,
     model: props.controls.model.selection,
+    goal: {
+      key: goalArmKey,
+      consume: goals.consumeArm,
+      restore: goals.restoreArm,
+      quickStart: goals.quickStart,
+      refreshFocused: goals.refreshFocused,
+      focused: goals.focused,
+    },
   })
 
   const referenceDescription = (reference: ReferenceInfo) =>
@@ -663,7 +1364,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     commands,
     context,
     searchContextFiles: async (query, options) =>
-      (await files.searchMentions(query, options)).results.flatMap((entry) => {
+      (await files.searchMentions(query, { ...options, symbols: false })).results.flatMap((entry) => {
         if (entry.kind !== "file") return []
         // normalizeMentionPage projects positions onto the basename; this label
         // is the FULL path, so shift them back into label space.

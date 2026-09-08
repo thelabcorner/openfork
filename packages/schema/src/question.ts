@@ -30,14 +30,12 @@ const base = {
   header: Schema.String.annotate({ description: "Very short label (max 30 chars)" }),
   options: Schema.Array(Option).annotate({ description: "Available choices" }),
   multiple: Schema.Boolean.pipe(optional).annotate({ description: "Allow selecting multiple choices" }),
+  custom: Schema.Boolean.pipe(optional).annotate({
+    description: "Allow an optional free-form response in addition to any selected choices (default: true)",
+  }),
 }
 
-export const Info = Schema.Struct({
-  ...base,
-  custom: Schema.Boolean.pipe(optional).annotate({
-    description: "Allow typing a custom answer (default: true)",
-  }),
-}).annotate({ identifier: "QuestionV2.Info" })
+export const Info = Schema.Struct(base).annotate({ identifier: "QuestionV2.Info" })
 export interface Info extends Schema.Schema.Type<typeof Info> {}
 
 export const Prompt = Schema.Struct(base).annotate({ identifier: "QuestionV2.Prompt" })
@@ -62,7 +60,10 @@ export type Answer = typeof Answer.Type
 
 export const Reply = Schema.Struct({
   answers: Schema.Array(Answer).annotate({
-    description: "User answers in order of questions (each answer is an array of selected labels)",
+    description: "Selected option labels in question order",
+  }),
+  details: Schema.Array(Schema.String).pipe(optional).annotate({
+    description: "Optional free-form response text in question order; empty string means no details",
   }),
 }).annotate({ identifier: "QuestionV2.Reply" })
 export interface Reply extends Schema.Schema.Type<typeof Reply> {}
@@ -74,6 +75,7 @@ const Replied = define({
     sessionID: SessionID,
     requestID: ID,
     answers: Schema.Array(Answer),
+    details: Schema.Array(Schema.String).pipe(optional),
   },
 })
 const Rejected = define({

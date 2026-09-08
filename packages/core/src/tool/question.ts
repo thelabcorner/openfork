@@ -18,8 +18,10 @@ export const description = `Use this tool when you need to ask the user question
 4. Offer choices to the user about what direction to take.
 
 Usage notes:
-- When \`custom\` is enabled (default), a "Type your own answer" option is added automatically; don't include "Other" or catch-all options
-- Answers are returned as arrays of labels; set \`multiple: true\` to allow selecting more than one
+- \`multiple: false\` (default) allows one provided option; \`multiple: true\` allows selecting any number of provided options
+- \`custom: true\` (default) adds a free-form response field that is independent of the provided options. The user may select option(s), type a custom response, or do both. Set \`custom: false\` only when free-form context would not be useful
+- Selected option labels are returned in \`answers\`; independent free-form text is returned in the parallel \`details\` array
+- Option labels must be unique within a question
 - If you recommend a specific option, make that the first option in the list and add "(Recommended)" at the end of the label`
 
 export const Input = Schema.Struct({
@@ -28,18 +30,28 @@ export const Input = Schema.Struct({
 
 export const Output = Schema.Struct({
   answers: Schema.Array(QuestionV2.Answer),
+  details: Schema.Array(Schema.String),
 })
 export type Output = typeof Output.Type
 
 export const toModelOutput = (
   questions: ReadonlyArray<QuestionV2.Prompt>,
   answers: ReadonlyArray<QuestionV2.Answer>,
+  details: ReadonlyArray<string> = [],
 ) => {
+  if (questions.length === 0) return "The question tool was called without any questions. Continue without user input."
   const formatted = questions
-    .map(
-      (question, index) =>
-        `"${question.question}"="${answers[index]?.length ? answers[index].join(", ") : "Unanswered"}"`,
-    )
+    .map((question, index) => {
+      const answer = answers[index] ?? []
+      const detail = details[index]?.trim() ?? ""
+      const prompt = JSON.stringify(question.question)
+      if (answer.length === 0 && !detail) return `${prompt}: Unanswered`
+      const parts = [
+        answer.length > 0 ? `selected=${JSON.stringify(answer)}` : undefined,
+        detail ? `details=${JSON.stringify(detail)}` : undefined,
+      ].filter(Boolean)
+      return `${prompt}: ${parts.join(" ")}`
+    })
     .join(", ")
   return `User has answered your questions: ${formatted}. You can now continue with the user's answers in mind.`
 }
@@ -57,7 +69,7 @@ const layer = Layer.effectDiscard(
           input: Input,
           output: Output,
           toModelOutput: ({ input, output }) => [
-            { type: "text", text: toModelOutput(input.questions, output.answers) },
+            { type: "text", text: toModelOutput(input.questions, output.answers, output.details) },
           ],
           execute: (input, context) =>
             permission
@@ -72,14 +84,14 @@ const layer = Layer.effectDiscard(
                 Effect.mapError(() => new ToolFailure({ message: "Permission denied: question" })),
                 Effect.andThen(
                   question
-                    .ask({
+                    .askDetailed({
                       sessionID: context.sessionID,
                       questions: input.questions,
                       tool: { messageID: context.assistantMessageID, callID: context.toolCallID },
                     })
                     .pipe(Effect.orDie),
                 ),
-                Effect.map((answers) => ({ answers })),
+                Effect.map(({ answers, details }) => ({ answers, details })),
               ),
         }),
       })

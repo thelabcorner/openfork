@@ -1,33 +1,33 @@
 export * as SessionTitle from "./title"
 
-import { LLM, LLMClient, Message, SystemPart } from "@opencode-ai/llm"
+import { LLM, LLMClient, Message, SystemPart, Tool, toDefinitions } from "@opencode-ai/llm"
 import { eq } from "drizzle-orm"
 import { Context, DateTime, Effect, Layer, Ref, Schema, Scope } from "effect"
 import { AgentV2 } from "../agent"
 import { Catalog } from "../catalog"
 import { Config } from "../config"
 import { Database } from "../database/database"
+import { EventV2 } from "../event"
 import { makeLocationNode } from "../effect/app-node"
 import { llmClient } from "../effect/app-node-platform"
 import { Integration } from "../integration"
 import { ModelV2 } from "../model"
-import { PROMPT_TITLE } from "../plugin/agent"
 import { ProviderV2 } from "../provider"
+import { type ToolChoiceCapabilityIdentity } from "../tool-choice-compatibility"
+import { generateAdaptive, runTerminalCompletion } from "../special-agent-completion"
+import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
 import { SessionRunnerModel } from "./runner/model"
 import { SessionSchema } from "./schema"
 import { SessionTable } from "./sql"
 import { SessionStore } from "./store"
+import { DEFAULT_PROMPT, GENERATED_TITLE_TOOL, PROTOCOL_PROMPT } from "./title-prompt"
 
-/** The task section of `PROMPT_TITLE` (packages/core/src/plugin/agent.ts), extracted so settings can display it. */
-export const DEFAULT_TITLE_PROMPT = `Generate a brief title that would help the user find this conversation later.
-
-Follow all rules in <rules>
-Use the <examples> so you know what a good title looks like.
-Your output must be:
-- A single line
-- <=50 characters
-- No explanations`
+/** Back-compatible export used by settings and V1 title generation. */
+export const DEFAULT_TITLE_PROMPT = DEFAULT_PROMPT
+export { DEFAULT_PROMPT, GENERATED_TITLE_TOOL, PROTOCOL_PROMPT } from "./title-prompt"
+export const GeneratedTitleToolInput = Schema.Struct({ title: Schema.String })
+export type GeneratedTitleToolInput = typeof GeneratedTitleToolInput.Type
 
 export const MAX_TITLE_LENGTH = 60
 export const MAX_TITLE_CONTEXT_CHARS = 8_000
@@ -45,22 +45,33 @@ export function isDefaultTitle(title: string) {
 
 /**
  * Normalizes raw model output into a single-line title. Strips think blocks,
- * code fences, inline quotes, and blockquote markers; keeps the first non-empty
- * line; caps at {@link MAX_TITLE_LENGTH} (58 + ellipsis). Returns `undefined`
+ * code-fence markers, inline quotes, and blockquote markers; keeps the first
+ * non-empty line; caps at {@link MAX_TITLE_LENGTH} (59 + ellipsis). Returns `undefined`
  * when nothing usable remains — treated as failure, never written.
  */
 export function sanitizeTitle(raw: string): string | undefined {
   const cleaned = raw
     .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
-    .replace(/```[\s\S]*?```/g, "")
+    .replace(/```(?:[a-zA-Z0-9_-]+)?/g, "")
     .replace(/`/g, "")
     .replace(/^\s*>\s?/gm, "")
     .split("\n")
     .map((line) => line.trim())
     .find((line) => line.length > 0)
   if (cleaned === undefined) return undefined
-  if (cleaned.length > MAX_TITLE_LENGTH) return cleaned.slice(0, MAX_TITLE_LENGTH - 2) + "…"
+  if (cleaned.length > MAX_TITLE_LENGTH) return cleaned.slice(0, MAX_TITLE_LENGTH - 1) + "…"
   return cleaned
+}
+
+/**
+ * Legacy compatibility for title_prompt values authored before runtime context
+ * was host-injected. New policies do not need either placeholder.
+ */
+export function renderLegacyPolicy(
+  policy: string,
+  input: { readonly previousTitle: string; readonly conversation: string },
+) {
+  return policy.replaceAll("{previousTitle}", input.previousTitle).replaceAll("{conversation}", input.conversation)
 }
 
 const renderBlock = (message: SessionMessage.Message): string | undefined => {
@@ -120,8 +131,9 @@ type PendingEntry = { readonly requestID: string; readonly baselineTitle: string
 
 export interface Interface {
   /**
-   * Generate a title for a session in the background and apply it through the
-   * shared race guards. Replaces any pending generation for the session
+   * Generate and apply a title through the shared race guards. The caller owns
+   * background lifetime so the Location-scoped service stays alive for the
+   * entire model request. Replaces any pending generation for the session
    * (supersede). The current title is the baseline — a manual rename while
    * generation is in flight discards the generated title. Never routes through
    * the Session runner, never admits session inputs, and works while paused.
@@ -156,9 +168,16 @@ const layer = Layer.effect(
     const catalog = yield* Catalog.Service
     const integrations = yield* Integration.Service
     const models = yield* SessionRunnerModel.Service
+    const events = yield* EventV2.Service
     const db = (yield* Database.Service).db
     const scope = yield* Scope.Scope
     const pending = yield* Ref.make(new Map<SessionSchema.ID, PendingEntry>())
+    const generatedTitleTool = Tool.make({
+      description:
+        "Commit the final session title. This is the only valid successful completion for title generation. Supply only the title artifact; do not put explanations or reasoning in the title field.",
+      parameters: GeneratedTitleToolInput,
+      success: Schema.String,
+    })
 
     const clearPending = (sessionID: SessionSchema.ID, requestID: string) =>
       Ref.update(pending, (map) => {
@@ -171,7 +190,11 @@ const layer = Layer.effect(
       readonly id: ModelV2.ID
     }) {
       const model = yield* catalog.model.get(ref.providerID, ref.id)
-      if (model === undefined || !SessionRunnerModel.supported(model)) return undefined
+      // Structured title completion is a hard transport requirement now. A
+      // prose-only model can never satisfy generated_title, so do not select it
+      // and then fail the request with a misleading 503. Let the cascade move
+      // on to the next usable model instead.
+      if (model === undefined || !model.capabilities.tools || !SessionRunnerModel.supported(model)) return undefined
       const provider = yield* catalog.provider.get(ref.providerID)
       const connection = yield* integrations.connection.active(
         provider?.integrationID ?? Integration.ID.make(ref.providerID),
@@ -234,12 +257,24 @@ const layer = Layer.effect(
         yield* clearPending(input.sessionID, input.requestID)
         return false
       }
-      yield* db
-        .update(SessionTable)
-        .set({ title: input.title, time_updated: DateTime.toEpochMillis(yield* DateTime.now) })
-        .where(eq(SessionTable.id, input.sessionID))
-        .run()
-        .pipe(Effect.orDie)
+      const timestamp = yield* DateTime.now
+      yield* events.publish(
+        SessionEvent.Renamed,
+        {
+          sessionID: input.sessionID,
+          timestamp,
+          title: input.title,
+        },
+        {
+          commit: () =>
+            db
+              .update(SessionTable)
+              .set({ title: input.title, time_updated: DateTime.toEpochMillis(timestamp) })
+              .where(eq(SessionTable.id, input.sessionID))
+              .run()
+              .pipe(Effect.orDie),
+        },
+      )
       yield* clearPending(input.sessionID, input.requestID)
       return true
     })
@@ -254,14 +289,22 @@ const layer = Layer.effect(
       readonly messages?: SessionMessage.Message[]
     }) {
       const session = input.session
-      const messages = input.messages ?? (yield* store.context(session.id))
+      const messages =
+        input.messages ??
+        (yield* store.context(session.id).pipe(
+          Effect.mapError(
+            (error) =>
+              new UnavailableError({
+                sessionID: session.id,
+                message: `Unable to load conversation context for title generation: ${error.message}`,
+              }),
+          ),
+        ))
       // Nothing to title without at least one real user message (edge #5).
       if (messages.filter((message) => message.type === "user").length === 0) return false
       const context = assembleContext(messages)
       const entries = yield* config.entries()
       const configured = Config.latest(entries, "title_prompt")
-      const taskPrompt =
-        input.prompt !== undefined && input.prompt.trim().length > 0 ? input.prompt : (configured ?? DEFAULT_TITLE_PROMPT)
       const model = yield* resolveModel(session, input.model).pipe(
         Effect.catch(
           (error) =>
@@ -272,30 +315,85 @@ const layer = Layer.effect(
         ),
       )
       const titleAgent = yield* agents.get(AgentV2.ID.make("title"))
+      const policySource =
+        input.prompt?.trim() || configured?.trim() || titleAgent?.system?.trim() || DEFAULT_TITLE_PROMPT
+      const policy = renderLegacyPolicy(policySource, { previousTitle: session.title, conversation: context })
+      const system = `${policy}\n\n${PROTOCOL_PROMPT}`
+      const capability: ToolChoiceCapabilityIdentity = {
+        providerID: String(model.provider),
+        modelID: String(model.id),
+        apiURL: model.route.endpoint.baseURL,
+        routeID: model.route.id,
+        routeProtocol: String(model.route.protocol),
+      }
       const request = LLM.request({
         model,
-        system: [SystemPart.make(titleAgent?.system ?? PROMPT_TITLE)],
+        system: [SystemPart.make(system)],
         messages: [
           Message.user(
-            `${taskPrompt.replaceAll("{previousTitle}", session.title)}\n\n<conversation>\n${context}\n</conversation>`,
+            `<title-generation-context>\n${JSON.stringify({
+              generationPurpose: input.defaultOnly ? "initial" : "regenerate",
+              currentTitle: session.title,
+              conversation: context,
+            })}\n</title-generation-context>`,
           ),
         ],
+        tools: toDefinitions({ [GENERATED_TITLE_TOOL]: generatedTitleTool }),
+        // There is exactly one available tool. `required` is semantically the
+        // same as a named forced choice here, but is supported by more provider
+        // adapters (and mirrors Prompt Revisor's terminal-tool contract).
+        toolChoice: "required",
+        generation: { maxTokens: 256, temperature: 0.2 },
       })
-      const response = yield* llm.generate(request).pipe(
-        Effect.mapError(
-          (error) =>
-            new UnavailableError({
-              sessionID: session.id,
-              message: `Title generation failed: ${error.message}`,
+      const generate = (current: typeof request, preferred: "required" | "auto") =>
+        generateAdaptive({
+          identity: capability,
+          requested: preferred,
+          generate: (toolChoice) => llm.generate(LLM.updateRequest(current, { toolChoice })),
+        }).pipe(
+          Effect.mapError(
+            (error) =>
+              new UnavailableError({
+                sessionID: session.id,
+                message: `Title generation failed: ${error.message}`,
+              }),
+          ),
+        )
+
+      let preferred: "required" | "auto" = "required"
+      const terminal = yield* runTerminalCompletion({
+        messages: request.messages,
+        toolName: GENERATED_TITLE_TOOL,
+        agentLabel: "session title generator",
+        generate: (messages) =>
+          generate(LLM.updateRequest(request, { messages }), preferred).pipe(
+            Effect.tap((attempt) => Effect.sync(() => (preferred = attempt.toolChoice))),
+            Effect.map((attempt) => attempt.response),
+          ),
+        validate: (call) =>
+          Schema.decodeUnknownEffect(GeneratedTitleToolInput)(call.input).pipe(
+            Effect.mapError((error) => `Invalid ${GENERATED_TITLE_TOOL} payload: ${error.message}`),
+            Effect.flatMap((committed) => {
+              const title = sanitizeTitle(committed.title)
+              return title === undefined
+                ? Effect.fail("The generated title is empty or unusable after normalization")
+                : Effect.succeed(title)
             }),
-        ),
-      )
-      const title = sanitizeTitle(response.text)
-      if (title === undefined)
-        return yield* new UnavailableError({
-          sessionID: session.id,
-          message: "Title generation produced no usable title",
-        })
+          ),
+        invalid: (failure) =>
+          new UnavailableError({
+            sessionID: session.id,
+            message:
+              failure.reason === "missing"
+                ? `Title generation did not call ${GENERATED_TITLE_TOOL} after its repair retry`
+                : failure.reason === "multiple"
+                  ? `Title generation emitted multiple ${GENERATED_TITLE_TOOL} calls`
+                  : failure.reason === "invalid-payload"
+                    ? `Title generation produced invalid ${GENERATED_TITLE_TOOL}: ${failure.detail ?? "invalid payload"}`
+                    : `${GENERATED_TITLE_TOOL} must be the only content-producing action in the response`,
+          }),
+      })
+      const title = terminal.artifact
       return yield* applyTitle({
         sessionID: session.id,
         requestID: input.requestID,
@@ -323,13 +421,7 @@ const layer = Layer.effect(
           prompt: input.prompt,
           model: input.model,
           defaultOnly: false,
-        }).pipe(
-          Effect.catch((error) =>
-            Effect.logError("Failed to regenerate session title", { sessionID: input.session.id, error }),
-          ),
-          Effect.ensuring(clearPending(input.session.id, requestID)),
-          Effect.forkIn(scope, { startImmediately: true }),
-        )
+        }).pipe(Effect.asVoid, Effect.ensuring(clearPending(input.session.id, requestID)))
       }),
       autoTitle: Effect.fn("SessionTitle.autoTitle")(function* (input) {
         const session = input.session
@@ -369,6 +461,7 @@ export const node = makeLocationNode({
     Integration.node,
     SessionRunnerModel.node,
     Database.node,
+    EventV2.node,
   ],
 })
 

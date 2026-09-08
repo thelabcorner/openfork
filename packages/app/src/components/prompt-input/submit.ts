@@ -23,11 +23,6 @@ import { createPromptSubmissionState } from "./submission-state"
 import { normalizeSessionInfo } from "@/utils/session"
 import { Event } from "@opencode-ai/schema/event"
 import { blobDataUrl } from "@/utils/draft-store"
-import { chatsRoot, isChatDirectory } from "@opencode-ai/core/project/chat-paths"
-
-function joinPath(...parts: string[]): string {
-  return parts.filter((p) => p && p !== ".").join("/").replace(/\/+/g, "/")
-}
 
 type PendingPrompt = {
   abort: AbortController
@@ -45,6 +40,13 @@ export type FollowupDraft = {
   model: { providerID: string; modelID: string }
   variant?: string
   subProvider?: string
+  goal?: {
+    armKey: string
+    projectID: string
+    workspaceID?: string
+    objective: string
+    mode: "auto_continue" | "unattended"
+  }
 }
 
 type FollowupSendInput = {
@@ -55,6 +57,7 @@ type FollowupSendInput = {
   messageID?: string
   optimisticBusy?: boolean
   before?: () => Promise<boolean> | boolean
+  prepare?: (draft: FollowupDraft) => Promise<void>
 }
 
 const draftText = (prompt: Prompt) => prompt.map((part) => ("content" in part ? part.content : "")).join("")
@@ -89,6 +92,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
         setIdle()
         return false
       }
+      await input.prepare?.(input.draft)
 
       const messageID = Identifier.ascending("message")
       await input.api.command({
@@ -170,6 +174,7 @@ export async function sendFollowupDraft(input: FollowupSendInput) {
       })
       return false
     }
+    await input.prepare?.(input.draft)
 
     await input.api.prompt({
       sessionID: input.draft.sessionID,
@@ -236,6 +241,22 @@ type PromptSubmitInput = {
   onAbort?: () => void
   onSubmit?: () => void
   model?: ModelSelection
+  goal?: {
+    key: (input: { sessionID?: string; draftID?: string; directory: string }) => string
+    consume: (key: string) => { mode: "auto_continue" | "unattended" } | undefined
+    restore: (key: string, intent: { mode: "auto_continue" | "unattended" } | undefined) => void
+    quickStart: (
+      sessionID: string,
+      input: {
+        projectID: string
+        workspaceID?: string
+        objective: string
+        mode: "auto_continue" | "unattended"
+      },
+    ) => Promise<unknown>
+    refreshFocused: (sessionID: string) => Promise<void>
+    focused: (sessionID: string) => unknown
+  }
 }
 
 export function createPromptSubmit(input: PromptSubmitInput) {
@@ -355,6 +376,13 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       return
     }
 
+    const armKey = input.goal?.key({ sessionID: params.id, draftID: search.draftId, directory: sdk().directory })
+    const goalArm = armKey && mode === "normal" && text.trim().length > 0 ? input.goal?.consume(armKey) : undefined
+    const restoreGoalArm = () => {
+      if (!armKey) return
+      input.goal?.restore(armKey, goalArm)
+    }
+
     input.addToHistory(currentPrompt, mode)
     input.resetHistoryNavigation()
 
@@ -368,13 +396,6 @@ export function createPromptSubmit(input: PromptSubmitInput) {
     let client = sdk().client
 
     if (isNewSession) {
-      // Chat session: generate a unique sub-directory under chats root.
-      if (isChatDirectory(projectDirectory)) {
-        const timestamp = Date.now()
-        const random = Math.random().toString(36).slice(2, 8)
-        sessionDirectory = joinPath(chatsRoot(), `${timestamp}-${random}`)
-      }
-
       if (worktreeSelection === "create") {
         const createdWorktree = await client.worktree
           .create({ directory: projectDirectory })
@@ -388,6 +409,7 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           })
 
         if (!createdWorktree?.directory) {
+          restoreGoalArm()
           showToast({
             title: language.t("prompt.toast.worktreeCreateFailed.title"),
             description: language.t("common.requestFailed"),
@@ -430,6 +452,17 @@ export function createPromptSubmit(input: PromptSubmitInput) {
           return undefined
         })
       if (created) {
+        // Built-in Chat sessions are isolated by the server. The returned
+        // directory is authoritative: a renderer may be connected to another
+        // machine and must never derive that machine's HOME/USERPROFILE path.
+        if (created.directory && created.directory !== sessionDirectory) {
+          sessionDirectory = created.directory
+          client = sdk().createClient({
+            directory: sessionDirectory,
+            throwOnError: true,
+          })
+          serverSync().child(sessionDirectory)
+        }
         seed(sessionDirectory, created)
         session = created
         await startTransition(() => {
@@ -449,9 +482,20 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       }
     }
     if (!session) {
+      restoreGoalArm()
       showToast({
         title: language.t("prompt.toast.promptSendFailed.title"),
         description: language.t("prompt.toast.promptSendFailed.description"),
+      })
+      return
+    }
+
+    const authoritativeSession = sync().session.get(session.id)
+    if (goalArm && !authoritativeSession) {
+      restoreGoalArm()
+      showToast({
+        title: language.t("goal.error.title"),
+        description: language.t("common.requestFailed"),
       })
       return
     }
@@ -470,6 +514,15 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       model,
       variant,
       subProvider,
+      goal: goalArm
+        ? {
+            armKey: armKey!,
+            projectID: authoritativeSession!.projectID,
+            workspaceID: authoritativeSession!.workspaceID,
+            objective: text.trim(),
+            mode: goalArm.mode,
+          }
+        : undefined,
     }
 
     const clearInput = () => {
@@ -640,10 +693,25 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       messageID,
       optimisticBusy: sessionDirectory === projectDirectory,
       before: waitForWorktree,
-    }).catch((err) => {
+      prepare: async (next) => {
+        if (!next.goal) return
+        await input.goal!.quickStart(next.sessionID, {
+          projectID: next.goal.projectID,
+          workspaceID: next.goal.workspaceID,
+          objective: next.goal.objective,
+          mode: next.goal.mode,
+        })
+      },
+    }).catch(async (err) => {
       pending.delete(pendingKey(session.id))
       if (sessionDirectory === projectDirectory) {
         sync().set("session_status", session.id, { type: "idle" })
+      }
+      if (draft.goal) {
+        await input.goal?.refreshFocused(draft.sessionID).catch(() => undefined)
+        if (!input.goal?.focused(draft.sessionID)) {
+          input.goal?.restore(draft.goal.armKey, { mode: draft.goal.mode })
+        }
       }
       showToast({
         title: language.t("prompt.toast.promptSendFailed.title"),

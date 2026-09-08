@@ -608,7 +608,13 @@ function hit(url: string, body: unknown) {
 
 function isTitleRequest(body: unknown): boolean {
   if (!body || typeof body !== "object") return false
-  return JSON.stringify(body).includes("Generate a title for this conversation")
+  const tools = (body as { tools?: unknown }).tools
+  if (!Array.isArray(tools)) return false
+  return tools.some((entry) => {
+    if (!entry || typeof entry !== "object") return false
+    const item = entry as { name?: unknown; function?: { name?: unknown } }
+    return item.name === "generated_title" || item.function?.name === "generated_title"
+  })
 }
 
 namespace TestLLMServer {
@@ -676,9 +682,20 @@ export class TestLLMServer extends Context.Service<TestLLMServer, TestLLMServer.
         const body = yield* req.json.pipe(Effect.orElseSucceed(() => ({})))
         const current = hit(req.originalUrl, body)
         if (isTitleRequest(body)) {
+          const queued = pull(current)
           hits = [...hits, current]
           yield* notify()
-          const auto: Sse = { type: "sse", head: [role()], tail: [textLine("E2E Title"), finishLine("stop")] }
+          if (queued) {
+            if (queued.type !== "sse") return fail(queued)
+            if (mode === "responses") return send(responses(queued, modelFrom(body)))
+            if (queued.reset) {
+              yield* reset(queued)
+              return HttpServerResponse.empty()
+            }
+            return send(queued)
+          }
+          const auto = reply().tool("generated_title", { title: "E2E Title" }).item()
+          if (auto.type !== "sse") return fail(auto)
           if (mode === "responses") return send(responses(auto, modelFrom(body)))
           return send(auto)
         }

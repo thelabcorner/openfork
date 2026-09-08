@@ -27,6 +27,7 @@ type PrepareInput = {
   readonly system: string[]
   readonly messages: ModelMessage[]
   readonly small?: boolean
+  readonly maxOutputTokens?: number
   readonly tools: Record<string, Tool>
   readonly provider: Provider.Info
   readonly auth: Auth.Info | undefined
@@ -149,7 +150,10 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
         : undefined,
       topP: input.agent.topP ?? ProviderTransform.topP(input.model),
       topK: ProviderTransform.topK(input.model),
-      maxOutputTokens: ProviderTransform.maxOutputTokens(input.model, input.flags.outputTokenMax),
+      maxOutputTokens:
+        input.maxOutputTokens === undefined
+          ? ProviderTransform.maxOutputTokens(input.model, input.flags.outputTokenMax)
+          : Math.min(input.maxOutputTokens, ProviderTransform.maxOutputTokens(input.model, input.flags.outputTokenMax)),
       options,
     },
   )

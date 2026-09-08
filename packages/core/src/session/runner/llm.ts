@@ -40,6 +40,7 @@ import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
 import { GoalContext } from "../../goal/context"
 import { GoalAutomation } from "../../goal/automation"
+import { GoalAuditor } from "../../goal/auditor"
 import { makeLocationNode } from "../../effect/app-node"
 import { llmClient } from "../../effect/app-node-platform"
 
@@ -123,6 +124,7 @@ const layer = Layer.effect(
     const snapshots = yield* Snapshot.Service
     const goalContext = yield* GoalContext.Service
     const goalAutomation = yield* GoalAutomation.Service
+    const goalAuditor = yield* GoalAuditor.Service
     const db = (yield* Database.Service).db
     const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
@@ -491,11 +493,17 @@ const layer = Layer.effect(
           continue
         }
 
+        const audit = yield* goalAuditor.evaluate({
+          sessionID: input.sessionID,
+          session,
+          latestWork: SessionTitle.assembleContext(yield* getContext(input.sessionID)),
+        })
         const decision = yield* goalAutomation.afterTurn({
           sessionID: input.sessionID,
           origin: cycleAutomatic ? "automatic" : "user",
           ...(cycleAutomatic ? { reservationID: cycleAutomatic.id } : {}),
           tokens: cycleTokens,
+          audit,
         })
 
         const lateSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
@@ -546,6 +554,7 @@ export const node = makeLocationNode({
     Snapshot.node,
     GoalContext.node,
     GoalAutomation.node,
+    GoalAuditor.node,
     Database.node,
     SessionTitle.node,
   ],

@@ -47,6 +47,14 @@ import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { SessionGroup } from "./group"
 import { Plugin } from "@/plugin"
 import { Goal } from "@opencode-ai/core/goal"
+import { CHAT_PROJECT_ID } from "@opencode-ai/core/project/chat"
+import {
+  chatSessionDirectoryKey,
+  chatSessionDirectoryMutex,
+  ensureChatSessionDirectory,
+  generateChatSessionDirectory,
+  removeChatSessionDirectory,
+} from "@opencode-ai/core/project/chat-directory"
 
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
@@ -589,6 +597,54 @@ const layer: Layer.Layer<
         })
       }).pipe(Effect.catchCause((cause) => Effect.logError("failed to group session", { cause })))
 
+    const publishCreated = (result: Info, chatRoot: string) => {
+      const key =
+        result.projectID === ProjectV2.ID.make(CHAT_PROJECT_ID)
+          ? chatSessionDirectoryKey(result.directory, chatRoot)
+          : undefined
+      const publish = Effect.gen(function* () {
+        // The directory may have been reclaimed immediately before a racing
+        // child/fork create acquired this lock. Recreate the empty scratch
+        // container before publishing a session that points at it.
+        if (key) yield* Effect.promise(() => ensureChatSessionDirectory(result.directory, chatRoot))
+        yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
+      })
+      return key ? chatSessionDirectoryMutex.withLock(key)(publish) : publish
+    }
+
+    const cleanupChatDirectoryIfUnused = Effect.fn("Session.cleanupChatDirectoryIfUnused")(function* (
+      target: Pick<Info, "directory" | "projectID">,
+    ) {
+      if (target.projectID !== ProjectV2.ID.make(CHAT_PROJECT_ID)) return
+      const project = yield* db
+        .select({ worktree: ProjectTable.worktree })
+        .from(ProjectTable)
+        .where(eq(ProjectTable.id, target.projectID))
+        .get()
+        .pipe(Effect.orDie)
+      if (!project) return
+      const directory = target.directory
+      const key = chatSessionDirectoryKey(directory, project.worktree)
+      if (!key) return
+      yield* chatSessionDirectoryMutex.withLock(key)(
+        Effect.gen(function* () {
+          const remaining = yield* db
+            .select({ id: SessionTable.id })
+            .from(SessionTable)
+            .where(eq(SessionTable.directory, directory))
+            .limit(1)
+            .get()
+            .pipe(Effect.orDie)
+          if (remaining) return
+          yield* Effect.promise(() => removeChatSessionDirectory(directory, project.worktree)).pipe(
+            Effect.catchCause((cause) =>
+              Effect.logWarning("failed to remove abandoned Chat session directory", { directory, cause }),
+            ),
+          )
+        }),
+      )
+    })
+
     const createNext = Effect.fn("Session.createNext")(function* (input: {
       id?: SessionID
       title?: string
@@ -625,7 +681,7 @@ const layer: Layer.Layer<
       }
       yield* Effect.logInfo("created", result)
 
-      yield* events.publish(SessionV1.Event.Created, { sessionID: result.id, info: result })
+      yield* publishCreated(result, ctx.worktree)
       // Inherit Goal focus synchronously before create() returns. TaskTool can
       // prompt a new child immediately, so deferring this alongside cosmetic
       // Session Group placement would create a real first-request context race.
@@ -734,7 +790,25 @@ const layer: Layer.Layer<
           yield* remove(child.id)
         }
 
+        // Group membership has its own cache and lifecycle events. If we let
+        // SQLite's FK cascade remove these rows implicitly, a last-member group
+        // can remain cached (and persisted as an empty shell). Explicitly detach
+        // immediately before deleting the session so the public invariant is
+        // always "a group has at least one live member".
+        const groups = Option.getOrUndefined(yield* Effect.serviceOption(SessionGroup.Service))
+        if (groups) {
+          yield* groups.detachDeletedSession(sessionID).pipe(
+            Effect.catchCause((cause) => Effect.logError("failed to detach deleted session from groups", { sessionID, cause })),
+          )
+        }
+
         yield* events.publish(SessionV1.Event.Deleted, { sessionID, info: session })
+        // Session projectors commit synchronously with durable publication, so
+        // by this point the deleted row is gone. Reclaim only managed Chat
+        // scratch directories with no surviving session references. This keeps
+        // a shared directory alive for forks/children and deletes it exactly
+        // when the final referencing session disappears.
+        yield* cleanupChatDirectoryIfUnused(session)
         yield* events.remove(sessionID)
       } catch (error) {
         yield* Effect.logError("failed to remove session", { sessionID, error })
@@ -790,10 +864,24 @@ const layer: Layer.Layer<
     }) {
       const ctx = yield* InstanceState.context
       const workspace = yield* InstanceState.workspaceID
-      return yield* createNext({
+      // Projectless chats run in an isolated scratch directory per root
+      // session. The server owns this allocation so web clients never have to
+      // guess HOME/USERPROFILE or fabricate a path that may not exist on the
+      // machine actually hosting OpenCode. Child/subagent sessions deliberately
+      // stay in their parent's current directory.
+      const directory =
+        ctx.project.id === ProjectV2.ID.make(CHAT_PROJECT_ID) && !input?.parentID
+          ? yield* Effect.promise(() => generateChatSessionDirectory(ctx.worktree))
+          : ctx.directory
+      const allocatedChatDirectory =
+        ctx.project.id === ProjectV2.ID.make(CHAT_PROJECT_ID) &&
+        chatSessionDirectoryKey(directory, ctx.worktree) !== undefined &&
+        directory !== ctx.directory
+      let completed = false
+      const created = createNext({
         parentID: input?.parentID,
-        directory: ctx.directory,
-        path: sessionPath(ctx.worktree, ctx.directory),
+        directory,
+        path: sessionPath(ctx.worktree, directory),
         title: input?.title,
         agent: input?.agent,
         model: input?.model,
@@ -801,6 +889,21 @@ const layer: Layer.Layer<
         permission: input?.permission,
         workspaceID: input?.workspaceID ?? workspace,
       })
+      if (!allocatedChatDirectory) return yield* created
+      return yield* created.pipe(
+        Effect.tap(() => Effect.sync(() => (completed = true))),
+        // If allocation succeeded but durable session creation did not, reclaim
+        // the brand-new scratch directory. cleanupChatDirectoryIfUnused also
+        // rechecks the database, so a partially committed create can never lose
+        // a directory that is already referenced by a surviving session.
+        Effect.ensuring(
+          Effect.suspend(() =>
+            completed
+              ? Effect.void
+              : cleanupChatDirectoryIfUnused({ directory, projectID: ctx.project.id }),
+          ),
+        ),
+      )
     })
 
     const fork = Effect.fn("Session.fork")(function* (input: {
@@ -889,7 +992,12 @@ const layer: Layer.Layer<
       try {
         const { SessionContextState } = yield* Effect.promise(() => import("./context/state"))
         const state = yield* (SessionContextState.getState as any)(input.sessionID).pipe(
-          Effect.catch(() => Effect.succeed(new Map())),
+          Effect.provideService(Database.Service, database),
+          // Context-state inheritance is an optional enhancement. Some minimal
+          // runtimes/tests intentionally do not provide its database service;
+          // contain both typed failures and missing-service defects here rather
+          // than allowing a fork to fail for an optional lookup.
+          Effect.catchCause(() => Effect.succeed(new Map())),
         )
         const stateMap = state as Map<string, any>
         if (stateMap.size > 0) {
@@ -929,7 +1037,8 @@ const layer: Layer.Layer<
           try {
             const { SessionContextState } = yield* Effect.promise(() => import("./context/state"))
             const ms = yield* (SessionContextState.getMessageState as any)(input.sessionID, msg.info.id).pipe(
-              Effect.catch(() => Effect.succeed(undefined)),
+              Effect.provideService(Database.Service, database),
+              Effect.catchCause(() => Effect.succeed(undefined)),
             )
             if (ms?.overrideData && !ms.excluded) {
               const od = ms.overrideData as any
@@ -960,13 +1069,16 @@ const layer: Layer.Layer<
           edge,
           kind,
           workspaceMode,
-        }).pipe(Effect.catch(() => Effect.void))
+        }).pipe(
+          Effect.provideService(Database.Service, database),
+          Effect.provideService(EventV2Bridge.Service, events),
+          Effect.catchCause(() => Effect.void),
+        )
       } catch {}
 
       // Preserve group_id lineage if sessions belong to a group — child joins same group
       if ((original as any).groupID) {
         try {
-          const { db } = yield* Database.Service
           const { SessionTable } = yield* Effect.promise(() => import("@opencode-ai/core/session/sql"))
           void SessionTable
           // Direct update: set group_id on the forked session row to match original's group

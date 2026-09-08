@@ -11,7 +11,7 @@ import { Session } from "./session"
 import { Agent } from "../agent/agent"
 import { Provider } from "@/provider/provider"
 
-import { type Tool as AITool, tool, jsonSchema } from "ai"
+import { type ModelMessage, type Tool as AITool, tool, jsonSchema } from "ai"
 import type { JSONSchema7 } from "@ai-sdk/provider"
 import { SessionCompaction } from "./compaction"
 import { SystemPrompt } from "./system"
@@ -59,11 +59,21 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionTitle } from "@opencode-ai/core/session/title"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
-import { LLMEvent } from "@opencode-ai/llm"
+import { LLMEvent, LLMResponse } from "@opencode-ai/llm"
 import { SpadSupervisor } from "./spad/supervisor"
 import { makeTurnPolicy } from "./spad/intent"
 import { GoalContext } from "@opencode-ai/core/goal/context"
 import { GoalAutomation } from "@opencode-ai/core/goal/automation"
+import { GoalAuditor } from "@opencode-ai/core/goal/auditor"
+import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { Location } from "@opencode-ai/core/location"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import {
+  generateAdaptive,
+  runTerminalCompletionWithTranscript,
+} from "@opencode-ai/core/special-agent-completion"
+import { type ToolChoiceCapabilityIdentity } from "@opencode-ai/core/tool-choice-compatibility"
+import { appendModelCompletionRepair } from "@/special-agent/model-message-bridge"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -97,6 +107,21 @@ const UNKNOWN_FINISH_CONTINUATION_PROMPT = `[AUTOMATIC CONTINUATION ΓÇö syste
 
 function goalTokenCount(tokens: SessionV1.Assistant["tokens"]) {
   return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+}
+
+function goalAuditLatestWork(messages: readonly SessionV1.WithParts[]) {
+  const blocks = messages.slice(-10).flatMap((message) => {
+    const parts = message.parts.flatMap((part) => {
+      if (part.type === "text" && !part.ignored) return [part.text]
+      if (part.type === "tool" && part.state.status === "completed")
+        return [`[tool ${part.tool}] ${part.state.title}\n${part.state.output}`]
+      if (part.type === "tool" && part.state.status === "error") return [`[tool ${part.tool} error] ${part.state.error}`]
+      return []
+    })
+    if (parts.length === 0) return []
+    return [`<${message.info.role}>\n${parts.join("\n")}\n</${message.info.role}>`]
+  })
+  return blocks.join("\n\n").slice(-18_000)
 }
 
 function mcpResourceBase64Size(value: string) {
@@ -168,6 +193,7 @@ const layer = Layer.effect(
     const question = yield* Question.Service
     const goalContext = yield* GoalContext.Service
     const goalAutomation = yield* GoalAutomation.Service
+    const locations = yield* LocationServiceMap.Service
     const database = yield* Database.Service
     const { db } = database
     // Throttle for the end-of-turn compaction.prune maintenance fork below.
@@ -250,9 +276,9 @@ const layer = Layer.effect(
     })
 
     // Shared title-generation body, used by auto-title (ensureTitle) and the V1
-    // regenerateTitle endpoint. Resolves the title model, streams the conversation,
-    // and sanitizes the result to a single line. Returns `undefined` when nothing
-    // usable is produced (empty/garbage output, no title agent, no anchor) ΓÇö the
+    // regenerateTitle endpoint. Title style comes from a user-editable policy;
+    // the host-owned protocol and generated_title tool remain authoritative.
+    // Returns `undefined` when no valid structured artifact is committed, so the
     // caller keeps the existing title untouched.
     const generateTitle = Effect.fn("SessionPrompt.generateTitle")(function* (input: {
       sessionID: SessionID
@@ -262,7 +288,8 @@ const layer = Layer.effect(
       modelID: ModelV2.ID
       model?: ModelV2.Ref
       previousTitle: string
-      prompt: string
+      prompt?: string
+      purpose: "initial" | "regenerate"
     }) {
       const firstInfo = input.firstUser.info
       if (firstInfo.role !== "user") return
@@ -271,6 +298,15 @@ const layer = Layer.effect(
 
       const ag = yield* agents.get("title")
       if (!ag) return
+      const cfg = yield* config.get()
+      const policySource = input.prompt?.trim() || cfg.title_prompt?.trim() || ag.prompt?.trim() || SessionTitle.DEFAULT_TITLE_PROMPT
+      const toolChoiceIdentity = (model: Provider.Model): ToolChoiceCapabilityIdentity => ({
+        providerID: model.providerID,
+        modelID: model.id,
+        apiNpm: model.api?.npm,
+        apiURL: model.api?.url,
+        apiID: model.api?.id,
+      })
       // Candidate cascade: explicit picker choice ΓåÆ agent.title.model ΓåÆ
       // config/plugin small model ΓåÆ session/default model. Runtime failures on
       // one candidate should not make manual retitle fail while another usable
@@ -292,11 +328,15 @@ const layer = Layer.effect(
         seen.add(key)
         return true
       })
+      const toolCandidates = uniqueCandidates.filter((item) => item.capabilities.toolcall)
       yield* Effect.logInfo("title generation candidates", {
         sessionID: input.sessionID,
-        candidates: uniqueCandidates.map((item) => `${item.providerID}/${item.id}`),
+        candidates: toolCandidates.map((item) => `${item.providerID}/${item.id}`),
+        skippedWithoutToolCalls: uniqueCandidates
+          .filter((item) => !item.capabilities.toolcall)
+          .map((item) => `${item.providerID}/${item.id}`),
       })
-      for (const mdl of uniqueCandidates) {
+      for (const mdl of toolCandidates) {
         const title = yield* Effect.gen(function* () {
           yield* Effect.logInfo("title model candidate starting", {
             sessionID: input.sessionID,
@@ -306,42 +346,112 @@ const layer = Layer.effect(
           const msgs = onlySubtasks
             ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
             : yield* MessageV2.toModelMessagesEffect(input.context, mdl)
-          const text = yield* llm
-            .stream({
-              agent: ag,
+          const policy = SessionTitle.renderLegacyPolicy(policySource, {
+            previousTitle: input.previousTitle,
+            conversation: JSON.stringify(msgs),
+          })
+          const titleAgent: Agent.Info = {
+            ...ag,
+            prompt: `${policy}\n\n${SessionTitle.PROTOCOL_PROMPT}`,
+            // The title runtime supplies exactly one host-owned terminal tool.
+            // Do not inherit the built-in title agent's wildcard tool denial or
+            // the structured completion tool would be filtered before dispatch.
+            permission: [],
+          }
+          const generatedTitleTool = tool({
+            description:
+              "Commit the final session title. This is the only valid successful completion for title generation. Supply only the title artifact; do not put explanations or reasoning in the title field.",
+            inputSchema: jsonSchema({
+              type: "object",
+              properties: { title: { type: "string" } },
+              required: ["title"],
+              additionalProperties: false,
+            }),
+          })
+          const baseMessages: ModelMessage[] = [
+            {
+              role: "user" as const,
+              content: `<title-generation-context>\n${JSON.stringify({
+                generationPurpose: input.purpose,
+                currentTitle: input.previousTitle,
+              })}\n</title-generation-context>`,
+            },
+            ...msgs,
+          ]
+          const collect = (toolChoice: "required" | "auto", messages: ReadonlyArray<ModelMessage>) =>
+            llm.stream({
+              agent: titleAgent,
               user: firstInfo,
               system: [],
               small: true,
-              tools: {},
+              tools: { [SessionTitle.GENERATED_TITLE_TOOL]: generatedTitleTool },
+              toolChoice,
               model: mdl,
               sessionID: input.sessionID,
               retries: 2,
-              // The caller resolves the task prompt (custom ΓåÆ default); the current
-              // title replaces the `{previousTitle}` token (retitle ┬º3.5).
-              messages: [
-                { role: "user", content: input.prompt.replaceAll("{previousTitle}", input.previousTitle) },
-                ...msgs,
-              ],
+              messages: [...messages],
             })
-            .pipe(
-              Stream.filter(LLMEvent.is.textDelta),
-              Stream.map((e) => e.text),
-              Stream.mkString,
-              Effect.orDie,
-            )
-          // Shared sanitize (SessionTitle): strips think/fence/quote markers,
-          // first non-empty line, capped at 60 chars.
-          const title = SessionTitle.sanitizeTitle(text)
-          if (!title) {
-            yield* Effect.logWarning("title model candidate produced no usable title", {
-              sessionID: input.sessionID,
-              providerID: mdl.providerID,
-              modelID: mdl.id,
-              outputLength: text.length,
-              outputPreview: text.slice(0, 200),
+          const collectAdaptive = Effect.fn("SessionPrompt.collectTitle")(function* (
+            messages: ReadonlyArray<ModelMessage>,
+            preferred: "required" | "auto",
+          ) {
+            const capability = toolChoiceIdentity(mdl)
+            const generated = yield* generateAdaptive({
+              identity: capability,
+              requested: preferred,
+              generate: (toolChoice) => collect(toolChoice, messages).pipe(Stream.runCollect),
+              onDowngrade: () =>
+                Effect.logInfo("title tool-choice compatibility fallback", {
+                  sessionID: input.sessionID,
+                  providerID: mdl.providerID,
+                  modelID: mdl.id,
+                  from: "required",
+                  to: "auto",
+                }),
             })
-            return
-          }
+            return { events: Array.from(generated.response), toolChoice: generated.toolChoice } as const
+          })
+          let preferred: "required" | "auto" = "required"
+          const terminal = yield* runTerminalCompletionWithTranscript<ModelMessage, string, unknown>({
+            messages: baseMessages,
+            toolName: SessionTitle.GENERATED_TITLE_TOOL,
+            agentLabel: "session title generator",
+            generate: (messages) =>
+              collectAdaptive(messages, preferred).pipe(
+                Effect.tap((attempt) => Effect.sync(() => (preferred = attempt.toolChoice))),
+                Effect.flatMap((attempt) => {
+                  const response = LLMResponse.fromEvents(attempt.events)
+                  return response
+                    ? Effect.succeed(response)
+                    : Effect.fail(new Error("Title generation ended without a terminal response"))
+                }),
+              ),
+            appendRepair: (messages, response, detail) =>
+              appendModelCompletionRepair({
+                messages,
+                response,
+                toolName: SessionTitle.GENERATED_TITLE_TOOL,
+                agentLabel: "session title generator",
+                detail,
+              }),
+            validate: (call) =>
+              Schema.decodeUnknownEffect(SessionTitle.GeneratedTitleToolInput)(call.input).pipe(
+                Effect.mapError((error) => `Invalid ${SessionTitle.GENERATED_TITLE_TOOL} payload: ${String(error)}`),
+                Effect.flatMap((decoded) => {
+                  const title = SessionTitle.sanitizeTitle(decoded.title)
+                  return title
+                    ? Effect.succeed(title)
+                    : Effect.fail("The generated title is empty or unusable after normalization")
+                }),
+              ),
+            invalid: (failure) =>
+              new Error(
+                failure.reason === "invalid-payload"
+                  ? (failure.detail ?? `Invalid ${SessionTitle.GENERATED_TITLE_TOOL} payload`)
+                  : `Title generation protocol failure (${failure.reason}): expected exactly one ${SessionTitle.GENERATED_TITLE_TOOL} tool call`,
+              ),
+          })
+          const title = terminal.artifact
           yield* Effect.logInfo("title model candidate succeeded", {
             sessionID: input.sessionID,
             providerID: mdl.providerID,
@@ -367,7 +477,10 @@ const layer = Layer.effect(
       }
       yield* Effect.logWarning("all title model candidates failed", {
         sessionID: input.sessionID,
-        candidates: uniqueCandidates.map((item) => `${item.providerID}/${item.id}`),
+        candidates: toolCandidates.map((item) => `${item.providerID}/${item.id}`),
+        skippedWithoutToolCalls: uniqueCandidates
+          .filter((item) => !item.capabilities.toolcall)
+          .map((item) => `${item.providerID}/${item.id}`),
       })
     })
 
@@ -397,7 +510,7 @@ const layer = Layer.effect(
         providerID: input.providerID,
         modelID: input.modelID,
         previousTitle: input.session.title,
-        prompt: "Generate a title for this conversation:\n",
+        purpose: "initial",
       })
       if (!t) return
       // Manual rename wins (retitle ┬º6): only write when the title is still the
@@ -458,19 +571,6 @@ const layer = Layer.effect(
       // everything newer follows chronologically, so the opening intent always
       // reaches the title model (retitle ┬º3.5).
       const context = history.slice(firstIdx)
-      const cfg = yield* config.get()
-      // Custom prompt; empty/whitespace falls back to the configured title
-      // prompt, then the shared default (retitle edge #13).
-      const taskPromptBase =
-        input.prompt !== undefined && input.prompt.trim().length > 0
-          ? input.prompt
-          : (cfg.title_prompt ?? SessionTitle.DEFAULT_TITLE_PROMPT)
-      const taskPrompt = taskPromptBase.includes("{previousTitle}")
-        ? taskPromptBase
-        : `${taskPromptBase}
-
-Current title: {previousTitle}
-Generate a fresh title. Do not reuse the current title.`
       return yield* generateTitle({
         sessionID: input.sessionID,
         firstUser,
@@ -479,7 +579,8 @@ Generate a fresh title. Do not reuse the current title.`
         modelID: baseModel.modelID,
         model: input.model,
         previousTitle: session.title,
-        prompt: taskPrompt,
+        prompt: input.prompt,
+        purpose: "regenerate",
       })
     })
 
@@ -1746,11 +1847,28 @@ Generate a fresh title. Do not reuse the current title.`
           )
           if (outcome === "goal-stop") {
             const completedReservation = goalReservation
+            const auditHistory = yield* sessions.messages({ sessionID, limit: 10 }).pipe(Effect.orDie)
+            const audit = yield* Effect.gen(function* () {
+              const goalAuditor = yield* GoalAuditor.Service
+              return yield* goalAuditor.evaluate({
+                sessionID,
+                workerModel: {
+                  providerID: ProviderV2.ID.make(model.providerID),
+                  id: ModelV2.ID.make(model.id),
+                },
+                latestWork: goalAuditLatestWork(auditHistory),
+              })
+            }).pipe(
+              Effect.provide(
+                locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) })),
+              ),
+            )
             const decision = yield* goalAutomation.afterTurn({
               sessionID,
               origin: completedReservation ? "automatic" : "user",
               ...(completedReservation ? { reservationID: completedReservation.id } : {}),
               tokens: goalCycleTokens,
+              audit,
             })
             goalReservation = undefined
             if (decision.reservation) {
@@ -2117,6 +2235,12 @@ const argsRegex = /(?:\[Image\s+\d+\]|"[^"]*"|'[^']*'|[^\s"']+)/gi
 const placeholderRegex = /\$(\d+)/g
 const quoteTrimRegex = /^["']|["']$/g
 
+const locationServiceMapNode = LayerNode.make({
+  service: LocationServiceMap.Service,
+  layer: locationServiceMapLayer,
+  deps: [],
+})
+
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
@@ -2152,6 +2276,7 @@ export const node = LayerNode.make({
     Question.node,
     GoalContext.node,
     GoalAutomation.node,
+    locationServiceMapNode,
   ],
 })
 

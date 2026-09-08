@@ -37,7 +37,19 @@ const question = Layer.succeed(
     ask: (input: QuestionV2.AskInput) =>
       Effect.sync(() => {
         captured = input
-      }).pipe(Effect.andThen(reject ? Effect.fail(new QuestionV2.RejectedError()) : Effect.succeed([["Build"], []]))),
+      }).pipe(
+        Effect.andThen(reject ? Effect.fail(new QuestionV2.RejectedError()) : Effect.succeed([["Build", "Use @src/index.ts"], []])),
+      ),
+    askDetailed: (input: QuestionV2.AskInput) =>
+      Effect.sync(() => {
+        captured = input
+      }).pipe(
+        Effect.andThen(
+          reject
+            ? Effect.fail(new QuestionV2.RejectedError())
+            : Effect.succeed({ answers: [["Build"], []], details: ["Use @src/index.ts", ""] }),
+        ),
+      ),
     reply: () => Effect.die("unused"),
     reject: () => Effect.die("unused"),
     list: () => Effect.die("unused"),
@@ -52,6 +64,21 @@ const it = testEffect(
 )
 
 describe("QuestionTool", () => {
+  it.effect("formats malformed empty calls without producing an empty sentence", () =>
+    Effect.sync(() => {
+      expect(QuestionTool.toModelOutput([], [], [])).toBe(
+        "The question tool was called without any questions. Continue without user input.",
+      )
+      expect(
+        QuestionTool.toModelOutput(
+          [{ question: 'Use "quoted" text?\nSecond line', header: "Quoted", options: [] }],
+          [[]],
+          ["yes"],
+        ),
+      ).toContain('"Use \\"quoted\\" text?\\nSecond line": details="yes"')
+    }),
+  )
+
   it.effect("omits a denied built-in question and terminally settles a stale call", () =>
     Effect.gen(function* () {
       captured = undefined
@@ -83,6 +110,8 @@ describe("QuestionTool", () => {
           question: "What should happen?",
           header: "Action",
           options: [{ label: "Build", description: "Build it" }],
+          multiple: true,
+          custom: true,
         },
         {
           question: "Which environment?",
@@ -102,14 +131,14 @@ describe("QuestionTool", () => {
         result: {
           type: "text",
           value:
-            'User has answered your questions: "What should happen?"="Build", "Which environment?"="Unanswered". You can now continue with the user\'s answers in mind.',
+            'User has answered your questions: "What should happen?": selected=["Build"] details="Use @src/index.ts", "Which environment?": Unanswered. You can now continue with the user\'s answers in mind.',
         },
         output: {
-          structured: { answers: [["Build"], []] },
+          structured: { answers: [["Build"], []], details: ["Use @src/index.ts", ""] },
           content: [
             {
               type: "text",
-              text: 'User has answered your questions: "What should happen?"="Build", "Which environment?"="Unanswered". You can now continue with the user\'s answers in mind.',
+              text: 'User has answered your questions: "What should happen?": selected=["Build"] details="Use @src/index.ts", "Which environment?": Unanswered. You can now continue with the user\'s answers in mind.',
             },
           ],
         },

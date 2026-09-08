@@ -55,16 +55,20 @@ describe("tool.question", () => {
             { label: "Red", description: "The color of passion" },
             { label: "Blue", description: "The color of sky" },
           ],
-          multiple: false,
+          multiple: true,
+          custom: true,
         },
       ]
 
       const fiber = yield* tool.execute({ questions }, ctx).pipe(Effect.forkScoped)
       const item = yield* pending(question)
-      yield* question.reply({ requestID: item.id, answers: [["Red"]] })
+      expect(item.questions[0]).toMatchObject({ multiple: true, custom: true })
+      yield* question.reply({ requestID: item.id, answers: [["Red", "Match @packages/app styling"]] })
 
       const result = yield* Fiber.join(fiber)
       expect(result.title).toBe("Asked 1 question")
+      expect(result.output).toContain('selected=["Red"] details="Match @packages/app styling"')
+      expect(result.metadata).toMatchObject({ answers: [["Red"]], details: ["Match @packages/app styling"] })
     }),
   )
 
@@ -86,7 +90,7 @@ describe("tool.question", () => {
       yield* question.reply({ requestID: item.id, answers: [["Dog"]] })
 
       const result = yield* Fiber.join(fiber)
-      expect(result.output).toContain(`"What is your favorite animal?"="Dog"`)
+      expect(result.output).toContain(`"What is your favorite animal?": selected=["Dog"]`)
     }),
   )
 

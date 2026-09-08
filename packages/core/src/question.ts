@@ -5,6 +5,9 @@ import { Context, Deferred, Effect, Layer, Schema } from "effect"
 import { Question } from "@opencode-ai/schema/question"
 import { EventV2 } from "./event"
 import { SessionSchema } from "./session/schema"
+import { flattenResolved, normalizeReply, type Resolved } from "./question-normalize"
+
+export { flattenResolved, normalizeReply, type Resolved } from "./question-normalize"
 
 export const ID = Question.ID
 export type ID = typeof ID.Type
@@ -51,10 +54,12 @@ export interface AskInput {
 export interface ReplyInput {
   readonly requestID: ID
   readonly answers: ReadonlyArray<Answer>
+  readonly details?: ReadonlyArray<string>
 }
 
 export interface Interface {
   readonly ask: (input: AskInput) => Effect.Effect<ReadonlyArray<Answer>, RejectedError>
+  readonly askDetailed: (input: AskInput) => Effect.Effect<Resolved, RejectedError>
   readonly reply: (input: ReplyInput) => Effect.Effect<void, NotFoundError>
   readonly reject: (requestID: ID) => Effect.Effect<void, NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
@@ -64,7 +69,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 
 interface Pending {
   readonly request: Request
-  readonly deferred: Deferred.Deferred<ReadonlyArray<Answer>, RejectedError>
+  readonly deferred: Deferred.Deferred<Resolved, RejectedError>
 }
 
 /**
@@ -90,11 +95,12 @@ const layer = Layer.effect(
       ),
     )
 
-    const ask = Effect.fn("QuestionV2.ask")((input: AskInput) =>
-      Effect.uninterruptibleMask((restore) =>
+    const askDetailed = Effect.fn("QuestionV2.askDetailed")((input: AskInput) => {
+      if (input.questions.length === 0) return Effect.succeed({ answers: [], details: [] } satisfies Resolved)
+      return Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
           const id = ID.ascending()
-          const deferred = yield* Deferred.make<ReadonlyArray<Answer>, RejectedError>()
+          const deferred = yield* Deferred.make<Resolved, RejectedError>()
           const request: Request = { id, ...input }
           pending.set(id, { request, deferred })
           return yield* events.publish(Event.Asked, request).pipe(
@@ -106,7 +112,11 @@ const layer = Layer.effect(
             ),
           )
         }),
-      ),
+      )
+    })
+
+    const ask = Effect.fn("QuestionV2.ask")((input: AskInput) =>
+      askDetailed(input).pipe(Effect.map(flattenResolved)),
     )
 
     const reply = Effect.fn("QuestionV2.reply")((input: ReplyInput) =>
@@ -114,12 +124,14 @@ const layer = Layer.effect(
         Effect.gen(function* () {
           const existing = pending.get(input.requestID)
           if (!existing) return yield* new NotFoundError({ requestID: input.requestID })
+          const resolved = normalizeReply(existing.request.questions, input)
           yield* events.publish(Event.Replied, {
             sessionID: existing.request.sessionID,
             requestID: existing.request.id,
-            answers: input.answers.map((answer) => [...answer]),
+            answers: flattenResolved(resolved).map((answer) => [...answer]),
+            details: [...resolved.details],
           })
-          yield* Deferred.succeed(existing.deferred, input.answers)
+          yield* Deferred.succeed(existing.deferred, resolved)
           pending.delete(input.requestID)
         }),
       ),
@@ -144,7 +156,7 @@ const layer = Layer.effect(
       return Array.from(pending.values(), (item) => item.request)
     })
 
-    return Service.of({ ask, reply, reject, list })
+    return Service.of({ ask, askDetailed, reply, reject, list })
   }),
 )
 

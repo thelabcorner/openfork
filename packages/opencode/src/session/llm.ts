@@ -50,6 +50,8 @@ export type StreamInput = {
   tools: Record<string, Tool>
   retries?: number
   toolChoice?: "auto" | "required" | "none"
+  /** Optional caller-specific cap, clamped against the provider/model maximum. */
+  maxOutputTokens?: number
 }
 
 export type StreamRequest = StreamInput & {

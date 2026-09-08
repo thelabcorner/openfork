@@ -22,12 +22,12 @@ const base = {
   header: Schema.String.annotate({ description: "Very short label (max 30 chars)" }),
   options: Schema.Array(Option).annotate({ description: "Available choices" }),
   multiple: Schema.optional(Schema.Boolean).annotate({ description: "Allow selecting multiple choices" }),
+  custom: Schema.optional(Schema.Boolean).annotate({
+    description: "Allow an optional free-form response in addition to any selected choices (default: true)",
+  }),
 }
 
-export const Info = Schema.Struct({
-  ...base,
-  custom: Schema.optional(Schema.Boolean).annotate({ description: "Allow typing a custom answer (default: true)" }),
-}).annotate({ identifier: "QuestionInfo" })
+export const Info = Schema.Struct(base).annotate({ identifier: "QuestionInfo" })
 export const Prompt = Schema.Struct(base).annotate({ identifier: "QuestionPrompt" })
 export const Tool = Schema.Struct({ messageID: SessionV1.MessageID, callID: Schema.String }).annotate({
   identifier: "QuestionTool",
@@ -41,13 +41,17 @@ export const Request = Schema.Struct({
 export const Answer = Schema.Array(Schema.String).annotate({ identifier: "QuestionAnswer" })
 export const Reply = Schema.Struct({
   answers: Schema.Array(Answer).annotate({
-    description: "User answers in order of questions (each answer is an array of selected labels)",
+    description: "Selected option labels in question order",
+  }),
+  details: Schema.optional(Schema.Array(Schema.String)).annotate({
+    description: "Optional free-form response text in question order; empty string means no details",
   }),
 }).annotate({ identifier: "QuestionReply" })
 export const Replied = Schema.Struct({
   sessionID: SessionID,
   requestID: ID,
   answers: Schema.Array(Answer),
+  details: Schema.optional(Schema.Array(Schema.String)),
 }).annotate({
   identifier: "QuestionReplied",
 })

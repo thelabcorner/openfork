@@ -1,13 +1,16 @@
-import { describe, expect } from "bun:test"
-import { Effect, Schedule } from "effect"
+import { describe, expect, test } from "bun:test"
+import { DateTime, Effect, Fiber } from "effect"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { Prompt } from "@opencode-ai/core/session/prompt"
 import { SessionMessage } from "@opencode-ai/core/session/message"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventTable } from "@opencode-ai/core/event/sql"
-import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionExecution } from "@opencode-ai/core/session/execution"
 import { eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import {
   assembleContext,
   DEFAULT_TITLE_PROMPT,
@@ -17,47 +20,75 @@ import {
   sanitizeTitle,
   SessionTitle,
 } from "@opencode-ai/core/session/title"
-import { makeHarness, catalogModel, insertSession, setTitle, textCompletion } from "./lib/session-harness"
+import {
+  makeHarness,
+  catalogModel,
+  generatedTitleCompletion,
+  generatedTitleResponse,
+  insertSession,
+  insertUserMessage,
+  setTitle,
+  textCompletion,
+  transportFailure,
+} from "./lib/session-harness"
 
 const h = makeHarness()
-const it = h.it
+const it = test
+const fx = h.it
 const sessionID = SessionV2.ID.make("ses_title_test")
+const epoch = DateTime.makeUnsafe(0)
+type RegenerateOptions = Omit<Parameters<SessionTitle.Interface["regenerate"]>[0], "session">
+
+const regenerate = (input: RegenerateOptions = {}) =>
+  Effect.gen(function* () {
+    const session = yield* SessionV2.Service
+    const title = yield* SessionTitle.Service
+    yield* title.regenerate({ session: yield* session.get(sessionID), ...input })
+  })
 
 const user = (text: string): SessionMessage.Message =>
-  SessionMessage.User.make({ id: SessionMessage.ID.create(), type: "user", text, files: [], agents: [] })
+  SessionMessage.User.make({
+    id: SessionMessage.ID.create(),
+    type: "user",
+    text,
+    files: [],
+    agents: [],
+    time: { created: epoch },
+  })
 
 const assistant = (text: string): SessionMessage.Message =>
   SessionMessage.Assistant.make({
     id: SessionMessage.ID.create(),
     type: "assistant",
     agent: "build",
-    model: { id: SessionMessage.Assistant.fields.model.fields.id.make("m"), providerID: SessionMessage.Assistant.fields.model.fields.providerID.make("p") },
+    model: {
+      id: SessionMessage.Assistant.fields.model.fields.id.make("m"),
+      providerID: SessionMessage.Assistant.fields.model.fields.providerID.make("p"),
+    },
     content: [{ type: "text", id: "t", text }],
-    time: { created: new Date(0) },
+    time: { created: epoch },
   })
 
 const waitForTitle = (expected: string, timeoutMs = 5_000) =>
   Effect.gen(function* () {
     const session = yield* SessionV2.Service
-    return yield* Effect.repeat(
-      session.get(sessionID).pipe(Effect.map((info) => info.title === expected)),
-      Schedule.recurWhile((done: boolean) => !done).pipe(
-        Schedule.compose(Schedule.spaced("10 millis")),
-        Schedule.upTo(timeoutMs),
-      ),
-    )
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if ((yield* session.get(sessionID)).title === expected) return true
+      yield* Effect.sleep("10 millis")
+    }
+    return (yield* session.get(sessionID)).title === expected
   })
 
 const waitForNoChange = (from: string, timeoutMs = 200) =>
   Effect.gen(function* () {
     const session = yield* SessionV2.Service
-    return yield* Effect.repeat(
-      session.get(sessionID).pipe(Effect.map((info) => info.title === from)),
-      Schedule.recurWhile((same: boolean) => same).pipe(
-        Schedule.compose(Schedule.spaced("10 millis")),
-        Schedule.upTo(timeoutMs),
-      ),
-    )
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      if ((yield* session.get(sessionID)).title !== from) return false
+      yield* Effect.sleep("10 millis")
+    }
+    return true
   })
 
 describe("SessionTitle.sanitizeTitle", () => {
@@ -78,7 +109,7 @@ describe("SessionTitle.sanitizeTitle", () => {
   it("caps at 60 chars with ellipsis", () => {
     const long = "a".repeat(200)
     const out = sanitizeTitle(long)
-    expect(out).toBe("a".repeat(MAX_TITLE_LENGTH - 2) + "…")
+    expect(out).toBe("a".repeat(MAX_TITLE_LENGTH - 1) + "…")
     expect(out!.length).toBe(MAX_TITLE_LENGTH)
   })
 
@@ -125,7 +156,7 @@ describe("SessionTitle.assembleContext", () => {
       callID: "c1",
       command: "ls",
       output: "file.txt",
-      time: { created: new Date(0) },
+      time: { created: epoch },
     })
     const out = assembleContext([user("hi"), assistant("hello"), shell])
     expect(out).toContain("<user>\nhi\n</user>")
@@ -135,250 +166,276 @@ describe("SessionTitle.assembleContext", () => {
 })
 
 describe("SessionTitle.DEFAULT_TITLE_PROMPT", () => {
-  it("is the verbatim task section of PROMPT_TITLE", () => {
-    expect(DEFAULT_TITLE_PROMPT.startsWith("Generate a brief title that would help the user find this conversation later.")).toBe(true)
-    expect(DEFAULT_TITLE_PROMPT).toContain("- A single line")
-    expect(DEFAULT_TITLE_PROMPT).toContain("- No explanations")
-    expect(DEFAULT_TITLE_PROMPT).not.toContain("<task>")
+  it("is policy-only and leaves completion mechanics to the host protocol", () => {
+    expect(DEFAULT_TITLE_PROMPT).toContain("retrieval-oriented titles")
+    expect(DEFAULT_TITLE_PROMPT).toContain("Use the same language")
+    expect(DEFAULT_TITLE_PROMPT).not.toContain("generated_title")
+    expect(DEFAULT_TITLE_PROMPT).not.toContain("ONLY successful completion path")
   })
 })
 
 describe("SessionTitle.regenerate", () => {
-  it("generates and applies a sanitized title, publishing the durable renamed event", () =>
-    it("applies generated title", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        const events = yield* EventV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.enqueueTitle(textCompletion(["Debugging production 500 errors"]))
-        yield* session.regenerateTitle({ sessionID })
-        expect(yield* waitForTitle("Debugging production 500 errors")).toBe(true)
-        const rows = yield* (yield* Database.Service).db
-          .select({ type: EventTable.type })
-          .from(EventTable)
-          .where(eq(EventTable.aggregate_id, sessionID))
-          .all()
-        expect(rows.some((row) => row.type === "session.next.renamed@1")).toBe(true)
-        expect(h.titleRequests.length).toBe(1)
-      })))
+  fx.live("generates and applies a sanitized title, publishing the durable renamed event", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      yield* insertUserMessage(sessionID, "first message")
+      h.enqueueTitle(generatedTitleCompletion("Debugging production 500 errors"))
+      yield* regenerate()
+      expect(yield* waitForTitle("Debugging production 500 errors")).toBe(true)
+      const rows = yield* (yield* Database.Service).db
+        .select({ type: EventTable.type })
+        .from(EventTable)
+        .where(eq(EventTable.aggregate_id, sessionID))
+        .all()
+      expect(
+        rows.some(
+          (row) => row.type === EventV2.versionedType(SessionEvent.Renamed.type, SessionEvent.Renamed.durable!.version),
+        ),
+      ).toBe(true)
+      expect(h.titleRequests.length).toBe(1)
+    }),
+  )
 
-  it("manual rename while generation is in flight wins (baseline mismatch discards)", () =>
-    it("keeps manual title", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.enqueueTitle(textCompletion(["Generated title"]))
-        yield* session.regenerateTitle({ sessionID })
-        yield* Effect.sleep("30 millis")
-        yield* setTitle(sessionID, "Manual rename")
-        expect(yield* waitForNoChange("Manual rename", 500)).toBe(true)
-        expect((yield* session.get(sessionID)).title).toBe("Manual rename")
-      })))
+  fx.live("manual rename while generation is in flight wins (baseline mismatch discards)", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* insertUserMessage(sessionID, "first message")
+      h.enqueueTitleEffect(Effect.sleep("75 millis").pipe(Effect.as(generatedTitleResponse("Generated title"))))
+      const fiber = yield* regenerate().pipe(Effect.forkScoped)
+      yield* Effect.sleep("20 millis")
+      yield* setTitle(sessionID, "Manual rename")
+      yield* Fiber.join(fiber)
+      expect(yield* waitForNoChange("Manual rename", 500)).toBe(true)
+      expect((yield* session.get(sessionID)).title).toBe("Manual rename")
+    }),
+  )
 
-  it("supersedes: a newer regenerate wins, the stale completion no-ops", () =>
-    it("applies only the latest request", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.enqueueTitle(textCompletion(["Stale title"]))
-        h.enqueueTitle(textCompletion(["Fresh title"]))
-        yield* session.regenerateTitle({ sessionID })
-        yield* session.regenerateTitle({ sessionID })
-        expect(yield* waitForTitle("Fresh title")).toBe(true)
-        expect((yield* session.get(sessionID)).title).not.toBe("Stale title")
-      })))
+  fx.live("supersedes: a newer regenerate wins, the stale completion no-ops", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* insertUserMessage(sessionID, "first message")
+      h.enqueueTitleEffect(Effect.sleep("75 millis").pipe(Effect.as(generatedTitleResponse("Stale title"))))
+      h.enqueueTitle(generatedTitleCompletion("Fresh title"))
+      const stale = yield* regenerate().pipe(Effect.forkScoped)
+      yield* Effect.sleep("20 millis")
+      yield* regenerate()
+      yield* Fiber.join(stale)
+      expect(yield* waitForTitle("Fresh title")).toBe(true)
+      expect((yield* session.get(sessionID)).title).not.toBe("Stale title")
+    }),
+  )
 
-  it("provider failure clears pending and never writes", () =>
-    it("keeps the existing title on failure", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        const baseline = (yield* session.get(sessionID)).title
-        h.failNextTitle(new (class extends Error {})("provider down"))
-        yield* session.regenerateTitle({ sessionID })
-        expect(yield* waitForNoChange(baseline, 500)).toBe(true)
-        expect((yield* session.get(sessionID)).title).toBe(baseline)
-      })))
+  fx.live("provider failure clears pending and never writes", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* insertUserMessage(sessionID, "first message")
+      const baseline = (yield* session.get(sessionID)).title
+      h.failNextTitle(transportFailure("provider down"))
+      yield* Effect.ignore(regenerate())
+      expect(yield* waitForNoChange(baseline, 500)).toBe(true)
+      expect((yield* session.get(sessionID)).title).toBe(baseline)
+    }),
+  )
 
-  it("sanitizer yielding empty is treated as failure (no write)", () =>
-    it("keeps the existing title on empty output", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        const baseline = (yield* session.get(sessionID)).title
-        h.enqueueTitle(textCompletion(["<think>only thinking</think>"]))
-        yield* session.regenerateTitle({ sessionID })
-        expect(yield* waitForNoChange(baseline, 500)).toBe(true)
-      })))
+  fx.live("sanitizer yielding empty is treated as failure (no write)", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* insertUserMessage(sessionID, "first message")
+      const baseline = (yield* session.get(sessionID)).title
+      h.enqueueTitle(generatedTitleCompletion("<think>only thinking</think>"))
+      yield* Effect.ignore(regenerate())
+      expect(yield* waitForNoChange(baseline, 500)).toBe(true)
+    }),
+  )
 
-  it("session with no real user messages no-ops without generation", () =>
-    it("does not call the LLM", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        h.enqueueTitle(textCompletion(["Should not apply"]))
-        yield* session.regenerateTitle({ sessionID })
-        expect(yield* waitForNoChange((yield* session.get(sessionID)).title, 300)).toBe(true)
-        expect(h.titleRequests.length).toBe(0)
-      })))
+  fx.live("repairs prose-only output in the same title-agent conversation", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      yield* insertUserMessage(sessionID, "first message")
+      h.enqueueTitle(textCompletion(["Looks like a title, but it is only prose"]))
+      h.enqueueTitle(generatedTitleCompletion("Recovered structured title"))
+      yield* regenerate()
+      expect(yield* waitForTitle("Recovered structured title")).toBe(true)
+      expect(h.titleRequests).toHaveLength(2)
+      const repairTranscript = JSON.stringify(h.titleRequests[1]?.messages)
+      expect(repairTranscript).toContain("Looks like a title, but it is only prose")
+      expect(repairTranscript).toContain("Protocol correction")
+      expect(repairTranscript).toContain("generated_title")
+    }),
+  )
 
-  it("custom prompt is sent and {previousTitle} replaced", () =>
-    it("uses the custom instruction", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.enqueueTitle(textCompletion(["Titled"]))
-        yield* session.regenerateTitle({ sessionID, prompt: "Title this as: {previousTitle} / custom" })
-        expect(yield* waitForTitle("Titled")).toBe(true)
-        const last = h.titleRequests.at(-1)
-        const userText = last?.messages.flatMap((m) =>
-          m.role === "user" ? m.content.map((c) => (c.type === "text" ? c.text : "")).join("") : [],
-        )
-        expect(userText?.some((t) => t.includes("Title this as: New session - "))).toBe(true)
-        expect(userText?.some((t) => t.includes("<conversation>"))).toBe(true)
-      })))
+  fx.live("session with no real user messages no-ops without generation", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      h.enqueueTitle(generatedTitleCompletion("Should not apply"))
+      yield* regenerate()
+      expect(yield* waitForNoChange((yield* session.get(sessionID)).title, 300)).toBe(true)
+      expect(h.titleRequests.length).toBe(0)
+    }),
+  )
+
+  fx.live("custom policy is system-scoped while host context and protocol remain separate", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* insertUserMessage(sessionID, "first message")
+      h.enqueueTitle(generatedTitleCompletion("Titled"))
+      yield* regenerate({ prompt: "Title this as: {previousTitle} / custom" })
+      expect(yield* waitForTitle("Titled")).toBe(true)
+      const last = h.titleRequests.at(-1)
+      const system = JSON.stringify(last?.system)
+      const messages = JSON.stringify(last?.messages)
+      expect(system).toContain("Title this as: New session - ")
+      expect(system).toContain("title-generation-protocol")
+      expect(system).toContain("generated_title")
+      expect(messages).toContain("title-generation-context")
+      expect(messages).toContain("conversation")
+      expect(last?.tools.map((item) => item.name)).toEqual(["generated_title"])
+      expect(last?.toolChoice).toMatchObject({ type: "required" })
+    }),
+  )
 })
 
 describe("SessionTitle model cascade", () => {
-  it("uses the session model fallback when nothing more specific resolves", () =>
-    it("requests the session model", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.enqueueTitle(textCompletion(["Title"]))
-        yield* session.regenerateTitle({ sessionID })
-        expect(yield* waitForTitle("Title")).toBe(true)
-        expect(h.titleRequests.at(-1)?.model.id).toBe("fake-model")
-      })))
+  fx.live("uses the session model fallback when nothing more specific resolves", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* insertUserMessage(sessionID, "first message")
+      h.enqueueTitle(generatedTitleCompletion("Title"))
+      yield* regenerate()
+      expect(yield* waitForTitle("Title")).toBe(true)
+      expect(h.titleRequests.at(-1)?.model.id).toBe("fake-model")
+    }),
+  )
 
-  it("resolves config small_model through the catalog", () =>
-    it("prefers small_model over the session model", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.addCatalogModel(catalogModel("fake", "small-v1"))
-        h.setConfig({ small_model: "fake/small-v1" })
-        h.enqueueTitle(textCompletion(["Title"]))
-        yield* session.regenerateTitle({ sessionID })
-        expect(yield* waitForTitle("Title")).toBe(true)
-        expect(h.titleRequests.at(-1)?.model.id).toBe("small-v1")
-      })))
+  fx.live("resolves config small_model through the catalog", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* insertUserMessage(sessionID, "first message")
+      h.addCatalogModel(catalogModel("fake", "small-v1"))
+      h.setConfig({ small_model: "fake/small-v1" })
+      h.enqueueTitle(generatedTitleCompletion("Title"))
+      yield* regenerate()
+      expect(yield* waitForTitle("Title")).toBe(true)
+      expect(h.titleRequests.at(-1)?.model.id).toBe("small-v1")
+    }),
+  )
 
-  it("resolves an explicit request model through the catalog", () =>
-    it("prefers the request model", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.addCatalogModel(catalogModel("fake", "picker-v1"))
-        h.enqueueTitle(textCompletion(["Title"]))
-        yield* session.regenerateTitle({
-          sessionID,
-          model: { providerID: "fake", id: "picker-v1" },
-        })
-        expect(yield* waitForTitle("Title")).toBe(true)
-        expect(h.titleRequests.at(-1)?.model.id).toBe("picker-v1")
-      })))
+  fx.live("resolves an explicit request model through the catalog", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      yield* insertUserMessage(sessionID, "first message")
+      h.addCatalogModel(catalogModel("fake", "picker-v1"))
+      h.enqueueTitle(generatedTitleCompletion("Title"))
+      yield* regenerate({
+        model: ModelV2.Ref.make({
+          providerID: ProviderV2.ID.make("fake"),
+          id: ModelV2.ID.make("picker-v1"),
+        }),
+      })
+      expect(yield* waitForTitle("Title")).toBe(true)
+      expect(h.titleRequests.at(-1)?.model.id).toBe("picker-v1")
+    }),
+  )
 
-  it("falls back to catalog.model.small for the session provider", () =>
-    it("uses catalog small", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.addCatalogModel(catalogModel("fake", "catalog-small"))
-        h.setCatalogSmall("fake", catalogModel("fake", "catalog-small"))
-        h.enqueueTitle(textCompletion(["Title"]))
-        yield* session.regenerateTitle({ sessionID })
-        expect(yield* waitForTitle("Title")).toBe(true)
-        expect(h.titleRequests.at(-1)?.model.id).toBe("catalog-small")
-      })))
+  fx.live("falls back to catalog.model.small for the session provider", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID, { model: { providerID: "fake", id: "fake-model" } })
+      const session = yield* SessionV2.Service
+      yield* insertUserMessage(sessionID, "first message")
+      h.addCatalogModel(catalogModel("fake", "catalog-small"))
+      h.setCatalogSmall("fake", catalogModel("fake", "catalog-small"))
+      h.enqueueTitle(generatedTitleCompletion("Title"))
+      yield* regenerate()
+      expect(yield* waitForTitle("Title")).toBe(true)
+      expect(h.titleRequests.at(-1)?.model.id).toBe("catalog-small")
+    }),
+  )
 
-  it("config title_prompt is used when no request prompt is given", () =>
-    it("uses the configured prompt", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.setConfig({ title_prompt: "Configured title instruction" })
-        h.enqueueTitle(textCompletion(["Title"]))
-        yield* session.regenerateTitle({ sessionID })
-        expect(yield* waitForTitle("Title")).toBe(true)
-        const userText = h.titleRequests
-          .at(-1)
-          ?.messages.flatMap((m) => (m.role === "user" ? m.content.map((c) => (c.type === "text" ? c.text : "")) : []))
-        expect(userText?.some((t) => t.startsWith("Configured title instruction"))).toBe(true)
-      })))
+  fx.live("config title_prompt is used when no request prompt is given", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* insertUserMessage(sessionID, "first message")
+      h.setConfig({ title_prompt: "Configured title instruction" })
+      h.enqueueTitle(generatedTitleCompletion("Title"))
+      yield* regenerate()
+      expect(yield* waitForTitle("Title")).toBe(true)
+      const request = h.titleRequests.at(-1)
+      expect(JSON.stringify(request?.system)).toContain("Configured title instruction")
+      expect(JSON.stringify(request?.messages)).not.toContain("Configured title instruction")
+    }),
+  )
 })
 
 describe("SessionTitle.autoTitle", () => {
   const drainOnce = () =>
     Effect.gen(function* () {
-      const execution = yield* import("@opencode-ai/core/session/execution").then((m) => m.SessionExecution.Service)
+      const execution = yield* SessionExecution.Service
       return yield* execution.resume(sessionID)
     })
 
-  it("auto-titles a default-titled session after exactly one real user message drains", () =>
-    it("applies the generated title", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.enqueueCompletion(textCompletion(["Answer"]))
-        h.enqueueTitle(textCompletion(["Auto title applied"]))
-        yield* drainOnce()
-        expect(yield* waitForTitle("Auto title applied")).toBe(true)
-      })))
+  fx.live("auto-titles a default-titled session after exactly one real user message drains", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
+      h.enqueueCompletion(textCompletion(["Answer"]))
+      h.enqueueTitle(generatedTitleCompletion("Auto title applied"))
+      yield* drainOnce()
+      expect(yield* waitForTitle("Auto title applied")).toBe(true)
+    }),
+  )
 
-  it("never overwrites a custom title", () =>
-    it("keeps the custom title", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* setTitle(sessionID, "Custom title")
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
-        h.enqueueCompletion(textCompletion(["Answer"]))
-        h.enqueueTitle(textCompletion(["Auto title applied"]))
-        yield* drainOnce()
-        expect(yield* waitForNoChange("Custom title", 300)).toBe(true)
-        expect(h.titleRequests.length).toBe(0)
-      })))
+  fx.live("never overwrites a custom title", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* setTitle(sessionID, "Custom title")
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first message" }), resume: false })
+      h.enqueueCompletion(textCompletion(["Answer"]))
+      h.enqueueTitle(generatedTitleCompletion("Auto title applied"))
+      yield* drainOnce()
+      expect(yield* waitForNoChange("Custom title", 300)).toBe(true)
+      expect(h.titleRequests.length).toBe(0)
+    }),
+  )
 
-  it("skips sessions with more than one real user message", () =>
-    it("does not auto-title multi-message sessions", () =>
-      Effect.gen(function* () {
-        yield* h.reset()
-        yield* insertSession(sessionID)
-        const session = yield* SessionV2.Service
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first" }), resume: false })
-        yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "second" }), resume: false })
-        h.enqueueCompletion(textCompletion(["Answer"]))
-        h.enqueueCompletion(textCompletion(["Answer 2"]))
-        h.enqueueTitle(textCompletion(["Should not apply"]))
-        yield* drainOnce()
-        expect(yield* waitForNoChange((yield* session.get(sessionID)).title, 300)).toBe(true)
-        expect(h.titleRequests.length).toBe(0)
-      })))
+  fx.live("skips sessions with more than one real user message", () =>
+    Effect.gen(function* () {
+      h.reset()
+      yield* insertSession(sessionID)
+      const session = yield* SessionV2.Service
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "first" }), resume: false })
+      yield* session.prompt({ sessionID, prompt: Prompt.make({ text: "second" }), resume: false })
+      h.enqueueCompletion(textCompletion(["Answer"]))
+      h.enqueueCompletion(textCompletion(["Answer 2"]))
+      h.enqueueTitle(generatedTitleCompletion("Should not apply"))
+      yield* drainOnce()
+      expect(yield* waitForNoChange((yield* session.get(sessionID)).title, 300)).toBe(true)
+      expect(h.titleRequests.length).toBe(0)
+    }),
+  )
 })

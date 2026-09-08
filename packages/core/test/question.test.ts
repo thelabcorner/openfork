@@ -34,6 +34,61 @@ const waitForAsk = Effect.fn("QuestionV2Test.waitForAsk")(function* (
 })
 
 describe("QuestionV2", () => {
+  it.effect("resolves an empty ask immediately without publishing a pending request", () =>
+    Effect.gen(function* () {
+      const service = yield* QuestionV2.Service
+      const events = yield* EventV2.Service
+      const published: EventV2.Payload[] = []
+      const unsubscribe = yield* events.listen((event) =>
+        Effect.sync(() => {
+          if (event.type === QuestionV2.Event.Asked.type) published.push(event)
+        }),
+      )
+      yield* Effect.addFinalizer(() => unsubscribe)
+
+      expect(yield* service.askDetailed({ sessionID, questions: [] })).toEqual({ answers: [], details: [] })
+      expect(yield* service.ask({ sessionID, questions: [] })).toEqual([])
+      expect(yield* service.list()).toEqual([])
+      expect(published).toEqual([])
+    }),
+  )
+
+  it.effect("normalizes selections and preserves explicit details without label collisions", () =>
+    Effect.sync(() => {
+      expect(
+        QuestionV2.normalizeReply(
+          [
+            {
+              question: "Choose one",
+              header: "Choice",
+              options: [
+                { label: "One", description: "First" },
+                { label: "Two", description: "Second" },
+              ],
+              multiple: false,
+              custom: true,
+            },
+          ],
+          { answers: [["Two", "One", "Two", "legacy detail"]], details: ["One"] },
+        ),
+      ).toEqual({ answers: [["Two"]], details: ["legacy detail\nOne"] })
+
+      expect(
+        QuestionV2.normalizeReply(
+          [{ question: "Strict", header: "Strict", options: [{ label: "Yes", description: "Yes" }], custom: false }],
+          { answers: [["Yes", "ignored"]], details: ["also ignored"] },
+        ),
+      ).toEqual({ answers: [["Yes"]], details: [""] })
+
+      expect(
+        QuestionV2.normalizeReply(
+          [{ question: "Malformed", header: "Fallback", options: [], custom: false }],
+          { answers: [[]], details: ["Still answerable"] },
+        ),
+      ).toEqual({ answers: [[]], details: ["Still answerable"] })
+    }),
+  )
+
   it.effect("publishes lifecycle events and settles a pending reply", () =>
     Effect.gen(function* () {
       const service = yield* QuestionV2.Service
@@ -55,7 +110,7 @@ describe("QuestionV2", () => {
       expect(yield* service.list()).toEqual([])
       expect(published.map((event) => [event.type, event.data])).toEqual([
         [QuestionV2.Event.Asked.type, request],
-        [QuestionV2.Event.Replied.type, { sessionID, requestID: request.id, answers: [["One"]] }],
+        [QuestionV2.Event.Replied.type, { sessionID, requestID: request.id, answers: [["One"]], details: [""] }],
       ])
     }),
   )
