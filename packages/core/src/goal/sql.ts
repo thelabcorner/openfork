@@ -24,6 +24,7 @@ export const GoalTable = sqliteTable(
       .$type<Goal.ContinuationPolicy>()
       .notNull()
       .default({ mode: "manual" }),
+    auditor_policy: text({ mode: "json" }).$type<Goal.AuditorPolicy>().notNull().default({}),
     blocker: text(),
     time_created: integer()
       .notNull()
@@ -126,11 +127,15 @@ export const GoalAutomationTable = sqliteTable(
     started_at: integer().notNull(),
     consecutive_turns: integer().notNull().default(0),
     no_progress_turns: integer().notNull().default(0),
+    auditor_blocked_streak: integer().notNull().default(0),
     consumed_tokens: integer().notNull().default(0),
+    last_auditor_decision: text().$type<Goal.AuditorDecision>(),
+    last_auditor_rationale: text(),
     previous_revision: integer(),
     reservation_id: text(),
     reservation_owner: text(),
     reservation_created_at: integer(),
+    continuation_prompt: text(),
     time_updated: integer()
       .notNull()
       .$default(() => Date.now()),

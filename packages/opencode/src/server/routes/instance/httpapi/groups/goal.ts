@@ -43,6 +43,7 @@ export const CreatePayload = Schema.Struct({
   criteria: Schema.optionalKey(Schema.Array(Schema.String)),
   steps: Schema.optionalKey(Schema.Array(StepDraft)),
   continuationPolicy: Schema.optionalKey(Goal.ContinuationPolicy),
+  auditorPolicy: Schema.optionalKey(Goal.AuditorPolicy),
 })
 
 export const UpdatePayload = Schema.Struct({
@@ -53,6 +54,7 @@ export const UpdatePayload = Schema.Struct({
   criteria: Schema.optionalKey(Schema.Array(Schema.String)),
   steps: Schema.optionalKey(Schema.Array(StepDraft)),
   continuationPolicy: Schema.optionalKey(Goal.ContinuationPolicy),
+  auditorPolicy: Schema.optionalKey(Goal.AuditorPolicy),
 })
 
 export const TransitionPayload = Schema.Struct({

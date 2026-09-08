@@ -1,10 +1,50 @@
-import type { GoalAuditEvent, GoalDetail, GoalEvidence, GoalFocus, GoalInfo } from "@opencode-ai/sdk/v2/client"
+import type {
+  GoalAuditEvent,
+  GoalAuditorPolicy,
+  GoalDetail,
+  GoalEvidence,
+  GoalFocus,
+  GoalInfo,
+} from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useServerSDK } from "./server-sdk"
 
 export type FocusedGoal = { focus: GoalFocus; detail: GoalDetail }
+
+function isFocusedGoal(value: unknown): value is FocusedGoal {
+  if (!value || typeof value !== "object") return false
+  const candidate = value as { focus?: unknown; detail?: { goal?: { id?: unknown; status?: unknown } } }
+  return (
+    !!candidate.focus &&
+    typeof candidate.detail?.goal?.id === "string" &&
+    typeof candidate.detail?.goal?.status === "string"
+  )
+}
+export type GoalArmIntent = {
+  /** Quick Goal Mode intentionally auto-continues by default. */
+  mode: "auto_continue" | "unattended"
+}
+
+export type GoalCreateAndFocusInput = {
+  projectID: string
+  workspaceID?: string
+  title: string
+  objective: string
+  criteria: string[]
+  constraints?: string[]
+  steps?: Array<{ title: string; description?: string }>
+  continuationPolicy?: { mode: "manual" | "auto_continue" | "unattended" }
+  auditorPolicy?: GoalAuditorPolicy
+  start?: boolean
+}
+
+export function goalArmKey(input: { sessionID?: string; draftID?: string; directory: string }) {
+  if (input.sessionID) return `session:${input.sessionID}`
+  if (input.draftID) return `draft:${input.draftID}`
+  return `draft-directory:${input.directory}`
+}
 
 type ExpandedGoal = {
   evidence?: GoalEvidence[]
@@ -19,6 +59,8 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
     const [state, setState] = createStore({
       focused: {} as Record<string, FocusedGoal | null | undefined>,
       expanded: {} as Record<string, ExpandedGoal | undefined>,
+      // Transient composer intent only. Durable Goal state starts after send.
+      armed: {} as Record<string, GoalArmIntent | undefined>,
     })
     const focusedInflight = new Map<string, Promise<void>>()
     const goalInflight = new Map<string, Promise<void>>()
@@ -32,7 +74,7 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
       const promise = sdk()
         .focused({ sessionID }, { throwOnError: true })
         .then((response) => {
-          setState("focused", sessionID, (response.data ?? null) as FocusedGoal | null)
+          setState("focused", sessionID, isFocusedGoal(response.data) ? response.data : null)
         })
         .catch(() => {
           // Older servers or a transient route failure should make Goal Mode
@@ -124,7 +166,98 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
       return value
     }
 
+    const createAndFocus = async (sessionID: string, input: GoalCreateAndFocusInput) => {
+      const { start = true, ...payload } = input
+      const created = await sdk().create(payload, { throwOnError: true })
+      if (!created.data) throw new Error("Goal create returned no data")
+      let detail = created.data
+      await sdk().focus({ sessionID, goalID: detail.goal.id, role: "owner" }, { throwOnError: true })
+      setState("focused", sessionID, {
+        focus: { sessionID, goalID: detail.goal.id, role: "owner", focusedAt: Date.now() },
+        detail,
+      })
+      if (start) {
+        if (detail.criteria.length === 0) throw new Error("Add at least one acceptance criterion before starting this Goal")
+        const started = await sdk().transition(
+          { goalID: detail.goal.id, expectedRevision: detail.goal.revision, action: "start" },
+          { throwOnError: true },
+        )
+        if (started.data) {
+          detail = started.data
+          setState("focused", sessionID, "detail", detail)
+        }
+      }
+      return detail
+    }
+
+    const quickTitle = (objective: string) => {
+      const line = objective.split(/\r?\n/, 1)[0]?.trim() ?? ""
+      if (!line) return "Goal"
+      return line.length <= 72 ? line : `${line.slice(0, 69).trimEnd()}…`
+    }
+
+    const quickStart = async (
+      sessionID: string,
+      input: {
+        projectID: string
+        workspaceID?: string
+        objective: string
+        mode?: GoalArmIntent["mode"]
+      },
+    ) => {
+      let current = state.focused[sessionID]
+      if (current === undefined) {
+        await refreshFocused(sessionID)
+        current = state.focused[sessionID]
+      }
+      if (current) {
+        // Prompt delivery may be retried after Goal creation succeeded. Treat
+        // the same active objective as an idempotent prepare, never duplicate
+        // the Goal simply because transport failed later in the send path.
+        if (
+          !["completed", "cancelled", "failed"].includes(current.detail.goal.status) &&
+          current.detail.goal.objective === input.objective
+        ) {
+          return current.detail
+        }
+        throw new Error("This Session already has a focused Goal")
+      }
+
+      return createAndFocus(sessionID, {
+        projectID: input.projectID,
+        workspaceID: input.workspaceID,
+        title: quickTitle(input.objective),
+        objective: input.objective,
+        // Quick mode stays zero-friction while retaining the same evidence gate
+        // as structured Goals. The agent/verifier must still attach concrete
+        // proof before this criterion can pass.
+        criteria: ["The Goal objective is fully satisfied and the result is verified."],
+        continuationPolicy: { mode: input.mode ?? "auto_continue" },
+        start: true,
+      })
+    }
+
     return {
+      arm(key: string) {
+        return state.armed[key]
+      },
+      setArm(key: string, intent: GoalArmIntent | undefined) {
+        setState("armed", key, intent)
+      },
+      toggleArm(key: string, mode: GoalArmIntent["mode"] = "auto_continue") {
+        const next = state.armed[key] ? undefined : ({ mode } satisfies GoalArmIntent)
+        setState("armed", key, next)
+        return next
+      },
+      consumeArm(key: string) {
+        const current = state.armed[key]
+        if (current) setState("armed", key, undefined)
+        return current
+      },
+      restoreArm(key: string, intent: GoalArmIntent | undefined) {
+        if (!intent) return
+        setState("armed", key, intent)
+      },
       focused,
       refreshFocused,
       refreshGoal,
@@ -144,36 +277,44 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
         criteria: string[]
         constraints?: string[]
         continuationPolicy?: { mode: "manual" | "auto_continue" | "unattended" }
+        auditorPolicy?: GoalAuditorPolicy
       }) {
         const response = await sdk().create(input, { throwOnError: true })
         if (!response.data) throw new Error("Goal create returned no data")
         return response.data
       },
-      async createAndFocus(
+      createAndFocus,
+      quickStart,
+      async updateDraft(
         sessionID: string,
         input: {
-          projectID: string
-          workspaceID?: string
           title: string
           objective: string
           criteria: string[]
           constraints?: string[]
-          continuationPolicy?: { mode: "manual" | "auto_continue" | "unattended" }
+          steps?: Array<{ title: string; description?: string }>
+          auditorPolicy?: GoalAuditorPolicy
         },
       ) {
-        const created = await sdk().create(input, { throwOnError: true })
-        if (!created.data) throw new Error("Goal create returned no data")
-        let detail = created.data
-        if (detail.criteria.length > 0) {
-          const started = await sdk().transition(
-            { goalID: detail.goal.id, expectedRevision: detail.goal.revision, action: "start" },
-            { throwOnError: true },
-          )
-          if (started.data) detail = started.data
-        }
-        await sdk().focus({ sessionID, goalID: detail.goal.id, role: "owner" }, { throwOnError: true })
-        setState("focused", sessionID, { focus: { sessionID, goalID: detail.goal.id, role: "owner", focusedAt: Date.now() }, detail })
-        return detail
+        const current = state.focused[sessionID]
+        if (!current) throw new Error("No focused Goal")
+        if (current.detail.goal.status !== "draft") throw new Error("Only draft Goals can edit setup")
+        const response = await sdk().update(
+          {
+            goalID: current.detail.goal.id,
+            expectedRevision: current.detail.goal.revision,
+            title: input.title,
+            objective: input.objective,
+            criteria: input.criteria,
+            constraints: input.constraints,
+            steps: input.steps,
+            auditorPolicy: input.auditorPolicy,
+          },
+          { throwOnError: true },
+        )
+        if (!response.data) throw new Error("Goal update returned no data")
+        setState("focused", sessionID, "detail", response.data)
+        return response.data
       },
       async focus(sessionID: string, goalID: string, role: "owner" | "worker" | "verifier" = "owner") {
         await sdk().focus({ sessionID, goalID, role }, { throwOnError: true })
@@ -222,6 +363,40 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
           { throwOnError: true },
         )
         if (response.data) setState("focused", sessionID, "detail", response.data)
+        return response.data
+      },
+      async setAuditorModel(sessionID: string, model: { providerID: string; modelID: string } | undefined) {
+        const current = state.focused[sessionID]
+        if (!current) throw new Error("No focused Goal")
+        const response = await sdk().update(
+          {
+            goalID: current.detail.goal.id,
+            expectedRevision: current.detail.goal.revision,
+            auditorPolicy: {
+              ...current.detail.goal.auditorPolicy,
+              model: model ? { providerID: model.providerID, id: model.modelID } : undefined,
+            },
+          },
+          { throwOnError: true },
+        )
+        if (!response.data) throw new Error("Goal auditor update returned no data")
+        setState("focused", sessionID, "detail", response.data)
+        return response.data
+      },
+      async updateCriterion(sessionID: string, criterionID: string, status: "pending" | "passed" | "failed") {
+        const current = state.focused[sessionID]
+        if (!current) throw new Error("No focused Goal")
+        const response = await sdk().criterion(
+          {
+            goalID: current.detail.goal.id,
+            criterionID,
+            expectedRevision: current.detail.goal.revision,
+            status,
+          },
+          { throwOnError: true },
+        )
+        if (!response.data) throw new Error("Criterion update returned no data")
+        setState("focused", sessionID, "detail", response.data)
         return response.data
       },
     }

@@ -19,11 +19,17 @@ const detail = {
     status: "active",
     revision: 7,
     continuationPolicy: { mode: "auto_continue", maxConsecutiveTurns: 8, maxNoProgressTurns: 2 },
+    auditorPolicy: {},
     time: { created: now - 2_730_000, updated: now - 14_000 },
   },
   criteria: [
     { id: "criterion_1", position: 0, description: "Autonomous turns survive process recovery", status: "passed" },
-    { id: "criterion_2", position: 1, description: "The composer remains stable while Goal Mode is active", status: "pending" },
+    {
+      id: "criterion_2",
+      position: 1,
+      description: "The composer remains stable while Goal Mode is active",
+      status: "pending",
+    },
     { id: "criterion_3", position: 2, description: "Delegated workers inherit Goal context", status: "passed" },
   ],
   steps: [
@@ -87,7 +93,29 @@ async function mockGoals(page: Page) {
   await page.route(`**/goal/${goalID}/audit`, (route) =>
     json(route, [
       { id: "audit_1", goalID, seq: 1, type: "created", actor: "user", payload: {}, createdAt: now - 2_730_000 },
-      { id: "audit_2", goalID, seq: 2, type: "transitioned", actor: "user", payload: { to: "active" }, createdAt: now - 2_700_000 },
+      {
+        id: "audit_2",
+        goalID,
+        seq: 2,
+        type: "transitioned",
+        actor: "user",
+        payload: { to: "active" },
+        createdAt: now - 2_700_000,
+      },
+      {
+        id: "audit_3",
+        goalID,
+        seq: 3,
+        type: "audited",
+        actor: "auditor",
+        payload: {
+          decision: "continue",
+          rationale: "One acceptance criterion remains pending.",
+          progressMade: true,
+          continuationPrompt: "Finish the remaining shelf stability criterion and capture verification evidence.",
+        },
+        createdAt: now - 10_000,
+      },
     ]),
   )
   await page.route(`**/goal/${goalID}/focus`, (route) =>
@@ -164,6 +192,11 @@ test("renders Goal Mode as a stable premium shelf above PromptInputV2", async ({
   await expect(popover).toContainText("Autonomous turns survive process recovery")
   await expect(popover).toContainText("Verify premium shelf UX")
   await expect(popover).toContainText("Auto")
+  await expect(popover).toContainText("Auditor")
+  await expect(popover).toContainText("Inherit worker model")
+  await expect(popover).toContainText("One acceptance criterion remains pending.")
+  await expect(popover).toContainText("Next cycle")
+  await expect(popover).toContainText("Finish the remaining shelf stability criterion and capture verification evidence.")
   await expect(popover).toContainText("ses_goal_worker")
   await expect(popover.getByRole("button", { name: "Manual" })).not.toBeFocused()
 
@@ -179,4 +212,133 @@ test("renders Goal Mode as a stable premium shelf above PromptInputV2", async ({
   expect(popoverBox.width).toBeLessThanOrEqual(420)
   expect(popoverBox.y + popoverBox.height).toBeLessThanOrEqual(shelfBox.y)
   await page.screenshot({ path: testInfo.outputPath("goal-popover-dark.png") })
+})
+
+test("places the inactive Goal entrypoint between add and agent as an icon-only control", async ({ page }) => {
+  const models = Object.fromEntries(
+    Array.from({ length: 24 }, (_, index) => {
+      const id = `goal-auditor-${index + 1}`
+      return [
+        id,
+        {
+          id,
+          name: `Goal Auditor ${index + 1}`,
+          cost: { input: 1, output: 2, cache: { read: 0.1, write: 1.25 } },
+          limit: { context: 200_000 },
+        },
+      ]
+    }),
+  )
+  await mockOpenCodeServer(page, {
+    directory,
+    project: {
+      id: projectID,
+      worktree: directory,
+      vcs: "git",
+      name: "goal-composer-launcher",
+      time: { created: now - 3_000_000, updated: now },
+      sandboxes: [],
+    },
+    provider: {
+      all: [{ id: "opencode", name: "OpenCode", models }],
+      connected: ["opencode"],
+      default: { providerID: "opencode", modelID: "goal-auditor-1" },
+    },
+    sessions: [
+      {
+        id: sessionID,
+        slug: "goal-composer-launcher",
+        projectID,
+        directory,
+        title: "Goal launcher placement verification",
+        version: "dev",
+        time: { created: now - 3_000_000, updated: now },
+      },
+    ],
+    pageMessages: () => ({ items: [] }),
+  })
+  await page.route(`**/session/${sessionID}/goal`, (route) => json(route, null))
+  await page.addInitScript(() => {
+    localStorage.setItem("settings.v3", JSON.stringify({ general: { newLayoutDesigns: true } }))
+    localStorage.setItem("opencode-theme-id", "oc-2")
+    localStorage.setItem("opencode-color-scheme", "dark")
+  })
+
+  await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+  const composer = page.locator('[data-component="prompt-input-v2"]')
+  await expectAppVisible(composer)
+
+  const add = composer.getByRole("button", { name: "Add images and files" })
+  const launcher = composer.getByRole("button", { name: "Goal", exact: true })
+  const menu = composer.getByRole("button", { name: "Goal setup" })
+  const agent = composer.getByRole("button", { name: "Choose agent" })
+  await expect(launcher).toBeVisible()
+  await expect(menu).toBeVisible()
+  await expect(launcher).toHaveText("")
+  await expect(menu).toHaveText("")
+  await expect(page.locator('[data-component="goal-composer-shelf"]')).toHaveCount(0)
+
+  const [addBox, launcherBox, menuBox, agentBox] = await Promise.all([
+    add.boundingBox(),
+    launcher.boundingBox(),
+    menu.boundingBox(),
+    agent.boundingBox(),
+  ])
+  if (!addBox || !launcherBox || !menuBox || !agentBox) throw new Error("Composer control bounds unavailable")
+  expect(Math.round(launcherBox.width)).toBe(Math.round(addBox.width))
+  expect(Math.round(launcherBox.height)).toBe(Math.round(addBox.height))
+  expect(addBox.x + addBox.width).toBeLessThanOrEqual(launcherBox.x)
+  expect(launcherBox.x + launcherBox.width).toBeLessThanOrEqual(menuBox.x)
+  expect(menuBox.x + menuBox.width).toBeLessThanOrEqual(agentBox.x)
+
+  await launcher.click()
+  await expect(launcher).toHaveAttribute("aria-pressed", "true")
+  await expect(launcher).toHaveAttribute("data-goal-armed", "true")
+  await expect(page.locator('[data-component="popover-content"]').filter({ hasText: "Goal Mode" })).toHaveCount(0)
+
+  await launcher.click()
+  await expect(launcher).toHaveAttribute("aria-pressed", "false")
+
+  // Reproduce the effective layout width/height seen under high desktop zoom.
+  // Goal creation must remain a bounded surface with an internal scroll region,
+  // rather than clipping fields/footer or pushing content outside the viewport.
+  await page.setViewportSize({ width: 460, height: 440 })
+  await menu.click()
+  const chooser = page.locator('[data-component="popover-content"]').filter({ hasText: "Goal Mode" })
+  await expect(chooser).toBeVisible()
+
+  // Its nested model selector used to be forced downward from a near-bottom
+  // trigger, rendering a large catalog below the viewport.
+  await chooser.getByRole("button", { name: "New Goal" }).click()
+  const creation = page.locator("[data-goal-create-surface]")
+  await expect(creation).toBeVisible()
+  const creationBox = await creation.boundingBox()
+  if (!creationBox) throw new Error("Goal creation popover bounds unavailable")
+  const compactViewport = page.viewportSize()
+  if (!compactViewport) throw new Error("Compact viewport unavailable")
+  expect(creationBox.x).toBeGreaterThanOrEqual(8)
+  expect(creationBox.y).toBeGreaterThanOrEqual(8)
+  expect(creationBox.x + creationBox.width).toBeLessThanOrEqual(compactViewport.width - 8)
+  expect(creationBox.y + creationBox.height).toBeLessThanOrEqual(compactViewport.height - 8)
+  expect(await creation.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
+  const createScroll = creation.locator("[data-goal-create-scroll]")
+  await expect(createScroll).toBeVisible()
+  expect(await createScroll.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
+  const objectivePlaceholder = creation.getByPlaceholder("What should OpenCode accomplish?")
+  await expect(objectivePlaceholder).toBeVisible()
+  expect(
+    await objectivePlaceholder.evaluate((element) => Number.parseFloat(getComputedStyle(element, "::placeholder").opacity)),
+  ).toBeLessThanOrEqual(0.4)
+
+  const auditor = page.locator('[data-action="goal-create-auditor-model"]')
+  await expect(auditor).toBeVisible()
+  await auditor.click()
+  const modelMenu = page.locator('[data-component="menu-v2-content"]').filter({ hasText: "Goal Auditor 1" }).first()
+  await expect(modelMenu).toBeVisible()
+  const modelMenuBox = await modelMenu.boundingBox()
+  if (!modelMenuBox) throw new Error("Goal auditor model menu bounds unavailable")
+  expect(modelMenuBox.x).toBeGreaterThanOrEqual(8)
+  expect(modelMenuBox.y).toBeGreaterThanOrEqual(8)
+  expect(modelMenuBox.x + modelMenuBox.width).toBeLessThanOrEqual(compactViewport.width - 8)
+  expect(modelMenuBox.y + modelMenuBox.height).toBeLessThanOrEqual(compactViewport.height - 8)
 })

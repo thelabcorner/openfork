@@ -6,6 +6,7 @@ import { GoalID } from "./goal-id"
 import { ProjectID } from "./project-id"
 import { SessionID } from "./session-id"
 import { WorkspaceID } from "./workspace-id"
+import { Model } from "./model"
 import { DateTimeUtcFromMillis, optional, statics } from "./schema"
 import { descending } from "./identifier"
 
@@ -75,6 +76,56 @@ export const ContinuationPolicy = Schema.Struct({
   tokenBudget: optional(Schema.Number),
 }).annotate({ identifier: "Goal.ContinuationPolicy" })
 
+/**
+ * Independent evaluator configuration for automatic Goal execution.
+ *
+ * `model` is intentionally optional: when omitted the runtime inherits the
+ * worker Session model. Persisting the override on the Goal keeps auditor
+ * choice stable across workers, app restarts, and delegated Sessions.
+ */
+export interface AuditorPolicy extends Schema.Schema.Type<typeof AuditorPolicy> {}
+export const AuditorPolicy = Schema.Struct({
+  model: Model.Ref.pipe(optional),
+  blockedThreshold: Schema.Number.pipe(optional),
+  maxAttempts: Schema.Number.pipe(optional),
+}).annotate({ identifier: "Goal.AuditorPolicy" })
+
+export const AuditorDecision = Schema.Literals(["continue", "complete", "blocked"]).annotate({
+  identifier: "Goal.AuditorDecision",
+})
+export type AuditorDecision = typeof AuditorDecision.Type
+
+const AuditorVerdictBase = {
+  rationale: Schema.String,
+  progressMade: Schema.Boolean,
+  confidence: Schema.Number.pipe(optional),
+} as const
+
+/**
+ * The verdict is also the semantic handoff between the independent auditor and
+ * the next autonomous worker cycle. `continuationPrompt` is deliberately
+ * decision-specific rather than optional on every verdict: if the auditor
+ * authorizes more work, it must say what the next worker should actually do.
+ */
+export const AuditorVerdict = Schema.Union([
+  Schema.Struct({
+    ...AuditorVerdictBase,
+    decision: Schema.Literal("continue"),
+    continuationPrompt: Schema.String,
+  }),
+  Schema.Struct({
+    ...AuditorVerdictBase,
+    decision: Schema.Literal("blocked"),
+    blocker: Schema.String,
+    continuationPrompt: Schema.String,
+  }),
+  Schema.Struct({
+    ...AuditorVerdictBase,
+    decision: Schema.Literal("complete"),
+  }),
+]).annotate({ identifier: "Goal.AuditorVerdict" })
+export type AuditorVerdict = typeof AuditorVerdict.Type
+
 export interface Criterion extends Schema.Schema.Type<typeof Criterion> {}
 export const Criterion = Schema.Struct({
   id: CriterionID,
@@ -109,6 +160,7 @@ export const Info = Schema.Struct({
   status: Status,
   revision: Schema.Number,
   continuationPolicy: ContinuationPolicy,
+  auditorPolicy: AuditorPolicy,
   blocker: optional(Schema.String),
   time: Schema.Struct({
     created: DateTimeUtcFromMillis,
@@ -132,7 +184,7 @@ export const Focus = Schema.Struct({
   focusedAt: DateTimeUtcFromMillis,
 }).annotate({ identifier: "Goal.Focus" })
 
-export const AuditActor = Schema.Literals(["user", "agent", "system"]).annotate({ identifier: "Goal.AuditActor" })
+export const AuditActor = Schema.Literals(["user", "agent", "auditor", "system"]).annotate({ identifier: "Goal.AuditActor" })
 export type AuditActor = typeof AuditActor.Type
 
 export const AuditEventType = Schema.Literals([
@@ -142,6 +194,7 @@ export const AuditEventType = Schema.Literals([
   "criterion_updated",
   "step_updated",
   "evidence_added",
+  "audited",
   "focused",
   "unfocused",
 ]).annotate({ identifier: "Goal.AuditEventType" })

@@ -41,6 +41,7 @@ export interface CreateInput {
   readonly criteria?: ReadonlyArray<string>
   readonly steps?: ReadonlyArray<{ readonly title: string; readonly description?: string }>
   readonly continuationPolicy?: GoalModel.ContinuationPolicy
+  readonly auditorPolicy?: GoalModel.AuditorPolicy
   readonly actor?: GoalModel.AuditActor
 }
 
@@ -53,6 +54,7 @@ export interface UpdateInput {
   readonly criteria?: ReadonlyArray<string>
   readonly steps?: ReadonlyArray<{ readonly title: string; readonly description?: string }>
   readonly continuationPolicy?: GoalModel.ContinuationPolicy
+  readonly auditorPolicy?: GoalModel.AuditorPolicy
   readonly actor?: GoalModel.AuditActor
 }
 
@@ -145,6 +147,11 @@ export interface Interface {
   ) => Effect.Effect<{ focus: Focus; detail: Detail } | undefined>
   readonly focuses: (goalID: ID) => Effect.Effect<ReadonlyArray<Focus>>
   readonly audit: (goalID: ID) => Effect.Effect<ReadonlyArray<GoalModel.AuditEvent>, GoalSchema.NotFoundError>
+  readonly recordAuditorVerdict: (input: {
+    goalID: ID
+    verdict: GoalModel.AuditorVerdict
+    model?: import("../model").ModelV2.Ref
+  }) => Effect.Effect<void, GoalSchema.NotFoundError>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Goal") {}
@@ -228,6 +235,8 @@ const layer = Layer.effect(
       const steps = normalizeSteps(input.steps ?? [])
       if (!steps.ok) return yield* new GoalSchema.ValidationError({ reason: steps.reason })
       const policy = input.continuationPolicy ?? { mode: "manual" as const }
+      const auditorPolicy = normalizeAuditorPolicy(input.auditorPolicy ?? {})
+      if (!auditorPolicy.ok) return yield* new GoalSchema.ValidationError({ reason: auditorPolicy.reason })
       const id = GoalModel.ID.create()
       const now = Date.now()
 
@@ -270,6 +279,7 @@ const layer = Layer.effect(
                 objective: objective.value,
                 constraints: constraints.value,
                 continuation_policy: policy,
+                auditor_policy: auditorPolicy.value,
                 time_created: now,
                 time_updated: now,
               })
@@ -346,7 +356,8 @@ const layer = Layer.effect(
         input.constraints === undefined &&
         input.criteria === undefined &&
         input.steps === undefined &&
-        input.continuationPolicy === undefined
+        input.continuationPolicy === undefined &&
+        input.auditorPolicy === undefined
       ) {
         return yield* new GoalSchema.ValidationError({ reason: "no Goal fields were supplied to update" })
       }
@@ -360,6 +371,8 @@ const layer = Layer.effect(
       if (criteria && !criteria.ok) return yield* new GoalSchema.ValidationError({ reason: criteria.reason })
       const steps = input.steps === undefined ? undefined : normalizeSteps(input.steps)
       if (steps && !steps.ok) return yield* new GoalSchema.ValidationError({ reason: steps.reason })
+      const auditorPolicy = input.auditorPolicy === undefined ? undefined : normalizeAuditorPolicy(input.auditorPolicy)
+      if (auditorPolicy && !auditorPolicy.ok) return yield* new GoalSchema.ValidationError({ reason: auditorPolicy.reason })
       const now = Date.now()
 
       const detail = yield* db
@@ -385,6 +398,7 @@ const layer = Layer.effect(
               ...(objective?.ok ? { objective: objective.value } : {}),
               ...(constraints?.ok ? { constraints: constraints.value } : {}),
               ...(input.continuationPolicy ? { continuation_policy: input.continuationPolicy } : {}),
+              ...(auditorPolicy?.ok ? { auditor_policy: auditorPolicy.value } : {}),
               revision: sql`${GoalTable.revision} + 1`,
               time_updated: now,
             })
@@ -1017,6 +1031,37 @@ const layer = Layer.effect(
       }))
     })
 
+    const recordAuditorVerdict = Effect.fn("Goal.recordAuditorVerdict")(function* (input: {
+      goalID: ID
+      verdict: GoalModel.AuditorVerdict
+      model?: import("../model").ModelV2.Ref
+    }) {
+      yield* requireRow(db, input.goalID)
+      yield* db
+        .transaction((tx) =>
+          appendAudit(tx, {
+            goalID: input.goalID,
+            type: "audited",
+            actor: "auditor",
+            payload: {
+              decision: input.verdict.decision,
+              rationale: input.verdict.rationale,
+              progressMade: input.verdict.progressMade,
+              ...(input.verdict.confidence === undefined ? {} : { confidence: input.verdict.confidence }),
+              ...(input.verdict.decision === "blocked" ? { blocker: input.verdict.blocker } : {}),
+              ...(input.verdict.decision === "continue" || input.verdict.decision === "blocked"
+                ? { continuationPrompt: input.verdict.continuationPrompt }
+                : {}),
+              ...(input.model
+                ? { model: { providerID: input.model.providerID, id: input.model.id, variant: input.model.variant } }
+                : {}),
+            },
+            now: Date.now(),
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", Effect.die))
+    })
+
     return Service.of({
       create,
       get,
@@ -1034,6 +1079,7 @@ const layer = Layer.effect(
       focused,
       focuses,
       audit,
+      recordAuditorVerdict,
     })
   }),
 )
@@ -1101,6 +1147,7 @@ function hydrateInfo(row: typeof GoalTable.$inferSelect): Info {
     status: row.status,
     revision: row.revision,
     continuationPolicy: row.continuation_policy,
+    auditorPolicy: row.auditor_policy,
     blocker: row.blocker ?? undefined,
     time: {
       created: DateTime.makeUnsafe(row.time_created),
@@ -1193,6 +1240,25 @@ function normalizeSteps(
     result.push({ title, description: value.description?.trim() ?? "" })
   }
   return { ok: true, value: result }
+}
+
+function normalizeAuditorPolicy(value: GoalModel.AuditorPolicy): Normalized<GoalModel.AuditorPolicy> {
+  const blockedThreshold = value.blockedThreshold
+  if (blockedThreshold !== undefined && (!Number.isFinite(blockedThreshold) || blockedThreshold < 1 || blockedThreshold > 16)) {
+    return { ok: false, reason: "auditor blockedThreshold must be between 1 and 16" }
+  }
+  const maxAttempts = value.maxAttempts
+  if (maxAttempts !== undefined && (!Number.isFinite(maxAttempts) || maxAttempts < 1 || maxAttempts > 8)) {
+    return { ok: false, reason: "auditor maxAttempts must be between 1 and 8" }
+  }
+  return {
+    ok: true,
+    value: {
+      ...(value.model ? { model: value.model } : {}),
+      ...(blockedThreshold === undefined ? {} : { blockedThreshold: Math.floor(blockedThreshold) }),
+      ...(maxAttempts === undefined ? {} : { maxAttempts: Math.floor(maxAttempts) }),
+    },
+  }
 }
 
 export const node = makeGlobalNode({ service: Service, layer, deps: [Database.node, EventV2.node] })

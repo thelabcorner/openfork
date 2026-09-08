@@ -37,6 +37,27 @@ const sessionA2 = SessionV2.ID.make("ses_goal_a2")
 const sessionOtherWorkspace = SessionV2.ID.make("ses_goal_other_workspace")
 const sessionB = SessionV2.ID.make("ses_goal_b")
 
+const continueAudit = (progressMade = false): GoalAutomation.AuditOutcome => ({
+  ok: true,
+  verdict: {
+    decision: "continue",
+    rationale: "Concrete Goal work remains.",
+    progressMade,
+    continuationPrompt: "Continue with the next concrete Goal task and verify it with evidence.",
+  },
+})
+
+const blockedAudit = (blocker = "A required external decision is unavailable"): GoalAutomation.AuditOutcome => ({
+  ok: true,
+  verdict: {
+    decision: "blocked",
+    rationale: blocker,
+    blocker,
+    progressMade: false,
+    continuationPrompt: "Investigate the suspected blocker, attempt a safe workaround, and record concrete evidence either way.",
+  },
+})
+
 const setup = Effect.gen(function* () {
   const { db } = yield* Database.Service
   yield* db
@@ -372,17 +393,27 @@ describe("Goal automation reservations", () => {
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 
-      const decision = yield* automation.afterTurn({ sessionID: sessionA, origin: "user", tokens: 120 })
+      const decision = yield* automation.afterTurn({
+        sessionID: sessionA,
+        origin: "user",
+        tokens: 120,
+        audit: continueAudit(true),
+      })
       expect(decision.continue).toBe(true)
       expect(decision.reservation?.id).toBeString()
+      expect(decision.reservation?.prompt).toContain("Continue with the next concrete Goal task and verify it with evidence.")
+      expect(decision.reservation?.prompt).toContain("<auditor-continuation>")
 
       const first = yield* automation.claim(sessionA)
       expect(first?.id).toBe(decision.reservation?.id)
+      expect(first?.prompt).toBe(decision.reservation?.prompt)
       expect(yield* automation.claim(sessionA)).toBeUndefined()
 
       yield* automation.release({ sessionID: sessionA, reservationID: first!.id })
       expect(yield* automation.pendingSessions()).toContain(sessionA)
-      expect((yield* automation.claim(sessionA))?.id).toBe(first?.id)
+      const recovered = yield* automation.claim(sessionA)
+      expect(recovered?.id).toBe(first?.id)
+      expect(recovered?.prompt).toBe(first?.prompt)
     }),
   )
 
@@ -395,7 +426,7 @@ describe("Goal automation reservations", () => {
       const created = yield* createGoal({ continuationPolicy: { mode: "unattended" } })
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
-      yield* automation.afterTurn({ sessionID: sessionA, origin: "user" })
+      yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: continueAudit(true) })
       const claimed = yield* automation.claim(sessionA)
       expect(claimed).toBeDefined()
 
@@ -422,7 +453,7 @@ describe("Goal automation reservations", () => {
       })
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
-      const first = yield* automation.afterTurn({ sessionID: sessionA, origin: "user" })
+      const first = yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: continueAudit(false) })
       const claimed = yield* automation.claim(sessionA)
       expect(first.reservation?.id).toBe(claimed?.id)
 
@@ -430,12 +461,107 @@ describe("Goal automation reservations", () => {
         sessionID: sessionA,
         origin: "automatic",
         reservationID: claimed!.id,
+        audit: continueAudit(false),
       })
       expect(stopped.continue).toBe(false)
       expect(stopped.reason).toContain("guardrail:no Goal-state progress")
       expect((yield* goals.get(created.goal.id)).goal).toMatchObject({
         status: "blocked",
         blocker: "Automation guardrail: no Goal-state progress for 1 automatic turns",
+      })
+    }),
+  )
+
+  it.effect("moves an auditor-complete Goal into formal verification without completing it", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal({ continuationPolicy: { mode: "auto_continue" } })
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+
+      const decision = yield* automation.afterTurn({
+        sessionID: sessionA,
+        origin: "user",
+        audit: {
+          ok: true,
+          verdict: {
+            decision: "complete",
+            rationale: "The worker result satisfies the objective and is ready for verification.",
+            progressMade: true,
+          },
+        },
+      })
+
+      expect(decision).toMatchObject({ continue: false, reason: "auditor_complete" })
+      expect((yield* goals.get(created.goal.id)).goal.status).toBe("verifying")
+    }),
+  )
+
+  it.effect("requires repeated auditor-blocked verdicts before settling the Goal as blocked", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal({
+        continuationPolicy: { mode: "auto_continue", maxConsecutiveTurns: 8 },
+        auditorPolicy: { blockedThreshold: 3 },
+      })
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+
+      const first = yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: blockedAudit() })
+      expect(first.continue).toBe(true)
+      expect(first.reservation?.prompt).toContain("1/3")
+      expect(first.reservation?.prompt).toContain("Investigate the suspected blocker")
+      let claimed = yield* automation.claim(sessionA)
+      expect(claimed).toBeDefined()
+
+      const second = yield* automation.afterTurn({
+        sessionID: sessionA,
+        origin: "automatic",
+        reservationID: claimed!.id,
+        audit: blockedAudit(),
+      })
+      expect(second.continue).toBe(true)
+      expect(second.reservation?.prompt).toContain("2/3")
+      claimed = yield* automation.claim(sessionA)
+      expect(claimed).toBeDefined()
+
+      const third = yield* automation.afterTurn({
+        sessionID: sessionA,
+        origin: "automatic",
+        reservationID: claimed!.id,
+        audit: blockedAudit("Need a user-provided deployment credential"),
+      })
+      expect(third).toMatchObject({ continue: false, reason: "auditor_blocked:3" })
+      expect((yield* goals.get(created.goal.id)).goal).toMatchObject({
+        status: "blocked",
+        blocker: "Goal auditor: Need a user-provided deployment credential",
+      })
+    }),
+  )
+
+  it.effect("blocks instead of blindly continuing when the auditor is unavailable", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const goals = yield* GoalV2.Service
+      const automation = yield* GoalAutomation.Service
+      const created = yield* createGoal({ continuationPolicy: { mode: "unattended" } })
+      const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
+      yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
+
+      const decision = yield* automation.afterTurn({
+        sessionID: sessionA,
+        origin: "user",
+        audit: { ok: false, error: "provider timeout" },
+      })
+      expect(decision.continue).toBe(false)
+      expect(decision.reason).toContain("auditor_error:provider timeout")
+      expect((yield* goals.get(created.goal.id)).goal).toMatchObject({
+        status: "blocked",
+        blocker: "Goal auditor unavailable: provider timeout",
       })
     }),
   )
