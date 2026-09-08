@@ -21,8 +21,13 @@ describe("classifyConflict", () => {
   test("fork-owned and meta keep ours", () => {
     expect(classifyConflict("packages/app/src/components/titlebar-tab-nav.tsx", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/core/src/session/title.ts", PRUNE)).toBe("fork-ours")
+    expect(classifyConflict("packages/core/src/special-agent-completion.ts", PRUNE)).toBe("fork-ours")
+    expect(classifyConflict("packages/core/src/prompt-revisor.ts", PRUNE)).toBe("fork-ours")
+    expect(classifyConflict("packages/opencode/src/prompt-revisor/runtime.ts", PRUNE)).toBe("fork-ours")
+    expect(classifyConflict("packages/opencode/src/special-agent/model-message-bridge.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/opencode/src/fork/credentials.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/core/src/goal/automation.ts", PRUNE)).toBe("fork-ours")
+    expect(classifyConflict("packages/core/src/goal/auditor.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/schema/src/goal.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/opencode/src/tool/goal.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/app/src/components/goal-composer-shelf.tsx", PRUNE)).toBe("fork-ours")
@@ -32,6 +37,9 @@ describe("classifyConflict", () => {
   test("unions and unknowns need a human", () => {
     expect(classifyConflict("packages/opencode/src/tool/registry.ts", PRUNE)).toBe("union-manual")
     expect(classifyConflict("packages/opencode/src/session/prompt.ts", PRUNE)).toBe("union-manual")
+    expect(classifyConflict("packages/core/src/config.ts", PRUNE)).toBe("union-manual")
+    expect(classifyConflict("packages/core/src/session/runner/llm.ts", PRUNE)).toBe("union-manual")
+    expect(classifyConflict("packages/app/src/components/settings-v2/general.tsx", PRUNE)).toBe("union-manual")
     expect(classifyConflict("packages/app/src/components/some-new-thing.tsx", PRUNE)).toBe("manual")
   })
 })

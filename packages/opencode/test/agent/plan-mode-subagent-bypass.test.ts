@@ -158,3 +158,78 @@ it.effect("subagent inherits parent session deny rules as hard runtime ceilings"
     expect(Permission.evaluate("bash", "git status", effective).action).toBe("deny")
   }),
 )
+
+
+it.effect("YOLO auto-approves subagent asks without overriding explicit denies", () =>
+  Effect.sync(() => {
+    const autonomous = testAgent({
+      name: "autonomous",
+      mode: "subagent",
+      permission: {
+        "*": "ask",
+        read: "allow",
+        edit: "deny",
+        external_directory: "ask",
+      },
+    })
+
+    const effective = Permission.merge(
+      autonomous.permission,
+      deriveSubagentSessionPermission({
+        parentSessionPermission: [],
+        subagent: autonomous,
+        autoApproveAsks: true,
+      }),
+    )
+
+    expect(Permission.evaluate("bash", "git status", effective).action).toBe("allow")
+    expect(Permission.evaluate("external_directory", "C:\\outside\\repo", effective).action).toBe("allow")
+    expect(Permission.evaluate("read", "README.md", effective).action).toBe("allow")
+    expect(Permission.evaluate("edit", "src/index.ts", effective).action).toBe("deny")
+  }),
+)
+
+it.effect("YOLO child autonomy preserves parent-session deny ceilings", () =>
+  Effect.sync(() => {
+    const autonomous = testAgent({
+      name: "autonomous",
+      mode: "subagent",
+      permission: {
+        "*": "ask",
+        bash: "ask",
+      },
+    })
+
+    const effective = Permission.merge(
+      autonomous.permission,
+      deriveSubagentSessionPermission({
+        parentSessionPermission: Permission.fromConfig({ bash: "deny", external_directory: "ask" }),
+        subagent: autonomous,
+        autoApproveAsks: true,
+      }),
+    )
+
+    expect(Permission.evaluate("bash", "git status", effective).action).toBe("deny")
+    expect(Permission.evaluate("external_directory", "C:\\outside\\repo", effective).action).toBe("allow")
+  }),
+)
+
+it.instance("YOLO keeps explore read-only while removing its ask walls", () =>
+  Effect.gen(function* () {
+    const explore = yield* Agent.use.get("explore")
+    expect(explore).toBeDefined()
+
+    const effective = Permission.merge(
+      explore!.permission,
+      deriveSubagentSessionPermission({
+        parentSessionPermission: [],
+        subagent: explore!,
+        autoApproveAsks: true,
+      }),
+    )
+
+    expect(Permission.evaluate("edit", "src/index.ts", effective).action).toBe("deny")
+    expect(Permission.evaluate("bash", "git status", effective).action).toBe("allow")
+    expect(Permission.evaluate("external_directory", "C:\\outside\\repo", effective).action).toBe("allow")
+  }),
+)

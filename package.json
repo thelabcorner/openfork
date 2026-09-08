@@ -18,7 +18,8 @@
     "translate:app": "bun run script/translate-app.ts",
     "test": "echo 'do not run tests from root' && exit 1",
     "fork:prune": "bun run script/fork-prune.ts",
-    "fork:sync": "bun run script/fork-sync.ts"
+    "fork:sync": "bun run script/fork-sync.ts",
+    "install:jetbrains-acp": "bun run --cwd packages/opencode script/install-jetbrains-acp.ts"
   },
   "workspaces": {
     "packages": [

@@ -34,6 +34,7 @@ import { ToolApi } from "./groups/tool"
 import { TuiApi } from "./groups/tui"
 import { UsageApi } from "./groups/usage"
 import { WorkspaceApi } from "./groups/workspace"
+import { PromptRevisorApi } from "./groups/prompt-revisor"
 import { makeApi } from "@opencode-ai/protocol/api"
 import { LocationMiddleware } from "@opencode-ai/server/location"
 import { SessionLocationMiddleware } from "@opencode-ai/server/middleware/session-location"
@@ -90,6 +91,7 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
   .addHttpApi(TuiApi)
   .addHttpApi(UsageApi)
   .addHttpApi(WorkspaceApi)
+  .addHttpApi(PromptRevisorApi)
   .middleware(SchemaErrorMiddleware)
 
 export const OpenCodeHttpApi = HttpApi.make("opencode")

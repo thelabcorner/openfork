@@ -50,6 +50,7 @@ it.instance("returns default native agents when no config", () =>
     const names = agents.map((a) => a.name)
     expect(names).toContain("build")
     expect(names).toContain("plan")
+    expect(names).toContain("yolo")
     expect(names).toContain("general")
     expect(names).toContain("explore")
     expect(names).toContain("compaction")
@@ -67,6 +68,41 @@ it.instance("build agent has correct default properties", () =>
     expect(evalPerm(build, "edit")).toBe("allow")
     expect(evalPerm(build, "bash")).toBe("allow")
   }),
+)
+
+it.instance("yolo auto-allows routine permissions", () =>
+  Effect.gen(function* () {
+    const yolo = yield* load((svc) => svc.get("yolo"))
+    expect(yolo).toBeDefined()
+    expect(yolo?.mode).toBe("primary")
+    expect(yolo?.native).toBe(true)
+    expect(Permission.evaluate("doom_loop", "*", yolo!.permission).action).toBe("allow")
+    expect(Permission.evaluate("external_directory", "C:\\outside\\repo", yolo!.permission).action).toBe("allow")
+    expect(Permission.evaluate("read", ".env", yolo!.permission).action).toBe("allow")
+    expect(Permission.evaluate("checkpoint", "checkpoint:restore:1", yolo!.permission).action).toBe("allow")
+    expect(Permission.evaluate("bash", "rm -rf dist", yolo!.permission).action).toBe("allow")
+  }),
+)
+
+it.instance(
+  "yolo final allow overrides project permission denials",
+  () =>
+    Effect.gen(function* () {
+      const yolo = yield* load((svc) => svc.get("yolo"))
+      expect(yolo).toBeDefined()
+      expect(Permission.evaluate("bash", "*", yolo!.permission).action).toBe("allow")
+      expect(Permission.evaluate("read", ".env", yolo!.permission).action).toBe("allow")
+      expect(Permission.evaluate("checkpoint", "*", yolo!.permission).action).toBe("allow")
+    }),
+  {
+    config: {
+      permission: {
+        bash: "deny",
+        read: { "*.env": "deny" },
+        checkpoint: "deny",
+      },
+    },
+  },
 )
 
 it.instance("plan agent denies edits except .opencode/plans/*", () =>
@@ -749,6 +785,7 @@ it.instance(
       agent: {
         build: { disable: true },
         plan: { disable: true },
+        yolo: { disable: true },
       },
     },
   },

@@ -7,6 +7,8 @@ import { AgentV2 } from "../agent"
 import { Global } from "../global"
 import { Location } from "../location"
 import { PermissionV2 } from "../permission"
+import { DEFAULT_PROMPT as PROMPT_REVISOR } from "../prompt-revisor-prompt"
+import { DEFAULT_PROMPT as TITLE_POLICY_PROMPT } from "../session/title-prompt"
 
 const TRUNCATION_GLOB = path.join(Global.Path.data, "tool-output", "*")
 const BUILD_SYSTEM =
@@ -36,49 +38,7 @@ Always follow the exact output structure requested by the user prompt. Keep ever
 
 Do not continue the conversation. Do not respond to any questions in the conversation. Only output the structured summary in the exact format requested by the user prompt. Respond in the same language as the conversation.`
 
-export const PROMPT_TITLE = `You are a title generator. You output ONLY a thread title. Nothing else.
-<task>
-Generate a brief title that would help the user find this conversation later.
-
-Follow all rules in <rules>
-Use the <examples> so you know what a good title looks like.
-Your output must be:
-- A single line
-- <=50 characters
-- No explanations
-</task>
-
-<rules>
-- you MUST use the same language as the user message you are summarizing
-- Title must be grammatically correct and read naturally - no word salad
-- Never include tool names in the title (e.g. "read tool", "bash tool", "edit tool")
-- Focus on the main topic or question the user needs to retrieve
-- Vary your phrasing - avoid repetitive patterns like always starting with "Analyzing"
-- When a file is mentioned, focus on WHAT the user wants to do WITH the file, not just that they shared it
-- Keep exact: technical terms, numbers, filenames, HTTP codes
-- Remove: the, this, my, a, an
-- Never assume tech stack
-- Never use tools
-- NEVER respond to questions, just generate a title for the conversation
-- The title should NEVER include "summarizing" or "generating" when generating a title
-- DO NOT SAY YOU CANNOT GENERATE A TITLE OR COMPLAIN ABOUT THE INPUT
-- Always output something meaningful, even if the input is minimal.
-- If the user message is short or conversational (e.g. "hello", "lol", "what's up", "hey"):
-  -> create a title that reflects the user's tone or intent (such as Greeting, Quick check-in, Light chat, Intro message, etc.)
-</rules>
-
-<examples>
-"debug 500 errors in production" -> Debugging production 500 errors
-"refactor user service" -> Refactoring user service
-"why is app.js failing" -> app.js failure investigation
-"implement rate limiting" -> Rate limiting implementation
-"how do I connect postgres to my API" -> Postgres API connection
-"best practices for React hooks" -> React hooks best practices
-"@src/credential.ts can you add refresh token support" -> Credential refresh token support
-"@utils/parser.ts this is broken" -> Parser bug fix
-"look at @config.json" -> Config review
-"@App.tsx add dark mode toggle" -> Dark mode toggle in App
-</examples>`
+export const PROMPT_TITLE = TITLE_POLICY_PROMPT
 
 const PROMPT_SUMMARY = `Summarize what was done in this conversation. Write like a pull request description.
 
@@ -188,6 +148,24 @@ export const Plugin = define({
         item.hidden = true
         item.system = PROMPT_TITLE
         item.permissions.push(...PermissionV2.merge(defaults, [{ action: "*", resource: "*", effect: "deny" }]))
+      })
+
+      draft.update(AgentV2.ID.make("prompt-revisor"), (item) => {
+        item.mode = "primary"
+        item.hidden = true
+        item.system = PROMPT_REVISOR
+        item.steps = 3
+        item.permissions.push(
+          ...PermissionV2.merge(defaults, [
+            { action: "*", resource: "*", effect: "deny" },
+            { action: "grep", resource: "*", effect: "allow" },
+            { action: "glob", resource: "*", effect: "allow" },
+            { action: "read", resource: "*", effect: "allow" },
+            { action: "question", resource: "*", effect: "allow" },
+            { action: "composer_context", resource: "*", effect: "allow" },
+            { action: "revised_prompt", resource: "*", effect: "allow" },
+          ]),
+        )
       })
 
       draft.update(AgentV2.ID.make("summary"), (item) => {

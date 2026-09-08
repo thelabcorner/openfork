@@ -100,6 +100,44 @@ describe("plugin.loader.shared", () => {
     ),
   )
 
+  it.live("exposes a safe JavaScript runtime recipe to server plugins", () =>
+    withTmp(
+      async (dir) => {
+        const file = path.join(dir, "runtime-plugin.ts")
+        const mark = path.join(dir, "runtime.json")
+        await Bun.write(
+          file,
+          [
+            "export default async (input) => {",
+            `  await Bun.write(${JSON.stringify(mark)}, JSON.stringify(input.runtime))`,
+            "  return {}",
+            "}",
+            "",
+          ].join("\n"),
+        )
+
+        await Bun.write(path.join(dir, "opencode.json"), JSON.stringify({ plugin: [pathToFileURL(file).href] }, null, 2))
+        return { mark }
+      },
+      (tmp) =>
+        Effect.gen(function* () {
+          yield* load(tmp.path)
+          const runtime = JSON.parse(yield* Effect.promise(() => fs.readFile(tmp.extra.mark, "utf8"))) as {
+            kind: string
+            execPath: string
+            standalone: boolean
+            script: { command: string; args: string[]; env: Record<string, string> }
+          }
+          expect(runtime.kind).toBe("bun")
+          expect(runtime.execPath).toBe(process.execPath)
+          expect(runtime.standalone).toBe(false)
+          expect(runtime.script.command).toBe(process.execPath)
+          expect(runtime.script.args).toEqual([])
+          expect(runtime.script.env).toEqual({})
+        }),
+    ),
+  )
+
   it.live("deduplicates same function exported as default and named", () =>
     withTmp(
       async (dir) => {

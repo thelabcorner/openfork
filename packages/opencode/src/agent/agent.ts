@@ -13,9 +13,9 @@ import PROMPT_GENERATE from "./generate.txt"
 import PROMPT_COMPACTION from "./prompt/compaction.txt"
 import PROMPT_EXPLORE from "./prompt/explore.txt"
 import PROMPT_SUMMARY from "./prompt/summary.txt"
-import PROMPT_TITLE from "./prompt/title.txt"
+import { DEFAULT_PROMPT as PROMPT_TITLE } from "@opencode-ai/core/session/title-prompt"
 import { Permission } from "@/permission"
-import { mergeDeep, pipe, sortBy, values } from "remeda"
+import { mergeDeep } from "remeda"
 import { Global } from "@opencode-ai/core/global"
 import path from "path"
 import { Plugin } from "@/plugin"
@@ -179,6 +179,15 @@ const layer = Layer.effect(
             mode: "primary",
             native: true,
           },
+          yolo: {
+            name: "yolo",
+            description:
+              "Full-autonomy mode for trusted development work. Routine permissions are auto-approved; catastrophic recursive deletes remain hard-blocked.",
+            options: {},
+            permission: Permission.merge(defaults, user, Permission.fromConfig({ "*": "allow" })),
+            mode: "primary",
+            native: true,
+          },
           general: {
             name: "general",
             description: `General-purpose agent for researching complex questions and executing multi-step tasks. Use this agent to execute multiple units of work in parallel.`,
@@ -293,6 +302,13 @@ const layer = Layer.effect(
           item.permission = Permission.merge(item.permission, Permission.fromConfig(value.permission ?? {}))
         }
 
+        // YOLO is deliberately stronger than project/global permission policy.
+        // Keep the final wildcard last so a project-level ask/deny cannot turn
+        // trusted autonomous work back into a modal permission loop.
+        if (agents.yolo) {
+          agents.yolo.permission = Permission.merge(agents.yolo.permission, Permission.fromConfig({ "*": "allow" }))
+        }
+
         // Ensure Truncate.GLOB is allowed unless explicitly configured
         for (const name in agents) {
           const agent = agents[name]
@@ -315,14 +331,13 @@ const layer = Layer.effect(
 
         const list = Effect.fnUntraced(function* () {
           const cfg = yield* config.get()
-          return pipe(
-            agents,
-            values(),
-            sortBy(
-              [(x) => (cfg.default_agent ? x.name === cfg.default_agent : x.name === "build"), "desc"],
-              [(x) => x.name, "asc"],
-            ),
-          )
+          const preferred = cfg.default_agent ?? "build"
+          return Object.values(agents).toSorted((a, b) => {
+            const aPreferred = a.name === preferred
+            const bPreferred = b.name === preferred
+            if (aPreferred !== bPreferred) return aPreferred ? -1 : 1
+            return a.name.localeCompare(b.name)
+          })
         })
 
         const defaultInfo = Effect.fnUntraced(function* () {

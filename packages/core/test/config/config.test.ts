@@ -87,6 +87,14 @@ describe("Config", () => {
     }),
   )
 
+  it.effect("preserves Prompt Revisor instructions through v1-compatible config migration", () =>
+    Effect.sync(() => {
+      const migrated = ConfigMigrateV1.migrate({ prompt_revisor_prompt: "CUSTOM PROMPT REVISOR" })
+      expect(migrated.prompt_revisor_prompt).toBe("CUSTOM PROMPT REVISOR")
+      expect(Schema.decodeUnknownSync(Config.Info)(migrated).prompt_revisor_prompt).toBe("CUSTOM PROMPT REVISOR")
+    }),
+  )
+
   it.effect("migrates v1 provider setup options into AISDK settings", () =>
     Effect.sync(() => {
       const migrated = ConfigMigrateV1.migrate({

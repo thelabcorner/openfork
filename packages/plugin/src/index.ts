@@ -53,6 +53,25 @@ export type WorkspaceAdapter = {
   target(config: WorkspaceInfo): WorkspaceTarget | Promise<WorkspaceTarget>
 }
 
+export type PluginRuntime = {
+  /** Runtime hosting the plugin itself. `process.execPath` is not guaranteed to be Node. */
+  kind: "bun" | "node" | "electron"
+  /** Host executable path. In packaged builds this may be `opencode` or `electron`, not `node`. */
+  execPath: string
+  /** True only for Bun single-file executables. */
+  standalone: boolean
+  /**
+   * Safe launch recipe for JavaScript/TypeScript helper scripts.
+   * Spawn `command` with `[...args, script, ...scriptArgs]` and merge `env`
+   * into the child environment instead of assuming `process.execPath` is Node.
+   */
+  script: {
+    command: string
+    args: string[]
+    env: Record<string, string>
+  }
+}
+
 export type PluginInput = {
   client: ReturnType<typeof createOpencodeClient>
   project: Project
@@ -63,6 +82,8 @@ export type PluginInput = {
   }
   serverUrl: URL
   $: BunShell
+  /** Present on current hosts; optional in the type for older host/plugin compatibility. */
+  runtime?: PluginRuntime
 }
 
 export type PluginOptions = Record<string, unknown>

@@ -28,6 +28,7 @@ import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from ".
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionInputTable, SessionMessageTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionTitle } from "@opencode-ai/core/session/title"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import * as DateTime from "effect/DateTime"
@@ -1258,7 +1259,7 @@ describe("session HttpApi", () => {
   it.live("regenerates a session title in the background", () =>
     Effect.gen(function* () {
       const llm = yield* TestLLMServer
-      yield* llm.text("Generated Title", { usage: { input: 1, output: 1 } })
+      yield* llm.tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Generated Title" })
 
       const config = testProviderConfig(llm.url)
       const directory = yield* tmpdirScoped({ git: true, config })
@@ -1299,11 +1300,120 @@ describe("session HttpApi", () => {
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 
-  it.live("regenerateTitle leaves the title untouched when nothing usable is produced", () =>
+  it.live("regenerateTitle repairs prose in the same title-agent conversation", () =>
     Effect.gen(function* () {
       const llm = yield* TestLLMServer
-      // Empty model output → sanitizer yields nothing → no write.
-      yield* llm.push(reply().stop().item())
+      yield* llm.push(
+        reply().text("This looks like a title, but I forgot the completion tool.").stop().item(),
+        reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Recovered Title" }).item(),
+      )
+
+      const config = testProviderConfig(llm.url)
+      const directory = yield* tmpdirScoped({ git: true, config })
+      const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
+      const svc = yield* Session.Service
+      const message = yield* svc.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: session.id,
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+        time: { created: Date.now() },
+      })
+      yield* svc.updatePart({
+        id: PartID.ascending(),
+        sessionID: session.id,
+        messageID: message.id,
+        type: "text",
+        text: "repair title generation",
+      })
+
+      const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+      expect(response.status).toBe(204)
+
+      const titled = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
+          return current.title === "Old Title" ? undefined : current.title
+        }),
+        "repaired title was not regenerated",
+        "10 seconds",
+      )
+      expect(titled).toBe("Recovered Title")
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      expect(JSON.stringify(inputs[1])).toContain("Protocol correction")
+      expect(JSON.stringify(inputs[1])).toContain(SessionTitle.GENERATED_TITLE_TOOL)
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    20_000,
+  )
+
+  it.live("regenerateTitle repairs an invalid generated_title payload before succeeding", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      yield* llm.push(
+        reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { wrong: "field" }).item(),
+        reply().tool(SessionTitle.GENERATED_TITLE_TOOL, { title: "Validated Title" }).item(),
+      )
+
+      const config = testProviderConfig(llm.url)
+      const directory = yield* tmpdirScoped({ git: true, config })
+      const session = yield* createSession({ title: "Old Title" }).pipe(provideInstanceEffect(directory))
+      const svc = yield* Session.Service
+      const message = yield* svc.updateMessage({
+        id: MessageID.ascending(),
+        role: "user",
+        sessionID: session.id,
+        agent: "build",
+        model: { providerID: ProviderV2.ID.make("test"), modelID: ModelV2.ID.make("test-model") },
+        time: { created: Date.now() },
+      })
+      yield* svc.updatePart({
+        id: PartID.ascending(),
+        sessionID: session.id,
+        messageID: message.id,
+        type: "text",
+        text: "validate title payload",
+      })
+
+      const response = yield* request(pathFor(SessionPaths.regenerateTitle, { sessionID: session.id }), {
+        method: "POST",
+        headers: { "x-opencode-directory": directory, "content-type": "application/json" },
+        body: JSON.stringify({}),
+      })
+      expect(response.status).toBe(204)
+
+      const titled = yield* pollWithTimeout(
+        Effect.gen(function* () {
+          const current = yield* Session.use.get(session.id).pipe(provideInstanceEffect(directory), Effect.orDie)
+          return current.title === "Old Title" ? undefined : current.title
+        }),
+        "payload-repaired title was not regenerated",
+        "10 seconds",
+      )
+      expect(titled).toBe("Validated Title")
+
+      const inputs = yield* llm.inputs
+      expect(inputs).toHaveLength(2)
+      const repair = JSON.stringify(inputs[1])
+      expect(repair).toContain("Protocol error")
+      expect(repair).toContain("Protocol correction")
+      expect(repair).toContain("host rejected the previous completion")
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+    20_000,
+  )
+
+  it.live("regenerateTitle rejects missing structured output and leaves the title untouched", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      // No generated_title tool call is an invalid terminal response and must
+      // never be inferred into a title from prose or an empty completion.
+      yield* llm.push(reply().stop().item(), reply().stop().item())
 
       const config = testProviderConfig(llm.url)
       const directory = yield* tmpdirScoped({ git: true, config })
@@ -1330,7 +1440,7 @@ describe("session HttpApi", () => {
         headers: { "x-opencode-directory": directory, "content-type": "application/json" },
         body: JSON.stringify({}),
       })
-      expect(response.status).toBe(204)
+      expect(response.status).toBe(503)
 
       // Give the background generation a moment to run, then confirm no write.
       yield* llm.wait(1)
@@ -1338,4 +1448,5 @@ describe("session HttpApi", () => {
       expect(current.title).toBe("Keep Me")
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
+
 })

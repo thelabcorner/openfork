@@ -88,7 +88,7 @@ export const RevertPayload = Schema.Struct(Struct.omit(SessionRevert.RevertInput
 export const RegenerateTitlePayload = Schema.Struct({
   // Explicit picker choice (settings "Title generation" model); omitted = cascade.
   model: Schema.optional(ModelV2.Ref),
-  // Custom instruction for the title model; omitted = default prompt.
+  // Custom title policy; runtime context and the host completion protocol are injected separately.
   prompt: Schema.optional(Schema.String),
 })
 export const PermissionResponsePayload = Schema.Struct({

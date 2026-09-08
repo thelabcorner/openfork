@@ -160,10 +160,15 @@ const FORK_OWNED = [
   /^packages\/opencode\/src\/session\/group\.ts$/,
   /^packages\/opencode\/src\/quota\//,
   /^packages\/opencode\/src\/fork\//,
-  /^packages\/opencode\/src\/tool\/(json|background|sqlite|git|typecheck|project|symbols|test|refactor|sympy|patch|archive|swarm|browser|reload)/,
+  /^packages\/opencode\/src\/tool\/(json|background|sqlite|git|typecheck|project|symbols|test|refactor|sympy|patch|archive|swarm|browser|reload|checkpoint|shell-safety)/,
   /^packages\/core\/src\/search\//,
   /^packages\/core\/src\/checkpoint\.ts$/,
   /^packages\/opencode\/src\/session\/checkpoint\.ts$/,
+  /^packages\/opencode\/script\/install-jetbrains-acp\.ts$/,
+  /^packages\/core\/src\/special-agent-completion\.ts$/,
+  /^packages\/core\/src\/prompt-revisor(?:-prompt)?\.ts$/,
+  /^packages\/opencode\/src\/prompt-revisor\//,
+  /^packages\/opencode\/src\/special-agent\//,
   /^packages\/core\/src\/session\/title\.ts$/,
   /^packages\/opencode\/src\/session\/spad\//,
   /^packages\/schema\/src\/goal(?:-id)?\.ts$/,
@@ -183,6 +188,17 @@ const UNION_MANUAL = [
   /^packages\/opencode\/src\/session\/message-v2\.ts$/,
   /^packages\/opencode\/src\/provider\/provider\.ts$/,
   /^packages\/opencode\/src\/server\/routes\/instance\/httpapi\/(api|server)\.ts$/,
+  /^packages\/opencode\/src\/agent\/agent\.ts$/,
+  /^packages\/opencode\/src\/tool\/shell\.ts$/,
+  /^packages\/core\/src\/config\.ts$/,
+  /^packages\/core\/src\/v1\/config\/(config|migrate)\.ts$/,
+  /^packages\/core\/src\/session\/runner\/llm\.ts$/,
+  /^packages\/core\/src\/location-services\.ts$/,
+  /^packages\/app\/src\/context\/settings\.tsx$/,
+  /^packages\/app\/src\/components\/settings-v2\/general\.tsx$/,
+  /^packages\/app\/src\/components\/prompt-input-v2\.tsx$/,
+  /^packages\/app\/src\/i18n\/en\.ts$/,
+  /^packages\/session-ui\/src\/v2\/components\/prompt-input\/index\.tsx$/,
 ]
 
 export function classifyConflict(path: string, prune: string[]): ConflictClass {
@@ -710,6 +726,55 @@ function cmdVerify(tag?: string): number {
         if (!fileContains("packages/app/src/components/prompt-input-v2.tsx", "GoalComposerShelf")) missing.push("GoalComposerShelf")
         if (!fileContains("packages/session-ui/src/v2/components/prompt-input/index.tsx", "goalControl")) missing.push("goalControl slot")
         return missing.length > 0 ? `Goal composer integration missing: ${missing.join(", ")}` : undefined
+      },
+    },
+    {
+      name: "goal auditor semantic gate",
+      run: () => {
+        const missing: string[] = []
+        if (!fileContains("packages/schema/src/goal.ts", "AuditorPolicy")) missing.push("per-Goal AuditorPolicy")
+        if (!fileContains("packages/core/src/config.ts", "auditor_prompt")) missing.push("global auditor_prompt")
+        if (!fileContains("packages/core/src/goal/auditor.ts", "audit_verdict")) missing.push("audit_verdict tool")
+        if (!fileContains("packages/core/src/goal/auditor-prompt.ts", "PROTOCOL_PROMPT")) missing.push("host-owned auditor protocol")
+        if (!fileContains("packages/schema/src/goal.ts", "continuationPrompt")) missing.push("auditor continuation artifact")
+        if (!fileContains("packages/core/src/goal/sql.ts", "continuation_prompt")) missing.push("durable continuation prompt")
+        if (!fileContains("packages/core/src/goal/automation.ts", "renderContinuationPrompt")) missing.push("auditor continuation wrapper")
+        for (const tool of ["read", "grep", "glob"]) {
+          if (!fileContains("packages/core/src/goal/auditor.ts", `${tool}: Tool.make`)) missing.push(`auditor ${tool} tool`)
+        }
+        if (!fileContains("packages/core/src/session/runner/llm.ts", "GoalAuditor")) missing.push("V2 auditor seam")
+        if (!fileContains("packages/opencode/src/session/prompt.ts", "GoalAuditor")) missing.push("V1 auditor seam")
+        if (!fileContains("packages/app/src/components/settings-v2/general.tsx", "AuditorPromptDialog")) missing.push("auditor prompt settings")
+        if (!fileContains("packages/app/src/components/goal-composer-shelf.tsx", "goal-auditor-model")) missing.push("per-Goal auditor model picker")
+        return missing.length > 0 ? `Goal auditor missing: ${missing.join(", ")}` : undefined
+      },
+    },
+    {
+      name: "shared special-agent completion protocol",
+      run: () => {
+        const missing: string[] = []
+        const shared = "packages/core/src/special-agent-completion.ts"
+        if (!fileContains(shared, "runAdaptiveToolChoice")) missing.push("shared tool-choice negotiation")
+        if (!fileContains(shared, "runTerminalCompletionWithTranscript")) missing.push("shared terminal protocol")
+        if (!fileContains(shared, "appendCompletionRepair")) missing.push("same-session repair transcript")
+        if (!fileContains("packages/core/src/prompt-revisor.ts", "runTerminalCompletion")) missing.push("Prompt Revisor shared completion seam")
+        if (!fileContains("packages/core/src/session/title.ts", "runTerminalCompletion")) missing.push("V2 title shared completion seam")
+        if (!fileContains("packages/core/src/goal/auditor.ts", "runTerminalCompletion")) missing.push("Goal Auditor shared completion seam")
+        if (!fileContains("packages/opencode/src/session/prompt.ts", "runTerminalCompletionWithTranscript")) missing.push("V1 title shared completion seam")
+        if (!fileContains("packages/opencode/src/prompt-revisor/runtime.ts", "generateAdaptive")) missing.push("Prompt Revisor host compatibility seam")
+        if (!fileContains("packages/opencode/src/special-agent/model-message-bridge.ts", "appendModelCompletionRepair")) missing.push("legacy transcript bridge")
+        return missing.length > 0 ? `Special-agent protocol missing: ${missing.join(", ")}` : undefined
+      },
+    },
+    {
+      name: "JetBrains ACP YOLO integration",
+      run: () => {
+        const missing: string[] = []
+        if (!fileContains("packages/opencode/src/agent/agent.ts", 'name: "yolo"')) missing.push("native yolo agent")
+        if (!fileContains("packages/opencode/src/tool/shell.ts", "catastrophicDeleteReason")) missing.push("catastrophic shell guard")
+        if (!fileContains("packages/opencode/script/install-jetbrains-acp.ts", "OpenCode (OpenFork)")) missing.push("JetBrains installer")
+        if (!fileContains("packages/opencode/src/tool/registry.ts", "CheckpointTool")) missing.push("checkpoint tool")
+        return missing.length > 0 ? `JetBrains ACP integration missing: ${missing.join(", ")}` : undefined
       },
     },
     {

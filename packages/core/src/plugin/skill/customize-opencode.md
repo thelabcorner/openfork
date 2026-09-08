@@ -330,7 +330,7 @@ function, not a plain object literal, and the function returns an object
 ```ts
 import type { Plugin } from "@opencode-ai/plugin"
 
-export default (async ({ client, project, directory, $ }) => {
+export default (async ({ client, project, directory, $, runtime }) => {
   return {
     config: (cfg) => {
       // cfg is the live merged config; mutate fields here.
@@ -341,6 +341,36 @@ export default (async ({ client, project, directory, $ }) => {
   }
 }) satisfies Plugin
 ```
+
+### Launching helper scripts from plugins
+
+Do not assume `process.execPath` is Node. Server plugins can run inside a Bun
+standalone `opencode` executable or an Electron utility process, where spawning
+`process.execPath` with a `.js` file can relaunch the host application.
+
+Use `input.runtime.script` as the launch recipe:
+
+```ts
+import { spawn } from "node:child_process"
+import type { Plugin } from "@opencode-ai/plugin"
+
+export default (async (input) => {
+  const launch = input.runtime?.script
+  if (!launch) throw new Error("This OpenCode host does not expose a safe plugin script runtime")
+  const child = spawn(launch.command, [...launch.args, "./scripts/index.js"], {
+    env: { ...process.env, ...launch.env },
+    cwd: input.worktree,
+  })
+
+  return {
+    dispose: async () => child.kill(),
+  }
+}) satisfies Plugin
+```
+
+`runtime.kind` is `node`, `bun`, or `electron`; `runtime.standalone` identifies
+compiled Bun executables. OpenCode also contains a fail-safe for nested packaged
+OpenCode script launches, but plugins should use the explicit runtime recipe.
 
 Hook surface (mutate `output` in place; return `void`):
 

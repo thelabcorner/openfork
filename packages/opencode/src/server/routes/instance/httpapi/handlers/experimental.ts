@@ -44,14 +44,14 @@ const openRouterFreeUsageTrackers = new Map<string, OpenRouterFreeUsageTracker>(
 
 // Mirrors the renderer's parser in packages/app/src/utils/openrouter-endpoints.ts:
 // OpenRouter's `/api/v1/models/{id}/endpoints` returns `{ data: { endpoints: [] } }`
-// where each row carries `provider_name`, `tag` (e.g. "novita/fp8"), string
-// `pricing.{prompt,completion,input_cache_read}` and `uptime_last_30m`. Defensive:
-// unknown/malformed rows are skipped, pricing strings are coerced to numbers.
+// where each row carries provider identity, quantization/capabilities, public
+// p50 performance, string pricing, and uptime windows. Defensive: unknown/
+// malformed rows are skipped and numeric strings are coerced to numbers.
 function parseOpenRouterEndpoints(payload: unknown) {
   const rows = (payload as { data?: { endpoints?: unknown } } | null)?.data?.endpoints
   if (!Array.isArray(rows)) return []
   const num = (value: unknown) => {
-    if (typeof value === "number") return value
+    if (typeof value === "number") return Number.isFinite(value) ? value : undefined
     if (typeof value === "string") {
       const parsed = Number(value)
       if (Number.isFinite(parsed)) return parsed
@@ -64,6 +64,17 @@ function parseOpenRouterEndpoints(payload: unknown) {
     provider: string
     pricing: { prompt: number; completion: number; cacheRead: number }
     uptime?: number
+    quantization?: string
+    contextLength?: number
+    maxCompletionTokens?: number
+    maxPromptTokens?: number
+    supportedParameters?: string[]
+    supportsImplicitCaching?: boolean
+    latencyP50?: number
+    throughputP50?: number
+    uptime5m?: number
+    uptime1d?: number
+    status?: number
   }> = []
   for (const row of rows) {
     if (!row || typeof row !== "object") continue
@@ -72,10 +83,32 @@ function parseOpenRouterEndpoints(payload: unknown) {
       tag?: unknown
       pricing?: { prompt?: unknown; completion?: unknown; input_cache_read?: unknown }
       uptime_last_30m?: unknown
+      uptime_last_5m?: unknown
+      uptime_last_1d?: unknown
+      quantization?: unknown
+      context_length?: unknown
+      max_completion_tokens?: unknown
+      max_prompt_tokens?: unknown
+      supported_parameters?: unknown
+      supports_implicit_caching?: unknown
+      latency_last_30m?: { p50?: unknown }
+      throughput_last_30m?: { p50?: unknown }
+      status?: unknown
     }
     const tag = typeof item.tag === "string" ? item.tag : undefined
     if (!tag) continue
     const uptime = num(item.uptime_last_30m)
+    const uptime5m = num(item.uptime_last_5m)
+    const uptime1d = num(item.uptime_last_1d)
+    const contextLength = num(item.context_length)
+    const maxCompletionTokens = num(item.max_completion_tokens)
+    const maxPromptTokens = num(item.max_prompt_tokens)
+    const latencyP50 = num(item.latency_last_30m?.p50)
+    const throughputP50 = num(item.throughput_last_30m?.p50)
+    const status = num(item.status)
+    const supportedParameters = Array.isArray(item.supported_parameters)
+      ? item.supported_parameters.filter((value): value is string => typeof value === "string")
+      : undefined
     const perMillion = (value: unknown) => (num(value) ?? 0) * 1_000_000
     result.push({
       providerName: typeof item.provider_name === "string" ? item.provider_name : tag,
@@ -87,6 +120,19 @@ function parseOpenRouterEndpoints(payload: unknown) {
         cacheRead: perMillion(item.pricing?.input_cache_read),
       },
       ...(uptime === undefined ? {} : { uptime }),
+      ...(typeof item.quantization === "string" && item.quantization ? { quantization: item.quantization } : {}),
+      ...(contextLength === undefined ? {} : { contextLength }),
+      ...(maxCompletionTokens === undefined ? {} : { maxCompletionTokens }),
+      ...(maxPromptTokens === undefined ? {} : { maxPromptTokens }),
+      ...(supportedParameters === undefined ? {} : { supportedParameters }),
+      ...(typeof item.supports_implicit_caching === "boolean"
+        ? { supportsImplicitCaching: item.supports_implicit_caching }
+        : {}),
+      ...(latencyP50 === undefined ? {} : { latencyP50 }),
+      ...(throughputP50 === undefined ? {} : { throughputP50 }),
+      ...(uptime5m === undefined ? {} : { uptime5m }),
+      ...(uptime1d === undefined ? {} : { uptime1d }),
+      ...(status === undefined ? {} : { status }),
     })
   }
   return result
@@ -334,13 +380,22 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       if (!permaslugBody) return []
       const models = permaslugBody.data?.models ?? []
       const permaslug =
-        models.find((m) => (m.slug === modelId || m.slug === rawModelId) && m.endpoint?.variant === "standard")?.permaslug ??
-        models.find((m) => m.slug === modelId || m.slug === rawModelId)?.permaslug
+        models.find((m) => (m.slug === modelId || m.slug === rawModelId) && m.endpoint?.variant === "standard")
+          ?.permaslug ?? models.find((m) => m.slug === modelId || m.slug === rawModelId)?.permaslug
       if (!permaslug) return []
 
       const pricingBody = (yield* fetchJson(
         `https://openrouter.ai/api/frontend/v1/stats/effective-pricing?permaslug=${encodeURIComponent(permaslug)}&shape=v7&variant=standard`,
-      )) as { data?: { providerSummaries?: Array<{ endpointId?: string; providerName?: string; providerSlug?: string; cacheHitRate?: number }> } } | null
+      )) as {
+        data?: {
+          providerSummaries?: Array<{
+            endpointId?: string
+            providerName?: string
+            providerSlug?: string
+            cacheHitRate?: number
+          }>
+        }
+      } | null
       if (!pricingBody) return []
       const summaries = pricingBody.data?.providerSummaries ?? []
       const allowedIds = new Set(summaries.map((s) => s.endpointId).filter((id): id is string => !!id))
@@ -370,7 +425,9 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
           providerName,
           providerSlug,
           cacheHitPercent: Math.round((summary.cacheHitRate ?? 0) * 10000) / 100,
-          throughputTps: throughputLatest.has(endpointId) ? Math.round(throughputLatest.get(endpointId)! * 100) / 100 : undefined,
+          throughputTps: throughputLatest.has(endpointId)
+            ? Math.round(throughputLatest.get(endpointId)! * 100) / 100
+            : undefined,
         }
       })
       return result
@@ -393,9 +450,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
           // renderer can distinguish "couldn't load" from a model with no providers.
           Effect.mapError(() => new HttpApiError.InternalServerError({})),
         )
-      const body = yield* response.json.pipe(
-        Effect.mapError(() => new HttpApiError.InternalServerError({})),
-      )
+      const body = yield* response.json.pipe(Effect.mapError(() => new HttpApiError.InternalServerError({})))
       return parseOpenRouterEndpoints(body)
     })
 
@@ -453,7 +508,13 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       return yield* Effect.tryPromise({
         try: () => tracker!.getUsage({ includeValue, forceRefresh }),
         catch: (cause) => cause,
-      }).pipe(Effect.catch(() => Effect.succeed(degradedFreeUsageReport("OpenRouter usage unavailable; a Management key is required for analytics."))))
+      }).pipe(
+        Effect.catch(() =>
+          Effect.succeed(
+            degradedFreeUsageReport("OpenRouter usage unavailable; a Management key is required for analytics."),
+          ),
+        ),
+      )
     })
 
     return handlers

@@ -120,6 +120,17 @@ export const OpenRouterEndpointSchema = Schema.Struct({
     cacheRead: Schema.Number,
   }),
   uptime: Schema.optional(Schema.Number),
+  quantization: Schema.optional(Schema.String),
+  contextLength: Schema.optional(Schema.Number),
+  maxCompletionTokens: Schema.optional(Schema.Number),
+  maxPromptTokens: Schema.optional(Schema.Number),
+  supportedParameters: Schema.optional(Schema.Array(Schema.String)),
+  supportsImplicitCaching: Schema.optional(Schema.Boolean),
+  latencyP50: Schema.optional(Schema.Number),
+  throughputP50: Schema.optional(Schema.Number),
+  uptime5m: Schema.optional(Schema.Number),
+  uptime1d: Schema.optional(Schema.Number),
+  status: Schema.optional(Schema.Number),
 }).annotate({ identifier: "OpenRouterEndpoint" })
 
 export const OpenRouterEndpointsResponse = Schema.Array(OpenRouterEndpointSchema).annotate({

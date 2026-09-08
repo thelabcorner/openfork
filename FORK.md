@@ -59,12 +59,13 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 | SPAD | `packages/opencode/src/session/spad/**` |
 | Quota | `packages/opencode/src/quota/**`, `httpapi/**/quota.ts` |
 | Fork credentials | `packages/opencode/src/fork/**`, `httpapi/**/fork-credential.ts` |
-| Extra tools | `packages/opencode/src/tool/{json,background,sqlite,git,typecheck,project,symbols,test,refactor,sympy,patch,archive,swarm,browser,reload}*` |
+| Extra tools | `packages/opencode/src/tool/{json,background,sqlite,git,typecheck,project,symbols,test,refactor,sympy,patch,archive,swarm,browser,reload,checkpoint,shell-safety}*` |
 | Search extras | `packages/core/src/search/**` |
-| Checkpoints | `packages/core/src/checkpoint.ts`, `packages/opencode/src/session/checkpoint.ts` |
+| Checkpoints | `packages/core/src/checkpoint.ts`, `packages/opencode/src/session/checkpoint.ts`, `packages/opencode/src/tool/checkpoint.ts` |
+| JetBrains ACP | `packages/opencode/script/install-jetbrains-acp.ts`, `packages/opencode/src/tool/shell-safety.ts` |
 | Conversation Control | `packages/schema/src/session-context.ts`, `packages/core/src/session/sql.ts` (context tables), `packages/core/src/database/migration/*conversation_control*`, `packages/opencode/src/session/context/**`, `packages/opencode/src/session/fork/**`, `httpapi/**/session-context.ts`, `packages/opencode/src/session/message-v2.ts` (context seam), `packages/app/src/components/context-ledger/**`, `packages/app/src/components/context-history/**` |
 | Throughput | `packages/schema/src/session-message.ts` + `v1/session.ts` (`streamedAt`), `packages/schema/src/session-event.ts` (`Step.Streamed`, `requestSentAt` on `Step.Started`), `packages/core/src/session/{throughput,message-updater,projector,runner}` (boundary + projection + pure calc), `packages/opencode/src/session/processor.ts` (V1 stamps — the path that serves the desktop timeline), `packages/session-ui/src/components/message-part.tsx` (`toThroughputMessage`, footer meta) + `session-turn.tsx`, `packages/app/src/pages/session/timeline/message-timeline.tsx` (the chip the desktop actually renders), `packages/ui/src/i18n/en.ts` (`ui.message.throughput`) |
-| Goal Mode | `packages/schema/src/goal*`, `packages/core/src/goal/**`, `packages/core/src/goal.ts`, `packages/core/src/tool/goal.ts`, `packages/core/test/goal/**`, `packages/core/src/database/migration/*goal*`, `packages/opencode/src/tool/goal.ts`, `httpapi/**/goal.ts`, `packages/app/src/context/goals.ts`, `packages/app/src/components/goal-composer-shelf*`. Shared seams are union-owned: V1 `session/{prompt,session}.ts`, V1 `tool/registry.ts`, V2 `core/session/{runner/llm,execution/local}.ts`, `core/tool/builtins.ts`, `app/{app,components/prompt-input-v2}.tsx`, and `session-ui/v2/components/prompt-input/index.tsx`. Preserve durable CAS state, reservation recovery, Goal-context injection, worker focus inheritance, and the zinc composer shelf when taking upstream changes. |
+| Goal Mode | `packages/schema/src/goal*`, `packages/core/src/goal/**` (including `auditor.ts` + browser-safe `auditor-prompt.ts` policy/protocol), `packages/core/src/goal.ts`, `packages/core/src/tool/goal.ts`, `packages/core/test/goal/**`, `packages/core/src/database/migration/*goal*`, `packages/opencode/src/tool/goal.ts`, `httpapi/**/goal.ts`, `packages/app/src/context/goals.ts`, `packages/app/src/components/goal-composer-shelf*`. Shared seams are union-owned: V1 `session/{prompt,session}.ts`, V1 `tool/registry.ts`, V2 `core/session/{runner/llm,execution/local}.ts`, `core/tool/builtins.ts`, config + V1 config migration, `core/location-services.ts`, `app/{app,components/prompt-input-v2,components/settings-v2/general,context/settings}.tsx`, app i18n, and `session-ui/v2/components/prompt-input/index.tsx`. Preserve durable CAS state, crash-safe auditor-authored continuation reservations, Goal-context injection, worker focus inheritance, independent auditor gating, and the zinc composer shelf when taking upstream changes. |
 | Meta | `docs/handoff/AGENTS.md`, `FORK.md`, `.github/workflows/**`, root `README.md`, `packages/desktop/src/main/updater.ts` |
 
 ### Union — combine both sides
@@ -72,8 +73,10 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 | Path | Rule |
 |---|---|
 | `packages/opencode/src/tool/registry.ts` | Fork tools **plus** every new upstream tool |
+| `packages/opencode/src/agent/agent.ts` | Take upstream agent fixes; keep native `yolo` primary mode and its final permission-allow policy |
+| `packages/opencode/src/tool/shell.ts` | Take upstream shell/parser fixes; keep the `catastrophicDeleteReason` pre-execution guard |
 | `packages/opencode/src/plugin/index.ts` | Union provider/plugin hooks |
-| `packages/opencode/src/session/prompt.ts` | Take upstream loop/safety fixes; keep fork hooks (SPAD, quota, pause, **conversation-control compiler**, **Goal context + durable continuation**) |
+| `packages/opencode/src/session/prompt.ts` | Take upstream loop/safety fixes; keep fork hooks (SPAD, quota, pause, **conversation-control compiler**, **Goal context + durable continuation + GoalAuditor semantic gate**) |
 | `packages/opencode/src/session/message-v2.ts` | Keep fork hook (effective-context compiler) — upstream has no context overlay |
 | `packages/opencode/src/provider/provider.ts` | Take upstream provider fixes; keep fork credential/usage hooks |
 | `packages/opencode/src/server/routes/instance/httpapi/api.ts` | Re-register fork groups after upstream edits |
@@ -90,7 +93,9 @@ These KEEP-path files had real conflicts in v1.18.21 but follow no blanket rule:
 
 `packages/app/src/pages/session/timeline/message-timeline.tsx`, `packages/app/src/pages/session/use-session-commands.tsx`, `packages/app/src/pages/session/v2/session-file-browser-tab.tsx`, `packages/app/e2e/utils/mock-server.ts`, `packages/core/src/session/projector.ts`, `packages/core/src/session/runner/llm.ts`, `packages/opencode/src/session/llm/ai-sdk.ts`, `packages/opencode/src/session/session.ts`, `packages/core/src/session/sql.ts`
 
-For Goal Mode specifically, `packages/core/src/session/runner/llm.ts` and `packages/opencode/src/session/prompt.ts` must continue to use the same `GoalAutomation` service. `packages/opencode/src/session/session.ts` must inherit a parent's focused Goal synchronously before returning a new child Session; Session Group decoration may remain asynchronous.
+For Goal Mode specifically, `packages/core/src/session/runner/llm.ts` and `packages/opencode/src/session/prompt.ts` must continue to use the same `GoalAutomation` service and the same independent `GoalAuditor` contract. Automatic continuation is never a blind loop: the auditor gets only workspace-confined `read`, `grep`, `glob`, and the terminating `audit_verdict` tool; `complete` enters formal verification, `blocked` uses semantic hysteresis, and model/provider failure uses the separate bounded `maxAttempts` retry policy before automation blocks. The auditor prompt is a global `auditor_prompt` setting, while the auditor model is durable **per Goal** in `auditorPolicy`; do not add a global auditor-model preference. `packages/opencode/src/session/session.ts` must inherit a parent's focused Goal synchronously before returning a new child Session; Session Group decoration may remain asynchronous.
+
+Prompt Revisor, session-title generation, and Goal Auditor must share `packages/core/src/special-agent-completion.ts` for terminal-tool protocol handling and tool-choice compatibility. Do not reintroduce per-agent `required -> auto` negotiation or bespoke prose-retry loops. A failed completion attempt (prose/no tool, wrong or mixed tools, extra prose, or invalid completion payload) is continued in the **same special-agent conversation** with the failed assistant response preserved, unresolved tool calls settled with host protocol errors, and a bounded host-authored correction turn that exposes only the agent's completion tool. Prompt Revisor commits with `revised_prompt`, title generation with `generated_title`, and Goal Auditor with `audit_verdict`. Legacy/V1 hosts may adapt transcript formats, but the retry/classification/budget state machine remains the shared Core implementation.
 
 ### Generated — do not hand-merge
 
@@ -125,6 +130,9 @@ tracked, no conflict markers). The rest still needs eyes:
 - Session-group plugin hooks registered
 - Quota routes registered
 - Extra tools present **and** new upstream tools present
+- JetBrains custom `OpenCode (OpenFork)` ACP installer still preserves existing `~/.jetbrains/acp.json` entries
+- Native YOLO ACP mode remains permission-frictionless while catastrophic recursive root/home deletion stays hard-blocked
+- ACP runtime still exposes fork tools including `checkpoint`; automatic per-turn checkpoints remain active
 - Websearch = fork engines ∪ upstream additions
 - Plugin/provider unions intact
 - Explorer/tab e2e match fork UI
