@@ -16,7 +16,13 @@ import { useSync } from "@/context/sync"
 import { useTabs } from "@/context/tabs"
 import { useProviders } from "@/hooks/use-providers"
 import { pathKey } from "@/utils/path-key"
-import { chatsRoot } from "@opencode-ai/core/project/chat-paths"
+import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
+import {
+  findChatProject,
+  isChatProjectAlias,
+  isReservedChatProjectPath,
+  type ChatProjectLike,
+} from "@/utils/chat-project"
 
 export function createPromptInputController(input: {
   sessionKey: Accessor<string>
@@ -102,28 +108,40 @@ export function createPromptProjectControls() {
   const [search] = useSearchParams<{ draftId?: string }>()
   const projectServer = () => serverSDK().server
   const projectServerCtx = createMemo(() => global.ensureServerCtx(projectServer()))
-  const chatProject = () => {
-    const root = chatsRoot()
-    return {
-      name: "Chat",
-      id: "chats",
-      worktree: root,
-      sandboxes: [],
-    } as const
+
+  const withChat = <T extends ChatProjectLike>(
+    list: T[],
+    serverProjects: readonly T[],
+  ): T[] => {
+    const canonical = findChatProject(serverProjects)
+    if (!canonical) {
+      // Never expose the old browser-derived faux path while the authoritative
+      // server project list is still bootstrapping.
+      return list.filter((project) => project.id !== "chats" && !isReservedChatProjectPath(project.worktree))
+    }
+    const existing = list.find((project) => isChatProjectAlias(project, canonical))
+    const chat = {
+      ...(existing ?? canonical),
+      ...canonical,
+      name: canonical.name ?? CHAT_PROJECT_NAME,
+      worktree: canonical.worktree,
+    } as T
+    return [chat, ...list.filter((project) => !isChatProjectAlias(project, canonical))]
   }
 
   const projects = createMemo(() => {
-    const chat = chatProject()
-    const list = server.list.length <= 1
-      ? (search.draftId ? projectServerCtx().projects.list() : layout.projects.list())
-      : server.list.flatMap((conn) => {
+    if (server.list.length <= 1) {
+      const ctx = projectServerCtx()
+      const list = search.draftId ? ctx.projects.list() : layout.projects.list()
+      return withChat(list, ctx.sync.data.project as typeof list)
+    }
+    return server.list.flatMap((conn) => {
           const item = { key: ServerConnection.key(conn), name: serverName(conn) }
-          return global
-            .ensureServerCtx(conn)
-            .projects.list()
-            .map((project) => ({ ...project, server: item }))
+          const ctx = global.ensureServerCtx(conn)
+          return withChat(ctx.projects.list(), ctx.sync.data.project as ReturnType<typeof ctx.projects.list>).map(
+            (project) => ({ ...project, server: item }),
+          )
         })
-    return [chat, ...list]
   })
   const selectProject = (worktree: string, serverKey?: string) => {
     const conn = serverKey ? server.list.find((conn) => ServerConnection.key(conn) === serverKey) : projectServer()

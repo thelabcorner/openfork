@@ -10,6 +10,10 @@ import { computeBonus } from "./matcher-score"
 
 export const PREFIX_CHAMPIONS = 128
 const ALPHABET = 48
+// staticPrior = extension affinity (0..24) + short-primary bonus (0..24).
+// Keep this explicit so prefix champion selection can use O(n) counting order
+// instead of sorting every posting list independently.
+const STATIC_PRIOR_MAX = 48
 
 // One candidate's raw input: display text, where its primary field
 // (basename/name) starts inside that text, and static metadata.
@@ -266,12 +270,15 @@ export function buildIndex(docs: readonly IndexDoc[]): SearchIndex {
   const gramKey = new Int32Array(gramMask).fill(-1)
   const gramOff = new Uint32Array(gramMask)
   const gramLen = new Uint32Array(gramMask)
-  const postingLists = [...grams.entries()].sort((a, b) => a[0] - b[0])
+  // IDs are appended while documents are visited in ascending id order, and
+  // perDocGrams guarantees one append per document. Posting lists are therefore
+  // already sorted by id. Hash-table correctness does not depend on key insertion
+  // order, so sorting every key/list here was pure cold-start work.
+  const postingLists = [...grams.entries()]
   const postingsTotal = postingLists.reduce((acc, [, ids]) => acc + ids.length, 0)
   const postings = new Uint32Array(postingsTotal)
   let poff = 0
   for (const [key, ids] of postingLists) {
-    ids.sort((a, b) => a - b)
     postings.set(ids, poff)
     insertGram(gramKey, gramOff, gramLen, gramMask, key, poff, ids.length)
     poff += ids.length
@@ -283,12 +290,11 @@ export function buildIndex(docs: readonly IndexDoc[]): SearchIndex {
   const agramKey = new Int32Array(agramMask).fill(-1)
   const agramOff = new Uint32Array(agramMask)
   const agramLen = new Uint32Array(agramMask)
-  const apostingLists = [...agrams.entries()].sort((a, b) => a[0] - b[0])
+  const apostingLists = [...agrams.entries()]
   const apostingsTotal = apostingLists.reduce((acc, [, ids]) => acc + ids.length, 0)
   const apostings = new Uint32Array(apostingsTotal)
   let apoff = 0
   for (const [key, ids] of apostingLists) {
-    ids.sort((a, b) => a - b)
     apostings.set(ids, apoff)
     insertGram(agramKey, agramOff, agramLen, agramMask, key, apoff, ids.length)
     apoff += ids.length
@@ -301,20 +307,38 @@ export function buildIndex(docs: readonly IndexDoc[]): SearchIndex {
   const prefixKey = new Int32Array(prefixMask).fill(-1)
   const prefixOff = new Uint32Array(prefixMask)
   const prefixLen = new Uint16Array(prefixMask)
+  const prefixEntries = [...prefixes.entries()]
   const champScratch: number[][] = []
+  const priorCounts = new Uint32Array(STATIC_PRIOR_MAX + 1)
+  const priorNext = new Uint32Array(STATIC_PRIOR_MAX + 1)
   let champTotal = 0
-  for (const [, ids] of [...prefixes.entries()].sort((a, b) => a[0] - b[0])) {
-    const ranked = ids
-      .slice()
-      .sort((a, b) => staticPrior[b]! - staticPrior[a]! || a - b)
-      .slice(0, PREFIX_CHAMPIONS)
+  for (const [, ids] of prefixEntries) {
+    // `ids` is already ascending. Counting-sort by the tiny static-prior domain
+    // preserves the old exact ordering (prior DESC, id ASC) in O(n + 49), while
+    // the previous slice().sort().slice() paid O(n log n) plus two allocations
+    // for every prefix key. Common one-character prefixes can contain thousands
+    // of ids, so this was a major first-query latency sink.
+    priorCounts.fill(0)
+    for (const id of ids) priorCounts[Math.max(0, Math.min(STATIC_PRIOR_MAX, staticPrior[id]!))]++
+    let cursor = 0
+    for (let prior = STATIC_PRIOR_MAX; prior >= 0; prior--) {
+      priorNext[prior] = cursor
+      cursor += priorCounts[prior]!
+    }
+    const cap = Math.min(ids.length, PREFIX_CHAMPIONS)
+    const ranked = new Array<number>(cap)
+    for (const id of ids) {
+      const prior = Math.max(0, Math.min(STATIC_PRIOR_MAX, staticPrior[id]!))
+      const slot = priorNext[prior]++
+      if (slot < cap) ranked[slot] = id
+    }
     champScratch.push(ranked)
     champTotal += ranked.length
   }
   const champions = new Uint32Array(champTotal)
   let coff = 0
   let ci = 0
-  for (const [key] of [...prefixes.entries()].sort((a, b) => a[0] - b[0])) {
+  for (const [key] of prefixEntries) {
     const ranked = champScratch[ci++]!
     insertPrefix(prefixKey, prefixOff, prefixLen, prefixMask, key, coff, ranked.length)
     for (let k = 0; k < ranked.length; k++) champions[coff + k] = ranked[k]!

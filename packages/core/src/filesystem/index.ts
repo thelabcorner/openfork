@@ -12,6 +12,7 @@ import { RelativePath } from "../schema"
 import { Hash } from "../util/hash"
 import { ChunkStore, KIND_DIR, KIND_FILE } from "../search/chunk-store"
 import { frontDecode } from "../search/front-code"
+import { availableParallelism } from "node:os"
 
 /**
  * Server-side persisted, incrementally-invalidated project file index.
@@ -156,7 +157,12 @@ export const layer = Layer.effect(
       return subtrees.delete(dir)
     }
 
-    const STAT_CONCURRENCY = 24
+    // This path does more than stat(): for small text files it also reads the
+    // entire file to compute lineCount. Keep per-host fan-out deliberately low
+    // because several ACP/Desktop hosts may hydrate the same worktree at once.
+    // The previous fixed 24-way fan-out became 96 concurrent metadata reads with
+    // 3 ACP hosts + desktop on a 24-thread machine.
+    const STAT_CONCURRENCY = Math.max(1, Math.min(6, availableParallelism()))
     const LINE_COUNT_MAX_BYTES = 512 * 1024
     const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|pdf|zip|tar|gz|tgz|bz2|xz|7z|rar|mp4|mp3|mov|avi|mkv|wasm|pyc|class|o|so|dll|exe|bin|dat|lock)$/i
     const attachMeta = (entries: readonly FileSystem.Entry[]): Effect.Effect<FileSystem.Entry[]> =>

@@ -14,6 +14,8 @@ import { RelativePath } from "../schema"
 import { Flag } from "../flag/flag"
 import { Watcher } from "./watcher"
 import { Matcher } from "../search/matcher"
+import { rankFileMentionResults } from "../search/mention-ranking"
+import { searchFileMentionsFast } from "../search/mention-fast"
 import { SearchIndex } from "../search/index-service"
 import { ChunkStore } from "../search/chunk-store"
 import { Global } from "../global"
@@ -248,6 +250,7 @@ export const ripgrepLayer = Layer.effect(
             const trimmed = d.endsWith(path.sep) ? d.slice(0, -path.sep.length) : d
             paths.push({ path: trimmed, isDir: true })
           }
+          if (!input.symbols) return searchFileMentionsFast(paths, input)
           return mentionsFromEntries(state, paths, [], input)
         }),
     })
@@ -462,7 +465,20 @@ const indexLayer = Layer.effect(
             paths: SearchIndex.PathEntry[]
             symbols: Matcher.SymbolEntry[]
           }>)
-          return mentionsFromEntries(index, snapshot.paths, snapshot.symbols, input)
+          // Prompt Input V2 is file-only. Do not build the full trigram/prefix
+          // matcher on its first keystroke: at 100k paths Matcher.prepare is
+          // seconds of cold latency while a bounded scan is low-millisecond and
+          // preserves the structural ranking users care about. Symbol-enabled
+          // callers keep the richer prepared matcher/session.
+          const page = input.symbols
+            ? mentionsFromEntries(index, snapshot.paths, snapshot.symbols, input)
+            : searchFileMentionsFast(snapshot.paths, input)
+          // Prompt Input V2 requests file-only results. Blend a bounded, live
+          // mtime prior into those rows after lexical matching so ordinary saves
+          // never force an expensive Matcher.prepare rebuild. This is O(K log K)
+          // over the returned page (K <= API limit), with O(1) metadata lookups.
+          if (input.symbols) return page
+          return { ...page, results: rankFileMentionResults(page.results, index.fileMetadata) }
         }),
     })
   }),

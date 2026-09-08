@@ -56,32 +56,59 @@ export function createPromptInputV2State() {
   return createStore(createPromptInputV2InteractionState())
 }
 
-const CONTEXT_SEARCH_DEBOUNCE_MS = 70
+// The server-side file picker is designed for low-millisecond hot queries. Keep
+// a small coalescing window for normal typing, but do not make debounce itself
+// the dominant perceived latency.
+const CONTEXT_SEARCH_DEBOUNCE_MS = 30
 
-function createDeferredContextSearch(
+export function createDeferredContextSearch(
   search: (query: string, options?: { signal?: AbortSignal; limit?: number }) => PromptInputV2Suggestion[] | Promise<PromptInputV2Suggestion[]>,
 ) {
   let controller: AbortController | undefined
   let timer: ReturnType<typeof setTimeout> | undefined
   let generation = 0
+  let settlePending: ((results: PromptInputV2Suggestion[]) => void) | undefined
 
   const run = (query: string) =>
     new Promise<PromptInputV2Suggestion[]>((resolve) => {
       const token = ++generation
-      if (timer) clearTimeout(timer)
+      if (timer) {
+        clearTimeout(timer)
+        timer = undefined
+      }
+      // A superseded debounce used to leave its Promise unresolved forever.
+      // `useFilteredList` can be awaiting that Promise while the user keeps
+      // typing, which looks exactly like a hung @-mention search. Settle it
+      // immediately and abort any request that is already in flight.
+      settlePending?.([])
+      settlePending = resolve
+      controller?.abort()
       timer = setTimeout(() => {
-        controller?.abort()
+        timer = undefined
         const next = new AbortController()
         controller = next
         Promise.resolve(search(query, { signal: next.signal, limit: 200 }))
-          .then((results) => resolve(token === generation && !next.signal.aborted ? results : []))
-          .catch(() => resolve([]))
+          .then((results) => {
+            if (settlePending !== resolve) return
+            settlePending = undefined
+            resolve(token === generation && !next.signal.aborted ? results : [])
+          })
+          .catch(() => {
+            if (settlePending !== resolve) return
+            settlePending = undefined
+            resolve([])
+          })
       }, CONTEXT_SEARCH_DEBOUNCE_MS)
     })
 
   const cancel = () => {
     generation++
-    if (timer) clearTimeout(timer)
+    if (timer) {
+      clearTimeout(timer)
+      timer = undefined
+    }
+    settlePending?.([])
+    settlePending = undefined
     controller?.abort()
   }
 

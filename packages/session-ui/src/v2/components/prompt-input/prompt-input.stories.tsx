@@ -105,7 +105,7 @@ const commandSuggestions: PromptInputV2Suggestion[] = [
   },
 ]
 
-function ControlledPromptInput(props: { goalControl?: unknown } = {}) {
+function ControlledPromptInput(props: { goalControl?: unknown; goalShelf?: unknown } = {}) {
   // Agent choice is a persisted user/workspace preference in v1, not part of PromptStore.
   const [preferences, setPreferences] = createStore({ agent: "build" })
 
@@ -206,7 +206,7 @@ function ControlledPromptInput(props: { goalControl?: unknown } = {}) {
 
   return (
     <div class="mx-auto flex max-w-[760px] flex-col gap-4 pt-32">
-      <PromptInputV2 controller={controller} goalControl={props.goalControl} />
+      <PromptInputV2 controller={controller} goalControl={props.goalControl} goalShelf={props.goalShelf} />
     </div>
   )
 }
@@ -251,5 +251,5 @@ export const ControlledComposition = {
  * to the absolute anchor, width, z-order and surrounding composer geometry.
  */
 export const GoalShelfComposition = {
-  render: () => <ControlledPromptInput goalControl={<GoalShelfVisualFixture />} />,
+  render: () => <ControlledPromptInput goalShelf={<GoalShelfVisualFixture />} />,
 }

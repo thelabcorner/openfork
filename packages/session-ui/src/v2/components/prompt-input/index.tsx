@@ -15,6 +15,11 @@ import { AttachmentCardV2 } from "../attachment-card-v2"
 import { CommentCardV2 } from "../comment-card-v2"
 import { typeLabel } from "../../../components/message-file"
 import { getDirectory, getFilename } from "@opencode-ai/core/util/path"
+import {
+  highlightPromptInputV2Label,
+  splitPromptInputV2PathSegments,
+  type PromptInputV2LabelSegment,
+} from "./path-label"
 import type {
   PromptInputV2Attachment,
   PromptInputV2Comment,
@@ -46,8 +51,12 @@ export type PromptInputV2Props = {
   usageControl?: JSX.Element
   autoAcceptControl?: JSX.Element
   footerControl?: JSX.Element
-  /** Persistent app-owned control rendered above the composer, independent of the prompt popover machine. */
+  /** App-owned footer control rendered immediately after the add (+) menu. */
   goalControl?: JSX.Element
+  /** App-owned prompt transformation controls rendered beside Goal. */
+  revisionControl?: JSX.Element
+  /** Persistent app-owned Goal shelf rendered above the composer, independent of the prompt popover machine. */
+  goalShelf?: JSX.Element
   variantControlVisible?: boolean
   attachKeybind?: string[]
   attachShortcut?: string
@@ -117,9 +126,9 @@ export function PromptInputV2(props: PromptInputV2Props) {
           event.currentTarget.value = ""
         }}
       />
-      <Show when={props.goalControl}>
+      <Show when={props.goalShelf}>
         <div data-slot="goal-control" class="absolute inset-x-0 -top-2 z-30 -translate-y-full">
-          {props.goalControl}
+          {props.goalShelf}
         </div>
       </Show>
       <Show when={state.popover.type !== "closed"}>
@@ -255,6 +264,8 @@ export function PromptInputV2(props: PromptInputV2Props) {
               onContext={props.controller.openContext}
               onShell={props.controller.openShell}
             />
+            <Show when={props.goalControl}>{props.goalControl}</Show>
+            <Show when={props.revisionControl}>{props.revisionControl}</Show>
             <Show when={view.agent} keyed>
               {(control) => (
                 <PromptInputV2ConfiguredSelect
@@ -797,6 +808,8 @@ export function PromptInputV2Popover(props: {
   emptyLabel: string
   items: PromptInputV2Suggestion[]
   activeID?: string
+  /** Render in normal flow instead of floating above the composer. Useful inside clipped dock surfaces. */
+  inline?: boolean
   /** Current typed query, used for pragmatic substring highlighting when an item has no server-computed `positions`. */
   query?: string
   search?: {
@@ -811,7 +824,11 @@ export function PromptInputV2Popover(props: {
 }) {
   return (
     <div
-      class="absolute inset-x-0 -top-2 z-40 flex max-h-72 -translate-y-full flex-col overflow-auto rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-base p-1 shadow-[var(--v2-elevation-floating)] no-scrollbar"
+      classList={{
+        "z-40 flex flex-col overflow-auto rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-base p-1 shadow-[var(--v2-elevation-floating)] no-scrollbar": true,
+        "absolute inset-x-0 -top-2 max-h-72 -translate-y-full": !props.inline,
+        "relative mt-1 max-h-52 w-full shrink-0": props.inline,
+      }}
       onMouseDown={(event) => event.preventDefault()}
     >
       <Show when={props.search}>
@@ -990,68 +1007,6 @@ function PromptInputV2LabelSegments(props: { segments: PromptInputV2LabelSegment
       }
     </For>
   )
-}
-
-type PromptInputV2LabelSegment = { text: string; matched: boolean }
-
-// Splits a full-path label into filename/directory segment runs at the last
-// path separator, preserving match highlighting across the split point.
-function splitPromptInputV2PathSegments(
-  label: string,
-  positions: number[] | undefined,
-  query: string | undefined,
-): { dirSegments: PromptInputV2LabelSegment[]; nameSegments: PromptInputV2LabelSegment[] } | undefined {
-  const nameStart = label.length - getFilename(label).length
-  if (nameStart <= 0) return undefined
-  const segments = highlightPromptInputV2Label(label, positions, query)
-  const dirSegments: PromptInputV2LabelSegment[] = []
-  const nameSegments: PromptInputV2LabelSegment[] = []
-  let offset = 0
-  for (const segment of segments) {
-    const start = offset
-    const end = offset + segment.text.length
-    offset = end
-    if (end <= nameStart) {
-      dirSegments.push(segment)
-      continue
-    }
-    if (start >= nameStart) {
-      nameSegments.push(segment)
-      continue
-    }
-    dirSegments.push({ text: segment.text.slice(0, nameStart - start), matched: segment.matched })
-    nameSegments.push({ text: segment.text.slice(nameStart - start), matched: segment.matched })
-  }
-  return { dirSegments, nameSegments }
-}
-
-function highlightPromptInputV2Label(label: string, positions: number[] | undefined, query: string | undefined): PromptInputV2LabelSegment[] {
-  if (positions && positions.length > 0) {
-    const matched = new Set(positions)
-    const segments: PromptInputV2LabelSegment[] = []
-    let buffer = ""
-    let bufferMatched = false
-    for (let index = 0; index < label.length; index++) {
-      const isMatched = matched.has(index)
-      if (buffer && isMatched !== bufferMatched) {
-        segments.push({ text: buffer, matched: bufferMatched })
-        buffer = ""
-      }
-      buffer += label[index]
-      bufferMatched = isMatched
-    }
-    if (buffer) segments.push({ text: buffer, matched: bufferMatched })
-    return segments
-  }
-  const needle = query?.trim()
-  if (!needle) return [{ text: label, matched: false }]
-  const index = label.toLowerCase().indexOf(needle.toLowerCase())
-  if (index === -1) return [{ text: label, matched: false }]
-  const segments: PromptInputV2LabelSegment[] = []
-  if (index > 0) segments.push({ text: label.slice(0, index), matched: false })
-  segments.push({ text: label.slice(index, index + needle.length), matched: true })
-  if (index + needle.length < label.length) segments.push({ text: label.slice(index + needle.length), matched: false })
-  return segments
 }
 
 export function PromptInputV2SubmitButton(props: {

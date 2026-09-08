@@ -7,6 +7,7 @@ import { FSUtil } from "../fs-util"
 import { Global } from "../global"
 import { Location } from "../location"
 import { Ripgrep } from "../ripgrep"
+import { Flock } from "../util/flock"
 import { Watcher } from "../filesystem/watcher"
 import { ChunkStore, KIND_DIR, KIND_FILE } from "./chunk-store"
 import { compareBytes, frontDecode } from "./front-code"
@@ -23,7 +24,11 @@ export interface PathEntry {
 
 const DEBOUNCE_MS = 150
 const CHUNK_SIZE = 8192
+const BULK_METADATA_GRACE_MS = 200
+const METADATA_CHUNK_SIZE = 256
 const LINE_COUNT_MAX_BYTES = 512 * 1024
+const COLD_SEED_LOCK_STALE_MS = 60_000
+const COLD_SEED_LOCK_TIMEOUT_MS = 10 * 60 * 1000
 const BINARY_EXT_RE =
   /\.(png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|pdf|zip|tar|gz|tgz|bz2|xz|7z|rar|mp4|mp3|mov|avi|mkv|wasm|pyc|class|o|so|dll|exe|bin|dat|lock)$/i
 
@@ -40,6 +45,8 @@ export interface Interface {
   readonly readRawChunks: (isDir: boolean) => Effect.Effect<readonly ChunkStore.RawChunk[], unknown, unknown>
   /** Lazily materialize one chunk for display/top-K rows. */
   readonly decodeChunk: (seq: number) => Effect.Effect<readonly string[], unknown, unknown>
+  /** O(1) live metadata lookup, hydrated asynchronously after structural seals. */
+  readonly fileMetadata: (entryPath: string) => { size: number; mtime: number; lineCount?: number } | undefined
   readonly subscribe: (listener: (updates: readonly PathEntry[]) => void) => Effect.Effect<() => void, never, never>
   readonly upsert: (entry: PathEntry) => Effect.Effect<void, never, never>
   readonly remove: (entryPath: string) => Effect.Effect<void, never, never>
@@ -78,7 +85,8 @@ const serviceLayer = Layer.effect(
     const tombstones = new Set<string>()
     const pending = new Map<string, PathEntry | undefined>()
     const sealed = new Map<string, PathEntry>()
-    // Tier-2 metadata (size/mtime) captured at seal time, kept as a SEPARATE
+    // Tier-2 metadata (size/mtime) queued by seals and hydrated asynchronously,
+    // kept as a SEPARATE
     // key-value blob in the meta table (like `tombstones`) rather than inside
     // the front-coded path-byte chunks. Front-coding compresses sorted path
     // bytes only — there is no per-entry slot for auxiliary fields, so this
@@ -87,12 +95,50 @@ const serviceLayer = Layer.effect(
     const fileMeta = new Map<string, { size: number; mtime: number; lineCount?: number }>()
     const symbols = new Map<string, SymbolEntry[]>()
     const listeners = new Set<(updates: readonly PathEntry[]) => void>()
+    let snapshotCache: PathEntry[] | undefined
+    let snapshotLookup: Map<string, number> | undefined
+    const metadataPending = new Map<string, { entry: PathEntry; countLines: boolean }>()
+    const metadataWake = yield* Queue.dropping<void>(1)
+
+    const setFileMeta = (entryPath: string, meta: { size: number; mtime: number; lineCount?: number }) => {
+      // A bulk stat/read can race an unlink that arrived while the I/O was in
+      // flight. Never resurrect metadata for a path already tombstoned by the
+      // watcher.
+      if (tombstones.has(entryPath)) return
+      fileMeta.set(entryPath, meta)
+      const index = snapshotLookup?.get(entryPath)
+      if (index === undefined || !snapshotCache) return
+      const row = snapshotCache[index]
+      if (!row) return
+      // Keep the snapshot ARRAY identity stable so the file-only fast matcher
+      // can reuse its prepared masks/base offsets while metadata hydrates in the
+      // background. Only the row object changes; its path/isDir are immutable.
+      snapshotCache[index] = { ...row, ...meta }
+    }
+
+    const setStatOnlyMeta = (entryPath: string, size: number, mtime: number) => {
+      const previous = fileMeta.get(entryPath)
+      // Preserve a line count only when it was measured for the exact same file
+      // version. If mtime changed, carrying the old count forward would be stale.
+      setFileMeta(
+        entryPath,
+        previous?.mtime === mtime && previous.lineCount !== undefined
+          ? { size, mtime, lineCount: previous.lineCount }
+          : { size, mtime },
+      )
+    }
+
+    const invalidateSnapshot = () => {
+      snapshotCache = undefined
+      snapshotLookup = undefined
+    }
 
     const ancestors = (entryPath: string) => {
       const parts = entryPath.split("/")
       return parts.slice(0, -1).map((_, index) => parts.slice(0, index + 1).join("/"))
     }
     const record = (entry: PathEntry) => {
+      invalidateSnapshot()
       tombstones.delete(entry.path)
       sealed.delete(entry.path)
       pending.set(entry.path, entry)
@@ -103,11 +149,13 @@ const serviceLayer = Layer.effect(
       }
     }
     const deleteEntry = (entryPath: string) => {
+      invalidateSnapshot()
       pending.delete(entryPath)
       sealed.delete(entryPath)
       tombstones.add(entryPath)
       symbols.delete(entryPath)
       fileMeta.delete(entryPath)
+      metadataPending.delete(entryPath)
     }
 
     const loadRaw = Effect.gen(function* () {
@@ -119,41 +167,28 @@ const serviceLayer = Layer.effect(
       ])
       rawFileChunks = fileChunks
       rawDirChunks = dirChunks
+      invalidateSnapshot()
       tombstones.clear()
       if (storedTombstones) for (const entryPath of JSON.parse(storedTombstones) as string[]) tombstones.add(entryPath)
       fileMeta.clear()
       if (storedFileMeta) {
-        const parsed = JSON.parse(storedFileMeta) as Array<[string, { size: number; mtime: number; lineCount?: number }]>
+        const parsed = JSON.parse(storedFileMeta) as Array<
+          [string, { size: number; mtime: number; lineCount?: number }]
+        >
         for (const [entryPath, meta] of parsed) fileMeta.set(entryPath, meta)
       }
     })
     yield* loadRaw
 
-    // A new cache has no chunks; seed files once with the same bounded rg walk
-    // as the legacy search layer. Awaited inline (only on a fresh cache) so the
-    // first snapshot is complete; record() materializes every ancestor folder
-    // into the directory stream before the first debounced seal.
-    if (rawFileChunks.length === 0 && rawDirChunks.length === 0) {
-      yield* ripgrep
-        .find({
-          cwd: location.directory,
-          pattern: "*",
-          limit: location.vcs ? Number.MAX_SAFE_INTEGER : 100_000,
-          onEntry: (entry) => Effect.sync(() => record({ path: String(entry.path), isDir: false })),
-        })
-        .pipe(Effect.orDie, Effect.asVoid)
-    }
-
     const snapshot = (): PathEntry[] => {
+      if (snapshotCache) return snapshotCache
       const out: PathEntry[] = []
       const seen = new Set<string>()
       const push = (entry: PathEntry) => {
         if (seen.has(entry.path) || tombstones.has(entry.path)) return
         seen.add(entry.path)
         const meta = !entry.isDir ? fileMeta.get(entry.path) : undefined
-        out.push(
-          meta ? { ...entry, size: meta.size, mtime: meta.mtime, lineCount: meta.lineCount } : entry,
-        )
+        out.push(meta ? { ...entry, size: meta.size, mtime: meta.mtime, lineCount: meta.lineCount } : entry)
       }
       // Base rows with a pending record are stale: deleted or superseded by
       // the overlay copies below.
@@ -165,8 +200,23 @@ const serviceLayer = Layer.effect(
           if (!pending.has(entryPath)) push({ path: entryPath, isDir: true })
       for (const entry of sealed.values()) push(entry)
       for (const entry of pending.values()) if (entry !== undefined) push(entry)
+      snapshotCache = out
+      snapshotLookup = new Map(out.map((entry, index) => [entry.path, index]))
       return out
     }
+
+    const queueMetadata = (entries: readonly PathEntry[], countLines: boolean) =>
+      Effect.gen(function* () {
+        for (const entry of entries) {
+          if (entry.isDir) continue
+          const previous = metadataPending.get(entry.path)
+          metadataPending.set(entry.path, {
+            entry,
+            countLines: countLines || previous?.countLines === true,
+          })
+        }
+        if (metadataPending.size > 0) yield* Queue.offer(metadataWake, undefined).pipe(Effect.ignore)
+      })
 
     const seal = Effect.gen(function* () {
       if (pending.size === 0) return
@@ -188,89 +238,131 @@ const serviceLayer = Layer.effect(
         if (entry !== undefined) sealed.set(entryPath, entry)
       }
       yield* store.putMeta("tombstones", JSON.stringify([...tombstones])).pipe(Effect.ignore)
-      // Tier-2: best-effort stat capture for newly sealed files, alongside
-      // (not inside) the front-coded stream. One extra stat (+ optional line
-      // count for text files) per newly sealed file per debounced seal — bounded
-      // by watcher churn, not query volume.
+      // Metadata is deliberately NOT collected inline. A fresh index can contain
+      // 100k+ files; stat'ing and reading every text file here used to block the
+      // first @-mention request behind seconds/minutes of unrelated I/O. Queue
+      // metadata after the structural seal and let the low-priority worker below
+      // hydrate it without holding up search readiness.
       const statTargets = adds.filter((entry) => !entry.isDir)
-      if (statTargets.length > 0) {
-        yield* Effect.forEach(
-          statTargets,
-          (entry) =>
-            fs.stat(path.join(root, entry.path)).pipe(
-              Effect.flatMap((info) => {
-                const size = Number(info.size)
-                const mtime = info.mtime._tag === "Some" ? info.mtime.value.getTime() : Date.now()
-                if (!shouldCountLines(entry.path, size)) {
-                  fileMeta.set(entry.path, { size, mtime })
-                  return Effect.void
-                }
-                return fs.readFileStringSafe(path.join(root, entry.path)).pipe(
-                  Effect.map((text) => {
-                    const lineCount = text === undefined ? undefined : text.split("\n").length
-                    fileMeta.set(entry.path, { size, mtime, lineCount })
-                  }),
-                  Effect.catch(() => {
-                    fileMeta.set(entry.path, { size, mtime })
-                    return Effect.void
-                  }),
-                )
-              }),
-              Effect.catch(() => Effect.void),
-            ),
-          { concurrency: 8 },
-        )
-        yield* store.putMeta("fileMeta", JSON.stringify([...fileMeta])).pipe(Effect.ignore)
-      }
+      if (statTargets.length > 0) yield* queueMetadata(statTargets, statTargets.length <= 64)
     })
 
-    // If this was a fresh cache the ripgrep seed above left the full file set in
-    // `pending`. Flush it immediately so Tier-2 metadata (size/mtime/lineCount)
-    // is persisted without waiting for the next watcher event.
-    if (pending.size > 0) {
-      yield* seal.pipe(Effect.ignore)
+    // Cold seeding is a MACHINE-WIDE operation for this physical index DB. ACP,
+    // Desktop, and other hosts can construct the same project service at nearly
+    // the same time. Without election they all see an empty DB and independently
+    // launch a whole-repository rg walk before the first writer seals chunks.
+    //
+    // The elected owner walks + seals while holding a DB-local crash-recovering
+    // lease. Contenders wait cheaply, then re-read the chunks written by the
+    // winner and skip discovery. This prevents N-host cold-start CPU and duplicate
+    // chunk amplification without introducing a process-specific XDG namespace.
+    if (rawFileChunks.length === 0 && rawDirChunks.length === 0) {
+      const dbPath = ChunkStore.dbPathFor(root, global.data)
+      const lockDir = path.join(path.dirname(dbPath), ".opencode-runtime-locks")
+      yield* Effect.scoped(
+        Flock.effect(`search-index-cold-seed:${dbPath}`, {
+          dir: lockDir,
+          staleMs: COLD_SEED_LOCK_STALE_MS,
+          timeoutMs: COLD_SEED_LOCK_TIMEOUT_MS,
+          baseDelayMs: 100,
+          maxDelayMs: 2_000,
+        }).pipe(
+          Effect.andThen(
+            Effect.gen(function* () {
+              // Another process may have completed the seed while this host was
+              // waiting for ownership. Re-read under the lease before doing any
+              // expensive discovery.
+              yield* loadRaw
+              if (rawFileChunks.length > 0 || rawDirChunks.length > 0) return
+
+              yield* ripgrep
+                .find({
+                  cwd: location.directory,
+                  pattern: "*",
+                  limit: location.vcs ? Number.MAX_SAFE_INTEGER : 100_000,
+                  onEntry: (entry) => Effect.sync(() => record({ path: String(entry.path), isDir: false })),
+                })
+                .pipe(Effect.orDie, Effect.asVoid)
+
+              // Persist the structural seed BEFORE releasing ownership. That is
+              // what makes the next contender's loadRaw() an O(chunks) path
+              // instead of another full repository walk.
+              if (pending.size > 0) yield* seal.pipe(Effect.ignore)
+            }),
+          ),
+        ),
+      ).pipe(Effect.orDie)
     }
 
-    // Backfill Tier-2 metadata for existing persisted chunks that were created
-    // before size/mtime/lineCount capture existed (or before the immediate-seal
-    // flush above). Runs in the background so startup stays fast.
+    // Low-priority metadata hydrator. Bulk seed/backfill does stat-only work;
+    // line counts are reserved for small watcher batches where reading one or a
+    // few edited files is cheap and useful. Persist once per drained wave rather
+    // than JSON-stringifying the entire metadata map every 1000 files (quadratic
+    // write amplification on huge repositories).
     yield* Effect.forkIn(
       Effect.gen(function* () {
-        const missing = snapshot().filter((p) => !p.isDir && !fileMeta.has(p.path))
-        if (missing.length === 0) return
-        // Cap background work on enormous repos; prioritize visible files later
-        // via query-time enrichment if needed.
-        const batchSize = 1000
-        for (let i = 0; i < missing.length; i += batchSize) {
-          const batch = missing.slice(i, i + batchSize)
-          yield* Effect.forEach(
-            batch,
-            (entry) =>
-              fs.stat(path.join(root, entry.path)).pipe(
-                Effect.flatMap((info) => {
-                  const size = Number(info.size)
-                  const mtime = info.mtime._tag === "Some" ? info.mtime.value.getTime() : Date.now()
-                  if (!shouldCountLines(entry.path, size)) {
-                    fileMeta.set(entry.path, { size, mtime })
-                    return Effect.void
-                  }
-                  return fs.readFileStringSafe(path.join(root, entry.path)).pipe(
-                    Effect.map((text) => {
-                      const lineCount = text === undefined ? undefined : text.split("\n").length
-                      fileMeta.set(entry.path, { size, mtime, lineCount })
-                    }),
-                    Effect.catch(() => {
-                      fileMeta.set(entry.path, { size, mtime })
+        while (true) {
+          yield* Queue.take(metadataWake)
+          // Coalesce rapid watcher seals before snapshotting the pending map.
+          yield* Effect.sleep(25)
+          // On a cold 100k+ project, give the first interactive query a short
+          // uncontended grace window before bulk stat traffic begins. Small
+          // watcher batches (the latency-sensitive case) bypass this delay.
+          if (metadataPending.size > 64) yield* Effect.sleep(BULK_METADATA_GRACE_MS)
+          const priority: Array<{ entry: PathEntry; countLines: boolean }> = []
+          const bulk: Array<{ entry: PathEntry; countLines: boolean }> = []
+          for (const item of metadataPending.values()) (item.countLines ? priority : bulk).push(item)
+          metadataPending.clear()
+          const work = priority.length === 0 ? bulk : priority.concat(bulk)
+          if (work.length === 0) continue
+          const chunkSize = METADATA_CHUNK_SIZE
+          for (let i = 0; i < work.length; i += chunkSize) {
+            const chunk = work.slice(i, i + chunkSize)
+            yield* Effect.forEach(
+              chunk,
+              ({ entry, countLines }) =>
+                fs.stat(path.join(root, entry.path)).pipe(
+                  Effect.flatMap((info) => {
+                    const size = Number(info.size)
+                    const mtime = info.mtime._tag === "Some" ? info.mtime.value.getTime() : Date.now()
+                    if (!countLines || !shouldCountLines(entry.path, size)) {
+                      setStatOnlyMeta(entry.path, size, mtime)
                       return Effect.void
-                    }),
-                  )
-                }),
-                Effect.catch(() => Effect.void),
-              ),
-            { concurrency: 8 },
-          )
+                    }
+                    return fs.readFileStringSafe(path.join(root, entry.path)).pipe(
+                      Effect.map((text) => {
+                        const lineCount = text === undefined ? undefined : text.split("\n").length
+                        setFileMeta(entry.path, { size, mtime, lineCount })
+                      }),
+                      Effect.catch(() => {
+                        setFileMeta(entry.path, { size, mtime })
+                        return Effect.void
+                      }),
+                    )
+                  }),
+                  Effect.catch(() => Effect.void),
+                ),
+              { concurrency: 8 },
+            )
+            // Cooperative breathing room keeps a bulk metadata backfill from
+            // competing with interactive search for an entire event-loop turn.
+            if (work.length > chunkSize) yield* Effect.sleep(5)
+          }
           yield* store.putMeta("fileMeta", JSON.stringify([...fileMeta])).pipe(Effect.ignore)
         }
+      }),
+      scope,
+    )
+
+    // Existing persisted indexes may predate metadata. Even materializing the
+    // full path snapshot can cost tens of milliseconds at 100k+ entries, so do
+    // not do that while building the service. Schedule the entire discovery +
+    // stat-only backfill after the interactive grace period instead.
+    yield* Effect.forkIn(
+      Effect.gen(function* () {
+        yield* Effect.sleep(BULK_METADATA_GRACE_MS)
+        const missing = snapshot().filter((p) => !p.isDir && !fileMeta.has(p.path))
+        if (missing.length > 0) yield* queueMetadata(missing, false)
       }),
       scope,
     )
@@ -313,6 +405,7 @@ const serviceLayer = Layer.effect(
         }),
       readRawChunks: (isDir) => store.readRaw(isDir ? KIND_DIR : KIND_FILE),
       decodeChunk: (seq) => store.decodeChunk(seq),
+      fileMetadata: (entryPath) => fileMeta.get(entryPath),
       subscribe: (listener) =>
         Effect.sync(() => {
           listeners.add(listener)
@@ -354,4 +447,3 @@ const serviceLayer = Layer.effect(
     })
   }),
 )
-

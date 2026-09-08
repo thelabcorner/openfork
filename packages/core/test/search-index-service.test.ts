@@ -16,7 +16,12 @@ import { tmpdir } from "./fixture/tmpdir"
 
 // Deterministic seed fixture instead of spawning rg: the stub feeds the same
 // entry shape the real Ripgrep.Service.find would.
-const makeLayer = (directory: string, dataDir: string, seededFiles: string[]) =>
+const makeLayer = (
+  directory: string,
+  dataDir: string,
+  seededFiles: string[],
+  options?: { statGate?: Promise<void>; onRead?: () => void; seedGate?: Promise<void>; onSeed?: () => void },
+) =>
   SearchIndex.layerWith(ChunkStore.dbPathFor(directory, dataDir)).pipe(
     Layer.provide(
       Layer.succeed(
@@ -34,9 +39,14 @@ const makeLayer = (directory: string, dataDir: string, seededFiles: string[]) =>
         Ripgrep.Service.of({
           find: (input) =>
             input.onEntry
-              ? Effect.forEach(seededFiles, (file) => input.onEntry!({ path: RelativePath.make(file), type: "file" })).pipe(
-                  Effect.as([]),
-                )
+              ? Effect.gen(function* () {
+                  options?.onSeed?.()
+                  if (options?.seedGate) yield* Effect.promise(() => options.seedGate!)
+                  yield* Effect.forEach(seededFiles, (file) =>
+                    input.onEntry!({ path: RelativePath.make(file), type: "file" }),
+                  )
+                  return []
+                })
               : Effect.succeed([]),
           glob: () => Effect.succeed([]),
           grep: () => Effect.succeed([]),
@@ -54,13 +64,18 @@ const makeLayer = (directory: string, dataDir: string, seededFiles: string[]) =>
         realPath: (target: string) => Effect.succeed(target),
         isDir: () => Effect.succeed(false),
         stat: () =>
-          Effect.succeed({
-            size: 100,
-            mtime: Option.some(new Date()),
-            ino: Option.some(0),
-            type: "File",
-          } as unknown as FSUtil.Stat),
-        readFileStringSafe: () => Effect.succeed("a\nb\nc"),
+          (options?.statGate ? Effect.promise(() => options.statGate!) : Effect.void).pipe(
+            Effect.as({
+              size: 100,
+              mtime: Option.some(new Date()),
+              ino: Option.some(0),
+              type: "File",
+            } as any),
+          ),
+        readFileStringSafe: () => {
+          options?.onRead?.()
+          return Effect.succeed("a\nb\nc")
+        },
       } as unknown as FSUtil.Interface),
     ),
   )
@@ -76,7 +91,8 @@ const pollUntil = async (check: () => Promise<boolean>, timeoutMs = 5000) => {
 
 type Snapshot = { paths: SearchIndex.PathEntry[]; symbols: never[] }
 const load = (index: SearchIndex.Interface) => Effect.runPromise(index.loadAll() as Effect.Effect<Snapshot>)
-const run = (effect: Effect.Effect<void, unknown, unknown>) => Effect.runPromise(effect as Effect.Effect<void, unknown, never>)
+const run = (effect: Effect.Effect<void, unknown, unknown>) =>
+  Effect.runPromise(effect as Effect.Effect<void, unknown, never>)
 
 describe("SearchIndex", () => {
   test("seeds files and first-class directories, seals, removes, compacts", async () => {
@@ -153,4 +169,92 @@ describe("SearchIndex", () => {
       await tmp[Symbol.asyncDispose]()
     }
   }, 20_000)
+
+  test("concurrent hosts elect one cold seeder for the shared project db", async () => {
+    const tmp = await tmpdir()
+    try {
+      const dataDir = path.join(tmp.path, "data")
+      const seededFiles = ["src/one.ts", "src/two.ts", "README.md"]
+      let seedCalls = 0
+      let releaseSeed!: () => void
+      const seedGate = new Promise<void>((resolve) => {
+        releaseSeed = resolve
+      })
+      const options = {
+        seedGate,
+        onSeed: () => seedCalls++,
+      }
+
+      const host = () =>
+        run(
+          Effect.gen(function* () {
+            const index = yield* SearchIndex.Service
+            const all = yield* Effect.promise(() => load(index))
+            expect(all.paths.filter((entry) => !entry.isDir)).toHaveLength(seededFiles.length)
+          }).pipe(Effect.provide(makeLayer(tmp.path, dataDir, seededFiles, options)), Effect.scoped),
+        )
+
+      const first = host()
+      const second = host()
+      expect(await pollUntil(async () => seedCalls === 1, 2_000)).toBe(true)
+      // Give the contender enough time to reach the DB-local lease. It must not
+      // execute the ripgrep stub while the elected owner is still blocked.
+      await Bun.sleep(200)
+      expect(seedCalls).toBe(1)
+      releaseSeed()
+      await Promise.all([first, second])
+      expect(seedCalls).toBe(1)
+    } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  }, 20_000)
+
+  test("bulk metadata hydration never blocks structural search readiness", async () => {
+    const tmp = await tmpdir()
+    try {
+      const seededFiles = Array.from({ length: 100 }, (_, index) => `src/file-${index}.ts`)
+      let releaseStat!: () => void
+      const statGate = new Promise<void>((resolve) => {
+        releaseStat = resolve
+      })
+      let reads = 0
+      let bodyReachedAt = Number.POSITIVE_INFINITY
+      const started = performance.now()
+      // Safety release means a regression fails by latency rather than hanging
+      // the test until Bun's outer timeout.
+      const safety = setTimeout(() => releaseStat(), 1_500)
+
+      await run(
+        Effect.gen(function* () {
+          const index = yield* SearchIndex.Service
+          bodyReachedAt = performance.now()
+          const all = yield* Effect.promise(() => load(index))
+          expect(all.paths.filter((entry) => !entry.isDir)).toHaveLength(seededFiles.length)
+
+          // If metadata were still collected inline, this body could not be
+          // reached until statGate opened.
+          releaseStat()
+          const hydrated = yield* Effect.promise(() =>
+            pollUntil(async () => index.fileMetadata("src/file-0.ts") !== undefined),
+          )
+          expect(hydrated).toBe(true)
+          // Bulk hydration is stat-only: line-count file reads are reserved for
+          // tiny watcher batches, not a whole-repository cold start.
+          expect(reads).toBe(0)
+        }).pipe(
+          Effect.provide(
+            makeLayer(tmp.path, path.join(tmp.path, "data"), seededFiles, {
+              statGate,
+              onRead: () => reads++,
+            }),
+          ),
+          Effect.scoped,
+        ),
+      )
+      clearTimeout(safety)
+      expect(bodyReachedAt - started).toBeLessThan(1_000)
+    } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  }, 10_000)
 })
