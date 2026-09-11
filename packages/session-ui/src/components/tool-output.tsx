@@ -3,6 +3,7 @@ import { Dynamic } from "solid-js/web"
 import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { checksum } from "@opencode-ai/core/util/encode"
 import { Markdown } from "./markdown"
+import { ToolScrollArea } from "./tool-parts"
 import { ToolText, looksLikeMarkdown } from "./tool-text"
 
 export function CodeView(props: { contents: string; filename: string }) {
@@ -84,9 +85,9 @@ export function SmartToolOutput(props: { output?: string; filename?: string }) {
           )}
         </Match>
         <Match when={markdown()}>
-          <div data-component="tool-output" data-scrollable tabIndex={0} role="region">
+          <ToolScrollArea component="tool-output" axis="both">
             <Markdown text={props.output!} />
-          </div>
+          </ToolScrollArea>
         </Match>
       </Switch>
     </Show>

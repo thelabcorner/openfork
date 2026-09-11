@@ -1,6 +1,7 @@
 import { createMemo, Show } from "solid-js"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
 import { SmartToolOutput } from "./tool-output"
+import { ToolScrollArea } from "./tool-parts"
 
 function unescapeXml(text: string) {
   return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
@@ -47,7 +48,7 @@ export function SympyOutput(props: { output: string }) {
           <div data-slot="sympy-message">{i18n.t("ui.tool.sympy.timedOut")}</div>
         </Show>
         <Show when={diagnostics()}>
-          <pre data-slot="sympy-diagnostics">{unescapeXml(diagnostics()!)}</pre>
+          <ToolScrollArea slot="sympy-diagnostics">{unescapeXml(diagnostics()!)}</ToolScrollArea>
         </Show>
       </div>
     </Show>

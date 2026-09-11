@@ -1,5 +1,6 @@
 import { createMemo, For, Show, Switch, Match } from "solid-js"
 import { CodeView, SmartToolOutput } from "./tool-output"
+import { ToolScrollArea } from "./tool-parts"
 
 type ParsedTable = {
   preamble: string[]
@@ -55,7 +56,7 @@ function SqliteTable(props: { table: ParsedTable }) {
   return (
     <div data-component="sqlite-table-wrap">
       <For each={props.table.preamble}>{(line) => <div data-slot="sqlite-preamble-line">{line}</div>}</For>
-      <div data-component="sqlite-table-scroll" data-scrollable>
+      <ToolScrollArea component="sqlite-table-scroll" axis="both">
         <table data-component="sqlite-table">
           <thead>
             <tr>
@@ -76,7 +77,7 @@ function SqliteTable(props: { table: ParsedTable }) {
             </For>
           </tbody>
         </table>
-      </div>
+      </ToolScrollArea>
       <Show when={props.table.footer}>
         <div data-slot="sqlite-table-footer">{props.table.footer}</div>
       </Show>

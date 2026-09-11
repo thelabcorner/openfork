@@ -37,7 +37,7 @@ import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type UiI18n, useI18n } from "@opencode-ai/ui/context/i18n"
 import { BasicTool, GenericTool, type TriggerTitle } from "./basic-tool"
-import { ToolBoundedList, ToolEmpty, ToolParams, ToolRow } from "./tool-parts"
+import { ToolBoundedList, ToolEmpty, ToolParams, ToolRow, ToolScrollArea } from "./tool-parts"
 import { Accordion } from "@opencode-ai/ui/accordion"
 import { StickyAccordionHeader } from "@opencode-ai/ui/sticky-accordion-header"
 import { Collapsible } from "@opencode-ai/ui/collapsible"
@@ -2203,7 +2203,7 @@ type ReadDisplay =
 
 function DirectoryOutput(props: { entries: string[] }) {
   return (
-    <div data-component="directory-output" data-scrollable tabIndex={0} role="region">
+    <ToolScrollArea component="directory-output">
       <For each={props.entries}>
         {(entry) => {
           const isDir = entry.endsWith("/")
@@ -2216,7 +2216,7 @@ function DirectoryOutput(props: { entries: string[] }) {
           )
         }}
       </For>
-    </div>
+    </ToolScrollArea>
   )
 }
 
@@ -2808,19 +2808,13 @@ ToolRegistry.register({
             </div>
           </Show>
           <Show when={output()}>
-            <div
-              data-slot="bash-scroll"
-              data-scrollable
-              tabIndex={0}
-              role="region"
-              aria-label={i18n.t("ui.scrollView.ariaLabel")}
-            >
+            <ToolScrollArea slot="bash-scroll">
               <pre data-slot="bash-pre">
                 <code>
                   <ShellOutput parsed={parsedOutput} />
                 </code>
               </pre>
-            </div>
+            </ToolScrollArea>
           </Show>
         </div>
       </BasicTool>

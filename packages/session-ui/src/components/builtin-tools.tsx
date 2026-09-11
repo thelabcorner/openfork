@@ -12,6 +12,7 @@ import {
   ToolNotice,
   ToolPath,
   ToolRow,
+  ToolScrollArea,
   ToolStats,
   type Tone,
 } from "./tool-parts"
@@ -446,9 +447,9 @@ export function WebfetchOutput(props: { output: string; input?: Record<string, a
         </ToolBlock>
       </Show>
       <ToolBlock label={i18n.t("ui.tool.webfetch.content")}>
-        <div data-component="webfetch-content">
+        <ToolScrollArea component="webfetch-content" axis="both">
           <Markdown text={preview()} />
-        </div>
+        </ToolScrollArea>
         <Show when={truncated()}>
           <button type="button" data-component="tool-more" onClick={() => setFull(true)}>
             {i18n.t("ui.tool.webfetch.showFull", { size: size() })}
@@ -596,7 +597,7 @@ export function TestOutput(props: { output: string; metadata?: Record<string, un
                 </button>
               }
             >
-              <pre data-component="tool-pre">{tail()}</pre>
+              <ToolScrollArea component="tool-pre" axis="both">{tail()}</ToolScrollArea>
             </Show>
           </ToolBlock>
         </Show>
@@ -829,7 +830,7 @@ export function JsonOutput(props: { output: string }) {
                   mono={false}
                 />
                 <Show when={result().excerpt}>
-                  <pre data-component="tool-pre">{result().excerpt}</pre>
+                  <ToolScrollArea component="tool-pre" axis="both">{result().excerpt}</ToolScrollArea>
                 </Show>
               </ToolBlock>
             )}
@@ -1136,7 +1137,7 @@ function DiffPre(props: { text: string }) {
     return undefined
   }
   return (
-    <div data-component="tool-diff">
+    <ToolScrollArea component="tool-diff" axis="both">
       <For each={lines()}>
         {(line) => (
           <div data-slot="tool-diff-line" data-kind={kind(line)}>
@@ -1144,7 +1145,7 @@ function DiffPre(props: { text: string }) {
           </div>
         )}
       </For>
-    </div>
+    </ToolScrollArea>
   )
 }
 

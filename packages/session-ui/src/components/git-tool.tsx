@@ -8,7 +8,7 @@ import { resolveFileDiff } from "./session-diff"
 import { Markdown } from "./markdown"
 import { SmartToolOutput } from "./tool-output"
 import { ToolFileAccordion } from "./message-part"
-import { ToolBadge, ToolBoundedList, ToolEmpty, ToolPath, ToolRow, ToolStats } from "./tool-parts"
+import { ToolBadge, ToolBoundedList, ToolEmpty, ToolPath, ToolRow, ToolScrollArea, ToolStats } from "./tool-parts"
 
 function unescapeXml(text: string) {
   return text.replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&amp;/g, "&")
@@ -251,7 +251,7 @@ function GitLogMode(props: { output: string }) {
 
 function GitRawMode(props: { output: string; tag: string }) {
   const tag = createMemo(() => extractTag(props.output, props.tag))
-  return <pre data-component="git-raw">{unescapeXml(tag()?.inner ?? "").trim()}</pre>
+  return <ToolScrollArea component="git-raw" axis="both">{unescapeXml(tag()?.inner ?? "").trim()}</ToolScrollArea>
 }
 
 function GitCommitMode(props: { output: string }) {
@@ -272,7 +272,7 @@ function GitCommitMode(props: { output: string }) {
         <GitStatusList entries={parseStatusEntries(extractAll(status()!.inner, "entry"))} />
       </Show>
       <Show when={!applied()}>
-        <pre data-component="git-raw">{unescapeXml(tag()?.inner ?? "").trim()}</pre>
+        <ToolScrollArea component="git-raw" axis="both">{unescapeXml(tag()?.inner ?? "").trim()}</ToolScrollArea>
       </Show>
     </div>
   )

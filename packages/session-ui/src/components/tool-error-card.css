@@ -73,7 +73,6 @@
     padding: 7px 0 8px;
     max-height: 420px;
     overflow-y: auto;
-    scrollbar-width: thin;
   }
 
   /* Prose. Explicitly normal weight — the surrounding row styles this inherits
@@ -91,13 +90,17 @@
 
   /* Source the tool quoted back. Alignment is the whole point, so this never
      wraps — it scrolls sideways like the code viewer it is standing in for. */
-  [data-slot="tool-error-code"] {
+  [data-component="tool-scroll-shell"]:has(> [data-slot="tool-error-code"]) {
+    width: auto;
     margin: 0 10px;
+  }
+
+  [data-slot="tool-error-code"] {
+    margin: 0;
     padding: 4px 0;
     border-radius: 5px;
     background: color-mix(in srgb, var(--v2-text-text-base) 5%, transparent);
     overflow-x: auto;
-    scrollbar-width: thin;
   }
 
   [data-slot="tool-error-code-line"] {
@@ -154,7 +157,6 @@
     padding: 0 10px 8px;
     max-height: 240px;
     overflow: auto;
-    scrollbar-width: thin;
     font-family: var(--tp-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
     font-size: 11px;
     line-height: 1.55;

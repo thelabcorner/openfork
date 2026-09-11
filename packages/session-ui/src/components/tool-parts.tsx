@@ -1,5 +1,6 @@
-import { For, Show, createMemo, createSignal, type JSX } from "solid-js"
+import { For, Show, createMemo, createSignal, onCleanup, onMount, type JSX } from "solid-js"
 import { useI18n } from "@opencode-ai/ui/context/i18n"
+import { ScrollViewOverlayScrollbar } from "@opencode-ai/ui/scroll-view"
 import { ShellOutput, parseShellOutput } from "./shell-output"
 
 /**
@@ -16,6 +17,81 @@ import { ShellOutput, parseShellOutput } from "./shell-output"
  */
 
 export type Tone = "neutral" | "success" | "warning" | "danger" | "info" | "accent"
+export type ToolScrollAxis = "vertical" | "horizontal" | "both"
+
+/**
+ * Tool-output scroll viewport backed by the shared OpenCode overlay scrollbar.
+ *
+ * Keeping this primitive here is intentional: tool renderers should never grow
+ * their own Chromium scrollbar styling. The viewport remains the real native
+ * scroller for wheel, trackpad, touch, keyboard and accessibility behavior; the
+ * browser chrome is hidden and the same draggable overlay thumb used elsewhere
+ * in the app is mounted on top. `both` mounts one overlay per axis.
+ */
+export function ToolScrollArea(props: {
+  children: JSX.Element
+  axis?: ToolScrollAxis
+  component?: string
+  slot?: string
+  scroll?: boolean
+}) {
+  const i18n = useI18n()
+  let shell: HTMLDivElement | undefined
+  let viewport: HTMLDivElement | undefined
+  const axis = () => props.axis ?? "vertical"
+  const [contentRevision, setContentRevision] = createSignal(0)
+
+  onMount(() => {
+    if (!viewport) return
+    let updateFrame: number | undefined
+    const mutations = new MutationObserver(() => {
+      if (updateFrame !== undefined) return
+      updateFrame = requestAnimationFrame(() => {
+        updateFrame = undefined
+        setContentRevision((value) => value + 1)
+      })
+    })
+    mutations.observe(viewport, { childList: true, characterData: true, subtree: true })
+    onCleanup(() => {
+      mutations.disconnect()
+      if (updateFrame !== undefined) cancelAnimationFrame(updateFrame)
+    })
+  })
+
+  return (
+    <div ref={shell} data-component="tool-scroll-shell" data-axis={axis()}>
+      <div
+        ref={viewport}
+        data-component={props.component}
+        data-slot={props.slot}
+        data-scroll={props.scroll ? "true" : undefined}
+        data-tool-scroll-viewport
+        data-scrollable
+        tabIndex={0}
+        role="region"
+        aria-label={i18n.t("ui.scrollView.ariaLabel")}
+      >
+        {props.children}
+      </div>
+      <Show when={axis() !== "horizontal"}>
+        <ScrollViewOverlayScrollbar
+          viewport={() => viewport}
+          hoverTarget={() => shell}
+          orientation="vertical"
+          refresh={contentRevision}
+        />
+      </Show>
+      <Show when={axis() !== "vertical"}>
+        <ScrollViewOverlayScrollbar
+          viewport={() => viewport}
+          hoverTarget={() => shell}
+          orientation="horizontal"
+          refresh={contentRevision}
+        />
+      </Show>
+    </div>
+  )
+}
 
 /* ── Params ────────────────────────────────────────────────────────────────
    Replaces the "INPUT" JSON block. Scalars become inline chips; long strings
@@ -116,9 +192,14 @@ export function ToolBadge(props: { children: JSX.Element; tone?: Tone; mono?: bo
 
 export function ToolRows(props: { children: JSX.Element; scroll?: boolean }) {
   return (
-    <div data-component="tool-rows" data-scroll={props.scroll ? "true" : undefined}>
-      {props.children}
-    </div>
+    <Show
+      when={props.scroll}
+      fallback={<div data-component="tool-rows">{props.children}</div>}
+    >
+      <ToolScrollArea component="tool-rows" scroll>
+        {props.children}
+      </ToolScrollArea>
+    </Show>
   )
 }
 
@@ -232,13 +313,13 @@ export function ToolLog(props: { text: string; label?: string }) {
       <Show when={props.label}>
         <div data-slot="tool-log-label">{props.label}</div>
       </Show>
-      <div data-slot="tool-log-scroll" tabIndex={0} role="region">
+      <ToolScrollArea slot="tool-log-scroll" axis="both">
         <pre data-slot="tool-log-pre">
           <code>
             <ShellOutput parsed={parsed} />
           </code>
         </pre>
-      </div>
+      </ToolScrollArea>
     </div>
   )
 }

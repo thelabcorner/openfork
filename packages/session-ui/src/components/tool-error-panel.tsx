@@ -4,6 +4,7 @@ import { Icon } from "@opencode-ai/ui/icon"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { parseToolError, type ErrorBlock } from "./tool-error-parse"
+import { ToolScrollArea } from "./tool-parts"
 
 /**
  * Body of a failed tool call.
@@ -18,7 +19,7 @@ import { parseToolError, type ErrorBlock } from "./tool-error-parse"
 
 function ErrorCode(props: { block: Extract<ErrorBlock, { kind: "code" }> }) {
   return (
-    <div data-slot="tool-error-code">
+    <ToolScrollArea slot="tool-error-code" axis="horizontal">
       <For each={props.block.lines}>
         {(line) => (
           <div data-slot="tool-error-code-line" data-marker={line.marker ? "true" : undefined}>
@@ -29,7 +30,7 @@ function ErrorCode(props: { block: Extract<ErrorBlock, { kind: "code" }> }) {
           </div>
         )}
       </For>
-    </div>
+    </ToolScrollArea>
   )
 }
 
@@ -69,7 +70,7 @@ export function ToolErrorPanel(props: { error: string }) {
         </Tooltip>
       </div>
 
-      <div data-slot="tool-error-body">
+      <ToolScrollArea slot="tool-error-body">
         <For each={parsed().blocks}>
           {(block) => (
             <Show when={block.kind === "code"} fallback={<div data-slot="tool-error-message">{(block as any).text}</div>}>
@@ -77,7 +78,7 @@ export function ToolErrorPanel(props: { error: string }) {
             </Show>
           )}
         </For>
-      </div>
+      </ToolScrollArea>
 
       <Show when={parsed().hints.length > 0}>
         <div data-slot="tool-error-hints">
@@ -94,9 +95,9 @@ export function ToolErrorPanel(props: { error: string }) {
             </button>
           }
         >
-          <pre data-slot="tool-error-stack">
+          <ToolScrollArea slot="tool-error-stack" axis="both">
             <code>{parsed().stack.join("\n")}</code>
-          </pre>
+          </ToolScrollArea>
         </Show>
       </Show>
     </div>
