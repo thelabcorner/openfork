@@ -3,6 +3,7 @@
 import { $ } from "bun"
 import path from "path"
 import { fileURLToPath } from "url"
+import { readdir, rm } from "node:fs/promises"
 import { createSolidTransformPlugin } from "@opentui/solid/bun-plugin"
 import { validateChunkDbCapability } from "./chunkdb-capability"
 
@@ -135,7 +136,16 @@ const targets = singleFlag
     })
   : allTargets
 
-await $`rm -rf dist`
+// `dist/node` is the live Electron sidecar build in local development. The
+// running process lazily opens sibling WASM assets (tree-sitter, photon, ...),
+// so deleting the whole dist directory while Desktop is open turns otherwise
+// unrelated shell/tool calls into ENOENT failures. Clean CLI build artifacts
+// without invalidating the sidecar that may currently be executing from here.
+const distDir = path.join(dir, "dist")
+for (const entry of await readdir(distDir, { withFileTypes: true }).catch(() => [])) {
+  if (entry.name === "node") continue
+  await rm(path.join(distDir, entry.name), { recursive: true, force: true })
+}
 
 const binaries: Record<string, string> = {}
 if (!skipInstall) {

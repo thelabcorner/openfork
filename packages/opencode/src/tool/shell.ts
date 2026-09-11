@@ -2,6 +2,7 @@ import { Effect, Stream } from "effect"
 import { Duration } from "effect"
 import os from "os"
 import { createWriteStream } from "node:fs"
+import { readFile } from "node:fs/promises"
 import * as Tool from "./tool"
 import path from "path"
 import { containsPath, type InstanceContext } from "../project/instance-context"
@@ -42,6 +43,9 @@ import { withShellSlot } from "./shell-concurrency"
 import { brotliCompress, brotliDecompress } from "node:zlib"
 import { promisify } from "node:util"
 import { userChildEnvironment } from "@/util/javascript-runtime"
+import treeWasmAsset from "web-tree-sitter/tree-sitter.wasm" with { type: "wasm" }
+import bashWasmAsset from "tree-sitter-bash/tree-sitter-bash.wasm" with { type: "wasm" }
+import psWasmAsset from "tree-sitter-powershell/tree-sitter-powershell.wasm" with { type: "wasm" }
 
 // Async brotli for the output sidecar merge below: the sync variants block the
 // single event loop for the whole (de)compression of potentially megabytes of
@@ -162,6 +166,37 @@ const resolveWasm = (asset: string) => {
   if (asset.startsWith("/") || /^[a-z]:/i.test(asset)) return asset
   const url = new URL(asset, import.meta.url)
   return fileURLToPath(url)
+}
+
+// Start reading the parser assets as soon as the shell module is loaded. In
+// Desktop development this module executes from packages/opencode/dist/node,
+// which is also a build output directory. Keeping the bytes process-owned
+// means a later CLI rebuild cannot break the already-running sidecar before
+// its first shell call. The promise is handled immediately so a genuinely
+// broken startup does not create an unhandled rejection before shell is used.
+const loadParserAssets = () =>
+  Promise.all([
+    readFile(resolveWasm(treeWasmAsset)),
+    readFile(resolveWasm(bashWasmAsset)),
+    readFile(resolveWasm(psWasmAsset)),
+  ]).then(
+    ([tree, bash, ps]) => ({ tree, bash, ps } as const),
+    (error) => ({ error } as const),
+  )
+
+let parserAssetBytes = loadParserAssets()
+
+const getParserAssets = async () => {
+  let assets = await parserAssetBytes
+  if (!("error" in assets)) return assets
+
+  // A dev build may have briefly removed the generated directory while this
+  // process was starting. Retry from disk on demand rather than permanently
+  // poisoning every shell call for the lifetime of the sidecar.
+  parserAssetBytes = loadParserAssets()
+  assets = await parserAssetBytes
+  if ("error" in assets) throw assets.error
+  return assets
 }
 
 function parts(node: Node) {
@@ -458,30 +493,23 @@ function cmd(
   })
 }
 const parser = lazy(async () => {
-  const { Parser } = await import("web-tree-sitter")
-  const { default: treeWasm } = await import("web-tree-sitter/tree-sitter.wasm" as string, {
-    with: { type: "wasm" },
-  })
-  const treePath = resolveWasm(treeWasm)
-  await Parser.init({
-    locateFile() {
-      return treePath
-    },
-  })
-  const { default: bashWasm } = await import("tree-sitter-bash/tree-sitter-bash.wasm" as string, {
-    with: { type: "wasm" },
-  })
-  const { default: psWasm } = await import("tree-sitter-powershell/tree-sitter-powershell.wasm" as string, {
-    with: { type: "wasm" },
-  })
-  const bashPath = resolveWasm(bashWasm)
-  const psPath = resolveWasm(psWasm)
-  const [bashLanguage, psLanguage] = await Promise.all([Language.load(bashPath), Language.load(psPath)])
-  const bash = new Parser()
-  bash.setLanguage(bashLanguage)
-  const ps = new Parser()
-  ps.setLanguage(psLanguage)
-  return { bash, ps }
+  try {
+    const { Parser } = await import("web-tree-sitter")
+    const assets = await getParserAssets()
+    await Parser.init({ wasmBinary: assets.tree } as any)
+    const [bashLanguage, psLanguage] = await Promise.all([Language.load(assets.bash), Language.load(assets.ps)])
+    const bash = new Parser()
+    bash.setLanguage(bashLanguage)
+    const ps = new Parser()
+    ps.setLanguage(psLanguage)
+    return { bash, ps }
+  } catch (error) {
+    // `lazy()` normally memoizes rejected promises forever. Parser asset
+    // failures are recoverable in dev once the build finishes, so let the next
+    // invocation make a fresh initialization attempt.
+    parser.reset()
+    throw error
+  }
 })
 
 export const ShellTool = Tool.define(
