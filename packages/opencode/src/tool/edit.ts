@@ -106,7 +106,7 @@ export const Parameters = Schema.Struct({
   }),
   edits: Schema.optional(Schema.Array(BatchOp)).annotate({
     description:
-      "Batch of edits applied atomically: [{line,newText,oldText?}], [{startLine,endLine,newText?,oldText?,delete?}], or [{oldString,newString}]. Every op is validated against the file as read, overlaps are rejected, and ops apply against original coordinates so earlier edits never shift later targets. Single-file only — for multi-file/bulk work use the patchText bulk pathway.",
+      "PREFERRED when 2+ non-overlapping changes in ONE file are already known. Apply them atomically in ONE call instead of sequential edit calls: [{line,newText,oldText?}], [{startLine,endLine,newText?,oldText?,delete?}], or [{oldString,newString}]. Every op is validated against original coordinates; overlaps are rejected. For multi-file/create/delete/move work use patch/patchText.",
   }),
   runTypecheck: Schema.optional(Schema.Boolean).annotate({
     description:
@@ -114,7 +114,7 @@ export const Parameters = Schema.Struct({
   }),
   patchText: Schema.optional(Schema.String).annotate({
     description:
-      "Bulk pathway: multi-file / multi-hunk patch text (opencode format or git-style unified diff, auto-detected). Batch ALL known edits into ONE call: one context processing instead of n sequential edit calls, one permission prompt, atomic all-or-nothing apply. Validates every hunk first ('if-clean' default: asks once and applies when zero conflicts, else returns the plan; apply:false = plan only; apply:true = fail on conflicts). Cannot be combined with filePath/oldString/line-style params (paths live INSIDE the patch, relative to the project directory).",
+      "Bulk pathway for 2+ files, arbitrary multi-hunk changes, or structural create/delete/move work (the dedicated patch tool is also appropriate). Batch ALL known edits into ONE mutation call instead of looping edit. One context processing, one permission prompt, atomic all-or-nothing apply. Validates every hunk first ('if-clean' default: asks once and applies when zero conflicts, else returns the plan; apply:false = plan only; apply:true = fail on conflicts). Cannot be combined with filePath/oldString/line-style params.",
   }),
   apply: Schema.optional(Schema.Union([Schema.Boolean, Schema.Literal("if-clean")])).annotate({
     description:
@@ -278,12 +278,12 @@ type PlanInput = {
 // (for the permission prompt's diff) and again inside the write lock when the
 // file moved under us (re-validation, never a blind overwrite).
 const buildExactPlan = Effect.fn("EditTool.exactPlan")(function* (input: PlanInput) {
-  const { services, params, filePath } = input
+  const { services, params, filePath, ctx } = input
   const { afs } = services
   const oldString = params.oldString!
   const newString = params.newString!
 
-  const prior = yield* checkPriorRead(afs, filePath, "exact")
+  const prior = yield* checkPriorRead(afs, ctx.sessionID, filePath, "exact")
   const warnings: string[] = [...prior]
 
   const healedOldTop = healInput(oldString, "oldString")
@@ -357,7 +357,7 @@ const buildExactPlan = Effect.fn("EditTool.exactPlan")(function* (input: PlanInp
 })
 
 const buildStrategyPlan = Effect.fn("EditTool.strategyPlan")(function* (input: PlanInput) {
-  const { services, params, filePath } = input
+  const { services, params, filePath, ctx } = input
   const { afs } = services
 
   const source = yield* readExisting(afs, filePath)
@@ -384,7 +384,7 @@ const buildStrategyPlan = Effect.fn("EditTool.strategyPlan")(function* (input: P
   })
   warnings.push(...result.warnings)
 
-  const prior = yield* checkPriorRead(afs, filePath, result.strategy)
+  const prior = yield* checkPriorRead(afs, ctx.sessionID, filePath, result.strategy)
   warnings.push(...prior)
 
   const plan = buildPlan({
@@ -409,8 +409,13 @@ const readExisting = Effect.fn("EditTool.readExisting")(function* (afs: FSUtil.I
   return yield* Bom.readFile(afs, filePath)
 })
 
-const checkPriorRead = Effect.fn("EditTool.priorRead")(function* (afs: FSUtil.Interface, filePath: string, strategy: string) {
-  const outcome = yield* enforcePriorReadEffect(Option.some(globalReadCache), afs, filePath, strategy)
+const checkPriorRead = Effect.fn("EditTool.priorRead")(function* (
+  afs: FSUtil.Interface,
+  sessionID: string,
+  filePath: string,
+  strategy: string,
+) {
+  const outcome = yield* enforcePriorReadEffect(Option.some(globalReadCache), afs, sessionID, filePath, strategy)
   if (outcome.refusal) throw new Error(outcome.refusal)
   return outcome.warning ? [outcome.warning] : []
 })

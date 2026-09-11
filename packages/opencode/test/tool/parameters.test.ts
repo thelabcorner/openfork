@@ -241,6 +241,18 @@ describe("tool parameters", () => {
       expect(parsed.offset).toBe(10)
       expect(parsed.limit).toBe(100)
     })
+    test("accepts per-target batch read windows", () => {
+      const parsed = parse(Read, {
+        reads: [
+          { filePath: "/a", offset: 10, limit: 20 },
+          { filePath: "/b", offset: 30, limit: 40 },
+        ],
+      })
+      expect(parsed.reads).toEqual([
+        { filePath: "/a", offset: 10, limit: 20 },
+        { filePath: "/b", offset: 30, limit: 40 },
+      ])
+    })
   })
 
   describe("skill", () => {

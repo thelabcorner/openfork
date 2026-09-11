@@ -19,7 +19,7 @@ import { applySpans } from "../../src/tool/edit/span"
 import { assertSpansExplain } from "../../src/tool/edit/invariant"
 import { resolveMatch } from "../../src/tool/edit/match"
 import { absorbDeletionNewline, healInput, stripCodeFence, stripReadPrefix } from "../../src/tool/edit/heal"
-import { enforce as enforcePriorRead, ReadCache } from "../../src/tool/edit/prior-read"
+import { enforce as enforcePriorRead, globalReadCache, ReadCache } from "../../src/tool/edit/prior-read"
 import { withRollback } from "../../src/tool/patch/rollback"
 import { applyTextEdits } from "../../src/tool/refactor"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
@@ -323,32 +323,58 @@ describe("edit input rails (pure)", () => {
 })
 
 describe("prior-read enforcement (pure)", () => {
+  const sessionA = "ses-a"
+  const sessionB = "ses-b"
   const staleAfs = {
     stat: () => Effect.succeed({ type: "File", mtime: Option.some(new Date(5000)), size: 5 }),
   } as never
 
-  test("refuses files changed after they were read", async () => {
+  test("refuses files changed outside the session after they were read", async () => {
     const cache = new ReadCache()
-    cache.record("/f.txt", 1000, 5)
-    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, "/f.txt", "line"))
-    expect(outcome.refusal).toContain("changed on disk")
+    cache.recordRead(sessionA, "/f.txt", 1000, 5)
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, sessionA, "/f.txt", "line"))
+    expect(outcome.refusal).toContain("outside the current session")
+  })
+
+  test("same-session writes advance freshness without forcing a re-read", async () => {
+    const cache = new ReadCache()
+    cache.recordRead(sessionA, "/f.txt", 1000, 5)
+    cache.recordWrite(sessionA, "/f.txt", 5000, 5)
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, sessionA, "/f.txt", "line"))
+    expect(outcome).toEqual({})
+  })
+
+  test("one session cannot advance another session's freshness", async () => {
+    const cache = new ReadCache()
+    cache.recordRead(sessionB, "/f.txt", 1000, 5)
+    cache.recordWrite(sessionA, "/f.txt", 5000, 5)
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, sessionB, "/f.txt", "exact"))
+    expect(outcome.refusal).toContain("outside the current session")
+  })
+
+  test("same-session write without a read preserves line-grounding warning", async () => {
+    const cache = new ReadCache()
+    cache.recordWrite(sessionA, "/f.txt", 5000, 5)
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, sessionA, "/f.txt", "line"))
+    expect(outcome.refusal).toBeUndefined()
+    expect(outcome.warning).toContain("only been written, not read")
   })
 
   test("warns (not refuses) on missing records for line-targeted strategies", async () => {
     const cache = new ReadCache()
-    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, "/never.txt", "line"))
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, sessionA, "/never.txt", "line"))
     expect(outcome.refusal).toBeUndefined()
     expect(outcome.warning).toContain("no read record")
   })
 
   test("stays silent on missing records for the exact path", async () => {
     const cache = new ReadCache()
-    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, "/never.txt", "exact"))
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.some(cache), staleAfs, sessionA, "/never.txt", "exact"))
     expect(outcome).toEqual({})
   })
 
   test("degrades to silence without a cache", async () => {
-    const outcome = await Effect.runPromise(enforcePriorRead(Option.none(), staleAfs, "/f.txt", "line"))
+    const outcome = await Effect.runPromise(enforcePriorRead(Option.none(), staleAfs, sessionA, "/f.txt", "line"))
     expect(outcome).toEqual({})
   })
 })
@@ -423,6 +449,58 @@ describe("tool.edit safety rails (integration)", () => {
       expect(result.metadata.strategy).toBe("line")
       expect(result.metadata.oldPreview).toBe("beta")
       expect(yield* load(filepath)).toBe("alpha\nBETA\ngamma")
+    }),
+  )
+
+  it.instance("same-session sequential edits do not require a redundant re-read", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "same-session.txt")
+      yield* put(filepath, "alpha\nbeta\ngamma")
+      const afs = yield* FSUtil.Service
+      const before = yield* afs.stat(filepath)
+      globalReadCache.recordRead(
+        ctx.sessionID,
+        filepath,
+        Option.getOrElse(before.mtime, () => new Date(0)).getTime(),
+        Number(before.size),
+      )
+
+      yield* run({ filePath: filepath, oldString: "alpha", newString: "ALPHA" })
+      const afterFirst = yield* afs.stat(filepath)
+      const tracked = globalReadCache.get(ctx.sessionID, filepath)
+      expect(tracked?.mtimeMs).toBe(Option.getOrElse(afterFirst.mtime, () => new Date(0)).getTime())
+      expect(tracked?.size).toBe(Number(afterFirst.size))
+      const result = yield* run({ filePath: filepath, oldString: "gamma", newString: "GAMMA" })
+
+      expect(result.output).toContain("Edit applied successfully")
+      expect(yield* load(filepath)).toBe("ALPHA\nbeta\nGAMMA")
+    }),
+  )
+
+  it.instance("a different session still gets a stale-file refusal", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "cross-session.txt")
+      yield* put(filepath, "alpha\nbeta\ngamma")
+      const afs = yield* FSUtil.Service
+      const before = yield* afs.stat(filepath)
+      const other = SessionID.make("ses_test-edit-other")
+      globalReadCache.recordRead(
+        other,
+        filepath,
+        Option.getOrElse(before.mtime, () => new Date(0)).getTime(),
+        Number(before.size),
+      )
+
+      yield* run({ filePath: filepath, oldString: "alpha", newString: "ALPHA" })
+      const err = yield* fail(
+        { filePath: filepath, oldString: "gamma", newString: "GAMMA" },
+        { ...ctx, sessionID: other },
+      )
+
+      expect(err.message).toContain("outside the current session")
+      expect(yield* load(filepath)).toBe("ALPHA\nbeta\ngamma")
     }),
   )
 
@@ -629,6 +707,54 @@ describe("tool.edit safety rails (integration)", () => {
       expect(err.message).toContain("Could not find oldString")
       // Nothing was discarded: the external change stands, ours was refused.
       expect(yield* load(filepath)).toBe("target = 200\nother = 2\n")
+    }),
+  )
+
+  it.instance("same session can edit its own freshly-mutated file without a redundant re-read", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "same-session.txt")
+      yield* put(filepath, "alpha\nbeta\ngamma\n")
+      const fsutil = yield* FSUtil.Service
+      const stat = yield* fsutil.stat(filepath)
+      globalReadCache.recordRead(
+        ctx.sessionID,
+        filepath,
+        Option.getOrElse(stat.mtime, () => new Date(0)).getTime(),
+        Number(stat.size),
+      )
+
+      yield* run({ filePath: filepath, oldString: "alpha", newString: "ALPHA" })
+      const second = yield* run({ filePath: filepath, oldString: "gamma", newString: "GAMMA" })
+
+      expect(second.output).toContain("Edit applied successfully")
+      expect(yield* load(filepath)).toBe("ALPHA\nbeta\nGAMMA\n")
+    }),
+  )
+
+  it.instance("a write from another session still invalidates this session's grounding", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const filepath = path.join(test.directory, "cross-session.txt")
+      yield* put(filepath, "alpha\nbeta\n")
+      const fsutil = yield* FSUtil.Service
+      const stat = yield* fsutil.stat(filepath)
+      const other = SessionID.make("ses_other-edit-session")
+      globalReadCache.recordRead(
+        other,
+        filepath,
+        Option.getOrElse(stat.mtime, () => new Date(0)).getTime(),
+        Number(stat.size),
+      )
+
+      yield* run({ filePath: filepath, oldString: "alpha", newString: "ALPHA" })
+      const err = yield* fail(
+        { filePath: filepath, oldString: "beta", newString: "BETA" },
+        { ...ctx, sessionID: other },
+      )
+
+      expect(err.message).toContain("outside the current session")
+      expect(yield* load(filepath)).toBe("ALPHA\nbeta\n")
     }),
   )
 })

@@ -15,6 +15,7 @@ import { assertExternalDirectoryEffect } from "./external-directory"
 import * as Bom from "@/util/bom"
 import { AppProcess } from "@opencode-ai/core/process"
 import { TypecheckScope } from "./typecheck-scope"
+import { globalReadCache, noteWrite as noteSessionWrite } from "./edit/prior-read"
 
 const MAX_PROJECT_DIAGNOSTICS_FILES = 5
 
@@ -69,6 +70,7 @@ export const WriteTool = Tool.define(
           if (yield* format.file(filepath)) {
             yield* Bom.syncFile(fs, filepath, desiredBom)
           }
+          yield* noteSessionWrite(globalReadCache, fs, ctx.sessionID, filepath)
           yield* events.publish(FileSystem.Event.Edited, { file: filepath })
           yield* events.publish(Watcher.Event.Updated, {
             file: filepath,

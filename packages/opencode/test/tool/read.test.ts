@@ -650,6 +650,47 @@ describe("tool.read subtools", () => {
     }),
   )
 
+  it.live("batches different known read windows in one reads call", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const a = path.join(dir, "a.txt")
+      const b = path.join(dir, "b.txt")
+      yield* put(a, Array.from({ length: 8 }, (_, i) => `a${i + 1}`).join("\n"))
+      yield* put(b, Array.from({ length: 8 }, (_, i) => `b${i + 1}`).join("\n"))
+
+      const result = yield* exec(dir, {
+        reads: [
+          { filePath: a, offset: 2, limit: 2 },
+          { filePath: b, offset: 6, limit: 1 },
+        ],
+      })
+
+      expect(result.title).toBe("read 2 targets")
+      expect(result.output).toContain("2: a2")
+      expect(result.output).toContain("3: a3")
+      expect(result.output).not.toContain("4: a4")
+      expect(result.output).toContain("6: b6")
+      expect(result.output).not.toContain("7: b7")
+    }),
+  )
+
+  it.live("rejects mixing batch read pathways or top-level windows with reads", () =>
+    Effect.gen(function* () {
+      const dir = yield* tmpdirScoped()
+      const file = path.join(dir, "a.txt")
+      yield* put(file, "a")
+
+      const mixed = yield* fail(dir, { filePath: file, filePaths: [file] })
+      expect(mixed.message).toContain("exactly one read pathway")
+
+      const window = yield* fail(dir, { reads: [{ filePath: file }], limit: 10 })
+      expect(window.message).toContain("Top-level offset/limit cannot be combined with reads[]")
+
+      const searched = yield* fail(dir, { filePaths: [file], pattern: "a" })
+      expect(searched.message).toContain("plain text-window batch pathways")
+    }),
+  )
+
   it.live("pattern searches inside one file", () =>
     Effect.gen(function* () {
       const dir = yield* tmpdirScoped()

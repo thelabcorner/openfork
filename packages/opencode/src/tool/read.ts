@@ -35,35 +35,60 @@ const DEFAULT_TAIL = 80
 const HINT =
   'Tip: action="outline" for a symbol TOC, pattern="name" to search this file, symbol="name" to jump to a definition.'
 
+const BatchRead = Schema.Struct({
+  filePath: Schema.String.annotate({
+    description: "Path for this read window. Relative paths resolve from the project directory.",
+  }),
+  offset: Schema.optional(NonNegativeInt).annotate({
+    description: "1-based start line for this target (default 1).",
+  }),
+  limit: Schema.optional(NonNegativeInt).annotate({
+    description: "Maximum lines for this target (default 2000).",
+  }),
+})
+
 class ReadStop extends Schema.TaggedErrorClass<ReadStop>()("ReadStop", {}) {}
 
 // Prior-read grounding (D47): every successful file-content read records
 // mtime+size so edit/patch can refuse targets that moved under the model.
 // Directory listings are not recorded — they ground no edit.
 const noteRead = (
+  sessionID: string,
   filepath: string,
   stat: { type: string; mtime: Option.Option<Date>; size: unknown } | undefined,
 ) => {
   if (!stat || stat.type === "Directory") return
-  globalReadCache.record(filepath, Option.getOrElse(stat.mtime, () => new Date(0)).getTime(), Number(stat.size))
+  globalReadCache.recordRead(
+    sessionID,
+    filepath,
+    Option.getOrElse(stat.mtime, () => new Date(0)).getTime(),
+    Number(stat.size),
+  )
 }
 
 export const Parameters = Schema.Struct({
   filePath: Schema.optional(Schema.String).annotate({
-    description: "The absolute path to the file or directory to read",
+    description:
+      "Single-target path. If 2-8 read targets are already known, batch them with filePaths[] or reads[] instead of making separate read calls.",
   }),
   file_path: Schema.optional(Schema.String).annotate({
     description: "Alias for filePath",
   }),
   filePaths: Schema.optional(Schema.Union([Schema.Array(Schema.String), Schema.String])).annotate({
     description:
-      "Bulk read: up to 8 files in one call, each rendered as its own <file> block. Mutually exclusive with filePath. JSON array, not a string.",
+      "ECONOMY: batch 2-8 known text files into ONE plain-read call when they can share the same offset/limit. Prefer a JSON array. Use reads[] when targets need different windows. Mutually exclusive with filePath/reads.",
+  }),
+  reads: Schema.optional(Schema.Array(BatchRead)).annotate({
+    description:
+      "ECONOMY: batch up to 8 known text-file windows into ONE plain-read call. Each item has its own filePath and optional offset/limit, so different ranges do not require separate tool calls. Mutually exclusive with filePath/filePaths and top-level offset/limit.",
   }),
   offset: Schema.optional(NonNegativeInt).annotate({
-    description: "The line number to start reading from (1-indexed). Past EOF clamps to the last page.",
+    description:
+      "The line number to start reading from (1-indexed). Past EOF clamps to the last page. Applies to filePath/filePaths; reads[] carries per-target offsets.",
   }),
   limit: Schema.optional(NonNegativeInt).annotate({
-    description: "The maximum number of lines to read (defaults to 2000)",
+    description:
+      "The maximum number of lines to read (defaults to 2000). Applies to filePath/filePaths; reads[] carries per-target limits.",
   }),
   action: Schema.optional(Schema.Literals(["read", "outline", "grep", "around", "tail"])).annotate({
     description:
@@ -440,21 +465,52 @@ export const ReadTool = Tool.define<
       const instance = yield* InstanceState.context
       const action = resolveAction(params)
 
-      if (params.filePaths != null) {
-        let paths: string[]
-        try {
-          paths = coerceFilePaths(params.filePaths)
-        } catch (error) {
-          throw error instanceof Error ? error : new Error(String(error))
+      const hasSinglePath = params.filePath !== undefined || params.file_path !== undefined
+      const hasFilePaths = params.filePaths != null
+      const hasReads = params.reads != null
+      if (Number(hasSinglePath) + Number(hasFilePaths) + Number(hasReads) > 1) {
+        throw new Error(
+          "Choose exactly one read pathway: filePath/file_path for one target, filePaths[] for 2-8 targets sharing one offset/limit, or reads[] for 2-8 targets with per-target windows.",
+        )
+      }
+      if (hasReads && (params.offset !== undefined || params.limit !== undefined)) {
+        throw new Error(
+          "Top-level offset/limit cannot be combined with reads[]. Put offset/limit on each reads[] item instead.",
+        )
+      }
+      if (
+        (hasFilePaths || hasReads) &&
+        (params.pattern !== undefined ||
+          params.symbol !== undefined ||
+          (params.action !== undefined && params.action !== "read"))
+      ) {
+        throw new Error(
+          "filePaths[]/reads[] are plain text-window batch pathways. pattern, symbol, outline, grep, around, and tail are single-target operations; use filePath for those, then batch the resulting known ranges if needed.",
+        )
+      }
+
+      if (hasFilePaths || hasReads) {
+        let requests: Array<{ filePath: string; offset?: number; limit?: number }>
+        if (params.reads != null) {
+          requests = params.reads.map((item) => ({ filePath: item.filePath, offset: item.offset, limit: item.limit }))
+        } else {
+          let paths: string[]
+          try {
+            paths = coerceFilePaths(params.filePaths!)
+          } catch (error) {
+            throw error instanceof Error ? error : new Error(String(error))
+          }
+          requests = paths.map((filePath) => ({ filePath, offset: params.offset, limit: params.limit }))
         }
-        if (paths.length === 0) {
-          throw new Error("Provide filePath or filePaths[] to read.")
+        if (requests.length === 0) {
+          throw new Error("Provide at least one target in filePaths[] or reads[].")
         }
-        const overflow = paths.length > MAX_BULK_FILES ? paths.slice(MAX_BULK_FILES) : []
-        const batch = paths.slice(0, MAX_BULK_FILES)
+        const overflow = requests.length > MAX_BULK_FILES ? requests.slice(MAX_BULK_FILES) : []
+        const batch = requests.slice(0, MAX_BULK_FILES)
         const blocks: string[] = []
         let truncated = false
-        for (const input of batch) {
+        for (const request of batch) {
+          const input = request.filePath
           let filepath = input
           if (!path.isAbsolute(filepath) && !isPosixAbsoluteOnWindows(filepath)) {
             filepath = path.resolve(instance.directory, filepath)
@@ -478,8 +534,11 @@ export const ReadTool = Tool.define<
             blocks.push(`<file path="${filepath}">\n<missing />${hint}\n</file>`)
             continue
           }
-          const file = yield* clampRead(filepath, { limit: params.limit ?? DEFAULT_READ_LIMIT, offset: params.offset || 1 })
-          noteRead(filepath, resolved.stat)
+          const file = yield* clampRead(filepath, {
+            limit: request.limit ?? DEFAULT_READ_LIMIT,
+            offset: request.offset || 1,
+          })
+          noteRead(ctx.sessionID, filepath, resolved.stat)
           const heal = resolved.repaired ? renderHeal(input, filepath, resolved.repaired) : ""
           const block = [
             heal,
@@ -499,11 +558,13 @@ export const ReadTool = Tool.define<
         }
         if (overflow.length > 0) {
           blocks.push(
-            `<remaining count="${overflow.length}">Read ${batch.length} of ${paths.length}. Remaining:\n${overflow.join("\n")}\nCall again with these, or glob + grep.</remaining>`,
+            `<remaining count="${overflow.length}">Read ${batch.length} of ${requests.length}. Remaining:\n${overflow
+              .map((item) => item.filePath)
+              .join("\n")}\nCall again with these, or glob + grep.</remaining>`,
           )
         }
         return {
-          title: `read ${batch.length} files`,
+          title: `read ${batch.length} targets`,
           output: blocks.join("\n\n"),
           metadata: {
             preview: blocks[0]?.slice(0, 20) ?? "",
@@ -633,7 +694,7 @@ export const ReadTool = Tool.define<
         return yield* Effect.fail(new Error(`Cannot read binary file: ${filepath}`))
       }
 
-      noteRead(filepath, stat)
+      noteRead(ctx.sessionID, filepath, stat)
 
       if (action === "outline") {
         const cache = yield* InstanceState.get(cacheState)

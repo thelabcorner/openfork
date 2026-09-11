@@ -18,7 +18,13 @@ import * as Bom from "@/util/bom"
 import * as Core from "./patch/core"
 import { deriveContent } from "./patch/resolve"
 import { withRollback, type Restorable } from "./patch/rollback"
-import { enforce as enforcePriorReadEffect, globalReadCache } from "./edit/prior-read"
+import {
+  enforce as enforcePriorReadEffect,
+  globalReadCache,
+  noteDelete as noteSessionDelete,
+  noteMove as noteSessionMove,
+  noteWrite as noteSessionWrite,
+} from "./edit/prior-read"
 import { Option } from "effect"
 import DESCRIPTION from "./patch.txt"
 
@@ -135,7 +141,7 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
       // pathway validates everything first, and a file that moved under the
       // model belongs in the plan alongside hunk mismatches.
       const checkFresh = (filePath: string) =>
-        enforcePriorReadEffect(Option.some(globalReadCache), afs, filePath, "patch")
+        enforcePriorReadEffect(Option.some(globalReadCache), afs, ctx.sessionID, filePath, "patch")
 
       // Merge repeated sections for one path. Every update hunk derives from
       // on-disk bytes independently, so without merging the last write would
@@ -499,6 +505,18 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
         }
       })
       yield* withFileLocks(targets, applyAll)
+
+      for (const change of actionable) {
+        if (change.type === "delete") {
+          noteSessionDelete(globalReadCache, ctx.sessionID, change.filePath)
+          continue
+        }
+        if (change.type === "move") {
+          yield* noteSessionMove(globalReadCache, afs, ctx.sessionID, change.filePath, change.movePath!)
+          continue
+        }
+        yield* noteSessionWrite(globalReadCache, afs, ctx.sessionID, change.filePath)
+      }
 
       for (const change of actionable) {
         if (change.type === "delete") continue

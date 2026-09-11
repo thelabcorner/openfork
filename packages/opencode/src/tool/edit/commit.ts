@@ -13,6 +13,7 @@ import * as Fingerprint from "./fingerprint"
 import type { EditPlan } from "./plan"
 import type * as Tool from "./../tool"
 import { withLock } from "./../file-lock"
+import { globalReadCache, noteWrite as noteSessionWrite } from "./prior-read"
 
 const NUL_SCAN_BYTES = 512
 
@@ -146,8 +147,9 @@ export const commitPlan = Effect.fn("EditCommit.commit")(function* (
   // call misfires.
   if (final.reformatted) {
     output +=
-      `\n\nNOTE: the formatter changed this file after the edit was applied. Line numbers have shifted — ` +
-      `re-read before any line/insertAt/range edit to this file.`
+      `\n\nNOTE: the formatter changed this file after the edit was applied, so old line coordinates may have shifted. ` +
+      `This is still a same-session change and does NOT require a re-read for freshness. Prefer exact/nearText targeting for a follow-up edit, ` +
+      `or re-read only if you specifically need refreshed line numbers.`
   }
 
   yield* lsp.touchFile(plan.filePath, "document")
@@ -180,7 +182,7 @@ export const commitPlan = Effect.fn("EditCommit.commit")(function* (
 const commitLocked = Effect.fn("EditCommit.locked")(function* (
   services: CommitServices,
   plan: EditPlan,
-  _ctx: Tool.Context,
+  ctx: Tool.Context,
   _instance: { directory: string; worktree: string },
   options: {
     fingerprint?: Fingerprint.Fingerprint
@@ -243,6 +245,7 @@ const commitLocked = Effect.fn("EditCommit.locked")(function* (
         finalContent = yield* Bom.syncFile(afs, active.filePath, active.bom)
         reformatted = finalContent !== active.contentNew
       }
+      yield* noteSessionWrite(globalReadCache, afs, ctx.sessionID, active.filePath)
       yield* events.publish(FileSystem.Event.Edited, { file: active.filePath })
       yield* events.publish(Watcher.Event.Updated, { file: active.filePath, event: active.isNew ? "add" : "change" })
 

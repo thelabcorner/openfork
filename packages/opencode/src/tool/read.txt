@@ -1,11 +1,17 @@
-Read a file or directory. Prefer outline / pattern / symbol over paging.
+Read files or directories with token-aware targeting. Prefer the smallest number of tool calls that returns the context you actually need.
 
-Usage:
-- filePath (or file_path): absolute path. filePaths[]: up to 8 files in one call.
-- offset (1-indexed) + limit (default 2000). Offset past EOF clamps to the last page.
-- action: read (default) | outline | grep | around | tail
-- pattern: search this file (implies grep). Do NOT page looking for a name.
-- symbol: jump to that definition (implies around).
-- Call in parallel for known files. Avoid tiny 30-line slices.
-- Unsure of the path? Use glob. Project-wide search? Use grep.
-- Directories list entries (trailing /). Images/PDFs attach. Binary is rejected.
+COST MODEL: tool round trips repeatedly carry/reprocess conversation context and add tool-result framing. If you already know 2-8 reads, BATCH THEM into ONE read call instead of issuing sequential reads. Do not batch speculative files just to fill the limit: batch known-relevant targets.
+
+ROUTING
+- ONE target -> filePath (or file_path), with offset + limit when a window is known.
+- 2-8 known text files sharing one window -> filePaths:[...]. Top-level offset/limit applies to every file.
+- 2-8 known text-file targets needing DIFFERENT windows -> reads:[{filePath,offset?,limit?}, ...]. This is the preferred economy path for several known ranges.
+- Need a symbol/name inside ONE file -> pattern or symbol. Do NOT page through the file looking for it.
+- Unsure of the path -> glob. Need project-wide content search -> grep. Search first, then batch the known reads that search identifies.
+
+TOKEN ECONOMY
+- Avoid chains of tiny reads. Read enough surrounding context to reason/edit safely, but do not fetch unrelated whole files when exact ranges are known.
+- Before a multi-file edit/refactor, collect all known grounding reads into as few read calls as possible, then send the edits in one bulk edit call.
+- Do not re-read unchanged content already present in context unless an edit/tool result says the file changed or the needed range was truncated.
+
+Batch pathways are plain text-window reads only. Single-target actions: read (default) | outline | grep | around | tail. pattern implies grep; symbol implies around. Offset past EOF clamps to the last page. Directories list entries, images/PDFs attach, binary files are rejected.
