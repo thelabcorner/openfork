@@ -67,12 +67,25 @@ const parseQueue = createLatestWorkerQueue<Extract<MarkdownWorkerRequest, { type
   dispose: () => undefined,
 })
 const parser = createMarkdownParser(async (code, language) => {
+  const languageID = language.trim().split(/\s+/, 1)[0]?.toLowerCase()
+  if (languageID === "mermaid" || languageID === "mmd") return plainCode(code, languageID)
   const instance = await getHighlighter()
   const name = language in bundledLanguages ? language : "text"
   if (!instance.getLoadedLanguages().includes(name))
     await instance.loadLanguage(bundledLanguages[name as BundledLanguage])
   return instance.codeToHtml(code, { lang: name as BundledLanguage, theme: "OpenCode", tabindex: false })
 })
+
+function plainCode(code: string, language: string) {
+  const safe = code
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;")
+  const lang = language.trim().split(/\s+/, 1)[0] || "mermaid"
+  return `<pre class="shiki OpenCode"><code class="language-${lang}">${safe}</code></pre>`
+}
 
 self.onmessage = (event: MessageEvent<MarkdownWorkerRequest>) => {
   if (event.data.type === "dispose") {

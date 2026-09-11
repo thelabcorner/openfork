@@ -32,6 +32,12 @@ import { markdownBlockKey, type MarkdownToken } from "./markdown-worker-protocol
 import { shouldResetCodeTokens, type RenderedCodeState } from "./markdown-code-state"
 import { getCachedMarkdown, sanitizeMarkdown, touchCachedMarkdown, type MarkdownCacheEntry } from "./markdown-cache"
 import { inlineCodeKind } from "./markdown-inline-code-kind"
+import {
+  disposeMermaidBlocks,
+  hydrateMermaidBlocks,
+  isMermaidLanguage,
+  mountMermaidBlock,
+} from "./markdown-mermaid"
 import { markdownTraceEnabled, traceMarkdown } from "./markdown-trace"
 
 type RenderedBlock =
@@ -40,6 +46,7 @@ type RenderedBlock =
       key: string
       mode: "code"
       raw: string
+      src: string
       hash: string
       language: string
       complete: boolean
@@ -69,6 +76,14 @@ function fallback(markdown: string) {
 }
 
 async function code(text: string, language: string | undefined, key: string, complete = false) {
+  if (isMermaidLanguage(language)) {
+    return {
+      language: "mermaid",
+      generation: 0,
+      stable: complete ? ([[text, ""]] as MarkdownToken[]) : [],
+      unstable: complete ? [] : ([[text, ""]] as MarkdownToken[]),
+    }
+  }
   try {
     const result = await highlightStreamingCode(key, text, language ?? "text", complete)
     return {
@@ -281,6 +296,7 @@ let newLayout: boolean | undefined
 function decorate(root: HTMLDivElement, labels: CopyLabels, live = false) {
   const blocks = Array.from(root.querySelectorAll("pre"))
   for (const block of blocks) {
+    if (isMermaidLanguage(codeLanguage(block)) && !live) continue
     ensureCodeWrapper(block, labels)
   }
   if (live) return
@@ -386,7 +402,7 @@ export function Markdown(
   const completedCodeSizes = new Map<string, number>()
   let completedCodeBytes = 0
   const codeBytes = (value: Extract<RenderedBlock, { mode: "code" }>) => {
-    let total = value.raw.length * 2 + value.language.length * 2
+    let total = (value.raw.length + value.src.length + value.language.length) * 2
     for (const token of [...value.stable, ...value.unstable]) total += token[0].length * 2 + token[1].length * 2
     return total
   }
@@ -492,6 +508,7 @@ export function Markdown(
               key: blockKey,
               mode: block.mode,
               raw: block.raw,
+              src: block.src,
               hash: String(block.raw.length),
               complete: !!block.complete,
               ...result,
@@ -563,6 +580,7 @@ export function Markdown(
     if (isServer) return
     if (content.length === 0) {
       disposeCopyButtons(container)
+      disposeMermaidBlocks(container)
       container.innerHTML = ""
       if (tracing)
         traceMarkdown({
@@ -590,6 +608,7 @@ export function Markdown(
       const child = container.lastElementChild
       if (!child) break
       disposeCopyButtons(child)
+      disposeMermaidBlocks(child)
       child.remove()
     }
     container
@@ -612,6 +631,8 @@ export function Markdown(
 
   onCleanup(() => {
     if (copyCleanup) copyCleanup()
+    const container = root()
+    if (container) disposeMermaidBlocks(container)
     disposeMarkdownProjection(owner)
     activeCodeKeys.forEach(disposeCode)
     completedCode.clear()
@@ -652,6 +673,7 @@ function pendingBlocks(
       key,
       mode: block.mode,
       raw: block.raw,
+      src: block.src,
       hash: String(block.raw.length),
       language: block.language ?? "text",
       complete: !!block.complete,
@@ -676,6 +698,10 @@ function updateBlock(
   const started = tracing ? performance.now() : 0
   const current = container.children[index]
   if (block.mode === "code") {
+    if (block.complete && isMermaidLanguage(block.language)) {
+      updateMermaidBlock(container, current, block, labels, tracing, started)
+      return
+    }
     updateCodeBlock(container, current, block, labels, tracing, started)
     return
   }
@@ -710,6 +736,7 @@ function updateBlock(
 
   if (!(current instanceof HTMLDivElement)) {
     container.appendChild(next)
+    if (block.mode !== "live") hydrateMermaidBlocks(next, labels)
     if (tracing)
       traceMarkdown({
         phase: "block",
@@ -739,10 +766,14 @@ function updateBlock(
       return true
     },
     onBeforeNodeDiscarded: (node) => {
-      if (node instanceof Element) disposeCopyButtons(node)
+      if (node instanceof Element) {
+        disposeCopyButtons(node)
+        disposeMermaidBlocks(node)
+      }
       return true
     },
   })
+  if (block.mode !== "live") hydrateMermaidBlocks(current, labels)
   if (tracing)
     traceMarkdown({
       phase: "block",
@@ -754,6 +785,55 @@ function updateBlock(
       innerHTMLMs,
       decorateMs,
       morphMs: performance.now() - morphStarted,
+    })
+}
+
+function updateMermaidBlock(
+  container: HTMLDivElement,
+  current: Element | undefined,
+  block: Extract<RenderedBlock, { mode: "code" }>,
+  labels: CopyLabels,
+  tracing: boolean,
+  started: number,
+) {
+  const existing = current instanceof HTMLDivElement && current.dataset.markdownKey === block.key ? current : undefined
+  const next = existing ?? document.createElement("div")
+  next.dataset.markdownBlock = ""
+  next.dataset.markdownKey = block.key
+  next.dataset.markdownHash = block.hash
+  next.dataset.markdownComplete = "true"
+  next.style.display = "contents"
+  renderedCodeTokens.delete(next)
+
+  if (existing) {
+    disposeCopyButtons(next)
+    mountMermaidBlock(next, block.src, labels)
+    if (tracing)
+      traceMarkdown({
+        phase: "block",
+        ms: performance.now() - started,
+        action: "mermaid-update",
+        mode: block.mode,
+        chars: block.raw.length,
+      })
+    return
+  }
+
+  if (current) {
+    disposeCopyButtons(current)
+    disposeMermaidBlocks(current)
+    current.replaceWith(next)
+  } else {
+    container.appendChild(next)
+  }
+  mountMermaidBlock(next, block.src, labels)
+  if (tracing)
+    traceMarkdown({
+      phase: "block",
+      ms: performance.now() - started,
+      action: "mermaid-mount",
+      mode: block.mode,
+      chars: block.raw.length,
     })
 }
 

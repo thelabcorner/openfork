@@ -89,11 +89,34 @@ export function scrollTopFromThumbPointer(input: {
   /** Viewport height used for max scroll. Defaults to `clientHeight` (track == viewport). */
   scrollClientHeight?: number
 }) {
+  return scrollOffsetFromThumbPointer({
+    pointer: input.pointer,
+    viewportStart: input.viewportTop,
+    grabOffset: input.grabOffset,
+    clientSize: input.clientHeight,
+    scrollSize: input.scrollHeight,
+    thumbSize: input.thumbHeight,
+    scrollClientSize: input.scrollClientHeight,
+  })
+}
+
+function scrollOffsetFromThumbPointer(input: {
+  pointer: number
+  viewportStart: number
+  grabOffset: number
+  clientSize: number
+  scrollSize: number
+  thumbSize: number
+  scrollClientSize?: number
+}) {
   const padding = 8
-  const maxThumbTop = input.clientHeight - padding * 2 - input.thumbHeight
-  if (maxThumbTop <= 0) return 0
-  const thumbTop = Math.max(0, Math.min(input.pointer - input.viewportTop - padding - input.grabOffset, maxThumbTop))
-  return (thumbTop / maxThumbTop) * Math.max(0, input.scrollHeight - (input.scrollClientHeight ?? input.clientHeight))
+  const maxThumbOffset = input.clientSize - padding * 2 - input.thumbSize
+  if (maxThumbOffset <= 0) return 0
+  const thumbOffset = Math.max(
+    0,
+    Math.min(input.pointer - input.viewportStart - padding - input.grabOffset, maxThumbOffset),
+  )
+  return (thumbOffset / maxThumbOffset) * Math.max(0, input.scrollSize - (input.scrollClientSize ?? input.clientSize))
 }
 
 export function ScrollView(props: ScrollViewProps) {
@@ -395,14 +418,19 @@ export function ScrollView(props: ScrollViewProps) {
 export function ScrollViewOverlayScrollbar(props: {
   viewport: () => HTMLElement | undefined
   hoverTarget?: () => HTMLElement | undefined
+  /** Axis represented by this overlay thumb. Multiple overlays may target the same viewport. */
+  orientation?: "vertical" | "horizontal"
+  /** Optional invalidation signal for overflow changes that do not resize the viewport. */
+  refresh?: Accessor<unknown>
 }) {
+  const orientation = () => props.orientation ?? "vertical"
   const [state, setState] = createStore({
     hovered: false,
     dragging: false,
     scrolling: false,
     show: false,
     size: 0,
-    top: 0,
+    offset: 0,
   })
   let idleTimer: ReturnType<typeof setTimeout> | undefined
   let thumbRef!: HTMLDivElement
@@ -410,20 +438,27 @@ export function ScrollViewOverlayScrollbar(props: {
   const update = () => {
     const viewport = props.viewport()
     if (!viewport) return
-    const { scrollTop, scrollHeight, clientHeight } = viewport
-    if (scrollHeight <= clientHeight || scrollHeight === 0) {
+    const vertical = orientation() === "vertical"
+    const scrollOffset = vertical ? viewport.scrollTop : viewport.scrollLeft
+    const scrollSize = vertical ? viewport.scrollHeight : viewport.scrollWidth
+    const clientSize = vertical ? viewport.clientHeight : viewport.clientWidth
+    if (scrollSize <= clientSize || scrollSize === 0) {
       setState("show", false)
       return
     }
     const trackPadding = 8
-    const trackHeight = clientHeight - trackPadding * 2
-    const height = Math.max(32, (clientHeight / scrollHeight) * trackHeight)
-    const maxScrollTop = scrollHeight - clientHeight
-    const maxThumbTop = trackHeight - height
+    const trackSize = clientSize - trackPadding * 2
+    if (trackSize <= 0) {
+      setState("show", false)
+      return
+    }
+    const size = Math.min(trackSize, Math.max(32, (clientSize / scrollSize) * trackSize))
+    const maxScrollOffset = scrollSize - clientSize
+    const maxThumbOffset = trackSize - size
     setState({
       show: true,
-      size: height,
-      top: trackPadding + (maxScrollTop > 0 ? (scrollTop / maxScrollTop) * maxThumbTop : 0),
+      size,
+      offset: trackPadding + (maxScrollOffset > 0 ? (scrollOffset / maxScrollOffset) * maxThumbOffset : 0),
     })
   }
 
@@ -440,6 +475,14 @@ export function ScrollViewOverlayScrollbar(props: {
   createEffect(() => {
     const viewport = props.viewport()
     if (!viewport) return
+    let updateFrame: number | undefined
+    const scheduleUpdate = () => {
+      if (updateFrame !== undefined) return
+      updateFrame = requestAnimationFrame(() => {
+        updateFrame = undefined
+        update()
+      })
+    }
     const onScroll = () => {
       update()
       markScrolling()
@@ -450,10 +493,18 @@ export function ScrollViewOverlayScrollbar(props: {
         [viewport, viewport.firstElementChild].filter(
           (element): element is HTMLElement => element instanceof HTMLElement,
         ),
-      update,
+      scheduleUpdate,
     )
     update()
-    onCleanup(() => viewport.removeEventListener("scroll", onScroll))
+    onCleanup(() => {
+      viewport.removeEventListener("scroll", onScroll)
+      if (updateFrame !== undefined) cancelAnimationFrame(updateFrame)
+    })
+  })
+
+  createEffect(() => {
+    props.refresh?.()
+    update()
   })
 
   createEffect(() => {
@@ -473,21 +524,26 @@ export function ScrollViewOverlayScrollbar(props: {
   const onThumbPointerDown = (event: PointerEvent) => {
     const viewport = props.viewport()
     if (!viewport) return
+    const vertical = orientation() === "vertical"
     event.preventDefault()
     event.stopPropagation()
     setState("dragging", true)
-    const grabOffset = event.clientY - thumbRef.getBoundingClientRect().top
+    const thumbRect = thumbRef.getBoundingClientRect()
+    const grabOffset = vertical ? event.clientY - thumbRect.top : event.clientX - thumbRect.left
     thumbRef.setPointerCapture(event.pointerId)
 
     const onPointerMove = (move: PointerEvent) => {
-      viewport.scrollTop = scrollTopFromThumbPointer({
-        pointer: move.clientY,
-        viewportTop: viewport.getBoundingClientRect().top,
+      const viewportRect = viewport.getBoundingClientRect()
+      const offset = scrollOffsetFromThumbPointer({
+        pointer: vertical ? move.clientY : move.clientX,
+        viewportStart: vertical ? viewportRect.top : viewportRect.left,
         grabOffset,
-        clientHeight: viewport.clientHeight,
-        scrollHeight: viewport.scrollHeight,
-        thumbHeight: state.size,
+        clientSize: vertical ? viewport.clientHeight : viewport.clientWidth,
+        scrollSize: vertical ? viewport.scrollHeight : viewport.scrollWidth,
+        thumbSize: state.size,
       })
+      if (vertical) viewport.scrollTop = offset
+      else viewport.scrollLeft = offset
     }
     const done = (up: PointerEvent) => {
       setState("dragging", false)
@@ -507,13 +563,14 @@ export function ScrollViewOverlayScrollbar(props: {
         <div
           ref={(el) => (thumbRef = el)}
           class="scroll-view__thumb"
+          data-orientation={orientation()}
           data-visible={state.hovered || state.dragging || state.scrolling}
           data-dragging={state.dragging}
-          style={{
-            height: `${state.size}px`,
-            transform: `translateY(${state.top}px)`,
-            "z-index": 100,
-          }}
+          style={
+            orientation() === "vertical"
+              ? { height: `${state.size}px`, transform: `translateY(${state.offset}px)`, "z-index": 100 }
+              : { width: `${state.size}px`, transform: `translateX(${state.offset}px)`, "z-index": 100 }
+          }
           onPointerDown={onThumbPointerDown}
         />
       </Show>

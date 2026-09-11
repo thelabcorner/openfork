@@ -4,7 +4,7 @@ import { create } from "@opencode-ai/ui/storybook/scaffold"
 import { markdown } from "@opencode-ai/ui/storybook/fixtures"
 
 const docs = `### Overview
-Render sanitized Markdown with code blocks, inline code, and safe links.
+Render sanitized Markdown with code blocks, Mermaid diagrams, inline code, and safe links.
 
 Pair with \`Code\` for standalone code views.
 
@@ -14,6 +14,7 @@ Pair with \`Code\` for standalone code views.
 
 ### Variants and states
 - Code blocks include copy buttons when rendered.
+- Completed \`mermaid\` fences lazy-render as interactive, theme-aware diagrams.
 
 ### Behavior
 - Sanitizes HTML and auto-converts inline URL code to links.
@@ -51,3 +52,9 @@ export default {
 }
 
 export const Basic = story.Basic
+
+export const Mermaid = {
+  args: {
+    text: `## Architecture\n\n\`\`\`mermaid\nflowchart LR\n  UI[Message timeline] --> Projector[Streaming projector]\n  Projector --> Fence{Fence complete?}\n  Fence -- No --> Code[Cheap source block]\n  Fence -- Yes --> Lazy[Viewport lazy loader]\n  Lazy --> Cache[Theme-aware SVG cache]\n  Cache --> Diagram[Interactive diagram]\n\`\`\`\n`,
+  },
+}
