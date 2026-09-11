@@ -2,7 +2,7 @@ import { afterEach, describe, expect } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
-import { Effect, Layer, Result, Schema } from "effect"
+import { Effect, Exit, Layer, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { ToolRegistry } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
@@ -218,6 +218,58 @@ describe("tool.registry", () => {
       const registry = yield* ToolRegistry.Service
       const ids = yield* registry.ids()
       expect(ids).toContain("hello")
+    }),
+  )
+
+  it.instance("keeps session-denied custom tools in the cache-stable manifest but blocks execution", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const toolDir = path.join(test.directory, ".opencode", "tool")
+      yield* Effect.promise(() => fs.mkdir(toolDir, { recursive: true }))
+      yield* Effect.promise(() =>
+        Bun.write(
+          path.join(toolDir, "swarm.ts"),
+          [
+            "export const create = { description: 'create swarm', args: {}, execute: async () => 'created' }",
+            "export const delegate = { description: 'delegate swarm', args: {}, execute: async () => 'delegated' }",
+            "",
+          ].join("\n"),
+        ),
+      )
+
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const build = yield* agents.get("build")
+      const ids = yield* registry.ids()
+      expect(ids).toContain("swarm_create")
+      expect(ids).toContain("swarm_delegate")
+
+      const visible = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: build,
+        permission: [{ permission: "swarm_*", pattern: "*", action: "deny" }],
+      })
+      const visibleIds = visible.map((tool) => tool.id)
+      expect(visibleIds).toContain("swarm_create")
+      expect(visibleIds).toContain("swarm_delegate")
+      expect(visibleIds).toContain("read")
+
+      const denied = visible.find((tool) => tool.id === "swarm_create")
+      if (!denied) throw new Error("swarm_create missing from provider-visible manifest")
+      const exit = yield* denied.execute(
+        {},
+        {
+          sessionID: SessionID.descending(),
+          messageID: MessageID.ascending(),
+          agent: "build",
+          abort: new AbortController().signal,
+          messages: [],
+          metadata: () => Effect.void,
+          ask: () => Effect.void,
+        },
+      ).pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
     }),
   )
 

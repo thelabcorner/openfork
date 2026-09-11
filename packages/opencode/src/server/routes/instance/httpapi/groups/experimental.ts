@@ -59,6 +59,20 @@ export const ToolListQuery = Schema.Struct({
   provider: ProviderV2.ID,
   model: ModelV2.ID,
 })
+const ToolCatalogItem = Schema.Struct({
+  id: Schema.String,
+  description: Schema.String,
+  exposure: Schema.Union([Schema.Literal("default"), Schema.Literal("lazy")]),
+  source: Schema.Union([Schema.Literal("registry"), Schema.Literal("mcp"), Schema.Literal("mcp-resource")]),
+}).annotate({ identifier: "ToolCatalogItem" })
+const ToolCatalog = Schema.Array(ToolCatalogItem).annotate({ identifier: "ToolCatalog" })
+export const ToolCatalogQuery = Schema.Struct({
+  ...WorkspaceRoutingQueryFields,
+  provider: ProviderV2.ID,
+  model: ModelV2.ID,
+  agent: Schema.optional(Schema.String),
+  sessionID: Schema.optional(SessionID),
+})
 
 const WorktreeList = Schema.Array(Schema.String)
 const WorktreeErrorName = Schema.Union([
@@ -245,6 +259,7 @@ export const ExperimentalPaths = {
   consoleOrgs: "/experimental/console/orgs",
   consoleSwitch: "/experimental/console/switch",
   tool: "/experimental/tool",
+  toolCatalog: "/experimental/tool/catalog",
   toolIDs: "/experimental/tool/ids",
   worktree: "/experimental/worktree",
   worktreeReset: "/experimental/worktree/reset",
@@ -314,6 +329,18 @@ export const ExperimentalApi = HttpApi.make("experimental")
             summary: "List tools",
             description:
               "Get a list of available tools with their JSON schema parameters for a specific provider and model combination.",
+          }),
+        ),
+        HttpApiEndpoint.get("toolCatalog", ExperimentalPaths.toolCatalog, {
+          query: ToolCatalogQuery,
+          success: described(ToolCatalog, "Tool catalog"),
+          error: HttpApiError.BadRequest,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "tool.catalog",
+            summary: "List discoverable tools",
+            description:
+              "Get the lightweight effective tool catalog for an agent/model, including MCP and brokered lazy tools, without returning tool parameter schemas.",
           }),
         ),
         HttpApiEndpoint.get("toolIDs", ExperimentalPaths.toolIDs, {

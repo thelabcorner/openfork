@@ -147,6 +147,7 @@ export const SympyTool = Tool.define<typeof Parameters, Metadata, ChildProcessSp
     const spawner = yield* ChildProcessSpawner
 
     return {
+      exposure: "lazy" as const,
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>

@@ -9,6 +9,7 @@ import { Tool } from "@/tool/tool"
 import { ToolInterrupt } from "@/tool/interrupt"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
+import { isLazyTool, TOOL_ACCESS_ID } from "@/tool/access"
 import { Truncate } from "@/tool/truncate"
 
 import { Plugin } from "@/plugin"
@@ -22,6 +23,7 @@ import { PartID } from "./schema"
 import { EffectBridge } from "@/effect/bridge"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 
@@ -29,6 +31,14 @@ const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
   listTemplates: "list_mcp_resource_templates",
   read: "read_mcp_resource",
+} as const
+const MCP_RESOURCE_TOOL_DESCRIPTIONS = {
+  [MCP_RESOURCE_TOOLS.list]:
+    "Lists resources provided by connected MCP servers. Resources provide context such as files, database schemas, or application-specific information.",
+  [MCP_RESOURCE_TOOLS.listTemplates]:
+    "Lists resource templates provided by connected MCP servers. Resource templates are parameterized resources that can be read after filling in their URI template.",
+  [MCP_RESOURCE_TOOLS.read]:
+    "Read a specific resource from an MCP server using the server name and resource URI. The URI is an MCP identifier and does not need to be a file URL.",
 } as const
 const MAX_MCP_RESOURCE_BLOB_BYTES = 10 * 1024 * 1024
 const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
@@ -38,6 +48,189 @@ const SUPPORTED_MCP_RESOURCE_ATTACHMENT_MIMES = new Set([
   "image/png",
   "image/webp",
 ])
+const MAX_EXPLICIT_LAZY_TOOL_MENTIONS = 4
+const MAX_EXPLICIT_LAZY_TOOL_CONTEXT_CHARS = 48_000
+const TOOL_MENTION_TOKEN = /@([A-Za-z0-9_][A-Za-z0-9_.:-]*)/g
+
+export type CatalogItem = {
+  id: string
+  description: string
+  exposure: "default" | "lazy"
+  source: "registry" | "mcp" | "mcp-resource"
+}
+
+function compactToolDescription(value: string | undefined) {
+  const line = value
+    ?.split(/\r?\n/, 1)[0]
+    ?.replace(/\s+/g, " ")
+    .trim()
+  if (!line) return ""
+  return line.length > 220 ? `${line.slice(0, 217).trimEnd()}...` : line
+}
+
+/**
+ * Extract explicit @tool-style tokens in source order. A mention must begin at
+ * a token boundary so ordinary email/package text such as user@example.com
+ * does not accidentally activate a capability.
+ */
+export function explicitToolMentions(text: string) {
+  const seen = new Set<string>()
+  const result: string[] = []
+  for (const match of text.matchAll(TOOL_MENTION_TOKEN)) {
+    const index = match.index ?? 0
+    const previous = index > 0 ? text[index - 1] : undefined
+    if (previous && /[A-Za-z0-9_.-]/.test(previous)) continue
+    const id = match[1]
+    if (!id || seen.has(id)) continue
+    const next = text[index + match[0].length]
+    if (next === "/") continue
+    seen.add(id)
+    result.push(id)
+  }
+  return result
+}
+
+/**
+ * Pre-seed schemas for explicitly mentioned lazy tools without changing the
+ * provider-visible tool manifest. The returned text is intended to be appended
+ * as request-only user-role capability metadata next to the triggering turn,
+ * preserving the stable tool-prefix cache while removing the broker's usual
+ * list/describe discovery round trip.
+ */
+export const explicitLazyToolContext = Effect.fn("SessionTools.explicitLazyToolContext")(function* (input: {
+  agent: Agent.Info
+  text: string
+  permission?: PermissionV1.Ruleset
+}) {
+  const mentions = explicitToolMentions(input.text)
+  if (mentions.length === 0) return undefined
+
+  const registry = yield* ToolRegistry.Service
+  const lazy = new Map((yield* registry.all()).filter(isLazyTool).map((item) => [item.id, item] as const))
+  if (lazy.size === 0) return undefined
+
+  const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
+  const disabled = Permission.disabled([...lazy.keys(), TOOL_ACCESS_ID], ruleset)
+  if (disabled.has(TOOL_ACCESS_ID)) return undefined
+
+  const blocks: string[] = []
+  let size = 0
+  for (const id of mentions) {
+    if (blocks.length >= MAX_EXPLICIT_LAZY_TOOL_MENTIONS) break
+    const target = lazy.get(id)
+    if (!target || disabled.has(id)) continue
+
+    let parameters: unknown
+    try {
+      parameters = ToolJsonSchema.fromTool(target)
+    } catch (error) {
+      yield* Effect.logWarning("explicit lazy tool schema conversion failed", {
+        tool: target.id,
+        error: error instanceof Error ? error.message : String(error),
+      })
+      continue
+    }
+
+    const block = [
+      `Tool: @${target.id}`,
+      `Description: ${target.description}`,
+      `Parameters: ${JSON.stringify(parameters)}`,
+      `Invocation: call the provider-visible \`${TOOL_ACCESS_ID}\` tool with {"action":"call","tool":"${target.id}","args":<object matching Parameters>}.`,
+    ].join("\n")
+    if (size + block.length > MAX_EXPLICIT_LAZY_TOOL_CONTEXT_CHARS) continue
+    blocks.push(block)
+    size += block.length
+  }
+
+  if (blocks.length === 0) return undefined
+  return [
+    "<explicit-tool-mention-context>",
+    "The immediately preceding user request explicitly referenced the lazy tool(s) below. This is harness-generated capability metadata, not an additional user task. The schemas are already supplied here, so do not spend a tool call listing or describing these capabilities before use. Invoke the stable `tool` broker directly when the request calls for them.",
+    blocks.join("\n\n"),
+    "</explicit-tool-mention-context>",
+  ].join("\n")
+})
+
+/**
+ * Resolve the lightweight, user-discoverable catalog for an agent/model without
+ * materializing JSON schemas. This mirrors the tool sources used by `resolve`:
+ * registry tools, MCP resource helpers, connected MCP tools, plus brokered lazy
+ * registry tools. Canonical IDs are retained so composer mentions never depend
+ * on a display label or a guessed alias.
+ */
+export const catalog = Effect.fn("SessionTools.catalog")(function* (input: {
+  agent: Agent.Info
+  providerID: ProviderV2.ID
+  modelID: ModelV2.ID
+  permission?: PermissionV1.Ruleset
+}) {
+  const registry = yield* ToolRegistry.Service
+  const mcp = yield* MCP.Service
+  const flags = yield* RuntimeFlags.Service
+  const items = new Map<string, CatalogItem>()
+
+  const direct = yield* registry.tools({
+    providerID: input.providerID,
+    modelID: input.modelID,
+    agent: input.agent,
+  })
+  for (const item of direct) {
+    if (item.id === "invalid") continue
+    items.set(item.id, {
+      id: item.id,
+      description: compactToolDescription(item.description),
+      exposure: "default",
+      source: "registry",
+    })
+  }
+
+  const hasMcpResourceServer = Object.values(yield* mcp.clients()).some(
+    (client) => !!client.getServerCapabilities()?.resources,
+  )
+  if (hasMcpResourceServer) {
+    for (const id of Object.values(MCP_RESOURCE_TOOLS)) {
+      items.set(id, {
+        id,
+        description: compactToolDescription(MCP_RESOURCE_TOOL_DESCRIPTIONS[id]),
+        exposure: "default",
+        source: "mcp-resource",
+      })
+    }
+  }
+
+  // SessionTools.resolve intentionally omits ordinary MCP tools in code mode.
+  if (!flags.experimentalCodeMode) {
+    for (const [id, entry] of Object.entries(yield* mcp.tools())) {
+      items.set(id, {
+        id,
+        description: compactToolDescription(entry.def.description),
+        exposure: "default",
+        source: "mcp",
+      })
+    }
+  }
+
+  // Lazy tools are deliberately absent from registry.tools() because their
+  // schemas are brokered through the stable `tool` capability. They still
+  // belong in discovery so an explicit @sqlite/@refactor mention can identify
+  // the exact capability without globally expanding the provider manifest.
+  for (const item of (yield* registry.all()).filter(isLazyTool)) {
+    if (item.id === "invalid" || items.has(item.id)) continue
+    items.set(item.id, {
+      id: item.id,
+      description: compactToolDescription(item.description),
+      exposure: "lazy",
+      source: "registry",
+    })
+  }
+
+  const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
+  const disabled = Permission.disabled([...items.keys()], ruleset)
+  const lazyBrokerAvailable = items.has(TOOL_ACCESS_ID) && !disabled.has(TOOL_ACCESS_ID)
+  return [...items.values()]
+    .filter((item) => !disabled.has(item.id) && (item.exposure !== "lazy" || lazyBrokerAvailable))
+    .sort((a, b) => a.id.localeCompare(b.id))
+})
 
 export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   agent: Agent.Info
@@ -179,8 +372,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   )
   if (hasMcpResourceServer) {
     tools[MCP_RESOURCE_TOOLS.list] = tool({
-      description:
-        "Lists resources provided by connected MCP servers. Resources provide context such as files, database schemas, or application-specific information.",
+      description: MCP_RESOURCE_TOOL_DESCRIPTIONS[MCP_RESOURCE_TOOLS.list],
       inputSchema: jsonSchema(
         ProviderTransform.schema(input.model, {
           type: "object",
@@ -261,8 +453,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
 
     tools[MCP_RESOURCE_TOOLS.listTemplates] = tool({
-      description:
-        "Lists resource templates provided by connected MCP servers. Resource templates are parameterized resources that can be read after filling in their URI template.",
+      description: MCP_RESOURCE_TOOL_DESCRIPTIONS[MCP_RESOURCE_TOOLS.listTemplates],
       inputSchema: jsonSchema(
         ProviderTransform.schema(input.model, {
           type: "object",
@@ -344,8 +535,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
 
     tools[MCP_RESOURCE_TOOLS.read] = tool({
-      description:
-        "Read a specific resource from an MCP server using the server name and resource URI. The URI is an MCP identifier and does not need to be a file URL.",
+      description: MCP_RESOURCE_TOOL_DESCRIPTIONS[MCP_RESOURCE_TOOLS.read],
       inputSchema: jsonSchema(
         ProviderTransform.schema(input.model, {
           type: "object",

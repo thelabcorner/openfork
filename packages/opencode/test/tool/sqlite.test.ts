@@ -43,11 +43,7 @@ const asks = () => {
 
 const toolByID = (registry: ToolRegistry.Interface, id: string) =>
   registry
-    .tools({
-      providerID: "opencode" as any,
-      modelID: "gpt-5" as any,
-      agent: { name: "build", mode: "primary" as const, permission: [], options: {} },
-    })
+    .all()
     .pipe(Effect.map((list) => list.find((t) => t.id === id)))
 
 // Create a real sqlite db in the test directory with the given schema + rows.

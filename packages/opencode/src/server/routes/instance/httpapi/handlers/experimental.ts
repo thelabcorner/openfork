@@ -8,6 +8,7 @@ import { RuntimeFlags } from "@/effect/runtime-flags"
 import { MCP } from "@/mcp"
 import { Project } from "@/project/project"
 import { Session } from "@/session/session"
+import * as SessionTools from "@/session/tools"
 import type { SessionID } from "@/session/schema"
 import { ToolJsonSchema } from "@/tool/json-schema"
 import { ToolRegistry } from "@/tool/registry"
@@ -23,6 +24,7 @@ import {
   OpenRouterFreeUsageQuery,
   OpenRouterTelemetryQuery,
   SessionListQuery,
+  ToolCatalogQuery,
   ToolListQuery,
   WorktreeApiError,
 } from "../groups/experimental"
@@ -279,6 +281,23 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       }))
     })
 
+    const toolCatalog = Effect.fn("ExperimentalHttpApi.toolCatalog")(function* (ctx: {
+      query: typeof ToolCatalogQuery.Type
+    }) {
+      const agent = ctx.query.agent ? yield* agents.get(ctx.query.agent) : yield* agents.defaultInfo()
+      const session = ctx.query.sessionID
+        ? yield* sessions
+            .get(ctx.query.sessionID)
+            .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
+        : undefined
+      return yield* SessionTools.catalog({
+        agent,
+        providerID: ctx.query.provider,
+        modelID: ctx.query.model,
+        permission: session?.permission,
+      })
+    })
+
     const toolIDs = Effect.fn("ExperimentalHttpApi.toolIDs")(function* () {
       return yield* registry.ids()
     })
@@ -523,6 +542,7 @@ export const experimentalHandlers = HttpApiBuilder.group(InstanceHttpApi, "exper
       .handle("consoleOrgs", listConsoleOrgs)
       .handle("consoleSwitch", switchConsole)
       .handle("tool", tool)
+      .handle("toolCatalog", toolCatalog)
       .handle("toolIDs", toolIDs)
       .handle("worktree", worktree)
       .handle("worktreeCreate", worktreeCreate)

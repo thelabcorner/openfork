@@ -60,6 +60,13 @@ export interface Def<
   description: string
   parameters: Parameters
   jsonSchema?: JSONSchema7
+  /**
+   * Provider exposure policy. Lazy tools remain registered internally but are
+   * omitted from the provider tool manifest and reached through the stable
+   * `tool` broker instead. This avoids invalidating prompt/tool-prefix caches
+   * merely because a low-frequency capability is needed mid-conversation.
+   */
+  exposure?: "default" | "lazy"
   execute(args: Schema.Schema.Type<Parameters>, ctx: Context): Effect.Effect<ExecuteResult<M>>
   formatValidationError?(error: unknown): string
 }

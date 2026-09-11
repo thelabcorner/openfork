@@ -36,6 +36,36 @@ const model = {
   api: { id: "test-model" },
 } as Provider.Model
 
+const lazySqlite = {
+  id: "sqlite",
+  description: "Run bounded SQLite inspection operations.",
+  parameters: Schema.Struct({ action: Schema.String, query: Schema.optional(Schema.String) }),
+  jsonSchema: {
+    type: "object",
+    properties: { action: { type: "string" }, query: { type: "string" } },
+    required: ["action"],
+  },
+  exposure: "lazy" as const,
+  execute: () => Effect.succeed({ title: "sqlite", metadata: {}, output: "ok" }),
+} satisfies Tool.Def
+
+const lazyRefactor = {
+  id: "refactor",
+  description: "Perform structured refactoring operations.",
+  parameters: Schema.Struct({ action: Schema.String }),
+  jsonSchema: { type: "object", properties: { action: { type: "string" } }, required: ["action"] },
+  exposure: "lazy" as const,
+  execute: () => Effect.succeed({ title: "refactor", metadata: {}, output: "ok" }),
+} satisfies Tool.Def
+
+const toolBroker = {
+  id: "tool",
+  description: "Access optional lazy tools.",
+  parameters: Schema.Struct({ action: Schema.String }),
+  jsonSchema: { type: "object", properties: { action: { type: "string" } }, required: ["action"] },
+  execute: () => Effect.succeed({ title: "tool", metadata: {}, output: "ok" }),
+} satisfies Tool.Def
+
 function fakeMcp() {
   return MCP.Service.of({
     tools: () => Effect.succeed({}),
@@ -79,11 +109,12 @@ const layer = Layer.mergeAll(
     ToolRegistry.Service,
     ToolRegistry.Service.of({
       ids: () => Effect.succeed(["timing"]),
-      all: () => Effect.succeed([]),
+      all: () => Effect.succeed([lazySqlite, lazyRefactor]),
       named: () =>
         Effect.succeed({} as unknown as Effect.Success<ReturnType<ToolRegistry.Interface["named"]>>),
       tools: (_model: Parameters<ToolRegistry.Interface["tools"]>[0]) =>
         Effect.succeed([
+          toolBroker,
           {
             id: "timing",
             description: "updates metadata more than once",
@@ -120,6 +151,72 @@ const layer = Layer.mergeAll(
 )
 
 const it = testEffect(layer)
+
+it.effect("extracts intentional tool mentions without treating email or npm scopes as capabilities", () =>
+  Effect.sync(() => {
+    expect(
+      SessionTools.explicitToolMentions(
+        "Use @sqlite, mail user@example.com, install @scope/pkg@latest, then try (@refactor). Use @sqlite again.",
+      ),
+    ).toEqual(["sqlite", "refactor"])
+  }),
+)
+
+it.effect("pre-seeds an explicitly mentioned lazy tool schema for direct broker invocation", () =>
+  Effect.gen(function* () {
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      text: "Use @sqlite for this database inspection. Ignore @missing.",
+    })
+
+    expect(context).toContain("<explicit-tool-mention-context>")
+    expect(context).toContain("Tool: @sqlite")
+    expect(context).toContain('"action"')
+    expect(context).toContain('"tool":"sqlite"')
+    expect(context).not.toContain("@missing")
+    expect(context).not.toContain("Tool: @refactor")
+  }),
+)
+
+it.effect("does not pre-seed a lazy tool denied by the active agent", () =>
+  Effect.gen(function* () {
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent: {
+        ...agent,
+        permission: [
+          { permission: "*", pattern: "*", action: "allow" },
+          { permission: "sqlite", pattern: "*", action: "deny" },
+        ],
+      },
+      text: "Use @sqlite.",
+    })
+    expect(context).toBeUndefined()
+  }),
+)
+
+it.effect("does not pre-seed a lazy tool denied by the session ruleset", () =>
+  Effect.gen(function* () {
+    const context = yield* SessionTools.explicitLazyToolContext({
+      agent,
+      permission: [{ permission: "sqlite", pattern: "*", action: "deny" }],
+      text: "Use @sqlite.",
+    })
+    expect(context).toBeUndefined()
+  }),
+)
+
+it.effect("filters session-denied lazy tools from the discovery catalog", () =>
+  Effect.gen(function* () {
+    const catalog = yield* SessionTools.catalog({
+      agent,
+      providerID: ProviderV2.ID.make("test"),
+      modelID: ModelV2.ID.make("test-model"),
+      permission: [{ permission: "sqlite", pattern: "*", action: "deny" }],
+    })
+    expect(catalog.some((item) => item.id === "sqlite")).toBe(false)
+    expect(catalog.some((item) => item.id === "refactor")).toBe(true)
+  }),
+)
 
 it.effect("preserves running tool start time across metadata updates", () =>
   Effect.gen(function* () {

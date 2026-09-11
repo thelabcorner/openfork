@@ -839,6 +839,7 @@ export const SqliteTool = Tool.define<typeof Parameters, Metadata, ChildProcessS
   Effect.gen(function* () {
     const spawner = yield* ChildProcessSpawner
     return {
+      exposure: "lazy" as const,
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>

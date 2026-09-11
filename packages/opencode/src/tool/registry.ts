@@ -35,6 +35,7 @@ import { SymbolsTool } from "./symbols"
 import { TestTool } from "./test"
 import { RefactorTool } from "./refactor"
 import { SympyTool } from "./sympy"
+import { createToolAccessTool, isLazyTool, TOOL_ACCESS_ID } from "./access"
 import * as Tool from "./tool"
 import { buildCustomTools } from "./custom"
 import { Config } from "@/config/config"
@@ -298,6 +299,9 @@ const layer = Layer.effect(
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
 
+        const lazy = [...Object.values(tool), ...custom].filter(isLazyTool)
+        const toolAccessDef = createToolAccessTool(lazy, plugin)
+
         return yield* Ref.make<State>({
           custom,
           builtin: [
@@ -328,6 +332,7 @@ const layer = Layer.effect(
             tool.project,
             tool.symbols,
             tool.test,
+            toolAccessDef,
             tool.refactor,
             tool.sympy,
             tool.patchTool,
@@ -385,7 +390,11 @@ const layer = Layer.effect(
       // Invariant: in-flight execute closures were captured at build time (the
       // ai-sdk tool() wraps the def at resolve), so this swap affects only the
       // NEXT resolve ΓÇö a running tool call keeps the def it started with.
-      yield* Ref.set(stateRef, { ...current, custom })
+      const lazy = [...current.builtin, ...custom].filter(isLazyTool)
+      const builtin = current.builtin.map((tool) =>
+        tool.id === TOOL_ACCESS_ID ? createToolAccessTool(lazy, plugin) : tool,
+      )
+      yield* Ref.set(stateRef, { ...current, builtin, custom })
       const currentIds = new Set(current.custom.map((tool) => tool.id))
       const nextIds = new Set(custom.map((tool) => tool.id))
       return {
@@ -426,7 +435,10 @@ const layer = Layer.effect(
     })
 
     const tools: Interface["tools"] = Effect.fn("ToolRegistry.tools")(function* (input) {
-      const filtered = (yield* all()).filter((tool) => {
+      const ruleset = Permission.merge(input.agent.permission, input.permission ?? [])
+      const candidates = (yield* all()).filter((tool) => {
+        if (isLazyTool(tool)) return false
+
         if (tool.id === WebSearchTool.id) {
           return webSearchEnabled(input.providerID, {
             exa: flags.enableExa,
@@ -446,6 +458,12 @@ const layer = Layer.effect(
 
         return true
       })
+      // IMPORTANT: do not filter provider-visible tools by session permission here.
+      // The tool prefix is cache-sensitive. A local/session policy such as
+      // `swarm_* = deny` must not mutate the manifest and destroy prompt-cache
+      // reuse. Instead, keep the schema stable and enforce explicit denies in the
+      // returned execute closure before the underlying tool can run.
+      const filtered = candidates
 
       const codeModeDescription = filtered.some((tool) => tool.id === "execute")
         ? yield* describeCodeMode(input)
@@ -455,6 +473,7 @@ const layer = Layer.effect(
       return yield* Effect.forEach(
         visible,
         Effect.fnUntraced(function* (tool: Tool.Def) {
+          const policy = Permission.evaluate(tool.id, "*", ruleset)
           const output = {
             description: tool.description,
             parameters: tool.parameters,
@@ -476,7 +495,10 @@ const layer = Layer.effect(
               .join("\n"),
             parameters: output.parameters,
             jsonSchema,
-            execute: tool.execute,
+            execute:
+              policy.action === "deny"
+                ? () => Effect.die(new PermissionV1.DeniedError({ ruleset: [policy] }))
+                : tool.execute,
             formatValidationError: tool.formatValidationError,
           }
         }),

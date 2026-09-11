@@ -323,6 +323,7 @@ export const RefactorTool = Tool.define<typeof Parameters, Metadata, AppProcess.
     })
 
     return {
+      exposure: "lazy" as const,
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>
