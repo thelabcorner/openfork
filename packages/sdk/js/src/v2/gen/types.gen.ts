@@ -2390,6 +2390,15 @@ export type ToolListItem = {
 
 export type ToolList = Array<ToolListItem>
 
+export type ToolCatalogItem = {
+  id: string
+  description: string
+  exposure: "default" | "lazy"
+  source: "registry" | "mcp" | "mcp-resource"
+}
+
+export type ToolCatalog = Array<ToolCatalogItem>
+
 export type ToolIds = Array<string>
 
 export type WorktreeError = {
@@ -9428,6 +9437,38 @@ export type ToolListResponses = {
 
 export type ToolListResponse = ToolListResponses[keyof ToolListResponses]
 
+export type ToolCatalogData = {
+  body?: never
+  path?: never
+  query: {
+    directory?: string
+    workspace?: string
+    provider: string
+    model: string
+    agent?: string
+    sessionID?: string
+  }
+  url: "/experimental/tool/catalog"
+}
+
+export type ToolCatalogErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+}
+
+export type ToolCatalogError = ToolCatalogErrors[keyof ToolCatalogErrors]
+
+export type ToolCatalogResponses = {
+  /**
+   * Tool catalog
+   */
+  200: ToolCatalog
+}
+
+export type ToolCatalogResponse = ToolCatalogResponses[keyof ToolCatalogResponses]
+
 export type ToolIdsData = {
   body?: never
   path?: never
@@ -15005,6 +15046,54 @@ export type UsageSummaryResponses = {
       coverage: number
       mode: "recorded" | "estimated" | "mixed" | "unpriced"
     }
+    maintenance: {
+      totals: {
+        requests: number
+        sessions: number
+        cost: number
+        estimatedCost: number
+        pricedRecords: number
+        estimatedRecords: number
+        unpricedRecords: number
+        tokens: {
+          input: number
+          cacheRead: number
+          cacheWrite: number
+          output: number
+          reasoning: number
+        }
+        totalTokens: number
+        durationMs: number
+        durationRecords: number
+      }
+      agents: Array<{
+        agent: string
+        requests: number
+        sessions: number
+        models: number
+        cost: number
+        estimatedCost: number
+        totalTokens: number
+        tokenShare: number
+        costShare: number
+      }>
+      models: Array<{
+        agent: string
+        providerID: string
+        modelID: string
+        variant: string
+        requests: number
+        cost: number
+        estimatedCost: number
+        totalTokens: number
+      }>
+      periods: Array<{
+        start: number
+        requests: number
+        cost: number
+        tokens: number
+      }>
+    }
   }
 }
 
@@ -18406,6 +18495,7 @@ export type V2BrowserHostHelloData = {
       supportedAppearances: Array<"system" | "light" | "dark">
       supportsRecording: boolean
       cdp: boolean
+      chrome?: true
     }
     guest: {
       attached: boolean
@@ -18557,6 +18647,7 @@ export type V2BrowserHostsResponses = {
         supportedAppearances: Array<"system" | "light" | "dark">
         supportsRecording: boolean
         cdp: boolean
+        chrome?: true
       }
       guest: {
         attached: boolean

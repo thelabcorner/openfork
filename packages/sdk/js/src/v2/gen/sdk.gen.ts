@@ -362,6 +362,8 @@ import type {
   SyncStealErrors,
   SyncStealResponses,
   TextPartInput,
+  ToolCatalogErrors,
+  ToolCatalogResponses,
   ToolIdsErrors,
   ToolIdsResponses,
   ToolKillErrors,
@@ -2160,6 +2162,44 @@ export class Tool extends HeyApiClient {
     )
     return (options?.client ?? this.client).get<ToolListResponses, ToolListErrors, ThrowOnError>({
       url: "/experimental/tool",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * List discoverable tools
+   *
+   * Get the lightweight effective tool catalog for an agent/model, including MCP and brokered lazy tools, without returning tool parameter schemas.
+   */
+  public catalog<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory?: string
+      workspace?: string
+      provider: string
+      model: string
+      agent?: string
+      sessionID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "workspace" },
+            { in: "query", key: "provider" },
+            { in: "query", key: "model" },
+            { in: "query", key: "agent" },
+            { in: "query", key: "sessionID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<ToolCatalogResponses, ToolCatalogErrors, ThrowOnError>({
+      url: "/experimental/tool/catalog",
       ...options,
       ...params,
     })
@@ -9858,6 +9898,7 @@ export class Host extends HeyApiClient {
         supportedAppearances: Array<"system" | "light" | "dark">
         supportsRecording: boolean
         cdp: boolean
+        chrome?: true
       }
       guest?: {
         attached: boolean
