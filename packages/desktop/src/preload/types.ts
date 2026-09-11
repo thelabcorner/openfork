@@ -4,6 +4,23 @@ import type { UpdaterState } from "@opencode-ai/app/updater"
 import type { DesktopNativeBundle } from "@opencode-ai/app/i18n/desktop-native"
 import type { BrowserAnnotationResult, BrowserPointerEvent, BrowserState, HostOwner, WireGuestTabState } from "../main/browser/contracts"
 export type { BrowserAnnotationResult } from "../main/browser/contracts"
+export type ChromePairingStatus = {
+  installed: boolean
+  hosts: Record<"chrome" | "brave" | "edge", boolean>
+  paths: Record<"chrome" | "brave" | "edge", string>
+  extensionId?: string
+  lastError?: string
+}
+export type ChromePairingInstructions = {
+  steps: string[]
+  manualHostPaths: Record<"chrome" | "brave" | "edge", string>
+}
+export type ChromeAPI = {
+  getStatus: () => Promise<ChromePairingStatus>
+  writeHosts: (opts: { hostBinaryPath: string; allowedOrigins: string[] }) => Promise<ChromePairingStatus>
+  removeHosts: () => Promise<ChromePairingStatus>
+  getInstructions: () => Promise<ChromePairingInstructions>
+}
 export type {
   WslDistroProbe,
   WslInstalledDistro,
@@ -154,4 +171,5 @@ export type ElectronAPI = {
   recordFatalRendererError: (error: FatalRendererError) => Promise<void>
   setNativeTranslations: (bundle: DesktopNativeBundle) => Promise<void>
   browser: BrowserAPI
+  chrome: ChromeAPI
 }

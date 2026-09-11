@@ -17,6 +17,9 @@
 import { createServer } from "node:http"
 import type { Server, IncomingMessage, ServerResponse } from "node:http"
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto"
+import { mkdirSync, writeFileSync, unlinkSync } from "node:fs"
+import { homedir } from "node:os"
+import { join } from "node:path"
 
 import {
   toBrokerErrorBody,
@@ -35,9 +38,14 @@ import {
   type HostCapabilities,
   type HostEvent,
 } from "./contracts"
+import type { ExtensionHost } from "./extension-bridge/extension-host"
 
 const HELLO_PATH = "/api/browser/host/hello"
 const EVENT_PATH = "/api/browser/event"
+const EXTENSION_HELLO_PATH = "/v1/browser/extension/hello"
+const EXTENSION_POLL_PATH = "/v1/browser/extension/poll"
+const EXTENSION_RESPONSE_PATH = "/v1/browser/extension/response"
+const EXTENSION_DISCONNECT_PATH = "/v1/browser/extension/disconnect"
 // Steady-state re-register cadence. The broker never expires registrations,
 // but the heartbeat revives connections it marked dead after a transport
 // failure and re-syncs the guest snapshot, so it is worth keeping — it just
@@ -61,6 +69,12 @@ export interface BrowserHostOptions {
   hostEpoch: number
   windowId: string
   capabilities: HostCapabilities
+  /** Optional dynamic capabilities resolver — when present, hello registration uses this instead of the static `capabilities`. */
+  getCapabilities?: () => HostCapabilities
+  /** Optional chrome health enrichment for GET /health (used by extension WS fallback). */
+  getHealthExtra?: () => { chrome: boolean; lanes: string[] }
+  /** Desktop-side queue for the Chrome-launched Native Messaging host. */
+  extensionRelay?: Pick<ExtensionHost, "markConnected" | "markDisconnected" | "nextMessage" | "acceptResponse">
   /** Latest sidecar endpoint+auth; null until the app server is ready. */
   sidecarProvider: () => { url: string; username: string; password: string } | null
   getGuestSnapshot: () => { attached: boolean; activeTabId: string | null; url: string | null }
@@ -145,6 +159,7 @@ export class BrowserHost {
     const address = server.address()
     this.port = typeof address === "object" && address !== null ? address.port : 0
     this.log(`browser host listening on ${this.callbackUrl}`)
+    this.writeHostConfig()
     this.registerHello(0, "start")
     this.helloTimer = setInterval(() => this.registerHello(0, "heartbeat"), HELLO_INTERVAL_MS)
   }
@@ -163,6 +178,7 @@ export class BrowserHost {
       flight.respond(responseError(flight.request.requestId, 0, new BrowserControlInterruptedError("Host stopping")))
     }
     this.inFlight.clear()
+    this.removeHostConfig()
     if (this.server) {
       const server = this.server
       this.server = null
@@ -195,7 +211,90 @@ export class BrowserHost {
       const method = req.method ?? "GET"
 
       if (method === "GET" && url.pathname === "/health") {
-        respondJson(res, 200, { ok: true, connected: this.connected })
+        const extra = this.options.getHealthExtra?.()
+        respondJson(res, 200, {
+          ok: true,
+          connected: this.connected,
+          ...(extra ? { chrome: extra.chrome, lanes: extra.lanes } : {}),
+        })
+        return
+      }
+
+      if (method === "GET" && url.pathname === "/extension") {
+        respondJson(res, 200, { ok: false, error: "Chrome extension relay uses authenticated long-poll endpoints under /v1/browser/extension/*" })
+        return
+      }
+
+      if (method === "POST" && url.pathname === EXTENSION_HELLO_PATH) {
+        if (!authorizeRequest(req, this.callbackToken)) {
+          respondJson(res, 401, { ok: false, error: "Unauthorized" })
+          return
+        }
+        const relay = this.options.extensionRelay
+        if (!relay) {
+          respondJson(res, 503, { ok: false, error: "Extension relay unavailable" })
+          return
+        }
+        const body = await readJson(req).catch(() => null)
+        relay.markConnected(isRecord(body) ? body : undefined)
+        this.reRegister()
+        respondJson(res, 200, { ok: true, protocolVersion: BROWSER_PROTOCOL_VERSION })
+        return
+      }
+
+      if (method === "GET" && url.pathname === EXTENSION_POLL_PATH) {
+        if (!authorizeRequest(req, this.callbackToken)) {
+          respondJson(res, 401, { ok: false, error: "Unauthorized" })
+          return
+        }
+        const relay = this.options.extensionRelay
+        if (!relay) {
+          respondJson(res, 503, { ok: false, error: "Extension relay unavailable" })
+          return
+        }
+        relay.markConnected()
+        const requestedWait = Number(url.searchParams.get("waitMs") ?? "20000")
+        const waitMs = Number.isFinite(requestedWait) ? Math.max(100, Math.min(requestedWait, 25_000)) : 20_000
+        const message = await relay.nextMessage(waitMs)
+        respondJson(res, 200, { ok: true, message })
+        return
+      }
+
+      if (method === "POST" && url.pathname === EXTENSION_RESPONSE_PATH) {
+        if (!authorizeRequest(req, this.callbackToken)) {
+          respondJson(res, 401, { ok: false, error: "Unauthorized" })
+          return
+        }
+        const relay = this.options.extensionRelay
+        if (!relay) {
+          respondJson(res, 503, { ok: false, error: "Extension relay unavailable" })
+          return
+        }
+        const body = await readJson(req)
+        const response = isRecord(body) && isRecord(body.response) ? body.response : body
+        if (!isBrokerResponseLike(response)) {
+          respondJson(res, 400, { ok: false, error: "Invalid BrokerResponse envelope" })
+          return
+        }
+        const accepted = relay.acceptResponse(response)
+        respondJson(res, 200, { ok: true, accepted })
+        return
+      }
+
+      if (method === "POST" && url.pathname === EXTENSION_DISCONNECT_PATH) {
+        if (!authorizeRequest(req, this.callbackToken)) {
+          respondJson(res, 401, { ok: false, error: "Unauthorized" })
+          return
+        }
+        const relay = this.options.extensionRelay
+        if (!relay) {
+          respondJson(res, 503, { ok: false, error: "Extension relay unavailable" })
+          return
+        }
+        const body = await readJson(req).catch(() => null)
+        relay.markDisconnected(isRecord(body) && typeof body.reason === "string" ? body.reason : undefined)
+        this.reRegister()
+        respondJson(res, 200, { ok: true })
         return
       }
 
@@ -306,13 +405,14 @@ export class BrowserHost {
       this.scheduleHelloRetry(attempt)
       return
     }
+    const capabilities = this.options.getCapabilities?.() ?? this.options.capabilities
     const registration = {
       protocolVersion: BROWSER_PROTOCOL_VERSION,
       hostId: this.options.hostId,
       hostEpoch: this.options.hostEpoch,
       connectionId: this.callbackToken,
       windowId: this.options.windowId,
-      capabilities: this.options.capabilities,
+      capabilities,
       guest: this.options.getGuestSnapshot(),
       callbackUrl: this.callbackUrl,
       callbackToken: this.callbackToken,
@@ -433,6 +533,24 @@ export class BrowserHost {
     this.options.onConnectedChange?.(connected)
   }
 
+  private writeHostConfig(): void {
+    const config = { callbackUrl: this.callbackUrl, callbackToken: this.callbackToken }
+    for (const p of getHostConfigPaths()) {
+      try {
+        mkdirSync(join(p, ".."), { recursive: true })
+        writeFileSync(p, JSON.stringify(config, null, 2), "utf8")
+      } catch {}
+    }
+  }
+
+  private removeHostConfig(): void {
+    for (const p of getHostConfigPaths()) {
+      try {
+        unlinkSync(p)
+      } catch {}
+    }
+  }
+
   private log(message: string, meta?: Record<string, unknown>): void {
     this.options.logger?.log(message, meta)
   }
@@ -498,4 +616,36 @@ const respondJson = (res: ServerResponse, status: number, body: unknown): void =
 const responseError = (requestId: string, elapsedMs: number, error: unknown): BrokerResponse => {
   const body: BrokerResponseErrorBody = toBrokerErrorBody(error)
   return { ok: false, requestId, elapsedMs, error: body }
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null
+
+const isBrokerResponseLike = (value: unknown): value is BrokerResponse => {
+  if (!isRecord(value) || typeof value.requestId !== "string" || typeof value.ok !== "boolean") return false
+  if (typeof value.elapsedMs !== "number") return false
+  if (value.ok) return "result" in value
+  return isRecord(value.error) && typeof value.error.tag === "string" && typeof value.error.message === "string"
+}
+
+function getHostConfigPaths(): string[] {
+  const candidates: string[] = []
+  const xdg = process.env.XDG_STATE_HOME
+  if (xdg) candidates.push(join(xdg, "opencode", "browser-host.json"))
+  const home = (() => {
+    try {
+      return homedir()
+    } catch {
+      return ""
+    }
+  })()
+  if (home) {
+    candidates.push(join(home, ".local", "state", "opencode", "browser-host.json"))
+    candidates.push(join(home, "Library", "Application Support", "opencode", "browser-host.json"))
+    candidates.push(join(home, "AppData", "Roaming", "opencode", "browser-host.json"))
+    candidates.push(join(home, "AppData", "Local", "opencode", "browser-host.json"))
+  }
+  try {
+    candidates.push(join(process.cwd(), "browser-host.json"))
+  } catch {}
+  return candidates
 }

@@ -23,6 +23,7 @@ import {
 } from "./windows"
 import type { UpdaterController } from "./updater-controller"
 import { createUpdaterSubscriptions } from "./updater-subscriptions"
+import { getStatus as getChromePairingStatus, writeHosts as writeChromeHosts, removeHosts as removeChromeHosts, getInstructions as getChromeInstructions } from "./browser/extension-bridge/pairing"
 import { createDesktopDraftStore } from "./draft-store"
 import { nativeT } from "./native-translations"
 import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
@@ -445,5 +446,23 @@ export function registerBrowserIpcHandlers(engine: BrowserEngine, trust: Rendere
   ipcMain.handle("browser-cancel-annotation", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     engine.api.cancelAnnotation(tabId)
+  })
+  // Chrome pairing (native host manifest) — exposed as window.api.chrome
+  ipcMain.handle("chrome-get-status", (event) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return getChromePairingStatus()
+  })
+  ipcMain.handle("chrome-write-hosts", (event, opts: { hostBinaryPath: string; allowedOrigins: string[] }) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    if (!opts?.hostBinaryPath || !Array.isArray(opts.allowedOrigins)) throw new Error("Invalid chrome-write-hosts payload")
+    return writeChromeHosts({ hostBinaryPath: opts.hostBinaryPath, allowedOrigins: opts.allowedOrigins })
+  })
+  ipcMain.handle("chrome-remove-hosts", (event) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return removeChromeHosts()
+  })
+  ipcMain.handle("chrome-get-instructions", (event) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return getChromeInstructions()
   })
 }

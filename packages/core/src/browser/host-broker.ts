@@ -69,6 +69,8 @@ export interface HostCapabilities {
   readonly supportedAppearances: readonly ("system" | "light" | "dark")[]
   readonly supportsRecording: boolean
   readonly cdp: boolean
+  /** Additive protocol-v2 capability; absent means no live Chrome-extension lane. */
+  readonly chrome?: true
 }
 
 export interface HostGuestState {
@@ -740,6 +742,54 @@ const layer = Layer.effect(
           muted: record.muted,
         }))
 
+    /** Reconcile the host's authoritative full-tab status snapshot into the
+     * broker routing/ownership mirror. Without this, the broker replaces the
+     * host's Chrome+webview list with its older event-only webview cache. */
+    const reconcileStatusTabs = (windowId: string, raw: unknown) => {
+      if (!Array.isArray(raw)) return
+      const seen = new Set<string>()
+      const now = Date.now()
+      for (const value of raw) {
+        if (typeof value !== "object" || value === null) continue
+        const row = value as Record<string, unknown>
+        const tabId = typeof row["tabId"] === "string" ? row["tabId"] : ""
+        if (!tabId || !isHostOwner(row["owner"])) continue
+        seen.add(tabId)
+
+        const existing = tabs.get(tabKey(windowId, tabId))
+        const active = row["active"] === true
+        const readyState =
+          row["readyState"] === "Idle" || row["readyState"] === "Loading" || row["readyState"] === "Success" || row["readyState"] === "LoadFailed"
+            ? row["readyState"]
+            : existing?.readyState ?? "Success"
+        const controller =
+          row["controller"] === "human" || row["controller"] === "agent" || row["controller"] === "none"
+            ? row["controller"]
+            : existing?.controller ?? "none"
+
+        tabs.set(tabKey(windowId, tabId), {
+          windowId,
+          tabId,
+          url: typeof row["url"] === "string" ? row["url"] : existing?.url ?? "",
+          title: typeof row["title"] === "string" ? row["title"] : existing?.title ?? "",
+          readyState,
+          controller,
+          zoomFactor: typeof row["zoomFactor"] === "number" ? row["zoomFactor"] : existing?.zoomFactor ?? 1,
+          attached: typeof row["attached"] === "boolean" ? row["attached"] : existing?.attached ?? true,
+          active,
+          muted: row["muted"] === true,
+          owner: row["owner"],
+          lastActiveAt: active ? now : existing?.lastActiveAt ?? now,
+        })
+      }
+
+      // Status is a full snapshot for this host/window. Closed Chrome tabs must
+      // not remain in the broker and accidentally stay routable.
+      for (const record of [...tabs.values()]) {
+        if (record.windowId === windowId && !seen.has(record.tabId)) tabs.delete(tabKey(windowId, record.tabId))
+      }
+    }
+
     const isHostOwner = (value: unknown): value is HostOwner => {
       if (typeof value !== "object" || value === null) return false
       const kind = (value as { kind?: unknown }).kind
@@ -921,6 +971,7 @@ const layer = Layer.effect(
         const response = outcome.response
         const result = (response.result ?? {}) as Record<string, unknown>
         if (request.operation.name === "status") {
+          reconcileStatusTabs(windowId, result["tabs"])
           return { ...response, result: { ...result, tabs: sessionTabInfosForWindow(windowId) } }
         }
         if (request.operation.name === "open") {

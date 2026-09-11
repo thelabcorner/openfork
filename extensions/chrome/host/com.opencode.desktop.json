@@ -1,0 +1,9 @@
+{
+  "name": "com.opencode.desktop",
+  "description": "opencode native messaging host — bridges the Chrome extension to the desktop app",
+  "path": "C:\\Users\\slooshied\\WebstormProjects\\opencode\\extensions\\chrome\\host\\native-host.bat",
+  "type": "stdio",
+  "allowed_origins": [
+    "chrome-extension://nehhhcdamclidbfpodbafafcnmgbgkgc/"
+  ]
+}

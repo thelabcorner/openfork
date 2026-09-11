@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>opencode — Chrome</title>
+    <style>
+      :root {
+        color-scheme: light dark;
+        --bg: #0f1115;
+        --fg: #e6e8eb;
+        --muted: #9aa0a6;
+        --accent: #3b82f6;
+        --border: #2a2e35;
+        --ok: #22c55e;
+        --warn: #f59e0b;
+      }
+      * { box-sizing: border-box; margin: 0; padding: 0; }
+      body {
+        font: 13px/1.5 ui-sans-serif, system-ui, -apple-system, sans-serif;
+        background: var(--bg);
+        color: var(--fg);
+        padding: 16px;
+      }
+      h1 { font-size: 14px; font-weight: 700; margin-bottom: 4px; }
+      .sub { color: var(--muted); font-size: 12px; margin-bottom: 16px; }
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 12px;
+        margin-bottom: 12px;
+      }
+      .row { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+      .badge {
+        font-size: 11px; font-weight: 600; padding: 2px 8px; border-radius: 999px;
+        background: var(--border); color: var(--muted);
+      }
+      .badge.ok { background: rgba(34,197,94,0.15); color: var(--ok); }
+      .badge.warn { background: rgba(245,158,11,0.15); color: var(--warn); }
+      button {
+        appearance: none; border: 1px solid var(--border); background: var(--accent);
+        color: #fff; font-weight: 600; font-size: 12px; padding: 6px 12px;
+        border-radius: 6px; cursor: pointer;
+      }
+      button:disabled { opacity: 0.5; cursor: default; }
+      button.secondary { background: transparent; color: var(--fg); }
+      code { font-size: 11px; background: var(--border); padding: 1px 4px; border-radius: 4px; }
+      .mono { font-family: ui-monospace, monospace; font-size: 11px; color: var(--muted); word-break: break-all; }
+      .hint { font-size: 11px; color: var(--muted); margin-top: 8px; }
+      ul { margin: 8px 0 0 16px; color: var(--muted); font-size: 12px; }
+    </style>
+  </head>
+  <body>
+    <h1>opencode for Chrome</h1>
+    <p class="sub">Drive your existing Chrome from an opencode session — cookies &amp; history intact.</p>
+
+    <div class="card" id="status-card">
+      <div class="row">
+        <span style="font-weight:600">Extension status</span>
+        <span class="badge" id="status-badge">checking…</span>
+      </div>
+      <div class="mono" id="status-detail" style="margin-top:8px">—</div>
+      <div class="row" style="margin-top:12px">
+        <button id="btn-ping" class="secondary">Ping native host</button>
+        <button id="btn-reconnect">Reconnect</button>
+      </div>
+      <p class="hint" id="status-hint"></p>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:600; margin-bottom:4px">Pairing</div>
+      <p class="hint" style="margin:0 0 8px 0">
+        The native host is installed via <code>bun extensions/chrome/host/install.ts --extension-id &lt;id&gt;</code>.
+        Copy your extension ID from <code>chrome://extensions</code> (Developer mode).
+      </p>
+      <div class="mono" id="ext-id">extension id: —</div>
+      <ul>
+        <li><code>debugger</code> permission shows an infobar when attached — expected Chrome behavior.</li>
+        <li>This panel does not inject into page DOM; overlay lives in a closed shadow root.</li>
+      </ul>
+    </div>
+
+    <div class="card">
+      <div style="font-weight:600; margin-bottom:4px">Need help?</div>
+      <p class="hint" style="margin:0">
+        Run <code>opencode chrome status</code> in the desktop app to verify the bridge.
+        See <code>extensions/chrome/host/README.md</code> for per-OS manifest locations.
+      </p>
+    </div>
+
+    <script src="sidepanel.js" type="module"></script>
+  </body>
+</html>

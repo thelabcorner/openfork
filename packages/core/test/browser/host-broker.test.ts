@@ -473,6 +473,59 @@ describe("BrowserHostBroker dispatch", () => {
     ),
   )
 
+  it.live("status reconciles host-reported Chrome tabs into the broker mirror instead of discarding them", () =>
+    withHost({
+      type: "ok",
+      result: {
+        status: { connected: true },
+        tabs: [
+          {
+            tabId: "chrome-42",
+            url: "https://chatgpt.com/",
+            title: "ChatGPT",
+            readyState: "Success",
+            controller: "none",
+            zoomFactor: 1,
+            attached: true,
+            active: true,
+            muted: false,
+            owner: { kind: "user" },
+          },
+        ],
+      },
+    })((host) =>
+      Effect.gen(function* () {
+        const broker = yield* BrowserHostBroker.Service
+        yield* broker.register({ ...baseHello, callbackUrl: host.url, capabilities: { ...baseHello.capabilities, chrome: true as const } })
+        const response = yield* broker.dispatch(statusRequest())
+        expect(response.ok).toBe(true)
+        if (response.ok) {
+          const result = response.result as { tabs: SessionTabInfo[] }
+          expect(result.tabs).toEqual([
+            {
+              tabId: "chrome-42",
+              url: "https://chatgpt.com/",
+              title: "ChatGPT",
+              active: true,
+              muted: false,
+              owner: { kind: "user" },
+            },
+          ])
+        }
+        expect(yield* broker.listTabs()).toEqual([
+          {
+            tabId: "chrome-42",
+            url: "https://chatgpt.com/",
+            title: "ChatGPT",
+            active: true,
+            muted: false,
+            owner: { kind: "user" },
+          },
+        ])
+      }),
+    ),
+  )
+
   it.live("fills windowId + tabId on the forwarded envelope", () =>
     withHost({ type: "ok", result: { status: { connected: true } } })((host) =>
       Effect.gen(function* () {

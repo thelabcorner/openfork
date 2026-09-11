@@ -125,6 +125,8 @@ export interface HostCapabilities {
   supportedAppearances: readonly Appearance[]
   supportsRecording: boolean
   cdp: true
+  /** Additive flag — true when the ExtensionBridge native host is reachable. Optional so protocol 2 need not bump. */
+  chrome?: true
 }
 
 export interface HostGuestState {
@@ -737,6 +739,13 @@ export interface BrowserState {
   }
   appearance: Appearance
   tabs: WireGuestTabState[]
+  /** Extension lane (chrome-attach) — optional so protocol version stays 2. */
+  chrome?: {
+    attached: boolean
+    activeTabId: string | null
+    url: string | null
+    tabs: WireGuestTabState[]
+  }
 }
 export interface OpenOutput {
   opened: {

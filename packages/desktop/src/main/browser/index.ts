@@ -12,6 +12,8 @@ import { ControlArbiter } from "./arbitration"
 import { ControlSessionManager } from "./control-session"
 import { BrowserHost } from "./host"
 import { AnnotationController } from "./annotation"
+import { ExtensionHost } from "./extension-bridge/extension-host"
+import { ExtensionBridge, type ExtensionTabRecord } from "./extension-bridge/extension-bridge"
 import {
   BROWSER_PROTOCOL_VERSION,
   type Appearance,
@@ -80,6 +82,11 @@ export class BrowserEngine {
   readonly operations: BrowserOperations
   readonly host: BrowserHost
   readonly annotation = new AnnotationController()
+  // Chrome-attach extension lane (optional — present when extension-bridge is bundled)
+  readonly extensionHost: ExtensionHost
+  readonly extensionBridge: ExtensionBridge
+  private readonly chromeTabsMirror: ExtensionTabRecord[] = []
+  private chromeActiveTabId: string | null = null
   private readonly options: BrowserEngineOptions
   private readonly hostId = randomUUID()
   private readonly hostEpoch = 1
@@ -94,6 +101,7 @@ export class BrowserEngine {
       supportedAppearances: ["system", "light", "dark"],
       supportsRecording: true,
       cdp: true,
+      // chrome flag advertised dynamically via getCapabilities; static fallback false
     }
     this.sessions = new ControlSessionManager({
       arbiter: this.arbiter,
@@ -142,11 +150,37 @@ export class BrowserEngine {
       onPointerEvent: (event) => this.options.broadcast("browser-pointer-event", event),
       logger: options.logger,
     })
+    // Extension lane — shares the same arbiter epoch and operations dispatch
+    this.extensionHost = new ExtensionHost({
+      onConnectedChange: (connected) => {
+        if (!connected) {
+          this.chromeTabsMirror.length = 0
+          this.chromeActiveTabId = null
+        }
+        if (this.started) this.host.reRegister()
+      },
+      logger: options.logger,
+    })
+    this.extensionBridge = new ExtensionBridge({
+      registry: this.registry,
+      operations: this.operations,
+      extensionHost: this.extensionHost,
+      getExtensionTabs: () => this.chromeTabsMirror,
+      getExtensionActiveTabId: () => this.chromeActiveTabId,
+      onExtensionSnapshot: (tabs, activeTabId) => {
+        this.chromeTabsMirror.splice(0, this.chromeTabsMirror.length, ...tabs)
+        this.chromeActiveTabId = activeTabId
+      },
+      logger: options.logger,
+    })
     this.host = new BrowserHost({
       hostId: this.hostId,
       hostEpoch: this.hostEpoch,
       windowId: options.windowId,
       capabilities,
+      getCapabilities: () => this.extensionBridge.hostHelloCapabilities(capabilities),
+      getHealthExtra: () => this.extensionBridge.health() as { chrome: boolean; lanes: string[] },
+      extensionRelay: this.extensionHost,
       sidecarProvider: options.sidecarProvider,
       getGuestSnapshot: () => {
         const active = this.registry.activeTab
@@ -156,7 +190,7 @@ export class BrowserEngine {
           url: active?.url ?? null,
         }
       },
-      dispatch: (tabId, operation, sessionId) => this.operations.dispatch(tabId, operation, sessionId),
+      dispatch: (tabId, operation, sessionId) => this.extensionBridge.dispatch(tabId, operation, sessionId),
       onConnectedChange: (connected) => {
         this.options.broadcast("browser-host-state", { connected })
         this.options.logger?.log("browser host connected", { connected })
@@ -177,6 +211,7 @@ export class BrowserEngine {
   async start(): Promise<void> {
     if (this.started) return
     this.started = true
+    await this.extensionHost.start().catch(() => undefined)
     await this.host.start()
   }
   async stop(): Promise<void> {
@@ -187,6 +222,7 @@ export class BrowserEngine {
     for (const tab of this.registry.list()) this.annotation.cancel(tab.runtimeTabId)
     this.registry.teardown()
     await this.sessions.detachAll()
+    await this.extensionHost.stop().catch(() => undefined)
     await this.host.stop()
   }
   get isHostConnected(): boolean {
@@ -195,6 +231,29 @@ export class BrowserEngine {
   getState(): BrowserState {
     const tabs = this.registry.list().map((record) => this.registry.tabState(record))
     const active = this.registry.activeTab
+    const baseCapabilities: HostCapabilities = {
+      maxSnapshotBytes: 256 * 1024,
+      maxResultBytes: 64 * 1024,
+      supportedAppearances: ["system", "light", "dark"],
+      supportsRecording: true,
+      cdp: true,
+    }
+    const capabilities = this.extensionBridge.hostHelloCapabilities(baseCapabilities)
+    // Extension lane state — merged into Chrome optional field (no protocol bump)
+    const chromeTabs = this.chromeTabsMirror.map((t) => ({
+      tabId: t.tabId,
+      url: t.url,
+      title: t.title,
+      readyState: (t.readyState ?? "Success") as WireGuestTabState["readyState"],
+      controller: (t.controller ?? "none") as WireGuestTabState["controller"],
+      zoomFactor: 1,
+      attached: true,
+      owner: t.owner ?? { kind: "user" as const },
+      active: t.tabId === this.chromeActiveTabId,
+      muted: t.muted ?? false,
+    }))
+    const chromeAttached = this.extensionHost.isConnected || this.chromeTabsMirror.length > 0
+    const chromeActive = this.chromeTabsMirror.find((t) => t.tabId === this.chromeActiveTabId) ?? this.chromeTabsMirror.find((t) => t.active) ?? null
     return {
       host: {
         connected: this.host.isConnected,
@@ -202,13 +261,7 @@ export class BrowserEngine {
         hostEpoch: this.hostEpoch,
         connectionId: this.host.callbackUrlToken,
         windowId: this.options.windowId,
-        capabilities: {
-          maxSnapshotBytes: 256 * 1024,
-          maxResultBytes: 64 * 1024,
-          supportedAppearances: ["system", "light", "dark"],
-          supportsRecording: true,
-          cdp: true,
-        },
+        capabilities,
       },
       appearance: this.registry.getAppearance(),
       guest: {
@@ -219,6 +272,16 @@ export class BrowserEngine {
         zoomFactor: active?.zoomFactor ?? 1,
       },
       tabs,
+      ...(chromeTabs.length > 0 || chromeAttached
+        ? {
+            chrome: {
+              attached: chromeAttached,
+              activeTabId: chromeActive?.tabId ?? this.chromeActiveTabId,
+              url: chromeActive?.url ?? null,
+              tabs: chromeTabs,
+            },
+          }
+        : {}),
     }
   }
   /** Renderer-facing API (window.api.browser). */

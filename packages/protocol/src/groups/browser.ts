@@ -71,6 +71,8 @@ export const HostCapabilities = Schema.Struct({
   supportedAppearances: Schema.Array(Schema.Literals(["system", "light", "dark"])),
   supportsRecording: Schema.Boolean,
   cdp: Schema.Boolean,
+  /** Additive protocol-v2 capability: a real-Chrome extension lane is currently reachable. */
+  chrome: Schema.optional(Schema.Literal(true)),
 })
 export type HostCapabilities = Schema.Schema.Type<typeof HostCapabilities>
 

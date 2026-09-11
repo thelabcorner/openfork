@@ -188,6 +188,12 @@ const api: ElectronAPI = {
   recordFatalRendererError: (error) => ipcRenderer.invoke("record-fatal-renderer-error", error),
   setNativeTranslations: (bundle) => ipcRenderer.invoke("set-native-translations", bundle),
   browser: browserApi,
+  chrome: {
+    getStatus: () => ipcRenderer.invoke("chrome-get-status"),
+    writeHosts: (opts) => ipcRenderer.invoke("chrome-write-hosts", opts),
+    removeHosts: () => ipcRenderer.invoke("chrome-remove-hosts"),
+    getInstructions: () => ipcRenderer.invoke("chrome-get-instructions"),
+  },
 }
 
 contextBridge.exposeInMainWorld("api", api)
