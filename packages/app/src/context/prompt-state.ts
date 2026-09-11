@@ -34,6 +34,20 @@ export interface AgentPart extends PartBase {
   name: string
 }
 
+export interface SkillPart extends PartBase {
+  type: "skill"
+  name: string
+  description?: string
+}
+
+export interface ToolPart extends PartBase {
+  type: "tool"
+  name: string
+  description?: string
+  exposure?: "default" | "lazy"
+  source?: "registry" | "mcp" | "mcp-resource"
+}
+
 export interface ExternalPathPart extends PartBase {
   type: "external-path"
   path: string
@@ -50,7 +64,14 @@ export interface ImageAttachmentPart {
   blob: BlobReference
 }
 
-export type ContentPart = TextPart | FileAttachmentPart | AgentPart | ExternalPathPart | ImageAttachmentPart
+export type ContentPart =
+  | TextPart
+  | FileAttachmentPart
+  | AgentPart
+  | SkillPart
+  | ToolPart
+  | ExternalPathPart
+  | ImageAttachmentPart
 export type Prompt = ContentPart[]
 
 export type PromptModel = {
@@ -110,6 +131,10 @@ function isPartEqual(partA: ContentPart, partB: ContentPart) {
       )
     case "agent":
       return partB.type === "agent" && partA.name === partB.name
+    case "skill":
+      return partB.type === "skill" && partA.name === partB.name
+    case "tool":
+      return partB.type === "tool" && partA.name === partB.name
     case "external-path":
       return partB.type === "external-path" && partA.path === partB.path && partA.isDir === partB.isDir
     case "image":
@@ -134,6 +159,8 @@ function clonePart(part: ContentPart): ContentPart {
   if (part.type === "text") return { ...part }
   if (part.type === "image") return { ...part }
   if (part.type === "agent") return { ...part }
+  if (part.type === "skill") return { ...part }
+  if (part.type === "tool") return { ...part }
   if (part.type === "external-path") return { ...part }
   return {
     ...part,

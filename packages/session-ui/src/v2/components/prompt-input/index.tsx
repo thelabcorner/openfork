@@ -57,6 +57,10 @@ export type PromptInputV2Props = {
   revisionControl?: JSX.Element
   /** Persistent app-owned Goal shelf rendered above the composer, independent of the prompt popover machine. */
   goalShelf?: JSX.Element
+  /** Optional app-owned submit affordance. The session-ui default remains the
+   * plain send/stop button; products can progressively disclose richer send
+   * policy without coupling this package to those policies. */
+  submitControl?: JSX.Element
   variantControlVisible?: boolean
   attachKeybind?: string[]
   attachShortcut?: string
@@ -102,7 +106,9 @@ export function PromptInputV2(props: PromptInputV2Props) {
     }
     if (previousParts && isPromptInputV2PromptEqual(previousParts, parts)) return
     previousParts = parts
-    const hadFocus = document.activeElement === editor || (editor.contains(document.activeElement) && document.activeElement !== document.body)
+    const hadFocus =
+      document.activeElement === editor ||
+      (editor.contains(document.activeElement) && document.activeElement !== document.body)
     // Prefer the draft's authoritative cursor (set by addMention/addAttachment/history)
     // when it differs from the editor's current cursor; otherwise preserve the
     // editor's existing cursor to keep typing position stable.
@@ -207,7 +213,7 @@ export function PromptInputV2(props: PromptInputV2Props) {
             spellcheck={state.mode === "normal"}
             // @ts-expect-error
             autocomplete="off"
-            class="relative z-10 block min-h-[60px] max-h-[180px] w-full overflow-y-auto no-scrollbar whitespace-pre-wrap bg-transparent px-4 pt-4 pb-2 text-[13px] font-[440] leading-5 text-v2-text-text-base focus:outline-none empty:before:content-['\200B'] [&_[data-mention=file]]:text-syntax-property [&_[data-mention=agent]]:text-syntax-type [&_[data-mention=reference]]:text-syntax-keyword"
+            class="relative z-10 block min-h-[60px] max-h-[180px] w-full overflow-y-auto no-scrollbar whitespace-pre-wrap bg-transparent px-4 pt-4 pb-2 text-[13px] font-[440] leading-5 text-v2-text-text-base focus:outline-none empty:before:content-['\200B'] [&_[data-mention=file]]:text-syntax-property [&_[data-mention=agent]]:text-syntax-type [&_[data-mention=reference]]:text-syntax-keyword [&_[data-mention=tool]]:text-v2-text-text-accent"
             classList={{ "font-mono!": state.mode === "shell", "opacity-50": props.disabled }}
             onInput={(event) => {
               const cursor = promptInputV2Cursor(event.currentTarget)
@@ -309,15 +315,22 @@ export function PromptInputV2(props: PromptInputV2Props) {
           <Show when={props.footerControl}>
             <div class="flex items-center pe-1">{props.footerControl}</div>
           </Show>
-          <PromptInputV2SubmitButton
-            mode={state.mode}
-            stopping={view.submit.stopping()}
-            disabled={!props.controller.canSubmit()}
-            sendLabel={i18n.t("ui.promptInput.send")}
-            stopLabel={i18n.t("ui.promptInput.stop")}
-            onSubmit={props.controller.submit}
-            onStop={props.controller.stop}
-          />
+          <Show
+            when={props.submitControl}
+            fallback={
+              <PromptInputV2SubmitButton
+                mode={state.mode}
+                stopping={view.submit.stopping()}
+                disabled={!props.controller.canSubmit()}
+                sendLabel={i18n.t("ui.promptInput.send")}
+                stopLabel={i18n.t("ui.promptInput.stop")}
+                onSubmit={props.controller.submit}
+                onStop={props.controller.stop}
+              />
+            }
+          >
+            {props.submitControl}
+          </Show>
         </div>
       </form>
     </div>
@@ -343,6 +356,7 @@ function renderPromptInputV2Editor(
         part.type === "file" && part.mime === "application/x-directory" ? "reference" : part.type
       if (part.type === "agent") mention.dataset.name = part.name
       if (part.type === "skill") mention.dataset.name = part.name
+      if (part.type === "tool") mention.dataset.name = part.name
       if (part.type === "file") {
         mention.dataset.path = part.path
         if (part.mime) mention.dataset.mime = part.mime
@@ -424,6 +438,8 @@ function isPromptInputV2PromptEqual(a: PromptInputV2Prompt, b: PromptInputV2Prom
     if ("content" in partA && "content" in partB) {
       if (partA.content !== partB.content) return false
       if (partA.type === "agent" && partB.type === "agent" && partA.name !== partB.name) return false
+      if (partA.type === "skill" && partB.type === "skill" && partA.name !== partB.name) return false
+      if (partA.type === "tool" && partB.type === "tool" && partA.name !== partB.name) return false
       if (partA.type === "file" && partB.type === "file") {
         if (partA.path !== partB.path) return false
         if (partA.mime !== partB.mime) return false
@@ -467,6 +483,17 @@ function parsePromptInputV2Editor(editor: HTMLDivElement) {
     if (element.dataset.mention === "skill") {
       parts.push({
         type: "skill",
+        name: element.dataset.name ?? content.slice(1),
+        content,
+        start: position,
+        end: position + content.length,
+      })
+      position += content.length
+      return
+    }
+    if (element.dataset.mention === "tool") {
+      parts.push({
+        type: "tool",
         name: element.dataset.name ?? content.slice(1),
         content,
         start: position,
@@ -541,13 +568,7 @@ export function PromptInputV2Attachments(props: {
 }) {
   const i18n = useI18n()
   return (
-    <Show
-      when={
-        props.attachments.length > 0 ||
-        (props.comments?.length ?? 0) > 0 ||
-        (props.files?.length ?? 0) > 0
-      }
-    >
+    <Show when={props.attachments.length > 0 || (props.comments?.length ?? 0) > 0 || (props.files?.length ?? 0) > 0}>
       <div data-component="prompt-input-v2-attachments" data-slot="prompt-attachments" class="relative">
         <div
           data-slot="prompt-attachments-scroll"
@@ -728,7 +749,17 @@ function PromptInputV2ConfiguredSelect(props: {
       variant={!props.model}
       currentIcon={
         <>
-          <Show when={props.model && providerID()} fallback={props.model ? undefined : <PromptInputV2VariantIcon value={current()} index={props.control.options().findIndex((option) => option.id === current())} />}>
+          <Show
+            when={props.model && providerID()}
+            fallback={
+              props.model ? undefined : (
+                <PromptInputV2VariantIcon
+                  value={current()}
+                  index={props.control.options().findIndex((option) => option.id === current())}
+                />
+              )
+            }
+          >
             <ProviderIcon id={providerID()!} class="size-4 shrink-0 opacity-60" />
           </Show>
         </>
@@ -799,7 +830,18 @@ export function PromptInputV2Select(props: {
 }
 
 function PromptInputV2VariantIcon(props: { value: string; index: number }) {
-  const icons = ["brain", "dash", "glasses", "task", "subagent", "code", "mcp", "prompt", "selector", "sliders"] as const
+  const icons = [
+    "brain",
+    "dash",
+    "glasses",
+    "task",
+    "subagent",
+    "code",
+    "mcp",
+    "prompt",
+    "selector",
+    "sliders",
+  ] as const
   const name = icons[props.index % icons.length]
   return <Icon name={name} size="small" class="shrink-0 text-icon-info-active" />
 }
@@ -880,9 +922,7 @@ export function PromptInputV2Popover(props: {
                 </Show>
               </div>
               <Show when={promptInputV2SuggestionMeta(item)}>
-                {(meta) => (
-                  <span class="shrink-0 text-[10.5px] tabular-nums text-v2-text-text-faint">{meta()}</span>
-                )}
+                {(meta) => <span class="shrink-0 text-[10.5px] tabular-nums text-v2-text-text-faint">{meta()}</span>}
               </Show>
               <Show when={item.keybind?.length}>
                 <KeybindV2 keys={item.keybind ?? []} variant="ghost" />
@@ -900,6 +940,10 @@ export function PromptInputV2Popover(props: {
 // searchContextFiles's mapping in prompt-input-v2.tsx.
 function promptInputV2SuggestionMeta(item: PromptInputV2Suggestion): string | undefined {
   if (item.kind !== "file") return undefined
+  // Directory size/line metadata is not meaningful in this picker. More
+  // importantly, old/cold index rows can surface numeric zero sentinels for a
+  // directory; rendering those produces the misleading "0 B · 0 lines" UI.
+  if (item.isDir) return undefined
   const parts: string[] = []
   if (typeof item.size === "number" && Number.isFinite(item.size) && item.size >= 0)
     parts.push(formatPromptInputV2FileSize(item.size))
@@ -999,11 +1043,7 @@ function PromptInputV2LabelSegments(props: { segments: PromptInputV2LabelSegment
   return (
     <For each={props.segments}>
       {(segment) =>
-        segment.matched ? (
-          <span class="font-[600] text-v2-text-text-accent">{segment.text}</span>
-        ) : (
-          <>{segment.text}</>
-        )
+        segment.matched ? <span class="font-[600] text-v2-text-text-accent">{segment.text}</span> : <>{segment.text}</>
       }
     </For>
   )
@@ -1055,10 +1095,15 @@ function PromptInputV2SuggestionIcon(props: { item: PromptInputV2Suggestion; act
   const color = props.active ? "text-v2-icon-icon-base" : "text-v2-icon-icon-muted"
   if (props.item.kind === "agent") return <Icon name="brain" size="small" class={`shrink-0 ${color}`} />
   if (props.item.kind === "command") return <Icon name="terminal" size="small" class={`shrink-0 ${color}`} />
+  if (props.item.kind === "tool") return <Icon name="code" size="small" class={`shrink-0 ${color}`} />
+  if (props.item.kind === "skill") return <Icon name="prompt" size="small" class={`shrink-0 ${color}`} />
   if (props.item.kind === "resource") return <Icon name="mcp" size="small" class={`shrink-0 ${color}`} />
   return (
     <FileIcon
-      node={{ path: props.item.path ?? props.item.label, type: props.item.kind === "reference" ? "directory" : "file" }}
+      node={{
+        path: props.item.path ?? props.item.label,
+        type: props.item.kind === "reference" || props.item.isDir ? "directory" : "file",
+      }}
       class={`size-4 shrink-0 ${color}`}
     />
   )

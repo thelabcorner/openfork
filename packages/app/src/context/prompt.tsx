@@ -40,7 +40,9 @@ export type {
   PromptStore,
   PromptScope,
   PromptSession,
+  SkillPart,
   TextPart,
+  ToolPart,
 } from "./prompt-state"
 
 const WORKSPACE_KEY = "__workspace__"

@@ -27,6 +27,28 @@ export interface TitleGenerationSettings {
 export interface PromptRevisionSettings {
   model?: { providerID: string; modelID: string }
   prompt?: string
+  autoBeforeSend?: boolean
+  autoSendAfterRevision?: boolean
+}
+
+/**
+ * Prompt Revision automation is tiered: auto-send is only meaningful when
+ * auto-revise is enabled. Normalize at the settings boundary so every caller
+ * (menu, Settings, persisted state, future commands) observes the same valid
+ * state instead of re-implementing dependency rules.
+ */
+export function normalizePromptRevisionSettings(
+  value: PromptRevisionSettings | undefined,
+): PromptRevisionSettings | undefined {
+  if (!value) return undefined
+  const autoBeforeSend = value.autoBeforeSend === true
+  const next: PromptRevisionSettings = {
+    ...value,
+    autoBeforeSend: autoBeforeSend || undefined,
+    autoSendAfterRevision: autoBeforeSend && value.autoSendAfterRevision === true ? true : undefined,
+  }
+  if (!next.model && !next.prompt && !next.autoBeforeSend && !next.autoSendAfterRevision) return undefined
+  return next
 }
 
 export interface AuditorSettings {
@@ -486,9 +508,9 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         setTitleGeneration(value: TitleGenerationSettings | undefined) {
           setStore("general", "titleGeneration", value)
         },
-        promptRevision: withFallback(() => store.general?.promptRevision, undefined),
+        promptRevision: withFallback(() => normalizePromptRevisionSettings(store.general?.promptRevision), undefined),
         setPromptRevision(value: PromptRevisionSettings | undefined) {
-          setStore("general", "promptRevision", value)
+          setStore("general", "promptRevision", normalizePromptRevisionSettings(value))
         },
         auditor: withFallback(() => store.general?.auditor, undefined),
         setAuditor(value: AuditorSettings | undefined) {

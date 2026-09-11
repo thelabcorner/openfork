@@ -5,10 +5,12 @@ import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
+import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { Popover } from "@opencode-ai/ui/popover"
 import { ScrollView, ScrollViewOverlayScrollbar } from "@opencode-ai/ui/scroll-view"
 import type { ReferenceInfo } from "@opencode-ai/sdk/v2/client"
+import { getFilename } from "@opencode-ai/core/util/path"
 import {
   createEffect,
   createMemo,
@@ -35,8 +37,15 @@ import { promptDesignPlaceholder, promptPlaceholder } from "@/components/prompt-
 import { createPromptSubmit } from "@/components/prompt-input/submit"
 import { createLiveGenerationRate, type LiveGenerationRateState } from "@/components/prompt-input/live-generation-rate"
 import {
+  isPromptTextRevisable,
+  promptOneShotRevisionAction,
+  resolveAutomaticRevisionIntent,
+  resolvePromptPrimaryAction,
+} from "@/components/prompt-input/send-policy"
+import {
   promptRevisionClarifications,
   promptRevisionDraftContext,
+  promptRevisionUsablePath,
   promptRevisionFingerprint,
   promptRevisionPrefix,
   promptRevisionRevealBoundaries,
@@ -84,10 +93,31 @@ export type PromptInputV2ComposerProps = {
 }
 
 export type PromptInputV2ControllerProps = Omit<PromptInputProps, "class" | "submission">
+type PromptRevisionSendRegistration = {
+  run: (intent: PromptRevisionFlow["intent"]) => void
+  busy: () => boolean
+  awaitingClarification: () => boolean
+  readyForSend: () => boolean
+  showPending: () => void
+  cancel: () => void
+}
+
 export type PromptInputV2ComposerController = PromptInputV2Interaction & {
   readonly model: PromptInputProps["controls"]["model"]
   readonly autoAccept: { active: () => boolean; toggle: () => void }
   readonly liveRate: () => LiveGenerationRateState
+  readonly revisionSend: {
+    autoBeforeSend: () => boolean
+    setAutoBeforeSend: (value: boolean) => void
+    autoSendAfterRevision: () => boolean
+    setAutoSendAfterRevision: (value: boolean) => void
+    busy: () => boolean
+    awaitingClarification: () => boolean
+    readyForSend: () => boolean
+    register: (registration: PromptRevisionSendRegistration) => () => void
+    sendWithRevision: () => void
+    sendWithoutRevision: () => void
+  }
 }
 
 export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
@@ -117,9 +147,16 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
             onToggle={props.controller.autoAccept.toggle}
           />
         }
-        goalControl={<GoalComposerLauncher sessionID={sessionID()} armKey={armKey()} />}
+        goalControl={
+          <GoalComposerLauncher sessionID={sessionID()} armKey={armKey()} promptText={() => props.controller.value()} />
+        }
         revisionControl={<PromptInputV2RevisionControl controller={props.controller} sessionID={sessionID()} />}
-        goalShelf={<Show when={sessionID()}>{(id) => <GoalComposerShelf sessionID={id()} />}</Show>}
+        submitControl={<PromptInputV2SendControl controller={props.controller} />}
+        goalShelf={
+          <Show when={sessionID()}>
+            {(id) => <GoalComposerShelf sessionID={id()} promptText={() => props.controller.value()} />}
+          </Show>
+        }
         footerControl={<PromptInputV2LiveRate value={props.controller.liveRate()} />}
         modelControl={
           <PromptInputV2ModelControl
@@ -151,6 +188,7 @@ type PromptRevisionQuestion = {
 
 type PromptRevisionFlow = {
   token: number
+  intent: "review" | "send"
   draft: string
   before: ReturnType<PromptInputV2ComposerController["parts"]>
   beforeFingerprint: string
@@ -542,6 +580,19 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
 
     if (flow.token !== request || promptRevisionFingerprint(props.controller.parts()) !== appliedFingerprint)
       return false
+    setGuidance("")
+    setModelOverride(undefined)
+    props.controller.restoreFocus()
+    if (flow.intent === "send") {
+      // Revise-and-send is an atomic user intent. Once the revised draft has
+      // finished its reveal animation, bypass the auto-revise interceptor so
+      // the exact artifact we just committed is submitted once rather than
+      // recursively entering another revision cycle.
+      setRestoreState(undefined)
+      props.controller.revisionSend.sendWithoutRevision()
+      return true
+    }
+
     const restored = {
       before: flow.restoreBefore,
       text: flow.restoreDraft,
@@ -559,9 +610,6 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
         },
       ],
     })
-    setGuidance("")
-    setModelOverride(undefined)
-    props.controller.restoreFocus()
     return true
   }
 
@@ -615,7 +663,7 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
     }
   }
 
-  const run = (extra?: string) => {
+  const run = (extra?: string, intent: PromptRevisionFlow["intent"] = "review") => {
     const draft = props.controller.value()
     if (busy() || !draft.trim()) return
     const token = ++request
@@ -628,8 +676,10 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
     const current = props.controller.model.selection.current()
     const variant = props.controller.model.selection.variant.current()
     setQuestionState(undefined)
+    if (intent === "send") setOpen(false)
     void send({
       token,
+      intent,
       draft,
       before,
       beforeFingerprint,
@@ -671,6 +721,18 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
     setModelOverride(undefined)
     props.controller.restoreFocus()
   }
+
+  const unregisterRevisionSend = props.controller.revisionSend.register({
+    run: (intent) => run(undefined, intent),
+    busy,
+    awaitingClarification: () => !!questionState(),
+    readyForSend: () => !!restorable(),
+    showPending: () => {
+      if (questionState()) setOpen(true)
+    },
+    cancel: cancelQuestions,
+  })
+  onCleanup(unregisterRevisionSend)
 
   const hasDraft = () => props.controller.state.mode === "normal" && props.controller.value().trim().length > 0
 
@@ -804,6 +866,208 @@ function PromptInputV2RevisionControl(props: { controller: PromptInputV2Composer
   )
 }
 
+function PromptInputV2SendControl(props: { controller: PromptInputV2ComposerController }) {
+  const language = useLanguage()
+  const mode = () => props.controller.state.mode
+  const working = () => props.controller.view.submit.working?.() ?? false
+  const canSubmit = () => props.controller.canSubmit()
+  const autoRevise = () => props.controller.revisionSend.autoBeforeSend()
+  const autoSend = () => props.controller.revisionSend.autoSendAfterRevision()
+  const revisionBusy = () => props.controller.revisionSend.busy()
+  const awaitingClarification = () => props.controller.revisionSend.awaitingClarification()
+  const revisionReadyForSend = () => props.controller.revisionSend.readyForSend()
+  const hasRevisableText = () => isPromptTextRevisable(props.controller.value())
+  const action = createMemo(() =>
+    resolvePromptPrimaryAction({
+      mode: mode(),
+      working: working(),
+      canSubmit: canSubmit(),
+      hasRevisableText: hasRevisableText(),
+      autoReviseBeforeSending: autoRevise(),
+      revisionBusy: revisionBusy(),
+      awaitingClarification: awaitingClarification(),
+      revisionReadyForSend: revisionReadyForSend(),
+    }),
+  )
+  const oneShot = createMemo(() => promptOneShotRevisionAction(autoRevise() || awaitingClarification()))
+  const menuAvailable = () => working() || mode() === "normal"
+  const primaryDisabled = () =>
+    action() === "blocked" || (!canSubmit() && action() !== "stop" && action() !== "clarify")
+  const primaryLabel = () => {
+    if (revisionBusy()) return language.t("prompt.revision.send.revising")
+    if (action() === "clarify") return language.t("prompt.revision.send.needsInput")
+    if (action() === "stop") return language.t("prompt.action.stop")
+    if (action() === "revise")
+      return autoSend()
+        ? language.t("prompt.revision.send.reviseAndSend")
+        : language.t("prompt.revision.send.reviseBeforeSend")
+    return language.t("prompt.action.send")
+  }
+  const sendOneShot = () => {
+    if (oneShot() === "send-without-revisor") {
+      props.controller.revisionSend.sendWithoutRevision()
+      return
+    }
+    props.controller.revisionSend.sendWithRevision()
+  }
+
+  return (
+    <div
+      data-prompt-send-split=""
+      data-auto-revise={autoRevise() ? "true" : "false"}
+      data-auto-send-after-revision={autoSend() ? "true" : "false"}
+      data-revision-busy={revisionBusy() ? "true" : "false"}
+      class="relative size-[30px] shrink-0"
+    >
+      {/* The disclosure is embedded into the main surface instead of extending
+       * the outer silhouette. The control is a true 30x30 square. The pocket is
+       * intentionally a little larger than the source-SVG scale for legibility;
+       * its top-left and bottom-right stay square while only its smaller
+       * top-right and larger bottom-left arcs round. */}
+      <svg
+        aria-hidden="true"
+        class="pointer-events-none absolute inset-0 z-0 overflow-visible"
+        viewBox="0 0 30 30"
+        fill="none"
+        style={{
+          filter: "drop-shadow(0 1px 2px color-mix(in srgb, var(--v2-background-bg-deep) 38%, transparent))",
+        }}
+      >
+        <rect
+          x="0.5"
+          y="0.5"
+          width="29"
+          height="29"
+          rx="8"
+          ry="8"
+          fill="var(--v2-background-bg-layer-02)"
+        />
+        <path
+          d="M0.5 18.5H8C9.933 18.5 11.5 20.067 11.5 22V29.5H8.5C4.082 29.5 0.5 25.918 0.5 21.5V18.5Z"
+          fill="color-mix(in srgb, var(--v2-background-bg-layer-02) 68%, var(--v2-background-bg-deep) 32%)"
+        />
+        <rect
+          x="0.5"
+          y="0.5"
+          width="29"
+          height="29"
+          rx="8"
+          ry="8"
+          fill="none"
+          stroke="var(--v2-border-border-muted)"
+          stroke-width="1"
+        />
+      </svg>
+
+      <TooltipV2 placement="top" gutter={4} value={primaryLabel()}>
+        <IconButtonV2
+          data-action="prompt-submit"
+          type="button"
+          size="large"
+          variant="ghost"
+          disabled={primaryDisabled()}
+          tabIndex={mode() === "normal" ? undefined : -1}
+          aria-label={primaryLabel()}
+          class={`absolute inset-0 z-[2] shrink-0 !size-[30px] !rounded-[8px] !bg-transparent !text-v2-icon-icon-base !shadow-none hover:!bg-transparent active:!bg-transparent ${
+            action() === "stop" ? "!text-v2-state-fg-danger" : ""
+          }`}
+          icon={
+            <Show
+              when={revisionBusy()}
+              fallback={
+                <Show
+                  when={action() === "stop"}
+                  fallback={
+                    <Show
+                      when={action() === "clarify"}
+                      fallback={
+                        <Show when={mode() === "shell"} fallback={<Icon name="arrow-up" size="small" />}>
+                          <Icon name="arrow-undo-down" size="small" />
+                        </Show>
+                      }
+                    >
+                      <Icon name="pencil-sparkles" size="small" class="text-v2-icon-icon-accent" />
+                    </Show>
+                  }
+                >
+                  <Icon name="stop" size="small" />
+                </Show>
+              }
+            >
+              <PromptRevisionBusyIcon />
+            </Show>
+          }
+          onClick={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            props.controller.submit()
+            requestAnimationFrame(() => props.controller.restoreFocus())
+          }}
+        />
+      </TooltipV2>
+
+      <MenuV2
+        gutter={6}
+        modal={false}
+        placement="top-start"
+        onOpenChange={(open) => {
+          if (!open) requestAnimationFrame(() => props.controller.restoreFocus())
+        }}
+      >
+        <MenuV2.Trigger
+          as={IconButtonV2}
+          type="button"
+          size="small"
+          variant="ghost-muted"
+          disabled={!menuAvailable()}
+          data-action="prompt-send-options"
+          aria-label={language.t("prompt.revision.send.options")}
+          class={`absolute bottom-0 left-0 z-[3] !size-[11px] !rounded-none !rounded-bl-[8px] !rounded-tr-[3.5px] !bg-transparent !shadow-none hover:!bg-v2-overlay-simple-overlay-hover hover:!text-v2-icon-icon-base ${
+            autoRevise() && mode() === "normal" ? "!text-v2-icon-icon-accent" : "!text-v2-icon-icon-faint"
+          }`}
+          icon={<Icon name="chevron-down" size="small" class="size-[7px]" />}
+        />
+        <MenuV2.Portal>
+          <MenuV2.Content>
+            <Show when={working()}>
+              <MenuV2.Item shortcut="Esc" onSelect={() => props.controller.stop()}>
+                <span class="text-v2-state-text-danger">{language.t("prompt.revision.send.stopCurrent")}</span>
+              </MenuV2.Item>
+              <Show when={mode() === "normal"}>
+                <MenuV2.Separator />
+              </Show>
+            </Show>
+            <Show when={mode() === "normal"}>
+              <MenuV2.Item
+                disabled={!canSubmit() || revisionBusy() || (oneShot() === "send-with-revisor" && !hasRevisableText())}
+                onSelect={sendOneShot}
+              >
+                {oneShot() === "send-without-revisor"
+                  ? language.t("prompt.revision.send.withoutRevisor")
+                  : language.t("prompt.revision.send.withRevisor")}
+              </MenuV2.Item>
+              <MenuV2.Separator />
+              <MenuV2.CheckboxItem
+                checked={autoRevise()}
+                onSelect={() => props.controller.revisionSend.setAutoBeforeSend(!autoRevise())}
+              >
+                {language.t("prompt.revision.send.autoBeforeSend")}
+              </MenuV2.CheckboxItem>
+              <MenuV2.CheckboxItem
+                checked={autoSend()}
+                disabled={!autoRevise()}
+                onSelect={() => props.controller.revisionSend.setAutoSendAfterRevision(!autoSend())}
+              >
+                {language.t("prompt.revision.send.autoSendAfterRevision")}
+              </MenuV2.CheckboxItem>
+            </Show>
+          </MenuV2.Content>
+        </MenuV2.Portal>
+      </MenuV2>
+    </div>
+  )
+}
+
 function PromptInputV2LiveRate(props: { value: LiveGenerationRateState }) {
   const language = useLanguage()
   const [display, setDisplay] = createSignal(0)
@@ -846,7 +1110,7 @@ function PromptInputV2LiveRate(props: { value: LiveGenerationRateState }) {
   })
 
   return (
-    <div class="flex items-center gap-1.5 px-1 text-[11px] leading-4 text-text-weaker tabular-nums select-none">
+    <div class="flex h-[30px] items-center gap-1.5 px-1 text-[11px] leading-4 text-text-weaker tabular-nums select-none">
       <Show when={hasRate()}>
         <Show when={isLive()} fallback={<span class="size-1.5 rounded-full bg-current" />}>
           <span class="relative flex size-1.5 shrink-0">
@@ -1065,6 +1329,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   const command = useCommand()
   const permission = usePermission()
   const goals = useGoals()
+  const settings = useSettings()
   const language = useLanguage()
   const platform = usePlatform()
   const prompt = props.state ?? usePrompt()
@@ -1219,27 +1484,132 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     },
   })
 
+  let controller!: PromptInputV2ComposerController
+  let revisionSendRegistration: PromptRevisionSendRegistration | undefined
+  const autoReviseBeforeSending = () => settings.general.promptRevision()?.autoBeforeSend === true
+  const autoSendAfterRevision = () =>
+    autoReviseBeforeSending() && settings.general.promptRevision()?.autoSendAfterRevision === true
+  const setAutoReviseBeforeSending = (value: boolean) => {
+    const current = settings.general.promptRevision() ?? {}
+    settings.general.setPromptRevision({
+      ...current,
+      autoBeforeSend: value || undefined,
+      // Dependency invariant: disabling auto-revise must also disable the
+      // child auto-send preference immediately, not merely hide it in the UI.
+      autoSendAfterRevision: value ? current.autoSendAfterRevision : undefined,
+    })
+  }
+  const setAutoSendAfterRevision = (value: boolean) => {
+    const current = settings.general.promptRevision() ?? {}
+    settings.general.setPromptRevision({
+      ...current,
+      autoSendAfterRevision: current.autoBeforeSend === true && value ? true : undefined,
+    })
+  }
+  const directSubmit = () => {
+    revisionSendRegistration?.cancel()
+    void submission.handleSubmit(new Event("submit"))
+  }
+  const revisionUnavailable = () =>
+    showToast({
+      variant: "error",
+      title: language.t("prompt.revision.error.title"),
+      description: language.t("prompt.revision.send.unavailable"),
+    })
+  const runRevision = (intent: PromptRevisionFlow["intent"]) => {
+    if (mode() !== "normal" || !controller.canSubmit()) return
+    if (!isPromptTextRevisable(controller.value())) {
+      directSubmit()
+      return
+    }
+    const registration = revisionSendRegistration
+    if (!registration) {
+      revisionUnavailable()
+      return
+    }
+    if (registration.busy()) return
+    if (registration.awaitingClarification()) {
+      registration.showPending()
+      return
+    }
+    registration.run(intent)
+  }
+  const sendWithRevision = () => runRevision("send")
+  const revisionSend = {
+    autoBeforeSend: autoReviseBeforeSending,
+    setAutoBeforeSend: setAutoReviseBeforeSending,
+    autoSendAfterRevision,
+    setAutoSendAfterRevision,
+    busy: () => revisionSendRegistration?.busy() ?? false,
+    awaitingClarification: () => revisionSendRegistration?.awaitingClarification() ?? false,
+    readyForSend: () => revisionSendRegistration?.readyForSend() ?? false,
+    register(registration: PromptRevisionSendRegistration) {
+      revisionSendRegistration = registration
+      return () => {
+        if (revisionSendRegistration === registration) revisionSendRegistration = undefined
+      }
+    },
+    sendWithRevision,
+    sendWithoutRevision: directSubmit,
+  }
+  const submitFromPrimary = () => {
+    const action = resolvePromptPrimaryAction({
+      mode: mode(),
+      working: working(),
+      canSubmit: controller.canSubmit(),
+      hasRevisableText: isPromptTextRevisable(controller.value()),
+      autoReviseBeforeSending: autoReviseBeforeSending(),
+      revisionBusy: revisionSend.busy(),
+      awaitingClarification: revisionSend.awaitingClarification(),
+      revisionReadyForSend: revisionSend.readyForSend(),
+    })
+    if (action === "blocked") return
+    if (action === "stop") {
+      void submission.abort()
+      return
+    }
+    if (action === "clarify") {
+      sendWithRevision()
+      return
+    }
+    if (action === "revise") {
+      const intent = resolveAutomaticRevisionIntent({
+        autoReviseBeforeSending: autoReviseBeforeSending(),
+        autoSendAfterRevision: autoSendAfterRevision(),
+      })
+      if (intent) runRevision(intent)
+      return
+    }
+    directSubmit()
+  }
+
   const referenceDescription = (reference: ReferenceInfo) =>
     reference.source.type === "git" ? reference.source.repository : reference.source.path
   const references = createMemo(() =>
     sync()
       .data.reference.filter((reference) => !reference.hidden)
-      .map((reference) => ({
-        id: `reference:${reference.name}`,
-        kind: "reference" as const,
-        label: `@${reference.name}`,
-        path: reference.path,
-        description: reference.description ?? referenceDescription(reference),
-        mention: {
-          type: "file" as const,
-          path: reference.path,
-          content: `@${reference.name}`,
-          start: 0,
-          end: 0,
-          mime: "application/x-directory",
-          filename: reference.name,
-        },
-      })),
+      .flatMap((reference) => {
+        const path = promptRevisionUsablePath((reference as { path?: unknown }).path)
+        if (!path) return []
+        return [
+          {
+            id: `reference:${reference.name}`,
+            kind: "reference" as const,
+            label: `@${reference.name}`,
+            path,
+            description: reference.description ?? referenceDescription(reference),
+            mention: {
+              type: "file" as const,
+              path,
+              content: `@${reference.name}`,
+              start: 0,
+              end: 0,
+              mime: "application/x-directory",
+              filename: reference.name,
+            },
+          },
+        ]
+      }),
   )
   const resources = createMemo(() =>
     Object.values(sync().data.mcp_resource).map((resource) => ({
@@ -1285,7 +1655,13 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     }
   })
   const skills = createMemo<PromptInputV2Suggestion[]>(() => {
-    const raw = skillsResource() as unknown
+    // Context suggestions are rendered beneath the session route Suspense
+    // boundary. Never call a pending resource accessor from this path: doing
+    // so parks the whole route and presents as a full-tab black flash when the
+    // user types `@`. `latest` is explicitly non-suspending and is sufficient
+    // for autocomplete, where an empty list while the first fetch resolves is
+    // preferable to blanking the session UI.
+    const raw = skillsResource.latest as unknown
     const list: any[] = Array.isArray(raw) ? raw : []
     return list.map((skill: any) => ({
       id: `skill:${skill.name}`,
@@ -1295,6 +1671,98 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       description: skill.description ?? "",
       mention: { type: "skill" as const, name: skill.name, content: `@${skill.name}`, start: 0, end: 0 },
     }))
+  })
+  const toolCatalogTarget = createMemo(() => {
+    const model = props.controls.model.selection.current()
+    if (!model) return undefined
+    const request = {
+      provider: model.provider.id,
+      model: model.id,
+      agent: props.controls.agents.current || undefined,
+      sessionID: props.controls.session.id || undefined,
+    }
+    return {
+      request,
+      // A resolved catalog from another session/model must never bleed into a
+      // newly selected target while its own request is pending, particularly
+      // because the endpoint is permission-aware.
+      key: [request.provider, request.model, request.agent ?? "", request.sessionID ?? ""].join("\u0000"),
+    }
+  })
+  // Do not model this autocomplete cache as a Solid resource. Resource reads
+  // participate in Suspense, and this controller lives beneath the session
+  // route's Suspense boundary. A slow/refetched tool catalog must never be
+  // capable of blanking the route just because the user opened `@`.
+  const [toolCatalog, setToolCatalog] = createSignal<{ key: string; items: any[] }>()
+  let toolCatalogGeneration = 0
+  let toolCatalogLoadingKey: string | undefined
+  const refreshToolCatalog = async (target = toolCatalogTarget()) => {
+    if (!target) return
+    if (toolCatalogLoadingKey === target.key) return
+    const generation = ++toolCatalogGeneration
+    toolCatalogLoadingKey = target.key
+    try {
+      const result: any = await sdkClient().client.tool.catalog(target.request)
+      const items = Array.isArray(result)
+        ? result
+        : Array.isArray(result?.data)
+          ? result.data
+          : Array.isArray(result?.data?.data)
+            ? result.data.data
+            : Array.isArray(result?.data?.data?.data)
+              ? result.data.data.data
+              : []
+      if (generation !== toolCatalogGeneration || toolCatalogTarget()?.key !== target.key) return
+      setToolCatalog({ key: target.key, items })
+    } catch {
+      if (generation !== toolCatalogGeneration || toolCatalogTarget()?.key !== target.key) return
+      // Preserve a last-known-good catalog across transient refresh failures.
+      // On a first-load failure, settle to an empty list instead.
+      if (toolCatalog()?.key !== target.key) setToolCatalog({ key: target.key, items: [] })
+    } finally {
+      if (generation === toolCatalogGeneration) toolCatalogLoadingKey = undefined
+    }
+  }
+  createEffect(
+    on(toolCatalogTarget, (target) => {
+      if (!target) {
+        toolCatalogGeneration++
+        toolCatalogLoadingKey = undefined
+        setToolCatalog(undefined)
+        return
+      }
+      // Drop data from another model/session immediately. The catalog is
+      // permission-aware, so stale cross-target suggestions are not acceptable.
+      if (toolCatalog()?.key !== target.key) setToolCatalog(undefined)
+      void refreshToolCatalog(target)
+    }),
+  )
+  const tools = createMemo<PromptInputV2Suggestion[]>(() => {
+    const target = toolCatalogTarget()
+    const latest = toolCatalog()
+    const list: any[] = target && latest?.key === target.key ? latest.items : []
+    return list.map((item: any) => {
+      const description = typeof item.description === "string" ? item.description : ""
+      const lazy = item.exposure === "lazy"
+      return {
+        id: `tool:${item.id}`,
+        kind: "tool" as const,
+        label: `@${item.id}`,
+        title: item.id,
+        description: lazy ? (description ? `Lazy-loaded · ${description}` : "Lazy-loaded tool") : description,
+        mention: {
+          type: "tool" as const,
+          name: item.id,
+          content: `@${item.id}`,
+          start: 0,
+          end: 0,
+          exposure: lazy ? ("lazy" as const) : ("default" as const),
+          ...(item.source === "mcp" || item.source === "mcp-resource" || item.source === "registry"
+            ? { source: item.source }
+            : {}),
+        },
+      }
+    })
   })
   const context = createMemo<PromptInputV2Suggestion[]>(() => [
     ...references(),
@@ -1307,6 +1775,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
         label: `@${agent.name}`,
         mention: { type: "agent" as const, name: agent.name, content: `@${agent.name}`, start: 0, end: 0 },
       })),
+    ...tools(),
     ...resources(),
     ...recent().map((path) => ({
       id: `file:${path}`,
@@ -1347,7 +1816,7 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     })),
   )
   const variants = createMemo(() => ["default", ...props.controls.model.selection.variant.list()])
-  const controller = createPromptInputV2Controller({
+  controller = createPromptInputV2Controller({
     store: () => prompt.capture().store,
     state: interaction,
     identity: () => prompt.capture(),
@@ -1363,9 +1832,16 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     },
     commands,
     context,
+    onContextOpen() {
+      // Initial loading is started by the target effect. This is a no-op while
+      // that request is in flight; later opens refresh so MCP/tool reloads show
+      // up without turning autocomplete into a route-level loading state.
+      void refreshToolCatalog()
+    },
     searchContextFiles: async (query, options) =>
       (await files.searchMentions(query, { ...options, symbols: false })).results.flatMap((entry) => {
         if (entry.kind !== "file") return []
+        const isDir = entry.type === "directory"
         // normalizeMentionPage projects positions onto the basename; this label
         // is the FULL path, so shift them back into label space.
         const dirOffset = entry.baseOffset !== undefined && entry.baseOffset > 0 ? entry.baseOffset : 0
@@ -1375,11 +1851,22 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
             kind: "file" as const,
             label: entry.path,
             path: entry.path,
+            isDir,
             positions: entry.positions?.map((p) => p + dirOffset),
-            size: entry.size,
-            mtime: entry.mtime,
-            lineCount: entry.lineCount,
-            mention: { type: "file", path: entry.path, content: `@${entry.path}`, start: 0, end: 0 },
+            // File-only metrics are intentionally absent for directories. This
+            // is both semantically correct and protects the UI from stale zero
+            // sentinels emitted by older/cold indexes.
+            size: isDir ? undefined : entry.size,
+            mtime: isDir ? undefined : entry.mtime,
+            lineCount: isDir ? undefined : entry.lineCount,
+            mention: {
+              type: "file",
+              path: entry.path,
+              content: `@${entry.path}`,
+              start: 0,
+              end: 0,
+              ...(isDir ? { mime: "application/x-directory", filename: getFilename(entry.path) } : {}),
+            },
           },
         ]
       }),
@@ -1443,16 +1930,17 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       submit: {
         stopping,
         working,
-        onSubmit: () => void submission.handleSubmit(new Event("submit")),
+        onSubmit: submitFromPrimary,
         onStop: () => void submission.abort(),
       },
     },
-  })
+  }) as PromptInputV2ComposerController
   Object.defineProperty(controller, "model", { get: () => props.controls.model })
   Object.defineProperty(controller, "autoAccept", {
     get: () => ({ active: accepting, toggle: toggleAutoAccept }),
   })
   Object.defineProperty(controller, "liveRate", { get: () => liveRate })
+  Object.defineProperty(controller, "revisionSend", { get: () => revisionSend })
 
   command.register("prompt-input", () => [
     {

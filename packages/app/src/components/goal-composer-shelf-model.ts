@@ -21,6 +21,17 @@ export function goalLifecycleAction(status: GoalLifecycleStatus | string): GoalL
   return undefined
 }
 
+/**
+ * Manual criterion cycle used by the Goal popover. Completion is gated on every
+ * criterion passing with evidence attached, so the UI has to be able to walk a
+ * criterion all the way around without a separate menu.
+ */
+export function nextCriterionStatus(status: string) {
+  if (status === "pending") return "passed" as const
+  if (status === "passed") return "failed" as const
+  return "pending" as const
+}
+
 export function goalProgress(input: {
   criteria: ReadonlyArray<{ status: string }>
   steps: ReadonlyArray<{ status: string }>
@@ -33,11 +44,31 @@ export function goalProgress(input: {
 }
 
 export function formatGoalElapsed(ms: number) {
-  const seconds = Math.max(0, Math.floor(ms / 1000))
-  if (seconds < 60) return `${seconds}s`
-  const minutes = Math.floor(seconds / 60)
-  if (minutes < 60) return `${minutes}m`
-  const hours = Math.floor(minutes / 60)
-  const rest = minutes % 60
-  return rest ? `${hours}h ${rest}m` : `${hours}h`
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000))
+  if (totalSeconds === 0) return "0s"
+  const MINUTE = 60
+  const HOUR = 60 * MINUTE
+  const DAY = 24 * HOUR
+  const WEEK = 7 * DAY
+  const MONTH = 30 * DAY
+  let rest = totalSeconds
+  const months = Math.floor(rest / MONTH)
+  rest -= months * MONTH
+  const weeks = Math.floor(rest / WEEK)
+  rest -= weeks * WEEK
+  const days = Math.floor(rest / DAY)
+  rest -= days * DAY
+  const hours = Math.floor(rest / HOUR)
+  rest -= hours * HOUR
+  const minutes = Math.floor(rest / MINUTE)
+  rest -= minutes * MINUTE
+  const seconds = rest
+  const parts: string[] = []
+  if (months) parts.push(`${months}mo`)
+  if (weeks) parts.push(`${weeks}w`)
+  if (days) parts.push(`${days}d`)
+  if (hours) parts.push(`${hours}h`)
+  if (minutes) parts.push(`${minutes}m`)
+  if (seconds) parts.push(`${seconds}s`)
+  return parts.join(" ") || "0s"
 }

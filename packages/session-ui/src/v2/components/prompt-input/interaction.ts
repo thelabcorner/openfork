@@ -14,6 +14,7 @@ import type {
   PromptInputV2PersistedState,
   PromptInputV2SkillPart,
   PromptInputV2Suggestion,
+  PromptInputV2ToolPart,
 } from "./types"
 import {
   createPromptInputV2InteractionState,
@@ -130,6 +131,8 @@ export function createPromptInputV2Controller(input: {
   ) => PromptInputV2Suggestion[] | Promise<PromptInputV2Suggestion[]>
   openAttachment?: (attachment: PromptInputV2Attachment) => void
   openContext?: (key: string) => void
+  /** Called once whenever the @ context picker transitions from closed to open. */
+  onContextOpen?: () => void
   onContextRemove?: (item: PromptInputV2Comment) => void
   onEditor?: (element: HTMLElement) => void
   onSuggestionSelect?: (item: PromptInputV2Suggestion) => (() => void) | void
@@ -145,8 +148,8 @@ export function createPromptInputV2Controller(input: {
   }
   function addPart(part: PromptInputV2PersistedState["prompt"][number]) {
     if (part.type === "image") return false
-    if (part.type === "file" || part.type === "agent" || part.type === "skill") {
-      draft.addMention(part as PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart)
+    if (part.type === "file" || part.type === "agent" || part.type === "skill" || part.type === "tool") {
+      draft.addMention(part as PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart | PromptInputV2ToolPart)
       return true
     }
     draft.addText(part.content)
@@ -196,12 +199,14 @@ export function createPromptInputV2Controller(input: {
     groupBy: (item) => {
       if (item.kind === "reference") return "reference"
       if (item.kind === "agent") return "agent"
+      if (item.kind === "tool") return "tool"
+      if (item.kind === "skill") return "skill"
       if (item.kind === "resource") return "resource"
       if (item.recent) return "recent"
       return "file"
     },
     sortGroupsBy: (a, b) => {
-      const order = ["reference", "agent", "resource", "recent", "file"]
+      const order = ["reference", "agent", "tool", "skill", "resource", "recent", "file"]
       return order.indexOf(a.category) - order.indexOf(b.category)
     },
   })
@@ -212,6 +217,13 @@ export function createPromptInputV2Controller(input: {
   })
   const list = () => (state.popover.type === "context" ? contextList : commandList)
   const suggestions = () => list().flat()
+
+  let contextWasOpen = false
+  createEffect(() => {
+    const open = state.popover.type === "context"
+    if (open && !contextWasOpen) input.onContextOpen?.()
+    contextWasOpen = open
+  })
 
   const execute = (command: PromptInputV2InteractionCommand) => {
     if (command.type === "draft.setText") {

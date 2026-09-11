@@ -8,6 +8,7 @@ import {
   promptRevisionRevealBoundaries,
   promptRevisionResponse,
   promptRevisionText,
+  promptRevisionUsablePath,
   revisedPromptParts,
 } from "./prompt-revision"
 
@@ -167,6 +168,30 @@ describe("prompt revision helpers", () => {
     })
   })
 
+  test("drops malformed null-like file/reference paths from the Revisor draft snapshot", () => {
+    expect(promptRevisionUsablePath(null)).toBeUndefined()
+    expect(promptRevisionUsablePath(undefined)).toBeUndefined()
+    expect(promptRevisionUsablePath("null")).toBeUndefined()
+    expect(promptRevisionUsablePath(" undefined ")).toBeUndefined()
+    expect(promptRevisionUsablePath(" src/a.ts ")).toBe("src/a.ts")
+
+    const malformed = [
+      { type: "file", path: null, content: "@broken", start: 0, end: 7 },
+      {
+        type: "file",
+        path: "null",
+        content: "@broken-ref",
+        start: 7,
+        end: 18,
+        mime: "application/x-directory",
+        filename: "broken-ref",
+      },
+      { type: "text", content: "keep this", start: 18, end: 27 },
+    ] as unknown as PromptInputV2Prompt
+
+    expect(promptRevisionDraftContext(malformed)).toEqual({ mentions: [], attachments: [] })
+  })
+
   test("materializes Revisor-declared references as native Prompt Input V2 parts", () => {
     const original: PromptInputV2Prompt = [
       { type: "text", content: "old", start: 0, end: 3 },
@@ -215,6 +240,35 @@ describe("prompt revision helpers", () => {
       end: 35,
     })
     expect(revised.at(-1)).toBe(original[1])
+  })
+
+  test("preserves tool mentions locally without widening the Revisor reference protocol", () => {
+    const original: PromptInputV2Prompt = [
+      { type: "text", content: "Use ", start: 0, end: 4 },
+      {
+        type: "tool",
+        name: "read",
+        content: "@read",
+        start: 4,
+        end: 9,
+        exposure: "default",
+        source: "registry",
+      },
+      { type: "text", content: " for this", start: 9, end: 18 },
+    ]
+
+    expect(promptRevisionDraftContext(original)).toEqual({ mentions: [], attachments: [] })
+
+    const revised = revisedPromptParts("Please use @read for this", original)
+    expect(revised.find((part) => part.type === "tool")).toEqual({
+      type: "tool",
+      name: "read",
+      content: "@read",
+      start: 11,
+      end: 16,
+      exposure: "default",
+      source: "registry",
+    })
   })
 
   test("keeps multi-select labels separate from independent details", () => {

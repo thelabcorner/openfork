@@ -31,6 +31,15 @@ export type PromptInputV2SkillPart = PromptInputV2PartBase & {
   description?: string
 }
 
+export type PromptInputV2ToolPart = PromptInputV2PartBase & {
+  type: "tool"
+  /** Canonical runtime tool ID, not a display alias. */
+  name: string
+  description?: string
+  exposure?: "default" | "lazy"
+  source?: "registry" | "mcp" | "mcp-resource"
+}
+
 export type PromptInputV2ExternalPathPart = PromptInputV2PartBase & {
   type: "external-path"
   path: string
@@ -52,6 +61,7 @@ export type PromptInputV2Prompt = (
   | PromptInputV2FilePart
   | PromptInputV2AgentPart
   | PromptInputV2SkillPart
+  | PromptInputV2ToolPart
   | PromptInputV2ExternalPathPart
   | PromptInputV2Attachment
 )[]
@@ -109,7 +119,7 @@ export type PromptInputV2Option = {
 
 export type PromptInputV2Suggestion = {
   id: string
-  kind: "agent" | "command" | "file" | "reference" | "resource" | "skill"
+  kind: "agent" | "command" | "file" | "reference" | "resource" | "skill" | "tool"
   label: string
   title?: string
   trigger?: string
@@ -117,7 +127,9 @@ export type PromptInputV2Suggestion = {
   path?: string
   keybind?: string[]
   recent?: boolean
-  mention?: PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart
+  /** True when a file-kind suggestion represents a directory rather than a regular file. */
+  isDir?: boolean
+  mention?: PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart | PromptInputV2ToolPart
   /** Character offsets into `label` matched by the server-side query, when known (file search results). */
   positions?: number[]
   /** File size in bytes, when known (file search results). */

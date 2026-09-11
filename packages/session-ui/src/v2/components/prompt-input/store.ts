@@ -9,6 +9,7 @@ import type {
   PromptInputV2PersistedState,
   PromptInputV2Prompt,
   PromptInputV2SkillPart,
+  PromptInputV2ToolPart,
 } from "./types"
 
 export type PromptInputV2StoreTuple = [
@@ -78,7 +79,7 @@ export function createPromptInputV2Store(input: PromptInputV2StoreInput) {
     removeContext(key: string) {
       setStore()("context", "items", (items) => items.filter((item) => item.key !== key))
     },
-    addMention(mention: PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart) {
+    addMention(mention: PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart | PromptInputV2ToolPart) {
       const text = store()
         .prompt.map((part) => ("content" in part ? part.content : ""))
         .join("")
@@ -132,7 +133,7 @@ function insertMention(
   prompt: PromptInputV2Prompt,
   start: number,
   end: number,
-  mention: PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart,
+  mention: PromptInputV2FilePart | PromptInputV2AgentPart | PromptInputV2SkillPart | PromptInputV2ToolPart,
 ): PromptInputV2Prompt {
   let position = 0
   let inserted = false
@@ -184,6 +185,8 @@ function isPromptInputV2PromptEqual(a: PromptInputV2Prompt, b: PromptInputV2Prom
     if ("content" in partA && "content" in partB) {
       if (partA.content !== partB.content) return false
       if (partA.type === "agent" && partB.type === "agent" && partA.name !== partB.name) return false
+      if (partA.type === "skill" && partB.type === "skill" && partA.name !== partB.name) return false
+      if (partA.type === "tool" && partB.type === "tool" && partA.name !== partB.name) return false
       if (partA.type === "file" && partB.type === "file") {
         if (partA.path !== partB.path) return false
         if (partA.mime !== partB.mime) return false

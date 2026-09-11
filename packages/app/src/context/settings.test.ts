@@ -8,6 +8,7 @@ import {
   newLayoutDesignsDefault,
   nextSunsetCheckDelay,
   resolveNewLayoutDesigns,
+  normalizePromptRevisionSettings,
   shouldDisplayTabsToast,
   shouldEnableNewLayout,
 } from "./settings"
@@ -25,6 +26,33 @@ describe("agent visibility", () => {
   test("preserves the preference after initialization", () => {
     expect(initialAgentVisibility(true, true, "1.18.8")).toBeUndefined()
     expect(initialAgentVisibility(true, false)).toBeUndefined()
+  })
+})
+
+describe("prompt revision automation", () => {
+  test("keeps auto-send tiered beneath auto-revise", () => {
+    expect(normalizePromptRevisionSettings({ autoBeforeSend: true, autoSendAfterRevision: true })).toEqual({
+      autoBeforeSend: true,
+      autoSendAfterRevision: true,
+    })
+    expect(normalizePromptRevisionSettings({ autoBeforeSend: true, autoSendAfterRevision: false })).toEqual({
+      autoBeforeSend: true,
+      autoSendAfterRevision: undefined,
+    })
+  })
+
+  test("clears impossible persisted auto-send state when auto-revise is off", () => {
+    expect(normalizePromptRevisionSettings({ autoBeforeSend: false, autoSendAfterRevision: true })).toBeUndefined()
+    expect(
+      normalizePromptRevisionSettings({
+        model: { providerID: "openai", modelID: "gpt-test" },
+        autoSendAfterRevision: true,
+      }),
+    ).toEqual({
+      model: { providerID: "openai", modelID: "gpt-test" },
+      autoBeforeSend: undefined,
+      autoSendAfterRevision: undefined,
+    })
   })
 })
 

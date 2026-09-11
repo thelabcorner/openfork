@@ -36,6 +36,8 @@ export function clonePromptParts(prompt: Prompt): Prompt {
     if (part.type === "text") return { ...part }
     if (part.type === "image") return { ...part }
     if (part.type === "agent") return { ...part }
+    if (part.type === "skill") return { ...part }
+    if (part.type === "tool") return { ...part }
     if (part.type === "external-path") return { ...part }
     return {
       ...part,

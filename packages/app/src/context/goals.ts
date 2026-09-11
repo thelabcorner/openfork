@@ -399,6 +399,33 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
         setState("focused", sessionID, "detail", response.data)
         return response.data
       },
+      /**
+       * Realtime brief edit for a live Goal. The backend only allows
+       * title/objective (plus policy) replacement once a Goal has left
+       * draft, so criteria/steps stay read-only here by construction.
+       * The updated detail flows to the agent through GoalContext on its
+       * next turn; callers that need an immediate nudge should additionally
+       * post {@link buildGoalUpdatedMessage}-style session text.
+       */
+      async updateActive(sessionID: string, input: { title: string; objective: string }) {
+        const current = state.focused[sessionID]
+        if (!current) throw new Error("No focused Goal")
+        if (!["active", "paused", "blocked"].includes(current.detail.goal.status)) {
+          throw new Error("Only live Goals can use realtime brief editing")
+        }
+        const response = await sdk().update(
+          {
+            goalID: current.detail.goal.id,
+            expectedRevision: current.detail.goal.revision,
+            title: input.title,
+            objective: input.objective,
+          },
+          { throwOnError: true },
+        )
+        if (!response.data) throw new Error("Goal update returned no data")
+        setState("focused", sessionID, "detail", response.data)
+        return response.data
+      },
     }
   },
 })

@@ -96,6 +96,40 @@ describe("prompt input v2 store", () => {
     expect(prompt.state.cursor).toBe(18)
   })
 
+  test("inserts a registered tool mention as a structured atomic part", () => {
+    const [state, setState] = createStore<PromptInputV2PersistedState>({
+      prompt: [{ type: "text", content: "use @re", start: 0, end: 7 }],
+      cursor: 7,
+      context: { items: [] },
+    })
+    const prompt = createPromptInputV2Store([state, setState])
+
+    prompt.addMention({
+      type: "tool",
+      name: "read",
+      content: "@read",
+      start: 0,
+      end: 0,
+      exposure: "default",
+      source: "registry",
+    })
+
+    expect(prompt.state.prompt).toEqual([
+      { type: "text", content: "use ", start: 0, end: 4 },
+      {
+        type: "tool",
+        name: "read",
+        content: "@read",
+        start: 4,
+        end: 9,
+        exposure: "default",
+        source: "registry",
+      },
+      { type: "text", content: " ", start: 9, end: 10 },
+    ])
+    expect(prompt.state.cursor).toBe(10)
+  })
+
   test("inserts a dragged mention at the cursor without eating a prior @mention", () => {
     const [state, setState] = createStore<PromptInputV2PersistedState>({
       prompt: [

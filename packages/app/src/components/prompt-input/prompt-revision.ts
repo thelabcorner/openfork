@@ -71,6 +71,15 @@ export function promptRevisionText(parts: PromptInputV2Prompt) {
     .join("")
 }
 
+export function promptRevisionUsablePath(value: unknown) {
+  if (typeof value !== "string") return undefined
+  const path = value.trim()
+  if (!path) return undefined
+  const sentinel = path.toLowerCase()
+  if (sentinel === "null" || sentinel === "undefined") return undefined
+  return path
+}
+
 export function promptRevisionDraftContext(parts: PromptInputV2Prompt): PromptRevisionDraftContext {
   const mentions: PromptRevisionDraftContext["mentions"] = []
   const attachments: PromptRevisionDraftContext["attachments"] = []
@@ -89,6 +98,11 @@ export function promptRevisionDraftContext(parts: PromptInputV2Prompt): PromptRe
       mentions.push({ id, type: "skill", token: part.content, name: part.name })
       return
     }
+    // Tool mentions are local composer semantics. Their visible @tool token is
+    // already present in the draft text and revisedPromptParts can recover the
+    // original atomic part from that token. Do not widen the special-agent HTTP
+    // reference protocol just to transmit runtime tool identity.
+    if (part.type === "tool") return
     if (part.source?.type === "resource") {
       mentions.push({
         id,
@@ -101,14 +115,18 @@ export function promptRevisionDraftContext(parts: PromptInputV2Prompt): PromptRe
       return
     }
     if (part.mime === "application/x-directory" && part.filename) {
-      mentions.push({ id, type: "reference", token: part.content, name: part.filename, path: part.path })
+      const path = promptRevisionUsablePath((part as { path?: unknown }).path)
+      if (!path) return
+      mentions.push({ id, type: "reference", token: part.content, name: part.filename, path })
       return
     }
+    const path = promptRevisionUsablePath((part as { path?: unknown }).path)
+    if (!path) return
     mentions.push({
       id,
       type: "file",
       token: part.content,
-      path: part.path,
+      path,
       ...(part.selection ? { selection: { ...part.selection } } : {}),
     })
   })

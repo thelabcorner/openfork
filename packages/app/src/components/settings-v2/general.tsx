@@ -25,10 +25,7 @@ import { SettingsRowV2 } from "./parts/row"
 import { LayoutRetirementNotice, LayoutTransitionToggle } from "./interface-transition"
 import { DEFAULT_PROMPT as DEFAULT_PROMPT_REVISOR } from "@opencode-ai/core/prompt-revisor-prompt"
 import { DEFAULT_PROMPT as DEFAULT_AUDITOR_PROMPT } from "@opencode-ai/core/goal/auditor-prompt"
-import {
-  DEFAULT_PROMPT as DEFAULT_TITLE_PROMPT,
-  GENERATED_TITLE_TOOL,
-} from "@opencode-ai/core/session/title-prompt"
+import { DEFAULT_PROMPT as DEFAULT_TITLE_PROMPT, GENERATED_TITLE_TOOL } from "@opencode-ai/core/session/title-prompt"
 import {
   createAppearanceSettingsController,
   createPermissionScopeController,
@@ -361,7 +358,9 @@ const TitlePromptDialog: Component<{ onClose: () => void }> = (props) => {
                 {language.t("dialog.titlePrompt.default")}
               </span>
               <span class="text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
-                {usesDefaultPrompt() ? language.t("dialog.titlePrompt.builtin") : language.t("dialog.titlePrompt.custom")}
+                {usesDefaultPrompt()
+                  ? language.t("dialog.titlePrompt.builtin")
+                  : language.t("dialog.titlePrompt.custom")}
               </span>
             </div>
 
@@ -621,7 +620,9 @@ const AuditorPromptDialog: Component<{ onClose: () => void }> = (props) => {
                 {language.t("dialog.auditorPrompt.default")}
               </span>
               <span class="text-[12px] font-[440] leading-4 tracking-normal text-v2-text-text-muted">
-                {usesDefaultPrompt() ? language.t("dialog.auditorPrompt.builtin") : language.t("dialog.auditorPrompt.custom")}
+                {usesDefaultPrompt()
+                  ? language.t("dialog.auditorPrompt.builtin")
+                  : language.t("dialog.auditorPrompt.custom")}
               </span>
             </div>
             <TextareaV2
@@ -648,7 +649,11 @@ const AuditorPromptDialog: Component<{ onClose: () => void }> = (props) => {
             <DividerV2 />
             <div class="flex flex-wrap gap-1.5">
               <For each={["read", "grep", "glob", "audit_verdict"]}>
-                {(name) => <code class="rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">{name}</code>}
+                {(name) => (
+                  <code class="rounded-sm bg-v2-overlay-simple-overlay-hover px-1.5 py-0.5 font-mono text-[11px] text-v2-text-text-base">
+                    {name}
+                  </code>
+                )}
               </For>
             </div>
             <div class="mt-auto text-[11px] leading-4 text-v2-text-text-faint">
@@ -661,8 +666,12 @@ const AuditorPromptDialog: Component<{ onClose: () => void }> = (props) => {
         <ButtonV2 type="button" variant="ghost" class="mr-auto" onClick={() => setPrompt(DEFAULT_AUDITOR_PROMPT)}>
           {language.t("dialog.auditorPrompt.reset")}
         </ButtonV2>
-        <ButtonV2 type="button" variant="neutral" onClick={props.onClose}>{language.t("common.cancel")}</ButtonV2>
-        <ButtonV2 type="button" variant="contrast" onClick={save}>{language.t("common.save")}</ButtonV2>
+        <ButtonV2 type="button" variant="neutral" onClick={props.onClose}>
+          {language.t("common.cancel")}
+        </ButtonV2>
+        <ButtonV2 type="button" variant="contrast" onClick={save}>
+          {language.t("common.save")}
+        </ButtonV2>
       </DialogFooter>
     </Dialog>
   )
@@ -680,7 +689,7 @@ const PromptRevisionPromptDialog: Component<{ onClose: () => void }> = (props) =
     const next = settings.general.promptRevision() ?? {}
     const value = prompt().trim()
     const promptValue = value && value !== DEFAULT_PROMPT_REVISOR.trim() ? value : undefined
-    if (!promptValue && !next.model) settings.general.setPromptRevision(undefined)
+    if (!promptValue && !next.model && !next.autoBeforeSend) settings.general.setPromptRevision(undefined)
     else settings.general.setPromptRevision({ ...next, prompt: promptValue })
     void serverSync().updateConfig({ prompt_revisor_prompt: promptValue })
     props.onClose()
@@ -771,8 +780,23 @@ const PromptRevisionSection: Component = () => {
   const settings = useSettings()
   const selectModel = (model: { providerID: string; modelID: string } | undefined) => {
     const next = settings.general.promptRevision() ?? {}
-    if (!model && !next.prompt) settings.general.setPromptRevision(undefined)
+    if (!model && !next.prompt && !next.autoBeforeSend) settings.general.setPromptRevision(undefined)
     else settings.general.setPromptRevision({ ...next, model })
+  }
+  const setAutoBeforeSend = (autoBeforeSend: boolean) => {
+    const next = settings.general.promptRevision() ?? {}
+    settings.general.setPromptRevision({
+      ...next,
+      autoBeforeSend: autoBeforeSend || undefined,
+      autoSendAfterRevision: autoBeforeSend ? next.autoSendAfterRevision : undefined,
+    })
+  }
+  const setAutoSendAfterRevision = (autoSendAfterRevision: boolean) => {
+    const next = settings.general.promptRevision() ?? {}
+    settings.general.setPromptRevision({
+      ...next,
+      autoSendAfterRevision: next.autoBeforeSend === true && autoSendAfterRevision ? true : undefined,
+    })
   }
 
   return (
@@ -802,6 +826,22 @@ const PromptRevisionSection: Component = () => {
               />
             </TooltipV2>
           </div>
+        </SettingsRowV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.promptRevisionAutoRevise.title")}
+          description={language.t("settings.general.row.promptRevisionAutoRevise.description")}
+        >
+          <Switch checked={settings.general.promptRevision()?.autoBeforeSend === true} onChange={setAutoBeforeSend} />
+        </SettingsRowV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.promptRevisionAutoSendAfterRevision.title")}
+          description={language.t("settings.general.row.promptRevisionAutoSendAfterRevision.description")}
+        >
+          <Switch
+            checked={settings.general.promptRevision()?.autoSendAfterRevision === true}
+            disabled={settings.general.promptRevision()?.autoBeforeSend !== true}
+            onChange={setAutoSendAfterRevision}
+          />
         </SettingsRowV2>
       </SettingsListV2>
     </div>
@@ -841,24 +881,25 @@ const CompactionSection: Component = () => {
   const dialog = useDialog()
   const settings = useSettings()
   const serverSync = useServerSync()
-  const selectCompactionModel = (tier: "small" | "medium" | "large") => (model: { providerID: string; modelID: string } | undefined) => {
-    const next = settings.general.compaction() ?? {}
-    const updated = { ...next, [tier]: model }
-    if (!updated.small && !updated.medium && !updated.large && !updated.prompt) {
-      settings.general.setCompaction(undefined)
-    } else {
-      settings.general.setCompaction(updated as typeof next)
-    }
-    void serverSync().updateConfig({
-      compaction: {
-        models: {
-          small: updated.small ? `${updated.small.providerID}/${updated.small.modelID}` : undefined,
-          medium: updated.medium ? `${updated.medium.providerID}/${updated.medium.modelID}` : undefined,
-          large: updated.large ? `${updated.large.providerID}/${updated.large.modelID}` : undefined,
+  const selectCompactionModel =
+    (tier: "small" | "medium" | "large") => (model: { providerID: string; modelID: string } | undefined) => {
+      const next = settings.general.compaction() ?? {}
+      const updated = { ...next, [tier]: model }
+      if (!updated.small && !updated.medium && !updated.large && !updated.prompt) {
+        settings.general.setCompaction(undefined)
+      } else {
+        settings.general.setCompaction(updated as typeof next)
+      }
+      void serverSync().updateConfig({
+        compaction: {
+          models: {
+            small: updated.small ? `${updated.small.providerID}/${updated.small.modelID}` : undefined,
+            medium: updated.medium ? `${updated.medium.providerID}/${updated.medium.modelID}` : undefined,
+            large: updated.large ? `${updated.large.providerID}/${updated.large.modelID}` : undefined,
+          },
         },
-      },
-    } as unknown as Record<string, unknown>)
-  }
+      } as unknown as Record<string, unknown>)
+    }
   const defaultCompactionLabel = () => language.t("settings.general.row.compactionModel.default")
 
   return (

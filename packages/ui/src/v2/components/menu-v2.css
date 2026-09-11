@@ -4,6 +4,8 @@
 }
 
 [data-component="menu-v2-content"] {
+  --menu-v2-radius: 6px;
+
   box-sizing: border-box;
   display: flex;
   flex-direction: column;
@@ -14,7 +16,16 @@
   pointer-events: auto;
 
   background: var(--v2-background-bg-layer-01);
-  border-radius: 6px;
+  /* Pin each corner explicitly instead of relying on the shorthand, so a
+   * single-corner override on one edge cannot survive and square off a corner
+   * (the send split-button menu rendered with a sharp top-left corner).
+   * `overflow: hidden` keeps item backgrounds, hover states and inner scroll
+   * containers clipped to the same curve rather than painting square over it. */
+  border-top-left-radius: var(--menu-v2-radius);
+  border-top-right-radius: var(--menu-v2-radius);
+  border-bottom-right-radius: var(--menu-v2-radius);
+  border-bottom-left-radius: var(--menu-v2-radius);
+  overflow: hidden;
   box-shadow: var(--v2-elevation-floating);
 
   outline: none;
