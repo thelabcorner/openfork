@@ -160,7 +160,7 @@ const FORK_OWNED = [
   /^packages\/opencode\/src\/session\/group\.ts$/,
   /^packages\/opencode\/src\/quota\//,
   /^packages\/opencode\/src\/fork\//,
-  /^packages\/opencode\/src\/tool\/(json|background|sqlite|git|typecheck|project|symbols|test|refactor|sympy|patch|archive|swarm|browser|reload|checkpoint|shell-safety)/,
+  /^packages\/opencode\/src\/tool\/(json|background|sqlite|git|typecheck|project|symbols|test|refactor|sympy|access|patch|archive|swarm|browser|reload|checkpoint|shell-safety)/,
   /^packages\/core\/src\/search\//,
   /^packages\/core\/src\/checkpoint\.ts$/,
   /^packages\/opencode\/src\/session\/checkpoint\.ts$/,
@@ -683,7 +683,7 @@ function cmdVerify(tag?: string): number {
     {
       name: "fork tools present in registry",
       run: () => {
-        const need = ["BackgroundTool", "SqliteTool", "SympyTool", "MemoryTool"]
+        const need = ["BackgroundTool", "SqliteTool", "SympyTool", "MemoryTool", "createToolAccessTool"]
         const missing = need.filter((n) => !fileContains("packages/opencode/src/tool/registry.ts", n))
         return missing.length > 0 ? `tool/registry.ts missing fork tools: ${missing.join(", ")}` : undefined
       },
