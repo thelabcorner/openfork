@@ -4,7 +4,7 @@ import { createCompatibleApi } from "./server-compat"
 
 function setup(
   protocol: "v1" | "v2" | Promise<"v1" | "v2">,
-  responses?: { vcs?: { branch: string; default_branch: string } },
+  responses?: { vcs?: { branch: string; default_branch: string }; reviseError?: Response },
 ) {
   const requests: Request[] = []
   const fetcher = Object.assign(
@@ -36,6 +36,7 @@ function setup(
         })
       }
       if (request.method === "POST" && new URL(request.url).pathname === "/prompt/revise") {
+        if (responses?.reviseError) return responses.reviseError
         return Response.json({
           type: "revision",
           prompt: "Revised prompt",
@@ -92,6 +93,33 @@ describe("createCompatibleApi", () => {
     const request = requests.at(-1)!
     expect(new URL(request.url).pathname).toBe("/question/que_1/reply")
     expect(await request.json()).toEqual({ answers: [["Build", "Focus @packages/app"]] })
+  })
+
+  test("surfaces the server's own message instead of a raw tagged error body", async () => {
+    const { api } = setup("v2", {
+      reviseError: Response.json(
+        {
+          _tag: "ServiceUnavailableError",
+          message: "The prompt revisor's response hit the model output limit before it could commit the revision.",
+          service: "prompt-revisor",
+        },
+        { status: 503 },
+      ),
+    })
+
+    const error = await api.promptRevisor.revise({ prompt: "Improve this." }).catch((value: unknown) => value)
+    expect(error).toBeInstanceOf(Error)
+    expect((error as Error).message).toBe(
+      "The prompt revisor's response hit the model output limit before it could commit the revision.",
+    )
+  })
+
+  test("falls back to the status line when a failure body is not a tagged error", async () => {
+    const { api } = setup("v2", { reviseError: new Response("", { status: 502 }) })
+
+    const error = await api.promptRevisor.revise({ prompt: "Improve this." }).catch((value: unknown) => value)
+    expect((error as Error).message).toContain("502")
+    expect((error as Error).message).toContain("/prompt/revise")
   })
 
   test("routes Prompt Revisor to the selected workspace and preserves structured clarification details", async () => {

@@ -296,7 +296,10 @@ async function post(input: CompatibleInput, path: string, body?: unknown) {
     headers,
     body: body === undefined ? undefined : JSON.stringify(body),
   })
-  if (!response.ok) throw new Error(`POST ${path} failed: ${response.status}`)
+  if (!response.ok) {
+    const detail = serverErrorDetail(await response.text().catch(() => ""))
+    throw new Error(detail || `POST ${path} failed: ${response.status}`)
+  }
   try {
     await response.body?.cancel()
   } catch {}
@@ -317,10 +320,32 @@ async function postJSON<T>(input: CompatibleInput, path: string, body?: unknown)
     body: body === undefined ? undefined : JSON.stringify(body),
   })
   if (!response.ok) {
-    const detail = await response.text().catch(() => "")
-    throw new Error(`POST ${path} failed: ${response.status}${detail ? ` — ${detail.slice(0, 500)}` : ""}`)
+    const body = await response.text().catch(() => "")
+    const detail = serverErrorDetail(body)
+    throw new Error(detail || `POST ${path} failed: ${response.status}`)
   }
   return (await response.json()) as T
+}
+
+/**
+ * Server errors are tagged Effect payloads (`{_tag, message, service}`). Showing
+ * the raw JSON in a toast buries the one part a user can act on, so lift
+ * `message` out and keep the raw body only as a fallback.
+ */
+function serverErrorDetail(body: string) {
+  const trimmed = body.trim()
+  if (!trimmed) return ""
+  try {
+    const parsed = JSON.parse(trimmed) as unknown
+    if (parsed && typeof parsed === "object") {
+      const record = parsed as Record<string, unknown>
+      const message = record.message ?? record.error ?? record.detail
+      if (typeof message === "string" && message.trim()) return message.trim()
+    }
+  } catch {
+    // Not JSON: fall through to the raw body.
+  }
+  return trimmed.slice(0, 500)
 }
 
 function createV1Api(input: CompatibleInput): CompatibleApi {
