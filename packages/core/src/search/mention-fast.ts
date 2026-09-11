@@ -372,9 +372,7 @@ export function searchFileMentionsFast(
       score: ranked.score,
       positions,
       baseOffset,
-      size: row.size,
-      mtime: row.mtime,
-      lineCount: row.lineCount,
+      ...(row.isDir ? {} : { size: row.size, mtime: row.mtime, lineCount: row.lineCount }),
     })
   }
 

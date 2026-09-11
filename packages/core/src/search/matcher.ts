@@ -943,9 +943,7 @@ function merge(fp: CorpusPage<PathEntry>, sp: CorpusPage<SymbolEntry>, prepared:
         score: fp.scores[i]!,
         positions: fp.positions[i],
         baseOffset: fp.baseOffsets[i],
-        size: row.size,
-        mtime: row.mtime,
-        lineCount: row.lineCount,
+        ...(row.isDir ? {} : { size: row.size, mtime: row.mtime, lineCount: row.lineCount }),
       },
     })
   }

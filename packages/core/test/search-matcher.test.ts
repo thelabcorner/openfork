@@ -65,6 +65,27 @@ describe("matcher golden relevance", () => {
     }
   })
 
+  test("unified directory results omit file-only metadata", () => {
+    const local = Matcher.prepare({
+      paths: [
+        { path: "src/components/", isDir: true, size: 0, mtime: 0, lineCount: 0 },
+        { path: "src/components/empty.ts", isDir: false, size: 0, mtime: 123, lineCount: 0 },
+      ],
+      symbols: [],
+    })
+    const page = Matcher.query(local, "components", { limit: 20, symbols: false })
+    const directory = page.results.find((row) => row.path === "src/components/")
+    const file = page.results.find((row) => row.path === "src/components/empty.ts")
+
+    expect(directory?.type).toBe("directory")
+    expect(directory?.size).toBeUndefined()
+    expect(directory?.mtime).toBeUndefined()
+    expect(directory?.lineCount).toBeUndefined()
+    expect(file?.size).toBe(0)
+    expect(file?.mtime).toBe(123)
+    expect(file?.lineCount).toBe(0)
+  })
+
   test("deterministic across repeated calls", () => {
     const a = Matcher.queryPaths(prepared, "search", { limit: 20 }).map((r) => r.item.path)
     const b = Matcher.queryPaths(prepared, "search", { limit: 20 }).map((r) => r.item.path)

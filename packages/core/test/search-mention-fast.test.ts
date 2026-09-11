@@ -42,6 +42,24 @@ describe("fast file mention search", () => {
     expect(page.results.every((row) => row.type === "directory")).toBe(true)
   })
 
+  test("directory results never expose file-only metadata", () => {
+    const paths: Matcher.PathEntry[] = [
+      { path: "src/components", isDir: true, size: 0, mtime: 0, lineCount: 0 },
+      { path: "src/components/empty.ts", isDir: false, size: 0, mtime: 123, lineCount: 0 },
+    ]
+    const page = searchFileMentionsFast(paths, { query: "components", limit: 20, offset: 0 })
+    const directory = page.results.find((row) => row.path === "src/components")
+    const file = page.results.find((row) => row.path === "src/components/empty.ts")
+
+    expect(directory?.type).toBe("directory")
+    expect(directory?.size).toBeUndefined()
+    expect(directory?.mtime).toBeUndefined()
+    expect(directory?.lineCount).toBeUndefined()
+    expect(file?.size).toBe(0)
+    expect(file?.mtime).toBe(123)
+    expect(file?.lineCount).toBe(0)
+  })
+
   test("paging is deterministic and non-overlapping", () => {
     const paths = Array.from({ length: 500 }, (_, i): Matcher.PathEntry => ({ path: `src/file-${i}.ts`, isDir: false }))
     const p1 = searchFileMentionsFast(paths, { query: "file", limit: 100, offset: 0 })

@@ -394,8 +394,11 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     ): Promise<MentionSearchPage> =>
       search(query, "true", options).then((paths) => ({
         results: paths.map((path): MentionResult => {
-          if (!path.endsWith("/")) return { kind: "file", path }
-          return { kind: "file", path: path.replace(/\/+$/, ""), type: "directory" }
+          // `search()` platform-normalizes the legacy path first. On Windows a
+          // directory therefore ends in `\\`, not `/`; checking only `/` made
+          // fallback folders indistinguishable from regular files.
+          if (!/[\\/]$/.test(path)) return { kind: "file", path, type: "file" }
+          return { kind: "file", path: path.replace(/[\\/]+$/, ""), type: "directory" }
         }),
         hasMore: false,
       }))

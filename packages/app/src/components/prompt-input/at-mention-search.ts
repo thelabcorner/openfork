@@ -93,17 +93,22 @@ export function normalizeMentionPage(page: WireMentionPage): { results: MentionR
         entry.positions && baseOffset !== undefined && baseOffset > 0
           ? entry.positions.map(Number).filter((p) => p >= baseOffset).map((p) => p - baseOffset)
           : entry.positions?.map(Number)
+      const type = entry.type ?? (/[\\/]$/.test(entry.path) ? "directory" : "file")
+      const isDir = type === "directory"
       return {
         kind: "file",
         path: entry.path,
-        type: entry.type,
+        type,
         positions,
         // Preserved so consumers rendering the FULL path as label can re-project
         // basename-relative positions back into label space (see prompt-input-v2).
         baseOffset,
-        size: entry.size === undefined ? undefined : Number(entry.size),
-        mtime: entry.mtime === undefined ? undefined : Number(entry.mtime),
-        lineCount: entry.lineCount === undefined ? undefined : Number(entry.lineCount),
+        // Size/mtime/lineCount are file metadata in mention search. Directory
+        // rows must never inherit numeric zero sentinels and masquerade as an
+        // empty document in downstream pickers.
+        size: isDir || entry.size === undefined ? undefined : Number(entry.size),
+        mtime: isDir || entry.mtime === undefined ? undefined : Number(entry.mtime),
+        lineCount: isDir || entry.lineCount === undefined ? undefined : Number(entry.lineCount),
       }
     }),
     hasMore: page.hasMore,
