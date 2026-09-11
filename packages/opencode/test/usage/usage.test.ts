@@ -1,4 +1,4 @@
-import { describe, expect } from "bun:test"
+import { afterAll, describe, expect } from "bun:test"
 import path from "path"
 import { sql } from "drizzle-orm"
 import { Effect, Layer } from "effect"
@@ -71,6 +71,8 @@ type SeedMessage = {
   requestSentAt?: number
   firstTokenAt?: number
   cost?: number | null
+  mode?: string
+  agent?: string
   tokens: { input: number; cacheRead: number; cacheWrite: number; output: number; reasoning: number }
 }
 
@@ -130,6 +132,18 @@ const MESSAGES: SeedMessage[] = [
     cost: null,
     tokens: { input: 10, cacheRead: 0, cacheWrite: 0, output: 5, reasoning: 0 },
   },
+  {
+    id: "m6-compaction",
+    sessionID: "s1",
+    providerID: "anthropic",
+    modelID: "claude-3.5",
+    created: BASE + 90_000,
+    completed: BASE + 92_000,
+    cost: 0.001,
+    mode: "compaction",
+    agent: "compaction",
+    tokens: { input: 80, cacheRead: 10, cacheWrite: 0, output: 10, reasoning: 0 },
+  },
 ]
 
 function seedMessage(db: Database.Interface["db"], message: SeedMessage) {
@@ -152,8 +166,8 @@ function seedMessage(db: Database.Interface["db"], message: SeedMessage) {
       cache: { read: message.tokens.cacheRead, write: message.tokens.cacheWrite },
     },
     parentID: `parent-${message.id}`,
-    mode: "primary",
-    agent: "build",
+    mode: message.mode ?? "primary",
+    agent: message.agent ?? "build",
     path: { cwd: "/cwd", root: "/root" },
   }
   return db.run(
@@ -178,9 +192,20 @@ const seedDatabase = Effect.gen(function* () {
            ('s3', 'p2', '/proj/b', 's3', 'Session 3', '1', ${BASE}, ${BASE})
   `)
   yield* Effect.forEach(MESSAGES, (message) => seedMessage(db, message))
+  yield* db.run(sql`
+    INSERT INTO maintenance_usage (
+      agent, provider_id, model_id, variant, session_id, project_id, requests,
+      cost_usd, cost_estimated, input_tokens, cache_read_tokens, cache_write_tokens,
+      output_tokens, reasoning_tokens, total_tokens, time_started, time_completed
+    ) VALUES
+      ('title', 'anthropic', 'claude-3.5', NULL, 's1', 'p1', 1,
+       0.0002, 0, 20, 0, 0, 5, 0, 25, ${BASE + 20_000}, ${BASE + 20_500}),
+      ('prompt-revisor', 'openai', 'gpt-4o', NULL, 's3', 'p2', 1,
+       0.0003, 1, 30, 0, 0, 10, 0, 40, ${BASE + 7_300_000}, ${BASE + 7_301_000})
+  `)
 })
 
-await using tmp = await tmpdir()
+const tmp = await tmpdir()
 const dbPath = path.join(tmp.path, "opencode.db")
 const usageLayer = LayerNode.compile(Usage.node, [
   [Database.node, Database.layerFromPath(dbPath)],
@@ -189,6 +214,13 @@ const usageLayer = LayerNode.compile(Usage.node, [
 await Effect.runPromise(seedDatabase.pipe(Effect.provide(Database.layerFromPath(dbPath))))
 
 const it = testEffect(usageLayer)
+
+// Usage summaries intentionally scan from a dedicated read connection. Keep
+// the backing temp database alive through the test bodies instead of disposing
+// it immediately after module-level test registration completes.
+afterAll(async () => {
+  await tmp[Symbol.asyncDispose]()
+})
 
 describe("usage summary aggregation", () => {
   it.live("aggregates global totals, rates, and cost provenance", () =>
@@ -207,6 +239,19 @@ describe("usage summary aggregation", () => {
       expect(summary.totals.estimatedCost).toBeCloseTo(0.000925, 6)
       expect(summary.totals.pricedRecords).toBe(4)
       expect(summary.totals.unpricedRecords).toBe(1)
+
+      // Host-owned model work is accounted independently and must never alter
+      // ordinary conversation totals, rates, portfolio, or activity buckets.
+      expect(summary.maintenance.totals.requests).toBe(3)
+      expect(summary.maintenance.totals.sessions).toBe(2)
+      expect(summary.maintenance.totals.cost).toBeCloseTo(0.0012, 6)
+      expect(summary.maintenance.totals.estimatedCost).toBeCloseTo(0.0003, 6)
+      expect(summary.maintenance.totals.totalTokens).toBe(165)
+      expect(summary.maintenance.agents.map((item) => item.agent).sort()).toEqual([
+        "compaction",
+        "prompt-revisor",
+        "title",
+      ])
 
       const tokens = summary.totals.tokens
       expect(tokens.input).toBe(370)
@@ -300,6 +345,8 @@ describe("usage summary aggregation", () => {
       expect(summary.totals.messages).toBe(3)
       expect(summary.totals.sessions).toBe(2)
       expect(summary.projects.every((p) => p.projectID === "p1")).toBe(true)
+      expect(summary.maintenance.totals.requests).toBe(2)
+      expect(summary.maintenance.agents.some((item) => item.agent === "prompt-revisor")).toBe(false)
     }),
   )
 

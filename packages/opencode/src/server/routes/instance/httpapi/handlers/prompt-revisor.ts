@@ -7,6 +7,7 @@ import { Provider } from "@/provider/provider"
 import { LLM } from "@/session/llm"
 import { MCP } from "@/mcp"
 import { makeRuntime } from "@/prompt-revisor/runtime"
+import { Usage } from "@/usage/usage"
 import { Effect } from "effect"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import { InstanceHttpApi } from "../api"
@@ -18,7 +19,8 @@ export const promptRevisorHandlers = HttpApiBuilder.group(InstanceHttpApi, "prom
     const provider = yield* Provider.Service
     const llm = yield* LLM.Service
     const mcp = yield* MCP.Service
-    const runtime = makeRuntime(provider, llm, mcp)
+    const usage = yield* Usage.Service
+    const runtime = makeRuntime(provider, llm, mcp, usage)
 
     const revise = Effect.fn("PromptRevisorHttpApi.revise")(function* (ctx) {
       if (!ctx.payload.prompt.trim()) {

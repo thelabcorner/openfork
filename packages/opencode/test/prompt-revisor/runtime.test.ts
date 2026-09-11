@@ -112,6 +112,54 @@ describe("Prompt Revisor production runtime", () => {
     expect(request?.sessionID.startsWith("ses")).toBe(true)
   })
 
+  test("stops consuming and finalizes the production Session LLM stream at revised_prompt", async () => {
+    const selectedRef = ref("dedicated", "revisor")
+    const selected = providerModel("dedicated", "revisor")
+    let finalized = false
+    let trailingPulled = false
+    const provider = {
+      getModel: () => Effect.succeed(selected),
+      defaultModel: () => Effect.die("unused"),
+    } as unknown as Provider.Interface
+    const llm = {
+      stream() {
+        return Stream.concat(
+          Stream.make(
+            LLMEvent.toolCall({
+              id: "terminal",
+              name: "revised_prompt",
+              input: { content: "Done", references: [] },
+            }),
+          ),
+          Stream.fromEffect(
+            Effect.sync(() => {
+              trailingPulled = true
+              return LLMEvent.textDelta({ id: "late", text: "should not be consumed" })
+            }),
+          ),
+        ).pipe(Stream.ensuring(Effect.sync(() => (finalized = true))))
+      },
+    } as SessionLLM.Interface
+    const runtime = makeRuntime(provider, llm)
+    const model = await Effect.runPromise(runtime.resolveModel({ candidates: [selectedRef] }))
+
+    const response = await Effect.runPromise(
+      runtime.generate({
+        model,
+        system: "PROMPT REVISOR SYSTEM",
+        messages: [Message.user("Improve this")],
+        tools: [],
+        toolChoice: "required",
+        generation: { maxTokens: 4096 },
+      }),
+    )
+
+    expect(response.toolCalls[0]?.name).toBe("revised_prompt")
+    expect(response.finishReason).toBe("tool-calls")
+    expect(trailingPulled).toBe(false)
+    expect(finalized).toBe(true)
+  })
+
   test("retries required tool choice as auto when the upstream only supports auto", async () => {
     const selectedRef = ref("console-go", "revisor")
     const selected = providerModel("console-go", "revisor")

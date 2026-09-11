@@ -59,7 +59,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionTitle } from "@opencode-ai/core/session/title"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
-import { LLMEvent, LLMResponse } from "@opencode-ai/llm"
+import { LLMEvent, LLMResponse, Usage as LLMUsage } from "@opencode-ai/llm"
 import { SpadSupervisor } from "./spad/supervisor"
 import { makeTurnPolicy } from "./spad/intent"
 import { GoalContext } from "@opencode-ai/core/goal/context"
@@ -69,11 +69,15 @@ import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/l
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import {
+  collectUntilTerminalTool,
   generateAdaptive,
   runTerminalCompletionWithTranscript,
+  withSpecialAgentTimeout,
 } from "@opencode-ai/core/special-agent-completion"
 import { type ToolChoiceCapabilityIdentity } from "@opencode-ai/core/tool-choice-compatibility"
 import { appendModelCompletionRepair } from "@/special-agent/model-message-bridge"
+import { Usage as UsageAnalytics } from "@/usage/usage"
+import * as MaintenanceUsage from "@/usage/maintenance"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -109,13 +113,22 @@ function goalTokenCount(tokens: SessionV1.Assistant["tokens"]) {
   return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
 }
 
+function visibleUserText(message: SessionV1.WithParts | undefined) {
+  if (!message || message.info.role !== "user") return ""
+  return message.parts
+    .filter((part): part is SessionV1.TextPart => part.type === "text" && part.synthetic !== true)
+    .map((part) => part.text)
+    .join("\n")
+}
+
 function goalAuditLatestWork(messages: readonly SessionV1.WithParts[]) {
   const blocks = messages.slice(-10).flatMap((message) => {
     const parts = message.parts.flatMap((part) => {
       if (part.type === "text" && !part.ignored) return [part.text]
       if (part.type === "tool" && part.state.status === "completed")
         return [`[tool ${part.tool}] ${part.state.title}\n${part.state.output}`]
-      if (part.type === "tool" && part.state.status === "error") return [`[tool ${part.tool} error] ${part.state.error}`]
+      if (part.type === "tool" && part.state.status === "error")
+        return [`[tool ${part.tool} error] ${part.state.error}`]
       return []
     })
     if (parts.length === 0) return []
@@ -182,11 +195,12 @@ const layer = Layer.effect(
     const scope = yield* Scope.Scope
     const instruction = yield* Instruction.Service
     const state = yield* SessionRunState.Service
-     const revert = yield* SessionRevert.Service
-     const turnCheckpoint = yield* TurnCheckpoint.Service
+    const revert = yield* SessionRevert.Service
+    const turnCheckpoint = yield* TurnCheckpoint.Service
     const summary = yield* SessionSummary.Service
     const sys = yield* SystemPrompt.Service
     const llm = yield* LLM.Service
+    const usageAnalytics = yield* UsageAnalytics.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
     const ingress = yield* SessionIngress.Service
@@ -221,7 +235,8 @@ const layer = Layer.effect(
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
-        prompt: ((input: PromptInput) => prompt(input).pipe(Effect.catch(Effect.die))) as unknown as TaskPromptOps["prompt"],
+        prompt: ((input: PromptInput) =>
+          prompt(input).pipe(Effect.catch(Effect.die))) as unknown as TaskPromptOps["prompt"],
         dispatch: ((input: PromptInput, options?: { wait?: boolean }) =>
           dispatchFn
             ? dispatchFn(input, options)
@@ -299,7 +314,8 @@ const layer = Layer.effect(
       const ag = yield* agents.get("title")
       if (!ag) return
       const cfg = yield* config.get()
-      const policySource = input.prompt?.trim() || cfg.title_prompt?.trim() || ag.prompt?.trim() || SessionTitle.DEFAULT_TITLE_PROMPT
+      const policySource =
+        input.prompt?.trim() || cfg.title_prompt?.trim() || ag.prompt?.trim() || SessionTitle.DEFAULT_TITLE_PROMPT
       const toolChoiceIdentity = (model: Provider.Model): ToolChoiceCapabilityIdentity => ({
         providerID: model.providerID,
         modelID: model.id,
@@ -312,9 +328,7 @@ const layer = Layer.effect(
       // one candidate should not make manual retitle fail while another usable
       // model is available.
       const resolve = (providerID: ProviderV2.ID, modelID: ModelV2.ID) =>
-        provider
-          .getModel(providerID, modelID)
-          .pipe(Effect.option, Effect.map(Option.getOrElse(() => undefined)))
+        provider.getModel(providerID, modelID).pipe(Effect.option, Effect.map(Option.getOrElse(() => undefined)))
       const candidates = [
         input.model ? yield* resolve(input.model.providerID, input.model.id) : undefined,
         ag.model ? yield* resolve(ag.model.providerID, ag.model.modelID) : undefined,
@@ -360,7 +374,7 @@ const layer = Layer.effect(
           }
           const generatedTitleTool = tool({
             description:
-              "Commit the final session title. This is the only valid successful completion for title generation. Supply only the title artifact; do not put explanations or reasoning in the title field.",
+              "Commit the final session title. This is the only valid successful completion for title generation. Supply only the title artifact; do not put explanations or reasoning in the title field. IMMEDIATELY END GENERATION after this tool call; do not reason, emit prose, or call another tool afterward.",
             inputSchema: jsonSchema({
               type: "object",
               properties: { title: { type: "string" } },
@@ -378,19 +392,45 @@ const layer = Layer.effect(
             },
             ...msgs,
           ]
-          const collect = (toolChoice: "required" | "auto", messages: ReadonlyArray<ModelMessage>) =>
-            llm.stream({
-              agent: titleAgent,
-              user: firstInfo,
-              system: [],
-              small: true,
-              tools: { [SessionTitle.GENERATED_TITLE_TOOL]: generatedTitleTool },
+          const collect = (toolChoice: "required" | "auto", messages: ReadonlyArray<ModelMessage>) => {
+            const startedAt = Date.now()
+            const request = {
+              agentPrompt: titleAgent.prompt,
+              messages,
+              tool: SessionTitle.GENERATED_TITLE_TOOL,
               toolChoice,
-              model: mdl,
-              sessionID: input.sessionID,
-              retries: 2,
-              messages: [...messages],
-            })
+            }
+            return collectUntilTerminalTool(
+              llm.stream({
+                agent: titleAgent,
+                user: firstInfo,
+                system: [],
+                small: true,
+                tools: { [SessionTitle.GENERATED_TITLE_TOOL]: generatedTitleTool },
+                toolChoice,
+                model: mdl,
+                sessionID: input.sessionID,
+                retries: 2,
+                messages: [...messages],
+              }),
+              SessionTitle.GENERATED_TITLE_TOOL,
+            ).pipe(
+              Effect.tap((response) =>
+                response
+                  ? MaintenanceUsage.recordResponse({
+                      usage: usageAnalytics,
+                      agent: "title",
+                      model: mdl,
+                      response,
+                      request,
+                      sessionID: input.sessionID,
+                      variant: firstInfo.model.variant,
+                      startedAt,
+                    })
+                  : Effect.void,
+              ),
+            )
+          }
           const collectAdaptive = Effect.fn("SessionPrompt.collectTitle")(function* (
             messages: ReadonlyArray<ModelMessage>,
             preferred: "required" | "auto",
@@ -399,7 +439,8 @@ const layer = Layer.effect(
             const generated = yield* generateAdaptive({
               identity: capability,
               requested: preferred,
-              generate: (toolChoice) => collect(toolChoice, messages).pipe(Stream.runCollect),
+              generate: (toolChoice) =>
+                collect(toolChoice, messages),
               onDowngrade: () =>
                 Effect.logInfo("title tool-choice compatibility fallback", {
                   sessionID: input.sessionID,
@@ -409,7 +450,9 @@ const layer = Layer.effect(
                   to: "auto",
                 }),
             })
-            return { events: Array.from(generated.response), toolChoice: generated.toolChoice } as const
+            if (!generated.response)
+              return yield* Effect.fail(new Error("Title generation ended without a terminal response"))
+            return { response: generated.response, toolChoice: generated.toolChoice } as const
           })
           let preferred: "required" | "auto" = "required"
           const terminal = yield* runTerminalCompletionWithTranscript<ModelMessage, string, unknown>({
@@ -419,12 +462,7 @@ const layer = Layer.effect(
             generate: (messages) =>
               collectAdaptive(messages, preferred).pipe(
                 Effect.tap((attempt) => Effect.sync(() => (preferred = attempt.toolChoice))),
-                Effect.flatMap((attempt) => {
-                  const response = LLMResponse.fromEvents(attempt.events)
-                  return response
-                    ? Effect.succeed(response)
-                    : Effect.fail(new Error("Title generation ended without a terminal response"))
-                }),
+                Effect.map((attempt) => attempt.response),
               ),
             appendRepair: (messages, response, detail) =>
               appendModelCompletionRepair({
@@ -448,7 +486,9 @@ const layer = Layer.effect(
               new Error(
                 failure.reason === "invalid-payload"
                   ? (failure.detail ?? `Invalid ${SessionTitle.GENERATED_TITLE_TOOL} payload`)
-                  : `Title generation protocol failure (${failure.reason}): expected exactly one ${SessionTitle.GENERATED_TITLE_TOOL} tool call`,
+                  : failure.reason === "truncated"
+                    ? `Title generation hit the model output limit before it could call ${SessionTitle.GENERATED_TITLE_TOOL}`
+                    : `Title generation protocol failure (${failure.reason}): expected exactly one ${SessionTitle.GENERATED_TITLE_TOOL} tool call`,
               ),
           })
           const title = terminal.artifact
@@ -484,6 +524,14 @@ const layer = Layer.effect(
       })
     })
 
+    // One wall-clock budget for the entire title operation, including model
+    // fallback candidates and protocol-repair retries. A per-candidate timeout
+    // could otherwise multiply the intended five-minute ceiling.
+    const timedGenerateTitle = (input: Parameters<typeof generateTitle>[0]) =>
+      withSpecialAgentTimeout(generateTitle(input), () =>
+        Effect.fail(new Error("Title generation timed out after 5 minutes")),
+      )
+
     const title = Effect.fn("SessionPrompt.ensureTitle")(function* (input: {
       session: Session.Info
       history: SessionV1.WithParts[]
@@ -503,7 +551,7 @@ const layer = Layer.effect(
       const firstUser = context[idx]
       if (!firstUser || firstUser.info.role !== "user") return
 
-      const t = yield* generateTitle({
+      const t = yield* timedGenerateTitle({
         sessionID: input.session.id,
         firstUser,
         context,
@@ -545,7 +593,8 @@ const layer = Layer.effect(
       // configured/default model. Legacy V1 sessions can be missing either
       // message or session model metadata; manual retitle should still work.
       const fallbackModel = yield* provider.defaultModel().pipe(Effect.option)
-      const baseModel = firstUser.info.model ??
+      const baseModel =
+        firstUser.info.model ??
         (session.model ? { providerID: session.model.providerID, modelID: session.model.id } : undefined) ??
         Option.getOrUndefined(fallbackModel)
       if (!baseModel) {
@@ -571,7 +620,7 @@ const layer = Layer.effect(
       // everything newer follows chronologically, so the opening intent always
       // reaches the title model (retitle ┬º3.5).
       const context = history.slice(firstIdx)
-      return yield* generateTitle({
+      return yield* timedGenerateTitle({
         sessionID: input.sessionID,
         firstUser,
         context,
@@ -1382,9 +1431,7 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt = Effect.fn(
-      "SessionPrompt.prompt",
-    )(function* (input: PromptInput) {
+    const prompt = Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput) {
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       // A genuine user prompt always supersedes a reserved autonomous cycle.
       // If an automatic provider request is already in flight, its eventual
@@ -1419,512 +1466,579 @@ const layer = Layer.effect(
     })
 
     const runLoop = Effect.fn("SessionPrompt.run")(function* (sessionID: SessionID) {
-        const ctx = yield* InstanceState.context
-        let structured: unknown
-        let step = 0
-        let spad: SpadSupervisor | undefined
-        let spadStarted = false
-        let turn: TurnCheckpoint.Turn | undefined
-        let titleStarted = false
-        let goalReservation = yield* goalAutomation.claim(sessionID)
-        let goalCycleTokens = 0
-        const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
-        // Hard pause gate (V1): a paused session must not start any provider
-        // work. Prompt admission already gates, but direct loop callers (resume,
-        // summarize, command) and in-flight wake races need the same check.
-        if (session.pausedAt !== undefined) return yield* lastAssistant(sessionID)
+      const ctx = yield* InstanceState.context
+      let structured: unknown
+      let step = 0
+      let spad: SpadSupervisor | undefined
+      let spadStarted = false
+      let turn: TurnCheckpoint.Turn | undefined
+      let titleStarted = false
+      let goalReservation = yield* goalAutomation.claim(sessionID)
+      let goalCycleTokens = 0
+      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      // Hard pause gate (V1): a paused session must not start any provider
+      // work. Prompt admission already gates, but direct loop callers (resume,
+      // summarize, command) and in-flight wake races need the same check.
+      if (session.pausedAt !== undefined) return yield* lastAssistant(sessionID)
 
-         while (true) {
-           yield* status.set(sessionID, { type: "busy" })
-           yield* Effect.logInfo("loop", { "session.id": sessionID, step })
+      while (true) {
+        yield* status.set(sessionID, { type: "busy" })
+        yield* Effect.logInfo("loop", { "session.id": sessionID, step })
 
-            let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
-              Effect.provideService(Database.Service, database),
-            )
-            // ── Conversation Control: Effective Context Compiler ─────
-            // Fork-owned seam (see FORK.md). Filters excluded/pinned/edits before
-            // provider lowering. Best-effort — falls back to canonical on error.
-            {
-              const maybeCompiled = yield* Effect.gen(function* () {
-                const { EffectiveContextCompiler } = yield* Effect.promise(
-                  () => import("./context/compiler"),
-                )
-                const compiled = yield* (EffectiveContextCompiler.compileForSession as any)({
-                  messages: msgs,
-                  sessionID,
-                }).pipe(Effect.provideService(Database.Service, database))
-                const issues = EffectiveContextCompiler.validateEffectiveHistory(compiled.effective)
-                if (issues.length > 0) {
-                  yield* Effect.logWarning("effective context validation warnings", {
-                    sessionID,
-                    issues,
-                  })
-                  return undefined
-                }
-                if (compiled.warnings.length > 0) {
-                  yield* Effect.logWarning("effective context compiler warnings", {
-                    sessionID,
-                    warnings: compiled.warnings,
-                  })
-                }
-                return compiled
-              }).pipe(
-                Effect.catch((e) =>
-                  Effect.logWarning("effective context compile failed — using canonical", {
-                    sessionID,
-                    error: String(e),
-                  }).pipe(Effect.as(undefined)),
-                ),
-                Effect.catchDefect((e) =>
-                  Effect.logWarning("effective context compile defect — using canonical", {
-                    sessionID,
-                    error: String(e),
-                  }).pipe(Effect.as(undefined)),
-                ),
-              )
-              if (maybeCompiled) msgs = (maybeCompiled as any).effective as any
-            }
-
-           const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
-
-           if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
-
-           // Per-turn checkpoint: capture a pre-turn tree and insert a `capturing`
-           // row on the first step of this runLoop invocation (one logical turn).
-           // On resume of an interrupted turn, begin() reconciles the existing row.
-           if (step === 0 && turn === undefined) {
-             turn = yield* turnCheckpoint.begin({ sessionID, userMessageID: lastUser.id }).pipe(
-               Effect.catch((err) =>
-                 Effect.logWarning("turn checkpoint begin failed", {
-                   "session.id": sessionID,
-                   error: String(err),
-                 }).pipe(Effect.as(undefined)),
-               ),
-             )
-           }
-
-          const lastUserMsg = msgs.findLast((msg) => msg.info.role === "user" && msg.info.id === lastUser.id)
-          if (!spadStarted && (yield* config.get()).experimental?.spad_recovery !== false && lastUserMsg) {
-            const userText = lastUserMsg.parts
-              .filter((part): part is SessionV1.TextPart => part.type === "text" && part.synthetic !== true)
-              .map((part) => part.text)
-              .join("\n")
-            spad = new SpadSupervisor()
-            const policy = makeTurnPolicy(userText, lastUser.format?.type === "json_schema")
-            spad.beginTurn((yield* config.get()).experimental?.spad_observe_only ? { ...policy, observeOnly: true } : policy)
-            spadStarted = true
-          }
-
-          const lastAssistantMsg = msgs.findLast(
-            (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
-          )
-          // Some providers return "stop" even when the assistant message contains
-          // tool calls. Keep the loop running so tool results can be sent back to
-          // the model, but ignore cleanup-marked interrupted orphans.
-          const hasToolCalls =
-            lastAssistantMsg?.parts.some(
-              (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
-            ) ?? false
-
-          if (
-            lastAssistant?.finish &&
-            !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
-            !hasToolCalls &&
-            lastAssistant.parentID === lastUser.id &&
-            !goalReservation
-          ) {
-            const hasPendingIngress = yield* ingress.hasPending(sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
-            let gated = false
-            if (hasPendingIngress) {
-              const pendingQs2 = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
-              gated = pendingQs2.some((q: any) => q.sessionID === sessionID) || (yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))).some((p: any) => p.sessionID === sessionID)
-              if (!gated) {
-                yield* Effect.logInfo("loop continuing for pending monitor ingress", { sessionID })
-                // don't break — next iteration will drain ingress as system context
-              } else {
-                yield* Effect.logInfo("loop not continuing — ingress gated", { sessionID })
-              }
-            }
-            if (!hasPendingIngress || gated) {
-              const orphan = lastAssistantMsg?.parts.find(
-                (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
-              )
-              if (orphan) {
-                yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
-                  "session.id": sessionID,
-                  messageID: lastAssistant.id,
-                  tool: orphan.tool,
-                  callID: orphan.callID,
-                })
-              }
-              yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
-              break
-            }
-            // else: pending ingress present, not gated → continue loop to process event
-          }
-
-          step++
-          if (step === 1 && !titleStarted) {
-            titleStarted = true
-            yield* title({
-              session,
-              modelID: lastUser.model.modelID,
-              providerID: lastUser.model.providerID,
-              history: msgs,
-            }).pipe(Effect.ignore, Effect.forkIn(scope))
-          }
-
-          const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
-          const task = tasks.pop()
-
-          if (task?.type === "subtask") {
-            yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
-            continue
-          }
-
-          if (task?.type === "compaction") {
-            const result = yield* compaction.process({
+        let msgs = yield* MessageV2.filterCompactedEffect(sessionID).pipe(
+          Effect.provideService(Database.Service, database),
+        )
+        // ── Conversation Control: Effective Context Compiler ─────
+        // Fork-owned seam (see FORK.md). Filters excluded/pinned/edits before
+        // provider lowering. Best-effort — falls back to canonical on error.
+        {
+          const maybeCompiled = yield* Effect.gen(function* () {
+            const { EffectiveContextCompiler } = yield* Effect.promise(() => import("./context/compiler"))
+            const compiled = yield* (EffectiveContextCompiler.compileForSession as any)({
               messages: msgs,
-              parentID: lastUser.id,
               sessionID,
-              auto: task.auto,
-              continueAfter: task.continueAfter,
-              overflow: task.overflow,
-            })
-            // A prompt can be admitted while compaction is generating its
-            // summary. Re-read after compaction: the original continuation
-            // decision predates that prompt, so stopping here would leave the
-            // newly admitted user message stranded until another wake.
-            const afterCompaction = yield* MessageV2.stream(sessionID).pipe(
-              Effect.provideService(Database.Service, database),
-            )
-            const newestUser = MessageV2.latest(afterCompaction).user
-            const hasConcurrentUser =
-              newestUser !== undefined &&
-              (newestUser.time.created > lastUser.time.created ||
-                (newestUser.time.created === lastUser.time.created && newestUser.id > lastUser.id))
-            if (hasConcurrentUser) continue
-            if (result === "stop") break
-            if (!task.auto && !task.continueAfter) break
-            continue
-          }
-
-          if (
-            lastFinished &&
-            lastFinished.summary !== true &&
-            (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
-          ) {
-            yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
-            continue
-          }
-
-          const agent = yield* agents.get(lastUser.agent)
-          if (!agent) {
-            const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
-            const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
-            const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
-            yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
-            throw error
-          }
-          const maxSteps = agent.steps ?? Infinity
-          const isLastStep = step >= maxSteps
-          msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
-            Effect.provideService(RuntimeFlags.Service, flags),
-            Effect.provideService(FSUtil.Service, fsys),
-            Effect.provideService(Session.Service, sessions),
-          )
-
-          const msg: SessionV1.Assistant = {
-            id: MessageID.ascending(),
-            parentID: lastUser.id,
-            role: "assistant",
-            mode: agent.name,
-            agent: agent.name,
-            variant: lastUser.model.variant,
-            path: { cwd: ctx.directory, root: ctx.worktree },
-            cost: 0,
-            tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
-            modelID: model.id,
-            providerID: model.providerID,
-            time: { created: Date.now() },
-            sessionID,
-          }
-          yield* sessions.updateMessage(msg)
-
-          const finalizeInterruptedAssistant = Effect.gen(function* () {
-            if (msg.time.completed) return
-            msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
-              providerID: msg.providerID,
-              aborted: true,
-            })
-            msg.time.completed = Date.now()
-            yield* sessions.updateMessage(msg)
-          })
-
-          const handle = yield* processor
-            .create({
-              assistantMessage: msg,
-              sessionID,
-              model,
-              spad,
-            })
-            .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
-
-          // True when THIS generation is an automatic continuation of a
-          // previous one that ended with finish "unknown" ΓÇö the #43892 case.
-          const continuingAfterUnknown =
-            lastAssistant?.finish === "unknown" && lastAssistant.parentID === lastUser.id
-
-          const outcome: "break" | "continue" | "goal-stop" = yield* Effect.gen(function* () {
-            const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
-            const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
-            const promptOps = yield* ops()
-
-            const tools = yield* SessionTools.resolve({
-              agent,
-              session,
-              model,
-              processor: handle,
-              bypassAgentCheck,
-              messages: msgs,
-              promptOps,
-            }).pipe(
-              Effect.provideService(Plugin.Service, plugin),
-              Effect.provideService(Permission.Service, permission),
-              Effect.provideService(ToolRegistry.Service, registry),
-              Effect.provideService(MCP.Service, mcp),
-              Effect.provideService(Truncate.Service, truncate),
-              Effect.provideService(RuntimeFlags.Service, flags),
-            )
-
-            if (lastUser.format?.type === "json_schema") {
-              tools["StructuredOutput"] = createStructuredOutputTool({
-                schema: lastUser.format.schema,
-                onSuccess(output) {
-                  structured = output
-                },
+            }).pipe(Effect.provideService(Database.Service, database))
+            const issues = EffectiveContextCompiler.validateEffectiveHistory(compiled.effective)
+            if (issues.length > 0) {
+              yield* Effect.logWarning("effective context validation warnings", {
+                sessionID,
+                issues,
+              })
+              return undefined
+            }
+            if (compiled.warnings.length > 0) {
+              yield* Effect.logWarning("effective context compiler warnings", {
+                sessionID,
+                warnings: compiled.warnings,
               })
             }
-
-            if (step === 1)
-              yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
-
-            yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
-
-            // Drain monitor ingress at safe boundary — respecting Question/Permission gates (§48-49)
-            let monitorContext: string | undefined
-            {
-              const pendingQs = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
-              const hasQuestion = pendingQs.some((q: any) => q.sessionID === sessionID)
-              const pendingPs = yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
-              const hasPermission = pendingPs.some((p: any) => p.sessionID === sessionID)
-              if (!hasQuestion && !hasPermission) {
-                const evs = yield* ingress.drain(sessionID).pipe(Effect.catch(() => Effect.succeed([] as any[])))
-                if (evs.length > 0) monitorContext = formatMonitorEvents(evs as any)
-              } else if (hasQuestion || hasPermission) {
-                // keep queued — do not drain when gate active
-                yield* Effect.logInfo("monitor ingress gated — retaining events", { sessionID, hasQuestion, hasPermission })
-              }
-            }
-
-            const [skills, env, instructions, mcpInstructions, goalSystem, modelMsgs] = yield* Effect.all([
-              sys.skills(agent),
-              sys.environment(model),
-              instruction.system().pipe(Effect.orDie),
-              sys.mcp(agent, session.permission),
-              goalContext.render(sessionID),
-              MessageV2.toModelMessagesEffect(msgs, model),
-            ])
-            const system = [
-              ...env,
-              ...instructions,
-              ...(mcpInstructions ? [mcpInstructions] : []),
-              ...(skills ? [skills] : []),
-              ...(goalSystem ? [goalSystem] : []),
-              ...(goalReservation ? [goalReservation.prompt] : []),
-              ...(monitorContext ? [monitorContext] : []),
-            ]
-            const format = lastUser.format ?? { type: "text" as const }
-            if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
-            const result = yield* handle
-              .process({
-                user: lastUser,
-                agent,
-                permission: session.permission,
-                sessionID,
-                parentSessionID: session.parentID,
-                system,
-                messages: [
-                  ...modelMsgs,
-                  // #43892 continuation context: when the previous generation
-                  // ended with finish "unknown" (provider stream dropped before
-                  // a stop reason), the loop starts ANOTHER generation with no
-                  // new user input. Left unexplained, models experience this as
-                  // a blank prompt / phantom user turn and may restart, ask the
-                  // user what happened, or freeze. Tell it why ΓÇö REQUEST-ONLY,
-                  // never persisted into the session.
-                  ...(continuingAfterUnknown
-                    ? [{ role: "user" as const, content: UNKNOWN_FINISH_CONTINUATION_PROMPT }]
-                    : []),
-                  ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
-                ],
-                tools,
-                model,
-                toolChoice: format.type === "json_schema" ? "required" : undefined,
-              })
-              .pipe(
-                Effect.onError(() =>
-                  goalReservation
-                    ? goalAutomation.release({ sessionID, reservationID: goalReservation.id })
-                    : Effect.void,
-                ),
-              )
-            goalCycleTokens += goalTokenCount(handle.message.tokens)
-
-            if (structured !== undefined) {
-              handle.message.structured = structured
-              handle.message.finish = handle.message.finish ?? "stop"
-              yield* sessions.updateMessage(handle.message)
-              return "break" as const
-            }
-
-            if (handle.recovery) {
-              const recoveryUser: SessionV1.User = {
-                ...lastUser,
-                id: MessageID.ascending(),
-                time: { created: Date.now() },
-              }
-              yield* sessions.updateMessage(recoveryUser)
-              yield* sessions.updatePart({
-                id: PartID.ascending(),
-                messageID: recoveryUser.id,
-                sessionID,
-                type: "text",
-                text: handle.recovery.prompt,
-                synthetic: true,
-              } satisfies SessionV1.TextPart)
-              return "continue" as const
-            }
-
-            const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
-            if (finished && !handle.message.error) {
-              // Surface any content-filter finish (e.g. Anthropic stop_reason:
-              // refusal) as an error. These turns may have produced no visible
-              // output at all ΓÇö previously the session went idle silently ΓÇö or
-              // partial text that was cut off by the provider's filter.
-              if (handle.message.finish === "content-filter") {
-                handle.message.error = new SessionV1.ContentFilterError({
-                  message: "The response was blocked by the provider's content filter",
-                }).toObject()
-                yield* sessions.updateMessage(handle.message)
-                yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
-                return "break" as const
-              }
-              if (format.type === "json_schema") {
-                handle.message.error = new SessionV1.StructuredOutputError({
-                  message: "Model did not produce structured output",
-                  retries: 0,
-                }).toObject()
-                yield* sessions.updateMessage(handle.message)
-                return "break" as const
-              }
-            }
-
-            if (result === "stop") return "goal-stop" as const
-            if (result === "compact") {
-              yield* compaction.create({
-                sessionID,
-                agent: lastUser.agent,
-                model: lastUser.model,
-                auto: true,
-                overflow: !handle.message.finish,
-              })
-            }
-            return "continue" as const
+            return compiled
           }).pipe(
-            Effect.ensuring(instruction.clear(handle.message.id)),
-            Effect.onInterrupt(() => finalizeInterruptedAssistant),
-          )
-          if (outcome === "goal-stop") {
-            const completedReservation = goalReservation
-            const auditHistory = yield* sessions.messages({ sessionID, limit: 10 }).pipe(Effect.orDie)
-            const audit = yield* Effect.gen(function* () {
-              const goalAuditor = yield* GoalAuditor.Service
-              return yield* goalAuditor.evaluate({
+            Effect.catch((e) =>
+              Effect.logWarning("effective context compile failed — using canonical", {
                 sessionID,
-                workerModel: {
-                  providerID: ProviderV2.ID.make(model.providerID),
-                  id: ModelV2.ID.make(model.id),
-                },
-                latestWork: goalAuditLatestWork(auditHistory),
-              })
-            }).pipe(
-              Effect.provide(
-                locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) })),
-              ),
+                error: String(e),
+              }).pipe(Effect.as(undefined)),
+            ),
+            Effect.catchDefect((e) =>
+              Effect.logWarning("effective context compile defect — using canonical", {
+                sessionID,
+                error: String(e),
+              }).pipe(Effect.as(undefined)),
+            ),
+          )
+          if (maybeCompiled) msgs = (maybeCompiled as any).effective as any
+        }
+
+        const { user: lastUser, assistant: lastAssistant, finished: lastFinished, tasks } = MessageV2.latest(msgs)
+
+        if (!lastUser) throw new Error("No user message found in stream. This should never happen.")
+
+        // Per-turn checkpoint: capture a pre-turn tree and insert a `capturing`
+        // row on the first step of this runLoop invocation (one logical turn).
+        // On resume of an interrupted turn, begin() reconciles the existing row.
+        if (step === 0 && turn === undefined) {
+          turn = yield* turnCheckpoint.begin({ sessionID, userMessageID: lastUser.id }).pipe(
+            Effect.catch((err) =>
+              Effect.logWarning("turn checkpoint begin failed", {
+                "session.id": sessionID,
+                error: String(err),
+              }).pipe(Effect.as(undefined)),
+            ),
+          )
+        }
+
+        const lastUserMsg = msgs.findLast((msg) => msg.info.role === "user" && msg.info.id === lastUser.id)
+        if (!spadStarted && (yield* config.get()).experimental?.spad_recovery !== false && lastUserMsg) {
+          const userText = visibleUserText(lastUserMsg)
+          spad = new SpadSupervisor()
+          const policy = makeTurnPolicy(userText, lastUser.format?.type === "json_schema")
+          spad.beginTurn(
+            (yield* config.get()).experimental?.spad_observe_only ? { ...policy, observeOnly: true } : policy,
+          )
+          spadStarted = true
+        }
+
+        const lastAssistantMsg = msgs.findLast(
+          (msg) => msg.info.role === "assistant" && msg.info.id === lastAssistant?.id,
+        )
+        // Some providers return "stop" even when the assistant message contains
+        // tool calls. Keep the loop running so tool results can be sent back to
+        // the model, but ignore cleanup-marked interrupted orphans.
+        const hasToolCalls =
+          lastAssistantMsg?.parts.some(
+            (part) => part.type === "tool" && !part.metadata?.providerExecuted && !isOrphanedInterruptedTool(part),
+          ) ?? false
+
+        if (
+          lastAssistant?.finish &&
+          !["tool-calls", "unknown"].includes(lastAssistant.finish) &&
+          !hasToolCalls &&
+          lastAssistant.parentID === lastUser.id &&
+          !goalReservation
+        ) {
+          const hasPendingIngress = yield* ingress.hasPending(sessionID).pipe(Effect.catch(() => Effect.succeed(false)))
+          let gated = false
+          if (hasPendingIngress) {
+            const pendingQs2 = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
+            gated =
+              pendingQs2.some((q: any) => q.sessionID === sessionID) ||
+              (yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))).some(
+                (p: any) => p.sessionID === sessionID,
+              )
+            if (!gated) {
+              yield* Effect.logInfo("loop continuing for pending monitor ingress", { sessionID })
+              // don't break — next iteration will drain ingress as system context
+            } else {
+              yield* Effect.logInfo("loop not continuing — ingress gated", { sessionID })
+            }
+          }
+          if (!hasPendingIngress || gated) {
+            const orphan = lastAssistantMsg?.parts.find(
+              (part): part is SessionV1.ToolPart => part.type === "tool" && isOrphanedInterruptedTool(part),
             )
-            const decision = yield* goalAutomation.afterTurn({
-              sessionID,
-              origin: completedReservation ? "automatic" : "user",
-              ...(completedReservation ? { reservationID: completedReservation.id } : {}),
-              tokens: goalCycleTokens,
-              audit,
-            })
-            goalReservation = undefined
-            if (decision.reservation) {
-              goalReservation = yield* goalAutomation.claim(sessionID)
-              if (goalReservation) {
-                // A Goal continuation is a fresh bounded logical cycle. Reset
-                // the agent step budget, but retain the same user-turn
-                // checkpoint and transcript because no fake user message exists.
-                step = 0
-                goalCycleTokens = 0
-                continue
-              }
+            if (orphan) {
+              yield* Effect.logWarning("loop exit with orphaned interrupted tool", {
+                "session.id": sessionID,
+                messageID: lastAssistant.id,
+                tool: orphan.tool,
+                callID: orphan.callID,
+              })
             }
+            yield* Effect.logInfo("exiting loop", { "session.id": sessionID })
             break
           }
-          if (outcome === "break") {
-            if (goalReservation) {
-              yield* goalAutomation.cancel(sessionID)
-              goalReservation = undefined
-            }
-            break
-          }
+          // else: pending ingress present, not gated → continue loop to process event
+        }
+
+        step++
+        if (step === 1 && !titleStarted) {
+          titleStarted = true
+          yield* title({
+            session,
+            modelID: lastUser.model.modelID,
+            providerID: lastUser.model.providerID,
+            history: msgs,
+          }).pipe(Effect.ignore, Effect.forkIn(scope))
+        }
+
+        const model = yield* getModel(lastUser.model.providerID, lastUser.model.modelID, sessionID)
+        const task = tasks.pop()
+
+        if (task?.type === "subtask") {
+          yield* handleSubtask({ task, model, lastUser, sessionID, session, msgs })
           continue
         }
 
-        // Quiescence: the turn reached a terminal assistant completion. Capture
-        // the post-turn tree, diff against the pre-turn tree, and finalize the
-        // checkpoint row (best-effort; never breaks the turn result).
-        yield* turnCheckpoint.finish(turn)
-        turn = undefined
+        if (task?.type === "compaction") {
+          const result = yield* compaction.process({
+            messages: msgs,
+            parentID: lastUser.id,
+            sessionID,
+            auto: task.auto,
+            continueAfter: task.continueAfter,
+            overflow: task.overflow,
+          })
+          // A prompt can be admitted while compaction is generating its
+          // summary. Re-read after compaction: the original continuation
+          // decision predates that prompt, so stopping here would leave the
+          // newly admitted user message stranded until another wake.
+          const afterCompaction = yield* MessageV2.stream(sessionID).pipe(
+            Effect.provideService(Database.Service, database),
+          )
+          const newestUser = MessageV2.latest(afterCompaction).user
+          const hasConcurrentUser =
+            newestUser !== undefined &&
+            (newestUser.time.created > lastUser.time.created ||
+              (newestUser.time.created === lastUser.time.created && newestUser.id > lastUser.id))
+          if (hasConcurrentUser) continue
+          if (result === "stop") break
+          if (!task.auto && !task.continueAfter) break
+          continue
+        }
 
-        yield* maybePrune(sessionID).pipe(Effect.ignore, Effect.forkIn(scope))
-        return yield* lastAssistant(sessionID)
+        if (
+          lastFinished &&
+          lastFinished.summary !== true &&
+          (yield* compaction.isOverflow({ tokens: lastFinished.tokens, model }))
+        ) {
+          yield* compaction.create({ sessionID, agent: lastUser.agent, model: lastUser.model, auto: true })
+          continue
+        }
+
+        const agent = yield* agents.get(lastUser.agent)
+        if (!agent) {
+          const available = (yield* agents.list()).filter((a) => !a.hidden).map((a) => a.name)
+          const hint = available.length ? ` Available agents: ${available.join(", ")}` : ""
+          const error = new NamedError.Unknown({ message: `Agent not found: "${lastUser.agent}".${hint}` })
+          yield* events.publish(Session.Event.Error, { sessionID, error: error.toObject() })
+          throw error
+        }
+        const maxSteps = agent.steps ?? Infinity
+        const isLastStep = step >= maxSteps
+        msgs = yield* SessionReminders.apply({ messages: msgs, agent, session }).pipe(
+          Effect.provideService(RuntimeFlags.Service, flags),
+          Effect.provideService(FSUtil.Service, fsys),
+          Effect.provideService(Session.Service, sessions),
+        )
+
+        const msg: SessionV1.Assistant = {
+          id: MessageID.ascending(),
+          parentID: lastUser.id,
+          role: "assistant",
+          mode: agent.name,
+          agent: agent.name,
+          variant: lastUser.model.variant,
+          path: { cwd: ctx.directory, root: ctx.worktree },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: model.id,
+          providerID: model.providerID,
+          time: { created: Date.now() },
+          sessionID,
+        }
+        yield* sessions.updateMessage(msg)
+
+        const finalizeInterruptedAssistant = Effect.gen(function* () {
+          if (msg.time.completed) return
+          msg.error ??= MessageV2.fromError(new DOMException("Aborted", "AbortError"), {
+            providerID: msg.providerID,
+            aborted: true,
+          })
+          msg.time.completed = Date.now()
+          yield* sessions.updateMessage(msg)
+        })
+
+        const handle = yield* processor
+          .create({
+            assistantMessage: msg,
+            sessionID,
+            model,
+            spad,
+          })
+          .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
+
+        // True when THIS generation is an automatic continuation of a
+        // previous one that ended with finish "unknown" ΓÇö the #43892 case.
+        const continuingAfterUnknown = lastAssistant?.finish === "unknown" && lastAssistant.parentID === lastUser.id
+
+        const outcome: "break" | "continue" | "goal-stop" = yield* Effect.gen(function* () {
+          const lastUserMsg = msgs.findLast((m) => m.info.role === "user")
+          const bypassAgentCheck = lastUserMsg?.parts.some((p) => p.type === "agent") ?? false
+          const promptOps = yield* ops()
+
+          const tools = yield* SessionTools.resolve({
+            agent,
+            session,
+            model,
+            processor: handle,
+            bypassAgentCheck,
+            messages: msgs,
+            promptOps,
+          }).pipe(
+            Effect.provideService(Plugin.Service, plugin),
+            Effect.provideService(Permission.Service, permission),
+            Effect.provideService(ToolRegistry.Service, registry),
+            Effect.provideService(MCP.Service, mcp),
+            Effect.provideService(Truncate.Service, truncate),
+            Effect.provideService(RuntimeFlags.Service, flags),
+          )
+
+          if (lastUser.format?.type === "json_schema") {
+            tools["StructuredOutput"] = createStructuredOutputTool({
+              schema: lastUser.format.schema,
+              onSuccess(output) {
+                structured = output
+              },
+            })
+          }
+
+          if (step === 1)
+            yield* summary.summarize({ sessionID, messageID: lastUser.id }).pipe(Effect.ignore, Effect.forkIn(scope))
+
+          yield* plugin.trigger("experimental.chat.messages.transform", {}, { messages: msgs })
+
+          // Drain monitor ingress at safe boundary — respecting Question/Permission gates (§48-49)
+          let monitorContext: string | undefined
+          {
+            const pendingQs = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
+            const hasQuestion = pendingQs.some((q: any) => q.sessionID === sessionID)
+            const pendingPs = yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])))
+            const hasPermission = pendingPs.some((p: any) => p.sessionID === sessionID)
+            if (!hasQuestion && !hasPermission) {
+              const evs = yield* ingress.drain(sessionID).pipe(Effect.catch(() => Effect.succeed([] as any[])))
+              if (evs.length > 0) monitorContext = formatMonitorEvents(evs as any)
+            } else if (hasQuestion || hasPermission) {
+              // keep queued — do not drain when gate active
+              yield* Effect.logInfo("monitor ingress gated — retaining events", {
+                sessionID,
+                hasQuestion,
+                hasPermission,
+              })
+            }
+          }
+
+          const [skills, env, instructions, mcpInstructions, goalSystem, modelMsgs] = yield* Effect.all([
+            sys.skills(agent),
+            sys.environment(model),
+            instruction.system().pipe(Effect.orDie),
+            sys.mcp(agent, session.permission),
+            goalContext.render(sessionID),
+            MessageV2.toModelMessagesEffect(msgs, model),
+          ])
+          const explicitToolContext = yield* SessionTools.explicitLazyToolContext({
+            agent,
+            text: visibleUserText(lastUserMsg),
+            permission: session.permission,
+          }).pipe(
+            Effect.provideService(ToolRegistry.Service, registry),
+            Effect.catch((error) =>
+              Effect.logWarning("explicit lazy tool context failed", {
+                sessionID,
+                error: String(error),
+              }).pipe(Effect.as(undefined)),
+            ),
+          )
+          const system = [
+            ...env,
+            ...instructions,
+            ...(mcpInstructions ? [mcpInstructions] : []),
+            ...(skills ? [skills] : []),
+            ...(goalSystem ? [goalSystem] : []),
+            ...(goalReservation ? [goalReservation.prompt] : []),
+            ...(monitorContext ? [monitorContext] : []),
+          ]
+          const format = lastUser.format ?? { type: "text" as const }
+          if (format.type === "json_schema") system.push(STRUCTURED_OUTPUT_SYSTEM_PROMPT)
+          const result = yield* handle
+            .process({
+              user: lastUser,
+              agent,
+              permission: session.permission,
+              sessionID,
+              parentSessionID: session.parentID,
+              system,
+              messages: [
+                ...modelMsgs,
+                ...(explicitToolContext ? [{ role: "user" as const, content: explicitToolContext }] : []),
+                // #43892 continuation context: when the previous generation
+                // ended with finish "unknown" (provider stream dropped before
+                // a stop reason), the loop starts ANOTHER generation with no
+                // new user input. Left unexplained, models experience this as
+                // a blank prompt / phantom user turn and may restart, ask the
+                // user what happened, or freeze. Tell it why ΓÇö REQUEST-ONLY,
+                // never persisted into the session.
+                ...(continuingAfterUnknown
+                  ? [{ role: "user" as const, content: UNKNOWN_FINISH_CONTINUATION_PROMPT }]
+                  : []),
+                ...(isLastStep ? [{ role: "assistant" as const, content: MAX_STEPS_PROMPT }] : []),
+              ],
+              tools,
+              model,
+              toolChoice: format.type === "json_schema" ? "required" : undefined,
+            })
+            .pipe(
+              Effect.onError(() =>
+                goalReservation
+                  ? goalAutomation.release({ sessionID, reservationID: goalReservation.id })
+                  : Effect.void,
+              ),
+            )
+          goalCycleTokens += goalTokenCount(handle.message.tokens)
+
+          if (structured !== undefined) {
+            handle.message.structured = structured
+            handle.message.finish = handle.message.finish ?? "stop"
+            yield* sessions.updateMessage(handle.message)
+            return "break" as const
+          }
+
+          if (handle.recovery) {
+            const recoveryUser: SessionV1.User = {
+              ...lastUser,
+              id: MessageID.ascending(),
+              time: { created: Date.now() },
+            }
+            yield* sessions.updateMessage(recoveryUser)
+            yield* sessions.updatePart({
+              id: PartID.ascending(),
+              messageID: recoveryUser.id,
+              sessionID,
+              type: "text",
+              text: handle.recovery.prompt,
+              synthetic: true,
+            } satisfies SessionV1.TextPart)
+            return "continue" as const
+          }
+
+          const finished = handle.message.finish && !["tool-calls", "unknown"].includes(handle.message.finish)
+          if (finished && !handle.message.error) {
+            // Surface any content-filter finish (e.g. Anthropic stop_reason:
+            // refusal) as an error. These turns may have produced no visible
+            // output at all ΓÇö previously the session went idle silently ΓÇö or
+            // partial text that was cut off by the provider's filter.
+            if (handle.message.finish === "content-filter") {
+              handle.message.error = new SessionV1.ContentFilterError({
+                message: "The response was blocked by the provider's content filter",
+              }).toObject()
+              yield* sessions.updateMessage(handle.message)
+              yield* events.publish(Session.Event.Error, { sessionID, error: handle.message.error })
+              return "break" as const
+            }
+            if (format.type === "json_schema") {
+              handle.message.error = new SessionV1.StructuredOutputError({
+                message: "Model did not produce structured output",
+                retries: 0,
+              }).toObject()
+              yield* sessions.updateMessage(handle.message)
+              return "break" as const
+            }
+          }
+
+          if (result === "stop") return "goal-stop" as const
+          if (result === "compact") {
+            yield* compaction.create({
+              sessionID,
+              agent: lastUser.agent,
+              model: lastUser.model,
+              auto: true,
+              overflow: !handle.message.finish,
+            })
+          }
+          return "continue" as const
+        }).pipe(
+          Effect.ensuring(instruction.clear(handle.message.id)),
+          Effect.onInterrupt(() => finalizeInterruptedAssistant),
+        )
+        if (outcome === "goal-stop") {
+          const completedReservation = goalReservation
+          const auditHistory = yield* sessions.messages({ sessionID, limit: 10 }).pipe(Effect.orDie)
+          const audit = yield* Effect.gen(function* () {
+            const goalAuditor = yield* GoalAuditor.Service
+            return yield* goalAuditor.evaluate({
+              sessionID,
+              workerModel: {
+                providerID: ProviderV2.ID.make(model.providerID),
+                id: ModelV2.ID.make(model.id),
+              },
+              latestWork: goalAuditLatestWork(auditHistory),
+            })
+          }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
+          if (audit.model && audit.usage?.length) {
+            const auditModel = yield* provider
+              .getModel(audit.model.providerID, audit.model.id)
+              .pipe(Effect.option)
+            if (Option.isSome(auditModel)) {
+              yield* Effect.forEach(
+                audit.usage,
+                (sample) => {
+                  const raw = new LLMUsage({
+                    inputTokens: sample.inputTokens,
+                    outputTokens: sample.outputTokens,
+                    cacheReadInputTokens: sample.cacheReadInputTokens,
+                    cacheWriteInputTokens: sample.cacheWriteInputTokens,
+                    reasoningTokens: sample.reasoningTokens,
+                    totalTokens: sample.totalTokens,
+                  })
+                  const normalized = Session.getUsage({ model: auditModel.value, usage: raw })
+                  return usageAnalytics.recordMaintenance({
+                    agent: "goal-auditor",
+                    providerID: auditModel.value.providerID,
+                    modelID: auditModel.value.id,
+                    sessionID,
+                    cost: normalized.cost,
+                    costEstimated: sample.estimated,
+                    tokens: {
+                      input: normalized.tokens.input,
+                      cacheRead: normalized.tokens.cache.read,
+                      cacheWrite: normalized.tokens.cache.write,
+                      output: normalized.tokens.output,
+                      reasoning: normalized.tokens.reasoning,
+                    },
+                    totalTokens: sample.totalTokens,
+                    startedAt: sample.startedAt,
+                    completedAt: sample.completedAt,
+                  })
+                },
+                { concurrency: 4, discard: true },
+              )
+            }
+          }
+          const decision = yield* goalAutomation.afterTurn({
+            sessionID,
+            origin: completedReservation ? "automatic" : "user",
+            ...(completedReservation ? { reservationID: completedReservation.id } : {}),
+            tokens: goalCycleTokens,
+            audit,
+          })
+          goalReservation = undefined
+          if (decision.reservation) {
+            goalReservation = yield* goalAutomation.claim(sessionID)
+            if (goalReservation) {
+              // A Goal continuation is a fresh bounded logical cycle. Reset
+              // the agent step budget, but retain the same user-turn
+              // checkpoint and transcript because no fake user message exists.
+              step = 0
+              goalCycleTokens = 0
+              continue
+            }
+          }
+          break
+        }
+        if (outcome === "break") {
+          if (goalReservation) {
+            yield* goalAutomation.cancel(sessionID)
+            goalReservation = undefined
+          }
+          break
+        }
+        continue
+      }
+
+      // Quiescence: the turn reached a terminal assistant completion. Capture
+      // the post-turn tree, diff against the pre-turn tree, and finalize the
+      // checkpoint row (best-effort; never breaks the turn result).
+      yield* turnCheckpoint.finish(turn)
+      turn = undefined
+
+      yield* maybePrune(sessionID).pipe(Effect.ignore, Effect.forkIn(scope))
+      return yield* lastAssistant(sessionID)
+    })
+
+    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, never, any> = Effect.fn("SessionPrompt.loop")(
+      function* (input: LoopInput) {
+        return yield* (
+          state.ensureRunning as unknown as (
+            a: SessionID,
+            b: Effect.Effect<SessionV1.WithParts, never, any>,
+            c: Effect.Effect<SessionV1.WithParts, never, any>,
+          ) => Effect.Effect<SessionV1.WithParts, never, any>
+        )(
+          input.sessionID,
+          lastAssistant(input.sessionID) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
+          runLoop(input.sessionID).pipe(
+            Effect.onError(() => turnCheckpoint.finishAborted(input.sessionID)),
+          ) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
+        )
       },
     )
-
-    const loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts, never, any> = Effect.fn("SessionPrompt.loop")(function* (
-      input: LoopInput,
-    ) {
-      return yield* (state.ensureRunning as unknown as (a: SessionID, b: Effect.Effect<SessionV1.WithParts, never, any>, c: Effect.Effect<SessionV1.WithParts, never, any>) => Effect.Effect<SessionV1.WithParts, never, any>)(
-        input.sessionID,
-        lastAssistant(input.sessionID) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
-        runLoop(input.sessionID).pipe(Effect.onError(() => turnCheckpoint.finishAborted(input.sessionID))) as unknown as Effect.Effect<SessionV1.WithParts, never, any>,
-      )
-    })
 
     // Register monitor ingress wake handler — enqueue first, wake second, coalesce if busy, gate on Question/Permission (§42-49)
     yield* ingress.registerWakeHandler(
       (sessionID: SessionID) =>
         Effect.gen(function* () {
-          const pendingQs = yield* question.list().pipe(Effect.catch(() => Effect.succeed([] as any[])), Effect.as([]))
+          const pendingQs = yield* question.list().pipe(
+            Effect.catch(() => Effect.succeed([] as any[])),
+            Effect.as([]),
+          )
           if (pendingQs.some((q: any) => q.sessionID === sessionID)) {
             yield* Effect.logInfo("monitor wake gated by question", { sessionID })
             return
           }
-          const pendingPs = yield* permission.list().pipe(Effect.catch(() => Effect.succeed([] as any[])), Effect.as([]))
+          const pendingPs = yield* permission.list().pipe(
+            Effect.catch(() => Effect.succeed([] as any[])),
+            Effect.as([]),
+          )
           if (pendingPs.some((p: any) => p.sessionID === sessionID)) {
             yield* Effect.logInfo("monitor wake gated by permission", { sessionID })
             return
@@ -1945,10 +2059,7 @@ const layer = Layer.effect(
         }) as Effect.Effect<void>,
     )
 
-    dispatchFn = Effect.fn("SessionPrompt.dispatch")(function* (
-      input: PromptInput,
-      options?: { wait?: boolean },
-    ) {
+    dispatchFn = Effect.fn("SessionPrompt.dispatch")(function* (input: PromptInput, options?: { wait?: boolean }) {
       const admitted = yield* prompt({ ...input, noReply: true })
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (session.pausedAt !== undefined) {
@@ -2038,7 +2149,8 @@ const layer = Layer.effect(
         const sh = Shell.preferred(cfg.shell)
         const results = yield* Effect.forEach(
           shellMatches,
-          ([, cmd]) => Effect.promise(() => Process.text([cmd], { shell: sh, nothrow: true }).then((result) => result.text)),
+          ([, cmd]) =>
+            Effect.promise(() => Process.text([cmd], { shell: sh, nothrow: true }).then((result) => result.text)),
           { concurrency: 4 },
         )
         let index = 0
@@ -2263,12 +2375,13 @@ export const node = LayerNode.make({
     Image.node,
     CrossSpawnSpawner.node,
     Instruction.node,
-     SessionRunState.node,
-     SessionRevert.node,
-     TurnCheckpoint.node,
+    SessionRunState.node,
+    SessionRevert.node,
+    TurnCheckpoint.node,
     SessionSummary.node,
     SystemPrompt.node,
     LLM.node,
+    UsageAnalytics.node,
     EventV2Bridge.node,
     RuntimeFlags.node,
     Database.node,

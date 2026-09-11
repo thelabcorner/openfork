@@ -591,6 +591,28 @@ export default {
           CONSTRAINT \`fk_session_share_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
       `)
+      yield* tx.run(`
+        CREATE TABLE \`maintenance_usage\` (
+          \`id\` integer PRIMARY KEY AUTOINCREMENT,
+          \`agent\` text NOT NULL,
+          \`provider_id\` text NOT NULL,
+          \`model_id\` text NOT NULL,
+          \`variant\` text,
+          \`session_id\` text,
+          \`project_id\` text,
+          \`requests\` integer DEFAULT 1 NOT NULL,
+          \`cost_usd\` real,
+          \`cost_estimated\` integer DEFAULT false NOT NULL,
+          \`input_tokens\` integer DEFAULT 0 NOT NULL,
+          \`cache_read_tokens\` integer DEFAULT 0 NOT NULL,
+          \`cache_write_tokens\` integer DEFAULT 0 NOT NULL,
+          \`output_tokens\` integer DEFAULT 0 NOT NULL,
+          \`reasoning_tokens\` integer DEFAULT 0 NOT NULL,
+          \`total_tokens\` integer DEFAULT 0 NOT NULL,
+          \`time_started\` integer NOT NULL,
+          \`time_completed\` integer NOT NULL
+        );
+      `)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_value_agg_sha_idx\` ON \`event_value\` (\`aggregate_id\`,\`sha256\`);`)
@@ -701,6 +723,13 @@ export default {
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_group_idx\` ON \`session\` (\`group_id\`);`)
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
+      yield* tx.run(`CREATE INDEX \`maintenance_usage_completed_idx\` ON \`maintenance_usage\` (\`time_completed\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`maintenance_usage_project_completed_idx\` ON \`maintenance_usage\` (\`project_id\`,\`time_completed\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`maintenance_usage_agent_completed_idx\` ON \`maintenance_usage\` (\`agent\`,\`time_completed\`);`,
+      )
     })
   },
 } satisfies Omit<DatabaseMigration.Migration, "id">

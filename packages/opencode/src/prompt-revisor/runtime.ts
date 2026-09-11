@@ -5,13 +5,16 @@ import { MessageID, SessionID } from "@/session/schema"
 import { MCP } from "@/mcp"
 import { PromptRevisor } from "@opencode-ai/core/prompt-revisor"
 import { type ToolChoiceCapabilityIdentity } from "@opencode-ai/core/tool-choice-compatibility"
-import { generateAdaptive } from "@opencode-ai/core/special-agent-completion"
+import { collectUntilTerminalTool, generateAdaptive } from "@opencode-ai/core/special-agent-completion"
 import { SessionV1 } from "@opencode-ai/core/v1/session"
-import { LLMResponse, type ToolDefinition as CanonicalToolDefinition } from "@opencode-ai/llm"
+import { type ToolDefinition as CanonicalToolDefinition } from "@opencode-ai/llm"
 import { Effect } from "effect"
 import * as Stream from "effect/Stream"
 import { jsonSchema, tool, type Tool } from "ai"
 import { canonicalMessagesToModelMessages } from "@/special-agent/model-message-bridge"
+import { InstanceState } from "@/effect/instance-state"
+import type { Interface as UsageInterface } from "@/usage/usage"
+import * as MaintenanceUsage from "@/usage/maintenance"
 
 const toTools = (definitions: readonly CanonicalToolDefinition[]): Record<string, Tool> =>
   Object.fromEntries(
@@ -42,6 +45,7 @@ export const makeRuntime = (
   provider: Provider.Interface,
   llm: SessionLLM.Interface,
   mcp?: MCP.Interface,
+  usage?: UsageInterface,
 ): PromptRevisor.Runtime => ({
   resolveModel: Effect.fn("PromptRevisorRuntime.resolveModel")(function* ({ candidates }) {
     const seen = new Set<string>()
@@ -79,6 +83,7 @@ export const makeRuntime = (
     const model = request.model.value as Provider.Model
     const capability = toolChoiceIdentity(model)
     const sessionID = request.sessionID ?? SessionID.create()
+    const instance = usage ? yield* InstanceState.context : undefined
     const user: SessionV1.User = {
       id: MessageID.ascending(),
       sessionID,
@@ -103,24 +108,51 @@ export const makeRuntime = (
       temperature: request.generation.temperature,
     }
 
-    const collect = (toolChoice: SessionLLM.StreamInput["toolChoice"]) =>
-      llm.stream({
-        user,
-        sessionID,
-        model,
-        agent,
-        system: [],
-        messages: canonicalMessagesToModelMessages(request.messages),
-        tools: toTools(request.tools),
-        retries: 0,
+    const collect = (toolChoice: SessionLLM.StreamInput["toolChoice"]) => {
+      const startedAt = Date.now()
+      const messages = canonicalMessagesToModelMessages(request.messages)
+      const trackingRequest = {
+        system: request.system,
+        messages,
+        tools: request.tools,
         toolChoice,
-        maxOutputTokens: request.generation.maxTokens,
-      })
+      }
+      return collectUntilTerminalTool(
+        llm.stream({
+          user,
+          sessionID,
+          model,
+          agent,
+          system: [],
+          messages,
+          tools: toTools(request.tools),
+          retries: 0,
+          toolChoice,
+          maxOutputTokens: request.generation.maxTokens,
+        }),
+        "revised_prompt",
+      ).pipe(
+        Effect.tap((response) =>
+          response && usage
+            ? MaintenanceUsage.recordResponse({
+                usage,
+                agent: "prompt-revisor",
+                model,
+                response,
+                request: trackingRequest,
+                sessionID,
+                projectID: instance?.project.id,
+                variant: request.model.ref.variant,
+                startedAt,
+              })
+            : Effect.void,
+        ),
+      )
+    }
 
-    const events =
+    const response =
       request.toolChoice === "none"
         ? yield* collect("none").pipe(
-            Stream.runCollect,
             Effect.mapError(
               (error) =>
                 new PromptRevisor.UnavailableError({
@@ -128,21 +160,18 @@ export const makeRuntime = (
                 }),
             ),
           )
-        : (
-            yield* generateAdaptive({
-              identity: capability,
-              requested: request.toolChoice,
-              generate: (toolChoice) => collect(toolChoice).pipe(Stream.runCollect),
-            }).pipe(
-              Effect.mapError(
-                (error) =>
-                  new PromptRevisor.UnavailableError({
-                    message: `Prompt revision failed: ${error instanceof Error ? error.message : String(error)}`,
-                  }),
-              ),
-            )
-          ).response
-    const response = LLMResponse.fromEvents(events)
+        : (yield* generateAdaptive({
+            identity: capability,
+            requested: request.toolChoice,
+            generate: (toolChoice) => collect(toolChoice),
+          }).pipe(
+            Effect.mapError(
+              (error) =>
+                new PromptRevisor.UnavailableError({
+                  message: `Prompt revision failed: ${error instanceof Error ? error.message : String(error)}`,
+                }),
+            ),
+          )).response
     if (!response) {
       return yield* new PromptRevisor.UnavailableError({ message: "Prompt revision ended without a terminal response" })
     }

@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "19f816ec-1c4d-46a6-a2d6-14d1f3a7d4b3",
+  "id": "24a11ed1-11c9-4e03-b1e1-11a4b3a884f8",
   "prevIds": [
-    "a7f305fc-abad-407d-ac9b-f5c02e3ec9be"
+    "19f816ec-1c4d-46a6-a2d6-14d1f3a7d4b3"
   ],
   "ddl": [
     {
@@ -180,6 +180,10 @@
     },
     {
       "name": "session_share",
+      "entityType": "tables"
+    },
+    {
+      "name": "maintenance_usage",
       "entityType": "tables"
     },
     {
@@ -3903,6 +3907,186 @@
       "table": "session_share"
     },
     {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": true,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "agent",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provider_id",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "model_id",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "variant",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_id",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "1",
+      "generated": null,
+      "name": "requests",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "real",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "cost_usd",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "cost_estimated",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "input_tokens",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "cache_read_tokens",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "cache_write_tokens",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "output_tokens",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "reasoning_tokens",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "total_tokens",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_started",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_completed",
+      "entityType": "columns",
+      "table": "maintenance_usage"
+    },
+    {
       "columns": [
         "project_id"
       ],
@@ -4797,6 +4981,15 @@
       "nameExplicit": false,
       "name": "session_share_pk",
       "table": "session_share",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "maintenance_usage_pk",
+      "table": "maintenance_usage",
       "entityType": "pks"
     },
     {
@@ -5858,6 +6051,56 @@
       "name": "todo_session_idx",
       "entityType": "indexes",
       "table": "todo"
+    },
+    {
+      "columns": [
+        {
+          "value": "time_completed",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "maintenance_usage_completed_idx",
+      "entityType": "indexes",
+      "table": "maintenance_usage"
+    },
+    {
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_completed",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "maintenance_usage_project_completed_idx",
+      "entityType": "indexes",
+      "table": "maintenance_usage"
+    },
+    {
+      "columns": [
+        {
+          "value": "agent",
+          "isExpression": false
+        },
+        {
+          "value": "time_completed",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "maintenance_usage_agent_completed_idx",
+      "entityType": "indexes",
+      "table": "maintenance_usage"
     },
     {
       "columns": [

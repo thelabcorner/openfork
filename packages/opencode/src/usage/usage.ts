@@ -27,6 +27,65 @@ const TokenTotals = Schema.Struct({
 export type TokenTotals = Schema.Schema.Type<typeof TokenTotals>
 type MutableTokens = Mutable<TokenTotals>
 
+export const MaintenanceTotals = Schema.Struct({
+  requests: Schema.Finite,
+  sessions: Schema.Finite,
+  cost: Schema.Finite,
+  estimatedCost: Schema.Finite,
+  pricedRecords: Schema.Finite,
+  estimatedRecords: Schema.Finite,
+  unpricedRecords: Schema.Finite,
+  /** Detailed token classes when the provider supplied them. */
+  tokens: TokenTotals,
+  /** Authoritative all-token count; may exceed the detailed sum when a
+   * terminally-cancelled provider omitted its final usage breakdown. */
+  totalTokens: Schema.Finite,
+  durationMs: Schema.Finite,
+  durationRecords: Schema.Finite,
+})
+export type MaintenanceTotals = Schema.Schema.Type<typeof MaintenanceTotals>
+
+export const MaintenanceAgentBucket = Schema.Struct({
+  agent: Schema.String,
+  requests: Schema.Finite,
+  sessions: Schema.Finite,
+  models: Schema.Finite,
+  cost: Schema.Finite,
+  estimatedCost: Schema.Finite,
+  totalTokens: Schema.Finite,
+  tokenShare: Schema.Finite,
+  costShare: Schema.Finite,
+})
+export type MaintenanceAgentBucket = Schema.Schema.Type<typeof MaintenanceAgentBucket>
+
+export const MaintenanceModelBucket = Schema.Struct({
+  agent: Schema.String,
+  providerID: Schema.String,
+  modelID: Schema.String,
+  variant: Schema.NullOr(Schema.String),
+  requests: Schema.Finite,
+  cost: Schema.Finite,
+  estimatedCost: Schema.Finite,
+  totalTokens: Schema.Finite,
+})
+export type MaintenanceModelBucket = Schema.Schema.Type<typeof MaintenanceModelBucket>
+
+export const MaintenancePeriodBucket = Schema.Struct({
+  start: Schema.Finite,
+  requests: Schema.Finite,
+  cost: Schema.Finite,
+  tokens: Schema.Finite,
+})
+export type MaintenancePeriodBucket = Schema.Schema.Type<typeof MaintenancePeriodBucket>
+
+export const MaintenanceSummary = Schema.Struct({
+  totals: MaintenanceTotals,
+  agents: Schema.Array(MaintenanceAgentBucket),
+  models: Schema.Array(MaintenanceModelBucket),
+  periods: Schema.Array(MaintenancePeriodBucket),
+})
+export type MaintenanceSummary = Schema.Schema.Type<typeof MaintenanceSummary>
+
 const zeroTokens = (): MutableTokens => ({
   input: 0,
   cacheRead: 0,
@@ -280,6 +339,10 @@ export const UsageSummary = Schema.Struct({
     CountBucket,
   ]),
   pricing: Pricing,
+  /** Host-owned support-agent usage. Deliberately excluded from all ordinary
+   * work totals/series above so maintenance overhead cannot distort activity,
+   * model portfolio, or per-turn economics. */
+  maintenance: MaintenanceSummary,
 })
 export type UsageSummary = Schema.Schema.Type<typeof UsageSummary>
 
@@ -293,6 +356,7 @@ export type UsageSummaryRequest = Schema.Schema.Type<typeof UsageSummaryRequest>
 
 export interface Interface {
   readonly summary: (request: UsageSummaryRequest) => Effect.Effect<UsageSummary>
+  readonly recordMaintenance: (input: MaintenanceRecordInput) => Effect.Effect<void>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Usage") {}
@@ -317,6 +381,45 @@ type UsageRow = {
   directory: string
   project_name: string | null
   session_title: string | null
+  agent: string | null
+  mode: string | null
+}
+
+type MaintenanceUsageRow = {
+  agent: string
+  provider_id: string
+  model_id: string
+  variant: string | null
+  session_id: string | null
+  project_id: string | null
+  requests: number
+  cost_usd: number | null
+  cost_estimated: number
+  input_tokens: number
+  cache_read_tokens: number
+  cache_write_tokens: number
+  output_tokens: number
+  reasoning_tokens: number
+  total_tokens: number
+  started_ms: number
+  completed_ms: number
+}
+
+export type MaintenanceRecordInput = {
+  agent: string
+  providerID: string
+  modelID: string
+  variant?: string | null
+  sessionID?: string | null
+  projectID?: string | null
+  requests?: number
+  cost?: number | null
+  /** True when provider usage was unavailable and the caller priced a local token estimate. */
+  costEstimated?: boolean
+  tokens: TokenTotals
+  totalTokens?: number
+  startedAt?: number
+  completedAt?: number
 }
 
 type ModelRates = { input: number; output: number; cacheRead: number; cacheWrite: number }
@@ -426,7 +529,9 @@ const layer = Layer.effect(
                   s.project_id,
                   s.directory,
                   s.title AS session_title,
-                  p.name AS project_name
+                  p.name AS project_name,
+                  json_extract(m.data, '$.agent') AS agent,
+                  json_extract(m.data, '$.mode') AS mode
                 FROM message m
                 JOIN session s ON s.id = m.session_id
                 LEFT JOIN project p ON p.id = s.project_id
@@ -438,7 +543,36 @@ const layer = Layer.effect(
               `,
               )
               .pipe(Effect.orDie)
-            return aggregate(rows, rates, request)
+            const maintenanceRows = yield* conn
+              .all<MaintenanceUsageRow>(
+                sql`
+                  SELECT
+                    agent,
+                    provider_id,
+                    model_id,
+                    variant,
+                    session_id,
+                    project_id,
+                    requests,
+                    cost_usd,
+                    cost_estimated,
+                    input_tokens,
+                    cache_read_tokens,
+                    cache_write_tokens,
+                    output_tokens,
+                    reasoning_tokens,
+                    total_tokens,
+                    time_started AS started_ms,
+                    time_completed AS completed_ms
+                  FROM maintenance_usage
+                  WHERE time_completed >= ${request.since}
+                    AND time_completed < ${request.until}
+                    AND (${projectID} IS NULL OR project_id = ${projectID})
+                  ORDER BY time_completed ASC
+                `,
+              )
+              .pipe(Effect.orDie)
+            return aggregate(rows, maintenanceRows, rates, request)
           }),
         ).pipe(Effect.orDie),
       )
@@ -448,7 +582,43 @@ const layer = Layer.effect(
       return result
     })
 
-    return Service.of({ summary })
+    /**
+     * Persist one completed support-agent generation (or an already-aggregated
+     * operation with requests > 1). Usage accounting must never become a new
+     * failure mode for the feature being measured, so storage failures are
+     * intentionally best-effort and leave the caller unaffected.
+     */
+    const recordMaintenance: Interface["recordMaintenance"] = (input) =>
+      Effect.gen(function* () {
+        const completedAt = input.completedAt ?? Date.now()
+        const startedAt = Math.min(input.startedAt ?? completedAt, completedAt)
+        const requests = Math.max(1, Math.floor(input.requests ?? 1))
+        const detailTotal = totalTokens(input.tokens)
+        const allTokens = Math.max(detailTotal, Math.floor(input.totalTokens ?? detailTotal))
+        const sessionID = input.sessionID ?? null
+        const projectID = input.projectID ?? null
+        const variant = input.variant ?? null
+        const cost = input.cost !== undefined && input.cost !== null && Number.isFinite(input.cost) ? input.cost : null
+        yield* db.run(sql`
+          INSERT INTO maintenance_usage (
+            agent, provider_id, model_id, variant, session_id, project_id,
+            requests, cost_usd, cost_estimated, input_tokens, cache_read_tokens,
+            cache_write_tokens, output_tokens, reasoning_tokens, total_tokens,
+            time_started, time_completed
+          ) VALUES (
+            ${input.agent}, ${input.providerID}, ${input.modelID}, ${variant}, ${sessionID},
+            COALESCE(${projectID}, (SELECT project_id FROM session WHERE id = ${sessionID} LIMIT 1)),
+            ${requests}, ${cost}, ${input.costEstimated === true ? 1 : 0}, ${input.tokens.input}, ${input.tokens.cacheRead},
+            ${input.tokens.cacheWrite}, ${input.tokens.output}, ${input.tokens.reasoning}, ${allTokens},
+            ${startedAt}, ${completedAt}
+          )
+        `)
+        // Maintenance calls are infrequent; clearing is cheaper and safer than
+        // trying to mutate every cached range that may contain this timestamp.
+        summaryCache.clear()
+      }).pipe(Effect.catch(() => Effect.void))
+
+    return Service.of({ summary, recordMaintenance })
   }),
 )
 
@@ -471,7 +641,12 @@ function buildRates(catalog: Record<string, ModelsDev.Provider>) {
   return rates
 }
 
-function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: UsageSummaryRequest): UsageSummary {
+function aggregate(
+  rows: UsageRow[],
+  maintenanceRows: MaintenanceUsageRow[],
+  rates: Map<string, ModelRates>,
+  request: UsageSummaryRequest,
+): UsageSummary {
   const totals: Mutable<UsageTotals> = {
     sessions: 0,
     messages: 0,
@@ -506,6 +681,127 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
   let cacheSavingsRecords = 0
   let estimatedRecords = 0
 
+  const maintenanceTotals: Mutable<MaintenanceTotals> = {
+    requests: 0,
+    sessions: 0,
+    cost: 0,
+    estimatedCost: 0,
+    pricedRecords: 0,
+    estimatedRecords: 0,
+    unpricedRecords: 0,
+    tokens: zeroTokens(),
+    totalTokens: 0,
+    durationMs: 0,
+    durationRecords: 0,
+  }
+  const maintenanceAgents = new Map<string, Mutable<MaintenanceAgentBucket>>()
+  const maintenanceModels = new Map<string, Mutable<MaintenanceModelBucket>>()
+  const maintenancePeriods = new Map<number, Mutable<MaintenancePeriodBucket>>()
+  const maintenanceSessions = new Set<string>()
+  const maintenanceAgentSessions = new Map<string, Set<string>>()
+  const maintenanceAgentModels = new Map<string, Set<string>>()
+
+  const addMaintenance = (record: {
+    agent: string
+    providerID: string
+    modelID: string
+    variant: string | null
+    sessionID: string | null
+    requests: number
+    cost: number | null
+    costEstimated?: boolean
+    tokens: TokenTotals
+    allTokens: number
+    started: number | null
+    completed: number
+  }) => {
+    const requests = Math.max(1, record.requests)
+    const rate = rates.get(`${record.providerID}/${record.modelID}`)
+    const detailed = totalTokens(record.tokens)
+    const allTokens = Math.max(detailed, record.allTokens)
+    let effectiveCost = 0
+    let recordedCost = 0
+    let estimatedCost = 0
+    if (record.cost !== null && Number.isFinite(record.cost)) {
+      effectiveCost = record.cost
+      if (record.costEstimated) {
+        estimatedCost = record.cost
+        maintenanceTotals.estimatedCost += record.cost
+        maintenanceTotals.estimatedRecords += requests
+      } else {
+        recordedCost = record.cost
+        maintenanceTotals.cost += record.cost
+      }
+      maintenanceTotals.pricedRecords += requests
+    } else if (rate && detailed > 0) {
+      estimatedCost = estimateCost(record.tokens, rate)
+      effectiveCost = estimatedCost
+      maintenanceTotals.estimatedCost += estimatedCost
+      maintenanceTotals.pricedRecords += requests
+    } else {
+      maintenanceTotals.unpricedRecords += requests
+    }
+    maintenanceTotals.requests += requests
+    addTokens(maintenanceTotals.tokens, record.tokens)
+    maintenanceTotals.totalTokens += allTokens
+    if (record.sessionID) maintenanceSessions.add(record.sessionID)
+    if (record.started !== null && record.completed >= record.started) {
+      maintenanceTotals.durationMs += record.completed - record.started
+      maintenanceTotals.durationRecords += 1
+    }
+
+    const agent = maintenanceAgents.get(record.agent) ?? {
+      agent: record.agent,
+      requests: 0,
+      sessions: 0,
+      models: 0,
+      cost: 0,
+      estimatedCost: 0,
+      totalTokens: 0,
+      tokenShare: 0,
+      costShare: 0,
+    }
+    agent.requests += requests
+    agent.cost += recordedCost
+    agent.estimatedCost += estimatedCost
+    agent.totalTokens += allTokens
+    maintenanceAgents.set(record.agent, agent)
+
+    if (record.sessionID) {
+      const set = maintenanceAgentSessions.get(record.agent) ?? new Set<string>()
+      set.add(record.sessionID)
+      maintenanceAgentSessions.set(record.agent, set)
+    }
+    const modelIdentity = `${record.providerID}/${record.modelID}`
+    const agentModelSet = maintenanceAgentModels.get(record.agent) ?? new Set<string>()
+    agentModelSet.add(modelIdentity)
+    maintenanceAgentModels.set(record.agent, agentModelSet)
+
+    const modelKey = `${record.agent}\u0000${record.providerID}/${record.modelID}\u0000${record.variant ?? ""}`
+    const model = maintenanceModels.get(modelKey) ?? {
+      agent: record.agent,
+      providerID: record.providerID,
+      modelID: record.modelID,
+      variant: record.variant,
+      requests: 0,
+      cost: 0,
+      estimatedCost: 0,
+      totalTokens: 0,
+    }
+    model.requests += requests
+    model.cost += recordedCost
+    model.estimatedCost += estimatedCost
+    model.totalTokens += allTokens
+    maintenanceModels.set(modelKey, model)
+
+    const periodStart = bucketPeriod(record.completed)
+    const period = maintenancePeriods.get(periodStart) ?? { start: periodStart, requests: 0, cost: 0, tokens: 0 }
+    period.requests += requests
+    period.cost += effectiveCost
+    period.tokens += allTokens
+    maintenancePeriods.set(periodStart, period)
+  }
+
   const bucketPeriod = (ms: number) => (request.resolution === "hour" ? utcHourStart(ms) : utcDayStart(ms))
 
   for (const row of rows) {
@@ -518,6 +814,29 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
     }
     const completed = row.completed_ms
     if (completed === null) continue
+
+    // Compaction/summary generations are durable assistant rows for replay, but
+    // they are host maintenance rather than user-facing turns. Keep them out of
+    // every ordinary usage bucket while still accounting for their real model
+    // work alongside non-persisted special agents.
+    const maintenanceAgent = row.mode === "compaction" || row.agent === "compaction" ? "compaction" : row.agent === "summary" ? "summary" : undefined
+    if (maintenanceAgent) {
+      addMaintenance({
+        agent: maintenanceAgent,
+        providerID: row.provider_id ?? "unknown",
+        modelID: row.model_id ?? "unknown",
+        variant: row.variant ?? null,
+        sessionID: row.session_id,
+        requests: 1,
+        cost: row.cost_usd,
+        costEstimated: false,
+        tokens,
+        allTokens: totalTokens(tokens),
+        started: row.created_ms,
+        completed,
+      })
+      continue
+    }
 
     totals.messages += 1
 
@@ -726,7 +1045,32 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
     sessionModelSet.add(`${providerID}/${modelID}`)
   }
 
+  for (const row of maintenanceRows) {
+    const tokens: TokenTotals = {
+      input: row.input_tokens,
+      cacheRead: row.cache_read_tokens,
+      cacheWrite: row.cache_write_tokens,
+      output: row.output_tokens,
+      reasoning: row.reasoning_tokens,
+    }
+    addMaintenance({
+      agent: row.agent,
+      providerID: row.provider_id,
+      modelID: row.model_id,
+      variant: row.variant,
+      sessionID: row.session_id,
+      requests: row.requests,
+      cost: row.cost_usd,
+      costEstimated: row.cost_estimated === 1,
+      tokens,
+      allTokens: row.total_tokens,
+      started: row.started_ms,
+      completed: row.completed_ms,
+    })
+  }
+
   totals.sessions = sessions.size
+  maintenanceTotals.sessions = maintenanceSessions.size
 
   for (const provider of providers.values()) {
     provider.sessions = providerSessions.get(provider.providerID)?.size ?? 0
@@ -746,6 +1090,13 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
   }
   for (const session of sessionBuckets.values()) {
     session.models = sessionModels.get(session.sessionID)?.size ?? 0
+  }
+  const maintenanceSpend = maintenanceTotals.cost + maintenanceTotals.estimatedCost
+  for (const agent of maintenanceAgents.values()) {
+    agent.sessions = maintenanceAgentSessions.get(agent.agent)?.size ?? 0
+    agent.models = maintenanceAgentModels.get(agent.agent)?.size ?? 0
+    agent.tokenShare = safeDiv(agent.totalTokens, maintenanceTotals.totalTokens)
+    agent.costShare = safeDiv(agent.cost + agent.estimatedCost, maintenanceSpend)
   }
 
   const processedTokens = totals.tokens.output + totals.tokens.reasoning
@@ -830,6 +1181,14 @@ function aggregate(rows: UsageRow[], rates: Map<string, ModelRates>, request: Us
     pricing: {
       coverage: safeDiv(totals.pricedRecords, totals.messages),
       mode,
+    },
+    maintenance: {
+      totals: maintenanceTotals,
+      agents: [...maintenanceAgents.values()].sort((a, b) => b.totalTokens - a.totalTokens),
+      models: [...maintenanceModels.values()].sort(
+        (a, b) => b.cost + b.estimatedCost - (a.cost + a.estimatedCost) || b.totalTokens - a.totalTokens,
+      ),
+      periods: downsample([...maintenancePeriods.values()].sort((a, b) => a.start - b.start), MAX_PERIODS),
     },
   }
 }
