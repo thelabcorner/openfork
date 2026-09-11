@@ -13,10 +13,11 @@ import { UsageOverviewCache, UsageOverviewStats } from "@/pages/usage/usage-page
 import { UsageSubsidyPanel } from "@/pages/usage/usage-page-subsidy"
 import { UsagePageModels } from "@/pages/usage/usage-page-models"
 import { UsagePageActivity } from "@/pages/usage/usage-page-activity"
+import { UsagePageMaintenance } from "@/pages/usage/usage-page-maintenance"
 import { createUsageValuation } from "@/pages/usage/use-usage-valuation"
 
 type Metric = "cost" | "tokens"
-type Section = "overview" | "models" | "activity"
+type Section = "overview" | "models" | "activity" | "maintenance"
 
 export function UsagePage() {
   const language = useLanguage()
@@ -175,6 +176,10 @@ export function UsagePage() {
                     <Icon name="usage" />
                     {language.t("usage.nav.activity")}
                   </TabsV2.Trigger>
+                  <TabsV2.Trigger value="maintenance">
+                    <Icon name="settings-gear" />
+                    {language.t("usage.nav.maintenance")}
+                  </TabsV2.Trigger>
                 </TabsV2.List>
 
                 <TabsV2.Content value="overview">
@@ -210,6 +215,12 @@ export function UsagePage() {
                 <TabsV2.Content value="activity">
                   <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">
                     <UsagePageActivity data={data()!} metric={metric()} projectID={projectID()} />
+                  </div>
+                </TabsV2.Content>
+
+                <TabsV2.Content value="maintenance">
+                  <div class="mx-auto flex w-full max-w-[1400px] flex-col gap-3 p-4">
+                    <UsagePageMaintenance data={data()!} metric={metric()} />
                   </div>
                 </TabsV2.Content>
               </TabsV2>

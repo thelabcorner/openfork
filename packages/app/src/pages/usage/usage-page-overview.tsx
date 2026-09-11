@@ -36,6 +36,9 @@ export function UsageOverviewStats(props: { data: UsageSummaryResponse; valuatio
     return tokens.input + tokens.cacheRead + tokens.cacheWrite + tokens.output + tokens.reasoning
   }
   const spend = () => totals().cost + totals().estimatedCost
+  const maintenanceSpend = () => props.data.maintenance.totals.cost + props.data.maintenance.totals.estimatedCost
+  const allInSpend = () => spend() + maintenanceSpend()
+  const maintenanceShare = () => (allInSpend() > 0 ? maintenanceSpend() / allInSpend() : 0)
   const ttftAvg = () => (totals().ttftRecords > 0 ? totals().ttftMs / totals().ttftRecords : 0)
   // Per-session averages come off the same session count the hero reports, so
   // a session that spans the window boundary is counted once here and there.
@@ -46,8 +49,13 @@ export function UsageOverviewStats(props: { data: UsageSummaryResponse; valuatio
   return (
     <div class="flex flex-col gap-3">
       <Panel title={language.t("usage.section.economics")} flush>
-        <RuleGrid class="grid-cols-2 sm:grid-cols-3 xl:grid-cols-6">
+        <RuleGrid class="grid-cols-2 sm:grid-cols-4 xl:grid-cols-7">
           <Stat label={language.t("usage.metric.spend")} value={formatUSD(spend(), language.intl())} size="lg" />
+          <Stat
+            label={language.t("usage.metric.maintenanceSpend")}
+            value={formatUSD(maintenanceSpend(), language.intl())}
+            sub={language.t("usage.maintenance.shareSub", { value: formatPercent(maintenanceShare(), language.intl()) })}
+          />
           <Stat
             label={language.t("usage.metric.freeValue")}
             value={formatUSD(subsidy().total, language.intl())}
