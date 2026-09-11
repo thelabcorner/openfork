@@ -14,9 +14,18 @@ import { Integration } from "../integration"
 import { ModelV2 } from "../model"
 import { ProviderV2 } from "../provider"
 import { type ToolChoiceCapabilityIdentity } from "../tool-choice-compatibility"
-import { generateAdaptive, runTerminalCompletion } from "../special-agent-completion"
+import {
+  collectUntilTerminalTool,
+  generateAdaptive,
+  boundedMaxTokens,
+  retryMaxTokens,
+  runTerminalCompletion,
+  terminalCompletionAccepted,
+  withSpecialAgentTimeout,
+} from "../special-agent-completion"
 import { SessionEvent } from "./event"
 import { SessionMessage } from "./message"
+import { SpecialAgentSessionContext } from "../special-agent-session-context"
 import { SessionRunnerModel } from "./runner/model"
 import { SessionSchema } from "./schema"
 import { SessionTable } from "./sql"
@@ -32,6 +41,13 @@ export type GeneratedTitleToolInput = typeof GeneratedTitleToolInput.Type
 export const MAX_TITLE_LENGTH = 60
 export const MAX_TITLE_CONTEXT_CHARS = 8_000
 
+/**
+ * A committed title is a few dozen tokens, but the same budget also has to cover
+ * whatever reasoning the model emits before the tool call. Too small a budget
+ * truncates the turn and looks like the model refusing the protocol.
+ */
+const TITLE_MAX_TOKENS = 1_024
+const TITLE_MAX_TOKENS_CEILING = 8_192
 const parentTitlePrefix = "New session - "
 const childTitlePrefix = "Child session - "
 const defaultTitlePattern = new RegExp(
@@ -74,24 +90,6 @@ export function renderLegacyPolicy(
   return policy.replaceAll("{previousTitle}", input.previousTitle).replaceAll("{conversation}", input.conversation)
 }
 
-const renderBlock = (message: SessionMessage.Message): string | undefined => {
-  switch (message.type) {
-    case "user":
-      return `<user>\n${message.text}\n</user>`
-    case "assistant": {
-      const text = message.content
-        .filter((content): content is SessionMessage.AssistantText => content.type === "text")
-        .map((content) => content.text)
-        .join("\n")
-      return text.length > 0 ? `<assistant>\n${text}\n</assistant>` : undefined
-    }
-    case "shell":
-      return message.output.length > 0 ? `<shell>\n${message.output}\n</shell>` : undefined
-    default:
-      return undefined
-  }
-}
-
 /**
  * Builds the title-generation conversation block. Walks messages newest-first
  * and stops near {@link MAX_TITLE_CONTEXT_CHARS}; if that truncation dropped
@@ -99,27 +97,13 @@ const renderBlock = (message: SessionMessage.Message): string | undefined => {
  * sees the opening intent.
  */
 export function assembleContext(messages: readonly SessionMessage.Message[]): string {
-  let oldestUser = -1
-  for (let i = messages.length - 1; i >= 0; i--) {
-    if (messages[i].type === "user") oldestUser = i
-  }
-  const blocks: string[] = []
-  let chars = 0
-  let pinned = oldestUser >= 0
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const block = renderBlock(messages[i])
-    if (block === undefined) continue
-    if (chars + block.length > MAX_TITLE_CONTEXT_CHARS) break
-    blocks.push(block)
-    chars += block.length
-    if (i === oldestUser) pinned = false
-  }
-  blocks.reverse()
-  if (pinned && oldestUser >= 0) {
-    const firstUser = messages[oldestUser]
-    if (firstUser.type === "user") blocks.unshift(`<user>\n${firstUser.text}\n</user>`)
-  }
-  return blocks.join("\n\n")
+  return SpecialAgentSessionContext.assemble(messages, {
+    maxChars: MAX_TITLE_CONTEXT_CHARS,
+    maxBlockChars: MAX_TITLE_CONTEXT_CHARS,
+    includeShell: true,
+    pinOpeningUser: true,
+    pinLatestCompaction: true,
+  })
 }
 
 export class UnavailableError extends Schema.TaggedErrorClass<UnavailableError>()("SessionTitle.UnavailableError", {
@@ -174,9 +158,10 @@ const layer = Layer.effect(
     const pending = yield* Ref.make(new Map<SessionSchema.ID, PendingEntry>())
     const generatedTitleTool = Tool.make({
       description:
-        "Commit the final session title. This is the only valid successful completion for title generation. Supply only the title artifact; do not put explanations or reasoning in the title field.",
+        "Commit the final session title. This is the only valid successful completion for title generation. Supply only the title artifact; do not put explanations or reasoning in the title field. IMMEDIATELY END GENERATION after this tool call; do not reason, emit prose, or call another tool afterward.",
       parameters: GeneratedTitleToolInput,
       success: Schema.String,
+      execute: () => Effect.succeed(terminalCompletionAccepted(GENERATED_TITLE_TOOL)),
     })
 
     const clearPending = (sessionID: SessionSchema.ID, requestID: string) =>
@@ -343,13 +328,20 @@ const layer = Layer.effect(
         // same as a named forced choice here, but is supported by more provider
         // adapters (and mirrors Prompt Revisor's terminal-tool contract).
         toolChoice: "required",
-        generation: { maxTokens: 256, temperature: 0.2 },
+        generation: { maxTokens: boundedMaxTokens(model, TITLE_MAX_TOKENS), temperature: 0.2 },
       })
       const generate = (current: typeof request, preferred: "required" | "auto") =>
         generateAdaptive({
           identity: capability,
           requested: preferred,
-          generate: (toolChoice) => llm.generate(LLM.updateRequest(current, { toolChoice })),
+          generate: (toolChoice) =>
+            collectUntilTerminalTool(llm.stream(LLM.updateRequest(current, { toolChoice })), GENERATED_TITLE_TOOL).pipe(
+              Effect.flatMap((response) =>
+                response
+                  ? Effect.succeed(response)
+                  : Effect.fail(new Error("Title generation ended without a terminal response")),
+              ),
+            ),
         }).pipe(
           Effect.mapError(
             (error) =>
@@ -365,8 +357,20 @@ const layer = Layer.effect(
         messages: request.messages,
         toolName: GENERATED_TITLE_TOOL,
         agentLabel: "session title generator",
-        generate: (messages) =>
-          generate(LLM.updateRequest(request, { messages }), preferred).pipe(
+        generate: (messages, attempt) =>
+          generate(
+            LLM.updateRequest(request, {
+              messages,
+              // A title is tiny, but a reasoning model spends the same budget
+              // before it emits any tool call. Retry a truncated attempt with
+              // more room instead of repeating an impossible request.
+              generation: {
+                maxTokens: boundedMaxTokens(model, retryMaxTokens(TITLE_MAX_TOKENS, attempt, TITLE_MAX_TOKENS_CEILING)),
+                temperature: 0.2,
+              },
+            }),
+            preferred,
+          ).pipe(
             Effect.tap((attempt) => Effect.sync(() => (preferred = attempt.toolChoice))),
             Effect.map((attempt) => attempt.response),
           ),
@@ -384,8 +388,10 @@ const layer = Layer.effect(
           new UnavailableError({
             sessionID: session.id,
             message:
-              failure.reason === "missing"
-                ? `Title generation did not call ${GENERATED_TITLE_TOOL} after its repair retry`
+              failure.reason === "truncated"
+                ? `Title generation hit the model output limit before it could call ${GENERATED_TITLE_TOOL}`
+                : failure.reason === "missing"
+                  ? `Title generation did not call ${GENERATED_TITLE_TOOL} after its repair retry`
                 : failure.reason === "multiple"
                   ? `Title generation emitted multiple ${GENERATED_TITLE_TOOL} calls`
                   : failure.reason === "invalid-payload"
@@ -414,14 +420,23 @@ const layer = Layer.effect(
           map.set(input.session.id, { requestID, baselineTitle: input.session.title })
           return map
         })
-        yield* runGeneration({
-          session: input.session,
-          requestID,
-          baselineTitle: input.session.title,
-          prompt: input.prompt,
-          model: input.model,
-          defaultOnly: false,
-        }).pipe(Effect.asVoid, Effect.ensuring(clearPending(input.session.id, requestID)))
+        yield* withSpecialAgentTimeout(
+          runGeneration({
+            session: input.session,
+            requestID,
+            baselineTitle: input.session.title,
+            prompt: input.prompt,
+            model: input.model,
+            defaultOnly: false,
+          }),
+          () =>
+            Effect.fail(
+              new UnavailableError({
+                sessionID: input.session.id,
+                message: "Title generation timed out after 5 minutes",
+              }),
+            ),
+        ).pipe(Effect.asVoid, Effect.ensuring(clearPending(input.session.id, requestID)))
       }),
       autoTitle: Effect.fn("SessionTitle.autoTitle")(function* (input) {
         const session = input.session
@@ -433,13 +448,19 @@ const layer = Layer.effect(
           map.set(session.id, { requestID, baselineTitle: session.title })
           return map
         })
-        yield* runGeneration({
-          session,
-          requestID,
-          baselineTitle: session.title,
-          defaultOnly: true,
-          messages: input.messages,
-        }).pipe(
+        yield* withSpecialAgentTimeout(
+          runGeneration({
+            session,
+            requestID,
+            baselineTitle: session.title,
+            defaultOnly: true,
+            messages: input.messages,
+          }),
+          () =>
+            Effect.fail(
+              new UnavailableError({ sessionID: session.id, message: "Title generation timed out after 5 minutes" }),
+            ),
+        ).pipe(
           Effect.catch((error) => Effect.logError("Failed to auto-title session", { sessionID: session.id, error })),
           Effect.ensuring(clearPending(session.id, requestID)),
           Effect.forkIn(scope, { startImmediately: true }),

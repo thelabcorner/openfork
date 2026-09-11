@@ -3,7 +3,13 @@ import { Effect } from "effect"
 import { LLMEvent } from "@opencode-ai/llm"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionTitle } from "@opencode-ai/core/session/title"
-import { generatedTitleCompletion, insertSession, insertUserMessage, makeHarness, textCompletion } from "./lib/session-harness"
+import {
+  generatedTitleCompletion,
+  insertSession,
+  insertUserMessage,
+  makeHarness,
+  textCompletion,
+} from "./lib/session-harness"
 
 const h = makeHarness()
 const it = h.it
@@ -38,6 +44,7 @@ describe("SessionTitle structured protocol", () => {
       const messages = JSON.stringify(request?.messages)
       expect(system).toContain(`Previous: ${baseline.title}`)
       expect(system).toContain("title-generation-protocol")
+      expect(system).toContain("IMMEDIATELY END GENERATION")
       expect(messages).toContain("title-generation-context")
       expect(messages).toContain("debug 500 errors in production")
       expect(messages).not.toContain("Prefer direct, technical titles")

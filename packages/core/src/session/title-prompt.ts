@@ -52,5 +52,5 @@ ${GENERATED_TITLE_TOOL} contract:
 - the host validates and normalizes the committed title and enforces its storage-length limit.
 - when generation-purpose is "regenerate", use the current title only as context and prefer a genuinely useful fresh title rather than mechanically echoing it.
 
-When the title is ready, call ${GENERATED_TITLE_TOOL} exactly once and make it the only tool call in that response. Do not provide the final title only as prose and do not explain hidden reasoning in the tool payload.
+When the title is ready, call ${GENERATED_TITLE_TOOL} exactly once and make it the only tool call in that response. Do not provide the final title only as prose and do not explain hidden reasoning in the tool payload. IMMEDIATELY END GENERATION after the ${GENERATED_TITLE_TOOL} call. Do not continue reasoning, emit prose/Markdown, or call any other tool after it.
 </title-generation-protocol>`

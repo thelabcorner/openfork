@@ -20,6 +20,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { Config } from "@opencode-ai/core/config"
 import { Effect, Layer } from "effect"
+import * as Stream from "effect/Stream"
 import { testEffect } from "../lib/effect"
 
 const projectID = ProjectV2.ID.make("goal-auditor-project")
@@ -48,7 +49,11 @@ const llmClient = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
     prepare: () => Effect.die("unused"),
-    stream: (() => Effect.die("unused")) as unknown as LLMClientShape["stream"],
+    stream: ((request: LLMRequest) => {
+      generateRequests.push(request)
+      const next = generateResponses.shift()
+      return next ? Stream.fromIterable(next.events) : Stream.die("auditor test exhausted generated responses")
+    }) as LLMClientShape["stream"],
     generate: (request) => {
       generateRequests.push(request)
       const next = generateResponses.shift()
@@ -231,6 +236,7 @@ describe("GoalAuditor", () => {
 
       expect(result).toMatchObject({ ok: true, model: auditorRef, rounds: 2 })
       if (!result.ok) return
+      expect(result.tokens).toBeGreaterThan(0)
       expect(result.tools).toEqual(["read", "grep", "glob", "audit_verdict"])
       expect(readCalls).toEqual(["src/feature.ts"])
       expect(grepCalls).toEqual(["shipped"])
@@ -242,6 +248,7 @@ describe("GoalAuditor", () => {
       }
       expect(JSON.stringify(generateRequests[0]!.system)).toContain("CUSTOM AUDITOR PROMPT")
       expect(JSON.stringify(generateRequests[0]!.system)).toContain("<goal-auditor-protocol>")
+      expect(JSON.stringify(generateRequests[0]!.system)).toContain("IMMEDIATELY END GENERATION")
       expect(JSON.stringify(generateRequests[0]!.system)).toContain("continuationPrompt")
       expect(JSON.stringify(generateRequests[1]!.messages)).toContain("export const shipped = true")
       expect(JSON.stringify(generateRequests[1]!.messages)).toContain("src/feature.ts:1")
@@ -328,6 +335,58 @@ describe("GoalAuditor", () => {
       expect(transcript).toContain("Protocol correction")
       expect(transcript).toContain("host rejected the previous completion")
       expect(transcript).toContain("audit_verdict")
+    }),
+  )
+
+  it.effect("keeps a verdict whose only defect is an out-of-range confidence once repairs are exhausted", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      const noisy = () =>
+        response({
+          id: "noisy-confidence",
+          name: "audit_verdict",
+          input: {
+            decision: "continue",
+            rationale: "Verified work remains actionable.",
+            progressMade: true,
+            continuationPrompt: "Finish the remaining implementation and verify the exact acceptance criterion.",
+            confidence: 4.2,
+          },
+        })
+      generateResponses = [noisy(), noisy(), noisy()]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      // The unusable number is dropped rather than reported or clamped.
+      expect(result.verdict).toMatchObject({ decision: "continue" })
+      expect("confidence" in result.verdict).toBe(false)
+      // A correction was still requested before the host healed the payload.
+      expect(generateRequests.length).toBeGreaterThan(1)
+      expect(JSON.stringify(generateRequests[1]!.messages)).toContain("confidence must be between 0 and 1")
+    }),
+  )
+
+  it.effect("never invents the auditor's judgment when a required field is missing", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      const missing = () =>
+        response({
+          id: "missing-blocker",
+          name: "audit_verdict",
+          input: {
+            decision: "blocked",
+            rationale: "Something is in the way.",
+            progressMade: false,
+            continuationPrompt: "Probe the boundary and report what is required.",
+          },
+        })
+      generateResponses = [missing(), missing(), missing()]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(false)
     }),
   )
 

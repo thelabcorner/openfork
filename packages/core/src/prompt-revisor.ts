@@ -26,11 +26,24 @@ import { SessionRunnerModel } from "./session/runner/model"
 import { SessionSchema } from "./session/schema"
 import { SessionStore } from "./session/store"
 import { SessionMessage } from "./session/message"
+import { SpecialAgentSessionContext } from "./special-agent-session-context"
 import { QuestionV2 } from "./question"
 import { QuestionTool } from "./tool/question"
 import { Reference } from "./reference"
 import { SkillV2 } from "./skill"
-import { generateAdaptive, repairMissingCompletion, runTerminalCompletion } from "./special-agent-completion"
+import {
+  boundedMaxTokens,
+  collectUntilTerminalTool,
+  generateAdaptive,
+  repairMissingCompletion,
+  retryMaxTokens,
+  runTerminalCompletion,
+  TRUNCATION_DETAIL,
+  terminalCompletionAccepted,
+  withSpecialAgentTimeout,
+  type TerminalAttempt,
+  type TerminalFailure,
+} from "./special-agent-completion"
 import { type ToolChoiceCapabilityIdentity } from "./tool-choice-compatibility"
 import { DEFAULT_PROMPT, PROTOCOL_PROMPT } from "./prompt-revisor-prompt"
 
@@ -46,10 +59,23 @@ const READ_BYTES = 24 * 1024
 const READ_LINES = 240
 const GREP_RESULTS = 30
 const GLOB_RESULTS = 50
-const MAX_SESSION_CONTEXT_CHARS = 6_000
+const MAX_SESSION_CONTEXT_CHARS = 28_000
 const MAX_COMPOSER_CONTEXT_RESULTS = 24
 const MAX_REVISED_REFERENCES = 24
 const MAX_REVISED_PROMPT_CHARS = 64_000
+/**
+ * Output budget for any round that may commit `revised_prompt`. This has to be
+ * large enough for the artifact the host is willing to accept: a 4k-token
+ * budget against a 64k-character cap truncated long revisions mid-tool-call,
+ * which the terminal protocol then reported as "did not call revised_prompt".
+ * Reasoning models spend part of the same budget before emitting any tool call,
+ * so the floor is deliberately generous. Runtimes clamp this to the
+ * provider/model maximum.
+ */
+const AUTHORING_MAX_TOKENS = 16_384
+/** Ceiling for the truncation-escalated retry budget. */
+const AUTHORING_MAX_TOKENS_CEILING = 48_000
+const MAX_TERMINAL_REPAIRS = 2
 
 export const ComposerContextKind = Schema.Literals(["agent", "skill", "reference", "resource"])
 export type ComposerContextKind = typeof ComposerContextKind.Type
@@ -295,35 +321,14 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/PromptRevisor") {}
 
-const renderSessionBlock = (message: SessionMessage.Message): string | undefined => {
-  switch (message.type) {
-    case "user":
-      return `<user>\n${message.text}\n</user>`
-    case "assistant": {
-      const text = message.content
-        .filter((part): part is SessionMessage.AssistantText => part.type === "text")
-        .map((part) => part.text)
-        .join("\n")
-      return text ? `<assistant>\n${text}\n</assistant>` : undefined
-    }
-    case "compaction":
-      return message.summary ? `<conversation-summary>\n${message.summary}\n</conversation-summary>` : undefined
-    default:
-      return undefined
-  }
-}
-
 export function assembleSessionContext(messages: readonly SessionMessage.Message[]) {
-  const blocks: string[] = []
-  let chars = 0
-  for (let index = messages.length - 1; index >= 0; index--) {
-    const block = renderSessionBlock(messages[index])
-    if (!block) continue
-    if (chars + block.length > MAX_SESSION_CONTEXT_CHARS) break
-    blocks.push(block)
-    chars += block.length
-  }
-  return blocks.reverse().join("\n\n")
+  return SpecialAgentSessionContext.assemble(messages, {
+    maxChars: MAX_SESSION_CONTEXT_CHARS,
+    maxBlockChars: 10_000,
+    includeShell: true,
+    pinOpeningUser: true,
+    pinLatestCompaction: true,
+  })
 }
 
 const sensitivePath = (value: string) => {
@@ -400,47 +405,75 @@ export const normalizeClarifications = (input: readonly Clarification[] | undefi
     ...(item.detail?.trim() ? { detail: item.detail.trim().slice(0, MAX_CLARIFICATION_DETAIL_CHARS) } : {}),
   }))
 
+const boundedString = (value: unknown, max: number) => (typeof value === "string" ? value.trim().slice(0, max) : "")
+
+/**
+ * Reference/catalog data can originate from older config/plugin state that did
+ * not pass through today's Effect schemas. Never coerce nullable paths with
+ * String(value): String(null) === "null" is a syntactically valid relative path
+ * and can otherwise escape all the way into FileSystem.stat().
+ */
+const usablePath = (value: unknown, max = 4_000) => {
+  const path = boundedString(value, max)
+  if (!path) return undefined
+  const sentinel = path.toLowerCase()
+  if (sentinel === "null" || sentinel === "undefined") return undefined
+  return path
+}
+
 const normalizeDraftContext = (input: DraftContext | undefined): DraftContext => ({
-  mentions: (input?.mentions ?? []).slice(0, 64).map((item) => {
+  mentions: (input?.mentions ?? []).slice(0, 64).flatMap((item): DraftMention[] => {
     if (item.type === "file") {
-      return {
-        ...item,
-        id: item.id.trim().slice(0, 80),
-        token: item.token.trim().slice(0, 240),
-        path: item.path.trim().slice(0, 2_000),
-      }
+      const path = usablePath((item as { path?: unknown }).path, 2_000)
+      if (!path) return []
+      return [
+        {
+          ...item,
+          id: boundedString(item.id, 80),
+          token: boundedString(item.token, 240),
+          path,
+        },
+      ]
     }
     if (item.type === "resource") {
-      return {
-        ...item,
-        id: item.id.trim().slice(0, 80),
-        token: item.token.trim().slice(0, 240),
-        name: item.name.trim().slice(0, 240),
-        clientName: item.clientName.trim().slice(0, 240),
-        uri: item.uri.trim().slice(0, 4_000),
-      }
+      return [
+        {
+          ...item,
+          id: boundedString(item.id, 80),
+          token: boundedString(item.token, 240),
+          name: boundedString(item.name, 240),
+          clientName: boundedString(item.clientName, 240),
+          uri: boundedString(item.uri, 4_000),
+        },
+      ]
     }
     if (item.type === "reference") {
-      return {
+      const path = usablePath((item as { path?: unknown }).path, 2_000)
+      if (!path) return []
+      return [
+        {
+          ...item,
+          id: boundedString(item.id, 80),
+          token: boundedString(item.token, 240),
+          name: boundedString(item.name, 240),
+          path,
+        },
+      ]
+    }
+    return [
+      {
         ...item,
-        id: item.id.trim().slice(0, 80),
-        token: item.token.trim().slice(0, 240),
-        name: item.name.trim().slice(0, 240),
-        path: item.path.trim().slice(0, 2_000),
-      }
-    }
-    return {
-      ...item,
-      id: item.id.trim().slice(0, 80),
-      token: item.token.trim().slice(0, 240),
-      name: item.name.trim().slice(0, 240),
-    }
+        id: boundedString(item.id, 80),
+        token: boundedString(item.token, 240),
+        name: boundedString(item.name, 240),
+      },
+    ]
   }),
   attachments: (input?.attachments ?? []).slice(0, 24).map((item) => ({
     ...item,
-    id: item.id.trim().slice(0, 120),
-    filename: item.filename.trim().slice(0, 500),
-    mime: item.mime.trim().slice(0, 200),
+    id: boundedString(item.id, 120),
+    filename: boundedString(item.filename, 500),
+    mime: boundedString(item.mime, 200),
   })),
 })
 
@@ -462,6 +495,18 @@ const contextScore = (item: ComposerContextItem, query: string) => {
 }
 
 const referencePlaceholder = (id: string) => `{{ref:${id}}}`
+
+/** Every `{{ref:id}}` occurrence in a revised prompt, declared or not. */
+const REFERENCE_PLACEHOLDER_PATTERN = /\{\{ref:([^}]{1,120})\}\}/g
+
+/**
+ * How one placeholder is materialized: as a canonical composer mention, or as
+ * degraded plain text (possibly empty) when the host could not resolve the
+ * declaration the model wrote.
+ */
+type ReferenceResolution =
+  | { readonly kind: "rich"; readonly token: string; readonly metadata: RevisedPromptReferenceMetadata }
+  | { readonly kind: "text"; readonly text: string }
 
 const cleanReferenceID = (value: string) =>
   value
@@ -491,10 +536,18 @@ const layer = Layer.effect(
         success: Schema.String,
         execute: ({ path }) =>
           Effect.gen(function* () {
-            if (sensitivePath(path)) return yield* toolFailure("Sensitive files are not available to prompt revision")
+            const rawPath = usablePath(path, 2_000)
+            if (!rawPath) return yield* toolFailure("Prompt revision received an invalid file path")
+            const safePath = RelativePath.make(rawPath)
+            if (sensitivePath(safePath))
+              return yield* toolFailure("Sensitive files are not available to prompt revision")
+            // FileSystem.read has a `never` error channel: a missing path, a
+            // directory, and a path that escapes the location are all defects.
+            // Only a Cause-level catch turns them into a tool error the Revisor
+            // can react to - mapError here would let them kill the request.
             const result = yield* files
-              .read({ path })
-              .pipe(Effect.mapError(() => toolFailure(`Unable to read ${path}`)))
+              .read({ path: safePath })
+              .pipe(Effect.catchDefect(() => Effect.fail(toolFailure(`Unable to read ${safePath}`))))
             if (result.content.includes(0))
               return yield* toolFailure("Binary files are not available to prompt revision")
             return lineSlice(new TextDecoder().decode(result.content))
@@ -510,14 +563,28 @@ const layer = Layer.effect(
         }),
         success: Schema.String,
         execute: ({ pattern, path, include }) =>
-          files.grep(new FileSystem.GrepInput({ pattern, path, include, limit: GREP_RESULTS })).pipe(
-            Effect.map((matches) =>
-              matches.length === 0
-                ? "No matches found"
-                : matches.map((match) => `${match.entry.path}:${match.line}: ${match.text.trimEnd()}`).join("\n"),
-            ),
-            Effect.mapError(() => toolFailure("Search failed")),
-          ),
+          Effect.gen(function* () {
+            const safePath = path === undefined ? undefined : usablePath(path, 2_000)
+            if (path !== undefined && !safePath)
+              return yield* toolFailure("Prompt revision received an invalid search path")
+            return yield* files
+              .grep(
+                new FileSystem.GrepInput({
+                  pattern,
+                  path: safePath === undefined ? undefined : RelativePath.make(safePath),
+                  include,
+                  limit: GREP_RESULTS,
+                }),
+              )
+              .pipe(
+                Effect.map((matches) =>
+                  matches.length === 0
+                    ? "No matches found"
+                    : matches.map((match) => `${match.entry.path}:${match.line}: ${match.text.trimEnd()}`).join("\n"),
+                ),
+                Effect.catchDefect(() => Effect.fail(toolFailure("Search failed"))),
+              )
+          }),
       }),
       glob: Tool.make({
         description:
@@ -525,12 +592,25 @@ const layer = Layer.effect(
         parameters: Schema.Struct({ pattern: Schema.String, path: Schema.optional(RelativePath) }),
         success: Schema.String,
         execute: ({ pattern, path }) =>
-          files.glob(new FileSystem.GlobInput({ pattern, path, limit: GLOB_RESULTS })).pipe(
-            Effect.map((entries) =>
-              entries.length === 0 ? "No files found" : entries.map((entry) => entry.path).join("\n"),
-            ),
-            Effect.mapError(() => toolFailure("Glob failed")),
-          ),
+          Effect.gen(function* () {
+            const safePath = path === undefined ? undefined : usablePath(path, 2_000)
+            if (path !== undefined && !safePath)
+              return yield* toolFailure("Prompt revision received an invalid glob path")
+            return yield* files
+              .glob(
+                new FileSystem.GlobInput({
+                  pattern,
+                  path: safePath === undefined ? undefined : RelativePath.make(safePath),
+                  limit: GLOB_RESULTS,
+                }),
+              )
+              .pipe(
+                Effect.map((entries) =>
+                  entries.length === 0 ? "No files found" : entries.map((entry) => entry.path).join("\n"),
+                ),
+                Effect.catchDefect(() => Effect.fail(toolFailure("Glob failed"))),
+              )
+          }),
       }),
     } as const
 
@@ -546,9 +626,10 @@ const layer = Layer.effect(
 
     const revisedPromptTool = Tool.make({
       description:
-        "Commit the finished Prompt Input V2 revision. This is the only valid successful completion. Put the user-facing draft in content. For rich mentions, place {{ref:ID}} in content and declare the matching semantic reference. Do not calculate offsets or fabricate editor metadata. Call exactly once and as the only tool call when the rewrite is ready.",
+        "Commit the finished Prompt Input V2 revision. This is the only valid successful completion. Put the user-facing draft in content. For rich mentions, place {{ref:ID}} in content and declare the matching semantic reference. Do not calculate offsets or fabricate editor metadata. Call exactly once and as the only tool call when the rewrite is ready. IMMEDIATELY END GENERATION after this tool call; do not reason, emit prose, or call another tool afterward.",
       parameters: RevisedPromptToolInput,
       success: Schema.String,
+      execute: () => Effect.succeed(terminalCompletionAccepted("revised_prompt")),
     })
 
     const defaultRuntime: Runtime = {
@@ -571,16 +652,28 @@ const layer = Layer.effect(
       }),
       generate: Effect.fn("PromptRevisor.defaultRuntime.generate")(function* (request) {
         const model = request.model.value as Model
+        // Providers reject a max-token request above the model ceiling, so the
+        // caller's generous authoring budget is a request, not a demand.
+        const maxTokens =
+          request.generation.maxTokens === undefined
+            ? undefined
+            : boundedMaxTokens(model, request.generation.maxTokens)
         const base = LLM.request({
           model,
           system: request.system,
           messages: request.messages,
           tools: request.tools,
           toolChoice: request.toolChoice,
-          generation: request.generation,
+          generation: { ...request.generation, ...(maxTokens === undefined ? {} : { maxTokens }) },
         })
         const run = (toolChoice: "required" | "auto" | "none") =>
-          llm.generate(LLM.updateRequest(base, { toolChoice }))
+          collectUntilTerminalTool(llm.stream(LLM.updateRequest(base, { toolChoice })), "revised_prompt").pipe(
+            Effect.flatMap((response) =>
+              response
+                ? Effect.succeed(response)
+                : Effect.fail(new Error("Prompt revision ended without a terminal response")),
+            ),
+          )
 
         if (request.toolChoice === "none") {
           return yield* run("none").pipe(
@@ -623,17 +716,22 @@ const layer = Layer.effect(
       // reconnaissance and protocol-correction retries. This ID is ephemeral and
       // is never persisted as a real Session; it only scopes provider/plugin telemetry.
       const runtimeSessionID = session?.id ?? SessionSchema.ID.create()
-      const sessionContext = session
-        ? assembleSessionContext(
-            yield* sessions
-              .context(session.id)
-              .pipe(
-                Effect.mapError(
-                  (error) => new UnavailableError({ message: `Unable to load session context: ${error.message}` }),
-                ),
-              ),
+      // Conversation context sharpens a revision but is not required for one.
+      // A store hiccup should degrade to a context-free rewrite rather than
+      // refusing to revise the draft the user is looking at.
+      const loadedContext = session
+        ? yield* sessions.context(session.id).pipe(
+            Effect.tapError((error) =>
+              Effect.logWarning("prompt revision continuing without session context", {
+                sessionID: session.id,
+                error: error.message,
+              }),
+            ),
+            Effect.option,
           )
-        : ""
+        : undefined
+      const sessionContext =
+        loadedContext && loadedContext._tag === "Some" ? assembleSessionContext(loadedContext.value) : ""
       const agent = yield* agents.get(AgentV2.ID.make("prompt-revisor"))
       const candidates = [input.model, agent?.model, input.fallbackModel, session?.model].filter(
         (item): item is ModelV2.Ref => item !== undefined,
@@ -677,10 +775,17 @@ const layer = Layer.effect(
         if (kinds.has("reference")) {
           for (const item of yield* references.list()) {
             if (item.hidden) continue
+            const path = usablePath((item as { path?: unknown }).path)
+            if (!path) {
+              yield* Effect.logWarning("Prompt Revisor skipped project reference with unusable path", {
+                name: item.name,
+              })
+              continue
+            }
             local.push({
               kind: "reference",
               name: item.name,
-              path: String(item.path),
+              path,
               ...(item.description ? { description: item.description } : {}),
             })
           }
@@ -724,64 +829,148 @@ const layer = Layer.effect(
           }).pipe(
             Effect.map((items) => JSON.stringify(items)),
             Effect.mapError((error) => toolFailure(error.message)),
+            Effect.catchDefect(() => Effect.fail(toolFailure("Composer context lookup failed"))),
           ),
       })
 
-      const validateTerminal = Effect.fn("PromptRevisor.validateTerminal")(function* (raw: unknown) {
-        const decoded = yield* Schema.decodeUnknownEffect(RevisedPromptToolInput)(raw).pipe(
-          Effect.mapError(
-            (error) =>
-              new UnavailableError({ message: `Prompt revisor produced invalid revised_prompt: ${error.message}` }),
-          ),
-        )
-        const content = decoded.content.trim()
+      /**
+       * Terminal payload validation with reference auto-healing.
+       *
+       * The user-visible artifact is `content`. Rich-reference declarations are
+       * auxiliary metadata the model reconstructs from memory, and it gets them
+       * wrong in predictable ways: a missing `path`, a duplicate id, a file that
+       * no longer exists, a placeholder it never declared.
+       *
+       * While a corrective retry is still available, those problems are reported
+       * so the model gets the chance to declare the reference properly - a real
+       * composer mention is better than a degraded one. On the final attempt the
+       * host heals instead of failing: the declaration becomes the plain `@token`
+       * text when one can be recovered and its placeholder is dropped when it
+       * cannot, because a revision with an imperfect mention beats a 503 that
+       * discards a finished rewrite. Problems with `content` itself - absent,
+       * empty, or oversized - always fail; there is nothing to hand back.
+       */
+      const validateTerminal = Effect.fn("PromptRevisor.validateTerminal")(function* (raw: unknown, heal = true) {
+        const record =
+          raw !== null && typeof raw === "object" && !Array.isArray(raw) ? (raw as Record<string, unknown>) : undefined
+        if (!record || typeof record["content"] !== "string")
+          return yield* new UnavailableError({
+            message: "Prompt revisor produced invalid revised_prompt: content must be a string",
+          })
+        const content = record["content"].trim()
         if (!content) return yield* new UnavailableError({ message: "Prompt revisor produced an empty revised_prompt" })
         if (content.length > MAX_REVISED_PROMPT_CHARS)
           return yield* new UnavailableError({ message: "Prompt revisor produced an oversized revised_prompt" })
-        if (decoded.references.length > MAX_REVISED_REFERENCES)
-          return yield* new UnavailableError({ message: "Prompt revisor produced too many rich references" })
 
-        const declarations: Array<{
-          source: RevisedPromptReferenceInput
-          placeholder: string
-          index: number
-          token: string
-          resolved: RevisedPromptReferenceMetadata
-        }> = []
-        const ids = new Set<string>()
-        for (const source of decoded.references) {
-          const id = cleanReferenceID(source.id)
-          if (!id || id !== source.id || ids.has(id))
-            return yield* new UnavailableError({
-              message: `Prompt revisor produced an invalid reference id: ${source.id}`,
-            })
-          ids.add(id)
-          const placeholder = referencePlaceholder(id)
-          const first = content.indexOf(placeholder)
-          if (first < 0 || content.indexOf(placeholder, first + placeholder.length) >= 0) {
-            return yield* new UnavailableError({
-              message: `Prompt revisor reference ${id} must appear exactly once as ${placeholder}`,
-            })
+        const healed: string[] = []
+        /**
+         * Reference-level problems are only tolerated on the final attempt. Any
+         * earlier attempt reports them so the model can declare the reference
+         * correctly on its corrective turn.
+         */
+        const reject = (reason: string) =>
+          new UnavailableError({ message: `Prompt revisor produced an invalid revised_prompt: ${reason}` })
+        const note = (reason: string) =>
+          heal ? Effect.sync(() => healed.push(reason)) : Effect.fail(reject(reason))
+        /** Best-effort plain-text token for a declaration the host cannot resolve. */
+        const fallbackText = (entry: unknown) => {
+          if (!entry || typeof entry !== "object") return undefined
+          const fields = entry as Record<string, unknown>
+          const path = usablePath(fields["path"], 2_000)
+          // A sensitive path is never re-emitted, not even as plain text.
+          if (path) return sensitivePath(path) ? undefined : `@${path}`
+          const name = boundedString(fields["name"], 200)
+          return name ? `@${name}` : undefined
+        }
+        const degrade = (entry: unknown, reason: string) =>
+          Effect.gen(function* () {
+            if (!heal) return yield* reject(reason)
+            const text = fallbackText(entry)
+            healed.push(text ? `${reason}; kept as plain text ${text}` : `${reason}; placeholder removed`)
+            return { kind: "text", text: text ?? "" } satisfies ReferenceResolution
+          })
+
+        // Placeholder occurrences are collected from the content first: the
+        // content is authoritative about which references are actually used, and
+        // one pass over it keeps rich-reference offsets correct no matter how
+        // many declarations heal into plain text or disappear.
+        const occurrences: Array<{ id: string; index: number; length: number }> = []
+        for (const match of content.matchAll(REFERENCE_PLACEHOLDER_PATTERN)) {
+          if (match.index === undefined) continue
+          occurrences.push({ id: match[1]!, index: match.index, length: match[0]!.length })
+        }
+        const referenced = new Set(occurrences.map((occurrence) => occurrence.id))
+
+        const entries = Array.isArray(record["references"]) ? record["references"] : []
+        if (record["references"] !== undefined && !Array.isArray(record["references"]))
+          yield* note("references must be an array")
+
+        const resolutions = new Map<string, ReferenceResolution>()
+        let richCount = 0
+        for (const entry of entries) {
+          const id =
+            entry && typeof entry === "object"
+              ? boundedString((entry as Record<string, unknown>)["id"], 120)
+              : undefined
+          if (!id) {
+            yield* note("a reference declaration has no usable id")
+            continue
+          }
+          // Models sometimes declare a reference they ultimately decide not to
+          // use. The content is authoritative, so an unused declaration is
+          // harmless and should not burn a repair retry or fail the revision.
+          if (!referenced.has(id)) continue
+          if (resolutions.has(id)) {
+            yield* note(`a duplicate reference declaration: ${id}`)
+            continue
+          }
+          if (cleanReferenceID(id) !== id) {
+            resolutions.set(id, yield* degrade(entry, `an invalid reference id: ${id}`))
+            continue
+          }
+          if (richCount >= MAX_REVISED_REFERENCES) {
+            resolutions.set(id, yield* degrade(entry, `more than ${MAX_REVISED_REFERENCES} rich references`))
+            continue
           }
 
+          const decoded = yield* Schema.decodeUnknownEffect(RevisedPromptReferenceInput)(entry).pipe(Effect.option)
+          if (decoded._tag === "None") {
+            resolutions.set(id, yield* degrade(entry, `a malformed ${id} reference declaration`))
+            continue
+          }
+          const source = decoded.value
+
           if (source.type === "file") {
-            if (sensitivePath(source.path))
-              return yield* new UnavailableError({
-                message: `Prompt revisor cannot reference sensitive path: ${source.path}`,
-              })
-            const exists = yield* files.read({ path: source.path }).pipe(Effect.option)
-            if (exists._tag === "None")
-              return yield* new UnavailableError({
-                message: `Prompt revisor referenced unavailable file: ${source.path}`,
-              })
-            declarations.push({
-              source,
-              placeholder,
-              index: first,
-              token: `@${source.path}`,
-              resolved: {
+            const rawPath = usablePath(source.path, 2_000)
+            if (!rawPath) {
+              resolutions.set(id, yield* degrade(entry, `an invalid file reference path: ${source.path}`))
+              continue
+            }
+            const path = RelativePath.make(rawPath)
+            if (sensitivePath(path)) {
+              // Healing never re-emits the path, so this one is dropped outright
+              // rather than degraded to text.
+              yield* note(`a sensitive path reference: ${path}`)
+              resolutions.set(id, { kind: "text", text: "" })
+              continue
+            }
+            // Missing paths, directories, and location escapes all arrive as
+            // defects from FileSystem.read, so this probe catches the Cause.
+            const readable = yield* files.read({ path }).pipe(
+              Effect.as(true),
+              Effect.catchDefect(() => Effect.succeed(false)),
+            )
+            if (!readable) {
+              resolutions.set(id, yield* degrade(entry, `an unavailable file reference: ${path}`))
+              continue
+            }
+            richCount += 1
+            resolutions.set(id, {
+              kind: "rich",
+              token: `@${path}`,
+              metadata: {
                 type: "file",
-                path: source.path,
+                path,
                 ...(source.selection ? { selection: source.selection } : {}),
               },
             })
@@ -794,16 +983,18 @@ const layer = Layer.effect(
               (item): item is Extract<ComposerContextItem, { kind: "resource" }> =>
                 item.kind === "resource" && item.clientName === source.clientName && item.uri === source.uri,
             )
-            if (!match)
-              return yield* new UnavailableError({
-                message: `Prompt revisor referenced unavailable resource: ${source.clientName}/${source.uri}`,
-              })
-            declarations.push({
-              source,
-              placeholder,
-              index: first,
+            if (!match) {
+              resolutions.set(
+                id,
+                yield* degrade(entry, `an unavailable resource reference: ${source.clientName}/${source.uri}`),
+              )
+              continue
+            }
+            richCount += 1
+            resolutions.set(id, {
+              kind: "rich",
               token: `@${match.name}`,
-              resolved: {
+              metadata: {
                 type: "resource",
                 name: match.name,
                 clientName: match.clientName,
@@ -815,63 +1006,81 @@ const layer = Layer.effect(
           }
 
           const match = candidates.find((item) => item.kind === source.type && item.name === source.name)
-          if (!match)
-            return yield* new UnavailableError({
-              message: `Prompt revisor referenced unavailable ${source.type}: ${source.name}`,
-            })
-          if (source.type === "reference" && match.kind === "reference") {
-            declarations.push({
-              source,
-              placeholder,
-              index: first,
-              token: `@${match.name}`,
-              resolved: { type: "reference", name: match.name, path: match.path },
-            })
+          if (!match || match.kind !== source.type) {
+            resolutions.set(id, yield* degrade(entry, `an unavailable ${source.type} reference: ${source.name}`))
             continue
           }
-          if (source.type === "agent" && match.kind === "agent") {
-            declarations.push({
-              source,
-              placeholder,
-              index: first,
-              token: `@${match.name}`,
-              resolved: { type: "agent", name: match.name },
-            })
-            continue
-          }
-          if (source.type === "skill" && match.kind === "skill") {
-            declarations.push({
-              source,
-              placeholder,
-              index: first,
-              token: `@${match.name}`,
-              resolved: { type: "skill", name: match.name },
-            })
-          }
+          richCount += 1
+          resolutions.set(id, {
+            kind: "rich",
+            token: `@${match.name}`,
+            metadata:
+              match.kind === "reference"
+                ? { type: "reference", name: match.name, path: match.path }
+                : match.kind === "agent"
+                  ? { type: "agent", name: match.name }
+                  : { type: "skill", name: match.name },
+          })
         }
 
-        declarations.sort((a, b) => a.index - b.index)
         let cursor = 0
         let prompt = ""
         const rich: RevisedPromptReference[] = []
-        for (const declaration of declarations) {
-          prompt += content.slice(cursor, declaration.index)
-          const start = prompt.length
-          prompt += declaration.token
-          const end = prompt.length
-          rich.push({ ...declaration.resolved, content: declaration.token, start, end } as RevisedPromptReference)
-          cursor = declaration.index + declaration.placeholder.length
+        for (const occurrence of occurrences) {
+          prompt += content.slice(cursor, occurrence.index)
+          cursor = occurrence.index + occurrence.length
+          const resolution = resolutions.get(occurrence.id)
+          if (!resolution) yield* note(`an undeclared reference placeholder: ${occurrence.id}`)
+          if (resolution?.kind === "rich") {
+            const start = prompt.length
+            prompt += resolution.token
+            rich.push({
+              ...resolution.metadata,
+              content: resolution.token,
+              start,
+              end: prompt.length,
+            } as RevisedPromptReference)
+            continue
+          }
+          const text = resolution?.text ?? ""
+          // Dropping a placeholder outright would otherwise leave a double space
+          // where the mention used to sit.
+          if (!text && prompt.endsWith(" ") && content[cursor] === " ") cursor += 1
+          prompt += text
         }
-        prompt += content.slice(cursor)
-        if (/\{\{ref:[^}]+\}\}/.test(prompt))
-          return yield* new UnavailableError({
-            message: "Prompt revisor produced an undeclared rich reference placeholder",
-          })
+        // Only the tail is trimmed: trimming the front would shift every
+        // rich-reference offset already recorded above.
+        prompt = (prompt + content.slice(cursor)).trimEnd()
+        if (!prompt.trim())
+          return yield* new UnavailableError({ message: "Prompt revisor produced an empty revised_prompt" })
+        if (healed.length)
+          yield* Effect.logWarning("prompt revision healed model reference declarations", { healed })
         return { prompt, references: rich }
       })
 
+      // One place that turns a terminal-protocol failure into something a user
+      // can act on. Truncation and budget exhaustion are host problems and must
+      // not be reported as the model refusing to call the tool.
+      const terminalFailureMessage = (failure: TerminalFailure) =>
+        failure.reason === "truncated"
+          ? "The prompt revisor's response hit the model output limit before it could commit the revision. Try again, shorten the draft, or pick a model with a larger output limit."
+          : failure.reason === "invalid-payload"
+            ? `Prompt revisor produced invalid revised_prompt after ${failure.repairs + 1} attempts: ${failure.detail ?? "invalid payload"}`
+            : failure.reason === "multiple"
+              ? "Prompt revisor emitted multiple revised_prompt calls in one round"
+              : failure.reason === "missing"
+                ? `Prompt revisor did not call revised_prompt after ${failure.repairs + 1} attempts`
+                : "revised_prompt must be the only content-producing action in its response"
+
+      const authoringGeneration = (attempt?: TerminalAttempt) => ({
+        maxTokens: retryMaxTokens(AUTHORING_MAX_TOKENS, attempt, AUTHORING_MAX_TOKENS_CEILING),
+        temperature: 0.2,
+      })
+
       const user = [
-        sessionContext ? `<conversation-context>\n${sessionContext}\n</conversation-context>` : undefined,
+        sessionContext
+          ? `<conversation-context>\n${sessionContext}\n</conversation-context>\n<context-resolution-rule>Resolve contextual references in the current draft from this conversation before rewriting. Phrases such as "it", "this", "that", "the feature", "the issue", "continue", "proceed", "the approach above", and similar shorthand should become concrete in the revised prompt whenever the conversation supplies enough information. Prefer carrying the actual feature name, decisions, constraints, files, architecture, and acceptance criteria into revised_prompt. Do not emit vague meta-instructions like "use the existing chat context" when you can resolve the referent yourself.</context-resolution-rule>`
+          : undefined,
         input.guidance?.trim() ? `<rewrite-guidance>\n${input.guidance.trim()}\n</rewrite-guidance>` : undefined,
         clarifications.length
           ? `<user-clarifications>\n${JSON.stringify(clarifications)}\n</user-clarifications>`
@@ -902,7 +1111,8 @@ const layer = Layer.effect(
             messages,
             toolName: "revised_prompt",
             agentLabel: "prompt revisor",
-            generate: (terminalMessages) =>
+            maxRepairs: MAX_TERMINAL_REPAIRS,
+            generate: (terminalMessages, attempt) =>
               runtime.generate({
                 model,
                 sessionID: runtimeSessionID,
@@ -910,20 +1120,11 @@ const layer = Layer.effect(
                 messages: terminalMessages,
                 tools: toDefinitions({ revised_prompt: revisedPromptTool }),
                 toolChoice: "required",
-                generation: { maxTokens: 4096, temperature: 0.2 },
+                generation: authoringGeneration(attempt),
               }),
-            validate: (call) => validateTerminal(call.input).pipe(Effect.mapError((error) => error.message)),
-            invalid: (failure) =>
-              new UnavailableError({
-                message:
-                  failure.reason === "missing"
-                    ? "Prompt revisor did not call revised_prompt after its repair retry"
-                    : failure.reason === "multiple"
-                      ? "Prompt revisor emitted multiple revised_prompt calls in one round"
-                      : failure.reason === "invalid-payload"
-                        ? `Prompt revisor produced invalid revised_prompt after its repair retry: ${failure.detail ?? "invalid payload"}`
-                        : "revised_prompt must be the only content-producing action in its response",
-              }),
+            validate: (call, context) =>
+              validateTerminal(call.input, context.final).pipe(Effect.mapError((error) => error.message)),
+            invalid: (failure) => new UnavailableError({ message: terminalFailureMessage(failure) }),
           })
           const revised = terminal.artifact
           usedTools.push("revised_prompt")
@@ -936,6 +1137,8 @@ const layer = Layer.effect(
           } satisfies RevisionResult
         }
 
+        // Reconnaissance rounds may also commit revised_prompt, so they get the
+        // same authoring budget rather than a tool-call-sized one.
         const response = yield* runtime.generate({
           model,
           sessionID: runtimeSessionID,
@@ -943,7 +1146,7 @@ const layer = Layer.effect(
           messages,
           tools: toDefinitions(authoringTools),
           toolChoice: "required",
-          generation: { maxTokens: 4096, temperature: 0.2 },
+          generation: authoringGeneration(),
         })
 
         const calls = response.toolCalls.filter((call) => call.providerExecuted !== true)
@@ -953,8 +1156,9 @@ const layer = Layer.effect(
             response,
             toolName: "revised_prompt",
             agentLabel: "Prompt Revisor",
-            detail,
-            generate: (terminalMessages) =>
+            detail: detail ?? (response.finishReason === "length" ? TRUNCATION_DETAIL : undefined),
+            maxRepairs: MAX_TERMINAL_REPAIRS,
+            generate: (terminalMessages, attempt) =>
               runtime.generate({
                 model,
                 sessionID: runtimeSessionID,
@@ -962,20 +1166,15 @@ const layer = Layer.effect(
                 messages: terminalMessages,
                 tools: toDefinitions({ revised_prompt: revisedPromptTool }),
                 toolChoice: "required",
-                generation: { maxTokens: 4096, temperature: 0.2 },
+                // A round truncated before its tool call must not be retried on
+                // the same budget; escalate immediately.
+                generation: authoringGeneration(
+                  response.finishReason === "length" ? { ...attempt, previous: "truncated" } : attempt,
+                ),
               }),
-            validate: (call) => validateTerminal(call.input).pipe(Effect.mapError((error) => error.message)),
-            invalid: (failure) =>
-              new UnavailableError({
-                message:
-                  failure.reason === "invalid-payload"
-                    ? `Prompt revisor produced invalid revised_prompt after its repair retry: ${failure.detail ?? "invalid payload"}`
-                    : failure.reason === "multiple"
-                      ? "Prompt revisor emitted multiple revised_prompt calls after its repair retry"
-                      : failure.reason === "missing"
-                        ? "Prompt revisor did not call revised_prompt after its repair retry"
-                        : "revised_prompt must be the only content-producing action in its response",
-              }),
+            validate: (call, context) =>
+              validateTerminal(call.input, context.final).pipe(Effect.mapError((error) => error.message)),
+            invalid: (failure) => new UnavailableError({ message: terminalFailureMessage(failure) }),
           })
           usedTools.push("revised_prompt")
           return {
@@ -983,7 +1182,8 @@ const layer = Layer.effect(
             prompt: terminal.artifact.prompt,
             references: terminal.artifact.references,
             tools: usedTools,
-            rounds: rounds + 2,
+            // This round, the corrective turn, plus any further repairs inside it.
+            rounds: rounds + 2 + terminal.repairs,
           } satisfies RevisionResult
         })
 
@@ -991,8 +1191,11 @@ const layer = Layer.effect(
 
         const revisedCalls = calls.filter((call) => call.name === "revised_prompt")
         if (revisedCalls.length > 0) {
-          if (revisedCalls.length !== 1 || calls.length !== 1) return yield* repairTerminal()
-          const validated = yield* validateTerminal(revisedCalls[0]!.input).pipe(Effect.exit)
+          if (revisedCalls.length !== 1 || calls.length !== 1)
+            return yield* repairTerminal("revised_prompt must be the only tool call in its response")
+          // A repair round is still available here, so reference problems are
+          // reported rather than healed.
+          const validated = yield* validateTerminal(revisedCalls[0]!.input, false).pipe(Effect.exit)
           if (validated._tag === "Failure") {
             const error = Cause.squash(validated.cause)
             return yield* repairTerminal(error instanceof Error ? error.message : String(error))
@@ -1007,29 +1210,38 @@ const layer = Layer.effect(
           } satisfies RevisionResult
         }
 
+        // Every malformed clarification interrupt below is recoverable: the user
+        // asked for a revision, so a bad `question` turn falls through to a
+        // terminal repair that demands revised_prompt instead of failing the
+        // request outright.
         const questionCalls = calls.filter((call) => call.name === "question")
         if (questionCalls.length > 1) {
-          return yield* new UnavailableError({ message: "Prompt revisor emitted multiple question calls in one round" })
+          return yield* repairTerminal("only one question tool call is allowed per round")
         }
         if (questionCalls.length === 1) {
           if (calls.length !== 1) {
-            return yield* new UnavailableError({ message: "question must be the only tool call in its response" })
+            return yield* repairTerminal("question must be the only tool call in its response")
           }
           if (!canAsk) {
-            return yield* new UnavailableError({ message: "Prompt revisor exceeded its clarification budget" })
+            return yield* repairTerminal(
+              "the clarification budget is exhausted; revise the draft from the information already available",
+            )
           }
-          const decoded = yield* Schema.decodeUnknownEffect(QuestionTool.Input)(questionCalls[0]!.input).pipe(
-            Effect.mapError(
-              (error) =>
-                new UnavailableError({ message: `Prompt revisor produced invalid questions: ${error.message}` }),
-            ),
-          )
-          const questions = decoded.questions
+          const decodedQuestions = yield* Schema.decodeUnknownEffect(QuestionTool.Input)(
+            questionCalls[0]!.input,
+          ).pipe(Effect.exit)
+          if (decodedQuestions._tag === "Failure") {
+            const error = Cause.squash(decodedQuestions.cause)
+            return yield* repairTerminal(
+              `the question payload was invalid: ${error instanceof Error ? error.message : String(error)}`,
+            )
+          }
+          const questions = decodedQuestions.value.questions
             .slice(0, MAX_QUESTIONS_PER_INTERRUPT)
             .map(sanitizeQuestion)
             .filter((question) => question.question.length > 0)
           if (questions.length === 0) {
-            return yield* new UnavailableError({ message: "Prompt revisor produced no usable clarification question" })
+            return yield* repairTerminal("the question payload contained no usable question text")
           }
           usedTools.push("question")
           return {
@@ -1060,9 +1272,27 @@ const layer = Layer.effect(
       return yield* new UnavailableError({ message: "Prompt revision exceeded its reconnaissance budget" })
     })
 
+    const timedReviseWithRuntime: Interface["reviseWithRuntime"] = (input, runtime) =>
+      withSpecialAgentTimeout(reviseWithRuntime(input, runtime), () =>
+        Effect.fail(new UnavailableError({ message: "Prompt revision timed out after 5 minutes" })),
+      ).pipe(
+        // Prompt revision is a user-initiated composer action. A defect anywhere
+        // beneath it (services here report missing paths and similar conditions
+        // by dying) would otherwise surface as an opaque 500 with only an error
+        // ref. Convert it into the typed failure the composer already renders,
+        // and keep the real cause in the server log.
+        Effect.catchDefect((defect) =>
+          Effect.logError("prompt revision failed with a defect", { defect: String(defect) }).pipe(
+            Effect.andThen(
+              Effect.fail(new UnavailableError({ message: "Prompt revision failed unexpectedly. Please try again." })),
+            ),
+          ),
+        ),
+      )
+
     return Service.of({
-      revise: (input) => reviseWithRuntime(input, defaultRuntime),
-      reviseWithRuntime,
+      revise: (input) => timedReviseWithRuntime(input, defaultRuntime),
+      reviseWithRuntime: timedReviseWithRuntime,
     })
   }),
 )
@@ -1083,5 +1313,3 @@ export const node = makeLocationNode({
     Location.node,
   ],
 })
-
-

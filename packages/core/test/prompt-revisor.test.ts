@@ -19,6 +19,7 @@ import { FileSystem } from "@opencode-ai/core/filesystem"
 import { Location } from "@opencode-ai/core/location"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProviderV2 } from "@opencode-ai/core/provider"
+import { Reference } from "@opencode-ai/core/reference"
 import {
   PromptRevisor,
   normalizeClarifications,
@@ -27,9 +28,13 @@ import {
 } from "@opencode-ai/core/prompt-revisor"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionStore } from "@opencode-ai/core/session/store"
+import { MessageDecodeError } from "@opencode-ai/core/session/error"
 import { resetToolChoiceCapabilityMemory } from "@opencode-ai/core/tool-choice-compatibility"
-import { Effect, Layer } from "effect"
+import { Cause, DateTime, Effect, Layer } from "effect"
+import * as Stream from "effect/Stream"
 import { testEffect } from "./lib/effect"
 
 const modelRef: ModelV2.Ref = {
@@ -40,12 +45,20 @@ const model = Model.make({ id: "test-model", provider: "prompt-revisor-test", ro
 const generatedRequests: LLMRequest[] = []
 let generatedResponses: Array<LLMResponse | LLMError> = []
 let configEntries: Config.Entry[] = []
+let referenceItems: Reference.Info[] = []
+let sessionInfo: SessionSchema.Info | undefined
+let sessionMessages: SessionMessage.Message[] = []
 
 const llmClient = Layer.succeed(
   LLMClient.Service,
   LLMClient.Service.of({
     prepare: () => Effect.die("unused"),
-    stream: (() => Effect.die("unused")) as unknown as LLMClientShape["stream"],
+    stream: ((request: LLMRequest) => {
+      generatedRequests.push(request)
+      const next = generatedResponses.shift()
+      if (!next) return Stream.die("prompt revisor test exhausted generated responses")
+      return next instanceof LLMError ? Stream.fail(next) : Stream.fromIterable(next.events)
+    }) as LLMClientShape["stream"],
     generate: (request) => {
       generatedRequests.push(request)
       const next = generatedResponses.shift()
@@ -55,8 +68,13 @@ const llmClient = Layer.succeed(
   }),
 )
 
+let fileRead: (path: string) => Effect.Effect<{ content: Uint8Array; mime: string }> = () =>
+  Effect.die("unexpected read")
+
 const filesystem = Layer.mock(FileSystem.Service, {
-  read: () => Effect.die("unexpected read"),
+  // The real FileSystem service has a `never` error channel and reports missing
+  // paths, directories, and location escapes as defects, so the mock does too.
+  read: (input: { path: string }) => fileRead(input.path),
   grep: () => Effect.die("unexpected grep"),
   glob: () => Effect.die("unexpected glob"),
 })
@@ -88,8 +106,15 @@ const config = Layer.succeed(
   }),
 )
 
+const references = Layer.mock(Reference.Service, {
+  list: () => Effect.succeed(referenceItems),
+})
+
+let sessionContextError: MessageDecodeError | undefined
+
 const sessions = Layer.mock(SessionStore.Service, {
-  get: () => Effect.succeed(undefined),
+  get: () => Effect.succeed(sessionInfo),
+  context: () => (sessionContextError ? Effect.fail(sessionContextError) : Effect.succeed(sessionMessages)),
 })
 
 const models = SessionRunnerModel.layerWith(
@@ -102,6 +127,7 @@ const integrationLayer = AppNodeBuilder.build(PromptRevisor.node, [
   [FileSystem.node, filesystem],
   [Catalog.node, catalog],
   [Config.node, config],
+  [Reference.node, references],
   [SessionRunnerModel.node, models],
   [SessionStore.node, sessions],
   [Location.node, Location.boundNode({ directory: AbsolutePath.make(process.cwd()) })],
@@ -111,14 +137,34 @@ const it = testEffect(integrationLayer)
 const callResponse = (name: string, input: unknown, id = `${name}-1`) =>
   LLMResponse.fromEvents([LLMEvent.toolCall({ id, name, input }), LLMEvent.finish({ reason: "tool-calls" })])!
 const multiCallResponse = (...calls: Array<{ id: string; name: string; input: unknown }>) =>
-  LLMResponse.fromEvents([
-    ...calls.map((call) => LLMEvent.toolCall(call)),
-    LLMEvent.finish({ reason: "tool-calls" }),
-  ])!
+  LLMResponse.fromEvents([...calls.map((call) => LLMEvent.toolCall(call)), LLMEvent.finish({ reason: "tool-calls" })])!
 
 const questionResponse = (input: unknown) => callResponse("question", input)
 const revisionResponse = (content: string, references: unknown[] = []) =>
   callResponse("revised_prompt", { content, references }, "revision-1")
+
+const epoch = DateTime.makeUnsafe(0)
+const sessionUser = (text: string): SessionMessage.Message =>
+  SessionMessage.User.make({
+    id: SessionMessage.ID.create(),
+    type: "user",
+    text,
+    files: [],
+    agents: [],
+    time: { created: epoch },
+  })
+const sessionAssistant = (text: string): SessionMessage.Message =>
+  SessionMessage.Assistant.make({
+    id: SessionMessage.ID.create(),
+    type: "assistant",
+    agent: "build",
+    model: {
+      id: SessionMessage.Assistant.fields.model.fields.id.make("m"),
+      providerID: SessionMessage.Assistant.fields.model.fields.providerID.make("p"),
+    },
+    content: [{ type: "text", id: "t", text }],
+    time: { created: epoch },
+  })
 
 const textResponse = (text: string) =>
   LLMResponse.fromEvents([
@@ -126,6 +172,14 @@ const textResponse = (text: string) =>
     LLMEvent.textDelta({ id: "text-1", text }),
     LLMEvent.textEnd({ id: "text-1" }),
     LLMEvent.finish({ reason: "stop" }),
+  ])!
+
+/** A round the provider cut off at the output-token limit before any tool call. */
+const truncatedResponse = (text = "Thinking about the rewrite") =>
+  LLMResponse.fromEvents([
+    LLMEvent.textStart({ id: "text-1" }),
+    LLMEvent.textDelta({ id: "text-1", text }),
+    LLMEvent.finish({ reason: "length" }),
   ])!
 
 describe("PromptRevisor", () => {
@@ -265,7 +319,59 @@ describe("PromptRevisor", () => {
       expect(result.type).toBe("revision")
       expect(JSON.stringify(generatedRequests[0]?.system)).toContain("CUSTOM PROMPT REVISOR SYSTEM")
       expect(JSON.stringify(generatedRequests[0]?.system)).toContain("revised_prompt")
+      expect(JSON.stringify(generatedRequests[0]?.system)).toContain("IMMEDIATELY END GENERATION")
     }),
+  )
+
+  it.effect(
+    "injects concrete conversation context for existing sessions but keeps new-session revisions context-free",
+    () =>
+      Effect.gen(function* () {
+        configEntries = []
+        generatedRequests.length = 0
+        generatedResponses = [
+          revisionResponse(
+            "Implement the first-party Agent Swarms feature with a 3-member swarm and preserve coordinator-as-parent grouping.",
+          ),
+          revisionResponse("Improve the standalone draft without assuming prior conversation context."),
+        ]
+        const sessionID = SessionSchema.ID.make("ses_prompt_revisor_context")
+        sessionInfo = {
+          id: sessionID,
+          location: { directory: AbsolutePath.make(process.cwd()) },
+        } as SessionSchema.Info
+        sessionMessages = [
+          sessionUser("We are implementing Agent Swarms as a first-party feature using a 3-member swarm."),
+          sessionAssistant(
+            "The coordinator should be represented as the parent and swarm members should use the same grouping semantics as subagents.",
+          ),
+          sessionUser("Keep the project-explorer grouping API as the source of truth."),
+        ]
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            sessionInfo = undefined
+            sessionMessages = []
+          }),
+        )
+
+        const revisor = yield* PromptRevisor.Service
+        const existing = yield* revisor.revise({ prompt: "Proceed with it.", model: modelRef, sessionID })
+        expect(existing.type).toBe("revision")
+        const existingRequest = JSON.stringify(generatedRequests[0]!.messages)
+        expect(existingRequest).toContain("conversation-context")
+        expect(existingRequest).toContain("Agent Swarms")
+        expect(existingRequest).toContain("3-member swarm")
+        expect(existingRequest).toContain("coordinator should be represented as the parent")
+        expect(existingRequest).toContain("context-resolution-rule")
+        expect(existingRequest).toContain("Do not emit vague meta-instructions")
+
+        const fresh = yield* revisor.revise({ prompt: "Improve this standalone prompt.", model: modelRef })
+        expect(fresh.type).toBe("revision")
+        const freshRequest = JSON.stringify(generatedRequests[1]!.messages)
+        expect(freshRequest).not.toContain("conversation-context")
+        expect(freshRequest).not.toContain("context-resolution-rule")
+        expect(freshRequest).not.toContain("Agent Swarms")
+      }),
   )
 
   it.effect("default runtime shares required-to-auto capability learning across revisions", () =>
@@ -295,6 +401,90 @@ describe("PromptRevisor", () => {
       expect(second).toMatchObject({ type: "revision", prompt: "Remembered adaptive revision" })
       expect(generatedRequests.map((request) => request.toolChoice?.type)).toEqual(["required", "auto", "auto"])
       resetToolChoiceCapabilityMemory()
+    }),
+  )
+
+  it.effect("skips malformed project references whose runtime path is null instead of exposing a null sentinel", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      referenceItems = [
+        {
+          name: "Broken Reference",
+          path: null,
+          source: { type: "local", path: null },
+        } as unknown as Reference.Info,
+      ]
+      yield* Effect.addFinalizer(() => Effect.sync(() => (referenceItems = [])))
+
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const responses = [
+        callResponse("composer_context", { query: "broken", kinds: ["reference"], limit: 5 }, "bad-ref-context"),
+        revisionResponse("Final revised prompt without the malformed reference."),
+      ]
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(responses.shift()!)
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this prompt.", model: modelRef },
+        runtime,
+      )
+
+      expect(result).toMatchObject({
+        type: "revision",
+        prompt: "Final revised prompt without the malformed reference.",
+      })
+      expect(requests).toHaveLength(2)
+      const continuation = JSON.stringify(requests[1]!.messages)
+      expect(continuation).not.toContain('"path":"null"')
+      expect(continuation).not.toContain("Broken Reference")
+    }),
+  )
+
+  it.effect("repairs a revised_prompt file path equal to the null sentinel without touching the filesystem", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [
+        revisionResponse("Inspect {{ref:bad_file}}.", [{ id: "bad_file", type: "file", path: "null" }]),
+        revisionResponse("Inspect the relevant implementation files and fix the issue."),
+      ]
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Fix the issue.", model: modelRef })
+
+      expect(result).toMatchObject({
+        type: "revision",
+        prompt: "Inspect the relevant implementation files and fix the issue.",
+      })
+      expect(generatedRequests).toHaveLength(2)
+      const repair = JSON.stringify(generatedRequests[1]!.messages)
+      expect(repair).toContain("Protocol correction")
+      expect(repair).toContain("invalid file reference path")
+      expect(repair).toContain("null")
+    }),
+  )
+
+  it.effect("rejects a null-sentinel reconnaissance path before filesystem access and lets the Revisor continue", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      generatedResponses = [
+        callResponse("read", { path: "null" }, "bad-read"),
+        revisionResponse("Inspect the relevant implementation files and fix the issue."),
+      ]
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Fix the issue.", model: modelRef })
+
+      expect(result).toMatchObject({
+        type: "revision",
+        prompt: "Inspect the relevant implementation files and fix the issue.",
+      })
+      expect(generatedRequests).toHaveLength(2)
+      expect(JSON.stringify(generatedRequests[1]!.messages)).toContain("Prompt revision received an invalid file path")
     }),
   )
 
@@ -371,6 +561,60 @@ describe("PromptRevisor", () => {
       expect(JSON.stringify(requests[0]!.messages)).toContain("existing-prompt-context")
       expect(JSON.stringify(requests[0]!.messages)).toContain("bug.png")
       expect(JSON.stringify(requests[0]!.messages)).not.toContain("blob:")
+    }),
+  )
+
+  it.effect("ignores unused rich-reference declarations instead of failing the revision", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: () =>
+          Effect.succeed(
+            revisionResponse("Implement the agreed feature directly.", [
+              { id: "attachment_context", type: "file", path: "does-not-need-to-exist.ts" },
+            ]),
+          ),
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Proceed with it.", model: modelRef },
+        runtime,
+      )
+
+      expect(result).toMatchObject({
+        type: "revision",
+        prompt: "Implement the agreed feature directly.",
+        references: [],
+      })
+    }),
+  )
+
+  it.effect("materializes every occurrence of a declared rich reference", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        composerContext: () =>
+          Effect.succeed([{ kind: "resource", name: "API Docs", clientName: "docs", uri: "mcp://docs/api" } as const]),
+        generate: () =>
+          Effect.succeed(
+            revisionResponse("Read {{ref:docs}}, implement the change, then verify against {{ref:docs}}.", [
+              { id: "docs", type: "resource", name: "API Docs", clientName: "docs", uri: "mcp://docs/api" },
+            ]),
+          ),
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef },
+        runtime,
+      )
+
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Read @API Docs, implement the change, then verify against @API Docs.")
+      expect(result.references).toHaveLength(2)
+      expect(result.references?.map((item) => item.content)).toEqual(["@API Docs", "@API Docs"])
     }),
   )
 
@@ -538,7 +782,12 @@ describe("PromptRevisor", () => {
     Effect.gen(function* () {
       configEntries = []
       const requests: PromptRevisor.RuntimeGenerateInput[] = []
-      const responses = [textResponse("Terminal prose failure one"), textResponse("Terminal prose failure two")]
+      const responses = [
+        textResponse("Terminal prose failure one"),
+        textResponse("Terminal prose failure two"),
+        textResponse("Terminal prose failure three"),
+        textResponse("Terminal prose failure four"),
+      ]
       const runtime: PromptRevisor.Runtime = {
         resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
         generate: (request) => {
@@ -551,8 +800,143 @@ describe("PromptRevisor", () => {
         .reviseWithRuntime({ prompt: "Improve this.", model: modelRef }, runtime)
         .pipe(Effect.exit)
       expect(exit._tag).toBe("Failure")
-      expect(requests).toHaveLength(2)
+      expect(requests).toHaveLength(4)
+      expect(responses).toHaveLength(0)
       expect(JSON.stringify(requests[1]!.messages)).toContain("Protocol correction")
+    }),
+  )
+
+  it.effect("escalates the output budget and reports truncation honestly instead of blaming the model", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const responses = [truncatedResponse(), truncatedResponse(), revisionResponse("Recovered after truncation")]
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(responses.shift()!)
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef },
+        runtime,
+      )
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Recovered after truncation")
+      expect(requests).toHaveLength(3)
+      const budgets = requests.map((request) => request.generation.maxTokens!)
+      expect(budgets[1]).toBeGreaterThan(budgets[0]!)
+      expect(budgets[2]).toBeGreaterThan(budgets[0]!)
+      expect(JSON.stringify(requests[1]!.messages)).toContain("output token limit")
+    }),
+  )
+
+  it.effect("surfaces a truncation-specific failure once the escalated budget is still not enough", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const responses = [truncatedResponse(), truncatedResponse(), truncatedResponse(), truncatedResponse()]
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: () => Effect.succeed(responses.shift()!),
+      }
+
+      const exit = yield* (yield* PromptRevisor.Service)
+        .reviseWithRuntime({ prompt: "Improve this.", model: modelRef }, runtime)
+        .pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag !== "Failure") return
+      const error = Cause.squash(exit.cause)
+      expect(String((error as PromptRevisor.UnavailableError).message)).toContain("output limit")
+    }),
+  )
+
+  it.effect("commits a valid revision that arrives in a malformed turn rather than failing the request", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const mixed = () =>
+        multiCallResponse(
+          { id: "stray-read", name: "read", input: { path: "src/index.ts" } },
+          { id: "mixed-revision", name: "revised_prompt", input: { content: "Salvaged revision", references: [] } },
+        )
+      const responses = [mixed(), mixed(), mixed(), mixed()]
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: () => Effect.succeed(responses.shift()!),
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef },
+        runtime,
+      )
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Salvaged revision")
+    }),
+  )
+
+  it.effect("falls back to a revision when the clarification interrupt itself is malformed", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const responses = [
+        questionResponse({ questions: [{ header: "Scope", options: [] }] }),
+        revisionResponse("Revised without a usable question"),
+      ]
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(responses.shift()!)
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef },
+        runtime,
+      )
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Revised without a usable question")
+      expect(requests).toHaveLength(2)
+      expect(requests[1]!.tools.map((tool) => tool.name)).toEqual(["revised_prompt"])
+      expect(JSON.stringify(requests[1]!.messages)).toContain("question payload was invalid")
+    }),
+  )
+
+  it.effect("falls back to a revision when a question is emitted alongside other tool calls", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const responses = [
+        multiCallResponse(
+          { id: "stray-glob", name: "glob", input: { pattern: "**/*.ts" } },
+          {
+            id: "stray-question",
+            name: "question",
+            input: { questions: [{ question: "Scope?", header: "Scope", options: [] }] },
+          },
+        ),
+        revisionResponse("Revised after a mixed question round"),
+      ]
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(responses.shift()!)
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service).reviseWithRuntime(
+        { prompt: "Improve this.", model: modelRef },
+        runtime,
+      )
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Revised after a mixed question round")
+      expect(requests[1]!.tools.map((tool) => tool.name)).toEqual(["revised_prompt"])
     }),
   )
   it.effect("gives the dedicated Prompt Revisor model priority over the composer fallback", () =>
@@ -589,6 +973,217 @@ describe("PromptRevisor", () => {
     }),
   )
 
+  it.effect("revises without conversation context when the session history cannot be loaded", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      sessionInfo = {
+        id: SessionSchema.ID.create(),
+        location: { directory: AbsolutePath.make(process.cwd()) },
+      } as SessionSchema.Info
+      sessionContextError = new MessageDecodeError({
+        sessionID: sessionInfo.id,
+        messageID: SessionMessage.ID.create(),
+      })
+      const requests: PromptRevisor.RuntimeGenerateInput[] = []
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: (request) => {
+          requests.push(request)
+          return Effect.succeed(revisionResponse("Revised without conversation context"))
+        },
+      }
+
+      const result = yield* (yield* PromptRevisor.Service)
+        .reviseWithRuntime({ prompt: "Improve this.", model: modelRef, sessionID: sessionInfo.id }, runtime)
+        .pipe(Effect.ensuring(Effect.sync(() => ((sessionContextError = undefined), (sessionInfo = undefined)))))
+
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Revised without conversation context")
+      expect(JSON.stringify(requests[0]!.messages)).not.toContain("conversation-context")
+    }),
+  )
+
+  it.effect("heals a reference declaration the model never got right instead of failing the revision", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      // The model insists on a file declaration with no path. The content is
+      // finished work, so the last attempt keeps it and drops the mention.
+      const broken = () =>
+        callResponse(
+          "revised_prompt",
+          { content: "Fix the parser in {{ref:target}} and add tests.", references: [{ id: "target", type: "file" }] },
+          "broken-revision",
+        )
+      generatedResponses = [broken(), broken(), broken(), broken()]
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Fix the parser.", model: modelRef })
+
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Fix the parser in and add tests.")
+      expect(result.references).toEqual([])
+      // Every attempt was spent asking for a correct declaration first.
+      expect(generatedRequests).toHaveLength(4)
+      expect(JSON.stringify(generatedRequests[1]!.messages)).toContain("malformed target reference declaration")
+    }),
+  )
+
+  it.effect("keeps an unresolvable reference as plain text when a token can be recovered", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      referenceItems = []
+      const broken = () =>
+        callResponse(
+          "revised_prompt",
+          {
+            content: "Delegate this to {{ref:agent}}.",
+            references: [{ id: "agent", type: "agent", name: "nonexistent-agent" }],
+          },
+          "broken-agent",
+        )
+      generatedResponses = [broken(), broken(), broken(), broken()]
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Delegate this.", model: modelRef })
+
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      // The user still sees the intent; it is plain text, not a rich mention.
+      expect(result.prompt).toBe("Delegate this to @nonexistent-agent.")
+      expect(result.references).toEqual([])
+    }),
+  )
+
+  it.effect("strips an undeclared placeholder rather than rejecting the finished content", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      const broken = () =>
+        callResponse("revised_prompt", { content: "Review {{ref:ghost}} carefully.", references: [] }, "ghost")
+      generatedResponses = [broken(), broken(), broken(), broken()]
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Review it.", model: modelRef })
+
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Review carefully.")
+      expect(JSON.stringify(generatedRequests[1]!.messages)).toContain("undeclared reference placeholder")
+    }),
+  )
+
+  it.effect("prefers a corrected declaration over healing when a retry is still available", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      referenceItems = []
+      generatedResponses = [
+        callResponse(
+          "revised_prompt",
+          { content: "Delegate to {{ref:a}}.", references: [{ id: "a", type: "agent" }] },
+          "bad",
+        ),
+        callResponse(
+          "revised_prompt",
+          { content: "Delegate to the build agent.", references: [] },
+          "good",
+        ),
+      ]
+
+      const result = yield* (yield* PromptRevisor.Service).revise({ prompt: "Delegate this.", model: modelRef })
+
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Delegate to the build agent.")
+      expect(generatedRequests).toHaveLength(2)
+    }),
+  )
+
+  it.effect("still rejects a payload whose content is unusable", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      const bad = () => callResponse("revised_prompt", { references: [] }, "no-content")
+      generatedResponses = [bad(), bad(), bad(), bad()]
+
+      const exit = yield* (yield* PromptRevisor.Service)
+        .revise({ prompt: "Improve this.", model: modelRef })
+        .pipe(Effect.exit)
+
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag !== "Failure") return
+      expect(String((Cause.squash(exit.cause) as PromptRevisor.UnavailableError).message)).toContain(
+        "content must be a string",
+      )
+    }),
+  )
+
+  it.effect("degrades a reference whose path is a directory instead of dying with a server error", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      // Exactly what FileSystem.read does for a directory target.
+      fileRead = () => Effect.die(new Error("Path is not a file"))
+      const broken = () =>
+        revisionResponse("Refactor {{ref:dir}} carefully.", [
+          { id: "dir", type: "file", path: "packages/core/src" },
+        ])
+      generatedResponses = [broken(), broken(), broken(), broken()]
+
+      const result = yield* (yield* PromptRevisor.Service)
+        .revise({ prompt: "Refactor the core package.", model: modelRef })
+        .pipe(Effect.ensuring(Effect.sync(() => (fileRead = () => Effect.die("unexpected read")))))
+
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Refactor @packages/core/src carefully.")
+      expect(result.references).toEqual([])
+    }),
+  )
+
+  it.effect("reports an unreadable reconnaissance path to the Revisor rather than failing the request", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      generatedRequests.length = 0
+      fileRead = () => Effect.die(new Error("Path is not a file"))
+      generatedResponses = [
+        callResponse("read", { path: "packages/core/src" }, "dir-read"),
+        revisionResponse("Revised after the failed reconnaissance read."),
+      ]
+
+      const result = yield* (yield* PromptRevisor.Service)
+        .revise({ prompt: "Improve this.", model: modelRef })
+        .pipe(Effect.ensuring(Effect.sync(() => (fileRead = () => Effect.die("unexpected read")))))
+
+      expect(result.type).toBe("revision")
+      if (result.type !== "revision") return
+      expect(result.prompt).toBe("Revised after the failed reconnaissance read.")
+      // The tool error is fed back into the same conversation.
+      expect(JSON.stringify(generatedRequests[1]!.messages)).toContain("Unable to read packages/core/src")
+    }),
+  )
+
+  it.effect("turns an unexpected defect into the typed composer failure instead of a 500", () =>
+    Effect.gen(function* () {
+      configEntries = []
+      const runtime: PromptRevisor.Runtime = {
+        resolveModel: ({ candidates }) => Effect.succeed({ ref: candidates[0]!, value: {} }),
+        generate: () => Effect.die(new Error("boom")),
+      }
+
+      const exit = yield* (yield* PromptRevisor.Service)
+        .reviseWithRuntime({ prompt: "Improve this.", model: modelRef }, runtime)
+        .pipe(Effect.exit)
+
+      expect(exit._tag).toBe("Failure")
+      if (exit._tag !== "Failure") return
+      const error = Cause.squash(exit.cause) as PromptRevisor.UnavailableError
+      expect(error._tag).toBe("PromptRevisor.UnavailableError")
+      expect(String(error.message)).toContain("Prompt revision failed unexpectedly")
+    }),
+  )
+
   it.effect("removes the question tool after the clarification budget is exhausted", () =>
     Effect.gen(function* () {
       configEntries = []
@@ -612,8 +1207,3 @@ describe("PromptRevisor", () => {
     }),
   )
 })
-
-
-
-
-

@@ -20,10 +20,20 @@ import { FileSystem } from "../filesystem"
 import { ModelV2 } from "../model"
 import { ProviderV2 } from "../provider"
 import { RelativePath } from "../schema"
-import { generateAdaptive, runTerminalCompletion } from "../special-agent-completion"
+import {
+  collectUntilTerminalTool,
+  generateAdaptive,
+  boundedMaxTokens,
+  retryMaxTokens,
+  runTerminalCompletion,
+  type TerminalAttempt,
+  terminalCompletionAccepted,
+  withSpecialAgentTimeout,
+} from "../special-agent-completion"
 import { type ToolChoiceCapabilityIdentity } from "../tool-choice-compatibility"
 import { SessionRunnerModel } from "../session/runner/model"
 import { SessionSchema } from "../session/schema"
+import { Token } from "../util/token"
 import { Goal } from "./index"
 import { DEFAULT_PROMPT, PROTOCOL_PROMPT } from "./auditor-prompt"
 
@@ -36,6 +46,7 @@ export type Success = {
   readonly tokens: number
   readonly rounds: number
   readonly tools: ReadonlyArray<string>
+  readonly usage: ReadonlyArray<UsageSample>
 }
 
 export type Failure = {
@@ -45,9 +56,24 @@ export type Failure = {
   readonly tokens?: number
   readonly rounds?: number
   readonly tools?: ReadonlyArray<string>
+  readonly usage?: ReadonlyArray<UsageSample>
 }
 
 export type Result = Success | Failure
+
+/** One physical provider request made by the Goal auditor. Kept provider-neutral
+ * so the host can price it with the same model catalog used for normal turns. */
+export type UsageSample = {
+  readonly estimated: boolean
+  readonly inputTokens: number
+  readonly outputTokens: number
+  readonly cacheReadInputTokens: number
+  readonly cacheWriteInputTokens: number
+  readonly reasoningTokens: number
+  readonly totalTokens: number
+  readonly startedAt: number
+  readonly completedAt: number
+}
 
 export interface Interface {
   readonly evaluate: (input: {
@@ -69,28 +95,42 @@ const READ_LINES = 320
 const GREP_RESULTS = 50
 const GLOB_RESULTS = 80
 const AUDIT_VERDICT = "audit_verdict"
+const AUDIT_MAX_TOKENS = 8_192
+const AUDIT_MAX_TOKENS_CEILING = 32_768
 const MAX_RATIONALE_CHARS = 4_000
 const MAX_BLOCKER_CHARS = 2_000
 const MAX_CONTINUATION_PROMPT_CHARS = 16_000
 
-const validateAuditorVerdict = (input: unknown): Effect.Effect<GoalModel.AuditorVerdict, string> =>
+/**
+ * `heal` is set only on the final attempt, when no corrective retry is left.
+ * It relaxes the two bounds that carry no auditor judgment - an over-long
+ * rationale is explanatory text, and an out-of-range confidence is noise - so a
+ * whole verdict is not discarded over them. Everything else stays strict:
+ * healing a missing blocker or continuationPrompt would mean inventing the
+ * auditor's decision, which is worse than failing the cycle.
+ */
+const validateAuditorVerdict = (input: unknown, heal = false): Effect.Effect<GoalModel.AuditorVerdict, string> =>
   Effect.gen(function* () {
     const raw = yield* Schema.decodeUnknownEffect(GoalModel.AuditorVerdict)(input).pipe(
       Effect.mapError((error): string => `Invalid audit_verdict payload: ${String(error)}`),
     )
-    const rationale = raw.rationale.trim()
-    if (!rationale) return yield* Effect.fail("Invalid audit_verdict payload: rationale cannot be empty")
-    if (rationale.length > MAX_RATIONALE_CHARS)
+    const trimmedRationale = raw.rationale.trim()
+    if (!trimmedRationale) return yield* Effect.fail("Invalid audit_verdict payload: rationale cannot be empty")
+    if (trimmedRationale.length > MAX_RATIONALE_CHARS && !heal)
       return yield* Effect.fail(`Invalid audit_verdict payload: rationale exceeds ${MAX_RATIONALE_CHARS} characters`)
-    if (raw.confidence !== undefined && (!Number.isFinite(raw.confidence) || raw.confidence < 0 || raw.confidence > 1))
+    const rationale = trimmedRationale.slice(0, MAX_RATIONALE_CHARS)
+    const unusableConfidence =
+      raw.confidence !== undefined && (!Number.isFinite(raw.confidence) || raw.confidence < 0 || raw.confidence > 1)
+    if (unusableConfidence && !heal)
       return yield* Effect.fail("Invalid audit_verdict payload: confidence must be between 0 and 1")
+    const confidence = unusableConfidence ? undefined : raw.confidence
 
     if (raw.decision === "complete") {
       return {
         decision: "complete" as const,
         rationale,
         progressMade: raw.progressMade,
-        ...(raw.confidence === undefined ? {} : { confidence: raw.confidence }),
+        ...(confidence === undefined ? {} : { confidence }),
       } satisfies GoalModel.AuditorVerdict
     }
 
@@ -115,7 +155,7 @@ const validateAuditorVerdict = (input: unknown): Effect.Effect<GoalModel.Auditor
         progressMade: raw.progressMade,
         blocker,
         continuationPrompt,
-        ...(raw.confidence === undefined ? {} : { confidence: raw.confidence }),
+        ...(confidence === undefined ? {} : { confidence }),
       } satisfies GoalModel.AuditorVerdict
     }
 
@@ -124,7 +164,7 @@ const validateAuditorVerdict = (input: unknown): Effect.Effect<GoalModel.Auditor
       rationale,
       progressMade: raw.progressMade,
       continuationPrompt,
-      ...(raw.confidence === undefined ? {} : { confidence: raw.confidence }),
+      ...(confidence === undefined ? {} : { confidence }),
     } satisfies GoalModel.AuditorVerdict
   })
 
@@ -198,6 +238,34 @@ const tokenCount = (
     | undefined,
 ) => usage?.totalTokens ?? (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0)
 
+const safetyUsageEstimate = (
+  request: { system: unknown; messages: unknown; tools: unknown },
+  response: LLMResponse,
+) => {
+  const encode = (value: unknown) => {
+    try {
+      return JSON.stringify(value) ?? ""
+    } catch {
+      return String(value)
+    }
+  }
+  const input = Token.estimate(
+    encode({
+      system: request.system,
+      messages: request.messages,
+      tools: request.tools,
+    }),
+  )
+  const output = Token.estimate(encode(response.message))
+  // Goal token budgets are safety ceilings, not billing estimates. Terminal
+  // cancellation can intentionally prevent the provider's final usage packet
+  // from arriving, so bias the fallback upward instead of undercounting an
+  // unattended audit cycle.
+  const inputTokens = Math.max(1, Math.ceil(input * 1.5))
+  const outputTokens = Math.max(1, Math.ceil(output * 1.5))
+  return { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }
+}
+
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -257,10 +325,10 @@ const layer = Layer.effect(
       }),
       [AUDIT_VERDICT]: Tool.make({
         description:
-          "Commit the independent Goal audit verdict. For continue, author the exact task-specific continuationPrompt for the next autonomous worker cycle. For blocked, include both the blocker and a recovery/probe continuationPrompt because the runtime may allow another bounded cycle before settling blocked. Call exactly once and as the only tool call when you have enough evidence. This is the only valid way to finish an audit.",
+          "Commit the independent Goal audit verdict. For continue, author the exact task-specific continuationPrompt for the next autonomous worker cycle. For blocked, include both the blocker and a recovery/probe continuationPrompt because the runtime may allow another bounded cycle before settling blocked. Call exactly once and as the only tool call when you have enough evidence. This is the only valid way to finish an audit. IMMEDIATELY END GENERATION after this tool call; do not reason, emit prose, or call another tool afterward.",
         parameters: GoalModel.AuditorVerdict,
         success: Schema.String,
-        execute: () => Effect.succeed("Audit verdict accepted"),
+        execute: () => Effect.succeed(terminalCompletionAccepted(AUDIT_VERDICT)),
       }),
     } as const
 
@@ -286,6 +354,7 @@ const layer = Layer.effect(
     }) {
       const messages: Message[] = [Message.user(render(input.detail, input.evidence, input.latestWork))]
       const usedTools: string[] = []
+      const usageSamples: UsageSample[] = []
       let tokens = 0
       const capability: ToolChoiceCapabilityIdentity = {
         providerID: String(input.model.provider),
@@ -299,6 +368,7 @@ const layer = Layer.effect(
         messages: ReadonlyArray<Message>
         terminalOnly: boolean
         preferred?: "required" | "auto"
+        attempt?: TerminalAttempt
       }) {
         const availableTools = inputGenerate.terminalOnly
           ? { [AUDIT_VERDICT]: readonlyTools[AUDIT_VERDICT] }
@@ -309,14 +379,45 @@ const layer = Layer.effect(
           messages: inputGenerate.messages,
           tools: toDefinitions(availableTools),
           toolChoice: "required",
-          generation: { maxTokens: 8192, temperature: 0.1 },
+          generation: {
+            // A verdict truncated at the output limit is a budget problem, not a
+            // protocol violation: give the retry more room.
+            maxTokens: boundedMaxTokens(
+              input.model,
+              retryMaxTokens(AUDIT_MAX_TOKENS, inputGenerate.attempt, AUDIT_MAX_TOKENS_CEILING),
+            ),
+            temperature: 0.1,
+          },
         })
+        const startedAt = Date.now()
         const generated = yield* generateAdaptive({
           identity: capability,
           requested: inputGenerate.preferred ?? "required",
-          generate: (toolChoice) => llm.generate(LLM.updateRequest(baseRequest, { toolChoice })),
+          generate: (toolChoice) =>
+            collectUntilTerminalTool(llm.stream(LLM.updateRequest(baseRequest, { toolChoice })), AUDIT_VERDICT).pipe(
+              Effect.flatMap((response) =>
+                response
+                  ? Effect.succeed(response)
+                  : Effect.fail(new Error("Goal audit ended without a terminal response")),
+              ),
+            ),
         })
-        tokens += tokenCount(generated.response.usage)
+        const completedAt = Date.now()
+        const reported = generated.response.usage
+        const fallback = reported === undefined ? safetyUsageEstimate(baseRequest, generated.response) : undefined
+        const sample: UsageSample = {
+          estimated: reported === undefined,
+          inputTokens: reported?.inputTokens ?? fallback?.inputTokens ?? 0,
+          outputTokens: reported?.outputTokens ?? fallback?.outputTokens ?? 0,
+          cacheReadInputTokens: reported?.cacheReadInputTokens ?? 0,
+          cacheWriteInputTokens: reported?.cacheWriteInputTokens ?? 0,
+          reasoningTokens: reported?.reasoningTokens ?? 0,
+          totalTokens: reported === undefined ? (fallback?.totalTokens ?? 0) : tokenCount(reported),
+          startedAt,
+          completedAt,
+        }
+        usageSamples.push(sample)
+        tokens += sample.totalTokens
         return generated
       })
 
@@ -331,7 +432,7 @@ const layer = Layer.effect(
           toolName: AUDIT_VERDICT,
           agentLabel: "Goal auditor",
           maxRepairs: MAX_COMPLETION_RETRIES,
-          generate: (terminalMessages) => {
+          generate: (terminalMessages, attempt) => {
             if (seeded) {
               seeded = false
               return Effect.succeed(inputFinish.response)
@@ -340,14 +441,17 @@ const layer = Layer.effect(
               messages: terminalMessages,
               terminalOnly: true,
               preferred: inputFinish.preferred,
+              attempt,
             }).pipe(
               Effect.map((attempt) => attempt.response),
               Effect.mapError((error) => String(error)),
             )
           },
-          validate: (call) => validateAuditorVerdict(call.input),
+          validate: (call, context) => validateAuditorVerdict(call.input, context.final),
           invalid: (failure) =>
-            failure.reason === "invalid-payload"
+            failure.reason === "truncated"
+              ? "Goal auditor hit the model output limit before it could call audit_verdict"
+              : failure.reason === "invalid-payload"
               ? (failure.detail ?? "Invalid audit_verdict payload")
               : failure.reason === "multiple"
                 ? "Goal auditor emitted multiple audit_verdict calls"
@@ -363,6 +467,7 @@ const layer = Layer.effect(
             tokens,
             rounds: inputFinish.rounds + MAX_COMPLETION_RETRIES,
             tools: usedTools,
+            usage: usageSamples,
           }
         }
         usedTools.push(AUDIT_VERDICT)
@@ -372,6 +477,7 @@ const layer = Layer.effect(
           tokens,
           rounds: inputFinish.rounds + terminal.value.repairs,
           tools: usedTools,
+          usage: usageSamples,
         }
       })
 
@@ -385,6 +491,7 @@ const layer = Layer.effect(
             tokens,
             rounds: round,
             tools: usedTools,
+            usage: usageSamples,
           }
         }
         const response = generated.value.response
@@ -434,6 +541,7 @@ const layer = Layer.effect(
         tokens,
         rounds: MAX_AUDIT_ROUNDS + 1,
         tools: usedTools,
+        usage: usageSamples,
       }
     })
     const evaluate = Effect.fn("GoalAuditor.evaluate")(function* (input: {
@@ -470,6 +578,7 @@ const layer = Layer.effect(
       let consumedTokens = 0
       let rounds = 0
       let usedTools: ReadonlyArray<string> = []
+      let usage: ReadonlyArray<UsageSample> = []
 
       for (let attempt = 0; attempt < attempts; attempt++) {
         const attemptResult = yield* runAudit({
@@ -482,6 +591,7 @@ const layer = Layer.effect(
         consumedTokens += attemptResult.tokens
         rounds += attemptResult.rounds
         usedTools = [...usedTools, ...attemptResult.tools]
+        usage = [...usage, ...attemptResult.usage]
         if (attemptResult.ok) {
           yield* goals
             .recordAuditorVerdict({ goalID: focused.detail.goal.id, verdict: attemptResult.verdict, model: ref })
@@ -493,6 +603,7 @@ const layer = Layer.effect(
             tokens: consumedTokens,
             rounds,
             tools: usedTools,
+            usage,
           } satisfies Success
         }
         lastError = attemptResult.error
@@ -505,10 +616,16 @@ const layer = Layer.effect(
         tokens: consumedTokens,
         rounds,
         tools: usedTools,
+        usage,
       } satisfies Failure
     })
 
-    return Service.of({ evaluate })
+    const timedEvaluate: Interface["evaluate"] = (input) =>
+      withSpecialAgentTimeout(evaluate(input), () =>
+        Effect.succeed({ ok: false, error: "Goal auditor timed out after 5 minutes" } satisfies Failure),
+      )
+
+    return Service.of({ evaluate: timedEvaluate })
   }),
 )
 

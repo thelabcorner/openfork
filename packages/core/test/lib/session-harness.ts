@@ -144,6 +144,20 @@ export const makeHarness = (): Harness => {
     LLMClient.Service.of({
       prepare: () => Effect.die("unused"),
       stream: (request: LLMRequest) => {
+        if (request.tools.some((item) => item.name === SessionTitle.GENERATED_TITLE_TOOL)) {
+          titleRequests.push(request)
+          const next = titleQueue.shift()
+          // Preserve the historical fake-client fallback: an exhausted title
+          // queue yields prose, not a valid terminal artifact. Repair-exhaustion
+          // tests depend on that distinction.
+          if (next === undefined) return Stream.fromIterable(textCompletion(["Auto"]))
+          return Stream.unwrap(
+            next.pipe(
+              Effect.map((response) => Stream.fromIterable(response.events)),
+              Effect.catch((error) => Effect.succeed(Stream.fail(error))),
+            ),
+          )
+        }
         requests.push(request)
         const events = completions.shift()
         const items = events === undefined ? textCompletion(["Default response"]) : events
@@ -412,10 +426,5 @@ export const insertUserMessage = (sessionID: SessionV2.ID, text: string, seq = 1
 export const setTitle = (id: SessionV2.ID, title: string) =>
   Effect.gen(function* () {
     const { db } = yield* Database.Service
-    yield* db
-      .update(SessionTable)
-      .set({ title })
-      .where(eq(SessionTable.id, id))
-      .run()
-      .pipe(Effect.orDie)
+    yield* db.update(SessionTable).set({ title }).where(eq(SessionTable.id, id)).run().pipe(Effect.orDie)
   })
