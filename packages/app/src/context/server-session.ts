@@ -535,6 +535,8 @@ export function createServerSession(
       pendingParts.delete(sessionID)
       orphanParts.delete(sessionID)
       removedMessages.delete(sessionID)
+      suspended.delete(sessionID)
+      stale.delete(sessionID)
     })
     setData(
       produce((draft) => {
@@ -883,7 +885,7 @@ export function createServerSession(
 
   const sync = (sessionID: string, options?: { force?: boolean; messageLimit?: number }) => {
     touch(sessionID)
-    suspended.delete(sessionID)
+    resume(sessionID)
     return runInflight(inflight, sessionID, () =>
       gated(async () => {
         const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
@@ -901,6 +903,13 @@ export function createServerSession(
 
   const release = (sessionID: string) => {
     suspended.add(sessionID)
+  }
+
+  // Timeline activity is a local lifecycle fact, not a network-sync fact.
+  // Keep this synchronous and allocation-free so cache-first navigation can
+  // reactivate streaming without paying for (or joining) an HTTP request.
+  const resume = (sessionID: string) => {
+    suspended.delete(sessionID)
   }
 
   const prefetch = async (sessionID: string, limit: number) => {
@@ -1430,6 +1439,7 @@ export function createServerSession(
       },
     },
     sync,
+    resume,
     release,
     prefetch,
     shouldPrefetch(sessionID: string, limit: number) {

@@ -213,6 +213,57 @@ describe("server session", () => {
     expect(ctx.store.data.part.msg_2_assistant).toMatchObject([{ type: "text", text: "world" }])
   })
 
+  test("resumes a cached session before streaming without requiring a network sync", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    ctx.store.set("session_message", "child", [
+      {
+        id: "msg_1_user",
+        type: "user",
+        text: "hello",
+        time: { created: 1 },
+      },
+    ])
+
+    // Reproduce tab lifecycle: leaving suspends an already-cached session,
+    // returning cache-first must reactivate it without fetching anything.
+    ctx.store.release("child")
+    ctx.store.resume("child")
+
+    const apply = (input: object) => ctx.store.applyV2(input as OpenCodeEvent)
+    apply({
+      id: "evt_step",
+      created: 2,
+      type: "session.step.started",
+      data: {
+        sessionID: "child",
+        assistantMessageID: "msg_2_assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+      },
+    })
+    apply({
+      id: "evt_text_start",
+      created: 3,
+      type: "session.text.started",
+      data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0 },
+    })
+    apply({
+      id: "evt_text_delta",
+      created: 4,
+      type: "session.text.delta",
+      data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0, delta: "live" },
+    })
+
+    expect(ctx.get).toEqual([])
+    expect(ctx.messages).toEqual([])
+    expect(ctx.store.data.session_message.child?.at(-1)).toMatchObject({
+      id: "msg_2_assistant",
+      content: [{ type: "text", text: "live" }],
+    })
+    expect(ctx.store.data.part.msg_2_assistant).toMatchObject([{ type: "text", text: "live" }])
+  })
+
   test("resolves lineage by session ID without directory", async () => {
     const ctx = setup({ child: session("child", "root"), root: session("root") })
 

@@ -20,6 +20,11 @@ export function createTimelineModel(input: {
   createEffect(
     on(input.sessionID, (id, previous) => {
       if (previous && previous !== id) sync().session.release(previous)
+      // `release()` suppresses content deltas for inactive sessions. Resume
+      // on route activation independently of session.sync(): cached timelines
+      // intentionally skip sync for immediate paint, and must still consume
+      // the live stream rather than waiting for a later tab revisit/hydration.
+      if (id) serverSync().session.resume(id)
     }),
   )
   onCleanup(() => {
