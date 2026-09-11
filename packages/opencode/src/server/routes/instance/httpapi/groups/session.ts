@@ -63,6 +63,16 @@ export const UpdatePayload = Schema.Struct({
   title: Schema.optional(Schema.String),
   metadata: Schema.optional(Session.Metadata),
   permission: Schema.optional(PermissionV1.Ruleset),
+  /** Persist the session's selected primary agent without manufacturing a prompt. */
+  agent: Schema.optional(Schema.String),
+  /** Persist provider/model/reasoning selection. `variant: "default"` selects the base model. */
+  model: Schema.optional(
+    Schema.Struct({
+      providerID: ProviderV2.ID,
+      id: ModelV2.ID,
+      variant: Schema.optional(Schema.String),
+    }),
+  ),
   time: Schema.optional(
     Schema.Struct({
       // `null` clears the archive timestamp (unarchive); a number archives.

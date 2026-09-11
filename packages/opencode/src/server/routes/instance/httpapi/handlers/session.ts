@@ -15,6 +15,7 @@ import { SessionRevert } from "@/session/revert"
 import { SessionRunState } from "@/session/run-state"
 import { SessionStatus } from "@/session/status"
 import { SessionSummary } from "@/session/summary"
+import { Provider } from "@/provider/provider"
 import { Todo } from "@/session/todo"
 import { MessageID, PartID, SessionID } from "@/session/schema"
 import { NamedError } from "@opencode-ai/core/util/error"
@@ -57,6 +58,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     const compactSvc = yield* SessionCompaction.Service
     const runState = yield* SessionRunState.Service
     const agentSvc = yield* Agent.Service
+    const providerSvc = yield* Provider.Service
     const permissionSvc = yield* Permission.Service
     const statusSvc = yield* SessionStatus.Service
     const todoSvc = yield* Todo.Service
@@ -204,6 +206,40 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
         yield* session.setPermission({
           sessionID: ctx.params.sessionID,
           permission: Permission.merge(current.permission ?? [], ctx.payload.permission),
+        })
+      }
+      if (ctx.payload.agent !== undefined || ctx.payload.model !== undefined) {
+        const nextAgent = ctx.payload.agent ?? current.agent ?? (yield* agentSvc.defaultAgent())
+        const knownAgents = yield* agentSvc.list()
+        if (!knownAgents.some((agent) => agent.name === nextAgent)) {
+          return yield* new HttpApiError.BadRequest({})
+        }
+
+        const requestedModel = ctx.payload.model ?? current.model
+        const nextModel = requestedModel
+          ? {
+              providerID: requestedModel.providerID,
+              id: requestedModel.id,
+              variant: requestedModel.variant ?? "default",
+            }
+          : yield* providerSvc.defaultModel().pipe(
+              Effect.map((model) => ({ ...model, id: model.modelID, variant: "default" })),
+              Effect.mapError(() => new HttpApiError.BadRequest({})),
+            )
+
+        const model = yield* providerSvc.getModel(nextModel.providerID, nextModel.id).pipe(
+          Effect.mapError(() => new HttpApiError.BadRequest({})),
+        )
+        const variant = nextModel.variant === "default" ? "default" : nextModel.variant
+        const published = Object.keys(model.variants ?? {})
+        if (variant !== "default" && published.length > 0 && !published.includes(variant)) {
+          return yield* new HttpApiError.BadRequest({})
+        }
+        yield* session.setAgentModel({
+          sessionID: ctx.params.sessionID,
+          agent: nextAgent,
+          model: { providerID: nextModel.providerID, id: nextModel.id, variant },
+          time: Date.now(),
         })
       }
       if (ctx.payload.time?.archived !== undefined) {

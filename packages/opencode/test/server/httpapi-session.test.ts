@@ -428,6 +428,48 @@ describe("session HttpApi", () => {
     }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
   )
 
+  it.live("persists validated agent and model selection through session PATCH without creating a prompt", () =>
+    Effect.gen(function* () {
+      const llm = yield* TestLLMServer
+      const config = testProviderConfig(llm.url)
+      const directory = yield* tmpdirScoped({ git: true, config })
+      const session = yield* createSession({ title: "selection patch" }).pipe(provideInstanceEffect(directory))
+      const headers = { "x-opencode-directory": directory, "content-type": "application/json" }
+      const path = pathFor(SessionPaths.update, { sessionID: session.id })
+
+      const updated = yield* request(path, {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({
+          agent: "build",
+          model: { providerID: "test", id: "test-model", variant: "default" },
+        }),
+      })
+      expect(updated.status).toBe(200)
+      const selected = (yield* responseJson(updated)) as Session.Info
+      expect(selected.agent).toBe("build")
+      expect(selected.model).toEqual({ providerID: "test", id: "test-model", variant: "default" })
+
+      // Selection is session state, not a synthetic conversation turn.
+      expect(yield* Session.use.messages({ sessionID: session.id }).pipe(provideInstanceEffect(directory), Effect.orDie)).toHaveLength(0)
+
+      const invalid = yield* request(path, {
+        method: "PATCH",
+        headers,
+        body: JSON.stringify({
+          model: { providerID: "test", id: "missing-model", variant: "default" },
+        }),
+      })
+      expect(invalid.status).toBe(400)
+
+      const fetched = yield* request(pathFor(SessionPaths.get, { sessionID: session.id }), { headers })
+      expect(fetched.status).toBe(200)
+      const after = (yield* responseJson(fetched)) as Session.Info
+      expect(after.agent).toBe("build")
+      expect(after.model).toEqual({ providerID: "test", id: "test-model", variant: "default" })
+    }).pipe(Effect.provide(TestLLMServer.layer), Effect.provide(AppNodeBuilder.build(CrossSpawnSpawner.node))),
+  )
+
   it.instance(
     "returns v2 public request errors for cursor and workspace query failures",
     () =>
