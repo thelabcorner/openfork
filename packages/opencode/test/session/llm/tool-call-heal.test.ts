@@ -83,15 +83,34 @@ describe("legacy find tool-call healing", () => {
     expect(isCanonicalFindToolMap(withoutFind)).toBe(false)
   })
 
-  test("ignores inherited wire fields instead of treating them as trusted input", () => {
+  test("rejects non-plain runtime objects and never executes accessor payloads", () => {
     const inheritedPattern = Object.create({ pattern: "**/*.ts" }) as Record<string, unknown>
     expect(healLegacyFindCall("glob", inheritedPattern, findOnly()).healed).toBe(false)
 
-    const inheritedPath = Object.assign(Object.create({ path: "secret" }), { pattern: "*.ts" }) as Record<
-      string,
-      unknown
-    >
-    expect(healLegacyFindCall("glob", inheritedPath, findOnly())).toMatchObject({
+    let getterRead = false
+    const accessor: Record<string, unknown> = {}
+    Object.defineProperty(accessor, "pattern", {
+      enumerable: true,
+      get() {
+        getterRead = true
+        throw new Error("must not execute")
+      },
+    })
+    expect(healLegacyFindCall("glob", accessor, findOnly()).healed).toBe(false)
+    expect(getterRead).toBe(false)
+
+    const hostile = new Proxy(
+      { pattern: "*.ts" },
+      {
+        ownKeys() {
+          throw new Error("unreadable keys")
+        },
+      },
+    )
+    expect(healLegacyFindCall("glob", hostile, findOnly()).healed).toBe(false)
+
+    const nullPrototype = Object.assign(Object.create(null), { pattern: "*.ts" }) as Record<string, unknown>
+    expect(healLegacyFindCall("glob", nullPrototype, findOnly())).toMatchObject({
       healed: true,
       input: { glob: "*.ts" },
     })

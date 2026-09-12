@@ -14,7 +14,13 @@ export type HealedToolCall = {
 
 function record(value: unknown): Record<string, unknown> | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
-  return value as Record<string, unknown>
+  try {
+    const proto = Object.getPrototypeOf(value)
+    if (proto !== Object.prototype && proto !== null) return undefined
+    return value as Record<string, unknown>
+  } catch {
+    return undefined
+  }
 }
 
 function decodeInput(value: unknown): { value: Record<string, unknown>; encoded: boolean } | undefined {
@@ -43,8 +49,25 @@ function hasToolCaseInsensitive(tools: ToolMap, name: string) {
   return Object.keys(tools).some((candidate) => candidate.toLowerCase() === lower)
 }
 
-function owns(value: Record<string, unknown>, key: string) {
-  return Object.prototype.hasOwnProperty.call(value, key)
+function ownData(value: Record<string, unknown>, key: string): { present: boolean; value?: unknown } {
+  try {
+    const descriptor = Object.getOwnPropertyDescriptor(value, key)
+    if (!descriptor) return { present: false }
+    // Model/provider JSON must be data, never executable accessors. A getter
+    // here is a runtime object, not a valid wire payload, so fail closed.
+    if (!("value" in descriptor)) return { present: true, value: Symbol.for("accessor") }
+    return { present: true, value: descriptor.value }
+  } catch {
+    return { present: true, value: Symbol.for("unreadable") }
+  }
+}
+
+function ownKeys(value: Record<string, unknown>): string[] | undefined {
+  try {
+    return Object.keys(value)
+  } catch {
+    return undefined
+  }
 }
 
 export function markCanonicalFindToolMap<T extends ToolMap>(tools: T): T {
@@ -87,19 +110,23 @@ export function healLegacyFindCall(name: string, input: unknown, tools: ToolMap)
   if (!decoded) return { name, input, healed: false }
   const source = decoded.value
   const allowed = lower === "glob" ? new Set(["pattern", "path"]) : new Set(["pattern", "path", "include"])
-  if (Object.keys(source).some((key) => !allowed.has(key))) return { name, input, healed: false }
-  if (!owns(source, "pattern") || typeof source.pattern !== "string" || source.pattern.length === 0) {
+  const keys = ownKeys(source)
+  if (!keys || keys.some((key) => !allowed.has(key))) return { name, input, healed: false }
+  const patternData = ownData(source, "pattern")
+  if (!patternData.present || typeof patternData.value !== "string" || patternData.value.length === 0) {
     return { name, input, healed: false }
   }
-  const path = owns(source, "path") ? source.path : undefined
-  const include = owns(source, "include") ? source.include : undefined
+  const pathData = ownData(source, "path")
+  const includeData = ownData(source, "include")
+  const path = pathData.present ? pathData.value : undefined
+  const include = includeData.present ? includeData.value : undefined
   if (path !== undefined && typeof path !== "string") return { name, input, healed: false }
   if (lower === "grep" && include !== undefined && typeof include !== "string") {
     return { name, input, healed: false }
   }
 
   const translated: Record<string, unknown> = {
-    [lower]: source.pattern,
+    [lower]: patternData.value,
     ...(path !== undefined ? { path } : {}),
     ...(lower === "grep" && include !== undefined ? { include } : {}),
   }

@@ -403,6 +403,74 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     })
   })
 
+  test("MCP alias correlation matches surviving args when parallel find aliases execute out of order", async () => {
+    resetSharedState()
+    const script = new SdkScript()
+    let mcpOptions: any
+    const runtime = new ClaudeAgentRuntime({
+      loader: async () =>
+        ({
+          createSdkMcpServer: (options: any) => {
+            mcpOptions = options
+            return { type: "sdk", name: options.name, instance: {} }
+          },
+          query: (request: any) => {
+            script.requests.push(request)
+            return { events: script.events, interrupt: async () => {}, close: () => script.end(), pid: 4242 }
+          },
+        }) as never,
+    })
+    const store = new BridgeStore()
+    const pending = events(
+      ClaudeRuntimeAdapter.stream(
+        baseInput({ runtime, store, tools: markCanonicalFindToolMap({ find: findTool }) }),
+      ),
+    )
+
+    script.push({ type: "system", subtype: "init", session_id: "ext-mcp-parallel-1" })
+    script.push({
+      type: "assistant",
+      session_id: "ext-mcp-parallel-1",
+      message: {
+        content: [
+          { type: "tool_use", id: "call-glob-first", name: "glob", input: { pattern: "**/*.ts", path: "src" } },
+          {
+            type: "tool_use",
+            id: "call-grep-second",
+            name: "grep",
+            input: { pattern: "needle", path: "test", include: "*.ts" },
+          },
+        ],
+      },
+    })
+
+    await script.waitForRequest(1)
+    const findHandler = mcpOptions.tools[0].handler
+
+    // Deliberately execute the second call first. Matching path/include remnants
+    // must select call-grep-second rather than blindly consuming FIFO.
+    const grepResult = await findHandler(
+      { path: "test", include: "*.ts" },
+      { signal: new AbortController().signal },
+    )
+    const globResult = await findHandler({ path: "src" }, { signal: new AbortController().signal })
+    expect(grepResult.content[0].text).toBe("find:needle:test:*.ts")
+    expect(globResult.content[0].text).toBe("find:**/*.ts:src:")
+    expect(store.get("call-grep-second")?.request.input).toEqual({ grep: "needle", path: "test", include: "*.ts" })
+    expect(store.get("call-glob-first")?.request.input).toEqual({ glob: "**/*.ts", path: "src" })
+
+    script.push({ type: "assistant", message: { content: [{ type: "text", text: "Done." }] } })
+    script.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Done.",
+      session_id: "ext-mcp-parallel-1",
+    })
+    script.end()
+    await pending
+  })
+
   test("second turn resumes the bound external session with only the new user text", async () => {
     resetSharedState()
     const script = new SdkScript()

@@ -673,12 +673,19 @@ class ToolCallCorrelator {
   private readonly observed = new Map<string, ResolvedToolUse[]>()
   private readonly waiters = new Map<
     string,
-    Array<{ resolve: (toolUse: ResolvedToolUse) => void; reject: (error: unknown) => void }>
+    Array<{
+      matches?: (toolUse: ResolvedToolUse) => boolean
+      resolve: (toolUse: ResolvedToolUse) => void
+      reject: (error: unknown) => void
+    }>
   >()
 
   observe(toolUse: ResolvedToolUse): void {
-    const waiter = this.waiters.get(toolUse.name)?.shift()
+    const pending = this.waiters.get(toolUse.name)
+    const waiterIndex = pending?.findIndex((waiter) => !waiter.matches || waiter.matches(toolUse)) ?? -1
+    const waiter = waiterIndex >= 0 ? pending?.splice(waiterIndex, 1)[0] : undefined
     if (waiter) {
+      if (pending?.length === 0) this.waiters.delete(toolUse.name)
       waiter.resolve(toolUse)
       return
     }
@@ -687,15 +694,17 @@ class ToolCallCorrelator {
     this.observed.set(toolUse.name, calls)
   }
 
-  claim(name: string, signal: AbortSignal): Promise<ResolvedToolUse> {
+  claim(name: string, signal: AbortSignal, matches?: (toolUse: ResolvedToolUse) => boolean): Promise<ResolvedToolUse> {
     const calls = this.observed.get(name)
-    const toolUse = calls?.shift()
+    const callIndex = calls?.findIndex((toolUse) => !matches || matches(toolUse)) ?? -1
+    const toolUse = callIndex >= 0 ? calls?.splice(callIndex, 1)[0] : undefined
     if (toolUse) return Promise.resolve(toolUse)
 
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const waiters = this.waiters.get(name) ?? []
       const waiter = {
+        matches,
         resolve: (resolved: ResolvedToolUse) => {
           if (timer) clearTimeout(timer)
           signal.removeEventListener("abort", onAbort)
@@ -923,7 +932,19 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
               : input.abort
           const canonical = canonicalToolName(name, input.tools) ?? name
           try {
-            const observed = await correlator.claim(canonical, signal)
+            const handlerInput = isRecord(args) ? args : undefined
+            const findAliasMatcher =
+              canonical === "find" && isCanonicalFindToolMap(input.tools) && handlerInput
+                ? (toolUse: ResolvedToolUse) => {
+                    if (!isRecord(toolUse.input)) return false
+                    if (typeof handlerInput.glob === "string" && toolUse.input.glob !== handlerInput.glob) return false
+                    if (typeof handlerInput.grep === "string" && toolUse.input.grep !== handlerInput.grep) return false
+                    if (typeof handlerInput.path === "string" && toolUse.input.path !== handlerInput.path) return false
+                    if (typeof handlerInput.include === "string" && toolUse.input.include !== handlerInput.include) return false
+                    return true
+                  }
+                : undefined
+            const observed = await correlator.claim(canonical, signal, findAliasMatcher)
             // Agent SDK tool aliases are name-only. The target MCP Zod schema
             // strips an upstream legacy `pattern` field before this handler,
             // so a glob/grep alias may arrive here as `{}` / `{ path, include }`.
@@ -932,7 +953,6 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
             // only when it is a valid canonical find call and the validated
             // handler args no longer contain a find discriminator.
             const observedInput = isRecord(observed.input) ? observed.input : undefined
-            const handlerInput = isRecord(args) ? args : undefined
             const recoverFindAlias =
               canonical === "find" &&
               isCanonicalFindToolMap(input.tools) &&
