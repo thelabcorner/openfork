@@ -9,14 +9,22 @@ import { BashArity } from "@/permission/arity"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { NonNegativeInt, PositiveInt } from "@opencode-ai/core/schema"
 import { TRUNCATION_DIR } from "./truncation-dir"
+import { Config } from "@/config/config"
+import { Shell } from "@opencode-ai/core/shell"
+import { containsPath } from "../project/instance-context"
+import { Plugin } from "@/plugin"
+import { ShellJob } from "@/background/shell-job"
+import { MonitorDelivery } from "@/background/monitor-delivery"
+import { InstanceState } from "@/effect/instance-state"
+import { Agent } from "@/agent/agent"
 
 export const Parameters = Schema.Struct({
-  action: Schema.Literals(["list", "status", "kill", "read", "wait", "send"]).annotate({
+  action: Schema.Literals(["list", "status", "kill", "read", "wait", "send", "monitor"]).annotate({
     description:
-      "What to do: 'list' shows all jobs, 'status' shows one job, 'read' reads its live log, 'wait' blocks until it finishes, 'send' writes to its stdin, 'kill' terminates it",
+      "What to do: list/status/read/wait/send/kill manage jobs; monitor starts a long-running event-producing command that can wake this session on meaningful stdout lines.",
   }),
   id: Schema.optional(Schema.String).annotate({
-    description: "Job id returned by the bash tool's background launch. Required for all actions except 'list'",
+    description: "Job id. Required for status/read/wait/send/kill; optional custom id when action=monitor.",
   }),
   offset: Schema.optional(NonNegativeInt).annotate({
     description: "For 'read': 1-indexed line to start from (default 1)",
@@ -25,10 +33,22 @@ export const Parameters = Schema.Struct({
     description: "For 'read': max number of lines to return (default 2000)",
   }),
   timeout: Schema.optional(NonNegativeInt).annotate({
-    description: "For 'wait': max milliseconds to wait. Omit to wait indefinitely; 0 polls once",
+    description: "wait: max milliseconds to wait (omit = indefinitely, 0 = poll once). monitor: process timeout in ms (default 300000 unless persistent=true).",
   }),
   input: Schema.optional(Schema.String).annotate({
     description: "For 'send': text to write to the job's stdin (a newline is appended if missing)",
+  }),
+  command: Schema.optional(Schema.String).annotate({
+    description: "monitor: long-running shell command. It should print only meaningful state changes to stdout.",
+  }),
+  description: Schema.optional(Schema.String).annotate({
+    description: "monitor: short description of the watched condition, shown in wake events and UI.",
+  }),
+  workdir: Schema.optional(Schema.String).annotate({
+    description: "monitor: command working directory (defaults to project directory).",
+  }),
+  persistent: Schema.optional(Schema.Boolean).annotate({
+    description: "monitor: run until explicitly killed. Default false.",
   }),
 })
 
@@ -86,9 +106,24 @@ function renderList(rows: Row[]): string {
   if (rows.length > 0) {
     lines.push("")
     lines.push("Use `background status {id}` for details, `background read {id}` for output, `background kill {id}` to terminate.")
-    lines.push("Monitor jobs share this manager; start them with the `monitor` tool.")
+    lines.push('Start event-driven monitors with background({ action: "monitor", command, description }).')
   }
   return lines.join("\n")
+}
+
+const escapeXML = (text: string) => text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+
+function renderMonitorStarted(jobId: string, command: string, description: string, logPath: string, persistent: boolean) {
+  return [
+    `<monitor job="${escapeXML(jobId)}" state="monitoring">`,
+    `  <summary>Monitoring ${escapeXML(description)}</summary>`,
+    `  <command>${escapeXML(command)}</command>`,
+    "  Each meaningful stdout line may wake this session in a future turn.",
+    "  Do not poll this job. Use background status/read/send/wait/kill with the returned id when management is needed.",
+    `  Full output: ${escapeXML(logPath)}`,
+    `  ${persistent ? "Persistent: runs until killed." : "Bounded monitor: exits at timeout unless it finishes first."}`,
+    "</monitor>",
+  ].join("\n")
 }
 
 export const BackgroundTool = Tool.define(
@@ -97,11 +132,26 @@ export const BackgroundTool = Tool.define(
     const background = yield* BackgroundJob.Service
     const jobs = yield* ShellJobs.Service
     const fs = yield* FSUtil.Service
+    const config = yield* Config.Service
+    const plugin = yield* Plugin.Service
+    const shellJob = yield* ShellJob.Service
+    const monitorDelivery = yield* MonitorDelivery.Service
+    const agents = yield* Agent.Service
+
+    const resolvePath = Effect.fn("BackgroundTool.resolvePath")(function* (text: string, root: string) {
+      if (process.platform === "win32") return FSUtil.normalizePath(path.resolve(root, FSUtil.windowsPath(text)))
+      return path.resolve(root, text)
+    })
+
+    const shellEnv = Effect.fn("BackgroundTool.shellEnv")(function* (ctx: Tool.Context, cwd: string) {
+      const extra = yield* plugin.trigger("shell.env", { cwd, sessionID: ctx.sessionID, callID: ctx.callID }, { env: {} })
+      return { ...process.env, ...extra.env }
+    })
 
     const readLog = Effect.fn("BackgroundTool.readLog")(function* (logPath: string, offset: number, limit: number) {
       const text = yield* fs.readFileStringSafe(logPath)
       if (!text) return "(no output yet)"
-      const lines = text.replace(/\r\n/g, "\n").split("\n")
+      const lines = text.replace(/\n/g, "\n").split("\n")
       const start = Math.max(0, offset - 1)
       const shown = lines.slice(start, start + limit)
       const out = shown.join("\n") || "(no output yet)"
@@ -179,9 +229,9 @@ export const BackgroundTool = Tool.define(
         // leaking the raw SchemaError.
         if (message.includes("Missing key") && message.includes('["action"]')) {
           return [
-            'The `background` tool manages jobs already launched by the `bash` tool (`background: true`); it has no `command` parameter.',
-            'To launch a job, call `bash` with `background: true` — it returns a job id.',
-            "To manage one, pass `action` (one of list | status | kill | read | wait | send) and the job's `id`, e.g. background({ action: \"read\", id: \"job_abc\" }).",
+            'The `background` tool manages jobs and can also start event-driven monitors.',
+            'For an ordinary background process, call `bash` with `background: true`. For a condition/event watch, call background({ action: "monitor", command, description }).',
+            "To manage a job, pass `action` (list | status | kill | read | wait | send) and its `id`, e.g. background({ action: \"read\", id: \"job_abc\" }).",
             "Call background({ action: \"list\" }) to see running jobs and ids.",
           ].join(" ")
         }
@@ -190,6 +240,99 @@ export const BackgroundTool = Tool.define(
       execute: (params: Params, ctx: Tool.Context): Effect.Effect<Tool.ExecuteResult> =>
         Effect.gen(function* () {
           switch (params.action) {
+            case "monitor": {
+              if ((ctx.extra as any)?.bypassAgentCheck === true) {
+                throw new Error("background action=monitor is not available to subagents in V1")
+              }
+              const ag = yield* agents.get(ctx.agent).pipe(Effect.catch(() => Effect.succeed(undefined)))
+              if (ag && ag.mode === "subagent") {
+                throw new Error("background action=monitor is not available to subagents in V1; run it from the primary session")
+              }
+
+              const command = params.command?.trim()
+              const description = params.description?.trim()
+              if (!command) throw new Error("monitor requires command")
+              if (!description) throw new Error("monitor requires description")
+
+              const cfg = yield* config.get()
+              const shell = Shell.acceptable(cfg.shell)
+              let instance: any
+              try {
+                instance = yield* InstanceState.context
+              } catch {
+                instance = { directory: process.cwd(), worktree: process.cwd() }
+              }
+              const cwd = params.workdir ? yield* resolvePath(params.workdir, instance.directory) : instance.directory
+              if (!containsPath(cwd, instance)) {
+                const globs = [
+                  process.platform === "win32"
+                    ? FSUtil.normalizePathPattern(path.join(cwd, "*"))
+                    : path.join(cwd, "*"),
+                ]
+                yield* ctx.ask({
+                  permission: "external_directory",
+                  patterns: globs,
+                  always: globs,
+                  metadata: { command, directories: [cwd], patterns: globs },
+                })
+              }
+              const tokens = command.split(/\s+/)
+              yield* ctx.ask({
+                permission: ShellID.ToolID,
+                patterns: [command],
+                always: [BashArity.prefix(tokens).join(" ") + " *"],
+                metadata: { command, action: "monitor" },
+              })
+
+              const env = yield* shellEnv(ctx, cwd)
+              const persistent = params.persistent ?? false
+              const timeoutMs = persistent ? params.timeout : (params.timeout ?? 5 * 60 * 1000)
+              const startedAt = Date.now()
+              const job = yield* shellJob.launch(
+                {
+                  command,
+                  shell,
+                  cwd,
+                  env,
+                  kind: "monitor",
+                  delivery: {
+                    mode: "events",
+                    ownerSessionID: ctx.sessionID as any,
+                    description,
+                    debounceMs: 200,
+                    eventStream: "stdout",
+                  },
+                  description,
+                  timeoutMs,
+                  id: params.id,
+                },
+                ctx as any,
+              )
+              return {
+                title: `background monitor ${description}`,
+                metadata: {
+                  action: "monitor",
+                  jobId: job.jobId,
+                  logPath: job.logPath,
+                  kind: "monitor",
+                  description,
+                  command,
+                  persistent,
+                  timeoutMs,
+                  startedAt,
+                  status: "running",
+                  delivery: {
+                    mode: "events",
+                    ownerSessionID: String(ctx.sessionID),
+                    description,
+                    eventStream: "stdout",
+                    debounceMs: 200,
+                  },
+                },
+                output: renderMonitorStarted(job.jobId, command, description, job.logPath, persistent),
+              }
+            }
+
             case "list": {
               const infos = yield* background.list()
               const rows: Row[] = infos.map((info) => ({
@@ -353,19 +496,33 @@ export const BackgroundTool = Tool.define(
                 throw new Error(`No such job: ${params.id}`)
               }
               const command = entry?.command ?? info?.title ?? params.id
+              const kind = (entry as any)?.kind ?? (info?.metadata as any)?.kind ?? "shell"
               yield* askCommand(ctx, "kill", {
                 id: params.id,
                 status: "running",
-                kind: (entry as any)?.kind ?? (info?.metadata as any)?.kind ?? "shell",
+                kind,
                 command,
                 logPath: entry?.logPath,
               })
               if (!info || info.status === "running") {
-                // Cancel first: sets status "cancelled" deterministically and closes the
-                // job scope (the spawn release kills the process). handle.kill after is a
-                // belt-and-suspenders in case the release path is insufficient.
-                yield* background.cancel(params.id).pipe(Effect.ignore)
-                if (entry) yield* entry.handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.ignore)
+                // Explicit monitor kill must never wake the model. Detach the
+                // event-delivery state before closing the job scope so pending
+                // debounce fibers cannot participate in teardown or emit a
+                // terminal event.
+                if (kind === "monitor") {
+                  yield* monitorDelivery.detach(params.id).pipe(Effect.ignore)
+                  yield* background.cancel(params.id).pipe(Effect.ignore)
+                  if (entry) {
+                    yield* entry.handle
+                      .kill({ forceKillAfter: "3 seconds" })
+                      .pipe(Effect.timeout("4 seconds"), Effect.ignore)
+                  }
+                } else {
+                  // Ordinary shell jobs already close cleanly through the
+                  // background scope; retain the established ordering here.
+                  yield* background.cancel(params.id).pipe(Effect.ignore)
+                  if (entry) yield* entry.handle.kill({ forceKillAfter: "3 seconds" }).pipe(Effect.ignore)
+                }
               }
               const after = yield* background.get(params.id)
               return {

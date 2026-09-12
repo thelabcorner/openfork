@@ -130,6 +130,12 @@ const cancelBackgroundJobs = Effect.fn("SessionRunState.cancelBackgroundJobs")(f
   const matches = (job: BackgroundJob.Info) => {
     if (job.status !== "running") return false
     if (cancelled.has(job.id)) return false
+    // Detached task work is session-owned, not parent-turn-owned. Stopping a
+    // parent generation must not kill background children that are expected to
+    // finish independently and report back later. Cancelling the child session
+    // itself still owns and cancels its job.
+    if (job.id === sessionID || job.metadata?.sessionId === sessionID) return true
+    if (job.metadata?.background === true) return false
     if (pending.has(job.id)) return true
     if (typeof job.metadata?.sessionId === "string" && pending.has(job.metadata.sessionId)) return true
     return typeof job.metadata?.parentSessionId === "string" && pending.has(job.metadata.parentSessionId)

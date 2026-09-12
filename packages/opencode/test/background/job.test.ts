@@ -151,6 +151,55 @@ describe("background.job", () => {
     }),
   )
 
+  it.instance("keeps ordinary jobs fail-fast even when a queued extension can settle quickly", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      yield* Effect.forEach(
+        Array.from({ length: 25 }),
+        (_, index) =>
+          Effect.gen(function* () {
+            const fail = yield* Deferred.make<void>()
+            const job = yield* jobs.start({
+              id: `job_fail_fast_${index}`,
+              type: "test",
+              run: Deferred.await(fail).pipe(Effect.andThen(Effect.fail(new Error("boom")))),
+            })
+            expect(yield* jobs.extend({ id: job.id, run: Effect.succeed("too late") })).toBe(true)
+            yield* Deferred.succeed(fail, undefined)
+            const result = yield* jobs.wait({ id: job.id })
+            expect(result.info?.status).toBe("error")
+            expect(result.info?.error).toBe("boom")
+          }),
+        { concurrency: 5 },
+      )
+    }),
+  )
+
+  it.instance("can continue queued work after a non-interrupt failure when opted in", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const fail = yield* Deferred.make<void>()
+      const recovered = yield* Deferred.make<void>()
+      const job = yield* jobs.start({
+        type: "test",
+        continueOnFailure: true,
+        run: Deferred.await(fail).pipe(Effect.andThen(Effect.fail(new Error("first failed")))),
+      })
+      expect(
+        yield* jobs.extend({
+          id: job.id,
+          run: Deferred.succeed(recovered, undefined).pipe(Effect.as("recovered")),
+        }),
+      ).toBe(true)
+
+      yield* Deferred.succeed(fail, undefined)
+      yield* Deferred.await(recovered)
+      const result = yield* jobs.wait({ id: job.id })
+      expect(result.info?.status).toBe("completed")
+      expect(result.info?.output).toBe("recovered")
+    }),
+  )
+
   it.instance("ignores stale settlements after restarting a failed job", () =>
     Effect.gen(function* () {
       const jobs = yield* BackgroundJob.Service
@@ -224,6 +273,77 @@ describe("background.job", () => {
 
       yield* Deferred.succeed(latch, undefined)
       expect((yield* jobs.wait({ id: job.id })).info?.output).toBe("done")
+    }),
+  )
+
+  it.instance("can foreground and re-promote the same running job", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const latch = yield* Deferred.make<void>()
+      const job = yield* jobs.start({
+        type: "test",
+        metadata: { parentSessionId: "parent", background: false },
+        run: Deferred.await(latch).pipe(Effect.as("done")),
+      })
+
+      yield* jobs.promote(job.id)
+      expect((yield* jobs.get(job.id))?.metadata?.background).toBe(true)
+
+      yield* jobs.foreground(job.id)
+      expect((yield* jobs.get(job.id))?.metadata?.background).toBe(false)
+      const premature = yield* jobs.waitForPromotion(job.id).pipe(Effect.timeoutOption(10))
+      expect(premature._tag).toBe("None")
+
+      yield* jobs.promote(job.id)
+      expect((yield* jobs.waitForPromotion(job.id)).metadata?.background).toBe(true)
+
+      yield* Deferred.succeed(latch, undefined)
+      expect((yield* jobs.wait({ id: job.id })).info?.output).toBe("done")
+    }),
+  )
+
+  it.instance("tryStart reports whether it won the running id", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const release = yield* Deferred.make<void>()
+      let duplicateRan = false
+      const first = yield* jobs.tryStart({
+        id: "job_try_start",
+        type: "test",
+        run: Deferred.await(release).pipe(Effect.as("first")),
+      })
+      const duplicate = yield* jobs.tryStart({
+        id: "job_try_start",
+        type: "test",
+        run: Effect.sync(() => {
+          duplicateRan = true
+          return "duplicate"
+        }),
+      })
+
+      expect(first.started).toBe(true)
+      expect(duplicate.started).toBe(false)
+      expect(duplicate.info.generation).toBe(first.info.generation)
+      expect(duplicateRan).toBe(false)
+      yield* Deferred.succeed(release, undefined)
+      expect((yield* jobs.wait({ id: first.info.id })).info?.output).toBe("first")
+      expect(duplicateRan).toBe(false)
+    }),
+  )
+
+  it.instance("increments generation when the same id is restarted", () =>
+    Effect.gen(function* () {
+      const jobs = yield* BackgroundJob.Service
+      const id = "job_generation"
+      const first = yield* jobs.start({ id, type: "test", run: Effect.succeed("first") })
+      const firstDone = (yield* jobs.wait({ id })).info
+      const second = yield* jobs.start({ id, type: "test", run: Effect.never })
+
+      expect(first.generation).toBe(1)
+      expect(firstDone?.generation).toBe(1)
+      expect(second.generation).toBe(2)
+      expect((yield* jobs.get(id))?.generation).toBe(2)
+      yield* jobs.cancel(id)
     }),
   )
 

@@ -1,6 +1,8 @@
-Manages commands launched in the background with the `bash` tool (`background: true`). Lists, inspects, reads live output from, waits on, sends input to, and kills background jobs.
+Manages background jobs and starts event-driven monitors. Ordinary long-running commands are launched with `bash background=true`; condition/event watches are launched here with `action:"monitor"`.
 
 Actions (use the `action` parameter):
+
+- `monitor` — Start a long-running shell command whose meaningful stdout lines may wake this session in future turns. Requires `command` and a short `description`. The command should stay quiet unless state actually changes. `persistent:true` runs until killed; otherwise `timeout` defaults to 300000 ms. The returned id is managed by the same status/read/wait/send/kill actions below.
 
 - `list` — List every background job in this project plus `stale` leftovers from before a restart. Columns: id, status, kind (shell|monitor), command (+ monitor description), started time, log path.
 - `status` — Full status for one job: status (running/completed/error/cancelled/stale), kind, description (for monitors), exit code, command, started/completed times, and the log path. Pass the job `id` returned at launch.
@@ -12,6 +14,6 @@ Actions (use the `action` parameter):
 Notes:
 
 - Jobs are scoped to the project instance and die on restart; leftover logs are listed as `stale` and remain readable for 7 days.
-- A job started in one session can be managed from any session in the same project; only the launching session receives the completion notification (when launched with `notify: true`). Monitor jobs use the same manager — start them with the `monitor` tool and control them here.
+- A job started in one session can be managed from any session in the same project; only the launching session receives the completion notification (when launched with `notify: true`). Monitor jobs use the same manager and are started with `action:"monitor"`.
 - `kill`/`send` ask for the `bash` permission using the job's original command, so an existing "always allow" rule for that command covers them with no extra prompts.
-- Monitor jobs appear with `kind=monitor` and their `description` in `list`/`status`; they share the same `read`/`wait`/`send`/`kill` lifecycle — there is no separate monitor manager.
+- Monitor jobs appear with `kind=monitor` and their `description` in `list`/`status`; they share the same `read`/`wait`/`send`/`kill` lifecycle. Every stdout line can trigger a future model wake, so filter noisy streams at the source. Monitors are primary-session only in V1.

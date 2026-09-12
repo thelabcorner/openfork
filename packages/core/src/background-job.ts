@@ -11,6 +11,7 @@ export type Info = {
   type: string
   title?: string
   status: Status
+  generation?: number
   started_at: number
   completed_at?: number
   output?: string
@@ -26,9 +27,11 @@ type Active = {
   pending: number
   next: number
   output?: { sequence: number; text: string }
+  failure?: { sequence: number; text: string }
   tail: Deferred.Deferred<void>
   promoted: Deferred.Deferred<Info>
   onPromote?: Effect.Effect<void>
+  continueOnFailure: boolean
 }
 
 type State = {
@@ -67,6 +70,7 @@ export type StartInput = {
   title?: string
   metadata?: Record<string, unknown>
   onPromote?: Effect.Effect<void>
+  continueOnFailure?: boolean
   run: Effect.Effect<string, unknown>
 }
 
@@ -89,10 +93,12 @@ export interface Interface {
   readonly list: () => Effect.Effect<Info[]>
   readonly get: (id: string) => Effect.Effect<Info | undefined>
   readonly start: (input: StartInput) => Effect.Effect<Info>
+  readonly tryStart: (input: StartInput) => Effect.Effect<{ info: Info; started: boolean }>
   readonly extend: (input: ExtendInput) => Effect.Effect<boolean>
   readonly wait: (input: WaitInput) => Effect.Effect<WaitResult>
   readonly waitForPromotion: (id: string) => Effect.Effect<Info>
   readonly promote: (id: string) => Effect.Effect<Info | undefined>
+  readonly foreground: (id: string, onPromote?: Effect.Effect<void>) => Effect.Effect<Info | undefined>
   readonly cancel: (id: string) => Effect.Effect<Info | undefined>
 }
 
@@ -136,29 +142,38 @@ export const make = Effect.gen(function* () {
       if (job.token !== token) return [{}, jobs]
       if (job.info.status !== "running") return [{ info: snapshot(job) }, jobs]
       const pending = job.pending - 1
+      const interrupted = Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)
       const output =
         Exit.isSuccess(exit) && (!job.output || sequence > job.output.sequence)
           ? { sequence, text: exit.value }
           : job.output
-      if (Exit.isSuccess(exit) && pending > 0) {
-        return [{}, new Map(jobs).set(id, { ...job, pending, output })]
+      const failure =
+        Exit.isFailure(exit) && !interrupted && (!job.failure || sequence > job.failure.sequence)
+          ? { sequence, text: errorText(Cause.squash(exit.cause)) }
+          : job.failure
+
+      if (!interrupted && (Exit.isSuccess(exit) || job.continueOnFailure) && pending > 0) {
+        return [{}, new Map(jobs).set(id, { ...job, pending, output, failure })]
       }
-      const status: Exclude<Status, "running"> = Exit.isSuccess(exit)
-        ? "completed"
-        : Cause.hasInterruptsOnly(exit.cause)
-          ? "cancelled"
-          : "error"
+
+      const failFast = Exit.isFailure(exit) && !interrupted && !job.continueOnFailure
+      const latestFailed =
+        !interrupted && failure !== undefined && (!output || failure.sequence > output.sequence)
+      const status: Exclude<Status, "running"> =
+        interrupted ? "cancelled" : failFast || latestFailed ? "error" : "completed"
+      const terminalError = failFast && Exit.isFailure(exit) ? errorText(Cause.squash(exit.cause)) : failure?.text
       const next = {
         ...job,
         onPromote: undefined,
         pending: 0,
         output,
+        failure,
         info: {
           ...job.info,
           status,
           completed_at,
           ...(output ? { output: output.text } : {}),
-          ...(Exit.isFailure(exit) ? { error: errorText(Cause.squash(exit.cause)) } : {}),
+          ...(status === "error" && terminalError ? { error: terminalError } : {}),
         },
       }
       return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
@@ -199,7 +214,7 @@ export const make = Effect.gen(function* () {
     return snapshot(job)
   })
 
-  const start: Interface["start"] = Effect.fn("BackgroundJob.start")(function* (input) {
+  const tryStart: Interface["tryStart"] = Effect.fn("BackgroundJob.tryStart")(function* (input) {
     return yield* Effect.uninterruptibleMask((restore) =>
       Effect.gen(function* () {
         const id = input.id ?? Identifier.ascending("job")
@@ -222,6 +237,7 @@ export const make = Effect.gen(function* () {
                 type: input.type,
                 title: input.title,
                 status: "running" as const,
+                generation: (existing?.info.generation ?? 0) + 1,
                 started_at,
                 metadata: input.metadata,
               },
@@ -233,6 +249,7 @@ export const make = Effect.gen(function* () {
               tail,
               promoted,
               onPromote: input.onPromote,
+              continueOnFailure: input.continueOnFailure === true,
             }
             return [{ info: snapshot(job), scope, token }, new Map(jobs).set(id, job)] as readonly [
               StartResult,
@@ -248,9 +265,13 @@ export const make = Effect.gen(function* () {
             0,
             restore(input.run).pipe(Effect.ensuring(Deferred.succeed(tail, undefined))),
           )
-        return result.info
+        return { info: result.info, started: "scope" in result }
       }),
     )
+  })
+
+  const start: Interface["start"] = Effect.fn("BackgroundJob.start")(function* (input) {
+    return (yield* tryStart(input)).info
   })
 
   const extend: Interface["extend"] = Effect.fn("BackgroundJob.extend")(function* (input) {
@@ -334,6 +355,28 @@ export const make = Effect.gen(function* () {
     return result.info
   })
 
+  const foreground: Interface["foreground"] = Effect.fn("BackgroundJob.foreground")(function* (id, onPromote) {
+    return yield* SynchronizedRef.modifyEffect(
+      state.jobs,
+      Effect.fnUntraced(function* (jobs) {
+        const job = jobs.get(id)
+        if (!job) return [undefined, jobs] as const
+        if (job.info.metadata?.background !== true) return [snapshot(job), jobs] as const
+        const promoted = job.info.status === "running" ? yield* Deferred.make<Info>() : job.promoted
+        const next = {
+          ...job,
+          promoted,
+          onPromote: job.info.status === "running" ? onPromote : undefined,
+          info: {
+            ...job.info,
+            metadata: { ...job.info.metadata, background: false },
+          },
+        }
+        return [snapshot(next), new Map(jobs).set(id, next)] as const
+      }),
+    )
+  })
+
   const cancel: Interface["cancel"] = Effect.fn("BackgroundJob.cancel")(function* (id) {
     const completed_at = yield* Clock.currentTimeMillis
     const result = yield* SynchronizedRef.modify(state.jobs, (jobs): readonly [FinishResult, Map<string, Active>] => {
@@ -353,11 +396,21 @@ export const make = Effect.gen(function* () {
       return [{ info: snapshot(next), done: job.done, scope: job.scope }, new Map(jobs).set(id, next)]
     })
     if (result.info && result.done) yield* Deferred.succeed(result.done, result.info).pipe(Effect.ignore)
-    if (result.scope) yield* Scope.close(result.scope, Exit.void)
+    // Cancellation is a state transition, not a teardown barrier. Mirror the
+    // normal settle path above: publish the terminal state immediately, then
+    // close the owned scope asynchronously. A child process or stream finalizer
+    // can otherwise make cancel() block even though the job is already marked
+    // cancelled, which is especially visible for event-driven monitor jobs.
+    if (result.scope) {
+      yield* Scope.close(result.scope, Exit.void).pipe(
+        Effect.forkIn(state.scope, { startImmediately: true }),
+        Effect.asVoid,
+      )
+    }
     return result.info
   })
 
-  return Service.of({ list, get, start, extend, wait, waitForPromotion, promote, cancel })
+  return Service.of({ list, get, start, tryStart, extend, wait, waitForPromotion, promote, foreground, cancel })
 })
 
 const layer = Layer.effect(Service, make)

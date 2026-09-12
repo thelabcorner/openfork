@@ -35,9 +35,9 @@ You MUST provide `subagent_type`. Choose the available specialist whose descript
 best matches the work. The tool description lists the allowed agent types and their
 capabilities.
 
-Use a short `description` (3-5 words), and write a self-contained `prompt`. The
-subagent cannot see this conversation unless you explicitly include the relevant
-context. State all of the following in the prompt:
+Use a short `description` (3-5 words), and normally write a self-contained
+`prompt`. The subagent cannot see this conversation unless you explicitly include
+the relevant context. State all of the following in the prompt:
 - the concrete goal and scope;
 - the files, symbols, or subsystem it owns;
 - whether it should investigate only or modify files;
@@ -57,7 +57,7 @@ test investigation, independent implementation slices, and focused research.
 
 Do not use Task for a tiny operation you can complete immediately yourself:
 - reading one known file: use Read;
-- locating a symbol or exact text: use Grep or Glob;
+- locating a symbol or exact text: use Find (`grep` for contents, `glob` for paths);
 - inspecting a small two- or three-file change: use the direct tools;
 - work for which no available agent is suitable.
 
@@ -70,6 +70,12 @@ Omit `task_id` to start a new subagent with a fresh context. Include `task_id` o
 when continuing that exact subagent session after a result, failure, cancellation, or
 request for more work. Resuming preserves the subagent's existing context; do not
 restate the original task as if it were a new investigation.
+
+When `task_id` names a task that is still running, `prompt` may be omitted to change
+only how the parent waits for it: foreground attaches to the existing run and blocks;
+background leaves/detaches it and returns immediately. Supplying a prompt while that
+task is running queues a continuation in the same child session, preserving all child
+history and tools. A completed child can likewise be re-prompted in either mode.
 
 If a subagent fails or is cancelled, do not silently restart from scratch. Use the
 reported `task_id` to resume the preserved session, or inspect that session's

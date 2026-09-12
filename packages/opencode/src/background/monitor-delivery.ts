@@ -64,7 +64,7 @@ function truncateLine(line: string): { text: string; truncated: boolean } {
 }
 
 function frameLines(partial: string, chunk: string): { lines: string[]; remaining: string } {
-  const text = partial + chunk.replace(/\r\n/g, "\n")
+  const text = partial + chunk.replace(/\n/g, "\n")
   const parts = text.split("\n")
   const remaining = parts.pop() ?? ""
   const lines: string[] = []
@@ -313,8 +313,20 @@ const layer = Layer.effect(
       const internal = yield* SynchronizedRef.get(stateRef)
       const state = internal.jobs.get(jobID)
       if (!state) return
-      if (state.timerFiber) yield* Fiber.interrupt(state.timerFiber).pipe(Effect.ignore)
+      const timerFiber = state.timerFiber
+      // Remove authority to publish first. A debounce fiber may currently be
+      // inside an async boundary (including a wake handler); waiting for its
+      // interruption can make explicit monitor kill block indefinitely. Once
+      // the state row is gone, flushBatch's mandatory re-read turns any late
+      // continuation into a no-op, so interrupt cleanup can be asynchronous.
       internal.jobs.delete(jobID)
+      if (timerFiber) {
+        yield* Fiber.interrupt(timerFiber).pipe(
+          Effect.ignore,
+          Effect.forkIn(scope, { startImmediately: true }),
+          Effect.asVoid,
+        )
+      }
     })
 
     yield* Effect.addFinalizer(() =>

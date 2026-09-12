@@ -105,6 +105,49 @@ const shell = () =>
   })
 
 describe("tool.background", () => {
+  it.instance("starts monitor jobs with event delivery on the shared background runtime", () =>
+    Effect.gen(function* () {
+      const { backgroundTool } = yield* shell()
+      const { asks, ctx } = harness()
+      const watch = command(`console.log("watch-hit"); setTimeout(() => {}, 30000)`)
+
+      const start = yield* backgroundTool.execute(
+        {
+          action: "monitor",
+          command: watch,
+          description: "test watcher",
+          persistent: true,
+        },
+        ctx,
+      )
+      const jobId = start.metadata.jobId as string
+
+      expect(start.metadata.kind).toBe("monitor")
+      expect(start.metadata.status).toBe("running")
+      expect(start.output).toContain("test watcher")
+      expect(asks.some((ask) => ask.permission === "bash")).toBe(true)
+
+      const delivery = start.metadata.delivery as {
+        mode: string
+        ownerSessionID: string
+        description: string
+        eventStream: string
+        debounceMs: number
+      }
+      expect(delivery.mode).toBe("events")
+      expect(delivery.ownerSessionID).toBe(String(baseCtx.sessionID))
+      expect(delivery.description).toBe("test watcher")
+      expect(delivery.eventStream).toBe("stdout")
+      expect(delivery.debounceMs).toBe(200)
+
+      const status = yield* backgroundTool.execute({ action: "status", id: jobId }, ctx)
+      expect(status.metadata.status).toBe("running")
+
+      const killed = yield* backgroundTool.execute({ action: "kill", id: jobId }, ctx)
+      expect(killed.metadata.status).toBe("cancelled")
+    }),
+  )
+
   it.instance("starts a background job, returns immediately, and completes", () =>
     Effect.gen(function* () {
       const { shellTool, backgroundTool } = yield* shell()
