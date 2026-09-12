@@ -205,10 +205,12 @@ export function createSessionQuestionController(input: { request: Accessor<Quest
     binding()?.focus()
   }
 
-  const finish = (run: () => Promise<unknown>) => {
+  const finish = (run: () => Promise<unknown>, options?: { clearComposer?: boolean }) => {
     setStore("sending", true)
     onSubmitted?.()
-    binding()?.clear()
+    // Only a sent reply consumed the composer text. Dismissing must leave it
+    // alone: it may be an ordinary message draft the question interrupted.
+    if (options?.clearComposer) binding()?.clear()
     void run()
       .then(() => {
         replied = true
@@ -229,13 +231,15 @@ export function createSessionQuestionController(input: { request: Accessor<Quest
       answers: store.answers,
       details: store.drafts.map((draft) => draft?.text ?? ""),
     })
-    finish(() =>
-      sdk().api.question.reply({
-        sessionID: req.sessionID,
-        requestID: req.id,
-        answers: resolved.answers.map((answer) => [...answer]),
-        details: [...resolved.details],
-      }),
+    finish(
+      () =>
+        sdk().api.question.reply({
+          sessionID: req.sessionID,
+          requestID: req.id,
+          answers: resolved.answers.map((answer) => [...answer]),
+          details: [...resolved.details],
+        }),
+      { clearComposer: true },
     )
   }
 

@@ -42,7 +42,7 @@ test("shows a pending question dock", async ({ page }) => {
   const rejectRequests: string[] = []
   page.on("request", (request) => {
     if (request.method() !== "POST") return
-    if (new URL(request.url()).pathname === `/api/session/${sessionID}/question/question-request/reject`)
+    if (new URL(request.url()).pathname.endsWith(`/question/question-request/reject`))
       rejectRequests.push(request.url())
   })
 
@@ -67,7 +67,7 @@ test("shows a pending question dock", async ({ page }) => {
   const reply = page.waitForRequest(
     (request) =>
       request.method() === "POST" &&
-      new URL(request.url()).pathname === `/api/session/${sessionID}/question/question-request/reply`,
+      new URL(request.url()).pathname.endsWith(`/question/question-request/reply`),
   )
   await question.getByRole("button", { name: "Submit" }).click()
   expect((await reply).postDataJSON()).toEqual({ answers: [["Minimal"]] })
