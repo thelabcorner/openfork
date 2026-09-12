@@ -814,3 +814,17 @@ To analyze a run: server file above plus the desktop log's `[phase-trace]`
 lines, or `__opencodePhaseTrace()` live in devtools. Join on 5s/15s windows
 by timestamp; per-session histograms identify which session's traffic precedes
 each stall cluster.
+
+### Tenth Pass: Concurrent Session Renderer Flooding Bottleneck Analysis
+
+Investigation into concurrent session flooding under active workloads (e.g. 8 concurrent running sessions) confirms the primary renderer bottleneck is not network/SSE throughput or core event-loop dispatch, but rather the reactive invalidation cost and state model in `packages/app/src/context/server-session.ts`:
+
+1. **Monolithic Store Reactivity**: All active sessions share a single `createStore` instance. Updates from any background session trigger Solid store graph evaluations and invalidation checks across all components observing the session store.
+2. **Reactive Delta Accumulator**: `part_text_accum_delta` is stored inside the reactive store. Every streaming delta mutates the store directly, causing hundreds of reactive notices per second across concurrent sessions.
+3. **Per-Message Part Array Granularity**: Parts are keyed per message as `Record<string, Part[]>`. Any incremental part delta replaces or mutates the parent message parts array, invalidating every sibling part and row in that message's timeline tree.
+4. **Lack of Viewport/Active-Session Gating**: Background sessions actively run `applyV2` and `projectV2` on every token chunk if their message structures have been loaded, compounding main-thread rendering starvation superlinearly.
+
+**Remediation Plan**:
+- Defer and batch background session projection and normalization until session activation or step completion.
+- Move `part_text_accum_delta` out of the reactive Solid store into a plain Map with discrete, frame-scheduled signals.
+- Re-key parts by partID (`Record<string, Part>`) to isolate token invalidation to the individual leaf part being streamed.

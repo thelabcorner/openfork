@@ -264,6 +264,53 @@ describe("server session", () => {
     expect(ctx.store.data.part.msg_2_assistant).toMatchObject([{ type: "text", text: "live" }])
   })
 
+  test("prefetched background sessions drop stream deltas until the timeline activates them", async () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    ctx.store.set("session_message", "child", [
+      { id: "msg_1_user", type: "user", text: "hello", time: { created: 1 } },
+      {
+        id: "msg_2_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "" }],
+        time: { created: 2, firstTokenAt: 2 },
+      },
+    ])
+
+    // Warm the cache the way the chats pane and layout prefetchers do, without
+    // activating the session in the timeline.
+    await ctx.store.prefetch("child", 20)
+
+    const apply = (input: object) => ctx.store.applyV2(input as OpenCodeEvent)
+    apply({
+      id: "evt_text_delta_background",
+      created: 3,
+      type: "session.text.delta",
+      data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0, delta: "background" },
+    })
+
+    expect(ctx.store.data.session_message.child?.at(-1)).toMatchObject({
+      id: "msg_2_assistant",
+      content: [{ type: "text", text: "" }],
+    })
+
+    // Timeline activation resumes live content consumption.
+    ctx.store.resume("child")
+    apply({
+      id: "evt_text_delta_live",
+      created: 4,
+      type: "session.text.delta",
+      data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0, delta: "live" },
+    })
+
+    expect(ctx.store.data.session_message.child?.at(-1)).toMatchObject({
+      id: "msg_2_assistant",
+      content: [{ type: "text", text: "live" }],
+    })
+  })
+
   test("resolves lineage by session ID without directory", async () => {
     const ctx = setup({ child: session("child", "root"), root: session("root") })
 

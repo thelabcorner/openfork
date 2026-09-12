@@ -251,6 +251,10 @@ export function createServerSession(
   const removedMessages = new Map<string, Set<string>>()
   const deltaBases = new Map<string, { base: string; sessionID: string }>()
   const suspended = new Set<string>()
+  // Sessions whose timeline has been activated. A prefetch warms a session's
+  // cache but must not leave it consuming content deltas; only activation
+  // resolves that background status (see `prefetch` and `release`/`resume`).
+  const activated = new Set<string>()
   const stale = new Set<string>()
   const v1ContentEvents = new Set([
     "message.updated",
@@ -536,6 +540,7 @@ export function createServerSession(
       orphanParts.delete(sessionID)
       removedMessages.delete(sessionID)
       suspended.delete(sessionID)
+      activated.delete(sessionID)
       stale.delete(sessionID)
     })
     setData(
@@ -902,6 +907,7 @@ export function createServerSession(
   }
 
   const release = (sessionID: string) => {
+    activated.delete(sessionID)
     suspended.add(sessionID)
   }
 
@@ -909,6 +915,7 @@ export function createServerSession(
   // Keep this synchronous and allocation-free so cache-first navigation can
   // reactivate streaming without paying for (or joining) an HTTP request.
   const resume = (sessionID: string) => {
+    activated.add(sessionID)
     suspended.delete(sessionID)
   }
 
@@ -918,9 +925,12 @@ export function createServerSession(
     if (
       Date.now() - (meta.at[sessionID] ?? 0) <= 15_000 &&
       (meta.complete[sessionID] || (data.message[sessionID]?.length ?? 0) >= limit)
-    )
+    ) {
+      if (!activated.has(sessionID)) suspended.add(sessionID)
       return
+    }
     await runInflight(inflight, sessionID, () => loadMessages(sessionID, limit))
+    if (!activated.has(sessionID)) suspended.add(sessionID)
   }
 
   const eventSessionID = (event: { type: string; properties?: unknown }) => {
