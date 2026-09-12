@@ -26,6 +26,7 @@ import { ModelV2 } from "@opencode-ai/core/model"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { markCanonicalFindToolMap } from "./llm/tool-call-heal"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -250,6 +251,8 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
   const interrupt = yield* ToolInterrupt.Service
+  const canonicalFind = (yield* registry.all()).find((item) => item.id === "find")
+  let canonicalFindTool: AITool | undefined
 
   // Throttle for per-chunk tool progress metadata below. Chatty tools (shell
   // spewing build/test output calls ctx.metadata once per stdout chunk) each
@@ -317,7 +320,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     permission: input.session.permission,
   })) {
     const schema = ProviderTransform.schema(input.model, ToolJsonSchema.fromTool(item))
-    tools[item.id] = tool({
+    const wrapped = tool({
       description: item.description,
       inputSchema: jsonSchema(schema),
       execute(args, options) {
@@ -365,6 +368,10 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
         )
       },
     })
+    tools[item.id] = wrapped
+    if (item.id === "find") {
+      canonicalFindTool = item.execute === canonicalFind?.execute ? wrapped : undefined
+    }
   }
 
   const hasMcpResourceServer = Object.values(yield* mcp.clients()).some(
@@ -616,7 +623,12 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     })
   }
 
-  if (flags.experimentalCodeMode) return tools
+  const finalize = () => {
+    if (canonicalFindTool && tools.find === canonicalFindTool) markCanonicalFindToolMap(tools)
+    return tools
+  }
+
+  if (flags.experimentalCodeMode) return finalize()
 
   for (const [key, entry] of Object.entries(yield* mcp.tools())) {
     const item = McpCatalog.convertTool(entry.def, entry.client, entry.timeout)
@@ -720,7 +732,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
     tools[key] = item
   }
 
-  return tools
+  return finalize()
 })
 
 function toRecord(value: unknown) {

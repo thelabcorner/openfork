@@ -5,6 +5,7 @@ import type { Tool } from "ai"
 import { LLMEvent } from "@opencode-ai/llm"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { ClaudeRuntimeAdapter, resetSharedState } from "../../src/session/llm/claude-runtime"
+import { markCanonicalFindToolMap } from "../../src/session/llm/tool-call-heal"
 import { ClaudeAgentRuntime } from "../../src/claude/runtime"
 import { BridgeStore } from "../../src/claude/bridge"
 import { makeMemoryStorage, type BindingStorage } from "../../src/claude/sessions"
@@ -85,6 +86,12 @@ function fakeSdk(script: SdkScript) {
 const echoTool = {
   description: "echo fixture",
   execute: async (args: { text: string }) => `echo:${args.text}`,
+} as unknown as Tool
+
+const findTool = {
+  description: "find fixture",
+  execute: async (args: { glob?: string; grep?: string; path?: string; include?: string }) =>
+    `find:${args.glob ?? args.grep}:${args.path ?? ""}:${args.include ?? ""}`,
 } as unknown as Tool
 
 function baseInput(overrides: Partial<Parameters<typeof ClaudeRuntimeAdapter.stream>[0]> = {}) {
@@ -197,6 +204,67 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     const saved = bindings.map.get(`claude/binding/claude/sess-opencode-1`) as any
     expect(saved?.claudeSessionID).toBe("ext-rt-1")
     expect(saved?.modelFamily).toBe("claude-sonnet-4")
+  })
+
+  test("auto-heals upstream grep tool_use into canonical find in execution and transcript events", async () => {
+    resetSharedState()
+    const script = new SdkScript()
+    const runtime = new ClaudeAgentRuntime({ loader: async () => fakeSdk(script) as never })
+    const store = new BridgeStore()
+    const permissions: string[] = []
+    const pending = events(
+      ClaudeRuntimeAdapter.stream(
+        baseInput({
+          runtime,
+          store,
+          tools: markCanonicalFindToolMap({ find: findTool }),
+          permission: {
+            ask: (request) =>
+              Effect.sync(() => {
+                permissions.push(request.permission)
+              }),
+          },
+        }),
+      ),
+    )
+
+    script.push({ type: "system", subtype: "init", session_id: "ext-heal-1" })
+    script.push({
+      type: "assistant",
+      session_id: "ext-heal-1",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "call-heal-1",
+            name: "grep",
+            input: { pattern: "SessionIngress", path: "src", include: "*.{ts,tsx}" },
+          },
+        ],
+      },
+    })
+
+    await script.nextPromptMessage()
+    const fedBack = await script.nextPromptMessage()
+    expect(fedBack.message.content[0]).toMatchObject({
+      type: "tool_result",
+      tool_use_id: "call-heal-1",
+      content: "find:SessionIngress:src:*.{ts,tsx}",
+    })
+
+    script.push({ type: "assistant", message: { content: [{ type: "text", text: "Done." }] } })
+    script.push({ type: "result", subtype: "success", is_error: false, result: "Done.", session_id: "ext-heal-1" })
+    script.end()
+
+    const list = await pending
+    const call = list.find((event) => event.type === "tool-call")
+    expect(call?.name).toBe("find")
+    expect(call?.input).toEqual({ grep: "SessionIngress", path: "src", include: "*.{ts,tsx}" })
+    const result = list.find((event) => event.type === "tool-result")
+    expect(result?.name).toBe("find")
+    expect(result?.result.value).toBe("find:SessionIngress:src:*.{ts,tsx}")
+    expect(store.get("call-heal-1")?.request.tool).toBe("find")
+    expect(permissions).toEqual([])
   })
 
   test("registers OpenCode tools through the Agent SDK MCP server", async () => {

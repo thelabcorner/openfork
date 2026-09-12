@@ -6,6 +6,7 @@ import { Effect, Fiber, Layer, Stream } from "effect"
 import { FetchHttpClient } from "effect/unstable/http"
 import { LLMNative } from "@/session/llm/native-request"
 import { LLMNativeRuntime } from "@/session/llm/native-runtime"
+import { markCanonicalFindToolMap } from "@/session/llm/tool-call-heal"
 import type { Provider } from "@/provider/provider"
 
 import { OAUTH_DUMMY_KEY } from "@/auth"
@@ -597,6 +598,52 @@ describe("session.llm-native.request", () => {
       release?.()
       yield* Fiber.join(fiber)
       expect(observed).toEqual(["tool-call", "tool-call", "finish", "tool-result", "tool-result"])
+    }),
+  )
+
+  it.effect("auto-heals an upstream glob call into canonical find without advertising glob", () =>
+    Effect.gen(function* () {
+      const executed: unknown[] = []
+      const find = {
+        description: "Find files or text",
+        inputSchema: jsonSchema({
+          type: "object",
+          properties: { glob: { type: "string" }, grep: { type: "string" }, path: { type: "string" } },
+        }),
+        execute: async (args: unknown) => {
+          executed.push(args)
+          return { output: "found" }
+        },
+      } satisfies Tool
+      const llmClient = {
+        prepare: () => Effect.die("unused"),
+        stream: () =>
+          Stream.fromIterable([
+            LLMEvent.toolCall({ id: "call-glob", name: "glob", input: { pattern: "**/*.ts", path: "src" } }),
+            LLMEvent.finish({ reason: "tool-calls" }),
+          ]),
+        generate: () => Effect.die("unused"),
+      } as LLMClientShape
+      const native = LLMNativeRuntime.stream({
+        model: baseModel,
+        provider: providerInfo,
+        auth: undefined,
+        llmClient,
+        messages: [],
+        tools: markCanonicalFindToolMap({ find }),
+        headers: {},
+        abort: new AbortController().signal,
+      })
+      expect(native.type).toBe("supported")
+      if (native.type === "unsupported") throw new Error(native.reason)
+
+      const list = Array.from(yield* Stream.runCollect(native.stream))
+      const call = list.find(LLMEvent.is.toolCall)
+      expect(call?.name).toBe("find")
+      expect(call?.input).toEqual({ glob: "**/*.ts", path: "src" })
+      expect(executed).toEqual([{ glob: "**/*.ts", path: "src" }])
+      const result = list.find(LLMEvent.is.toolResult)
+      expect(result?.name).toBe("find")
     }),
   )
 

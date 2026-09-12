@@ -34,6 +34,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { healLegacyFindCall } from "./llm/tool-call-heal"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
 
@@ -134,12 +135,15 @@ const live: Layer.Layer<
         workflowModel.sessionID = input.sessionID
         workflowModel.systemPrompt = prepared.system.join("\n")
         workflowModel.toolExecutor = async (toolName, argsJson, _requestID) => {
-          const t = prepared.tools[toolName]
+          const healed = healLegacyFindCall(toolName, argsJson, prepared.tools)
+          const resolvedName = healed.name
+          const t = prepared.tools[resolvedName]
           if (!t || !t.execute) {
             return { result: "", error: `Unknown tool: ${toolName}` }
           }
           try {
-            const result = await t.execute!(JSON.parse(argsJson), {
+            const args = typeof healed.input === "string" ? JSON.parse(healed.input) : healed.input
+            const result = await t.execute!(args, {
               toolCallId: _requestID,
               messages: input.messages,
               abortSignal: input.abort,
@@ -343,6 +347,14 @@ const live: Layer.Layer<
           // Copilot returns the authoritative billed amount only in provider-specific response fields.
           includeRawChunks: input.model.providerID.includes("github-copilot"),
           async experimental_repairToolCall(failed) {
+            const healed = healLegacyFindCall(failed.toolCall.toolName, failed.toolCall.input, prepared.tools)
+            if (healed.healed) {
+              return {
+                ...failed.toolCall,
+                toolName: healed.name,
+                input: healed.input as string,
+              }
+            }
             const lower = failed.toolCall.toolName.toLowerCase()
             if (lower !== failed.toolCall.toolName && prepared.tools[lower]) {
               return {

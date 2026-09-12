@@ -25,6 +25,7 @@ import { ClaudeAgentRuntime, type RuntimeTimeouts, type SdkMcpToolDefinition, ty
 import { defaultSdkLoader } from "@/claude/availability"
 import type { AssistantEvent, ContentBlock, RuntimeEvent } from "@/claude/events"
 import { BridgeStore, completeEffect, parkEffect, validateScope, type BridgeRequest, type Scope } from "@/claude/bridge"
+import { healLegacyFindCall, isCanonicalFindToolMap } from "./tool-call-heal"
 import {
   boundHistory,
   createBinding,
@@ -614,7 +615,7 @@ function emitAssistantBlocks(
   out: PushChannel<LLMEvent>,
   blocks: readonly ContentBlock[],
   onToolUse: (block: ResolvedToolUse) => void,
-  normalizeName: (name: string) => string = (name) => name,
+  normalizeToolUse: (toolUse: ResolvedToolUse) => ResolvedToolUse = (toolUse) => toolUse,
   partial?: PartialStreamState,
 ): void {
   let index = 0
@@ -638,10 +639,10 @@ function emitAssistantBlocks(
     if (block.type === "tool_use") {
       const toolUse = toolUseOf(block)
       if (!toolUse) continue
-      const name = normalizeName(toolUse.name)
-      out.push(LLMEvent.toolInputStart({ id: toolUse.id, name }))
-      out.push(LLMEvent.toolCall({ id: toolUse.id, name, input: toolUse.input }))
-      onToolUse({ ...toolUse, name })
+      const normalized = normalizeToolUse(toolUse)
+      out.push(LLMEvent.toolInputStart({ id: normalized.id, name: normalized.name }))
+      out.push(LLMEvent.toolCall({ id: normalized.id, name: normalized.name, input: normalized.input }))
+      onToolUse(normalized)
     }
   }
 }
@@ -790,8 +791,9 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
     const pending = new Set<Promise<void>>()
     const executeToolUse = async (toolUse: ResolvedToolUse, signal = input.abort): Promise<SdkToolResult> => {
       const callID = toolUse.id
-      const name = canonicalToolName(toolUse.name, input.tools) ?? toolUse.name
-      const callInput = toolUse.input
+      const healed = healLegacyFindCall(toolUse.name, toolUse.input, input.tools)
+      const name = canonicalToolName(healed.name, input.tools) ?? healed.name
+      const callInput = healed.input
       const failTool = (message: string): SdkToolResult => {
         out.push(LLMEvent.toolError({ id: callID, name, message }))
         if (!mcpRegistered) {
@@ -824,23 +826,29 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       } catch (error) {
         return failTool(error instanceof Error ? error.message : String(error))
       }
-      try {
-        await runPromise(
-          input.permission.ask({
-            sessionID: SessionID.make(input.sessionID),
-            permission: name,
-            patterns: [name],
-            always: [name],
-            metadata: { source: "claude-first-party", tool: name },
-            tool: { messageID: `claude-${callID}`, callID },
-            ruleset: [...(input.ruleset ?? [])],
-          }),
-        )
-      } catch {
+      // Canonical find performs action-specific glob/grep permission checks in
+      // its delegated leaf tool. A generic pre-check on "find" would break
+      // legacy rules such as `*=deny, glob=allow, grep=allow` and duplicate the
+      // more precise pattern-aware check performed by the leaf.
+      if (!(name === "find" && isCanonicalFindToolMap(input.tools))) {
         try {
-          store.deny(callID)
-        } catch {}
-        return failTool(`tool denied: ${name}`)
+          await runPromise(
+            input.permission.ask({
+              sessionID: SessionID.make(input.sessionID),
+              permission: name,
+              patterns: [name],
+              always: [name],
+              metadata: { source: "claude-first-party", tool: name },
+              tool: { messageID: `claude-${callID}`, callID },
+              ruleset: [...(input.ruleset ?? [])],
+            }),
+          )
+        } catch {
+          try {
+            store.deny(callID)
+          } catch {}
+          return failTool(`tool denied: ${name}`)
+        }
       }
       if (!validateScope(request.scope, ownerScope)) {
         try {
@@ -931,7 +939,14 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
           pending.add(task)
           void task.finally(() => pending.delete(task))
         },
-        (name) => canonicalToolName(name, input.tools) ?? name,
+        (toolUse) => {
+          const healed = healLegacyFindCall(toolUse.name, toolUse.input, input.tools)
+          return {
+            ...toolUse,
+            name: canonicalToolName(healed.name, input.tools) ?? healed.name,
+            input: healed.input,
+          }
+        },
         partial,
       )
     }

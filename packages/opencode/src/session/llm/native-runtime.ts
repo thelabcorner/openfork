@@ -18,6 +18,7 @@ import {
 } from "@opencode-ai/llm"
 import type { LLMClientShape } from "@opencode-ai/llm/route"
 import { LLMNative } from "./native-request"
+import { healLegacyFindCall, preserveCanonicalFindToolMap } from "./tool-call-heal"
 
 export type RuntimeStatus =
   | { readonly type: "supported"; readonly apiKey: string; readonly baseURL?: string }
@@ -115,10 +116,13 @@ export function stream(input: StreamInput): StreamResult {
             Stream.flatMap((event) =>
               event.type !== "tool-call" || event.providerExecuted
                 ? Stream.make(event)
-                : Stream.make(event).pipe(
+                : (() => {
+                    const healed = healLegacyFindCall(event.name, event.input, tools)
+                    const call = healed.healed ? { ...event, name: healed.name, input: healed.input } : event
+                    return Stream.make(call).pipe(
                     Stream.concat(
                       Stream.fromEffectDrain(
-                        ToolRuntime.dispatch(tools, event).pipe(
+                        ToolRuntime.dispatch(tools, call).pipe(
                           Effect.flatMap((dispatched) => Queue.offerAll(results, dispatched.events)),
                           Effect.catchCause((cause) => Queue.failCause(results, cause)),
                           Effect.asVoid,
@@ -126,7 +130,8 @@ export function stream(input: StreamInput): StreamResult {
                         ),
                       ),
                     ),
-                  ),
+                    )
+                  })(),
             ),
             Stream.concat(
               Stream.fromEffectDrain(
@@ -167,7 +172,7 @@ function nativeSchema(value: unknown): JsonSchema {
 }
 
 export function nativeTools(tools: Record<string, Tool>, input: Pick<StreamInput, "messages" | "abort">) {
-  return Object.fromEntries(
+  const result = Object.fromEntries(
     Object.entries(tools).map(([name, item]) => [
       name,
       // Tool execution remains opencode-owned. The native runtime only adapts
@@ -188,8 +193,9 @@ export function nativeTools(tools: Record<string, Tool>, input: Pick<StreamInput
             catch: (error) => new ToolFailure({ message: errorMessage(error), error }),
           }),
       }),
-    ]),
+      ]),
   )
+  return preserveCanonicalFindToolMap(tools, result)
 }
 
 export * as LLMNativeRuntime from "./native-runtime"

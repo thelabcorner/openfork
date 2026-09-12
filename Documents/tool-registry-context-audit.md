@@ -60,11 +60,37 @@ The merge also fixed search semantics rather than merely wrapping the old tools:
 - provider prompts, explorer guidance, shell guidance, ACP classification, CLI rendering, session UI, context grouping, result summaries, and i18n were updated for `find`;
 - legacy `glob` / `grep` UI renderers remain only for historical session playback.
 
+### Unadvertised legacy-call auto-healing
+
+`glob` and `grep` remain absent from the provider manifest, but execution has a compatibility repair path for models that emit the upstream OpenCode tool names from prior training.
+
+The current upstream OpenCode wire shapes are:
+
+```text
+glob({ pattern: string, path?: string })
+grep({ pattern: string, path?: string, include?: string })
+```
+
+When `find` is available and no real tool owns the requested legacy name, these calls are rewritten before execution:
+
+```text
+glob({ pattern, path })
+  -> find({ glob: pattern, path })
+
+grep({ pattern, path, include })
+  -> find({ grep: pattern, path, include })
+```
+
+The repair accepts both object arguments and JSON-encoded arguments used by the AI SDK repair hook. It is deliberately conservative: malformed inputs, unknown fields, or a genuinely registered `glob` / `grep` tool are not rewritten.
+
+The compatibility layer is wired into the AI SDK tool-call repair path, the native `@opencode-ai/llm` dispatcher, GitLab workflow execution, and first-party Claude tool execution. Native and Claude paths normalize both the tool name and arguments before durable transcript events are emitted, so current UI consistently sees `find` rather than a repaired legacy call.
+
 Validation for the file-search consolidation:
 
 - focused OpenCode matrix: **133 passed, 0 failed** across permission, registry, ACP, `find`, `glob`, and `grep` suites;
 - session UI result-summary suite: **23 passed, 0 failed**;
 - OpenTUI inline-tool suite: **17 passed, 0 failed**; TUI typecheck is clean;
+- legacy-call healing/runtime matrix: **29 passed, 0 failed** across the pure translator, native runtime, and first-party Claude runtime;
 - direct OpenCode typecheck reports no `find`, registry, permission, or ACP errors; remaining failures are unrelated dirty-worktree errors in SPAD/control-plane/background/test areas;
 - session UI typecheck reports only the two pre-existing unrelated errors in `AssistantMessage.model` and missing `session-changes-v2`.
 
