@@ -2185,7 +2185,7 @@ PART_MAPPING["text"] = function TextPartDisplay(props) {
     if (props.message.role !== "assistant") return ""
     const agent = (props.message as AssistantMessage).agent
     const message = props.message as AssistantMessage
-    const variant = message.model?.variant
+    const variant = message.variant
     const items = [
       agent ? agent[0]?.toUpperCase() + agent.slice(1) : "",
       model(),

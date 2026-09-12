@@ -64,6 +64,10 @@ describe("legacy find tool-call healing", () => {
 
   test("does not heal an unmarked or unrelated find tool", () => {
     expect(healLegacyFindCall("glob", { pattern: "*" }, { find: {} }).healed).toBe(false)
+
+    const spoofed = { find: {} } as Record<string | symbol, unknown>
+    Object.defineProperty(spoofed, Symbol.for("@opencode/session/llm/canonical-find"), { value: true })
+    expect(healLegacyFindCall("glob", { pattern: "*" }, spoofed as any).healed).toBe(false)
   })
 
   test("marker is non-enumerable and survives request filtering copies", () => {

@@ -318,6 +318,91 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     expect(list.at(-1)?.type).toBe("finish")
   })
 
+  test("MCP path auto-heals hidden upstream grep alias without registering a grep schema", async () => {
+    resetSharedState()
+    const script = new SdkScript()
+    let mcpOptions: any
+    const runtime = new ClaudeAgentRuntime({
+      loader: async () =>
+        ({
+          createSdkMcpServer: (options: any) => {
+            mcpOptions = options
+            return { type: "sdk", name: options.name, instance: {} }
+          },
+          query: (request: any) => {
+            script.requests.push(request)
+            return { events: script.events, interrupt: async () => {}, close: () => script.end(), pid: 4242 }
+          },
+        }) as never,
+    })
+    const store = new BridgeStore()
+    const pending = events(
+      ClaudeRuntimeAdapter.stream(
+        baseInput({
+          runtime,
+          store,
+          tools: markCanonicalFindToolMap({ find: findTool }),
+        }),
+      ),
+    )
+
+    script.push({ type: "system", subtype: "init", session_id: "ext-mcp-heal-1" })
+    script.push({
+      type: "assistant",
+      session_id: "ext-mcp-heal-1",
+      message: {
+        content: [
+          {
+            type: "tool_use",
+            id: "call-mcp-heal-1",
+            name: "grep",
+            input: { pattern: "SessionIngress", path: "src", include: "*.{ts,tsx}" },
+          },
+        ],
+      },
+    })
+
+    await script.waitForRequest(1)
+    expect(mcpOptions.tools).toHaveLength(1)
+    expect(mcpOptions.tools[0].name).toBe("find")
+    expect(script.requests[0].options.allowedTools).toEqual(["mcp__opencode__find"])
+    const aliases = script.requests[0].options.toolAliases as Record<string, string>
+    expect(aliases.grep).toBe("mcp__opencode__find")
+    expect(aliases.GREP).toBe("mcp__opencode__find")
+    expect(aliases.gLoB).toBe("mcp__opencode__find")
+
+    // The Agent SDK resolves the alias by name, then validates against find's
+    // canonical schema. Unknown `pattern` is stripped before the handler. Feed
+    // exactly that post-validation shape to prove the correlator restores the
+    // normalized assistant input rather than executing an empty find request.
+    const toolResult = await mcpOptions.tools[0].handler(
+      { path: "src", include: "*.{ts,tsx}" },
+      { signal: new AbortController().signal },
+    )
+    expect(toolResult.content[0].text).toBe("find:SessionIngress:src:*.{ts,tsx}")
+
+    script.push({ type: "assistant", message: { content: [{ type: "text", text: "Done." }] } })
+    script.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Done.",
+      session_id: "ext-mcp-heal-1",
+    })
+    script.end()
+
+    const list = await pending
+    const call = list.find((event) => event.type === "tool-call")
+    expect(call?.name).toBe("find")
+    expect(call?.input).toEqual({ grep: "SessionIngress", path: "src", include: "*.{ts,tsx}" })
+    expect(list.find((event) => event.type === "tool-result")?.name).toBe("find")
+    expect(store.get("call-mcp-heal-1")?.request.input).toEqual({
+      grep: "SessionIngress",
+      path: "src",
+      include: "*.{ts,tsx}",
+    })
+  })
+
   test("second turn resumes the bound external session with only the new user text", async () => {
     resetSharedState()
     const script = new SdkScript()

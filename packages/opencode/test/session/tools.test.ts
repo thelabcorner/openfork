@@ -16,6 +16,7 @@ import { ToolInterrupt } from "@/tool/interrupt"
 import { Truncate } from "@/tool/truncate"
 import { Plugin } from "@/plugin"
 import { RuntimeFlags } from "@/effect/runtime-flags"
+import { isCanonicalFindToolMap } from "@/session/llm/tool-call-heal"
 import { Effect, Layer, Schema } from "effect"
 import { testEffect } from "../lib/effect"
 
@@ -152,6 +153,44 @@ const layer = Layer.mergeAll(
 
 const it = testEffect(layer)
 
+function findDef(label: string): Tool.Def {
+  return {
+    id: "find",
+    description: label,
+    parameters: Schema.Struct({ glob: Schema.optional(Schema.String), grep: Schema.optional(Schema.String) }),
+    jsonSchema: {
+      type: "object",
+      properties: { glob: { type: "string" }, grep: { type: "string" } },
+    },
+    execute: () => Effect.succeed({ title: label, metadata: {}, output: label }),
+  }
+}
+
+function findLayer(defs: Tool.Def[]) {
+  return Layer.mergeAll(
+    Layer.succeed(Plugin.Service, fakePlugin),
+    Layer.succeed(Permission.Service, fakePermission),
+    Layer.succeed(MCP.Service, fakeMcp()),
+    Layer.succeed(Truncate.Service, fakeTruncate),
+    Layer.succeed(ToolInterrupt.Service, fakeInterrupt),
+    RuntimeFlags.layer(),
+    Layer.succeed(
+      ToolRegistry.Service,
+      ToolRegistry.Service.of({
+        ids: () => Effect.succeed(defs.map((item) => item.id)),
+        all: () => Effect.succeed(defs),
+        named: () => Effect.succeed({} as unknown as Effect.Success<ReturnType<ToolRegistry.Interface["named"]>>),
+        tools: () => Effect.succeed(defs),
+        refreshCustom: () => Effect.succeed({ added: [], updated: [], removed: [] }),
+      }),
+    ),
+  )
+}
+
+const canonicalFindDef = findDef("canonical find")
+const canonicalFindIt = testEffect(findLayer([canonicalFindDef]))
+const shadowedFindIt = testEffect(findLayer([canonicalFindDef, findDef("custom find")]))
+
 it.effect("extracts intentional tool mentions without treating email or npm scopes as capabilities", () =>
   Effect.sync(() => {
     expect(
@@ -159,6 +198,75 @@ it.effect("extracts intentional tool mentions without treating email or npm scop
         "Use @sqlite, mail user@example.com, install @scope/pkg@latest, then try (@refactor). Use @sqlite again.",
       ),
     ).toEqual(["sqlite", "refactor"])
+  }),
+)
+
+canonicalFindIt.effect("marks SessionTools output only when builtin find remains the resolved find tool", () =>
+  Effect.gen(function* () {
+    const tools = yield* SessionTools.resolve({
+      agent,
+      model,
+      session: { id: sessionID, permission: [] } as unknown as Session.Info,
+      processor: {
+        message: {
+          id: messageID,
+          sessionID,
+          role: "assistant",
+          parentID: MessageID.ascending(),
+          agent: "build",
+          mode: "build",
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: ModelV2.ID.make("test-model"),
+          providerID: ProviderV2.ID.make("test"),
+          time: { created: 1 },
+        } satisfies SessionV1.Assistant,
+        updateToolCall: () => Effect.die("unused"),
+        completeToolCall: () => Effect.die("unused"),
+      },
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    })
+
+    expect(Object.keys(tools)).toEqual(["find"])
+    expect(isCanonicalFindToolMap(tools)).toBe(true)
+  }),
+)
+
+shadowedFindIt.effect("does not mark SessionTools output when a custom find shadows builtin find", () =>
+  Effect.gen(function* () {
+    const tools = yield* SessionTools.resolve({
+      agent,
+      model,
+      session: { id: sessionID, permission: [] } as unknown as Session.Info,
+      processor: {
+        message: {
+          id: messageID,
+          sessionID,
+          role: "assistant",
+          parentID: MessageID.ascending(),
+          agent: "build",
+          mode: "build",
+          path: { cwd: "/tmp", root: "/tmp" },
+          cost: 0,
+          tokens: { input: 0, output: 0, reasoning: 0, cache: { read: 0, write: 0 } },
+          modelID: ModelV2.ID.make("test-model"),
+          providerID: ProviderV2.ID.make("test"),
+          time: { created: 1 },
+        } satisfies SessionV1.Assistant,
+        updateToolCall: () => Effect.die("unused"),
+        completeToolCall: () => Effect.die("unused"),
+      },
+      bypassAgentCheck: false,
+      messages: [],
+      promptOps: {} as never,
+    })
+
+    expect(Object.keys(tools)).toEqual(["find"])
+    expect(isCanonicalFindToolMap(tools)).toBe(false)
+    expect(tools.find.description).toBe("custom find")
   }),
 )
 

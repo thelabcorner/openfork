@@ -21,7 +21,7 @@ import type {
   SessionReviewFocus,
   SessionReviewLineComment,
 } from "../../components/session-review"
-import type { SessionReviewExpandMode } from "./session-changes-v2"
+import type { SessionReviewExpandMode } from "./session-review-v2"
 import { createLineCommentControllerV2 } from "./line-comment-annotations-v2"
 import { shouldVirtualizeReviewDiff } from "./session-review-file-preview-v2-virtualize"
 import { LineCommentV2OverflowIcon } from "@opencode-ai/ui/v2/line-comment-v2"

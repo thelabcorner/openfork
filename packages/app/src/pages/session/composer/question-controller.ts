@@ -107,11 +107,19 @@ export function createSessionQuestionController(input: { request: Accessor<Quest
     setStore("drafts", index(), { text: draft.text.slice(0, QUESTION_DETAIL_MAX_CHARS), parts: draft.parts })
   }
 
-  const loadDraft = (target: number) => {
+  /**
+   * Puts question `target`'s stored draft into the composer.
+   *
+   * `replace` wipes whatever is there first, which is right when stepping
+   * between questions (the outgoing draft was just captured) but wrong when a
+   * question first arrives — the composer may hold an ordinary message draft
+   * the question interrupted, and clearing it would destroy the user's text.
+   */
+  const loadDraft = (target: number, options?: { replace?: boolean }) => {
     const bound = binding()
     if (!bound) return
-    bound.clear()
     const draft = store.drafts[target]
+    if (options?.replace) bound.clear()
     if (draft?.text) bound.write({ ...draft })
   }
 
@@ -144,7 +152,8 @@ export function createSessionQuestionController(input: { request: Accessor<Quest
           cursor: -1,
         })
         if (!id) return
-        // A restored draft belongs back in the composer, not in limbo.
+        // A cached draft belongs back in the composer; an untouched composer
+        // keeps whatever the user was already writing.
         loadDraft(restored?.index ?? 0)
       },
     ),
@@ -201,7 +210,7 @@ export function createSessionQuestionController(input: { request: Accessor<Quest
     if (next === index()) return
     captureDraft()
     setStore({ index: next, cursor: -1 })
-    loadDraft(next)
+    loadDraft(next, { replace: true })
     binding()?.focus()
   }
 

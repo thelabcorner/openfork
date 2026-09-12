@@ -334,7 +334,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
                     parent: options.abortSignal,
                   })
                 : undefined
-            const ctx = context(args, options, killable)
+            const ctx = context(toRecord(args), options, killable)
             try {
               yield* plugin.trigger(
                 "tool.execute.before",

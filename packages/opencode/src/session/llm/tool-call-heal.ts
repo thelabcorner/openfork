@@ -1,7 +1,9 @@
 import type { Tool } from "ai"
 
 type ToolMap = Record<string, Tool> | Readonly<Record<string, unknown>>
-const CANONICAL_FIND = Symbol.for("@opencode/session/llm/canonical-find")
+// Module-private capability marker. Do not use Symbol.for(): this must not be
+// forgeable through the global symbol registry by unrelated plugins/runtime code.
+const CANONICAL_FIND = Symbol("@opencode/session/llm/canonical-find")
 
 export type HealedToolCall = {
   readonly name: string

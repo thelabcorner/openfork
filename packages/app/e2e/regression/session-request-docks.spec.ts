@@ -149,10 +149,11 @@ test("restores the draft caret before typing after a request dock closes", async
   })
   const question = page.locator('[data-component="session-question-card"]')
   await expect(question).toBeVisible()
-  // The composer is never torn down for a question now, so the in-progress
-  // draft (and the caret inside it) survive by construction.
+  // The same composer is temporarily repurposed as the question-details
+  // editor. The interrupted chat draft is held aside until the question ends.
   await expect(editor).toBeVisible()
-  await expect(editor).toHaveText(draft)
+  await expect(editor).toHaveText("")
+  await editor.fill("temporary question detail")
 
   await transport.send({
     directory,

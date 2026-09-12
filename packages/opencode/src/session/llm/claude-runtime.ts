@@ -258,7 +258,23 @@ function toolAliases(tools: Record<string, Tool>): Record<string, string> {
     if (compact === "todoread") aliases.TodoRead = target
     if (compact === "todowrite") aliases.TodoWrite = target
   }
+  if (isCanonicalFindToolMap(tools)) {
+    const names = Object.keys(tools).map((name) => name.toLowerCase())
+    const findTarget = mcpToolName("find")
+    for (const legacy of ["glob", "grep"] as const) {
+      // A genuine registered legacy tool always wins. Compatibility aliases
+      // exist only for names that are absent from the provider tool map.
+      if (names.includes(legacy)) continue
+      for (const variant of casingVariants(legacy)) aliases[variant] = findTarget
+    }
+  }
   return aliases
+}
+
+function casingVariants(value: string): string[] {
+  let variants = [""]
+  for (const char of value) variants = variants.flatMap((prefix) => [prefix + char.toLowerCase(), prefix + char.toUpperCase()])
+  return [...new Set(variants)]
 }
 
 function canonicalToolName(name: string, tools: Record<string, Tool>): string | undefined {
@@ -654,36 +670,36 @@ async function runPromise<A>(effect: Effect.Effect<A, unknown, never>): Promise<
 }
 
 class ToolCallCorrelator {
-  private readonly observed = new Map<string, string[]>()
+  private readonly observed = new Map<string, ResolvedToolUse[]>()
   private readonly waiters = new Map<
     string,
-    Array<{ resolve: (callID: string) => void; reject: (error: unknown) => void }>
+    Array<{ resolve: (toolUse: ResolvedToolUse) => void; reject: (error: unknown) => void }>
   >()
 
   observe(toolUse: ResolvedToolUse): void {
     const waiter = this.waiters.get(toolUse.name)?.shift()
     if (waiter) {
-      waiter.resolve(toolUse.id)
+      waiter.resolve(toolUse)
       return
     }
     const calls = this.observed.get(toolUse.name) ?? []
-    calls.push(toolUse.id)
+    calls.push(toolUse)
     this.observed.set(toolUse.name, calls)
   }
 
-  claim(name: string, signal: AbortSignal): Promise<string> {
+  claim(name: string, signal: AbortSignal): Promise<ResolvedToolUse> {
     const calls = this.observed.get(name)
-    const callID = calls?.shift()
-    if (callID) return Promise.resolve(callID)
+    const toolUse = calls?.shift()
+    if (toolUse) return Promise.resolve(toolUse)
 
     return new Promise((resolve, reject) => {
       let timer: ReturnType<typeof setTimeout> | undefined
       const waiters = this.waiters.get(name) ?? []
       const waiter = {
-        resolve: (id: string) => {
+        resolve: (resolved: ResolvedToolUse) => {
           if (timer) clearTimeout(timer)
           signal.removeEventListener("abort", onAbort)
-          resolve(id)
+          resolve(resolved)
         },
         reject: (error: unknown) => {
           if (timer) clearTimeout(timer)
@@ -907,8 +923,32 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
               : input.abort
           const canonical = canonicalToolName(name, input.tools) ?? name
           try {
-            const callID = await correlator.claim(canonical, signal)
-            return await executeToolUse({ id: callID, name: canonical, input: args }, signal)
+            const observed = await correlator.claim(canonical, signal)
+            // Agent SDK tool aliases are name-only. The target MCP Zod schema
+            // strips an upstream legacy `pattern` field before this handler,
+            // so a glob/grep alias may arrive here as `{}` / `{ path, include }`.
+            // The assistant transport event is the model-emitted source of
+            // truth and was normalized before correlation; recover its input
+            // only when it is a valid canonical find call and the validated
+            // handler args no longer contain a find discriminator.
+            const observedInput = isRecord(observed.input) ? observed.input : undefined
+            const handlerInput = isRecord(args) ? args : undefined
+            const recoverFindAlias =
+              canonical === "find" &&
+              isCanonicalFindToolMap(input.tools) &&
+              observedInput !== undefined &&
+              (typeof observedInput.glob === "string" || typeof observedInput.grep === "string") &&
+              handlerInput !== undefined &&
+              typeof handlerInput.glob !== "string" &&
+              typeof handlerInput.grep !== "string"
+            return await executeToolUse(
+              {
+                id: observed.id,
+                name: canonical,
+                input: recoverFindAlias ? observed.input : args,
+              },
+              signal,
+            )
           } catch (error) {
             const message = error instanceof Error ? error.message : String(error)
             return sdkToolResult(message, true)
