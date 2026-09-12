@@ -1,4 +1,15 @@
-Use the `apply_patch` tool to edit files. Your patch language is a stripped‑down, file‑oriented diff format designed to be easy to parse and safe to apply. You can think of it as a high‑level envelope:
+Use `apply_patch` for file mutations. This is the GPT-facing name for OpenCode's hardened bulk patch engine. Prefer one complete patch call over several sequential edits when the desired changes are already known.
+
+The tool accepts either the native OpenCode patch format below or a git-style unified diff. `format:"auto"` is the default and detects which one you supplied.
+
+QoL/safety controls:
+- `apply:true` is the `apply_patch` default: validate the entire change set, ask once, atomically apply it, and fail without writes if any conflict exists.
+- `apply:"if-clean"`: validate first; if there are zero conflicts, ask once and atomically apply it. If conflicts exist, return a compact plan without writing.
+- `apply:false`: dry-run only. Validate and return the plan without writing or asking permission.
+- `showDiff:true`: include per-file diffs in plan output. Default false keeps plans token-lean.
+- The engine checks stale prior reads, merges repeated update sections safely, supports add/update/delete/move, serializes overlapping writes with file locks, and rolls back captured preimages if commit fails.
+
+Native OpenCode patch format:
 
 *** Begin Patch
 [ one or more file sections ]

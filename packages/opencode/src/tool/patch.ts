@@ -357,7 +357,7 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
           patch: c.diff,
           additions: c.additions,
           deletions: c.deletions,
-          movePath: c.movePath,
+          ...(c.movePath ? { movePath: c.movePath } : {}),
         }))
 
       // "if-clean" (default): validate; with zero conflicts, ask once with the

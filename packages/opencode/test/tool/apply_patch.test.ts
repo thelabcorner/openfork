@@ -54,7 +54,15 @@ type ToolCtx = typeof baseCtx & {
   ask: (input: AskInput) => Effect.Effect<void>
 }
 
-const execute = Effect.fn("ApplyPatchToolTest.execute")(function* (params: { patchText: string }, ctx: ToolCtx) {
+const execute = Effect.fn("ApplyPatchToolTest.execute")(function* (
+  params: {
+    patchText: string
+    apply?: boolean | "if-clean"
+    format?: "auto" | "opencode" | "git"
+    showDiff?: boolean
+  },
+  ctx: ToolCtx,
+) {
   const info = yield* ApplyPatchTool
   const tool = yield* info.init()
   return yield* tool.execute(params, ctx)
@@ -97,7 +105,7 @@ describe("tool.apply_patch freeform", () => {
   it.live("rejects invalid patch format", () =>
     Effect.gen(function* () {
       const { ctx } = makeCtx()
-      yield* expectFailure(execute({ patchText: "invalid patch" }, ctx), "apply_patch verification failed")
+      yield* expectFailure(execute({ patchText: "invalid patch" }, ctx), "Invalid patch")
     }),
   )
 
@@ -106,6 +114,57 @@ describe("tool.apply_patch freeform", () => {
       const { ctx } = makeCtx()
       yield* expectFailure(execute({ patchText: "*** Begin Patch\n*** End Patch" }, ctx), "patch rejected: empty patch")
     }),
+  )
+
+  it.instance("supports explicit dry-run planning without a permission ask", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx, calls } = makeCtx()
+      const target = path.join(test.directory, "dry-run.txt")
+      yield* writeText(target, "before\n")
+
+      const result = yield* execute(
+        {
+          patchText: "*** Begin Patch\n*** Update File: dry-run.txt\n@@\n-before\n+after\n*** End Patch",
+          apply: false,
+        },
+        ctx,
+      )
+
+      expect(result.title).toBe("patch plan")
+      expect(result.output).toContain("dry-run plan")
+      expect(result.metadata.applied).toBe(false)
+      expect(calls).toHaveLength(0)
+      expect(yield* readText(target)).toBe("before\n")
+    }),
+    { git: true },
+  )
+
+  it.instance("accepts git-style unified diffs through the GPT adapter", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "git-diff.txt")
+      yield* writeText(target, "before\n")
+
+      const result = yield* execute(
+        {
+          patchText: [
+            "diff --git a/git-diff.txt b/git-diff.txt",
+            "--- a/git-diff.txt",
+            "+++ b/git-diff.txt",
+            "@@ -1 +1 @@",
+            "-before",
+            "+after",
+          ].join("\n"),
+        },
+        ctx,
+      )
+
+      expect(result.metadata.format).toBe("git")
+      expect(yield* readText(target)).toBe("after\n")
+    }),
+    { git: true },
   )
 
   it.instance(
@@ -143,8 +202,8 @@ describe("tool.apply_patch freeform", () => {
 
         const result = yield* execute({ patchText }, ctx)
 
-        expect(result.title).toContain("Success. Updated the following files")
-        expect(result.output).toContain("Success. Updated the following files")
+        expect(result.title).toBe("patch: applied 3 changes")
+        expect(result.output).toContain("patch: applied 3 changes")
         // Strict formatting assertions for slashes
         expect(result.output).toMatch(/A nested\/new\.txt/)
         expect(result.output).toMatch(/D delete\.txt/)
@@ -260,7 +319,7 @@ describe("tool.apply_patch freeform", () => {
     }),
   )
 
-  it.instance("appends trailing newline on update", () =>
+  it.instance("preserves missing trailing newline on update", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance
       const { ctx } = makeCtx()
@@ -273,8 +332,8 @@ describe("tool.apply_patch freeform", () => {
       yield* execute({ patchText }, ctx)
 
       const contents = yield* readText(target)
-      expect(contents.endsWith("\n")).toBe(true)
-      expect(contents).toBe("first line\nsecond line\n")
+      expect(contents.endsWith("\n")).toBe(false)
+      expect(contents).toBe("first line\nsecond line")
     }),
   )
 
@@ -339,7 +398,7 @@ describe("tool.apply_patch freeform", () => {
 
       yield* expectFailure(
         execute({ patchText }, ctx),
-        "apply_patch verification failed: Failed to read file to update",
+        "patch verification failed",
       )
     }),
   )
@@ -371,7 +430,7 @@ describe("tool.apply_patch freeform", () => {
       const { ctx } = makeCtx()
       const patchText = "*** Begin Patch\n*** Frobnicate File: foo\n*** End Patch"
 
-      yield* expectFailure(execute({ patchText }, ctx), "apply_patch verification failed")
+      yield* expectFailure(execute({ patchText }, ctx), "No file operations found")
     }),
   )
 
@@ -384,7 +443,7 @@ describe("tool.apply_patch freeform", () => {
 
       const patchText = "*** Begin Patch\n*** Update File: modify.txt\n@@\n-missing\n+changed\n*** End Patch"
 
-      yield* expectFailure(execute({ patchText }, ctx), "apply_patch verification failed")
+      yield* expectFailure(execute({ patchText }, ctx), "patch verification failed")
       expect(yield* readText(target)).toBe("line1\nline2\n")
     }),
   )
