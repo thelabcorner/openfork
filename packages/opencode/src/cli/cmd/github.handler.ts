@@ -831,6 +831,7 @@ export const githubRun = Effect.fn("Cli.github.run")(function* (args: { event?: 
         todowrite: ["Todo", UI.Style.TEXT_WARNING_BOLD],
         bash: ["Shell", UI.Style.TEXT_DANGER_BOLD],
         edit: ["Edit", UI.Style.TEXT_SUCCESS_BOLD],
+        find: ["Find", UI.Style.TEXT_INFO_BOLD],
         glob: ["Glob", UI.Style.TEXT_INFO_BOLD],
         grep: ["Grep", UI.Style.TEXT_INFO_BOLD],
         list: ["List", UI.Style.TEXT_INFO_BOLD],

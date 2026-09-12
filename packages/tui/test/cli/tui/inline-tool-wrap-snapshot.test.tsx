@@ -225,6 +225,7 @@ async function renderFrame(component: () => JSX.Element, options: { width: numbe
 describe("TUI inline tool wrapping", () => {
   test("falls back for unknown tool names", () => {
     expect(toolDisplay("bash")).toBe("bash")
+    expect(toolDisplay("find")).toBe("find")
     expect(toolDisplay("plugin_tool")).toBe("generic")
   })
 

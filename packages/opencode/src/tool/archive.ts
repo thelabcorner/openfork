@@ -776,6 +776,7 @@ export const ArchiveTool = Tool.define<typeof Parameters, Metadata, never>(
   "archive",
   Effect.gen(function* () {
     return {
+      exposure: "lazy" as const,
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>

@@ -77,6 +77,17 @@ export function getToolResult(input: {
       const entries = lineCount(output)
       return entries === undefined ? undefined : { text: plural(entries, "entry", "entries") }
     }
+    case "find": {
+      const action = metadata.action === "grep" || typeof args.grep === "string" ? "grep" : "glob"
+      if (action === "grep") {
+        const matches = num(metadata.matches)
+        if (matches === undefined) return undefined
+        return { text: plural(matches, "match", "matches"), tone: matches === 0 ? "warning" : undefined }
+      }
+      const count = num(metadata.count) ?? lineCount(output)
+      if (count === undefined) return undefined
+      return { text: plural(count, "file", "files"), tone: count === 0 ? "warning" : undefined }
+    }
     case "glob": {
       const count = num(metadata.count) ?? lineCount(output)
       if (count === undefined) return undefined

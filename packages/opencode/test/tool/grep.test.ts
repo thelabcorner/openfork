@@ -154,7 +154,9 @@ describe("tool.grep", () => {
     Effect.gen(function* () {
       const test = yield* TestInstance
       const file = path.join(test.directory, "test.txt")
+      const sibling = path.join(test.directory, "sibling.txt")
       yield* Effect.promise(() => Bun.write(file, "line1\nline2\nline3"))
+      yield* Effect.promise(() => Bun.write(sibling, "line2 sibling must not leak"))
       const info = yield* GrepTool
       const grep = yield* info.init()
       const result = yield* grep.execute(
@@ -167,6 +169,27 @@ describe("tool.grep", () => {
       expect(result.metadata.matches).toBe(1)
       expect(result.output).toContain(file)
       expect(result.output).toContain("Line 2: line2")
+      expect(result.output).not.toContain(sibling)
+      expect(result.output).not.toContain("sibling must not leak")
+    }),
+  )
+
+  it.instance("does not mark exactly 100 matches as truncated", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        Promise.all(
+          Array.from({ length: 100 }, (_, index) => Bun.write(path.join(test.directory, `exact-${index}.txt`), "needle")),
+        ),
+      )
+      const info = yield* GrepTool
+      const grep = yield* info.init()
+      const result = yield* grep.execute({ pattern: "needle", path: test.directory, include: "*.txt" }, ctx)
+
+      expect(result.metadata.matches).toBe(100)
+      expect(result.metadata.truncated).toBe(false)
+      expect(result.output).not.toContain("more matches available")
+      expect(result.output).not.toContain("Results truncated")
     }),
   )
 

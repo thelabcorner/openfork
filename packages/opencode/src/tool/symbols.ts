@@ -136,7 +136,7 @@ export const SymbolsTool = Tool.define<
         const info = yield* fs.stat(abs).pipe(Effect.catch(() => Effect.succeed(undefined)))
         if (!info || info.type !== "File") throw new Error(`File not found: ${abs}`)
         if (info.size > 1024 * 1024) {
-          throw new Error(`File too large to outline (${info.size} bytes > 1 MB). Use grep with a pattern instead.`)
+          throw new Error(`File too large to outline (${info.size} bytes > 1 MB). Use Find with grep instead.`)
         }
         const text = yield* fs.readFileStringSafe(abs)
         if (text === undefined) throw new Error(`File not found: ${abs}`)
@@ -201,7 +201,7 @@ export const SymbolsTool = Tool.define<
         ]
         if (outline.parseErrors > 0)
           out.push(`  <note>parseErrors="${outline.parseErrors}" — file has syntax errors; symbols below are best-effort.</note>`)
-        if (capped) out.push(`  <next>… ${outline.symbols.length - shown} more symbols — narrow with grep or Read.</next>`)
+        if (capped) out.push(`  <next>… ${outline.symbols.length - shown} more symbols — narrow with Find grep or Read.</next>`)
         out.push(`</symbols-outline>`)
 
         return {
@@ -250,7 +250,7 @@ export const SymbolsTool = Tool.define<
         }
         if (result.hits.length === 0) {
           lines.push(
-            `  <hint>No declarations found for '${escapeXml(query)}'. Try the grep tool with a looser pattern or a substring query.</hint>`,
+            `  <hint>No declarations found for '${escapeXml(query)}'. Try Find with grep using a looser pattern or substring query.</hint>`,
           )
         } else if (result.capped) {
           lines.push(`  <next>… more results (maxResults=${maxResults}). Narrow with path= or kind=.</next>`)

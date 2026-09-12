@@ -14,7 +14,7 @@ export function renderHeal(requested: string, opened: string, reason: string): s
     `Opened:    ${escapeXml(opened)}`,
     `Why: ${escapeXml(reason)}`,
     `This path was missing. Opened a unique same-name file instead — it may be the wrong one.`,
-    `If this is not the file you wanted, ignore the content below and glob the basename. Do not keep using the opened path as if you requested it.`,
+    `If this is not the file you wanted, ignore the content below and use Find with glob on the basename. Do not keep using the opened path as if you requested it.`,
     `</heal>`,
     ``,
   ].join("\n")

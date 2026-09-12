@@ -63,6 +63,17 @@ describe("getToolResult", () => {
     expect(getToolResult({ tool: "glob", metadata: { count: 31 }, output: "one\ntwo" })?.text).toBe("31 files")
   })
 
+  test("find summarizes file and text modes", () => {
+    expect(getToolResult({ tool: "find", args: { glob: "**/*.ts" }, metadata: { action: "glob", count: 7 } })).toEqual({
+      text: "7 files",
+      tone: undefined,
+    })
+    expect(getToolResult({ tool: "find", args: { grep: "needle" }, metadata: { action: "grep", matches: 2 } })).toEqual({
+      text: "2 matches",
+      tone: undefined,
+    })
+  })
+
   test("shell reports a zero exit as success", () => {
     expect(getToolResult({ tool: "shell", metadata: { exit: 0 } })).toEqual({ text: "exit 0", tone: "success" })
   })

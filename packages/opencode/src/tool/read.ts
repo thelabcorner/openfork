@@ -181,7 +181,7 @@ export const ReadTool = Tool.define<
         )
       }
       return yield* Effect.fail(
-        new Error(`File not found: ${filepath}${posix}\nNo unique same-name file to open. Use glob for the basename.`),
+        new Error(`File not found: ${filepath}${posix}\nNo unique same-name file to open. Use Find with glob for the basename.`),
       )
     })
 
@@ -560,7 +560,7 @@ export const ReadTool = Tool.define<
           blocks.push(
             `<remaining count="${overflow.length}">Read ${batch.length} of ${requests.length}. Remaining:\n${overflow
               .map((item) => item.filePath)
-              .join("\n")}\nCall again with these, or glob + grep.</remaining>`,
+              .join("\n")}\nCall again with these, or use Find with glob/grep.</remaining>`,
           )
         }
         return {
@@ -632,11 +632,11 @@ export const ReadTool = Tool.define<
             `<entries>`,
             sliced.join("\n"),
             truncated
-              ? `\n(Showing ${sliced.length} of ${items.length} entries. Use offset to continue. This is a directory listing — for patterns use glob.)`
-              : `\n(${items.length} entries. This is a directory listing — for patterns use glob.)`,
+              ? `\n(Showing ${sliced.length} of ${items.length} entries. Use offset to continue. This is a directory listing — for patterns use Find with glob.)`
+              : `\n(${items.length} entries. This is a directory listing — for patterns use Find with glob.)`,
             clamped ? `\n(offset ${params.offset} past end — ${items.length} entries. Showing last page.)` : "",
             action === "outline" || action === "grep" || action === "around"
-              ? `\n<note>${action} needs a file. This is a directory listing — for patterns use glob, for contents use grep.</note>`
+              ? `\n<note>${action} needs a file. This is a directory listing — use Find with glob for paths or Find with grep for contents.</note>`
               : "",
             `</entries>`,
           ]

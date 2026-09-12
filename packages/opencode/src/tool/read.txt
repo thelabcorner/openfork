@@ -7,7 +7,7 @@ ROUTING
 - 2-8 known text files sharing one window -> filePaths:[...]. Top-level offset/limit applies to every file.
 - 2-8 known text-file targets needing DIFFERENT windows -> reads:[{filePath,offset?,limit?}, ...]. This is the preferred economy path for several known ranges.
 - Need a symbol/name inside ONE file -> pattern or symbol. Do NOT page through the file looking for it.
-- Unsure of the path -> glob. Need project-wide content search -> grep. Search first, then batch the known reads that search identifies.
+- Unsure of the path -> Find with `glob`. Need project-wide content search -> Find with `grep`. Search first, then batch the known reads that search identifies.
 
 TOKEN ECONOMY
 - Avoid chains of tiny reads. Read enough surrounding context to reason/edit safely, but do not fetch unrelated whole files when exact ranges are known.

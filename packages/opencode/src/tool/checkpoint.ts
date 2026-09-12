@@ -253,6 +253,7 @@ export const CheckpointTool = Tool.define<typeof Parameters, Metadata, Database.
     })
 
     return {
+      exposure: "lazy" as const,
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context<Metadata>) =>

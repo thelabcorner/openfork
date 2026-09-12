@@ -16,6 +16,7 @@ describe("acp tool conversion", () => {
   test("maps OpenCode tool ids to ACP tool kinds", () => {
     expect(toToolKind("bash")).toBe("execute")
     expect(toToolKind("shell")).toBe("execute")
+    expect(toToolKind("web")).toBe("fetch")
     expect(toToolKind("webfetch")).toBe("fetch")
     expect(toToolKind("edit")).toBe("edit")
     expect(toToolKind("apply_patch")).toBe("edit")
@@ -23,6 +24,7 @@ describe("acp tool conversion", () => {
     expect(toToolKind("write")).toBe("edit")
     expect(toToolKind("grep")).toBe("search")
     expect(toToolKind("glob")).toBe("search")
+    expect(toToolKind("find")).toBe("search")
     expect(toToolKind("context7_resolve_library_id")).toBe("search")
     expect(toToolKind("context7_get_library_docs")).toBe("search")
     expect(toToolKind("read")).toBe("read")
@@ -36,6 +38,7 @@ describe("acp tool conversion", () => {
     expect(toLocations("write", { filePath: "/tmp/c.ts" })).toEqual([{ path: "/tmp/c.ts" }])
     expect(toLocations("grep", { path: "/repo/src" })).toEqual([{ path: "/repo/src" }])
     expect(toLocations("glob", { path: "/repo/test" })).toEqual([{ path: "/repo/test" }])
+    expect(toLocations("find", { path: "/repo/src" })).toEqual([{ path: "/repo/src" }])
     expect(toLocations("context7_get_library_docs", { path: "/docs" })).toEqual([{ path: "/docs" }])
     expect(toLocations("external_directory", { directories: ["/tmp/outside"], patterns: ["/tmp/outside/*"] })).toEqual([
       { path: "/tmp/outside" },

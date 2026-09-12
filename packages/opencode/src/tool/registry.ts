@@ -7,20 +7,18 @@ import { Session } from "@/session/session"
 import { QuestionTool } from "./question"
 import { ShellTool } from "./shell"
 import { EditTool } from "./edit"
-import { GlobTool } from "./glob"
-import { GrepTool } from "./grep"
+import { FindTool } from "./find"
 import { ReadTool } from "./read"
 import { TaskTool } from "./task"
 import { Database } from "@opencode-ai/core/database/database"
 import { TodoWriteTool } from "./todo"
-import { WebFetchTool } from "./webfetch"
+import { WebTool } from "./web"
 import { WriteTool } from "./write"
 import { InvalidTool } from "./invalid"
 import { SkillTool } from "./skill"
 import { ArchiveTool } from "./archive"
 import { JsonTool } from "./json"
 import { BackgroundTool } from "./background"
-import { MonitorTool } from "./monitor"
 import { MemoryTool } from "./memory"
 import { SqliteTool } from "./sqlite"
 import { GitTool } from "./git"
@@ -44,36 +42,11 @@ import { Project } from "@/project/project"
 import { Plugin } from "../plugin"
 import { Provider } from "@/provider/provider"
 
-import { WebSearchTool } from "./websearch"
 import { LspTool } from "./lsp"
 import * as Truncate from "./truncate"
 import { ApplyPatchTool } from "./apply_patch"
 import { PatchTool } from "./patch"
-import { BrowserStatusTool } from "./browser/status"
-import { BrowserOpenTool } from "./browser/open"
-import { BrowserClaimTool } from "./browser/claim"
-import { BrowserNavigateTool } from "./browser/navigate"
-import { BrowserResizeTool } from "./browser/resize"
-import { BrowserSetAppearanceTool } from "./browser/set-appearance"
-import { BrowserSnapshotTool } from "./browser/snapshot"
-import { BrowserScreenshotTool } from "./browser/screenshot"
-import { BrowserClickTool } from "./browser/click"
-import { BrowserTypeTool } from "./browser/type"
-import { BrowserPressTool } from "./browser/press"
-import { BrowserScrollTool } from "./browser/scroll"
-import { BrowserEvaluateTool } from "./browser/evaluate"
-import { BrowserWaitForTool } from "./browser/wait-for"
-import { BrowserRecordingStartTool } from "./browser/recording-start"
-import { BrowserRecordingStopTool } from "./browser/recording-stop"
-import { BrowserCloseTool } from "./browser/close"
-import { BrowserQueryTool } from "./browser/query"
-import { BrowserHighlightTool } from "./browser/highlight"
-import { BrowserAnnotateTool } from "./browser/annotate"
-import { BrowserProfilerStartTool } from "./browser/profiler-start"
-import { BrowserProfilerStopTool } from "./browser/profiler-stop"
-import { BrowserReactInspectTool } from "./browser/react-inspect"
-import { BrowserOpenDevtoolsTool } from "./browser/open-devtools"
-import { BrowserExtensionsListTool } from "./browser/extensions-list"
+import { BrowserTool } from "./browser"
 import { BrokerClient } from "@/browser/broker-client"
 import { Effect, Layer, Context, Ref } from "effect"
 import { ChildProcessSpawner } from "effect/unstable/process/ChildProcessSpawner"
@@ -131,6 +104,19 @@ type State = {
   read: ReadDef
 }
 
+const delegatedPermissionTools = new Set([FindTool.id, WebTool.id, BrowserTool.id])
+
+function providerPolicy(toolID: string, ruleset: PermissionV1.Ruleset): PermissionV1.Rule {
+  if (!delegatedPermissionTools.has(toolID)) return Permission.evaluate(toolID, "*", ruleset)
+  return (
+    ruleset.findLast((rule) => rule.permission === toolID && rule.pattern === "*") ?? {
+      action: "allow",
+      permission: toolID,
+      pattern: "*",
+    }
+  )
+}
+
 export interface Interface {
   readonly ids: () => Effect.Effect<string[]>
   readonly all: () => Effect.Effect<Tool.Def[]>
@@ -168,19 +154,16 @@ const layer = Layer.effect(
     const todo = yield* TodoWriteTool
     const lsptool = yield* LspTool
     const plan = yield* PlanExitTool
-    const webfetch = yield* WebFetchTool
-    const websearch = yield* WebSearchTool
+    const webtool = yield* WebTool
     const shell = yield* ShellTool
-    const globtool = yield* GlobTool
+    const findtool = yield* FindTool
     const writetool = yield* WriteTool
     const edit = yield* EditTool
-    const greptool = yield* GrepTool
     const patchtool = yield* ApplyPatchTool
     const skilltool = yield* SkillTool
     const archivetool = yield* ArchiveTool
     const jsontool = yield* JsonTool
     const backgroundtool = yield* BackgroundTool
-    const monitortool = yield* MonitorTool
     const memorytool = yield* MemoryTool
     const sqlitetool = yield* SqliteTool
     const gittool = yield* GitTool
@@ -194,31 +177,7 @@ const layer = Layer.effect(
     const refactortool = yield* RefactorTool
     const sympytool = yield* SympyTool
     const patchTool = yield* PatchTool
-    const browserStatus = yield* BrowserStatusTool
-    const browserOpen = yield* BrowserOpenTool
-    const browserClaim = yield* BrowserClaimTool
-    const browserNavigate = yield* BrowserNavigateTool
-    const browserResize = yield* BrowserResizeTool
-    const browserSetAppearance = yield* BrowserSetAppearanceTool
-    const browserSnapshot = yield* BrowserSnapshotTool
-    const browserScreenshot = yield* BrowserScreenshotTool
-    const browserClick = yield* BrowserClickTool
-    const browserType = yield* BrowserTypeTool
-    const browserPress = yield* BrowserPressTool
-    const browserScroll = yield* BrowserScrollTool
-    const browserEvaluate = yield* BrowserEvaluateTool
-    const browserWaitFor = yield* BrowserWaitForTool
-    const browserRecordingStart = yield* BrowserRecordingStartTool
-    const browserRecordingStop = yield* BrowserRecordingStopTool
-    const browserClose = yield* BrowserCloseTool
-    const browserQuery = yield* BrowserQueryTool
-    const browserHighlight = yield* BrowserHighlightTool
-    const browserAnnotate = yield* BrowserAnnotateTool
-    const browserProfilerStart = yield* BrowserProfilerStartTool
-    const browserProfilerStop = yield* BrowserProfilerStopTool
-    const browserReactInspect = yield* BrowserReactInspectTool
-    const browserOpenDevtools = yield* BrowserOpenDevtoolsTool
-    const browserExtensionsList = yield* BrowserExtensionsListTool
+    const browsertool = yield* BrowserTool
     const codeMode = flags.experimentalCodeMode ? yield* Effect.promise(() => import("./code-mode")) : undefined
     const codeModeTool = codeMode ? yield* codeMode.CodeModeTool : undefined
 
@@ -241,19 +200,16 @@ const layer = Layer.effect(
           invalid: Tool.init(invalid),
           shell: Tool.init(shell),
           read: Tool.init(read),
-          glob: Tool.init(globtool),
-          grep: Tool.init(greptool),
+          find: Tool.init(findtool),
           edit: Tool.init(edit),
           write: Tool.init(writetool),
           task: Tool.init(task),
-          fetch: Tool.init(webfetch),
+          web: Tool.init(webtool),
           todo: Tool.init(todo),
-          search: Tool.init(websearch),
           skill: Tool.init(skilltool),
           archive: Tool.init(archivetool),
           json: Tool.init(jsontool),
           background: Tool.init(backgroundtool),
-          monitor: Tool.init(monitortool),
           memory: Tool.init(memorytool),
           sqlite: Tool.init(sqlitetool),
           git: Tool.init(gittool),
@@ -271,31 +227,7 @@ const layer = Layer.effect(
           question: Tool.init(question),
           lsp: Tool.init(lsptool),
           plan: Tool.init(plan),
-          browserStatus: Tool.init(browserStatus),
-          browserOpen: Tool.init(browserOpen),
-          browserClaim: Tool.init(browserClaim),
-          browserNavigate: Tool.init(browserNavigate),
-          browserResize: Tool.init(browserResize),
-          browserSetAppearance: Tool.init(browserSetAppearance),
-          browserSnapshot: Tool.init(browserSnapshot),
-          browserScreenshot: Tool.init(browserScreenshot),
-          browserClick: Tool.init(browserClick),
-          browserType: Tool.init(browserType),
-          browserPress: Tool.init(browserPress),
-          browserScroll: Tool.init(browserScroll),
-          browserEvaluate: Tool.init(browserEvaluate),
-          browserWaitFor: Tool.init(browserWaitFor),
-          browserRecordingStart: Tool.init(browserRecordingStart),
-          browserRecordingStop: Tool.init(browserRecordingStop),
-          browserClose: Tool.init(browserClose),
-          browserQuery: Tool.init(browserQuery),
-          browserHighlight: Tool.init(browserHighlight),
-          browserAnnotate: Tool.init(browserAnnotate),
-          browserProfilerStart: Tool.init(browserProfilerStart),
-          browserProfilerStop: Tool.init(browserProfilerStop),
-          browserReactInspect: Tool.init(browserReactInspect),
-          browserOpenDevtools: Tool.init(browserOpenDevtools),
-          browserExtensionsList: Tool.init(browserExtensionsList),
+          browser: Tool.init(browsertool),
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
 
@@ -309,19 +241,16 @@ const layer = Layer.effect(
             ...(questionEnabled ? [tool.question] : []),
             tool.shell,
             tool.read,
-            tool.glob,
-            tool.grep,
+            tool.find,
             tool.edit,
             tool.write,
             tool.task,
-            tool.fetch,
+            tool.web,
             tool.todo,
-            tool.search,
             tool.skill,
             tool.archive,
             tool.json,
             tool.background,
-            tool.monitor,
             tool.memory,
             tool.sqlite,
             tool.git,
@@ -337,31 +266,7 @@ const layer = Layer.effect(
             tool.sympy,
             tool.patchTool,
             tool.patch,
-            tool.browserStatus,
-            tool.browserOpen,
-            tool.browserClaim,
-            tool.browserNavigate,
-            tool.browserResize,
-            tool.browserSetAppearance,
-            tool.browserSnapshot,
-            tool.browserScreenshot,
-            tool.browserClick,
-            tool.browserType,
-            tool.browserPress,
-            tool.browserScroll,
-            tool.browserEvaluate,
-            tool.browserWaitFor,
-            tool.browserRecordingStart,
-            tool.browserRecordingStop,
-            tool.browserClose,
-            tool.browserQuery,
-            tool.browserHighlight,
-            tool.browserAnnotate,
-            tool.browserProfilerStart,
-            tool.browserProfilerStop,
-            tool.browserReactInspect,
-            tool.browserOpenDevtools,
-            tool.browserExtensionsList,
+            tool.browser,
             ...(tool.execute ? [tool.execute] : []),
             ...(flags.experimentalLspTool ? [tool.lsp] : []),
             ...(flags.experimentalPlanMode && flags.client === "cli" ? [tool.plan] : []),
@@ -439,21 +344,10 @@ const layer = Layer.effect(
       const candidates = (yield* all()).filter((tool) => {
         if (isLazyTool(tool)) return false
 
-        if (tool.id === WebSearchTool.id) {
-          return webSearchEnabled(input.providerID, {
-            exa: flags.enableExa,
-            parallel: flags.enableParallel,
-            firecrawl: flags.enableFirecrawl,
-            duckduckgo: flags.enableDuckDuckGo,
-            brave: flags.enableBrave,
-            tavily: flags.enableTavily,
-            searxng: flags.enableSearxng,
-          })
-        }
-
         const usePatch =
           input.modelID.includes("gpt-") && !input.modelID.includes("oss") && !input.modelID.includes("gpt-4")
         if (tool.id === ApplyPatchTool.id) return usePatch
+        if (tool.id === PatchTool.id) return !usePatch
         if (tool.id === EditTool.id || tool.id === WriteTool.id) return !usePatch
 
         return true
@@ -473,7 +367,10 @@ const layer = Layer.effect(
       return yield* Effect.forEach(
         visible,
         Effect.fnUntraced(function* (tool: Tool.Def) {
-          const policy = Permission.evaluate(tool.id, "*", ruleset)
+          // Composite provider tools defer action-specific authorization to
+          // their delegated leaf tools. This preserves legacy rules such as
+          // `*=deny, grep=allow, glob=allow` after the provider-facing merge.
+          const policy = providerPolicy(tool.id, ruleset)
           const output = {
             description: tool.description,
             parameters: tool.parameters,

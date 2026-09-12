@@ -13,6 +13,6 @@ Actions:
             an honest 'unattributed' bucket — never pretended usages.
 
 Tree-sitter based (comments/strings excluded); grep-anchored candidate search
-keeps it fast on large repos. For plain-text search across files use grep; for
+keeps it fast on large repos. For plain-text search across files use Find with `grep`; for
 whole-file reading use read; prefer usages over grepping a name when you need
 references rather than raw matches.

@@ -526,6 +526,58 @@ export function getToolInfo(
   // the part you actually recognise — is what survives a narrow column.
   const projectPath = (value: unknown) =>
     typeof value === "string" && value ? relativizeProjectPath(value, useData().directory) : undefined
+  if (tool === "browser") {
+    const action = typeof input.action === "string" ? input.action : undefined
+    const operation =
+      typeof metadata.operation === "string"
+        ? metadata.operation
+        : typeof input.operation === "string"
+          ? input.operation
+          : undefined
+    const nested = input.args && typeof input.args === "object" && !Array.isArray(input.args) ? input.args : {}
+    return {
+      icon: "window-cursor",
+      title:
+        action === "call" && operation
+          ? "Browser " + humanizeToolName(operation)
+          : action === "describe" && operation
+            ? "Browser Describe " + humanizeToolName(operation)
+            : "Browser Operations",
+      subtitle:
+        typeof nested.url === "string"
+          ? nested.url
+          : typeof nested.selector === "string"
+            ? nested.selector
+            : undefined,
+    }
+  }
+  if (tool === "web") {
+    const action =
+      typeof metadata.action === "string"
+        ? metadata.action
+        : typeof input.action === "string"
+          ? input.action
+          : typeof input.url === "string"
+            ? "fetch"
+            : typeof input.query === "string"
+              ? "search"
+              : "fetch"
+    return {
+      icon: "window-cursor",
+      title:
+        action === "search"
+          ? webSearchProviderLabel(metadata?.provider, i18n)
+          : action === "providers"
+            ? `${i18n.t("ui.tool.websearch")} Providers`
+            : i18n.t("ui.tool.webfetch"),
+      subtitle:
+        action === "search"
+          ? input.query
+          : action === "fetch"
+            ? input.url
+            : undefined,
+    }
+  }
   if (tool.startsWith("browser_")) {
     return {
       icon: "window-cursor",
@@ -548,6 +600,16 @@ export function getToolInfo(
         subtitle: projectPath(input.path),
         subtitleTruncate: "start",
       }
+    case "find": {
+      const grep = typeof input.grep === "string" ? input.grep : undefined
+      const glob = typeof input.glob === "string" ? input.glob : undefined
+      return {
+        icon: "magnifying-glass-menu",
+        title: grep ? i18n.t("ui.tool.find.text") : i18n.t("ui.tool.find.files"),
+        subtitle: grep ?? glob,
+        subtitleMono: true,
+      }
+    }
     case "glob":
       return {
         icon: "magnifying-glass-menu",
@@ -745,7 +807,7 @@ function taskSession(
     .sort((a, b) => (b.time.created ?? 0) - (a.time.created ?? 0))[0]?.id
 }
 
-const CONTEXT_GROUP_TOOLS = new Set(["read", "glob", "grep", "list"])
+const CONTEXT_GROUP_TOOLS = new Set(["read", "find", "glob", "grep", "list"])
 const HIDDEN_TOOLS = new Set(["todowrite"])
 
 function list<T>(value: T[] | undefined | null, fallback: T[]) {
@@ -1079,6 +1141,21 @@ function contextToolTrigger(part: ToolPart, i18n: ReturnType<typeof useI18n>) {
         title: i18n.t("ui.tool.list"),
         subtitle: getDirectory(path),
       }
+    case "find": {
+      const grep = typeof input.grep === "string" ? input.grep : undefined
+      const glob = typeof input.glob === "string" ? input.glob : undefined
+      const info = getToolInfo(part.tool, input, "metadata" in part.state ? part.state.metadata : undefined)
+      const args: string[] = []
+      if (grep) args.push("grep=" + grep)
+      if (glob) args.push("glob=" + glob)
+      if (include) args.push("include=" + include)
+      return {
+        icon,
+        title: info.title,
+        subtitle: getDirectory(path),
+        args,
+      }
+    }
     case "glob":
       return {
         icon,
@@ -1111,7 +1188,7 @@ function contextToolTrigger(part: ToolPart, i18n: ReturnType<typeof useI18n>) {
 
 function contextToolSummary(parts: ToolPart[]) {
   const read = parts.filter((part) => part.tool === "read").length
-  const search = parts.filter((part) => part.tool === "glob" || part.tool === "grep").length
+  const search = parts.filter((part) => part.tool === "find" || part.tool === "glob" || part.tool === "grep").length
   const list = parts.filter((part) => part.tool === "list").length
   return { read, search, list }
 }
@@ -1430,6 +1507,16 @@ function contextItemBody(part: ToolPart, output: string, fileComponent: ValidCom
     }
     if (display?.type === "directory") return <DirectoryOutput entries={display.entries} />
     return <SmartToolOutput output={output} />
+  }
+
+  if (part.tool === "find") {
+    const action = metadata?.action === "grep" || typeof input.grep === "string" ? "grep" : "glob"
+    if (action === "grep") {
+      const parsed = parseGrepOutput(output)
+      if (parsed) return <GrepResults result={parsed} pattern={typeof input.grep === "string" ? input.grep : undefined} />
+      return <SmartToolOutput output={output} />
+    }
+    return <GlobResults result={parseGlobOutput(output)} />
   }
 
   if (part.tool === "grep") {
@@ -2467,6 +2554,46 @@ ToolRegistry.register({
 })
 
 ToolRegistry.register({
+  name: "find",
+  render(props) {
+    const grep = typeof props.input.grep === "string" ? props.input.grep : undefined
+    const action = props.metadata?.action === "grep" || grep ? "grep" : "glob"
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const grepResult = createMemo(() => (action === "grep" && props.output ? parseGrepOutput(props.output) : undefined))
+    const globResult = createMemo(() => (action === "glob" && props.output ? parseGlobOutput(props.output) : undefined))
+    const args: string[] = []
+    if (props.input.path) args.push(getDirectory(props.input.path))
+    if (props.input.include) args.push("include=" + props.input.include)
+    return (
+      <BasicTool
+        {...props}
+        icon={info().icon}
+        trigger={{
+          title: info().title,
+          subtitle: info().subtitle,
+          subtitleMono: info().subtitleMono,
+          args,
+          ...resultProps(props),
+        }}
+      >
+        <Show
+          when={action === "grep" ? grepResult() : globResult()}
+          fallback={<SmartToolOutput output={props.output} />}
+        >
+          {(result) =>
+            action === "grep" ? (
+              <GrepResults result={result() as GrepResult} pattern={grep} />
+            ) : (
+              <GlobResults result={result() as GlobResult} />
+            )
+          }
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
   name: "glob",
   render(props) {
     const i18n = useI18n()
@@ -2513,6 +2640,27 @@ ToolRegistry.register({
       >
         <Show when={parsed()} fallback={<SmartToolOutput output={props.output} />}>
           {(result) => <GrepResults result={result()} pattern={props.input.pattern} />}
+        </Show>
+      </BasicTool>
+    )
+  },
+})
+
+ToolRegistry.register({
+  name: "web",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    return (
+      <BasicTool
+        {...props}
+        icon={info().icon}
+        trigger={{
+          title: info().title,
+          subtitle: info().subtitle,
+        }}
+      >
+        <Show when={props.output}>
+          <WebfetchOutput output={props.output!} input={props.input} />
         </Show>
       </BasicTool>
     )
@@ -3583,3 +3731,25 @@ ToolRegistry.register({
 for (const name of BROWSER_TOOLS) {
   ToolRegistry.register({ name, render: builtinRenderer(BrowserOutput) })
 }
+
+ToolRegistry.register({
+  name: "browser",
+  render(props) {
+    const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+    const trigger = createMemo(() => toolTrigger(props))
+    const params = createMemo(() => {
+      const input = props.input ?? {}
+      if (input.action !== "call") return input
+      const nested = input.args
+      return nested && typeof nested === "object" && !Array.isArray(nested) ? nested : {}
+    })
+    return (
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <ToolParams input={params()} skip={["action", "operation"]} />
+        <Show when={props.output}>
+          <BrowserOutput output={props.output!} />
+        </Show>
+      </BasicTool>
+    )
+  },
+})

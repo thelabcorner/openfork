@@ -590,6 +590,27 @@ test("disabled - specific allow overrides wildcard deny", () => {
   expect(result.has("read")).toBe(true)
 })
 
+test("disabled - composite find stays visible when either legacy search permission is allowed", () => {
+  const partial = Permission.disabled(
+    ["find"],
+    [
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "grep", pattern: "*", action: "allow" },
+    ],
+  )
+  expect(partial.has("find")).toBe(false)
+
+  const denied = Permission.disabled(
+    ["find"],
+    [
+      { permission: "*", pattern: "*", action: "deny" },
+      { permission: "grep", pattern: "*", action: "deny" },
+      { permission: "glob", pattern: "*", action: "deny" },
+    ],
+  )
+  expect(denied.has("find")).toBe(true)
+})
+
 // ask tests
 
 it.instance(

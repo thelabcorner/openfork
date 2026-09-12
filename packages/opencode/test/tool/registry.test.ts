@@ -12,6 +12,7 @@ import { TestConfig } from "../fixture/config"
 import { Config } from "@/config/config"
 import { Plugin } from "@/plugin"
 import { Agent } from "@/agent/agent"
+import { Permission } from "@/permission"
 import { InstanceState } from "@/effect/instance-state"
 
 import { ToolJsonSchema } from "@/tool/json-schema"
@@ -124,6 +125,212 @@ describe("tool.registry", () => {
     }),
   )
 
+  it.instance("exposes browser as one provider-facing capability", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const ids = yield* registry.ids()
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+
+      expect(ids).toContain("browser")
+      expect(ids.filter((id) => id.startsWith("browser_"))).toEqual([])
+      expect(tools.filter((tool) => tool.id === "browser")).toHaveLength(1)
+      expect(tools.some((tool) => tool.id.startsWith("browser_"))).toBe(false)
+
+      const browser = tools.find((tool) => tool.id === "browser")
+      if (!browser) throw new Error("browser tool missing from provider-visible manifest")
+      const ctx = {
+        sessionID: SessionID.descending(),
+        messageID: MessageID.ascending(),
+        agent: "build",
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      } satisfies Tool.Context
+      const listed = yield* browser.execute({ action: "list" }, ctx)
+      expect(listed.output).toContain("snapshot")
+      expect(listed.output).toContain("react_inspect")
+
+      const described = yield* browser.execute({ action: "describe", operation: "open" }, ctx)
+      const description = JSON.parse(described.output)
+      expect(description.operation).toBe("open")
+      expect(description.args.required).toContain("url")
+    }),
+  )
+
+  it.instance("keeps optional heavy tools lazy while memory and typecheck stay direct", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const ids = yield* registry.ids()
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const visible = tools.map((tool) => tool.id)
+
+      for (const id of ["checkpoint", "archive", "json", "test"]) {
+        expect(ids).toContain(id)
+        expect(visible).not.toContain(id)
+      }
+      expect(visible).toContain("tool")
+      expect(visible).toContain("memory")
+      expect(visible).toContain("typecheck")
+    }),
+  )
+
+  it.instance("coalesces webfetch and websearch into one fetch-first web tool", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const ids = yield* registry.ids()
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const visible = tools.map((tool) => tool.id)
+
+      expect(ids).toContain("web")
+      expect(ids).not.toContain("webfetch")
+      expect(ids).not.toContain("websearch")
+      expect(visible).toContain("web")
+      expect(visible).not.toContain("webfetch")
+      expect(visible).not.toContain("websearch")
+
+      const web = tools.find((tool) => tool.id === "web")
+      if (!web) throw new Error("web tool missing")
+      const ctx = {
+        sessionID: SessionID.descending(),
+        messageID: MessageID.ascending(),
+        agent: "build",
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      } satisfies Tool.Context
+      const providers = yield* web.execute({ action: "providers" }, ctx)
+      expect(providers.output).toContain("providers (7")
+    }),
+  )
+
+  it.instance("coalesces glob and grep into one provider-facing find tool", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const ids = yield* registry.ids()
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const visible = tools.map((tool) => tool.id)
+
+      expect(ids).toContain("find")
+      expect(ids).not.toContain("glob")
+      expect(ids).not.toContain("grep")
+      expect(visible).toContain("find")
+      expect(visible).not.toContain("glob")
+      expect(visible).not.toContain("grep")
+
+      const find = tools.find((tool) => tool.id === "find")
+      if (!find) throw new Error("find tool missing")
+      expect(find.description).toContain("exactly one")
+      expect(find.description).toContain("`glob`")
+      expect(find.description).toContain("`grep`")
+    }),
+  )
+
+  it.instance("find defers wildcard-deny rules to legacy search permissions", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, "searchable.ts"), "needle\n"))
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+        permission: Permission.fromConfig({ "*": "deny", glob: "allow", grep: "allow" }),
+      })
+      const find = tools.find((tool) => tool.id === "find")
+      if (!find) throw new Error("find tool missing")
+      const ctx = {
+        sessionID: SessionID.descending(),
+        messageID: MessageID.ascending(),
+        agent: "build",
+        abort: new AbortController().signal,
+        messages: [],
+        metadata: () => Effect.void,
+        ask: () => Effect.void,
+      } satisfies Tool.Context
+
+      const result = yield* find.execute({ grep: "needle", path: test.directory }, ctx)
+      expect(result.output).toContain("needle")
+    }),
+  )
+
+  it.instance("merges monitor launch into background", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const ids = yield* registry.ids()
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("test"),
+        agent: yield* agents.defaultInfo(),
+      })
+
+      expect(ids).toContain("background")
+      expect(ids).not.toContain("monitor")
+      const background = tools.find((tool) => tool.id === "background")
+      expect(background).toBeDefined()
+      expect(background?.description).toContain("monitor")
+    }),
+  )
+
+  it.instance("gpt models see apply_patch as the only patch mutation surface", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("gpt-5.6-test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const visible = tools.map((tool) => tool.id)
+
+      expect(visible).toContain("apply_patch")
+      expect(visible).not.toContain("patch")
+      expect(visible).not.toContain("edit")
+      expect(visible).not.toContain("write")
+    }),
+  )
+
+  it.instance("non-gpt models keep edit write patch and hide apply_patch", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const agents = yield* Agent.Service
+      const tools = yield* registry.tools({
+        providerID: ProviderV2.ID.opencode,
+        modelID: ModelV2.ID.make("claude-test"),
+        agent: yield* agents.defaultInfo(),
+      })
+      const visible = tools.map((tool) => tool.id)
+
+      expect(visible).not.toContain("apply_patch")
+      expect(visible).toContain("patch")
+      expect(visible).toContain("edit")
+      expect(visible).toContain("write")
+    }),
+  )
+
   withAcp.instance("keeps fork tools exposed through the ACP runtime", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
@@ -177,7 +384,7 @@ describe("tool.registry", () => {
     }),
   )
 
-  it.instance("hides task background parameter unless experimental background subagents are enabled", () =>
+  it.instance("exposes task background mode as a stable task capability", () =>
     Effect.gen(function* () {
       const registry = yield* ToolRegistry.Service
       const agent = yield* Agent.Service
@@ -190,7 +397,7 @@ describe("tool.registry", () => {
       })).find((tool) => tool.id === "task")
 
       expect(task?.jsonSchema).toBeDefined()
-      expect((task?.jsonSchema?.properties as Record<string, unknown> | undefined)?.background).toBeUndefined()
+      expect((task?.jsonSchema?.properties as Record<string, unknown> | undefined)?.background).toBeDefined()
     }),
   )
 

@@ -20,6 +20,7 @@ import type * as Tool from "@/tool/tool"
 import type { ApplyPatchTool } from "@/tool/apply_patch"
 import type { ShellTool as BashTool } from "@/tool/shell"
 import type { EditTool } from "@/tool/edit"
+import type { FindTool } from "@/tool/find"
 import type { GlobTool } from "@/tool/glob"
 import type { GrepTool } from "@/tool/grep"
 import type { InvalidTool } from "@/tool/invalid"
@@ -102,6 +103,7 @@ type ToolDefs = {
   todowrite: typeof TodoWriteTool
   question: typeof QuestionTool
   read: typeof ReadTool
+  find: typeof FindTool
   glob: typeof GlobTool
   grep: typeof GrepTool
   list: Tool.Info
@@ -290,6 +292,21 @@ function runGlob(p: ToolProps<typeof GlobTool>): ToolInline {
   const title = `Glob "${p.input.pattern ?? ""}"`
   const suffix = root ? `in ${toolPath(root)}` : ""
   const matches = p.metadata.count
+  const description = matches === undefined ? suffix : `${suffix}${suffix ? " · " : ""}${count(matches, "match")}`
+  return {
+    icon: "✱",
+    title,
+    ...(description && { description }),
+  }
+}
+
+function runFind(p: ToolProps<typeof FindTool>): ToolInline {
+  const root = p.input.path ?? ""
+  const pattern = p.input.grep ?? p.input.glob ?? ""
+  const action = p.input.grep !== undefined ? "text" : "files"
+  const title = `Find ${action} "${pattern}"`
+  const suffix = root ? `in ${toolPath(root)}` : ""
+  const matches = action === "text" ? p.metadata.matches : p.metadata.count
   const description = matches === undefined ? suffix : `${suffix}${suffix ? " · " : ""}${count(matches, "match")}`
   return {
     icon: "✱",
@@ -888,6 +905,14 @@ function scrollGlobStart(p: ToolProps<typeof GlobTool>): string {
   return `${head} in ${toolPath(dir)}`
 }
 
+function scrollFindStart(p: ToolProps<typeof FindTool>): string {
+  const pattern = p.input.grep ?? p.input.glob ?? ""
+  const action = p.input.grep !== undefined ? "text" : "files"
+  const head = pattern ? `✱ Find ${action} "${pattern}"` : `✱ Find ${action}`
+  const dir = p.input.path ?? ""
+  return dir ? `${head} in ${toolPath(dir)}` : head
+}
+
 function scrollGlobFinal(p: ToolProps<typeof GlobTool>): string {
   return toolError(p.frame) || fail(p.frame)
 }
@@ -1165,6 +1190,16 @@ const TOOL_RULES = {
       start: scrollReadStart,
     },
     permission: permRead,
+  },
+  find: {
+    view: {
+      output: false,
+      final: false,
+    },
+    run: runFind,
+    scroll: {
+      start: scrollFindStart,
+    },
   },
   glob: {
     view: {

@@ -43,6 +43,7 @@ export function toToolKind(toolName: string): ToolKind {
     case "shell":
       return "execute"
 
+    case "web":
     case "webfetch":
       return "fetch"
 
@@ -54,6 +55,7 @@ export function toToolKind(toolName: string): ToolKind {
 
     case "grep":
     case "glob":
+    case "find":
     case "context":
     case "context7_resolve_library_id":
     case "context7_get_library_docs":
@@ -90,6 +92,7 @@ export function toLocations(toolName: string, input: ToolInput, cwd?: string): T
 
     case "grep":
     case "glob":
+    case "find":
     case "context":
     case "context7_resolve_library_id":
     case "context7_get_library_docs":

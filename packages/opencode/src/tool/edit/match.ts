@@ -350,7 +350,7 @@ function notFoundMessage(content: string, find: string, lines: readonly Line[], 
   parts.push(
     "",
     `HINT: read({action:"around", symbol:"<name>"}) shows the exact current text around a symbol; ` +
-      `grep({pattern:"<text>"}) locates it. Copy the result verbatim into ${label}.`,
+      `find({grep:"<text>"}) locates it. Copy the result verbatim into ${label}.`,
   )
   return parts.join("\n")
 }

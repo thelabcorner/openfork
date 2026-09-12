@@ -1,0 +1,1 @@
+Find files or search file contents with ripgrep through one compact tool. Set exactly one of `glob` or `grep`: use `glob` for file/path patterns and `grep` for regex content search. `path` scopes either operation; `include` is a grep-only file filter. Prefer this over shell find/grep/rg for ordinary codebase discovery.

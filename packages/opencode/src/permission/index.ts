@@ -210,11 +210,27 @@ export function merge(...rulesets: PermissionV1.Ruleset[]): PermissionV1.Rule[] 
 export function disabled(tools: string[], ruleset: PermissionV1.Ruleset): Set<string> {
   const edits = ["edit", "write", "apply_patch"]
   const reads = ["list_mcp_resources", "list_mcp_resource_templates", "read_mcp_resource"]
+  const composite: Record<string, string[]> = {
+    find: ["glob", "grep"],
+    web: ["webfetch", "websearch"],
+    browser: ["browser.read", "browser.navigate", "browser.interact", "browser.evaluate", "browser.record"],
+  }
+
+  const fullyDenied = (permission: string) => {
+    const rule = ruleset.findLast((rule) => Wildcard.match(permission, rule.permission))
+    return rule?.pattern === "*" && rule.action === "deny"
+  }
+
   return new Set(
     tools.filter((tool) => {
+      const delegated = composite[tool]
+      if (delegated) {
+        const direct = ruleset.findLast((rule) => rule.permission === tool && rule.pattern === "*")
+        if (direct) return direct.action === "deny"
+        return delegated.every(fullyDenied)
+      }
       const permission = edits.includes(tool) ? "edit" : reads.includes(tool) ? "read" : tool
-      const rule = ruleset.findLast((rule) => Wildcard.match(permission, rule.permission))
-      return rule?.pattern === "*" && rule.action === "deny"
+      return fullyDenied(permission)
     }),
   )
 }

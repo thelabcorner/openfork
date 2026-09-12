@@ -22,6 +22,6 @@ Snapshot tiers:
 
 It NEVER reads source bodies: only manifests/config (capped), ripgrep file
 lists/line counts, and file sizes — so it is always cheap and safe. Prefer it
-over grep/glob/read when the question is "what kind of repo is this and what
-can I run in it?" For precise structure use glob; for content use grep; for
+over find/read when the question is "what kind of repo is this and what
+can I run in it?" For precise structure use Find with `glob`; for content use Find with `grep`; for
 files use read.

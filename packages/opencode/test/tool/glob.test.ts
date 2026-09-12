@@ -1,5 +1,6 @@
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { describe, expect } from "bun:test"
+import fs from "fs/promises"
 import path from "path"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Cause, Effect, Exit, Layer } from "effect"
@@ -127,6 +128,39 @@ describe("tool.glob", () => {
         const err = Cause.squash(exit.cause)
         expect(err instanceof Error ? err.message : String(err)).toContain("glob path must be a directory")
       }
+    }),
+  )
+
+  it.instance("finds hidden files while still excluding git internals", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, ".hidden.ts"), "hidden\n"))
+      yield* Effect.promise(() => fs.mkdir(path.join(test.directory, ".git"), { recursive: true }))
+      yield* Effect.promise(() => Bun.write(path.join(test.directory, ".git", "internal.ts"), "git\n"))
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const result = yield* glob.execute({ pattern: "**/*.ts", path: test.directory }, ctx)
+
+      expect(result.output).toContain(path.join(test.directory, ".hidden.ts"))
+      expect(result.output).not.toContain(path.join(test.directory, ".git", "internal.ts"))
+    }),
+  )
+
+  it.instance("does not mark exactly 100 files as truncated", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      yield* Effect.promise(() =>
+        Promise.all(
+          Array.from({ length: 100 }, (_, index) => Bun.write(path.join(test.directory, `exact-${index}.ts`), "x\n")),
+        ),
+      )
+      const info = yield* GlobTool
+      const glob = yield* info.init()
+      const result = yield* glob.execute({ pattern: "*.ts", path: test.directory }, ctx)
+
+      expect(result.metadata.count).toBe(100)
+      expect(result.metadata.truncated).toBe(false)
+      expect(result.output).not.toContain("Results are truncated")
     }),
   )
 })

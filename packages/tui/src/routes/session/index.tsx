@@ -1750,6 +1750,9 @@ function ToolPart(props: { last: boolean; part: ToolPart; message: AssistantMess
         <Match when={display() === "glob"}>
           <Glob {...toolprops} />
         </Match>
+        <Match when={display() === "find"}>
+          <Find {...toolprops} />
+        </Match>
         <Match when={display() === "read"}>
           <Read {...toolprops} />
         </Match>
@@ -2148,6 +2151,29 @@ function Glob(props: ToolProps) {
       <Show when={stringValue(props.input.path)}>in {pathFormatter.format(stringValue(props.input.path))} </Show>
       <Show when={numberValue(props.metadata.count)}>
         ({numberValue(props.metadata.count)} {numberValue(props.metadata.count) === 1 ? "match" : "matches"})
+      </Show>
+    </InlineTool>
+  )
+}
+
+function Find(props: ToolProps) {
+  const pathFormatter = usePathFormatter()
+  const grep = createMemo(() => stringValue(props.input.grep))
+  const glob = createMemo(() => stringValue(props.input.glob))
+  const pattern = createMemo(() => grep() ?? glob())
+  const text = createMemo(() => grep() !== undefined)
+  const matches = createMemo(() => (text() ? numberValue(props.metadata.matches) : numberValue(props.metadata.count)))
+  return (
+    <InlineTool
+      icon="✱"
+      pending={text() ? "Searching content…" : "Finding files…"}
+      complete={pattern()}
+      part={props.part}
+    >
+      Find {text() ? "text" : "files"} "{pattern()}"{" "}
+      <Show when={stringValue(props.input.path)}>in {pathFormatter.format(stringValue(props.input.path))} </Show>
+      <Show when={matches() !== undefined}>
+        ({matches()} {matches() === 1 ? "match" : "matches"})
       </Show>
     </InlineTool>
   )
@@ -2631,6 +2657,7 @@ function numberValue(value: unknown) {
 
 const toolDisplays = new Set([
   "bash",
+  "find",
   "glob",
   "read",
   "grep",

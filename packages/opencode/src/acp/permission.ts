@@ -152,6 +152,9 @@ function permissionTitle(toolName: string, input: ToolInput) {
     case "glob":
       return stringValue(input.pattern)
 
+    case "find":
+      return stringValue(input.grep) ?? stringValue(input.glob)
+
     case "read":
     case "edit":
     case "write":

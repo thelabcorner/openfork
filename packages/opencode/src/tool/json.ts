@@ -136,6 +136,7 @@ export const JsonTool = Tool.define<typeof Parameters, JsonMeta, never>(
   "json",
   Effect.gen(function* () {
     return {
+      exposure: "lazy" as const,
       description: DESCRIPTION,
       parameters: Parameters,
       execute: (params: Schema.Schema.Type<typeof Parameters>, ctx: Tool.Context) =>

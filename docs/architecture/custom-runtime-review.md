@@ -20,7 +20,7 @@ Seven changes to the prior design, in descending order of importance:
 | C4 | Trust is keyed to a **content hash**, not a function name | A name-keyed permission grant is a persistent write-once/execute-forever backdoor |
 | C5 | Treat persistence itself as a new attack surface (provenance + git propagation) | Not covered at all in the prior doc |
 | C6 | **Python kernel first**; TS gets cold invocation only in P0 | The JS/TS REPL is the one genuinely hard part and it is not on the critical path |
-| C7 | Static tool description, enforced by test | The *existing* Code Mode already violates this; do not inherit the bug |
+| C7 | Static tool description, enforced by test | The *existing* Code Mode already violates this; do not inherit the bug || C8 | Agent-authored lazy tool promotion (new section 9, still gated at P2) | The `exposure: "lazy"`   `tool` broker machinery now exists in-tree; this supersedes C3's tail-injection-only plan |
 
 ---
 
