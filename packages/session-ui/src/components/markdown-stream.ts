@@ -46,34 +46,54 @@ function closesFence(raw: string, suffix: string) {
   return `${raw.slice(-(mark.length - 1))}${suffix}`.includes(mark)
 }
 
-// remend's setext-heading guard treats a trailing `-`/`=` line as a pending
-// setext underline and appends U+200B to keep it from being consumed. A bullet
-// list marker mid-stream looks exactly like that: "- item\n-" becomes
-// "- item\n-\u200b", so the new list item collapses into a lazy continuation of
-// the previous one and re-splits a token later. That flicker is the list the
-// user sees jumping. Only a line that follows a real paragraph can be a setext
-// underline, so skip the guard when the previous line is a list marker.
-const SETEXT_GUARD_LINE = /^[ \t]{0,3}-{1,2}[ \t]*$/
-const LIST_MARKER_LINE = /^[ \t]{0,3}(?:[-*+]|\d{1,9}[.)])[ \t]/
+// remend's setext-heading guard treats a trailing `-` line as a pending setext
+// underline and appends U+200B directly to the dash. Inside a list that changes
+// the marker into plain text, so an item temporarily collapses into its parent
+// and re-splits when the next character arrives. For a nested first item,
+// simply removing the guard is not enough: `- parent\n  -` is itself parsed as
+// a setext heading. Instead, when marked confirms that the source immediately
+// before the pending marker is still a list and that the marker is valid at its
+// current indentation, give the empty item invisible content (`- <U+200B>`).
+// That preserves the list DOM shape from the first streamed marker onward.
+const STREAM_LIST_SENTINEL = "\u200b"
+const PENDING_BULLET_LINE = /^[ \t]*-[ \t]*$/
+
+function containsStreamListSentinel(tokens: Tokens.Generic[]): boolean {
+  for (const token of tokens) {
+    if (token.type !== "list") continue
+    const list = token as Tokens.List
+    for (const item of list.items) {
+      if (item.text === STREAM_LIST_SENTINEL) return true
+      if (containsStreamListSentinel(item.tokens)) return true
+    }
+  }
+  return false
+}
+
+function stabilizePendingList(text: string) {
+  const newline = text.lastIndexOf("\n")
+  if (newline < 0) return undefined
+  const line = text.slice(newline + 1)
+  if (!PENDING_BULLET_LINE.test(line)) return undefined
+
+  // A setext underline after ordinary prose must retain remend's original
+  // protection. We only prefer list semantics while the preceding source is
+  // already parsed as a list. This also handles a fresh list after a blank line
+  // and switches between ordered/unordered list kinds.
+  const before = marked.lexer(text.slice(0, newline))
+  const previous = before.findLast((token) => token.type !== "space")
+  if (previous?.type !== "list") return undefined
+
+  const candidate = `${text.replace(/[ \t]+$/, "")} ${STREAM_LIST_SENTINEL}`
+  // Let marked enforce CommonMark indentation instead of duplicating list
+  // width/depth rules here. Excessively indented dashes remain prose/code and
+  // therefore keep remend's setext guard.
+  if (!containsStreamListSentinel(marked.lexer(candidate))) return undefined
+  return candidate
+}
 
 function heal(text: string) {
-  const healed = remend(text, { linkMode: "text-only" })
-  if (!healed.endsWith("​")) return healed
-  if (healed.length !== text.replace(/[ \t]+$/, "").length + 1) return healed
-  const newline = healed.lastIndexOf("\n")
-  if (newline < 0) return healed
-  const line = healed.slice(newline + 1, -1)
-  if (!SETEXT_GUARD_LINE.test(line)) return healed
-  // Only suppress the guard when the marker starts a new list item: it must sit
-  // at the same indent as the list item above it. A deeper indent is a nested
-  // list or setext underline, and a shallower one is genuinely ambiguous, so
-  // both keep remend's original behaviour.
-  const before = healed.slice(0, newline)
-  const previous = before.slice(before.lastIndexOf("\n") + 1)
-  const marker = line.match(/^[ \t]{0,3}/)?.[0] ?? ""
-  if (!previous.startsWith(marker)) return healed
-  if (!LIST_MARKER_LINE.test(previous.slice(marker.length))) return healed
-  return text
+  return remend(stabilizePendingList(text) ?? text, { linkMode: "text-only" })
 }
 
 export function stream(text: string, live: boolean): Block[] {
@@ -86,11 +106,17 @@ export function stream(text: string, live: boolean): Block[] {
   if (!last) return [{ raw: text, src: heal(text), mode: "live" }] satisfies Block[]
 
   const result: Block[] = []
+  let prefix = ""
   for (let index = 0; index < tail; index++) {
     const token = tokens[index]
-    if (!token || token.type === "space") continue
+    if (!token) continue
+    if (token.type === "space") {
+      prefix += token.raw
+      continue
+    }
     let raw = token.raw
     while (tokens[index + 1]?.type === "space" && index + 1 < tail) raw += tokens[++index]!.raw
+    prefix += raw
     if (token.type === "code") {
       const code = token as Tokens.Code
       result.push({ raw, src: code.text, mode: "code", language: language(code.lang), complete: true })
@@ -99,10 +125,15 @@ export function stream(text: string, live: boolean): Block[] {
     result.push({ raw, src: raw, mode: "full" })
   }
 
-  const raw = tokens
+  const parsedRaw = tokens
     .slice(tail)
     .map((token) => token.raw)
     .join("")
+  // marked normalizes some incomplete list tails (notably a trailing `- `) by
+  // replacing the source whitespace with a newline. Keep the exact source tail
+  // whenever the already-frozen prefix still matches, otherwise incremental
+  // projection can manufacture bytes that never existed in the model output.
+  const raw = text.startsWith(prefix) ? text.slice(prefix.length) : parsedRaw
   if (last.type !== "code") return [...result, { raw, src: heal(raw), mode: "live" }]
 
   const code = last as Tokens.Code
@@ -134,12 +165,13 @@ export function project(previous: Projection | undefined, text: string, live: bo
   const suffix = text.slice(previous.text.length)
   if (tail?.mode === "live" && suffix) {
     const appended = tail.raw + suffix
-    // Plain prose cannot change token boundaries or remend's interpretation.
-    // Keep the previous projection and append the fragment directly; the
-    // structural-marker path below still heals links/emphasis/fences exactly
-    // when syntax arrives. This removes a full lexer + remend pass from the
-    // hottest ordinary-token path.
-    if (!/[`*_~[\]()<>{}]/.test(suffix) && !suffix.includes("\n")) {
+    // Plain prose can be appended directly only while the rendered source is
+    // identical to the raw source. If remend (or the list stabilizer above)
+    // synthesized anything, the next character may resolve that temporary
+    // syntax and must be healed again instead of appended after the synthetic
+    // suffix. This keeps the fast path for ordinary prose without freezing
+    // placeholders or closing syntax into the live block.
+    if (tail.src === tail.raw && !/[`*_~[\]()<>{}]/.test(suffix) && !suffix.includes("\n")) {
       return {
         text,
         blocks: [...previous.blocks.slice(0, -1), { ...tail, raw: appended, src: tail.src + suffix }],

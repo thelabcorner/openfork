@@ -9,25 +9,66 @@ describe("markdown stream", () => {
   })
 
   test("does not collapse a pending bullet marker into the previous item", () => {
-    // remend appends U+200B to a trailing `-` to protect a pending setext
-    // underline. Mid-list that turns the marker into a lazy continuation, so
-    // "first item" absorbs the marker and re-splits on the next token, which is
-    // the list visibly jumping while it streams.
+    // A pending list marker receives invisible content so it remains an actual
+    // list item instead of becoming remend's `-<U+200B>` lazy continuation.
     expect(stream("- first item\n-", true)).toEqual([
-      { raw: "- first item\n-", src: "- first item\n-", mode: "live" },
+      { raw: "- first item\n-", src: "- first item\n- \u200b", mode: "live" },
     ])
-    expect(stream("- a\n- b\n-", true)).toEqual([{ raw: "- a\n- b\n-", src: "- a\n- b\n-", mode: "live" }])
+    expect(stream("- a\n- b\n-", true)).toEqual([
+      { raw: "- a\n- b\n-", src: "- a\n- b\n- \u200b", mode: "live" },
+    ])
   })
 
-  test("keeps remend's setext guard for non-list text", () => {
+  test("stabilizes nested list markers across ordered and unordered permutations", () => {
+    const parents = [
+      { marker: "-", indent: "  " },
+      { marker: "*", indent: "  " },
+      { marker: "+", indent: "  " },
+      { marker: "1.", indent: "   " },
+      { marker: "1)", indent: "   " },
+    ]
+    const children = ["-", "*", "+", "1.", "1)"]
+
+    for (const parent of parents) {
+      for (const child of children) {
+        const first = `${parent.marker} parent\n${parent.indent}${child}`
+        expect(stream(first, true).at(-1)?.src).toBe(child === "-" ? `${first} \u200b` : first)
+
+        const sibling = `${parent.marker} parent\n${parent.indent}${child} child\n${parent.indent}-`
+        expect(stream(sibling, true).at(-1)?.src).toBe(`${sibling} \u200b`)
+
+        const childIndent = " ".repeat(child.length + 1)
+        const grandchild = `${parent.marker} parent\n${parent.indent}${child} child\n${parent.indent}${childIndent}-`
+        expect(stream(grandchild, true).at(-1)?.src).toBe(`${grandchild} \u200b`)
+      }
+    }
+  })
+
+  test("re-heals a stabilized nested marker as soon as content arrives", () => {
+    const pending = project(undefined, "- parent\n  -", true)
+    expect(pending.blocks.at(-1)?.src).toBe("- parent\n  - \u200b")
+
+    const spaced = project(pending, `${pending.text} `, true)
+    expect(spaced.blocks.at(-1)?.raw).toBe("- parent\n  - ")
+    expect(spaced.blocks.at(-1)?.src).toBe("- parent\n  - \u200b")
+
+    const content = project(spaced, `${spaced.text}child`, true)
+    expect(content.blocks.at(-1)?.src).toBe("- parent\n  - child")
+  })
+
+  test("keeps remend's setext guard outside an active list", () => {
     expect(stream("real paragraph\n-", true)).toEqual([
       { raw: "real paragraph\n-", src: "real paragraph\n-​", mode: "live" },
     ])
     expect(stream("real paragraph\n=", true)).toEqual([
       { raw: "real paragraph\n=", src: "real paragraph\n=​", mode: "live" },
     ])
-    // A deeper indent is a nested list or setext underline, not a sibling item.
-    expect(stream("- a\n  -", true)).toEqual([{ raw: "- a\n  -", src: "- a\n  -​", mode: "live" }])
+    expect(stream("- a\n\nreal paragraph\n-", true).at(-1)?.src).toBe("real paragraph\n-​")
+  })
+
+  test("does not force invalid list indentation into a nested item", () => {
+    const text = "- parent\n      -"
+    expect(stream(text, true).at(-1)?.src).not.toContain("- \u200b")
   })
 
   test("keeps incomplete links non-clickable until they finish", () => {
