@@ -2,7 +2,7 @@ import { Show, type JSX } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { useSettings } from "@/context/settings"
 import { SessionPermissionDock } from "@/pages/session/composer/session-permission-dock"
-import { SessionQuestionDock } from "@/pages/session/composer/session-question-dock"
+import { SessionQuestionCard } from "@/pages/session/composer/session-question-card"
 import { SessionFollowupDock } from "@/pages/session/composer/session-followup-dock"
 import { SessionRevertDock } from "@/pages/session/composer/session-revert-dock"
 import { SessionTodoDock } from "@/pages/session/composer/session-todo-dock"
@@ -36,14 +36,6 @@ export function SessionComposerRegion(props: {
           "md:max-w-200 md:mx-auto 2xl:max-w-[1000px]": controller.centered(),
         }}
       >
-        <Show when={controller.state.questionRequest()} keyed>
-          {(request) => (
-            <div>
-              <SessionQuestionDock request={request} onSubmit={controller.onResponseSubmit} />
-            </div>
-          )}
-        </Show>
-
         <Show when={controller.state.permissionRequest()} keyed>
           {(request) => (
             <div>
@@ -98,6 +90,9 @@ export function SessionComposerRegion(props: {
                     </div>
                   )}
                 </Show>
+                <Show when={controller.question.active()}>
+                  <SessionQuestionCard controller={controller.question} />
+                </Show>
                 <div
                   class="w-full min-h-32 md:min-h-40 rounded-md border border-border-weak-base bg-background-base/50 px-4 py-3 text-text-weak whitespace-pre-wrap pointer-events-none"
                   style={{ "margin-top": `${-36 * controller.dockProgress()}px` }}
@@ -131,6 +126,9 @@ export function SessionComposerRegion(props: {
                 "margin-top": `${-controller.lift()}px`,
               }}
             >
+              <Show when={controller.question.active()}>
+                <SessionQuestionCard controller={controller.question} />
+              </Show>
               <Show when={controller.followup()?.items.length}>
                 <SessionFollowupDock
                   items={controller.followup()!.items}
@@ -141,7 +139,7 @@ export function SessionComposerRegion(props: {
               </Show>
               <Show
                 when={controller.child()}
-                fallback={<Show when={!controller.state.blocked()}>{props.promptInput}</Show>}
+                fallback={<Show when={!controller.state.permissionRequest()}>{props.promptInput}</Show>}
               >
                 <div
                   ref={controller.setPromptRef}

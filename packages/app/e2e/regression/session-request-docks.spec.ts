@@ -32,12 +32,12 @@ test("shows a pending question dock", async ({ page }) => {
   await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
   await expectSessionTitle(page, title)
 
-  const question = page.locator('[data-component="dock-prompt"][data-kind="question"]')
+  const question = page.locator('[data-component="session-question-card"]')
   await expect(question).toBeVisible()
   await expect(question.getByText("Which implementation should be used?")).toBeVisible()
   await expect(question.getByRole("radio", { name: /Minimal/ })).toBeVisible()
   await expect(question.getByRole("radio", { name: /Extended/ })).toBeVisible()
-  await expect(page.locator('[data-component="session-composer"]')).toHaveCount(0)
+  await expect(page.locator('[data-component="prompt-input"]')).toBeVisible()
 
   const rejectRequests: string[] = []
   page.on("request", (request) => {
@@ -46,20 +46,17 @@ test("shows a pending question dock", async ({ page }) => {
       rejectRequests.push(request.url())
   })
 
-  await question.locator('[data-component="icon-button"][data-icon="chevron-down"]').click()
+  await question.getByRole("button", { name: "Minimize question" }).click()
   await expect(question).toBeVisible()
   await expect(question.getByText("Which implementation should be used?")).toBeVisible()
-  await expect(question.getByText("Select one answer")).toBeHidden()
   await expect(question.getByRole("radio", { name: /Minimal/ })).toBeHidden()
   await expect(question.getByRole("radio", { name: /Extended/ })).toBeHidden()
   await expect(question.getByRole("button", { name: "Dismiss" })).toBeVisible()
-  await expect(question.getByRole("button", { name: "Submit" })).toBeVisible()
-  await expect(page.locator('[data-component="question-minimized-dock"]')).toHaveCount(0)
+  await expect(question.getByRole("button", { name: /Submit/ })).toBeVisible()
   expect(rejectRequests).toEqual([])
 
-  await question.locator('[data-component="icon-button"][data-icon="chevron-down"]').click()
+  await question.getByRole("button", { name: "Restore question" }).click()
   await expect(question).toBeVisible()
-  await expect(question.getByText("Which implementation should be used?")).toBeVisible()
   await expect(question.getByRole("radio", { name: /Minimal/ })).toBeVisible()
   expect(rejectRequests).toEqual([])
 
@@ -69,8 +66,8 @@ test("shows a pending question dock", async ({ page }) => {
       request.method() === "POST" &&
       new URL(request.url()).pathname.endsWith(`/question/question-request/reply`),
   )
-  await question.getByRole("button", { name: "Submit" }).click()
-  expect((await reply).postDataJSON()).toEqual({ answers: [["Minimal"]] })
+  await question.getByRole("button", { name: /Submit/ }).click()
+  expect((await reply).postDataJSON().answers).toEqual([["Minimal"]])
 })
 
 test("shows a pending permission dock", async ({ page }) => {
@@ -150,9 +147,12 @@ test("restores the draft caret before typing after a request dock closes", async
       },
     },
   })
-  const question = page.locator('[data-component="dock-prompt"][data-kind="question"]')
+  const question = page.locator('[data-component="session-question-card"]')
   await expect(question).toBeVisible()
-  await expect(editor).toHaveCount(0)
+  // The composer is never torn down for a question now, so the in-progress
+  // draft (and the caret inside it) survive by construction.
+  await expect(editor).toBeVisible()
+  await expect(editor).toHaveText(draft)
 
   await transport.send({
     directory,
@@ -160,6 +160,7 @@ test("restores the draft caret before typing after a request dock closes", async
   })
   await expect(question).toHaveCount(0)
   await expect(editor).toBeVisible()
+  await expect(editor).toHaveText(draft)
   await page.keyboard.press("x")
 
   await expect(editor).toHaveText(`${draft.slice(0, cursor)}x${draft.slice(cursor)}`)

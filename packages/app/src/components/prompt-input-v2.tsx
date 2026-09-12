@@ -22,6 +22,7 @@ import {
   onCleanup,
   Show,
   Suspense,
+  untrack,
 } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useParams, useSearchParams } from "@solidjs/router"
@@ -34,6 +35,8 @@ import type { PromptInputProps } from "@/components/prompt-input/contracts"
 import { normalizePromptHistoryEntry, promptLength, type PromptHistoryComment } from "@/components/prompt-input/history"
 import { createPersistedPromptInputHistory } from "@/components/prompt-input/history-store"
 import { promptDesignPlaceholder, promptPlaceholder } from "@/components/prompt-input/placeholder"
+import type { QuestionDetailsBinding } from "@/pages/session/composer/question-controller"
+import { questionDetailsText } from "@/pages/session/composer/question-details"
 import { createPromptSubmit } from "@/components/prompt-input/submit"
 import { createLiveGenerationRate, type LiveGenerationRateState } from "@/components/prompt-input/live-generation-rate"
 import {
@@ -61,7 +64,7 @@ import { useCommand } from "@/context/command"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
 import { usePermission } from "@/context/permission"
-import { type ImageAttachmentPart, usePrompt } from "@/context/prompt"
+import { type ImageAttachmentPart, type Prompt, usePrompt } from "@/context/prompt"
 import { usePlatform } from "@/context/platform"
 import { useSDK } from "@/context/sdk"
 import { useForkUsage } from "@/context/fork-usage"
@@ -92,7 +95,26 @@ export type PromptInputV2ComposerProps = {
   borderUnderlay?: boolean
 }
 
-export type PromptInputV2ControllerProps = Omit<PromptInputProps, "class" | "submission">
+export type PromptInputV2ControllerProps = Omit<PromptInputProps, "class" | "submission"> & {
+  /**
+   * Hands the composer over to a pending question: the editor becomes that
+   * question's "additional details" field instead of a message draft, so the
+   * full mention system (`@file`, `@agent`, `@skill`) works while answering.
+   */
+  question?: PromptInputV2QuestionIntegration
+}
+
+export type PromptInputV2QuestionIntegration = {
+  active: () => boolean
+  /** Placeholder describing the question being answered. */
+  placeholder: () => string
+  /** Whether the primary action can fire (an option is picked or details exist). */
+  canSubmit: () => boolean
+  /** Advance to the next question, or send the reply on the last one. */
+  submit: () => void
+  /** Registers the composer as the details editor; returns an unbind callback. */
+  bind: (binding: QuestionDetailsBinding) => () => void
+}
 type PromptRevisionSendRegistration = {
   run: (intent: PromptRevisionFlow["intent"]) => void
   busy: () => boolean
@@ -1378,10 +1400,13 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
       t: (key, params) => language.t(key as Parameters<typeof language.t>[0], params as never),
     }),
   )
-  const designPlaceholder = () =>
-    promptDesignPlaceholder(mode(), placeholder(), (key, params) =>
+  const questionActive = () => props.question?.active() === true
+  const designPlaceholder = () => {
+    if (questionActive() && mode() === "normal") return props.question!.placeholder()
+    return promptDesignPlaceholder(mode(), placeholder(), (key, params) =>
       language.t(key as Parameters<typeof language.t>[0], params as never),
     )
+  }
 
   const historyComments = () => {
     const byID = new Map(comments.all().map((item) => [`${item.file}\n${item.id}`, item] as const))
@@ -1553,6 +1578,14 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
     sendWithoutRevision: directSubmit,
   }
   const submitFromPrimary = () => {
+    // A pending question owns the composer: Enter (and the send button) answer
+    // it rather than starting a new turn. Revision/queue/goal paths are
+    // deliberately skipped — none of them apply to an answer.
+    if (questionActive() && mode() === "normal") {
+      if (!props.question!.canSubmit()) return
+      props.question!.submit()
+      return
+    }
     const action = resolvePromptPrimaryAction({
       mode: mode(),
       working: working(),
@@ -1941,6 +1974,60 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   })
   Object.defineProperty(controller, "liveRate", { get: () => liveRate })
   Object.defineProperty(controller, "revisionSend", { get: () => revisionSend })
+
+  // While a question owns the composer the send affordance follows the
+  // question's readiness, not "is there a draft" — picking an option with no
+  // typed details is already a complete answer.
+  const baseCanSubmit = controller.canSubmit
+  Object.defineProperty(controller, "canSubmit", {
+    value: () => (questionActive() && mode() === "normal" ? props.question!.canSubmit() : baseCanSubmit()),
+  })
+
+  // A pending question temporarily owns the normal composer. Snapshot the
+  // interrupted chat draft and cursor outside the question controller, then
+  // restore them when question ownership ends. Question drafts remain owned by
+  // the controller and can change independently while this snapshot stays put.
+  createEffect(() => {
+    const question = props.question
+    if (!question?.active()) return
+
+    // Keep typing and question-step state out of this effect's dependency set.
+    // Only question ownership should create or destroy the saved chat draft.
+    const original = untrack(() => {
+      const parts = prompt.current().map((part) => ({ ...part })) as Prompt
+      return { parts, cursor: prompt.cursor() ?? promptLength(parts) }
+    })
+
+    untrack(() => prompt.reset())
+    const dispose = untrack(() =>
+      question.bind({
+        read: () => {
+          const parts = prompt.current()
+          return { text: questionDetailsText(parts), parts: parts.map((part) => ({ ...part })) }
+        },
+        write: (draft) => {
+          const parts = draft.parts as Prompt | undefined
+          if (parts && parts.length > 0) {
+            prompt.set(
+              parts.map((part) => ({ ...part })),
+              promptLength(parts),
+            )
+            return
+          }
+          if (!draft.text) return
+          prompt.set([{ type: "text", content: draft.text, start: 0, end: draft.text.length }], draft.text.length)
+        },
+        clear: () => prompt.reset(),
+        focus: () => requestAnimationFrame(() => editor?.focus()),
+      }),
+    )
+
+    onCleanup(() => {
+      dispose()
+      prompt.set(original.parts, original.cursor)
+      requestAnimationFrame(() => controller.restoreFocus(original.cursor))
+    })
+  })
 
   command.register("prompt-input", () => [
     {

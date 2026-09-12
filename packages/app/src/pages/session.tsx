@@ -2340,7 +2340,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
 
       <Show when={(params.id || !newSessionDesign()) && !mobileChanges()}>
         {(_) => {
-          const controller = createSessionComposerRegionController({
+          const promptRegion = createSessionComposerRegionController({
             state: composer,
             sessionKey,
             sessionID: () => params.id,
@@ -2388,7 +2388,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
           })
           return (
             <SessionComposerRegion
-              controller={controller}
+              controller={promptRegion}
               promptInput={
                 <Show
                   when={newSessionDesign()}
@@ -2414,9 +2414,20 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
                   }
                 >
                   {(_) => {
+                    const question = promptRegion.question
                     const controller = usePromptInputV2Controller({
                       get controls() {
                         return inputController()
+                      },
+                      question: {
+                        active: question.active,
+                        canSubmit: question.canAdvance,
+                        submit: question.advance,
+                        bind: question.bind,
+                        placeholder: () =>
+                          question.customAllowed()
+                            ? language.t("session.question.placeholder.details")
+                            : language.t("session.question.placeholder.selectOnly"),
                       },
                       ref: (el) => {
                         inputRef = el

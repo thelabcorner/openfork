@@ -345,4 +345,5 @@ export const dict: Record<string, string> = {
   "ui.question.custom.optional": "optional",
   "ui.question.custom.mentionHint": "Type @ to mention a project file",
   "ui.question.answer.details": "Details",
+  "ui.question.answer.multiple": "Multiple",
 }

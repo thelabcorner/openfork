@@ -3404,11 +3404,26 @@ ToolRegistry.register({
       () => answers().length > 0 || (structuredDetails()?.some((detail) => detail.trim().length > 0) ?? false),
     )
 
+    /** What one question resolved to, split into picked options and free-form detail. */
+    const resolve = (question: QuestionInfo, index: number) => {
+      const answer = answers()[index] ?? []
+      const labels = new Set((question.options ?? []).map((option) => option.label))
+      const selections = answer.filter((item) => labels.has(item))
+      const details = structuredDetails()
+        ? [structuredDetails()![index]?.trim() ?? ""].filter(Boolean)
+        : answer.filter((item) => !labels.has(item))
+      return { selections, details, empty: selections.length === 0 && details.length === 0 }
+    }
+
+    // A collapsed row is worth more carrying the decision itself than a count,
+    // so lead with the chosen labels and fall back to the count.
     const subtitle = createMemo(() => {
       const count = questions().length
       if (count === 0) return ""
-      if (completed()) return i18n.t("ui.question.subtitle.answered", { count })
-      return `${count} ${i18n.t(count > 1 ? "ui.common.question.other" : "ui.common.question.one")}`
+      if (!completed()) return `${count} ${i18n.t(count > 1 ? "ui.common.question.other" : "ui.common.question.one")}`
+      const picked = questions().flatMap((question, index) => resolve(question, index).selections)
+      if (picked.length > 0) return picked.join(" · ")
+      return i18n.t("ui.question.subtitle.answered", { count })
     })
 
     return (
@@ -3421,40 +3436,70 @@ ToolRegistry.register({
           subtitle: subtitle(),
         }}
       >
-        <Show when={completed()}>
-          <div data-component="question-answers">
-            <For each={questions()}>
-              {(q, i) => {
-                const answer = () => answers()[i()] ?? []
-                const optionLabels = new Set((q.options ?? []).map((option) => option.label))
-                const selections = createMemo(() => answer().filter((item) => optionLabels.has(item)))
-                const details = createMemo(() => {
-                  const explicit = structuredDetails()?.[i()]?.trim()
-                  if (structuredDetails()) return explicit ? [explicit] : []
-                  return answer().filter((item) => !optionLabels.has(item))
-                })
-                const empty = createMemo(() => selections().length === 0 && details().length === 0)
-                return (
-                  <div data-slot="question-answer-item">
-                    <div data-slot="question-text">{q.question}</div>
-                    <Show when={selections().length > 0}>
-                      <div data-slot="answer-text">{selections().join(", ")}</div>
+        <div data-component="question-answers">
+          <For each={questions()}>
+            {(question, i) => {
+              const result = createMemo(() => resolve(question, i()))
+              const options = createMemo(() => question.options ?? [])
+              const multiple = () => question.multiple === true
+              const picked = (label: string) => result().selections.includes(label)
+              return (
+                <section data-slot="question-answer-item" data-answered={result().empty ? undefined : "true"}>
+                  <div data-slot="question-answer-head">
+                    <Show when={questions().length > 1}>
+                      <span data-slot="question-answer-index">{i() + 1}</span>
                     </Show>
-                    <Show when={details().length > 0}>
-                      <div data-slot="answer-detail">
-                        <span data-slot="answer-detail-label">{i18n.t("ui.question.answer.details")}: </span>
-                        {details().join("\n")}
-                      </div>
+                    <Show when={question.header?.trim()}>
+                      {(header) => <span data-slot="question-answer-header">{header()}</span>}
                     </Show>
-                    <Show when={empty()}>
-                      <div data-slot="answer-text">{i18n.t("ui.question.answer.none")}</div>
+                    <Show when={multiple()}>
+                      <span data-slot="question-answer-badge">{i18n.t("ui.question.answer.multiple")}</span>
+                    </Show>
+                    <Show when={result().empty}>
+                      <span data-slot="question-answer-badge" data-tone="muted">
+                        {i18n.t("ui.question.review.notAnswered")}
+                      </span>
                     </Show>
                   </div>
-                )
-              }}
-            </For>
-          </div>
-        </Show>
+
+                  <div data-slot="question-text">{question.question}</div>
+
+                  <Show when={options().length > 0}>
+                    <ul data-slot="question-answer-options">
+                      <For each={options()}>
+                        {(option) => (
+                          <li data-slot="question-answer-option" data-picked={picked(option.label) ? "true" : undefined}>
+                            <span
+                              data-slot="question-answer-mark"
+                              data-type={multiple() ? "checkbox" : "radio"}
+                              data-picked={picked(option.label) ? "true" : undefined}
+                              aria-hidden="true"
+                            >
+                              <Show when={picked(option.label) && multiple()}>
+                                <Icon name="check-small" size="small" />
+                              </Show>
+                            </span>
+                            <span data-slot="question-answer-option-label">{option.label}</span>
+                            <Show when={option.description}>
+                              <span data-slot="question-answer-option-description">{option.description}</span>
+                            </Show>
+                          </li>
+                        )}
+                      </For>
+                    </ul>
+                  </Show>
+
+                  <Show when={result().details.length > 0}>
+                    <div data-slot="question-answer-detail">
+                      <span data-slot="question-answer-detail-label">{i18n.t("ui.question.answer.details")}</span>
+                      <div data-slot="question-answer-detail-body">{result().details.join("\n")}</div>
+                    </div>
+                  </Show>
+                </section>
+              )
+            }}
+          </For>
+        </div>
       </BasicTool>
     )
   },

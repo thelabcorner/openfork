@@ -5,6 +5,7 @@ import { createStore } from "solid-js/store"
 import type { PromptInputState } from "@/components/prompt-input"
 import { useSync } from "@/context/sync"
 import { getSessionHandoff, setSessionHandoff } from "@/pages/session/handoff"
+import { createSessionQuestionController } from "./question-controller"
 import type { SessionComposerController } from "./session-composer-state"
 
 export type SessionComposerFollowupDock = {
@@ -40,6 +41,8 @@ export function createSessionComposerRegionController(input: {
   setDockRef: (el: HTMLDivElement) => void
 }) {
   const sync = useSync()
+  const question = createSessionQuestionController({ request: input.state.questionRequest })
+  question.onSubmitted(input.onResponseSubmit)
   const [store, setStore] = createStore({
     ready: input.ready() || input.state.dock(),
     height: 320,
@@ -115,6 +118,7 @@ export function createSessionComposerRegionController(input: {
   const value = createMemo(() => Math.max(0, Math.min(1, progress())))
   return {
     state: input.state,
+    question,
     centered: input.centered,
     todo: input.todo,
     followup: input.followup,
@@ -125,7 +129,7 @@ export function createSessionComposerRegionController(input: {
     setDockRef: input.setDockRef,
     parentID,
     child: () => !!parentID(),
-    showComposer: () => !input.state.blocked() || !!parentID(),
+    showComposer: () => !input.state.permissionRequest() || !!parentID(),
     handoffPrompt: () => getSessionHandoff(input.sessionKey())?.prompt,
     promptReady: input.prompt.ready,
     dock: () => (store.ready && input.state.dock()) || value() > 0.001,
