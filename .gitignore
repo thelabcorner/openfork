@@ -65,3 +65,13 @@ startup-investigation/raw/*cpuprofile-summary.txt
 workbuddy-usage-forensics.tar.br
 *.tar.br
 .opencode.json
+
+# Local analysis, replay, benchmark, and hot-reload artifacts
+.opencode/cache/
+.opencode/hot-reload-status.json
+.tmp-chunkdb-bench/
+.tmp-opencode-db-prune/
+.tmp-special-agent.patch
+.tmp-full-status.txt
+packages/opencode/.tmp-spad-*
+packages/opencode/.opencode-runtime-locks/
