@@ -96,6 +96,17 @@ function heal(text: string) {
   return remend(stabilizePendingList(text) ?? text, { linkMode: "text-only" })
 }
 
+const BLANK_LINE = /\r?\n[ \t]*\r?\n/
+const BLANK_LINE_AT_END = /\r?\n[ \t]*\r?\n[ \t]*$/
+
+function crossesBlankLine(raw: string, suffix: string) {
+  if (BLANK_LINE.test(suffix)) return true
+  if (BLANK_LINE_AT_END.test(raw)) return true
+  const newline = raw.lastIndexOf("\n")
+  if (newline < 0) return false
+  return BLANK_LINE.test(raw.slice(newline) + suffix)
+}
+
 export function stream(text: string, live: boolean): Block[] {
   if (!live) return completedProjection(text).blocks
   if (refs(text)) return [{ raw: text, src: heal(text), mode: "live" }] satisfies Block[]
@@ -165,6 +176,18 @@ export function project(previous: Projection | undefined, text: string, live: bo
   const suffix = text.slice(previous.text.length)
   if (tail?.mode === "live" && suffix) {
     const appended = tail.raw + suffix
+    // A blank line can close the current top-level block. Resolve that boundary
+    // before the plain-text fast path so the next block cannot be appended into
+    // the old live DOM subtree and then split out later when some unrelated
+    // structural character (for example an inline-code backtick) finally forces
+    // a reparse. Use stream() rather than slicing at the raw blank line because
+    // blank lines can also legally occur inside a single list block.
+    if (crossesBlankLine(tail.raw, suffix)) {
+      return {
+        text,
+        blocks: [...previous.blocks.slice(0, -1), ...stream(appended, true)],
+      }
+    }
     // Plain prose can be appended directly only while the rendered source is
     // identical to the raw source. If remend (or the list stabilizer above)
     // synthesized anything, the next character may resolve that temporary
@@ -175,19 +198,6 @@ export function project(previous: Projection | undefined, text: string, live: bo
       return {
         text,
         blocks: [...previous.blocks.slice(0, -1), { ...tail, raw: appended, src: tail.src + suffix }],
-      }
-    }
-    // Once a blank-line boundary is present, every paragraph before it is
-    // immutable. Parse that bounded tail once and keep the still-growing
-    // suffix live; this prevents ordinary prose from re-lexing the entire
-    // message on every token.
-    const boundary = appended.lastIndexOf("\n\n")
-    if (boundary > 0 && boundary < appended.length - 2) {
-      const stable = completedProjection(appended.slice(0, boundary + 2)).blocks
-      const open = stream(appended.slice(boundary + 2), true)
-      return {
-        text,
-        blocks: [...previous.blocks.slice(0, -1), ...stable, ...open],
       }
     }
   }

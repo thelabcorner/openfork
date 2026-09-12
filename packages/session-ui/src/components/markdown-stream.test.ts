@@ -127,6 +127,46 @@ describe("markdown stream", () => {
     ])
   })
 
+  test("freezes a paragraph before a new list before later inline syntax can trigger a split", () => {
+    const approach = project(undefined, "Approach:\n\n", true)
+    const bullet = project(approach, "Approach:\n\n-", true)
+    expect(bullet.blocks).toEqual([
+      { raw: "Approach:\n\n", src: "Approach:\n\n", mode: "full" },
+      { raw: "-", src: "-", mode: "live" },
+    ])
+
+    const prose = project(bullet, "Approach:\n\n- Read source", true)
+    expect(prose.blocks).toHaveLength(2)
+    expect(prose.blocks[0]).toEqual(bullet.blocks[0])
+
+    const code = project(prose, "Approach:\n\n- Read source `file.ts`", true)
+    expect(code.blocks).toHaveLength(2)
+    expect(code.blocks[0]).toEqual(bullet.blocks[0])
+
+    // Once the next top-level block has started, no later character is allowed
+    // to be the event that suddenly changes the projection from one block to
+    // two. That delayed topology change was the visible timeline jump.
+    const full = "Approach:\n\n- Read source `file.ts` and continue"
+    let incremental = project(undefined, "Approach:\n\n-", true)
+    for (let index = "Approach:\n\n-".length + 1; index <= full.length; index++) {
+      incremental = project(incremental, full.slice(0, index), true)
+      expect(incremental.blocks).toHaveLength(2)
+    }
+
+    const insights = project(undefined, "KEY INSIGHTS:\n\n1", true)
+    expect(insights.blocks).toEqual([
+      { raw: "KEY INSIGHTS:\n\n", src: "KEY INSIGHTS:\n\n", mode: "full" },
+      { raw: "1", src: "1", mode: "live" },
+    ])
+  })
+
+  test("does not split a blank line that remains inside one list block", () => {
+    const text = "- item\n\n  continuation"
+    let projection: ReturnType<typeof project> | undefined
+    for (let index = 1; index <= text.length; index++) projection = project(projection, text.slice(0, index), true)
+    expect(projection?.blocks).toEqual([{ raw: text, src: text, mode: "live" }])
+  })
+
   test("keeps a growing table together until a later block freezes it", () => {
     expect(stream("| a | b |\n|---|---|\n| 1 | 2 |", true)).toEqual([
       { raw: "| a | b |\n|---|---|\n| 1 | 2 |", src: "| a | b |\n|---|---|\n| 1 | 2 |", mode: "live" },
