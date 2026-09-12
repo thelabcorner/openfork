@@ -1,4 +1,5 @@
 import type { PeriodThresholdBand, SpadLane } from "./types"
+import type { BoundedExactPeriodVerifier, ExactPeriodProofResult } from "./exact-proof"
 
 export interface LaneDetection {
   readonly lane: SpadLane
@@ -21,6 +22,36 @@ export interface PeriodLaneOptions {
   readonly coverageMultiplier: number
   readonly exponentBonus: number
   readonly storeRawPositions: boolean
+  /** Optional benchmark/telemetry counters. Omit on the production hot path. */
+  readonly stats?: PeriodLaneStats
+}
+
+export interface PeriodLaneStats {
+  pushes: number
+  candidateComparisons: number
+  candidateMismatches: number
+  rollingHashMatches: number
+  exactQgramChecks: number
+  exactQgramComparisons: number
+  candidatesAdded: number
+  thresholdPasses: number
+  extensionComparisons: number
+  confirmations: number
+}
+
+export function createPeriodLaneStats(): PeriodLaneStats {
+  return {
+    pushes: 0,
+    candidateComparisons: 0,
+    candidateMismatches: 0,
+    rollingHashMatches: 0,
+    exactQgramChecks: 0,
+    exactQgramComparisons: 0,
+    candidatesAdded: 0,
+    thresholdPasses: 0,
+    extensionComparisons: 0,
+    confirmations: 0,
+  }
 }
 
 const HASH_BASE = 0x9e3779b1 >>> 0
@@ -45,11 +76,15 @@ export class PeriodLane {
   private readonly bands: readonly PeriodThresholdBand[]
   private readonly coverageMultiplier: number
   private readonly exponentBonus: number
+  private readonly stats: PeriodLaneStats | undefined
   private readonly candPeriod: Int32Array
   private readonly candMatched: Int32Array
   private readonly candRelationStart: Int32Array
   private readonly candMinCoverage: Int32Array
-  private readonly candMinExponent: Float64Array
+  /** Integer coverage needed to satisfy the exponent floor exactly. */
+  private readonly candMinExponentCoverage: Int32Array
+  /** Candidate slots are kept compact in [0, activeCandidates). */
+  private activeCandidates = 0
   private position = -1
   private rollingHash = 0 >>> 0
   private symbolsInHash = 0
@@ -68,29 +103,36 @@ export class PeriodLane {
     this.bands = options.bands
     this.coverageMultiplier = options.coverageMultiplier
     this.exponentBonus = options.exponentBonus
+    this.stats = options.stats
     this.candPeriod = new Int32Array(options.maxCandidates)
     this.candMatched = new Int32Array(options.maxCandidates)
     this.candRelationStart = new Int32Array(options.maxCandidates)
     this.candMinCoverage = new Int32Array(options.maxCandidates)
-    this.candMinExponent = new Float64Array(options.maxCandidates)
+    this.candMinExponentCoverage = new Int32Array(options.maxCandidates)
   }
 
   reset(): void {
     this.position = -1
     this.rollingHash = 0
     this.symbolsInHash = 0
+    this.activeCandidates = 0
     this.anchorsHash.fill(0)
     this.anchorsPos.fill(0)
-    this.candPeriod.fill(0)
-    this.candMatched.fill(0)
-    this.candRelationStart.fill(0)
-    this.candMinCoverage.fill(0)
-    this.candMinExponent.fill(0)
   }
 
   get length(): number { return this.position + 1 }
+  get capacity(): number { return this.ring.length }
   get(index: number): number { return this.ring[index & this.ringMask]! }
   rawPosition(index: number): number { return this.rawPositions ? this.rawPositions[index & this.ringMask]! : index }
+
+  proveExact(
+    verifier: BoundedExactPeriodVerifier,
+    start: number,
+    length: number,
+    period: number,
+  ): ExactPeriodProofResult {
+    return verifier.proveRing(this.ring, this.ringMask, start, length, period)
+  }
 
   extract(start: number, length: number, maxLength = length): Uint16Array {
     const n = Math.max(0, Math.min(length, maxLength))
@@ -105,27 +147,46 @@ export class PeriodLane {
   }
 
   private exactQgramMatch(currentStart: number, previousStart: number): boolean {
-    for (let i = 0; i < this.qgram; i++) if (this.get(currentStart + i) !== this.get(previousStart + i)) return false
+    if (this.stats) this.stats.exactQgramChecks++
+    for (let i = 0; i < this.qgram; i++) {
+      if (this.stats) this.stats.exactQgramComparisons++
+      if (this.get(currentStart + i) !== this.get(previousStart + i)) return false
+    }
     return true
   }
 
   private addCandidate(period: number, relationStart: number): void {
-    for (let i = 0; i < this.candPeriod.length; i++) if (this.candPeriod[i] === period) return
-    let slot = -1
-    let weakest = 0
-    let weakestMatched = Number.POSITIVE_INFINITY
-    for (let i = 0; i < this.candPeriod.length; i++) {
-      if (this.candPeriod[i] === 0) { slot = i; break }
-      const matched = this.candMatched[i]!
-      if (matched < weakestMatched) { weakestMatched = matched; weakest = i }
+    let slot: number
+    if (this.activeCandidates < this.candPeriod.length) {
+      slot = this.activeCandidates++
+    } else {
+      slot = 0
+      let weakestMatched = this.candMatched[0]!
+      for (let i = 1; i < this.activeCandidates; i++) {
+        const matched = this.candMatched[i]!
+        if (matched < weakestMatched) { weakestMatched = matched; slot = i }
+      }
     }
-    if (slot < 0) slot = weakest
+    if (this.stats) this.stats.candidatesAdded++
     const band = this.threshold(period)
     this.candPeriod[slot] = period
     this.candMatched[slot] = this.qgram
     this.candRelationStart[slot] = relationStart
     this.candMinCoverage[slot] = Math.ceil(band.minCoverage * this.coverageMultiplier)
-    this.candMinExponent[slot] = band.minExponent + this.exponentBonus
+    this.candMinExponentCoverage[slot] = Math.ceil(period * (band.minExponent + this.exponentBonus))
+  }
+
+  /** Remove one active slot while preserving candidate priority/order. */
+  private removeCandidate(slot: number): void {
+    const last = this.activeCandidates - 1
+    for (let i = slot; i < last; i++) {
+      this.candPeriod[i] = this.candPeriod[i + 1]!
+      this.candMatched[i] = this.candMatched[i + 1]!
+      this.candRelationStart[i] = this.candRelationStart[i + 1]!
+      this.candMinCoverage[i] = this.candMinCoverage[i + 1]!
+      this.candMinExponentCoverage[i] = this.candMinExponentCoverage[i + 1]!
+    }
+    this.activeCandidates = last
   }
 
   private maybeConfirm(slot: number, dynamicCoverageMultiplier: number): LaneDetection | undefined {
@@ -133,12 +194,16 @@ export class PeriodLane {
     if (period === 0) return undefined
     const matched = this.candMatched[slot]!
     const coverage = period + matched
-    const minCoverage = Math.ceil(this.candMinCoverage[slot]! * dynamicCoverageMultiplier)
-    const minExponent = this.candMinExponent[slot]!
-    if (coverage < minCoverage || coverage / period < minExponent) return undefined
+    const baseCoverage = this.candMinCoverage[slot]!
+    const minCoverage = dynamicCoverageMultiplier === 1
+      ? baseCoverage
+      : Math.ceil(baseCoverage * dynamicCoverageMultiplier)
+    if (coverage < minCoverage || coverage < this.candMinExponentCoverage[slot]!) return undefined
+    if (this.stats) this.stats.thresholdPasses++
     let relationStart = this.candRelationStart[slot]!
     const oldest = Math.max(0, this.position - this.ring.length + 1)
     while (relationStart - 1 - period >= oldest) {
+      if (this.stats) this.stats.extensionComparisons++
       if (this.get(relationStart - 1) !== this.get(relationStart - 1 - period)) break
       relationStart--
     }
@@ -147,30 +212,39 @@ export class PeriodLane {
     const exactCoverage = laneRunEnd - laneRunStart
     const rawRunStart = this.rawPosition(laneRunStart)
     const rawRunEnd = this.rawPosition(laneRunEnd - 1) + 1
+    if (this.stats) this.stats.confirmations++
     return { lane: this.lane, period, laneRunStart, laneRunEnd, rawRunStart, rawRunEnd, exponent: exactCoverage / period }
   }
 
   push(code: number, rawPosition: number, dynamicCoverageMultiplier = 1): LaneDetection | undefined {
+    if (this.stats) this.stats.pushes++
     this.position++
     const pos = this.position
     this.ring[pos & this.ringMask] = code
     if (this.rawPositions) this.rawPositions[pos & this.ringMask] = rawPosition >>> 0
-    for (let i = 0; i < this.candPeriod.length; i++) {
+    for (let i = 0; i < this.activeCandidates;) {
       const period = this.candPeriod[i]!
-      if (period === 0) continue
       const relationStart = this.candRelationStart[i]!
-      if (pos < relationStart + this.qgram) continue
-      if (this.get(pos) !== this.get(pos - period)) { this.candPeriod[i] = 0; this.candMatched[i] = 0; continue }
+      if (pos < relationStart + this.qgram) { i++; continue }
+      if (this.stats) this.stats.candidateComparisons++
+      // `code` was just written at `pos`; avoid rereading the current symbol
+      // through the ring accessor on every active-candidate comparison.
+      if (code !== this.ring[(pos - period) & this.ringMask]!) {
+        if (this.stats) this.stats.candidateMismatches++
+        this.removeCandidate(i)
+        continue
+      }
       this.candMatched[i] = this.candMatched[i]! + 1
       const detection = this.maybeConfirm(i, dynamicCoverageMultiplier)
       if (detection) return detection
+      i++
     }
     if (this.symbolsInHash < this.qgram) {
       this.rollingHash = (Math.imul(this.rollingHash, HASH_BASE) + code + 1) >>> 0
       this.symbolsInHash++
       if (this.symbolsInHash < this.qgram) return undefined
     } else {
-      const outgoing = this.get(pos - this.qgram)
+      const outgoing = this.ring[(pos - this.qgram) & this.ringMask]!
       const removed = Math.imul(outgoing + 1, this.qPow) >>> 0
       this.rollingHash = (Math.imul((this.rollingHash - removed) >>> 0, HASH_BASE) + code + 1) >>> 0
     }
@@ -179,12 +253,24 @@ export class PeriodLane {
     const previousStored = this.anchorsPos[slot]!
     const previousEnd = previousStored - 1
     if (previousStored !== 0 && this.anchorsHash[slot] === this.rollingHash) {
+      if (this.stats) this.stats.rollingHashMatches++
       const period = pos - previousEnd
       if (period >= 1 && period <= this.maxPeriod) {
         const currentStart = pos - this.qgram + 1
         const previousStart = currentStart - period
         const oldest = Math.max(0, pos - this.ring.length + 1)
-        if (previousStart >= oldest && this.exactQgramMatch(currentStart, previousStart)) this.addCandidate(period, currentStart)
+        if (previousStart >= oldest) {
+          let duplicate = false
+          for (let i = 0; i < this.activeCandidates; i++) {
+            if (this.candPeriod[i] === period) { duplicate = true; break }
+          }
+          // Exact verification is necessary only when admitting a new period.
+          // Repeated anchor hits for an already-active period contribute no new
+          // evidence and used to dominate q-gram verification cost on structured
+          // output. Fresh candidates remain collision-free.
+          if (!duplicate && this.exactQgramMatch(currentStart, previousStart))
+            this.addCandidate(period, currentStart)
+        }
       }
     }
     this.anchorsHash[slot] = this.rollingHash

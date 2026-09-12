@@ -876,6 +876,60 @@ const AuditorSection: Component = () => {
   )
 }
 
+const SpadAuditorSection: Component = () => {
+  const language = useLanguage()
+  const settings = useSettings()
+  const serverSync = useServerSync()
+  const current = () => settings.general.spadAuditor()
+  const enabled = () => current()?.enabled !== false
+
+  const setEnabled = (value: boolean) => {
+    const next = current() ?? {}
+    settings.general.setSpadAuditor({ ...next, enabled: value ? undefined : false })
+    void serverSync().updateConfig({
+      experimental: {
+        spad_auditor: value,
+      },
+    } as unknown as Record<string, unknown>)
+  }
+
+  const selectModel = (model: { providerID: string; modelID: string } | undefined) => {
+    const next = current() ?? {}
+    settings.general.setSpadAuditor({ ...next, model })
+    void serverSync().updateConfig({
+      experimental: {
+        spad_auditor: enabled(),
+        spad_auditor_model: model ? `${model.providerID}/${model.modelID}` : undefined,
+      },
+    } as unknown as Record<string, unknown>)
+  }
+
+  return (
+    <div class="settings-v2-section">
+      <h3 class="settings-v2-section-title">{language.t("settings.general.section.spadAuditor")}</h3>
+      <SettingsListV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.spadAuditorEnabled.title")}
+          description={language.t("settings.general.row.spadAuditorEnabled.description")}
+        >
+          <Switch checked={enabled()} onChange={setEnabled} />
+        </SettingsRowV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.spadAuditorModel.title")}
+          description={language.t("settings.general.row.spadAuditorModel.description")}
+        >
+          <SettingsModelPickerV2
+            action="settings-spad-auditor-model"
+            value={current()?.model}
+            defaultLabel={language.t("settings.general.row.spadAuditorModel.default")}
+            onChange={selectModel}
+          />
+        </SettingsRowV2>
+      </SettingsListV2>
+    </div>
+  )
+}
+
 const CompactionSection: Component = () => {
   const language = useLanguage()
   const dialog = useDialog()
@@ -1245,6 +1299,7 @@ export const SettingsGeneralV2: Component<{
           <TitleGenerationSection />
           <PromptRevisionSection />
           <AuditorSection />
+          <SpadAuditorSection />
           <CompactionSection />
         </SettingsLocalScope>
 

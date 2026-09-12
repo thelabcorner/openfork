@@ -3,8 +3,12 @@ import { SpadDetector } from "@/session/spad/detector";
 import { SpadSupervisor } from "@/session/spad/supervisor";
 import { makeTurnPolicy } from "@/session/spad/intent";
 import { clearPersistedMotifs } from "@/session/spad/pattern-store";
+import { DEFAULT_SPAD_CONFIG } from "@/session/spad/config";
 import fs from "fs";
 import path from "path";
+
+const canonicalRecovery = { ...DEFAULT_SPAD_CONFIG, autoRecoverCanonical: true };
+const toolRecovery = { ...DEFAULT_SPAD_CONFIG, autoRecoverToolLoop: true };
 
 function feed(det: SpadDetector, text: string) {
   let hit: any;
@@ -68,7 +72,7 @@ describe("SPAD more fixtures — unseen", () => {
     const vars = [base, base.toUpperCase(), base.toLowerCase().replaceAll(" ", "  ")];
     let t = "";
     for (let i = 0; i < 30; i++) t += vars[i % vars.length] + "\n";
-    const sup = new SpadSupervisor();
+    const sup = new SpadSupervisor(canonicalRecovery);
     sup.beginTurn(makeTurnPolicy("Continue"));
     sup.startPart("text");
     let a: any;
@@ -79,12 +83,12 @@ describe("SPAD more fixtures — unseen", () => {
 
   test("tool sequences — 23 reads no trigger, 24 triggers, write resets (resource-aware threshold)", () => {
     clearPersistedMotifs();
-    const sup = new SpadSupervisor();
+    const sup = new SpadSupervisor(toolRecovery);
     sup.beginTurn(makeTurnPolicy("explore"));
     for (let i = 0; i < 23; i++) expect(sup.pushTool("read", false)).toBeUndefined();
     expect(sup.pushTool("read", false)?.type).toBe("recover");
     clearPersistedMotifs();
-    const sup2 = new SpadSupervisor();
+    const sup2 = new SpadSupervisor(toolRecovery);
     sup2.beginTurn(makeTurnPolicy("explore"));
     for (let i = 0; i < 23; i++) sup2.pushTool("read", false);
     sup2.pushTool("write", true);

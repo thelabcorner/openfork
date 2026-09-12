@@ -19,13 +19,22 @@ export const DEFAULT_SPAD_CONFIG: SpadConfig = Object.freeze({
   canonicalCoverageMultiplier: 1.5,
   canonicalExponentBonus: 2,
   codeFenceCoverageMultiplier: 1.75,
-  recoveryThresholdMultiplier: 0.65,
-  maxRecoveryAttempts: 3,
+  // Do not lower thresholds after a recovery. A prior intervention is not
+  // evidence that the next generation should be judged more aggressively.
+  recoveryThresholdMultiplier: 1,
+  maxRecoveryAttempts: 2,
   relapseMatchChars: 96,
   recoveryWatchChars: 1536,
-  autoRecoverCanonical: true,
+  // Production safety profile: only high-confidence exact repetition may
+  // mutate a text response. Every heuristic/fuzzy/cross-turn lane remains
+  // detect/observe-only until it clears the SPAD gym precision gate.
+  autoRecoverRaw: true,
+  autoRecoverInsideCodeFence: false,
+  autoRecoverCanonical: false,
   canonicalMinDuplicate4GramRatio: 0.65,
-  autoRecoverExpansion: true,
+  autoRecoverExpansion: false,
+  autoRecoverPersistedMotifs: false,
+  autoRecoverToolLoop: false,
   expansionMinLines: 8,
   expansionMinCycles: 2,
   expansionWindowSize: 512,
@@ -33,7 +42,7 @@ export const DEFAULT_SPAD_CONFIG: SpadConfig = Object.freeze({
   expansionSeenHashCap: 32768,
   lowLexicalDistinctLetters: 4,
   lowLexicalMinCoverage: 1024,
-  autoRecoverThrash: true,
+  autoRecoverThrash: false,
   thrashMinGenerations: 3,
   thrashMinToolCalls: 8,
   thrashNoMutationGens: 3,

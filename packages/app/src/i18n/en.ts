@@ -1823,6 +1823,7 @@ export const dict = {
   "settings.general.section.titleGeneration": "Title generation",
   "settings.general.section.promptRevision": "Prompt revision",
   "settings.general.section.goalAuditor": "Goal auditor",
+  "settings.general.section.spadAuditor": "SPAD auditor",
   "settings.general.section.compaction": "Compaction",
   "settings.general.row.compactionModel.small.title": "Compaction small model",
   "settings.general.row.compactionModel.small.description": "Model for small compaction contexts (cheapest)",
@@ -1910,6 +1911,13 @@ export const dict = {
   "settings.general.row.auditorPrompt.description":
     "Instructions used by the independent read-only auditor after autonomous Goal turns",
   "settings.general.row.auditorPrompt.edit": "Edit auditor prompt",
+  "settings.general.row.spadAuditorEnabled.title": "Enable SPAD auditor",
+  "settings.general.row.spadAuditorEnabled.description":
+    "Review ambiguous SPAD observations with a bounded veto-only special agent. Enabled by default.",
+  "settings.general.row.spadAuditorModel.title": "SPAD auditor model",
+  "settings.general.row.spadAuditorModel.description":
+    "Model used for bounded SPAD repetition-quality review. Must support tool calls.",
+  "settings.general.row.spadAuditorModel.default": "Default (small tool-capable model)",
 
   "prompt.revision.title": "Revise prompt",
   "prompt.revision.description": "Rewrite this draft for clarity and stronger execution guidance",

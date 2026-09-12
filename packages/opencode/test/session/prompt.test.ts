@@ -825,11 +825,41 @@ it.instance("SPAD recovery truncates a repetitive tail and continues with a hidd
 
 it.instance("SPAD disabled preserves repetitive output and avoids recovery", () =>
   Effect.gen(function* () {
-    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), experimental: { spad_recovery: false } }))
+    const { llm } = yield* useServerConfig((url) => ({
+      ...providerCfg(url),
+      experimental: { spad_recovery: false, spad_auditor: false },
+    }))
     const prompt = yield* SessionPrompt.Service
     const sessions = yield* Session.Service
     const session = yield* sessions.create({
       title: "SPAD disabled",
+      permission: [{ permission: "*", pattern: "*", action: "allow" }],
+    })
+    const motif = "The implementation should continue from the last stable state. "
+    const loop = motif.repeat(12)
+
+    yield* prompt.prompt({
+      sessionID: session.id,
+      agent: "build",
+      noReply: true,
+      parts: [{ type: "text", text: "Continue implementing the feature." }],
+    })
+    yield* llm.text(loop)
+
+    const result = yield* prompt.loop({ sessionID: session.id })
+    expect(result.parts.some((part) => part.type === "text" && part.text === loop)).toBe(true)
+    expect(yield* llm.hits).toHaveLength(1)
+  }),
+)
+
+it.instance("SPAD destructive recovery is disabled by default when the experimental flag is unset", () =>
+  Effect.gen(function* () {
+    clearPersistedMotifs()
+    const { llm } = yield* useServerConfig((url) => ({ ...providerCfg(url), experimental: { spad_auditor: false } }))
+    const prompt = yield* SessionPrompt.Service
+    const sessions = yield* Session.Service
+    const session = yield* sessions.create({
+      title: "SPAD default off",
       permission: [{ permission: "*", pattern: "*", action: "allow" }],
     })
     const motif = "The implementation should continue from the last stable state. "

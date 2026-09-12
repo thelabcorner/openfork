@@ -6,6 +6,8 @@ import { SpadSupervisor } from "@/session/spad/supervisor"
 import { clearPersistedMotifs } from "@/session/spad/pattern-store"
 import { readFileSync } from "node:fs"
 
+const expansionRecovery = { ...DEFAULT_SPAD_CONFIG, autoRecoverExpansion: true }
+
 const incidents = Array.from({ length: 16 }, (_, i) => `${i + 1}. sensor-${(i % 5) + 1} reported a transient read timeout`)
 
 function expandingLedger(cycles: number) {
@@ -45,7 +47,7 @@ function feed(sup: SpadSupervisor, text: string, chunks: number[]) {
 
 describe("SPAD expansion lane", () => {
   it("detects an expanding restatement ledger", () => {
-    const sup = new SpadSupervisor()
+    const sup = new SpadSupervisor(expansionRecovery)
     sup.beginTurn(makeTurnPolicy("process the incidents", false))
     sup.startPart("text")
     const action = feed(sup, expandingLedger(16), [97])
@@ -59,7 +61,7 @@ describe("SPAD expansion lane", () => {
   })
 
   it("detects prose restatement expansion", () => {
-    const sup = new SpadSupervisor()
+    const sup = new SpadSupervisor(expansionRecovery)
     sup.beginTurn(makeTurnPolicy("write findings", false))
     sup.startPart("text")
     expect(feed(sup, expandingProse(14), [31, 7])?.type).toBe("recover")
@@ -67,7 +69,7 @@ describe("SPAD expansion lane", () => {
 
   it("chunk invariance: single-shot and 1-char feeds both detect", () => {
     for (const chunks of [[expandingLedger(16).length], [1]] as number[][]) {
-      const sup = new SpadSupervisor()
+      const sup = new SpadSupervisor(expansionRecovery)
       sup.beginTurn(makeTurnPolicy("x", false))
       sup.startPart("text")
       expect(feed(sup, expandingLedger(16), chunks)?.type).toBe("recover")
@@ -81,11 +83,33 @@ describe("SPAD expansion lane", () => {
       "test/session/spad-frontier.test.ts",
       "test/lib/llm-server.ts",
     ]) {
-      const sup = new SpadSupervisor()
+      const sup = new SpadSupervisor(expansionRecovery)
       sup.beginTurn(makeTurnPolicy("x", false))
       sup.startPart("text")
       const action = feed(sup, readFileSync(file, "utf8"), [512])
       expect(action?.detection?.lane ?? "none").not.toBe("expansion")
+    }
+  })
+
+  it("does not accumulate unrelated fixed repeated blocks into fake expansion cycles", () => {
+    const block = Array.from({ length: 10 }, (_, i) => `shared-property-${i}: value-${i};`)
+    const text = Array.from({ length: 18 }, (_, cycle) => [`/* section ${cycle} */`, ...block, `unique-${cycle}: ${cycle};`, ""].join("\n")).join("\n")
+    const lane = new ExpansionLane({ lane: "expansion", channel: "text", config: DEFAULT_SPAD_CONFIG })
+    let detected
+    for (let i = 0; i < text.length && !detected; i++) detected = lane.push(text.charCodeAt(i))
+    expect(detected).toBeUndefined()
+  })
+
+  it("does not flag the real CSS files that exposed unrelated-cycle accumulation", () => {
+    for (const file of [
+      "../app/src/components/settings-v2/settings-v2.css",
+      "../session-ui/src/components/message-part.css",
+    ]) {
+      const text = readFileSync(file, "utf8")
+      const lane = new ExpansionLane({ lane: "expansion", channel: "text", config: DEFAULT_SPAD_CONFIG })
+      let detected
+      for (let i = 0; i < text.length && !detected; i++) detected = lane.push(text.charCodeAt(i))
+      expect(detected, file).toBeUndefined()
     }
   })
 
@@ -96,7 +120,7 @@ describe("SPAD expansion lane", () => {
     ).join("\n\n")
     const templated = Array.from({ length: 20 }, (_, i) => `## Day ${i + 1}\nStatus nominal.\nDetail note ${i}\n`).join("\n")
     for (const text of [diverse, templated]) {
-      const sup = new SpadSupervisor()
+      const sup = new SpadSupervisor(expansionRecovery)
       sup.beginTurn(makeTurnPolicy("x", false))
       sup.startPart("text")
       expect(feed(sup, text + "\n", [97])).toBeUndefined()
@@ -105,12 +129,12 @@ describe("SPAD expansion lane", () => {
 
   it("observe-only and intent gates suppress expansion recovery", () => {
     clearPersistedMotifs()
-    const observe = new SpadSupervisor()
+    const observe = new SpadSupervisor(expansionRecovery)
     observe.beginTurn(makeTurnPolicy("x", true))
     observe.startPart("text", false, true)
     expect(feed(observe, expandingLedger(16), [97])?.type).toBe("observe")
 
-    const intent = new SpadSupervisor()
+    const intent = new SpadSupervisor(expansionRecovery)
     intent.beginTurn(makeTurnPolicy("copy the ledger exactly as shown for each cycle", false))
     intent.startPart("text")
     expect(feed(intent, expandingLedger(16), [97])?.type).toBe("observe")
@@ -118,7 +142,7 @@ describe("SPAD expansion lane", () => {
 
   it("escalates to abort when expansion continues after recovery", () => {
     clearPersistedMotifs()
-    const sup = new SpadSupervisor()
+    const sup = new SpadSupervisor(expansionRecovery)
     sup.beginTurn(makeTurnPolicy("x", false))
     sup.startPart("text")
     const first = feed(sup, expandingLedger(16), [97])

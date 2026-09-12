@@ -15,18 +15,17 @@ export interface ExpansionLaneOptions {
  * cycle ("A / A B / A B C / ..."). The repeat distance drifts upward, so no
  * fixed period ever confirms no matter how much of the stream is duplication.
  *
- * Signal: contiguous line-block recurrence, decoupled from any period
- * hypothesis. Each completed line is hashed (FNV-1a over its codes, signature
- * quantized so whitespace-only differences still match). The lane tracks the
- * longest suffix of the line history that contiguously matches an earlier
- * block. When that suffix match reaches `expansionMinLines` and this is the
- * `expansionMinCycles`-th such completion, the stream is restating earlier
- * content — the expanding-loop signature. Individual repeated lines (code
- * idioms, closing braces, template phrases) never sustain a contiguous block
- * match, which keeps real source code and varied prose below threshold.
+ * Signal: contiguous line-block recurrence with *strict growth*. Each
+ * completed line is hashed (FNV-1a over its non-whitespace codes). A candidate
+ * cycle is a contiguous block that matches an earlier block for at least
+ * `expansionMinLines`. Subsequent cycles only reinforce the same expansion
+ * series when they begin with the same line signature and their matched block
+ * is strictly longer than the previous cycle. This is the actual A / AB / ABC
+ * invariant; unrelated fixed repeated blocks must not accumulate evidence.
  *
- * State is bounded: a fixed line-hash ring, one anchor position, and O(1)
- * per-line counters. No regex, no string building in the hot path.
+ * State is bounded: a fixed line-hash ring, absolute line ids, a bounded map of
+ * most-recent line signatures, one active anchor, and O(1)-average per-line
+ * work. No regex and no string building in the hot path.
  */
 export class ExpansionLane {
   readonly lane = "expansion" as const
@@ -38,15 +37,28 @@ export class ExpansionLane {
   private readonly minCycles: number
   private readonly minStreamChars: number
   private readonly lines = new Uint32Array(8192)
+  private readonly lineStarts = new Uint32Array(8192)
+  private readonly lineIds = new Int32Array(8192)
+  private readonly anchorHashes: Uint32Array
+  private readonly anchorPositions: Int32Array
+  private readonly anchorMask: number
   private lineCount = 0
   private lineHash = 0x811c9dc5 >>> 0
   private lineCodes = 0
+  private lineStartPosition = 0
   private position = -1
-  /** Anchor in line history that the current line suffix matches against. */
+  /** Absolute earlier line id that the current contiguous run matches against. */
   private anchor = -1
-  /** Length of the current contiguous suffix match onto `anchor`. */
+  /** Absolute first line id of the active matching run. */
+  private matchStart = -1
+  /** Length of the active contiguous match onto `anchor`. */
   private matchLen = 0
-  private cycles = 0
+  /** Stable first-line signature for the current expanding series. */
+  private seriesHeadHash: number | undefined
+  /** Full matched length of the previous qualifying cycle. */
+  private lastRunLength = 0
+  /** Number of strict growth steps after the first qualifying cycle. */
+  private growthSteps = 0
   private cycleStart = -1
   private bestRatio = 0
 
@@ -58,19 +70,33 @@ export class ExpansionLane {
     this.minLines = options.config.expansionMinLines
     this.minCycles = options.config.expansionMinCycles
     this.minStreamChars = options.config.expansionMinStreamChars
+    let anchorSize = 64
+    const requested = Math.max(64, Math.min(65536, options.config.expansionSeenHashCap))
+    while (anchorSize < requested) anchorSize <<= 1
+    this.anchorHashes = new Uint32Array(anchorSize)
+    this.anchorPositions = new Int32Array(anchorSize)
+    this.anchorMask = anchorSize - 1
   }
 
   reset(): void {
     this.lineCount = 0
     this.lineHash = 0x811c9dc5 >>> 0
     this.lineCodes = 0
+    this.lineStartPosition = 0
     this.position = -1
     this.anchor = -1
+    this.matchStart = -1
     this.matchLen = 0
-    this.cycles = 0
+    this.seriesHeadHash = undefined
+    this.lastRunLength = 0
+    this.growthSteps = 0
     this.cycleStart = -1
     this.bestRatio = 0
     this.lines.fill(0)
+    this.lineStarts.fill(0)
+    this.lineIds.fill(-1)
+    this.anchorHashes.fill(0)
+    this.anchorPositions.fill(0)
   }
 
   get length(): number {
@@ -86,61 +112,113 @@ export class ExpansionLane {
     return (Math.imul(hash ^ codes, 0x01000193) + codes) >>> 0
   }
 
-  /** Find the most recent earlier line equal to `hash`, or -1. Excludes the line just stored. */
-  private previousOccurrence(hash: number): number {
-    const cap = Math.min(this.lineCount - 1, this.ringSize - 1)
-    for (let i = cap - 1; i >= 0; i--) {
-      if (this.lines[i] === hash) return i
-    }
-    return -1
+  private retained(line: number): boolean {
+    if (line < 0 || line >= this.lineCount) return false
+    return this.lineIds[line % this.ringSize] === line
   }
 
-  private closeLine(hash: number): PeriodDetection | undefined {
-    this.lines[this.lineCount % this.ringSize] = hash
+  private getLineHash(line: number): number | undefined {
+    return this.retained(line) ? this.lines[line % this.ringSize] : undefined
+  }
+
+  private anchorSlot(hash: number): number {
+    const mixed = (hash ^ (hash >>> 16)) >>> 0
+    return mixed & this.anchorMask
+  }
+
+  private recentLine(hash: number): number {
+    const slot = this.anchorSlot(hash)
+    const stored = this.anchorPositions[slot]!
+    if (stored === 0 || this.anchorHashes[slot] !== hash) return -1
+    const line = stored - 1
+    return this.retained(line) ? line : -1
+  }
+
+  private storeLine(hash: number, start: number): number {
+    const line = this.lineCount
+    const slot = line % this.ringSize
+    this.lines[slot] = hash
+    this.lineStarts[slot] = start >>> 0
+    this.lineIds[slot] = line
+    const anchorSlot = this.anchorSlot(hash)
+    this.anchorHashes[anchorSlot] = hash
+    this.anchorPositions[anchorSlot] = line + 1
     this.lineCount++
+    return line
+  }
+
+  private finalizeRun(): PeriodDetection | undefined {
+    if (this.matchLen < this.minLines || this.matchStart < 0) return undefined
+    const head = this.getLineHash(this.matchStart)
+    if (head === undefined) {
+      this.seriesHeadHash = undefined
+      this.lastRunLength = 0
+      this.growthSteps = 0
+      this.cycleStart = -1
+      return undefined
+    }
+
+    if (this.seriesHeadHash === head && this.lastRunLength >= this.minLines && this.matchLen > this.lastRunLength) {
+      this.growthSteps++
+      this.lastRunLength = this.matchLen
+      this.bestRatio = Math.max(this.bestRatio, this.matchLen / Math.max(1, this.lineCount))
+      const requiredGrowths = Math.max(1, this.minCycles - (this.recoveryMode ? 1 : 0))
+      if (this.growthSteps >= requiredGrowths && this.length >= this.minStreamChars) return this.detect()
+      return undefined
+    }
+
+    this.seriesHeadHash = head
+    this.lastRunLength = this.matchLen
+    this.growthSteps = 0
+    this.cycleStart = this.matchStart
+    this.bestRatio = Math.max(this.bestRatio, this.matchLen / Math.max(1, this.lineCount))
+    return undefined
+  }
+
+  private closeLine(hash: number, start: number): PeriodDetection | undefined {
+    const currentLine = this.lineCount
 
     if (this.anchor >= 0 && this.matchLen > 0) {
-      // The expected line must strictly predate the line just stored; without
+      // The expected line must strictly predate the current line; without
       // this guard the match window catches up to the write head and every
       // line trivially matches itself.
       const expectedIndex = this.anchor + this.matchLen
-      if (expectedIndex < this.lineCount - 1) {
-        const expected = this.lines[expectedIndex % this.ringSize]
+      if (expectedIndex < currentLine) {
+        const expected = this.getLineHash(expectedIndex)
         if (expected === hash) {
           this.matchLen++
-          // Count each contiguous match run once, at the moment it first reaches
-          // minLines; a second such run is the restatement signature.
-          if (this.matchLen === this.minLines) {
-            this.cycles++
-            this.bestRatio = this.matchLen / Math.max(1, this.lineCount)
-            const requiredCycles = Math.max(1, this.minCycles - (this.recoveryMode ? 1 : 0))
-            if (this.cycles > requiredCycles && this.length >= this.minStreamChars) return this.detect()
-          }
+          this.storeLine(hash, start)
           return undefined
         }
       }
     }
-    // No continuation: re-anchor on the most recent earlier occurrence of this
-    // line so a fresh restatement immediately re-establishes the match.
-    this.anchor = this.previousOccurrence(hash)
+
+    const detection = this.finalizeRun()
+    if (detection) return detection
+
+    // No continuation: re-anchor on the most recent retained earlier occurrence
+    // before storing the current line, so the anchor is an absolute line id.
+    this.anchor = this.recentLine(hash)
+    this.matchStart = this.anchor >= 0 ? currentLine : -1
     this.matchLen = this.anchor >= 0 ? 1 : 0
-    if (this.matchLen === 1 && this.cycleStart < 0) this.cycleStart = this.lineCount - 1
+    this.storeLine(hash, start)
     return undefined
   }
 
   private detect(): PeriodDetection {
     const runStartLine = Math.max(0, this.cycleStart)
-    const runStart = Math.floor((runStartLine / Math.max(1, this.lineCount)) * Math.max(1, this.length))
-    this.cycles = 0
+    const runStart = this.retained(runStartLine) ? this.lineStarts[runStartLine % this.ringSize]! : 0
+    this.growthSteps = 0
     return {
       kind: "periodic-attractor",
       lane: "expansion",
+      source: "expansion-heuristic",
       channel: this.channel,
       period: 0,
       runStart,
       runEnd: this.position + 1,
       runLength: this.position + 1 - runStart,
-      exponent: this.matchLen,
+      exponent: this.lastRunLength,
       agreement: 1,
       insideCodeFence: false,
       expansionDuplicateRatio: this.bestRatio,
@@ -155,7 +233,9 @@ export class ExpansionLane {
       const hash = this.lineSignature(this.lineHash, this.lineCodes)
       this.lineHash = 0x811c9dc5 >>> 0
       this.lineCodes = 0
-      return this.closeLine(hash)
+      const start = this.lineStartPosition
+      this.lineStartPosition = this.position + 1
+      return this.closeLine(hash, start)
     }
     if (code !== 13 && code !== 32 && code !== 9) {
       this.lineHash = Math.imul(this.lineHash ^ code, 0x01000193) >>> 0

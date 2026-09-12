@@ -45,7 +45,7 @@ import { SessionIngress, formatMonitorEvents } from "./ingress"
 import { Question } from "@/question"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, Duration, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -78,6 +78,7 @@ import { type ToolChoiceCapabilityIdentity } from "@opencode-ai/core/tool-choice
 import { appendModelCompletionRepair } from "@/special-agent/model-message-bridge"
 import { Usage as UsageAnalytics } from "@/usage/usage"
 import * as MaintenanceUsage from "@/usage/maintenance"
+import { SpadAuditor } from "@opencode-ai/core/spad-auditor"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -522,6 +523,200 @@ const layer = Layer.effect(
           .filter((item) => !item.capabilities.toolcall)
           .map((item) => `${item.providerID}/${item.id}`),
       })
+    })
+
+    const auditSpadCases = Effect.fn("SessionPrompt.auditSpadCases")(function* (input: {
+      sessionID: SessionID
+      user: SessionV1.User
+      intentExcerpt: string
+      activeModel: Provider.Model
+      variant?: string
+      cases: ReturnType<SpadSupervisor["takeAuditCases"]>
+    }) {
+      if (input.cases.length === 0) return
+      const cfg = yield* config.get()
+      if (!SpadAuditor.enabled(cfg.experimental?.spad_auditor)) return
+
+      const resolve = (ref: { providerID: ProviderV2.ID; modelID: ModelV2.ID }) =>
+        provider.getModel(ref.providerID, ref.modelID).pipe(Effect.option, Effect.map(Option.getOrElse(() => undefined)))
+      const explicit = cfg.experimental?.spad_auditor_model?.trim()
+      const explicitModel = explicit ? yield* resolve(Provider.parseModel(explicit)) : undefined
+      const smallModel = yield* provider.getSmallModel(input.activeModel.providerID)
+      const models = [explicitModel, smallModel].filter((item): item is Provider.Model => item !== undefined)
+      const seen = new Set<string>()
+      const model = models.find((item) => {
+        const key = `${item.providerID}/${item.id}`
+        if (seen.has(key)) return false
+        seen.add(key)
+        return item.capabilities.toolcall
+      })
+      if (!model) {
+        yield* Effect.logInfo("spad auditor skipped: no tool-capable small model", {
+          sessionID: input.sessionID,
+          activeProviderID: input.activeModel.providerID,
+          configuredModel: explicit ?? null,
+        })
+        return
+      }
+
+      const auditAgent: Agent.Info = {
+        name: "spad-auditor",
+        description: "Hidden bounded repetition-quality auditor",
+        mode: "primary",
+        native: true,
+        hidden: true,
+        temperature: 0,
+        permission: [],
+        options: {},
+        prompt: `${SpadAuditor.DEFAULT_PROMPT}\n\n${SpadAuditor.PROTOCOL_PROMPT}`,
+      }
+      const verdictTool = tool({
+        description:
+          "Commit the repetition-quality audit verdict. This is the only valid completion. Use uncertain when evidence is insufficient. IMMEDIATELY END GENERATION after this tool call.",
+        inputSchema: jsonSchema({
+          type: "object",
+          properties: {
+            decision: { type: "string", enum: [...SpadAuditor.DECISIONS] },
+            confidence: { type: "number", minimum: 0, maximum: 1 },
+            reason: { type: "string", enum: [...SpadAuditor.REASONS] },
+          },
+          required: ["decision", "confidence", "reason"],
+          additionalProperties: false,
+        }),
+      })
+      const capability: ToolChoiceCapabilityIdentity = {
+        providerID: model.providerID,
+        modelID: model.id,
+        apiNpm: model.api?.npm,
+        apiURL: model.api?.url,
+        apiID: model.api?.id,
+      }
+
+      // Keep the auditor economically bounded even if several heuristic lanes
+      // observe the same generation. Remaining cases are still represented by
+      // deterministic SPAD telemetry and can be sampled offline.
+      for (const candidate of input.cases.slice(0, 2)) {
+        const rendered = SpadAuditor.renderCase({
+          intentExcerpt: input.intentExcerpt,
+          ...candidate.intentIndependent,
+        })
+        const baseMessages: ModelMessage[] = [{ role: "user", content: rendered }]
+        const startedAt = Date.now()
+        const run = Effect.gen(function* () {
+          let preferred: "required" | "auto" = "required"
+          const collect = (messages: ReadonlyArray<ModelMessage>, toolChoice: "required" | "auto") => {
+            const request = {
+              agentPrompt: auditAgent.prompt,
+              messages,
+              tool: SpadAuditor.VERDICT_TOOL,
+              toolChoice,
+              maxOutputTokens: 256,
+            }
+            return collectUntilTerminalTool(
+              llm.stream({
+                agent: auditAgent,
+                user: input.user,
+                system: [],
+                small: true,
+                tools: { [SpadAuditor.VERDICT_TOOL]: verdictTool },
+                toolChoice,
+                model,
+                sessionID: input.sessionID,
+                retries: 0,
+                messages: [...messages],
+                maxOutputTokens: 256,
+              }),
+              SpadAuditor.VERDICT_TOOL,
+            ).pipe(
+              Effect.tap((response) =>
+                response
+                  ? MaintenanceUsage.recordResponse({
+                      usage: usageAnalytics,
+                      agent: "spad-auditor",
+                      model,
+                      response,
+                      request,
+                      sessionID: input.sessionID,
+                      variant: input.variant,
+                      startedAt,
+                    })
+                  : Effect.void,
+              ),
+            )
+          }
+          const terminal = yield* runTerminalCompletionWithTranscript<ModelMessage, SpadAuditor.Verdict, Error>({
+            messages: baseMessages,
+            toolName: SpadAuditor.VERDICT_TOOL,
+            agentLabel: "SPAD auditor",
+            maxRepairs: 1,
+            generate: (messages) =>
+              generateAdaptive({
+                identity: capability,
+                requested: preferred,
+                generate: (toolChoice) => collect(messages, toolChoice),
+              }).pipe(
+                Effect.tap((attempt) => Effect.sync(() => (preferred = attempt.toolChoice))),
+                Effect.flatMap((attempt) =>
+                  attempt.response
+                    ? Effect.succeed(attempt.response)
+                    : Effect.fail(new Error("SPAD auditor ended without a terminal response")),
+                ),
+                Effect.mapError((error) => (error instanceof Error ? error : new Error(String(error)))),
+              ),
+            appendRepair: (messages, response, detail) =>
+              appendModelCompletionRepair({
+                messages,
+                response,
+                toolName: SpadAuditor.VERDICT_TOOL,
+                agentLabel: "SPAD auditor",
+                detail,
+              }),
+            validate: (call) => SpadAuditor.validateVerdict(call.input),
+            invalid: (failure) =>
+              new Error(
+                failure.reason === "invalid-payload"
+                  ? (failure.detail ?? `Invalid ${SpadAuditor.VERDICT_TOOL} payload`)
+                  : `SPAD auditor protocol failure (${failure.reason})`,
+              ),
+          })
+          const disposition = SpadAuditor.disposition(terminal.artifact)
+          yield* Effect.logInfo("spad.audit", {
+            sessionID: input.sessionID,
+            providerID: model.providerID,
+            modelID: model.id,
+            source: candidate.detection.source,
+            lane: candidate.detection.lane,
+            policyReason: candidate.policyReason,
+            decision: terminal.artifact.decision,
+            confidence: terminal.artifact.confidence,
+            reason: terminal.artifact.reason,
+            disposition,
+            latencyMs: Date.now() - startedAt,
+          })
+        })
+        yield* withSpecialAgentTimeout(
+          run,
+          () =>
+            Effect.logInfo("spad.audit", {
+              sessionID: input.sessionID,
+              source: candidate.detection.source,
+              lane: candidate.detection.lane,
+              disposition: "retain-observation",
+              error: "timeout",
+            }),
+          Duration.seconds(4),
+        ).pipe(
+          Effect.catch((error) =>
+            Effect.logInfo("spad.audit", {
+              sessionID: input.sessionID,
+              source: candidate.detection.source,
+              lane: candidate.detection.lane,
+              disposition: "retain-observation",
+              error: String(error),
+            }),
+          ),
+        )
+      }
     })
 
     // One wall-clock budget for the entire title operation, including model
@@ -1471,6 +1666,7 @@ const layer = Layer.effect(
       let step = 0
       let spad: SpadSupervisor | undefined
       let spadStarted = false
+      let spadAuditRemaining = 4
       let turn: TurnCheckpoint.Turn | undefined
       let titleStarted = false
       let goalReservation = yield* goalAutomation.claim(sessionID)
@@ -1549,14 +1745,23 @@ const layer = Layer.effect(
         }
 
         const lastUserMsg = msgs.findLast((msg) => msg.info.role === "user" && msg.info.id === lastUser.id)
-        if (!spadStarted && (yield* config.get()).experimental?.spad_recovery !== false && lastUserMsg) {
-          const userText = visibleUserText(lastUserMsg)
-          spad = new SpadSupervisor()
-          const policy = makeTurnPolicy(userText, lastUser.format?.type === "json_schema")
-          spad.beginTurn(
-            (yield* config.get()).experimental?.spad_observe_only ? { ...policy, observeOnly: true } : policy,
-          )
-          spadStarted = true
+        // Destructive SPAD-R recovery remains explicitly opt-in. The bounded
+        // veto-only auditor is enabled by default, so an ordinary turn still
+        // runs SPAD in observe-only mode to collect ambiguous evidence without
+        // gaining authority to mutate or abort model output.
+        if (!spadStarted && lastUserMsg) {
+          const experimental = (yield* config.get()).experimental
+          const recoveryEnabled = experimental?.spad_recovery === true
+          const auditorEnabled = SpadAuditor.enabled(experimental?.spad_auditor)
+          if (recoveryEnabled || auditorEnabled) {
+            const userText = visibleUserText(lastUserMsg)
+            spad = new SpadSupervisor()
+            const policy = makeTurnPolicy(userText, lastUser.format?.type === "json_schema")
+            spad.beginTurn(
+              experimental?.spad_observe_only || !recoveryEnabled ? { ...policy, observeOnly: true } : policy,
+            )
+            spadStarted = true
+          }
         }
 
         const lastAssistantMsg = msgs.findLast(
@@ -1845,6 +2050,22 @@ const layer = Layer.effect(
               ),
             )
           goalCycleTokens += goalTokenCount(handle.message.tokens)
+
+          if (spad) {
+            const auditCases = spad.takeAuditCases()
+            const selected = auditCases.slice(0, Math.max(0, spadAuditRemaining))
+            spadAuditRemaining -= selected.length
+            if (selected.length > 0) {
+              yield* auditSpadCases({
+                sessionID,
+                user: lastUser,
+                intentExcerpt: visibleUserText(lastUserMsg),
+                activeModel: model,
+                variant: lastUser.model.variant,
+                cases: selected,
+              }).pipe(Effect.forkIn(scope))
+            }
+          }
 
           if (structured !== undefined) {
             handle.message.structured = structured

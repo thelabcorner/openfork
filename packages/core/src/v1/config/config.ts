@@ -214,8 +214,18 @@ export const Info = Schema.Struct({
       policies: Schema.optional(Schema.mutable(Schema.Array(ConfigExperimental.Policy))).annotate({
         description: "Policy statements applied to supported resources, such as provider access",
       }),
-      spad_recovery: Schema.optional(Schema.Boolean),
+      spad_recovery: Schema.optional(Schema.Boolean).annotate({
+        description: "Enable experimental SPAD-R repetitive-output recovery. Disabled unless explicitly true.",
+      }),
       spad_observe_only: Schema.optional(Schema.Boolean),
+      spad_auditor: Schema.optional(Schema.Boolean).annotate({
+        description:
+          "Enable cheap special-agent review of ambiguous SPAD observations. Enabled by default unless explicitly false. Auditor verdicts are telemetry/veto-only and cannot authorize destructive recovery.",
+      }),
+      spad_auditor_model: Schema.optional(Schema.String).annotate({
+        description:
+          "Optional provider/model override for the SPAD auditor. If omitted, small_model then the active provider's catalog-selected small model are tried; the active session model is never used as a fallback.",
+      }),
     }),
   ),
 }).annotate({ identifier: "Config" })

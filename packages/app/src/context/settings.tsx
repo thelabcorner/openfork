@@ -55,6 +55,11 @@ export interface AuditorSettings {
   prompt?: string
 }
 
+export interface SpadAuditorSettings {
+  enabled?: boolean
+  model?: { providerID: string; modelID: string }
+}
+
 export interface CompactionModelRef {
   providerID: string
   modelID: string
@@ -90,6 +95,7 @@ export interface Settings {
     titleGeneration?: TitleGenerationSettings
     promptRevision?: PromptRevisionSettings
     auditor?: AuditorSettings
+    spadAuditor?: SpadAuditorSettings
     compaction?: CompactionSettings
   }
   appearance: {
@@ -515,6 +521,10 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         auditor: withFallback(() => store.general?.auditor, undefined),
         setAuditor(value: AuditorSettings | undefined) {
           setStore("general", "auditor", value)
+        },
+        spadAuditor: withFallback(() => store.general?.spadAuditor, undefined),
+        setSpadAuditor(value: SpadAuditorSettings | undefined) {
+          setStore("general", "spadAuditor", value)
         },
         compaction: withFallback(() => store.general?.compaction, undefined),
         setCompaction(value: CompactionSettings | undefined) {

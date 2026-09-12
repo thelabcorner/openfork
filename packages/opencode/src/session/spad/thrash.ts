@@ -4,47 +4,135 @@ function isRecord(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v)
 }
 
+function boundedContentSignature(value: string): string {
+  const normalized = value.trim().toLowerCase().replace(/\s+/g, " ")
+  let h1 = 0x811c9dc5 >>> 0
+  let h2 = 0x9e3779b9 >>> 0
+  for (let i = 0; i < normalized.length; i++) {
+    const code = normalized.charCodeAt(i)
+    h1 ^= code
+    h1 = Math.imul(h1, 0x01000193) >>> 0
+    h2 = Math.imul(h2 ^ code, 0x85ebca6b) >>> 0
+    h2 ^= h2 >>> 13
+  }
+  const prefix = normalized.slice(0, 48).replace(/[^a-z0-9._:-]+/g, "_")
+  return `${normalized.length}:${h1.toString(16)}:${h2.toString(16)}:${prefix}`
+}
+
+export function toolResultSignature(value: string): string {
+  let h1 = 0x811c9dc5 >>> 0
+  let h2 = 0x9e3779b9 >>> 0
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i)
+    h1 ^= code
+    h1 = Math.imul(h1, 0x01000193) >>> 0
+    h2 ^= code + 0x9e37 + ((h2 << 6) >>> 0) + (h2 >>> 2)
+    h2 >>>= 0
+  }
+  return `${value.length}:${h1.toString(16)}:${h2.toString(16)}`
+}
+
 /**
- * Normalize a tool input into a coarse, comparable resource key so that the
- * same file reached through different tools/paths collapses to one identity.
- *
- * File tools (read, write, edit, glob, grep, ...) are keyed by the lower-cased
- * basename of the path or glob, so a read of "a/b.ts" and a glob that also
- * resolves to "b.ts" collapse to the same resource. Non-file tools fall back
- * to the tool name plus a short signature of their primary string argument, so
- * genuinely different commands stay distinct resources (avoiding false
- * re-access on e.g. `bash`).
+ * Bounded cache used to decide whether repeating the same exact operation
+ * produced new information. Only signatures are retained, never tool output.
+ */
+export class ToolResultProgressTracker {
+  private readonly signatures = new Map<string, string>()
+
+  constructor(private readonly maxEntries = 256) {}
+
+  reset(): void {
+    this.signatures.clear()
+  }
+
+  observe(resource: string, output: string): boolean {
+    return this.observeSignature(resource, toolResultSignature(output))
+  }
+
+  observeSignature(resource: string, signature: string): boolean {
+    const previous = this.signatures.get(resource)
+    const changed = previous !== undefined && previous !== signature
+    if (!this.signatures.has(resource) && this.signatures.size >= this.maxEntries) {
+      const oldest = this.signatures.keys().next().value as string | undefined
+      if (oldest !== undefined) this.signatures.delete(oldest)
+    }
+    this.signatures.set(resource, signature)
+    return changed
+  }
+}
+
+function normalizedPath(value: string): string {
+  return value.trim().replace(/\\/g, "/").replace(/\/{2,}/g, "/").toLowerCase()
+}
+
+function stableInputProjection(value: unknown, depth = 0): string {
+  if (value === null) return "null"
+  if (typeof value === "string") return JSON.stringify(value.length > 512 ? `${value.slice(0, 512)}#${boundedContentSignature(value)}` : value)
+  if (typeof value === "number" || typeof value === "boolean") return String(value)
+  if (depth >= 2) return typeof value
+  if (Array.isArray(value)) return `[${value.slice(0, 16).map((item) => stableInputProjection(item, depth + 1)).join(",")}]`
+  if (!isRecord(value)) return typeof value
+  return `{${Object.keys(value)
+    .sort()
+    .slice(0, 32)
+    .map((key) => `${JSON.stringify(key)}:${stableInputProjection(value[key], depth + 1)}`)
+    .join(",")}}`
+}
+
+/**
+ * Normalize a tool input into a precision-first operation/resource identity.
+ * Only equivalences the host can actually prove are collapsed. In particular,
+ * files keep their normalized full path and search/glob operations include
+ * both query and scope. This deliberately prefers false negatives over
+ * manufacturing recurrence from same-basename or same-action collisions.
  */
 export function toolResourceKey(name: string, input: unknown, mutationResult?: string): string {
   const n = name.toLowerCase()
   const rec = isRecord(input) ? input : {}
-  const path = rec.filePath ?? rec.path ?? rec.file_path
-  if (typeof path === "string") {
-    // Hash more of the toolcall: include the exact line/offset reference
-    // (not just basename) so reads of different sections don't falsely
-    // collapse to the same resource identity.
-    const fullPath = path.toLowerCase()
-    const offset = typeof rec.offset === "number" ? `:o${rec.offset}` : ""
-    const limit = typeof rec.limit === "number" ? `:l${rec.limit}` : ""
-    const baseName = fullPath.split(/[\\/]/).pop()!
+  // Query-style tools often put a generic verb (`action: "query"`) before the
+  // actual query text. Falling through to Object.values() would collapse every
+  // distinct SQLite query into the same `sqlite:query` resource and manufacture
+  // a tool loop during legitimate analytical work. Key SQL by bounded content
+  // instead. The full SQL is never retained in detector state.
+  if (typeof rec.sql === "string") {
+    const db = typeof rec.db === "string" ? boundedContentSignature(normalizedPath(rec.db)) : "db"
     const mutationSig = mutationResult ? `:m${mutationResult.slice(0, 16).replace(/\s+/g, "_")}` : ""
-    return `${baseName}${offset}${limit}${mutationSig}`
+    return `${n}:${db}:sql:${boundedContentSignature(rec.sql)}${mutationSig}`
   }
   const pat = rec.pattern ?? rec.glob ?? rec.query ?? rec.url ?? rec.src
-  if (typeof pat === "string") {
-    const base = pat.toLowerCase().split(/[\\/]/).pop()!.split(/[?*{}]/)[0]!
+  if (typeof pat === "string" && pat.trim().length > 0) {
+    const scope = rec.path ?? rec.filePath ?? rec.file_path ?? rec.cwd ?? rec.directory
+    const scopeSig = typeof scope === "string" ? `:scope:${boundedContentSignature(normalizedPath(scope))}` : ""
     const mutationSig = mutationResult ? `:m${mutationResult.slice(0, 16).replace(/\s+/g, "_")}` : ""
-    return `${base}${mutationSig}`
+    return `${n}:query:${boundedContentSignature(pat)}${scopeSig}${mutationSig}`
   }
-  let sig = ""
-  for (const value of Object.values(rec)) {
-    if (typeof value === "string" && value.length > 1) {
-      sig = value.slice(0, 40).toLowerCase().replace(/\s+/g, " ")
-      break
-    }
+  const path = rec.filePath ?? rec.file_path ?? rec.path
+  if (typeof path === "string") {
+    const offset = typeof rec.offset === "number" ? `:o${rec.offset}` : ""
+    const limit = typeof rec.limit === "number" ? `:l${rec.limit}` : ""
+    const mutationSig = mutationResult ? `:m${mutationResult.slice(0, 16).replace(/\s+/g, "_")}` : ""
+    return `file:${boundedContentSignature(normalizedPath(path))}${offset}${limit}${mutationSig}`
   }
+  const projected = stableInputProjection(rec)
   const mutationSig = mutationResult ? `:m${mutationResult.slice(0, 16).replace(/\s+/g, "_")}` : ""
-  return sig ? `${n}:${sig}${mutationSig}` : `${n}${mutationSig}`
+  return `${n}:input:${boundedContentSignature(projected)}${mutationSig}`
+}
+
+/**
+ * Tool-name mutation classification is only an early hint. The authoritative
+ * progress signal is `SpadSupervisor.markProgress()`, driven by the host
+ * filesystem patch observed at step-finish.
+ */
+export function isSpadMutatingTool(name: string): boolean {
+  switch (name.toLowerCase()) {
+    case "write":
+    case "edit":
+    case "patch":
+    case "apply_patch":
+      return true
+    default:
+      return false
+  }
 }
 
 function normalizeWords(delta: string): string[] {
@@ -130,6 +218,18 @@ export class CrossTurnWatch {
     this.prevGenNarration = undefined
   }
 
+  /** Host-attested state progress invalidates all pre-progress stagnation evidence. */
+  markProgress(): void {
+    this.globalResources.clear()
+    this.toolCalls = 0
+    this.reaccess = 0
+    this.lastMutationGen = this.gen
+    this.narrationRecurrenceStreak = 0
+    this.genWords.length = 0
+    this.genNarration.clear()
+    this.prevGenNarration = undefined
+  }
+
   /** Call once at the start of every generation (every provider request). */
   markGeneration(): void {
     if (this.gen > 0) {
@@ -148,12 +248,11 @@ export class CrossTurnWatch {
   }
 
   pushTool(_family: string, isMutating: boolean, resource?: string): void {
-    this.toolCalls++
     if (isMutating) {
-      this.lastMutationGen = this.gen
-      this.narrationRecurrenceStreak = 0
+      this.markProgress()
       return
     }
+    this.toolCalls++
     if (resource) {
       if (this.globalResources.has(resource)) this.reaccess++
       else if (this.globalResources.size < CrossTurnWatch.MAX_GLOBAL) this.globalResources.add(resource)
@@ -190,6 +289,7 @@ export class CrossTurnWatch {
       return {
         kind: "periodic-attractor",
         lane: "thrash",
+        source: "cross-turn-thrash",
         channel,
         period: 0,
         runStart: 0,

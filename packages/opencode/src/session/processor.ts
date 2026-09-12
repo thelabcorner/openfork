@@ -30,7 +30,7 @@ import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 import { stableZenIdentity } from "@/plugin/zen-accounts"
 import { SpadSupervisor } from "./spad/supervisor"
 import type { SpadAction } from "./spad/types"
-import { toolResourceKey } from "./spad/thrash"
+import { isSpadMutatingTool, toolResourceKey } from "./spad/thrash"
 
 const DOOM_LOOP_THRESHOLD = 3
 export type Result = "compact" | "stop" | "continue"
@@ -398,7 +398,9 @@ const layer = Layer.effect(
               "session.id": ctx.sessionID,
               "spad.type": action.type,
               "spad.lane": action.detection.lane,
+              "spad.source": action.detection.source,
               "spad.channel": action.detection.channel,
+              "spad.policyReason": action.policyReason,
               "spad.period": action.detection.period,
               "spad.runLength": action.detection.runLength,
               "spad.exponent": action.detection.exponent,
@@ -424,7 +426,10 @@ const layer = Layer.effect(
               ctx.assistantMessage.time.firstTokenAt = Date.now()
               yield* session.updateMessage(ctx.assistantMessage)
             }
-            ctx.spad?.startPart("reasoning", false, false)
+            // Reasoning is observation-only. Rewriting/cancelling hidden
+            // reasoning is substantially riskier than truncating visible text
+            // and has not cleared the SPAD precision/replay-safety gym.
+            ctx.spad?.startPart("reasoning", false, true)
             ctx.reasoningMap[value.id] = {
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,
@@ -546,7 +551,7 @@ const layer = Layer.effect(
             }
 
             {
-              const isMutating = value.name === "write" || value.name === "edit" || value.name === "patch"
+              const isMutating = isSpadMutatingTool(value.name)
               const resource = toolResourceKey(value.name, input)
               const toolAction = ctx.spad?.pushTool(value.name, isMutating, resource)
               yield* spadTelemetry(toolAction)
@@ -592,11 +597,38 @@ const layer = Layer.effect(
               attachments: attachments.length ? attachments : undefined,
             }
             yield* completeToolCall(value.id, output)
+            if (toolCall) {
+              const resource = toolResourceKey(toolCall.part.tool, toolCall.part.state.input)
+              const resultAction = ctx.spad?.pushToolResult(resource, output.output, isSpadMutatingTool(toolCall.part.tool))
+              yield* spadTelemetry(resultAction)
+              if (resultAction?.type === "abort") {
+                ctx.needsSpadAbort = `Repetitive tool calls continued after recovery (${resultAction.reason})`
+                return
+              }
+              if (resultAction?.type === "recover") {
+                ctx.needsRecovery = { prompt: resultAction.recoveryPrompt }
+                return
+              }
+            }
             return
           }
 
           case "tool-error": {
-            yield* failToolCall(value.id, value.error ?? new Error(value.message))
+            const toolCall = yield* readToolCall(value.id)
+            const error = value.error ?? new Error(value.message)
+            yield* failToolCall(value.id, error)
+            if (toolCall) {
+              const resource = toolResourceKey(toolCall.part.tool, toolCall.part.state.input)
+              const resultAction = ctx.spad?.pushToolResult(
+                resource,
+                `[tool-error] ${errorMessage(error)}`,
+                isSpadMutatingTool(toolCall.part.tool),
+              )
+              yield* spadTelemetry(resultAction)
+              if (resultAction?.type === "abort")
+                ctx.needsSpadAbort = `Repetitive tool calls continued after recovery (${resultAction.reason})`
+              else if (resultAction?.type === "recover") ctx.needsRecovery = { prompt: resultAction.recoveryPrompt }
+            }
             return
           }
 
@@ -678,6 +710,7 @@ const layer = Layer.effect(
             if (ctx.snapshot) {
               const patch = yield* snapshot.patch(ctx.snapshot)
               if (patch.files.length) {
+                ctx.spad?.markProgress()
                 yield* session.updatePart({
                   id: PartID.ascending(),
                   messageID: ctx.assistantMessage.id,
@@ -781,6 +814,7 @@ const layer = Layer.effect(
         if (ctx.snapshot) {
           const patch = yield* snapshot.patch(ctx.snapshot)
           if (patch.files.length) {
+            ctx.spad?.markProgress()
             yield* session.updatePart({
               id: PartID.ascending(),
               messageID: ctx.assistantMessage.id,

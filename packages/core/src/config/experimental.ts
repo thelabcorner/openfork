@@ -21,6 +21,13 @@ export class Experimental extends Schema.Class<Experimental>("ConfigV2.Experimen
   continue_loop_on_deny: Schema.optional(Schema.Boolean),
   mcp_timeout: Schema.optional(Schema.Number),
   policies: Policy.pipe(Schema.Array, Schema.optional),
+  // Destructive repetition-loop recovery. Intentionally opt-in while the
+  // detector is being calibrated against real agent/conversational traffic.
   spad_recovery: Schema.optional(Schema.Boolean),
   spad_observe_only: Schema.optional(Schema.Boolean),
+  // Cheap special-agent review of ambiguous SPAD observations. Enabled by
+  // default unless explicitly false. The auditor is calibration/veto-only and
+  // has no destructive authority.
+  spad_auditor: Schema.optional(Schema.Boolean),
+  spad_auditor_model: Schema.optional(Schema.String),
 }) {}
