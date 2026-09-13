@@ -79,6 +79,31 @@ describe("ChunkDB semantic prune", () => {
     }
   })
 
+  test.serial("semantic pruning cannot write while the master ChunkDB sealer is disabled", () => {
+    const previousEnabled = process.env.OPENCODE_SEAL_ENABLED
+    const previousPrune = process.env.OPENCODE_SEAL_PRUNE
+    try {
+      delete process.env.OPENCODE_SEAL_ENABLED
+      delete process.env.OPENCODE_SEAL_PRUNE
+      expect(Flag.OPENCODE_SEAL_PRUNE).toBe(false)
+
+      process.env.OPENCODE_SEAL_PRUNE = "1"
+      expect(Flag.OPENCODE_SEAL_PRUNE).toBe(false)
+
+      process.env.OPENCODE_SEAL_ENABLED = "1"
+      delete process.env.OPENCODE_SEAL_PRUNE
+      expect(Flag.OPENCODE_SEAL_PRUNE).toBe(true)
+
+      process.env.OPENCODE_SEAL_PRUNE = "0"
+      expect(Flag.OPENCODE_SEAL_PRUNE).toBe(false)
+    } finally {
+      if (previousEnabled === undefined) delete process.env.OPENCODE_SEAL_ENABLED
+      else process.env.OPENCODE_SEAL_ENABLED = previousEnabled
+      if (previousPrune === undefined) delete process.env.OPENCODE_SEAL_PRUNE
+      else process.env.OPENCODE_SEAL_PRUNE = previousPrune
+    }
+  })
+
   test("SQLITE_BUSY retry repeats the exact operation and never retries non-busy failures", async () => {
     let attempts = 0
     const value = await Effect.runPromise(

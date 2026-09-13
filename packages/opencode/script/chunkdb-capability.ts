@@ -70,7 +70,6 @@ export async function validateChunkDbCapability(binaryPath: string): Promise<Chu
       ...baseEnv,
       OPENCODE_SEAL_ENABLED: "0",
       OPENCODE_SEAL_DEDUP: "0",
-      OPENCODE_SEAL_PRUNE: "0",
     })
     if (bootstrap.code !== 0) {
       throw new Error(

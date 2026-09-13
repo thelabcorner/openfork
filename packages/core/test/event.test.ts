@@ -1,10 +1,12 @@
-import { describe, expect } from "bun:test"
+import { describe, expect, test } from "bun:test"
 import { Cause, DateTime, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schema, Stream } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
 import { Session } from "@opencode-ai/schema/session"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
 import { SessionV1 } from "@opencode-ai/schema/session-v1"
+import { Provider } from "@opencode-ai/schema/provider"
+import { Model } from "@opencode-ai/schema/model"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
@@ -85,6 +87,51 @@ const it = testEffect(
 const itWithoutLocation = testEffect(AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node])))
 
 describe("EventV2", () => {
+  test.serial("clean default flags do not attempt semantic indexing when the master sealer is off", async () => {
+    const previousEnabled = process.env.OPENCODE_SEAL_ENABLED
+    const previousPrune = process.env.OPENCODE_SEAL_PRUNE
+    try {
+      delete process.env.OPENCODE_SEAL_ENABLED
+      delete process.env.OPENCODE_SEAL_PRUNE
+
+      const layer = AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node]))
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const events = yield* EventV2.Service
+          const aggregateID = Session.ID.create()
+          const messageID = SessionV1.MessageID.ascending("msg_clean_release_default")
+
+          yield* events.publish(SessionV1.Event.MessageUpdated, {
+            sessionID: aggregateID,
+            info: {
+              id: messageID,
+              sessionID: aggregateID,
+              role: "user",
+              time: { created: 1 },
+              agent: "build",
+              model: { providerID: Provider.ID.make("provider"), modelID: Model.ID.make("model") },
+            },
+          })
+
+          const { db } = yield* Database.Service
+          const rows = yield* db
+            .select()
+            .from(EventTable)
+            .where(eq(EventTable.aggregate_id, aggregateID))
+            .all()
+            .pipe(Effect.orDie)
+          expect(rows).toHaveLength(1)
+          expect(rows[0]?.type).toBe(EventV2.versionedType(SessionV1.Event.MessageUpdated.type, 1))
+        }).pipe(Effect.scoped, Effect.provide(layer)),
+      )
+    } finally {
+      if (previousEnabled === undefined) delete process.env.OPENCODE_SEAL_ENABLED
+      else process.env.OPENCODE_SEAL_ENABLED = previousEnabled
+      if (previousPrune === undefined) delete process.env.OPENCODE_SEAL_PRUNE
+      else process.env.OPENCODE_SEAL_PRUNE = previousPrune
+    }
+  })
+
   it.effect("publishes events with the current location", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service

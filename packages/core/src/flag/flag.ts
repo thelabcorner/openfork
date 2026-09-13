@@ -45,7 +45,14 @@ export const Flag = {
   get OPENCODE_SEAL_DEDUP() {
     return truthy("OPENCODE_SEAL_DEDUP")
   },
-  // Semantic compaction runs before ordinary ChunkDB compression. When ON, a
+  // Semantic compaction runs before ordinary ChunkDB compression. This is a
+  // child writer capability of OPENCODE_SEAL_ENABLED: the child preference is
+  // default-ON, but the effective writer must be OFF while the master sealer is
+  // OFF. Keeping that dependency here prevents hot write paths from attempting
+  // to use semantic tables that ensureChunkDB intentionally does not create
+  // when the master feature is disabled.
+  //
+  // When ON, a
   // superseded full-snapshot event may be physically deleted after its latest
   // snapshot is proven equal to the authoritative materialized projection. Its
   // durable sequence is retained as one bit in event_compaction; wire/export
@@ -54,6 +61,7 @@ export const Flag = {
   // writer kill switch. Sparse read/replay support remains available even when
   // the writer is disabled, so already-compacted databases stay readable.
   get OPENCODE_SEAL_PRUNE() {
+    if (!truthy("OPENCODE_SEAL_ENABLED")) return false
     const value = process.env["OPENCODE_SEAL_PRUNE"]?.toLowerCase()
     return value !== "0" && value !== "false"
   },
