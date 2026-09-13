@@ -30,6 +30,7 @@ import { BrowserProfilerStopTool } from "./browser/profiler-stop"
 import { BrowserReactInspectTool } from "./browser/react-inspect"
 import { BrowserOpenDevtoolsTool } from "./browser/open-devtools"
 import { BrowserExtensionsListTool } from "./browser/extensions-list"
+import { normalizeBrokerArgs, withObjectBrokerArgsSchema } from "./broker-args"
 
 const OPERATIONS = [
   "status",
@@ -70,9 +71,12 @@ export const Parameters = Schema.Struct({
     description: "Browser operation for describe/call.",
   }),
   args: Schema.optional(Schema.Unknown).annotate({
-    description: "Arguments for action=call. Omit for operations that take no required arguments.",
+    description:
+      "Arguments for action=call. Pass a JSON object matching the selected operation schema. Omit only for operations with no required arguments; never pass describe output or placeholder text as args.",
   }),
 })
+
+const ProviderParameters = withObjectBrokerArgsSchema(ToolJsonSchema.fromSchema(Parameters))
 
 type Metadata = {
   browserAction: "list" | "describe" | "call"
@@ -94,22 +98,8 @@ function requireOperation(operation: Operation | undefined, action: "describe" |
   throw new Error(`operation is required for browser action=${action}`)
 }
 
-function callArgs(value: unknown): Record<string, unknown> {
-  if (value === undefined) return {}
-  if (isRecord(value)) return value
-  throw new Error("browser args must be an object for action=call")
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value)
-}
-
 function modelDescription(text: string) {
   return text.replace(/\bbrowser_([a-z_]+)\b/g, (_match, operation: string) => `browser operation "${operation}"`)
-}
-
-function callShape(operation: Operation, args: unknown) {
-  return { action: "call" as const, operation, args }
 }
 
 export const BrowserTool = Tool.define<
@@ -184,6 +174,7 @@ export const BrowserTool = Tool.define<
       description:
         "One compact gateway for Desktop browser control. Operations: status, open, claim, navigate, resize, set_appearance, snapshot, screenshot, click, type, press, scroll, evaluate, wait_for, recording_start, recording_stop, close, query, highlight, annotate, profiler_start, profiler_stop, react_inspect, open_devtools, extensions_list. Use action=list for grouped discovery, action=describe for one operation's exact argument schema, and action=call to execute it. Legacy result text may say browser_open/browser_snapshot/etc.; treat those names as the corresponding operation through this tool.",
       parameters: Parameters,
+      jsonSchema: ProviderParameters,
       execute: (params, ctx) =>
         Effect.gen(function* () {
           if (params.action === "list") {
@@ -210,7 +201,7 @@ export const BrowserTool = Tool.define<
                   operation,
                   description: modelDescription(target.description),
                   args: ToolJsonSchema.fromTool(target),
-                  invoke: callShape(operation, "<args matching schema>"),
+                  usage: `Call browser again with action="call", operation="${operation}", and args set to a JSON object whose fields satisfy the args schema above. Do not pass the schema itself or placeholder text as args.`,
                 },
                 null,
                 2,
@@ -219,7 +210,7 @@ export const BrowserTool = Tool.define<
             }
           }
 
-          const args = callArgs(params.args)
+          const args = normalizeBrokerArgs(params.args, { broker: "browser", allowOmitted: true })
           yield* plugin.trigger(
             "tool.execute.before",
             { tool: target.id, sessionID: ctx.sessionID, callID: ctx.callID },

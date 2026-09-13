@@ -57,8 +57,10 @@ describe("optional tool access", () => {
       })
       const broker = tools.find((tool) => tool.id === TOOL_ACCESS_ID)
       expect(broker).toBeDefined()
-      const wire = JSON.stringify(ToolJsonSchema.fromTool(broker!))
+      const schema = ToolJsonSchema.fromTool(broker!)
+      const wire = JSON.stringify(schema)
       expect(wire.length).toBeLessThan(2000)
+      expect((schema.properties?.args as { type?: string } | undefined)?.type).toBe("object")
       expect(wire).not.toContain("previewId")
       expect(wire).not.toContain("timeoutMs")
       expect(wire).not.toContain("attach")
@@ -104,6 +106,25 @@ describe("optional tool access", () => {
       expect(result.metadata.action).toBe("run")
       expect(result.output).toContain("schema changed")
       expect(result.output).toContain("rolled back")
+    }),
+  )
+
+  it.instance("call accepts a JSON-encoded object from models that stringify broker args", () =>
+    Effect.gen(function* () {
+      const registry = yield* ToolRegistry.Service
+      const tools = yield* registry.tools({ providerID: "opencode" as any, modelID: "gpt-5" as any, agent })
+      const broker = tools.find((tool) => tool.id === TOOL_ACCESS_ID)!
+      const result = yield* broker.execute(
+        {
+          action: "call",
+          tool: "sqlite",
+          args: JSON.stringify({ action: "run", db: "lazy-string.db", sql: "CREATE TABLE t (x INTEGER)" }),
+        },
+        ctx,
+      )
+      expect(result.metadata.delegatedTool).toBe("sqlite")
+      expect(result.metadata.brokerAction).toBe("call")
+      expect(result.output).toContain("schema changed")
     }),
   )
 })

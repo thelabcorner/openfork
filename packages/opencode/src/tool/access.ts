@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import { Plugin } from "@/plugin"
 import { ToolJsonSchema } from "./json-schema"
+import { normalizeBrokerArgs, withObjectBrokerArgsSchema } from "./broker-args"
 import * as Tool from "./tool"
 
 export const TOOL_ACCESS_ID = "tool"
@@ -13,9 +14,12 @@ export const Parameters = Schema.Struct({
     description: "Lazy tool id returned by list. Required for describe and call.",
   }),
   args: Schema.optional(Schema.Unknown).annotate({
-    description: "Arguments forwarded to the selected lazy tool for call. Use describe first when its schema is unknown.",
+    description:
+      "Arguments forwarded to the selected lazy tool for call. Pass a JSON object matching the described schema. Use describe first when its schema is unknown.",
   }),
 })
+
+const ProviderParameters = withObjectBrokerArgsSchema(ToolJsonSchema.fromSchema(Parameters))
 
 type Metadata = {
   brokerAction: "list" | "describe" | "call"
@@ -30,11 +34,6 @@ function requireTool(catalog: ReadonlyMap<string, Tool.Def>, id: string | undefi
   if (target) return target
   const available = [...catalog.keys()].sort().join(", ") || "none"
   throw new Error(`Unknown lazy tool: ${id}. Available lazy tools: ${available}`)
-}
-
-function requireArgs(value: unknown): Record<string, unknown> {
-  if (typeof value === "object" && value !== null && !Array.isArray(value)) return value as Record<string, unknown>
-  throw new Error("args must be an object for action=call")
 }
 
 function summary(tool: Tool.Def) {
@@ -60,6 +59,7 @@ export function createToolAccessTool(
     description:
       "Access optional heavy tools without expanding the default tool schema. Use list to discover lazy tools, describe to load one tool's full instructions/schema into context, and call to invoke it with args. Prefer calling directly when you already know the arguments. If the user explicitly references a lazy tool as @<tool-id>, treat that token as the exact registered tool id. The harness may already pre-seed that tool's schema into the turn context; when it does, call it directly without list/describe.",
     parameters: Parameters,
+    jsonSchema: ProviderParameters,
     execute: (input, ctx) =>
       Effect.gen(function* () {
         const params = yield* decode(input).pipe(
@@ -100,7 +100,7 @@ export function createToolAccessTool(
           }
         }
 
-        const args = requireArgs(params.args)
+        const args = normalizeBrokerArgs(params.args, { broker: "tool" })
         yield* plugin.trigger(
           "tool.execute.before",
           { tool: target.id, sessionID: ctx.sessionID, callID: ctx.callID },

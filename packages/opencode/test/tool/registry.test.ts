@@ -143,6 +143,7 @@ describe("tool.registry", () => {
 
       const browser = tools.find((tool) => tool.id === "browser")
       if (!browser) throw new Error("browser tool missing from provider-visible manifest")
+      expect((ToolJsonSchema.fromTool(browser).properties?.args as { type?: string } | undefined)?.type).toBe("object")
       const ctx = {
         sessionID: SessionID.descending(),
         messageID: MessageID.ascending(),
@@ -156,10 +157,13 @@ describe("tool.registry", () => {
       expect(listed.output).toContain("snapshot")
       expect(listed.output).toContain("react_inspect")
 
-      const described = yield* browser.execute({ action: "describe", operation: "open" }, ctx)
+      const described = yield* browser.execute({ action: "describe", operation: "navigate" }, ctx)
       const description = JSON.parse(described.output)
-      expect(description.operation).toBe("open")
+      expect(description.operation).toBe("navigate")
       expect(description.args.required).toContain("url")
+      expect(description.invoke).toBeUndefined()
+      expect(description.usage).toContain('args set to a JSON object')
+      expect(described.output).not.toContain("<args matching schema>")
     }),
   )
 
