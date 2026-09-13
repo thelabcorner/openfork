@@ -206,10 +206,15 @@ export const prepare = Effect.fn("LLMRequestPrep.prepare")(function* (input: Pre
     ? (yield* InstanceState.context).project.id
     : undefined
 
+  const sortedTools = preserveCanonicalFindToolMap(
+    tools,
+    Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b))),
+  )
+
   return {
     system,
     messages,
-    tools: Object.fromEntries(Object.entries(tools).toSorted(([a], [b]) => a.localeCompare(b))),
+    tools: sortedTools,
     params,
     messageTransformOptions: options,
     headers: {

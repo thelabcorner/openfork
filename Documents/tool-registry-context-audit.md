@@ -81,17 +81,34 @@ grep({ pattern, path, include })
   -> find({ grep: pattern, path, include })
 ```
 
-The repair accepts both object arguments and JSON-encoded arguments used by the AI SDK repair hook. It is deliberately conservative: malformed inputs, unknown fields, or a genuinely registered `glob` / `grep` tool are not rewritten.
+The repair accepts both object arguments and JSON-encoded arguments used by the AI SDK repair hook. It is deliberately conservative: malformed inputs, unknown fields, non-plain/accessor-bearing runtime objects, or a genuinely registered `glob` / `grep` tool are not rewritten. All casing variants of the two legacy names are accepted when no real legacy tool owns that name family.
 
-The compatibility layer is wired into the AI SDK tool-call repair path, the native `@opencode-ai/llm` dispatcher, GitLab workflow execution, and first-party Claude tool execution. Native and Claude paths normalize both the tool name and arguments before durable transcript events are emitted, so current UI consistently sees `find` rather than a repaired legacy call.
+The compatibility layer is wired into the AI SDK tool-call repair path, the native `@opencode-ai/llm` dispatcher, GitLab workflow execution, and both first-party Claude execution paths. Native and Claude normalize the tool name and arguments before durable transcript events are emitted, so current UI consistently sees `find` rather than a repaired legacy call.
+
+The edge-case audit added a non-enumerable, module-private canonical-find marker to the runtime tool map. Healing only occurs when the resolved `find` is the built-in consolidated tool. A custom or MCP tool named `find` therefore cannot accidentally become the repair target. The marker survives request filtering and native-tool wrapping without entering `Object.keys`, JSON schemas, or provider manifests.
+
+Claude's in-process MCP path needs an additional compatibility bridge because Agent SDK `toolAliases` redirect names but do not transform arguments. `glob` / `grep` are added only as hidden alias names targeting the single registered `find` MCP tool; no extra MCP tool definitions or schemas are registered. The assistant transport event is healed first and retained by the tool-call correlator. If MCP schema validation strips the legacy `pattern` field, the `find` handler restores the correlated canonical input. Correlation matches surviving `glob` / `grep` / `path` / `include` fields before FIFO fallback, which also handles reverse-order execution of distinguishable parallel calls. A genuinely registered legacy tool keeps its own MCP target and is never shadowed by these aliases.
+
+The audit found and fixed several issues that the initial happy-path implementation did not cover:
+
+- arbitrary-case real legacy tool names could be shadowed by repair;
+- an unrelated custom/MCP tool named `find` could become an accidental repair target;
+- the canonical marker was initially lost when the native runtime rebuilt its tool wrappers;
+- the AI SDK production path lost the same non-enumerable marker a second time when `LLMRequestPrep.prepare` sorted tools through `Object.fromEntries`, causing real unadvertised `grep` / `glob` calls to fall through to the `invalid` tool despite helper/runtime tests passing. Request preparation now preserves the marker across that clone boundary;
+- first-party Claude could pre-check permission `find` and break the intended `*=deny, glob=allow, grep=allow` policy before leaf authorization;
+- Claude MCP name aliases can lose the upstream `pattern` during target-schema validation, requiring transcript-to-handler argument recovery;
+- same-target parallel Claude MCP calls needed argument-aware correlation rather than unconditional FIFO;
+- extracting the SessionTools wrapper briefly widened tool arguments to `unknown`; typecheck caught it and the context boundary now normalizes through `toRecord`.
 
 Validation for the file-search consolidation:
 
-- focused OpenCode matrix: **133 passed, 0 failed** across permission, registry, ACP, `find`, `glob`, and `grep` suites;
+- provider-boundary AI SDK regression now advertises only `find`, injects raw OpenAI Responses function calls named both `grep` and `glob`, and verifies both surface as canonical `find` calls with no `invalid` event;
+- full relevant search/repair matrix: **743 passed, 0 failed** with **1,820 assertions** across request preparation, permission, registry, ACP, `find`, `glob`, `grep`, SessionTools collision behavior, the pure healer, native runtime, and first-party Claude fallback + MCP paths;
+- broader `session.llm` regression suite: **31 passed, 0 failed** with **83 assertions**;
 - session UI result-summary suite: **23 passed, 0 failed**;
 - OpenTUI inline-tool suite: **17 passed, 0 failed**; TUI typecheck is clean;
-- legacy-call healing/runtime matrix: **29 passed, 0 failed** across the pure translator, native runtime, and first-party Claude runtime;
-- direct OpenCode typecheck reports no `find`, registry, permission, or ACP errors; remaining failures are unrelated dirty-worktree errors in SPAD/control-plane/background/test areas;
+- direct OpenCode typecheck reports no errors in the healer, SessionTools wiring, AI-SDK/native/Claude runtimes, request filtering, or their touched tests; remaining failures are unrelated dirty-worktree errors in SPAD/control-plane/background/server/test areas;
+- CRLF-aware targeted `git diff --check` passes for all healer/runtime/session-tools files and tests;
 - session UI typecheck reports only the two pre-existing unrelated errors in `AssistantMessage.model` and missing `session-changes-v2`.
 
 ## Browser Consolidation Baseline

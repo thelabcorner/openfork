@@ -8,6 +8,12 @@ import {
 
 const findOnly = () => markCanonicalFindToolMap({ find: {} })
 
+function casingVariants(value: string) {
+  let variants = [""]
+  for (const char of value) variants = variants.flatMap((prefix) => [prefix + char.toLowerCase(), prefix + char.toUpperCase()])
+  return [...new Set(variants)]
+}
+
 describe("legacy find tool-call healing", () => {
   test("rewrites upstream glob object input", () => {
     expect(healLegacyFindCall("glob", { pattern: "**/*.ts", path: "src" }, findOnly())).toEqual({
@@ -34,6 +40,20 @@ describe("legacy find tool-call healing", () => {
     expect(healed.name).toBe("find")
     expect(healed.healed).toBe(true)
     expect(JSON.parse(healed.input as string)).toEqual({ glob: "*.md" })
+  })
+
+  test("heals every casing variant of upstream glob and grep names", () => {
+    for (const legacy of ["glob", "grep"] as const) {
+      for (const name of casingVariants(legacy)) {
+        const healed = healLegacyFindCall(name, { pattern: "needle" }, findOnly())
+        expect(healed).toMatchObject({
+          name: "find",
+          healed: true,
+          legacyName: legacy,
+          input: { [legacy]: "needle" },
+        })
+      }
+    }
   })
 
   test("does not shadow a genuinely registered legacy tool", () => {

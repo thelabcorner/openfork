@@ -4,6 +4,7 @@ type ToolMap = Record<string, Tool> | Readonly<Record<string, unknown>>
 // Module-private capability marker. Do not use Symbol.for(): this must not be
 // forgeable through the global symbol registry by unrelated plugins/runtime code.
 const CANONICAL_FIND = Symbol("@opencode/session/llm/canonical-find")
+const INVALID_DATA = Symbol("invalid-wire-data")
 
 export type HealedToolCall = {
   readonly name: string
@@ -55,10 +56,10 @@ function ownData(value: Record<string, unknown>, key: string): { present: boolea
     if (!descriptor) return { present: false }
     // Model/provider JSON must be data, never executable accessors. A getter
     // here is a runtime object, not a valid wire payload, so fail closed.
-    if (!("value" in descriptor)) return { present: true, value: Symbol.for("accessor") }
+    if (!("value" in descriptor)) return { present: true, value: INVALID_DATA }
     return { present: true, value: descriptor.value }
   } catch {
-    return { present: true, value: Symbol.for("unreadable") }
+    return { present: true, value: INVALID_DATA }
   }
 }
 

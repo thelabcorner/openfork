@@ -28,6 +28,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { LayerNodePlatform } from "@opencode-ai/core/effect/app-node-platform"
 import { ProviderError } from "@/provider/error"
+import { markCanonicalFindToolMap } from "@/session/llm/tool-call-heal"
 
 type ConfigModel = NonNullable<NonNullable<ConfigV1.Info["provider"]>[string]["models"]>[string]
 
@@ -67,6 +68,21 @@ const drainWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
     return yield* Effect.promise(() =>
       Effect.runPromise(
         LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runDrain)).pipe(
+          Effect.provide(layer),
+          Effect.provideService(InstanceRef, ctx),
+        ),
+      ),
+    )
+  })
+
+const collectWith = (layer: Layer.Layer<LLM.Service>, input: LLM.StreamInput) =>
+  Effect.gen(function* () {
+    const ctx = yield* InstanceRef
+    if (!ctx) return yield* Effect.die("InstanceRef not provided")
+    return yield* Effect.promise(() =>
+      Effect.runPromise(
+        LLM.Service.use((svc) => svc.stream(input).pipe(Stream.runCollect)).pipe(
+          Effect.map((events) => Array.from(events)),
           Effect.provide(layer),
           Effect.provideService(InstanceRef, ctx),
         ),
@@ -1642,6 +1658,182 @@ describe("session.llm.stream", () => {
         expect(executed).toEqual({ args: { query: "weather" }, toolCallId: "call-injected-tool" })
       }),
     { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, "https://injected-openai.test/v1") },
+  )
+
+  it.instance(
+    "AI SDK auto-heals unadvertised upstream grep and glob calls into find after request preparation",
+    () =>
+      Effect.gen(function* () {
+        const model = loadFixture("openai", "gpt-5.2").model
+        const chunks = [
+          {
+            type: "response.created",
+            response: {
+              id: "resp-healed-grep",
+              created_at: Math.floor(Date.now() / 1000),
+              model: model.id,
+              service_tier: null,
+            },
+          },
+          {
+            type: "response.output_item.added",
+            sequence_number: 1,
+            output_index: 0,
+            item: {
+              type: "function_call",
+              id: "item-healed-grep",
+              call_id: "call-healed-grep",
+              name: "grep",
+              arguments: "",
+              status: "in_progress",
+            },
+          },
+          {
+            type: "response.function_call_arguments.delta",
+            sequence_number: 2,
+            output_index: 0,
+            item_id: "item-healed-grep",
+            delta: '{"pattern":"SessionIngress","path":"src","include":"*.{ts,tsx}"}',
+          },
+          {
+            type: "response.function_call_arguments.done",
+            sequence_number: 3,
+            output_index: 0,
+            item_id: "item-healed-grep",
+            arguments: '{"pattern":"SessionIngress","path":"src","include":"*.{ts,tsx}"}',
+          },
+          {
+            type: "response.output_item.done",
+            sequence_number: 4,
+            output_index: 0,
+            item: {
+              type: "function_call",
+              id: "item-healed-grep",
+              call_id: "call-healed-grep",
+              name: "grep",
+              arguments: '{"pattern":"SessionIngress","path":"src","include":"*.{ts,tsx}"}',
+              status: "completed",
+            },
+          },
+          {
+            type: "response.output_item.added",
+            sequence_number: 5,
+            output_index: 1,
+            item: {
+              type: "function_call",
+              id: "item-healed-glob",
+              call_id: "call-healed-glob",
+              name: "glob",
+              arguments: "",
+              status: "in_progress",
+            },
+          },
+          {
+            type: "response.function_call_arguments.delta",
+            sequence_number: 6,
+            output_index: 1,
+            item_id: "item-healed-glob",
+            delta: '{"pattern":"**/*.tsx","path":"src"}',
+          },
+          {
+            type: "response.function_call_arguments.done",
+            sequence_number: 7,
+            output_index: 1,
+            item_id: "item-healed-glob",
+            arguments: '{"pattern":"**/*.tsx","path":"src"}',
+          },
+          {
+            type: "response.output_item.done",
+            sequence_number: 8,
+            output_index: 1,
+            item: {
+              type: "function_call",
+              id: "item-healed-glob",
+              call_id: "call-healed-glob",
+              name: "glob",
+              arguments: '{"pattern":"**/*.tsx","path":"src"}',
+              status: "completed",
+            },
+          },
+          {
+            type: "response.completed",
+            sequence_number: 9,
+            response: {
+              incomplete_details: null,
+              usage: {
+                input_tokens: 1,
+                input_tokens_details: null,
+                output_tokens: 1,
+                output_tokens_details: null,
+              },
+              service_tier: null,
+            },
+          },
+        ]
+        const request = waitRequest("/responses", createEventResponse(chunks, true))
+        const resolved = yield* Provider.use.getModel(ProviderV2.ID.openai, ModelV2.ID.make(model.id))
+        const sessionID = SessionID.make("session-test-ai-sdk-healed-grep")
+        const agent = {
+          name: "test",
+          mode: "primary",
+          options: {},
+          permission: [{ permission: "*", pattern: "*", action: "allow" }],
+        } satisfies Agent.Info
+
+        const events = yield* collectWith(
+          AppNodeBuilder.build(LLM.node, [
+            [RuntimeFlags.node, RuntimeFlags.layer({ experimentalNativeLlm: false })],
+          ]),
+          {
+            user: {
+              id: MessageID.make("msg_user-ai-sdk-healed-grep"),
+              sessionID,
+              role: "user",
+              time: { created: Date.now() },
+              agent: agent.name,
+              model: { providerID: ProviderV2.ID.make("openai"), modelID: resolved.id },
+            } satisfies SessionV1.User,
+            sessionID,
+            model: resolved,
+            agent,
+            system: [],
+            messages: [{ role: "user", content: "Search for SessionIngress" }],
+            tools: markCanonicalFindToolMap({
+              find: tool({
+                description: "Find files or text",
+                inputSchema: z.object({
+                  glob: z.string().optional(),
+                  grep: z.string().optional(),
+                  path: z.string().optional(),
+                  include: z.string().optional(),
+                }),
+                execute: async () => ({ output: "found" }),
+              }),
+            }),
+          },
+        )
+
+        const capture = yield* Effect.promise(() => request)
+        const tools = capture.body.tools as Array<{ name?: string }>
+        expect(tools.map((item) => item.name)).toEqual(["find"])
+        const calls = events.filter((event) => event.type === "tool-call")
+        expect(calls).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              type: "tool-call",
+              name: "find",
+              input: { grep: "SessionIngress", path: "src", include: "*.{ts,tsx}" },
+            }),
+            expect.objectContaining({
+              type: "tool-call",
+              name: "find",
+              input: { glob: "**/*.tsx", path: "src" },
+            }),
+          ]),
+        )
+        expect(events.some((event) => event.type === "tool-call" && event.name === "invalid")).toBe(false)
+      }),
+    { config: () => openAIConfig(loadFixture("openai", "gpt-5.2").model, `${state.server!.url.origin}/v1`) },
   )
 
   it.instance(

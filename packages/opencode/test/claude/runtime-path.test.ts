@@ -471,6 +471,55 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     await pending
   })
 
+  test("MCP compatibility aliases never override a genuinely registered grep tool", async () => {
+    resetSharedState()
+    const script = new SdkScript()
+    let mcpOptions: any
+    const grepTool = {
+      description: "real grep fixture",
+      execute: async () => "real-grep",
+    } as unknown as Tool
+    const runtime = new ClaudeAgentRuntime({
+      loader: async () =>
+        ({
+          createSdkMcpServer: (options: any) => {
+            mcpOptions = options
+            return { type: "sdk", name: options.name, instance: {} }
+          },
+          query: (request: any) => {
+            script.requests.push(request)
+            return { events: script.events, interrupt: async () => {}, close: () => script.end(), pid: 4242 }
+          },
+        }) as never,
+    })
+    const pending = events(
+      ClaudeRuntimeAdapter.stream(
+        baseInput({
+          runtime,
+          tools: markCanonicalFindToolMap({ find: findTool, grep: grepTool }),
+        }),
+      ),
+    )
+
+    script.push({ type: "system", subtype: "init", session_id: "ext-mcp-shadow-1" })
+    await script.waitForRequest(1)
+    const aliases = script.requests[0].options.toolAliases as Record<string, string>
+    expect(aliases.grep).toBe("mcp__opencode__grep")
+    expect(aliases.Grep).toBe("mcp__opencode__grep")
+    expect(mcpOptions.tools.map((tool: { name: string }) => tool.name)).toEqual(["find", "grep"])
+
+    script.push({ type: "assistant", message: { content: [{ type: "text", text: "Done." }] } })
+    script.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "Done.",
+      session_id: "ext-mcp-shadow-1",
+    })
+    script.end()
+    await pending
+  })
+
   test("second turn resumes the bound external session with only the new user text", async () => {
     resetSharedState()
     const script = new SdkScript()
