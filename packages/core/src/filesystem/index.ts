@@ -1,7 +1,7 @@
 export * as FileIndex from "./index"
 
 import path from "path"
-import { Context, Effect, Layer, Option, Queue, Ref, Scope } from "effect"
+import { Context, Effect, Layer, Option, Queue, Ref } from "effect"
 import { makeLocationNode } from "../effect/app-node"
 import { FileSystem } from "../filesystem"
 import { IndexSerialization } from "./index-serialization"
@@ -10,8 +10,7 @@ import { Global } from "../global"
 import { Location } from "../location"
 import { RelativePath } from "../schema"
 import { Hash } from "../util/hash"
-import { ChunkStore, KIND_DIR, KIND_FILE } from "../search/chunk-store"
-import { frontDecode } from "../search/front-code"
+import { ChunkStore } from "../search/chunk-store"
 import { availableParallelism } from "node:os"
 
 /**
@@ -35,6 +34,14 @@ import { availableParallelism } from "node:os"
 
 export const SCHEMA_VERSION = 1
 const DEBOUNCE_MS = 300
+// FileIndex is an interactive directory cache, not a second whole-repository
+// database. Keep both the live catalog and its durable snapshot bounded. Search
+// owns full-project discovery and metadata persistence.
+const MAX_LIVE_SUBTREES = 2_048
+const MAX_LIVE_ENTRIES = 50_000
+const MAX_PERSISTED_SUBTREES = 512
+const MAX_PERSISTED_ENTRIES = 4_096
+const MAX_PERSISTED_BYTES = 1024 * 1024
 
 export type RootStat = IndexSerialization.IndexRootStat
 export type Subtree = IndexSerialization.IndexSubtree
@@ -56,8 +63,12 @@ export interface Interface {
   readonly invalidate: (dirPath: string) => Effect.Effect<void>
   /** Apply an incremental put/delete patch to a cached subtree. */
   readonly applyPatch: (patch: Patch) => Effect.Effect<void>
-  /** Re-scan a single directory and patch the index. */
-  readonly refresh: (dirPath: string) => Effect.Effect<void>
+  /** Re-scan one directory. `changedPaths` forces metadata refresh only for the
+   * watcher-touched entries; `forceMetadata` is the bounded overflow fallback. */
+  readonly refresh: (
+    dirPath: string,
+    options?: { readonly changedPaths?: readonly string[]; readonly forceMetadata?: boolean },
+  ) => Effect.Effect<void>
   /** Force a synchronous persist (used by tests; production uses debounced flush). */
   readonly flush: () => Effect.Effect<void>
 }
@@ -116,27 +127,58 @@ export const layer = Layer.effect(
     const isOpencodePath = (p: string) => p === ".opencode" || p.startsWith(".opencode/")
 
     const subtrees = new Map<string, Subtree>()
-    /** Subtrees loaded from the search chunks, pending confirmation against disk. */
-    const unverified = new Set<string>()
     const byPath = new Map<string, FileSystem.Entry>()
+    const scanVersions = new Map<string, number>()
+    const restoredSubtrees = new Set<string>()
+    const subtreeTouches = new Map<string, number>()
+    let touchClock = 0
+    let cachedEntries = 0
     let builtAt = 0
     let rootStat: RootStat | undefined
     let loaded = false
     let persistRevision = 0
 
+    const touchSubtree = (dir: string) => subtreeTouches.set(dir, ++touchClock)
+    const dropSubtree = (dir: string) => {
+      const prev = subtrees.get(dir)
+      if (!prev) return false
+      for (const e of prev.entries) byPath.delete(catalogKey(String(e.path)))
+      cachedEntries -= prev.entries.length
+      subtreeTouches.delete(dir)
+      restoredSubtrees.delete(dir)
+      scanVersions.delete(dir)
+      return subtrees.delete(dir)
+    }
+    const dropBranch = (dir: string) => {
+      const key = normalizeDirPath(dir)
+      const prefix = key ? `${key}/` : ""
+      let changed = false
+      for (const candidate of [...subtrees.keys()]) {
+        if (candidate !== key && (!prefix || !candidate.startsWith(prefix))) continue
+        if (dropSubtree(candidate)) changed = true
+      }
+      return changed
+    }
+    const trimLiveCache = (protectedDir?: string) => {
+      if (subtrees.size <= MAX_LIVE_SUBTREES && cachedEntries <= MAX_LIVE_ENTRIES) return
+      const victims = [...subtrees.keys()]
+        .filter((dir) => dir !== "" && dir !== protectedDir)
+        .sort((left, right) => (subtreeTouches.get(left) ?? 0) - (subtreeTouches.get(right) ?? 0))
+      for (const dir of victims) {
+        if (subtrees.size <= MAX_LIVE_SUBTREES && cachedEntries <= MAX_LIVE_ENTRIES) break
+        dropSubtree(dir)
+      }
+    }
+
     // A directory listing can never legitimately contain the same path twice,
-    // but a persisted index can: `hydrate` front-decodes the file and directory
-    // chunks and pushes every decoded path into its parent group, so a path
-    // duplicated across chunks is emitted once per occurrence. Those duplicates
-    // reach the client as repeated children of one directory — `docs` in this
-    // repo listed 45 children for 19 real ones, with `docs/handoff` eight times.
-    // Deduping here covers every writer (hydrate, live scan, restore) instead of
-    // just the one that happened to produce it, and keeps `byPath` consistent
-    // with the entries actually stored.
+    // but old persisted snapshots may contain duplicates from earlier hydrate
+    // implementations. Deduping here covers restore and live scans and keeps
+    // `byPath` consistent with the entries actually stored.
     const setSubtree = (dir: string, entries: FileSystem.Entry[], at = Date.now()) => {
       const prev = subtrees.get(dir)
       if (prev) {
         for (const e of prev.entries) byPath.delete(catalogKey(String(e.path)))
+        cachedEntries -= prev.entries.length
       }
       const seen = new Set<string>()
       const deduped: FileSystem.Entry[] = []
@@ -147,25 +189,32 @@ export const layer = Layer.effect(
         deduped.push(e)
       }
       subtrees.set(dir, { at, entries: deduped })
+      cachedEntries += deduped.length
+      touchSubtree(dir)
       for (const e of deduped) byPath.set(catalogKey(String(e.path)), e)
+      trimLiveCache(dir)
     }
 
-    const dropSubtree = (dir: string) => {
-      const prev = subtrees.get(dir)
-      if (!prev) return false
-      for (const e of prev.entries) byPath.delete(catalogKey(String(e.path)))
-      return subtrees.delete(dir)
-    }
-
-    // This path does more than stat(): for small text files it also reads the
-    // entire file to compute lineCount. Keep per-host fan-out deliberately low
-    // because several ACP/Desktop hosts may hydrate the same worktree at once.
-    // The previous fixed 24-way fan-out became 96 concurrent metadata reads with
-    // 3 ACP hosts + desktop on a 24-thread machine.
+    // Metadata is useful to the explorer, but it must never turn a directory
+    // listing into a whole-project content crawl. Keep stat fan-out bounded and
+    // only count lines for small batches (typically one/few watcher updates).
+    // Large/cold directories get size+mtime only, mirroring SearchIndex's
+    // structural-first policy. This avoids reading hundreds/thousands of source
+    // files just because a tree node became visible.
     const STAT_CONCURRENCY = Math.max(1, Math.min(6, availableParallelism()))
+    const LINE_COUNT_BATCH_LIMIT = 32
     const LINE_COUNT_MAX_BYTES = 512 * 1024
     const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|pdf|zip|tar|gz|tgz|bz2|xz|7z|rar|mp4|mp3|mov|avi|mkv|wasm|pyc|class|o|so|dll|exe|bin|dat|lock)$/i
-    const attachMeta = (entries: readonly FileSystem.Entry[]): Effect.Effect<FileSystem.Entry[]> =>
+    const countLines = (bytes: Uint8Array) => {
+      if (bytes.byteLength === 0) return 1
+      let lines = 1
+      for (let index = 0; index < bytes.byteLength; index++) if (bytes[index] === 10) lines++
+      return lines
+    }
+    const attachMeta = (
+      entries: readonly FileSystem.Entry[],
+      options?: { countLines?: boolean },
+    ): Effect.Effect<FileSystem.Entry[]> =>
       Effect.forEach(
         entries,
         (entry) => {
@@ -180,10 +229,15 @@ export const layer = Layer.effect(
                 size: Number.isFinite(size) ? size : undefined,
                 mtime: mtime > 0 ? mtime : undefined,
               }
-              if (!Number.isFinite(size) || size > LINE_COUNT_MAX_BYTES || BINARY_EXT_RE.test(String(entry.path)))
+              if (
+                options?.countLines === false ||
+                !Number.isFinite(size) ||
+                size > LINE_COUNT_MAX_BYTES ||
+                BINARY_EXT_RE.test(String(entry.path))
+              )
                 return Effect.succeed(base)
-              return fs.readFileStringSafe(abs).pipe(
-                Effect.map((text) => (text === undefined ? base : { ...base, lineCount: text.split("\n").length })),
+              return fs.readFile(abs).pipe(
+                Effect.map((bytes) => ({ ...base, lineCount: countLines(bytes) })),
                 Effect.catch(() => Effect.succeed(base)),
               )
             }),
@@ -192,73 +246,6 @@ export const layer = Layer.effect(
         },
         { concurrency: STAT_CONCURRENCY },
       )
-
-    const subtreeBytes = (dir: string, memo: Map<string, number | undefined>): number | undefined => {
-      if (memo.has(dir)) return memo.get(dir)
-      const sub = subtrees.get(dir)
-      if (!sub) {
-        memo.set(dir, undefined)
-        return undefined
-      }
-      let total = 0
-      let any = false
-      for (const e of sub.entries) {
-        if (e.type === "file") {
-          if (typeof e.size === "number") {
-            total += e.size
-            any = true
-          }
-          continue
-        }
-        const nested = subtreeBytes(catalogKey(String(e.path)), memo)
-        if (nested !== undefined) {
-          total += nested
-          any = true
-        }
-      }
-      const result = any ? total : undefined
-      memo.set(dir, result)
-      return result
-    }
-
-    const subtreeMtime = (dir: string, memo: Map<string, number | undefined>): number | undefined => {
-      if (memo.has(dir)) return memo.get(dir)
-      const sub = subtrees.get(dir)
-      if (!sub) {
-        memo.set(dir, undefined)
-        return undefined
-      }
-      let max: number | undefined
-      for (const e of sub.entries) {
-        if (e.type === "file") {
-          if (typeof e.mtime === "number" && e.mtime > 0) {
-            if (max === undefined || e.mtime > max) max = e.mtime
-          }
-          continue
-        }
-        const nested = subtreeMtime(catalogKey(String(e.path)), memo)
-        if (nested !== undefined && (max === undefined || nested > max)) max = nested
-      }
-      memo.set(dir, max)
-      return max
-    }
-
-    const withDirMeta = (entries: readonly FileSystem.Entry[]): FileSystem.Entry[] => {
-      if (entries.length === 0) return [...entries]
-      const sizeMemo = new Map<string, number | undefined>()
-      const mtimeMemo = new Map<string, number | undefined>()
-      return entries.map((e) => {
-        if (e.type !== "directory") return e
-        const bytes = subtreeBytes(catalogKey(String(e.path)), sizeMemo)
-        const max = subtreeMtime(catalogKey(String(e.path)), mtimeMemo)
-        if (bytes === undefined && max === undefined) return e
-        return {
-          ...e,
-          ...(bytes !== undefined ? { size: bytes } : {}),
-          ...(max !== undefined ? { mtime: max } : {}),
-        }
-      })
-    }
     const dirty = yield* Ref.make(false)
     const flushQueue = yield* Queue.dropping<number>(1)
 
@@ -283,16 +270,43 @@ export const layer = Layer.effect(
       Effect.gen(function* () {
         const revision = persistRevision
         const snapshotSubtrees: Record<string, { at: number; entries: readonly FileSystem.Entry[] }> = {}
-        for (const [dir, sub] of subtrees) snapshotSubtrees[dir] = { at: sub.at, entries: sub.entries.slice() }
+        // Persist the root plus the hottest directories only. Persisting every
+        // expanded directory recreated the old whole-repo mirror: the 78k-node
+        // benchmark produced a ~6 MiB blob with hundreds of milliseconds of
+        // canonical-JSON/schema work. A bounded warm set retains the useful part
+        // of persistence without making startup proportional to repository size.
+        const ordered = [...subtrees.keys()].sort((left, right) => {
+          if (left === "") return -1
+          if (right === "") return 1
+          return (subtreeTouches.get(right) ?? 0) - (subtreeTouches.get(left) ?? 0)
+        })
+        let persistedEntries = 0
+        let persistedSubtrees = 0
+        for (const dir of ordered) {
+          if (persistedSubtrees >= MAX_PERSISTED_SUBTREES) break
+          const sub = subtrees.get(dir)
+          if (!sub) continue
+          if (persistedEntries + sub.entries.length > MAX_PERSISTED_ENTRIES) continue
+          snapshotSubtrees[dir] = { at: sub.at, entries: sub.entries.slice() }
+          persistedEntries += sub.entries.length
+          persistedSubtrees++
+        }
         const snapshotRootStat = rootStat ?? (yield* currentRootStat())
-        const state: IndexState = {
+        let state: IndexState = {
           schemaVersion: SCHEMA_VERSION,
           builtAt,
           root,
           rootStat: snapshotRootStat,
           subtrees: snapshotSubtrees,
         }
-        const bytes = IndexSerialization.encode(state)
+        let bytes = IndexSerialization.encode(state)
+        if (bytes.byteLength > MAX_PERSISTED_BYTES) {
+          // Pathological single directories / long paths can exceed the byte
+          // budget even under the entry cap. Persist an empty valid warm set
+          // rather than keeping or replacing it with another startup hazard.
+          state = { ...state, subtrees: {} }
+          bytes = IndexSerialization.encode(state)
+        }
         const str = new TextDecoder().decode(bytes)
         // Unified SQLite persistence: single `file-index/<hash>.db` holds both
         // the search chunks (`ChunkStore`) and the explorer snapshot
@@ -354,6 +368,10 @@ export const layer = Layer.effect(
           Effect.catch(() => Effect.succeed(undefined as string | undefined)),
         )
         if (!str) return false
+        // Old versions could persist the entire repository here. Avoid paying a
+        // large JSON parse + schema walk + canonical re-hash on startup. The
+        // first lazy scan will replace it with the bounded hot-set format.
+        if (str.length > MAX_PERSISTED_BYTES) return false
         const bytes = new TextEncoder().encode(str)
         const blob = yield* IndexSerialization.decode(bytes).pipe(
           Effect.catch(() => Effect.succeed(undefined as IndexSerialization.IndexBlob | undefined)),
@@ -366,97 +384,9 @@ export const layer = Layer.effect(
           if (isOpencodePath(dir)) continue
           const filtered = sub.entries.filter((e) => !isOpencodePath(String(e.path)))
           setSubtree(dir, normalizeEntries(filtered), sub.at)
+          restoredSubtrees.add(dir)
         }
         return true
-      }).pipe(Effect.catch(() => Effect.succeed(false)))
-
-    const tryLoadFromSearchDB = (): Effect.Effect<boolean> =>
-      Effect.gen(function* () {
-        const exists = yield* fs.stat(dbPath).pipe(
-          Effect.map(() => true),
-          Effect.catch(() => Effect.succeed(false)),
-        )
-        if (!exists) return false
-        const ok = yield* Effect.gen(function* () {
-          const store = yield* ChunkStore.Service
-          const [fileChunks, dirChunks, storedFileMeta, storedTombstones] = yield* Effect.all([
-            store.readRaw(KIND_FILE).pipe(Effect.catch(() => Effect.succeed([] as ChunkStore.RawChunk[]))),
-            store.readRaw(KIND_DIR).pipe(Effect.catch(() => Effect.succeed([] as ChunkStore.RawChunk[]))),
-            store.getMeta("fileMeta").pipe(Effect.catch(() => Effect.succeed(undefined as string | undefined))),
-            store.getMeta("tombstones").pipe(Effect.catch(() => Effect.succeed(undefined as string | undefined))),
-          ])
-          if (fileChunks.length === 0 && dirChunks.length === 0) return false
-          const fileMeta = new Map<string, { size: number; mtime: number; lineCount?: number }>()
-          if (storedFileMeta) {
-            try {
-              const parsed = JSON.parse(storedFileMeta) as Array<[string, { size: number; mtime: number; lineCount?: number }]>
-              for (const [p, m] of parsed) fileMeta.set(p, m)
-            } catch {}
-          }
-          const tombstones = new Set<string>()
-          if (storedTombstones) {
-            try {
-              for (const p of JSON.parse(storedTombstones) as string[]) tombstones.add(p)
-            } catch {}
-          }
-          const groups = new Map<string, FileSystem.Entry[]>()
-          const ensureGroup = (dir: string) => {
-            if (!groups.has(dir)) groups.set(dir, [])
-            return groups.get(dir)!
-          }
-          ensureGroup("")
-          const pushPath = (p: string, isDir: boolean) => {
-            if (tombstones.has(p)) return
-            if (isOpencodePath(p)) return
-            const dir = p.includes("/") ? p.slice(0, p.lastIndexOf("/")) : ""
-            if (isOpencodePath(dir)) return
-            const meta = !isDir ? fileMeta.get(p) : undefined
-            const entry: FileSystem.Entry = {
-              path: RelativePath.make(p + (isDir ? "/" : "")),
-              type: isDir ? "directory" : "file",
-              ...(meta?.size !== undefined ? { size: meta.size } : {}),
-              ...(meta?.mtime !== undefined ? { mtime: meta.mtime } : {}),
-              ...(meta?.lineCount !== undefined ? { lineCount: meta.lineCount } : {}),
-            }
-            ensureGroup(dir).push(entry)
-            if (isDir) ensureGroup(p)
-          }
-          for (const chunk of fileChunks) for (const pp of frontDecode(chunk.body, chunk.count)) pushPath(pp, false)
-          for (const chunk of dirChunks) for (const pp of frontDecode(chunk.body, chunk.count)) pushPath(pp, true)
-          const now = Date.now()
-          let any = false
-          for (const [dir, entries] of groups) {
-            if (entries.length === 0 && dir !== "") continue
-            entries.sort(compareEntries)
-            // These entries come from the SEARCH chunks, which carry no build
-            // timestamp and — unlike the `fileIndex` blob, restored with its real
-            // per-subtree `sub.at` — are not an authoritative directory listing.
-            // They can name paths deleted while this process was not running, so
-            // no watcher event ever tombstoned them.
-            //
-            // There is no honest `at` to use here: `Date.now()` claims the data
-            // was verified this instant, which permanently disables the
-            // `isDirStale` (`mtime >= at`) check for anything that changed
-            // offline, and the DB's own mtime is the time the SEARCH index was
-            // last written, which is routinely newer than the directory it
-            // describes. Either way `docs/chunkdb`, `docs/claude-first-party`
-            // and `docs/pwa-mobile` kept being served long after
-            // `chore: reorganize docs` deleted them.
-            //
-            // So do not encode trust in a timestamp at all: mark the subtree
-            // unverified and let the first `list` of that directory confirm it
-            // against disk. Cost is one targeted rescan per directory actually
-            // opened, after which it is cached normally.
-            setSubtree(dir, entries, now)
-            unverified.add(dir)
-            any = true
-          }
-          if (!any) return false
-          builtAt = now
-          rootStat = yield* currentRootStat()
-          return true
-        }).pipe(Effect.provide(ChunkStore.layerFromPath(dbPath)), Effect.scoped)
-        return ok
       }).pipe(Effect.catch(() => Effect.succeed(false)))
 
     const ensureLoaded = (): Effect.Effect<void> =>
@@ -466,17 +396,16 @@ export const layer = Layer.effect(
         // Best-effort delete of the repo-local Brotli copy on first load —
         // it is no longer written, but old clones may still have it.
         yield* fs.remove(path.join(root, ".opencode", "file-index.json.br"), { force: true }).pipe(Effect.ignore)
-        // Unified SQLite cold start: `file-index/<hash>.db` is the single
-        // durable copy. Try the explorer's own `fileIndex` meta first
-        // (written via `persist()`), then the search chunks grouping
-        // (for upgrades where only the search DB exists), then the legacy
-        // global JSON blob.
+        // Unified SQLite cold start: load only the explorer's own lazy snapshot.
+        // Do NOT decode the search index's entire path corpus here. Search keeps
+        // those chunks byte-oriented specifically so a 100k+ project does not
+        // materialize every path just because the explorer asks for its root.
+        // On cache miss, requested directories are scanned lazily below.
         const fromFileIndex = yield* tryLoadFileIndexMeta()
         if (fromFileIndex) return
-        const fromSearch = yield* tryLoadFromSearchDB()
-        if (fromSearch) return
         const bytes = yield* fs.readFile(cachePath).pipe(Effect.catch(() => Effect.succeed(undefined as Uint8Array | undefined)))
         if (bytes === undefined) return
+        if (bytes.byteLength > MAX_PERSISTED_BYTES) return
         const blob = yield* IndexSerialization.decode(bytes).pipe(
           Effect.catch(() => Effect.succeed(undefined as IndexSerialization.IndexBlob | undefined)),
         )
@@ -487,52 +416,31 @@ export const layer = Layer.effect(
           if (isOpencodePath(dir)) continue
           const filtered = sub.entries.filter((e) => !isOpencodePath(String(e.path)))
           setSubtree(dir, normalizeEntries(filtered), sub.at)
+          restoredSubtrees.add(dir)
         }
       })
 
-    const checkFreshness = (): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        const current = yield* currentRootStat()
-        if (
-          rootStat &&
-          (current.mtimeMs !== Math.floor(rootStat.mtimeMs) ||
-            current.size !== rootStat.size ||
-            current.ino !== rootStat.ino)
-        ) {
-          rootStat = current
-        }
-      })
+    const sameEntry = (left: FileSystem.Entry, right: FileSystem.Entry) =>
+      left.path === right.path &&
+      left.type === right.type &&
+      left.size === right.size &&
+      left.mtime === right.mtime &&
+      left.lineCount === right.lineCount
 
-    const buildDir = (dirPath: string): Effect.Effect<void> =>
+    /**
+     * Verify one directory structurally and preserve metadata for untouched
+     * children. Directory enumeration is cheap; stat/read amplification is not.
+     * This makes `list()` correct even when native watcher delivery is delayed or
+     * disabled, while a one-file watcher change only stats/reads that one file.
+     */
+    const targetedScan = (
+      dirPath: string,
+      options?: { readonly changedPaths?: ReadonlySet<string>; readonly forceMetadata?: boolean },
+    ): Effect.Effect<void> =>
       Effect.gen(function* () {
         if (isOpencodePath(dirPath)) return
-        const listed = yield* filesystem.list({ path: RelativePath.make(dirPath) }).pipe(
-          Effect.option,
-          Effect.catchDefect(() => Effect.succeed(Option.none())),
-        )
-        if (Option.isNone(listed)) return
-        const raw = normalizeEntries(listed.value).filter((e) => !isOpencodePath(String(e.path)))
-        const withMeta = yield* attachMeta(raw)
-        setSubtree(dirPath, withMeta)
-        for (const entry of withMeta) {
-          if (entry.type === "directory") yield* buildDir(normalizeDirPath(entry.path))
-        }
-      })
-
-    const fullBuild = (): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        byPath.clear()
-        subtrees.clear()
-        unverified.clear()
-        yield* buildDir("")
-        builtAt = Date.now()
-        rootStat = yield* currentRootStat()
-        yield* markDirty()
-      })
-
-    const targetedScan = (dirPath: string): Effect.Effect<void> =>
-      Effect.gen(function* () {
-        if (isOpencodePath(dirPath)) return
+        const version = (scanVersions.get(dirPath) ?? 0) + 1
+        scanVersions.set(dirPath, version)
         const listed = yield* filesystem.list({ path: RelativePath.make(dirPath) }).pipe(
           Effect.option,
           Effect.catchDefect(() => Effect.succeed(Option.none())),
@@ -543,67 +451,88 @@ export const layer = Layer.effect(
         // error` for the whole request, so treat "gone" as "empty": drop the
         // stale subtree instead of serving paths that no longer exist.
         if (Option.isNone(listed)) {
-          if (dropSubtree(dirPath)) yield* markDirty()
+          if (scanVersions.get(dirPath) !== version) return
+          if (dropBranch(dirPath)) yield* markDirty()
           return
         }
         const entries = normalizeEntries(listed.value).filter((e) => !isOpencodePath(String(e.path)))
-        const withMeta = yield* attachMeta(entries)
-        setSubtree(dirPath, withMeta)
+        const previous = subtrees.get(dirPath)
+        const previousByPath = new Map(previous?.entries.map((entry) => [catalogKey(String(entry.path)), entry]))
+        const restored = restoredSubtrees.has(dirPath)
+        const metadataTargets = entries.filter((entry) => {
+          if (entry.type !== "file") return false
+          const key = catalogKey(String(entry.path))
+          const before = previousByPath.get(key)
+          if (restored || options?.forceMetadata || options?.changedPaths?.has(key)) return true
+          return !before || before.type !== "file" || before.size === undefined || before.mtime === undefined
+        })
+        const hydrated =
+          metadataTargets.length === 0
+            ? []
+            : yield* attachMeta(metadataTargets, {
+                countLines: !options?.forceMetadata && metadataTargets.length <= LINE_COUNT_BATCH_LIMIT,
+              })
+        const hydratedByPath = new Map(
+          hydrated.map((entry) => {
+            const key = catalogKey(String(entry.path))
+            const before = previousByPath.get(key)
+            // Stat-only bulk verification should not erase a valid cached line
+            // count. Preserve it only when the file identity metadata matches.
+            if (
+              entry.lineCount === undefined &&
+              before?.lineCount !== undefined &&
+              before.size === entry.size &&
+              before.mtime === entry.mtime
+            ) {
+              return [key, { ...entry, lineCount: before.lineCount }] as const
+            }
+            return [key, entry] as const
+          }),
+        )
+        const next = entries.map((entry) => {
+          // Directory aggregate size/mtime used to recursively walk every cached
+          // descendant on each root response and became incorrect once the cache
+          // was lazy. Directory rows stay structural; their loaded child count is
+          // maintained client-side.
+          if (entry.type === "directory") return entry
+          const key = catalogKey(String(entry.path))
+          return hydratedByPath.get(key) ?? previousByPath.get(key) ?? entry
+        })
+        // A later scan of the same directory started while this one was doing
+        // metadata I/O. Never let an older snapshot win merely because it
+        // completed last.
+        if (scanVersions.get(dirPath) !== version) return
+        restoredSubtrees.delete(dirPath)
+        const nextDirectoryKeys = new Set(
+          entries.filter((entry) => entry.type === "directory").map((entry) => catalogKey(String(entry.path))),
+        )
+        for (const old of previous?.entries ?? []) {
+          if (old.type !== "directory") continue
+          const key = catalogKey(String(old.path))
+          if (!nextDirectoryKeys.has(key)) dropBranch(key)
+        }
+        const changed =
+          !previous ||
+          previous.entries.length !== next.length ||
+          previous.entries.some((entry, index) => !next[index] || !sameEntry(entry, next[index]!))
+        if (!changed) return
+        setSubtree(dirPath, next)
+        if (builtAt === 0) builtAt = Date.now()
+        if (dirPath === "") rootStat = yield* currentRootStat()
         yield* markDirty()
       })
 
-    const scope = yield* Scope.Scope
-    const isDirStale = (dirPath: string, at: number) =>
-      Effect.gen(function* () {
-        const abs = path.join(root, dirPath)
-        const info: any = yield* (fs.stat(abs) as any).pipe(Effect.catch(() => Effect.succeed(undefined as any)) as any)
-        if (!info) return true
-        const mtimeOpt = (info as { mtime?: Option.Option<Date> }).mtime as Option.Option<Date> | undefined
-        const mtime = mtimeOpt ? Option.getOrElse(mtimeOpt, () => new Date(0)).getTime() : 0
-        // Unified staleness: any mtime newer than or equal to the cached
-        // `at` triggers a targeted rescan. The previous `+1000` ms guard hid
-        // newly added files created within the same second as the cached `at`
-        // (flaky on fast test tmpdirs and on Windows where dir mtime
-        // granularity is coarse). Coarse FS is handled by the fallback
-        // `checkFreshness` rootStat path and by the watcher; a false-positive
-        // rescan is cheap compared to permanently hiding a new file.
-        return mtime >= at
-      }).pipe(Effect.catch(() => Effect.succeed(true)) as any) as Effect.Effect<boolean>
-
     const list = Effect.fn("FileIndex.list")(function* (input: RelativePath) {
       yield* ensureLoaded()
-      yield* checkFreshness()
       const dirPath = normalizeDirPath(input)
-      const cached = subtrees.get(dirPath)
-      if (cached) {
-        if (unverified.has(dirPath)) {
-          unverified.delete(dirPath)
-          yield* targetedScan(dirPath)
-          return withDirMeta(subtrees.get(dirPath)?.entries ?? [])
-        }
-        if (yield* isDirStale(dirPath, cached.at)) {
-          yield* targetedScan(dirPath)
-          return withDirMeta(subtrees.get(dirPath)?.entries ?? [])
-        }
-        if (cached.entries.some((e) => e.type === "file" && e.size === undefined)) {
-          const withMeta = yield* attachMeta(cached.entries)
-          setSubtree(dirPath, withMeta, cached.at)
-          yield* markDirty()
-          return withDirMeta(withMeta)
-        }
-        return withDirMeta(cached.entries)
-      }
-      if (subtrees.size === 0) {
-        yield* targetedScan(dirPath)
-        yield* (fullBuild().pipe(
-          Effect.catch(() => Effect.void),
-          Effect.forkIn(scope),
-          Effect.ignore as any,
-        ) as any)
-        return withDirMeta(subtrees.get(dirPath)?.entries ?? [])
-      }
+      // Always do one cheap structural verification. This removes the coarse
+      // timestamp race that made same-tick creates invisible on Windows and
+      // avoids relying on watcher delivery for correctness. Unchanged files keep
+      // their cached metadata, so this is readdir-scale work rather than N stats
+      // plus N file reads.
       yield* targetedScan(dirPath)
-      return withDirMeta(subtrees.get(dirPath)?.entries ?? [])
+      if (subtrees.has(dirPath)) touchSubtree(dirPath)
+      return subtrees.get(dirPath)?.entries ?? []
     })
 
     const invalidate = Effect.fn("FileIndex.invalidate")(function* (dirPath: string) {
@@ -615,25 +544,38 @@ export const layer = Layer.effect(
       const sub = subtrees.get(key)
       if (!sub) return
       if (patch.op === "put" && patch.entry) {
-        const entry = { ...patch.entry, path: RelativePath.make(normalizeEntryPath(String(patch.entry.path))) }
-        const stated = entry.type === "file" ? (yield* attachMeta([entry]))[0]! : entry
-        const next = sub.entries.filter((item) => item.path !== stated.path)
+        const rawPath = catalogKey(String(patch.entry.path)) + (patch.entry.type === "directory" ? "/" : "")
+        const entry = { ...patch.entry, path: RelativePath.make(rawPath) }
+        const stated = entry.type === "file" ? (yield* attachMeta([entry], { countLines: true }))[0]! : entry
+        const statedKey = catalogKey(String(stated.path))
+        const next = sub.entries.filter((item) => catalogKey(String(item.path)) !== statedKey)
         next.push(stated)
         next.sort(compareEntries)
         setSubtree(key, next)
         yield* markDirty()
       } else if (patch.op === "delete" && patch.entryPath) {
-        const entryPath = normalizeEntryPath(patch.entryPath)
-        const next = sub.entries.filter((item) => item.path !== entryPath)
+        const entryPath = catalogKey(patch.entryPath)
+        const removed = sub.entries.find((item) => catalogKey(String(item.path)) === entryPath)
+        const next = sub.entries.filter((item) => catalogKey(String(item.path)) !== entryPath)
         if (next.length !== sub.entries.length) {
+          if (removed?.type === "directory") dropBranch(entryPath)
           setSubtree(key, next)
           yield* markDirty()
         }
       }
     })
 
-    const refresh = Effect.fn("FileIndex.refresh")(function* (dirPath: string) {
-      yield* targetedScan(normalizeDirPath(dirPath))
+    const refresh = Effect.fn("FileIndex.refresh")(function* (
+      dirPath: string,
+      options?: { readonly changedPaths?: readonly string[]; readonly forceMetadata?: boolean },
+    ) {
+      const changedPaths = options?.changedPaths
+        ? new Set(options.changedPaths.map((entryPath) => catalogKey(entryPath)))
+        : undefined
+      yield* targetedScan(normalizeDirPath(dirPath), {
+        changedPaths,
+        forceMetadata: options?.forceMetadata,
+      })
     })
 
     const flush = Effect.fn("FileIndex.flush")(function* () {

@@ -5,8 +5,6 @@ import { Effect } from "effect"
 import * as fs from "fs/promises"
 import path from "path"
 import { FileIndex } from "@opencode-ai/core/filesystem/index"
-import { FileSystem } from "@opencode-ai/core/filesystem"
-import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { IndexSerialization } from "@opencode-ai/core/filesystem/index-serialization"
 import { Global } from "@opencode-ai/core/global"
 import { Location } from "@opencode-ai/core/location"
@@ -44,7 +42,7 @@ const withIndex = <A, E>(dir: string, dataDir: string, effect: Effect.Effect<A, 
   )
 
 describe("FileIndex", () => {
-  test("cold build lists children and persists a decodable blob", async () => {
+  test("cold root list stays lazy and persists only requested subtrees", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
         await Bun.write(path.join(dir, "a.txt"), "a")
@@ -57,7 +55,6 @@ describe("FileIndex", () => {
     await Effect.runPromise(
       withIndex(tmp.path, data.path, Effect.gen(function* () {
         const index = yield* FileIndex.Service
-        console.log("FI===FS:", FileIndex.Service === (FileSystem.Service as unknown), "FI===W:", FileIndex.Service === (Watcher.Service as unknown))
         const entries = yield* index.list(rp(""))
         expect(paths(entries)).toContain("a.txt")
         expect(paths(entries)).toContain("src/")
@@ -74,7 +71,19 @@ describe("FileIndex", () => {
         const bytes = new TextEncoder().encode(chunkStore!)
         const blob = yield* IndexSerialization.decode(bytes)
         expect(blob.subtrees[""].entries.map((e) => String(e.path))).toContain("a.txt")
-        expect(blob.subtrees["src"].entries.map((e) => String(e.path))).toContain("src/b.ts")
+        // Listing the root must not recursively crawl the project in a hidden
+        // background build. Child directories enter the cache only when used.
+        expect(blob.subtrees["src"]).toBeUndefined()
+
+        const src = yield* index.list(rp("src"))
+        expect(paths(src)).toContain("src/b.ts")
+        yield* index.flush()
+        const updated = yield* Effect.gen(function* () {
+          const store = yield* ChunkStore.Service
+          return yield* store.getMeta("fileIndex")
+        }).pipe(Effect.provide(ChunkStore.layerFromPath(dbPath)), Effect.scoped)
+        const updatedBlob = yield* IndexSerialization.decode(new TextEncoder().encode(updated!))
+        expect(updatedBlob.subtrees["src"].entries.map((e) => String(e.path))).toContain("src/b.ts")
         // Legacy JSON should have been cleaned up
         const legacyExists = yield* Effect.promise(() =>
           fs
@@ -87,7 +96,7 @@ describe("FileIndex", () => {
     )
   })
 
-  test("serves sub-children from the index", async () => {
+  test("lists sub-children lazily on first use", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
         await fs.mkdir(path.join(dir, "src"), { recursive: true })
@@ -115,10 +124,12 @@ describe("FileIndex", () => {
         const index = yield* FileIndex.Service
         yield* index.list(rp(""))
 
+        yield* write(tmp.path, "new.txt", "new")
         yield* index.applyPatch({ op: "put", dir: "", entry: { path: rp("new.txt"), type: "file" } })
         let entries = yield* index.list(rp(""))
         expect(paths(entries)).toContain("new.txt")
 
+        yield* Effect.promise(() => fs.rm(path.join(tmp.path, "new.txt")))
         yield* index.applyPatch({ op: "delete", dir: "", entryPath: "new.txt" })
         entries = yield* index.list(rp(""))
         expect(paths(entries)).not.toContain("new.txt")
@@ -143,7 +154,7 @@ describe("FileIndex", () => {
     )
   })
 
-  test("freshness invalidation rebuilds when the root stat changes", async () => {
+  test("structural verification sees same-tick root changes", async () => {
     await using tmp = await tmpdir({ init: async (dir) => Bun.write(path.join(dir, "a.txt"), "a") })
     await using data = await tmpdir()
 
@@ -153,7 +164,8 @@ describe("FileIndex", () => {
         let entries = yield* index.list(rp(""))
         expect(paths(entries)).toContain("a.txt")
 
-        // Adding a file to the root changes the root dir mtime -> stale -> rebuild.
+        // This intentionally does not sleep for filesystem timestamp granularity.
+        // The old mtime-vs-scan-time cache missed this on Windows.
         yield* write(tmp.path, "b.txt", "b")
         entries = yield* index.list(rp(""))
         expect(paths(entries)).toContain("b.txt")
@@ -161,7 +173,7 @@ describe("FileIndex", () => {
     )
   })
 
-  test("search-chunk hydrate drops paths deleted while the process was stopped", async () => {
+  test("search-only chunks never hydrate stale paths into the explorer", async () => {
     await using tmp = await tmpdir({
       init: async (dir) => {
         await Bun.write(path.join(dir, "kept.txt"), "kept")
@@ -198,10 +210,89 @@ describe("FileIndex", () => {
         expect(paths(root)).toContain("kept.txt")
         expect(paths(root)).not.toContain("ghost/")
 
-        // A nested directory hydrated the same way is confirmed on its own
-        // first list, not just the root.
+        // A nonexistent nested path is an ordinary empty/missing result and the
+        // stale search corpus is never materialized into FileIndex first.
         const nested = yield* index.list(rp("ghost"))
         expect(paths(nested)).toEqual([])
+      })),
+    )
+  })
+
+  test("bulk directory metadata is stat-only and watcher refresh counts only touched files", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await Promise.all(
+          Array.from({ length: 40 }, (_, index) => Bun.write(path.join(dir, `f${index}.ts`), `line ${index}\nnext`)),
+        )
+      },
+    })
+    await using data = await tmpdir()
+
+    await Effect.runPromise(
+      withIndex(tmp.path, data.path, Effect.gen(function* () {
+        const index = yield* FileIndex.Service
+        let entries = yield* index.list(rp(""))
+        const initial = entries.find((entry) => String(entry.path) === "f0.ts")!
+        expect(initial.size).toBeGreaterThan(0)
+        expect(initial.mtime).toBeGreaterThan(0)
+        expect(initial.lineCount).toBeUndefined()
+
+        yield* write(tmp.path, "f0.ts", "one\ntwo\nthree")
+        yield* index.refresh("", { changedPaths: ["f0.ts"] })
+        entries = yield* index.list(rp(""))
+        const touched = entries.find((entry) => String(entry.path) === "f0.ts")!
+        const sibling = entries.find((entry) => String(entry.path) === "f1.ts")!
+        expect(touched.lineCount).toBe(3)
+        expect(sibling.lineCount).toBeUndefined()
+      })),
+    )
+  })
+
+  test("restored metadata is revalidated after offline file changes", async () => {
+    await using tmp = await tmpdir({ init: async (dir) => Bun.write(path.join(dir, "a.ts"), "one\ntwo") })
+    await using data = await tmpdir()
+
+    await Effect.runPromise(
+      withIndex(tmp.path, data.path, Effect.gen(function* () {
+        const index = yield* FileIndex.Service
+        const entries = yield* index.list(rp(""))
+        expect(entries.find((entry) => String(entry.path) === "a.ts")?.lineCount).toBe(2)
+        yield* index.flush()
+      })),
+    )
+
+    // Simulate a change while no FileIndex/watch service is alive.
+    await Bun.write(path.join(tmp.path, "a.ts"), "one\ntwo\nthree")
+
+    await Effect.runPromise(
+      withIndex(tmp.path, data.path, Effect.gen(function* () {
+        const index = yield* FileIndex.Service
+        const entries = yield* index.list(rp(""))
+        expect(entries.find((entry) => String(entry.path) === "a.ts")?.lineCount).toBe(3)
+      })),
+    )
+  })
+
+  test("deleting a cached directory purges descendant catalog entries", async () => {
+    await using tmp = await tmpdir({
+      init: async (dir) => {
+        await fs.mkdir(path.join(dir, "src/deep"), { recursive: true })
+        await Bun.write(path.join(dir, "src/deep/leaf.ts"), "leaf")
+      },
+    })
+    await using data = await tmpdir()
+
+    await Effect.runPromise(
+      withIndex(tmp.path, data.path, Effect.gen(function* () {
+        const index = yield* FileIndex.Service
+        yield* index.list(rp(""))
+        yield* index.list(rp("src"))
+        yield* index.list(rp("src/deep"))
+        expect(index.lookup("src/deep/leaf.ts")).toBeDefined()
+
+        yield* Effect.promise(() => fs.rm(path.join(tmp.path, "src"), { recursive: true, force: true }))
+        yield* index.list(rp(""))
+        expect(index.lookup("src/deep/leaf.ts")).toBeUndefined()
       })),
     )
   })
@@ -226,15 +317,14 @@ describe("FileIndex", () => {
     )
   })
 
-  test("loads a pre-existing index from disk without re-scanning", async () => {
+  test("persisted snapshots never override current disk structure", async () => {
     await using tmp = await tmpdir()
     await using data = await tmpdir()
 
     await Effect.runPromise(
       withIndex(tmp.path, data.path, Effect.gen(function* () {
-        // Write a cache blob manually whose entry does NOT exist on disk. If the
-        // index loads from disk (fresh rootStat), list("") returns the ghost entry
-        // without re-scanning the filesystem.
+        // A persisted cache is only a metadata accelerator. Structural truth is
+        // verified by readdir on every list, so an offline delete cannot survive.
         const stat = yield* Effect.promise(() => fs.stat(tmp.path))
         const blob = IndexSerialization.encode({
           schemaVersion: 1,
@@ -250,7 +340,7 @@ describe("FileIndex", () => {
 
         const index = yield* FileIndex.Service
         const entries = yield* index.list(rp(""))
-        expect(paths(entries)).toContain("ghost.txt")
+        expect(paths(entries)).not.toContain("ghost.txt")
       })),
     )
   })

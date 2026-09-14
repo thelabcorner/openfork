@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Duration, Effect, Exit, Fiber, Scope, Stream } from "effect"
+import { Deferred, Duration, Effect, Exit, Fiber, Scope, Stream } from "effect"
 import * as TestClock from "effect/testing/TestClock"
 import { Credential } from "@opencode-ai/core/credential"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
@@ -185,6 +185,65 @@ describe("Integration", () => {
           }),
         }),
       )
+    }),
+  )
+
+  it.effect("coalesces concurrent refreshes of the same OAuth credential", () =>
+    Effect.gen(function* () {
+      const integrations = yield* Integration.Service
+      const credentials = yield* Credential.Service
+      const integrationID = Integration.ID.make("refresh-singleflight")
+      const methodID = Integration.MethodID.make("oauth")
+      const release = yield* Deferred.make<void>()
+      const started = yield* Deferred.make<void>()
+      let refreshes = 0
+
+      yield* integrations.transform((editor) =>
+        editor.method.update({
+          integrationID,
+          method: { id: methodID, type: "oauth", label: "OAuth" },
+          authorize: () => Effect.die("unused"),
+          refresh: (credential) =>
+            Effect.gen(function* () {
+              refreshes++
+              yield* Deferred.succeed(started, undefined)
+              yield* Deferred.await(release)
+              return Credential.OAuth.make({
+                ...credential,
+                access: "refreshed-access",
+                refresh: "refreshed-token",
+                expires: Number.MAX_SAFE_INTEGER,
+              })
+            }),
+        }),
+      )
+      yield* credentials.add({
+        integrationID,
+        label: "shared",
+        value: Credential.OAuth.make({
+          type: "oauth",
+          methodID,
+          access: "expired-access",
+          refresh: "expired-token",
+          expires: 1,
+        }),
+      })
+      const connection = yield* integrations.connection.active(integrationID)
+      if (!connection || connection.type !== "credential") return yield* Effect.die("credential connection not found")
+
+      const resolved = yield* Effect.all(
+        Array.from({ length: 6 }, () => integrations.connection.resolve(connection)),
+        { concurrency: "unbounded" },
+      ).pipe(Effect.forkScoped)
+      yield* Deferred.await(started)
+      yield* Effect.yieldNow
+      expect(refreshes).toBe(1)
+      yield* Deferred.succeed(release, undefined)
+
+      const values = yield* Fiber.join(resolved)
+      expect(refreshes).toBe(1)
+      expect(values).toHaveLength(6)
+      expect(values.every((value) => value?.type === "oauth" && value.access === "refreshed-access")).toBe(true)
     }),
   )
 

@@ -3,7 +3,7 @@ export * as EventV2 from "./event"
 import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
-import { and, asc, eq, gt, inArray } from "drizzle-orm"
+import { and, asc, eq, gt, inArray, lt } from "drizzle-orm"
 import { Database } from "./database/database"
 import type { DatabaseShape } from "./database/database"
 import {
@@ -16,10 +16,17 @@ import {
   decodeV5Correction,
   applyV5Correction,
   decodeValueBytesRaw,
+  preencodeJson,
+  preencodedJsonText,
 } from "./database/json-codec"
 import { decompressValueAsync } from "./database/decompress-pool"
-import { EventSequenceTable, EventTable } from "./event/sql"
-import { EventValueTable } from "./event/sql"
+import {
+  EventPayloadChunkTable,
+  EventPayloadMetaTable,
+  EventSequenceTable,
+  EventTable,
+  EventValueTable,
+} from "./event/sql"
 import { Flag } from "./flag/flag"
 import { EventTrace } from "./event-trace"
 import { Location } from "./location"
@@ -32,6 +39,7 @@ import { indexSemanticEvent } from "./database/chunk-semantic"
 import { isCompactedSequence, loadCompaction, recordCompactedSequences } from "./database/chunk-compaction"
 
 const streamingDecoder = new TextDecoder()
+type DatabaseReader = Pick<DatabaseShape, "select">
 
 export const ID = Event.ID
 export type ID = import("@opencode-ai/schema/event").ID
@@ -41,7 +49,7 @@ export type Subscriber<D extends Definition = Definition> = (event: Payload<D>) 
 export type Unsubscribe = Effect.Effect<void>
 
 export const latestSequence = Effect.fn("EventV2.latestSequence")(function* (
-  db: Database.Interface["db"],
+  db: DatabaseReader,
   aggregateID: string,
 ) {
   const row = yield* db
@@ -82,7 +90,30 @@ export class CdbRehydrateError extends Schema.TaggedErrorClass<CdbRehydrateError
   reason: Schema.String,
 }) {}
 
+export class EventPayloadRehydrateError extends Schema.TaggedErrorClass<EventPayloadRehydrateError>()(
+  "EventV2.EventPayloadRehydrateError",
+  {
+    payloadID: Schema.String,
+    reason: Schema.String,
+  },
+) {}
+
 const CDB_REF = "$cdbRef"
+const EVENT_PAYLOAD_REF = "$eventPayload"
+// Bound each implicit SQLite writer transaction to at most ~768 KiB even for
+// three-byte UTF-8 BMP code points. ASCII/base64 payloads are exactly 256 KiB.
+// A trailing high surrogate is carried into the next chunk so round-trip UTF-8
+// encoding never substitutes U+FFFD at a chunk boundary.
+const EVENT_PAYLOAD_CHUNK_CHARS = 256 * 1024
+const EVENT_PAYLOAD_ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000
+const EVENT_PAYLOAD_STARTUP_CLEANUP_LIMIT = 8
+
+type EventPayloadRef = {
+  readonly [EVENT_PAYLOAD_REF]: {
+    readonly id: string
+    readonly count: number
+  }
+}
 
 /**
  * A promoted reference is EXACTLY `{"$cdbRef": "<value_id>"}` — a sole-key JSON
@@ -96,6 +127,134 @@ function isCdbRef(data: unknown): data is { readonly [CDB_REF]: string } {
   if (Object.keys(record).length !== 1) return false
   return typeof record[CDB_REF] === "string"
 }
+
+function isEventPayloadRef(data: unknown): data is EventPayloadRef {
+  if (typeof data !== "object" || data === null || Array.isArray(data)) return false
+  const record = data as Record<string, unknown>
+  if (Object.keys(record).length !== 1) return false
+  const ref = record[EVENT_PAYLOAD_REF]
+  if (typeof ref !== "object" || ref === null || Array.isArray(ref)) return false
+  const value = ref as Record<string, unknown>
+  return typeof value.id === "string" && Number.isSafeInteger(value.count) && Number(value.count) > 0
+}
+
+function payloadChunkEnd(text: string, start: number) {
+  let end = Math.min(text.length, start + EVENT_PAYLOAD_CHUNK_CHARS)
+  if (end < text.length) {
+    const tail = text.charCodeAt(end - 1)
+    if (tail >= 0xd800 && tail <= 0xdbff) end -= 1
+  }
+  return end
+}
+
+/**
+ * Stage an oversized canonical event body in short, independently committed
+ * chunks. The semantic event is still committed atomically later; these rows
+ * are unreachable until its tiny content-addressed reference is inserted.
+ */
+const stageEventPayload = Effect.fnUntraced(function* (db: DatabaseShape, text: string) {
+  if (text.length <= EVENT_PAYLOAD_CHUNK_CHARS) return undefined
+
+  const chunks: string[] = []
+  const hash = createHash("sha256")
+  for (let start = 0; start < text.length; ) {
+    const end = payloadChunkEnd(text, start)
+    const chunk = text.slice(start, end)
+    chunks.push(chunk)
+    hash.update(chunk, "utf8")
+    start = end
+    // Hashing/slicing a very large payload must not itself become one long JS
+    // turn before the cooperative SQLite phase even starts.
+    if (chunks.length % 8 === 0 && start < text.length) yield* Effect.yieldNow
+  }
+  const payloadID = hash.digest("hex")
+  const touched = Date.now()
+
+  // Publish-independent staging is intentionally allowed, so record a tiny
+  // zero-ref lifecycle row first. If the process dies before the semantic
+  // event commits, a later startup can distinguish this orphan from a payload
+  // referenced by one or more durable events without scanning the event log.
+  yield* db
+    .insert(EventPayloadMetaTable)
+    .values({ payload_id: payloadID, chunk_count: chunks.length, refs: 0, time_touched: touched })
+    .onConflictDoUpdate({
+      target: EventPayloadMetaTable.payload_id,
+      set: { time_touched: touched },
+    })
+    .run()
+    .pipe(Effect.orDie)
+
+  // Identical jumbo payloads are naturally deduplicated. Count first so a
+  // fully staged prior value avoids all writer work; a partial crash residue is
+  // repaired by the idempotent inserts below.
+  const existing = yield* db
+    .select({ count: EventPayloadChunkTable.chunk_index })
+    .from(EventPayloadChunkTable)
+    .where(eq(EventPayloadChunkTable.payload_id, payloadID))
+    .all()
+    .pipe(Effect.orDie)
+  if (existing.length !== chunks.length) {
+    const created = Date.now()
+    for (let index = 0; index < chunks.length; index++) {
+      yield* db
+        .insert(EventPayloadChunkTable)
+        .values({ payload_id: payloadID, chunk_index: index, text: chunks[index]!, time_created: created })
+        .onConflictDoNothing()
+        .run()
+        .pipe(Effect.orDie)
+      // Release both the native connection permit and the Effect scheduler
+      // between bounded writes so another Session's tiny durable commit can run.
+      if (index + 1 < chunks.length) yield* Effect.yieldNow
+    }
+  }
+
+  return { [EVENT_PAYLOAD_REF]: { id: payloadID, count: chunks.length } } satisfies EventPayloadRef
+})
+
+/**
+ * Reclaim crash residue from prior processes. This runs while the EventV2
+ * service is still constructing, before this process can publish anything.
+ * A 24-hour grace window protects payloads another process may be staging; the
+ * candidate is rechecked under IMMEDIATE writer ownership before deletion.
+ */
+const cleanupOrphanedEventPayloads = Effect.fnUntraced(function* (db: DatabaseShape) {
+  const cutoff = Date.now() - EVENT_PAYLOAD_ORPHAN_GRACE_MS
+  const candidates = yield* db
+    .select({ payloadID: EventPayloadMetaTable.payload_id })
+    .from(EventPayloadMetaTable)
+    .where(and(eq(EventPayloadMetaTable.refs, 0), lt(EventPayloadMetaTable.time_touched, cutoff)))
+    .limit(EVENT_PAYLOAD_STARTUP_CLEANUP_LIMIT)
+    .all()
+    .pipe(Effect.orDie)
+
+  for (const candidate of candidates) {
+    yield* db
+      .transaction(
+        () =>
+          Effect.gen(function* () {
+            const meta = yield* db
+              .select({ refs: EventPayloadMetaTable.refs, touched: EventPayloadMetaTable.time_touched })
+              .from(EventPayloadMetaTable)
+              .where(eq(EventPayloadMetaTable.payload_id, candidate.payloadID))
+              .get()
+              .pipe(Effect.orDie)
+            if (!meta || meta.refs !== 0 || meta.touched >= cutoff) return
+            yield* db
+              .delete(EventPayloadChunkTable)
+              .where(eq(EventPayloadChunkTable.payload_id, candidate.payloadID))
+              .run()
+              .pipe(Effect.orDie)
+            yield* db
+              .delete(EventPayloadMetaTable)
+              .where(eq(EventPayloadMetaTable.payload_id, candidate.payloadID))
+              .run()
+              .pipe(Effect.orDie)
+          }),
+        { behavior: "immediate" },
+      )
+      .pipe(Effect.orDie)
+  }
+})
 
 /**
  * Epoch-3 HOT-VALUE rehydration cache: a per-database, size-bounded,
@@ -212,7 +371,7 @@ export const rehydrateCacheStats = (db: object) => {
  * - Cached per-db (refs-weighted) like the event.data path.
  */
 export const resolveCdbRef = Effect.fn("EventV2.resolveCdbRef")(function* (
-  db: DatabaseShape,
+  db: DatabaseReader,
   aggregateID: string,
   valueID: string,
   opts?: { readonly failSoft?: boolean },
@@ -301,7 +460,7 @@ export const resolveCdbRef = Effect.fn("EventV2.resolveCdbRef")(function* (
  *   so the caller regenerates from event history instead of throwing.
  */
 export const resolveProjectionRef = Effect.fn("EventV2.resolveProjectionRef")(function* (
-  db: DatabaseShape,
+  db: DatabaseReader,
   aggregateID: string,
   column: "session_message.data" | "message.data" | "session.summary_diffs" | "part.data",
   value: unknown,
@@ -418,16 +577,94 @@ export const decodeValueBytesObjectStreaming = (bytes: Uint8Array) =>
  *   fail sha256 validation, throws CdbRehydrateError rather than returning a
  *   fabricated value.
  */
-export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
+const rehydrateStagedEventPayloads = Effect.fnUntraced(function* <
   R extends { readonly data: Record<string, unknown> },
->(db: DatabaseShape, aggregateID: string, rows: ReadonlyArray<R>) {
-  if (!Flag.OPENCODE_SEAL_DEDUP) return rows
-
-  const refs: Array<{ row: R; valueID: string }> = []
+>(db: DatabaseReader, rows: ReadonlyArray<R>) {
+  const refs: Array<{ readonly row: R; readonly ref: EventPayloadRef[typeof EVENT_PAYLOAD_REF] }> = []
   for (const row of rows) {
-    if (isCdbRef(row.data)) refs.push({ row, valueID: row.data[CDB_REF] })
+    if (isEventPayloadRef(row.data)) refs.push({ row, ref: row.data[EVENT_PAYLOAD_REF] })
   }
   if (refs.length === 0) return rows
+
+  const ids = Array.from(new Set(refs.map(({ ref }) => ref.id)))
+  const stored = yield* db
+    .select({
+      payloadID: EventPayloadChunkTable.payload_id,
+      index: EventPayloadChunkTable.chunk_index,
+      text: EventPayloadChunkTable.text,
+    })
+    .from(EventPayloadChunkTable)
+    .where(inArray(EventPayloadChunkTable.payload_id, ids))
+    .orderBy(asc(EventPayloadChunkTable.payload_id), asc(EventPayloadChunkTable.chunk_index))
+    .all()
+    .pipe(Effect.orDie)
+
+  const grouped = Map.groupBy(stored, (chunk) => chunk.payloadID)
+  const resolved = new Map<string, Record<string, unknown>>()
+  let resolvedCount = 0
+  for (const { ref } of refs) {
+    if (resolved.has(ref.id)) continue
+    const chunks = grouped.get(ref.id) ?? []
+    if (chunks.length !== ref.count) {
+      throw new EventPayloadRehydrateError({
+        payloadID: ref.id,
+        reason: `expected ${ref.count} chunks, found ${chunks.length}`,
+      })
+    }
+    const hash = createHash("sha256")
+    const parts: string[] = []
+    for (let index = 0; index < chunks.length; index++) {
+      const chunk = chunks[index]!
+      if (chunk.index !== index) {
+        throw new EventPayloadRehydrateError({
+          payloadID: ref.id,
+          reason: `expected chunk ${index}, found ${chunk.index}`,
+        })
+      }
+      hash.update(chunk.text, "utf8")
+      parts.push(chunk.text)
+      if ((index + 1) % 8 === 0 && index + 1 < chunks.length) yield* Effect.yieldNow
+    }
+    if (hash.digest("hex") !== ref.id) {
+      throw new EventPayloadRehydrateError({ payloadID: ref.id, reason: "sha256 mismatch" })
+    }
+    try {
+      const value = JSON.parse(parts.join(""))
+      if (typeof value !== "object" || value === null || Array.isArray(value)) {
+        throw new Error("event payload is not an object")
+      }
+      resolved.set(ref.id, value as Record<string, unknown>)
+      resolvedCount += 1
+      // Parsing itself is intentionally fail-closed and synchronous, but never
+      // parse several independent jumbo event bodies back-to-back in one
+      // Effect turn. This bounds a cold multi-session replay burst to one JSON
+      // construction before the scheduler can service other Sessions.
+      if (resolvedCount < ids.length) yield* Effect.yieldNow
+    } catch (cause) {
+      if (cause instanceof EventPayloadRehydrateError) throw cause
+      throw new EventPayloadRehydrateError({ payloadID: ref.id, reason: `invalid JSON: ${String(cause)}` })
+    }
+  }
+
+  return rows.map((row) => {
+    if (!isEventPayloadRef(row.data)) return row
+    const value = resolved.get(row.data[EVENT_PAYLOAD_REF].id)
+    if (!value) return row
+    return { ...row, data: value }
+  }) as R[]
+})
+
+export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
+  R extends { readonly data: Record<string, unknown> },
+>(db: DatabaseReader, aggregateID: string, rows: ReadonlyArray<R>) {
+  const source = yield* rehydrateStagedEventPayloads(db, rows)
+  if (!Flag.OPENCODE_SEAL_DEDUP) return source
+
+  const refs: Array<{ row: R; valueID: string }> = []
+  for (const row of source) {
+    if (isCdbRef(row.data)) refs.push({ row, valueID: row.data[CDB_REF] })
+  }
+  if (refs.length === 0) return source
 
   const valueIDs = Array.from(new Set(refs.map((ref) => ref.valueID)))
   const stored = yield* db
@@ -457,7 +694,7 @@ export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
   // underlying buffer to the worker pool more than once, which would detach it).
   const missSet = new Set<string>()
   const resolved = new Map<string, unknown>()
-  for (const row of rows) {
+  for (const row of source) {
     if (!isCdbRef(row.data)) continue
     const valueID = row.data[CDB_REF]
     const cached = cache.get(rehydrateCacheKey(aggregateID, valueID))
@@ -541,7 +778,7 @@ export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
   }
 
   // Splice resolved payloads back into their rows, byte-exact.
-  return rows.map((row) => {
+  return source.map((row) => {
     if (!isCdbRef(row.data)) return row
     const value = resolved.get(row.data[CDB_REF])
     if (value === undefined) return row
@@ -637,6 +874,18 @@ export interface Interface {
   readonly durable: (input: { readonly aggregateID: string; readonly after?: number }) => Stream.Stream<Payload>
   /** @deprecated Use `all()` and consume the returned stream. */
   readonly listen: (listener: Subscriber) => Effect.Effect<Unsubscribe>
+  /**
+   * Subscribe synchronously to one event type at one exact Location. High-rate
+   * location services should prefer this over `listen()` so events from another
+   * project never invoke their callback just to be filtered out.
+   */
+  readonly listenLocation: <D extends Definition>(
+    definition: D,
+    location: Location.Ref,
+    listener: Subscriber<D>,
+  ) => Effect.Effect<Unsubscribe>
+  /** Subscribe synchronously to one durable aggregate without process-global fanout. */
+  readonly listenAggregate: (aggregateID: string, listener: Subscriber) => Effect.Effect<Unsubscribe>
   readonly project: <D extends Definition>(definition: D, projector: Subscriber<D>) => Effect.Effect<void>
   readonly replay: (
     event: SerializedEvent,
@@ -679,8 +928,21 @@ export const makeSubscriberQueue = <A>(capacity: number) =>
  */
 export const makeByteBoundedSubscriberQueue = <A>(options: {
   readonly capacity: number
+  /**
+   * Maximum ordinary backlog bytes, excluding the largest retained frame when
+   * `maxSingleFrameBytes` is supplied. Without `maxSingleFrameBytes` this keeps
+   * the historical total-retained-byte semantics.
+   */
   readonly maxBytes: number
+  /**
+   * Optional independent per-frame ceiling. Transports use this when one
+   * authoritative snapshot is legitimately close to the wire/ring limit: that
+   * frame must not consume the entire ordinary backlog budget by itself.
+   */
+  readonly maxSingleFrameBytes?: number
   readonly sizeOf: (value: A) => number
+  /** Metadata-only label for overflow traces; never return payload content. */
+  readonly typeOf?: (value: A) => string | undefined
 }) =>
   Effect.gen(function* () {
     if (!Number.isSafeInteger(options.capacity) || options.capacity < 1) {
@@ -689,30 +951,85 @@ export const makeByteBoundedSubscriberQueue = <A>(options: {
     if (!Number.isFinite(options.maxBytes) || options.maxBytes <= 0) {
       throw new Error("Subscriber queue byte capacity must be positive")
     }
+    if (
+      options.maxSingleFrameBytes !== undefined &&
+      (!Number.isFinite(options.maxSingleFrameBytes) || options.maxSingleFrameBytes <= 0)
+    ) {
+      throw new Error("Subscriber queue single-frame byte capacity must be positive")
+    }
     const queue = yield* Queue.dropping<A, SubscriberOverflowError>(options.capacity)
     yield* Effect.addFinalizer(() => Queue.shutdown(queue).pipe(Effect.asVoid))
     let failed = false
     let pendingBytes = 0
+    let largestPendingBytes = 0
+    const pendingSizes = new Map<number, number>()
+    const singleFrameLimit = options.maxSingleFrameBytes ?? options.maxBytes
+    const addPendingSize = (size: number) => {
+      pendingSizes.set(size, (pendingSizes.get(size) ?? 0) + 1)
+      if (size > largestPendingBytes) largestPendingBytes = size
+    }
+    const removePendingSize = (size: number) => {
+      const count = pendingSizes.get(size)
+      if (count === undefined) return
+      if (count > 1) pendingSizes.set(size, count - 1)
+      else pendingSizes.delete(size)
+      if (size !== largestPendingBytes || count > 1) return
+      largestPendingBytes = 0
+      for (const retained of pendingSizes.keys()) {
+        if (retained > largestPendingBytes) largestPendingBytes = retained
+      }
+    }
+    const typeOf = (event: A) => {
+      try {
+        const value = options.typeOf?.(event)
+        return value === undefined || value.length === 0 ? "unknown" : value
+      } catch {
+        return "unknown"
+      }
+    }
     const offer = (event: A) => {
       if (failed) return false
       const rawSize = options.sizeOf(event)
       const size = Number.isFinite(rawSize) ? Math.max(0, rawSize) : Number.POSITIVE_INFINITY
-      if (size > options.maxBytes || pendingBytes > options.maxBytes - size) {
+      const nextPendingBytes = pendingBytes + size
+      const nextLargestBytes = Math.max(largestPendingBytes, size)
+      const nextBacklogBytes =
+        options.maxSingleFrameBytes === undefined ? nextPendingBytes : nextPendingBytes - nextLargestBytes
+      if (size > singleFrameLimit || nextBacklogBytes > options.maxBytes) {
         failed = true
         EventTrace.count("queue.overflow")
-        EventTrace.event({ phase: "queue.overflow", capacity: options.capacity, size })
+        EventTrace.event({
+          phase: "queue.overflow",
+          capacity: options.capacity,
+          size,
+          type: typeOf(event),
+          branch: size > singleFrameLimit ? "oversize" : "backpressure",
+          pendingBytes,
+          largestPendingBytes,
+          backlogBytes: Math.max(0, pendingBytes - largestPendingBytes),
+        })
         Queue.failCauseUnsafe(queue, Cause.fail(new SubscriberOverflowError({ capacity: options.capacity })))
         return false
       }
       if (Queue.offerUnsafe(queue, event)) {
         pendingBytes += size
+        addPendingSize(size)
         EventTrace.count("queue.offered")
         EventTrace.sum("queue.offeredBytes", size)
         return true
       }
       failed = true
       EventTrace.count("queue.overflow")
-      EventTrace.event({ phase: "queue.overflow", capacity: options.capacity, size })
+      EventTrace.event({
+        phase: "queue.overflow",
+        capacity: options.capacity,
+        size,
+        type: typeOf(event),
+        branch: "backpressure",
+        pendingBytes,
+        largestPendingBytes,
+        backlogBytes: Math.max(0, pendingBytes - largestPendingBytes),
+      })
       Queue.failCauseUnsafe(queue, Cause.fail(new SubscriberOverflowError({ capacity: options.capacity })))
       return false
     }
@@ -721,6 +1038,7 @@ export const makeByteBoundedSubscriberQueue = <A>(options: {
         const rawSize = options.sizeOf(event)
         const size = Number.isFinite(rawSize) ? Math.max(0, rawSize) : Number.POSITIVE_INFINITY
         pendingBytes = Math.max(0, pendingBytes - size)
+        removePendingSize(size)
       })
     const take = Queue.take(queue).pipe(Effect.tap(release))
     // Do not expose the raw queue stream: consumers of `stream` do not call
@@ -736,6 +1054,7 @@ export const allBounded = (events: Interface, capacity: number, maxBytes = 8 * 1
       capacity,
       maxBytes,
       sizeOf: estimateEventBytes,
+      typeOf: (event) => event.type,
     })
     const unsubscribe = yield* events.listen((event) => Effect.sync(() => subscriber.offer(event)))
     yield* Effect.addFinalizer(() => unsubscribe)
@@ -758,7 +1077,13 @@ export const layerWith = (options?: LayerOptions) =>
       const projectors = new Map<string, Subscriber[]>()
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
-      const { db } = yield* Database.Service
+      const locatedListeners = new Map<string, Subscriber[]>()
+      const aggregateListeners = new Map<string, Subscriber[]>()
+      const { db, readDb } = yield* Database.Service
+      yield* cleanupOrphanedEventPayloads(db)
+
+      const locatedKey = (type: string, location: Location.Ref) =>
+        `${type}\0${location.directory}\0${location.workspaceID ?? ""}`
 
       const getOrCreate = (definition: Definition) =>
         Effect.gen(function* () {
@@ -813,12 +1138,32 @@ export const layerWith = (options?: LayerOptions) =>
                 )
               }
               const list = projectors.get(event.type) ?? []
+              // Schema encoding can walk/allocate multi-megabyte tool outputs.
+              // It depends only on the immutable event payload, not transaction
+              // state, so doing it after acquiring SQLite's single-connection
+              // semaphore needlessly stalls every unrelated session. Prepare the
+              // canonical row before entering the immediate transaction; keep
+              // projectors + sequence advancement + inserts atomic below.
+              const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<string, unknown>
+              const encodedText = JSON.stringify(encoded)
+              if (encodedText === undefined) return yield* Effect.die("Durable event data could not be JSON encoded")
+              // Jumbo canonical bodies are staged as independently committed,
+              // content-addressed chunks with scheduler yields between writes.
+              // The semantic transaction below then inserts only a tiny ref.
+              // Small events stay inline, but their JSON is still pre-encoded so
+              // Drizzle does not stringify under the global writer permit.
+              const staged = yield* stageEventPayload(db, encodedText)
+              const storedData = staged ? preencodeJson(staged) : preencodedJsonText(encodedText)
+              const sparseCheckpoint = definition.type === Event.Compacted.type
+              const storedType = versionedType(definition.type, durable.version)
+              let transactionStarted = 0
               return yield* Effect.uninterruptible(
                 Effect.gen(function* () {
                   const committed = yield* db
                     .transaction(
                       () =>
                         Effect.gen(function* () {
+                          if (EventTrace.active()) transactionStarted = performance.now()
                           const row = yield* db
                             .select({ seq: EventSequenceTable.seq, ownerID: EventSequenceTable.owner_id })
                             .from(EventSequenceTable)
@@ -826,11 +1171,6 @@ export const layerWith = (options?: LayerOptions) =>
                             .get()
                             .pipe(Effect.orDie)
                           const latest = row?.seq ?? -1
-                          const sparseCheckpoint = definition.type === Event.Compacted.type
-                          const encoded = Schema.encodeUnknownSync(definition.data)(event.data) as Record<
-                            string,
-                            unknown
-                          >
                           if (input?.strictOwner && row?.ownerID && row.ownerID !== input.ownerID) {
                             yield* Effect.die(
                               new InvalidDurableEventError({
@@ -865,7 +1205,7 @@ export const layerWith = (options?: LayerOptions) =>
                               : undefined
                             if (
                               canonicalStored?.id === event.id &&
-                              canonicalStored.type === versionedType(definition.type, durable.version) &&
+                              canonicalStored.type === storedType &&
                               isDeepStrictEqual(canonicalStored.data, encoded)
                             ) {
                               if (input.ownerID && row?.ownerID == null) {
@@ -945,13 +1285,36 @@ export const layerWith = (options?: LayerOptions) =>
                               {
                                 id: event.id,
                                 aggregate_id: aggregateID,
-                                seq,
-                                type: versionedType(definition.type, durable.version),
-                                data: encoded,
-                              },
+                                  seq,
+                                  type: storedType,
+                                  data: storedData as never,
+                                },
                             ])
                             .run()
                             .pipe(Effect.orDie)
+                          if (staged) {
+                            const payloadID = staged[EVENT_PAYLOAD_REF].id
+                            const meta = yield* db
+                              .select({ refs: EventPayloadMetaTable.refs })
+                              .from(EventPayloadMetaTable)
+                              .where(eq(EventPayloadMetaTable.payload_id, payloadID))
+                              .get()
+                              .pipe(Effect.orDie)
+                            if (!meta) {
+                              return yield* Effect.die(
+                                new EventPayloadRehydrateError({
+                                  payloadID,
+                                  reason: "staged payload metadata disappeared before event commit",
+                                }),
+                              )
+                            }
+                            yield* db
+                              .update(EventPayloadMetaTable)
+                              .set({ refs: meta.refs + 1, time_touched: Date.now() })
+                              .where(eq(EventPayloadMetaTable.payload_id, payloadID))
+                              .run()
+                              .pipe(Effect.orDie)
+                          }
                           if (Flag.OPENCODE_SEAL_PRUNE) {
                             yield* indexSemanticEvent(db, {
                               aggregateID,
@@ -965,6 +1328,11 @@ export const layerWith = (options?: LayerOptions) =>
                       { behavior: "immediate" },
                     )
                     .pipe(Effect.orDie)
+                  if (transactionStarted > 0) {
+                    const elapsed = performance.now() - transactionStarted
+                    EventTrace.timing("durable.transaction", elapsed)
+                    EventTrace.timing(`durable.transaction.${definition.type}`, elapsed)
+                  }
                   if (committed) {
                     yield* Effect.forEach(
                       pubsub.durable.get(committed.aggregateID) ?? [],
@@ -1009,7 +1377,19 @@ export const layerWith = (options?: LayerOptions) =>
         })
       }
 
-      const observe = (event: Payload, observer: (event: Payload) => Effect.Effect<void>) =>
+      const removeFrom = (registry: Map<string, Subscriber[]>, key: string, observer: Subscriber) => {
+        const current = registry.get(key)
+        if (!current) return
+        const index = current.indexOf(observer)
+        if (index >= 0) current.splice(index, 1)
+        if (current.length === 0) registry.delete(key)
+      }
+
+      const observe = (
+        event: Payload,
+        observer: (event: Payload) => Effect.Effect<void>,
+        detach: () => void,
+      ) =>
         Effect.suspend(() => observer(event)).pipe(
           Effect.catchCauseIf(
             (cause) => !Cause.hasInterrupts(cause),
@@ -1019,8 +1399,7 @@ export const layerWith = (options?: LayerOptions) =>
                 // for every subsequent token. Detach it after the first
                 // failure; interruption remains observable and is not treated
                 // as a subscriber defect.
-                const index = listeners.indexOf(observer)
-                if (index >= 0) listeners.splice(index, 1)
+                detach()
               }).pipe(
                 Effect.andThen(
                   Effect.logError("Event listener failed", { eventID: event.id, eventType: event.type, cause }),
@@ -1039,7 +1418,10 @@ export const layerWith = (options?: LayerOptions) =>
             // A live subscriber is outside the transaction boundary. Keep the
             // hot path inline, but still contain defects so a renderer/socket
             // listener can never make the producer's publish fail.
-            yield* observe(event, listener)
+            yield* observe(event, listener, () => {
+              const index = listeners.indexOf(listener)
+              if (index >= 0) listeners.splice(index, 1)
+            })
           } else if (listeners.length > 1) {
             const snapshot = listeners.slice()
             if (!isolateListeners) {
@@ -1047,14 +1429,65 @@ export const layerWith = (options?: LayerOptions) =>
               // filter + Queue.offerUnsafe fan-out. Running them sequentially
               // preserves publish order and avoids spawning fibers per event;
               // `observe` contains a bad subscriber without forking a fiber.
-              for (const listener of snapshot) yield* observe(event, listener)
+              for (const listener of snapshot)
+                yield* observe(event, listener, () => {
+                  const index = listeners.indexOf(listener)
+                  if (index >= 0) listeners.splice(index, 1)
+                })
             } else {
               // Durable path: isolate listener failures so one bad subscriber
               // cannot fail the publish, with bounded parallelism.
-              yield* Effect.forEach(snapshot, (listener) => observe(event, listener), {
-                concurrency: 8,
-                discard: true,
-              })
+              yield* Effect.forEach(
+                snapshot,
+                (listener) =>
+                  observe(event, listener, () => {
+                    const index = listeners.indexOf(listener)
+                    if (index >= 0) listeners.splice(index, 1)
+                  }),
+                {
+                  concurrency: 8,
+                  discard: true,
+                },
+              )
+            }
+          }
+          if (event.location) {
+            const key = locatedKey(event.type, event.location)
+            const located = locatedListeners.get(key)
+            if (located?.length === 1) {
+              const listener = located[0]!
+              yield* observe(event, listener, () => removeFrom(locatedListeners, key, listener))
+            } else if (located && located.length > 1) {
+              // Location-local callbacks are already a narrow set (normally
+              // the filesystem index/search services for one project). Retain
+              // ordering for live watcher traffic and isolate durable defects
+              // consistently with process-global listeners.
+              const snapshot = located.slice()
+              if (!isolateListeners) {
+                for (const listener of snapshot)
+                  yield* observe(event, listener, () => removeFrom(locatedListeners, key, listener))
+              } else {
+                yield* Effect.forEach(
+                  snapshot,
+                  (listener) => observe(event, listener, () => removeFrom(locatedListeners, key, listener)),
+                  { concurrency: 8, discard: true },
+                )
+              }
+            }
+          }
+          if (event.durable) {
+            const key = event.durable.aggregateID
+            const aggregate = aggregateListeners.get(key)
+            if (aggregate?.length === 1) {
+              const listener = aggregate[0]!
+              yield* observe(event, listener, () => removeFrom(aggregateListeners, key, listener))
+            } else if (aggregate && aggregate.length > 1) {
+              const snapshot = aggregate.slice()
+              yield* Effect.forEach(
+                snapshot,
+                (listener) => observe(event, listener, () => removeFrom(aggregateListeners, key, listener)),
+                { concurrency: 8, discard: true },
+              )
             }
           }
           const typed = pubsub.typed.get(event.type)
@@ -1160,11 +1593,40 @@ export const layerWith = (options?: LayerOptions) =>
 
       function remove(aggregateID: string) {
         return db
-          .transaction(() =>
+          .transaction(
+            () =>
             Effect.gen(function* () {
+              const payloadRows = yield* db
+                .select({ data: EventTable.data })
+                .from(EventTable)
+                .where(eq(EventTable.aggregate_id, aggregateID))
+                .all()
+                .pipe(Effect.orDie)
+              const payloadRefs = new Map<string, number>()
+              for (const row of payloadRows) {
+                if (!isEventPayloadRef(row.data)) continue
+                const payloadID = row.data[EVENT_PAYLOAD_REF].id
+                payloadRefs.set(payloadID, (payloadRefs.get(payloadID) ?? 0) + 1)
+              }
               yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
               yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
+              for (const [payloadID, count] of payloadRefs) {
+                const meta = yield* db
+                  .select({ refs: EventPayloadMetaTable.refs })
+                  .from(EventPayloadMetaTable)
+                  .where(eq(EventPayloadMetaTable.payload_id, payloadID))
+                  .get()
+                  .pipe(Effect.orDie)
+                if (!meta) continue
+                yield* db
+                  .update(EventPayloadMetaTable)
+                  .set({ refs: Math.max(0, meta.refs - count), time_touched: Date.now() })
+                  .where(eq(EventPayloadMetaTable.payload_id, payloadID))
+                  .run()
+                  .pipe(Effect.orDie)
+              }
             }),
+            { behavior: "immediate" },
           )
           .pipe(Effect.orDie)
       }
@@ -1189,7 +1651,7 @@ export const layerWith = (options?: LayerOptions) =>
       const readAfter = (aggregateID: string, after: number) =>
         (options?.beforeAggregateRead?.(aggregateID) ?? Effect.void).pipe(
           Effect.andThen(
-            db
+            readDb
               .select()
               .from(EventTable)
               .where(and(eq(EventTable.aggregate_id, aggregateID), gt(EventTable.seq, after)))
@@ -1198,7 +1660,7 @@ export const layerWith = (options?: LayerOptions) =>
               .all(),
           ),
           Effect.orDie,
-          Effect.flatMap((rows) => rehydrateEvents(db, aggregateID, rows)),
+          Effect.flatMap((rows) => rehydrateEvents(readDb, aggregateID, rows)),
           Effect.map((rows) =>
             rows.map((event) =>
               decodeSerializedEvent({
@@ -1270,6 +1732,34 @@ export const layerWith = (options?: LayerOptions) =>
           })
         })
 
+      const listenLocation = <D extends Definition>(
+        definition: D,
+        location: Location.Ref,
+        listener: Subscriber<D>,
+      ): Effect.Effect<Unsubscribe> =>
+        Effect.sync(() => {
+          const key = locatedKey(definition.type, location)
+          const list = locatedListeners.get(key) ?? []
+          const subscriber = listener as Subscriber
+          list.push(subscriber)
+          locatedListeners.set(key, list)
+          return Effect.sync(() => {
+            const current = locatedListeners.get(key)
+            if (!current) return
+            const index = current.indexOf(subscriber)
+            if (index >= 0) current.splice(index, 1)
+            if (current.length === 0) locatedListeners.delete(key)
+          })
+        })
+
+      const listenAggregate = (aggregateID: string, listener: Subscriber): Effect.Effect<Unsubscribe> =>
+        Effect.sync(() => {
+          const list = aggregateListeners.get(aggregateID) ?? []
+          list.push(listener)
+          aggregateListeners.set(aggregateID, list)
+          return Effect.sync(() => removeFrom(aggregateListeners, aggregateID, listener))
+        })
+
       const project = <D extends Definition>(definition: D, projector: Subscriber<D>): Effect.Effect<void> =>
         Effect.sync(() => {
           const list = projectors.get(definition.type) ?? []
@@ -1283,6 +1773,8 @@ export const layerWith = (options?: LayerOptions) =>
         all: streamAll,
         durable,
         listen,
+        listenLocation,
+        listenAggregate,
         project,
         replay,
         replayAll,

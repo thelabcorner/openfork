@@ -1,12 +1,13 @@
 export * as SessionStore from "./store"
 
 import { eq } from "drizzle-orm"
-import { Context, Effect, Layer, Schema } from "effect"
+import { Context, Effect, Layer } from "effect"
 import { Database } from "../database/database"
 import { makeGlobalNode } from "../effect/app-node"
 import { SessionHistory } from "./history"
 import { MessageDecodeError } from "./error"
 import { SessionMessage } from "./message"
+import { SessionMessageProjection } from "./message-projection"
 import { SessionSchema } from "./schema"
 import { SessionMessageTable, SessionTable } from "./sql"
 import { fromRow } from "./info"
@@ -29,9 +30,11 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db } = yield* Database.Service
-    const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
-
+    // SessionStore is the read-side facade used by UI consumers and runner
+    // startup. Use the dedicated WAL reader so a durable projection transaction
+    // in another Session cannot head-of-line block these lookups on the primary
+    // connection's single permit.
+    const { readDb: db } = yield* Database.Service
     return Service.of({
       get: Effect.fn("SessionStore.get")(function* (sessionID) {
         const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, sessionID)).get().pipe(Effect.orDie)
@@ -53,10 +56,9 @@ const layer = Layer.effect(
           .get()
           .pipe(Effect.orDie)
         if (!row) return undefined
-        const data = yield* resolveProjectionRef(db, row.session_id, "session_message.data", row.data)
         return {
           sessionID: SessionSchema.ID.make(row.session_id),
-          message: yield* decodeMessage({ ...data, id: row.id, type: row.type }).pipe(Effect.orDie),
+          message: yield* SessionMessageProjection.decodeRow(db, row).pipe(Effect.orDie),
         }
       }),
     })

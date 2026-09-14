@@ -2,15 +2,18 @@ import { describe, expect } from "bun:test"
 import { $ } from "bun"
 import fs from "fs/promises"
 import path from "path"
-import { Effect } from "effect"
+import { Effect, Fiber, Layer } from "effect"
+import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Git } from "@opencode-ai/core/git"
+import { AppProcess } from "@opencode-ai/core/process"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
 import { branch, commit, gitRemote } from "./fixture/git"
 import { tmpdir } from "./fixture/tmpdir"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(LayerNode.compile(Git.node))
+const bare = testEffect(Layer.empty)
 
 describe("Git", () => {
   it.live("clones a remote and reads checkout metadata", () =>
@@ -161,4 +164,106 @@ describe("Git trees", () => {
       expect(yield* read(path.join(root.path, "outside.txt"))).toBe("changed outside\n")
     }),
   )
+
+  bare.live("coalesces concurrent identical captures into one write-tree", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (root) => {
+        const writes: string[] = []
+        return Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await initRepo(root.path)
+            await fs.writeFile(path.join(root.path, "tracked.txt"), "one\n")
+            await $`git add .`.cwd(root.path).quiet()
+            await $`git commit -m initial`.cwd(root.path).quiet()
+            await fs.writeFile(path.join(root.path, "tracked.txt"), "two\n")
+          })
+
+          const git = yield* Git.Service
+          const source = yield* git.repo.discover(AbsolutePath.make(root.path))
+          if (!source) throw new Error("Repository not found")
+          const repository = yield* git.repo.create({
+            worktree: source.worktree,
+            gitDirectory: AbsolutePath.make(path.join(root.path, ".snapshot")),
+            seed: source,
+          })
+          writes.length = 0
+          const input = {
+            repository,
+            scopes: [RelativePath.make(".")],
+            ignores: source,
+            maximumUntrackedFileBytes: 2 * 1024 * 1024,
+          }
+          const trees = yield* Effect.all(Array.from({ length: 6 }, () => git.tree.capture(input)), {
+            concurrency: "unbounded",
+          })
+          expect(new Set(trees).size).toBe(1)
+          expect(writes).toHaveLength(1)
+        }).pipe(Effect.provide(spiedGitLayer(writes)))
+      },
+      (root) => Effect.promise(() => root[Symbol.asyncDispose]()),
+    ),
+  )
+
+  bare.live("keeps a shared capture alive when one waiter is interrupted", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (root) => {
+        const writes: string[] = []
+        return Effect.gen(function* () {
+          yield* Effect.promise(async () => {
+            await initRepo(root.path)
+            await fs.writeFile(path.join(root.path, "tracked.txt"), "one\n")
+            await $`git add .`.cwd(root.path).quiet()
+            await $`git commit -m initial`.cwd(root.path).quiet()
+            await fs.writeFile(path.join(root.path, "tracked.txt"), "two\n")
+          })
+
+          const git = yield* Git.Service
+          const source = yield* git.repo.discover(AbsolutePath.make(root.path))
+          if (!source) throw new Error("Repository not found")
+          const repository = yield* git.repo.create({
+            worktree: source.worktree,
+            gitDirectory: AbsolutePath.make(path.join(root.path, ".snapshot")),
+            seed: source,
+          })
+          writes.length = 0
+          const capture = git.tree.capture({
+            repository,
+            scopes: [RelativePath.make(".")],
+            ignores: source,
+            maximumUntrackedFileBytes: 2 * 1024 * 1024,
+          })
+          const first = yield* capture.pipe(Effect.forkChild)
+          const second = yield* capture.pipe(Effect.forkChild)
+          // Both callers have a full scheduler turn to join the 10ms admission
+          // window before one waiter is cancelled.
+          yield* Effect.sleep("1 millis")
+          yield* Fiber.interrupt(first)
+          expect(yield* Fiber.join(second)).toBeString()
+          expect(writes).toHaveLength(1)
+        }).pipe(Effect.provide(spiedGitLayer(writes)))
+      },
+      (root) => Effect.promise(() => root[Symbol.asyncDispose]()),
+    ),
+  )
 })
+
+function spiedGitLayer(writes: string[]) {
+  const process = Layer.effect(
+    AppProcess.Service,
+    Effect.gen(function* () {
+      const base = yield* AppProcess.Service
+      return AppProcess.Service.of({
+        ...base,
+        run: (command, options) => {
+          if (command._tag === "StandardCommand" && command.command === "git" && command.args.includes("write-tree")) {
+            writes.push(command.args.join(" "))
+          }
+          return base.run(command, options)
+        },
+      })
+    }),
+  ).pipe(Layer.provide(LayerNode.compile(AppProcess.node)))
+  return AppNodeBuilder.build(Git.node, [[AppProcess.node, process]])
+}

@@ -106,6 +106,65 @@ export function mergeEventDeltas<T extends EventEnvelope>(previous: T, next: T):
   return { ...next, properties: data } as T
 }
 
+export type EventAccumulator<T> = {
+  /** Return private state when this event can use the accumulator fast path. */
+  readonly create: (event: T) => object | undefined
+  /** Add one same-key event. False makes the current entry a barrier/flush. */
+  readonly push: (state: object, event: T) => boolean
+  /** Materialize private state into an ordinary event immediately before delivery. */
+  readonly finalize: (state: object, event: T) => T
+}
+
+/**
+ * Fragment accumulator for use *inside* createEventCoalescer.
+ *
+ * Unlike a stateful merge callback, this never has to manufacture an
+ * intermediate event object. The coalescer keeps the newest envelope as the
+ * carrier while this state retains only fragment strings and their total
+ * length. Hot-path work is therefore O(1) per fragment, and the accumulated
+ * string plus one envelope clone are materialized exactly once at delivery.
+ */
+export function createEventDeltaAccumulator<T extends EventEnvelope>(): EventAccumulator<T> {
+  type State = { readonly descriptor: DeltaDescriptor; readonly fragments: string[]; length: number }
+
+  const replaceFragment = (event: T, descriptor: DeltaDescriptor, fragment: string): T => {
+    const source = dataOf(event)
+    if (!source) return event
+    const data = { ...source, [descriptor.field]: fragment }
+    if ("data" in event && event.data !== undefined) return { ...event, data } as T
+    return { ...event, properties: data } as T
+  }
+
+  return {
+    create(event) {
+      const descriptor = DELTAS.get(event.type)
+      const data = descriptor && dataOf(event)
+      if (!descriptor || !data) return undefined
+      const fragment = data[descriptor.field]
+      if (typeof fragment !== "string") return undefined
+      return { descriptor, fragments: [fragment], length: fragment.length } satisfies State
+    },
+    push(value, event) {
+      const state = value as State
+      if (DELTAS.get(event.type) !== state.descriptor) return false
+      const data = dataOf(event)
+      const fragment = data?.[state.descriptor.field]
+      if (typeof fragment !== "string") return false
+      if (state.length + fragment.length > MAX_DELTA_CHARS) return false
+      state.fragments.push(fragment)
+      state.length += fragment.length
+      return true
+    },
+    finalize(value, event) {
+      const state = value as State
+      // A one-fragment entry was never coalesced; preserve object identity and
+      // avoid an unnecessary envelope/data clone.
+      if (state.fragments.length === 1) return event
+      return replaceFragment(event, state.descriptor, state.fragments.join(""))
+    },
+  }
+}
+
 export type EventCoalescer<T> = {
   offer: (event: T) => void
   flush: () => void
@@ -117,6 +176,17 @@ export type EventCoalescer<T> = {
    * order and this tracks delivered count semantics instead.
    */
   readonly ackWatermark: number | undefined
+}
+
+type EventCoalescerOptions<T> = {
+  readonly keyOf: (event: T) => string | undefined
+  readonly merge: (previous: T, next: T) => T | undefined
+  /** Optional internal state path that avoids constructing intermediate merged events. */
+  readonly accumulator?: EventAccumulator<T>
+  readonly orderBy?: (event: T) => number
+  readonly withOrder?: (event: T, order: number) => T
+  readonly flushMs?: number
+  readonly maxPendingKeys?: number
 }
 
 /**
@@ -133,27 +203,13 @@ export type EventCoalescer<T> = {
  */
 export function createEventCoalescer<T>(
   offer: (event: T) => boolean | void,
-  options: {
-    readonly keyOf: (event: T) => string | undefined
-    readonly merge: (previous: T, next: T) => T | undefined
-    /** Optional wire-order key for transports that attach monotonic cursors. */
-    readonly orderBy?: (event: T) => number
-    /**
-     * Rewrite the cursor field of a frame before delivery. Defaults to
-     * overriding `sequence`, the cursor field every current SSE handler reads
-     * when it stamps the SSE `id`. A transport that names its cursor field
-     * differently must supply this or it silently loses watermark stamping.
-     */
-    readonly withOrder?: (event: T, order: number) => T
-    readonly flushMs?: number
-    readonly maxPendingKeys?: number
-  },
+  options: EventCoalescerOptions<T>,
 ): EventCoalescer<T> {
   const flushMs = options.flushMs ?? DEFAULT_FLUSH_MS
   const maxPendingKeys = options.maxPendingKeys ?? DEFAULT_MAX_PENDING_KEYS
   const orderBy = options.orderBy
   /** A retained key plus the inclusive order range its value covers. */
-  type Entry = { min: number; max: number; event: T }
+  type Entry = { min: number; max: number; event: T; accumulator?: object }
   let pending = new Map<string, Entry>()
   let timer: ReturnType<typeof setTimeout> | undefined
   let disposed = false
@@ -195,9 +251,13 @@ export function createEventCoalescer<T>(
     if (disposed || pending.size === 0) return
     const entries = [...pending.values()]
     pending = new Map()
+    const materialize = (entry: Entry) =>
+      entry.accumulator && options.accumulator
+        ? options.accumulator.finalize(entry.accumulator, entry.event)
+        : entry.event
     if (!orderBy) {
       for (const entry of entries) {
-        if (!deliver(entry.event)) break
+        if (!deliver(materialize(entry))) break
       }
       return
     }
@@ -206,14 +266,24 @@ export function createEventCoalescer<T>(
     // input that is delivered *at that moment*. Everything not yet handed to
     // `offer` is still in `remaining`, so the oldest undelivered order is the
     // minimum `min` over it; the prefix strictly below that is complete.
-    const remaining = entries.slice()
-    while (remaining.length > 0) {
-      const entry = remaining.shift()!
+    // Precompute the oldest retained order in each suffix. The previous loop
+    // used `shift()` plus `Math.min(...remaining.map(...))` for every delivered
+    // key, making one 256-key flush O(K²) allocations/scans. Under many
+    // concurrent sessions that work runs every ~16ms. The watermark only needs
+    // the minimum `min` in the *remaining suffix*, which is an O(K) reverse
+    // fold after the existing O(K log K) sort.
+    const suffixMin = new Array<number>(entries.length + 1)
+    suffixMin[entries.length] = Number.POSITIVE_INFINITY
+    for (let index = entries.length - 1; index >= 0; index--) {
+      suffixMin[index] = Math.min(entries[index]!.min, suffixMin[index + 1]!)
+    }
+    for (let index = 0; index < entries.length; index++) {
+      const entry = entries[index]!
       const own = entry.max
       highest = highest === undefined ? own : Math.max(highest, own)
-      const base = remaining.length === 0 ? highest : Math.min(...remaining.map((item) => item.min)) - 1
+      const base = index === entries.length - 1 ? highest : suffixMin[index + 1]! - 1
       const ack = watermark === undefined ? base : Math.max(watermark, base)
-      if (!deliver(entry.event, ack, own)) break
+      if (!deliver(materialize(entry), ack, own)) break
     }
   }
 
@@ -236,18 +306,35 @@ export function createEventCoalescer<T>(
 
     const previous = pending.get(key)
     if (previous !== undefined) {
-      const merged = options.merge(previous.event, event)
-      if (merged !== undefined) {
-        pending.set(key, { min: previous.min, max: order ?? previous.max, event: merged })
-        arm()
-        return
+      if (previous.accumulator && options.accumulator) {
+        if (options.accumulator.push(previous.accumulator, event)) {
+          pending.set(key, { ...previous, max: order ?? previous.max, event })
+          arm()
+          return
+        }
+        // The accumulator already represents more logical content than
+        // previous.event's carrier fragment, so falling back to merge() here
+        // would lose data. Flush the complete entry before starting a new one.
+        flush()
+      } else {
+        const merged = options.merge(previous.event, event)
+        if (merged !== undefined) {
+          pending.set(key, { min: previous.min, max: order ?? previous.max, event: merged })
+          arm()
+          return
+        }
+        // A size cap or a non-mergeable replacement is an ordering barrier for
+        // this key. Flush all keys before retaining the new fragment.
+        flush()
       }
-      // A size cap or a non-mergeable replacement is an ordering barrier for
-      // this key. Flush all keys before retaining the new fragment.
-      flush()
     }
     if (pending.size >= maxPendingKeys) flush()
-    pending.set(key, { min: order ?? 0, max: order ?? 0, event })
+    pending.set(key, {
+      min: order ?? 0,
+      max: order ?? 0,
+      event,
+      accumulator: options.accumulator?.create(event),
+    })
     arm()
   }
 
@@ -264,5 +351,36 @@ export function createEventCoalescer<T>(
     get ackWatermark() {
       return watermark
     },
+  }
+}
+
+/**
+ * Coalesce a finite replay batch without routing it through the live subscriber
+ * queue. SSE reconnect handlers use this to make replay a pull-driven stream
+ * prefix instead of synchronously preloading up to an entire replay window into
+ * the same bounded queue that receives live events.
+ *
+ * This deliberately reuses the exact live coalescer implementation, including
+ * cursor/watermark stamping and barrier semantics, so replay and live delivery
+ * cannot drift into subtly different ordering rules.
+ */
+export function coalesceEventBatch<T>(events: Iterable<T>, options: EventCoalescerOptions<T>): T[] {
+  const output: T[] = []
+  // A finite batch is always flushed synchronously below. A long timer prevents
+  // a needless near-zero timeout from racing the explicit flush while retaining
+  // the same implementation and maxPendingKeys behavior as the live path.
+  const coalescer = createEventCoalescer<T>(
+    (event) => {
+      output.push(event)
+      return true
+    },
+    { ...options, flushMs: 60_000 },
+  )
+  try {
+    for (const event of events) coalescer.offer(event)
+    coalescer.flush()
+    return output
+  } finally {
+    coalescer.dispose()
   }
 }

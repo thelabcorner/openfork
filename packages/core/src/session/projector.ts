@@ -9,17 +9,27 @@ import { SessionEvent } from "./event"
 import { SessionV1 } from "../v1/session"
 import { WorkspaceTable } from "../control-plane/workspace.sql"
 import { SessionMessage } from "./message"
+import { SessionMessageProjection } from "./message-projection"
 import { SessionMessageUpdater } from "./message-updater"
 import { SessionInput } from "./input"
 import { WorkspaceV2 } from "../workspace"
-import { MessageTable, PartTable, SessionInputTable, SessionMessageTable, SessionTable } from "./sql"
+import {
+  MessageTable,
+  PartTable,
+  SessionInputTable,
+  SessionMessageLifecycleTable,
+  SessionMessageTable,
+  SessionMessageToolOverlayTable,
+  SessionTable,
+  type SessionMessageSettlement,
+} from "./sql"
 import { SessionSearch } from "./search"
 import { searchText, partSearchText } from "./search-text"
 import type { DeepMutable } from "../schema"
+import { EventValueTable } from "../event/sql"
 
 type DatabaseService = Database.Interface["db"]
 
-const decodeMessage = Schema.decodeUnknownSync(SessionMessage.Message)
 const encodeMessage = Schema.encodeSync(SessionMessage.Message)
 
 export class SessionAlreadyProjected extends Error {}
@@ -115,25 +125,211 @@ function applyUsage(
 
 function run(db: DatabaseService, event: SessionEvent.Event) {
   return Effect.gen(function* () {
+    // `search_text` is backed by an external-content FTS5 table. Most assistant
+    // lifecycle events only mutate timing, snapshots, tool result/progress
+    // state, or provider metadata; recomputing searchable text for those events
+    // is wasted CPU and, more importantly, naming `search_text` in the UPDATE
+    // wakes the FTS update trigger. Keep the searchable projection coupled only
+    // to events that can actually change searchText(message).
+    const refreshSearchText =
+      event.type === SessionEvent.Shell.Ended.type ||
+      event.type === SessionEvent.Text.Ended.type ||
+      event.type === SessionEvent.Tool.Input.Ended.type ||
+      event.type === SessionEvent.Reasoning.Ended.type
+    const projectionRefs = new Map<SessionMessage.ID, string>()
+    const projectionRefID = (value: unknown) => {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined
+      const record = value as Record<string, unknown>
+      if (Object.keys(record).length !== 1) return undefined
+      return typeof record.$cdbRef === "string" ? record.$cdbRef : undefined
+    }
     const decodeRow = (row: typeof SessionMessageTable.$inferSelect) =>
-      decodeMessage({ ...row.data, id: row.id, type: row.type })
+      SessionMessageProjection.decodeMutableRow(db, row).pipe(
+        Effect.map((message) => ({ message, ref: projectionRefID(row.data) })),
+        Effect.orDie,
+      )
+    const releaseProjectionRef = (messageID: SessionMessage.ID) => {
+      const valueID = projectionRefs.get(messageID)
+      if (!valueID) return Effect.void
+      projectionRefs.delete(messageID)
+      return db
+        .update(EventValueTable)
+        .set({
+          refs: sql`CASE WHEN ${EventValueTable.refs} > 0 THEN ${EventValueTable.refs} - 1 ELSE 0 END`,
+        })
+        .where(and(eq(EventValueTable.aggregate_id, event.data.sessionID), eq(EventValueTable.value_id, valueID)))
+        .run()
+        .pipe(Effect.orDie)
+    }
     const updateMessage = (message: SessionMessage.Message) => {
       if (event.durable === undefined) return Effect.die("Durable Session event is missing aggregate sequence")
       const encoded = encodeMessage(message)
       const { id, type, ...data } = encoded
-      return db
-        .update(SessionMessageTable)
-        .set({ type, time_created: DateTime.toEpochMillis(message.time.created), data, search_text: searchText(message) })
-        .where(
-          and(
-            eq(SessionMessageTable.id, SessionMessage.ID.make(id)),
-            eq(SessionMessageTable.session_id, event.data.sessionID),
-          ),
-        )
-        .run()
-        .pipe(Effect.orDie)
+      const messageID = SessionMessage.ID.make(id)
+      return Effect.gen(function* () {
+        yield* db
+          .update(SessionMessageTable)
+          .set({
+            type,
+            time_created: DateTime.toEpochMillis(message.time.created),
+            data,
+            ...(refreshSearchText ? { search_text: searchText(message) } : {}),
+          })
+          .where(and(eq(SessionMessageTable.id, messageID), eq(SessionMessageTable.session_id, event.data.sessionID)))
+          .run()
+          .pipe(Effect.orDie)
+        // OPCL rebuilds can replace projection JSON with an event_value
+        // reference. A subsequent mutation materializes the canonical value
+        // back inline, so release exactly that projection root in the same
+        // durable transaction. GC can reclaim it later if no other direct or
+        // transitive reference remains.
+        yield* releaseProjectionRef(messageID)
+      })
     }
     const appendMessage = (message: SessionMessage.Message) => insertMessage(db, event, message)
+
+    // Step lifecycle mutations are tiny but can target assistants whose
+    // canonical JSON is many MiB. Keep them in a physically separate 1:1 table:
+    // SQLite rewrites a table record even when only one column changes, so a
+    // same-row metadata column still scales with `data` size. The sidecar keeps
+    // these durable writes bounded and also leaves OPCL `$cdbRef` rows untouched.
+    const patchAssistantLifecycle = Effect.fnUntraced(function* () {
+      if (event.durable === undefined) return false
+      if (
+        event.type !== SessionEvent.Step.Streamed.type &&
+        event.type !== SessionEvent.Step.Ended.type &&
+        event.type !== SessionEvent.Step.Failed.type
+      )
+        return false
+
+      const messageID = event.data.assistantMessageID
+      const target = yield* db
+        .select({ id: SessionMessageTable.id })
+        .from(SessionMessageTable)
+        .where(
+          and(
+            eq(SessionMessageTable.id, messageID),
+            eq(SessionMessageTable.session_id, event.data.sessionID),
+            eq(SessionMessageTable.type, "assistant"),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+      if (!target) return true
+
+      if (event.type === SessionEvent.Step.Streamed.type) {
+        const streamedAt = DateTime.toEpochMillis(event.data.timestamp)
+        yield* db
+          .insert(SessionMessageLifecycleTable)
+          .values({ message_id: messageID, streamed_at: streamedAt })
+          .onConflictDoUpdate({
+            target: SessionMessageLifecycleTable.message_id,
+            set: { streamed_at: sql`coalesce(${SessionMessageLifecycleTable.streamed_at}, ${streamedAt})` },
+          })
+          .run()
+          .pipe(Effect.orDie)
+        return true
+      }
+
+      const settlement: SessionMessageSettlement =
+        event.type === SessionEvent.Step.Failed.type
+          ? {
+              type: "failed",
+              completed: DateTime.toEpochMillis(event.data.timestamp),
+              error: event.data.error,
+            }
+          : {
+              type: "ended",
+              completed: DateTime.toEpochMillis(event.data.timestamp),
+              finish: event.data.finish,
+              cost: event.data.cost,
+              tokens: event.data.tokens,
+              ...(event.data.snapshot || event.data.files
+                ? {
+                    snapshot: {
+                      end: event.data.snapshot,
+                      files: event.data.files ? Array.from(event.data.files) : undefined,
+                    },
+                  }
+                : {}),
+            }
+      yield* db
+        .insert(SessionMessageLifecycleTable)
+        .values({ message_id: messageID, settlement })
+        .onConflictDoUpdate({ target: SessionMessageLifecycleTable.message_id, set: { settlement } })
+        .run()
+        .pipe(Effect.orDie)
+      return true
+    })
+
+    if (yield* patchAssistantLifecycle()) return
+
+    // Progress and settlement events already own the canonical tool payload in
+    // the durable event log. Rewriting that same payload into the assistant row
+    // duplicates large media while SQLite's one writer is held, and later tool
+    // mutations repeatedly copy every earlier result in the assistant. Keep a
+    // tiny event pointer instead. Cold readers overlay the pointed durable event;
+    // the active runner already applies the event in memory through its
+    // aggregate-local projection.
+    const patchToolOverlay = Effect.fnUntraced(function* () {
+      if (event.durable === undefined) return false
+      if (
+        event.type !== SessionEvent.Tool.Progress.type &&
+        event.type !== SessionEvent.Tool.Success.type &&
+        event.type !== SessionEvent.Tool.Failed.type
+      )
+        return false
+
+      const messageID = event.data.assistantMessageID
+      const target = yield* db
+        .select({ id: SessionMessageTable.id })
+        .from(SessionMessageTable)
+        .where(
+          and(
+            eq(SessionMessageTable.id, messageID),
+            eq(SessionMessageTable.session_id, event.data.sessionID),
+            eq(SessionMessageTable.type, "assistant"),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+      if (!target) return true
+
+      if (event.type === SessionEvent.Tool.Progress.type) {
+        yield* db
+          .insert(SessionMessageToolOverlayTable)
+          .values({ message_id: messageID, call_id: event.data.callID, progress_event_id: event.id })
+          .onConflictDoUpdate({
+            target: [SessionMessageToolOverlayTable.message_id, SessionMessageToolOverlayTable.call_id],
+            set: { progress_event_id: event.id },
+          })
+          .run()
+          .pipe(Effect.orDie)
+        return true
+      }
+
+      yield* db
+        .insert(SessionMessageToolOverlayTable)
+        .values({
+          message_id: messageID,
+          call_id: event.data.callID,
+          settlement_event_id: event.id,
+        })
+        .onConflictDoUpdate({
+          target: [SessionMessageToolOverlayTable.message_id, SessionMessageToolOverlayTable.call_id],
+          set: {
+            settlement_event_id: event.id,
+            // Success carries the final structured/content payload itself. The
+            // prior progress event is no longer needed to reconstruct state.
+            ...(event.type === SessionEvent.Tool.Success.type ? { progress_event_id: null } : {}),
+          },
+        })
+        .run()
+        .pipe(Effect.orDie)
+      return true
+    })
+
+    if (yield* patchToolOverlay()) return
     const adapter: SessionMessageUpdater.Adapter = {
       getCurrentAssistant() {
         return Effect.gen(function* () {
@@ -149,8 +345,9 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
             .get()
             .pipe(Effect.orDie)
           if (!row) return
-          const message = decodeRow(row)
-          return message.type === "assistant" && !message.time.completed ? message : undefined
+          const decoded = yield* decodeRow(row)
+          if (decoded.ref) projectionRefs.set(SessionMessage.ID.make(row.id), decoded.ref)
+          return decoded.message.type === "assistant" && !decoded.message.time.completed ? decoded.message : undefined
         })
       },
       getAssistant(messageID) {
@@ -168,8 +365,9 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
             .get()
             .pipe(Effect.orDie)
           if (!row) return
-          const message = decodeRow(row)
-          return message.type === "assistant" ? message : undefined
+          const decoded = yield* decodeRow(row)
+          if (decoded.ref) projectionRefs.set(SessionMessage.ID.make(row.id), decoded.ref)
+          return decoded.message.type === "assistant" ? decoded.message : undefined
         })
       },
       getCurrentShell(callID) {
@@ -181,9 +379,13 @@ function run(db: DatabaseService, event: SessionEvent.Event) {
             .orderBy(desc(SessionMessageTable.seq))
             .all()
             .pipe(Effect.orDie)
-          return rows
-            .map(decodeRow)
-            .find((message): message is SessionMessage.Shell => message.type === "shell" && message.callID === callID)
+          for (const row of rows) {
+            const decoded = yield* decodeRow(row)
+            const message = decoded.message
+            if (message.type !== "shell" || message.callID !== callID) continue
+            if (decoded.ref) projectionRefs.set(SessionMessage.ID.make(row.id), decoded.ref)
+            return message
+          }
         })
       },
       updateAssistant: updateMessage,
@@ -330,6 +532,7 @@ const layer = Layer.effectDiscard(
         const messageID = event.data.part.messageID
         const sessionID = event.data.part.sessionID
         const data = partData(event.data.part)
+        const nextSearchText = partSearchText(event.data.part)
         const row = yield* db.select().from(PartTable).where(eq(PartTable.id, id)).get().pipe(Effect.orDie)
         yield* db
           .insert(PartTable)
@@ -339,11 +542,16 @@ const layer = Layer.effectDiscard(
             session_id: sessionID,
             time_created: event.data.time,
             data,
-            search_text: partSearchText(event.data.part),
+            search_text: nextSearchText,
           })
           .onConflictDoUpdate({
             target: PartTable.id,
-            set: { data, search_text: partSearchText(event.data.part) },
+            // Avoid touching the FTS-backed column when only non-searchable
+            // state changed (step metadata, tool output/result state, etc.).
+            // `row.search_text` is authoritative even when OPCL has collapsed
+            // `row.data` to a reference, so this comparison stays cheap and
+            // does not require decoding the previous JSON payload.
+            set: { data, ...(row?.search_text === nextSearchText ? {} : { search_text: nextSearchText }) },
           })
           .run()
           .pipe(Effect.orDie)

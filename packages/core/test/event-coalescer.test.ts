@@ -1,5 +1,11 @@
 import { describe, expect, test } from "bun:test"
-import { createEventCoalescer, eventDeltaKey, mergeEventDeltas } from "@opencode-ai/core/event-coalescer"
+import {
+  coalesceEventBatch,
+  createEventDeltaAccumulator,
+  createEventCoalescer,
+  eventDeltaKey,
+  mergeEventDeltas,
+} from "@opencode-ai/core/event-coalescer"
 
 type TestEvent = {
   id: string
@@ -166,9 +172,13 @@ describe("event coalescer", () => {
     // `withOrder` reaches the wire cursor without a handler change.
     type Payload = { id: string; type: string; data: Record<string, unknown> }
     type SequencedEvent = { sequence: number; event: Payload }
-    type WireEvent = { sequence?: number; event: { id: string; type: string; data: unknown } }
+    type WireEvent = { sequence?: number; event: { id: string; type: string; data: Record<string, unknown> } }
     const wire: WireEvent[] = []
-    const subscriber = { offer: (item: WireEvent) => wire.push(item) }
+    const subscriber = {
+      offer: (item: WireEvent) => {
+        wire.push(item)
+      },
+    }
     const coalescer = createEventCoalescer<SequencedEvent>(
       (item) =>
         subscriber.offer({
@@ -238,6 +248,91 @@ describe("event coalescer", () => {
     expect(output).toHaveLength(8)
     expect(output.every((event) => (event.data.delta as string).length === 6)).toBe(true)
     expect(coalescer.ackWatermark).toBe(48)
+    coalescer.dispose()
+  })
+
+  test("transport accumulator joins a long fragment run exactly at delivery", () => {
+    const output: TestEvent[] = []
+    const deltas = createEventDeltaAccumulator<TestEvent>()
+    const coalescer = createEventCoalescer<TestEvent>((event) => {
+      output.push(event)
+    }, {
+      keyOf: eventDeltaKey,
+      merge: mergeEventDeltas,
+      accumulator: deltas,
+    })
+
+    for (let index = 0; index < 32_768; index++) coalescer.offer(delta("x", String(index)))
+    coalescer.flush()
+
+    expect(output).toHaveLength(1)
+    expect(output[0]?.data.delta).toBe("x".repeat(32_768))
+    coalescer.dispose()
+  })
+
+  test("transport accumulator preserves interleaved cursor watermark semantics", () => {
+    type Payload = TestEvent
+    type Sequenced = { sequence: number; event: Payload }
+    const deltas = createEventDeltaAccumulator<Payload>()
+    const make = (sequence: number, sessionID: string, value: string): Sequenced => ({
+      sequence,
+      event: {
+        id: String(sequence),
+        type: "session.text.delta",
+        data: { sessionID, assistantMessageID: "m", ordinal: 0, delta: value },
+      },
+    })
+    const output = coalesceEventBatch<Sequenced>([make(1, "a", "a1"), make(2, "b", "b1"), make(3, "a", "a2")], {
+      keyOf: (item) => eventDeltaKey(item.event),
+      orderBy: (item) => item.sequence,
+      merge: (previous, next) => {
+        const event = mergeEventDeltas(previous.event, next.event)
+        return event ? { sequence: next.sequence, event } : undefined
+      },
+      accumulator: {
+        create: (item) => deltas.create(item.event),
+        push: (state, item) => deltas.push(state, item.event),
+        finalize: (state, item) => ({ ...item, event: deltas.finalize(state, item.event) }),
+      },
+    })
+
+    expect(output.map((item) => item.event.data.delta)).toEqual(["b1", "a1a2"])
+    expect(output.map((item) => item.sequence)).toEqual([0, 3])
+  })
+
+  test("flushes the maximum pending-key window with monotonic safe cursors", () => {
+    type Sequenced = TestEvent & { sequence: number }
+    const output: Sequenced[] = []
+    const coalescer = createEventCoalescer<Sequenced>(
+      (event) => {
+        output.push(event)
+      },
+      {
+        keyOf: eventDeltaKey,
+        orderBy: (event) => event.sequence,
+        merge: (previous, next) => {
+          const merged = mergeEventDeltas(previous, next)
+          return merged ? { ...merged, sequence: next.sequence } : undefined
+        },
+        maxPendingKeys: 256,
+      },
+    )
+    for (let index = 0; index < 256; index++) {
+      coalescer.offer({
+        sequence: index + 1,
+        id: String(index + 1),
+        type: "session.text.delta",
+        data: { sessionID: `s${index}`, assistantMessageID: "m", ordinal: 0, delta: "x" },
+      })
+    }
+    coalescer.flush()
+
+    expect(output).toHaveLength(256)
+    expect(output.at(-1)?.sequence).toBe(256)
+    for (let index = 1; index < output.length; index++) {
+      expect(output[index]!.sequence).toBeGreaterThanOrEqual(output[index - 1]!.sequence)
+    }
+    expect(coalescer.ackWatermark).toBe(256)
     coalescer.dispose()
   })
 
@@ -312,5 +407,31 @@ describe("event coalescer", () => {
     for (const seed of [1, 7, 42, 1234, 98765]) check(8, 6, seed)
     check(1, 20, 3)
     check(32, 4, 11)
+  })
+
+  test("finite replay batches use the same cursor watermarks without a live queue", () => {
+    type Sequenced = TestEvent & { sequence: number }
+    const make = (sequence: number, sessionID: string, value: string): Sequenced => ({
+      sequence,
+      id: String(sequence),
+      type: "session.text.delta",
+      data: { sessionID, assistantMessageID: "m", ordinal: 0, delta: value },
+    })
+    const output = coalesceEventBatch<Sequenced>(
+      [make(1, "a", "a1"), make(2, "b", "b1"), make(3, "a", "a2")],
+      {
+        keyOf: eventDeltaKey,
+        orderBy: (event) => event.sequence,
+        merge: (previous, next) => {
+          const merged = mergeEventDeltas(previous, next)
+          return merged ? { ...merged, sequence: next.sequence } : undefined
+        },
+      },
+    )
+
+    expect(output.map((event) => event.data.delta)).toEqual(["b1", "a1a2"])
+    // Identical to the live coalescer's safe acknowledgements above: replay can
+    // be streamed directly without changing Last-Event-ID semantics.
+    expect(output.map((event) => event.sequence)).toEqual([0, 3])
   })
 })

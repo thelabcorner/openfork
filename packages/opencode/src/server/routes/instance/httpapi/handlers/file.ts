@@ -162,6 +162,7 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       query: { query: string; limit?: number; offset?: number; symbols?: "true" | "false" }
     }) {
       const started = performance.now()
+      const directory = (yield* InstanceState.context).directory
       const page = yield* filesystem(
         Effect.gen(function* () {
           const fs = yield* FileSystem.Service
@@ -194,7 +195,10 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
         total: page.total,
         duration: Math.round(performance.now() - started),
       })
-      return { results: page.results as never[], hasMore: page.hasMore, total: page.total }
+      // One canonical base per page is enough to make every relative result
+      // actionable on the server machine. Avoid repeating the same absolute
+      // prefix on every row, which matters for 200-1000 result mention pages.
+      return { base: directory, results: page.results as never[], hasMore: page.hasMore, total: page.total }
     })
 
     const findSymbol = Effect.fn("FileHttpApi.findSymbol")(function* () {

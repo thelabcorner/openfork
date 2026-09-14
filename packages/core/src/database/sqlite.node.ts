@@ -35,6 +35,8 @@ interface Config {
   readonly disableWAL?: boolean
   readonly timeout?: number
   readonly allowExtension?: boolean
+  /** Skip the best-effort TRUNCATE checkpoint performed when this handle closes. */
+  readonly checkpointOnClose?: boolean
   readonly spanAttributes?: Record<string, unknown>
   readonly transformResultNames?: (str: string) => string
   readonly transformQueryNames?: (str: string) => string
@@ -165,9 +167,11 @@ const nativeLayer = (config: Config) =>
       })
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
-          try {
-            native.exec("PRAGMA wal_checkpoint(TRUNCATE)")
-          } catch {}
+          if (config.checkpointOnClose !== false) {
+            try {
+              native.exec("PRAGMA wal_checkpoint(TRUNCATE)")
+            } catch {}
+          }
           try {
             native.close()
           } catch {}

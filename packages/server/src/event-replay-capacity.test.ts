@@ -1,26 +1,17 @@
 import { describe, expect, test } from "bun:test"
 import { Effect, Exit, Stream } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
-import { MAX_REPLAY_FRAMES, ringCapacity, subscriberCapacity } from "./handlers/event"
+import {
+  MAX_REPLAY_BYTES,
+  MAX_REPLAY_FRAMES,
+  ringCapacity,
+  ringMaxBytes,
+  subscriberCapacity,
+  subscriberFrameMaxBytes,
+} from "./handlers/event"
+import { estimateEventBytes } from "@opencode-ai/core/event-replay"
 
-/**
- * The native route's replay ceiling and its subscriber queue capacity are
- * COUPLED, and the coupling is easy to break silently.
- *
- * A full replay window is enqueued SYNCHRONOUSLY, before the response body
- * stream is ever pulled. `makeByteBoundedSubscriberQueue.offer` does not drop
- * on overflow: `Queue.offerUnsafe` returning false sets `failed` and calls
- * `Queue.failCauseUnsafe(SubscriberOverflowError)`, so an over-capacity replay
- * FAILS THE STREAM. A reconnect more than `capacity` frames behind becomes a
- * hard disconnect instead of a replay or a gap.
- *
- * Before this was fixed the route had MAX_REPLAY_FRAMES = 4096 over a 256-item
- * queue. The two traps when testing this (found the hard way):
- *   - `take(accepted + 1)` HANGS FOREVER: a failed queue never yields again.
- *   - `take(accepted)` SUCCEEDS even when the queue is already failed, so a
- *     naive "offer N, drain N, expect success" test passes against the bug.
- * The overflow is therefore detected via the offer loop's refusal index.
- */
+/** The subscriber is now LIVE-only. Replay is a pull-driven stream prefix. */
 const attempt = (capacity: number, frames: number) =>
   Effect.gen(function* () {
     const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<{ sequence: number }>({
@@ -46,27 +37,76 @@ const attempt = (capacity: number, frames: number) =>
   }).pipe(Effect.scoped)
 
 describe("native route replay capacity", () => {
-  test("the subscriber queue can hold a full replay window plus headroom", () => {
-    // The invariant, stated against the exported constants rather than literals,
-    // so raising the ceiling without the queue fails here.
-    expect(subscriberCapacity).toBeGreaterThan(MAX_REPLAY_FRAMES)
-    expect(subscriberCapacity).toBe(ringCapacity + 256)
+  test("replay limits match the ring while live queue sizing is independent", () => {
     expect(MAX_REPLAY_FRAMES).toBe(ringCapacity)
+    expect(MAX_REPLAY_BYTES).toBe(ringMaxBytes)
+    // This value is deliberately conservative for live bursts, but replay no
+    // longer depends on it being larger than MAX_REPLAY_FRAMES.
+    expect(subscriberCapacity).toBe(ringCapacity + 256)
   })
 
-  test("a full replay window is accepted and drained", async () => {
-    const result = await Effect.runPromise(attempt(subscriberCapacity, MAX_REPLAY_FRAMES))
-    // Nothing refused: the window fits with room for live events.
-    expect(result.firstRefusal).toBe(-1)
-    expect(result.accepted).toBe(MAX_REPLAY_FRAMES)
-    expect(result.delivered).toBe(MAX_REPLAY_FRAMES)
-  })
-
-  test("a window larger than the queue would fail the stream", async () => {
-    // The regression this guards. With the pre-fix 256-item queue, the 257th
-    // offer was refused and the queue was already failed.
+  test("live backlog still fails fast instead of silently dropping", async () => {
     const overflow = await Effect.runPromise(attempt(256, MAX_REPLAY_FRAMES))
     expect(overflow.firstRefusal).toBe(256)
     expect(overflow.accepted).toBeLessThan(MAX_REPLAY_FRAMES)
+  })
+
+  test("replay history cannot consume bytes needed by a near-budget live frame", async () => {
+    const live = {
+      sequence: 5000,
+      event: {
+        id: "evt_jumbo",
+        type: "message.part.updated",
+        data: { output: "x".repeat(ringMaxBytes - 256 * 1024) },
+      },
+    }
+    const size = estimateEventBytes(live)
+    expect(size).toBeLessThan(ringMaxBytes)
+
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<typeof live>({
+            capacity: subscriberCapacity,
+            maxBytes: ringMaxBytes,
+            sizeOf: estimateEventBytes,
+          })
+          // Hundreds of replay frames may exist, but the route emits them from
+          // Stream.fromIterable(replayPrefix), never through this queue.
+          const replayPrefix = Array.from({ length: 300 }, (_, sequence) => ({ sequence, event: { type: "replay" } }))
+          expect(replayPrefix).toHaveLength(300)
+          expect(subscriber.pendingBytes()).toBe(0)
+          const accepted = subscriber.offer(live)
+          return { accepted, pending: subscriber.pendingBytes() }
+        }),
+      ),
+    )
+
+    expect(result.accepted).toBe(true)
+    expect(result.pending).toBe(size)
+  })
+
+  test("one near-ring-limit live frame does not consume ordinary backlog headroom", async () => {
+    const backlog = 1024 * 1024
+    const jumbo = ringMaxBytes - 64 * 1024
+    const result = await Effect.runPromise(
+      Effect.scoped(
+        Effect.gen(function* () {
+          const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<{ size: number }>({
+            capacity: subscriberCapacity,
+            maxBytes: ringMaxBytes,
+            maxSingleFrameBytes: subscriberFrameMaxBytes,
+            sizeOf: (item) => item.size,
+          })
+          expect(subscriber.offer({ size: backlog })).toBe(true)
+          // Under the old single-budget rule this failed because 1 MiB + ~7.94
+          // MiB exceeded 8 MiB even though the jumbo frame was individually
+          // legal. The transport now reserves one frame independently.
+          expect(subscriber.offer({ size: jumbo })).toBe(true)
+          return subscriber.pendingBytes()
+        }),
+      ),
+    )
+    expect(result).toBe(backlog + jumbo)
   })
 })

@@ -34,7 +34,7 @@ export default {
         END;
       `)
       yield* tx.run(`
-        CREATE TRIGGER \`session_message_fts_au\` AFTER UPDATE ON \`session_message\` BEGIN
+        CREATE TRIGGER \`session_message_fts_au\` AFTER UPDATE OF \`search_text\` ON \`session_message\` BEGIN
           INSERT INTO \`session_message_fts\`(\`session_message_fts\`, rowid, search_text)
           VALUES ('delete', old.rowid, old.search_text);
           INSERT INTO \`session_message_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
@@ -75,7 +75,7 @@ export default {
         END;
       `)
       yield* tx.run(`
-        CREATE TRIGGER IF NOT EXISTS \`session_message_fts_au\` AFTER UPDATE ON \`session_message\` BEGIN
+        CREATE TRIGGER IF NOT EXISTS \`session_message_fts_au\` AFTER UPDATE OF \`search_text\` ON \`session_message\` BEGIN
           INSERT INTO \`session_message_fts\`(\`session_message_fts\`, rowid, search_text)
           VALUES ('delete', old.rowid, old.search_text);
           INSERT INTO \`session_message_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);

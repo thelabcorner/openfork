@@ -331,29 +331,55 @@ export function runPass(
         const frame = compressText(candidate.data)
         processed += 1
         if (typeof frame === "string") {
-          yield* db.run(sql`
-            INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
-            VALUES ('event', ${candidate.id}, 'data', ${rawLen}, ${rawLen}, 0, 0, ${Date.now()}, 0)
-            ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
-              raw_bytes = excluded.raw_bytes,
-              stored_bytes = excluded.stored_bytes,
-              time_sealed = excluded.time_sealed
-          `)
+          // Candidate discovery and compression happen outside the writer
+          // transaction. Revalidate under an IMMEDIATE transaction before
+          // recording any derived state: a factory reset (or any concurrent
+          // delete/update) may have invalidated this candidate meanwhile.
+          yield* db.transaction(
+            (tx) =>
+              Effect.gen(function* () {
+                const current = yield* tx.get<{ one: number }>(sql`
+                  SELECT 1 AS one FROM event
+                  WHERE id = ${candidate.id} AND typeof(data) = 'text' AND data = ${candidate.data}
+                  LIMIT 1
+                `)
+                if (!current) return
+                yield* tx.run(sql`
+                  INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
+                  VALUES ('event', ${candidate.id}, 'data', ${rawLen}, ${rawLen}, 0, 0, ${Date.now()}, 0)
+                  ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
+                    raw_bytes = excluded.raw_bytes,
+                    stored_bytes = excluded.stored_bytes,
+                    time_sealed = excluded.time_sealed
+                `)
+              }),
+            { behavior: "immediate" },
+          )
           continue
         }
-        yield* db.transaction((tx) =>
-          Effect.gen(function* () {
-            yield* tx.run(sql`UPDATE event SET data = ${frame} WHERE id = ${candidate.id}`)
-            yield* tx.run(sql`
-              INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
-              VALUES ('event', ${candidate.id}, 'data', ${rawLen}, ${frame.byteLength}, ${frame[5]}, ${frame[4]}, ${Date.now()}, 0)
-              ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
-                raw_bytes = excluded.raw_bytes,
-                stored_bytes = excluded.stored_bytes,
-                time_sealed = excluded.time_sealed
-            `)
-          }),
+        const committed = yield* db.transaction(
+          (tx) =>
+            Effect.gen(function* () {
+              const current = yield* tx.get<{ one: number }>(sql`
+                SELECT 1 AS one FROM event
+                WHERE id = ${candidate.id} AND typeof(data) = 'text' AND data = ${candidate.data}
+                LIMIT 1
+              `)
+              if (!current) return false
+              yield* tx.run(sql`UPDATE event SET data = ${frame} WHERE id = ${candidate.id}`)
+              yield* tx.run(sql`
+                INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
+                VALUES ('event', ${candidate.id}, 'data', ${rawLen}, ${frame.byteLength}, ${frame[5]}, ${frame[4]}, ${Date.now()}, 0)
+                ON CONFLICT (table_name, row_id, column_name) DO UPDATE SET
+                  raw_bytes = excluded.raw_bytes,
+                  stored_bytes = excluded.stored_bytes,
+                  time_sealed = excluded.time_sealed
+              `)
+              return true
+            }),
+          { behavior: "immediate" },
         )
+        if (!committed) continue
         promoted += 1
         bytes += rawLen
       }
@@ -705,8 +731,9 @@ export function runPassV2(
       for (const writeSlice of slices) {
         for (;;) {
           const outcome = yield* db
-            .transaction((tx) =>
-              Effect.gen(function* () {
+            .transaction(
+              (tx) =>
+                Effect.gen(function* () {
                 let committedPromoted = 0
                 let committedRepeated = 0
                 let committedBytes = 0
@@ -714,6 +741,18 @@ export function runPassV2(
                 for (const plan of writeSlice) {
                   const candidate = plan.candidate
                   const raw = candidate.data
+                  // The candidate was read and compressed outside this write
+                  // transaction. Acquire the writer slot first and verify the
+                  // exact source row is still current before emitting *any*
+                  // event_value/dependency/seal state. This prevents stale
+                  // background work from resurrecting derived history after a
+                  // concurrent local-data reset.
+                  const current = yield* tx.get<{ one: number }>(sql`
+                    SELECT 1 AS one FROM event
+                    WHERE id = ${candidate.id} AND typeof(data) = 'text' AND data = ${raw}
+                    LIMIT 1
+                  `)
+                  if (!current) continue
                   committedProcessed += 1
 
                   if (plan.kind === "inline") {
@@ -802,7 +841,8 @@ export function runPassV2(
                   bytes: committedBytes,
                   processed: committedProcessed,
                 }
-              }),
+                }),
+              { behavior: "immediate" },
             )
             .pipe(
               Effect.map((stats) => ({ kind: "ok" as const, stats })),

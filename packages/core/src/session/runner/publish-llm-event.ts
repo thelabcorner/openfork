@@ -10,7 +10,13 @@ type Input = {
   readonly sessionID: SessionSchema.ID
   readonly agent: string
   readonly model: ModelV2.Ref
-  readonly snapshot?: string
+  /**
+   * The start-of-turn filesystem capture may run concurrently with provider
+   * generation. The first assistant publication is the ordering barrier: it
+   * awaits this Effect before Step.Started becomes durable, so local tools can
+   * never mutate the worktree before the snapshot is finalized.
+   */
+  readonly snapshot?: Effect.Effect<string | undefined>
 }
 
 const safe = (value: number | undefined) => Math.max(0, Number.isFinite(value) ? (value ?? 0) : 0)
@@ -79,13 +85,19 @@ export const createLLMEventPublisher = (events: EventV2.Interface, input: Input)
 
   const startAssistant = Effect.fnUntraced(function* () {
     if (assistantMessageID !== undefined) return assistantMessageID
+    // Resolve the filesystem boundary before mutating publisher state. If the
+    // caller is interrupted while the capture is still running, a later retry
+    // must not observe an assistant ID whose Step.Started event never committed.
+    const snapshot = input.snapshot ? yield* input.snapshot : undefined
     assistantMessageID = SessionMessage.ID.create()
     assistantActive = true
     yield* events.publish(SessionEvent.Step.Started, {
-      ...input,
+      sessionID: input.sessionID,
+      agent: input.agent,
+      model: input.model,
       assistantMessageID,
       timestamp: yield* timestamp,
-      snapshot: input.snapshot,
+      snapshot,
       ...(requestSentAt === undefined ? {} : { requestSentAt }),
     })
     return assistantMessageID

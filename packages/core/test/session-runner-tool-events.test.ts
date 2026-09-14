@@ -12,7 +12,7 @@ import { createLLMEventPublisher } from "@opencode-ai/core/session/runner/publis
 const sessionID = SessionV2.ID.make("ses_tool_event_test")
 const base64 = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAAB"
 
-const capture = () => {
+const capture = (snapshot?: Effect.Effect<string | undefined>) => {
   const published: Array<{ readonly type: string; readonly data: unknown }> = []
   const events = EventV2.Service.of({
     publish: (definition, data) =>
@@ -30,6 +30,8 @@ const capture = () => {
     all: () => Stream.empty,
     durable: () => Stream.empty,
     listen: () => Effect.succeed(Effect.void),
+    listenLocation: () => Effect.succeed(Effect.void),
+    listenAggregate: () => Effect.succeed(Effect.void),
     project: () => Effect.void,
     replay: () => Effect.void,
     replayAll: () => Effect.succeed(undefined),
@@ -45,9 +47,26 @@ const capture = () => {
         id: ModelV2.ID.make("model"),
         providerID: ProviderV2.ID.make("provider"),
       },
+      snapshot,
     }),
   }
 }
+
+test("first assistant publication waits for the concurrent start snapshot", async () => {
+  const gate = Promise.withResolvers<string | undefined>()
+  const { published, publisher } = capture(Effect.promise(() => gate.promise))
+  const pending = Effect.runPromise(publisher.publish(LLMEvent.textStart({ id: "text-snapshot" })))
+
+  await Promise.resolve()
+  expect(published).toEqual([])
+
+  gate.resolve("tree-start")
+  await pending
+  expect(published[0]).toMatchObject({
+    type: "session.next.step.started.1",
+    data: { snapshot: "tree-start" },
+  })
+})
 
 const call = LLMEvent.toolCall({ id: "call-image", name: "read", input: { path: "pixel.png" } })
 const result = LLMEvent.toolResult({

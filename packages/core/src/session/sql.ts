@@ -20,6 +20,24 @@ type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
 type V1PartData = Omit<SessionV1.Part, "id" | "sessionID" | "messageID">
 
+export type SessionMessageSettlement =
+  | {
+      type: "ended"
+      completed: number
+      finish: string
+      cost: number
+      tokens: NonNullable<SessionMessage.Assistant["tokens"]>
+      snapshot?: {
+        end?: string
+        files?: NonNullable<NonNullable<SessionMessage.Assistant["snapshot"]>["files"]>
+      }
+    }
+  | {
+      type: "failed"
+      completed: number
+      error: NonNullable<SessionMessage.Assistant["error"]>
+    }
+
 export const SessionTable = sqliteTable(
   "session",
   {
@@ -202,6 +220,42 @@ export const SessionMessageTable = sqliteTable(
     index("session_message_session_type_seq_idx").on(table.session_id, table.type, table.seq),
     index("session_message_session_time_created_id_idx").on(table.session_id, table.time_created, table.id),
     index("session_message_time_created_idx").on(table.time_created),
+  ],
+)
+
+// Keep hot lifecycle metadata in its own physical record. SQLite rebuilds a
+// table record when any column changes, so putting these fields beside a
+// multi-MiB `data` value still makes Step.Streamed/Ended/Failed O(message size).
+// A 1:1 sidecar makes those writes independent of assistant content size.
+export const SessionMessageLifecycleTable = sqliteTable("session_message_lifecycle", {
+  message_id: text()
+    .$type<SessionMessage.ID>()
+    .primaryKey()
+    .references(() => SessionMessageTable.id, { onDelete: "cascade" }),
+  streamed_at: integer(),
+  settlement: text({ mode: "json" }).$type<SessionMessageSettlement>(),
+})
+
+// Tool progress/settlement payloads are already durable in EventV2. Do not
+// copy multi-MiB native media into a second projection row and do not rewrite
+// the growing assistant aggregate. This sidecar stores only tiny pointers to
+// the latest durable tool events. Projectors run before the event row insert,
+// so these are deliberately not SQL foreign keys; both writes are inside the
+// same EventV2 transaction and therefore commit or roll back together.
+export const SessionMessageToolOverlayTable = sqliteTable(
+  "session_message_tool_overlay",
+  {
+    message_id: text()
+      .$type<SessionMessage.ID>()
+      .notNull()
+      .references(() => SessionMessageTable.id, { onDelete: "cascade" }),
+    call_id: text().notNull(),
+    progress_event_id: text(),
+    settlement_event_id: text(),
+  },
+  (table) => [
+    primaryKey({ columns: [table.message_id, table.call_id] }),
+    index("session_message_tool_overlay_message_idx").on(table.message_id),
   ],
 )
 

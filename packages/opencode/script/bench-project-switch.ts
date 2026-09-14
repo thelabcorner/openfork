@@ -310,7 +310,7 @@ function benchMemory(entries: SynNode[]) {
 }
 
 // ---------------------------------------------------------------------------
-// F. Persisted-index codec (IndexSerialization) vs JSON baseline
+// F. Whole-repository persisted-index codec stress reference
 // ---------------------------------------------------------------------------
 
 /** Convert flat LegacyEntry list into the index blob's per-directory subtrees. */
@@ -335,7 +335,7 @@ function toIndexBlob(entries: SynNode[]): IndexSerialization.IndexBlobInput {
 }
 
 async function benchIndexCodec(entries: SynNode[]) {
-  console.log(`\n[F] Persisted-index codec (IndexSerialization, ${entries.length.toLocaleString()} nodes)`)
+  console.log(`\n[F] Whole-repo index codec stress reference (IndexSerialization, ${entries.length.toLocaleString()} nodes)`)
   const blob = toIndexBlob(entries)
   const subtreeCount = Object.keys(blob.subtrees).length
   console.log(`  subtrees: ${subtreeCount.toLocaleString()}`)
@@ -356,7 +356,7 @@ async function benchIndexCodec(entries: SynNode[]) {
 }
 
 // ---------------------------------------------------------------------------
-// G. FileIndex service: cold build vs warm list (the switch hot path)
+// G. FileIndex service: lazy cold list vs structurally verified warm list
 // ---------------------------------------------------------------------------
 
 const tempData = path.join(os.tmpdir(), `bench-file-index-${Date.now()}`)
@@ -377,13 +377,15 @@ async function benchFileIndex() {
   console.log(`\n[G] FileIndex service (dir=${BENCH_DIR})`)
   const root = RelativePath.make("")
 
-  // cold: first list builds the whole index (walks the tree)
+  // Cold: only the requested directory is enumerated + hydrated. There must be
+  // no hidden recursive full-project build behind this latency measurement.
   const t0 = performance.now()
   await runIndex(FileIndex.Service.use((svc) => svc.list(root)))
   const coldMs = performance.now() - t0
-  console.log(`  cold list("") [full build]: ${coldMs.toFixed(2)}ms`)
+  console.log(`  cold list("") [lazy root only]: ${coldMs.toFixed(2)}ms`)
 
-  // warm: subsequent lists are map lookups (the per-switch hot path)
+  // Warm: structural correctness is verified with one readdir. Existing file
+  // metadata is retained, so unchanged lists avoid per-child stat/read work.
   const samples: number[] = []
   for (let i = 0; i < ITERS; i++) {
     const t = performance.now()
@@ -391,7 +393,7 @@ async function benchFileIndex() {
     samples.push(performance.now() - t)
   }
   const warmMs = median(samples)
-  console.log(`  warm list("") [map lookup]: ${warmMs.toFixed(3)}ms  (n=${ITERS}, median)`)
+  console.log(`  warm list("") [verified readdir]: ${warmMs.toFixed(3)}ms  (n=${ITERS}, median)`)
 
   // warm list of a deep subdirectory (children-of-dir on switch)
   const deep = RelativePath.make("src")
@@ -402,7 +404,7 @@ async function benchFileIndex() {
     deepSamples.push(performance.now() - t)
   }
   const deepMs = median(deepSamples)
-  console.log(`  warm list("src") [map lookup]: ${deepMs.toFixed(3)}ms  (n=${ITERS}, median)`)
+  console.log(`  warm list("src") [verified readdir]: ${deepMs.toFixed(3)}ms  (n=${ITERS}, median)`)
   return { coldMs, warmMs, deepMs }
 }
 
@@ -413,7 +415,7 @@ async function benchFileIndex() {
 const bunVersion = (process.versions as { bun?: string }).bun ?? "n/a"
 
 async function main() {
-  console.log("=== perf-bench: project-switch latency BEFORE baseline ===")
+  console.log("=== perf-bench: project-switch / explorer current ===")
   console.log(`machine: ${process.platform} ${process.arch} | node ${process.version} | bun ${bunVersion}`)
   console.log(`config: nodes=${NODES} iters=${ITERS} branch=${BRANCH} filesPerDir=${FILES_PER_DIR} depth=${DEPTH} dir=${BENCH_DIR}`)
   console.log(`ts: ${new Date().toISOString()}`)
@@ -432,7 +434,7 @@ async function main() {
   console.log("\n=== BENCH_BEGIN ===")
   console.log(JSON.stringify(
     {
-      benchmark: "project-switch-before",
+      benchmark: "project-switch-explorer-current",
       machine: { platform: process.platform, arch: process.arch, node: process.version, bun: bunVersion },
       config: { nodes: NODES, iters: ITERS, branch: BRANCH, filesPerDir: FILES_PER_DIR, depth: DEPTH, dir: BENCH_DIR },
       syntheticNodes: entries.length,

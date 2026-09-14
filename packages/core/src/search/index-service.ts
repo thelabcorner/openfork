@@ -368,11 +368,12 @@ const serviceLayer = Layer.effect(
     )
 
     const queue = yield* Queue.dropping<void>(256)
-    yield* events.listen((event) =>
+    yield* events.listenLocation(
+      Watcher.Event.Updated,
+      { directory: location.directory, workspaceID: location.workspaceID },
+      (event) =>
       Effect.gen(function* () {
-        if (event.type !== Watcher.Event.Updated.type) return
         const data = event.data as { file: string; event: "add" | "change" | "unlink" }
-        if (event.location && event.location.directory !== location.directory) return
         const relative = path.relative(location.directory, data.file).replaceAll("\\", "/")
         if (!relative || relative.startsWith("..") || path.isAbsolute(relative)) return
         if (data.event === "unlink") deleteEntry(relative)

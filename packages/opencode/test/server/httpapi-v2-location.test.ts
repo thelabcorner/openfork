@@ -27,7 +27,11 @@ const Event = Schema.Struct({
   data: Schema.Unknown,
 })
 
-async function* eventStream(body: ReadableStream<Uint8Array>) {
+type StreamEvent = typeof Event.Type | { id?: string; type: string; data: unknown }
+
+const CONTROL_EVENTS = new Set(["server.connected", "server.heartbeat", "server.stream.gap", "server.instance.disposed"])
+
+async function* eventStream(body: ReadableStream<Uint8Array>): AsyncGenerator<StreamEvent> {
   const reader = body.getReader()
   const decoder = new TextDecoder()
   let buffer = ""
@@ -47,7 +51,14 @@ async function* eventStream(body: ReadableStream<Uint8Array>) {
         .split(/\r\n|\r|\n/)
         .filter((line) => line.startsWith("data:"))
         .map((line) => line.slice(5).replace(/^ /, ""))
-      if (data.length) yield Schema.decodeUnknownSync(Event)(JSON.parse(data.join("\n")))
+      if (data.length) {
+        const raw = JSON.parse(data.join("\n")) as { id?: string; type?: unknown; data?: unknown }
+        if (typeof raw.type === "string" && CONTROL_EVENTS.has(raw.type)) {
+          yield { id: raw.id, type: raw.type, data: raw.data }
+          continue
+        }
+        yield Schema.decodeUnknownSync(Event)(raw)
+      }
     }
   } finally {
     try {
@@ -58,13 +69,13 @@ async function* eventStream(body: ReadableStream<Uint8Array>) {
   }
 }
 
-async function readEvent(reader: AsyncIterator<typeof Event.Type>) {
+async function readEvent(reader: AsyncIterator<StreamEvent>) {
   const value = await reader.next()
   if (value.done) throw new Error("event stream closed")
   return value.value
 }
 
-async function readEventType(reader: AsyncIterator<typeof Event.Type>, type: string) {
+async function readEventType(reader: AsyncIterator<StreamEvent>, type: string) {
   for (let index = 0; index < 20; index++) {
     const event = await readEvent(reader)
     if (event.type === type) return event
@@ -118,8 +129,10 @@ describe("v2 location HttpApi", () => {
     expect(created.status).toBe(200)
     expect(await readEventType(reader, "session.created")).toMatchObject({
       type: "session.created",
-      location: { directory: publisher.path },
-      data: { sessionID: expect.any(String) },
+      data: {
+        sessionID: expect.any(String),
+        info: { directory: publisher.path },
+      },
     })
     await reader.return(undefined)
   })

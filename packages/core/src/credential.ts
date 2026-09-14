@@ -60,7 +60,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/v2
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db } = yield* Database.Service
+    const { db, readDb } = yield* Database.Service
     const decode = Schema.decodeUnknownSync(Value)
     const stored = (row: typeof CredentialTable.$inferSelect) => {
       if (!row.integration_id) return
@@ -75,7 +75,7 @@ const layer = Layer.effect(
 
     return Service.of({
       all: Effect.fn("Credential.all")(function* () {
-        return (yield* db
+        return (yield* readDb
           .select()
           .from(CredentialTable)
           .orderBy(asc(CredentialTable.time_created))
@@ -86,7 +86,7 @@ const layer = Layer.effect(
         })
       }),
       list: Effect.fn("Credential.list")(function* (integrationID) {
-        return (yield* db
+        return (yield* readDb
           .select()
           .from(CredentialTable)
           .where(eq(CredentialTable.integration_id, integrationID))
@@ -98,7 +98,12 @@ const layer = Layer.effect(
         })
       }),
       get: Effect.fn("Credential.get")(function* (id) {
-        const row = yield* db.select().from(CredentialTable).where(eq(CredentialTable.id, id)).get().pipe(Effect.orDie)
+        const row = yield* readDb
+          .select()
+          .from(CredentialTable)
+          .where(eq(CredentialTable.id, id))
+          .get()
+          .pipe(Effect.orDie)
         return row ? stored(row) : undefined
       }),
       create: Effect.fn("Credential.create")(function* (input) {

@@ -194,6 +194,7 @@ export const PtyHandler = HttpApiBuilder.group(Api, "server.pty", (handlers) =>
             capacity: PTY_OUTBOX_CAPACITY,
             maxBytes: PTY_OUTBOX_MAX_BYTES,
             sizeOf: ptyFrameBytes,
+            typeOf: (value) => (value instanceof Socket.CloseEvent ? "socket.close" : "pty.data"),
           })
           const attachment = yield* pty
             .attach(ctx.params.ptyID, {

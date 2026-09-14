@@ -1,6 +1,12 @@
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventReplayBuffer, estimateEventBytes, parseEventSequence } from "@opencode-ai/core/event-replay"
-import { createEventCoalescer, eventDeltaKey, mergeEventDeltas } from "@opencode-ai/core/event-coalescer"
+import {
+  coalesceEventBatch,
+  createEventDeltaAccumulator,
+  createEventCoalescer,
+  eventDeltaKey,
+  mergeEventDeltas,
+} from "@opencode-ai/core/event-coalescer"
 import { Effect, Stream } from "effect"
 import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
@@ -10,16 +16,11 @@ import { serializeEvent, wireEvent, type WireEvent } from "../event-serializer"
 import { EventTrace } from "@opencode-ai/core/event-trace"
 
 export const ringCapacity = 4096
-// A full replay window is enqueued synchronously, before the response stream is
-// ever consumed, so the subscriber queue's ITEM capacity must exceed the replay
-// window. At the old MAX_REPLAY_FRAMES of 128 a 256-item queue was comfortably
-// ahead of the burst; raising the ceiling to the ring capacity makes this
-// coupling load-bearing -- a 4096-frame replay into a 256-item queue overflows
-// it and fails the stream with SubscriberOverflowError, turning a reconnect
-// into a hard disconnect. Keep the headroom for live events that arrive while
-// the replay is still being enqueued.
+// Replay is emitted as a pull-driven stream prefix and never occupies this
+// queue. Keep the historical item headroom for live bursts; it is deliberately
+// no longer coupled to the replay frame count.
 export const subscriberCapacity = ringCapacity + 256
-const ringMaxBytes = 8 * 1024 * 1024
+export const ringMaxBytes = 8 * 1024 * 1024
 // A replay is only refused when it is genuinely too expensive to resend. The
 // ring already bounds retention by count (4096) and by bytes (8 MiB), so a
 // second 128-frame ceiling made ~97% of the retained window unusable and
@@ -32,6 +33,11 @@ export const MAX_REPLAY_FRAMES = ringCapacity
 // for a window the server is already retaining -- the same defect as a frame
 // ceiling below the ring capacity. Match the ring so the two budgets agree.
 export const MAX_REPLAY_BYTES = ringMaxBytes
+const subscriberEnvelopeBytes = 48
+// Queue accounting adds a small sequence/wrapper charge around an event whose
+// payload was already admitted to the 8 MiB replay ring. Keep that legal frame
+// limit independent from the ordinary live-backlog budget below.
+export const subscriberFrameMaxBytes = ringMaxBytes + subscriberEnvelopeBytes
 
 /**
  * Control frames are not replayable domain events: `server.heartbeat` proves
@@ -45,8 +51,37 @@ export const MAX_REPLAY_BYTES = ringMaxBytes
  * heartbeat safe to emit on an otherwise idle stream.
  */
 
-type SequencedWireEvent = { sequence?: number; event: WireEvent }
+type SequencedWireEvent = { sequence?: number; event: WireEvent; bytes?: number }
 type SequencedEvent = { sequence: number; event: EventV2.Payload }
+
+function sequencedDeltaOptions() {
+  const deltas = createEventDeltaAccumulator<EventV2.Payload>()
+  return {
+    keyOf: (item: SequencedEvent) => eventDeltaKey(item.event),
+    orderBy: (item: SequencedEvent) => item.sequence,
+    merge: (previous: SequencedEvent, next: SequencedEvent) => {
+      const event = mergeEventDeltas(previous.event, next.event)
+      return event === undefined ? undefined : { sequence: next.sequence, event }
+    },
+    accumulator: {
+      create: (item: SequencedEvent) => deltas.create(item.event),
+      push: (state: object, item: SequencedEvent) => deltas.push(state, item.event),
+      finalize: (state: object, item: SequencedEvent): SequencedEvent => ({
+        ...item,
+        event: deltas.finalize(state, item.event),
+      }),
+    },
+  }
+}
+
+const sequencedWireBytes = (item: SequencedWireEvent) =>
+  // `bytes` is measured on the original EventV2 payload. That payload was
+  // already measured when it entered the replay ring, so ordinary live events
+  // hit estimateEventBytes' WeakMap in O(1). Carrying the value across the wire
+  // projection avoids rescanning a multi-megabyte `data` object independently
+  // for every connected SSE subscriber. Control frames fall back to a tiny
+  // direct estimate. The fixed wrapper charge keeps accounting conservative.
+  subscriberEnvelopeBytes + (item.bytes ?? estimateEventBytes(item.event))
 
 function eventData(data: object, sequence?: string): Sse.Event {
   const started = performance.now()
@@ -82,22 +117,21 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
           Effect.gen(function* () {
             const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<SequencedWireEvent>({
               capacity: subscriberCapacity,
-              maxBytes: 8 * 1024 * 1024,
-              sizeOf: estimateEventBytes,
+              maxBytes: ringMaxBytes,
+              maxSingleFrameBytes: subscriberFrameMaxBytes,
+              sizeOf: sequencedWireBytes,
+              typeOf: (item) => item.event.type,
             })
             const coalescer = createEventCoalescer<SequencedEvent>(
               (item) => {
-                const accepted = subscriber.offer({ sequence: item.sequence, event: wireEvent(item.event) })
+                const accepted = subscriber.offer({
+                  sequence: item.sequence,
+                  event: wireEvent(item.event),
+                  bytes: estimateEventBytes(item.event),
+                })
                 EventTrace.count(accepted ? "native.subscriberOffered" : "native.subscriberFailed")
               },
-              {
-                keyOf: (item) => eventDeltaKey(item.event),
-                orderBy: (item) => item.sequence,
-                merge: (previous, next) => {
-                  const event = mergeEventDeltas(previous.event, next.event)
-                  return event === undefined ? undefined : { sequence: next.sequence, event }
-                },
-              },
+              sequencedDeltaOptions(),
             )
             const offerCoalescer = (item: SequencedEvent) => {
               EventTrace.count("native.coalescerIn")
@@ -132,10 +166,11 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
               frames: replayResult.kind === "gap" ? 0 : replayResult.frames.length,
               bytes: replayBytes,
             })
+            let replayPrefix: SequencedWireEvent[]
             if (replayResult.kind === "gap" || replayResult.frames.length > MAX_REPLAY_FRAMES ||
               replayBytes > MAX_REPLAY_BYTES) {
               if (replayResult.kind === "gap") EventTrace.count("native.gap")
-              subscriber.offer({
+              replayPrefix = [{
                 event: {
                   id: EventV2.ID.create(),
                   type: "server.stream.gap",
@@ -145,11 +180,22 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
                     latest: replayResult.latest,
                   },
                 },
-              })
+              }]
             } else {
-              for (const frame of replayResult.frames) offerCoalescer({ sequence: frame.sequence, event: frame.event })
+              replayPrefix = coalesceEventBatch<SequencedEvent>(
+                replayResult.frames.map((frame) => ({ sequence: frame.sequence, event: frame.event })),
+                sequencedDeltaOptions(),
+              ).map((item) => ({
+                sequence: item.sequence,
+                event: wireEvent(item.event),
+                bytes: estimateEventBytes(item.event),
+              }))
             }
-            coalescer.flush()
+            // The replay prefix is not offered to `subscriber`: doing so used to
+            // consume almost the full 8 MiB live byte budget before the response
+            // body could drain a single frame. A legal ~7.8 MiB live event then
+            // collided with a few hundred KiB of replay backlog and killed the
+            // whole SSE stream. Only genuinely live backlog is bounded below.
             for (const item of pendingLive) {
               if (item.sequence > replayResult.latest) offerCoalescer(item)
             }
@@ -174,7 +220,8 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
                 event: { id: EventV2.ID.create(), type: "server.heartbeat", data: {} },
               })),
             )
-            return Stream.make(connected).pipe(Stream.concat(Stream.merge(live, heartbeat, { haltStrategy: "left" })))
+            const domain = Stream.fromIterable(replayPrefix).pipe(Stream.concat(live))
+            return Stream.make(connected).pipe(Stream.concat(Stream.merge(domain, heartbeat, { haltStrategy: "left" })))
           }),
         ).pipe(
           Stream.map(({ sequence, event }) => eventData(event, sequence === undefined ? undefined : `${replay.epoch}:${sequence}`)),

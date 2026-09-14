@@ -120,7 +120,7 @@ export type Harness = {
   readonly reset: () => void
 }
 
-export const makeHarness = (): Harness => {
+export const makeHarness = (options: { readonly snapshotLayer?: Layer.Layer<Snapshot.Service> } = {}): Harness => {
   const requests: LLMRequest[] = []
   const titleRequests: LLMRequest[] = []
   const completions: LLMEvent[][] = []
@@ -165,7 +165,7 @@ export const makeHarness = (): Harness => {
         return Stream.unwrap(
           (streamStarted ? Deferred.succeed(streamStarted, undefined) : Effect.void).pipe(
             Effect.andThen(Deferred.await(streamGate)),
-            Effect.as(items),
+            Effect.as(Stream.fromIterable(items)),
           ),
         )
       },
@@ -265,10 +265,11 @@ export const makeHarness = (): Harness => {
     [Catalog.node, catalog],
     [Integration.node, integration],
   ] satisfies LayerNode.Replacements
+  const snapshotLayer = options.snapshotLayer ?? Snapshot.noopLayer
 
   const titleLayer = AppNodeBuilder.build(SessionTitle.node, sharedReplacements)
   const runnerLayer = AppNodeBuilder.build(SessionRunnerLLM.node, [
-    [Snapshot.node, Snapshot.noopLayer],
+    [Snapshot.node, snapshotLayer],
     ...sharedReplacements,
     [SessionTitle.node, titleLayer],
   ])
@@ -313,7 +314,7 @@ export const makeHarness = (): Harness => {
       SessionV2.node,
     ]),
     [
-      [Snapshot.node, Snapshot.noopLayer],
+      [Snapshot.node, snapshotLayer],
       ...sharedReplacements,
       [SessionExecution.node, execution],
       [SessionTitle.node, titleLayer],

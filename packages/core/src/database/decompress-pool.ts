@@ -43,6 +43,11 @@ interface Job {
   reject: (error: unknown) => void
 }
 
+interface ParseJob {
+  readonly job: Job
+  readonly raw: Uint8Array
+}
+
 const DEFAULT_MAX_RETAINED_BYTES = 64 * 1024 * 1024
 
 export class DecompressPool {
@@ -51,6 +56,8 @@ export class DecompressPool {
   private idle: Worker[] = []
   private busy = new Map<Worker, Job>()
   private queue: Job[] = []
+  private parseQueue: ParseJob[] = []
+  private parseScheduled = false
   private nextId = 1
   private started = false
   private closed = false
@@ -60,6 +67,10 @@ export class DecompressPool {
     size?: number,
     private readonly createWorker: () => Worker = () => new Worker(workerUrl),
     private readonly maxRetainedBytes = DEFAULT_MAX_RETAINED_BYTES,
+    // Bun can drain recursively-scheduled setImmediate callbacks in one check
+    // phase before timers get a chance to run. A zero-delay timer gives each
+    // jumbo parse a real event-loop boundary in both Bun and Node.
+    private readonly scheduleParse: (task: () => void) => void = (task) => setTimeout(task, 0),
   ) {
     const cpus = Math.max(1, os.cpus().length)
     this.size = size ?? Math.min(4, Math.max(2, cpus - 1))
@@ -98,19 +109,40 @@ export class DecompressPool {
       return
     }
     this.busy.delete(worker)
-    this.settle(job, () => {
-      try {
-        // The worker sends ONLY the raw bytes (transferred zero-copy). Parsing
-        // happens here on the main thread: structured-cloning the parsed object
-        // from the worker would serialize a large object on the main thread and
-        // negate the parallelism (epoch-3 bench: 16 jumbos 628ms vs 513ms sync).
-        job.resolve({ value: JSON.parse(decoder.decode(res.raw)), raw: res.raw })
-      } catch (error) {
-        job.reject(error)
-      }
-    })
+    // Keep the raw completion byte-accounted until parse settlement. Several
+    // workers can finish near-simultaneously, so counting only compressed input
+    // would let queued 16-32 MiB completions hide behind a tiny retained budget.
+    job.retainedBytes += res.raw.byteLength
+    this.retainedBytes += res.raw.byteLength
+    this.parseQueue.push({ job, raw: res.raw })
+    this.scheduleNextParse()
     this.idle.push(worker)
     this.drain()
+  }
+
+  private scheduleNextParse() {
+    if (this.closed || this.parseScheduled || this.parseQueue.length === 0) return
+    this.parseScheduled = true
+    this.scheduleParse(() => {
+      this.parseScheduled = false
+      if (this.closed) return
+      const next = this.parseQueue.shift()
+      if (!next) return
+      this.settle(next.job, () => {
+        try {
+          // Keep parsing on the main thread to avoid structured-clone cost, but
+          // parse at most ONE worker completion per event-loop turn. Previously
+          // four workers completing together could run four large JSON.parse
+          // calls back-to-back in message callbacks and stall every Session for
+          // the sum of their costs. The scheduler provides an explicit fairness
+          // boundary without changing the canonical parsed object shape.
+          next.job.resolve({ value: JSON.parse(decoder.decode(next.raw)), raw: next.raw })
+        } catch (error) {
+          next.job.reject(error)
+        }
+      })
+      this.scheduleNextParse()
+    })
   }
 
   private onError(worker: Worker, err: unknown) {
@@ -167,10 +199,13 @@ export class DecompressPool {
     const error = new Error("Decompression pool is closed")
     for (const job of this.busy.values()) this.settle(job, () => job.reject(error))
     for (const job of this.queue) this.settle(job, () => job.reject(error))
+    for (const item of this.parseQueue) this.settle(item.job, () => item.job.reject(error))
     this.workers = []
     this.idle = []
     this.busy.clear()
     this.queue = []
+    this.parseQueue = []
+    this.parseScheduled = false
     this.retainedBytes = 0
     this.started = false
     await Promise.all(workers.map((w) => w.terminate().catch(() => {})))

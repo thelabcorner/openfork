@@ -240,6 +240,7 @@ export const ptyConnectHandlers = HttpApiBuilder.group(PtyConnectApi, "pty-conne
           capacity: PTY_OUTBOX_CAPACITY,
           maxBytes: PTY_OUTBOX_MAX_BYTES,
           sizeOf: ptyFrameBytes,
+          typeOf: (value) => (value instanceof Socket.CloseEvent ? "socket.close" : "pty.data"),
         })
         const attachment = yield* pty(
           Pty.Service.use((service) =>

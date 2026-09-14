@@ -3,7 +3,13 @@ import { InstanceState } from "@/effect/instance-state"
 import { GlobalBus } from "@/bus/global"
 import { estimateEventBytes, parseEventSequence } from "@opencode-ai/core/event-replay"
 import { EventV2 } from "@opencode-ai/core/event"
-import { createEventCoalescer, eventDeltaKey, mergeEventDeltas } from "@opencode-ai/core/event-coalescer"
+import {
+  coalesceEventBatch,
+  createEventDeltaAccumulator,
+  createEventCoalescer,
+  eventDeltaKey,
+  mergeEventDeltas,
+} from "@opencode-ai/core/event-coalescer"
 import { EventTrace } from "@opencode-ai/core/event-trace"
 import { Effect } from "effect"
 import * as Stream from "effect/Stream"
@@ -18,8 +24,31 @@ type LegacyEvent = { id: string; type: string; properties: unknown }
 // `sequence` is optional because control frames (heartbeat, gap, disposal) are
 // not replayable domain state: they must not mint or reuse a Last-Event-ID
 // cursor. Only frames carrying a sequence get an `id:` on the wire.
-type SequencedLegacyEvent = { sequence?: number; event: LegacyEvent }
+type SequencedLegacyEvent = { sequence?: number; event: LegacyEvent; bytes?: number }
 type SequencedEvent = { sequence: number; event: EventV2.Payload }
+
+function sequencedDeltaOptions() {
+  const deltas = createEventDeltaAccumulator<EventV2.Payload>()
+  return {
+    keyOf: (item: SequencedEvent) => eventDeltaKey(item.event),
+    orderBy: (item: SequencedEvent) => item.sequence,
+    merge: (previous: SequencedEvent, next: SequencedEvent) => {
+      const event = mergeEventDeltas(previous.event, next.event)
+      return event === undefined ? undefined : { sequence: next.sequence, event }
+    },
+    accumulator: {
+      create: (item: SequencedEvent) => deltas.create(item.event),
+      push: (state: object, item: SequencedEvent) => deltas.push(state, item.event),
+      finalize: (state: object, item: SequencedEvent): SequencedEvent => ({
+        ...item,
+        event: deltas.finalize(state, item.event),
+      }),
+    },
+  }
+}
+
+const sequencedLegacyBytes = (item: SequencedLegacyEvent) =>
+  48 + (item.bytes ?? estimateEventBytes(item.event))
 
 // The bridge's replay ring already bounds retention by count (4096) and by
 // bytes (8 MiB). A much lower frame ceiling here made most of the retained
@@ -27,18 +56,16 @@ type SequencedEvent = { sequence: number; event: EventV2.Payload }
 // than a fraction of a second. Match the ring so the replayable window is the
 // window that actually exists; the byte ceiling below is the guard that
 // protects the client from payload size.
-// Exported so the capacity test can assert the coupling against the real values
-// instead of duplicating literals. Raising the ceiling without raising the
-// subscriber capacity is a regression, not an improvement.
-export const MAX_REPLAY_FRAMES = 4096
-export const MAX_REPLAY_BYTES = 4 * 1024 * 1024
-// The whole replay window is enqueued SYNCHRONOUSLY inside `Stream.unwrap`,
-// before the body stream is ever pulled, so subscriber capacity is coupled to
-// the replay ceiling. `offer()` does not drop on overflow: a full queue fails
-// the stream with SubscriberOverflowError, turning a reconnect into a hard
-// disconnect. The headroom holds live events arriving while replay is enqueued.
+// Exported so tests can assert replay policy directly against the bridge ring.
+export const MAX_REPLAY_FRAMES = EventV2Bridge.REPLAY_CAPACITY
+export const MAX_REPLAY_BYTES = EventV2Bridge.REPLAY_MAX_BYTES
+// Replay is emitted directly as a pull-driven stream prefix, so this queue is
+// now strictly a live-backlog bound. Retain the existing item headroom rather
+// than coupling correctness to how many replay frames happen to be retained.
 export const SUBSCRIBER_HEADROOM = 256
 export const SUBSCRIBER_CAPACITY = MAX_REPLAY_FRAMES + SUBSCRIBER_HEADROOM
+const SUBSCRIBER_ENVELOPE_BYTES = 48
+export const SUBSCRIBER_FRAME_MAX_BYTES = MAX_REPLAY_BYTES + SUBSCRIBER_ENVELOPE_BYTES
 
 function eventData(data: object, sequence?: string): Sse.Event {
   const started = performance.now()
@@ -75,22 +102,21 @@ function eventResponse(events: EventV2Bridge.Interface) {
       Effect.gen(function* () {
         const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<SequencedLegacyEvent>({
           capacity: SUBSCRIBER_CAPACITY,
-          maxBytes: 8 * 1024 * 1024,
-          sizeOf: estimateEventBytes,
+          maxBytes: EventV2Bridge.REPLAY_MAX_BYTES,
+          maxSingleFrameBytes: SUBSCRIBER_FRAME_MAX_BYTES,
+          sizeOf: sequencedLegacyBytes,
+          typeOf: (item) => item.event.type,
         })
         const coalescer = createEventCoalescer<SequencedEvent>(
           (item) => {
-            const accepted = subscriber.offer({ sequence: item.sequence, event: adaptLegacyEvent(item.event) })
+            const accepted = subscriber.offer({
+              sequence: item.sequence,
+              event: adaptLegacyEvent(item.event),
+              bytes: estimateEventBytes(item.event),
+            })
             EventTrace.count(accepted ? "legacy.subscriberOffered" : "legacy.subscriberFailed")
           },
-          {
-            keyOf: (item) => eventDeltaKey(item.event),
-            orderBy: (item) => item.sequence,
-            merge: (previous, next) => {
-              const event = mergeEventDeltas(previous.event, next.event)
-              return event === undefined ? undefined : { sequence: next.sequence, event }
-            },
-          },
+          sequencedDeltaOptions(),
         )
         const offerCoalescer = (item: SequencedEvent) => {
           EventTrace.count("legacy.coalescerIn")
@@ -101,8 +127,10 @@ function eventResponse(events: EventV2Bridge.Interface) {
           (event.location.workspaceID === undefined || event.location.workspaceID === workspaceID)
         let replaying = true
         const pendingLive: SequencedEvent[] = []
-        // Both sources subscribe before readiness, and share one bounded queue so
-        // disposal cannot race stream startup or overtake previously queued events.
+        // Subscribe before the replay snapshot so the replay/live handoff cannot
+        // lose an event. During this short synchronous setup window, new live
+        // events are held separately and only the post-cutoff suffix is admitted
+        // to the live queue.
         const unsubscribe = yield* events.listen((event) =>
           Effect.sync(() => {
             if (!matches(event)) return
@@ -131,12 +159,13 @@ function eventResponse(events: EventV2Bridge.Interface) {
         // `matches` filter. It costs no traversal, no per-frame wrapper
         // allocation and no re-estimate — shared with the native route rather
         // than open-coded here.
+        let replayPrefix: SequencedLegacyEvent[]
         if (replay.kind === "gap" || replay.frames.length > MAX_REPLAY_FRAMES ||
           replay.bytes > MAX_REPLAY_BYTES) {
           // A reconnect that fell behind the bounded window cannot be repaired by
           // silently dropping old events. Emit a control event so the client can
           // hydrate a snapshot, while keeping the stream itself healthy.
-          subscriber.offer({
+          replayPrefix = [{
             event: {
               id: eventID(),
               type: "server.stream.gap",
@@ -147,11 +176,22 @@ function eventResponse(events: EventV2Bridge.Interface) {
                 directory: instance.directory,
               },
             },
-          })
+          }]
         } else {
-          for (const frame of replay.frames) offerCoalescer({ sequence: frame.sequence, event: frame.event })
+          replayPrefix = coalesceEventBatch<SequencedEvent>(
+            replay.frames.map((frame) => ({ sequence: frame.sequence, event: frame.event })),
+            sequencedDeltaOptions(),
+          ).map((item) => ({
+            sequence: item.sequence,
+            event: adaptLegacyEvent(item.event),
+            bytes: estimateEventBytes(item.event),
+          }))
         }
-        coalescer.flush()
+        // Never preload replay into `subscriber`. Historically a legal live
+        // frame near the 8 MiB ring limit could arrive while replay occupied a
+        // few hundred KiB of this same byte budget and fail the entire stream.
+        // Replay is immutable history and can be pulled directly by the body;
+        // only genuinely live backlog belongs in the fail-fast subscriber queue.
         for (const item of pendingLive) {
           if (item.sequence > replayCutoff) offerCoalescer(item)
         }
@@ -187,20 +227,25 @@ function eventResponse(events: EventV2Bridge.Interface) {
           Stream.map(() => eventData({ id: eventID(), type: "server.heartbeat", properties: {} })),
         )
 
+        const replayStream = Stream.fromIterable(replayPrefix).pipe(
+          Stream.map(({ sequence, event }) =>
+            eventData(event, sequence === undefined ? undefined : `${events.replayEpoch}:${sequence}`),
+          ),
+        )
+        const liveStream = live.pipe(
+          Stream.map(({ sequence, event }) =>
+            eventData(event, sequence === undefined ? undefined : `${events.replayEpoch}:${sequence}`),
+          ),
+        )
+        const domain = replayStream.pipe(Stream.concat(liveStream))
+
         return Stream.make(
           eventData(
             { id: eventID(), type: "server.connected", properties: { epoch: events.replayEpoch } },
             cursor === undefined ? `${events.replayEpoch}:${replay.latest}` : undefined,
           ),
         ).pipe(
-          Stream.concat(
-            live.pipe(
-              Stream.map(({ sequence, event }) =>
-                eventData(event, sequence === undefined ? undefined : `${events.replayEpoch}:${sequence}`),
-              ),
-              Stream.merge(heartbeat, { haltStrategy: "left" }),
-            ),
-          ),
+          Stream.concat(domain.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
         )
       }),
     )

@@ -2,7 +2,7 @@ export * as Git from "./git"
 
 import path from "path"
 import { randomUUID } from "crypto"
-import { Context, Effect, Layer, Schema, Stream } from "effect"
+import { Context, Deferred, Effect, Layer, Schema, Scope, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 import { AbsolutePath, RelativePath } from "./schema"
 import { FSUtil } from "./fs-util"
@@ -177,6 +177,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const fs = yield* FSUtil.Service
     const proc = yield* AppProcess.Service
+    const scope = yield* Scope.Scope
     const locks = KeyedMutex.makeUnsafe<string>()
     const locked = <A, E, R>(repository: Repository, effect: Effect.Effect<A, E, R>) =>
       locks.withLock(repository.gitDirectory)(effect)
@@ -531,20 +532,63 @@ const layer = Layer.effect(
       return TreeID.make((yield* repositoryOperation("write_tree", repository, ["write-tree"])).text.trim())
     })
 
-    const captureTree = Effect.fn("Git.tree.capture")(
-      (input: {
-        repository: Repository
-        scopes: readonly RelativePath[]
-        ignores?: Repository
-        maximumUntrackedFileBytes?: number
-      }) =>
-        locked(
-          input.repository,
+    type CaptureInput = {
+      repository: Repository
+      scopes: readonly RelativePath[]
+      ignores?: Repository
+      maximumUntrackedFileBytes?: number
+    }
+    type CaptureBatch = {
+      readonly input: CaptureInput
+      readonly deferred: Deferred.Deferred<TreeID, OperationError>
+    }
+    const captureBatches = new Map<string, CaptureBatch>()
+    const captureBatchKey = (input: CaptureInput) =>
+      [
+        input.repository.gitDirectory,
+        input.ignores?.gitDirectory ?? "",
+        input.maximumUntrackedFileBytes ?? "",
+        ...input.scopes,
+      ].join("\0")
+
+    const runCaptureBatch = (key: string, batch: CaptureBatch) =>
+      Effect.gen(function* () {
+        // Give sibling session starts one scheduler window to coalesce. A batch
+        // stays joinable while waiting behind an earlier capture and seals only
+        // after acquiring the repository's mutable-index lock below.
+        yield* Effect.sleep("10 millis")
+        const exit = yield* locked(
+          batch.input.repository,
           Effect.gen(function* () {
-            yield* Effect.forEach(input.scopes, (scope) => refresh({ ...input, scope }), { discard: true })
-            return yield* writeTree(input.repository)
+            if (captureBatches.get(key) === batch) captureBatches.delete(key)
+            yield* Effect.forEach(
+              batch.input.scopes,
+              (scope) => refresh({ ...batch.input, scope }),
+              { discard: true },
+            )
+            return yield* writeTree(batch.input.repository)
           }),
-        ),
+        ).pipe(Effect.exit)
+        if (captureBatches.get(key) === batch) captureBatches.delete(key)
+        yield* Deferred.done(batch.deferred, exit).pipe(Effect.asVoid)
+      })
+
+    const captureTree = Effect.fn("Git.tree.capture")((input: CaptureInput) =>
+      Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const key = captureBatchKey(input)
+          const existing = captureBatches.get(key)
+          if (existing) return yield* restore(Deferred.await(existing.deferred))
+
+          const batch: CaptureBatch = {
+            input,
+            deferred: Deferred.makeUnsafe<TreeID, OperationError>(),
+          }
+          captureBatches.set(key, batch)
+          yield* runCaptureBatch(key, batch).pipe(Effect.forkIn(scope, { startImmediately: true }))
+          return yield* restore(Deferred.await(batch.deferred))
+        }),
+      ),
     )
 
     const treeFiles = Effect.fn("Git.tree.files")(function* (input: {

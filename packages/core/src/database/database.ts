@@ -21,6 +21,14 @@ export type DatabaseShape = Effect.Success<typeof makeDatabase>
 
 export interface Interface {
   db: DatabaseShape
+  /**
+   * Dedicated query-only connection for interactive/history reads. File-backed
+   * databases use a second native SQLite handle so reads do not queue behind a
+   * long transaction holding the primary connection's single permit. In-memory
+   * databases alias this to `db` because separate `:memory:` handles are
+   * independent databases.
+   */
+  readDb: DatabaseShape
   filename: string
 }
 
@@ -59,6 +67,23 @@ const layer = (filename: string) =>
       yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
       yield* DatabaseMigration.apply(db)
       yield* ensureChunkDB(db)
+
+      // WAL allows readers to observe the last committed snapshot while a
+      // writer transaction is active, but that concurrency is lost if reads and
+      // writes share our native client's single-permit semaphore. Keep one
+      // persistent query-only connection for latency-sensitive reads. Build it
+      // only after migrations so a fresh database never races schema creation.
+      let readDb = db
+      if (filename !== ":memory:") {
+        const readerContext = yield* Layer.build(
+          sqliteLayer({ filename, disableWAL: true, checkpointOnClose: false }),
+        )
+        readDb = yield* makeDatabase.pipe(Effect.provide(readerContext))
+        yield* readDb.run("PRAGMA query_only = ON")
+        yield* readDb.run("PRAGMA busy_timeout = 250")
+        yield* readDb.run("PRAGMA cache_size = -32000")
+        yield* readDb.run("PRAGMA foreign_keys = ON")
+      }
       if (Flag.OPENCODE_SEAL_ENABLED) {
         yield* Effect.forkScoped(runSealerLoop(filename).pipe(Effect.ignore))
       }
@@ -97,7 +122,7 @@ const layer = (filename: string) =>
         }),
       )
 
-      return { db, filename }
+      return { db, readDb, filename }
     }).pipe(Effect.orDie),
   )
 
@@ -134,7 +159,7 @@ export function withBackfillDb<A, E, R>(
     yield* db.run("PRAGMA busy_timeout = 100")
     yield* db.run("PRAGMA foreign_keys = ON")
     return yield* body(db)
-  }).pipe(Effect.provide(sqliteLayer({ filename })))
+  }).pipe(Effect.provide(sqliteLayer({ filename, checkpointOnClose: false })))
 }
 
 export function path() {

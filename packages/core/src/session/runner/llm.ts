@@ -8,7 +8,7 @@ import {
   isContextOverflowFailure,
   type ProviderErrorEvent,
 } from "@opencode-ai/llm"
-import { Cause, DateTime, Effect, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
+import { Cause, DateTime, Deferred, Effect, FiberSet, Layer, Option, Semaphore, Stream } from "effect"
 import { AgentV2 } from "../../agent"
 import { Config } from "../../config"
 import { Database } from "../../database/database"
@@ -27,14 +27,15 @@ import { ToolOutputStore } from "../../tool-output-store"
 import { SessionContextEpoch } from "../context-epoch"
 import { SessionCompaction } from "../compaction"
 import { SessionEvent } from "../event"
-import { SessionHistory } from "../history"
 import { SessionInput } from "../input"
+import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
 import { SessionTitle } from "../title"
 import { type RunError, Service } from "./index"
 import { SessionRunnerModel } from "./model"
 import { createLLMEventPublisher } from "./publish-llm-event"
+import { makeRunnerHistoryProjection, type RunnerHistoryProjection } from "./history-projection"
 import { toLLMMessages } from "./to-llm-message"
 import { MAX_STEPS_PROMPT } from "./max-steps"
 import { Snapshot } from "../../snapshot"
@@ -125,7 +126,9 @@ const layer = Layer.effect(
     const goalContext = yield* GoalContext.Service
     const goalAutomation = yield* GoalAutomation.Service
     const goalAuditor = yield* GoalAuditor.Service
-    const db = (yield* Database.Service).db
+    const database = yield* Database.Service
+    const db = database.db
+    const readDb = database.readDb
     const compaction = SessionCompaction.make({ events, llm, config: yield* config.entries() })
     const getSession = Effect.fn("SessionRunner.getSession")(function* (sessionID: SessionSchema.ID) {
       const session = yield* store.get(sessionID)
@@ -138,8 +141,9 @@ const layer = Layer.effect(
     })
     const failInterruptedTools = Effect.fn("SessionRunner.failInterruptedTools")(function* (
       sessionID: SessionSchema.ID,
+      entries: readonly { readonly message: SessionMessage.Message }[],
     ) {
-      for (const message of yield* getContext(sessionID)) {
+      for (const { message } of entries) {
         if (message.type !== "assistant") continue
         for (const tool of message.content) {
           if (tool.type !== "tool" || (tool.state.status !== "pending" && tool.state.status !== "running")) continue
@@ -185,12 +189,19 @@ const layer = Layer.effect(
     const continueAfterOverflowCompaction = (step: number) =>
       new TurnTransitionError({ _tag: "ContinueAfterOverflowCompaction", step })
 
+    type RunState = {
+      readonly history: RunnerHistoryProjection
+      recoveredInterruptedTools: boolean
+      baselineSeq: number
+    }
+
     const loadSystemContext = (sessionID: SessionSchema.ID, agent: AgentV2.Selection) =>
       Effect.all([systemContext.load(), skillGuidance.load(agent), referenceGuidance.load(), goalContext.forSession(sessionID)], {
         concurrency: "unbounded",
       }).pipe(Effect.map(SystemContext.combine))
 
     const runTurnAttempt = Effect.fn("SessionRunner.runTurn")(function* (
+      state: RunState,
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
@@ -201,7 +212,12 @@ const layer = Layer.effect(
       if (session.location.directory !== location.directory || session.location.workspaceID !== location.workspaceID)
         return yield* Effect.interrupt
       const agent = yield* agents.select(session.agent)
-      const initialized = yield* SessionContextEpoch.initialize(db, loadSystemContext(session.id, agent), session.id)
+      const initialized = yield* SessionContextEpoch.initialize(
+        db,
+        loadSystemContext(session.id, agent),
+        session.id,
+        readDb,
+      )
       const toolFibers = yield* FiberSet.make<void, ToolOutputStore.Error>()
       let needsContinuation = false
       let currentStep = step
@@ -216,9 +232,23 @@ const layer = Layer.effect(
         if (promoted > 0) currentStep = 1
       }
       const system =
-        initialized ?? (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(session.id, agent), session.id))
+        initialized ??
+        (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(session.id, agent), session.id, readDb))
       const model = yield* models.resolve(session)
-      const entries = yield* SessionHistory.entriesForRunner(db, session.id, system.baselineSeq)
+      // History is a committed-state read and can be large. Keep it off the
+      // primary writer connection so another Session's durable projection does
+      // not delay provider dispatch.
+      state.baselineSeq = system.baselineSeq
+      let entries = yield* state.history.entries(system.baselineSeq)
+      if (!state.recoveredInterruptedTools) {
+        // Interrupted local tools are recovery work for the current active
+        // projection, not a reason to perform a second full history read before
+        // dispatch. Publish their failures once, let the aggregate-local
+        // projection consume those commits inline, then refresh the cheap view.
+        yield* failInterruptedTools(session.id, entries)
+        state.recoveredInterruptedTools = true
+        entries = yield* state.history.entries(system.baselineSeq)
+      }
       const context = entries.map((entry) => entry.message)
       const isLastStep = agent.info?.steps !== undefined && currentStep >= agent.info.steps
       const toolMaterialization = isLastStep ? undefined : yield* tools.materialize(agent.info?.permissions)
@@ -242,7 +272,18 @@ const layer = Layer.effect(
       })
       if (yield* compaction.compactIfNeeded({ sessionID: session.id, entries, model, request }))
         return yield* Effect.die(continueAfterCompaction(currentStep))
-      const startSnapshot = yield* snapshots.capture()
+      // Start filesystem capture before consuming the provider, but do not make
+      // network/model generation wait for Git. Bridge the child through a
+      // Deferred rather than joining an unresolved Fiber from the provider hot
+      // path: Effect 4 beta's unresolved Fiber.join can monopolize the scheduler
+      // in this shape. The Deferred wait remains cooperative while preserving
+      // the same failure/interruption Exit.
+      const startSnapshot = yield* Deferred.make<Snapshot.ID | undefined>()
+      yield* snapshots.capture().pipe(
+        Effect.exit,
+        Effect.flatMap((exit) => Deferred.done(startSnapshot, exit)),
+        Effect.forkChild,
+      )
       const publisher = createLLMEventPublisher(events, {
         sessionID: session.id,
         agent: agent.id,
@@ -251,7 +292,7 @@ const layer = Layer.effect(
           providerID: ProviderV2.ID.make(model.provider),
           ...(session.model?.variant === undefined ? {} : { variant: session.model.variant }),
         },
-        snapshot: startSnapshot,
+        snapshot: Deferred.await(startSnapshot),
       })
       const withPublication = Semaphore.makeUnsafe(1).withPermit
       const publish = (event: LLMEvent, outputPaths: ReadonlyArray<string> = []) =>
@@ -309,8 +350,10 @@ const layer = Layer.effect(
 
       return yield* Effect.uninterruptibleMask((restore) =>
         Effect.gen(function* () {
-          // Explicit dispatch origin for throughput windows, captured after
-          // snapshot preparation and before the provider stream is consumed.
+          // Explicit dispatch origin for throughput windows, captured before
+          // the provider stream is consumed. Start-of-turn snapshot work is
+          // intentionally concurrent with provider generation and therefore is
+          // not part of provider throughput.
           // The lazily published Step.Started event can arrive after the
           // provider spent most of the request generating, so it must not
           // anchor rate denominators.
@@ -366,10 +409,11 @@ const layer = Layer.effect(
           const stepSettlement = publisher.stepSettlement()
           if (stepSettlement && !publisher.hasProviderError()) {
             const endSnapshot = yield* snapshots.capture()
+            const resolvedStartSnapshot = yield* Deferred.await(startSnapshot)
             const files =
-              startSnapshot && endSnapshot
+              resolvedStartSnapshot && endSnapshot
                 ? yield* snapshots
-                    .files({ from: startSnapshot, to: endSnapshot })
+                    .files({ from: resolvedStartSnapshot, to: endSnapshot })
                     .pipe(Effect.catch(() => Effect.succeed(undefined)))
                 : undefined
             yield* withPublication(
@@ -401,35 +445,55 @@ const layer = Layer.effect(
       )
     }, Effect.scoped)
     type RunTurn = (
+      state: RunState,
       sessionID: SessionSchema.ID,
       promotion: SessionInput.Delivery | undefined,
       step: number,
       goalContinuation?: string,
     ) => Effect.Effect<{ readonly needsContinuation: boolean; readonly step: number; readonly tokens: number }, RunError>
 
-    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, goalContinuation) {
-      return yield* runTurnAttempt(sessionID, promotion, step, undefined, goalContinuation).pipe(
+    const runAfterOverflowCompaction: RunTurn = Effect.fnUntraced(function* (
+      state,
+      sessionID,
+      promotion,
+      step,
+      goalContinuation,
+    ) {
+      return yield* runTurnAttempt(state, sessionID, promotion, step, undefined, goalContinuation).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
               return yield* Effect.die("Post-compaction provider attempt cannot recover another overflow")
             yield* Effect.yieldNow
-            return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, goalContinuation)
+            return yield* runAfterOverflowCompaction(state, sessionID, undefined, defect.transition.step, goalContinuation)
           }),
         ),
       )
     })
 
-    const runTurn: RunTurn = Effect.fnUntraced(function* (sessionID, promotion, step, goalContinuation) {
-      return yield* runTurnAttempt(sessionID, promotion, step, compaction.compactAfterOverflow, goalContinuation).pipe(
+    const runTurn: RunTurn = Effect.fnUntraced(function* (state, sessionID, promotion, step, goalContinuation) {
+      return yield* runTurnAttempt(
+        state,
+        sessionID,
+        promotion,
+        step,
+        compaction.compactAfterOverflow,
+        goalContinuation,
+      ).pipe(
         Effect.catchDefect(
           Effect.fnUntraced(function* (defect) {
             if (!(defect instanceof TurnTransitionError)) return yield* Effect.die(defect)
             yield* Effect.yieldNow
             if (defect.transition._tag === "ContinueAfterOverflowCompaction")
-              return yield* runAfterOverflowCompaction(sessionID, undefined, defect.transition.step, goalContinuation)
-            return yield* runTurn(sessionID, undefined, defect.transition.step, goalContinuation)
+              return yield* runAfterOverflowCompaction(
+                state,
+                sessionID,
+                undefined,
+                defect.transition.step,
+                goalContinuation,
+              )
+            return yield* runTurn(state, sessionID, undefined, defect.transition.step, goalContinuation)
           }),
         ),
       )
@@ -450,84 +514,88 @@ const layer = Layer.effect(
       if (hasSteer || hasQueue) yield* goalAutomation.cancel(input.sessionID)
       let automatic = !hasSteer && !hasQueue ? yield* goalAutomation.claim(input.sessionID) : undefined
       if (!input.force && !hasSteer && !hasQueue && !automatic) return
-      yield* failInterruptedTools(input.sessionID)
-      let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
-      let shouldRun = input.force || hasSteer || hasQueue || automatic !== undefined
-      while (shouldRun) {
-        let cycleAutomatic = automatic
-        automatic = undefined
-        let cycleTokens = 0
-        let needsContinuation = true
-        let step = 1
-        while (needsContinuation) {
-          const result = yield* runTurn(input.sessionID, promotion, step, cycleAutomatic?.prompt).pipe(
-            Effect.onError(() =>
-              cycleAutomatic
-                ? goalAutomation.release({ sessionID: input.sessionID, reservationID: cycleAutomatic.id })
-                : Effect.void,
-            ),
-          )
-          cycleTokens += result.tokens
-          needsContinuation = result.needsContinuation
-          step = result.step + 1
-          promotion = "steer"
-          if (!needsContinuation) {
-            const pendingSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
-            if (pendingSteer && cycleAutomatic) {
-              // A real user steer supersedes the autonomous reservation even if
-              // it arrived while the provider was streaming.
-              yield* goalAutomation.cancel(input.sessionID)
-              cycleAutomatic = undefined
+      const history = yield* makeRunnerHistoryProjection({ events, readDb, sessionID: input.sessionID })
+      const state: RunState = { history, recoveredInterruptedTools: false, baselineSeq: -1 }
+      return yield* Effect.gen(function* () {
+        let promotion: SessionInput.Delivery | undefined = hasSteer ? "steer" : hasQueue ? "queue" : undefined
+        let shouldRun = input.force || hasSteer || hasQueue || automatic !== undefined
+        while (shouldRun) {
+          let cycleAutomatic = automatic
+          automatic = undefined
+          let cycleTokens = 0
+          let needsContinuation = true
+          let step = 1
+          while (needsContinuation) {
+            const result = yield* runTurn(state, input.sessionID, promotion, step, cycleAutomatic?.prompt).pipe(
+              Effect.onError(() =>
+                cycleAutomatic
+                  ? goalAutomation.release({ sessionID: input.sessionID, reservationID: cycleAutomatic.id })
+                  : Effect.void,
+              ),
+            )
+            cycleTokens += result.tokens
+            needsContinuation = result.needsContinuation
+            step = result.step + 1
+            promotion = "steer"
+            if (!needsContinuation) {
+              const pendingSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+              if (pendingSteer && cycleAutomatic) {
+                // A real user steer supersedes the autonomous reservation even if
+                // it arrived while the provider was streaming.
+                yield* goalAutomation.cancel(input.sessionID)
+                cycleAutomatic = undefined
+              }
+              needsContinuation = pendingSteer
             }
-            needsContinuation = pendingSteer
           }
-        }
 
-        // User work always outranks another automatic cycle. Check queue first,
-        // then re-check both lanes after reserving to close the arrival race.
-        const pendingQueue = yield* SessionInput.hasPending(db, input.sessionID, "queue")
-        if (pendingQueue) {
-          if (cycleAutomatic) yield* goalAutomation.cancel(input.sessionID)
-          shouldRun = true
-          promotion = "queue"
-          continue
-        }
+          // User work always outranks another automatic cycle. Check queue first,
+          // then re-check both lanes after reserving to close the arrival race.
+          const pendingQueue = yield* SessionInput.hasPending(db, input.sessionID, "queue")
+          if (pendingQueue) {
+            if (cycleAutomatic) yield* goalAutomation.cancel(input.sessionID)
+            shouldRun = true
+            promotion = "queue"
+            continue
+          }
 
-        const audit = yield* goalAuditor.evaluate({
-          sessionID: input.sessionID,
-          session,
-          latestWork: SessionTitle.assembleContext(yield* getContext(input.sessionID)),
+          const activeEntries = yield* state.history.entries(state.baselineSeq)
+          const audit = yield* goalAuditor.evaluate({
+            sessionID: input.sessionID,
+            session,
+            latestWork: SessionTitle.assembleContext(activeEntries.map((entry) => entry.message)),
+          })
+          const decision = yield* goalAutomation.afterTurn({
+            sessionID: input.sessionID,
+            origin: cycleAutomatic ? "automatic" : "user",
+            ...(cycleAutomatic ? { reservationID: cycleAutomatic.id } : {}),
+            tokens: cycleTokens,
+            audit,
+          })
+
+          const lateSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
+          const lateQueue = lateSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
+          if (lateSteer || lateQueue) {
+            yield* goalAutomation.cancel(input.sessionID)
+            shouldRun = true
+            promotion = lateSteer ? "steer" : "queue"
+            continue
+          }
+
+          automatic = decision.reservation ? yield* goalAutomation.claim(input.sessionID) : undefined
+          shouldRun = automatic !== undefined
+          promotion = undefined
+        }
+        // Post-run maintenance (S6 auto-title parity): runs only on non-interrupted
+        // drain completion. An interrupt-driven exit (exactly what pause triggers)
+        // propagates interruption before this hook, so a paused session never
+        // auto-titles. Reuse the active projection instead of decoding the same
+        // history a third time at the end of the drain.
+        yield* title.autoTitle({
+          session: yield* getSession(input.sessionID),
+          messages: (yield* state.history.entries(state.baselineSeq)).map((entry) => entry.message),
         })
-        const decision = yield* goalAutomation.afterTurn({
-          sessionID: input.sessionID,
-          origin: cycleAutomatic ? "automatic" : "user",
-          ...(cycleAutomatic ? { reservationID: cycleAutomatic.id } : {}),
-          tokens: cycleTokens,
-          audit,
-        })
-
-        const lateSteer = yield* SessionInput.hasPending(db, input.sessionID, "steer")
-        const lateQueue = lateSteer ? false : yield* SessionInput.hasPending(db, input.sessionID, "queue")
-        if (lateSteer || lateQueue) {
-          yield* goalAutomation.cancel(input.sessionID)
-          shouldRun = true
-          promotion = lateSteer ? "steer" : "queue"
-          continue
-        }
-
-        automatic = decision.reservation ? yield* goalAutomation.claim(input.sessionID) : undefined
-        shouldRun = automatic !== undefined
-        promotion = undefined
-      }
-      // Post-run maintenance (S6 auto-title parity): runs only on non-interrupted
-      // drain completion. An interrupt-driven exit (exactly what pause triggers)
-      // propagates interruption before this hook, so a paused session never
-      // auto-titles. Auto-title re-checks default-title/one-real-user/parentID
-      // and takes a turn through the same pending registry as manual regenerate.
-      yield* title.autoTitle({
-        session: yield* getSession(input.sessionID),
-        messages: yield* getContext(input.sessionID),
-      })
+      }).pipe(Effect.ensuring(history.close))
     })
 
     return Service.of({

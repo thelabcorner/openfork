@@ -56,48 +56,103 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/ToolOutputStore") {}
 
+const utf8Forward = (input: string, index: number) => {
+  const code = input.charCodeAt(index)
+  if (code < 0x80) return { bytes: 1, units: 1 }
+  if (code < 0x800) return { bytes: 2, units: 1 }
+  if (code >= 0xd800 && code <= 0xdbff && index + 1 < input.length) {
+    const low = input.charCodeAt(index + 1)
+    if (low >= 0xdc00 && low <= 0xdfff) return { bytes: 4, units: 2 }
+  }
+  return { bytes: 3, units: 1 }
+}
+
+const utf8Backward = (input: string, end: number) => {
+  const code = input.charCodeAt(end - 1)
+  if (code >= 0xdc00 && code <= 0xdfff && end >= 2) {
+    const high = input.charCodeAt(end - 2)
+    if (high >= 0xd800 && high <= 0xdbff) return { bytes: 4, units: 2 }
+  }
+  if (code < 0x80) return { bytes: 1, units: 1 }
+  if (code < 0x800) return { bytes: 2, units: 1 }
+  return { bytes: 3, units: 1 }
+}
+
 const takePrefix = (input: string, maximumBytes: number) => {
   let bytes = 0
-  let content = ""
-  for (const char of input) {
-    const size = Buffer.byteLength(char, "utf-8")
-    if (bytes + size > maximumBytes) break
-    content += char
-    bytes += size
+  let index = 0
+  while (index < input.length) {
+    const width = utf8Forward(input, index)
+    if (bytes + width.bytes > maximumBytes) break
+    bytes += width.bytes
+    index += width.units
   }
-  return content
+  return input.slice(0, index)
 }
 
 const takeSuffix = (input: string, maximumBytes: number) => {
   let bytes = 0
-  const content: string[] = []
-  for (const char of Array.from(input).toReversed()) {
-    const size = Buffer.byteLength(char, "utf-8")
-    if (bytes + size > maximumBytes) break
-    content.unshift(char)
-    bytes += size
+  let index = input.length
+  while (index > 0) {
+    const width = utf8Backward(input, index)
+    if (bytes + width.bytes > maximumBytes) break
+    bytes += width.bytes
+    index -= width.units
   }
-  return content.join("")
+  return input.slice(index)
+}
+
+const withinByteLimit = (input: string, maximumBytes: number) => {
+  let bytes = 0
+  for (let index = 0; index < input.length; ) {
+    const width = utf8Forward(input, index)
+    bytes += width.bytes
+    if (bytes > maximumBytes) return false
+    index += width.units
+  }
+  return true
+}
+
+const hasMoreThanLines = (input: string, maximumLines: number) => {
+  if (maximumLines < 1) return input.length > 0
+  let at = -1
+  for (let line = 0; line < maximumLines; line++) {
+    at = input.indexOf("\n", at + 1)
+    if (at === -1) return false
+  }
+  return true
+}
+
+const takeHeadLines = (input: string, count: number) => {
+  if (count <= 0) return ""
+  let at = -1
+  for (let line = 0; line < count; line++) {
+    at = input.indexOf("\n", at + 1)
+    if (at === -1) return input
+  }
+  return input.slice(0, at)
+}
+
+const takeTailLines = (input: string, count: number) => {
+  if (count <= 0) return ""
+  let at = input.length
+  for (let line = 0; line < count; line++) {
+    const previous = input.lastIndexOf("\n", at - 1)
+    if (previous === -1) return input
+    at = previous
+  }
+  return input.slice(at + 1)
 }
 
 const preview = (text: string, maxLines: number, maxBytes: number) => {
-  const lines = text.split("\n")
+  const overLines = hasMoreThanLines(text, maxLines)
   const headLines = Math.ceil(maxLines / 2)
   const tailLines = Math.floor(maxLines / 2)
-  const sampled =
-    lines.length <= maxLines
-      ? text
-      : [
-          lines.slice(0, headLines).join("\n"),
-          ...(tailLines > 0 ? [lines.slice(lines.length - tailLines).join("\n")] : []),
-        ].join("\n")
-  if (Buffer.byteLength(sampled, "utf-8") <= maxBytes) {
-    return lines.length <= maxLines
-      ? { head: sampled, tail: "" }
-      : {
-          head: lines.slice(0, headLines).join("\n"),
-          tail: tailLines > 0 ? lines.slice(lines.length - tailLines).join("\n") : "",
-        }
+  const head = overLines ? takeHeadLines(text, headLines) : text
+  const tail = overLines && tailLines > 0 ? takeTailLines(text, tailLines) : ""
+  const sampled = overLines ? `${head}\n${tail}` : head
+  if (withinByteLimit(sampled, maxBytes)) {
+    return overLines ? { head, tail } : { head: sampled, tail: "" }
   }
   const headBytes = Math.ceil(maxBytes / 2)
   const tailBytes = Math.floor(maxBytes / 2)
@@ -112,10 +167,17 @@ const boundedPreview = (text: string, marker: string, maxLines: number, maxBytes
   return bounded.tail ? `${bounded.head}\n\n${marker}\n\n${bounded.tail}` : `${bounded.head}\n\n${marker}`
 }
 
-const lineCount = (text: string) => {
-  let count = 1
-  for (const char of text) if (char === "\n") count++
-  return count
+const withinLimits = (text: string, maxLines: number, maxBytes: number) => {
+  let lines = 1
+  let bytes = 0
+  for (let index = 0; index < text.length; ) {
+    const width = utf8Forward(text, index)
+    bytes += width.bytes
+    if (bytes > maxBytes) return false
+    if (text.charCodeAt(index) === 10 && ++lines > maxLines) return false
+    index += width.units
+  }
+  return lines <= maxLines
 }
 
 const layer = Layer.effect(
@@ -165,10 +227,7 @@ const layer = Layer.effect(
               catch: (cause) => new StorageError({ operation: "encode", cause }),
             })
           : text.map((item) => item.text).join("")
-      if (
-        lineCount(contextual) <= outputLimits.maxLines &&
-        Buffer.byteLength(contextual, "utf-8") <= outputLimits.maxBytes
-      )
+      if (withinLimits(contextual, outputLimits.maxLines, outputLimits.maxBytes))
         return {
           output: input.output,
           outputPaths: [],

@@ -21,6 +21,7 @@ declare const OPENCODE_LIBC: string | undefined
 
 const SUBSCRIBE_TIMEOUT_MS = 10_000
 const MAX_PENDING_UPDATES = 4096
+const DRAIN_CHUNK_SIZE = 64
 
 export const Event = FileSystemWatcher.Event
 
@@ -116,8 +117,12 @@ const layer = Layer.effect(
       runFork(
         Effect.gen(function* () {
           while (pending.size > 0) {
-            const batch = Array.from(pending.values())
-            pending.clear()
+            const batch: Array<{ path: string; type: string }> = []
+            for (const [key, update] of pending) {
+              pending.delete(key)
+              batch.push(update)
+              if (batch.length >= DRAIN_CHUNK_SIZE) break
+            }
             yield* Effect.forEach(
               batch,
               (update) =>
@@ -128,8 +133,9 @@ const layer = Layer.effect(
                 }),
               { discard: true },
             )
-            // A large native batch should not monopolize the runtime while new
-            // batches are arriving from another project/session.
+            // Bound each synchronous publication slice. A 4K path storm must
+            // not occupy one event-loop turn while another session is trying to
+            // dispatch a provider request, flush SSE, or commit a token.
             yield* Effect.yieldNow
           }
         }).pipe(

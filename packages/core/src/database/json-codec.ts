@@ -694,6 +694,29 @@ function parseDriverValue(value: unknown): unknown {
   return JSON.parse(decompressFrame(bytes))
 }
 
+const PREENCODED_JSON = Symbol("opencode.preencoded-json")
+export type PreencodedJson = { readonly [PREENCODED_JSON]: string }
+
+export function preencodedJsonText(text: string): PreencodedJson {
+  return { [PREENCODED_JSON]: text }
+}
+
+/**
+ * Serialize a JSON column value before entering a latency-sensitive SQLite
+ * transaction. Drizzle normally calls customType.toDriver while constructing
+ * the statement under the connection permit, which makes JSON.stringify of a
+ * jumbo event part of the global writer critical section.
+ */
+export function preencodeJson(value: unknown): PreencodedJson {
+  const text = JSON.stringify(value)
+  if (text === undefined) throw new TypeError("JSON value cannot be encoded")
+  return preencodedJsonText(text)
+}
+
+function isPreencodedJson(value: unknown): value is PreencodedJson {
+  return typeof value === "object" && value !== null && PREENCODED_JSON in value
+}
+
 /**
  * Drizzle customType with IDENTITY toDriver. `{ mode: "json" }` is inert for
  * customType in drizzle-orm@1.0.0-rc.2 (verified — no double-encode); it is
@@ -710,6 +733,7 @@ export const compressedJson = customType<{
     return "text"
   },
   toDriver(value) {
+    if (isPreencodedJson(value)) return value[PREENCODED_JSON]
     const text = JSON.stringify(value)
     if (text === undefined) return text
     return text

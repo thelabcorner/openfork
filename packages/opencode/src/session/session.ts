@@ -47,6 +47,7 @@ import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { SessionGroup } from "./group"
 import { Plugin } from "@/plugin"
 import { Goal } from "@opencode-ai/core/goal"
+import * as SessionContextProjector from "./context/projector"
 import { CHAT_PROJECT_ID } from "@opencode-ai/core/project/chat"
 import {
   chatSessionDirectoryKey,
@@ -522,8 +523,13 @@ const layer: Layer.Layer<
 > = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db } = yield* Database.Service
     const database = yield* Database.Service
+    const { db, readDb } = database
+    // Some legacy helpers (MessageV2.page/context state) consume the whole
+    // Database service instead of accepting a DB handle. Supply a read-side
+    // view for pure history/UI queries while keeping mutation paths on the
+    // primary writer service.
+    const readDatabase = Database.Service.of({ ...database, db: readDb, readDb })
     const background = yield* BackgroundJob.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
@@ -707,15 +713,24 @@ const layer: Layer.Layer<
       return result
     })
 
+    const getFrom = (database: Database.Interface["db"], id: SessionID) =>
+      database.select().from(SessionTable).where(eq(SessionTable.id, id)).get().pipe(Effect.orDie)
+
     const get = Effect.fn("Session.get")(function* (id: SessionID) {
-      const row = yield* db.select().from(SessionTable).where(eq(SessionTable.id, id)).get().pipe(Effect.orDie)
+      const row = yield* getFrom(readDb, id)
+      if (!row) return yield* Effect.fail(new NotFoundError({ message: `Session not found: ${id}` }))
+      return fromRow(row)
+    })
+
+    const getForMutation = Effect.fn("Session.getForMutation")(function* (id: SessionID) {
+      const row = yield* getFrom(db, id)
       if (!row) return yield* Effect.fail(new NotFoundError({ message: `Session not found: ${id}` }))
       return fromRow(row)
     })
 
     const list = Effect.fn("Session.list")(function* (input?: ListInput) {
       const ctx = yield* InstanceState.context
-      return yield* listByProject(db, {
+      return yield* listByProject(readDb, {
         projectID: ctx.project.id,
         experimentalWorkspaces: flags.experimentalWorkspaces,
         ...input,
@@ -734,11 +749,11 @@ const layer: Layer.Layer<
 
       const query =
         conditions.length > 0
-          ? db
+          ? readDb
               .select()
               .from(SessionTable)
               .where(and(...conditions))
-          : db.select().from(SessionTable)
+          : readDb.select().from(SessionTable)
       const rows = yield* query
         .orderBy(desc(SessionTable.time_updated), desc(SessionTable.id))
         .limit(input?.limit ?? 100)
@@ -747,7 +762,7 @@ const layer: Layer.Layer<
       const ids = [...new Set(rows.map((row) => row.project_id))]
       const projects = new Map<string, ProjectInfo>()
       if (ids.length > 0) {
-        const items = yield* db
+        const items = yield* readDb
           .select({ id: ProjectTable.id, name: ProjectTable.name, worktree: ProjectTable.worktree })
           .from(ProjectTable)
           .where(inArray(ProjectTable.id, ids))
@@ -764,18 +779,21 @@ const layer: Layer.Layer<
       return rows.map((row) => ({ ...fromRow(row), project: projects.get(row.project_id) ?? null }))
     })
 
-    const children = Effect.fn("Session.children")(function* (parentID: SessionID) {
-      const rows = yield* db
+    const childrenFrom = (database: Database.Interface["db"], parentID: SessionID) =>
+      database
         .select()
         .from(SessionTable)
         .where(and(eq(SessionTable.parent_id, parentID)))
         .all()
         .pipe(Effect.orDie)
+
+    const children = Effect.fn("Session.children")(function* (parentID: SessionID) {
+      const rows = yield* childrenFrom(readDb, parentID)
       return rows.map(fromRow)
     })
 
     const remove: Interface["remove"] = Effect.fnUntraced(function* (sessionID: SessionID) {
-      const session = yield* get(sessionID)
+      const session = yield* getForMutation(sessionID)
       try {
         // `remove` needs to work in all cases, such as broken sessions that
         // run cleanup without instance state.
@@ -785,7 +803,10 @@ const layer: Layer.Layer<
         )
 
         if (hasInstance) yield* cancelBackgroundJobs(background, sessionID)
-        const kids = yield* children(sessionID)
+        // Destructive recursion must observe writes that were already admitted
+        // to the primary connection. Unlike the public child-listing API, wait
+        // behind an in-flight child creation before deciding what to delete.
+        const kids = (yield* childrenFrom(db, sessionID)).map(fromRow)
         for (const child of kids) {
           yield* remove(child.id)
         }
@@ -832,7 +853,7 @@ const layer: Layer.Layer<
       }).pipe(Effect.withSpan("Session.updatePart"))
 
     const getPart: Interface["getPart"] = Effect.fn("Session.getPart")(function* (input) {
-      const row = yield* db
+      const row = yield* readDb
         .select()
         .from(PartTable)
         .where(
@@ -914,7 +935,7 @@ const layer: Layer.Layer<
       workspaceMode?: "shared-current" | "new-worktree"
     }) {
       const ctx = yield* InstanceState.context
-      const original = yield* get(input.sessionID)
+      const original = yield* getForMutation(input.sessionID)
       const title = getForkedTitle(original.title)
       const kind = input.kind ?? "manual"
       const workspaceMode = input.workspaceMode ?? "shared-current"
@@ -1098,7 +1119,7 @@ const layer: Layer.Layer<
 
     const patch = (sessionID: SessionID, info: Patch) =>
       Effect.gen(function* () {
-        const current = yield* get(sessionID)
+        const current = yield* getForMutation(sessionID)
         const next = {
           ...current,
           ...info,
@@ -1206,7 +1227,7 @@ const layer: Layer.Layer<
     const messages: Interface["messages"] = Effect.fn("Session.messages")(function* (input) {
       if (input.limit) {
         return (yield* MessageV2.page({ sessionID: input.sessionID, limit: input.limit }).pipe(
-          Effect.provideService(Database.Service, database),
+          Effect.provideService(Database.Service, readDatabase),
         )).items
       }
 
@@ -1215,7 +1236,7 @@ const layer: Layer.Layer<
       let before: string | undefined
       while (true) {
         const page = yield* MessageV2.page({ sessionID: input.sessionID, limit: size, before }).pipe(
-          Effect.provideService(Database.Service, database),
+          Effect.provideService(Database.Service, readDatabase),
         )
         if (page.items.length === 0) break
         for (let i = page.items.length - 1; i >= 0; i--) {
@@ -1268,7 +1289,7 @@ const layer: Layer.Layer<
       let before: string | undefined
       while (true) {
         const page = yield* MessageV2.page({ sessionID, limit: size, before }).pipe(
-          Effect.provideService(Database.Service, database),
+          Effect.provideService(Database.Service, readDatabase),
         )
         if (page.items.length === 0) break
         for (let i = page.items.length - 1; i >= 0; i--) {
@@ -1392,7 +1413,16 @@ function listByProject(
 export const node = LayerNode.make({
   service: Service,
   layer: layer,
-  deps: [BackgroundJob.node, RuntimeFlags.node, Database.node, EventV2Bridge.node, SessionGroup.node, Plugin.node, Goal.node],
+  deps: [
+    BackgroundJob.node,
+    RuntimeFlags.node,
+    Database.node,
+    EventV2Bridge.node,
+    SessionContextProjector.node,
+    SessionGroup.node,
+    Plugin.node,
+    Goal.node,
+  ],
 })
 
 export * as Session from "./session"

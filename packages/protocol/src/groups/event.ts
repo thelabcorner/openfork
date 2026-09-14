@@ -12,18 +12,46 @@ const fields = {
   location: Schema.optional(Location.Ref),
 }
 
+const transportControls = [
+  {
+    type: "server.connected",
+    schema: Schema.Struct({
+      ...fields,
+      type: Schema.Literal("server.connected"),
+      // Native SSE includes the replay epoch so a client can identify the cursor
+      // generation even on a resumed connection whose control frame has no `id:`.
+      // Keep it optional for compatibility with older servers that emitted `{}`.
+      data: Schema.Struct({ epoch: Schema.optional(Schema.String) }),
+    }).annotate({ identifier: "V2Event.server.connected" }),
+  },
+  {
+    type: "server.heartbeat",
+    schema: Schema.Struct({
+      ...fields,
+      type: Schema.Literal("server.heartbeat"),
+      data: Schema.Struct({}),
+    }).annotate({ identifier: "V2Event.server.heartbeat" }),
+  },
+  {
+    type: "server.stream.gap",
+    schema: Schema.Struct({
+      ...fields,
+      type: Schema.Literal("server.stream.gap"),
+      data: Schema.Struct({
+        requested: Schema.Int,
+        oldest: Schema.optional(Schema.Int),
+        latest: Schema.Int,
+      }),
+    }).annotate({ identifier: "V2Event.server.stream.gap" }),
+  },
+] as const
+
 const schema = <const Definitions extends ReadonlyArray<Definition>>(definitions: Definitions) =>
   Schema.Union([
     ...definitions,
-    ...(definitions.some((definition) => definition.type === "server.connected")
-      ? []
-      : [
-          Schema.Struct({
-            ...fields,
-            type: Schema.Literal("server.connected"),
-            data: Schema.Struct({}),
-          }).annotate({ identifier: "V2Event.server.connected" }),
-        ]),
+    ...transportControls
+      .filter((control) => !definitions.some((definition) => definition.type === control.type))
+      .map((control) => control.schema),
   ]).annotate({ identifier: "V2Event" })
 
 const make = <const Definitions extends ReadonlyArray<Definition>>(definitions: Definitions) => {

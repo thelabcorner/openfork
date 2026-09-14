@@ -24,8 +24,9 @@ export function initialize(
   db: DatabaseService,
   context: Effect.Effect<SystemContext.SystemContext>,
   sessionID: SessionSchema.ID,
+  readDb: DatabaseService = db,
 ): Effect.Effect<Prepared | undefined, SystemContext.InitializationBlocked> {
-  return initializeOnce(db, context, sessionID).pipe(Effect.withSpan("SessionContextEpoch.initialize"))
+  return initializeOnce(db, readDb, context, sessionID).pipe(Effect.withSpan("SessionContextEpoch.initialize"))
 }
 
 export function prepare(
@@ -33,18 +34,20 @@ export function prepare(
   events: EventV2.Interface,
   context: Effect.Effect<SystemContext.SystemContext>,
   sessionID: SessionSchema.ID,
+  readDb: DatabaseService = db,
 ): Effect.Effect<Prepared, SystemContext.InitializationBlocked | ContextSnapshotDecodeError> {
-  return prepareOnce(db, events, context, sessionID).pipe(Effect.withSpan("SessionContextEpoch.prepare"))
+  return prepareOnce(db, readDb, events, context, sessionID).pipe(Effect.withSpan("SessionContextEpoch.prepare"))
 }
 
 const prepareOnce = Effect.fnUntraced(function* (
   db: DatabaseService,
+  readDb: DatabaseService,
   events: EventV2.Interface,
   context: Effect.Effect<SystemContext.SystemContext>,
   sessionID: SessionSchema.ID,
 ) {
   const [value, stored, compaction] = yield* Effect.all(
-    [context, find(db, sessionID), SessionHistory.latestCompaction(db, sessionID)],
+    [context, find(readDb, sessionID), SessionHistory.latestCompaction(readDb, sessionID)],
     { concurrency: "unbounded" },
   )
   if (!stored) {
@@ -79,10 +82,11 @@ const prepareOnce = Effect.fnUntraced(function* (
 
 const initializeOnce = Effect.fnUntraced(function* (
   db: DatabaseService,
+  readDb: DatabaseService,
   context: Effect.Effect<SystemContext.SystemContext>,
   sessionID: SessionSchema.ID,
 ) {
-  if (yield* exists(db, sessionID)) return
+  if (yield* exists(readDb, sessionID)) return
   const generation = yield* context.pipe(Effect.flatMap(SystemContext.initialize))
   const baselineSeq = yield* insert(db, sessionID, generation)
   return { baseline: generation.baseline, baselineSeq }

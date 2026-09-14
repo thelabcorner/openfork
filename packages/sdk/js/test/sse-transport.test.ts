@@ -75,5 +75,57 @@ for (const [name, client] of [["v1", v1], ["v2", v2]] as const) {
         random.mockRestore()
       }
     })
+
+    test("reconnect storms preserve the last validated cursor and stay serial with capped jitter", async () => {
+      const random = spyOn(Math, "random").mockReturnValue(0.5)
+      const delays: number[] = []
+      const cursors: Array<string | null> = []
+      let requests = 0
+      let inFlight = 0
+      let peakInFlight = 0
+
+      const first = new ReadableStream<Uint8Array>({
+        pull(controller) {
+          if ((this as any).sent) {
+            controller.error(new Error("radio dropped"))
+            return
+          }
+          ;(this as any).sent = true
+          controller.enqueue(new TextEncoder().encode('id: epoch:7\ndata: {"value":7}\n\n'))
+        },
+      })
+
+      const { stream } = transport({
+        url: "http://localhost/event",
+        sseDefaultRetryDelay: 100,
+        sseMaxRetryDelay: 800,
+        sseSleepFn: async (delay) => { delays.push(delay) },
+        fetch: async (request) => {
+          inFlight++
+          peakInFlight = Math.max(peakInFlight, inFlight)
+          try {
+            cursors.push(new Request(request).headers.get("Last-Event-ID"))
+            requests++
+            if (requests === 1) return new Response(first)
+            if (requests <= 5) throw new Error("offline")
+            return new Response('id: epoch:8\ndata: {"value":8}\n\n')
+          } finally {
+            inFlight--
+          }
+        },
+      })
+
+      try {
+        expect(await stream.next()).toMatchObject({ done: false, value: { value: 7 } })
+        expect(await stream.next()).toMatchObject({ done: false, value: { value: 8 } })
+        expect(await stream.next()).toEqual({ done: true, value: undefined })
+        expect(cursors).toEqual([null, "epoch:7", "epoch:7", "epoch:7", "epoch:7", "epoch:7"])
+        expect(delays).toEqual([50, 100, 200, 400, 400])
+        expect(peakInFlight).toBe(1)
+      } finally {
+        await stream.return()
+        random.mockRestore()
+      }
+    })
   })
 }

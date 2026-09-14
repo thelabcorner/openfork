@@ -81,6 +81,23 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`event_payload_chunk\` (
+          \`payload_id\` text NOT NULL,
+          \`chunk_index\` integer NOT NULL,
+          \`text\` text NOT NULL,
+          \`time_created\` integer NOT NULL,
+          CONSTRAINT \`event_payload_chunk_pk\` PRIMARY KEY(\`payload_id\`, \`chunk_index\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`event_payload_meta\` (
+          \`payload_id\` text PRIMARY KEY,
+          \`chunk_count\` integer NOT NULL,
+          \`refs\` integer DEFAULT 0 NOT NULL,
+          \`time_touched\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`event_sequence\` (
           \`aggregate_id\` text PRIMARY KEY,
           \`seq\` integer NOT NULL,
@@ -519,6 +536,14 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_message_lifecycle\` (
+          \`message_id\` text PRIMARY KEY,
+          \`streamed_at\` integer,
+          \`settlement\` text,
+          CONSTRAINT \`fk_session_message_lifecycle_message_id_session_message_id_fk\` FOREIGN KEY (\`message_id\`) REFERENCES \`session_message\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`session_message\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
@@ -529,6 +554,16 @@ export default {
           \`data\` text NOT NULL,
           \`search_text\` text DEFAULT '' NOT NULL,
           CONSTRAINT \`fk_session_message_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_message_tool_overlay\` (
+          \`message_id\` text NOT NULL,
+          \`call_id\` text NOT NULL,
+          \`progress_event_id\` text,
+          \`settlement_event_id\` text,
+          CONSTRAINT \`session_message_tool_overlay_pk\` PRIMARY KEY(\`message_id\`, \`call_id\`),
+          CONSTRAINT \`fk_session_message_tool_overlay_message_id_session_message_id_fk\` FOREIGN KEY (\`message_id\`) REFERENCES \`session_message\`(\`id\`) ON DELETE CASCADE
         );
       `)
       yield* tx.run(`
@@ -613,6 +648,12 @@ export default {
           \`time_completed\` integer NOT NULL
         );
       `)
+      yield* tx.run(
+        `CREATE INDEX \`event_payload_chunk_time_created_idx\` ON \`event_payload_chunk\` (\`time_created\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`event_payload_meta_orphan_idx\` ON \`event_payload_meta\` (\`refs\`,\`time_touched\`);`,
+      )
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_value_agg_sha_idx\` ON \`event_value\` (\`aggregate_id\`,\`sha256\`);`)
@@ -718,6 +759,9 @@ export default {
         `CREATE INDEX \`session_message_session_time_created_id_idx\` ON \`session_message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
       yield* tx.run(`CREATE INDEX \`session_message_time_created_idx\` ON \`session_message\` (\`time_created\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_message_tool_overlay_message_idx\` ON \`session_message_tool_overlay\` (\`message_id\`);`,
+      )
       yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)

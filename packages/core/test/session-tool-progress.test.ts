@@ -13,8 +13,9 @@ import { AbsolutePath } from "@opencode-ai/core/schema"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionEvent } from "@opencode-ai/core/session/event"
 import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionMessageProjection } from "@opencode-ai/core/session/message-projection"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
-import { SessionTable, SessionMessageTable } from "@opencode-ai/core/session/sql"
+import { SessionMessageTable, SessionMessageToolOverlayTable, SessionTable } from "@opencode-ai/core/session/sql"
 import { testEffect } from "./lib/effect"
 
 const it = testEffect(LayerNode.compile(LayerNode.group([Database.node, EventV2.node, SessionProjector.node])))
@@ -63,7 +64,9 @@ describe("Tool.Progress", () => {
           .get()
           .pipe(Effect.orDie)
         if (!row) return yield* Effect.die("Missing projected assistant")
-        return Schema.decodeUnknownSync(SessionMessage.Assistant)({ ...row.data, id: row.id, type: row.type })
+        const message = yield* SessionMessageProjection.decodeRow(db, row).pipe(Effect.orDie)
+        if (message.type !== "assistant") return yield* Effect.die("Projected message is not an assistant")
+        return message
       })
       const start = (callID: string) =>
         Effect.gen(function* () {
@@ -114,6 +117,14 @@ describe("Tool.Progress", () => {
       expect((yield* readAssistant).content[0]).toMatchObject({
         state: { status: "completed", structured: { phase: "done" }, content: content("complete") },
       })
+      expect(
+        yield* db
+          .select()
+          .from(SessionMessageToolOverlayTable)
+          .where(eq(SessionMessageToolOverlayTable.call_id, "call-success"))
+          .get()
+          .pipe(Effect.orDie),
+      ).toMatchObject({ settlement_event_id: success.id, progress_event_id: null })
 
       yield* start("call-failed")
       yield* service.publish(SessionEvent.Tool.Progress, {
@@ -140,6 +151,14 @@ describe("Tool.Progress", () => {
           error: { type: "unknown", message: "boom" },
         },
       })
+      expect(
+        yield* db
+          .select()
+          .from(SessionMessageToolOverlayTable)
+          .where(eq(SessionMessageToolOverlayTable.call_id, "call-failed"))
+          .get()
+          .pipe(Effect.orDie),
+      ).toMatchObject({ settlement_event_id: failed.id })
       expect(Schema.is(SessionEvent.Durable)(success)).toBe(true)
       expect(Schema.is(SessionEvent.Durable)(failed)).toBe(true)
 

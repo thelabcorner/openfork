@@ -11,6 +11,7 @@ import {
   Layer,
   Schedule,
   Schema,
+  Semaphore,
   Scope,
   SynchronizedRef,
   Types,
@@ -314,6 +315,21 @@ export const locationLayer = Layer.effect(
     const authorize = <A, E, R>(effect: Effect.Effect<A, E, R>) =>
       effect.pipe(Effect.mapError((cause) => new AuthorizationError({ cause })))
 
+    // Model resolution can happen concurrently for many Sessions. OAuth
+    // providers commonly rotate refresh tokens, so allowing all Sessions to
+    // refresh the same near-expiry credential at once is both wasteful and can
+    // invalidate the credential another waiter is about to persist. Serialize
+    // only by credential ID; unrelated providers remain fully concurrent.
+    const refreshLocks = new Map<string, ReturnType<typeof Semaphore.makeUnsafe>>()
+    const refreshLock = (id: Credential.ID) => {
+      const key = String(id)
+      const current = refreshLocks.get(key)
+      if (current) return current
+      const created = Semaphore.makeUnsafe(1)
+      refreshLocks.set(key, created)
+      return created
+    }
+
     const close = (attemptScope: Scope.Closeable) =>
       Scope.close(attemptScope, Exit.void).pipe(Effect.forkIn(scope, { startImmediately: true }), Effect.asVoid)
 
@@ -391,19 +407,32 @@ export const locationLayer = Layer.effect(
             const key = process.env[connection.name]
             return key ? Credential.Key.make({ type: "key", key }) : undefined
           }
-          const credential = yield* credentials.get(connection.id)
-          if (!credential) return undefined
-          if (credential.value.type === "key") return credential.value
-          const implementation = state
-            .get()
-            .integrations.get(credential.integrationID)
-            ?.implementations.get(credential.value.methodID)
-          if (!implementation?.refresh) return credential.value
+          const initial = yield* credentials.get(connection.id)
+          if (!initial) return undefined
+          if (initial.value.type === "key") return initial.value
           const now = yield* Clock.currentTimeMillis
-          if (credential.value.expires > now + Duration.toMillis(Duration.minutes(5))) return credential.value
-          const value = yield* authorize(implementation.refresh(credential.value))
-          yield* credentials.update(credential.id, { value })
-          return value
+          if (initial.value.expires > now + Duration.toMillis(Duration.minutes(5))) return initial.value
+
+          return yield* refreshLock(connection.id).withPermit(
+            Effect.gen(function* () {
+              // Another Session may have refreshed this credential while we
+              // waited for the keyed permit. Re-read it and skip network I/O if
+              // the persisted value is already fresh.
+              const credential = yield* credentials.get(connection.id)
+              if (!credential) return undefined
+              if (credential.value.type === "key") return credential.value
+              const implementation = state
+                .get()
+                .integrations.get(credential.integrationID)
+                ?.implementations.get(credential.value.methodID)
+              if (!implementation?.refresh) return credential.value
+              const current = yield* Clock.currentTimeMillis
+              if (credential.value.expires > current + Duration.toMillis(Duration.minutes(5))) return credential.value
+              const value = yield* authorize(implementation.refresh(credential.value))
+              yield* credentials.update(credential.id, { value })
+              return value
+            }),
+          )
         }),
         key: Effect.fn("Integration.connection.key")(function* (input) {
           const method = state

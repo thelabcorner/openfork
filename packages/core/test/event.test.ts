@@ -4,18 +4,24 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { Event } from "@opencode-ai/schema/event"
 import { Session } from "@opencode-ai/schema/session"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
+import { SessionMessage } from "@opencode-ai/schema/session-message"
 import { SessionV1 } from "@opencode-ai/schema/session-v1"
 import { Provider } from "@opencode-ai/schema/provider"
 import { Model } from "@opencode-ai/schema/model"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { EventSequenceTable, EventTable } from "@opencode-ai/core/event/sql"
+import {
+  EventPayloadChunkTable,
+  EventPayloadMetaTable,
+  EventSequenceTable,
+  EventTable,
+} from "@opencode-ai/core/event/sql"
 import { isCompactedSequence, loadCompaction } from "@opencode-ai/core/database/chunk-compaction"
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
@@ -316,6 +322,78 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("routes location listeners without invoking callbacks from other projects", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const projectA = {
+        directory: AbsolutePath.make("project-a"),
+        workspaceID: WorkspaceV2.ID.make("wrk_a"),
+      }
+      const projectB = {
+        directory: AbsolutePath.make("project-b"),
+        workspaceID: WorkspaceV2.ID.make("wrk_b"),
+      }
+      const received = new Array<string>()
+      const unsubscribeA = yield* events.listenLocation(Message, projectA, (event) =>
+        Effect.sync(() => received.push(`a:${event.data.text}`)),
+      )
+      yield* events.listenLocation(Message, projectB, (event) =>
+        Effect.sync(() => received.push(`b:${event.data.text}`)),
+      )
+
+      yield* events.publish(Message, { text: "one" }, { location: projectA })
+      yield* events.publish(Message, { text: "two" }, { location: projectB })
+      yield* events.publish(GlobalMessage, { text: "wrong type" }, { location: projectA })
+      yield* unsubscribeA
+      yield* events.publish(Message, { text: "after unsubscribe" }, { location: projectA })
+
+      expect(received).toEqual(["a:one", "b:two"])
+    }),
+  )
+
+  it.effect("routes aggregate listeners only to the matching durable aggregate", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const received = new Array<string>()
+      const unsubscribe = yield* events.listenAggregate("aggregate-a", (event) =>
+        Effect.sync(() => received.push(`${event.durable?.aggregateID}:${event.type}`)),
+      )
+
+      yield* events.publish(SyncMessage, { id: "aggregate-a", text: "one" })
+      yield* events.publish(SyncMessage, { id: "aggregate-b", text: "two" })
+      yield* events.publish(Message, { text: "live-only" })
+      yield* unsubscribe
+      yield* events.publish(SyncMessage, { id: "aggregate-a", text: "after unsubscribe" })
+
+      expect(received).toEqual([`aggregate-a:${SyncMessage.type}`])
+    }),
+  )
+
+  it.effect("detaches defective scoped listeners instead of retrying them on every event", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const project = { directory: AbsolutePath.make("project-defect") }
+      let locatedCalls = 0
+      let aggregateCalls = 0
+      yield* events.listenLocation(Message, project, () => {
+        locatedCalls++
+        throw new Error("located defect")
+      })
+      yield* events.listenAggregate("aggregate-defect", () => {
+        aggregateCalls++
+        throw new Error("aggregate defect")
+      })
+
+      yield* events.publish(Message, { text: "one" }, { location: project })
+      yield* events.publish(Message, { text: "two" }, { location: project })
+      yield* events.publish(SyncMessage, { id: "aggregate-defect", text: "one" })
+      yield* events.publish(SyncMessage, { id: "aggregate-defect", text: "two" })
+
+      expect(locatedCalls).toBe(1)
+      expect(aggregateCalls).toBe(1)
+    }),
+  )
+
   it.effect("isolates observer defects after durable events commit", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
@@ -498,6 +576,103 @@ describe("EventV2", () => {
       expect(rows).toHaveLength(1)
       expect(rows[0]?.type).toBe(EventV2.versionedType(SyncMessage.type, 1))
       expect(rows[0]?.aggregate_id).toBe(aggregateID)
+    }),
+  )
+
+  it.effect("stages jumbo durable payloads in cooperative chunks and rehydrates them byte-exact", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const text = `prefix:${"x".repeat(1024 * 1024)}:suffix`
+      const timestamp = DateTime.makeUnsafe(123)
+      const messageID = SessionMessage.ID.create()
+
+      const published = yield* events.publish(SessionEvent.Synthetic, { sessionID: aggregateID, messageID, timestamp, text })
+      const stored = yield* db
+        .select({ data: EventTable.data })
+        .from(EventTable)
+        .where(eq(EventTable.id, published.id))
+        .get()
+        .pipe(Effect.orDie)
+      const ref = (stored?.data as { $eventPayload: { id: string; count: number } }).$eventPayload
+      expect(Object.keys(stored?.data ?? {})).toEqual(["$eventPayload"])
+      expect(typeof ref.id).toBe("string")
+      expect(typeof ref.count).toBe("number")
+      const count = Number(ref.count)
+      expect(count).toBeGreaterThan(1)
+
+      const chunks = yield* db
+        .select()
+        .from(EventPayloadChunkTable)
+        .where(eq(EventPayloadChunkTable.payload_id, ref.id))
+        .all()
+        .pipe(Effect.orDie)
+      expect(chunks).toHaveLength(count)
+      expect(Math.max(...chunks.map((chunk) => chunk.text.length))).toBeLessThanOrEqual(256 * 1024)
+      expect(
+        yield* db
+          .select({ chunkCount: EventPayloadMetaTable.chunk_count, refs: EventPayloadMetaTable.refs })
+          .from(EventPayloadMetaTable)
+          .where(eq(EventPayloadMetaTable.payload_id, ref.id))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ chunkCount: count, refs: 1 })
+
+      const replayed = yield* events.durable({ aggregateID }).pipe(Stream.take(1), Stream.runCollect)
+      expect(Array.from(replayed)[0]?.data).toEqual({ sessionID: aggregateID, messageID, timestamp, text })
+
+      yield* events.remove(aggregateID)
+      expect(
+        yield* db
+          .select({ refs: EventPayloadMetaTable.refs })
+          .from(EventPayloadMetaTable)
+          .where(eq(EventPayloadMetaTable.payload_id, ref.id))
+          .get()
+          .pipe(Effect.orDie),
+      ).toEqual({ refs: 0 })
+      // Reclamation is deliberately age-gated and deferred to a later startup,
+      // so aggregate deletion never turns into a multi-megabyte writer hold.
+      expect(
+        yield* db
+          .select({ index: EventPayloadChunkTable.chunk_index })
+          .from(EventPayloadChunkTable)
+          .where(eq(EventPayloadChunkTable.payload_id, ref.id))
+          .all()
+          .pipe(Effect.orDie),
+      ).toHaveLength(count)
+    }),
+  )
+
+  it.effect("fails closed when a staged jumbo payload is incomplete", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const aggregateID = Session.ID.create()
+      const published = yield* events.publish(SessionEvent.Synthetic, {
+        sessionID: aggregateID,
+        messageID: SessionMessage.ID.create(),
+        timestamp: DateTime.makeUnsafe(456),
+        text: "y".repeat(1024 * 1024),
+      })
+      const stored = yield* db
+        .select({ data: EventTable.data })
+        .from(EventTable)
+        .where(eq(EventTable.id, published.id))
+        .get()
+        .pipe(Effect.orDie)
+      const ref = (stored?.data as { $eventPayload: { id: string; count: number } }).$eventPayload
+      const count = Number(ref.count)
+      yield* db
+        .delete(EventPayloadChunkTable)
+        .where(
+          and(eq(EventPayloadChunkTable.payload_id, ref.id), eq(EventPayloadChunkTable.chunk_index, count - 1)),
+        )
+        .run()
+        .pipe(Effect.orDie)
+
+      const exit = yield* events.durable({ aggregateID }).pipe(Stream.take(1), Stream.runCollect, Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
     }),
   )
 

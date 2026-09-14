@@ -149,11 +149,12 @@ export const ripgrepLayer = Layer.effect(
     // debounced batch, latest event per path wins) so the frozen rg snapshot stays
     // in sync with the filesystem — new/renamed/deleted/untracked files included.
     const queue = yield* Queue.dropping<{ file: string; event: "add" | "change" | "unlink" }>(1024)
-    const unsubscribe = yield* events.listen((event) =>
+    const unsubscribe = yield* events.listenLocation(
+      Watcher.Event.Updated,
+      { directory: location.directory, workspaceID: location.workspaceID },
+      (event) =>
       Effect.gen(function* () {
-        if (event.type !== Watcher.Event.Updated.type) return
         const data = event.data as { file: string; event: "add" | "change" | "unlink" }
-        if (event.location && event.location.directory !== location.directory) return
         yield* Queue.offer(queue, data).pipe(Effect.ignore)
       }),
     )

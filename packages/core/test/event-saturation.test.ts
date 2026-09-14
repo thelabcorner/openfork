@@ -1,11 +1,20 @@
 import { describe, expect } from "bun:test"
-import { Effect, Fiber, Layer, Ref, Schema } from "effect"
+import { DateTime, Effect, Fiber, Layer, Ref, Schema } from "effect"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Database } from "@opencode-ai/core/database/database"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Location } from "@opencode-ai/core/location"
+import { ModelV2 } from "@opencode-ai/core/model"
+import { Project } from "@opencode-ai/core/project"
+import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AbsolutePath } from "@opencode-ai/core/schema"
+import { SessionEvent } from "@opencode-ai/core/session/event"
+import { SessionMessage } from "@opencode-ai/core/session/message"
+import { SessionProjector } from "@opencode-ai/core/session/projector"
+import { SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionV2 } from "@opencode-ai/core/session"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
@@ -56,6 +65,7 @@ const DurableMarker = EventV2.define({
 const it = testEffect(
   AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, Location.node]), [[Location.node, locationLayer]]),
 )
+const itBoundary = testEffect(LayerNode.compile(LayerNode.group([Database.node, EventV2.node, SessionProjector.node])))
 
 function quantiles(samples: number[], qs: number[]) {
   const sorted = [...samples].sort((a, b) => a - b)
@@ -175,6 +185,102 @@ describe("event saturation", () => {
     // Durable-write contention is intentionally part of this stress harness;
     // on a cold Windows SQLite connection it can exceed Bun's five-second
     // default even though the measured event-loop budget remains healthy.
+    { timeout: 30_000 },
+  )
+
+  itBoundary.live(
+    "commits concurrent large assistant boundaries without starving the event loop",
+    () =>
+      Effect.gen(function* () {
+        const { db } = yield* Database.Service
+        const events = yield* EventV2.Service
+        yield* db
+          .insert(ProjectTable)
+          .values({ id: Project.ID.global, worktree: AbsolutePath.make("/boundary-project"), sandboxes: [] })
+          .onConflictDoNothing()
+          .run()
+          .pipe(Effect.orDie)
+
+        const model = { id: ModelV2.ID.make("boundary-model"), providerID: ProviderV2.ID.make("boundary-provider") }
+        const sessions = Array.from({ length: 6 }, (_, lane) => ({
+          id: SessionV2.ID.make(`ses_boundary_${lane}`),
+          assistant: SessionMessage.ID.create(),
+          textID: `text-${lane}`,
+        }))
+        for (const [lane, session] of sessions.entries()) {
+          yield* db
+            .insert(SessionTable)
+            .values({
+              id: session.id,
+              project_id: Project.ID.global,
+              slug: `boundary-${lane}`,
+              directory: "/boundary-project",
+              title: `boundary ${lane}`,
+              version: "test",
+            })
+            .run()
+            .pipe(Effect.orDie)
+          const timestamp = DateTime.makeUnsafe(lane + 1)
+          yield* events.publish(SessionEvent.Step.Started, {
+            sessionID: session.id,
+            assistantMessageID: session.assistant,
+            timestamp,
+            agent: "build",
+            model,
+          })
+          yield* events.publish(SessionEvent.Text.Started, {
+            sessionID: session.id,
+            assistantMessageID: session.assistant,
+            timestamp,
+            textID: session.textID,
+          })
+        }
+
+        const gaps: number[] = []
+        let last = performance.now()
+        const timer = setInterval(() => {
+          const now = performance.now()
+          gaps.push(now - last)
+          last = now
+        }, 10)
+
+        // Large enough to exercise projection + event-row duplication without
+        // making the regression suite itself a multi-hundred-MiB stress job.
+        const text = "0123456789abcdef".repeat(128 * 1024) // 2 MiB/session
+        const latencies: number[] = []
+        try {
+          yield* Effect.all(
+            sessions.map((session, lane) =>
+              Effect.gen(function* () {
+                const started = performance.now()
+                yield* events.publish(SessionEvent.Text.Ended, {
+                  sessionID: session.id,
+                  assistantMessageID: session.assistant,
+                  timestamp: DateTime.makeUnsafe(100 + lane),
+                  textID: session.textID,
+                  text,
+                })
+                latencies.push(performance.now() - started)
+              }),
+            ),
+            { concurrency: "unbounded", discard: true },
+          )
+        } finally {
+          clearInterval(timer)
+        }
+
+        const [p50, p99, max] = quantiles(latencies, [0.5, 0.99, 1])
+        const maxGap = Math.max(0, ...gaps)
+        console.log(
+          `[boundary-saturation] 6x2MiB durable Text.Ended ms p50=${p50.toFixed(1)} p99=${p99.toFixed(1)} max=${max.toFixed(1)} loopMaxGapMs=${maxGap.toFixed(1)}`,
+        )
+        // Regression guards are intentionally generous. This test exists to
+        // catch second-scale serialization/transaction collapse, not enforce a
+        // machine-specific microbenchmark number.
+        expect(p99).toBeLessThan(2_000)
+        expect(max).toBeLessThan(4_000)
+        expect(maxGap).toBeLessThan(1_000)
+      }),
     { timeout: 30_000 },
   )
 })

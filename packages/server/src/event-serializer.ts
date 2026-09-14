@@ -32,12 +32,11 @@ export function wireEvent(event: EventV2.Payload): WireEvent {
 export function serializeEvent(event: object): string {
   const cached = frames.get(event)
   if (cached !== undefined) return cached
-  // `server.stream.gap` is a transport control frame emitted when a replay
-  // cursor falls outside the bounded ring. It deliberately is not a domain
-  // event in OpenCodeEvent, but it must still be serializable so recovery can
-  // reach the client instead of failing inside the serializer.
-  const type = (event as { type?: unknown }).type
-  const frame = JSON.stringify(type === "server.stream.gap" ? event : encode(event))
+  // Transport controls (connected/heartbeat/replay-gap) are members of the
+  // protocol schema just like domain events. Keeping one validation path means
+  // generated clients and the server can never silently disagree about a data
+  // frame that is legal on this SSE route.
+  const frame = JSON.stringify(encode(event))
   frames.set(event, frame)
   return frame
 }

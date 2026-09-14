@@ -40,6 +40,7 @@ const BACKFILL_UPPER_KEY = "semantic_index_backfill_upper_v2"
 const TRANSFORMED_CURSOR_KEY = "semantic_index_transformed_cursor_v2"
 const DEPENDENCY_CURSOR_KEY = "semantic_dependency_backfill_cursor_v1"
 const DEPENDENCY_UPPER_KEY = "semantic_dependency_backfill_upper_v1"
+export const SEMANTIC_HISTORY_EPOCH_KEY = "semantic_history_epoch_v1"
 // ~36 ms on the 10 GiB corpus measured from the 636k-row/12s full extraction.
 // Keep one synchronous SQLite slice small enough not to create a foreground
 // latency cliff, then yield to the normal sealer loop.
@@ -188,15 +189,43 @@ const metaNumber = Effect.fn("ChunkDB.semanticPrune.metaNumber")(function* (db: 
   return Number.isSafeInteger(value) && value >= 0 ? value : undefined
 })
 
+const historyEpoch = Effect.fn("ChunkDB.semanticPrune.historyEpoch")(function* (db: DatabaseShape) {
+  const row = yield* db
+    .get<{ value: string | null }>(sql`SELECT value FROM ocdb_meta WHERE key = ${SEMANTIC_HISTORY_EPOCH_KEY}`)
+    .pipe(Effect.orDie)
+  const value = Number(row?.value ?? 0)
+  return Number.isSafeInteger(value) && value >= 0 ? value : 0
+})
+
 const writeMeta = Effect.fn("ChunkDB.semanticPrune.writeMeta")(function* (
   db: DatabaseShape,
   key: string,
   value: string | number,
+  expectedHistoryEpoch: number,
 ) {
-  yield* db.run(sql`
-    INSERT INTO ocdb_meta(key, value) VALUES (${key}, ${String(value)})
-    ON CONFLICT(key) DO UPDATE SET value = excluded.value
-  `).pipe(Effect.orDie)
+  // Acquire SQLite's writer slot before checking the epoch. A history reset
+  // increments the epoch in its own IMMEDIATE transaction; any stale backfill
+  // writer waiting behind that reset therefore observes the new epoch and its
+  // cursor write becomes a no-op instead of poisoning the fresh database.
+  yield* db
+    .transaction(
+      (tx) =>
+        tx.run(sql`
+          INSERT INTO ocdb_meta(key, value)
+          SELECT ${key}, ${String(value)}
+          WHERE COALESCE(
+            (SELECT CAST(value AS INTEGER) FROM ocdb_meta WHERE key = ${SEMANTIC_HISTORY_EPOCH_KEY}),
+            0
+          ) = ${expectedHistoryEpoch}
+          ON CONFLICT(key) DO UPDATE SET value = excluded.value
+          WHERE COALESCE(
+            (SELECT CAST(value AS INTEGER) FROM ocdb_meta WHERE key = ${SEMANTIC_HISTORY_EPOCH_KEY}),
+            0
+          ) = ${expectedHistoryEpoch}
+        `),
+      { behavior: "immediate" },
+    )
+    .pipe(Effect.orDie)
 })
 
 const prepareSemanticStage = Effect.fn("ChunkDB.semanticPrune.prepareStage")(function* (db: DatabaseShape) {
@@ -216,12 +245,19 @@ const flushSemanticStage = Effect.fn("ChunkDB.semanticPrune.flushStage")(functio
 ) {
   yield* db.run(`
     INSERT OR IGNORE INTO semantic_aggregate (aggregate_id)
-    SELECT DISTINCT aggregate_id FROM ocdb_semantic_stage
+    SELECT DISTINCT stage.aggregate_id
+    FROM ocdb_semantic_stage stage
+    JOIN event source
+      ON source.aggregate_id = stage.aggregate_id
+     AND source.seq = stage.seq
   `).pipe(Effect.orDie)
   yield* db.run(`
     INSERT OR IGNORE INTO semantic_entity (aggregate_key, kind, entity_id, parent_id)
     SELECT a.aggregate_key, s.kind, s.entity_id, s.parent_id
     FROM ocdb_semantic_stage s
+    JOIN event source
+      ON source.aggregate_id = s.aggregate_id
+     AND source.seq = s.seq
     JOIN semantic_aggregate a ON a.aggregate_id = s.aggregate_id
     GROUP BY a.aggregate_key, s.kind, s.entity_id, s.parent_id
   `).pipe(Effect.orDie)
@@ -229,6 +265,9 @@ const flushSemanticStage = Effect.fn("ChunkDB.semanticPrune.flushStage")(functio
     INSERT OR IGNORE INTO event_semantic (aggregate_key, seq, kind, entity_key, proven)
     SELECT a.aggregate_key, s.seq, s.kind, e.entity_key, ${proven}
     FROM ocdb_semantic_stage s
+    JOIN event source
+      ON source.aggregate_id = s.aggregate_id
+     AND source.seq = s.seq
     JOIN semantic_aggregate a ON a.aggregate_id = s.aggregate_id
     JOIN semantic_entity e
       ON e.aggregate_key = a.aggregate_key
@@ -316,13 +355,14 @@ const migrateLegacyCheckpoints = Effect.fn("ChunkDB.semanticPrune.migrateLegacyC
  */
 export const backfillSemanticIndex = Effect.fn("ChunkDB.semanticPrune.backfillIndex")(function* (
   db: DatabaseShape,
+  expectedHistoryEpoch: number,
 ) {
   let upper = yield* metaNumber(db, BACKFILL_UPPER_KEY)
   if (upper === undefined) {
     upper =
       (yield* db.get<{ value: number }>(sql`SELECT coalesce(max(rowid), 0) AS value FROM event`).pipe(Effect.orDie))
         ?.value ?? 0
-    yield* writeMeta(db, BACKFILL_UPPER_KEY, upper)
+    yield* writeMeta(db, BACKFILL_UPPER_KEY, upper, expectedHistoryEpoch)
   }
 
   let cursor = (yield* metaNumber(db, BACKFILL_CURSOR_KEY)) ?? 0
@@ -358,7 +398,7 @@ export const backfillSemanticIndex = Effect.fn("ChunkDB.semanticPrune.backfillIn
         AND (type = 'message.updated.1' OR json_type(data, '$.part.messageID') = 'text')
     `).pipe(Effect.orDie)
     indexed += yield* flushSemanticStage(db, 0)
-    yield* writeMeta(db, BACKFILL_CURSOR_KEY, through)
+    yield* writeMeta(db, BACKFILL_CURSOR_KEY, through, expectedHistoryEpoch)
     cursor = through
     if (through < upper) return { indexed, cursor: through, upper, complete: false }
   }
@@ -438,7 +478,7 @@ export const backfillSemanticIndex = Effect.fn("ChunkDB.semanticPrune.backfillIn
     indexed += yield* flushSemanticStage(db, 0)
   }
   const transformedThrough = transformed.at(-1)?.rowid ?? transformedCursor
-  yield* writeMeta(db, TRANSFORMED_CURSOR_KEY, transformedThrough)
+  yield* writeMeta(db, TRANSFORMED_CURSOR_KEY, transformedThrough, expectedHistoryEpoch)
   return {
     indexed,
     cursor,
@@ -456,6 +496,7 @@ export const backfillSemanticIndex = Effect.fn("ChunkDB.semanticPrune.backfillIn
  */
 const backfillDeltaDependencies = Effect.fn("ChunkDB.semanticPrune.backfillDependencies")(function* (
   db: DatabaseShape,
+  expectedHistoryEpoch: number,
 ) {
   const table = yield* db.get<{ one: number }>(sql`
     SELECT 1 AS one FROM sqlite_master WHERE type = 'table' AND name = 'event_value' LIMIT 1
@@ -467,7 +508,7 @@ const backfillDeltaDependencies = Effect.fn("ChunkDB.semanticPrune.backfillDepen
     upper =
       (yield* db.get<{ value: number }>(sql`SELECT coalesce(max(rowid), 0) AS value FROM event_value`).pipe(Effect.orDie))
         ?.value ?? 0
-    yield* writeMeta(db, DEPENDENCY_UPPER_KEY, upper)
+    yield* writeMeta(db, DEPENDENCY_UPPER_KEY, upper, expectedHistoryEpoch)
   }
   const cursor = (yield* metaNumber(db, DEPENDENCY_CURSOR_KEY)) ?? 0
   if (cursor >= upper) return { indexed: 0, complete: true }
@@ -508,7 +549,7 @@ const backfillDeltaDependencies = Effect.fn("ChunkDB.semanticPrune.backfillDepen
       // will quarantine this aggregate from canonical deletion.
     }
   }
-  yield* writeMeta(db, DEPENDENCY_CURSOR_KEY, through)
+  yield* writeMeta(db, DEPENDENCY_CURSOR_KEY, through, expectedHistoryEpoch)
   return { indexed, complete: through >= upper }
 })
 
@@ -550,8 +591,12 @@ const readCursor = Effect.fn("ChunkDB.semanticPrune.readCursor")(function* (db: 
   return row?.value ?? ""
 })
 
-const writeCursor = Effect.fn("ChunkDB.semanticPrune.writeCursor")(function* (db: DatabaseShape, cursor: string) {
-  yield* writeMeta(db, CURSOR_KEY, cursor)
+const writeCursor = Effect.fn("ChunkDB.semanticPrune.writeCursor")(function* (
+  db: DatabaseShape,
+  cursor: string,
+  expectedHistoryEpoch: number,
+) {
+  yield* writeMeta(db, CURSOR_KEY, cursor, expectedHistoryEpoch)
 })
 
 const candidatesForPolicy = Effect.fn("ChunkDB.semanticPrune.candidatesForPolicy")(function* (
@@ -828,9 +873,10 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
   const requested = options?.limit ?? DEFAULT_LIMIT
   const limit = Math.max(1, Math.min(MAX_LIMIT, requested))
   const writeSliceRows = Math.max(1, Math.min(512, options?.writeSliceRows ?? WRITE_SLICE_ROWS))
+  const expectedHistoryEpoch = yield* historyEpoch(db)
   const checkpointMigration = yield* migrateLegacyCheckpoints(db)
-  const dependency = yield* backfillDeltaDependencies(db)
-  const backfill = yield* backfillSemanticIndex(db)
+  const dependency = yield* backfillDeltaDependencies(db, expectedHistoryEpoch)
+  const backfill = yield* backfillSemanticIndex(db, expectedHistoryEpoch)
   if (!backfill.complete || !dependency.complete) {
     return {
       inspected: 0,
@@ -855,7 +901,7 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
   const cursor = yield* readCursor(db)
   const aggregate = yield* nextAggregate(db, cutoff, cursor)
   if (!aggregate) {
-    if (cursor !== "") yield* writeCursor(db, "")
+    if (cursor !== "") yield* writeCursor(db, "", expectedHistoryEpoch)
     return {
       inspected: 0,
       compacted: 0,
@@ -1129,7 +1175,7 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
   // minutes-long backfill into a multi-day migration.
   let hasLaterAggregate = false
   if (compacted === 0) {
-    yield* writeCursor(db, aggregateID)
+    yield* writeCursor(db, aggregateID, expectedHistoryEpoch)
     hasLaterAggregate = (yield* nextAggregate(db, cutoff, aggregateID)) !== undefined
   }
 
@@ -1153,6 +1199,7 @@ export const runSemanticPrunePass = Effect.fn("ChunkDB.semanticPrune.runPass")(f
 })
 
 export const SemanticPrune = {
+  historyEpochKey: SEMANTIC_HISTORY_EPOCH_KEY,
   checkpointType: CHECKPOINT_TYPE,
   policies: POLICIES,
   backfillRowidSpan: BACKFILL_ROWID_SPAN,

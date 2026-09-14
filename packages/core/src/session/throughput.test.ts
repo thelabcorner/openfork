@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test"
-import { turnThroughput, type ThroughputMessage } from "./throughput"
+import { turnThroughput, turnThroughputByTurn, type ThroughputMessage } from "./throughput"
 
 const user = (id: string): ThroughputMessage => ({ id, role: "user" })
 
@@ -130,5 +130,36 @@ describe("turnThroughput", () => {
     expect(result?.requestRate).toBe(100)
     expect(result?.decodeRate).toBeUndefined()
     expect(result?.ttftMs).toBeUndefined()
+  })
+})
+
+describe("turnThroughputByTurn", () => {
+  test("matches the single-turn API for every turn without rescanning history", () => {
+    const messages: ThroughputMessage[] = [
+      user("u1"),
+      step("a1", { sent: 100, first: 200, streamed: 1100 }, { output: 20, reasoning: 5 }),
+      user("u2"),
+      step("a2", { sent: 2000, first: 2100, streamed: 3000 }, { output: 40, reasoning: 10 }),
+      { id: "switch", role: "agent-switched" },
+      step("a3", { sent: 3100, first: 3200, streamed: 4100 }, { output: 30, reasoning: 0 }),
+      { id: "boundary", role: "synthetic" },
+      user("u3"),
+      step("a4", { sent: 5000, first: 5100, streamed: 6000 }, { output: 10, reasoning: 0 }),
+    ]
+    const bulk = turnThroughputByTurn(messages)
+    for (const id of ["u1", "u2", "u3"]) expect(bulk.get(id)).toEqual(turnThroughput(messages, id))
+  })
+
+  test("preserves invalidation semantics for failures and model switches", () => {
+    const messages: ThroughputMessage[] = [
+      user("u1"),
+      step("a1", { sent: 100, first: 200, streamed: 1100 }, { output: 20 }),
+      { id: "model-change", role: "model-switched" },
+      user("u2"),
+      { ...step("a2", { sent: 2000, first: 2100, streamed: 3000 }, { output: 40 }), failed: true },
+    ]
+    const bulk = turnThroughputByTurn(messages)
+    expect(bulk.has("u1")).toBe(false)
+    expect(bulk.has("u2")).toBe(false)
   })
 })

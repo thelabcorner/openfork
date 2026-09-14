@@ -9,8 +9,8 @@ import { xdgData } from "xdg-basedir"
  * Phase-by-phase trace for the server event pipeline, written as JSONL to a
  * file for post-run analysis.
  *
- * Default ON: set `OPENCODE_EVENT_TRACE=0` (or false/off/no) to disable, and
- * `OPENCODE_EVENT_TRACE_DIR` to override the output directory (default
+ * Opt-in: set `OPENCODE_EVENT_TRACE=1` (or any value other than
+ * 0/false/off/no) to enable, and `OPENCODE_EVENT_TRACE_DIR` to override the output directory (default
  * `<xdg-data>/opencode/log/event-trace`). One `trace-<pid>-<timestamp>.jsonl`
  * per process, rolled at 25 MiB keeping two rotated files.
  *
@@ -30,7 +30,12 @@ const SUMMARY_MS = 15_000
 const MAX_BUFFERED_BYTES = 1024 * 1024
 
 const traceEnv = process.env.OPENCODE_EVENT_TRACE
-let enabled = traceEnv === undefined ? true : !OFF.has(traceEnv.toLowerCase().trim())
+// This instrumentation was originally default-on while diagnosing concurrent
+// session stalls. It touches Maps/histograms on every publish and periodically
+// writes JSONL. Keeping that tax in the production hot path after the measured
+// bugs are fixed makes the observer part of the workload, so tracing is now an
+// explicit diagnostic mode.
+let enabled = traceEnv !== undefined && !OFF.has(traceEnv.toLowerCase().trim())
 
 let directory =
   process.env.OPENCODE_EVENT_TRACE_DIR ?? path.join(xdgData ?? path.join(os.tmpdir(), ".local", "share"), "opencode", "log", "event-trace")
@@ -46,6 +51,11 @@ let streamPath = ""
 let fileDead = false
 let summaryTimer: ReturnType<typeof setInterval> | undefined
 let summaryAt = 0
+
+/** Cheap hot-path gate so callers do not take timestamps when tracing is off. */
+export function active() {
+  return enabled
+}
 
 function ensureStream() {
   if (!enabled || fileDead || stream) return

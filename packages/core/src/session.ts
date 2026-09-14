@@ -9,9 +9,10 @@ import { WorkspaceV2 } from "./workspace"
 import { ModelV2 } from "./model"
 import { Location } from "./location"
 import { SessionMessage } from "./session/message"
+import { SessionMessageProjection } from "./session/message-projection"
 import { Prompt } from "./session/prompt"
 import { PromptInput } from "@opencode-ai/schema/prompt-input"
-import { EventV2, resolveProjectionRef } from "./event"
+import { EventV2 } from "./event"
 import { Database } from "./database/database"
 import { SessionProjector } from "./session/projector"
 import { SessionMessageTable, SessionTable } from "./session/sql"
@@ -205,24 +206,14 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const database = yield* Database.Service
     const db = database.db
+    const readDb = database.readDb
     const events = yield* EventV2.Service
     const projects = yield* ProjectV2.Service
     const execution = yield* SessionExecution.Service
     const store = yield* SessionStore.Service
     const locations = yield* LocationServiceMap.Service
     const scope = yield* Scope.Scope
-    const decodeMessage = Schema.decodeUnknownEffect(SessionMessage.Message)
     const isDurableSessionEvent = Schema.is(SessionEvent.Durable)
-    const decode = (row: typeof SessionMessageTable.$inferSelect) =>
-      decodeMessage({ ...row.data, id: row.id, type: row.type }).pipe(
-        Effect.mapError(
-          () =>
-            new MessageDecodeError({
-              sessionID: SessionSchema.ID.make(row.session_id),
-              messageID: SessionMessage.ID.make(row.id),
-            }),
-        ),
-      )
 
     // Historical FTS backfill writes into the main SQLite file. Even on its
     // own connection it can contend with live app writes and consume enough
@@ -319,7 +310,7 @@ const layer = Layer.effect(
                 )!,
           )
         }
-        const query = db
+        const query = readDb
           .select()
           .from(SessionTable)
           .where(conditions.length > 0 ? and(...conditions) : undefined)
@@ -332,14 +323,14 @@ const layer = Layer.effect(
         )
         return (direction === "previous" ? rows.toReversed() : rows).map((row) => fromRow(row))
       }),
-      search: (input) => SessionSearch.search(db, input),
+      search: (input) => SessionSearch.search(readDb, input),
       messages: Effect.fn("V2Session.messages")(function* (input) {
         yield* result.get(input.sessionID)
         const direction = input.cursor?.direction ?? "next"
         const requestedOrder = input.order ?? "desc"
         const order = direction === "previous" ? (requestedOrder === "asc" ? "desc" : "asc") : requestedOrder
         const anchor = input.cursor
-          ? yield* db
+          ? yield* readDb
               .select({ seq: SessionMessageTable.seq })
               .from(SessionMessageTable)
               .where(
@@ -357,7 +348,7 @@ const layer = Layer.effect(
         const where = boundary
           ? and(eq(SessionMessageTable.session_id, input.sessionID), boundary)
           : eq(SessionMessageTable.session_id, input.sessionID)
-        const query = db
+        const query = readDb
           .select()
           .from(SessionMessageTable)
           .where(where)
@@ -365,12 +356,7 @@ const layer = Layer.effect(
         const rows = yield* (input.limit === undefined ? query.all() : query.limit(input.limit).all()).pipe(
           Effect.orDie,
         )
-        return yield* Effect.forEach(direction === "previous" ? rows.toReversed() : rows, (row) =>
-          Effect.gen(function* () {
-            const data = yield* resolveProjectionRef(db, input.sessionID, "session_message.data", row.data)
-            return yield* decode({ ...row, data })
-          }),
-        )
+        return yield* SessionMessageProjection.decodeRows(readDb, direction === "previous" ? rows.toReversed() : rows)
       }),
       message: Effect.fn("V2Session.message")(function* (input) {
         const stored = yield* store.message(input.messageID)
@@ -388,7 +374,7 @@ const layer = Layer.effect(
         ).pipe(Stream.filter((event): event is SessionEvent.DurableEvent => isDurableSessionEvent(event))),
       history: Effect.fn("V2Session.history")(function* (input) {
         yield* result.get(input.sessionID)
-        return yield* EventV2.readAggregate(db, {
+        return yield* EventV2.readAggregate(readDb, {
           ...input,
           aggregateID: input.sessionID,
           manifest: SessionDurable,
@@ -462,7 +448,7 @@ const layer = Layer.effect(
         return yield* new OperationUnavailableError({ operation: "wait" })
       }),
       active: execution.active,
-      paused: db
+      paused: readDb
         .select({ id: SessionTable.id })
         .from(SessionTable)
         .where(isNotNull(SessionTable.paused_at))

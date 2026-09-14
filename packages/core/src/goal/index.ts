@@ -161,7 +161,7 @@ type DatabaseExecutor = Omit<Database.DatabaseShape, "$client">
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const { db } = yield* Database.Service
+    const { db, readDb } = yield* Database.Service
     const events = yield* EventV2.Service
 
     const detailTx = Effect.fnUntraced(function* (database: DatabaseExecutor, id: ID) {
@@ -329,7 +329,7 @@ const layer = Layer.effect(
     })
 
     const get = Effect.fn("Goal.get")(function* (id: ID) {
-      return yield* detailTx(db, id)
+      return yield* detailTx(readDb, id)
     })
 
     const list = Effect.fn("Goal.list")(function* (input: {
@@ -339,7 +339,7 @@ const layer = Layer.effect(
       const where = input.workspaceID
         ? and(eq(GoalTable.project_id, input.projectID), eq(GoalTable.workspace_id, input.workspaceID))
         : eq(GoalTable.project_id, input.projectID)
-      const rows = yield* db
+      const rows = yield* readDb
         .select()
         .from(GoalTable)
         .where(where)
@@ -989,19 +989,19 @@ const layer = Layer.effect(
     })
 
     const focused = Effect.fn("Goal.focused")(function* (sessionID: typeof SessionTable.$inferSelect.id) {
-      const row = yield* db
+      const row = yield* readDb
         .select()
         .from(GoalFocusTable)
         .where(eq(GoalFocusTable.session_id, sessionID))
         .get()
         .pipe(Effect.orDie)
       if (!row) return undefined
-      const detail = yield* detailTx(db, row.goal_id).pipe(Effect.catchTag("Goal.NotFoundError", Effect.die))
+      const detail = yield* detailTx(readDb, row.goal_id).pipe(Effect.catchTag("Goal.NotFoundError", Effect.die))
       return { focus: hydrateFocus(row), detail }
     })
 
     const focuses = Effect.fn("Goal.focuses")(function* (goalID: ID) {
-      const rows = yield* db
+      const rows = yield* readDb
         .select()
         .from(GoalFocusTable)
         .where(eq(GoalFocusTable.goal_id, goalID))
@@ -1012,8 +1012,8 @@ const layer = Layer.effect(
     })
 
     const audit = Effect.fn("Goal.audit")(function* (goalID: ID) {
-      yield* requireRow(db, goalID)
-      const rows = yield* db
+      yield* requireRow(readDb, goalID)
+      const rows = yield* readDb
         .select()
         .from(GoalEventTable)
         .where(eq(GoalEventTable.goal_id, goalID))

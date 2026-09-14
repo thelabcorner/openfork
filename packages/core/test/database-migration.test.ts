@@ -192,6 +192,14 @@ describe("DatabaseMigration", () => {
           ),
         ).toBeUndefined()
         expect(yield* db.get(sql`SELECT count(*) as count FROM migration`)).toEqual({ count: migrations.length })
+        const sessionFtsTrigger = yield* db.get<{ sql: string }>(
+          sql`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'session_message_fts_au'`,
+        )
+        const partFtsTrigger = yield* db.get<{ sql: string }>(
+          sql`SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'part_fts_au'`,
+        )
+        expect(sessionFtsTrigger?.sql).toContain("AFTER UPDATE OF `search_text` ON `session_message`")
+        expect(partFtsTrigger?.sql).toContain("AFTER UPDATE OF `search_text` ON `part`")
         expect(
           yield* db.all(
             sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('event_aggregate_seq_idx', 'event_aggregate_type_seq_idx', 'session_input_session_pending_seq_idx', 'session_input_session_pending_delivery_seq_idx', 'session_input_session_admitted_seq_idx', 'session_input_session_promoted_seq_idx', 'session_message_session_idx', 'session_message_session_type_idx', 'session_message_session_seq_idx', 'session_message_session_type_seq_idx', 'session_message_session_time_created_id_idx') ORDER BY name`,

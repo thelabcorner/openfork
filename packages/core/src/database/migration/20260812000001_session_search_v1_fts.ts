@@ -35,7 +35,7 @@ export default {
         END;
       `)
       yield* tx.run(`
-        CREATE TRIGGER \`part_fts_au\` AFTER UPDATE ON \`part\` BEGIN
+        CREATE TRIGGER \`part_fts_au\` AFTER UPDATE OF \`search_text\` ON \`part\` BEGIN
           INSERT INTO \`part_fts\`(\`part_fts\`, rowid, search_text)
           VALUES ('delete', old.rowid, old.search_text);
           INSERT INTO \`part_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);
@@ -76,7 +76,7 @@ export default {
         END;
       `)
       yield* tx.run(`
-        CREATE TRIGGER IF NOT EXISTS \`part_fts_au\` AFTER UPDATE ON \`part\` BEGIN
+        CREATE TRIGGER IF NOT EXISTS \`part_fts_au\` AFTER UPDATE OF \`search_text\` ON \`part\` BEGIN
           INSERT INTO \`part_fts\`(\`part_fts\`, rowid, search_text)
           VALUES ('delete', old.rowid, old.search_text);
           INSERT INTO \`part_fts\`(rowid, search_text) VALUES (new.rowid, new.search_text);

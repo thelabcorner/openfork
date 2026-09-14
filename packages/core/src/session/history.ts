@@ -1,17 +1,18 @@
 import { and, asc, desc, eq, gt, gte, ne, or } from "drizzle-orm"
-import { Effect, Schema } from "effect"
+import { Effect } from "effect"
 import { Database } from "../database/database"
-import { MessageDecodeError } from "./error"
+import { EventV2 } from "../event"
 import { SessionMessage } from "./message"
+import { SessionMessageProjection } from "./message-projection"
 import { SessionSchema } from "./schema"
 import { SessionContextEpochTable, SessionMessageTable } from "./sql"
-import { resolveProjectionRef } from "../event"
 
 type DatabaseService = Database.Interface["db"]
+type DatabaseReader = Pick<DatabaseService, "select">
+export type RunnerEntry = { readonly seq: number; readonly message: SessionMessage.Message }
+export type RunnerSnapshot = { readonly frontier: number; readonly entries: RunnerEntry[] }
 
-const decode = Schema.decodeUnknownEffect(SessionMessage.Message)
-
-export const latestCompaction = Effect.fnUntraced(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+export const latestCompaction = Effect.fnUntraced(function* (db: DatabaseReader, sessionID: SessionSchema.ID) {
   return yield* db
     .select({ seq: SessionMessageTable.seq })
     .from(SessionMessageTable)
@@ -23,7 +24,7 @@ export const latestCompaction = Effect.fnUntraced(function* (db: DatabaseService
 })
 
 const messageRows = Effect.fnUntraced(function* (
-  db: DatabaseService,
+  db: DatabaseReader,
   sessionID: SessionSchema.ID,
   compaction: { readonly seq: number } | undefined,
   baselineSeq?: number,
@@ -53,21 +54,7 @@ const messageRows = Effect.fnUntraced(function* (
   return rows
 })
 
-const decodeMessageRow = (db: DatabaseService, row: typeof SessionMessageTable.$inferSelect) =>
-  Effect.gen(function* () {
-    const data = yield* resolveProjectionRef(db, row.session_id, "session_message.data", row.data)
-    return yield* decode({ ...data, id: row.id, type: row.type }).pipe(
-      Effect.mapError(
-        () =>
-          new MessageDecodeError({
-            sessionID: SessionSchema.ID.make(row.session_id),
-            messageID: SessionMessage.ID.make(row.id),
-          }),
-      ),
-    )
-  })
-
-export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseService, sessionID: SessionSchema.ID) {
+export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseReader, sessionID: SessionSchema.ID) {
   const [epoch, compaction] = yield* Effect.all(
     [
       db
@@ -80,11 +67,14 @@ export const load = Effect.fn("SessionHistory.load")(function* (db: DatabaseServ
     ],
     { concurrency: "unbounded" },
   )
-  return yield* Effect.forEach(yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq), (row) => decodeMessageRow(db, row))
+  return yield* SessionMessageProjection.decodeRows(
+    db,
+    yield* messageRows(db, sessionID, compaction, epoch?.baselineSeq),
+  )
 })
 
 export const loadForRunner = Effect.fn("SessionHistory.loadForRunner")(function* (
-  db: DatabaseService,
+  db: DatabaseReader,
   sessionID: SessionSchema.ID,
   baselineSeq: number,
 ) {
@@ -92,14 +82,44 @@ export const loadForRunner = Effect.fn("SessionHistory.loadForRunner")(function*
 })
 
 export const entriesForRunner = Effect.fn("SessionHistory.entriesForRunner")(function* (
-  db: DatabaseService,
+  db: DatabaseReader,
   sessionID: SessionSchema.ID,
   baselineSeq: number,
 ) {
   const rows = yield* messageRows(db, sessionID, yield* latestCompaction(db, sessionID), baselineSeq)
-  return yield* Effect.forEach(rows, (row) =>
-    decodeMessageRow(db, row).pipe(Effect.map((message) => ({ seq: row.seq, message }))),
-  )
+  const messages = yield* SessionMessageProjection.decodeRows(db, rows)
+  return rows.map((row, index) => ({ seq: row.seq, message: messages[index]! }))
+})
+
+/**
+ * Read a runner projection and its durable frontier from one SQLite snapshot.
+ *
+ * The paired frontier is what lets the active runner subscribe before this
+ * read, then replay only buffered events newer than the snapshot without
+ * guessing whether an event raced the history query.
+ */
+export const snapshotForRunner = Effect.fn("SessionHistory.snapshotForRunner")(function* (
+  db: DatabaseService,
+  sessionID: SessionSchema.ID,
+  baselineSeq: number,
+) {
+  return yield* db
+    .transaction((tx) =>
+      Effect.gen(function* () {
+        // This first read establishes the transaction's WAL snapshot. Every row,
+        // lifecycle overlay, and optional ChunkDB ref decoded below belongs to
+        // the same committed frontier.
+        const frontier = yield* EventV2.latestSequence(tx, sessionID)
+        const compaction = yield* latestCompaction(tx, sessionID)
+        const rows = yield* messageRows(tx, sessionID, compaction, baselineSeq)
+        const messages = yield* SessionMessageProjection.decodeRows(tx, rows)
+        return {
+          frontier,
+          entries: rows.map((row, index) => ({ seq: row.seq, message: messages[index]! })),
+        } satisfies RunnerSnapshot
+      }),
+    )
+    .pipe(Effect.orDie)
 })
 
 export * as SessionHistory from "./history"

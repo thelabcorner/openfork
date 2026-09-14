@@ -28,6 +28,12 @@ export interface Interface extends EventV2.Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/EventV2Bridge") {}
 
+// Keep the resumable legacy route's replay policy sourced from the bridge that
+// actually owns the ring. Duplicating these literals in the HTTP handler let a
+// 4 MiB replay guard silently reject half of an 8 MiB retained window.
+export const REPLAY_CAPACITY = 4096
+export const REPLAY_MAX_BYTES = 8 * 1024 * 1024
+
 /**
  * Liveness probes for transports that can observe a legacy `GlobalBus`
  * envelope.
@@ -74,8 +80,8 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2.Service
-    const replay = new EventReplayBuffer<EventV2.Payload>(4096, {
-      maxBytes: 8 * 1024 * 1024,
+    const replay = new EventReplayBuffer<EventV2.Payload>(REPLAY_CAPACITY, {
+      maxBytes: REPLAY_MAX_BYTES,
       sizeOf: estimateEventBytes,
     })
     const sequences = new WeakMap<object, number>()

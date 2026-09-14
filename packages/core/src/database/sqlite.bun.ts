@@ -34,6 +34,8 @@ interface Config {
   readonly create?: boolean
   readonly readwrite?: boolean
   readonly disableWAL?: boolean
+  /** Skip the best-effort TRUNCATE checkpoint performed when this handle closes. */
+  readonly checkpointOnClose?: boolean
   readonly spanAttributes?: Record<string, unknown>
   readonly transformResultNames?: (str: string) => string
   readonly transformQueryNames?: (str: string) => string
@@ -170,9 +172,11 @@ const nativeLayer = (config: Config) =>
       })
       yield* Effect.addFinalizer(() =>
         Effect.sync(() => {
-          try {
-            native.run("PRAGMA wal_checkpoint(TRUNCATE)")
-          } catch {}
+          if (config.checkpointOnClose !== false) {
+            try {
+              native.run("PRAGMA wal_checkpoint(TRUNCATE)")
+            } catch {}
+          }
           try {
             native.close()
           } catch {}
@@ -186,10 +190,25 @@ const nativeLayer = (config: Config) =>
       )
       // Create-time-only pragmas MUST precede WAL: page_size/auto_vacuum are
       // silent no-ops once WAL is enabled or any table exists. On existing DBs
-      // they are harmless no-ops, so applying unconditionally is safe.
+      // they are harmless no-ops, so applying unconditionally is safe. Two
+      // embedded hosts can still open the same brand-new path concurrently
+      // before DatabaseMigration's higher-level semaphore exists. In that tiny
+      // window one handle can report SQLITE_BUSY while the other owns the file
+      // header transition. These pragmas are storage tuning, not correctness;
+      // the winning initializer applies them. Do not turn that race into a
+      // startup failure for the losing handle.
       if (config.createTimePragmas) {
-        native.run(`PRAGMA page_size = ${config.createTimePragmas.page_size}`)
-        native.run(`PRAGMA auto_vacuum = ${config.createTimePragmas.auto_vacuum}`)
+        const runCreateTime = (statement: string) => {
+          try {
+            native.run(statement)
+          } catch (error) {
+            const sqlite = error as { code?: string; errno?: number }
+            if (sqlite?.code === "SQLITE_BUSY" || sqlite?.errno === 5) return
+            throw error
+          }
+        }
+        runCreateTime(`PRAGMA page_size = ${config.createTimePragmas.page_size}`)
+        runCreateTime(`PRAGMA auto_vacuum = ${config.createTimePragmas.auto_vacuum}`)
       }
       if (config.disableWAL !== true) native.run("PRAGMA journal_mode = WAL;")
       return native

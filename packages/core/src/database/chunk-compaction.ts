@@ -96,6 +96,14 @@ export const recordCompactedSequences = Effect.fn("ChunkDB.compaction.record")(f
   sequences: ReadonlyArray<number>,
 ) {
   if (sequences.length === 0) return { added: 0, grewBytes: 0, bitmapBytes: 0 }
+  // A maintenance pass can hold candidate sequences while another connection
+  // deletes their aggregate (for example the local-data reset). Never create an
+  // orphan bitmap after that delete. When called inside a write transaction this
+  // check and the write share the same serialized SQLite writer epoch.
+  const aggregate = yield* db.get<{ one: number }>(sql`
+    SELECT 1 AS one FROM event_sequence WHERE aggregate_id = ${aggregateID} LIMIT 1
+  `)
+  if (!aggregate) return { added: 0, grewBytes: 0, bitmapBytes: 0 }
   const row = yield* loadCompaction(db, aggregateID)
   const merged = mergeCompactedSequences(row?.bitmap, sequences)
   yield* db.run(sql`

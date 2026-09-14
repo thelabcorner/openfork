@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "24a11ed1-11c9-4e03-b1e1-11a4b3a884f8",
+  "id": "b3e906b5-ed7c-45e9-9663-84796a3f908b",
   "prevIds": [
-    "19f816ec-1c4d-46a6-a2d6-14d1f3a7d4b3"
+    "477cd681-a8cd-4635-8e56-8b02290cfdcc"
   ],
   "ddl": [
     {
@@ -32,6 +32,14 @@
     },
     {
       "name": "device",
+      "entityType": "tables"
+    },
+    {
+      "name": "event_payload_chunk",
+      "entityType": "tables"
+    },
+    {
+      "name": "event_payload_meta",
       "entityType": "tables"
     },
     {
@@ -167,7 +175,15 @@
       "entityType": "tables"
     },
     {
+      "name": "session_message_lifecycle",
+      "entityType": "tables"
+    },
+    {
       "name": "session_message",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_message_tool_overlay",
       "entityType": "tables"
     },
     {
@@ -635,6 +651,86 @@
       "name": "revoked_at",
       "entityType": "columns",
       "table": "device"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "payload_id",
+      "entityType": "columns",
+      "table": "event_payload_chunk"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "chunk_index",
+      "entityType": "columns",
+      "table": "event_payload_chunk"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "text",
+      "entityType": "columns",
+      "table": "event_payload_chunk"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "event_payload_chunk"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "payload_id",
+      "entityType": "columns",
+      "table": "event_payload_meta"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "chunk_count",
+      "entityType": "columns",
+      "table": "event_payload_meta"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "refs",
+      "entityType": "columns",
+      "table": "event_payload_meta"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_touched",
+      "entityType": "columns",
+      "table": "event_payload_meta"
     },
     {
       "type": "text",
@@ -3392,6 +3488,36 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "session_message_lifecycle"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "streamed_at",
+      "entityType": "columns",
+      "table": "session_message_lifecycle"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "settlement",
+      "entityType": "columns",
+      "table": "session_message_lifecycle"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "id",
       "entityType": "columns",
       "table": "session_message"
@@ -3465,6 +3591,46 @@
       "name": "search_text",
       "entityType": "columns",
       "table": "session_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "session_message_tool_overlay"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "call_id",
+      "entityType": "columns",
+      "table": "session_message_tool_overlay"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "progress_event_id",
+      "entityType": "columns",
+      "table": "session_message_tool_overlay"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "settlement_event_id",
+      "entityType": "columns",
+      "table": "session_message_tool_overlay"
     },
     {
       "type": "text",
@@ -4523,6 +4689,21 @@
     },
     {
       "columns": [
+        "message_id"
+      ],
+      "tableTo": "session_message",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_message_lifecycle_message_id_session_message_id_fk",
+      "entityType": "fks",
+      "table": "session_message_lifecycle"
+    },
+    {
+      "columns": [
         "session_id"
       ],
       "tableTo": "session",
@@ -4535,6 +4716,21 @@
       "name": "fk_session_message_session_id_session_id_fk",
       "entityType": "fks",
       "table": "session_message"
+    },
+    {
+      "columns": [
+        "message_id"
+      ],
+      "tableTo": "session_message",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_message_tool_overlay_message_id_session_message_id_fk",
+      "entityType": "fks",
+      "table": "session_message_tool_overlay"
     },
     {
       "columns": [
@@ -4593,6 +4789,16 @@
     },
     {
       "columns": [
+        "payload_id",
+        "chunk_index"
+      ],
+      "nameExplicit": false,
+      "name": "event_payload_chunk_pk",
+      "entityType": "pks",
+      "table": "event_payload_chunk"
+    },
+    {
+      "columns": [
         "aggregate_id",
         "value_id"
       ],
@@ -4630,6 +4836,16 @@
       "name": "session_group_member_pk",
       "entityType": "pks",
       "table": "session_group_member"
+    },
+    {
+      "columns": [
+        "message_id",
+        "call_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_message_tool_overlay_pk",
+      "entityType": "pks",
+      "table": "session_message_tool_overlay"
     },
     {
       "columns": [
@@ -4693,6 +4909,15 @@
       "nameExplicit": false,
       "name": "device_pk",
       "table": "device",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "payload_id"
+      ],
+      "nameExplicit": false,
+      "name": "event_payload_meta_pk",
+      "table": "event_payload_meta",
       "entityType": "pks"
     },
     {
@@ -4958,6 +5183,15 @@
     },
     {
       "columns": [
+        "message_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_message_lifecycle_pk",
+      "table": "session_message_lifecycle",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
         "id"
       ],
       "nameExplicit": false,
@@ -4991,6 +5225,38 @@
       "name": "maintenance_usage_pk",
       "table": "maintenance_usage",
       "entityType": "pks"
+    },
+    {
+      "columns": [
+        {
+          "value": "time_created",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "event_payload_chunk_time_created_idx",
+      "entityType": "indexes",
+      "table": "event_payload_chunk"
+    },
+    {
+      "columns": [
+        {
+          "value": "refs",
+          "isExpression": false
+        },
+        {
+          "value": "time_touched",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "event_payload_meta_orphan_idx",
+      "entityType": "indexes",
+      "table": "event_payload_meta"
     },
     {
       "columns": [
@@ -5981,6 +6247,20 @@
       "name": "session_message_time_created_idx",
       "entityType": "indexes",
       "table": "session_message"
+    },
+    {
+      "columns": [
+        {
+          "value": "message_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_message_tool_overlay_message_idx",
+      "entityType": "indexes",
+      "table": "session_message_tool_overlay"
     },
     {
       "columns": [

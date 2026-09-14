@@ -1,4 +1,5 @@
 import { Effect, Layer } from "effect"
+import { and, eq } from "drizzle-orm"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { SessionContext } from "@opencode-ai/schema/session-context"
@@ -7,8 +8,9 @@ import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
 
 /**
  * Fork-owned projector: hydrates overlay tables from durable events for replay correctness.
- * Direct writes via SessionContextState.applyOps already insert rows and publish events;
- * this projector ensures that replaying the event log alone reconstructs the same state.
+ * Single authoritative writer for context overlays. Live commands publish the
+ * durable event and EventV2 executes this projector inline in the same
+ * transaction; replay invokes the identical projection path.
  *
  * Idempotent: onConflictDoNothing / onConflictDoUpdate so re-projection is safe.
  */
@@ -105,13 +107,59 @@ const layer = Layer.effectDiscard(
                 .pipe(Effect.orDie)
               break
             case "text.restore": {
-              const { eq, and } = yield* Effect.promise(() => import("drizzle-orm"))
               yield* (db as any)
                 .update(SessionContextStateTable)
                 .set({ override_data: null, override_search_text: null, modified_at: timestamp })
                 .where(and(eq(SessionContextStateTable.session_id, sessionID), eq(SessionContextStateTable.message_id, op.messageID)))
                 .run()
-                .pipe(Effect.catch(() => Effect.void))
+                .pipe(Effect.orDie)
+              break
+            }
+            case "tool.collapse": {
+              const override = { collapsed: true, partID: op.partID, collapsedAt: timestamp }
+              yield* db
+                .insert(SessionContextStateTable)
+                .values({
+                  session_id: sessionID,
+                  message_id: op.messageID,
+                  excluded: false,
+                  pinned: false,
+                  override_data: override,
+                  modified_at: timestamp,
+                })
+                .onConflictDoUpdate({
+                  target: [SessionContextStateTable.session_id, SessionContextStateTable.message_id],
+                  set: { override_data: override, modified_at: timestamp },
+                })
+                .run()
+                .pipe(Effect.orDie)
+              break
+            }
+            case "tool.restore": {
+              const existing = yield* db
+                .select({ override: SessionContextStateTable.override_data })
+                .from(SessionContextStateTable)
+                .where(
+                  and(
+                    eq(SessionContextStateTable.session_id, sessionID),
+                    eq(SessionContextStateTable.message_id, op.messageID),
+                  ),
+                )
+                .get()
+                .pipe(Effect.orDie)
+              if (existing?.override && (existing.override as { collapsed?: unknown }).collapsed) {
+                yield* db
+                  .update(SessionContextStateTable)
+                  .set({ override_data: null, modified_at: timestamp })
+                  .where(
+                    and(
+                      eq(SessionContextStateTable.session_id, sessionID),
+                      eq(SessionContextStateTable.message_id, op.messageID),
+                    ),
+                  )
+                  .run()
+                  .pipe(Effect.orDie)
+              }
               break
             }
             default:
