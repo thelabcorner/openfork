@@ -122,6 +122,8 @@ import type {
   GlobalPreferencesGetResponses,
   GlobalPreferencesUpdateErrors,
   GlobalPreferencesUpdateResponses,
+  GlobalResetLocalDataErrors,
+  GlobalResetLocalDataResponses,
   GlobalUpgradeErrors,
   GlobalUpgradeResponses,
   GoalAddEvidenceErrors,
@@ -1881,6 +1883,34 @@ export class Global extends HeyApiClient {
     return (options?.client ?? this.client).post<GlobalDisposeResponses, GlobalDisposeErrors, ThrowOnError>({
       url: "/global/dispose",
       ...options,
+    })
+  }
+
+  /**
+   * Reset local OpenCode history
+   *
+   * Delete sessions, goals, memory, usage history, and derived database indexes while preserving provider authentication, credentials, accounts, paired devices, application settings, project/workspace configuration, saved project permissions, and database migration state.
+   */
+  public resetLocalData<ThrowOnError extends boolean = false>(
+    parameters?: {
+      confirmation?: "RESET"
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "confirmation" }] }])
+    return (options?.client ?? this.client).post<
+      GlobalResetLocalDataResponses,
+      GlobalResetLocalDataErrors,
+      ThrowOnError
+    >({
+      url: "/global/reset-local-data",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
     })
   }
 
@@ -4574,6 +4604,12 @@ export class Session2 extends HeyApiClient {
         [key: string]: unknown
       }
       permission?: PermissionRuleset
+      agent?: string
+      model?: {
+        providerID: string
+        id: string
+        variant?: string
+      }
       time?: {
         archived?: SessionNullableArchivedTimestamp | null
       }
@@ -4591,6 +4627,8 @@ export class Session2 extends HeyApiClient {
             { in: "body", key: "title" },
             { in: "body", key: "metadata" },
             { in: "body", key: "permission" },
+            { in: "body", key: "agent" },
+            { in: "body", key: "model" },
             { in: "body", key: "time" },
           ],
         },

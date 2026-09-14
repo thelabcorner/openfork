@@ -2193,6 +2193,8 @@ export type Config = {
     policies?: Array<ConfigV2ExperimentalPolicy>
     spad_recovery?: boolean
     spad_observe_only?: boolean
+    spad_auditor?: boolean
+    spad_auditor_model?: string
   }
 }
 
@@ -2645,6 +2647,7 @@ export type MentionResult =
     }
 
 export type MentionSearchPage = {
+  base: string
   results: Array<MentionResult>
   hasMore: boolean
   total: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
@@ -3593,6 +3596,8 @@ export type V2Event =
   | WorktreeReady
   | WorktreeFailed
   | ServerConnected
+  | ServerHeartbeat
+  | ServerStreamGap
   | GlobalDisposed
 
 export type V2EventStream = string
@@ -7319,7 +7324,41 @@ export type ServerConnected = {
   }
   location?: LocationRef
   data: {
+    epoch?: string
+  }
+}
+
+export type ServerHeartbeat = {
+  id: string
+  metadata?: {
     [key: string]: unknown
+  }
+  type: "server.heartbeat"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: Record<string, never>
+}
+
+export type ServerStreamGap = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "server.stream.gap"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    requested: number
+    oldest?: number
+    latest: number
   }
 }
 
@@ -9053,6 +9092,38 @@ export type GlobalDisposeResponses = {
 }
 
 export type GlobalDisposeResponse = GlobalDisposeResponses[keyof GlobalDisposeResponses]
+
+export type GlobalResetLocalDataData = {
+  body?: {
+    confirmation: "RESET"
+  }
+  path?: never
+  query?: never
+  url: "/global/reset-local-data"
+}
+
+export type GlobalResetLocalDataErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalResetLocalDataError = GlobalResetLocalDataErrors[keyof GlobalResetLocalDataErrors]
+
+export type GlobalResetLocalDataResponses = {
+  /**
+   * Local history reset result
+   */
+  200: {
+    success: true
+    sessionsDeleted: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    memoriesDeleted: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+    compacted: boolean
+  }
+}
+
+export type GlobalResetLocalDataResponse = GlobalResetLocalDataResponses[keyof GlobalResetLocalDataResponses]
 
 export type GlobalUpgradeData = {
   body?: {
@@ -11943,6 +12014,12 @@ export type SessionUpdateData = {
       [key: string]: unknown
     }
     permission?: PermissionRuleset
+    agent?: string
+    model?: {
+      providerID: string
+      id: string
+      variant?: string
+    }
     time?: {
       archived?: SessionNullableArchivedTimestamp | null
     }
