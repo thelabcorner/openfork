@@ -974,6 +974,12 @@ export const dict = {
   "common.loading": "Loading",
   "common.loading.ellipsis": "...",
   "common.copy": "Copy",
+  "markdown.target.copyPath": "Copy path",
+  "markdown.target.copyUrl": "Copy link",
+  "markdown.target.open": "Open",
+  "markdown.target.openBrowser": "Open in browser",
+  "markdown.target.openWith": "Open with",
+  "markdown.target.missing": "File not found",
   "common.cut": "Cut",
   "common.paste": "Paste",
   "common.selectAll": "Select All",
@@ -1824,6 +1830,7 @@ export const dict = {
 
   "settings.general.section.appearance": "Appearance",
   "settings.general.section.advanced": "Advanced",
+  "settings.general.section.dangerZone": "Danger zone",
   "settings.general.section.notifications": "System notifications",
   "settings.general.section.updates": "Updates",
   "settings.general.section.sounds": "Sound effects",
@@ -1900,6 +1907,22 @@ export const dict = {
   "settings.general.row.newInterfaceNotice.dismiss": "Dismiss",
   "settings.general.row.pinchZoom.title": "Pinch to zoom",
   "settings.general.row.pinchZoom.description": "Allow trackpad pinch and Ctrl-scroll gestures to zoom",
+  "settings.general.row.resetLocalData.title": "Reset local data",
+  "settings.general.row.resetLocalData.description":
+    "Delete all local sessions, goals, memory, usage history, and conversation-derived database state. Providers, credentials, accounts, paired devices, settings, project/workspace configuration, and saved permissions are kept.",
+  "settings.general.row.resetLocalData.button": "Reset data",
+  "settings.general.resetLocalData.dialog.title": "Reset local OpenCode data?",
+  "settings.general.resetLocalData.dialog.description":
+    "This permanently deletes local conversation history and rebuildable database state. Provider authentication, credentials, accounts, paired devices, settings, project/workspace configuration, and saved permissions will not be removed.",
+  "settings.general.resetLocalData.dialog.confirmHint": "Type RESET to confirm",
+  "settings.general.resetLocalData.dialog.confirmLabel": "Confirmation",
+  "settings.general.resetLocalData.dialog.action": "Reset local data",
+  "settings.general.resetLocalData.dialog.running": "Resetting…",
+  "settings.general.resetLocalData.success": "Local data reset complete",
+  "settings.general.resetLocalData.successDescription": "Deleted {{count}} sessions.",
+  "settings.general.resetLocalData.successDescriptionNotCompacted":
+    "Deleted {{count}} sessions. The database file could not be compacted because another connection was active, but the old session rows are gone.",
+  "settings.general.resetLocalData.error": "Local data reset failed",
 
   "settings.general.row.titleModel.title": "Title model",
   "settings.general.row.titleModel.description": "Model used to generate and regenerate session titles",
