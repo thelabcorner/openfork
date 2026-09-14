@@ -165,7 +165,7 @@ export interface HostHelloReply {
   }
 }
 
-/** Wire guest-tab state as defined by the protocol group (used in broadcasts/HostEvent). */
+/** Sidecar/broker wire tab state. Keep byte-shape compatible with protocol/browser.ts. */
 export interface WireGuestTabState {
   tabId: string
   url: string
@@ -177,6 +177,12 @@ export interface WireGuestTabState {
   owner: HostOwner
   active: boolean
   muted: boolean
+}
+
+/** Renderer-only extension of the protocol tab state. The lifecycle epoch is
+ * host implementation detail and must never leak onto sidecar protocol wire. */
+export interface RendererGuestTabState extends WireGuestTabState {
+  lifecycleGeneration: number
 }
 
 /** One row of the FULL shared-host tab list (browser_status / broker mirror). */
@@ -354,6 +360,7 @@ export type GuestReadyState = "loading" | "interactive" | "complete"
 
 export interface GuestTabState {
   runtimeTabId: string
+  lifecycleGeneration: number
   windowId: string
   owner: HostOwner
   workspaceId?: string
@@ -738,13 +745,13 @@ export interface BrowserState {
     zoomFactor: number
   }
   appearance: Appearance
-  tabs: WireGuestTabState[]
+  tabs: RendererGuestTabState[]
   /** Extension lane (chrome-attach) — optional so protocol version stays 2. */
   chrome?: {
     attached: boolean
     activeTabId: string | null
     url: string | null
-    tabs: WireGuestTabState[]
+    tabs: RendererGuestTabState[]
   }
 }
 export interface OpenOutput {
@@ -1176,8 +1183,9 @@ export const isBrowserGuestUrl = (value: string): boolean => {
   return url.protocol === "http:" || url.protocol === "https:"
 }
 
-export const toWireGuestTabState = (tab: GuestTabState, active: boolean): WireGuestTabState => ({
+export const toRendererGuestTabState = (tab: GuestTabState, active: boolean): RendererGuestTabState => ({
   tabId: tab.runtimeTabId,
+  lifecycleGeneration: tab.lifecycleGeneration,
   url: tab.url,
   title: tab.title,
   readyState: tab.crashed ? "LoadFailed" : tab.loading || tab.readyState !== "complete" ? "Loading" : "Success",

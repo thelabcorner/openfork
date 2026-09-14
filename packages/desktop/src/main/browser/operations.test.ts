@@ -24,6 +24,7 @@ const makeRecord = (tabId: string, owner: HostOwner, overrides: Partial<GuestRec
   const muted = { setAudioMuted: () => undefined } as unknown as GuestRecord["webContents"]
   return {
     runtimeTabId: tabId,
+    lifecycleGeneration: 1,
     windowId: "win-1",
     owner,
     webContentsId: 1,
@@ -62,9 +63,14 @@ const makeHarness = (initial: GuestRecord[]): Harness => {
     get: (tabId: string) => records.get(tabId),
     requireTab: (tabId?: string) => (tabId ? records.get(tabId) : undefined),
     list: () => [...records.values()],
+    get activeTab() {
+      return records.values().next().value
+    },
     get size() {
       return records.size
     },
+    getAppearance: () => "system" as const,
+    getRecording: () => ({ active: false }),
     setOwner: (tabId: string, owner: HostOwner) => {
       calls.push(`setOwner:${tabId}`)
       const record = records.get(tabId)
@@ -76,8 +82,8 @@ const makeHarness = (initial: GuestRecord[]): Harness => {
       if (record) record.muted = muted
     },
     activate: (tabId: string) => calls.push(`activate:${tabId}`),
-    unregister: (tabId: string) => {
-      calls.push(`unregister:${tabId}`)
+    remove: (tabId: string) => {
+      calls.push(`remove:${tabId}`)
       records.delete(tabId)
     },
   } as unknown as GuestRegistry
@@ -92,8 +98,13 @@ const makeHarness = (initial: GuestRecord[]): Harness => {
       // Mimic the renderer: mount the <webview> and register it immediately.
       const record = makeRecord(request.tabId, userOwner, { url: request.url })
       records.set(request.tabId, record)
-      queueMicrotask(() => operationsRef?.resolveOpen(request.tabId, record))
+      queueMicrotask(() => {
+        operationsRef?.prepareOpen(request.tabId, record)
+        operationsRef?.resolveOpen(request.tabId, record)
+      })
+      return 1
     },
+    onTabRequestExpired: () => undefined,
     onTabClose: (tabId) => calls.push(`tabClose:${tabId}`),
     onTabClosed: (tabId) => calls.push(`tabClosed:${tabId}`),
     onPointerEvent: () => undefined,
@@ -109,6 +120,14 @@ test("claim on a user tab flips the owner to the session (O4)", async () => {
   expect(result).toEqual({ claimed: { tabId: "tab_user", owner: agentOwner("sess-1") } })
   expect(records.get("tab_user")?.owner).toEqual(agentOwner("sess-1"))
   expect(calls).toContain("setOwner:tab_user")
+})
+
+test("status keeps renderer lifecycle epochs off the broker wire", async () => {
+  const { operations } = makeHarness([makeRecord("tab_status", userOwner, { lifecycleGeneration: 99 })])
+  const result = await operations.dispatch(undefined, { name: "status", input: {} }, "")
+  const tabs = result.tabs as Array<Record<string, unknown>>
+  expect(tabs).toHaveLength(1)
+  expect(tabs[0]).not.toHaveProperty("lifecycleGeneration")
 })
 
 test("claim on the session's own tab is idempotent (O6)", async () => {
@@ -216,14 +235,15 @@ const makeDevtoolsHarness = () => {
     setOwner: () => undefined,
     setMuted: () => undefined,
     activate: () => undefined,
-    unregister: (tabId: string) => records.delete(tabId),
+    remove: (tabId: string) => records.delete(tabId),
   } as unknown as GuestRegistry
   const options: BrowserOperationsOptions = {
     registry,
     sessions,
     recordingDirectory: ".",
     maxResultBytes: 64_000,
-    onTabRequest: () => undefined,
+    onTabRequest: () => 1,
+    onTabRequestExpired: () => undefined,
     onTabClose: () => undefined,
     onTabClosed: () => undefined,
     onPointerEvent: () => undefined,

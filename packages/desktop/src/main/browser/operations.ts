@@ -17,6 +17,7 @@ import type { ControlSessionManager, SendCommand } from "./control-session"
 import type { GuestRecord, GuestRegistry } from "./guest"
 import {
   BrowserError,
+  BrowserControlInterruptedError,
   BrowserGuestCrashedError,
   BrowserInvalidSelectorError,
   BrowserNotAReactAppError,
@@ -115,8 +116,10 @@ export interface BrowserOperationsOptions {
   maxResultBytes: number
   /** Broker-wire host state for the status op (connected + host identity). */
   getHostState?: () => { connected: boolean; hostId: string; hostEpoch: number; protocolVersion: number; windowId: string }
-  /** Renderer must mount a <webview> for the tab and register it. */
-  onTabRequest: (request: { tabId: string; url: string; activate?: boolean }) => void
+  /** Main allocates a logical lifetime, then renderer mounts its presentation. */
+  onTabRequest: (request: { tabId: string; url: string; activate?: boolean }) => number
+  /** A requested presentation never attached before the broker timeout. */
+  onTabRequestExpired: (tabId: string, lifecycleGeneration: number) => void
   /** Renderer must remove the <webview> DOM for the tab. */
   onTabClose: (tabId: string) => void
   /** Any destroy path must emit `tab.closed` so the broker mirror drops the row. */
@@ -136,7 +139,9 @@ type AnnotationScriptItem = Pick<AnnotationTarget, "label" | "tone"> & {
 }
 interface PendingOpen {
   resolve: (tab: GuestRecord) => void
+  reject: (error: unknown) => void
   timer: ReturnType<typeof setTimeout>
+  lifecycleGeneration: number
   /** Broker-open path: attribute the created tab to this session (agent owner). */
   sessionId?: string
   /** Duplicate path: the new tab inherits this source tab's owner (D8). */
@@ -149,19 +154,38 @@ export class BrowserOperations {
   private readonly disabledExtensions = new Map<string, { path: string; name: string; version: string }>()
   private pointerSequence = 0
   constructor(private readonly deps: BrowserOperationsOptions) {}
-  /** Engine calls this when the renderer registers a webview for an open tab. */
+  /** Cancel a logical tab that was requested but has not attached yet. Used by
+   * user close/engine teardown so an agent `open` never waits for its timeout
+   * after main has already revoked that lifetime. */
+  cancelPendingOpen(runtimeTabId: string, message = "Browser tab closed before attachment"): boolean {
+    const pending = this.pendingOpens.get(runtimeTabId)
+    if (!pending) return false
+    clearTimeout(pending.timer)
+    this.pendingOpens.delete(runtimeTabId)
+    pending.reject(new BrowserControlInterruptedError(message))
+    return true
+  }
+  /** Apply pending-open ownership/activation before GuestRegistry publishes the
+   * first attached state. This prevents a one-frame/user-owned authority leak. */
+  prepareOpen(runtimeTabId: string, tab: GuestRecord): void {
+    const pending = this.pendingOpens.get(runtimeTabId)
+    if (!pending) return
+    if (pending.lifecycleGeneration !== tab.lifecycleGeneration) return
+    if (pending.sessionId) {
+      tab.owner = { kind: "agent", sessionId: pending.sessionId }
+    } else if (pending.inheritOwnerFrom) {
+      const source = this.deps.registry.get(pending.inheritOwnerFrom)
+      if (source) tab.owner = source.owner
+    }
+    if (pending.sessionId || pending.inheritOwnerFrom) this.deps.registry.activate(runtimeTabId)
+  }
+  /** Engine calls this after the configured guest has been published. */
   resolveOpen(runtimeTabId: string, tab: GuestRecord): void {
     const pending = this.pendingOpens.get(runtimeTabId)
     if (!pending) return
+    if (pending.lifecycleGeneration !== tab.lifecycleGeneration) return
     clearTimeout(pending.timer)
     this.pendingOpens.delete(runtimeTabId)
-    if (pending.sessionId) {
-      this.deps.registry.setOwner(runtimeTabId, { kind: "agent", sessionId: pending.sessionId })
-    } else if (pending.inheritOwnerFrom) {
-      const source = this.deps.registry.get(pending.inheritOwnerFrom)
-      if (source) this.deps.registry.setOwner(runtimeTabId, source.owner)
-    }
-    if (pending.sessionId || pending.inheritOwnerFrom) this.deps.registry.activate(runtimeTabId)
     pending.resolve(tab)
   }
   async dispatch(tabId: string | undefined, operation: BrowserOperation, sessionId: string): Promise<Record<string, unknown>> {
@@ -273,7 +297,14 @@ export class BrowserOperations {
         appearance: this.deps.registry.getAppearance(),
         recording: this.deps.registry.getRecording(),
       },
-      tabs: this.deps.registry.list().map((record) => this.deps.registry.tabState(record)),
+      tabs: this.deps.registry.list().map((record) => ({
+        tabId: record.runtimeTabId,
+        url: record.url,
+        title: record.title,
+        active: record === this.deps.registry.activeTab,
+        owner: record.owner,
+        muted: record.muted,
+      })),
     }
   }
   // --- open / navigate / close ------------------------------------------------
@@ -309,12 +340,18 @@ export class BrowserOperations {
     const runtimeTabId = randomUUID()
     const pending = new Promise<GuestRecord>((resolve, reject) => {
       const timer = setTimeout(() => {
+        const current = this.pendingOpens.get(runtimeTabId)
+        if (!current) return
         this.pendingOpens.delete(runtimeTabId)
+        this.deps.onTabRequestExpired(runtimeTabId, current.lifecycleGeneration)
         reject(new BrowserTimeoutError("open", OPEN_ATTACH_TIMEOUT_MS))
       }, OPEN_ATTACH_TIMEOUT_MS)
-      this.pendingOpens.set(runtimeTabId, { resolve, timer, sessionId })
+      timer.unref?.()
+      this.pendingOpens.set(runtimeTabId, { resolve, reject, timer, sessionId, lifecycleGeneration: 0 })
     })
-    this.deps.onTabRequest({ tabId: runtimeTabId, url: input.url, activate: input.activate ?? true })
+    const lifecycleGeneration = this.deps.onTabRequest({ tabId: runtimeTabId, url: input.url, activate: input.activate ?? true })
+    const pendingEntry = this.pendingOpens.get(runtimeTabId)
+    if (pendingEntry) pendingEntry.lifecycleGeneration = lifecycleGeneration
     const attached = await pending
     const viewport = await this.readViewport(attached)
     return {
@@ -375,8 +412,8 @@ export class BrowserOperations {
     // Broker is authoritative; the host double-checks ownership (own tab only).
     if (canDispatchTab(tab.owner, sessionId) !== "ok") throw new BrowserPermissionDeniedError()
     const wasActive = this.deps.registry.activeTab?.runtimeTabId === tab.runtimeTabId
-    this.deps.registry.unregister(tab.runtimeTabId)
     this.deps.onTabClose(tab.runtimeTabId)
+    this.deps.registry.remove(tab.runtimeTabId)
     this.deps.onTabClosed(tab.runtimeTabId)
     return {
       closed: {
@@ -397,12 +434,18 @@ export class BrowserOperations {
     const runtimeTabId = randomUUID()
     const pending = new Promise<GuestRecord>((resolve, reject) => {
       const timer = setTimeout(() => {
+        const current = this.pendingOpens.get(runtimeTabId)
+        if (!current) return
         this.pendingOpens.delete(runtimeTabId)
+        this.deps.onTabRequestExpired(runtimeTabId, current.lifecycleGeneration)
         reject(new BrowserTimeoutError("duplicate", OPEN_ATTACH_TIMEOUT_MS))
       }, OPEN_ATTACH_TIMEOUT_MS)
-      this.pendingOpens.set(runtimeTabId, { resolve, timer, inheritOwnerFrom: source.runtimeTabId })
+      timer.unref?.()
+      this.pendingOpens.set(runtimeTabId, { resolve, reject, timer, inheritOwnerFrom: source.runtimeTabId, lifecycleGeneration: 0 })
     })
-    this.deps.onTabRequest({ tabId: runtimeTabId, url: source.url, activate: true })
+    const lifecycleGeneration = this.deps.onTabRequest({ tabId: runtimeTabId, url: source.url, activate: true })
+    const pendingEntry = this.pendingOpens.get(runtimeTabId)
+    if (pendingEntry) pendingEntry.lifecycleGeneration = lifecycleGeneration
     const attached = await pending
     return { duplicated: { tabId: attached.runtimeTabId, url: attached.url || source.url } }
   }
@@ -936,7 +979,8 @@ export class BrowserOperations {
     const startedAt = Date.now()
     const frames: string[] = []
     let budget = maxBytes
-    const unsubscribe = this.deps.sessions.onScreencastFrame((params) => {
+    const unsubscribe = this.deps.sessions.onScreencastFrame((sourceTabId, params) => {
+      if (sourceTabId !== tab.runtimeTabId) return
       if (typeof params["sessionId"] === "number") {
         this.sendRaw(tab, "Page.screencastFrameAck", { sessionId: params["sessionId"] }, 1).catch(() => undefined)
       }

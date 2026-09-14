@@ -338,13 +338,13 @@ export function registerBrowserIpcHandlers(engine: BrowserEngine, trust: Rendere
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     return engine.api.closeTab(tabId)
   })
-  ipcMain.handle("browser-register-webview", (event, runtimeTabId: string, webContentsId: number, generation?: number) => {
+  ipcMain.handle("browser-register-webview", (event, runtimeTabId: string, webContentsId: number, generation: number, lifecycleGeneration: number) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.registerWebview(runtimeTabId, webContentsId, generation)
+    return engine.api.registerWebview(runtimeTabId, webContentsId, generation, lifecycleGeneration)
   })
-  ipcMain.handle("browser-unregister-webview", (event, runtimeTabId: string, webContentsId?: number, generation?: number) => {
+  ipcMain.handle("browser-unregister-webview", (event, runtimeTabId: string, webContentsId: number | undefined, generation: number | undefined, lifecycleGeneration: number) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
-    return engine.api.unregisterWebview(runtimeTabId, webContentsId, generation)
+    return engine.api.unregisterWebview(runtimeTabId, webContentsId, generation, lifecycleGeneration)
   })
   ipcMain.handle("browser-human-input", (event, runtimeTabId: string, signal: unknown) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")

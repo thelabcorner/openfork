@@ -28,7 +28,8 @@ export interface ResizeHandleProps extends Omit<JSX.HTMLAttributes<HTMLDivElemen
   edge?: "start" | "end"
   size: number
   min: number
-  max: number
+  /** Optional upper bound. Omit for panes that should grow until adjacent layout constraints stop them. */
+  max?: number
   onResize: (size: number) => void
   onCollapse?: () => void
   /** Called while dragging when size crosses `collapseThreshold`. */
@@ -89,7 +90,10 @@ export function ResizeHandle(props: ResizeHandleProps) {
 
   const resolveEdge = () => local.edge ?? (local.direction === "vertical" ? "start" : "end")
 
-  const clamp = (value: number) => Math.min(local.max, Math.max(local.min, value))
+  const clamp = (value: number) => {
+    const aboveMin = Math.max(local.min, value)
+    return local.max === undefined ? aboveMin : Math.min(local.max, aboveMin)
+  }
 
   const handlePointerDown = (e: PointerEvent) => {
     if (e.button !== undefined && e.button !== 0) return
@@ -480,7 +484,10 @@ export function ResizeHandle(props: ResizeHandleProps) {
     if (e.key === growKey) delta = step
     else if (e.key === shrinkKey) delta = -step
     else if (e.key === "Home") delta = local.min - local.size
-    else if (e.key === "End") delta = local.max - local.size
+    else if (e.key === "End") {
+      if (local.max === undefined) return
+      delta = local.max - local.size
+    }
     else return
 
     e.preventDefault()

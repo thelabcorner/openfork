@@ -5,6 +5,8 @@
 
 export type BrowserController = "human" | "agent" | "none"
 
+export type BrowserAppearance = "light" | "dark" | "system"
+
 /** A tab's owner — user-owned or owned by one agent session (two agents never
  * share a tab; the user may always reassign via the context menu). */
 export type HostOwner = { kind: "user" } | { kind: "agent"; sessionId: string }
@@ -62,6 +64,7 @@ export interface PresentedContent {
 /** Per-tab guest state as surfaced by the host (draft; engine adjusts). */
 export interface BrowserGuestState {
   tabId: string
+  lifecycleGeneration: number
   url: string | null
   title: string | null
   loading: boolean

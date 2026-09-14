@@ -42,6 +42,7 @@ export type HostOwner = { kind: "user" } | { kind: "agent"; sessionId: string }
 
 export interface GuestTabState {
   tabId: string
+  lifecycleGeneration: number
   url: string
   title: string
   readyState: "Idle" | "Loading" | "Success" | "LoadFailed"
@@ -71,6 +72,7 @@ export interface PreviewPointerEvent {
 
 export interface BrowserTabRequest {
   tabId: string
+  lifecycleGeneration: number
   url: string
   activate?: boolean
   newTab?: boolean
@@ -134,8 +136,8 @@ interface BrowserAPI {
   openTab: (url: string, opts?: { activate?: boolean; newTab?: boolean }) => Promise<{ tabId: string }>
   activateTab: (tabId: string) => Promise<BrowserState>
   closeTab: (tabId: string) => Promise<{ closed: boolean }>
-  registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) => Promise<{ ok: true; tabId: string }>
-  unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) => Promise<{ ok: true }>
+  registerWebview: (runtimeTabId: string, webContentsId: number, generation: number, lifecycleGeneration: number) => Promise<{ ok: true; tabId?: string }>
+  unregisterWebview: (runtimeTabId: string, webContentsId: number | undefined, generation: number | undefined, lifecycleGeneration: number) => Promise<{ ok: true }>
   getGuestPreloadPath: () => Promise<string>
   assignTab: (tabId: string, owner: HostOwner) => Promise<{ tabId: string; owner: HostOwner }>
   closeRange: (tabId: string, mode: "left" | "right" | "others" | "all") => Promise<{ closed: string[] }>
@@ -177,6 +179,64 @@ function rawBrowser(): BrowserAPI | undefined {
 
 const [hostState, setHostState] = createSignal<BrowserHostState>(DISCONNECTED_STATE)
 let initStarted = false
+let guestPreloadPath: string | undefined
+let guestPreloadPathRequest: Promise<string> | undefined
+let indexedGuests: BrowserGuestState[] | undefined
+let guestByTabId = new Map<string, BrowserGuestState>()
+let guestIndexByTabId = new Map<string, number>()
+
+function ensureGuestIndex(guests: BrowserGuestState[]) {
+  if (indexedGuests === guests) return
+  indexedGuests = guests
+  guestByTabId = new Map()
+  guestIndexByTabId = new Map()
+  for (let index = 0; index < guests.length; index += 1) {
+    const guest = guests[index]
+    guestByTabId.set(guest.tabId, guest)
+    guestIndexByTabId.set(guest.tabId, index)
+  }
+}
+
+function lookupGuest(tabId: string, guests = hostState().guests): BrowserGuestState | undefined {
+  ensureGuestIndex(guests)
+  return guestByTabId.get(tabId)
+}
+
+function lookupGuestIndex(tabId: string, guests: BrowserGuestState[]): number {
+  ensureGuestIndex(guests)
+  return guestIndexByTabId.get(tabId) ?? -1
+}
+
+function sameGuestList(a: BrowserGuestState[], b: BrowserGuestState[]): boolean {
+  if (a.length !== b.length) return false
+  for (let index = 0; index < a.length; index += 1) {
+    if (a[index] !== b[index]) return false
+  }
+  return true
+}
+
+function cachedGuestPreloadPath(): Promise<string> {
+  if (guestPreloadPath !== undefined) return Promise.resolve(guestPreloadPath)
+  if (guestPreloadPathRequest) return guestPreloadPathRequest
+  const api = rawBrowser()
+  if (!api) return Promise.resolve("")
+
+  // The guest preload bundle path is immutable for the lifetime of the
+  // renderer. Resolve it once instead of paying one renderer→main IPC round
+  // trip for every browser tab that mounts.
+  guestPreloadPathRequest = api.getGuestPreloadPath().then(
+    (path) => {
+      guestPreloadPath = path
+      guestPreloadPathRequest = undefined
+      return path
+    },
+    (error) => {
+      guestPreloadPathRequest = undefined
+      throw error
+    },
+  )
+  return guestPreloadPathRequest
+}
 
 /** Annotation send/attach target, populated by the session page while a chat
  * session is open. The browser pane lives in the app shell (above the routes),
@@ -199,6 +259,7 @@ const [annotationTarget, setAnnotationTarget] = createSignal<BrowserAnnotationTa
 function mapGuestTab(tab: GuestTabState): BrowserGuestState {
   return {
     tabId: tab.tabId,
+    lifecycleGeneration: tab.lifecycleGeneration,
     url: tab.url,
     title: tab.title,
     loading: tab.readyState === "Loading",
@@ -227,6 +288,7 @@ function sameGuest(a: BrowserGuestState, b: BrowserGuestState): boolean {
   }
   return (
     a.tabId === b.tabId &&
+    a.lifecycleGeneration === b.lifecycleGeneration &&
     a.url === b.url &&
     a.title === b.title &&
     a.loading === b.loading &&
@@ -244,19 +306,30 @@ function sameGuest(a: BrowserGuestState, b: BrowserGuestState): boolean {
 function applyHostState(next: BrowserState) {
   const previous = hostState()
   const epochChanged = next.host.hostEpoch !== previous.hostEpoch
-  const previousByTabId = new Map(previous.guests.map((guest) => [guest.tabId, guest]))
+  ensureGuestIndex(previous.guests)
+  const alive = new Set<string>()
   const guests = next.tabs.map((tab) => {
+    alive.add(tab.tabId)
     const mapped = mapGuestTab(tab)
-    const existing = previousByTabId.get(tab.tabId)
+    const existing = guestByTabId.get(tab.tabId)
     return existing && sameGuest(existing, mapped) ? existing : mapped
   })
-  setHostState({
+  const mappedState: BrowserHostState = {
     connected: next.host.connected,
     hostEpoch: next.host.hostEpoch ?? 0,
     activeTabId: next.guest.activeTabId,
     appearance: next.appearance ?? "system",
     guests,
-  })
+  }
+  if (
+    previous.connected !== mappedState.connected ||
+    previous.hostEpoch !== mappedState.hostEpoch ||
+    previous.activeTabId !== mappedState.activeTabId ||
+    previous.appearance !== mappedState.appearance ||
+    !sameGuestList(previous.guests, guests)
+  ) {
+    setHostState(mappedState)
+  }
 
   if (epochChanged) {
     // Snapshot/pointer stores are keyed by tabId; clear per live tab.
@@ -266,7 +339,6 @@ function applyHostState(next: BrowserState) {
     }
   }
 
-  const alive = new Set(next.tabs.map((tab) => tab.tabId))
   for (const tabId of Object.keys(browserSurfaceStore.byTabId)) {
     if (!alive.has(tabId)) browserSurfaceStore.clear(tabId)
   }
@@ -275,7 +347,7 @@ function applyHostState(next: BrowserState) {
 /** Apply one per-tab state push (onState). */
 function applyGuestTab(tab: GuestTabState) {
   const current = hostState()
-  const index = current.guests.findIndex((guest) => guest.tabId === tab.tabId)
+  const index = lookupGuestIndex(tab.tabId, current.guests)
   const mapped = mapGuestTab(tab)
 
   if (index === -1) {
@@ -299,7 +371,7 @@ function applyGuestTab(tab: GuestTabState) {
 /** Optimistically add a guest on tab request; the engine's browser-state push replaces it. */
 function applyTabRequest(request: BrowserTabRequest) {
   const current = hostState()
-  if (current.guests.some((guest) => guest.tabId === request.tabId)) return
+  if (lookupGuest(request.tabId, current.guests)) return
   setHostState({
     ...current,
     activeTabId: request.activate === false ? current.activeTabId : request.tabId,
@@ -307,6 +379,7 @@ function applyTabRequest(request: BrowserTabRequest) {
       ...current.guests,
       {
         tabId: request.tabId,
+        lifecycleGeneration: request.lifecycleGeneration,
         url: request.url,
         title: "",
         loading: true,
@@ -324,6 +397,12 @@ function applyTabRequest(request: BrowserTabRequest) {
 
 function applyTabClose(request: { tabId: string }) {
   const current = hostState()
+  if (!lookupGuest(request.tabId, current.guests)) {
+    browserSnapshotStore.clear(request.tabId)
+    browserPointerStore.clear(request.tabId)
+    browserSurfaceStore.clear(request.tabId)
+    return
+  }
   const guests = current.guests.filter((guest) => guest.tabId !== request.tabId)
   setHostState({
     ...current,
@@ -337,6 +416,7 @@ function applyTabClose(request: { tabId: string }) {
 
 const DISCONNECTED_GUEST: BrowserGuestState = {
   tabId: "",
+  lifecycleGeneration: 0,
   url: null,
   title: null,
   loading: false,
@@ -362,7 +442,8 @@ export const browserHostClient = {
   },
   get guest() {
     return (tabId: string): BrowserGuestState => {
-      const found = hostState().guests.find((guest) => guest.tabId === tabId)
+      const guests = hostState().guests
+      const found = lookupGuest(tabId, guests)
       return found ?? { ...DISCONNECTED_GUEST, tabId }
     }
   },
@@ -379,7 +460,9 @@ export const browserHostClient = {
     initStarted = true
     await browserHostClient.refreshState()
     api.onState((tab) => applyGuestTab(tab))
-    api.onHostState(({ connected }) => setHostState((current) => ({ ...current, connected })))
+    api.onHostState(({ connected }) =>
+      setHostState((current) => (current.connected === connected ? current : { ...current, connected })),
+    )
     api.onPointerEvent((event) => browserPointerStore.apply(event))
     // Premium feeds (snapshots/actions) land with the engine's final surface;
     // the stores stay empty until then and components render empty states.
@@ -418,8 +501,8 @@ export const browserHostClient = {
 
   activate: async (tabId: string) => {
     const current = hostState()
-    if (!current.guests.some((guest) => guest.tabId === tabId)) return { active: false }
-    setHostState({ ...current, activeTabId: tabId })
+    if (!lookupGuest(tabId, current.guests)) return { active: false }
+    if (current.activeTabId !== tabId) setHostState({ ...current, activeTabId: tabId })
     const next = await rawBrowser()?.activateTab(tabId).catch(() => null)
     if (next) applyHostState(next)
     return { active: true }
@@ -462,12 +545,12 @@ export const browserHostClient = {
   resize: (_tabId: string, _width: number, _height: number) => Promise.resolve(),
   toggleDevtools: (tabId: string) => browserHostClient.openDevtools(tabId),
 
-  registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) =>
-    rawBrowser()?.registerWebview(runtimeTabId, webContentsId, generation) ??
+  registerWebview: (runtimeTabId: string, webContentsId: number, generation: number, lifecycleGeneration: number) =>
+    rawBrowser()?.registerWebview(runtimeTabId, webContentsId, generation, lifecycleGeneration) ??
     Promise.resolve({ ok: true as const, tabId: runtimeTabId }),
-  unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) =>
-    rawBrowser()?.unregisterWebview(runtimeTabId, webContentsId, generation) ?? Promise.resolve({ ok: true as const }),
-  getGuestPreloadPath: () => rawBrowser()?.getGuestPreloadPath() ?? Promise.resolve(""),
+  unregisterWebview: (runtimeTabId: string, webContentsId: number | undefined, generation: number | undefined, lifecycleGeneration: number) =>
+    rawBrowser()?.unregisterWebview(runtimeTabId, webContentsId, generation, lifecycleGeneration) ?? Promise.resolve({ ok: true as const }),
+  getGuestPreloadPath: cachedGuestPreloadPath,
 
   startAnnotation: (tabId: string) => rawBrowser()?.startAnnotation(tabId) ?? Promise.resolve(null),
   cancelAnnotation: (tabId: string) => rawBrowser()?.cancelAnnotation(tabId) ?? Promise.resolve(),

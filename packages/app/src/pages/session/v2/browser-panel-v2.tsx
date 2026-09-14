@@ -11,7 +11,6 @@ import { HostedBrowserWebview } from "./browser/HostedBrowserWebview"
 import { BrowserTabContextMenu } from "./browser/browser-tab-context-menu"
 import { BrowserPanelV2SidebarToggle } from "./browser-panel-v2-sidebar-toggle"
 import {
-  BROWSER_PANEL_V2_WIDTH_MAX,
   BROWSER_PANEL_V2_WIDTH_MIN,
   type BrowserPanelV2State,
 } from "./browser-panel-v2-state"
@@ -45,7 +44,6 @@ export function BrowserPanelV2(props: {
       right: {
         size: props.state.sidebarWidth(),
         min: BROWSER_PANEL_V2_WIDTH_MIN,
-        max: BROWSER_PANEL_V2_WIDTH_MAX,
         onResize: props.state.resizeSidebar,
         el: () => document.getElementById("browser-panel"),
       },
@@ -159,7 +157,6 @@ export function BrowserPanelV2(props: {
         edge="start"
         size={props.state.sidebarWidth()}
         min={BROWSER_PANEL_V2_WIDTH_MIN}
-        max={BROWSER_PANEL_V2_WIDTH_MAX}
         onResize={props.state.resizeSidebar}
         pair={resizePair()}
       />

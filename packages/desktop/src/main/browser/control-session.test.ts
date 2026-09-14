@@ -8,6 +8,7 @@ import { ControlArbiter } from "./arbitration"
 // any debugger churn (DevTools open/close, webview replacement, etc.).
 const makeWebContents = (colorScheme: () => "light" | "dark") => {
   const commands: Array<{ method: string; params: unknown }> = []
+  const messageListeners = new Set<(event: unknown, method: string, params: Record<string, unknown>) => void>()
   let attached = false
   const wc = {
     id: 1,
@@ -21,16 +22,22 @@ const makeWebContents = (colorScheme: () => "light" | "dark") => {
       },
       sendCommand: async (method: string, params?: Record<string, unknown>) => {
         commands.push({ method, params })
-        // Domain.enable returns {} so ensureAttached's enable loop resolves.
         return {}
       },
-      on: () => undefined,
-      removeListener: () => undefined,
+      on: (event: string, listener: (event: unknown, method: string, params: Record<string, unknown>) => void) => {
+        if (event === "message") messageListeners.add(listener)
+      },
+      removeListener: (event: string, listener: (event: unknown, method: string, params: Record<string, unknown>) => void) => {
+        if (event === "message") messageListeners.delete(listener)
+      },
     },
     isDestroyed: () => false,
     isDevToolsOpened: () => false,
   } as unknown as Parameters<ControlSessionManager["obtain"]>[1] extends infer W ? W : never
-  return { wc: wc as any, commands }
+  const emitMessage = (method: string, params: Record<string, unknown>) => {
+    for (const listener of messageListeners) listener(undefined, method, params)
+  }
+  return { wc: wc as any, commands, messageListeners, emitMessage }
 }
 
 test("ControlSessionManager reapplies emulated appearance on reattach", async () => {
@@ -44,6 +51,12 @@ test("ControlSessionManager reapplies emulated appearance on reattach", async ()
   expect(setMedia.length).toBe(1)
   expect((setMedia[0].params as any).features).toEqual([{ name: "prefers-color-scheme", value: "light" }])
 
+  // A hot-path re-entry with the same appearance should not spend another
+  // debugger round-trip on an identical emulation command.
+  commands.length = 0
+  await manager.reattach(wc, "tab1")
+  expect(commands.filter((c) => c.method === "Emulation.setEmulatedMedia")).toHaveLength(0)
+
   // Simulate the user switching to dark in the renderer.
   scheme = "dark"
   commands.length = 0
@@ -53,4 +66,45 @@ test("ControlSessionManager reapplies emulated appearance on reattach", async ()
   setMedia = commands.filter((c) => c.method === "Emulation.setEmulatedMedia")
   expect(setMedia.length).toBe(1)
   expect((setMedia[0].params as any).features).toEqual([{ name: "prefers-color-scheme", value: "dark" }])
+})
+
+test("ControlSessionManager does not enable unused persistent CDP event domains", async () => {
+  const { wc, commands, messageListeners } = makeWebContents(() => "light")
+  const manager = new ControlSessionManager({ arbiter: new ControlArbiter(), colorScheme: () => "light" })
+
+  await manager.reattach(wc, "tab1")
+
+  expect(commands.filter((c) => c.method.endsWith(".enable"))).toEqual([])
+  expect(commands.some((c) => c.method === "Input.setIgnoreInputEvents")).toBe(true)
+  expect(commands.some((c) => c.method === "Emulation.setEmulatedMedia")).toBe(true)
+  expect(messageListeners.size).toBe(0)
+})
+
+test("ControlSessionManager cleanly rebinds a reused webContents id", async () => {
+  const { wc, commands } = makeWebContents(() => "light")
+  const manager = new ControlSessionManager({ arbiter: new ControlArbiter(), colorScheme: () => "light" })
+
+  await manager.reattach(wc, "tab1")
+  commands.length = 0
+  await manager.reattach(wc, "tab2")
+
+  expect(commands.some((c) => c.method === "Emulation.setEmulatedMedia")).toBe(true)
+})
+
+test("ControlSessionManager wires debugger messages only for active screencast subscribers", async () => {
+  const { wc, messageListeners, emitMessage } = makeWebContents(() => "light")
+  const manager = new ControlSessionManager({ arbiter: new ControlArbiter(), colorScheme: () => "light" })
+  await manager.reattach(wc, "tab1")
+  expect(messageListeners.size).toBe(0)
+
+  const frames: Array<{ tabId: string; params: Record<string, unknown> }> = []
+  const unsubscribe = manager.onScreencastFrame((tabId, params) => frames.push({ tabId, params }))
+  expect(messageListeners.size).toBe(1)
+
+  emitMessage("Runtime.consoleAPICalled", { ignored: true })
+  emitMessage("Page.screencastFrame", { sessionId: 7, data: "frame" })
+  expect(frames).toEqual([{ tabId: "tab1", params: { sessionId: 7, data: "frame" } }])
+
+  unsubscribe()
+  expect(messageListeners.size).toBe(0)
 })

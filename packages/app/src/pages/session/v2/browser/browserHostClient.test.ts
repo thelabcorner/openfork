@@ -9,6 +9,7 @@ import { browserHostClient, type GuestTabState, type HostOwner } from "./browser
 
 function tab(overrides: Partial<GuestTabState> & { tabId: string }): GuestTabState {
   return {
+    lifecycleGeneration: 1,
     url: "https://example.com",
     title: "Example",
     readyState: "Success",
@@ -25,6 +26,7 @@ function tab(overrides: Partial<GuestTabState> & { tabId: string }): GuestTabSta
 describe("browserHostClient state identity", () => {
   test("onState pushes preserve object identity across the guests list", async () => {
     let onStateCb: ((tab: GuestTabState) => void) | undefined
+    let preloadRequests = 0
 
     ;(window as unknown as { api: unknown }).api = {
       browser: {
@@ -42,7 +44,10 @@ describe("browserHostClient state identity", () => {
         closeTab: async () => ({ closed: false }),
         registerWebview: async () => ({ ok: true as const, tabId: "" }),
         unregisterWebview: async () => ({ ok: true as const }),
-        getGuestPreloadPath: async () => "",
+        getGuestPreloadPath: async () => {
+          preloadRequests += 1
+          return "guest-preload.js"
+        },
         assignTab: async (tabId: string, owner: HostOwner) => ({ tabId, owner }),
         closeRange: async () => ({ closed: [] }),
         refreshTab: async () => {},
@@ -69,6 +74,17 @@ describe("browserHostClient state identity", () => {
     const guestB = before.guests.find((g) => g.tabId === "b")!
     expect(guestA).toBeDefined()
     expect(guestB).toBeDefined()
+
+    // A full-state refresh containing byte-for-byte equivalent tab state must
+    // not invalidate the host signal or any per-tab item references.
+    await browserHostClient.refreshState()
+    expect(browserHostClient.state()).toBe(before)
+
+    // The preload path is process-stable. Repeated tab mounts should share one
+    // renderer->main request instead of issuing one IPC round-trip per tab.
+    expect(await browserHostClient.getGuestPreloadPath()).toBe("guest-preload.js")
+    expect(await browserHostClient.getGuestPreloadPath()).toBe("guest-preload.js")
+    expect(preloadRequests).toBe(1)
 
     // A duplicate broadcast with identical fields must be a true no-op: the
     // whole host state object (not just the guests array) keeps its identity.

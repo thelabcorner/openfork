@@ -63,6 +63,7 @@ export type FatalRendererError = {
 
 export type BrowserTabRequest = {
   tabId: string
+  lifecycleGeneration: number
   url: string
   activate?: boolean
   newTab?: boolean
@@ -73,8 +74,8 @@ export type BrowserAPI = {
   openTab: (url: string, opts?: { activate?: boolean; newTab?: boolean }) => Promise<{ tabId: string }>
   activateTab: (tabId: string) => Promise<BrowserState>
   closeTab: (tabId: string) => Promise<{ closed: boolean }>
-  registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) => Promise<{ ok: true }>
-  unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) => Promise<{ ok: true }>
+  registerWebview: (runtimeTabId: string, webContentsId: number, generation: number, lifecycleGeneration: number) => Promise<{ ok: true }>
+  unregisterWebview: (runtimeTabId: string, webContentsId: number | undefined, generation: number | undefined, lifecycleGeneration: number) => Promise<{ ok: true }>
   getGuestPreloadPath: () => Promise<string>
   assignTab: (tabId: string, owner: HostOwner) => Promise<{ tabId: string; owner: HostOwner }>
   closeRange: (tabId: string, mode: "left" | "right" | "others" | "all") => Promise<{ closed: string[] }>

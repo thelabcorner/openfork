@@ -76,11 +76,19 @@ interface WebviewElement extends HTMLElement {
   isCrashed: () => boolean
 }
 
+let cachedWebviewSupport = false
+
 function webviewSupported(): boolean {
   if (typeof document === "undefined") return false
+  if (cachedWebviewSupport) return true
   try {
     const probe = document.createElement("webview") as unknown as { getWebContentsId?: unknown }
-    return typeof probe.getWebContentsId === "function"
+    const supported = typeof probe.getWebContentsId === "function"
+    // A positive result is stable for this renderer. Keep retrying a negative
+    // result so a late custom-element upgrade cannot permanently disable the
+    // browser pane.
+    if (supported) cachedWebviewSupport = true
+    return supported
   } catch {
     return false
   }
@@ -114,8 +122,12 @@ export function HostedBrowserWebview(props: {
   let wrapperRef: HTMLDivElement | undefined
   let stageRef: HTMLDivElement | undefined
   let raf = 0
-  let registeredWebview: { webContentsId: number; generation: number } | undefined
+  let registeredWebview: { webContentsId: number; generation: number; lifecycleGeneration: number } | undefined
+  let registrationFlight: Promise<void> | undefined
+  let registrationQueued = false
+  let disposed = false
   let loadingStuckTimer = 0
+  let crashRemountTimer = 0
 
   const guest = createMemo(() => browserHostClient.guest(props.tabId))
   const [loadingOverride, setLoadingOverride] = createSignal(false)
@@ -204,26 +216,78 @@ export function HostedBrowserWebview(props: {
       setCrashState(plan.state)
       if (plan.remount) {
         const key = remountKey() + 1
-        window.setTimeout(() => setRemountKey(key), plan.delayMs)
+        if (crashRemountTimer) window.clearTimeout(crashRemountTimer)
+        crashRemountTimer = window.setTimeout(() => {
+          crashRemountTimer = 0
+          if (disposed) return
+          setRemountKey(key)
+        }, plan.delayMs)
       }
     })
   }
 
-  async function register() {
+  async function performRegister() {
     const el = webviewEl()
     if (!el) return
     try {
       const webContentsId = el.getWebContentsId()
       const generation = mountGeneration()
+      const lifecycleGeneration = guest().lifecycleGeneration
       const previous = registeredWebview
-      await browserHostClient.registerWebview(props.tabId, webContentsId, generation)
-      registeredWebview = { webContentsId, generation }
-      if (previous && (previous.webContentsId !== webContentsId || previous.generation !== generation)) {
-        void browserHostClient.unregisterWebview(props.tabId, previous.webContentsId, previous.generation)
+      if (
+        previous?.webContentsId === webContentsId &&
+        previous.generation === generation &&
+        previous.lifecycleGeneration === lifecycleGeneration
+      ) return
+      await browserHostClient.registerWebview(props.tabId, webContentsId, generation, lifecycleGeneration)
+
+      // The IPC call above is asynchronous. If this presentation was replaced
+      // while main was admitting it, immediately detach the stale identity and
+      // let the queued pass attach the current one. Serializing registration
+      // flights makes this cleanup race-free: a newer registration cannot have
+      // committed between this check and unregister.
+      if (
+        disposed ||
+        webviewEl() !== el ||
+        mountGeneration() !== generation ||
+        guest().lifecycleGeneration !== lifecycleGeneration
+      ) {
+        await browserHostClient.unregisterWebview(props.tabId, webContentsId, generation, lifecycleGeneration)
+        registrationQueued = true
+        return
+      }
+
+      registeredWebview = { webContentsId, generation, lifecycleGeneration }
+      if (
+        previous &&
+        (previous.webContentsId !== webContentsId ||
+          previous.generation !== generation ||
+          previous.lifecycleGeneration !== lifecycleGeneration)
+      ) {
+        void browserHostClient.unregisterWebview(
+          props.tabId,
+          previous.webContentsId,
+          previous.generation,
+          previous.lifecycleGeneration,
+        )
       }
     } catch {
       // Electron exposes getWebContentsId only after dom-ready; later events retry.
     }
+  }
+
+  function register(): Promise<void> {
+    if (registrationFlight) {
+      registrationQueued = true
+      return registrationFlight
+    }
+    registrationFlight = performRegister().finally(() => {
+      registrationFlight = undefined
+      if (disposed || !registrationQueued) return
+      registrationQueued = false
+      void register()
+    })
+    return registrationFlight
   }
 
   createEffect(() => {
@@ -231,13 +295,17 @@ export function HostedBrowserWebview(props: {
   })
 
   onCleanup(() => {
+    disposed = true
     clearTimeout(loadingStuckTimer)
+    if (crashRemountTimer) window.clearTimeout(crashRemountTimer)
+    registrationQueued = false
     if (raf) cancelAnimationFrame(raf)
     if (registeredWebview) {
       void browserHostClient.unregisterWebview(
         props.tabId,
         registeredWebview.webContentsId,
         registeredWebview.generation,
+        registeredWebview.lifecycleGeneration,
       )
     }
     browserSurfaceStore.clear(props.tabId)
@@ -246,32 +314,35 @@ export function HostedBrowserWebview(props: {
   // ── presentation (panel rect + content push) ──────────────────────────────
 
   function measureAndPresent() {
-    const el = webviewEl()
     const wrapper = wrapperRef
     if (!props.active) return
-    if (!el || !wrapper) return
-    const wrapperRect = wrapper.getBoundingClientRect()
-    const elRect = el.getBoundingClientRect()
-    const scale = layout().viewportScale
+    if (!webviewEl() || !wrapper) return
+    const resolved = layout()
     const content: PresentedContent = {
-      x: elRect.left - wrapperRect.left + wrapper.scrollLeft,
-      y: elRect.top - wrapperRect.top + wrapper.scrollTop,
-      width: elRect.width,
-      height: elRect.height,
-      scale,
+      // The layout solver is the source of the exact same geometry that is
+      // written to the webview's left/top/transform styles below. Reading it
+      // here avoids two synchronous getBoundingClientRect() calls on every
+      // momentum-scroll frame (and therefore avoids forced layout entirely).
+      x: resolved.viewportX,
+      y: resolved.viewportY,
+      width: resolved.viewportWidth,
+      height: resolved.viewportHeight,
+      scale: resolved.viewportScale,
       scrollLeft: wrapper.scrollLeft,
       scrollTop: wrapper.scrollTop,
     }
     browserSurfaceStore.presentContent(props.tabId, content)
   }
 
-  // Coalesces bursts into one measurement per frame — native "scroll" fires
-  // far faster than the display refresh rate during momentum/trackpad
-  // scrolling, and each measurement forces two synchronous getBoundingClientRect
-  // layout reads.
+  // Coalesce bursts into at most one presentation update per frame. Do not
+  // cancel/requeue an already-pending frame: that can starve the update during
+  // a continuous high-frequency scroll stream.
   function scheduleMeasure() {
-    if (raf) cancelAnimationFrame(raf)
-    raf = requestAnimationFrame(() => measureAndPresent())
+    if (raf) return
+    raf = requestAnimationFrame(() => {
+      raf = 0
+      measureAndPresent()
+    })
   }
 
   function presentPanelRect() {
@@ -302,14 +373,34 @@ export function HostedBrowserWebview(props: {
   onMount(() => {
     if (!wrapperRef) return
     panelResizeObserver = new ResizeObserver(() => presentPanelRect())
-    panelResizeObserver.observe(wrapperRef)
-    presentPanelRect()
+    if (props.active) {
+      panelResizeObserver.observe(wrapperRef)
+      presentPanelRect()
+    }
   })
   onCleanup(() => panelResizeObserver?.disconnect())
 
+  // Only the visible tab needs host-layout observation. Keeping every hidden
+  // webview subscribed means a panel/window resize fans out ResizeObserver
+  // work across the whole tab strip even though those callbacks immediately
+  // fail the `props.active` guard. Re-observing on activation also preserves
+  // the important display:none -> visible measurement edge case above.
   createEffect(() => {
+    const active = props.active
+    const observer = panelResizeObserver
+    const wrapper = wrapperRef
+    if (!observer || !wrapper) return
+    if (!active) {
+      observer.unobserve(wrapper)
+      return
+    }
+    observer.observe(wrapper)
+    presentPanelRect()
+  })
+
+  createEffect(() => {
+    if (!props.active) return
     layout()
-    elementSize()
     scheduleMeasure()
   })
 
@@ -732,11 +823,15 @@ export function HostedBrowserWebview(props: {
                 <div class="text-[12px] text-v2-text-text-base">{language.t("browser.crash.title")}</div>
                 <button
                   type="button"
-                  class="h-6 rounded-[4px] bg-v2-background-bg-layer-03 px-2 text-[11px] leading-none text-v2-text-text-base transition-colors duration-100 hover:bg-v2-background-bg-layer-02"
-                  onClick={() => {
-                    setCrashState(INITIAL_WEBVIEW_CRASH_RECOVERY_STATE)
-                    setCrashed(false)
-                    setRemountKey((key) => key + 1)
+                   class="h-6 rounded-[4px] bg-v2-background-bg-layer-03 px-2 text-[11px] leading-none text-v2-text-text-base transition-colors duration-100 hover:bg-v2-background-bg-layer-02"
+                   onClick={() => {
+                     if (crashRemountTimer) {
+                       window.clearTimeout(crashRemountTimer)
+                       crashRemountTimer = 0
+                     }
+                     setCrashState(INITIAL_WEBVIEW_CRASH_RECOVERY_STATE)
+                     setCrashed(false)
+                     setRemountKey((key) => key + 1)
                   }}
                 >
                   {language.t("browser.crash.reload")}

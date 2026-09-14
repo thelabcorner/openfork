@@ -10,8 +10,8 @@ import {
   type HostOwner,
   type HumanInputSignal,
   isHumanInputSignal,
-  toWireGuestTabState,
-  type WireGuestTabState,
+  toRendererGuestTabState,
+  type RendererGuestTabState,
 } from "./contracts"
 // Webview guest registry. The renderer owns the <webview> DOM element; this
 // registry owns the identity, lifecycle, and state of the guest webContents.
@@ -28,7 +28,7 @@ export type GuestRegistryOptions = {
   isTrustedHost: (wc: WebContents) => boolean
   getMainWindowWebContents: () => WebContents | null
   /** Tab state changed (or the tab went away: tab = null). */
-  onStateChange: (tab: WireGuestTabState | null) => void
+  onStateChange: (tab: RendererGuestTabState | null) => void
   /** Guest crashed or its webContents was destroyed. */
   onGuestGone: (runtimeTabId: string, webContentsId: number) => void
   /** Guest-posted human input (from the sandboxed guest preload). */
@@ -49,7 +49,11 @@ export class GuestRegistry {
   private readonly tabs = new Map<string, GuestRecord>()
   private readonly snapshotRefs = new Map<string, Map<string, unknown>>()
   private readonly partitionRefs = new Map<string, number>()
-  private readonly wired = new WeakSet<WebContents>()
+  private readonly lastWireState = new Map<string, RendererGuestTabState>()
+  private readonly bindings = new WeakMap<
+    WebContents,
+    { runtimeTabId: string; generation: number; dispose: () => void }
+  >()
   private appearance: Appearance = "system"
   private recording: { active: boolean; recordingId?: string } = { active: false }
   /** Explicitly activated tab. Falls back to the first tab so a tab is always
@@ -80,19 +84,26 @@ export class GuestRegistry {
     return record
   }
   /** Map an engine record to the wire tab state broadcast to the renderer. */
-  tabState(record: GuestRecord): WireGuestTabState {
-    return toWireGuestTabState(record, record === this.activeTab)
+  tabState(record: GuestRecord): RendererGuestTabState {
+    return toRendererGuestTabState(record, record === this.activeTab)
   }
   /** Push the current wire state for a tab to the onStateChange consumer. */
   sync(runtimeTabId: string): void {
     const record = this.tabs.get(runtimeTabId)
-    if (record) this.options.onStateChange(this.tabState(record))
+    if (!record) return
+    const next = this.tabState(record)
+    const previous = this.lastWireState.get(runtimeTabId)
+    if (previous && sameWireGuestTabState(previous, next)) return
+    this.lastWireState.set(runtimeTabId, next)
+    this.options.onStateChange(next)
   }
-  /** Resolve a tab for an operation; undefined when unknown or crashed. */
+  /** Resolve an attached live tab for an operation. Logical tabs intentionally
+   * survive presentation detach, but stale/destroyed WebContents must never be
+   * handed to CDP or browser chrome operations. */
   requireTab(runtimeTabId?: string): GuestRecord | undefined {
     const record = runtimeTabId ? this.tabs.get(runtimeTabId) : undefined
     if (!record) return undefined
-    if (record.crashed) return undefined
+    if (record.crashed || !record.attached || record.webContentsId === null || record.webContents.isDestroyed()) return undefined
     return record
   }
   /**
@@ -100,8 +111,17 @@ export class GuestRegistry {
    * record on first registration (open requests flow through the renderer, so
    * the record may not exist yet) and wires the guest lifecycle events.
    */
-  register(runtimeTabId: string, webContentsId: number, generation = 0): GuestRecord {
+  register(
+    runtimeTabId: string,
+    webContentsId: number,
+    generation = 0,
+    lifecycleGeneration = 1,
+    beforePublish?: (record: GuestRecord) => void,
+  ): GuestRecord {
     const existing = this.tabs.get(runtimeTabId)
+    if (existing && lifecycleGeneration !== existing.lifecycleGeneration) {
+      throw new Error(`Stale lifecycle registration for tab "${runtimeTabId}"`)
+    }
     if (existing && generation < existing.generation) {
       throw new Error(`Stale webview registration for tab "${runtimeTabId}"`)
     }
@@ -112,10 +132,19 @@ export class GuestRegistry {
       throw new Error("Invalid webview guest: not a webview or not hosted by this window")
     }
     if (!this.options.isTrustedHost(host)) throw new Error("Untrusted host window for browser guest")
+    const previousWebContents = existing?.webContents
+    if (previousWebContents && previousWebContents !== wc) {
+      const previousBinding = this.bindings.get(previousWebContents)
+      if (previousBinding?.runtimeTabId === runtimeTabId) {
+        previousBinding.dispose()
+        this.bindings.delete(previousWebContents)
+      }
+    }
     const record: GuestRecord =
       existing ??
       (({
         runtimeTabId,
+        lifecycleGeneration,
         windowId: this.options.windowId,
         owner: { kind: "user" },
         webContentsId: null,
@@ -134,7 +163,10 @@ export class GuestRegistry {
         muted: false,
         snapshotVersion: 0,
       } satisfies GuestTabState) as GuestRecord)
+    wc.setZoomFactor(record.zoomFactor)
+    wc.setAudioMuted(record.muted)
     record.webContents = wc
+    record.lifecycleGeneration = lifecycleGeneration
     record.generation = generation
     record.webContentsId = webContentsId
     record.crashed = false
@@ -146,24 +178,54 @@ export class GuestRegistry {
       if (this.activeTabId === null) this.activeTabId = runtimeTabId
       this.touchPartition(BROWSER_PARTITION)
     }
-    if (!this.wired.has(wc)) {
-      this.wired.add(wc)
-      this.wireGuest(record, wc)
+    const binding = this.bindings.get(wc)
+    if (binding?.runtimeTabId !== runtimeTabId || binding?.generation !== generation) {
+      binding?.dispose()
+      this.bindings.set(wc, {
+        runtimeTabId,
+        generation,
+        dispose: this.wireGuest(record, wc),
+      })
     }
+    beforePublish?.(record)
     this.sync(runtimeTabId)
     return record
   }
-  /** Tear down a tab: clear arbitration, refs, and the partition lease. */
-  unregister(runtimeTabId: string, webContentsId?: number, generation?: number): void {
+  /** Detach the renderer-owned presentation without deleting the logical tab. */
+  detach(runtimeTabId: string, webContentsId?: number, generation?: number): boolean {
     const record = this.tabs.get(runtimeTabId)
-    if (!record) return
-    if (webContentsId !== undefined && record.webContentsId !== webContentsId) return
-    if (generation !== undefined && record.generation !== generation) return
+    if (!record) return false
+    if (webContentsId !== undefined && record.webContentsId !== webContentsId) return false
+    if (generation !== undefined && record.generation !== generation) return false
+    const binding = this.bindings.get(record.webContents)
+    if (binding?.runtimeTabId === runtimeTabId && binding.generation === record.generation) {
+      binding.dispose()
+      this.bindings.delete(record.webContents)
+    }
     this.options.arbiter.reset(runtimeTabId)
     this.snapshotRefs.delete(runtimeTabId)
+    record.webContentsId = null
+    record.attached = false
+    record.loading = false
+    this.sync(runtimeTabId)
+    return true
+  }
+  /** Permanently remove a logical tab. Renderer cleanup must never call this. */
+  remove(runtimeTabId: string): boolean {
+    const record = this.tabs.get(runtimeTabId)
+    if (!record) return false
+    const binding = this.bindings.get(record.webContents)
+    if (binding?.runtimeTabId === runtimeTabId) {
+      binding.dispose()
+      this.bindings.delete(record.webContents)
+    }
+    this.options.arbiter.reset(runtimeTabId)
+    this.snapshotRefs.delete(runtimeTabId)
+    this.lastWireState.delete(runtimeTabId)
     this.tabs.delete(runtimeTabId)
     if (this.activeTabId === runtimeTabId) this.activeTabId = this.tabs.keys().next().value ?? null
     this.releasePartition(BROWSER_PARTITION)
+    return true
   }
   /** The agent is about to synthesize input; pre-register it for arbitration. */
   expectAgentInput(signal: HumanInputSignal): void {
@@ -222,7 +284,7 @@ export class GuestRegistry {
     return this.snapshotRefs.get(runtimeTabId)
   }
   teardown(): void {
-    for (const runtimeTabId of [...this.tabs.keys()]) this.unregister(runtimeTabId)
+    for (const runtimeTabId of [...this.tabs.keys()]) this.remove(runtimeTabId)
   }
   // --- internals -------------------------------------------------------------
   private resolveColorScheme(): "light" | "dark" {
@@ -248,7 +310,7 @@ export class GuestRegistry {
       })
     }
   }
-  private wireGuest(record: GuestRecord, wc: WebContents) {
+  private wireGuest(record: GuestRecord, wc: WebContents): () => void {
     const runtimeTabId = record.runtimeTabId
     const webContentsId = wc.id
     const generation = record.generation
@@ -256,40 +318,40 @@ export class GuestRegistry {
       const tab = this.tabs.get(runtimeTabId)
       return tab?.webContentsId === webContentsId && tab.generation === generation && tab.webContents === wc
     }
-    wc.on("did-start-loading", () => {
+    const onDidStartLoading = () => {
       if (!current()) return
       record.loading = true
       record.readyState = "loading"
       this.sync(runtimeTabId)
-    })
-    wc.on("did-stop-loading", () => {
+    }
+    const onDidStopLoading = () => {
       if (!current()) return
       record.loading = false
       record.readyState = "complete"
       this.sync(runtimeTabId)
-    })
-    wc.on("did-finish-load", () => {
+    }
+    const onDidFinishLoad = () => {
       if (!current()) return
       record.readyState = "complete"
       record.url = wc.getURL()
       this.sync(runtimeTabId)
-    })
-    wc.on("page-title-updated", (_event, title) => {
+    }
+    const onPageTitleUpdated = (_event: Electron.Event, title: string) => {
       if (!current()) return
       record.title = title
       this.sync(runtimeTabId)
-    })
-    wc.on("did-navigate", (_event, url) => {
+    }
+    const onDidNavigate = (_event: Electron.Event, url: string) => {
       if (!current()) return
       record.url = url
       this.sync(runtimeTabId)
-    })
-    wc.on("did-navigate-in-page", (_event, url) => {
+    }
+    const onDidNavigateInPage = (_event: Electron.Event, url: string) => {
       if (!current()) return
       record.url = url
       this.sync(runtimeTabId)
-    })
-    wc.on("render-process-gone", () => {
+    }
+    const onRenderProcessGone = () => {
       if (!current()) return
       record.crashed = true
       record.attached = false
@@ -300,8 +362,14 @@ export class GuestRegistry {
       })
       this.options.onGuestGone(runtimeTabId, wc.id)
       this.sync(runtimeTabId)
-    })
-    wc.on("did-fail-load", (_event, errorCode, errorDescription, validatedURL, isMainFrame) => {
+    }
+    const onDidFailLoad = (
+      _event: Electron.Event,
+      errorCode: number,
+      errorDescription: string,
+      validatedURL: string,
+      isMainFrame: boolean,
+    ) => {
       if (!current()) return
       this.options.logger?.error("browser guest failed load", {
         runtimeTabId,
@@ -315,22 +383,34 @@ export class GuestRegistry {
         record.readyState = "complete"
         this.sync(runtimeTabId)
       }
-    })
-    wc.on("destroyed", () => {
+    }
+    const onDestroyed = () => {
       if (!current()) return
       record.attached = false
       this.options.onGuestGone(runtimeTabId, wc.id)
       this.sync(runtimeTabId)
-    })
+    }
     // Guest-posted human input (from the sandboxed guest preload). The agent's
     // own CDP-dispatched input echoes back here too — the arbiter matches it
     // against the expected-agent-input queue so only REAL human input preempts.
-    wc.on("ipc-message", (_event, channel, ...args) => {
+    const onIpcMessage = (_event: Electron.Event, channel: string, ...args: unknown[]) => {
+      if (!current()) return
       if (channel !== HUMAN_INPUT_CHANNEL) return
       const signal = args[0] as HumanInputSignal | undefined
       if (!signal || !isHumanInputSignal(signal)) return
       this.options.onHumanInput(record.runtimeTabId, signal)
-    })
+    }
+
+    wc.on("did-start-loading", onDidStartLoading)
+    wc.on("did-stop-loading", onDidStopLoading)
+    wc.on("did-finish-load", onDidFinishLoad)
+    wc.on("page-title-updated", onPageTitleUpdated)
+    wc.on("did-navigate", onDidNavigate)
+    wc.on("did-navigate-in-page", onDidNavigateInPage)
+    wc.on("render-process-gone", onRenderProcessGone)
+    wc.on("did-fail-load", onDidFailLoad)
+    wc.on("destroyed", onDestroyed)
+    wc.on("ipc-message", onIpcMessage)
     // Deny popups inside the hosted guest. Loading the popup target in-place
     // can cause consent/login retry loops on sites that expect a separate tab.
     wc.setWindowOpenHandler(({ url }) => {
@@ -338,11 +418,53 @@ export class GuestRegistry {
       return { action: "deny" }
     })
     // Restrict guest navigation to http(s) only.
-    wc.on("will-navigate", (event, url) => {
+    const onWillNavigate = (event: Electron.Event, url: string) => {
       if (isBrowserGuestUrl(url)) return
       event.preventDefault()
       if (url.startsWith("javascript:")) return
       this.options.logger?.log("browser guest blocked navigation", { url })
-    })
+    }
+    wc.on("will-navigate", onWillNavigate)
+
+    return () => {
+      // Once Chromium has destroyed the target there is no live native target
+      // to detach from; the WebContents object itself will be collected. For a
+      // live rebind/unregister, remove every closure that captures tab identity
+      // so a reused WebContents cannot report state/input to a stale tab.
+      if (wc.isDestroyed()) return
+      wc.removeListener("did-start-loading", onDidStartLoading)
+      wc.removeListener("did-stop-loading", onDidStopLoading)
+      wc.removeListener("did-finish-load", onDidFinishLoad)
+      wc.removeListener("page-title-updated", onPageTitleUpdated)
+      wc.removeListener("did-navigate", onDidNavigate)
+      wc.removeListener("did-navigate-in-page", onDidNavigateInPage)
+      wc.removeListener("render-process-gone", onRenderProcessGone)
+      wc.removeListener("did-fail-load", onDidFailLoad)
+      wc.removeListener("destroyed", onDestroyed)
+      wc.removeListener("ipc-message", onIpcMessage)
+      wc.removeListener("will-navigate", onWillNavigate)
+      // Drop the tab-specific popup closure while preserving the deny policy
+      // until this live WebContents is rebound or destroyed.
+      wc.setWindowOpenHandler(() => ({ action: "deny" }))
+    }
   }
+}
+
+function sameWireGuestTabState(a: RendererGuestTabState, b: RendererGuestTabState): boolean {
+  const sameOwner =
+    a.owner.kind === b.owner.kind &&
+    (a.owner.kind !== "agent" || b.owner.kind !== "agent" || a.owner.sessionId === b.owner.sessionId)
+  return (
+    a.tabId === b.tabId &&
+    a.lifecycleGeneration === b.lifecycleGeneration &&
+    a.url === b.url &&
+    a.title === b.title &&
+    a.readyState === b.readyState &&
+    a.controller === b.controller &&
+    a.zoomFactor === b.zoomFactor &&
+    a.attached === b.attached &&
+    sameOwner &&
+    a.active === b.active &&
+    a.muted === b.muted
+  )
 }

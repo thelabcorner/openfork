@@ -3,7 +3,6 @@ import { Persist, persisted } from "@/utils/persist"
 
 export const BROWSER_PANEL_V2_WIDTH_DEFAULT = 480
 export const BROWSER_PANEL_V2_WIDTH_MIN = 320
-export const BROWSER_PANEL_V2_WIDTH_MAX = 960
 
 export type BrowserPanelExpandMode = "collapse" | "expand"
 
@@ -23,11 +22,10 @@ export function createBrowserPanelV2State() {
     sidebarTransition: ready,
     expandMode: () => store.expandMode,
     setExpandMode: (mode: BrowserPanelExpandMode) => setStore("expandMode", mode),
-    resizeSidebar: (width: number) =>
-      setStore(
-        "sidebarWidth",
-        Math.min(BROWSER_PANEL_V2_WIDTH_MAX, Math.max(BROWSER_PANEL_V2_WIDTH_MIN, width)),
-      ),
+    // No arbitrary upper bound: the paired resize geometry is constrained by
+    // the neighbouring panes' minimum widths, while standalone resizing is
+    // naturally bounded by the pointer's available window space.
+    resizeSidebar: (width: number) => setStore("sidebarWidth", Math.max(BROWSER_PANEL_V2_WIDTH_MIN, width)),
     toggleSidebar: () => setStore("sidebarOpened", (opened) => !opened),
   }
 }

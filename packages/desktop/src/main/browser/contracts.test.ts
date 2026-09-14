@@ -10,7 +10,7 @@ import {
   isLocator,
   isRefTarget,
   rangeTargets,
-  toWireGuestTabState,
+  toRendererGuestTabState,
   type GuestTabState,
 } from "./contracts"
 
@@ -68,9 +68,10 @@ test("isBrokerRequest accepts claim / set_tab_owner envelopes with tabId", () =>
   expect(isBrokerRequest(setOwner)).toBe(true)
 })
 
-test("toWireGuestTabState carries owner + active + muted", () => {
+test("toRendererGuestTabState carries lifecycle + owner + active + muted", () => {
   const record = {
     runtimeTabId: "tab_1",
+    lifecycleGeneration: 7,
     windowId: "win-1",
     owner: { kind: "agent", sessionId: "sess-1" },
     webContentsId: 1,
@@ -89,8 +90,9 @@ test("toWireGuestTabState carries owner + active + muted", () => {
     muted: true,
     snapshotVersion: 0,
   } satisfies GuestTabState
-  const wire = toWireGuestTabState(record, true)
+  const wire = toRendererGuestTabState(record, true)
   expect(wire.owner).toEqual({ kind: "agent", sessionId: "sess-1" })
+  expect(wire.lifecycleGeneration).toBe(7)
   expect(wire.active).toBe(true)
   expect(wire.muted).toBe(true)
 })

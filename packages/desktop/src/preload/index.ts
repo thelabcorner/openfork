@@ -15,10 +15,10 @@ const browserApi: BrowserAPI = {
   openTab: (url, opts) => ipcRenderer.invoke("browser-open-tab", url, opts),
   activateTab: (tabId) => ipcRenderer.invoke("browser-activate-tab", tabId),
   closeTab: (tabId) => ipcRenderer.invoke("browser-close-tab", tabId),
-  registerWebview: (runtimeTabId, webContentsId, generation) =>
-    ipcRenderer.invoke("browser-register-webview", runtimeTabId, webContentsId, generation),
-  unregisterWebview: (runtimeTabId, webContentsId, generation) =>
-    ipcRenderer.invoke("browser-unregister-webview", runtimeTabId, webContentsId, generation),
+  registerWebview: (runtimeTabId, webContentsId, generation, lifecycleGeneration) =>
+    ipcRenderer.invoke("browser-register-webview", runtimeTabId, webContentsId, generation, lifecycleGeneration),
+  unregisterWebview: (runtimeTabId, webContentsId, generation, lifecycleGeneration) =>
+    ipcRenderer.invoke("browser-unregister-webview", runtimeTabId, webContentsId, generation, lifecycleGeneration),
   getGuestPreloadPath: () => ipcRenderer.invoke("browser-get-guest-preload"),
   assignTab: (tabId, owner) => ipcRenderer.invoke("browser-assign-tab", tabId, owner),
   closeRange: (tabId, mode) => ipcRenderer.invoke("browser-close-range", tabId, mode),

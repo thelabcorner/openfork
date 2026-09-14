@@ -1,24 +1,17 @@
 import type { WebContents } from "electron"
 import { BrowserDebuggerConflictError, BrowserNotAttachedError } from "./errors"
 import { ControlArbiter, ControlEpoch, createEpochGuardedSender, type DebuggerCommand } from "./arbitration"
-import { DIAGNOSTIC_BUFFER_LIMIT } from "./types"
 
 // One CDP control session per guest webContents. Serializes agent actions with
-// a one-permit semaphore, attaches `wc.debugger` on protocol 1.3 and enables
-// the domains the operations layer needs (Runtime, Accessibility, Network,
-// Log), buffers diagnostics, and detaches/re-attaches cleanly around DevTools.
+// a one-permit semaphore, attaches `wc.debugger` on protocol 1.3, and
+// detaches/re-attaches cleanly around DevTools. Persistent event domains stay
+// disabled: the operations layer issues direct commands, and turning on
+// Accessibility/Network/Runtime/Log globally creates continuous bookkeeping
+// and event traffic that this implementation does not consume.
 //
 // ControlSessionManager is the facade the operations layer consumes: it owns
 // the per-webContents ControlSessions, the pointer sequence counter, and the
 // screencast frame fan-out.
-
-export type DiagnosticKind = "console" | "exception" | "log" | "network"
-
-export type DiagnosticEntry = {
-  kind: DiagnosticKind
-  at: number
-  detail: string
-}
 
 type DebuggerLike = {
   attach(protocolVersion: string): void
@@ -38,7 +31,6 @@ export type WebContentsLike = {
 
 export type ControlSession = {
   tabId: string
-  diagnostics: readonly DiagnosticEntry[]
   isAttached(): boolean
   ensureAttached(): Promise<void>
   detachForDevTools(): void
@@ -96,21 +88,13 @@ class Permit {
   }
 }
 
-function serializeDiagnostic(params: Record<string, unknown>): string {
-  try {
-    const value = JSON.stringify(params)
-    return value.length > 500 ? `${value.slice(0, 500)}…` : value
-  } catch {
-    return String(params)
-  }
-}
-
 export function createControlSession(options: ControlSessionOptions): ControlSession {
   const { webContents: wc, tabId, epoch, colorScheme } = options
   const permit = new Permit()
   let attached = false
   let command: DebuggerCommand | undefined
-  let diagnostics: DiagnosticEntry[] = []
+  let appliedColorScheme: "light" | "dark" | undefined
+  let messageWired = false
   const messageListeners = new Set<(method: string, params: Record<string, unknown>) => void>()
 
   const onDebuggerMessage = (event: unknown, method: string, params: Record<string, unknown>) => {
@@ -118,23 +102,26 @@ export function createControlSession(options: ControlSessionOptions): ControlSes
     for (const listener of messageListeners) listener(method, params)
   }
 
-  const record = (kind: DiagnosticKind, detail: string) => {
-    diagnostics.push({ kind, at: Date.now(), detail })
-    if (diagnostics.length > DIAGNOSTIC_BUFFER_LIMIT) diagnostics = diagnostics.slice(-DIAGNOSTIC_BUFFER_LIMIT)
-  }
-
-  const wireDiagnostics = () => {
+  const wireMessages = () => {
+    if (messageWired || messageListeners.size === 0) return
     wc.debugger.on("message", onDebuggerMessage)
+    messageWired = true
   }
 
-  const unwireDiagnostics = () => {
+  const unwireMessages = () => {
+    if (!messageWired) return
     wc.debugger.removeListener("message", onDebuggerMessage)
+    messageWired = false
   }
 
   const applyAppearance = async () => {
-    await command?.(`Emulation.setEmulatedMedia`, {
-      features: [{ name: "prefers-color-scheme", value: colorScheme() }],
+    if (!command) return
+    const next = colorScheme()
+    if (appliedColorScheme === next) return
+    await command(`Emulation.setEmulatedMedia`, {
+      features: [{ name: "prefers-color-scheme", value: next }],
     })
+    appliedColorScheme = next
   }
 
   const ensureAttached = async () => {
@@ -142,9 +129,8 @@ export function createControlSession(options: ControlSessionOptions): ControlSes
     if (wc.isDevToolsOpened()) throw new BrowserDebuggerConflictError()
     if (wc.debugger.isAttached()) {
       if (attached) {
-        // Already our session: appearance lives in the CDP SESSION, not the
-        // WebContents, so re-apply it defensively on every (re)entry — it is
-        // idempotent and cheap, and covers any debugger churn we missed.
+        // Already our session. Check the desired appearance on each entry,
+        // but only send CDP when it actually changed.
         await applyAppearance().catch(() => undefined)
         return
       }
@@ -156,15 +142,10 @@ export function createControlSession(options: ControlSessionOptions): ControlSes
       throw new BrowserDebuggerConflictError(`Failed to attach guest debugger: ${(error as Error).message}`)
     }
     attached = true
-    wireDiagnostics()
+    appliedColorScheme = undefined
+    wireMessages()
     const send = async (method: string, params?: Record<string, unknown>) => wc.debugger.sendCommand(method, params)
     command = send
-    const domains = ["Runtime", "Accessibility", "Network", "Log"]
-    for (const domain of domains) {
-      await send(`${domain}.enable`).catch((error: Error) => {
-        throw new BrowserDebuggerConflictError(`Failed to enable ${domain}: ${error.message}`)
-      })
-    }
     await send("Input.setIgnoreInputEvents", { ignore: false }).catch(() => undefined)
     await applyAppearance()
   }
@@ -179,14 +160,11 @@ export function createControlSession(options: ControlSessionOptions): ControlSes
 
   return {
     tabId,
-    get diagnostics() {
-      return diagnostics
-    },
     isAttached: () => attached,
     ensureAttached,
     detachForDevTools: () => {
       if (!attached) return
-      unwireDiagnostics()
+      unwireMessages()
       try {
         wc.debugger.detach()
       } catch {
@@ -194,6 +172,7 @@ export function createControlSession(options: ControlSessionOptions): ControlSes
       }
       attached = false
       command = undefined
+      appliedColorScheme = undefined
     },
     reattach: () => ensureAttached(),
     async withPermit(fn, waitMs = 15_000) {
@@ -207,7 +186,11 @@ export function createControlSession(options: ControlSessionOptions): ControlSes
     },
     onDebuggerMessage(listener) {
       messageListeners.add(listener)
-      return () => messageListeners.delete(listener)
+      if (attached) wireMessages()
+      return () => {
+        messageListeners.delete(listener)
+        if (messageListeners.size === 0) unwireMessages()
+      }
     },
   }
 }
@@ -228,8 +211,8 @@ export class ControlSessionManager {
   private readonly epoch: ControlEpoch
   private readonly colorScheme: () => "light" | "dark"
   private pointerSequence = 0
-  private readonly screencastListeners = new Set<(params: Record<string, unknown>) => void>()
-  private readonly wired = new Set<number>()
+  private readonly screencastListeners = new Set<(tabId: string, params: Record<string, unknown>) => void>()
+  private readonly screencastWires = new Map<number, () => void>()
 
   constructor(options: ControlSessionManagerOptions) {
     this.epoch = options.arbiter.getEpoch()
@@ -252,8 +235,9 @@ export class ControlSessionManager {
     const session = this.sessions.get(webContentsId)
     if (!session) return Promise.resolve()
     session.detachForDevTools()
+    this.screencastWires.get(webContentsId)?.()
+    this.screencastWires.delete(webContentsId)
     this.sessions.delete(webContentsId)
-    this.wired.delete(webContentsId)
     return Promise.resolve()
   }
 
@@ -277,10 +261,32 @@ export class ControlSessionManager {
     return this.pointerSequence
   }
 
-  /** Subscribe to Page.screencastFrame params across every live session. */
-  onScreencastFrame(cb: (params: Record<string, unknown>) => void): () => void {
+  /** Subscribe to Page.screencastFrame params across every live session. CDP
+   * message listeners are wired lazily only while at least one recording is
+   * active, so ordinary browser automation pays no event-listener overhead. */
+  onScreencastFrame(cb: (tabId: string, params: Record<string, unknown>) => void): () => void {
+    const wasEmpty = this.screencastListeners.size === 0
     this.screencastListeners.add(cb)
-    return () => this.screencastListeners.delete(cb)
+    if (wasEmpty) {
+      for (const [id, session] of this.sessions) this.wireScreencast(id, session)
+    }
+    return () => {
+      this.screencastListeners.delete(cb)
+      if (this.screencastListeners.size !== 0) return
+      for (const dispose of this.screencastWires.values()) dispose()
+      this.screencastWires.clear()
+    }
+  }
+
+  private wireScreencast(webContentsId: number, session: ControlSession): void {
+    if (this.screencastWires.has(webContentsId)) return
+    this.screencastWires.set(
+      webContentsId,
+      session.onDebuggerMessage((method, params) => {
+        if (method !== "Page.screencastFrame") return
+        for (const listener of this.screencastListeners) listener(session.tabId, params)
+      }),
+    )
   }
 
   private obtain(tabId: string, wc: WebContentsLike): ControlSession {
@@ -288,8 +294,13 @@ export class ControlSessionManager {
     if (existing) {
       if (existing.tabId !== tabId) {
         // Same webContents re-bound to a new tab after a crash remount.
+        // Detach our old debugger session before replacing the record; leaving
+        // it attached makes the replacement look like an external debugger
+        // conflict and retains its message listener indefinitely.
+        existing.detachForDevTools()
+        this.screencastWires.get(wc.id)?.()
+        this.screencastWires.delete(wc.id)
         this.sessions.delete(wc.id)
-        this.wired.delete(wc.id)
       } else {
         return existing
       }
@@ -301,14 +312,7 @@ export class ControlSessionManager {
       colorScheme: this.colorScheme,
     })
     this.sessions.set(wc.id, session)
-    if (!this.wired.has(wc.id)) {
-      this.wired.add(wc.id)
-      session.onDebuggerMessage((method, params) => {
-        if (method === "Page.screencastFrame") {
-          for (const listener of this.screencastListeners) listener(params)
-        }
-      })
-    }
+    if (this.screencastListeners.size > 0) this.wireScreencast(wc.id, session)
     return session
   }
 }

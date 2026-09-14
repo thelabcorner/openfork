@@ -42,9 +42,8 @@ function entry(): BrowserSurfaceEntry {
 
 const [state, setState] = createStore<BrowserSurfaceStoreState>({ byTabId: {} })
 
-function upsert(tabId: string, patch: Partial<BrowserSurfaceEntry>) {
-  const current = state.byTabId[tabId]
-  setState("byTabId", tabId, { ...entry(), ...current, ...patch })
+function createEntry(tabId: string, patch: Partial<BrowserSurfaceEntry>) {
+  setState("byTabId", tabId, { ...entry(), ...patch })
 }
 
 function sameRect(a: PanelRect | null | undefined, b: PanelRect): boolean {
@@ -64,6 +63,17 @@ function sameContent(a: PresentedContent | null | undefined, b: PresentedContent
   )
 }
 
+function sameViewport(a: ViewportSetting | null | undefined, b: ViewportSetting): boolean {
+  return (
+    !!a &&
+    a.mode === b.mode &&
+    a.width === b.width &&
+    a.height === b.height &&
+    a.presetId === b.presetId &&
+    a.orientation === b.orientation
+  )
+}
+
 export const browserSurfaceStore = {
   get byTabId() {
     return state.byTabId
@@ -79,29 +89,47 @@ export const browserSurfaceStore = {
   // otherwise retrigger itself every time it runs, forever. Skip the write
   // when nothing actually changed.
   presentContent(tabId: string, content: PresentedContent) {
-    if (sameContent(state.byTabId[tabId]?.content, content)) return
-    upsert(tabId, { content })
+    const current = state.byTabId[tabId]
+    if (sameContent(current?.content, content)) return
+    if (!current) return createEntry(tabId, { content })
+    setState("byTabId", tabId, "content", content)
   },
   presentRect(tabId: string, rect: PanelRect) {
-    if (sameRect(state.byTabId[tabId]?.rect, rect)) return
-    upsert(tabId, { rect })
+    const current = state.byTabId[tabId]
+    if (sameRect(current?.rect, rect)) return
+    if (!current) return createEntry(tabId, { rect })
+    setState("byTabId", tabId, "rect", rect)
   },
   setVisible(tabId: string, visible: boolean) {
-    upsert(tabId, { visible })
+    const current = state.byTabId[tabId]
+    if (current?.visible === visible) return
+    if (!current) return createEntry(tabId, { visible })
+    setState("byTabId", tabId, "visible", visible)
   },
   setViewport(tabId: string, viewport: ViewportSetting) {
-    upsert(tabId, { viewport })
+    const current = state.byTabId[tabId]
+    if (sameViewport(current?.viewport, viewport)) return
+    if (!current) return createEntry(tabId, { viewport })
+    setState("byTabId", tabId, "viewport", viewport)
   },
   setDragging(tabId: string, dragging: boolean) {
-    upsert(tabId, { dragging })
+    const current = state.byTabId[tabId]
+    if (current?.dragging === dragging) return
+    if (!current) return createEntry(tabId, { dragging })
+    setState("byTabId", tabId, "dragging", dragging)
   },
   setCornerRadius(tabId: string, cornerRadius: number) {
-    upsert(tabId, { cornerRadius })
+    const current = state.byTabId[tabId]
+    if (current?.cornerRadius === cornerRadius) return
+    if (!current) return createEntry(tabId, { cornerRadius })
+    setState("byTabId", tabId, "cornerRadius", cornerRadius)
   },
   clear(tabId: string) {
     if (!(tabId in state.byTabId)) return
-    const { [tabId]: _removed, ...rest } = state.byTabId
-    setState("byTabId", rest)
+    // Solid Store treats `undefined` at a keyed path as deletion. Mutate only
+    // that property instead of cloning the whole map: teardown stays O(1) and
+    // unrelated tab entries retain identity/reactive isolation.
+    setState("byTabId", tabId, undefined!)
   },
 }
 

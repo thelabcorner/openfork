@@ -12,6 +12,7 @@ import { ControlArbiter } from "./arbitration"
 import { ControlSessionManager } from "./control-session"
 import { BrowserHost } from "./host"
 import { AnnotationController } from "./annotation"
+import { BrowserTabLifecycle } from "./tab-lifecycle"
 import { ExtensionHost } from "./extension-bridge/extension-host"
 import { ExtensionBridge, type ExtensionTabRecord } from "./extension-bridge/extension-bridge"
 import {
@@ -23,6 +24,7 @@ import {
   type HostCapabilities,
   type HostOwner,
   type HumanInputSignal,
+  type RendererGuestTabState,
   type WireGuestTabState,
   rangeTargets,
 } from "./contracts"
@@ -51,8 +53,8 @@ export interface BrowserRenderApi {
   openTab: (url: string, opts?: { activate?: boolean; newTab?: boolean }) => { tabId: string }
   activateTab: (tabId: string) => BrowserState
   closeTab: (tabId: string) => { closed: boolean }
-  registerWebview: (runtimeTabId: string, webContentsId: number, generation?: number) => { ok: true }
-  unregisterWebview: (runtimeTabId: string, webContentsId?: number, generation?: number) => { ok: true }
+  registerWebview: (runtimeTabId: string, webContentsId: number, generation: number, lifecycleGeneration: number) => { ok: true }
+  unregisterWebview: (runtimeTabId: string, webContentsId: number | undefined, generation: number | undefined, lifecycleGeneration: number) => { ok: true }
   humanInput: (runtimeTabId: string, signal: unknown) => void
   /** User-initiated ownership change (D7) — assign/reassign/unassign to ANY owner. */
   assignTab: (tabId: string, owner: HostOwner) => Promise<{ tabId: string; owner: HostOwner }>
@@ -82,6 +84,7 @@ export class BrowserEngine {
   readonly operations: BrowserOperations
   readonly host: BrowserHost
   readonly annotation = new AnnotationController()
+  private readonly tabLifecycle = new BrowserTabLifecycle()
   // Chrome-attach extension lane (optional — present when extension-bridge is bundled)
   readonly extensionHost: ExtensionHost
   readonly extensionBridge: ExtensionBridge
@@ -124,8 +127,11 @@ export class BrowserEngine {
         this.scheduleGuestStateEvent(tab)
       },
       onGuestGone: (runtimeTabId, webContentsId) => {
+        const tab = this.registry.get(runtimeTabId)
+        if (tab) this.tabLifecycle.markDetached(runtimeTabId, tab.lifecycleGeneration)
         this.arbiter.reset(runtimeTabId)
         this.sessions.detach(webContentsId).catch(() => undefined)
+        this.annotation.cancel(runtimeTabId)
         this.host.emitHostEvent({ type: "guest.crashed", tabId: runtimeTabId, timestamp: new Date().toISOString() })
       },
       onHumanInput: (runtimeTabId, signal) => {
@@ -145,9 +151,24 @@ export class BrowserEngine {
         protocolVersion: BROWSER_PROTOCOL_VERSION,
         windowId: options.windowId,
       }),
-      onTabRequest: (request) => this.options.broadcast("browser-tab-request", request),
-      onTabClose: (tabId) => this.options.broadcast("browser-tab-close", { tabId }),
-      onTabClosed: (tabId) => this.host.emitHostEvent({ type: "tab.closed", tabId, timestamp: new Date().toISOString() }),
+      onTabRequest: (request) => this.requestTabPresentation(request),
+      onTabRequestExpired: (tabId, lifecycleGeneration) => this.expireTabRequest(tabId, lifecycleGeneration),
+      onTabClose: (tabId) => {
+        const tab = this.registry.get(tabId)
+        if (!tab || !this.tabLifecycle.beginClose(tabId, tab.lifecycleGeneration)) return
+        // Broker/agent close must own cleanup before the renderer unmounts.
+        // Once the lifecycle is closed, that later renderer unregister is
+        // intentionally stale and therefore cannot be relied on for cleanup.
+        this.arbiter.preempt(tabId)
+        if (tab.webContentsId != null) this.sessions.detach(tab.webContentsId).catch(() => undefined)
+        this.pendingActivation.delete(tabId)
+        this.annotation.cancel(tabId)
+        this.options.broadcast("browser-tab-close", { tabId })
+      },
+      onTabClosed: (tabId) => {
+        this.tabLifecycle.finishClose(tabId)
+        this.host.emitHostEvent({ type: "tab.closed", tabId, timestamp: new Date().toISOString() })
+      },
       onPointerEvent: (event) => this.options.broadcast("browser-pointer-event", event),
       logger: options.logger,
     })
@@ -206,12 +227,22 @@ export class BrowserEngine {
   }
   /** Human input (guest preload ipc or renderer-forwarded): preemption decision + controller lifecycle. */
   private handleHumanInput(runtimeTabId: string, signal: unknown): void {
-    void this.arbiter.handleHumanInput(runtimeTabId, signal as HumanInputSignal).then(() => {
+    const syncController = () => {
       const tab = this.registry.get(runtimeTabId)
       if (!tab) return
-      tab.controller = this.arbiter.controller(runtimeTabId)
+      const controller = this.arbiter.controller(runtimeTabId)
+      if (tab.controller === controller) return
+      tab.controller = controller
       this.registry.sync(runtimeTabId)
-    })
+    }
+
+    // handleHumanInput marks a real human takeover synchronously before its
+    // promise waits out the preemption window. Publish that immediate state now
+    // instead of waiting until the promise resolves (at which point it is
+    // already back to "none"), then publish the settled state if it changed.
+    const settled = this.arbiter.handleHumanInput(runtimeTabId, signal as HumanInputSignal)
+    syncController()
+    void settled.then(syncController)
   }
   /** Called after the app server is ready: start the host bridge. */
   async start(): Promise<void> {
@@ -227,6 +258,7 @@ export class BrowserEngine {
     this.guestStateEventTimers.clear()
     for (const tab of this.registry.list()) this.annotation.cancel(tab.runtimeTabId)
     this.registry.teardown()
+    this.tabLifecycle.clear()
     await this.sessions.detachAll()
     await this.extensionHost.stop().catch(() => undefined)
     await this.host.stop()
@@ -248,6 +280,7 @@ export class BrowserEngine {
     // Extension lane state — merged into Chrome optional field (no protocol bump)
     const chromeTabs = this.chromeTabsMirror.map((t) => ({
       tabId: t.tabId,
+      lifecycleGeneration: 0,
       url: t.url,
       title: t.title,
       readyState: (t.readyState ?? "Success") as WireGuestTabState["readyState"],
@@ -297,7 +330,7 @@ export class BrowserEngine {
       // Human-opened tabs are owner `user` (registry default; D2).
       const tabId = randomUUID()
       if (opts?.activate ?? true) this.pendingActivation.add(tabId)
-      this.options.broadcast("browser-tab-request", {
+      this.requestTabPresentation({
         tabId,
         url,
         activate: opts?.activate ?? true,
@@ -310,15 +343,35 @@ export class BrowserEngine {
       return this.getState()
     },
     closeTab: (tabId) => this.closeTabInternal(tabId).length === 1 ? { closed: true } : { closed: false },
-    registerWebview: (runtimeTabId, webContentsId, generation = 0) => {
-      const record = this.registry.register(runtimeTabId, webContentsId, generation)
-      if (this.pendingActivation.delete(runtimeTabId)) this.registry.activate(runtimeTabId)
+    registerWebview: (runtimeTabId, webContentsId, generation, lifecycleGeneration) => {
+      if (!this.tabLifecycle.canAttach(runtimeTabId, lifecycleGeneration)) {
+        throw new Error(`Rejected stale or unexpected webview registration for tab "${runtimeTabId}"`)
+      }
+      const current = this.registry.get(runtimeTabId)
+      if (
+        current?.attached &&
+        current.webContentsId === webContentsId &&
+        current.generation === generation &&
+        current.lifecycleGeneration === lifecycleGeneration
+      ) {
+        return { ok: true }
+      }
+      const record = this.registry.register(runtimeTabId, webContentsId, generation, lifecycleGeneration, (attached) => {
+        this.operations.prepareOpen(runtimeTabId, attached)
+        if (this.pendingActivation.delete(runtimeTabId)) this.registry.activate(runtimeTabId)
+      })
+      this.tabLifecycle.markAttached(runtimeTabId, lifecycleGeneration)
       this.operations.resolveOpen(runtimeTabId, record)
-      this.options.broadcast("browser-state", this.registry.tabState(record))
       return { ok: true }
     },
-    unregisterWebview: (runtimeTabId, webContentsId, generation) => {
-      this.registry.unregister(runtimeTabId, webContentsId, generation)
+    unregisterWebview: (runtimeTabId, webContentsId, generation, lifecycleGeneration) => {
+      if (!this.tabLifecycle.isCurrent(runtimeTabId, lifecycleGeneration)) return { ok: true }
+      const detached = this.registry.detach(runtimeTabId, webContentsId, generation)
+      if (detached) {
+        this.tabLifecycle.markDetached(runtimeTabId, lifecycleGeneration)
+        if (webContentsId !== undefined) this.sessions.detach(webContentsId).catch(() => undefined)
+        this.annotation.cancel(runtimeTabId)
+      }
       return { ok: true }
     },
     humanInput: (runtimeTabId, signal) => {
@@ -435,7 +488,10 @@ export class BrowserEngine {
       )
     },
     startAnnotation: (tabId) => {
-      const tab = this.registry.get(tabId)
+      // Logical records survive renderer detach by design. Annotation is a
+      // presentation operation, so never hand a detached/destroyed WebContents
+      // to the controller merely because its logical record still exists.
+      const tab = this.registry.requireTab(tabId)
       if (!tab) return Promise.resolve(null)
       // Starting an annotation session is the human taking control of this tab.
       // Bump the epoch so any in-flight agent automation on it aborts
@@ -471,27 +527,55 @@ export class BrowserEngine {
    * an in-flight agent op aborts (never hangs), then destroy and emit tab.closed. */
   private closeTabInternal(tabId: string): string[] {
     const tab = this.registry.get(tabId)
-    if (!tab) return []
+    if (!tab) {
+      const lifecycle = this.tabLifecycle.snapshot(tabId)
+      if (!lifecycle || !this.tabLifecycle.beginClose(tabId, lifecycle.generation)) return []
+      this.operations.cancelPendingOpen(tabId)
+      this.pendingActivation.delete(tabId)
+      this.tabLifecycle.finishClose(tabId, lifecycle.generation)
+      this.options.broadcast("browser-tab-close", { tabId })
+      this.host.emitHostEvent({ type: "tab.closed", tabId, timestamp: new Date().toISOString() })
+      return [tabId]
+    }
+    if (!this.tabLifecycle.beginClose(tabId, tab.lifecycleGeneration)) return []
     this.arbiter.preempt(tabId)
     this.sessions.detach(tab.webContentsId ?? -1).catch(() => undefined)
     this.pendingActivation.delete(tabId)
     this.annotation.cancel(tabId)
-    this.registry.unregister(tabId)
+    this.registry.remove(tabId)
+    this.tabLifecycle.finishClose(tabId, tab.lifecycleGeneration)
     this.host.emitHostEvent({ type: "tab.closed", tabId, timestamp: new Date().toISOString() })
     this.options.broadcast("browser-tab-close", { tabId })
     return [tabId]
+  }
+  private requestTabPresentation(request: { tabId: string; url: string; activate?: boolean; newTab?: boolean }): number {
+    const lifecycleGeneration = this.tabLifecycle.request(request.tabId)
+    this.options.broadcast("browser-tab-request", { ...request, lifecycleGeneration })
+    return lifecycleGeneration
+  }
+  private expireTabRequest(tabId: string, lifecycleGeneration: number): void {
+    if (!this.tabLifecycle.beginClose(tabId, lifecycleGeneration)) return
+    this.pendingActivation.delete(tabId)
+    const tab = this.registry.get(tabId)
+    if (tab?.webContentsId != null) this.sessions.detach(tab.webContentsId).catch(() => undefined)
+    this.annotation.cancel(tabId)
+    this.registry.remove(tabId)
+    this.tabLifecycle.finishClose(tabId, lifecycleGeneration)
+    this.options.broadcast("browser-tab-close", { tabId })
+    this.host.emitHostEvent({ type: "tab.closed", tabId, timestamp: new Date().toISOString() })
   }
   private closeTabs(tabIds: readonly string[]): string[] {
     const closed: string[] = []
     for (const tabId of tabIds) closed.push(...this.closeTabInternal(tabId))
     return closed
   }
-  private scheduleGuestStateEvent(tab: WireGuestTabState): void {
+  private scheduleGuestStateEvent(tab: RendererGuestTabState): void {
     const existing = this.guestStateEventTimers.get(tab.tabId)
     if (existing) clearTimeout(existing)
     const timer = setTimeout(() => {
       this.guestStateEventTimers.delete(tab.tabId)
-      this.host.emitHostEvent({ type: "guest.stateChanged", tab, timestamp: new Date().toISOString() })
+      const { lifecycleGeneration: _lifecycleGeneration, ...wireTab } = tab
+      this.host.emitHostEvent({ type: "guest.stateChanged", tab: wireTab, timestamp: new Date().toISOString() })
     }, GUEST_STATE_EVENT_DEBOUNCE_MS)
     timer.unref?.()
     this.guestStateEventTimers.set(tab.tabId, timer)
