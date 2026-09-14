@@ -4,10 +4,17 @@ import { registerLegacyTransport } from "@/event-v2-bridge"
 import { EffectBridge } from "@/effect/bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { EventReplayBuffer, estimateEventBytes, parseEventSequence } from "@opencode-ai/core/event-replay"
-import { createEventCoalescer, eventDeltaKey, mergeEventDeltas } from "@opencode-ai/core/event-coalescer"
+import {
+  coalesceEventBatch,
+  createEventCoalescer,
+  eventDeltaKey,
+  mergeEventDeltas,
+} from "@opencode-ai/core/event-coalescer"
 import { EventTrace } from "@opencode-ai/core/event-trace"
 import { Installation } from "@/installation"
-import { disposeAllInstancesAndEmitGlobalDisposed } from "@/server/global-lifecycle"
+import { disposeAllInstancesAndEmitGlobalDisposed, emitGlobalDisposed } from "@/server/global-lifecycle"
+import { InstanceStore } from "@/project/instance-store"
+import { resetLocalData } from "@/storage/reset-local-data"
 import { InstallationVersion } from "@opencode-ai/core/installation/version"
 import { Effect } from "effect"
 import * as Stream from "effect/Stream"
@@ -15,6 +22,8 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { ModelPreferences } from "@/preference/model-preferences"
+import { bumpUsageCache } from "@/fork/usage-cache"
+import { resetUsageSummaryCache } from "@/usage/usage"
 import { serializeLegacyEvent } from "@/server/event-serialization"
 import { RootHttpApi } from "../api"
 import { GlobalUpgradeInput, ModelPreferencesPatch } from "../groups/global"
@@ -24,21 +33,21 @@ import { GlobalUpgradeInput, ModelPreferencesPatch } from "../groups/global"
 // Only frames carrying a sequence get an `id:` on the wire.
 type SequencedGlobalEvent = { sequence?: number; event: GlobalBusEvent }
 
-// Exported so tests can assert the coupling below against the real constants
-// instead of duplicated literals: a test that hardcodes today's numbers stops
-// detecting the bug the moment either number moves.
+// Exported so tests can assert replay policy against the real ring constants.
 export const RING_CAPACITY = 4096
+export const RING_MAX_BYTES = 8 * 1024 * 1024
 // A replay is only refused when it is genuinely too expensive to resend. The
 // ring already bounds retention by count (RING_CAPACITY) and by bytes (8 MiB),
 // so a second 128-frame ceiling made ~97% of the retained window unusable and
 // forced a full hydration on any reconnect longer than a fraction of a second
 // of streaming. Reuse the ring's own capacity and trust its byte budget — this
 // matches the native route (packages/server/src/handlers/event.ts).
-// Exported so tests assert the queue/ceiling coupling against real values.
 export const MAX_REPLAY_FRAMES = RING_CAPACITY
-const MAX_REPLAY_BYTES = 4 * 1024 * 1024
-// Live-event headroom on top of a full replay window in the subscriber queue.
+export const MAX_REPLAY_BYTES = RING_MAX_BYTES
+// Conservative LIVE-event item headroom. Replay bypasses the subscriber queue.
 export const SUBSCRIBER_HEADROOM = 256
+const SUBSCRIBER_ENVELOPE_BYTES = 48
+export const SUBSCRIBER_FRAME_MAX_BYTES = RING_MAX_BYTES + SUBSCRIBER_ENVELOPE_BYTES
 
 /**
  * One connected range's replay state. A fresh generation starts a new epoch
@@ -53,7 +62,7 @@ type ReplayGeneration = {
 function newReplayGeneration(): ReplayGeneration {
   return {
     replay: new EventReplayBuffer<GlobalBusEvent>(RING_CAPACITY, {
-      maxBytes: 8 * 1024 * 1024,
+      maxBytes: RING_MAX_BYTES,
       sizeOf: estimateEventBytes,
     }),
     sequences: new WeakMap<object, number>(),
@@ -161,17 +170,19 @@ function eventResponse(gate: GlobalReplayGate) {
     const output = Stream.unwrap(
       Effect.gen(function* () {
         const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<SequencedGlobalEvent>({
-          // The subscriber queue must be able to hold a FULL replay window:
-          // the entire replay is enqueued synchronously here, before the body
-          // stream is ever pulled, and `offer` FAILS the stream on overflow
-          // rather than dropping. So the capacity is coupled to
-          // MAX_REPLAY_FRAMES: raising the replay ceiling without raising this
-          // turns a reconnect more than `capacity` frames behind into a hard
-          // disconnect instead of a replay or a gap. The +SUBSCRIBER_HEADROOM
-          // keeps space for live events arriving while the replay is enqueued.
+          // Replay bypasses this queue and is pulled directly by the response
+          // stream. This capacity is therefore a live-backlog bound only. Keep
+          // the existing count conservatively large while byte accounting is
+          // the primary memory guard.
           capacity: MAX_REPLAY_FRAMES + SUBSCRIBER_HEADROOM,
-          maxBytes: 8 * 1024 * 1024,
-          sizeOf: estimateEventBytes,
+          maxBytes: RING_MAX_BYTES,
+          maxSingleFrameBytes: SUBSCRIBER_FRAME_MAX_BYTES,
+          // The replay ring measures the GlobalBus envelope itself before the
+          // subscriber listener sees it. For normal live events this is an O(1)
+          // WeakMap hit instead of recursively rescanning a jumbo payload through
+          // the fresh `{ sequence, event }` wrapper once per subscriber.
+          sizeOf: (item) => SUBSCRIBER_ENVELOPE_BYTES + estimateEventBytes(item.event),
+          typeOf: (item) => (typeof item.event.payload?.type === "string" ? item.event.payload.type : "unknown"),
         })
         const coalescer = createEventCoalescer<SequencedGlobalEvent>(
           (item) => {
@@ -225,13 +236,14 @@ function eventResponse(gate: GlobalReplayGate) {
           bytes: replayResult.kind === "gap" ? 0 : replayResult.bytes,
         })
         if (replayResult.kind === "gap") EventTrace.count("global.gap")
+        let replayPrefix: SequencedGlobalEvent[]
         if (replayResult.kind === "gap" || replayResult.frames.length > MAX_REPLAY_FRAMES ||
           replayResult.bytes > MAX_REPLAY_BYTES) {
           // Deliberately sequence-free. `replayResult.latest` is the last
           // sequence already assigned to a real event, so using it here emitted a
           // duplicate, non-monotonic SSE id. A gap is a repair signal, not
           // replayable domain state, so it needs no cursor.
-          subscriber.offer({
+          replayPrefix = [{
             event: {
               directory: "global",
               payload: {
@@ -244,11 +256,24 @@ function eventResponse(gate: GlobalReplayGate) {
                 },
               },
             },
-          })
+          }]
         } else {
-          for (const frame of replayResult.frames) offerCoalescer({ sequence: frame.sequence, event: frame.event })
+          replayPrefix = coalesceEventBatch<SequencedGlobalEvent>(
+            replayResult.frames.map((frame) => ({ sequence: frame.sequence, event: frame.event })),
+            {
+              keyOf: (item) => eventDeltaKey(item.event.payload),
+              orderBy: (item) => item.sequence ?? 0,
+              merge: (previous, next) => {
+                const payload = mergeEventDeltas(previous.event.payload, next.event.payload)
+                return payload ? { sequence: next.sequence, event: { ...next.event, payload } } : undefined
+              },
+            },
+          )
         }
-        coalescer.flush()
+        // Replay is historical state and is streamed directly below. Keeping it
+        // out of the live subscriber queue removes the reconnect failure mode
+        // where replay consumed most of the 8 MiB byte budget before the body
+        // could drain and a legal large live frame tipped the queue over.
         for (const item of pendingLive) {
           if ((item.sequence ?? 0) > replayLatest) offerCoalescer(item)
         }
@@ -270,12 +295,19 @@ function eventResponse(gate: GlobalReplayGate) {
           Stream.map(() => eventData({ payload: { id: EventV2.ID.create(), type: "server.heartbeat", properties: {} } })),
         )
 
+        const replayEvents = Stream.fromIterable(replayPrefix).pipe(
+          Stream.map(({ event, sequence }) =>
+            eventData(event, sequence === undefined ? undefined : `${replay.epoch}:${sequence}`),
+          ),
+        )
+        const domain = replayEvents.pipe(Stream.concat(events))
+
         return Stream.make(
           eventData(
             { payload: { id: EventV2.ID.create(), type: "server.connected", properties: { epoch: replay.epoch } } },
             cursor === undefined ? `${replay.epoch}:${replayLatest}` : undefined,
           ),
-        ).pipe(Stream.concat(events.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))))
+        ).pipe(Stream.concat(domain.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))))
       }),
     )
 
@@ -360,6 +392,17 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       return true
     })
 
+    const resetData = Effect.fn("GlobalHttpApi.resetLocalData")(function* () {
+      const instances = yield* InstanceStore.Service
+      return yield* Effect.gen(function* () {
+        yield* instances.disposeAll()
+        const result = yield* resetLocalData()
+        resetUsageSummaryCache()
+        bumpUsageCache()
+        return result
+      }).pipe(Effect.ensuring(emitGlobalDisposed), Effect.uninterruptible)
+    })
+
     const upgrade = Effect.fn("GlobalHttpApi.upgrade")(function* (ctx: { payload: typeof GlobalUpgradeInput.Type }) {
       const method = yield* installation.method()
       if (method === "unknown") {
@@ -397,6 +440,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handle("preferencesGet", preferencesGet)
       .handle("preferencesUpdate", preferencesUpdate)
       .handle("dispose", dispose)
+      .handle("resetLocalData", resetData)
       .handle("upgrade", upgrade)
   }),
 )

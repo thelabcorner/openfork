@@ -444,6 +444,9 @@ const MAX_SERIES_VALUES = 60_000
 const SUMMARY_CACHE_TTL_MS = 3_000
 const summaryCache = new Map<string, { at: number; value: UsageSummary }>()
 
+/** Invalidate process-local analytics after an out-of-band history mutation. */
+export const resetUsageSummaryCache = () => summaryCache.clear()
+
 function downsample<T>(list: T[], max: number): T[] {
   if (list.length <= max) return list
   const step = Math.ceil(list.length / max)

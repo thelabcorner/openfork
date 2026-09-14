@@ -65,6 +65,13 @@ const GlobalUpgradeResult = Schema.Union([
   }),
 ])
 
+const GlobalResetLocalDataResult = Schema.Struct({
+  success: Schema.Literal(true),
+  sessionsDeleted: Schema.Number,
+  memoriesDeleted: Schema.Number,
+  compacted: Schema.Boolean,
+})
+
 // Model-selector preferences shared by every client of this server (desktop
 // renderer and paired PWA). Bounds are generous but finite: the document is
 // written by a UI, so an unbounded payload here would be a disk sink for any
@@ -119,6 +126,7 @@ export const GlobalPaths = {
   config: "/global/config",
   preferences: "/global/preferences",
   dispose: "/global/dispose",
+  resetLocalData: "/global/reset-local-data",
   upgrade: "/global/upgrade",
 } as const
 
@@ -192,6 +200,17 @@ export const GlobalApi = HttpApi.make("global").add(
           identifier: "global.dispose",
           summary: "Dispose instance",
           description: "Clean up and dispose all OpenCode instances, releasing all resources.",
+        }),
+      ),
+      HttpApiEndpoint.post("resetLocalData", GlobalPaths.resetLocalData, {
+        payload: Schema.Struct({ confirmation: Schema.Literal("RESET") }),
+        success: described(GlobalResetLocalDataResult, "Local history reset result"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.resetLocalData",
+          summary: "Reset local OpenCode history",
+          description:
+            "Delete sessions, goals, memory, usage history, and derived database indexes while preserving provider authentication, credentials, accounts, paired devices, application settings, project/workspace configuration, saved project permissions, and database migration state.",
         }),
       ),
       HttpApiEndpoint.post("upgrade", GlobalPaths.upgrade, {
