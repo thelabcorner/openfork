@@ -7,8 +7,14 @@ const server: ForkServer = { url: "http://localhost:4096" }
 let listCalls = 0
 let usageCalls = 0
 let listener:
-  | ((e: { name: string; details: { type: string; properties?: { status?: { type: string } } } }) => void)
+  | ((e: { name: string; details: { type: string; properties?: { status?: { type: string }; repair?: boolean } } }) => void)
   | undefined
+
+const ARM_WAIT_MS = 900
+
+async function waitForArm() {
+  await new Promise((resolve) => setTimeout(resolve, ARM_WAIT_MS))
+}
 
 mock.module("@/utils/fork-client", () => ({
   ForkClient: {
@@ -83,7 +89,7 @@ describe("ForkUsage controller", () => {
 
   test("mounts one resource pair and exposes credentials, usage, and the active credential", async () => {
     const usage = mount()
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    await waitForArm()
 
     expect(usage.activeCredentialID()).toBe("cred_1")
     expect(listCalls).toBe(1)
@@ -92,7 +98,7 @@ describe("ForkUsage controller", () => {
 
   test("refetches usage (debounced) when a session step finishes (status idle)", async () => {
     mount()
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    await waitForArm()
 
     const before = usageCalls
     // step-finish emits session.status idle
@@ -103,13 +109,19 @@ describe("ForkUsage controller", () => {
     expect(listCalls).toBe(1)
   })
 
-  test("refreshes credentials and usage on server reconnect", async () => {
+  test("refreshes credentials and usage only on a repair reconnect", async () => {
     mount()
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    await waitForArm()
 
     const listBefore = listCalls
     const usageBefore = usageCalls
     listener?.({ name: "global", details: { type: "server.connected" } })
+
+    await new Promise((resolve) => setTimeout(resolve, 10))
+    expect(listCalls).toBe(listBefore)
+    expect(usageCalls).toBe(usageBefore)
+
+    listener?.({ name: "global", details: { type: "server.connected", properties: { repair: true } } })
 
     await new Promise((resolve) => setTimeout(resolve, 10))
     expect(listCalls).toBe(listBefore + 1)
@@ -118,7 +130,7 @@ describe("ForkUsage controller", () => {
 
   test("refreshAll refetches credentials and usage", async () => {
     const usage = mount()
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    await waitForArm()
 
     const listBefore = listCalls
     const usageBefore = usageCalls
@@ -131,7 +143,7 @@ describe("ForkUsage controller", () => {
 
   test("heartbeat ticks while visible and is skipped while hidden", async () => {
     mount(500)
-    await new Promise((resolve) => setTimeout(resolve, 0))
+    await waitForArm()
     const before = usageCalls
 
     // Visible: the heartbeat fires a refetch.

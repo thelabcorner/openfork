@@ -43,7 +43,9 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
     )
 
     // SSE: refetch local usage shortly after a step finishes (session.status
-    // flips to idle at step-finish), and refresh everything on reconnect.
+    // flips to idle at step-finish). A normal reconnect is only transport
+    // recovery; refresh both resources only when the server marks the reconnect
+    // as a repair after a detected stream gap.
     // Debounced so bursts of session events collapse into one request.
     let eventTimer: ReturnType<typeof setTimeout> | undefined
     const scheduleRefresh = () => {
@@ -55,7 +57,10 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
     }
     const unsub = serverSDK().event.listen((e) => {
       const event = e.details
-      if (event.type === "server.connected") {
+      if (
+        event.type === "server.connected" &&
+        !!(event.properties as { repair?: boolean } | undefined)?.repair
+      ) {
         void refetchCredentials()
         void refetchUsage()
         return
