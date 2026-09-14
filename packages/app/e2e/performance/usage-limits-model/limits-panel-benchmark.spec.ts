@@ -1,12 +1,14 @@
 import type { Page, Route } from "@playwright/test"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { benchmark, expect } from "../benchmark"
+import { performanceBackendUrl } from "../performance-ports"
 import { mockOpenCodeServer } from "../../utils/mock-server"
 import { expectAppVisible } from "../../utils/waits"
 
 const directory = "C:/OpenCode/LimitsPerformance"
 const projectID = "proj_limits_perf"
 const sessionID = "ses_limits_perf"
+const backendURL = performanceBackendUrl()
 
 const providerCount = () => Number(process.env.LIMITS_BENCH_PROVIDERS ?? 50)
 const windowsPerProvider = () => Number(process.env.LIMITS_BENCH_WINDOWS ?? 6)
@@ -52,7 +54,7 @@ function providerResult(providerId: string, providerName: string, windows: numbe
 }
 
 async function createSession(page: Page) {
-  await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
+  await page.goto(`/server/${base64Encode(backendURL)}/session/${sessionID}`)
   await expectAppVisible(page.locator('[data-component="prompt-input-v2"]'))
 }
 
@@ -64,6 +66,7 @@ benchmark.describe("performance: limits pane", () => {
     let quotaRequests = 0
 
     await mockOpenCodeServer(page, {
+      strictBackendPort: true,
       directory,
       project: {
         id: projectID,
@@ -111,7 +114,7 @@ benchmark.describe("performance: limits pane", () => {
     // Registered after the generic mock route so these quota-specific handlers
     // take precedence. The app also injects Claude + Zen; return the same generic
     // fixture shape for those two so the stress case stays deterministic.
-    await page.route("**/quota/*", async (route: Route) => {
+    await page.route(`${backendURL}/quota/*`, async (route: Route) => {
       const path = new URL(route.request().url()).pathname
       if (path === "/quota/providers") return route.fallback()
       quotaRequests += 1
@@ -123,16 +126,23 @@ benchmark.describe("performance: limits pane", () => {
         body: JSON.stringify(providerResult(id, match?.providerName ?? id, windowCount)),
       })
     })
-    await page.route("**/quota/providers", async (route: Route) => {
+    await page.route(`${backendURL}/quota/providers`, async (route: Route) => {
       providerListRequests += 1
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ providers }) })
     })
 
-    await page.addInitScript(() => {
-      localStorage.setItem("settings.v3", JSON.stringify({ general: { newLayoutDesigns: true } }))
-      localStorage.setItem("opencode.global.dat:server", JSON.stringify({ projects: { local: [] } }))
-      localStorage.removeItem("opencode.limits.cache.v2")
-    })
+    await page.addInitScript(
+      (server) => {
+        localStorage.setItem("settings.v3", JSON.stringify({ general: { newLayoutDesigns: true } }))
+        localStorage.setItem("opencode.settings.dat:defaultServerUrl", server)
+        localStorage.setItem(
+          "opencode.global.dat:server",
+          JSON.stringify({ list: [server], projects: {}, lastProject: {}, recentlyClosed: {} }),
+        )
+        localStorage.removeItem("opencode.limits.cache.v2")
+      },
+      backendURL,
+    )
 
     await createSession(page)
 
@@ -150,7 +160,8 @@ benchmark.describe("performance: limits pane", () => {
     await limitsControl.click()
     const panel = page.locator("[data-context-panel]")
     await expect(panel).toBeVisible()
-    await expect(panel.locator('[data-limits-provider="bench-000"]')).toBeVisible()
+    const firstProvider = panel.locator("[data-limits-provider]").first()
+    await expect(firstProvider).toBeVisible()
     await page.evaluate(() => new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))))
     const openMs = (await page.evaluate(() => performance.now())) - openStarted
 
@@ -162,7 +173,7 @@ benchmark.describe("performance: limits pane", () => {
     // Visible tick cost: observe the pane for just over one second and count
     // DOM character-data changes caused by countdown text. Structural children
     // should remain stable; this is deliberately a renderer-level invariant.
-    const limitsBody = panel.locator('[data-limits-provider="bench-000"]').locator("xpath=ancestor::*[@aria-hidden][1]")
+    const limitsBody = firstProvider.locator("xpath=ancestor::*[@aria-hidden][1]")
     const visibleMutations = await limitsBody.evaluate(async (node) => {
       let characterData = 0
       let childList = 0

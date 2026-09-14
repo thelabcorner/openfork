@@ -55,7 +55,11 @@ type SharedQuotaTransport = {
 // giant global memo.
 const sharedTransports = new WeakMap<ServerSDK, SharedQuotaTransport>()
 const PROVIDER_LIST_DEDUPE_MS = 5_000
-const QUOTA_DEDUPE_MS = 1_000
+// A consumer cannot manually refresh more frequently than REFRESH_FLOOR_MS,
+// so sharing a fresh renderer snapshot for the same interval cannot hide data
+// the UI would otherwise be allowed to request. This also lets a pane opened
+// immediately after the composer reuse the exact same quota snapshot.
+const QUOTA_DEDUPE_MS = REFRESH_FLOOR_MS
 
 function sharedTransport(server: ServerSDK) {
   const existing = sharedTransports.get(server)
@@ -194,6 +198,21 @@ export function useLimits(options?: { now?: Accessor<number>; active?: Accessor<
       }
     }
   }
+  // Hydrate from the server-scoped in-memory transport after persistent cache
+  // so the freshest renderer snapshot wins. This is the common pane-open path:
+  // the always-mounted composer has already polled quotas, and reconstructing
+  // the same 20–50 provider map through one async signal write per provider is
+  // pure reactive churn. Fresh entries are safe to reuse for exactly the same
+  // interval in which manual refresh is disabled.
+  const transport = sharedTransport(sdk())
+  const transportNow = Date.now()
+  for (const cached of transport.quotas.values()) {
+    if (transportNow - cached.at >= QUOTA_DEDUPE_MS) continue
+    const result = cached.value.data as ProviderResult | undefined
+    if (!result?.providerId) continue
+    initialMap.set(result.providerId, result)
+    if (result.ok && result.usage) lastGoodQuotas.set(result.providerId, result)
+  }
 
   const [providersRes] = createResource(
     () => (active() ? tick() : undefined),
@@ -313,6 +332,7 @@ export function useLimits(options?: { now?: Accessor<number>; active?: Accessor<
           if (result.ok && result.providerId === "claude") setLastRateLimitedAt(0)
           else if (!result.ok && isRateLimited(result.error) && result.providerId === "claude") setLastRateLimitedAt(Date.now())
           setQuotaMap((prev) => {
+            if (prev.get(result.providerId) === result) return prev
             const next = new Map(prev)
             next.set(result.providerId, result)
             return next
@@ -322,6 +342,7 @@ export function useLimits(options?: { now?: Accessor<number>; active?: Accessor<
           const result = fallback(entry, err instanceof Error ? err.message : String(err))
           resultsThisGen.set(result.providerId, result)
           setQuotaMap((prev) => {
+            if (prev.get(result.providerId) === result) return prev
             const next = new Map(prev)
             next.set(result.providerId, result)
             return next

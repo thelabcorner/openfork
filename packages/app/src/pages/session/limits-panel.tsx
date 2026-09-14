@@ -1448,6 +1448,9 @@ type Entry =
   | { key: string; sort: number; kind: "go" }
   | { key: string; sort: number; kind: "verdent-free" }
 
+const LIMITS_INITIAL_ENTRIES = 8
+const LIMITS_PAGE_ENTRIES = 16
+
 export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
   const language = useLanguage()
   const now = useNow(() => props.active?.() ?? true)
@@ -1497,6 +1500,29 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
       items.push({ key: "p:verdent-free", sort: stableOrderKey("verdent"), kind: "verdent-free" as const })
     }
     return items.sort((a, b) => a.sort - b.sort)
+  })
+  // A normal account has only a handful of providers, but stress/dev setups can
+  // expose dozens. Mounting every provider card means hundreds of countdown,
+  // meter, and label nodes all become subscribers to the 1s display clock.
+  // Bound DOM admission while keeping the full provider set in `entries()` for
+  // global aggregation/sorting. Expansion is explicit and incremental.
+  const [entryLimit, setEntryLimit] = createSignal(LIMITS_INITIAL_ENTRIES)
+  const visibleEntries = createMemo(() => entries().slice(0, entryLimit()))
+  const hiddenEntryCount = createMemo(() => Math.max(0, entries().length - visibleEntries().length))
+
+  // Composer focus is a stronger intent than the admission bound: if the user
+  // explicitly asked for a provider outside the first page, admit enough rows
+  // for that provider before the existing scroll/highlight effect looks for it.
+  createEffect(() => {
+    const request = limitsFocusRequest()
+    if (!request) return
+    const index = entries().findIndex((entry) => {
+      if (entry.kind === "provider") return entry.provider.result.providerId === request.providerId
+      if (entry.kind === "go") return request.providerId === "opencode-go"
+      return request.providerId === "verdent"
+    })
+    if (index < 0 || index < entryLimit()) return
+    setEntryLimit(Math.ceil((index + 1) / LIMITS_PAGE_ENTRIES) * LIMITS_PAGE_ENTRIES)
   })
 
   /**
@@ -1730,7 +1756,7 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
                 <span class="text-right">{language.t("limits.column.reset")}</span>
                 <span />
               </div>
-              <For each={entries()}>
+              <For each={visibleEntries()}>
                 {(entry) => {
                   if (entry.kind === "go") {
                     return (
@@ -1770,6 +1796,15 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
                   )
                 }}
               </For>
+              <Show when={hiddenEntryCount() > 0}>
+                <button
+                  type="button"
+                  class="rounded-[8px] border border-v2-border-border-muted px-2.5 py-2 text-left text-[10px] font-[600] leading-3 text-v2-text-text-muted transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
+                  onClick={() => setEntryLimit((value) => value + LIMITS_PAGE_ENTRIES)}
+                >
+                  {language.t("common.showMore", { count: Math.min(LIMITS_PAGE_ENTRIES, hiddenEntryCount()) })}
+                </button>
+              </Show>
               <div class="px-1 pt-1 text-[9px] font-[440] leading-3 text-v2-text-text-faint">
                 {language.t("limits.updatedAgo", {
                   age: formatAge(providers()?.[0]?.result?.fetchedAt ?? Date.now(), now(), language.t),
