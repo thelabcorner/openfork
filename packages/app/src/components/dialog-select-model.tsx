@@ -1266,17 +1266,32 @@ function createModelSelectorController(input: {
       setRankReady(false)
       return
     }
-    // Defer the ~50ms ranking (fuzzy + sort) one frame so open->flush is cheap
-    // (~5ms alphabetical) and ranking lands after paint. openOrder pins the
-    // first ranked order so rows don't jump on subsequent recomputes.
-    const handle =
-      typeof requestIdleCallback !== "undefined"
-        ? requestIdleCallback(() => setRankReady(true), { timeout: 80 })
-        : setTimeout(() => setRankReady(true), 16)
+    // Ranking/enrichment is deliberately NOT part of first useful paint.
+    // requestIdleCallback may run before the next paint when the browser sees
+    // idle time, so calling it immediately can still put a 50-70ms ranking
+    // task directly on the click->paint critical path. Cross two frames first,
+    // then admit the enrichment during idle. Warm reopens can replay the last
+    // proven order synchronously without waiting for this gate (see allModels).
+    let frame1 = 0
+    let frame2 = 0
+    let idleHandle: number | undefined
+    let timeoutHandle: ReturnType<typeof setTimeout> | undefined
+    frame1 = requestAnimationFrame(() => {
+      frame1 = 0
+      frame2 = requestAnimationFrame(() => {
+        frame2 = 0
+        if (typeof requestIdleCallback !== "undefined") {
+          idleHandle = requestIdleCallback(() => setRankReady(true), { timeout: 160 })
+          return
+        }
+        timeoutHandle = setTimeout(() => setRankReady(true), 0)
+      })
+    })
     onCleanup(() => {
-      if (typeof cancelIdleCallback !== "undefined" && typeof (handle as unknown as number) === "number")
-        cancelIdleCallback(handle as unknown as number)
-      else clearTimeout(handle as unknown as ReturnType<typeof setTimeout>)
+      if (frame1) cancelAnimationFrame(frame1)
+      if (frame2) cancelAnimationFrame(frame2)
+      if (idleHandle !== undefined && typeof cancelIdleCallback !== "undefined") cancelIdleCallback(idleHandle)
+      if (timeoutHandle !== undefined) clearTimeout(timeoutHandle)
     })
   })
   // Durable learner: ingest live assistant messages into the global persisted
@@ -1333,8 +1348,7 @@ function createModelSelectorController(input: {
   let cachedThresholdFp = ""
   let cachedBands: CorpusBands | undefined
   let cachedBandsTablesFp = ""
-  let openOrderCfp: string | undefined
-  let openOrderTfp: string | undefined
+  let openOrderStructureFp: string | undefined
   let openOrderUsageRev: string | undefined
   // Set while closed; consumed once on the next open edge so usage-accrued
   // between opens invalidates the pin exactly once per open. Mid-open
@@ -1375,57 +1389,71 @@ function createModelSelectorController(input: {
     } else mix("h-")
     return (h >>> 0).toString(16).padStart(8, "0")
   }
-  // Catalog fingerprint: model.list length + FNV-1a ids hash. Empty list
-  // yields "" so the empty-local-list fallback path (view's props.models(""))
-  // is preserved and never poisons the cache.
-  function catalogIdsFp(): string {
-    let raw: Array<{ id: string; provider: { id: string } }> = []
+  const mixFingerprint = (hash: number, value: string) => {
+    let h = hash
+    for (let i = 0; i < value.length; i++) {
+      h ^= value.charCodeAt(i)
+      h = Math.imul(h, 0x01000193)
+    }
+    h ^= 0x9e3779b9
+    return Math.imul(h, 0x01000193)
+  }
+
+  // Structural catalog revision. IDs alone are insufficient: ranking and
+  // fuzzy/threshold fallbacks also depend on name/family/provider/prices. A
+  // same-id repricing must invalidate caches just as surely as an insertion.
+  // createMemo means the O(N) proof happens only when model.list itself changes,
+  // not once for every downstream memo/open-order check.
+  const catalogFp = createMemo(() => {
+    let raw: Array<{
+      id: string
+      name: string
+      family?: string
+      provider: { id: string; name?: string }
+      cost?: { input?: number; output?: number; cache?: { read?: number; write?: number } }
+    }> = []
     try {
-      raw = model.list() as unknown as Array<{ id: string; provider: { id: string } }>
+      raw = model.list() as unknown as typeof raw
     } catch {
       return ""
     }
     if (raw.length === 0) return ""
     let h = 0x811c9dc5
     for (const item of raw) {
-      const s = `${item.provider.id}:${item.id}`
-      for (let i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i)
-        h = Math.imul(h, 0x01000193)
-      }
-      h ^= 0x9e3779b9
-      h = Math.imul(h, 0x01000193)
+      const cost = item.cost
+      h = mixFingerprint(
+        h,
+        `${item.provider.id}\u0000${item.provider.name ?? ""}\u0000${item.id}\u0000${item.name}\u0000${item.family ?? ""}`,
+      )
+      h = mixFingerprint(
+        h,
+        `${cost?.input ?? 0}|${cost?.output ?? 0}|${cost?.cache?.read ?? 0}|${cost?.cache?.write ?? 0}`,
+      )
     }
     return `${raw.length}:${(h >>> 0).toString(16).padStart(8, "0")}`
-  }
-  // Tables fingerprint: profile/pricing lengths + FNV over pricing row names
-  // (threshold-relevant) and profile tuple stream. Cheap, deterministic.
-  function tablesFp(): string {
+  })
+  // Usage-table revision, likewise memoized. Threshold and time-regime metadata
+  // are rank inputs too; omitting them allowed a live pricing-table update to
+  // retain a stale threshold/regime cache even when headline prices matched.
+  const tablesFp = createMemo(() => {
     const t = tables.latest as import("@/utils/model-usage-profile").UsageTables | undefined
     const profile = t?.profile
     const pricing = t?.pricing
     if (!profile || !pricing || (profile.length === 0 && pricing.length === 0)) return ""
     let h = 0x811c9dc5
-    const mix = (s: string) => {
-      for (let i = 0; i < s.length; i++) {
-        h ^= s.charCodeAt(i)
-        h = Math.imul(h, 0x01000193)
-      }
-      h ^= 0x9e3779b9
-      h = Math.imul(h, 0x01000193)
-    }
     for (const e of profile) {
-      for (const n of e.names) mix(n)
-      mix(`${e.profile.input}|${e.profile.cached}|${e.profile.output}`)
+      for (const n of e.names) h = mixFingerprint(h, n)
+      h = mixFingerprint(h, `${e.profile.input}|${e.profile.cached}|${e.profile.output}`)
     }
     for (const e of pricing) {
-      for (const n of e.names) mix(n)
-      mix(
-        `${e.pricing.input}|${e.pricing.output}|${e.pricing.cache?.read ?? 0}|${e.pricing.cache?.write ?? 0}`,
+      for (const n of e.names) h = mixFingerprint(h, n)
+      h = mixFingerprint(
+        h,
+        `${e.pricing.input}|${e.pricing.output}|${e.pricing.cache?.read ?? 0}|${e.pricing.cache?.write ?? 0}|${e.threshold?.operator ?? ""}|${e.threshold?.tokens ?? ""}|${e.timeRegime ?? ""}`,
       )
     }
     return `p${profile.length}:r${pricing.length}:${(h >>> 0).toString(16).padStart(8, "0")}`
-  }
+  })
   const bands = createMemo(() => {
     // Cache-first: identical tables fingerprint reuses bands without rebuild,
     // even across closes (memos below are idle-gated while closed).
@@ -1444,7 +1472,7 @@ function createModelSelectorController(input: {
   const thresholdMap = createMemo(() => {
     // Cache-first keyed on catalog + tables fingerprint; exact same output as
     // a fresh build (same builders), reused across closes.
-    const cfp = catalogIdsFp()
+    const cfp = catalogFp()
     const tfp = tablesFp()
     const fp = cfp && tfp ? `${cfp}|${tfp}` : ""
     if (fp && cachedThreshold && cachedThresholdFp === fp) return cachedThreshold
@@ -1494,6 +1522,24 @@ function createModelSelectorController(input: {
   )
   const collapsedGroups = createMemo(() => collapseAccountVariants(unsorted(), MULTI_ACCOUNT_PROVIDERS))
   const groupIndex = createMemo(() => indexModelGroups(collapsedGroups()))
+  const canonicalModels = createMemo(() => collapsedGroups().map((group) => group.canonical))
+  // Visibility/provider filters are not part of the raw catalog revision, but
+  // they change the exact ranked set. Hash that set once per structural change
+  // so a hidden/unhidden model cannot accidentally inherit a stale pinned list.
+  const visibleOrderFp = createMemo(() => {
+    const list = canonicalModels()
+    let h = 0x811c9dc5
+    for (const item of list) h = mixFingerprint(h, modelKey(item))
+    return `${list.length}:${(h >>> 0).toString(16).padStart(8, "0")}`
+  })
+  const rankStructureFp = createMemo(() => {
+    const catalog = catalogFp()
+    if (!catalog) return ""
+    return `${catalog}|${tablesFp()}|${visibleOrderFp()}`
+  })
+  const alphabeticalModels = createMemo(() =>
+    [...canonicalModels()].sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id)),
+  )
   // Pricing fallback: same model id across providers is ~same price (except
   // openrouter). If a model is unpriced on one provider, borrow a sibling's
   // published price instead of sorting it as unpriced/last. Build from the
@@ -1522,7 +1568,7 @@ function createModelSelectorController(input: {
     // (exact-wins-over-fuzzy preserved via mergePricingFallbacks) without
     // rebuilding the O(unpriced × paid) fuzzy scan. Never caches the
     // empty-catalog case so the view's props.models("") fallback stays intact.
-    const cfp = catalogIdsFp()
+    const cfp = catalogFp()
     if (cfp && cachedMergedPricing && cachedMergedCatalogFp === cfp) return cachedMergedPricing
     if (!isOpen() || !rankReady()) return undefined
     const merged = mergePricingFallbacks(pricingFallback(), fuzzyPricingFallback())
@@ -1540,7 +1586,7 @@ function createModelSelectorController(input: {
     if (lightweight) return
     const warm = () => {
       try {
-        const cfp = catalogIdsFp()
+        const cfp = catalogFp()
         if (cfp && cfp !== cachedMergedCatalogFp) {
           try {
             const list = model.list() as never
@@ -1579,7 +1625,7 @@ function createModelSelectorController(input: {
               } catch {}
               // Threshold warm from fetched pricing + current catalog.
               try {
-                const cfpNow = catalogIdsFp()
+                const cfpNow = catalogFp()
                 const tfpNow = tablesFp()
                 const fpNow = cfpNow && tfpNow ? `${cfpNow}|${tfpNow}` : ""
                 if (fpNow && cachedThresholdFp !== fpNow && live.pricing.length > 0) {
@@ -1668,46 +1714,88 @@ function createModelSelectorController(input: {
     return out.size > 0 ? out : undefined
   })
   let openOrder: string[] | undefined
-  const allModels = createMemo(() => {
-    const list = collapsedGroups().map((group) => group.canonical)
-    if (!isOpen() || !rankReady()) {
-      if (!isOpen()) {
-        // Keep openOrder across closes; invalidate only when the catalog
-        // fingerprint (model.list length + ids hash + tables fingerprint)
-        // changed. Empty fingerprints are treated as unknown, never as a
-        // change: the tables fetch typically resolves mid-first-open, and
-        // "" -> loaded must adopt the new tables fingerprint, not discard
-        // the pinned order. Empty catalog never invalidates (fallback path
-        // preserved).
-        const cfpNow = catalogIdsFp()
-        const tfpNow = tablesFp()
-        if (openOrder !== undefined && cfpNow) {
-          if (openOrderCfp !== undefined && cfpNow !== openOrderCfp) openOrder = undefined
-          else if (tfpNow && openOrderTfp && tfpNow !== openOrderTfp) openOrder = undefined
-        }
-        if (openOrder === undefined) {
-          openOrderCfp = undefined
-          openOrderTfp = undefined
-          openOrderUsageRev = undefined
-        } else if (tfpNow && !openOrderTfp) {
-          openOrderTfp = tfpNow
-        }
-        // Arm the one-shot usage check for the next open edge.
-        openEdgeUsageCheck = true
-      }
-      return list.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id))
+  const clearOpenOrder = () => {
+    openOrder = undefined
+    openOrderStructureFp = undefined
+    openOrderUsageRev = undefined
+  }
+  // Replay a proven order in O(N). The old warm path performed a fresh
+  // O(N log N) yield sort and then another sort solely to put the rows back in
+  // this already-known order. Missing/new keys are appended deterministically;
+  // normal structural changes invalidate the pin before this path is used.
+  const applyOpenOrder = (list: ModelItem[]) => {
+    if (!openOrder) return list
+    const byKey = new Map<string, ModelItem>()
+    for (const item of list) byKey.set(modelKey(item), item)
+    const ordered: ModelItem[] = []
+    for (const key of openOrder) {
+      const item = byKey.get(key)
+      if (!item) continue
+      ordered.push(item)
+      byKey.delete(key)
     }
+    for (const item of list) {
+      const key = modelKey(item)
+      if (!byKey.has(key)) continue
+      ordered.push(item)
+      byKey.delete(key)
+    }
+    return ordered
+  }
+  const allModels = createMemo(() => {
+    const list = canonicalModels()
+    const structureFp = rankStructureFp()
+    const structureMatches = !!openOrder && !!structureFp && structureFp === openOrderStructureFp
+
+    if (!isOpen()) {
+      // Validate the retained order once while closed. In particular, a usage
+      // table that arrived after first-open ranking now invalidates the pin;
+      // the prior code merely copied the new table fingerprint onto the stale
+      // order and could preserve fallback-corpus ranking indefinitely.
+      if (openOrder && structureFp && !structureMatches) clearOpenOrder()
+      openEdgeUsageCheck = true
+      return alphabeticalModels()
+    }
+
+    if (!rankReady()) {
+      // Warm reopen: show the previously proven rank immediately, with zero
+      // pricing/yield work on the click path. A structural revision observed
+      // before first paint invalidates it; changes arriving later in this open
+      // are intentionally adopted on the next open to avoid rows moving under
+      // the pointer.
+      if (openOrder && structureMatches) return applyOpenOrder(list)
+      if (openOrder && structureFp && openEdgeUsageCheck) clearOpenOrder()
+      return alphabeticalModels()
+    }
+
+    const pCosts = personalCosts()
+    const hr = hitRates()
+    let usageRev: string | undefined
+    if (openOrder && structureMatches) {
+      // Mid-open recomputes never rerank a proven list. On a reopen, prove only
+      // the genuinely dynamic personal-usage inputs; if unchanged, return the
+      // pin before touching corpus/fallback/ranking machinery.
+      if (!openEdgeUsageCheck) return applyOpenOrder(list)
+      openEdgeUsageCheck = false
+      usageRev = usageRevOf(pCosts, hr)
+      if (usageRev === openOrderUsageRev) return applyOpenOrder(list)
+    } else if (openOrder) {
+      // A structural change discovered after the menu was already interactive
+      // stays pinned for this open; closing performs the invalidation. If this
+      // is the opening edge, invalidate now so the first enrichment is fresh.
+      if (!openEdgeUsageCheck) return applyOpenOrder(list)
+      clearOpenOrder()
+      openEdgeUsageCheck = false
+    }
+
     const b = bands()
     const tmap = thresholdMap()
-    const pCosts = personalCosts()
     const pFallback = personalFallback()
     const priceFallback = mergedPricingFallback()
-    const hr = hitRates()
     const hrFallback = hitRateFallback()
-    const corpus = b?.corpus
     const sorted = sortByCheapness(
       list as never,
-      corpus,
+      b?.corpus,
       tmap as never,
       pCosts as never,
       priceFallback as never,
@@ -1715,44 +1803,13 @@ function createModelSelectorController(input: {
       hr as never,
       hrFallback as never,
     ) as unknown as typeof list
-    let result: typeof list
-    if (!openOrder) {
-      openOrder = sorted.map(modelKey)
-      openOrderCfp = catalogIdsFp() || undefined
-      openOrderTfp = tablesFp() || undefined
-      openOrderUsageRev = usageRevOf(pCosts, hr)
-      openEdgeUsageCheck = false
-      result = sorted
-    } else if (openEdgeUsageCheck) {
-      // One-shot per open: usage accrued between opens (new personal samples
-      // or hit-rate shifts) adopts the fresh order instead of being overridden
-      // by the stale pin. Mid-open recomputes skip this (pin stays stable).
-      openEdgeUsageCheck = false
-      const rev = usageRevOf(pCosts, hr)
-      if (rev !== openOrderUsageRev) {
-        openOrder = sorted.map(modelKey)
-        openOrderCfp = catalogIdsFp() || undefined
-        openOrderTfp = tablesFp() || undefined
-        openOrderUsageRev = rev
-        result = sorted
-      } else {
-        const rank = new Map(openOrder.map((key, index) => [key, index]))
-        result = sorted.sort(
-          (a, b) =>
-            (rank.get(modelKey(a)) ?? Number.POSITIVE_INFINITY) - (rank.get(modelKey(b)) ?? Number.POSITIVE_INFINITY),
-        )
-      }
-    } else {
-      const rank = new Map(openOrder.map((key, index) => [key, index]))
-      result = sorted.sort(
-        (a, b) =>
-          (rank.get(modelKey(a)) ?? Number.POSITIVE_INFINITY) - (rank.get(modelKey(b)) ?? Number.POSITIVE_INFINITY),
-      )
-    }
-    return result
+    openOrder = sorted.map(modelKey)
+    openOrderStructureFp = structureFp || undefined
+    openOrderUsageRev = usageRev ?? usageRevOf(pCosts, hr)
+    openEdgeUsageCheck = false
+    return sorted
   })
   const searchableFields = createMemo(() => {
-    if (!isOpen()) return new Map<ModelItem, ReturnType<typeof prepareModelSearchFields>>()
     const fields = new Map<ModelItem, ReturnType<typeof prepareModelSearchFields>>()
     for (const group of collapsedGroups()) {
       fields.set(
