@@ -1,6 +1,6 @@
 <div align="center">
 
-<img src="docs/assets/openfork-wordmark.svg" alt="OpenFork" width="720" />
+<img src="docs/assets/openfork-wordmark-hero.svg" alt="OpenFork" width="640" />
 
 **A desktop-first, performance-focused fork of OpenCode.**
 
