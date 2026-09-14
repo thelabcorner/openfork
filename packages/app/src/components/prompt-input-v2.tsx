@@ -1200,6 +1200,7 @@ function PromptInputV2UsageArc(props: { model: PromptInputV2ComposerController["
   const language = useLanguage()
   const layout = useLayout()
   const sdk = useSDK()
+  const params = useParams<{ id?: string }>()
   const forkUsage = useForkUsage()
 
   let limits: ReturnType<typeof useLimits> | undefined
@@ -1280,7 +1281,11 @@ function PromptInputV2UsageArc(props: { model: PromptInputV2ComposerController["
     // `selectTab` toggles the tab shut when it is already showing; clicking
     // the arc is always "show me this", never "hide it", hence the guard.
     if (!layout.limits.opened() && !(layout.sessionContext.opened() && layout.sessionContext.tab() === "limits")) {
-      layout.sessionContext.selectTab("limits")
+      // Session routes own the integrated Context / Limits pane. Draft/new-
+      // session routes do not mount ContextPanel at all, so opening that state
+      // there is a visible no-op; use the app-shell LimitsPanel instead.
+      if (params.id) layout.sessionContext.selectTab("limits")
+      else layout.limits.open()
     }
     const target = arc().quotaProviderID
     if (target) focusLimitsProvider(target)

@@ -1,9 +1,12 @@
 import type { Page, Route } from "@playwright/test"
+import { base64Encode } from "@opencode-ai/core/util/encode"
 import { benchmark, expect } from "../benchmark"
 import { mockOpenCodeServer } from "../../utils/mock-server"
 import { expectAppVisible } from "../../utils/waits"
 
 const directory = "C:/OpenCode/LimitsPerformance"
+const projectID = "proj_limits_perf"
+const sessionID = "ses_limits_perf"
 
 const providerCount = () => Number(process.env.LIMITS_BENCH_PROVIDERS ?? 50)
 const windowsPerProvider = () => Number(process.env.LIMITS_BENCH_WINDOWS ?? 6)
@@ -49,12 +52,7 @@ function providerResult(providerId: string, providerName: string, windows: numbe
 }
 
 async function createSession(page: Page) {
-  await page.goto("/")
-  const addProject = page.locator('[data-action="home-add-project-row"]')
-  await expectAppVisible(addProject)
-  await addProject.click()
-  await page.locator("[data-directory-path]").click()
-  await page.locator('[data-action="home-new-session"]').click()
+  await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
   await expectAppVisible(page.locator('[data-component="prompt-input-v2"]'))
 }
 
@@ -68,7 +66,7 @@ benchmark.describe("performance: limits pane", () => {
     await mockOpenCodeServer(page, {
       directory,
       project: {
-        id: "proj_limits_perf",
+        id: projectID,
         worktree: directory,
         vcs: "git",
         name: "LimitsPerformance",
@@ -93,7 +91,17 @@ benchmark.describe("performance: limits pane", () => {
         connected: ["bench"],
         default: { providerID: "bench", modelID: "model-0000" },
       },
-      sessions: [],
+      sessions: [
+        {
+          id: sessionID,
+          slug: "limits-performance",
+          projectID,
+          directory,
+          title: "Limits performance",
+          version: "dev",
+          time: { created: 1_700_000_000_000, updated: 1_700_000_000_000 },
+        },
+      ],
       pageMessages: () => ({ items: [] }),
       fileList: (path) =>
         path ? [] : [{ name: "LimitsPerformance", path: "LimitsPerformance", absolute: directory, type: "directory", ignored: false }],
@@ -103,7 +111,7 @@ benchmark.describe("performance: limits pane", () => {
     // Registered after the generic mock route so these quota-specific handlers
     // take precedence. The app also injects Claude + Zen; return the same generic
     // fixture shape for those two so the stress case stays deterministic.
-    await page.route("http://127.0.0.1:4096/quota/*", async (route: Route) => {
+    await page.route("**/quota/*", async (route: Route) => {
       const path = new URL(route.request().url()).pathname
       if (path === "/quota/providers") return route.fallback()
       quotaRequests += 1
@@ -115,7 +123,7 @@ benchmark.describe("performance: limits pane", () => {
         body: JSON.stringify(providerResult(id, match?.providerName ?? id, windowCount)),
       })
     })
-    await page.route("http://127.0.0.1:4096/quota/providers", async (route: Route) => {
+    await page.route("**/quota/providers", async (route: Route) => {
       providerListRequests += 1
       await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ providers }) })
     })
@@ -133,11 +141,9 @@ benchmark.describe("performance: limits pane", () => {
     const providerRequestsBeforeOpen = providerListRequests
     const quotaRequestsBeforeOpen = quotaRequests
 
-    // Use the composer usage arc as the canonical production entrypoint. The
-    // synthetic new-session fixture intentionally omits some titlebar actions,
-    // and command registration is route/chrome dependent; the arc is always
-    // mounted with the composer and calls the exact same
-    // `sessionContext.selectTab("limits")` state transition as the header.
+    // Use the composer usage arc as the canonical production entrypoint on a
+    // real session route. That exercises the integrated Context→Limits pane,
+    // including its "visited but inactive" lifecycle after tab switching.
     const limitsControl = page.locator('[data-action="prompt-usage"]')
     await expect(limitsControl).toBeVisible()
     const openStarted = await page.evaluate(() => performance.now())
@@ -172,8 +178,8 @@ benchmark.describe("performance: limits pane", () => {
       return { characterData, childList }
     })
 
-    // Move away from Limits without unmounting it. Its local display clock and
-    // transport should go idle while Context is active.
+    // Move away from Limits without unmounting it. Its display clock and
+    // transport must go idle while the Context tab is active.
     await panel.getByRole("tab", { name: /context/i }).click()
     await expect(panel.getByRole("tab", { name: /context/i })).toHaveAttribute("aria-selected", "true")
     const requestsBeforeHidden = { providers: providerListRequests, quotas: quotaRequests }
