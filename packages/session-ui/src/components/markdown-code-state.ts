@@ -1,4 +1,5 @@
 import type { MarkdownToken } from "./markdown-worker-protocol"
+import { hasTextPrefix } from "./text-prefix"
 
 export type RenderedCodeState = {
   language: string
@@ -17,6 +18,6 @@ export function shouldResetCodeTokens(
     previous.language !== next.language ||
     previous.generation !== next.generation ||
     next.stableCount < previous.stableCount ||
-    !next.raw.startsWith(previous.raw)
+    !hasTextPrefix(next.raw, previous.raw)
   )
 }

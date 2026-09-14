@@ -22,6 +22,7 @@ import {
   disposeMarkdownProjection,
   disposeStreamingCode,
   highlightStreamingCode,
+  type HostMarkdownProjection,
   MarkdownWorkerDisposedError,
   MarkdownWorkerSupersededError,
   MarkdownWorkerUnavailableError,
@@ -57,7 +58,10 @@ type RenderedBlock =
 
 type RenderResult = {
   text: string
+  cacheKey?: string
   blocks: RenderedBlock[]
+  /** First block that may differ from the preceding rendered result. */
+  changedFrom: number
 }
 
 const renderedCodeTokens = new WeakMap<HTMLDivElement, RenderedCodeState>()
@@ -352,7 +356,7 @@ function setupCodeCopy(root: HTMLDivElement, getLabels: () => CopyLabels) {
 }
 
 function initialResult(text: string, key: string | undefined, projection: Projection, owner: string): RenderResult {
-  if (!text) return { text, blocks: [] }
+  if (!text) return { text, cacheKey: key, blocks: [], changedFrom: 0 }
   const base = key ?? checksum(text)
   if (base) {
     const blocks = projection.blocks.flatMap((block, index) => {
@@ -362,10 +366,12 @@ function initialResult(text: string, key: string | undefined, projection: Projec
       if (cached?.raw !== block.raw) return []
       return [{ key: `${owner}:${cacheKey}`, mode: block.mode, ...cached }]
     })
-    if (blocks.length === projection.blocks.length) return { text, blocks }
+    if (blocks.length === projection.blocks.length) return { text, cacheKey: key, blocks, changedFrom: 0 }
   }
   return {
     text,
+    cacheKey: key,
+    changedFrom: 0,
     blocks: [
       {
         key: "initial",
@@ -470,10 +476,12 @@ export function Markdown(
         projection: value,
       }
     },
-    async (src) => {
+    async (src, info) => {
       if (isServer)
         return {
           text: src.text,
+          cacheKey: src.key,
+          changedFrom: 0,
           blocks: [
             {
               key: "server",
@@ -484,15 +492,30 @@ export function Markdown(
             },
           ],
         } satisfies RenderResult
-      if (!src.text) return { text: src.text, blocks: [] } satisfies RenderResult
+      if (!src.text) return { text: src.text, cacheKey: src.key, blocks: [], changedFrom: 0 } satisfies RenderResult
 
-      const hasLiveBlock = src.projection.blocks.some((block) => block.mode === "live")
+      // stream() freezes every completed top-level block. Only the tail can be
+      // live, so a full-array `.some()` on every token is unnecessary.
+      const hasLiveBlock = src.projection.blocks.at(-1)?.mode === "live"
       // A live message changes on every token. Avoid hashing its entire
       // accumulated text and avoid populating the durable HTML cache with a
       // value that will be invalidated on the next token.
       const base = src.key ?? (hasLiveBlock ? undefined : checksum(src.text))
+      const change = (src.projection as HostMarkdownProjection).change
+      const previous = info.value as RenderResult | undefined
+      const canReusePrefix =
+        !!change &&
+        !!previous &&
+        previous.text === change.fromText &&
+        previous.cacheKey === src.key &&
+        change.keep <= previous.blocks.length &&
+        change.keep <= src.projection.blocks.length
+      const changedFrom = canReusePrefix ? change!.keep : 0
+      const prefix = canReusePrefix ? previous!.blocks.slice(0, changedFrom) : []
+      const suffix = src.projection.blocks.slice(changedFrom)
       return Promise.all(
-        src.projection.blocks.map(async (block, index) => {
+        suffix.map(async (block, offset) => {
+          const index = changedFrom + offset
           const key = base ? `${base}:${index}:${block.mode}` : undefined
           const blockKey = markdownBlockKey(owner, src.key, index, block.mode)
 
@@ -540,11 +563,18 @@ export function Markdown(
           return { key: blockKey, mode: block.mode, raw: block.raw, hash: hash ?? "", html: safe }
         }),
       )
-        .then((blocks) => ({ text: src.text, blocks }) satisfies RenderResult)
+        .then((blocks) => ({
+          text: src.text,
+          cacheKey: src.key,
+          changedFrom,
+          blocks: [...prefix, ...blocks],
+        }) satisfies RenderResult)
         .catch(
           () =>
             ({
               text: src.text,
+              cacheKey: src.key,
+              changedFrom: 0,
               blocks: [
                 {
                   key: base ?? "fallback",
@@ -568,17 +598,25 @@ export function Markdown(
   )
 
   let copyCleanup: (() => void) | undefined
+  let previousBlocks: RenderedBlock[] = []
+  let previousCopyLabels: CopyLabels | undefined
 
   createEffect(() => {
     const tracing = markdownTraceEnabled()
     const effectStarted = tracing ? performance.now() : 0
     const container = root()
-    const result = html.latest ?? html()
+    const result = (html.latest ?? html()) as RenderResult | undefined
     const projected = currentProjection()
-    const content = local.text ? pendingBlocks(result, projected, local.cacheKey, owner) : []
+    const pending = local.text
+      ? pendingBlocks(result, projected, local.cacheKey, owner)
+      : { blocks: [] as RenderedBlock[], changedFrom: 0 }
+    const content = pending.blocks
     if (!container) return
     if (isServer) return
     if (content.length === 0) {
+      activeCodeKeys.forEach(disposeCode)
+      activeCodeKeys.clear()
+      previousBlocks = []
       disposeCopyButtons(container)
       disposeMermaidBlocks(container)
       container.innerHTML = ""
@@ -597,13 +635,30 @@ export function Markdown(
       copy: i18n.t("ui.message.copy"),
       copied: i18n.t("ui.message.copied"),
     }
-    const nextCodeKeys = new Set(content.filter((block) => block.mode === "code").map((block) => block.key))
-    activeCodeKeys.forEach((key) => {
-      if (!nextCodeKeys.has(key)) disposeCode(key)
-    })
-    activeCodeKeys.clear()
-    nextCodeKeys.forEach((key) => activeCodeKeys.add(key))
-    content.forEach((block, index) => updateBlock(container, index, block, labels, tracing))
+    // Worker projection patches tell us the exact first changed block. Trust
+    // that seam only when our retained DOM/result prefix is long enough;
+    // otherwise recover conservatively with a full reconciliation.
+    let changedFrom = pending.changedFrom
+    if (changedFrom > previousBlocks.length || changedFrom > container.children.length) changedFrom = 0
+    const changedEnd = Math.max(previousBlocks.length, content.length)
+    for (let index = changedFrom; index < changedEnd; index++) {
+      const before = previousBlocks[index]
+      const after = content[index]
+      if (before?.mode === "code" && (after?.mode !== "code" || after.key !== before.key)) {
+        activeCodeKeys.delete(before.key)
+        disposeCode(before.key)
+      }
+      if (after?.mode === "code") activeCodeKeys.add(after.key)
+    }
+    // Projection keeps completed/pending blocks referentially stable. Updating
+    // every historical markdown block on each paced live token still performs
+    // DOM child lookup, mode dispatch, code-token bookkeeping, and (for code)
+    // querySelector work. Touch only blocks whose rendered object changed.
+    for (let index = changedFrom; index < content.length; index++) {
+      const block = content[index]!
+      if (previousBlocks[index] === block && container.children[index]) continue
+      updateBlock(container, index, block, labels, tracing)
+    }
     while (container.children.length > content.length) {
       const child = container.lastElementChild
       if (!child) break
@@ -611,9 +666,23 @@ export function Markdown(
       disposeMermaidBlocks(child)
       child.remove()
     }
-    container
-      .querySelectorAll<HTMLElement>('[data-slot="markdown-copy-button"]')
-      .forEach((button) => setCopyState(button, labels, button.dataset.copied === "true"))
+    if (changedFrom === 0) previousBlocks = content.slice()
+    else {
+      previousBlocks.length = changedFrom
+      for (let index = changedFrom; index < content.length; index++) previousBlocks.push(content[index]!)
+    }
+    // New copy controls receive current labels when their block is decorated.
+    // Existing controls only need a tree-wide update when locale labels change,
+    // not every streaming markdown render.
+    if (
+      previousCopyLabels &&
+      (previousCopyLabels.copy !== labels.copy || previousCopyLabels.copied !== labels.copied)
+    ) {
+      container
+        .querySelectorAll<HTMLElement>('[data-slot="markdown-copy-button"]')
+        .forEach((button) => setCopyState(button, labels, button.dataset.copied === "true"))
+    }
+    previousCopyLabels = labels
     if (!copyCleanup)
       copyCleanup = setupCodeCopy(container, () => ({
         copy: i18n.t("ui.message.copy"),
@@ -660,16 +729,32 @@ function pendingBlocks(
   cacheKey: string | undefined,
   owner: string,
 ) {
-  if (!result) return []
-  if (!projection || result.text === projection.text) return result.blocks
+  if (!result) return { blocks: [] as RenderedBlock[], changedFrom: 0 }
+  if (!projection || result.text === projection.text)
+    return { blocks: result.blocks, changedFrom: result.changedFrom }
   const initial = result.blocks.length === 1 && result.blocks[0]?.key === "initial"
-  return projection.blocks.map((block, index) => {
+  const change = (projection as HostMarkdownProjection).change
+  const canReusePrefix =
+    !initial &&
+    result.cacheKey === cacheKey &&
+    change?.fromText === result.text &&
+    change.keep <= result.blocks.length &&
+    change.keep <= projection.blocks.length
+  const changedFrom = canReusePrefix ? change!.keep : 0
+  const blocks = canReusePrefix ? result.blocks.slice(0, changedFrom) : []
+  for (let index = changedFrom; index < projection.blocks.length; index++) {
+    const block = projection.blocks[index]!
     const current = initial ? undefined : result.blocks[index]
-    if (current && canReusePendingBlock(current, block)) return current
+    if (current && canReusePendingBlock(current, block)) {
+      blocks.push(current)
+      continue
+    }
     const key = markdownBlockKey(owner, cacheKey, index, block.mode)
-    if (block.mode !== "code")
-      return { key, mode: block.mode, raw: block.raw, hash: String(block.raw.length), html: fallback(block.src) }
-    return {
+    if (block.mode !== "code") {
+      blocks.push({ key, mode: block.mode, raw: block.raw, hash: String(block.raw.length), html: fallback(block.src) })
+      continue
+    }
+    blocks.push({
       key,
       mode: block.mode,
       raw: block.raw,
@@ -680,8 +765,9 @@ function pendingBlocks(
       stable: [],
       generation: 0,
       unstable: [[block.src, ""] as MarkdownToken],
-    }
-  })
+    })
+  }
+  return { blocks, changedFrom }
 }
 
 function disposeCode(key: string) {

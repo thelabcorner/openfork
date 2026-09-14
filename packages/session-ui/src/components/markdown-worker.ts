@@ -1,7 +1,12 @@
 import MarkdownWorkerUrl from "./markdown.worker.ts?worker&url"
 import {
   applyMarkdownWorkerResponse,
+  applyMarkdownProjectionPatch,
+  markdownHighlightRequest,
+  markdownParseRequest,
   shouldReleaseMarkdownWorkerState,
+  type HostMarkdownHighlightRequest,
+  type HostMarkdownParseRequest,
   type MarkdownWorkerRequest,
   type MarkdownWorkerResponse,
   type MarkdownWorkerState,
@@ -9,9 +14,12 @@ import {
 import { createWorkerTransport } from "./markdown-worker-transport"
 import type { Projection } from "./markdown-stream"
 import { markdownTraceEnabled, traceMarkdown } from "./markdown-trace"
+import { hasTextPrefix } from "./text-prefix"
 
 type HighlightPending = {
   key: string
+  text: string
+  language: string
   complete: boolean
   resolve: (state: MarkdownWorkerState) => void
   reject: (error: Error) => void
@@ -19,30 +27,61 @@ type HighlightPending = {
 
 type ProjectPending = {
   key: string
-  resolve: (projection: Projection) => void
+  text: string
+  live: boolean
+  resolve: (projection: HostMarkdownProjection) => void
   reject: (error: Error) => void
 }
 
+export type HostMarkdownProjection = Projection & {
+  /**
+   * Exact worker-proven changed suffix relative to `fromText`. Consumers may
+   * keep every block before `keep` completely inert when they still render that
+   * predecessor. This is transition metadata only; it deliberately does not
+   * retain the predecessor Projection object.
+   */
+  change?: { fromText?: string; keep: number }
+}
+
+type HostProjectRequest = { type: "project"; id: number; key: string; text: string; live: boolean }
+
 type ParsePending = {
   key: string
+  text: string
   resolve: (html: string) => void
   reject: (error: Error) => void
 }
 
-let worker: Worker | undefined
+export const MARKDOWN_WORKER_LANES = 2
+let workers: Worker[] | undefined
 let disabled: Error | undefined
 let nextID = 0
 const pending = new Map<number, HighlightPending>()
 const projects = new Map<number, ProjectPending>()
+// Host-side projection references mirror worker state without duplicating
+// strings. They are released with the component key and let project responses
+// carry only a changed block suffix.
+const hostProjections = new Map<string, HostMarkdownProjection>()
 const parses = new Map<number, ParsePending>()
 const latestParse = new Map<string, number>()
+// Last parse source acknowledged successfully by the worker. The transport
+// uses it only to derive append suffixes; worker eviction is repaired by an
+// explicit parse-miss/full-reset handshake.
+const hostParseSources = new Map<string, string>()
 const states = new Map<string, MarkdownWorkerState>()
+// Last source the worker successfully acknowledged for each live code stream.
+// Values are existing JS strings, not copies; the bounded key set below owns
+// their lifetime. This lets the transport send only append suffixes.
+const hostHighlightSources = new Map<string, { text: string; language: string }>()
 const keys = new Set<string>()
 const latest = new Map<string, number>()
 const stateSizes = new Map<string, number>()
 let stateBytesTotal = 0
 const MAX_STATE_BYTES = 32 * 1024 * 1024
-export const MARKDOWN_PARSE_MAX_ACTIVE = 16
+// Each Worker is serial for a parse lane. Permit one active parse per Worker,
+// not multiple hidden jobs inside one Worker. This isolates a pathological
+// multi-hundred-millisecond Markdown parse from an unrelated session/key.
+export const MARKDOWN_PARSE_MAX_ACTIVE = MARKDOWN_WORKER_LANES
 const workerStarted = new Map<
   number,
   { kind: "parse" | "project" | "highlight"; chars: number; started: number; posted?: number }
@@ -63,6 +102,7 @@ function traceWorkerFinish(
   status: "ok" | "superseded" | "error" | "disposed",
   workerMs?: number,
   workerQueueMs?: number,
+  incremental?: boolean,
 ) {
   const request = workerStarted.get(id)
   if (!request) return
@@ -80,6 +120,7 @@ function traceWorkerFinish(
     workerQueueMs,
     dispatchWaitMs,
     responseWaitMs,
+    incremental,
   })
 }
 
@@ -94,10 +135,33 @@ function deleteState(key: string) {
   stateBytesTotal -= stateSizes.get(key) ?? 0
   stateSizes.delete(key)
 }
-const transport = createWorkerTransport<Extract<MarkdownWorkerRequest, { type: "highlight" }>>({
+
+export function markdownWorkerLane(key: string) {
+  // FNV-1a gives stable affinity without retaining an ever-growing key->lane
+  // map. Projection/highlight state for one key therefore always stays in the
+  // same Worker, while unrelated sessions distribute predictably across lanes.
+  let hash = 0x811c9dc5
+  for (let index = 0; index < key.length; index++) {
+    hash ^= key.charCodeAt(index)
+    hash = Math.imul(hash, 0x01000193)
+  }
+  return (hash >>> 0) % MARKDOWN_WORKER_LANES
+}
+
+function postToWorker(request: MarkdownWorkerRequest) {
+  getWorkers()[markdownWorkerLane(request.key)].postMessage(request)
+}
+
+const laneOptions = {
+  maxActive: MARKDOWN_WORKER_LANES,
+  maxActivePerLane: 1,
+  laneOf: (request: { key: string }) => markdownWorkerLane(request.key),
+}
+const transport = createWorkerTransport<HostMarkdownHighlightRequest>({
+  ...laneOptions,
   post: (request) => {
     traceWorkerPosted(request.id)
-    worker!.postMessage(request)
+    postToWorker(markdownHighlightRequest(request, hostHighlightSources.get(request.key)))
   },
   supersede: (request) => {
     traceWorkerFinish(request.id, "superseded")
@@ -107,10 +171,30 @@ const transport = createWorkerTransport<Extract<MarkdownWorkerRequest, { type: "
     result.reject(new MarkdownWorkerSupersededError())
   },
 })
-const projectTransport = createWorkerTransport<Extract<MarkdownWorkerRequest, { type: "project" }>>({
+const projectTransport = createWorkerTransport<HostProjectRequest>({
+  ...laneOptions,
   post: (request) => {
     traceWorkerPosted(request.id)
-    worker!.postMessage(request)
+    const previous = hostProjections.get(request.key)
+    if (previous && hasTextPrefix(request.text, previous.text)) {
+      postToWorker({
+        type: "project",
+        id: request.id,
+        key: request.key,
+        live: request.live,
+        baseLength: previous.text.length,
+        append: request.text.slice(previous.text.length),
+      })
+      return
+    }
+    postToWorker({
+      type: "project",
+      id: request.id,
+      key: request.key,
+      live: request.live,
+      text: request.text,
+      reset: true,
+    })
   },
   supersede: (request) => {
     traceWorkerFinish(request.id, "superseded")
@@ -120,11 +204,12 @@ const projectTransport = createWorkerTransport<Extract<MarkdownWorkerRequest, { 
     result.reject(new MarkdownWorkerSupersededError())
   },
 })
-const parseTransport = createWorkerTransport<Extract<MarkdownWorkerRequest, { type: "parse" }>>({
+const parseTransport = createWorkerTransport<HostMarkdownParseRequest>({
+  ...laneOptions,
   maxActive: MARKDOWN_PARSE_MAX_ACTIVE,
   post: (request) => {
     traceWorkerPosted(request.id)
-    worker!.postMessage(request)
+    postToWorker(markdownParseRequest(request, hostParseSources.get(request.key)))
   },
   supersede: (request) => {
     traceWorkerFinish(request.id, "superseded")
@@ -137,7 +222,7 @@ const parseTransport = createWorkerTransport<Extract<MarkdownWorkerRequest, { ty
 })
 
 export function parseMarkdown(text: string, key = `parse:${text.length}:${text.slice(0, 32)}`) {
-  const instance = getWorker()
+  getWorkers()
   const id = ++nextID
   return new Promise<string>((resolve, reject) => {
     const previous = latestParse.get(key)
@@ -150,17 +235,17 @@ export function parseMarkdown(text: string, key = `parse:${text.length}:${text.s
       }
     }
     latestParse.set(key, id)
-    parses.set(id, { key, resolve, reject })
+    parses.set(id, { key, text, resolve, reject })
     traceWorkerStart("parse", id, text.length)
     parseTransport.send({ type: "parse", id, key, text })
   })
 }
 
 export function projectMarkdown(key: string, text: string, live: boolean) {
-  getWorker()
+  getWorkers()
   const id = ++nextID
-  return new Promise<Projection>((resolve, reject) => {
-    projects.set(id, { key, resolve, reject })
+  return new Promise<HostMarkdownProjection>((resolve, reject) => {
+    projects.set(id, { key, text, live, resolve, reject })
     traceWorkerStart("project", id, text.length)
     projectTransport.send({ type: "project", id, key, text, live })
   })
@@ -175,25 +260,27 @@ export function disposeMarkdownProjection(key: string) {
     request.reject(new MarkdownWorkerDisposedError())
   })
   latestParse.delete(key)
+  hostParseSources.delete(key)
   projectTransport.dispose(key)
+  hostProjections.delete(key)
   projects.forEach((request, id) => {
     if (request.key !== key) return
     projects.delete(id)
     traceWorkerFinish(id, "disposed")
     request.reject(new MarkdownWorkerDisposedError())
   })
-  worker?.postMessage({ type: "dispose", key } satisfies MarkdownWorkerRequest)
+  workers?.[markdownWorkerLane(key)]?.postMessage({ type: "dispose", key } satisfies MarkdownWorkerRequest)
 }
 
 export function highlightStreamingCode(key: string, text: string, language: string, complete = false) {
-  const instance = getWorker()
+  getWorkers()
   const id = ++nextID
   latest.set(key, id)
   keys.delete(key)
   keys.add(key)
   if (keys.size > 200) disposeStreamingCode(keys.values().next().value!)
   return new Promise<MarkdownWorkerState>((resolve, reject) => {
-    pending.set(id, { key, complete, resolve, reject })
+    pending.set(id, { key, text, language, complete, resolve, reject })
     traceWorkerStart("highlight", id, text.length)
     transport.send({ type: "highlight", id, key, text, language, complete })
   })
@@ -202,6 +289,7 @@ export function highlightStreamingCode(key: string, text: string, language: stri
 export function disposeStreamingCode(key: string) {
   keys.delete(key)
   latest.delete(key)
+  hostHighlightSources.delete(key)
   deleteState(key)
   transport.dispose(key)
   pending.forEach((request, id) => {
@@ -210,28 +298,86 @@ export function disposeStreamingCode(key: string) {
     traceWorkerFinish(id, "disposed")
     request.reject(new MarkdownWorkerDisposedError())
   })
-  worker?.postMessage({ type: "dispose", key } satisfies MarkdownWorkerRequest)
+  workers?.[markdownWorkerLane(key)]?.postMessage({ type: "dispose", key } satisfies MarkdownWorkerRequest)
 }
 
 export class MarkdownWorkerDisposedError extends Error {}
 export class MarkdownWorkerSupersededError extends Error {}
 export class MarkdownWorkerUnavailableError extends Error {}
 
-function getWorker() {
-  if (worker) return worker
+function getWorkers() {
+  if (workers) return workers
   if (disabled) throw new MarkdownWorkerUnavailableError(disabled.message)
   try {
-    worker = new Worker(MarkdownWorkerUrl, { type: "module" })
+    workers = Array.from({ length: MARKDOWN_WORKER_LANES }, () => new Worker(MarkdownWorkerUrl, { type: "module" }))
   } catch (error) {
     disabled = error instanceof Error ? error : new Error(String(error))
     throw new MarkdownWorkerUnavailableError(disabled.message)
   }
-  worker.onmessage = (event: MessageEvent<MarkdownWorkerResponse>) => {
+  const onMessage = (event: MessageEvent<MarkdownWorkerResponse>) => {
+    if (event.data.type === "parse-miss") {
+      const result = parses.get(event.data.id)
+      if (!result) {
+        parseTransport.complete(event.data.key, event.data.id)
+        return
+      }
+      // Keep the lane occupied while repairing worker cache eviction. A queued
+      // newer parse for this key stays on the host where it remains supersedable.
+      postToWorker({
+        type: "parse",
+        id: event.data.id,
+        key: event.data.key,
+        text: result.text,
+        reset: true,
+      })
+      return
+    }
+    if (event.data.type === "project-miss") {
+      const result = projects.get(event.data.id)
+      if (!result) {
+        projectTransport.complete(event.data.key, event.data.id)
+        return
+      }
+      // The worker can evict a retained projection independently under its byte
+      // budget. Retry the same active request as an explicit reset while keeping
+      // its transport lane occupied; queued newer work remains supersedable.
+      postToWorker({
+        type: "project",
+        id: event.data.id,
+        key: event.data.key,
+        live: result.live,
+        text: result.text,
+        reset: true,
+      })
+      return
+    }
+    if (event.data.type === "highlight-miss") {
+      const result = pending.get(event.data.id)
+      if (!result) {
+        transport.complete(event.data.key, event.data.id)
+        return
+      }
+      // The worker can evict a tokenizer stream while the host still remembers
+      // the acknowledged source. Retry this exact active request as one full
+      // reset; do not release the lane, so a queued newer request remains
+      // supersedable and cannot overtake the repair.
+      postToWorker({
+        type: "highlight",
+        id: event.data.id,
+        key: event.data.key,
+        text: result.text,
+        language: result.language,
+        complete: result.complete,
+        reset: true,
+      })
+      return
+    }
     traceWorkerFinish(
       event.data.id,
       event.data.type === "error" ? "error" : event.data.type === "superseded" ? "superseded" : "ok",
       "workerMs" in event.data ? event.data.workerMs : undefined,
       "workerQueueMs" in event.data ? event.data.workerQueueMs : undefined,
+      "incremental" in event.data ? event.data.incremental : undefined,
     )
     if (event.data.type === "parse") {
       const result = parses.get(event.data.id)
@@ -249,6 +395,7 @@ function getWorker() {
         return
       }
       latestParse.delete(result.key)
+      hostParseSources.set(result.key, result.text)
       result.resolve(event.data.html)
       parseTransport.complete(event.data.key, event.data.id)
       return
@@ -260,7 +407,14 @@ function getWorker() {
         return
       }
       projects.delete(event.data.id)
-      result.resolve(event.data.projection)
+      const previous = hostProjections.get(result.key)
+      const base = applyMarkdownProjectionPatch(previous, result.text, event.data.patch)
+      const projection: HostMarkdownProjection = {
+        ...base,
+        change: { fromText: previous?.text, keep: event.data.patch.keep },
+      }
+      hostProjections.set(result.key, projection)
+      result.resolve(projection)
       projectTransport.complete(event.data.key, event.data.id)
       return
     }
@@ -323,6 +477,8 @@ function getWorker() {
       transport.complete(key, event.data.id)
       return
     }
+    if (result.complete) hostHighlightSources.delete(key)
+    else hostHighlightSources.set(key, { text: result.text, language: result.language })
     const state = applyMarkdownWorkerResponse(states.get(key), event.data)
     if (shouldReleaseMarkdownWorkerState(result.complete, latest.get(key), event.data.id)) {
       deleteState(key)
@@ -366,15 +522,20 @@ function getWorker() {
     parses.clear()
     workerStarted.clear()
     latestParse.clear()
+    hostParseSources.clear()
     states.clear()
+    hostHighlightSources.clear()
     stateSizes.clear()
     stateBytesTotal = 0
     keys.clear()
     latest.clear()
-    worker?.terminate()
-    worker = undefined
+    workers?.forEach((worker) => worker.terminate())
+    workers = undefined
   }
-  worker.onerror = (event) => fail(event.message || "Markdown highlighting worker failed")
-  worker.onmessageerror = () => fail("Markdown worker response failed")
-  return worker
+  for (const worker of workers) {
+    worker.onmessage = onMessage
+    worker.onerror = (event) => fail(event.message || "Markdown highlighting worker failed")
+    worker.onmessageerror = () => fail("Markdown worker response failed")
+  }
+  return workers
 }

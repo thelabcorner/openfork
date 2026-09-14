@@ -40,14 +40,18 @@ export type MarkdownTraceEvent =
       workerQueueMs?: number
       dispatchWaitMs?: number
       responseWaitMs?: number
+      incremental?: boolean
     }
 
 type MarkdownTraceGlobal = typeof globalThis & {
   __opencodeMarkdownTrace?: (event: MarkdownTraceEvent) => void
+  __opencodeMarkdownTraceEnabled?: () => boolean
 }
 
 export function markdownTraceEnabled() {
-  return typeof (globalThis as MarkdownTraceGlobal).__opencodeMarkdownTrace === "function"
+  const target = globalThis as MarkdownTraceGlobal
+  if (typeof target.__opencodeMarkdownTraceEnabled === "function") return target.__opencodeMarkdownTraceEnabled()
+  return typeof target.__opencodeMarkdownTrace === "function"
 }
 
 export function traceMarkdown(event: MarkdownTraceEvent) {

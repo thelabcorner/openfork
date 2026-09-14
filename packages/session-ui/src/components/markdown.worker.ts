@@ -3,6 +3,7 @@
 import { ShikiStreamTokenizer } from "@shikijs/stream"
 import { createMarkdownParser } from "@opencode-ai/ui/context/marked-parser"
 import { OpenCodeTheme } from "@opencode-ai/ui/context/marked-theme"
+import type { TokensList } from "marked"
 import {
   bundledLanguages,
   createHighlighter,
@@ -11,13 +12,21 @@ import {
   type BundledLanguage,
   type ThemedToken,
 } from "shiki"
-import type { MarkdownToken, MarkdownWorkerRequest, MarkdownWorkerResponse } from "./markdown-worker-protocol"
+import {
+  diffMarkdownProjection,
+  type MarkdownParseRequest,
+  type MarkdownProjectRequest,
+  type MarkdownToken,
+  type MarkdownWorkerRequest,
+  type MarkdownWorkerResponse,
+} from "./markdown-worker-protocol"
 import { createLatestWorkerQueue } from "./markdown-worker-queue"
+import { appendPlainMarkdownTokens } from "./markdown-incremental-tokens"
 import { project, type Projection } from "./markdown-stream"
 
 type Stream = {
   language: string
-  source: string
+  sourceLength: number
   tokenizer: ShikiStreamTokenizer
 }
 
@@ -28,8 +37,18 @@ const projections = new Map<string, Projection>()
 const projectionSizes = new Map<string, number>()
 let projectionBytesTotal = 0
 const MAX_PROJECTIONS = 512
-const MAX_PROJECTION_BYTES = 16 * 1024 * 1024
-const MAX_STREAM_BYTES = 16 * 1024 * 1024
+// The host runs two stable-affinity workers to eliminate cross-session parse
+// head-of-line blocking. Keep the aggregate cache budget near the former
+// singleton total instead of doubling retained Markdown source/state merely
+// because there are now two CPU lanes.
+const MAX_PROJECTION_BYTES = 8 * 1024 * 1024
+const MAX_STREAM_BYTES = 8 * 1024 * 1024
+const MAX_PARSE_STATE_BYTES = 8 * 1024 * 1024
+const MAX_PARSE_STATES = 200
+type ParseState = { text: string; tokens: TokensList }
+const parseStates = new Map<string, ParseState>()
+const parseStateSizes = new Map<string, number>()
+let parseStateBytesTotal = 0
 let highlighter: ReturnType<typeof createHighlighter> | undefined
 const workerReceived = new Map<number, number>()
 function disposeStream(key: string) {
@@ -41,6 +60,27 @@ function disposeProjection(key: string) {
   projections.delete(key)
   projectionBytesTotal -= projectionSizes.get(key) ?? 0
   projectionSizes.delete(key)
+}
+function disposeParseState(key: string) {
+  parseStates.delete(key)
+  parseStateBytesTotal -= parseStateSizes.get(key) ?? 0
+  parseStateSizes.delete(key)
+}
+function retainParseState(key: string, state: ParseState) {
+  disposeParseState(key)
+  // Marked token trees retain raw/text slices in addition to the source. Use a
+  // deliberately conservative multiplier so incremental parsing cannot turn
+  // long-lived sessions into an unbounded worker-side AST cache.
+  const size = state.text.length * 8
+  if (size > MAX_PARSE_STATE_BYTES) return
+  parseStates.set(key, state)
+  parseStateSizes.set(key, size)
+  parseStateBytesTotal += size
+  while (parseStates.size > MAX_PARSE_STATES || parseStateBytesTotal > MAX_PARSE_STATE_BYTES) {
+    const oldest = parseStates.keys().next().value
+    if (oldest === undefined) break
+    disposeParseState(oldest)
+  }
 }
 const highlightQueue = createLatestWorkerQueue<Extract<MarkdownWorkerRequest, { type: "highlight" }>>({
   run: highlight,
@@ -58,13 +98,13 @@ const projectQueue = createLatestWorkerQueue<Extract<MarkdownWorkerRequest, { ty
   },
   dispose: disposeProjection,
 })
-const parseQueue = createLatestWorkerQueue<Extract<MarkdownWorkerRequest, { type: "parse" }>>({
+const parseQueue = createLatestWorkerQueue<MarkdownParseRequest>({
   run: parse,
   supersede: (request) => {
     workerReceived.delete(request.id)
     post({ type: "superseded", id: request.id, key: request.key })
   },
-  dispose: () => undefined,
+  dispose: disposeParseState,
 })
 const parser = createMarkdownParser(async (code, language) => {
   const languageID = language.trim().split(/\s+/, 1)[0]?.toLowerCase()
@@ -109,21 +149,52 @@ self.onmessage = (event: MessageEvent<MarkdownWorkerRequest>) => {
   highlightQueue.highlight(event.data)
 }
 
-async function parse(request: Extract<MarkdownWorkerRequest, { type: "parse" }>) {
+async function parse(request: MarkdownParseRequest) {
   const started = performance.now()
   const received = workerReceived.get(request.id) ?? started
   workerReceived.delete(request.id)
   const workerQueueMs = started - received
   try {
+    const retained = "text" in request ? undefined : parseStates.get(request.key)
+    const text =
+      "text" in request
+        ? request.text
+        : retained?.text.length === request.baseLength
+          ? retained.text + request.append
+          : undefined
+    if (text === undefined) {
+      post({ type: "parse-miss", id: request.id, key: request.key })
+      return
+    }
+    // The lexer dominates live Markdown CPU (~99% in the streaming benchmark).
+    // For grammar-safe append-only text, update the retained terminal token path
+    // and render those tokens directly. Structural/ambiguous suffixes fall back
+    // to a normal configured lexer pass, so feature semantics remain identical.
+    let tokens: TokensList
+    const incremental =
+      !("text" in request) &&
+      !!retained &&
+      appendPlainMarkdownTokens(retained.tokens, request.append, retained.text)
+    if (incremental) {
+      tokens = retained.tokens
+    } else {
+      tokens = parser.lexer(text)
+    }
+    const html = await parser.parser(tokens)
+    retainParseState(request.key, { text, tokens })
     post({
       type: "parse",
       id: request.id,
       key: request.key,
-      html: await parser.parse(request.text),
+      html,
+      incremental,
       workerMs: performance.now() - started,
       workerQueueMs,
     })
   } catch (error) {
+    // Never reuse a token tree after a parser/renderer exception. The next
+    // request will repair from the host's full source through parse-miss/reset.
+    disposeParseState(request.key)
     post({
       type: "error",
       id: request.id,
@@ -135,13 +206,25 @@ async function parse(request: Extract<MarkdownWorkerRequest, { type: "parse" }>)
   }
 }
 
-async function runProject(request: Extract<MarkdownWorkerRequest, { type: "project" }>) {
+async function runProject(request: MarkdownProjectRequest) {
   const started = performance.now()
   const received = workerReceived.get(request.id) ?? started
   workerReceived.delete(request.id)
   const workerQueueMs = started - received
   try {
-    const projection = project(projections.get(request.key), request.text, request.live)
+    const retained = "text" in request ? undefined : projections.get(request.key)
+    const text =
+      "text" in request
+        ? request.text
+        : retained?.text.length === request.baseLength
+          ? retained.text + request.append
+          : undefined
+    if (text === undefined) {
+      post({ type: "project-miss", id: request.id, key: request.key })
+      return
+    }
+    const projection = project(retained, text, request.live)
+    const patch = diffMarkdownProjection(retained, projection)
     const size = projection.text.length * 2 + projection.blocks.reduce((total, block) => total + block.raw.length * 2 + block.src.length * 2, 0)
     const previousSize = projectionSizes.get(request.key)
     if (previousSize !== undefined) {
@@ -165,7 +248,7 @@ async function runProject(request: Extract<MarkdownWorkerRequest, { type: "proje
       type: "project",
       id: request.id,
       key: request.key,
-      projection,
+      patch,
       workerMs: performance.now() - started,
       workerQueueMs,
     })
@@ -193,6 +276,10 @@ async function highlight(request: Extract<MarkdownWorkerRequest, { type: "highli
       await instance.loadLanguage(bundledLanguages[language as BundledLanguage])
 
     if (request.complete) {
+      // Completion intentionally arrives as a full reset. The streaming path
+      // retains tokenizer state but not the full source string, so this is the
+      // one point where complete code is transferred/materialized for Shiki's
+      // whole-document tokenization.
       const result = instance.codeToTokens(request.text, { lang: language as BundledLanguage, theme: "OpenCode" })
       disposeStream(request.key)
       post({
@@ -214,18 +301,26 @@ async function highlight(request: Extract<MarkdownWorkerRequest, { type: "highli
     }
 
     const previous = streams.get(request.key)
-    const reset = !previous || previous.language !== language || !request.text.startsWith(previous.source)
+    const reset = "text" in request
+    if (
+      !reset &&
+      (!previous || previous.language !== language || previous.sourceLength !== request.baseLength)
+    ) {
+      post({ type: "highlight-miss", id: request.id, key: request.key })
+      return
+    }
     const stream = reset
       ? {
           language,
-          source: "",
+          sourceLength: 0,
           tokenizer: new ShikiStreamTokenizer({ highlighter: instance, lang: language, theme: "OpenCode" }),
         }
-      : previous
-    const result = await stream.tokenizer.enqueue(request.text.slice(stream.source.length))
-    stream.source = request.text
+      : previous!
+    const append = reset ? request.text : request.append
+    const result = await stream.tokenizer.enqueue(append)
+    stream.sourceLength += append.length
     disposeStream(request.key)
-    const size = stream.source.length * 2
+    const size = stream.sourceLength * 2
     if (size <= MAX_STREAM_BYTES) {
       streams.set(request.key, stream)
       streamSizes.set(request.key, size)

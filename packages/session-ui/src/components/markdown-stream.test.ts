@@ -272,6 +272,46 @@ describe("markdown stream", () => {
     })
   })
 
+  test("reparses structural suffixes locally without rebuilding frozen history", () => {
+    const previous = project(undefined, "# Plan\n\nFinished paragraph.\n\nLive tail", true)
+    const heading = previous.blocks[0]
+    const paragraph = previous.blocks[1]
+
+    const inline = project(previous, `${previous.text} with \`code\``, true)
+    expect(inline.blocks[0]).toBe(heading)
+    expect(inline.blocks[1]).toBe(paragraph)
+    expect(inline.blocks.at(-1)?.raw).toBe("Live tail with `code`")
+
+    const nextBlock = project(inline, `${inline.text}\n\n- item`, true)
+    expect(nextBlock.blocks[0]).toBe(heading)
+    expect(nextBlock.blocks[1]).toBe(paragraph)
+    expect(nextBlock.blocks.at(-1)?.raw).toBe("- item")
+  })
+
+  test("reference definitions escape tail-local projection because they can resolve frozen content", () => {
+    const previous = project(undefined, "[docs][id]\n\nLive tail", true)
+    expect(previous.blocks).toHaveLength(2)
+
+    const text = `${previous.text}\n\n[id]: /guide`
+    const next = project(previous, text, true)
+    expect(next.blocks).toEqual([{ raw: text, src: text, mode: "live" }])
+  })
+
+  test("closing a streamed fence preserves frozen blocks before the code tail", () => {
+    const previous = project(undefined, "# Plan\n\n```ts\nconst value = 1\n", true)
+    const heading = previous.blocks[0]
+    const closed = project(previous, `${previous.text}\`\`\``, true)
+
+    expect(closed.blocks[0]).toBe(heading)
+    expect(closed.blocks.at(-1)).toEqual({
+      raw: "```ts\nconst value = 1\n```",
+      src: "const value = 1",
+      mode: "code",
+      language: "ts",
+      complete: true,
+    })
+  })
+
   test("finalizes only the live tail when streaming stops", () => {
     const live = project(undefined, "# Plan\n\nFinished paragraph.\n\n- final item", true)
     const final = project(live, live.text, false)

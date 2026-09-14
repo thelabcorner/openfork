@@ -1,6 +1,7 @@
 import { marked, type Tokens } from "marked"
 import remend from "remend"
 import { completedProjection } from "./markdown-projection"
+import { hasTextPrefix } from "./text-prefix"
 
 export type Block = {
   raw: string
@@ -107,6 +108,29 @@ function crossesBlankLine(raw: string, suffix: string) {
   return BLANK_LINE.test(raw.slice(newline) + suffix)
 }
 
+/**
+ * Re-lex only the mutable tail of an append-only projection.
+ *
+ * Completed top-level blocks before the tail have already been accepted by the
+ * lexer and cannot be changed by ordinary suffix syntax. Re-running marked over
+ * the entire accumulated message whenever the tail sees a backtick/newline/list
+ * marker makes structural streaming O(total message size) per update and also
+ * destroys block identity that the renderer/worker caches rely on.
+ *
+ * Reference definitions are intentionally the exception: a definition emitted
+ * at the end can resolve a reference in an earlier block, so those must fall
+ * back to whole-message projection.
+ */
+function reprojectTail(previous: Projection, text: string, suffix: string): Projection {
+  if (refs(text)) return { text, blocks: stream(text, true) }
+  const tail = previous.blocks.at(-1)
+  if (!tail) return { text, blocks: stream(text, true) }
+  return {
+    text,
+    blocks: [...previous.blocks.slice(0, -1), ...stream(tail.raw + suffix, true)],
+  }
+}
+
 export function stream(text: string, live: boolean): Block[] {
   if (!live) return completedProjection(text).blocks
   if (refs(text)) return [{ raw: text, src: heal(text), mode: "live" }] satisfies Block[]
@@ -144,7 +168,7 @@ export function stream(text: string, live: boolean): Block[] {
   // replacing the source whitespace with a newline. Keep the exact source tail
   // whenever the already-frozen prefix still matches, otherwise incremental
   // projection can manufacture bytes that never existed in the model output.
-  const raw = text.startsWith(prefix) ? text.slice(prefix.length) : parsedRaw
+  const raw = hasTextPrefix(text, prefix) ? text.slice(prefix.length) : parsedRaw
   if (last.type !== "code") return [...result, { raw, src: heal(raw), mode: "live" }]
 
   const code = last as Tokens.Code
@@ -158,7 +182,7 @@ export function project(previous: Projection | undefined, text: string, live: bo
     const current =
       previous?.text === text
         ? previous
-        : previous && text.startsWith(previous.text)
+        : previous && hasTextPrefix(text, previous.text)
           ? project(previous, text, true)
           : undefined
     if (!current) return completedProjection(text)
@@ -171,7 +195,7 @@ export function project(previous: Projection | undefined, text: string, live: bo
       }),
     }
   }
-  if (!previous || !text.startsWith(previous.text)) return { text, blocks: stream(text, live) }
+  if (!previous || !hasTextPrefix(text, previous.text)) return { text, blocks: stream(text, live) }
   const tail = previous.blocks.at(-1)
   const suffix = text.slice(previous.text.length)
   if (tail?.mode === "live" && suffix) {
@@ -183,10 +207,7 @@ export function project(previous: Projection | undefined, text: string, live: bo
     // a reparse. Use stream() rather than slicing at the raw blank line because
     // blank lines can also legally occur inside a single list block.
     if (crossesBlankLine(tail.raw, suffix)) {
-      return {
-        text,
-        blocks: [...previous.blocks.slice(0, -1), ...stream(appended, true)],
-      }
+      return reprojectTail(previous, text, suffix)
     }
     // Plain prose can be appended directly only while the rendered source is
     // identical to the raw source. If remend (or the list stabilizer above)
@@ -202,7 +223,7 @@ export function project(previous: Projection | undefined, text: string, live: bo
     }
   }
   if (!suffix || tail?.mode !== "code" || tail.complete || closesFence(tail.raw, suffix))
-    return { text, blocks: stream(text, live) }
+    return reprojectTail(previous, text, suffix)
   return {
     text,
     blocks: [
