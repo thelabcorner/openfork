@@ -1,7 +1,7 @@
 import { Component, For, Show, createMemo, createResource, createSignal } from "solid-js"
 import { createMediaQuery } from "@solid-primitives/media"
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
-import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitle } from "@opencode-ai/ui/v2/dialog-v2"
+import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitle, DialogTitleGroup } from "@opencode-ai/ui/v2/dialog-v2"
 import { DividerV2 } from "@opencode-ai/ui/v2/divider-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
@@ -17,6 +17,8 @@ import { usePlatform } from "@/context/platform"
 import { useUpdaterAction } from "../updater-action"
 import { useSettings } from "@/context/settings"
 import { useServerSync } from "@/context/server-sync"
+import { useServerSDK } from "@/context/server-sdk"
+import { showToast } from "@/utils/toast"
 import { ExternalLink } from "../external-link"
 import { SettingsListV2 } from "./parts/list"
 import { SettingsLocalScope } from "./parts/local-scope"
@@ -1185,6 +1187,100 @@ export const SettingsGeneralV2: Component<{
     </div>
   )
 
+  const ResetLocalDataDialog = () => {
+    const dialog = useDialog()
+    const serverSdk = useServerSDK()
+    const [confirmation, setConfirmation] = createSignal("")
+    const [running, setRunning] = createSignal(false)
+
+    const reset = async () => {
+      if (confirmation() !== "RESET" || running()) return
+      setRunning(true)
+      try {
+        const result = await serverSdk().client.global.resetLocalData(
+          { confirmation: "RESET" },
+          { throwOnError: true },
+        )
+        dialog.close()
+        showToast({
+          title: language.t("settings.general.resetLocalData.success"),
+          description: language.t(
+            result.data?.compacted === false
+              ? "settings.general.resetLocalData.successDescriptionNotCompacted"
+              : "settings.general.resetLocalData.successDescription",
+            { count: result.data?.sessionsDeleted ?? 0 },
+          ),
+          variant: result.data?.compacted === false ? "default" : "success",
+        })
+      } catch (error) {
+        showToast({
+          title: language.t("settings.general.resetLocalData.error"),
+          description: error instanceof Error ? error.message : String(error),
+          variant: "error",
+        })
+      } finally {
+        setRunning(false)
+      }
+    }
+
+    return (
+      <Dialog fit>
+        <DialogHeader hideClose>
+          <DialogTitleGroup
+            title={language.t("settings.general.resetLocalData.dialog.title")}
+            description={language.t("settings.general.resetLocalData.dialog.description")}
+          />
+        </DialogHeader>
+        <DialogBody>
+          <div class="flex flex-col gap-2 min-w-[360px]">
+            <span class="text-12-medium text-text-strong">
+              {language.t("settings.general.resetLocalData.dialog.confirmHint")}
+            </span>
+            <TextInputV2
+              type="text"
+              appearance="base"
+              value={confirmation()}
+              onInput={(event) => setConfirmation(event.currentTarget.value)}
+              placeholder="RESET"
+              spellcheck={false}
+              autocomplete="off"
+              autocorrect="off"
+              autocapitalize="off"
+              aria-label={language.t("settings.general.resetLocalData.dialog.confirmLabel")}
+              disabled={running()}
+            />
+          </div>
+        </DialogBody>
+        <DialogFooter>
+          <ButtonV2 variant="ghost" disabled={running()} onClick={() => dialog.close()}>
+            {language.t("common.cancel")}
+          </ButtonV2>
+          <ButtonV2 variant="danger" disabled={confirmation() !== "RESET" || running()} onClick={() => void reset()}>
+            {running()
+              ? language.t("settings.general.resetLocalData.dialog.running")
+              : language.t("settings.general.resetLocalData.dialog.action")}
+          </ButtonV2>
+        </DialogFooter>
+      </Dialog>
+    )
+  }
+
+  const DangerZoneSection = () => (
+    <div class="settings-v2-section">
+      <h3 class="settings-v2-section-title">{language.t("settings.general.section.dangerZone")}</h3>
+      <SettingsListV2>
+        <SettingsRowV2
+          title={language.t("settings.general.row.resetLocalData.title")}
+          description={language.t("settings.general.row.resetLocalData.description")}
+        >
+          <ButtonV2 variant="danger" size="small" onClick={() => dialog.show(() => <ResetLocalDataDialog />)}>
+            {language.t("settings.general.row.resetLocalData.button")}
+          </ButtonV2>
+        </SettingsRowV2>
+      </SettingsListV2>
+    </div>
+  )
+
   const NotificationsSection = () => (
     <div class="settings-v2-section">
       <h3 class="settings-v2-section-title">{language.t("settings.general.section.notifications")}</h3>
@@ -1316,6 +1412,8 @@ export const SettingsGeneralV2: Component<{
         <DisplaySection />
 
         <AdvancedSection />
+
+        <DangerZoneSection />
       </div>
     </>
   )
