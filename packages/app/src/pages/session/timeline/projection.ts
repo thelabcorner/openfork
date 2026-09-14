@@ -4,15 +4,24 @@ import { createMemo, mapArray, type Accessor } from "solid-js"
 import { phaseTrace } from "@/context/phase-trace"
 import { reuseTimelineRows } from "./row-reconciliation"
 import { Timeline, TimelineRow } from "./rows"
+import { projectWorkingAssistantParts, workingAssistantPartsEqual } from "./working-part-structure"
 
 export { reuseTimelineRows } from "./row-reconciliation"
 
 const emptyRows: TimelineRow.TimelineRow[] = []
 const emptyIDs: string[] = []
+const emptyParts: Part[] = []
+type SessionMessageStructure = Pick<SessionMessageInfo, "id" | "type">
+const emptySessionMessageStructure: SessionMessageStructure[] = []
 
 function arraysShallowEqual(a: string[], b: string[]) {
   if (a.length !== b.length) return false
   return a.every((value, index) => value === b[index])
+}
+
+function messageStructureEqual(a: SessionMessageStructure[], b: SessionMessageStructure[]) {
+  if (a.length !== b.length) return false
+  return a.every((value, index) => value.id === b[index]?.id && value.type === b[index]?.type)
 }
 
 export function createTimelineProjection(input: {
@@ -38,22 +47,34 @@ export function createTimelineProjection(input: {
     })
     return result
   })
+  // Turn membership depends only on ordered message identity/type plus the
+  // normalized Message lookup below. Streaming text/reasoning/tool deltas replace
+  // one SessionMessageInfo object per token, but they do not change either of
+  // these structural fields. Solid's store tracks `id`/`type` at property
+  // granularity, so this memo stays asleep for content-only replacements; the
+  // explicit equality guard also protects non-store/accessor callers that hand
+  // us a fresh but structurally identical array. This removes an O(history)
+  // groupTurns pass from the per-token renderer path.
+  const structuralMessages = createMemo(
+    () => input.sessionMessages().map((message): SessionMessageStructure => ({ id: message.id, type: message.type })),
+    emptySessionMessageStructure,
+    { equals: messageStructureEqual },
+  )
 
   // Fine-grained per-turn row construction. `grouped()` is cheap (a single pass over
-  // messages, no part reads) and is expected to rerun on every message-list change.
+  // structural messages, no part reads) and only reruns when turn membership can change.
   // The EXPENSIVE part -- groupParts/markdown-height-estimation/comment parsing inside
   // constructMessageRows -- must not rerun for a turn whose own messages/parts didn't
   // change. Solid store mutations (message.part.delta, message.updated) are applied
   // in place via `produce`/`reconcile`, so array/object REFERENCES stay stable across
   // unrelated updates -- reference diffing can't detect real changes. Instead each turn
-  // gets its own `createMemo`, reading messages/parts directly off the store (via
-  // `getMessageDirect`/`input.parts`, not through a derived Map that gets rebuilt -- and
-  // therefore looks "changed" by reference -- on every message-list event), so Solid's
-  // own fine-grained dependency tracking decides which turn actually needs to recompute.
+  // gets its own `createMemo`, reading its message references through O(1) indexes
+  // and its own parts directly from the store, so Solid's fine-grained dependency
+  // tracking decides which turn actually needs to recompute.
   const grouped = createMemo(() => {
     const started = phaseTrace.enabled ? performance.now() : 0
     const turns = Timeline.groupTurns(
-      input.sessionMessages(),
+      structuralMessages(),
       (messageID) => messageByID().get(messageID) as UserMessage | AssistantMessage | undefined,
       input.userMessages(),
     )
@@ -64,42 +85,83 @@ export function createTimelineProjection(input: {
   const turnOrder = createMemo(() => grouped().turns.map((turn) => turn.user.id), emptyIDs, {
     equals: arraysShallowEqual,
   })
-  const getMessageDirect = (messageID: string) => input.messages().find((message) => message.id === messageID)
-
   const perTurnRows = mapArray(turnOrder, (userMessageID) => {
     const assistantIDs = createMemo(
-      () => grouped().turns.find((turn) => turn.user.id === userMessageID)?.assistants.map((a) => a.id) ?? emptyIDs,
+      () => grouped().turnByUserID.get(userMessageID)?.assistants.map((a) => a.id) ?? emptyIDs,
       emptyIDs,
       { equals: arraysShallowEqual },
     )
-    // `getMessageDirect` reads `input.messages().length` (an Array.prototype.find
-    // implementation detail), which a new unrelated message anywhere would touch. Wrapping
-    // each lookup in its own createMemo with default (reference) equals absorbs that
-    // spurious re-run here instead of letting it cascade into the expensive row-construction
-    // memo below -- which must only re-execute when THIS turn's own message objects change.
-    const userMessage = createMemo(() => getMessageDirect(userMessageID))
-    const assistantMessages = mapArray(assistantIDs, (assistantID) => createMemo(() => getMessageDirect(assistantID)))
+    // A message append rebuilds messageByID(), so these tiny lookup memos wake,
+    // but each lookup is O(1) and default reference equality prevents unchanged
+    // messages from propagating into row construction. The previous implementation
+    // used `messages.find(id)` here: every append woke every turn and each lookup
+    // rescanned the whole session, making structural growth O(turns × messages).
+    const userMessage = createMemo(() => messageByID().get(userMessageID))
+    const assistantViews = mapArray(assistantIDs, (assistantID) => {
+      const message = createMemo(() => messageByID().get(assistantID))
+      // This memo may evaluate on every delta in this assistant message, but it
+      // only notifies row construction when the structural projection changes.
+      // After text becomes non-empty, another 100k streamed characters compare
+      // equal to the same one-character marker.
+      const structuralParts = createMemo(
+        () => projectWorkingAssistantParts(input.parts(assistantID)),
+        emptyParts,
+        { equals: workingAssistantPartsEqual },
+      )
+      const reasoningHeading = createMemo(() => {
+        for (const part of input.parts(assistantID)) {
+          if (part.type !== "reasoning" || !part.text) continue
+          const heading = Timeline.reasoningHeading(part.text)
+          if (heading) return heading
+        }
+      })
+      return { id: assistantID, message, structuralParts, reasoningHeading }
+    })
+    const assistantViewByID = createMemo(() => new Map(assistantViews().map((view) => [view.id, view] as const)))
+    const liveReasoningHeading = createMemo(() => {
+      for (const view of assistantViews()) {
+        const heading = view.reasoningHeading()
+        if (heading) return heading
+      }
+    })
     const isFirstTurn = createMemo(() => turnOrder()[0] === userMessageID)
-    return createMemo<TimelineRow.TimelineRow[]>(() => {
+    return createMemo<TimelineRow.TimelineRow[]>((previous) => {
       const started = phaseTrace.enabled ? performance.now() : 0
       const user = userMessage()
       if (user?.role !== "user") return emptyRows
-      const assistants = assistantMessages()
-        .map((get) => get())
+      const views = assistantViews()
+      const assistants = views
+        .map((view) => view.message())
         .filter((message): message is AssistantMessage => message?.role === "assistant")
+      const status = input.status().type
+      const active = userMessageID === activeMessageID()
+      const working = active && status !== "idle"
+      const structural = assistantViewByID()
+      const getParts = working
+        ? (messageID: string) => structural.get(messageID)?.structuralParts() ?? input.parts(messageID)
+        : input.parts
       const rows = Timeline.constructMessageRows(
         user,
-        input.parts,
+        getParts,
         assistants,
         isFirstTurn() ? 0 : 1,
         input.showReasoningSummaries(),
-        input.status().type,
-        userMessageID === activeMessageID(),
+        status,
+        active,
         input.inlineComments(),
+        working ? { reasoningHeading: liveReasoningHeading() } : undefined,
       )
+      // Streamed text/reasoning lives in the part store and is consumed by the
+      // mounted row component directly; it is deliberately absent from the row
+      // descriptor. Stabilize topology HERE, at the turn boundary, so a token
+      // that leaves this turn's row keys/metadata unchanged returns the exact
+      // same array reference. That prevents the session-wide flatMap,
+      // reconciliation, index-map rebuild, and virtualizer topology from waking
+      // for content-only deltas.
+      const stable = reuseTimelineRows(previous, rows)
       if (phaseTrace.enabled) phaseTrace.row(userMessageID, performance.now() - started)
-      return rows
-    })
+      return stable
+    }, emptyRows)
   })
   const rows = createMemo((previous: TimelineRow.TimelineRow[] | undefined) =>
     reuseTimelineRows(previous, perTurnRows().flatMap((turnRows) => turnRows())),
@@ -112,12 +174,15 @@ export function createTimelineProjection(input: {
   //   the exact row containing a match, not just the turn start)
   const rowIndexMaps = createMemo(() => {
     const rowByKey = new Map<string, TimelineRow.TimelineRow>()
+    const rowIndexByKey = new Map<string, number>()
     const messageRowIndex = new Map<string, number>()
     const messageRowIndices = new Map<string, number[]>()
     const messageLastRowIndex = new Map<string, number>()
     const lastAssistantGroupKey = new Map<string, string>()
     rows().forEach((row, index) => {
-      rowByKey.set(TimelineRow.key(row), row)
+      const key = TimelineRow.key(row)
+      rowByKey.set(key, row)
+      rowIndexByKey.set(key, index)
       if (!("userMessageID" in row)) return
       const id = row.userMessageID
       if (!messageRowIndex.has(id)) messageRowIndex.set(id, index)
@@ -127,9 +192,10 @@ export function createTimelineProjection(input: {
       messageLastRowIndex.set(id, index)
       if (row._tag === "AssistantPart") lastAssistantGroupKey.set(id, row.group.key)
     })
-    return { rowByKey, messageRowIndex, messageRowIndices, messageLastRowIndex, lastAssistantGroupKey }
+    return { rowByKey, rowIndexByKey, messageRowIndex, messageRowIndices, messageLastRowIndex, lastAssistantGroupKey }
   })
   const rowByKey = createMemo(() => rowIndexMaps().rowByKey)
+  const rowIndexByKey = createMemo(() => rowIndexMaps().rowIndexByKey)
   const messageRowIndex = createMemo(() => rowIndexMaps().messageRowIndex)
   const messageRowIndices = createMemo(() => rowIndexMaps().messageRowIndices)
   const messageLastRowIndex = createMemo(() => rowIndexMaps().messageLastRowIndex)
@@ -144,6 +210,7 @@ export function createTimelineProjection(input: {
     messageRowIndices,
     messageLastRowIndex,
     rowByKey,
+    rowIndexByKey,
     rows,
   }
 }

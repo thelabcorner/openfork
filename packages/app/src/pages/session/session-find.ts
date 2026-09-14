@@ -1,5 +1,5 @@
 import type { Message, Part, UserMessage } from "@opencode-ai/sdk/v2"
-import { createEffect, createMemo, createSignal, type Accessor } from "solid-js"
+import { createEffect, createMemo, createSignal, mapArray, type Accessor } from "solid-js"
 import { createStore } from "solid-js/store"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
@@ -144,30 +144,63 @@ export function createSessionFindMatcher(input: {
     index: 0,
   })
   let debounce: ReturnType<typeof setTimeout> | undefined
-  const textCache: TurnTextCache = new Map()
 
   const clearDebounce = () => {
     if (debounce !== undefined) clearTimeout(debounce)
     debounce = undefined
   }
 
-  // Corpus building is its own memo, separate from query filtering, and only
-  // tracks session data (turns/messages/parts) — not the query. So typing
-  // doesn't rebuild it, and per-turn caching means only turns whose content
-  // actually changed (e.g. the one actively streaming) get re-scanned.
-  const turnText = createMemo(() => {
-    if (!state.open) return undefined
-    return buildTurnSearchText(input.turns(), input.sessionMessages(), input.parts, textCache)
+  const needle = createMemo(() => (state.open ? state.debouncedQuery.trim().toLowerCase() : ""))
+
+  // Message->turn membership changes structurally (new assistant, history
+  // hydration, etc.), not at token rate. Build that relationship once per
+  // message-list change instead of rediscovering it inside every turn cell.
+  const assistantsByParent = createMemo(() => {
+    const result = new Map<string, Message[]>()
+    for (const message of input.sessionMessages()) {
+      if (message.role !== "assistant") continue
+      const list = result.get(message.parentID)
+      if (list) list.push(message)
+      else result.set(message.parentID, [message])
+    }
+    return result
   })
 
-  // Zero idle cost: only scans while the bar is open, and only on the
-  // debounced query so keystrokes don't each trigger a full-session scan.
+  // One reactive cell per user turn. The cell subscribes only to that turn's
+  // parts plus structural assistant membership. During streaming, a delta in
+  // turn N therefore rebuilds/searches turn N only. Crucially, the boolean memo
+  // below suppresses propagation while the answer remains true/false, so the
+  // ordered session-wide match list does not perform an O(history) filter for
+  // every token. A query change intentionally reevaluates all cells once.
+  const turnMatches = mapArray(input.turns, (turn) => {
+    const text = createMemo(() => {
+      if (!needle()) return ""
+      const assistants = assistantsByParent().get(turn.id) ?? []
+      return [
+        messageSearchText(turn, input.parts(turn.id)),
+        ...assistants.map((message) => messageSearchText(message, input.parts(message.id))),
+      ]
+        .join(" ")
+        .toLowerCase()
+    })
+    return createMemo(() => {
+      const value = needle()
+      return value ? text().includes(value) : false
+    })
+  })
+
+  // Zero idle cost: with an empty debounced query, turn cells do not read any
+  // parts. While searching, this memo wakes only when ordered turn membership
+  // changes or one turn actually crosses the match/non-match boundary.
   const matches = createMemo(() => {
-    const text = turnText()
-    if (!text) return []
-    const needle = state.debouncedQuery.trim().toLowerCase()
-    if (!needle) return []
-    return input.turns().flatMap((turn) => (text.get(turn.id)?.includes(needle) ? [turn.id] : []))
+    if (!needle()) return []
+    const turns = input.turns()
+    const flags = turnMatches()
+    const result: string[] = []
+    for (let index = 0; index < turns.length; index++) {
+      if (flags[index]?.()) result.push(turns[index]!.id)
+    }
+    return result
   })
 
   const activeTurnID = createMemo(() => matches()[state.index])
@@ -182,6 +215,7 @@ export function createSessionFindMatcher(input: {
   return {
     open: () => state.open,
     query: () => state.query,
+    searching: () => Boolean(needle()),
     index: () => state.index,
     count: () => matches().length,
     activeTurnID,

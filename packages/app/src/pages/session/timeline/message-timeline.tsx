@@ -368,6 +368,7 @@ export function MessageTimeline(props: {
   const messageRowIndex = projection.messageRowIndex
   const messageRowIndices = projection.messageRowIndices
   const timelineRowByKey = projection.rowByKey
+  const timelineRowIndexByKey = projection.rowIndexByKey
   const timelineRows = projection.rows
   const safeTimelineRows = createMemo(() => timelineRows() ?? [])
   let estimateInputCache = new WeakMap<
@@ -427,14 +428,12 @@ export function MessageTimeline(props: {
   const updatePrependAnchor = () => {
     const root = listRoot()
     if (!root) return
-    const view = root.getBoundingClientRect()
-    const anchor = [...root.querySelectorAll<HTMLElement>("[data-timeline-key]")]
-      .map((element) => ({ element, rect: element.getBoundingClientRect() }))
-      .filter((item) => item.rect.bottom > view.top && item.rect.top < view.bottom)
-      .sort((a, b) => a.rect.top - b.rect.top)[0]
-    if (!anchor) return
-    if (!anchor.element.dataset.timelineKey) return
-    prependAnchor = { key: anchor.element.dataset.timelineKey, offset: anchor.rect.top - view.top }
+    const index = virtualizer.range?.startIndex
+    if (index === undefined) return
+    const item = virtualizer.measurementsCache[index]
+    if (!item) return
+    const margin = showHeader() ? 64 : 0
+    prependAnchor = { key: String(item.key), offset: item.start - margin - root.scrollTop }
   }
   const restorePrependAnchor = (done: boolean) => {
     if (done) prependLoading = false
@@ -450,18 +449,21 @@ export function MessageTimeline(props: {
       prependAnchorFrame = undefined
       const anchor = prependAnchor
       if (!anchor) return
-      const element = root.querySelector<HTMLElement>(`[data-timeline-key="${CSS.escape(anchor.key)}"]`)
-      const delta = element
-        ? element.getBoundingClientRect().top - root.getBoundingClientRect().top - anchor.offset
-        : undefined
+      const index = timelineRowIndexByKey().get(anchor.key)
+      const item = index === undefined ? undefined : virtualizer.measurementsCache[index]
+      const margin = showHeader() ? 64 : 0
+      const delta = item ? item.start - margin - root.scrollTop - anchor.offset : undefined
       if (delta !== undefined && Math.abs(delta) > 0.5) {
         root.scrollTop += delta
         stable = 0
-      } else {
+      } else if (delta !== undefined) {
         stable += 1
       }
       frames += 1
-      if (stable >= 30 || frames >= 180) {
+      // Dynamic row measurements can settle over a couple of frames. Two
+      // stable virtual-coordinate checks are sufficient; the old DOM-rect loop
+      // could run 180 frames and force layout on every one.
+      if (stable >= 2 || frames >= 12) {
         if (!prependLoading) prependAnchor = undefined
         return
       }
@@ -568,13 +570,10 @@ export function MessageTimeline(props: {
     const previous = item ? (virtualizer.itemSizeCache.get(item.key) ?? item.size) : undefined
     const root = listRoot()
     if (root && previous !== undefined && Math.abs(size - previous) > containerHeight) {
-      const view = root.getBoundingClientRect()
-      resizePinnedIndexes = [...root.querySelectorAll<HTMLElement>("[data-index]")]
-        .filter((element) => {
-          const rect = element.getBoundingClientRect()
-          return rect.bottom > view.top && rect.top < view.bottom
-        })
-        .map((element) => Number(element.dataset.index))
+      const range = virtualizer.range
+      resizePinnedIndexes = range
+        ? Array.from({ length: range.endIndex - range.startIndex + 1 }, (_, offset) => range.startIndex + offset)
+        : []
       if (resizePinFrame !== undefined) cancelAnimationFrame(resizePinFrame)
       resizePinFrame = requestAnimationFrame(() => {
         resizePinFrame = requestAnimationFrame(() => {
@@ -810,7 +809,8 @@ export function MessageTimeline(props: {
     props.onHistoryScroll()
     props.onAutoScrollHandleScroll()
     const el = event.currentTarget
-    const away = el.scrollHeight - el.clientHeight - el.scrollTop > 2
+    const viewport = containerHeight || el.clientHeight
+    const away = virtualizer.getTotalSize() - viewport - el.scrollTop > 2
     // Keep the gesture window alive for inertial / middle-click autoscroll,
     // which produce scroll events without pointer buttons after mouseup.
     if (!props.hasScrollGesture() && !away) return
@@ -934,7 +934,10 @@ export function MessageTimeline(props: {
       ([id, description]) => {
         if (!id || description) return
         if (sync().data.message[id] !== undefined) return
-        void sync().session.sync(id)
+        // Parent context is a data dependency, not a visible timeline. Keep it
+        // suspended so an active child session does not make its parent reduce
+        // every future streaming delta in the background.
+        void sync().session.sync(id, { activate: false })
       },
       { defer: true },
     ),
@@ -1136,36 +1139,33 @@ export function MessageTimeline(props: {
   const turnDurationMs = (userMessageID: string) => turnDurationByMessage().get(userMessageID)
 
   // Request throughput per turn, from persisted sidecar timestamps only.
-  // One O(N) adapter pass plus one bounded walk per turn; recomputes on
-  // message-list identity (step boundaries), never per token delta.
+  // Bulk computation is ONE forward pass. Calling turnThroughput separately
+  // for every user turn first searches from the beginning for each id and is
+  // O(turns * history), which becomes quadratic in long conversations.
   const turnThroughputByMessage = createMemo(() => {
     const flat = sessionMessages().map(toThroughputMessage)
     const result = new Map<string, number>()
-    for (const [userMessageID] of assistantMessagesByParent()) {
-      const value = SessionThroughput.turnThroughput(flat, userMessageID)
-      if (value) result.set(userMessageID, value.requestRate)
-    }
+    for (const [userMessageID, value] of SessionThroughput.turnThroughputByTurn(flat))
+      result.set(userMessageID, value.requestRate)
     return result
   })
   const turnThroughputRate = (userMessageID: string) => turnThroughputByMessage().get(userMessageID)
 
-  const assistantCopyPartByMessage = createMemo(() => {
-    const result = new Map<string, string>()
-    for (const [userMessageID, messages] of assistantMessagesByParent()) {
-      for (let i = messages.length - 1; i >= 0; i -= 1) {
-        const part = getMsgParts(messages[i]!.id).findLast((item) => item.type === "text" && !!item.text?.trim())
-        if (part?.type === "text") {
-          result.set(userMessageID, part.id)
-          break
-        }
-      }
-    }
-    return result
-  })
-  const assistantCopyPartID = (userMessageID: string) =>
-    workingTurn(userMessageID) ? null : (assistantCopyPartByMessage().get(userMessageID) ?? undefined)
-
   const renderAssistantPartGroup = (row: Accessor<TimelineRowMap["AssistantPart"]>, onSizeChange?: () => void) => {
+    // Keep copy-button discovery turn-local. The old global memo read parts for
+    // EVERY historical assistant, so one live text delta invalidated a scan of
+    // the entire conversation. Only mounted/virtualized rows need this value,
+    // and each now subscribes solely to its own turn's assistant part arrays.
+    const assistantCopyPartID = createMemo<string | null | undefined>(() => {
+      const userMessageID = row().userMessageID
+      if (workingTurn(userMessageID)) return null
+      const messages = assistantMessagesByParent().get(userMessageID) ?? []
+      for (let index = messages.length - 1; index >= 0; index -= 1) {
+        const part = getMsgParts(messages[index]!.id).findLast((item) => item.type === "text" && !!item.text?.trim())
+        if (part?.type === "text") return part.id
+      }
+      return undefined
+    })
     if (row().group.type === "context") {
       const parts = createMemo(() => {
         const group = row().group
@@ -1216,7 +1216,7 @@ export function MessageTimeline(props: {
               <MessagePart
                 part={part()}
                 message={message()}
-                showAssistantCopyPartID={assistantCopyPartID(row().userMessageID)}
+          showAssistantCopyPartID={assistantCopyPartID()}
                 turnDurationMs={turnDurationMs(row().userMessageID)}
                 turnThroughputRate={turnThroughputRate(row().userMessageID)}
                 useV2Actions={settings.general.newLayoutDesigns()}

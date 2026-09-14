@@ -57,12 +57,17 @@ import { ProjectExplorerSvgViewer } from "./project-explorer-svg-viewer"
 import "./project-explorer-editor-pane.css"
 import { ProjectExplorerScrollbar } from "./project-explorer-scrollbar"
 import "./project-explorer-scrollbar.css"
+import { trimProjectExplorerEditorBuffers } from "./project-explorer-editor-buffer-cache"
 
 type OpenBuffer = {
   path: string
   savedContent: string
   savedHash: string
   dirty: boolean
+  /** Content released from an inactive clean tab; rehydrate on activation. */
+  cold?: boolean
+  /** File watcher changed this path since the retained snapshot was read. */
+  stale?: boolean
   /** Base64 payload for binary files (viewer-only kinds); undefined for text buffers. */
   binary?: string
 }
@@ -206,7 +211,11 @@ export function ProjectExplorerEditorPane(props: {
   let disposed = false
   const [editorView, setEditorView] = createSignal<EditorView>()
   const languageCompartment = new Compartment()
+  // Only DIRTY inactive buffers retain a CodeMirror state. Clean tabs can be
+  // reconstructed exactly from savedContent and therefore must not pin a
+  // second syntax tree/history/doc copy for every file the user has visited.
   const viewsByPath = new Map<string, { state: EditorState }>()
+  let mountedPath: string | undefined
 
   // Bumped whenever the shared CodeMirror doc changes (swapToBuffer doc
   // replacement OR user typing). view.state.doc is not reactive on its own, so
@@ -279,6 +288,8 @@ export function ProjectExplorerEditorPane(props: {
   onCleanup(() => {
     disposed = true
     view?.destroy()
+    viewsByPath.clear()
+    mountedPath = undefined
     setEditorView(undefined)
   })
 
@@ -359,12 +370,36 @@ export function ProjectExplorerEditorPane(props: {
       savedContent: binary ? "" : (content?.content ?? ""),
       savedHash: content?.hash ?? hashFallback,
       dirty: false,
+      cold: false,
+      stale: false,
       binary: binary ? content?.content : undefined,
     }
   }
 
-  const openFile = async (path: string) => {
+  const trimCleanBuffers = (active = activePath()) => {
+    setBuffers((list) => trimProjectExplorerEditorBuffers(list, active))
+  }
+
+  const activateBuffer = async (path: string) => {
+    let buffer = buffers().find((entry) => entry.path === path)
+    if (!buffer) return
+    if (buffer.dirty && buffer.stale) {
+      // Preserve unsaved editor state; the user must resolve the external edit.
+      setConflict(path)
+    } else if (!buffer.dirty && (buffer.cold || buffer.stale)) {
+      await file.load(path, buffer.stale ? { force: true } : undefined)
+      if (disposed) return
+      const next = bufferFromFileState(path, buffer.savedHash)
+      setBuffers((list) => list.map((entry) => (entry.path === path ? next : entry)))
+      viewsByPath.delete(path)
+      buffer = next
+    }
+    if (disposed) return
     setActivePath(path)
+    trimCleanBuffers(path)
+  }
+
+  const openFile = async (path: string) => {
     if (!buffers().some((buffer) => buffer.path === path)) {
       await file.load(path)
       if (disposed) return
@@ -373,13 +408,19 @@ export function ProjectExplorerEditorPane(props: {
       // buffers, and do not let an older open overwrite the newer active tab.
       if (!buffers().some((buffer) => buffer.path === path)) setBuffers((list) => [...list, bufferFromFileState(path)])
     }
-    if (disposed || activePath() !== path) return
-    swapToBuffer(path)
+    if (disposed) return
+    await activateBuffer(path)
   }
 
   const reloadCleanBuffer = async (path: string) => {
     const buffer = buffers().find((entry) => entry.path === path)
     if (!buffer) return
+    if (path !== activePath()) {
+      // Hidden tabs are not live file viewers. Remember only that their
+      // snapshot is stale; activation will perform one authoritative read.
+      setBuffers((list) => list.map((entry) => (entry.path === path ? { ...entry, stale: true } : entry)))
+      return
+    }
     if (buffer.dirty) {
       setConflict(path)
       return
@@ -389,7 +430,12 @@ export function ProjectExplorerEditorPane(props: {
     if (disposed) return
     const next = bufferFromFileState(path, buffer.savedHash)
     setBuffers((list) => list.map((entry) => (entry.path === path ? next : entry)))
-    if (activePath() === path) swapToBuffer(path)
+    // An external write is authoritative only for a clean buffer. Throw away
+    // any cached editor state for that path so a later tab activation cannot
+    // resurrect the pre-write document/undo tree.
+    viewsByPath.delete(path)
+    if (activePath() === path) swapToBuffer(path, { fresh: true })
+    trimCleanBuffers(path)
   }
 
   // File watcher events can arrive once per write chunk (and a formatter or
@@ -442,6 +488,12 @@ export function ProjectExplorerEditorPane(props: {
         const oldest = pendingExternalReloads.values().next().value
         if (typeof oldest === "string") pendingExternalReloads.delete(oldest)
       }
+      const buffer = buffers().find((entry) => entry.path === path)
+      if (!buffer) return
+      if (path !== activePath()) {
+        setBuffers((list) => list.map((entry) => (entry.path === path ? { ...entry, stale: true } : entry)))
+        return
+      }
       pendingExternalReloads.add(path)
       drainExternalReloads()
     })
@@ -454,19 +506,23 @@ export function ProjectExplorerEditorPane(props: {
     })
   })
 
-  const swapToBuffer = (path: string) => {
+  const swapToBuffer = (path: string, options: { fresh?: boolean } = {}) => {
     const buffer = buffers().find((entry) => entry.path === path)
     if (!buffer || !view) return
-    const extensions = [...baseExtensions(onDocChanged, updateLineSelection), languageCompartment.of([])]
-    view.setState(
-      EditorState.create({
-        doc:
-          view.state.doc.toString() === buffer.savedContent && activePath() === path
-            ? view.state.doc
-            : buffer.savedContent,
-        extensions,
-      }),
-    )
+    if (mountedPath && mountedPath !== path) {
+      const previous = buffers().find((entry) => entry.path === mountedPath)
+      if (previous?.dirty) viewsByPath.set(mountedPath, { state: view.state })
+      else viewsByPath.delete(mountedPath)
+    }
+
+    const cached = options.fresh ? undefined : viewsByPath.get(path)?.state
+    if (cached) {
+      view.setState(cached)
+    } else {
+      const extensions = [...baseExtensions(onDocChanged, updateLineSelection), languageCompartment.of([])]
+      view.setState(EditorState.create({ doc: buffer.savedContent, extensions }))
+    }
+    mountedPath = path
     // EditorView.setState destroys/recreates plugins and does NOT run the
     // update pipeline, so the doc-changed listener never fires here — bump
     // explicitly so activeContent (which feeds the markdown/svg render views)
@@ -485,11 +541,15 @@ export function ProjectExplorerEditorPane(props: {
   })
 
   const closeBuffer = (path: string) => {
+    viewsByPath.delete(path)
     setBuffers((list) => list.filter((buffer) => buffer.path !== path))
     if (activePath() === path) {
       const next = buffers()[0]?.path
-      setActivePath(next)
-      if (!next) props.onCloseAll?.()
+      if (next) void activateBuffer(next)
+      else {
+        setActivePath(undefined)
+        props.onCloseAll?.()
+      }
     }
   }
 
@@ -539,11 +599,16 @@ export function ProjectExplorerEditorPane(props: {
       if (mode === "right") return i <= index
       return buffer.path === path
     })
+    const kept = new Set(keep.map((buffer) => buffer.path))
+    for (const buffer of list) if (!kept.has(buffer.path)) viewsByPath.delete(buffer.path)
     setBuffers(keep)
     if (keep.some((buffer) => buffer.path === activePath())) return
     const next = keep[0]?.path
-    setActivePath(next)
-    if (!next) props.onCloseAll?.()
+    if (next) void activateBuffer(next)
+    else {
+      setActivePath(undefined)
+      props.onCloseAll?.()
+    }
   }
 
   const save = async () => {
@@ -555,10 +620,12 @@ export function ProjectExplorerEditorPane(props: {
       setBuffers((list) =>
         list.map((entry) =>
           entry.path === buffer.path
-            ? { ...entry, savedContent: content, savedHash: result.hash, dirty: false }
+            ? { ...entry, savedContent: content, savedHash: result.hash, dirty: false, cold: false, stale: false }
             : entry,
         ),
       )
+      viewsByPath.delete(buffer.path)
+      trimCleanBuffers(buffer.path)
       showToast({
         title: language.t("projectExplorer.editor.saved", { name: buffer.path.split("/").pop() ?? buffer.path }),
       })
@@ -611,7 +678,7 @@ export function ProjectExplorerEditorPane(props: {
                     type="button"
                     data-slot="project-explorer-editor-tab"
                     data-active={activePath() === buffer.path ? "" : undefined}
-                    onClick={() => setActivePath(buffer.path)}
+                    onClick={() => void activateBuffer(buffer.path)}
                   >
                     <FileIcon
                       node={{ path: buffer.path, type: "file" }}

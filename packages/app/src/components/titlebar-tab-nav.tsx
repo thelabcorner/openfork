@@ -1,13 +1,12 @@
 import { createEffect, createMemo, createSignal, For, onCleanup, Show, type Ref } from "solid-js"
 import { makeEventListener } from "@solid-primitives/event-listener"
-import { createResizeObserver } from "@solid-primitives/resize-observer"
 import { createMutation } from "@tanstack/solid-query"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
-import { useGlobal } from "@/context/global"
+import type { ServerCtx } from "@/context/global"
 import { useLanguage } from "@/context/language"
-import { ServerConnection, serverName } from "@/context/server"
+import { ServerConnection } from "@/context/server"
 import { displayName, projectForSession } from "@/pages/layout/helpers"
 import { SessionTabAvatar } from "@/pages/layout/session-tab-avatar"
 import type { Session } from "@opencode-ai/sdk/v2"
@@ -15,9 +14,7 @@ import type { GroupTab } from "@/context/tabs"
 import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
 import { sessionApiOf } from "./titlebar-tab-actions"
 import { tabSessionState } from "./titlebar-tab-state"
-import { useSessionGroups } from "@/context/session-groups"
 import { TabPreviewPopover, type TabPreviewGroupSession } from "./titlebar-tab-popover"
-import { groupedSessionsForTabPreview } from "./titlebar-tab-group-preview"
 import "./titlebar-tab-nav.css"
 
 // MouseEvent.button uses 1 for the middle/wheel button.
@@ -27,6 +24,9 @@ export function TabNavItem(props: {
   ref?: Ref<HTMLDivElement>
   href: string
   server: ServerConnection.Key
+  serverCtx?: () => ServerCtx | undefined
+  serverLabel?: () => string | undefined
+  groupSessions?: () => TabPreviewGroupSession[] | undefined
   session: () => Session | undefined
   fallbackTitle?: string
   onRename: (title: string) => Promise<void>
@@ -41,10 +41,8 @@ export function TabNavItem(props: {
   hidden?: boolean
 }) {
   const [editing, setEditing] = createSignal(false)
-  const [titleOverflowing, setTitleOverflowing] = createSignal(false)
   let tabRoot!: HTMLDivElement
   let titleEl!: HTMLSpanElement
-  let measureFrame: number | undefined
   const rename = createMutation(() => ({ mutationFn: props.onRename }))
 
   const closeTab = (event: MouseEvent) => {
@@ -52,15 +50,10 @@ export function TabNavItem(props: {
     event.stopPropagation()
     props.onClose()
   }
-  const global = useGlobal()
   const language = useLanguage()
-  const sessionGroups = useSessionGroups()
-  const serverCtx = createMemo(() => {
-    const conn = global.servers.list().find((item) => ServerConnection.key(item) === props.server)
-    if (conn) return global.ensureServerCtx(conn)
-  })
+  const serverCtx = () => props.serverCtx?.()
   const sessionID = createMemo(() => props.session()?.id)
-  const groupSessions = createMemo(() => groupedSessionsForTabPreview(sessionGroups.list(), sessionID()))
+  const groupSessions = () => props.groupSessions?.()
   // Derivation lives in titlebar-tab-state: working from session_working(id),
   // paused from the session_paused sidecar (never from !session_working — the
   // interrupt-cleanup window would flicker paused -> working -> paused).
@@ -92,43 +85,10 @@ export function TabNavItem(props: {
     const home = serverCtx()?.sync.data.path.home
     return home ? session.directory.replace(home, "~") : session.directory
   })
-  // Only label the server when multiple servers are connected.
-  const serverLabel = createMemo(() => {
-    if (global.servers.list().length <= 1) return
-    const conn = global.servers.list().find((item) => ServerConnection.key(item) === props.server)
-    return conn ? serverName(conn) : undefined
-  })
+  const serverLabel = () => props.serverLabel?.()
 
   const [popoverOpen, setPopoverOpen] = createSignal(false)
   const previewBlocked = () => !!props.dragging || editing() || !!props.pressed || !props.session()
-
-  const measureTitleOverflow = () => {
-    if (!titleEl || editing()) {
-      setTitleOverflowing(false)
-      return
-    }
-    setTitleOverflowing(titleEl.scrollWidth > titleEl.clientWidth)
-  }
-
-  const scheduleTitleOverflow = () => {
-    if (measureFrame !== undefined) return
-    measureFrame = requestAnimationFrame(() => {
-      measureFrame = undefined
-      measureTitleOverflow()
-    })
-  }
-
-  createEffect(() => {
-    title()
-    props.forceTruncate
-    editing()
-    scheduleTitleOverflow()
-  })
-
-  createResizeObserver(() => tabRoot, scheduleTitleOverflow)
-  onCleanup(() => {
-    if (measureFrame !== undefined) cancelAnimationFrame(measureFrame)
-  })
 
   const selectTitle = () => {
     const range = document.createRange()
@@ -203,7 +163,6 @@ export function TabNavItem(props: {
       }}
       data-titlebar-tab
       data-slot="titlebar-tab-item"
-      data-title-overflow={titleOverflowing()}
       data-editing={editing()}
       data-session-state={sessionState()}
       class="group relative flex h-7 w-full min-w-0 select-none flex-row items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-[6px] px-1.5 [container-type:inline-size]"
@@ -385,6 +344,7 @@ export function TabNavItem(props: {
         groupSessions: groupSessions(),
       }}
       server={props.server}
+      serverCtx={props.serverCtx}
       currentSessionID={sessionID()}
     />
   )
@@ -492,6 +452,7 @@ export function GroupTabNavItem(props: {
   ref?: Ref<HTMLDivElement>
   href: string
   tab: GroupTab
+  serverCtx?: () => ServerCtx | undefined
   title: string
   sessionCount?: number
   sessions?: TabPreviewGroupSession[]
@@ -607,6 +568,7 @@ export function GroupTabNavItem(props: {
         groupSessions: props.sessions,
       }}
       server={props.tab.server}
+      serverCtx={props.serverCtx}
     />
   )
 }

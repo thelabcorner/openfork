@@ -1,6 +1,21 @@
 import type { SessionGroupEntry } from "@/context/session-groups"
 import type { TabPreviewGroupSession } from "./titlebar-tab-popover"
 
+export type TabPreviewMembershipIndex = ReadonlyMap<string, readonly SessionGroupEntry[]>
+
+/** Build session -> group membership once per group snapshot. */
+export function indexTabPreviewMemberships(groups: readonly SessionGroupEntry[]): TabPreviewMembershipIndex {
+  const index = new Map<string, SessionGroupEntry[]>()
+  for (const group of groups) {
+    for (const sessionID of group.sessionIds) {
+      const memberships = index.get(sessionID)
+      if (memberships) memberships.push(group)
+      else index.set(sessionID, [group])
+    }
+  }
+  return index
+}
+
 /**
  * Project a session's group memberships into the compact titlebar navigator.
  *
@@ -11,11 +26,12 @@ import type { TabPreviewGroupSession } from "./titlebar-tab-popover"
  * those folders would imply a hierarchy that does not exist.
  */
 export function groupedSessionsForTabPreview(
-  groups: SessionGroupEntry[],
+  groups: readonly SessionGroupEntry[],
   sessionID: string | undefined,
+  membershipIndex?: TabPreviewMembershipIndex,
 ): TabPreviewGroupSession[] | undefined {
   if (!sessionID) return undefined
-  const memberships = groups.filter((group) => group.sessionIds.includes(sessionID))
+  const memberships = membershipIndex?.get(sessionID) ?? groups.filter((group) => group.sessionIds.includes(sessionID))
   if (memberships.length === 0) return undefined
 
   const managed = memberships.filter((group) => group.kind === "subagent" || group.kind === "plugin")

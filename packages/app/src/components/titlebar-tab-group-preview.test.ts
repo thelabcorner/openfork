@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { SessionGroupEntry } from "@/context/session-groups"
-import { groupedSessionsForTabPreview } from "./titlebar-tab-group-preview"
+import { groupedSessionsForTabPreview, indexTabPreviewMemberships } from "./titlebar-tab-group-preview"
 
 function group(input: {
   id: string
@@ -55,5 +55,18 @@ describe("groupedSessionsForTabPreview", () => {
     const second = group({ id: "second", sessions: ["root", "b"] })
 
     expect(groupedSessionsForTabPreview([first, second], "root")?.map((row) => row.id)).toEqual(["root", "a"])
+  })
+
+  test("indexed membership lookup preserves exact projection semantics", () => {
+    const groups = [
+      group({ id: "manual", sessions: ["root", "manual-child"] }),
+      group({ id: "swarm-a", name: "Swarm A", kind: "plugin", sessions: ["root", "a"] }),
+      group({ id: "swarm-b", name: "Swarm B", kind: "plugin", sessions: ["root", "b"] }),
+    ]
+    const index = indexTabPreviewMemberships(groups)
+    for (const sessionID of ["root", "manual-child", "a", "b", "missing"])
+      expect(groupedSessionsForTabPreview(groups, sessionID, index)).toEqual(
+        groupedSessionsForTabPreview(groups, sessionID),
+      )
   })
 })

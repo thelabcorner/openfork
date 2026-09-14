@@ -8,6 +8,7 @@ import { useFile } from "@/context/file"
 import { useLanguage } from "@/context/language"
 import { virtualScrollElement } from "@/components/virtual-scroll-element"
 import { pathToFileUrl, withFileDragImage, type Kind } from "@/components/file-tree"
+import { buildFileDragTransfer } from "@opencode-ai/core/util/file-drag-transfer"
 import {
   flattenLiveFileTreeV2,
   normalizeFileTreeV2Path,
@@ -18,6 +19,10 @@ import type { ProjectExplorerFavorites } from "@/utils/project-explorer-favorite
 import { ProjectExplorerTreeContextMenu } from "@/components/project-explorer-tree-context-menu"
 import { createProjectExplorerSearchExpansion } from "@/components/project-explorer-search"
 import {
+  startProjectExplorerSearch,
+  type ProjectExplorerSearchResult,
+} from "@/components/project-explorer-search-runner"
+import {
   formatAbsoluteTime,
   formatFileSize,
   formatFolderCount,
@@ -27,6 +32,8 @@ import {
 import "./project-explorer-tree.css"
 
 type PendingCreate = { parentDir: string; kind: "file" | "directory" }
+
+const emptySearchSet = new Set<string>()
 
 export type ProjectExplorerTreeHandle = {
   startRename: (path: string) => void
@@ -245,17 +252,49 @@ export function ProjectExplorerTree(props: {
     return [...base.slice(0, insertAt), synthetic, ...base.slice(insertAt)]
   })
 
-  const searchIndex = createMemo(() => {
-    const index: { path: string; lower: string }[] = []
-    for (const node of file.tree.allNodes()) {
-      const path = normalizeFileTreeV2Path(node.path)
-      index.push({ path, lower: path.toLowerCase() })
-    }
-    return index
-  })
-
   const searching = createMemo(() => Boolean(props.search?.trim()))
   const searchQuery = createMemo(() => props.search?.trim().toLowerCase() ?? "")
+  const [searchResult, setSearchResult] = createSignal<ProjectExplorerSearchResult>()
+  const [searchBusy, setSearchBusy] = createSignal(false)
+  let searchGeneration = 0
+  let cancelSearch: (() => void) | undefined
+
+  createEffect(() => {
+    const query = searchQuery()
+    // allNodes() is intentionally read ONLY for an active query. Its nodeVersion
+    // dependency restarts this generation when a watcher changes the loaded
+    // corpus, but idle explorer metadata churn remains O(1).
+    const nodes = query ? file.tree.allNodes() : undefined
+    const generation = ++searchGeneration
+    cancelSearch?.()
+    cancelSearch = undefined
+    if (!query || !nodes) {
+      setSearchBusy(false)
+      setSearchResult(undefined)
+      return
+    }
+
+    setSearchBusy(true)
+    setSearchResult(undefined)
+    // Let the input event/paint settle before beginning even the first slice.
+    cancelSearch = startProjectExplorerSearch({
+      query,
+      nodes,
+      root: () => file.tree.children(""),
+      children: (path) => file.tree.children(path),
+      cancelled: () => generation !== searchGeneration,
+      complete: (result) => {
+        if (generation !== searchGeneration) return
+        setSearchResult(result)
+        setSearchBusy(false)
+      },
+    })
+  })
+
+  onCleanup(() => {
+    searchGeneration++
+    cancelSearch?.()
+  })
 
   const searchExpansion = createProjectExplorerSearchExpansion({
     isExpanded: (path) => file.tree.state(path)?.expanded ?? false,
@@ -265,25 +304,17 @@ export function ProjectExplorerTree(props: {
   })
 
   const searchMatches = createMemo(() => {
-    const query = props.search?.trim().toLowerCase()
+    const query = searchQuery()
     if (!query) return undefined
-    const matches = new Set<string>()
-    for (const entry of searchIndex()) {
-      if (entry.lower.includes(query)) matches.add(entry.path)
-    }
-    return matches
+    const result = searchResult()
+    return result?.query === query ? result.matches : emptySearchSet
   })
 
   const searchAncestors = createMemo(() => {
-    const matches = searchMatches()
-    if (!matches) return undefined
-    const ancestors = new Set<string>()
-    for (const path of matches) {
-      for (let parent = path.lastIndexOf("/"); parent !== -1; parent = path.lastIndexOf("/", parent - 1)) {
-        ancestors.add(path.slice(0, parent))
-      }
-    }
-    return ancestors
+    const query = searchQuery()
+    if (!query) return undefined
+    const result = searchResult()
+    return result?.query === query ? result.ancestors : emptySearchSet
   })
 
   createEffect(() => {
@@ -295,35 +326,26 @@ export function ProjectExplorerTree(props: {
   onCleanup(searchExpansion.dispose)
 
   const visibleRows = createMemo(() => {
-    const matches = searchMatches()
-    if (!matches) return rows()
-    const ancestors = searchAncestors()!
-    const out: FileTreeV2Row[] = []
-    const stack = file.tree
-      .children("")
-      .toReversed()
-      .map((node) => ({ node: toLive(node), level: 0 }))
-    while (stack.length > 0) {
-      const row = stack.pop()!
-      if (!matches.has(row.node.path) && !ancestors.has(row.node.path)) continue
-      out.push(row)
-      if (row.node.type !== "directory" || !ancestors.has(row.node.path)) continue
-      const nested = file.tree.children(row.node.originalPath)
-      for (let index = nested.length - 1; index >= 0; index--) {
-        stack.push({ node: toLive(nested[index]!), level: row.level + 1 })
-      }
-    }
-    return out
+    const query = searchQuery()
+    if (!query) return rows()
+    const result = searchResult()
+    return result?.query === query ? result.rows : []
   })
 
   const empty = createMemo(() => visibleRows().length === 0)
 
-  const visibleIndex = createMemo(() => {
+  const visibleLookup = createMemo(() => {
     const index = new Map<string, number>()
+    const row = new Map<string, FileTreeV2Row>()
     let i = 0
-    for (const row of visibleRows()) index.set(row.node.path, i++)
-    return index
+    for (const item of visibleRows()) {
+      index.set(item.node.path, i++)
+      row.set(item.node.path, item)
+    }
+    return { index, row }
   })
+  const visibleIndex = () => visibleLookup().index
+  const rowByKey = () => visibleLookup().row
 
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
     get count() {
@@ -379,7 +401,6 @@ export function ProjectExplorerTree(props: {
     onCleanup(() => observer.disconnect())
   })
 
-  const rowByKey = createMemo(() => new Map(visibleRows().map((row) => [row.node.path, row] as const)))
   // Iterate the virtual items themselves rather than a list of their `key`s.
   // `getItemKey` returns `node.path`, and a tree can legitimately surface the
   // same normalized path more than once in `visibleRows()` (an expanded
@@ -479,15 +500,16 @@ export function ProjectExplorerTree(props: {
   const handleRowDragStart = (event: DragEvent, node: FileTreeV2Node) => {
     const path = node.path
     const selected = selectedSet()
-    const dragPaths = selected.has(path) && selected.size > 1 ? [...selected] : [node.originalPath || path]
-    const first = dragPaths[0] ?? node.originalPath
+    const multi = selected.has(path) && selected.size > 1
+    const dragPaths: Iterable<string> = multi ? selected : [node.originalPath || path]
+    const transfer = buildFileDragTransfer(dragPaths, pathToFileUrl, { total: multi ? selected.size : 1 })
     setIsDragging(true)
     pendingSinglePath = null
-    event.dataTransfer?.setData("text/plain", dragPaths.map((p) => `file:${p}`).join("\n"))
-    // Provide file URIs for external drops; first URI is primary.
-    event.dataTransfer?.setData("text/uri-list", dragPaths.map((p) => pathToFileUrl(p)).join("\r\n"))
-    // Fallback single entry for consumers expecting `text/uri-list` with one item.
-    if (dragPaths.length === 1) event.dataTransfer?.setData("text/uri-list", pathToFileUrl(first))
+    event.dataTransfer?.setData("text/plain", transfer.plainText)
+    event.dataTransfer?.setData("text/uri-list", transfer.uriList)
+    if (transfer.truncated) {
+      event.dataTransfer?.setData("application/x-opencode-file-count", `${transfer.included}/${transfer.total}`)
+    }
     if (event.dataTransfer) event.dataTransfer.effectAllowed = "move"
     withFileDragImage(event)
   }
@@ -800,13 +822,23 @@ export function ProjectExplorerTree(props: {
             </div>
           }
         >
-          <Show
-            when={visibleRows().length > 0}
-            fallback={
-              <div data-slot="project-explorer-empty" class="absolute inset-0">
-                <EmptyState />
-              </div>
-            }
+           <Show
+             when={visibleRows().length > 0}
+             fallback={
+               <div data-slot="project-explorer-empty" class="absolute inset-0">
+                 <Show
+                   when={!searchBusy()}
+                   fallback={
+                     <div class="flex h-9 items-center justify-center gap-2 text-11-regular text-v2-text-text-faint">
+                       <Spinner class="size-3" />
+                       <span>{language.t("common.loading")}</span>
+                     </div>
+                   }
+                 >
+                   <EmptyState />
+                 </Show>
+               </div>
+             }
           >
             <For each={virtualItems()}>
               {(item) => (

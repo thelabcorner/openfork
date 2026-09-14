@@ -3,8 +3,11 @@ import {
   adaptServerEvent,
   coalesceServerEvents,
   createServerEventQueue,
+  drainServerEventQueue,
   enqueueServerEvent,
+  MAX_PENDING_EVENT_COUNT,
   resumeStreamAfterPageShow,
+  shouldDispatchSessionStreamFrame,
 } from "./server-sdk"
 import type { OpenCodeEvent } from "@opencode-ai/client/promise"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
@@ -20,6 +23,36 @@ describe("resumeStreamAfterPageShow", () => {
     resumeStreamAfterPageShow({ persisted: true } as PageTransitionEvent, start)
 
     expect(starts).toBe(1)
+  })
+})
+
+describe("shouldDispatchSessionStreamFrame", () => {
+  test("drops reconstructible content before the renderer queue for an uninterested session", () => {
+    const seen: string[] = []
+    const interest = (sessionID: string) => {
+      seen.push(sessionID)
+      return false
+    }
+
+    expect(shouldDispatchSessionStreamFrame("session.text.delta", "ses_bg", interest)).toBe(false)
+    expect(shouldDispatchSessionStreamFrame("message.part.delta", "ses_bg", interest)).toBe(false)
+    expect(shouldDispatchSessionStreamFrame("session.next.tool.input.delta", "ses_bg", interest)).toBe(false)
+    expect(shouldDispatchSessionStreamFrame("session.text.ended", "ses_bg", interest)).toBe(false)
+    expect(shouldDispatchSessionStreamFrame("message.part.updated", "ses_bg", interest)).toBe(false)
+    expect(shouldDispatchSessionStreamFrame("session.next.tool.success", "ses_bg", interest)).toBe(false)
+    expect(shouldDispatchSessionStreamFrame("session.next.step.ended", "ses_bg", interest)).toBe(false)
+
+    // Metadata/notification state is not reconstructible timeline content and
+    // must still reach background consumers.
+    expect(shouldDispatchSessionStreamFrame("session.status", "ses_bg", interest)).toBe(true)
+    expect(shouldDispatchSessionStreamFrame("permission.asked", "ses_bg", interest)).toBe(true)
+    expect(shouldDispatchSessionStreamFrame("session.next.moved", "ses_bg", interest)).toBe(true)
+    expect(seen).toEqual(["ses_bg", "ses_bg", "ses_bg", "ses_bg", "ses_bg", "ses_bg", "ses_bg"])
+  })
+
+  test("preserves allow-all behavior until an interest authority is registered", () => {
+    expect(shouldDispatchSessionStreamFrame("session.text.delta", "ses", undefined)).toBe(true)
+    expect(shouldDispatchSessionStreamFrame("session.text.delta", undefined, () => false)).toBe(true)
   })
 })
 
@@ -56,7 +89,7 @@ describe("coalesceServerEvents", () => {
         data: { sessionID, assistantMessageID: `msg_${sessionID}`, ...data },
       } as OpenCodeEvent
       const result = direct.reduce(expected.get(sessionID) ?? [], event)
-      if (result) expected.set(sessionID, result.messages)
+      if (result?.kind === "messages") expected.set(sessionID, result.messages)
       queue.push({ directory: "/repo", payload: adaptServerEvent(event) })
     }
     for (let session = 0; session < 32; session++) {
@@ -76,7 +109,7 @@ describe("coalesceServerEvents", () => {
         const event = item.payload.current!
         const id = (event.data as { sessionID: string }).sessionID
         const result = batched.reduce(actual.get(id) ?? [], event)
-        if (result) actual.set(id, result.messages)
+        if (result?.kind === "messages") actual.set(id, result.messages)
       }
     }
     expect(actual.size).toBe(32)
@@ -160,6 +193,47 @@ describe("coalesceServerEvents", () => {
 
     expect(result).toHaveLength(1)
     expect(result[0]?.payload.current).toMatchObject({ id: "evt_2", data: { delta: "hello world" } })
+  })
+
+  test("merges current session.next deltas by explicit stream id without mixing streams", () => {
+    const next = (
+      id: string,
+      value: string,
+      streamID: string,
+      type: "session.next.text.delta" | "session.next.reasoning.delta" = "session.next.text.delta",
+    ) =>
+      adaptServerEvent({
+        id,
+        type,
+        data: {
+          sessionID: "ses",
+          timestamp: 1,
+          assistantMessageID: "msg",
+          ...(type === "session.next.text.delta" ? { textID: streamID } : { reasoningID: streamID }),
+          delta: value,
+        },
+      } as any)
+    const result = coalesceServerEvents([
+      { directory: "/repo", payload: next("evt_1", "a", "txt_a") },
+      { directory: "/repo", payload: next("evt_2", "r", "rsn_a", "session.next.reasoning.delta") },
+      { directory: "/repo", payload: next("evt_3", "b", "txt_b") },
+      { directory: "/repo", payload: next("evt_4", "c", "txt_a") },
+    ])
+
+    expect(result).toHaveLength(3)
+    expect(result[0]?.payload.current).toMatchObject({
+      id: "evt_4",
+      type: "session.next.text.delta",
+      data: { textID: "txt_a", delta: "ac" },
+    })
+    expect(result[1]?.payload.current).toMatchObject({
+      type: "session.next.reasoning.delta",
+      data: { reasoningID: "rsn_a", delta: "r" },
+    })
+    expect(result[2]?.payload.current).toMatchObject({
+      type: "session.next.text.delta",
+      data: { textID: "txt_b", delta: "b" },
+    })
   })
 
   test("preserves event boundaries and distinct fields", () => {
@@ -252,6 +326,30 @@ describe("enqueueServerEvent", () => {
     expect(queue.size).toBe(0)
   })
 
+  test("compacts unread session.next deltas before renderer dispatch", () => {
+    const queue = createServerEventQueue()
+    for (let i = 0; i < 4096; i++) {
+      queue.push({
+        directory: "/repo",
+        payload: adaptServerEvent({
+          id: `evt_next_${i}`,
+          type: "session.next.text.delta",
+          data: {
+            sessionID: "session",
+            timestamp: i,
+            assistantMessageID: "message",
+            textID: "txt_1",
+            delta: "x",
+          },
+        } as any),
+      })
+    }
+
+    expect(queue.size).toBe(1)
+    expect(queue.take(128)[0]?.payload.current?.data).toMatchObject({ delta: "x".repeat(4096) })
+    expect(queue.size).toBe(0)
+  })
+
   test("drops queued streaming work when the renderer becomes hidden", () => {
     const queue = createServerEventQueue()
     queue.push({
@@ -322,6 +420,107 @@ describe("enqueueServerEvent", () => {
     add(4096, 4097)
     expect(queue.take(128)[0]?.payload.id).toBe("4096")
     expect(queue.size).toBe(0)
+  })
+
+  test("count overflow repairs locally through a global hydration barrier", () => {
+    const queue = createServerEventQueue()
+    for (let i = 0; i <= MAX_PENDING_EVENT_COUNT; i++) {
+      queue.push({
+        directory: "/repo",
+        payload: {
+          id: `status_${i}`,
+          type: "session.status",
+          properties: { sessionID: `session_${i}`, status: { type: "busy" } },
+        } as Event,
+      })
+    }
+
+    // Crossing the ceiling does not require pausing the SSE reader. The local
+    // backlog is replaced by the same global connected barrier that server-sync
+    // already uses to hydrate every active directory, followed by the current
+    // non-delta event so edge-triggered state is not needlessly lost.
+    const repaired = queue.take(8)
+    expect(repaired).toHaveLength(2)
+    expect(repaired[0]).toMatchObject({ directory: "global", payload: { type: "server.connected" } })
+    expect(repaired[1]?.payload.id).toBe(`status_${MAX_PENDING_EVENT_COUNT}`)
+    expect(queue.size).toBe(0)
+  })
+
+  test("byte overflow invalidates only the owning reconstructible session", () => {
+    const dropped: string[] = []
+    const queue = createServerEventQueue({ onSessionContentDropped: (sessionID) => dropped.push(sessionID) })
+    queue.push({
+      directory: "/repo",
+      payload: adaptServerEvent({
+        id: "oversized",
+        created: 1,
+        type: "session.text.delta",
+        data: {
+          sessionID: "session",
+          assistantMessageID: "message",
+          ordinal: 0,
+          delta: "x".repeat(8 * 1024 * 1024 + 1),
+        },
+      } as OpenCodeEvent),
+    })
+
+    expect(queue.take(8)).toEqual([])
+    expect(dropped).toEqual(["session"])
+    expect(queue.size).toBe(0)
+  })
+
+  test("content pressure preserves unrelated lifecycle backlog", () => {
+    const dropped: string[] = []
+    const queue = createServerEventQueue({ onSessionContentDropped: (sessionID) => dropped.push(sessionID) })
+    queue.push({
+      directory: "/repo",
+      payload: {
+        id: "status",
+        type: "session.status",
+        properties: { sessionID: "other", status: { type: "busy" } },
+      } as Event,
+    })
+    queue.push({
+      directory: "/repo",
+      payload: adaptServerEvent({
+        id: "huge",
+        created: 1,
+        type: "session.text.delta",
+        data: {
+          sessionID: "noisy",
+          assistantMessageID: "message",
+          ordinal: 0,
+          delta: "x".repeat(8 * 1024 * 1024 + 1),
+        },
+      } as OpenCodeEvent),
+    })
+
+    expect(queue.take(8).map((event) => event.payload.id)).toEqual(["status"])
+    expect(dropped).toEqual(["noisy"])
+  })
+
+  test("renderer byte accounting does not double-charge aliased V2 data", () => {
+    const queue = createServerEventQueue()
+    const delta = "x".repeat(4_500_000)
+    queue.push({
+      directory: "/repo",
+      payload: adaptServerEvent({
+        id: "large-but-valid",
+        created: 1,
+        type: "session.text.delta",
+        data: {
+          sessionID: "session",
+          assistantMessageID: "message",
+          ordinal: 0,
+          delta,
+        },
+      } as OpenCodeEvent),
+    })
+
+    const retained = queue.take(2)
+    expect(retained).toHaveLength(1)
+    expect(String(retained[0]?.payload.type)).toBe("session.text.delta")
+    expect(retained[0]?.payload.current?.data).toMatchObject({ delta })
   })
 
   const partUpdated = (text: string) =>
@@ -416,5 +615,61 @@ describe("enqueueServerEvent", () => {
     enqueue("busy")
 
     expect(events).toHaveLength(2)
+  })
+})
+
+describe("drainServerEventQueue", () => {
+  test("bounds a renderer drain by wall-clock budget as well as item count", () => {
+    const queue = createServerEventQueue()
+    for (let i = 0; i < 100; i++) {
+      queue.push({
+        directory: "/repo",
+        payload: {
+          id: String(i),
+          type: "session.status",
+          properties: { sessionID: "session", status: { type: "busy" } },
+        } as Event,
+      })
+    }
+
+    let clock = 0
+    const emitted: string[] = []
+    const processed = drainServerEventQueue(
+      queue,
+      (event) => {
+        emitted.push(event.payload.id)
+        clock += 2
+      },
+      { maxEvents: 128, budgetMs: 6, now: () => clock },
+    )
+
+    expect(processed).toBe(3)
+    expect(emitted).toEqual(["0", "1", "2"])
+    expect(queue.size).toBe(97)
+  })
+
+  test("still enforces the hard event-count ceiling when reducer work is cheap", () => {
+    const queue = createServerEventQueue()
+    for (let i = 0; i < 200; i++) {
+      queue.push({
+        directory: "/repo",
+        payload: {
+          id: String(i),
+          type: "session.status",
+          properties: { sessionID: "session", status: { type: "busy" } },
+        } as Event,
+      })
+    }
+
+    const emitted: string[] = []
+    const processed = drainServerEventQueue(queue, (event) => emitted.push(event.payload.id), {
+      maxEvents: 128,
+      budgetMs: 6,
+      now: () => 0,
+    })
+
+    expect(processed).toBe(128)
+    expect(emitted.at(-1)).toBe("127")
+    expect(queue.size).toBe(72)
   })
 })

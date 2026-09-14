@@ -1,5 +1,6 @@
 import { onMount } from "solid-js"
 import { makeEventListener } from "@solid-primitives/event-listener"
+import { parseFileDragText } from "@opencode-ai/core/util/file-drag-transfer"
 import { showToast } from "@/utils/toast"
 import { type ContentPart, type ImageAttachmentPart, type usePrompt } from "@/context/prompt"
 import { useLanguage } from "@/context/language"
@@ -189,11 +190,16 @@ export function createPromptAttachments(input: PromptAttachmentsInput) {
     input.setDraggingType(null)
 
     const plainText = event.dataTransfer?.getData("text/plain")
-    const filePrefix = "file:"
-    if (plainText?.startsWith(filePrefix)) {
-      const filePath = plainText.slice(filePrefix.length)
+    const filePaths = parseFileDragText(plainText)
+    if (filePaths.length > 0) {
       input.focusEditor()
-      input.addPart({ type: "file", path: filePath, content: "@" + filePath, start: 0, end: 0 })
+      for (let index = 0; index < filePaths.length; index++) {
+        const filePath = filePaths[index]!
+        input.addPart({ type: "file", path: filePath, content: "@" + filePath, start: 0, end: 0 })
+        // A bounded native transfer can still contain hundreds of files. Yield
+        // between small chunks so one drop cannot monopolize the renderer task.
+        if ((index + 1) % 32 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      }
       return
     }
 

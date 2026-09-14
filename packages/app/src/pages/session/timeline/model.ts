@@ -39,7 +39,29 @@ export function createTimelineModel(input: {
       if (!id) return
 
       const cached = untrack(() => sync().data.message[id] !== undefined)
+      const repair = cached && serverSync().session.needsRepair(id)
       const stale = cached && !serverSync().session.fresh(id, sessionFreshness)
+
+      // A known content gap is a correctness repair, not an opportunistic
+      // freshness refresh. Start it immediately on activation so the store can
+      // install MessageLoadState and resume tracked live deltas before the next
+      // provider chunk arrives. The ordinary age-based refresh below remains
+      // delayed and composer-aware to avoid unnecessary timeline reflow.
+      if (repair) {
+        const label = `session.repair:${id}`
+        const done = trackPending(label)
+        const markStart = `${label}.start`
+        const markEnd = `${label}.end`
+        performance.mark(markStart)
+        void Promise.resolve(sync().session.sync(id, { force: true })).finally(() => {
+          performance.mark(markEnd)
+          try {
+            performance.measure(label, markStart, markEnd)
+          } catch {}
+          done()
+        })
+        return
+      }
 
       refreshFrame = requestAnimationFrame(() => {
         refreshFrame = undefined

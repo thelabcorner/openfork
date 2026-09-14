@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import type { Message, Part, PermissionRequest, QuestionRequest, SessionStatus, Todo } from "@opencode-ai/sdk/v2/client"
 import type { FileDiffInfo } from "@opencode-ai/client/promise"
-import { dropSessionCaches, pickSessionCacheEvictions } from "./session-cache"
+import { dropSessionCaches, estimateSessionCacheBytes, pickSessionCacheEvictions } from "./session-cache"
 
 const msg = (id: string, sessionID: string) =>
   ({
@@ -100,5 +100,55 @@ describe("app session cache", () => {
 
     expect(stale).toEqual(["ses_2", "ses_3"])
     expect([...seen]).toEqual(["ses_1", "ses_4"])
+  })
+
+  test("pickSessionCacheEvictions evicts oldest idle sessions to meet a byte budget", () => {
+    const seen = new Set(["ses_1", "ses_2", "ses_3"])
+    const weights = new Map([
+      ["ses_1", 80],
+      ["ses_2", 30],
+      ["ses_3", 20],
+      ["ses_4", 10],
+    ])
+    const stale = pickSessionCacheEvictions({
+      seen,
+      keep: "ses_4",
+      limit: 40,
+      preserve: ["ses_2"],
+      weights,
+      maxBytes: 70,
+    })
+
+    expect(stale).toEqual(["ses_1"])
+    expect([...seen]).toEqual(["ses_2", "ses_3", "ses_4"])
+  })
+
+  test("estimateSessionCacheBytes accounts for large inline media strings", () => {
+    const m = msg("msg_media", "ses_media")
+    const payload = "x".repeat(6 * 1024 * 1024)
+    const store = {
+      session_status: {},
+      session_diff: {},
+      todo: {},
+      message: { ses_media: [m] },
+      session_message: {},
+      part: {
+        [m.id]: [
+          {
+            id: "prt_media",
+            sessionID: "ses_media",
+            messageID: m.id,
+            type: "file",
+            url: `data:image/png;base64,${payload}`,
+            mime: "image/png",
+          } as unknown as Part,
+        ],
+      },
+      permission: {},
+      question: {},
+      part_text_accum_delta: {},
+    }
+
+    expect(estimateSessionCacheBytes(store, "ses_media")).toBeGreaterThan(12 * 1024 * 1024)
   })
 })

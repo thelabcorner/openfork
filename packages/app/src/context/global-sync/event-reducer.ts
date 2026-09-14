@@ -40,7 +40,10 @@ export function applyGlobalEvent(input: {
   setGlobalProject: (next: Project[] | ((draft: Project[]) => Project[])) => void
   refresh: () => void
 }) {
-  if (input.event.type === "global.disposed" || input.event.type === "server.connected") {
+  const repairConnected =
+    input.event.type === "server.connected" &&
+    !!(input.event.properties as { repair?: boolean } | undefined)?.repair
+  if (input.event.type === "global.disposed" || repairConnected) {
     input.refresh()
     return
   }
@@ -369,11 +372,6 @@ export function applyDirectoryEvent(input: {
       if (!result.found) break
       const field = props.field as keyof (typeof parts)[number]
       const current = parts[result.index]?.[field]
-      input.setStore(
-        "part_text_accum_delta",
-        props.partID,
-        (existing) => (existing ?? (typeof current === "string" ? current : "")) + props.delta,
-      )
       input.setStore(
         "part",
         props.messageID,

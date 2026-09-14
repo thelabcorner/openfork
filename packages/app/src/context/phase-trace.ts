@@ -2,8 +2,8 @@
 // projection, row construction, frames and reconnects. Metadata only — event
 // types, session ids, counts, sizes and durations, never payload content.
 //
-// Default ON: set localStorage `opencode:phase-trace` to "0" (or add
-// `?phase-trace=0` to the URL) to disable. Summaries go to the console as
+// Opt-in: set localStorage `opencode:phase-trace` to "1" (or add
+// `?phase-trace=1` to the URL) to enable. Summaries go to the console as
 // `[phase-trace]` JSON lines every 5s, which the desktop file logger persists,
 // and the full snapshot is available live as `window.__opencodePhaseTrace()`.
 //
@@ -63,6 +63,9 @@ type MarkdownSummary = {
   workerSuperseded: number
   workerErrors: number
   workerByKind: Record<string, number>
+  parseIncremental: number
+  parseFull: number
+  parseUnknown: number
 }
 
 type MarkdownTraceEvent =
@@ -91,6 +94,7 @@ type MarkdownTraceEvent =
       workerQueueMs?: number
       dispatchWaitMs?: number
       responseWaitMs?: number
+      incremental?: boolean
     }
 
 const MAX_RING = 512
@@ -130,24 +134,27 @@ function freshMarkdown(): MarkdownSummary {
     workerSuperseded: 0,
     workerErrors: 0,
     workerByKind: {},
+    parseIncremental: 0,
+    parseFull: 0,
+    parseUnknown: 0,
   }
 }
 
-function flagOff(): boolean {
+function flagOn(): boolean {
   try {
-    if (typeof localStorage !== "undefined" && localStorage.getItem("opencode:phase-trace") === "0") return true
+    if (typeof localStorage !== "undefined" && localStorage.getItem("opencode:phase-trace") === "1") return true
   } catch {
-    // Storage access can throw in locked-down contexts; tracing stays on.
+    // Storage access can throw in locked-down contexts; tracing stays off.
   }
   try {
-    if (typeof location !== "undefined" && /[?&]phase-trace=0\b/.test(location.search)) return true
+    if (typeof location !== "undefined" && /[?&]phase-trace=1\b/.test(location.search)) return true
   } catch {
-    // No location (tests, SSR); tracing stays on.
+    // No location (tests, SSR); tracing stays off.
   }
   return false
 }
 
-const enabled = !flagOff()
+let enabled = flagOn()
 
 let window_: WindowSummary = freshWindow()
 let windows: WindowSummary[] = []
@@ -249,7 +256,19 @@ try {
 }
 
 export const phaseTrace = {
-  enabled,
+  get enabled() {
+    return enabled
+  },
+  /** Runtime/test switch. Production stays off unless explicitly opted in. */
+  configure(value: boolean) {
+    if (enabled === value) return
+    enabled = value
+    if (!enabled && summaryTimer !== undefined) {
+      clearInterval(summaryTimer)
+      summaryTimer = undefined
+    }
+    frameLast = 0
+  },
   /** One received SSE frame. kind is the event type, sessionID optional. */
   frame(kind: string, sessionID?: string) {
     if (!enabled) return
@@ -371,6 +390,11 @@ export const phaseTrace = {
     markdown.workerResponseWaitMs += event.responseWaitMs ?? 0
     markdown.workerMaxMs = Math.max(markdown.workerMaxMs, event.ms)
     markdown.workerByKind[`${event.kind}.${event.status}`] = (markdown.workerByKind[`${event.kind}.${event.status}`] ?? 0) + 1
+    if (event.kind === "parse" && event.status === "ok") {
+      if (event.incremental === true) markdown.parseIncremental += 1
+      else if (event.incremental === false) markdown.parseFull += 1
+      else markdown.parseUnknown += 1
+    }
     if (event.status === "superseded") markdown.workerSuperseded += 1
     if (event.status === "error") markdown.workerErrors += 1
     if (event.ms >= 100)
@@ -405,8 +429,15 @@ function pushRing(event: Record<string, unknown>) {
 }
 
 try {
-  const w = globalThis as typeof globalThis & { __opencodeMarkdownTrace?: (event: MarkdownTraceEvent) => void }
-  if (phaseTrace.enabled) w.__opencodeMarkdownTrace = (event) => phaseTrace.markdown(event)
+  const w = globalThis as typeof globalThis & {
+    __opencodeMarkdownTrace?: (event: MarkdownTraceEvent) => void
+    __opencodeMarkdownTraceEnabled?: () => boolean
+  }
+  // Keep both hooks stable so tracing can be enabled at runtime without reload.
+  // Session UI consults the enable hook before taking timestamps/allocating
+  // trace bookkeeping, so a configured-off trace is genuinely off the hot path.
+  w.__opencodeMarkdownTraceEnabled = () => phaseTrace.enabled
+  w.__opencodeMarkdownTrace = (event) => phaseTrace.markdown(event)
 } catch {
   // No global to attach to (tests, SSR); the module API still works.
 }

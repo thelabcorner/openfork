@@ -91,6 +91,6 @@ describe("applyDirectoryEvent session-content gate", () => {
     })
 
     expect((store.part.msg_1?.[0] as { text: string }).text).toBe("hello")
-    expect(store.part_text_accum_delta.prt_1).toBe("hello")
+    expect(store.part_text_accum_delta.prt_1).toBeUndefined()
   })
 })

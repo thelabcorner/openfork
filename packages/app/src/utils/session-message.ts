@@ -302,6 +302,53 @@ function assistantParts(sessionID: string, message: SessionMessageAssistant): Pa
   })
 }
 
+/**
+ * Project exactly one assistant content entry to the legacy Part model.
+ *
+ * The streaming reducer already knows both the changed content index and its
+ * stable legacy part id. Re-running `assistantParts()` for the whole assistant
+ * turn on every token made the indexed reducer O(number of prior content/tool
+ * blocks). This helper keeps the hot path O(1) while preserving the exact
+ * normalization rules used by the full hydration path.
+ */
+export function normalizeSessionAssistantContentPart(
+  sessionID: string,
+  message: SessionMessageAssistant,
+  content: SessionMessageAssistant["content"][number],
+  partID: string,
+): Part | undefined {
+  if (content.type === "text") {
+    if (!content.text.trim()) return
+    return {
+      id: partID,
+      sessionID,
+      messageID: message.id,
+      type: "text",
+      text: content.text,
+    }
+  }
+  if (content.type === "reasoning") {
+    if (!content.text.trim()) return
+    return {
+      id: partID,
+      sessionID,
+      messageID: message.id,
+      type: "reasoning",
+      text: content.text,
+      metadata: content.state,
+      time: {
+        start: content.time?.created ?? message.time.created,
+        end: content.time?.completed,
+      },
+    }
+  }
+  const part = toolPart(sessionID, message.id, content)
+  // Tool ids are call ids and should already equal the reducer's part id. Keep
+  // the reducer-provided id authoritative if a provider ever violates that
+  // assumption so projection and lookup cannot diverge.
+  return part.id === partID ? part : { ...part, id: partID, callID: partID }
+}
+
 function textPart(sessionID: string, messageID: string, ordinal: number, text: string, synthetic?: boolean): Part {
   return {
     id: sessionMessagePartID(messageID, "text", ordinal),

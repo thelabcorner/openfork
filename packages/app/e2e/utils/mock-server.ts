@@ -40,6 +40,14 @@ export interface MockServerConfig {
   fileContent?: (path: string) => unknown | Promise<unknown>
   findFiles?: (input: { query: string; dirs?: string; limit?: number }) => unknown | Promise<unknown>
   sessionStatus?: Record<string, unknown> | (() => Record<string, unknown>)
+  /**
+   * Only treat PLAYWRIGHT_SERVER_PORT as an OpenCode backend. Performance
+   * preview builds run on a separate Vite origin; allowing that origin to
+   * answer backend routes creates a second fake server context whose SSE
+   * subscriber can drain stateful fixture events away from the intended
+   * backend connection.
+   */
+  strictBackendPort?: boolean
 }
 
 export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
@@ -87,6 +95,16 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
       process.env.PLAYWRIGHT_BASE_URL ?? `http://127.0.0.1:${process.env.PLAYWRIGHT_PORT ?? "3000"}`,
     ).port
     if (url.port !== targetPort && url.port !== appPort) return route.fallback()
+    if (config.strictBackendPort && url.port !== targetPort) return route.fallback()
+
+    if (process.env.OPENCODE_MOCK_DIAGNOSTICS === "1" && url.port === targetPort) {
+      console.warn(
+        "[mock-server] backend request",
+        route.request().method(),
+        route.request().resourceType(),
+        url.pathname,
+      )
+    }
 
     const path = url.pathname
     if (path === "/global/event" || path === "/event" || path === "/api/event") {
@@ -488,6 +506,7 @@ function currentMessage(value: unknown) {
                     status: "completed",
                     input: state.input ?? {},
                     structured: state.metadata ?? {},
+                    metadata: state.metadata ?? {},
                     content: [{ type: "text", text: state.output ?? "" }],
                   }
                 : state.status === "error"

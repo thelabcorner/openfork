@@ -119,10 +119,19 @@ describe("applyGlobalEvent", () => {
     expect(refreshCount).toBe(1)
   })
 
-  test("handles server.connected by triggering refresh", () => {
+  test("treats ordinary server.connected as liveness and refreshes only explicit repair barriers", () => {
     let refreshCount = 0
     applyGlobalEvent({
       event: { type: "server.connected" },
+      project: [],
+      refresh: () => {
+        refreshCount += 1
+      },
+      setGlobalProject() {},
+    })
+    expect(refreshCount).toBe(0)
+    applyGlobalEvent({
+      event: { type: "server.connected", properties: { repair: true } },
       project: [],
       refresh: () => {
         refreshCount += 1
@@ -135,7 +144,7 @@ describe("applyGlobalEvent", () => {
 })
 
 describe("applyDirectoryEvent", () => {
-  test("initializes text delta accumulation from the current part text", () => {
+  test("updates text deltas without retaining a duplicate accumulated string", () => {
     const part = { ...textPart("part", "session", "message"), text: "existing" }
     const [store, setStore] = createStore(baseState({ part: { message: [part] } }))
 
@@ -151,7 +160,7 @@ describe("applyDirectoryEvent", () => {
       loadLsp() {},
     })
 
-    expect(store.part_text_accum_delta.part).toBe("existing appended")
+    expect(store.part_text_accum_delta.part).toBeUndefined()
     expect((store.part.message?.[0] as { text: string }).text).toBe("existing appended")
   })
 

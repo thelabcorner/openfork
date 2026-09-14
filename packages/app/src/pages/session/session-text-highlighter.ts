@@ -134,6 +134,10 @@ function renderOverlay(ranges: Range[], activeIndex: number, scrollRoot: HTMLEle
 
 export type SessionTextHighlighter = {
   scan: (scrollRoot: HTMLElement) => void
+  /** Mark one mutated subtree dirty and schedule a bounded rescan. */
+  invalidate: (node?: Node) => void
+  /** Scrolling does not change DOM ranges; only the legacy overlay needs geometry work. */
+  onScroll: () => void
   clear: () => void
   dispose: () => void
   setOverlayContainer: (el: HTMLDivElement | undefined) => void
@@ -150,10 +154,14 @@ export function createSessionTextHighlighter(): SessionTextHighlighter {
   let scrollRoot: HTMLElement | undefined
   let useOverlay = false
   let activeMessageID: string | undefined
+  let scanFrame: number | undefined
+  let scanTimer: ReturnType<typeof setTimeout> | undefined
+  let lastScanAt = 0
+  const MUTATION_SCAN_INTERVAL_MS = 50
 
   // Per-container cache: text content + ranges. Avoids re-walking shadow
   // roots and text nodes for containers whose content hasn't changed.
-  let containerCache = new Map<HTMLElement, { text: string; ranges: Range[] }>()
+  let containerCache = new Map<HTMLElement, { ranges: Range[] }>()
 
   // Cached container list — avoids querySelectorAll on every frame during
   // streaming. Invalidated when containers are added/removed (detected by
@@ -167,6 +175,8 @@ export function createSessionTextHighlighter(): SessionTextHighlighter {
   // rarely change — this avoids the delete/set flicker.
   let lastAppliedFingerprint = ""
   let activeContainer: HTMLElement | undefined
+  let rangeGeneration = 0
+  let currentRanges: Range[] = []
 
   const getContainers = (root: HTMLElement): HTMLElement[] => {
     // Fast path: reuse cached list if all elements are still in the DOM
@@ -204,12 +214,13 @@ export function createSessionTextHighlighter(): SessionTextHighlighter {
     const allRanges: Range[] = []
     const allContainers: HTMLElement[] = []
 
+    let rebuiltRanges = false
     for (const container of turnContainers) {
-      const quickText = container.textContent?.toLowerCase() ?? ""
       const cached = containerCache.get(container)
 
-      if (cached && cached.text === quickText) {
-        // Container unchanged — reuse cached ranges (no DOM walk)
+      if (cached) {
+        // Mutation invalidation is authoritative. Do not read/lowercase the
+        // entire subtree merely to prove an unchanged virtual row is unchanged.
         for (const range of cached.ranges) {
           allRanges.push(range)
           allContainers.push(container)
@@ -219,12 +230,15 @@ export function createSessionTextHighlighter(): SessionTextHighlighter {
 
       // Container changed or new — walk its text nodes
       const found = scanTurnNodes(container, needle)
-      containerCache.set(container, { text: quickText, ranges: found })
+      containerCache.set(container, { ranges: found })
+      rebuiltRanges = true
       for (const range of found) {
         allRanges.push(range)
         allContainers.push(container)
       }
     }
+    if (rebuiltRanges) rangeGeneration++
+    currentRanges = allRanges
 
     // Determine which turn contains the active match
     activeMessageID = undefined
@@ -242,7 +256,7 @@ export function createSessionTextHighlighter(): SessionTextHighlighter {
 
     // Build a fingerprint of the current state. If it matches what's already
     // painted, skip the expensive CSS.highlights delete/set entirely.
-    const fingerprint = `${allRanges.length}:${activeIndex}`
+    const fingerprint = `${rangeGeneration}:${allRanges.length}:${activeIndex}`
     if (fingerprint === lastAppliedFingerprint) return
     lastAppliedFingerprint = fingerprint
 
@@ -256,16 +270,52 @@ export function createSessionTextHighlighter(): SessionTextHighlighter {
     }
   }
 
-  const scheduleRescan = () => {
-    requestAnimationFrame(doScan)
+  const cancelScheduledScan = () => {
+    if (scanTimer !== undefined) {
+      clearTimeout(scanTimer)
+      scanTimer = undefined
+    }
+    if (scanFrame !== undefined) {
+      cancelAnimationFrame(scanFrame)
+      scanFrame = undefined
+    }
+  }
+
+  const scheduleRescan = (throttle = false) => {
+    if (scanFrame !== undefined) return
+    if (!throttle && scanTimer !== undefined) {
+      // User navigation/query changes outrank the mutation throttle. Promote a
+      // pending delayed scan to the next frame instead of making find-next wait.
+      clearTimeout(scanTimer)
+      scanTimer = undefined
+    } else if (scanTimer !== undefined) return
+    const enqueueFrame = () => {
+      scanTimer = undefined
+      if (scanFrame !== undefined) return
+      scanFrame = requestAnimationFrame(() => {
+        scanFrame = undefined
+        lastScanAt = performance.now()
+        doScan()
+      })
+    }
+    if (!throttle) {
+      enqueueFrame()
+      return
+    }
+    const wait = Math.max(0, MUTATION_SCAN_INTERVAL_MS - (performance.now() - lastScanAt))
+    if (wait === 0) enqueueFrame()
+    else scanTimer = setTimeout(enqueueFrame, wait)
   }
 
   const clearAll = () => {
+    cancelScheduledScan()
     containerCache.clear()
     cachedContainers = null
     containerGeneration = 0
     activeMessageID = undefined
     activeContainer = undefined
+    currentRanges = []
+    rangeGeneration++
     lastAppliedFingerprint = ""
     clearHighlights()
     clearOverlay()
@@ -274,7 +324,47 @@ export function createSessionTextHighlighter(): SessionTextHighlighter {
   return {
     scan(root: HTMLElement) {
       scrollRoot = root
+      if (!query) return
       scheduleRescan()
+    },
+
+    invalidate(node?: Node) {
+      // An open find bar with no query is intentionally cold. Streaming
+      // markdown can generate many mutations per second; there is nothing to
+      // invalidate or schedule until a real needle exists.
+      if (!query) return
+      if (!node) {
+        containerCache.clear()
+        cachedContainers = null
+        containerGeneration = 0
+      } else {
+        const element = node instanceof Element ? node : node.parentElement
+        const turn = element?.closest("[data-component='session-turn']")
+        if (turn instanceof HTMLElement) {
+          containerCache.delete(turn)
+        } else {
+          // A mutation outside a turn is usually the virtualizer adding/removing
+          // row containers. Re-query membership on the next scan.
+          cachedContainers = null
+          containerGeneration = 0
+        }
+      }
+      lastAppliedFingerprint = ""
+      scheduleRescan(true)
+    },
+
+    onScroll() {
+      // CSS Custom Highlight ranges are anchored to text nodes and move with
+      // normal layout/scrolling. Rewalking the transcript on every scroll event
+      // is pure waste. Only the fallback absolute-position overlay needs its
+      // rectangles recomputed.
+      if (!useOverlay || !scrollRoot || currentRanges.length === 0) return
+      if (globalOverlayFrame !== undefined) return
+      globalOverlayFrame = requestAnimationFrame(() => {
+        globalOverlayFrame = undefined
+        if (!scrollRoot || !useOverlay) return
+        renderOverlay(currentRanges, activeIndex, scrollRoot)
+      })
     },
 
     clear() {
@@ -293,8 +383,14 @@ export function createSessionTextHighlighter(): SessionTextHighlighter {
     setQuery(value: string) {
       if (query === value) return
       query = value
+      if (!query.trim()) {
+        query = ""
+        clearAll()
+        return
+      }
       // Query changed — all cached ranges are invalid (different needle)
       containerCache.clear()
+      rangeGeneration++
       lastAppliedFingerprint = ""
       if (scrollRoot) scheduleRescan()
     },
@@ -303,7 +399,7 @@ export function createSessionTextHighlighter(): SessionTextHighlighter {
       if (activeIndex === index) return
       activeIndex = index
       lastAppliedFingerprint = "" // Force re-apply
-      if (scrollRoot) scheduleRescan()
+      if (scrollRoot && query) scheduleRescan()
     },
 
     getActiveMessageID() {

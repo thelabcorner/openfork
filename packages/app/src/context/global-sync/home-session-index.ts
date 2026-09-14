@@ -33,10 +33,11 @@ export async function loadHomeSessionIndex(
   signal?: AbortSignal,
 ) {
   // Max retain: HOME_SESSION_LIMIT (64) per directory, but we don't know
-  // directory count here. Fetch at most 2 pages (10k) and early-exit once
-  // parseHomeSessionIndex already yields 500+ candidates - the retain step
-  // keeps only 64 per directory anyway. This cuts 9k scan 9331ms -> ~1800ms
-  // on 7GB DB and avoids background home fetches blocking session routes.
+  // directory count here. Start with a deliberately small 256-row probe, then
+  // fetch at most one 5k continuation page. Early-exit once the parsed index is
+  // already large enough that further background scanning is unlikely to
+  // improve the retained Home view. This keeps Home discovery from competing
+  // with active session routes on very large databases.
   const SOFT_CAP = 2_000
   const data: SessionV2Info[] = []
   let cursor: string | undefined
@@ -84,8 +85,8 @@ export function homeSessionIndexSessions(index: HomeSessionIndex | undefined, ev
     .reduce((sessions, entry) => applyHomeSessionEvent(sessions, entry.event), index.sessions)
 }
 
-export function homeSessionIndexRefresh(event: Event["type"], connected: boolean) {
-  if (event === "server.connected") return { connected: true, refetch: connected }
+export function homeSessionIndexRefresh(event: Event["type"], connected: boolean, repair = false) {
+  if (event === "server.connected") return { connected: true, refetch: repair }
   return {
     connected,
     refetch: event === "global.disposed" || event === "session.next.moved",
@@ -143,8 +144,8 @@ export function createHomeSessionIndexCache(queryClient: QueryClient, server: st
         return { ...index, sessions: index.sessions.toSpliced(at, 1) }
       })
     },
-    refresh(event: Event["type"]) {
-      const result = homeSessionIndexRefresh(event, connected)
+    refresh(event: Event["type"], repair = false) {
+      const result = homeSessionIndexRefresh(event, connected, repair)
       connected = result.connected
       if (!result.refetch) return
       void queryClient.refetchQueries({ queryKey: indexKey, exact: true, type: "active" })

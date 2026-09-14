@@ -146,6 +146,32 @@ describe("file tree store search + expand/collapse helpers", () => {
     expect(store.node("src")).toBe(before)
   })
 
+  test("identical forced refresh does not invalidate allNodes consumers", async () => {
+    const store = createRoot(() =>
+      createFileTreeStore({
+        scope: () => "/node-version",
+        schedulerKey: () => "node-version-regression",
+        normalizeDir: (input) => input,
+        list: async () => [
+          { path: "same.ts", name: "same.ts", absolute: "/node-version/same.ts", type: "file", ignored: false },
+        ],
+        onError: () => {},
+        cache: { store: new Map() },
+      }),
+    )
+
+    expect(store.nodeRevision()).toBe(0)
+    await store.listDir("")
+    expect(store.allNodes().length).toBe(1)
+    const revision = store.nodeRevision()
+    expect(revision).toBeGreaterThan(0)
+
+    await store.listDir("", { force: true })
+    expect(store.allNodes().length).toBe(1)
+    expect(store.nodeRevision()).toBe(revision)
+    store.dispose()
+  })
+
   test("bounds the live tree by dropping the coldest collapsed subtree", async () => {
     const { store } = makeStore({ cache: { maxLiveNodes: 2 } })
     await store.listDir("")
@@ -336,13 +362,37 @@ describe("per-project LRU tree cache", () => {
     expect(store.allNodes()).toEqual([])
   })
 
-  test("prewarm lists the root and shallow directories on a cold scope", async () => {
+  test("explicit prewarm is root-only", async () => {
     const { store, switchTo } = makeStore()
     switchTo("/other")
     await store.prewarm()
     expect(store.dirState("")?.loaded).toBe(true)
-    expect(store.dirState("src")?.loaded).toBe(true)
-    expect(store.dirState("src")?.children).toEqual(["src/index.ts", "src/lib"])
+    expect(store.dirState("src")?.loaded).toBeFalsy()
+  })
+
+  test("cold stores do not issue hidden prewarm requests", async () => {
+    let calls = 0
+    const store = createRoot(() =>
+      createFileTreeStore({
+        scope: () => "/idle",
+        schedulerKey: () => "idle-no-prewarm",
+        normalizeDir: (input) => input,
+        list: async () => {
+          calls++
+          return []
+        },
+        onError: () => {},
+        cache: { store: new Map() },
+      }),
+    )
+
+    // Regression: cold FileProvider mounts used to schedule a 150ms root list
+    // plus a fan-out over every top-level directory even when no tree UI was
+    // mounted. FileProvider is also used for prompt mentions, so this made the
+    // explorer do work while apparently closed.
+    await Bun.sleep(220)
+    expect(calls).toBe(0)
+    store.dispose()
   })
 
   test("a scope switch-back after watcher invalidations does not re-list", async () => {

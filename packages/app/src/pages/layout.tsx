@@ -1227,7 +1227,10 @@ export default function LegacyLayout(props: ParentProps) {
         return true
       }
       const resolved = await sync.session
-        .sync(target.id)
+        // This only resolves enough state to choose a route. The destination
+        // timeline resumes the session after navigation; activating here leaks
+        // background projection if navigation is cancelled or superseded.
+        .sync(target.id, { activate: false })
         .then(() => sync.session.get(target.id))
         .catch(() => undefined)
       if (!resolved?.directory) return false

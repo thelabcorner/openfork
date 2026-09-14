@@ -3,6 +3,7 @@ import type { Page } from "@playwright/test"
 import { mockOpenCodeServer } from "../../utils/mock-server"
 import { expectAppVisible, expectSessionTitle } from "../../utils/waits"
 import { expect } from "../benchmark"
+import { performanceBackendUrl } from "../performance-ports"
 
 const directory = "C:/OpenCode/TimelineStateRegression"
 const projectID = "proj_timeline_state_regression"
@@ -103,12 +104,14 @@ export async function setupTimelineBenchmark(
     turnDiffs?: unknown[]
   },
 ) {
+  const server = performanceBackendUrl()
   const events: EventPayload[] = []
   let eventBatch = options.eventBatch
   const currentUserMessage = options.turnDiffs
     ? { ...userMessage, info: { ...userMessage.info, summary: { diffs: options.turnDiffs } } }
     : userMessage
   await mockOpenCodeServer(page, {
+    strictBackendPort: true,
     directory,
     project: project(),
     provider: provider(),
@@ -127,6 +130,21 @@ export async function setupTimelineBenchmark(
   })
   await page.addInitScript(
     (input) => {
+      // Production builds intentionally default to location.origin. The
+      // performance harness must explicitly select the mocked OpenCode backend
+      // or it can appear healthy while exercising same-origin API mocks on the
+      // Vite frontend port instead of the backend-port contract under test.
+      localStorage.setItem("opencode.settings.dat:defaultServerUrl", input.server)
+      // The production web entry still registers location.origin as its built-in
+      // connection. Selecting a different default key without also registering
+      // that connection leaves PermissionProvider with an active key that does
+      // not exist in global.servers.list(). Seed the persisted connection list
+      // exactly as a user-added remote/local HTTP server would be stored.
+      localStorage.setItem(
+        "opencode.global.dat:server",
+        JSON.stringify({ list: [input.server], projects: {}, lastProject: {}, recentlyClosed: {} }),
+      )
+      localStorage.setItem("opencode:phase-trace", "1")
       localStorage.setItem(
         "settings.v3",
         JSON.stringify({
@@ -139,7 +157,7 @@ export async function setupTimelineBenchmark(
         }),
       )
     },
-    { newLayoutDesigns: options.newLayoutDesigns ?? false },
+    { newLayoutDesigns: options.newLayoutDesigns ?? false, server },
   )
   await page.setViewportSize({ width: 1366, height: 768 })
   const scroller = page.locator(".scroll-view__viewport", { has: page.locator("[data-timeline-row]") })
@@ -147,6 +165,9 @@ export async function setupTimelineBenchmark(
   await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
   await expectSessionTitle(page, title)
   await expectAppVisible(scroller)
+  await expect
+    .poll(() => page.url(), { message: "timeline benchmark must resolve through the configured mocked backend" })
+    .toContain(`/server/${base64Encode(server)}/session/${sessionID}`)
   return {
     scroller,
     text,
@@ -162,9 +183,16 @@ export async function setupTimelineBenchmark(
       },
     },
     async scrollToBottom() {
-      await scroller.evaluate((element) => {
-        element.scrollTop = element.scrollHeight
-      })
+      const distance = await scroller.evaluate((element) => element.scrollHeight - element.clientHeight - element.scrollTop)
+      if (distance <= 1) return
+
+      // Enter follow mode through the product-owned scroll coordinator. A raw
+      // `element.scrollTop = scrollHeight` bypasses the virtualizer's
+      // `markProgrammatic()` seam, so measurement corrections can be mistaken
+      // for a user escape and permanently disable bottom anchoring.
+      const jump = page.getByRole("button", { name: "Jump to latest" }).first()
+      await expect(jump).toBeVisible()
+      await jump.click()
     },
     async waitForStableGeometry() {
       await expect

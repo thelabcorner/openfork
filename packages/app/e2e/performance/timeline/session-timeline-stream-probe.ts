@@ -45,6 +45,31 @@ type TimelineProbeState = {
     height: number
     distance: number
   }[]
+  markdown: {
+    effects: number
+    effectMs: number
+    effectMaxMs: number
+    blocks: number
+    blockMs: number
+    blockMaxMs: number
+    innerHTMLMs: number
+    decorateMs: number
+    morphMs: number
+    codeMs: number
+    sanitizeCalls: number
+    sanitizeMs: number
+    sanitizeMaxMs: number
+    workerRequests: number
+    workerMs: number
+    workerComputeMs: number
+    workerInternalQueueMs: number
+    workerDispatchWaitMs: number
+    workerResponseWaitMs: number
+    workerMaxMs: number
+    parseIncremental: number
+    parseFull: number
+    workerByKind: Record<string, number>
+  }
   scroll: {
     calls: number
     callNoops: number
@@ -55,7 +80,7 @@ type TimelineProbeState = {
     frame: number
   }
   row: HTMLElement
-  markdown: HTMLElement
+  markdownNode: HTMLElement
   running: boolean
   previous: number
   cleanup: () => void
@@ -105,6 +130,31 @@ export async function installTimelineStreamProbe(
         maxPartTopMovement: 0,
         previousPartTop: part.getBoundingClientRect().top,
         slowFrames: [],
+        markdown: {
+          effects: 0,
+          effectMs: 0,
+          effectMaxMs: 0,
+          blocks: 0,
+          blockMs: 0,
+          blockMaxMs: 0,
+          innerHTMLMs: 0,
+          decorateMs: 0,
+          morphMs: 0,
+          codeMs: 0,
+          sanitizeCalls: 0,
+          sanitizeMs: 0,
+          sanitizeMaxMs: 0,
+          workerRequests: 0,
+          workerMs: 0,
+          workerComputeMs: 0,
+          workerInternalQueueMs: 0,
+          workerDispatchWaitMs: 0,
+          workerResponseWaitMs: 0,
+          workerMaxMs: 0,
+          parseIncremental: 0,
+          parseFull: 0,
+          workerByKind: {},
+        },
         scroll: {
           calls: 0,
           callNoops: 0,
@@ -115,13 +165,84 @@ export async function installTimelineStreamProbe(
           frame: 0,
         },
         row,
-        markdown,
+        markdownNode: markdown,
         running: false,
         previous: 0,
         cleanup: () => {},
         start: () => {},
       }
       ;(window as Window & { __timelineStreamBenchmark?: TimelineProbeState }).__timelineStreamBenchmark = state
+      type ProbeMarkdownTraceEvent =
+        | { phase: "effect"; ms: number }
+        | {
+            phase: "block"
+            ms: number
+            innerHTMLMs?: number
+            decorateMs?: number
+            morphMs?: number
+            codeMs?: number
+          }
+        | { phase: "sanitize"; ms: number }
+        | {
+            phase: "worker"
+            kind: "parse" | "project" | "highlight"
+            status: "ok" | "superseded" | "error" | "disposed"
+            ms: number
+            workerMs?: number
+            workerQueueMs?: number
+            dispatchWaitMs?: number
+            responseWaitMs?: number
+            incremental?: boolean
+          }
+        | { phase: "paced" }
+      const traceTarget = window as Window & {
+        __opencodeMarkdownTrace?: (event: ProbeMarkdownTraceEvent) => void
+        __opencodeMarkdownTraceEnabled?: () => boolean
+      }
+      const previousMarkdownTrace = traceTarget.__opencodeMarkdownTrace
+      const previousMarkdownTraceEnabled = traceTarget.__opencodeMarkdownTraceEnabled
+      traceTarget.__opencodeMarkdownTraceEnabled = () => true
+      traceTarget.__opencodeMarkdownTrace = (event) => {
+        previousMarkdownTrace?.(event)
+        if (!state.running) return
+        const markdown = state.markdown
+        if (event.phase === "effect") {
+          markdown.effects += 1
+          markdown.effectMs += event.ms
+          markdown.effectMaxMs = Math.max(markdown.effectMaxMs, event.ms)
+          return
+        }
+        if (event.phase === "block") {
+          markdown.blocks += 1
+          markdown.blockMs += event.ms
+          markdown.blockMaxMs = Math.max(markdown.blockMaxMs, event.ms)
+          markdown.innerHTMLMs += event.innerHTMLMs ?? 0
+          markdown.decorateMs += event.decorateMs ?? 0
+          markdown.morphMs += event.morphMs ?? 0
+          markdown.codeMs += event.codeMs ?? 0
+          return
+        }
+        if (event.phase === "sanitize") {
+          markdown.sanitizeCalls += 1
+          markdown.sanitizeMs += event.ms
+          markdown.sanitizeMaxMs = Math.max(markdown.sanitizeMaxMs, event.ms)
+          return
+        }
+        if (event.phase !== "worker") return
+        markdown.workerRequests += 1
+        markdown.workerMs += event.ms
+        markdown.workerComputeMs += event.workerMs ?? 0
+        markdown.workerInternalQueueMs += event.workerQueueMs ?? 0
+        markdown.workerDispatchWaitMs += event.dispatchWaitMs ?? 0
+        markdown.workerResponseWaitMs += event.responseWaitMs ?? 0
+        markdown.workerMaxMs = Math.max(markdown.workerMaxMs, event.ms)
+        const key = `${event.kind}.${event.status}`
+        markdown.workerByKind[key] = (markdown.workerByKind[key] ?? 0) + 1
+        if (event.kind === "parse" && event.status === "ok") {
+          if (event.incremental) markdown.parseIncremental += 1
+          else markdown.parseFull += 1
+        }
+      }
       const scrollTo = Element.prototype.scrollTo
       const scrollTop = Object.getOwnPropertyDescriptor(Element.prototype, "scrollTop")!
       if (profileVisual) {
@@ -258,6 +379,10 @@ export async function installTimelineStreamProbe(
         layoutShiftObserver?.disconnect()
         mutationObserver?.disconnect()
         progressObserver.disconnect()
+        if (previousMarkdownTrace) traceTarget.__opencodeMarkdownTrace = previousMarkdownTrace
+        else delete traceTarget.__opencodeMarkdownTrace
+        if (previousMarkdownTraceEnabled) traceTarget.__opencodeMarkdownTraceEnabled = previousMarkdownTraceEnabled
+        else delete traceTarget.__opencodeMarkdownTraceEnabled
         if (!profileVisual) return
         Element.prototype.scrollTo = scrollTo
         Object.defineProperty(Element.prototype, "scrollTop", scrollTop)
@@ -436,7 +561,7 @@ export async function collectTimelineStreamMetrics(
     state.running = false
     const part = document.querySelector<HTMLElement>(`[data-timeline-part-id="${textPartID}"]`)
     const row = part?.closest<HTMLElement>("[data-timeline-row]")
-    const markdown = part?.querySelector<HTMLElement>('[data-component="markdown"]')
+    const markdownNode = part?.querySelector<HTMLElement>('[data-component="markdown"]')
     const sorted = state.frames.slice().sort((a, b) => a - b)
     const duration = state.frames.reduce((sum, value) => sum + value, 0)
     const longestSlowStreak = state.frames.reduce(
@@ -498,6 +623,18 @@ export async function collectTimelineStreamMetrics(
           scroll: state.scroll,
         }
       : null
+    const parseTotal = state.markdown.parseIncremental + state.markdown.parseFull
+    const markdownMetrics = {
+      ...state.markdown,
+      parseIncrementalRatio: parseTotal ? state.markdown.parseIncremental / parseTotal : null,
+      workerAverageMs: state.markdown.workerRequests ? state.markdown.workerMs / state.markdown.workerRequests : null,
+      workerAverageComputeMs: state.markdown.workerRequests
+        ? state.markdown.workerComputeMs / state.markdown.workerRequests
+        : null,
+      workerAverageInternalQueueMs: state.markdown.workerRequests
+        ? state.markdown.workerInternalQueueMs / state.markdown.workerRequests
+        : null,
+    }
     const geometry = state.minimal
       ? null
       : {
@@ -537,10 +674,11 @@ export async function collectTimelineStreamMetrics(
       longestRafGapOver33MsStreak: longestSlowStreak,
       longTaskCount: state.longTasks.length,
       longTaskTimeMs: state.longTasks.reduce((sum, value) => sum + value, 0),
+      markdown: markdownMetrics,
       visual,
       geometry,
       rowReplaced: row !== state.row,
-      markdownReplaced: markdown !== state.markdown,
+      markdownReplaced: markdownNode !== state.markdownNode,
       domTextCharacters: part?.textContent?.length ?? 0,
     }
   }, options)

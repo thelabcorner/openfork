@@ -1,6 +1,6 @@
 import { HoverCard as Kobalte } from "@kobalte/core/hover-card"
 import { createMemo, createSignal, For, Show, startTransition, type JSXElement } from "solid-js"
-import { useGlobal } from "@/context/global"
+import type { ServerCtx } from "@/context/global"
 import { useLanguage } from "@/context/language"
 import { ServerConnection } from "@/context/server"
 import { tabKey, useTabs } from "@/context/tabs"
@@ -19,7 +19,12 @@ const CLOSE_DELAY = 140
 // the open delay — mirrors the tooltip's skipDelayDuration so moving across
 // tabs doesn't re-wait the full delay each time.
 const SKIP_WINDOW = 500
+export const GROUP_PREVIEW_PAGE = 80
+export const TAB_PREVIEW_RESOLVE_CONCURRENCY = 4
 let lastClosedAt = 0
+// One global preview lane is deliberate: rapidly sweeping across several tabs
+// must not multiply metadata hydration concurrency by 4 per popover instance.
+const previewResolveGate = createRequestGate(TAB_PREVIEW_RESOLVE_CONCURRENCY)
 
 export interface TabPreviewGroupSession {
   id: string
@@ -56,9 +61,9 @@ export function TabPreviewPopover(props: {
   onOpenChange: (open: boolean) => void
   data: TabPreviewData
   server?: ServerConnection.Key
+  serverCtx?: () => ServerCtx | undefined
   currentSessionID?: string
 }) {
-  const global = useGlobal()
   const language = useLanguage()
   const tabs = useTabs()
   let triggerEl: HTMLDivElement | undefined
@@ -70,26 +75,37 @@ export function TabPreviewPopover(props: {
   const [instant, setInstant] = createSignal(false)
   const [contextMenuOpen, setContextMenuOpen] = createSignal(false)
 
-  const serverCtx = createMemo(() => {
-    if (!props.server) return undefined
-    const conn = global.servers.list().find((item) => ServerConnection.key(item) === props.server)
-    return conn ? global.ensureServerCtx(conn) : undefined
-  })
+  const serverCtx = () => props.serverCtx?.()
 
   const interactive = createMemo(() => !!props.server && (props.data.groupSessions?.length ?? 0) > 0)
-  const resolveGate = createRequestGate(4)
   const resolving = new Set<string>()
   const resolveFailedAt = new Map<string, number>()
+  const [visibleLimit, setVisibleLimit] = createSignal(GROUP_PREVIEW_PAGE)
+  const visibleGroupSessions = createMemo(() => (props.data.groupSessions ?? []).slice(0, visibleLimit()))
+  const hiddenGroupSessions = createMemo(() => Math.max(0, (props.data.groupSessions?.length ?? 0) - visibleGroupSessions().length))
+  const openSessionIDs = createMemo(() => {
+    const server = props.server
+    if (!server) return new Set<string>()
+    const ids = new Set<string>()
+    for (const tab of tabs.store) {
+      if (tab.type === "session" && tab.server === server) ids.add(tab.sessionId)
+    }
+    return ids
+  })
+  const projects = createMemo(() => serverCtx()?.projects.list() ?? [])
+  const projectsByID = createMemo(
+    () => new Map(projects().flatMap((project) => (project.id ? [[project.id, project] as const] : []))),
+  )
 
-  const hydrateGroupSessions = () => {
+  const hydrateGroupSessions = (members = visibleGroupSessions()) => {
     const ctx = serverCtx()
     if (!ctx) return
-    for (const member of props.data.groupSessions ?? []) {
+    for (const member of members) {
       if (ctx.sync.session.peek(member.id) || resolving.has(member.id)) continue
       const failedAt = resolveFailedAt.get(member.id)
       if (failedAt !== undefined && Date.now() - failedAt < 30_000) continue
       resolving.add(member.id)
-      void resolveGate(() => ctx.sync.session.resolve(member.id))
+      void previewResolveGate(() => ctx.sync.session.resolve(member.id))
         .then(
           () => resolveFailedAt.delete(member.id),
           () => resolveFailedAt.set(member.id, Date.now()),
@@ -112,6 +128,7 @@ export function TabPreviewPopover(props: {
       hydrateGroupSessions()
     } else {
       lastClosedAt = Date.now()
+      setVisibleLimit(GROUP_PREVIEW_PAGE)
     }
     props.onOpenChange(open)
   }
@@ -152,9 +169,8 @@ export function TabPreviewPopover(props: {
   const fullSession = (sessionID: string) => serverCtx()?.sync.session.peek(sessionID)
   const memberProject = (sessionID: string, fallback?: string) => {
     const session = fullSession(sessionID)
-    const ctx = serverCtx()
-    if (!session || !ctx) return fallback
-    const project = projectForSession(session, ctx.projects.list())
+    if (!session) return fallback
+    const project = projectForSession(session, projects(), projectsByID())
     return project ? displayName(project) : displayName({ worktree: session.directory })
   }
   const memberTabID = (sessionID: string) => {
@@ -163,9 +179,15 @@ export function TabPreviewPopover(props: {
     return tabKey({ type: "session", server, sessionId: sessionID })
   }
   const memberTabOpen = (sessionID: string) => {
-    const server = props.server
-    if (!server) return false
-    return tabs.store.some((tab) => tab.type === "session" && tab.server === server && tab.sessionId === sessionID)
+    return openSessionIDs().has(sessionID)
+  }
+
+  const showMoreGroupSessions = () => {
+    const current = visibleLimit()
+    const next = Math.min((props.data.groupSessions?.length ?? 0), current + GROUP_PREVIEW_PAGE)
+    if (next <= current) return
+    setVisibleLimit(next)
+    hydrateGroupSessions((props.data.groupSessions ?? []).slice(current, next))
   }
 
   const moveGroupFocus = (event: KeyboardEvent & { currentTarget: HTMLButtonElement }) => {
@@ -202,7 +224,7 @@ export function TabPreviewPopover(props: {
         as="div"
         data-component="session-tab-popover-trigger"
         tabIndex={-1}
-        onPointerEnter={hydrateGroupSessions}
+        onPointerEnter={() => hydrateGroupSessions()}
       >
         {props.trigger}
       </Kobalte.Trigger>
@@ -238,9 +260,9 @@ export function TabPreviewPopover(props: {
             <div data-slot="server">{props.data.serverName}</div>
           </Show>
 
-          <Show when={props.data.groupSessions?.length}>
-            <div data-slot="group-sessions" role="group" aria-label={language.t("groupTab.switchSessions")}>
-              <For each={props.data.groupSessions}>
+           <Show when={props.data.groupSessions?.length}>
+             <div data-slot="group-sessions" role="group" aria-label={language.t("groupTab.switchSessions")}>
+               <For each={visibleGroupSessions()}>
                 {(member) => {
                   const session = () => fullSession(member.id)
                   const state = () => tabSessionState(serverCtx(), member.id)
@@ -256,7 +278,7 @@ export function TabPreviewPopover(props: {
                       data-session-state={state()}
                       aria-current={current() ? "page" : undefined}
                       title={member.title}
-                      onPointerEnter={hydrateGroupSessions}
+                      onPointerEnter={() => hydrateGroupSessions()}
                       onClick={(event) => {
                         event.preventDefault()
                         event.stopPropagation()
@@ -305,9 +327,14 @@ export function TabPreviewPopover(props: {
                       )}
                     </Show>
                   )
-                }}
-              </For>
-            </div>
+                 }}
+               </For>
+               <Show when={hiddenGroupSessions() > 0}>
+                 <button type="button" data-slot="group-session-more" onClick={showMoreGroupSessions}>
+                   {language.t("common.loadMore")} ({Math.min(GROUP_PREVIEW_PAGE, hiddenGroupSessions())})
+                 </button>
+               </Show>
+             </div>
             <Show when={(props.data.groupSessions?.length ?? 0) > 1}>
               <div data-slot="group-session-hint">{language.t("groupTab.keyboardHint")}</div>
             </Show>

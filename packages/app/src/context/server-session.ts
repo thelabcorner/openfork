@@ -1,6 +1,7 @@
 import { Binary } from "@opencode-ai/core/util/binary"
 import { retry } from "@opencode-ai/core/util/retry"
 import type { OpenCodeEvent, SessionApi, SessionMessageInfo } from "@opencode-ai/client/promise"
+import type * as SessionEvent from "@opencode-ai/schema/session-event"
 import type {
   Message,
   OpencodeClient,
@@ -19,12 +20,25 @@ import { sessionNotFoundError } from "@/utils/server-errors"
 import { rootSession } from "@/utils/session-route"
 import { normalizeSessionInfo } from "@/utils/session"
 import { createRequestGate } from "@/utils/request-gate"
-import { compareMessages, messageKey, normalizeSessionMessages } from "@/utils/session-message"
-import { dropSessionCaches, pickSessionCacheEvictions, SESSION_CACHE_LIMIT } from "./global-sync/session-cache"
+import {
+  compareMessages,
+  messageKey,
+  normalizeSessionAssistantContentPart,
+  normalizeSessionMessages,
+} from "@/utils/session-message"
+import {
+  dropSessionCaches,
+  estimateSessionCacheBytes,
+  pickSessionCacheEvictions,
+  SESSION_CACHE_BYTE_LIMIT,
+  SESSION_CACHE_LIMIT,
+} from "./global-sync/session-cache"
 import { createV2SessionReducer, type V2SessionReduction } from "./server-session-v2-reducer"
 import type { ServerApi } from "@/utils/server"
+import { isSessionStreamContentEvent } from "@/utils/session-stream-content"
 
 type MessageApi = ServerApi["message"]
+type SessionStreamEvent = OpenCodeEvent | typeof SessionEvent.All.Encoded
 
 const cmp = (a: string, b: string) => (a < b ? -1 : a > b ? 1 : 0)
 const SKIP_PARTS = new Set(["patch", "step-start", "step-finish"])
@@ -256,13 +270,6 @@ export function createServerSession(
   // resolves that background status (see `prefetch` and `release`/`resume`).
   const activated = new Set<string>()
   const stale = new Set<string>()
-  const v1ContentEvents = new Set([
-    "message.updated",
-    "message.removed",
-    "message.part.updated",
-    "message.part.removed",
-    "message.part.delta",
-  ])
   const deleteMessageParts = (
     cache: { part: Record<string, Part[] | undefined>; part_text_accum_delta: Record<string, string | undefined> },
     messageID: string,
@@ -276,6 +283,10 @@ export function createServerSession(
   const seen = new Set<string>()
   const infoSeen = new Set<string>()
   const pinned = new Map<string, number>()
+  // Updated only at cache/background lifecycle boundaries. Per-token stream
+  // events reuse the cached weight so byte-aware eviction adds no hot-path
+  // history walk or JSON serialization.
+  const cacheBytes = new Map<string, number>()
   const generations = new Map<string, object>()
   const generation = (sessionID: string) => {
     const current = generations.get(sessionID)
@@ -529,6 +540,7 @@ export function createServerSession(
       if (evicted.has(item.sessionID)) deltaBases.delete(partID)
     }
     sessionIDs.forEach((sessionID) => {
+      cacheBytes.delete(sessionID)
       generations.delete(sessionID)
       clearOptimistic(sessionID)
       requests.delete(sessionID)
@@ -580,9 +592,20 @@ export function createServerSession(
         .map(([sessionID]) => sessionID),
     ])
 
+  const refreshCacheBytes = (sessionID: string) => {
+    cacheBytes.set(sessionID, estimateSessionCacheBytes(data, sessionID))
+  }
+
   const touch = (sessionID: string) =>
     evict(
-      pickSessionCacheEvictions({ seen, keep: sessionID, limit: SESSION_CACHE_LIMIT, preserve: protectedSessions() }),
+      pickSessionCacheEvictions({
+        seen,
+        keep: sessionID,
+        limit: SESSION_CACHE_LIMIT,
+        preserve: protectedSessions(),
+        weights: cacheBytes,
+        maxBytes: SESSION_CACHE_BYTE_LIMIT,
+      }),
     )
 
   const fetchMessages = async (sessionID: string, limit: number, before?: string, onAttempt?: () => void) => {
@@ -680,8 +703,15 @@ export function createServerSession(
       const fetchedIDs = new Set(fetched.map((part) => part.id))
       const pending = pendingParts.get(sessionID)?.get(item.id)
       const touched = new Set([...(load?.touchedParts.get(item.id) ?? []), ...(pending ?? [])])
+      const currentParts = data.part[item.id] ?? []
       for (const part of fetched) {
-        const accumulated = data.part_text_accum_delta[part.id]
+        const existingResult = Binary.search(currentParts, part.id, (value) => value.id)
+        const existing = existingResult.found ? currentParts[existingResult.index] : undefined
+        // The canonical Part is already updated on every live delta. Reading
+        // that value here avoids retaining a second growing full-text copy in
+        // part_text_accum_delta solely for hydration reconciliation.
+        const accumulated =
+          existing && "text" in existing && typeof existing.text === "string" ? existing.text : undefined
         const base = deltaBases.get(part.id)?.base
         const preserveDelta =
           base !== undefined &&
@@ -767,7 +797,14 @@ export function createServerSession(
       compare: compareMessages,
     })
     batch(() => {
-      if (source) setData("session_message", sessionID, reconcile(source))
+      if (source) {
+        setData("session_message", sessionID, reconcile(source))
+        // HTTP hydration can replace message/content structure without passing
+        // through the V2 reducer. Invalidate its positional stream index once at
+        // this authoritative boundary so steady-state deltas can trust it without
+        // rescanning every assistant content block per token.
+        v2.invalidate(sessionID)
+      }
       const messageIDs = replaceMessages(sessionID, messages)
       replaceParts(sessionID, merged.part, messageIDs, load)
       const orphans = orphanParts.get(sessionID)
@@ -888,49 +925,153 @@ export function createServerSession(
     }
   }
 
-  const sync = (sessionID: string, options?: { force?: boolean; messageLimit?: number }) => {
+  const sync = async (
+    sessionID: string,
+    options?: { force?: boolean; messageLimit?: number; activate?: boolean },
+  ) => {
     touch(sessionID)
-    resume(sessionID)
-    return runInflight(inflight, sessionID, () =>
-      gated(async () => {
-        const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
-        if (cached && data.info[sessionID] && !options?.force) return
-        await Promise.all([
-          resolve(sessionID, options),
-          cached && !options?.force
-            ? Promise.resolve()
-            : loadMessages(sessionID, options?.messageLimit ?? meta.limit[sessionID] ?? initialMessagePageSize),
-        ])
-        stale.delete(sessionID)
-      }),
-    )
+    // Fetching/hydrating a session is not the same lifecycle fact as showing
+    // its timeline. Several background consumers (tab-strip warmup, parent
+    // context, pre-navigation resolution) need the cache but must not leave the
+    // session reducing every subsequent content delta forever. Foreground
+    // timeline ownership is explicit via resume()/release() in timeline/model.
+    //
+    // Preserve the historical default for callers that have not opted into the
+    // split yet. A background sync only marks the session suspended when no
+    // foreground owner has already activated it, so a late background request
+    // can never deactivate a visible timeline.
+    if (options?.activate === false) {
+      if (!activated.has(sessionID)) suspended.add(sessionID)
+    } else {
+      resume(sessionID)
+    }
+    const foreground = options?.activate !== false
+    let force = options?.force === true
+
+    // A foreground repair is stronger than an ordinary cache sync. If another
+    // operation (prefetch/history/background sync) already owns this session's
+    // lane, join it first, then re-check stale and run an authoritative latest
+    // page replacement if necessary. This prevents a route activation from
+    // mistaking an older in-flight request for the post-gap repair it needs.
+    while (true) {
+      const pending = inflight.get(sessionID)
+      if (pending) {
+        await pending
+        if (!foreground || !activated.has(sessionID) || !stale.has(sessionID)) return
+        force = true
+        continue
+      }
+
+      await runInflight(inflight, sessionID, () =>
+        gated(async () => {
+          const repairing = foreground && activated.has(sessionID) && stale.has(sessionID)
+          const effectiveForce = force || repairing
+          const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
+          if (cached && data.info[sessionID] && !effectiveForce) return
+
+          const messagePromise =
+            cached && !effectiveForce
+              ? Promise.resolve()
+              : loadMessages(sessionID, options?.messageLimit ?? meta.limit[sessionID] ?? initialMessagePageSize)
+
+          if (repairing && messageLoads.has(sessionID) && activated.has(sessionID)) {
+            // loadMessages installs its reconciliation state synchronously before
+            // its first await. From this point onward live deltas are safe: they
+            // are recorded as touched/delta parts and merged over the fetched
+            // base when the replacement page commits.
+            suspended.delete(sessionID)
+          }
+
+          await Promise.all([resolve(sessionID, effectiveForce ? { ...options, force: true } : options), messagePromise])
+
+          if (repairing) stale.delete(sessionID)
+          if (activated.has(sessionID) && !stale.has(sessionID)) suspended.delete(sessionID)
+        }),
+      )
+
+      if (!foreground || !activated.has(sessionID) || !stale.has(sessionID)) return
+      force = true
+    }
   }
 
   const release = (sessionID: string) => {
     activated.delete(sessionID)
     suspended.add(sessionID)
+    refreshCacheBytes(sessionID)
+    touch(sessionID)
   }
 
   // Timeline activity is a local lifecycle fact, not a network-sync fact.
   // Keep this synchronous and allocation-free so cache-first navigation can
-  // reactivate streaming without paying for (or joining) an HTTP request.
+  // reactivate streaming without paying for (or joining) an HTTP request. A
+  // stale session is the exception: it already dropped one or more content
+  // events while suspended, so admitting new deltas before hydration can splice
+  // them onto the wrong text/tool state. Keep it gated until sync() clears stale.
   const resume = (sessionID: string) => {
     activated.add(sessionID)
-    suspended.delete(sessionID)
+    if (stale.has(sessionID)) suspended.add(sessionID)
+    else suspended.delete(sessionID)
+  }
+
+  // Called by the SSE reader before it allocates/enqueues a high-frequency
+  // content delta. Background sessions do not need token fragments in the
+  // renderer, but a cached session must remember that content was missed so a
+  // later foreground activation performs authoritative repair. Unknown sessions
+  // need no tombstone: they have no local content to invalidate and will hydrate
+  // from scratch if opened later.
+  const acceptStreamContent = (sessionID: string) => {
+    // `resume()` can mark a stale session foreground before sync() has installed
+    // its reconciliation state. Do not pay renderer queue/emitter/reducer cost
+    // for those deltas yet: once loadMessages installs MessageLoadState it
+    // clears `suspended` synchronously (above), at which point admission is safe.
+    if (activated.has(sessionID) && !suspended.has(sessionID)) return true
+    const cached =
+      data.session_message[sessionID] !== undefined ||
+      data.message[sessionID] !== undefined ||
+      messageLoads.has(sessionID)
+    if (cached) {
+      suspended.add(sessionID)
+      stale.add(sessionID)
+    }
+    return false
+  }
+
+  const invalidateStreamContent = (sessionID: string, repair = true) => {
+    const cached =
+      data.session_message[sessionID] !== undefined ||
+      data.message[sessionID] !== undefined ||
+      messageLoads.has(sessionID)
+    if (!cached) return
+    suspended.add(sessionID)
+    stale.add(sessionID)
+    if (!repair || !activated.has(sessionID)) return
+    // Renderer queue loss is session-local. Repair only the affected active
+    // timeline and keep subsequent content gated until its authoritative page
+    // replacement has installed reconciliation state.
+    void sync(sessionID, { force: true, activate: true }).catch(() => {})
   }
 
   const prefetch = async (sessionID: string, limit: number) => {
     touch(sessionID)
+    // Prefetch is explicitly background work. Gate content before waiting for
+    // any existing request or starting a new one; otherwise an inactive tab can
+    // spend the whole fetch window reducing token deltas it will not display.
+    if (!activated.has(sessionID)) suspended.add(sessionID)
     await inflight.get(sessionID)
     if (
       Date.now() - (meta.at[sessionID] ?? 0) <= 15_000 &&
       (meta.complete[sessionID] || (data.message[sessionID]?.length ?? 0) >= limit)
     ) {
       if (!activated.has(sessionID)) suspended.add(sessionID)
+      if (!activated.has(sessionID)) refreshCacheBytes(sessionID)
       return
     }
     await runInflight(inflight, sessionID, () => loadMessages(sessionID, limit))
-    if (!activated.has(sessionID)) suspended.add(sessionID)
+    if (!activated.has(sessionID)) {
+      suspended.add(sessionID)
+      refreshCacheBytes(sessionID)
+      touch(sessionID)
+    }
   }
 
   const eventSessionID = (event: { type: string; properties?: unknown }) => {
@@ -958,35 +1099,65 @@ export function createServerSession(
   const projectV2 = (reduction: V2SessionReduction) => {
     reduction.touched.forEach((messageID) => messageLoads.get(reduction.sessionID)?.touchedSource.add(messageID))
 
+    // Control/metadata events explicitly declare that the message projection is
+    // unchanged. Do not materialize history, reconcile Solid state, or disturb
+    // the reducer's positional stream index for them.
+    if (reduction.kind === "unchanged") return
+
     const incremental = reduction.incremental
     const current = data.session_message[reduction.sessionID]
-    if (
-      incremental &&
-      current?.[incremental.index]?.id === incremental.message.id
-    ) {
-      // Streaming deltas only replace one message and one normalized part.
-      // Avoid reconciling and re-normalizing the complete history on every
-      // token; the full path below remains the recovery path when hydration
-      // changed the message layout underneath us.
-      setData("session_message", reduction.sessionID, incremental.index, incremental.message)
-      if (incremental.parent && incremental.partID) {
-        const normalized = normalizeSessionMessages(reduction.sessionID, [incremental.parent, incremental.message])
-        const message = normalized.messages.find((item) => item.id === incremental.message.id)
-        const part = normalized.parts.get(incremental.message.id)?.find((item) => item.id === incremental.partID)
-        batch(() => {
-          if (message) apply({ type: "message.updated", properties: { sessionID: reduction.sessionID, info: message } })
-          if (part) apply({ type: "message.part.updated", properties: { sessionID: reduction.sessionID, part } })
-        })
+    if (incremental?.kind === "assistant-content") {
+      const message = current?.[incremental.index]
+      const existing = message?.type === "assistant" ? message.content[incremental.partIndex] : undefined
+      const layoutMatches =
+        message?.type === "assistant" &&
+        message.id === incremental.messageID &&
+        existing?.type === incremental.content.type &&
+        (incremental.content.type !== "tool" ||
+          (existing.type === "tool" && existing.id === incremental.content.id))
+      if (layoutMatches) {
+        const part = normalizeSessionAssistantContentPart(
+          reduction.sessionID,
+          message,
+          incremental.content,
+          incremental.partID,
+        )
+        // Mutate only the changed raw content slot. The reducer already proved
+        // its location, so copying the complete session-message array and the
+        // assistant's complete content array per token would defeat the index.
+        setData(
+          produce((draft) => {
+            const target = draft.session_message[reduction.sessionID]?.[incremental.index]
+            if (!target || target.type !== "assistant") return
+            target.content[incremental.partIndex] = incremental.content
+          }),
+        )
+        // Indexed streaming reductions (text/reasoning/tool-input deltas) only
+        // mutate assistant content. Their legacy Message projection contains
+        // metadata only (model, agent, time, cost, tokens, finish), so emitting
+        // message.updated here is a no-op semantically but a very expensive
+        // reactive invalidation: it rebuilds timeline message maps/grouping and
+        // blows row-estimation caches once per token. Lifecycle events that can
+        // change Message metadata use the full reduction path below.
+        if (part) apply({ type: "message.part.updated", properties: { sessionID: reduction.sessionID, part } })
+        return
       }
+    } else if (incremental?.kind === "message" && current?.[incremental.index]?.id === incremental.message.id) {
+      setData("session_message", reduction.sessionID, incremental.index, incremental.message)
       return
     }
 
-    setData("session_message", reduction.sessionID, reconcile(reduction.messages))
+    // An indexed delta can fall back here if hydration changed the layout under
+    // it. The reconciled source is then authoritative, so force the next delta
+    // to rebuild positional indexes from that source.
+    if (incremental) v2.invalidate(reduction.sessionID)
+    const messages = reduction.messages
+    setData("session_message", reduction.sessionID, reconcile(messages))
     if (reduction.touched.length === 0) return
 
     const touched = new Set(reduction.touched)
     let parentID: string | undefined
-    for (const message of reduction.messages) {
+    for (const message of messages) {
       if (message.type === "user" || (message.type === "synthetic" && message.description?.trim()))
         parentID = message.id
       if (message.type === "shell") {
@@ -997,7 +1168,7 @@ export function createServerSession(
       if (message.type === "compaction" && touched.has(message.id) && parentID) touched.add(parentID)
     }
 
-    const normalized = normalizeSessionMessages(reduction.sessionID, reduction.messages)
+    const normalized = normalizeSessionMessages(reduction.sessionID, messages)
     batch(() => {
       for (const message of normalized.messages) {
         if (!touched.has(message.id)) continue
@@ -1027,12 +1198,12 @@ export function createServerSession(
       .then((message) => {
         const current = data.session_message[sessionID] ?? []
         const messages = [...current.filter((item) => item.id !== message.id), message].sort(compareMessages)
-        projectV2({ sessionID, messages, touched: [message.id] })
+        projectV2({ kind: "messages", sessionID, messages, touched: [message.id] })
       })
       .catch(() => {})
   }
 
-  const applyV2 = (event: OpenCodeEvent) => {
+  const applyV2 = (event: SessionStreamEvent) => {
     if (!("data" in event) || !("sessionID" in event.data) || typeof event.data.sessionID !== "string") return
     const sessionID = event.data.sessionID
     // Keep inactive streaming sessions lightweight. Their status and metadata
@@ -1040,19 +1211,7 @@ export function createServerSession(
     // on activation. Reducing every delta for every open session makes the
     // shared store do O(streams * deltas) work even when the timeline is hidden.
     const loaded = data.session_message[sessionID] !== undefined || data.message[sessionID] !== undefined
-    const contentEvent =
-      event.type.startsWith("session.input.") ||
-      event.type.startsWith("session.text.") ||
-      event.type.startsWith("session.reasoning.") ||
-      event.type.startsWith("session.tool.") ||
-      event.type.startsWith("session.shell.") ||
-      event.type === "session.agent.selected" ||
-      event.type === "session.model.selected" ||
-      event.type === "session.synthetic" ||
-      event.type === "session.skill.activated" ||
-      event.type === "session.step.started" ||
-      event.type === "session.step.ended" ||
-      event.type === "session.step.failed"
+    const contentEvent = isSessionStreamContentEvent(event.type)
     if (suspended.has(sessionID) && contentEvent) {
       stale.add(sessionID)
       return
@@ -1067,12 +1226,26 @@ export function createServerSession(
     }
 
     const info = data.info[sessionID]
+    // The app still consumes the vendored promise client package while the
+    // runtime/schema already publish these durable session.next lifecycle
+    // events. Keep the compatibility boundary explicit instead of pretending
+    // the stale generated union is exhaustive.
+    const eventType = event.type as string
     if (event.type === "session.renamed" && info)
       remember({ ...info, title: event.data.title, time: { ...info.time, updated: event.created } })
     if (event.type === "session.next.paused") setData("paused", sessionID, true)
     if (event.type === "session.next.resumed") setData("paused", sessionID, false)
     if (event.type === "session.next.renamed" && info)
-      remember({ ...info, title: event.data.title, time: { ...info.time, updated: event.created } })
+      remember({ ...info, title: event.data.title, time: { ...info.time, updated: event.data.timestamp } })
+    if (event.type === "session.next.moved" && info)
+      remember({
+        ...info,
+        projectID: event.data.projectID ?? info.projectID,
+        workspaceID: event.data.location.workspaceID,
+        directory: event.data.location.directory,
+        path: event.data.subdirectory,
+        time: { ...info.time, updated: event.data.timestamp },
+      })
     if (event.type === "session.moved" && info)
       remember({
         ...info,
@@ -1109,13 +1282,19 @@ export function createServerSession(
       event.type === "session.revert.committed"
     )
       void resolve(sessionID, { force: true }).catch(() => {})
+    if (
+      event.type === "session.next.revert.staged" ||
+      event.type === "session.next.revert.cleared" ||
+      event.type === "session.next.revert.committed"
+    )
+      void resolve(sessionID, { force: true }).catch(() => {})
   }
 
   const apply = (event: { type: string; properties?: unknown }) => {
     const eventID = eventSessionID(event)
     if (eventID) {
       touch(eventID)
-      const content = v1ContentEvents.has(event.type)
+      const content = isSessionStreamContentEvent(event.type)
       if (content && suspended.has(eventID)) {
         stale.add(eventID)
         return
@@ -1132,7 +1311,11 @@ export function createServerSession(
         !data.info[eventID] &&
         event.type !== "session.created" &&
         event.type !== "session.updated" &&
-        event.type !== "session.deleted"
+        event.type !== "session.deleted" &&
+        // `session.diff` is already a complete ID-keyed snapshot. Resolving the
+        // Session just to retain it turns a passive background diff notification
+        // into an unnecessary HTTP request and can amplify multi-session bursts.
+        event.type !== "session.diff"
       )
         void resolve(eventID).catch(() => {})
     }
@@ -1166,6 +1349,11 @@ export function createServerSession(
       case "session.status": {
         const props = event.properties as { sessionID: string; status: SessionStatus }
         setData("session_status", props.sessionID, reconcile(props.status))
+        return
+      }
+      case "session.diff": {
+        const props = event.properties as { sessionID: string; diff: FileDiffInfo[] }
+        setData("session_diff", props.sessionID, reconcile(props.diff, { key: "file" }))
         return
       }
       case "message.updated": {
@@ -1355,11 +1543,6 @@ export function createServerSession(
         if (!deltaBases.has(props.partID) && typeof current === "string")
           deltaBases.set(props.partID, { base: current, sessionID: props.sessionID })
         setData(
-          "part_text_accum_delta",
-          props.partID,
-          (value) => (value ?? (typeof current === "string" ? current : "")) + props.delta,
-        )
-        setData(
           "part",
           props.messageID,
           produce((draft) => {
@@ -1451,6 +1634,8 @@ export function createServerSession(
     sync,
     resume,
     release,
+    acceptStreamContent,
+    invalidateStreamContent,
     prefetch,
     shouldPrefetch(sessionID: string, limit: number) {
       if (data.message[sessionID] === undefined) return true
@@ -1460,6 +1645,9 @@ export function createServerSession(
     },
     fresh(sessionID: string, ttl: number) {
       return !stale.has(sessionID) && Date.now() - (meta.at[sessionID] ?? 0) <= ttl
+    },
+    needsRepair(sessionID: string) {
+      return stale.has(sessionID)
     },
     optimistic: {
       add(input: { sessionID: string; message: Message; parts: Part[] }) {
@@ -1545,7 +1733,7 @@ export function createServerSession(
       async loadMore(sessionID: string, count = historyMessagePageSize) {
         touch(sessionID)
         if (meta.loading[sessionID] || meta.complete[sessionID] || !meta.cursor[sessionID]) return
-        await loadMessages(sessionID, count, meta.cursor[sessionID], "prepend")
+        await runInflight(inflight, sessionID, () => loadMessages(sessionID, count, meta.cursor[sessionID], "prepend"))
       },
     },
     evict(sessionID: string) {

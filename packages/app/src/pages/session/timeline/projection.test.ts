@@ -1,7 +1,9 @@
 import { describe, expect, test } from "bun:test"
+import type { Part } from "@opencode-ai/sdk/v2"
 import type { PartGroup } from "@opencode-ai/session-ui/message-part"
 import { reuseTimelineRows } from "./row-reconciliation"
 import { TimelineRow } from "./timeline-row"
+import { projectWorkingAssistantParts, workingAssistantPartsEqual } from "./working-part-structure"
 
 const context = (key: string, partIDs: string[], userMessageID = "user-1") =>
   new TimelineRow.AssistantPart({
@@ -92,5 +94,47 @@ describe("reuseTimelineRows", () => {
     expect(keys(result)).toEqual([...expected])
     expect(new Set(keys(result)).size).toBe(result.length)
     reused.forEach(([resultIndex, previousIndex]) => expect(result[resultIndex]).toBe(previous[previousIndex]))
+  })
+})
+
+describe("working assistant structural projection", () => {
+  const text = (value: string) => ({ id: "text", type: "text", text: value } as Part)
+  const reasoning = (value: string) => ({ id: "reasoning", type: "reasoning", text: value } as Part)
+  const tool = (name: string, status: string) =>
+    ({ id: `${name}-tool`, type: "tool", tool: name, state: { status } } as unknown as Part)
+
+  test("ignores append-only text and reasoning growth after content becomes visible", () => {
+    const before = projectWorkingAssistantParts([text("hello"), reasoning("# Plan")])
+    const after = projectWorkingAssistantParts([
+      text("hello and another hundred streamed tokens"),
+      reasoning("# Plan\n\nA much longer reasoning body"),
+    ])
+    expect(workingAssistantPartsEqual(before, after)).toBe(true)
+  })
+
+  test("detects the first visible character because it creates a renderable row", () => {
+    const before = projectWorkingAssistantParts([text("   ")])
+    const after = projectWorkingAssistantParts([text("answer")])
+    expect(workingAssistantPartsEqual(before, after)).toBe(false)
+  })
+
+  test("ignores ordinary tool state churn but tracks question hidden-to-visible transition", () => {
+    const readRunning = projectWorkingAssistantParts([tool("read", "running")])
+    const readCompleted = projectWorkingAssistantParts([tool("read", "completed")])
+    expect(workingAssistantPartsEqual(readRunning, readCompleted)).toBe(true)
+
+    const questionPending = projectWorkingAssistantParts([tool("question", "pending")])
+    const questionRunning = projectWorkingAssistantParts([tool("question", "running")])
+    const questionCompleted = projectWorkingAssistantParts([tool("question", "completed")])
+    expect(workingAssistantPartsEqual(questionPending, questionRunning)).toBe(true)
+    expect(workingAssistantPartsEqual(questionPending, questionCompleted)).toBe(false)
+  })
+
+  test("tracks part identity/order and tool kind because both affect grouping", () => {
+    const left = projectWorkingAssistantParts([tool("read", "completed"), text("x")])
+    const reordered = projectWorkingAssistantParts([text("x"), tool("read", "completed")])
+    const renamed = projectWorkingAssistantParts([tool("find", "completed"), text("x")])
+    expect(workingAssistantPartsEqual(left, reordered)).toBe(false)
+    expect(workingAssistantPartsEqual(left, renamed)).toBe(false)
   })
 })

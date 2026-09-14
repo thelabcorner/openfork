@@ -88,14 +88,15 @@ type ApiQueryOptions<T, K extends readonly unknown[]> = SolidQueryOptions<T, Err
   queryKey: K
 }
 
-// Native V2 session events already have a dedicated reducer. Feeding their
-// adapted payload through the legacy reducer as well only repeats session-ID
-// lookup and store bookkeeping; for stream deltas it also makes every token
-// pay that cost before the directory event reducer sees it. The durable
-// `session.next.*` family is a separate schema and must keep its legacy path
-// until the app has a reducer for that family.
+// Native session events already have a dedicated reducer. Feeding their adapted
+// payload through the legacy reducer as well only repeats session-ID lookup and
+// store bookkeeping; for stream deltas it also makes every token pay that cost
+// before the directory event reducer sees it. The reducer is intentionally
+// bilingual: it accepts both the older `session.*` compatibility family and the
+// current `session.next.*` native schema.
 const isNativeSessionEvent = (type: string | undefined) => {
-  if (!type || type.startsWith("session.next.")) return false
+  if (!type) return false
+  if (type.startsWith("session.next.")) return true
   return (
     type.startsWith("session.input.") ||
     type.startsWith("session.text.") ||
@@ -121,7 +122,11 @@ const isNativeStreamDelta = (type: string | undefined) =>
   type === "session.text.delta" ||
   type === "session.reasoning.delta" ||
   type === "session.tool.input.delta" ||
-  type === "session.compaction.delta"
+  type === "session.compaction.delta" ||
+  type === "session.next.text.delta" ||
+  type === "session.next.reasoning.delta" ||
+  type === "session.next.tool.input.delta" ||
+  type === "session.next.compaction.delta"
 
 type SessionActiveApi = {
   readonly active: () => Promise<SessionActiveOutput>
@@ -293,6 +298,14 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const session = createServerSession(serverSDK.client, serverSDK.api.session, serverSDK.api.message, {
     protocol: serverSDK.protocol,
   })
+  // Push the foreground-content gate up to the SSE reader. The session store is
+  // still the authority: rejecting a cached background delta marks that session
+  // stale so resume()/sync() repairs exactly what was skipped.
+  const releaseStreamContentInterest = serverSDK.event.setStreamContentInterest(
+    session.acceptStreamContent,
+    session.invalidateStreamContent,
+  )
+  onCleanup(releaseStreamContentInterest)
   const queryOptionsApi = makeQueryOptionsApi(
     serverSDK.scope,
     () => serverSDK.client,
@@ -664,6 +677,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     const key = directoryKey(directory)
     const event = e.details
     const eventType: string = event.type
+    const connectedRepair =
+      eventType === "server.connected" &&
+      !!(event.properties as { repair?: boolean } | undefined)?.repair
     const recent = bootingRoot || Date.now() - bootedAt < 1500
     perf.event()
 
@@ -685,7 +701,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       if (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") {
         time("home", () => homeSessions.apply(event))
       }
-      time("home", () => homeSessions.refresh(event.type))
+      time("home", () => homeSessions.refresh(event.type, connectedRepair))
     }
     if (eventType === "integration.connection.updated") void refreshProviders()
 
@@ -725,7 +741,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         eventType === "project.directories.updated"
       )
         bootstrap.refetch()
-      if (eventType === "server.connected" || eventType === "global.disposed") {
+      if (connectedRepair || eventType === "global.disposed") {
         if (recent) return
         for (const directory of Object.keys(children.children)) {
           if (!children.active(directory)) continue

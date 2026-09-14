@@ -173,11 +173,12 @@ export function createAutoScroll(options: AutoScrollOptions) {
     const delta = el.scrollTop - lastScrollTop
     lastScrollTop = el.scrollTop
 
+    const programmaticCorrection = pendingProgAllowsUpward
     const programmatic = isProgrammaticScroll({
       pendingTop: pendingProg,
       scrollTop: el.scrollTop,
       delta,
-      allowUpward: pendingProgAllowsUpward,
+      allowUpward: programmaticCorrection,
     })
     pendingProg = null
     pendingProgAllowsUpward = false
@@ -188,7 +189,7 @@ export function createAutoScroll(options: AutoScrollOptions) {
       stickThreshold: stickThreshold(),
       escapeThreshold: escapeThreshold(),
       isProgrammatic: programmatic,
-      programmaticCorrection: programmatic && pendingProgAllowsUpward,
+      programmaticCorrection: programmatic && programmaticCorrection,
     })
 
     if (intent === "prog") {

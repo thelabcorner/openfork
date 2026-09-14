@@ -162,6 +162,48 @@ function setup(sessions: Record<string, Session>) {
 }
 
 describe("server session", () => {
+  test("background stream interest marks cached content stale without retaining unknown sessions", () => {
+    const store = createServerSession(messageClient(response()))
+
+    expect(store.acceptStreamContent("unknown")).toBe(false)
+    expect(store.needsRepair("unknown")).toBe(false)
+
+    store.set("message", "cached", [])
+    expect(store.acceptStreamContent("cached")).toBe(false)
+    expect(store.needsRepair("cached")).toBe(true)
+
+    // Foreground ownership is synchronous, but stale content must remain closed
+    // at the SDK admission boundary until sync() has installed reconciliation
+    // state. Otherwise deltas pay queue/emitter cost only to be rejected later,
+    // and can race against the stale base during reconnect repair.
+    store.resume("cached")
+    expect(store.acceptStreamContent("cached")).toBe(false)
+    store.release("cached")
+    expect(store.acceptStreamContent("cached")).toBe(false)
+  })
+
+  test("retains session.diff in the shared cache without activating or resolving the session", async () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.set("message", "child", [])
+    ctx.store.release("child")
+    const diff = [
+      {
+        file: "src/app.ts",
+        patch: "@@ -1 +1 @@\n-old\n+new\n",
+        additions: 1,
+        deletions: 1,
+        status: "modified" as const,
+      },
+    ]
+
+    ctx.store.apply({ type: "session.diff", properties: { sessionID: "child", diff } })
+
+    expect(ctx.store.data.session_diff.child).toEqual(diff)
+    expect(ctx.store.needsRepair("child")).toBe(false)
+    expect(ctx.get).toHaveLength(0)
+    await Promise.resolve()
+    expect(ctx.get).toHaveLength(0)
+  })
   test("projects V2 session events into current and legacy message state", () => {
     const ctx = setup({ child: session("child") })
     ctx.store.remember(session("child"))
@@ -211,6 +253,119 @@ describe("server session", () => {
     })
     expect(ctx.store.data.message.child?.map((message) => message.id)).toEqual(["msg_1_user", "msg_2_assistant"])
     expect(ctx.store.data.part.msg_2_assistant).toMatchObject([{ type: "text", text: "world" }])
+  })
+
+  test("projects current session.next streams with stable legacy part identities", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    ctx.store.set("session_message", "child", [
+      { id: "msg_user", type: "user", text: "hello", time: { created: 1 } },
+    ])
+    // Step boundaries are message lifecycle, not execution lifecycle. Keep an
+    // existing authoritative status untouched so continuation turns cannot
+    // flicker busy/idle between provider steps.
+    ctx.store.set("session_status", "child", { type: "retry", attempt: 1, message: "waiting", next: 99 })
+    const apply = (input: object) => ctx.store.applyV2(input as any)
+
+    apply({
+      id: "evt_next_step",
+      type: "session.next.step.started",
+      data: {
+        sessionID: "child",
+        timestamp: 2,
+        assistantMessageID: "msg_assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+      },
+    })
+    apply({
+      id: "evt_next_text_start",
+      type: "session.next.text.started",
+      data: {
+        sessionID: "child",
+        timestamp: 3,
+        assistantMessageID: "msg_assistant",
+        textID: "txt_native",
+      },
+    })
+    apply({
+      id: "evt_next_text_delta",
+      type: "session.next.text.delta",
+      data: {
+        sessionID: "child",
+        timestamp: 4,
+        assistantMessageID: "msg_assistant",
+        textID: "txt_native",
+        delta: "world",
+      },
+    })
+
+    expect(ctx.store.data.session_status.child).toEqual({ type: "retry", attempt: 1, message: "waiting", next: 99 })
+    expect(ctx.store.data.session_message.child?.at(-1)).toMatchObject({
+      id: "msg_assistant",
+      type: "assistant",
+      content: [{ type: "text", text: "world" }],
+    })
+    expect(ctx.store.data.part.msg_assistant).toMatchObject([
+      { id: "msg_assistant:text:0", type: "text", text: "world" },
+    ])
+
+    apply({
+      id: "evt_next_step_end",
+      type: "session.next.step.ended",
+      data: {
+        sessionID: "child",
+        timestamp: 5,
+        assistantMessageID: "msg_assistant",
+        finish: "stop",
+        cost: 0,
+        tokens: { input: 0, output: 1, reasoning: 0, cache: { read: 0, write: 0 } },
+      },
+    })
+    expect(ctx.store.data.session_status.child).toEqual({ type: "retry", attempt: 1, message: "waiting", next: 99 })
+  })
+
+  test("V2 content deltas do not invalidate legacy message metadata", () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    ctx.store.set("session_message", "child", [
+      { id: "msg_user", type: "user", text: "hello", time: { created: 0 } },
+    ])
+    const apply = (input: object) => ctx.store.applyV2(input as OpenCodeEvent)
+
+    apply({
+      id: "evt_step",
+      created: 1,
+      type: "session.step.started",
+      data: {
+        sessionID: "child",
+        assistantMessageID: "msg_assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+      },
+    })
+    apply({
+      id: "evt_text_start",
+      created: 2,
+      type: "session.text.started",
+      data: { sessionID: "child", assistantMessageID: "msg_assistant", ordinal: 0 },
+    })
+
+    const messages = ctx.store.data.message.child
+    const assistant = messages?.find((message) => message.id === "msg_assistant")
+
+    apply({
+      id: "evt_text_delta",
+      created: 3,
+      type: "session.text.delta",
+      data: { sessionID: "child", assistantMessageID: "msg_assistant", ordinal: 0, delta: "token" },
+    })
+
+    // Streaming content lives in Part. Message metadata is unchanged, so both
+    // identities must remain stable to keep broad timeline memos asleep.
+    expect(ctx.store.data.message.child).toBe(messages)
+    expect(ctx.store.data.message.child?.find((message) => message.id === "msg_assistant")).toBe(assistant)
+    expect(ctx.store.data.part.msg_assistant).toMatchObject([{ type: "text", text: "token" }])
   })
 
   test("resumes a cached session before streaming without requiring a network sync", () => {
@@ -296,7 +451,8 @@ describe("server session", () => {
       content: [{ type: "text", text: "" }],
     })
 
-    // Timeline activation resumes live content consumption.
+    // Activation alone is not enough after a missed event: the stale timeline
+    // remains gated until an authoritative refresh establishes a safe base.
     ctx.store.resume("child")
     apply({
       id: "evt_text_delta_live",
@@ -307,8 +463,169 @@ describe("server session", () => {
 
     expect(ctx.store.data.session_message.child?.at(-1)).toMatchObject({
       id: "msg_2_assistant",
-      content: [{ type: "text", text: "live" }],
+      content: [{ type: "text", text: "" }],
     })
+  })
+
+  test("background sync hydrates without activating content projection", async () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+
+    await ctx.store.sync("child", { activate: false })
+    ctx.store.set("session_message", "child", [
+      {
+        id: "msg_2_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "" }],
+        time: { created: 2 },
+      },
+    ])
+
+    const apply = (delta: string) =>
+      ctx.store.applyV2({
+        id: `evt_${delta}`,
+        created: 3,
+        type: "session.text.delta",
+        data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0, delta },
+      } as OpenCodeEvent)
+
+    apply("background")
+    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({ type: "text", text: "" })
+
+    ctx.store.resume("child")
+    apply("foreground")
+    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({ type: "text", text: "" })
+  })
+
+  test("background sync cannot suspend an already active foreground session", async () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    ctx.store.resume("child")
+
+    await ctx.store.sync("child", { activate: false })
+    ctx.store.set("session_message", "child", [
+      {
+        id: "msg_2_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "" }],
+        time: { created: 2 },
+      },
+    ])
+
+    ctx.store.applyV2({
+      id: "evt_foreground_after_background_sync",
+      created: 3,
+      type: "session.text.delta",
+      data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0, delta: "still-live" },
+    } as OpenCodeEvent)
+
+    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({ type: "text", text: "still-live" })
+  })
+
+  test("stale foreground activation stays content-gated until hydration succeeds", async () => {
+    const ctx = setup({ child: session("child") })
+    ctx.store.remember(session("child"))
+    ctx.store.set("session_message", "child", [
+      {
+        id: "msg_2_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "base" }],
+        time: { created: 2 },
+      },
+    ])
+
+    const apply = (id: string, delta: string) =>
+      ctx.store.applyV2({
+        id,
+        created: 3,
+        type: "session.text.delta",
+        data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0, delta },
+      } as OpenCodeEvent)
+
+    ctx.store.release("child")
+    apply("evt_missed", "-missed")
+    expect(ctx.store.acceptStreamContent("child")).toBe(false)
+
+    // Returning to a stale cached timeline marks it foreground-owned, but must
+    // not admit newer stream deltas onto the pre-gap base before hydration.
+    ctx.store.resume("child")
+    expect(ctx.store.acceptStreamContent("child")).toBe(false)
+    apply("evt_before_hydration", "-unsafe")
+    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({ type: "text", text: "base" })
+
+    await ctx.store.sync("child", { force: true })
+    expect(ctx.store.acceptStreamContent("child")).toBe(true)
+
+    // Successful hydration clears the stale gate for the still-active owner.
+    ctx.store.set("session_message", "child", [
+      {
+        id: "msg_2_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "hydrated" }],
+        time: { created: 2 },
+      },
+    ])
+    apply("evt_after_hydration", "-live")
+    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({
+      type: "text",
+      text: "hydrated-live",
+    })
+  })
+
+  test("foreground repair does not mistake an in-flight background prefetch for hydration", async () => {
+    const prefetchPage = deferredResponse()
+    const repairPage = deferredResponse()
+    const client = messageClient(prefetchPage.promise, repairPage.promise)
+    const store = createServerSession(client)
+    store.remember(session("child"))
+    store.set("session_message", "child", [
+      {
+        id: "msg_2_assistant",
+        type: "assistant",
+        agent: "build",
+        model: { id: "model", providerID: "provider" },
+        content: [{ type: "text", text: "base" }],
+        time: { created: 2 },
+      },
+    ])
+
+    const prefetching = store.prefetch("child", 20)
+    await client.requested(1)
+
+    // Prefetch is background work, so an event arriving while it is in flight
+    // is intentionally dropped and marks the cached timeline stale.
+    store.applyV2({
+      id: "evt_during_prefetch",
+      created: 3,
+      type: "session.text.delta",
+      data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0, delta: "-missed" },
+    } as OpenCodeEvent)
+
+    store.resume("child")
+    const repairing = store.sync("child")
+
+    // Foreground sync first joins the prefetch. It must not spawn a duplicate
+    // request until that owner releases the per-session lane.
+    expect(client.requests).toHaveLength(1)
+    prefetchPage.resolve(response())
+    await prefetching
+
+    // Because content was missed during the background request, foreground
+    // repair must issue a second authoritative latest-page request.
+    await client.requested(2)
+    expect(client.requests).toHaveLength(2)
+    repairPage.resolve(response())
+    await repairing
+
+    expect(store.fresh("child", 60_000)).toBe(true)
   })
 
   test("resolves lineage by session ID without directory", async () => {
@@ -1124,7 +1441,7 @@ describe("server session", () => {
     await store.sync("child", { force: true })
 
     expect(store.data.part[message.id]).toEqual([{ ...part, text: "stale delta" }])
-    expect(store.data.part_text_accum_delta[part.id]).toBe("stale delta")
+    expect(store.data.part_text_accum_delta[part.id]).toBeUndefined()
   })
 
   test("accepts fetched text that intentionally replaces an accumulated prefix", async () => {
@@ -1162,7 +1479,7 @@ describe("server session", () => {
     await store.sync("child", { force: true })
 
     expect(store.data.part[message.id]).toEqual([{ ...part, text: "abc" }])
-    expect(store.data.part_text_accum_delta[part.id]).toBe("abc")
+    expect(store.data.part_text_accum_delta[part.id]).toBeUndefined()
   })
 
   test("clears delta state after exact server catch-up", async () => {

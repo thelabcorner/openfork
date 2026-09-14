@@ -50,7 +50,6 @@ type TreeStoreOptions = {
 
 const DEFAULT_MAX_SCOPES = 5
 const DEFAULT_MAX_NODES = 50_000
-const PREWARM_DELAY_MS = 150
 const DIRECTORY_LIST_CONCURRENCY = 4
 const BACKGROUND_LIST_CONCURRENCY = DIRECTORY_LIST_CONCURRENCY - 1
 const MAX_QUEUED_LIST_REQUESTS = 1024
@@ -668,10 +667,10 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
         const sizeBefore = subtreeSize(dir)
         const nextChildren = nodes.map((node) => node.path)
         const nextSet = new Set(nextChildren)
-        if (
+        let nodeIndexChanged =
           prevChildren.length !== nextChildren.length ||
           prevChildren.some((path, index) => path !== nextChildren[index])
-        ) {
+        if (nodeIndexChanged) {
           childCache.delete(dir)
         }
         const removedDirectoryPaths = prevChildren.filter(
@@ -726,6 +725,7 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
                 ) {
                   continue
                 }
+                nodeIndexChanged = true
                 draft[node.path] = node
               }
             }),
@@ -762,7 +762,10 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
           // projections remain stable. Index the retained object as well, or a
           // search consumer would observe a new identity on every refresh.
           for (const node of nodes) upsertNodeIndex(tree.node[node.path] ?? node)
-          bumpNodeVersion((value) => value + 1)
+          // `allNodes()` backs the explorer's O(N) search index. A watcher
+          // force-list that returns byte-for-byte identical rows must not bump
+          // its revision and rebuild that index for the whole project.
+          if (nodeIndexChanged || removedPaths.size > 0) bumpNodeVersion((value) => value + 1)
           // The whole subtree below every removed path is gone, so its cached
           // sizes are garbage: drop them before the ancestor fold, or a later
           // recompute could resurrect a stale child size.
@@ -946,38 +949,21 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
     })
   }
 
-  // Prewarm: after switching to a cold project, list the root and its
-  // top-level directories in the background (debounced + idle priority) so
-  // the pane renders with data ready instead of waiting on the first paint.
-  let prewarmTimer: ReturnType<typeof setTimeout> | undefined
-  const schedulePrewarm = () => {
-    if (prewarmTimer) clearTimeout(prewarmTimer)
-    prewarmTimer = setTimeout(() => {
-      prewarmTimer = undefined
-      void prewarm()
-    }, PREWARM_DELAY_MS)
-  }
-
+  // Explicit root-only prewarm. The store used to schedule this automatically
+  // on every cold FileProvider mount and then fan out into *every top-level
+  // directory*. FileProvider also exists for prompt mentions while the explorer
+  // is closed, so merely opening a session could generate dozens of background
+  // directory requests. Actual tree components already request their root when
+  // mounted; keep this method for callers/tests without doing hidden work.
   const prewarm = async () => {
     const runGeneration = generation
     await listDir("", { generation: runGeneration, priority: "background" })
-    if (disposed || runGeneration !== generation) return
-    const rootChildren = tree.dir[""]?.children ?? []
-    const directories = rootChildren.flatMap((child) => {
-      const node = tree.node[child]
-      return node?.type === "directory" ? [node.path] : []
-    })
-    await mapLimited(directories, (directory) =>
-      listDir(directory, { generation: runGeneration, priority: "background" }).then(() => undefined),
-    )
   }
 
   const dispose = () => {
     if (disposed) return
     disposed = true
     generation += 1
-    if (prewarmTimer) clearTimeout(prewarmTimer)
-    prewarmTimer = undefined
     while (queuedListRequests.length > 0) queuedListRequests.shift()!.cancel()
     sharedGate.pump()
   }
@@ -1000,7 +986,6 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
       restore(cached)
     } else {
       reset()
-      schedulePrewarm()
     }
     evict()
   }
@@ -1016,19 +1001,13 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
     evict()
   }
 
-  // On a cold mount (no cached snapshot), eagerly seed the root and its
-  // top-level directories in the background so the tree renders with data on
-  // first paint and the first expand of any top-level dir is instant. This
-  // previously only happened on scope *switches* — a fresh FileProvider mount
-  // left the cold path un-pre-warmed, so the panel opened empty and every
-  // first expand paid a round trip.
   // A restored snapshot carries `dir` entries whose subtree sizes were never
-  // computed for this store, so seed them before anything can trim.
+  // computed for this store, so seed them before anything can trim. Cold stores
+  // intentionally stay idle until an actual tree consumer mounts.
   if (initialSnapshot) {
     rebuildSubtreeSizes()
     trimLiveTree()
   }
-  if (!initialSnapshot) schedulePrewarm()
 
   return {
     listDir,
@@ -1037,6 +1016,9 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
     dirState,
     children,
     allNodes,
+    // Primarily useful for diagnostics/regression tests. Consumers should use
+    // allNodes(), which already tracks this signal reactively.
+    nodeRevision: nodeVersion,
     hasNode: (input: string) => {
       const key = options.normalizeDir(input)
       return tree.node[key] !== undefined

@@ -5,6 +5,7 @@ import {
   applyHomeSessionEvent,
   appendHomeSessionEvent,
   createHomeSessionIndexCache,
+  HOME_V2_SESSION_FIRST_PAGE,
   HOME_V2_SESSION_PAGE_LIMIT,
   loadHomeSessionIndex,
   homeSessionIndexSessions,
@@ -39,7 +40,7 @@ describe("Home V2 session index", () => {
     })
 
     expect(result.sessions).toHaveLength(1)
-    expect(calls).toEqual([{ limit: HOME_V2_SESSION_PAGE_LIMIT, order: "desc" }])
+    expect(calls).toEqual([{ limit: HOME_V2_SESSION_FIRST_PAGE, order: "desc" }])
   })
 
   test("loads subsequent pages until the session index is complete", async () => {
@@ -51,7 +52,7 @@ describe("Home V2 session index", () => {
         if (!("cursor" in input)) {
           return {
             data: {
-              data: Array.from({ length: HOME_V2_SESSION_PAGE_LIMIT }, (_, index) =>
+              data: Array.from({ length: HOME_V2_SESSION_FIRST_PAGE }, (_, index) =>
                 session({ id: `page-1-${index}` }),
               ),
               cursor: { next: "next-page" },
@@ -64,9 +65,9 @@ describe("Home V2 session index", () => {
       controller.signal,
     )
 
-    expect(result.sessions).toHaveLength(HOME_V2_SESSION_PAGE_LIMIT + 1)
+    expect(result.sessions).toHaveLength(HOME_V2_SESSION_FIRST_PAGE + 1)
     expect(calls).toEqual([
-      { input: { limit: HOME_V2_SESSION_PAGE_LIMIT, order: "desc" }, signal: controller.signal },
+      { input: { limit: HOME_V2_SESSION_FIRST_PAGE, order: "desc" }, signal: controller.signal },
       {
         input: { limit: HOME_V2_SESSION_PAGE_LIMIT, order: "desc", cursor: "next-page" },
         signal: controller.signal,
@@ -147,9 +148,10 @@ describe("Home V2 session index", () => {
     expect(homeSessionIndexSessions({ sessions: initial, eventSequence: 1 }, events)[0]?.title).toBe("current")
   })
 
-  test("refetches after reconnect, disposal, and session moves", () => {
+  test("replayable reconnects stay incremental while explicit repair, disposal, and moves refetch", () => {
     expect(homeSessionIndexRefresh("server.connected", false)).toEqual({ connected: true, refetch: false })
-    expect(homeSessionIndexRefresh("server.connected", true)).toEqual({ connected: true, refetch: true })
+    expect(homeSessionIndexRefresh("server.connected", true)).toEqual({ connected: true, refetch: false })
+    expect(homeSessionIndexRefresh("server.connected", true, true)).toEqual({ connected: true, refetch: true })
     expect(homeSessionIndexRefresh("global.disposed", true).refetch).toBe(true)
     expect(homeSessionIndexRefresh("session.next.moved", true).refetch).toBe(true)
   })

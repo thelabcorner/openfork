@@ -1,6 +1,7 @@
 import { onMount } from "solid-js"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import type { PromptInputV2Attachment, PromptInputV2Prompt } from "./types"
+import { parseFileDragText } from "@opencode-ai/core/util/file-drag-transfer"
 
 const accepted = [
   "image/png",
@@ -206,9 +207,13 @@ export function createPromptInputV2Attachments(
     const target = capture()
     if (target?.cursor !== undefined) target.prompt.set(target.prompt.current(), target.cursor)
     const plainText = event.dataTransfer?.getData("text/plain")
-    if (plainText?.startsWith("file:")) {
-      const path = plainText.slice("file:".length)
-      input.addPart({ type: "file", path, content: `@${path}`, start: 0, end: 0 })
+    const filePaths = parseFileDragText(plainText)
+    if (filePaths.length > 0) {
+      for (let index = 0; index < filePaths.length; index++) {
+        const path = filePaths[index]!
+        input.addPart({ type: "file", path, content: `@${path}`, start: 0, end: 0 })
+        if ((index + 1) % 32 === 0) await new Promise<void>((resolve) => setTimeout(resolve, 0))
+      }
       input.focusEditor()
       return
     }

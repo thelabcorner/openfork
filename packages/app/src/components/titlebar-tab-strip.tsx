@@ -8,7 +8,7 @@ import { RestrictToHorizontalAxis } from "@dnd-kit/abstract/modifiers"
 import { RestrictToElement } from "@dnd-kit/dom/modifiers"
 import { arrayMove } from "@dnd-kit/helpers"
 import { tabHref, tabKey, type GroupTab, type SessionTab, type Tab } from "@/context/tabs"
-import { ServerConnection } from "@/context/server"
+import { ServerConnection, serverName } from "@/context/server"
 import { DraftTabItem, GroupTabNavItem, TabNavItem } from "@/components/titlebar-tab-nav"
 import type { TabPreviewGroupSession } from "@/components/titlebar-tab-popover"
 import { TitlebarTabContextMenu } from "@/components/titlebar-tab-context-menu"
@@ -18,6 +18,7 @@ import { useCommand } from "@/context/command"
 import { useTabs } from "@/context/tabs"
 import { showToast } from "@/utils/toast"
 import { useSessionGroups } from "@/context/session-groups"
+import { groupedSessionsForTabPreview, indexTabPreviewMemberships } from "./titlebar-tab-group-preview"
 import { canStartTabDrag, isTabActionTarget } from "./titlebar-tab-gesture"
 import { adjacentTabKey, mergeVisibleTabOrder } from "./titlebar-tab-order"
 import type { Session } from "@opencode-ai/sdk/v2"
@@ -30,6 +31,9 @@ function SessionTabSlot(props: {
   forceTruncate: boolean
   pending: boolean
   session: () => Session | undefined
+  serverCtx: () => ServerCtx | undefined
+  serverLabel: () => string | undefined
+  groupSessions: () => TabPreviewGroupSession[] | undefined
   fallbackTitle?: string
   onRename: (title: string) => Promise<void>
   onPrefetch: () => void
@@ -62,6 +66,9 @@ function SessionTabSlot(props: {
           }}
           href={tabHref(props.tab)}
           server={props.tab.server}
+          serverCtx={props.serverCtx}
+          serverLabel={props.serverLabel}
+          groupSessions={props.groupSessions}
           session={props.session}
           fallbackTitle={props.fallbackTitle}
           onRename={props.onRename}
@@ -85,6 +92,8 @@ function SessionTabEntry(props: {
   forceTruncate: boolean
   pending: boolean
   serverCtx: () => ServerCtx | undefined
+  serverLabel: () => string | undefined
+  groupSessions: () => TabPreviewGroupSession[] | undefined
   onVisibleChange: (visible: boolean) => void
   onNavigate: (element: HTMLDivElement) => void
   onClose: () => void
@@ -104,7 +113,6 @@ function SessionTabEntry(props: {
   const session = createMemo(() => cachedSession() ?? loadedSession())
   const missingSession = createMemo(() => !!props.serverCtx() && !loadedSession.loading && !session())
   const visible = createMemo(() => !!session() || missingSession() || !!persisted()?.title)
-  let prefetched = false
   let hoverPrefetchStarted = false
 
   const prefetch = () => {
@@ -138,20 +146,6 @@ function SessionTabEntry(props: {
   createEffect(() => props.onVisibleChange(visible()))
 
   createEffect(() => {
-    if (!props.active()) return
-    const ctx = props.serverCtx()
-    const value = session()
-    if (!ctx || !value || prefetched) return
-    prefetched = true
-    // Runs in this component's own owner (disposed with the tab) instead of a
-    // throw-away createRoot: sync() can register cleanups after an async gap,
-    // which a root disposed eagerly on settle can't attach — that mismatch was
-    // logged as "cleanups created outside a createRoot or render will never be
-    // run" and leaked reactive state for every tab visited in a session.
-    void ctx.sync.ensureDirSyncContext(value.directory).session.sync(value.id).catch(() => {})
-  })
-
-  createEffect(() => {
     const value = session()
     if (!value) return
     tabs.rememberSessionInfo(props.tab, value)
@@ -167,6 +161,9 @@ function SessionTabEntry(props: {
         forceTruncate={props.forceTruncate}
         pending={props.pending}
         session={session}
+        serverCtx={props.serverCtx}
+        serverLabel={props.serverLabel}
+        groupSessions={props.groupSessions}
         fallbackTitle={persisted()?.title ?? (missingSession() ? language.t("session.tab.unknown") : undefined)}
         onRename={rename}
         onPrefetch={prefetch}
@@ -232,6 +229,7 @@ function GroupTabSlot(props: {
   title: string
   sessionCount?: number
   sessions?: TabPreviewGroupSession[]
+  serverCtx: () => ServerCtx | undefined
   onNavigate: (element: HTMLDivElement) => void
   onClose: () => void
 }) {
@@ -263,6 +261,7 @@ function GroupTabSlot(props: {
           title={props.title}
           sessionCount={props.sessionCount}
           sessions={props.sessions}
+          serverCtx={props.serverCtx}
           onNavigate={() => props.onNavigate(ref)}
           onClose={props.onClose}
           active={props.active()}
@@ -316,6 +315,7 @@ function GroupTabEntry(props: {
       title={title()}
       sessionCount={sessionCount()}
       sessions={sessions()}
+      serverCtx={props.serverCtx}
       onNavigate={props.onNavigate}
       onClose={props.onClose}
     />
@@ -335,6 +335,7 @@ export function TitlebarTabStrip(props: {
   const global = useGlobal()
   const language = useLanguage()
   const command = useCommand()
+  const sessionGroups = useSessionGroups()
   let scrollRef!: HTMLDivElement
   let listRef!: HTMLDivElement
   let resizeFrame: number | undefined
@@ -346,6 +347,13 @@ export function TitlebarTabStrip(props: {
     visibleTabs().forEach((tab, i) => map.set(tabKey(tab), i))
     return map
   })
+  const serverConnections = createMemo(() => {
+    const map = new Map<ServerConnection.Key, ReturnType<typeof global.servers.list>[number]>()
+    for (const connection of global.servers.list()) map.set(ServerConnection.key(connection), connection)
+    return map
+  })
+  const multipleServers = createMemo(() => serverConnections().size > 1)
+  const previewMemberships = createMemo(() => indexTabPreviewMemberships(sessionGroups.list()))
 
   command.register("titlebar-tab-cycle", () => [
     {
@@ -394,20 +402,21 @@ export function TitlebarTabStrip(props: {
     if (!scrollRef) return
     props.onOverflowChange(scrollRef.scrollWidth > scrollRef.clientWidth)
   }
+  const scheduleOverflow = () => {
+    if (resizeFrame !== undefined) return
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = undefined
+      refreshOverflow()
+    })
+  }
 
   createResizeObserver(
     () => [scrollRef, listRef],
-    () => {
-      if (resizeFrame !== undefined) return
-      resizeFrame = requestAnimationFrame(() => {
-        resizeFrame = undefined
-        refreshOverflow()
-      })
-    },
+    scheduleOverflow,
   )
 
   onMount(() => {
-    refreshOverflow()
+    scheduleOverflow()
   })
 
   onCleanup(() => {
@@ -417,7 +426,7 @@ export function TitlebarTabStrip(props: {
   createEffect(() => {
     props.tabs.length
     visibleTabIds()
-    refreshOverflow()
+    scheduleOverflow()
   })
 
   return (
@@ -476,9 +485,14 @@ export function TitlebarTabStrip(props: {
                 const visibleIndex = () => visibleIndexMap().get(id) ?? -1
                 const pending = () => props.pendingTabKey?.() === id
                 const serverCtx = createMemo(() => {
-                  const conn = global.servers.list().find((item) => ServerConnection.key(item) === tab.server)
+                  const conn = serverConnections().get(tab.server)
                   if (conn) return global.ensureServerCtx(conn)
                 })
+                const serverLabel = () => {
+                  if (!multipleServers()) return
+                  const conn = serverConnections().get(tab.server)
+                  return conn ? serverName(conn) : undefined
+                }
 
                 if (tab.type === "session") {
                   return (
@@ -490,6 +504,10 @@ export function TitlebarTabStrip(props: {
                       forceTruncate={props.forceTruncate}
                       pending={pending()}
                       serverCtx={serverCtx}
+                      serverLabel={serverLabel}
+                      groupSessions={() =>
+                        groupedSessionsForTabPreview(sessionGroups.list(), tab.sessionId, previewMemberships())
+                      }
                       onVisibleChange={(visible) => setVisibility(id, visible)}
                       onNavigate={(element) => {
                         ref = element

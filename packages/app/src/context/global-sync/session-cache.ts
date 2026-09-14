@@ -3,6 +3,11 @@ import type { FileDiffInfo } from "@opencode-ai/client/promise"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
 
 export const SESSION_CACHE_LIMIT = 40
+// Approximate retained JS heap for background session caches. Strings are
+// counted as UTF-16 (2 bytes/code unit), which intentionally treats base64
+// media as expensive. Active/protected sessions are never evicted just to meet
+// this budget, but their known bytes still count so idle caches are shed first.
+export const SESSION_CACHE_BYTE_LIMIT = 128 * 1024 * 1024
 
 type SessionCache = {
   session_status: Record<string, SessionStatus | undefined>
@@ -14,6 +19,55 @@ type SessionCache = {
   permission: Record<string, PermissionRequest[] | undefined>
   question: Record<string, QuestionRequest[] | undefined>
   part_text_accum_delta: Record<string, string | undefined>
+}
+
+function roughValueBytes(value: unknown, seen: Set<object>): number {
+  if (value === null || value === undefined) return 0
+  if (typeof value === "string") return 16 + value.length * 2
+  if (typeof value === "number" || typeof value === "bigint") return 8
+  if (typeof value === "boolean") return 4
+  if (typeof value !== "object") return 0
+  if (seen.has(value)) return 0
+  seen.add(value)
+
+  if (Array.isArray(value)) {
+    let bytes = 24 + value.length * 8
+    for (const item of value) bytes += roughValueBytes(item, seen)
+    return bytes
+  }
+
+  let bytes = 32
+  for (const [key, item] of Object.entries(value)) {
+    bytes += 16 + key.length * 2 + roughValueBytes(item, seen)
+  }
+  return bytes
+}
+
+/**
+ * Approximate one session's retained renderer cache without serializing it.
+ * Called at background/cache lifecycle boundaries, never for each stream delta.
+ */
+export function estimateSessionCacheBytes(store: SessionCache, sessionID: string) {
+  const seen = new Set<object>()
+  let bytes = 0
+  bytes += roughValueBytes(store.session_status[sessionID], seen)
+  bytes += roughValueBytes(store.session_diff[sessionID], seen)
+  bytes += roughValueBytes(store.todo[sessionID], seen)
+  bytes += roughValueBytes(store.message[sessionID], seen)
+  bytes += roughValueBytes(store.session_message[sessionID], seen)
+  bytes += roughValueBytes(store.permission[sessionID], seen)
+  bytes += roughValueBytes(store.question[sessionID], seen)
+
+  const messageIDs = new Set<string>()
+  for (const message of store.message[sessionID] ?? []) messageIDs.add(message.id)
+  for (const message of store.session_message[sessionID] ?? []) messageIDs.add(message.id)
+  for (const [messageID, parts] of Object.entries(store.part)) {
+    if (messageIDs.has(messageID) || parts?.some((part) => part.sessionID === sessionID)) {
+      bytes += roughValueBytes(parts, seen)
+      for (const part of parts ?? []) bytes += roughValueBytes(store.part_text_accum_delta[part.id], seen)
+    }
+  }
+  return bytes
 }
 
 export function dropSessionCaches(store: SessionCache, sessionIDs: Iterable<string>) {
@@ -79,15 +133,24 @@ export function pickSessionCacheEvictions(input: {
   keep: string
   limit: number
   preserve?: Iterable<string>
+  weights?: ReadonlyMap<string, number>
+  maxBytes?: number
 }) {
   const stale: string[] = []
   const keep = new Set([input.keep, ...Array.from(input.preserve ?? [])])
   if (input.seen.has(input.keep)) input.seen.delete(input.keep)
   input.seen.add(input.keep)
+  let retainedBytes = 0
+  if (input.weights && input.maxBytes !== undefined) {
+    for (const id of input.seen) retainedBytes += input.weights.get(id) ?? 0
+  }
   for (const id of input.seen) {
-    if (input.seen.size - stale.length <= input.limit) break
+    const overCount = input.seen.size - stale.length > input.limit
+    const overBytes = input.maxBytes !== undefined && retainedBytes > input.maxBytes
+    if (!overCount && !overBytes) break
     if (keep.has(id)) continue
     stale.push(id)
+    retainedBytes -= input.weights?.get(id) ?? 0
   }
   for (const id of stale) {
     input.seen.delete(id)

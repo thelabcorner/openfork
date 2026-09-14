@@ -1,9 +1,15 @@
-import { afterEach, describe, expect, test } from "bun:test"
+import { afterEach, beforeEach, describe, expect, test } from "bun:test"
 import { phaseTrace } from "./phase-trace"
 
 describe("phase trace", () => {
+  beforeEach(() => {
+    phaseTrace.configure(true)
+    phaseTrace.reset()
+  })
+
   afterEach(() => {
     phaseTrace.reset()
+    phaseTrace.configure(false)
   })
 
   test("frames, reducer and projection costs accumulate per window", () => {
@@ -72,6 +78,24 @@ describe("phase trace", () => {
       dispatchWaitMs: 7,
       responseWaitMs: 7,
     })
+    phaseTrace.markdown({
+      phase: "worker",
+      kind: "parse",
+      status: "ok",
+      ms: 5,
+      chars: 64,
+      workerMs: 2,
+      incremental: true,
+    })
+    phaseTrace.markdown({
+      phase: "worker",
+      kind: "parse",
+      status: "ok",
+      ms: 6,
+      chars: 128,
+      workerMs: 3,
+      incremental: false,
+    })
     const snap = phaseTrace.snapshot()
     expect(snap.current.markdown.pacedUpdates).toBe(1)
     expect(snap.current.markdown.effectMs).toBe(30)
@@ -80,12 +104,16 @@ describe("phase trace", () => {
     expect(snap.current.markdown.morphMs).toBe(12)
     expect(snap.current.markdown.sanitizeCalls).toBe(1)
     expect(snap.current.markdown.sanitizeMs).toBe(3)
-    expect(snap.current.markdown.workerComputeMs).toBe(4)
+    expect(snap.current.markdown.workerComputeMs).toBe(9)
     expect(snap.current.markdown.workerInternalQueueMs).toBe(2)
-    expect(snap.current.markdown.workerQueueMs).toBe(10)
+    expect(snap.current.markdown.workerQueueMs).toBe(16)
     expect(snap.current.markdown.workerDispatchWaitMs).toBe(7)
     expect(snap.current.markdown.workerResponseWaitMs).toBe(7)
     expect(snap.current.markdown.workerByKind["project.ok"]).toBe(1)
+    expect(snap.current.markdown.workerByKind["parse.ok"]).toBe(2)
+    expect(snap.current.markdown.parseIncremental).toBe(1)
+    expect(snap.current.markdown.parseFull).toBe(1)
+    expect(snap.current.markdown.parseUnknown).toBe(0)
     expect(snap.recent.map((entry) => entry.phase)).toEqual(["markdown.effect.slow", "markdown.block.slow"])
   })
 })

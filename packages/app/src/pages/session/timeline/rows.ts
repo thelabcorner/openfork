@@ -69,7 +69,7 @@ export namespace Timeline {
   // comment parsing) so callers that only need turn membership (e.g. a per-turn reactive
   // cache) don't pay for reprocessing every turn's content on every message-list change.
   export function groupTurns(
-    messages: SessionMessageInfo[],
+    messages: readonly Pick<SessionMessageInfo, "id" | "type">[],
     getMessage: (messageID: string) => UserMessage | AssistantMessage | undefined,
     projectedUserMessages: UserMessage[],
   ) {
@@ -130,7 +130,11 @@ export namespace Timeline {
       turns.splice(0, turns.length, ...merged)
     }
     const activeMessageID = turns.at(-1)?.user.id
-    return { activeMessageID, turns }
+    // Keep the index we already built while grouping. Consumers that maintain
+    // one memo per turn must not rediscover that turn with Array.find(): on a
+    // structural append all of those memos wake together, so N independent
+    // linear searches turn an otherwise linear regroup into O(N²) work.
+    return { activeMessageID, turns, turnByUserID }
   }
 
   export function constructMessageRows(
@@ -143,6 +147,11 @@ export namespace Timeline {
     isActive: boolean,
     // v2 renders comments inside the user message attachments row instead of a strip row
     inlineComments: boolean,
+    // The reactive projection can derive this through a memo that only
+    // propagates when the visible heading changes. Presence of this options
+    // object means "do not inspect live reasoning text here", including when
+    // the current derived heading is undefined.
+    live?: { reasoningHeading?: string },
   ) {
     const rows: TimelineRow.TimelineRow[] = []
 
@@ -237,10 +246,12 @@ export namespace Timeline {
     })
 
     if (isActive && status === "busy" && !error && (showReasoning ? assistantPartRefs.length === 0 : true)) {
-      const heading = assistantMessages
-        .flatMap((message) => getMessageParts(message.id))
-        .map((part) => (part.type === "reasoning" && part.text ? reasoningHeading(part.text) : undefined))
-        .find((value): value is string => !!value)
+      const heading = live
+        ? live.reasoningHeading
+        : assistantMessages
+            .flatMap((message) => getMessageParts(message.id))
+            .map((part) => (part.type === "reasoning" && part.text ? reasoningHeading(part.text) : undefined))
+            .find((value): value is string => !!value)
 
       rows.push(
         new TimelineRow.Thinking({
@@ -277,7 +288,7 @@ export namespace Timeline {
     return rows
   }
 
-  function reasoningHeading(text: string) {
+  export function reasoningHeading(text: string) {
     const markdown = text.replace(/\r\n?/g, "\n")
     const html = markdown.match(/<h[1-6][^>]*>([\s\S]*?)<\/h[1-6]>/i)
     if (html?.[1]) {
