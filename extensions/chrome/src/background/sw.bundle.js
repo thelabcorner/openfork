@@ -1,6 +1,6 @@
 "use strict";
 (() => {
-  // extensions/chrome/src/shared/protocol.ts
+  // src/shared/protocol.ts
   var NATIVE_HOST_NAME = "com.opencode.desktop";
   var NATIVE_MESSAGE_MAX_HOST_TO_EXT_BYTES = 1 * 1024 * 1024;
   var NATIVE_MESSAGE_MAX_EXT_TO_HOST_BYTES = 64 * 1024 * 1024;
@@ -54,7 +54,7 @@
     return true;
   };
 
-  // extensions/chrome/src/background/debugger.ts
+  // src/background/debugger.ts
   var DebuggerError = class extends Error {
     tag;
     retryable;
@@ -77,14 +77,14 @@
   };
   var DebuggerManager = class {
     attached = /* @__PURE__ */ new Map();
+    /** Coalesce concurrent operations racing to attach the same Chrome tab. */
+    attaching = /* @__PURE__ */ new Map();
     opts;
     constructor(opts) {
       this.opts = opts;
-      this.opts.debuggerApi.onEvent.addListener(this.handleDebuggerEvent);
       this.opts.debuggerApi.onDetach.addListener(this.handleDebuggerDetach);
     }
     dispose() {
-      this.opts.debuggerApi.onEvent.removeListener(this.handleDebuggerEvent);
       this.opts.debuggerApi.onDetach.removeListener(this.handleDebuggerDetach);
     }
     getAttachedTabIds() {
@@ -93,13 +93,12 @@
     isAttached(tabId) {
       return this.attached.has(tabId);
     }
-    getChildSessions(tabId) {
-      return this.attached.get(tabId)?.childSessions;
-    }
     // ---- attach / detach ----------------------------------------------------
     async attach(tabId) {
       if (this.attached.has(tabId)) return;
-      await new Promise((resolve, reject) => {
+      const pending = this.attaching.get(tabId);
+      if (pending) return pending;
+      const attach = new Promise((resolve, reject) => {
         this.opts.debuggerApi.attach({ tabId }, "1.3", () => {
           const err = this.opts.runtime.lastError;
           if (err) {
@@ -113,23 +112,21 @@
             }
             return;
           }
-          this.attached.set(tabId, { tabId, childSessions: /* @__PURE__ */ new Map() });
+          this.attached.set(tabId, { tabId });
           this.opts.log?.("debugger attached", { tabId });
           resolve();
         });
       });
+      this.attaching.set(tabId, attach);
       try {
-        await this.sendCommand(tabId, "Target.setAutoAttach", {
-          autoAttach: true,
-          waitForDebuggerOnStart: false,
-          flatten: true,
-          filter: [{ type: "iframe", exclude: false }]
-        });
-      } catch (e) {
-        this.opts.log?.("Target.setAutoAttach failed (non-fatal)", { tabId, error: String(e) });
+        await attach;
+      } finally {
+        if (this.attaching.get(tabId) === attach) this.attaching.delete(tabId);
       }
     }
     async detach(tabId) {
+      const pending = this.attaching.get(tabId);
+      if (pending) await pending.catch(() => void 0);
       const entry = this.attached.get(tabId);
       if (!entry) return;
       this.attached.delete(tabId);
@@ -147,13 +144,8 @@
     }
     // ---- sendCommand multiplex ----------------------------------------------
     async sendCommand(tabId, method, params, opts) {
-      const attached = this.attached.get(tabId);
-      if (!attached) throw new BrowserNotAttachedError();
-      const target = opts?.sessionId ? (() => {
-        const entry = [...attached.childSessions.values()].find((v) => v.targetId);
-        return { tabId };
-      })() : { tabId };
-      const effectiveTarget = opts?.sessionId ? { tabId, sessionId: opts.sessionId } : target;
+      if (!this.attached.has(tabId)) throw new BrowserNotAttachedError();
+      const effectiveTarget = opts?.sessionId ? { tabId, sessionId: opts.sessionId } : { tabId };
       return await new Promise((resolve, reject) => {
         ;
         this.opts.debuggerApi.sendCommand(effectiveTarget, method, params, (result) => {
@@ -170,34 +162,13 @@
         });
       });
     }
-    // ---- event handlers -----------------------------------------------------
-    handleDebuggerEvent = (source, method, params) => {
-      if (method === "Target.attachedToTarget") {
-        const p = params;
-        if (!p) return;
-        const entry = this.attached.get(source.tabId);
-        if (!entry) return;
-        entry.childSessions.set(p.sessionId, { targetId: p.targetInfo.targetId, type: p.targetInfo.type });
-        this.opts.log?.("Target.attachedToTarget", {
-          tabId: source.tabId,
-          sessionId: p.sessionId,
-          targetId: p.targetInfo.targetId,
-          type: p.targetInfo.type
-        });
-      } else if (method === "Target.detachedFromTarget") {
-        const p = params;
-        if (!p) return;
-        this.attached.get(source.tabId)?.childSessions.delete(p.sessionId);
-        this.opts.log?.("Target.detachedFromTarget", { tabId: source.tabId, sessionId: p.sessionId });
-      }
-    };
     handleDebuggerDetach = (source, reason) => {
       this.attached.delete(source.tabId);
       this.opts.log?.("debugger onDetach", { tabId: source.tabId, reason });
     };
   };
 
-  // extensions/chrome/src/background/native-port.ts
+  // src/background/native-port.ts
   var NativePortV2 = class {
     constructor(opts) {
       this.opts = opts;
@@ -238,13 +209,7 @@
         port.disconnect();
       } catch {
       }
-      for (const { timer, resolve, request } of this.pending.values()) {
-        clearTimeout(timer);
-        const r = { ok: false, requestId: request.requestId, error: { tag: "BrowserHostUnavailable", message: "Native host disconnected", retryable: true }, elapsedMs: 0 };
-        resolve(r);
-        this.opts.onResponse(r);
-      }
-      this.pending.clear();
+      this.failPending("Native host disconnected");
     }
     send(request) {
       if (!this.port) this.connect();
@@ -258,7 +223,7 @@
           this.pending.delete(request.requestId);
           const r = { ok: false, requestId: request.requestId, error: { tag: "BrowserTimeout", message: `request ${request.requestId} exceeded ${request.timeoutMs}ms`, retryable: true }, elapsedMs: Date.now() - startedAt };
           resolve(r);
-          this.opts.onResponse(r);
+          this.opts.onResponse?.(r);
         }, request.timeoutMs);
         this.pending.set(request.requestId, { request, timer, resolve });
         try {
@@ -268,7 +233,7 @@
           this.pending.delete(request.requestId);
           const r = { ok: false, requestId: request.requestId, error: { tag: "BrowserHostUnavailable", message: String(e), retryable: true }, elapsedMs: Date.now() - startedAt };
           resolve(r);
-          this.opts.onResponse(r);
+          this.opts.onResponse?.(r);
         }
       });
     }
@@ -279,7 +244,7 @@
       this.pending.delete(requestId);
       const r = { ok: false, requestId, error: { tag: "BrowserControlInterrupted", message: "Request aborted by caller", retryable: true }, elapsedMs: 0 };
       entry.resolve(r);
-      this.opts.onResponse(r);
+      this.opts.onResponse?.(r);
       try {
         this.port?.postMessage({ type: "abort", requestId });
       } catch {
@@ -306,7 +271,7 @@
         clearTimeout(entry.timer);
         this.pending.delete(response.requestId);
         entry.resolve(response);
-        this.opts.onResponse(response);
+        this.opts.onResponse?.(response);
       } else if (msg.type === "pong" || msg.type === "hello_ack" || msg.type === "event_ack") {
         this.opts.log?.("native control", { type: msg.type });
       } else if (msg.type === "error") {
@@ -318,7 +283,7 @@
             this.pending.delete(requestId);
             const r = { ok: false, requestId, error: { tag: code ?? "BrowserOperationFailed", message: message ?? "host error", retryable: true }, elapsedMs: 0 };
             entry.resolve(r);
-            this.opts.onResponse(r);
+            this.opts.onResponse?.(r);
           }
         }
         this.opts.log?.("native host error", { code, message, requestId });
@@ -336,18 +301,154 @@
         } catch {
         }
       }
-      for (const { timer, resolve, request } of this.pending.values()) {
-        clearTimeout(timer);
-        const r = { ok: false, requestId: request.requestId, error: { tag: "BrowserHostUnavailable", message: "Native host disconnected", retryable: true }, elapsedMs: 0 };
-        resolve(r);
-        this.opts.onResponse(r);
-      }
-      this.pending.clear();
+      this.failPending("Native host disconnected");
       this.opts.onDisconnect?.(err);
     };
+    failPending(message) {
+      for (const { timer, resolve, request } of this.pending.values()) {
+        clearTimeout(timer);
+        const response = {
+          ok: false,
+          requestId: request.requestId,
+          error: { tag: "BrowserHostUnavailable", message, retryable: true },
+          elapsedMs: 0
+        };
+        resolve(response);
+        this.opts.onResponse?.(response);
+      }
+      this.pending.clear();
+    }
   };
 
-  // extensions/chrome/src/background/sw.ts
+  // src/background/active-tab-icon.ts
+  var ACTIVE_TAB_ICON_MESSAGE = "opencode:active-tab-icon";
+  var ActiveTabIconController = class {
+    constructor(tabs, log) {
+      this.tabs = tabs;
+      this.log = log;
+    }
+    tabs;
+    log;
+    activeByWindow = /* @__PURE__ */ new Map();
+    started = false;
+    epoch = 0;
+    async start() {
+      if (this.started) return;
+      this.started = true;
+      this.tabs.onActivated.addListener(this.onActivated);
+      this.tabs.onUpdated.addListener(this.onUpdated);
+      this.tabs.onRemoved.addListener(this.onRemoved);
+      const epoch = this.epoch;
+      const active = await this.tabs.query({ active: true }).catch(() => []);
+      if (!this.started || this.epoch !== epoch) return;
+      for (const tab of active) {
+        if (tab.id === void 0 || tab.windowId === void 0) continue;
+        this.setWindowActive(tab.windowId, tab.id);
+      }
+    }
+    stop() {
+      if (!this.started) return;
+      this.started = false;
+      this.epoch++;
+      this.tabs.onActivated.removeListener(this.onActivated);
+      this.tabs.onUpdated.removeListener(this.onUpdated);
+      this.tabs.onRemoved.removeListener(this.onRemoved);
+      for (const tabId of this.activeByWindow.values()) this.send(tabId, false);
+      this.activeByWindow.clear();
+    }
+    onActivated = ({ tabId, windowId }) => {
+      this.epoch++;
+      this.setWindowActive(windowId, tabId);
+    };
+    onUpdated = (tabId, changeInfo) => {
+      if (changeInfo.status !== "complete") return;
+      for (const activeId of this.activeByWindow.values()) {
+        if (activeId !== tabId) continue;
+        this.send(tabId, true);
+        return;
+      }
+    };
+    onRemoved = (tabId, { windowId }) => {
+      if (this.activeByWindow.get(windowId) !== tabId) return;
+      this.epoch++;
+      this.activeByWindow.delete(windowId);
+    };
+    setWindowActive(windowId, tabId) {
+      const previous = this.activeByWindow.get(windowId);
+      if (previous === tabId) {
+        this.send(tabId, true);
+        return;
+      }
+      if (previous !== void 0) this.send(previous, false);
+      this.activeByWindow.set(windowId, tabId);
+      this.send(tabId, true);
+    }
+    send(tabId, active) {
+      void this.tabs.sendMessage(tabId, { type: ACTIVE_TAB_ICON_MESSAGE, active }).catch((error) => this.log?.("active-tab icon message skipped", { tabId, active, error: String(error) }));
+    }
+  };
+
+  // src/background/tab-waits.ts
+  function createTabWait(tabs, tabId, timeoutMs, matches) {
+    let finish = () => {
+    };
+    const done = new Promise((resolve) => {
+      let settled = false;
+      const onUpdated = (updatedTabId, changeInfo, tab) => {
+        if (updatedTabId === tabId && matches(changeInfo, tab)) finish(tab);
+      };
+      const onRemoved = (removedTabId) => {
+        if (removedTabId === tabId) finish(null);
+      };
+      const timer = setTimeout(() => finish(null), Math.max(1, timeoutMs));
+      finish = (tab) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        tabs.onUpdated.removeListener(onUpdated);
+        tabs.onRemoved.removeListener(onRemoved);
+        resolve(tab);
+      };
+      tabs.onUpdated.addListener(onUpdated);
+      tabs.onRemoved.addListener(onRemoved);
+    });
+    return { done, finish };
+  }
+  async function waitForTabComplete(tabs, tabId, timeoutMs) {
+    const wait = createTabWait(
+      tabs,
+      tabId,
+      timeoutMs,
+      (changeInfo, tab) => changeInfo.status === "complete" || tab.status === "complete"
+    );
+    const current = await tabs.get(tabId).catch(() => null);
+    if (!current || current.status === "complete") wait.finish(current);
+    await wait.done;
+  }
+  async function waitForUrl(tabs, tabId, pattern, timeoutMs) {
+    const wait = createTabWait(
+      tabs,
+      tabId,
+      timeoutMs,
+      (changeInfo, tab) => (changeInfo.url ?? tab.url ?? "").includes(pattern)
+    );
+    const current = await tabs.get(tabId).catch(() => null);
+    if (!current || current.url?.includes(pattern)) wait.finish(current);
+    return wait.done;
+  }
+
+  // src/background/sw.ts
+  var DEBUGGER_OPERATIONS = /* @__PURE__ */ new Set([
+    "snapshot",
+    "screenshot",
+    "click",
+    "type",
+    "press",
+    "scroll",
+    "evaluate",
+    "resize",
+    "set_appearance"
+  ]);
   function toError(tag, message, retryable, details) {
     return { tag, message, retryable, ...details ? { details } : {} };
   }
@@ -365,6 +466,7 @@
   var debuggerManager = null;
   var nativePort = null;
   var wsFallback = null;
+  var activeTabIconController = null;
   function getDebuggerManager() {
     if (!debuggerManager) {
       debuggerManager = new DebuggerManager({
@@ -380,8 +482,6 @@
       nativePort = new NativePortV2({
         hostName: NATIVE_HOST_NAME,
         connectNative: (name) => chrome.runtime.connectNative(name),
-        onResponse: () => {
-        },
         onRequest: (request) => {
           void handleBrokerRequest(request, "native");
         },
@@ -404,6 +504,14 @@
       }
     }
     return nativePort;
+  }
+  function getActiveTabIconController() {
+    if (!activeTabIconController) {
+      activeTabIconController = new ActiveTabIconController(chrome.tabs, (message, meta) => {
+        console.debug(`[sw:icon] ${message}`, meta ?? "");
+      });
+    }
+    return activeTabIconController;
   }
   async function handleBrokerRequest(raw, source) {
     const startedAt = Date.now();
@@ -434,36 +542,20 @@
   async function dispatchOperation(tabIdStr, operation, sessionId) {
     const tabId = tabIdStr ? Number.parseInt(tabIdStr, 10) : await resolveActiveTabId();
     if (!Number.isFinite(tabId)) throw Object.assign(new Error(`Invalid tabId ${tabIdStr}`), { tag: "BrowserTabNotFound", retryable: true });
-    const dm = getDebuggerManager();
     const name = operation.name;
     const input = operation.input ?? {};
-    const needsDebugger = /* @__PURE__ */ new Set([
-      "snapshot",
-      "click",
-      "type",
-      "press",
-      "scroll",
-      "evaluate",
-      "wait_for",
-      "screenshot",
-      "highlight",
-      "annotate",
-      "query",
-      "profiler_start",
-      "profiler_stop",
-      "react_inspect",
-      "resize",
-      "recording_start",
-      "recording_stop",
-      "open_devtools"
-    ]);
-    if (needsDebugger.has(name) && !dm.isAttached(tabId)) {
+    const needsDebugger = DEBUGGER_OPERATIONS.has(name);
+    const dm = needsDebugger ? getDebuggerManager() : debuggerManager;
+    if (needsDebugger && !dm.isAttached(tabId)) {
       await dm.attach(tabId);
     }
     switch (name) {
       case "status": {
-        const tabs = await chrome.tabs.query({});
-        const active = tabs.find((t) => t.active);
+        const [tabs, focusedActiveTabs] = await Promise.all([
+          chrome.tabs.query({}),
+          chrome.tabs.query({ active: true, lastFocusedWindow: true })
+        ]);
+        const active = focusedActiveTabs[0] ?? tabs.find((t) => t.active);
         return {
           status: {
             connected: true,
@@ -507,14 +599,14 @@
       }
       case "navigate": {
         await chrome.tabs.update(tabId, { url: input.url });
-        await waitForTabComplete(tabId, input.timeoutMs ?? 15e3);
+        await waitForTabComplete(chrome.tabs, tabId, input.timeoutMs ?? 15e3);
         const tab = await chrome.tabs.get(tabId);
         return { navigated: { tabId: String(tabId), url: tab.url ?? input.url, title: tab.title ?? "", readyState: "Success", viewport: { width: tab.width ?? 1280, height: tab.height ?? 800, dpr: 1, scrollX: 0, scrollY: 0 } } };
       }
       case "close": {
         const closeId = input.tabId ? Number.parseInt(input.tabId, 10) : tabId;
         try {
-          await dm.detach(closeId);
+          await debuggerManager?.detach(closeId);
         } catch {
         }
         await chrome.tabs.remove(closeId);
@@ -544,17 +636,17 @@
           await chrome.tabs.sendMessage(tabId, { type: "opencode:hide" });
         } catch {
         }
-        await new Promise((r) => requestAnimationFrame(() => r(null))).catch(() => new Promise((r) => setTimeout(r, 16)));
+        const tab = await chrome.tabs.get(tabId).catch(() => null);
         let result;
         try {
           try {
             const res = await dm.sendCommand(tabId, "Page.captureScreenshot", { format: input.format ?? "png", captureBeyondViewport: !!input.fullPage });
-            result = { screenshot: { tabId: String(tabId), url: (await chrome.tabs.get(tabId)).url ?? "", title: (await chrome.tabs.get(tabId)).title ?? "", mime: input.format === "jpeg" ? "image/jpeg" : "image/png", data: res.data, width: 1280, height: 800, viewport: { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 }, capturedAt: Date.now() } };
+            result = { screenshot: { tabId: String(tabId), url: tab?.url ?? "", title: tab?.title ?? "", mime: input.format === "jpeg" ? "image/jpeg" : "image/png", data: res.data, width: 1280, height: 800, viewport: { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 }, capturedAt: Date.now() } };
           } catch {
-            const winId = (await chrome.tabs.get(tabId))?.windowId;
+            const winId = tab?.windowId;
             const dataUrl = winId !== void 0 ? await chrome.tabs.captureVisibleTab(winId, { format: input.format ?? "png" }) : await chrome.tabs.captureVisibleTab({ format: input.format ?? "png" });
             const data = dataUrl.split(",")[1] ?? "";
-            result = { screenshot: { tabId: String(tabId), url: "", title: "", mime: input.format === "jpeg" ? "image/jpeg" : "image/png", data, width: 1280, height: 800, viewport: { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 }, capturedAt: Date.now() } };
+            result = { screenshot: { tabId: String(tabId), url: tab?.url ?? "", title: tab?.title ?? "", mime: input.format === "jpeg" ? "image/jpeg" : "image/png", data, width: 1280, height: 800, viewport: { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 }, capturedAt: Date.now() } };
           }
         } finally {
           try {
@@ -635,18 +727,36 @@
       }
       case "wait_for": {
         const timeout = input.timeoutMs ?? 5e3;
-        const start = Date.now();
-        while (Date.now() - start < timeout) {
-          if (input.condition?.type === "url") {
-            const tab = await chrome.tabs.get(tabId);
-            if (tab.url?.includes(input.condition.pattern)) {
-              return { waited: { satisfied: true, at: { time: Date.now(), url: tab.url ?? "", title: tab.title ?? "" } } };
-            }
-          } else if (input.condition?.type === "text") {
-            const [{ result: found }] = await chrome.scripting.executeScript({ target: { tabId }, func: (t) => document.body?.innerText?.includes(t) ?? false, args: [input.condition.text] }).catch(() => [{ result: false }]);
-            if (found) return { waited: { satisfied: true, at: { time: Date.now(), url: "", title: "" } } };
-          }
-          await new Promise((r) => setTimeout(r, 100));
+        if (input.condition?.type === "url") {
+          const tab = await waitForUrl(chrome.tabs, tabId, input.condition.pattern, timeout);
+          if (tab) return { waited: { satisfied: true, at: { time: Date.now(), url: tab.url ?? "", title: tab.title ?? "" } } };
+        } else if (input.condition?.type === "text") {
+          const [{ result: found }] = await chrome.scripting.executeScript({
+            target: { tabId },
+            func: (text, timeoutMs) => {
+              if (document.body?.innerText?.includes(text)) return Promise.resolve(true);
+              return new Promise((resolve) => {
+                let checkTimer = 0;
+                const finish = (value) => {
+                  observer.disconnect();
+                  clearTimeout(timer);
+                  if (checkTimer) clearTimeout(checkTimer);
+                  resolve(value);
+                };
+                const observer = new MutationObserver(() => {
+                  if (checkTimer) return;
+                  checkTimer = setTimeout(() => {
+                    checkTimer = 0;
+                    if (document.body?.innerText?.includes(text)) finish(true);
+                  }, 25);
+                });
+                const timer = setTimeout(() => finish(false), timeoutMs);
+                observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true });
+              });
+            },
+            args: [input.condition.text, timeout]
+          }).catch(() => [{ result: false }]);
+          if (found) return { waited: { satisfied: true, at: { time: Date.now(), url: "", title: "" } } };
         }
         throw Object.assign(new Error("wait_for timeout"), { tag: "BrowserTimeout", retryable: true });
       }
@@ -672,7 +782,8 @@
           const els = [...document.querySelectorAll(sel)].slice(0, max ?? 20);
           return els.map((el) => {
             const r = el.getBoundingClientRect();
-            return { rect: { x: r.x, y: r.y, width: r.width, height: r.height }, center: { x: r.x + r.width / 2, y: r.y + r.height / 2 }, visibility: r.width > 0 && r.height > 0 ? "visible" : "hidden", display: getComputedStyle(el).display, position: getComputedStyle(el).position, text: el.textContent?.slice(0, 200) ?? "" };
+            const style = getComputedStyle(el);
+            return { rect: { x: r.x, y: r.y, width: r.width, height: r.height }, center: { x: r.x + r.width / 2, y: r.y + r.height / 2 }, visibility: r.width > 0 && r.height > 0 ? "visible" : "hidden", display: style.display, position: style.position, text: el.textContent?.slice(0, 200) ?? "" };
           });
         }, args: [selector, input.maxResults ?? 20] }).catch(() => [{ result: [] }]);
         const matches = results?.[0]?.result ?? [];
@@ -723,16 +834,8 @@
     return { x: 100, y: 100 };
   }
   async function resolveActiveTabId() {
-    const [active] = await chrome.tabs.query({ active: true, currentWindow: true });
+    const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
     return active?.id ?? null;
-  }
-  async function waitForTabComplete(tabId, timeoutMs) {
-    const start = Date.now();
-    while (Date.now() - start < timeoutMs) {
-      const tab = await chrome.tabs.get(tabId).catch(() => null);
-      if (tab?.status === "complete") return;
-      await new Promise((r) => setTimeout(r, 200));
-    }
   }
   chrome.runtime.onInstalled.addListener(() => {
     console.log("[sw] installed", chrome.runtime.getManifest().version);
@@ -751,6 +854,7 @@
     getNativePort().connect();
   } catch {
   }
+  void getActiveTabIconController().start();
   if (chrome.runtime.onConnectNative) {
   }
   chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
@@ -796,17 +900,4 @@
       return false;
     }
   });
-  chrome.debugger.onEvent.addListener((source, method, params) => {
-  });
-  chrome.debugger.onDetach.addListener((source, reason) => {
-    console.log("[sw] debugger detached", source, reason);
-  });
-  try {
-    chrome.alarms?.create("keepalive", { periodInMinutes: 0.5 });
-    chrome.alarms?.onAlarm.addListener((a) => {
-      if (a.name === "keepalive") void chrome.runtime.getPlatformInfo(() => {
-      });
-    });
-  } catch {
-  }
 })();

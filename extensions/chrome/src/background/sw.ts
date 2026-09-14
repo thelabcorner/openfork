@@ -6,6 +6,20 @@
 import { NATIVE_HOST_NAME, isBrokerRequest } from "../shared/protocol.js"
 import { DebuggerManager } from "./debugger.js"
 import { NativePortV2 } from "./native-port.js"
+import { ActiveTabIconController } from "./active-tab-icon.js"
+import { waitForTabComplete, waitForUrl } from "./tab-waits.js"
+
+const DEBUGGER_OPERATIONS = new Set([
+  "snapshot",
+  "screenshot",
+  "click",
+  "type",
+  "press",
+  "scroll",
+  "evaluate",
+  "resize",
+  "set_appearance",
+])
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -31,6 +45,7 @@ function toBrokerErrorBody(err) {
 let debuggerManager = null
 let nativePort = null
 let wsFallback = null // optional WS transport for WSL — see notes below
+let activeTabIconController = null
 
 function getDebuggerManager() {
   if (!debuggerManager) {
@@ -48,7 +63,6 @@ function getNativePort() {
     nativePort = new NativePortV2({
       hostName: NATIVE_HOST_NAME,
       connectNative: (name) => chrome.runtime.connectNative(name),
-      onResponse: () => {},
       onRequest: (request) => { void handleBrokerRequest(request, "native") },
       onAbort: (requestId) => console.debug("[sw:native] abort", { requestId }),
       onDisconnect: (err) => {
@@ -63,6 +77,15 @@ function getNativePort() {
     try { nativePort.connect() } catch (e) { console.warn("[sw:native] initial connect failed", e) }
   }
   return nativePort
+}
+
+function getActiveTabIconController() {
+  if (!activeTabIconController) {
+    activeTabIconController = new ActiveTabIconController(chrome.tabs, (message, meta) => {
+      console.debug(`[sw:icon] ${message}`, meta ?? "")
+    })
+  }
+  return activeTabIconController
 }
 
 // ---- WS fallback (WSL) -----------------------------------------------------
@@ -132,24 +155,25 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
   const tabId = tabIdStr ? Number.parseInt(tabIdStr, 10) : await resolveActiveTabId()
   if (!Number.isFinite(tabId)) throw Object.assign(new Error(`Invalid tabId ${tabIdStr}`), { tag: "BrowserTabNotFound", retryable: true })
 
-  const dm = getDebuggerManager()
   const name = operation.name
   const input = operation.input ?? {}
+  const needsDebugger = DEBUGGER_OPERATIONS.has(name)
+  const dm = needsDebugger ? getDebuggerManager() : debuggerManager
 
-  // Ensure attached for CDP ops
-  const needsDebugger = new Set([
-    "snapshot","click","type","press","scroll","evaluate","wait_for","screenshot",
-    "highlight","annotate","query","profiler_start","profiler_stop","react_inspect",
-    "resize","recording_start","recording_stop","open_devtools",
-  ])
-  if (needsDebugger.has(name) && !dm.isAttached(tabId)) {
+  // Attach only for operations that actually issue chrome.debugger commands.
+  // Scripting-only and unsupported operations should never flash Chrome's
+  // debugging infobar or subscribe the tab to CDP unnecessarily.
+  if (needsDebugger && !dm.isAttached(tabId)) {
     await dm.attach(tabId)
   }
 
   switch (name) {
     case "status": {
-      const tabs = await chrome.tabs.query({})
-      const active = tabs.find(t => t.active)
+      const [tabs, focusedActiveTabs] = await Promise.all([
+        chrome.tabs.query({}),
+        chrome.tabs.query({ active: true, lastFocusedWindow: true }),
+      ])
+      const active = focusedActiveTabs[0] ?? tabs.find(t => t.active)
       return {
         status: {
           connected: true,
@@ -196,13 +220,13 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
     }
     case "navigate": {
       await chrome.tabs.update(tabId, { url: input.url })
-      await waitForTabComplete(tabId, input.timeoutMs ?? 15000)
+      await waitForTabComplete(chrome.tabs, tabId, input.timeoutMs ?? 15000)
       const tab = await chrome.tabs.get(tabId)
       return { navigated: { tabId: String(tabId), url: tab.url ?? input.url, title: tab.title ?? "", readyState: "Success", viewport: { width: tab.width ?? 1280, height: tab.height ?? 800, dpr: 1, scrollX: 0, scrollY: 0 } } }
     }
     case "close": {
       const closeId = input.tabId ? Number.parseInt(input.tabId, 10) : tabId
-      try { await dm.detach(closeId) } catch {}
+      try { await debuggerManager?.detach(closeId) } catch {}
       await chrome.tabs.remove(closeId)
       return { closed: { tabId: String(closeId), wasActive: true, guestsRemaining: 0 } }
     }
@@ -228,20 +252,23 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
       // 1) ask content to hide overlay (Synchronous ack barrier), 2) capture, 3) show.
       // Non-fatal if content not present — still captured without ghost.
       try { await chrome.tabs.sendMessage(tabId, { type: "opencode:hide" }) } catch {}
-      // Small yield so hide display:none has been applied before capture (rAF boundary)
-      await new Promise(r => requestAnimationFrame(() => r(null) as unknown as void)).catch(() => new Promise(r => setTimeout(r, 16)))
+      // sendMessage resolves after the content script has synchronously applied
+      // display:none and acknowledged the barrier. MV3 service workers have no
+      // requestAnimationFrame; the previous code always paid its exception +
+      // 16ms fallback path here.
+      const tab = await chrome.tabs.get(tabId).catch(() => null)
       let result
       try {
         try {
           const res = await dm.sendCommand(tabId, "Page.captureScreenshot", { format: input.format ?? "png", captureBeyondViewport: !!input.fullPage })
-          result = { screenshot: { tabId: String(tabId), url: (await chrome.tabs.get(tabId)).url ?? "", title: (await chrome.tabs.get(tabId)).title ?? "", mime: input.format === "jpeg" ? "image/jpeg" : "image/png", data: res.data, width: 1280, height: 800, viewport: { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 }, capturedAt: Date.now() } }
+          result = { screenshot: { tabId: String(tabId), url: tab?.url ?? "", title: tab?.title ?? "", mime: input.format === "jpeg" ? "image/jpeg" : "image/png", data: res.data, width: 1280, height: 800, viewport: { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 }, capturedAt: Date.now() } }
         } catch {
-          const winId = (await chrome.tabs.get(tabId))?.windowId
+          const winId = tab?.windowId
           const dataUrl = winId !== undefined
             ? await chrome.tabs.captureVisibleTab(winId, { format: input.format ?? "png" })
             : await chrome.tabs.captureVisibleTab({ format: input.format ?? "png" } as unknown as chrome.tabs.CaptureVisibleTabOptions)
           const data = (dataUrl as string).split(",")[1] ?? ""
-          result = { screenshot: { tabId: String(tabId), url: "", title: "", mime: input.format === "jpeg" ? "image/jpeg" : "image/png", data, width: 1280, height: 800, viewport: { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 }, capturedAt: Date.now() } }
+          result = { screenshot: { tabId: String(tabId), url: tab?.url ?? "", title: tab?.title ?? "", mime: input.format === "jpeg" ? "image/jpeg" : "image/png", data, width: 1280, height: 800, viewport: { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 }, capturedAt: Date.now() } }
         }
       } finally {
         try { await chrome.tabs.sendMessage(tabId, { type: "opencode:show" }) } catch {}
@@ -316,18 +343,39 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
     }
     case "wait_for": {
       const timeout = input.timeoutMs ?? 5000
-      const start = Date.now()
-      while (Date.now() - start < timeout) {
-        if (input.condition?.type === "url") {
-          const tab = await chrome.tabs.get(tabId)
-          if (tab.url?.includes(input.condition.pattern)) {
-            return { waited: { satisfied: true, at: { time: Date.now(), url: tab.url ?? "", title: tab.title ?? "" } } }
-          }
-        } else if (input.condition?.type === "text") {
-          const [{ result: found }] = await chrome.scripting.executeScript({ target: { tabId }, func: (t) => document.body?.innerText?.includes(t) ?? false, args: [input.condition.text] }).catch(() => [{ result: false }])
-          if (found) return { waited: { satisfied: true, at: { time: Date.now(), url: "", title: "" } } }
-        }
-        await new Promise(r => setTimeout(r, 100))
+      if (input.condition?.type === "url") {
+        const tab = await waitForUrl(chrome.tabs, tabId, input.condition.pattern, timeout)
+        if (tab) return { waited: { satisfied: true, at: { time: Date.now(), url: tab.url ?? "", title: tab.title ?? "" } } }
+      } else if (input.condition?.type === "text") {
+        const [{ result: found }] = await chrome.scripting.executeScript({
+          target: { tabId },
+          func: (text, timeoutMs) => {
+            if (document.body?.innerText?.includes(text)) return Promise.resolve(true)
+            return new Promise((resolve) => {
+              let checkTimer = 0
+              const finish = (value) => {
+                observer.disconnect()
+                clearTimeout(timer)
+                if (checkTimer) clearTimeout(checkTimer)
+                resolve(value)
+              }
+              const observer = new MutationObserver(() => {
+                // Mutation-heavy applications can produce thousands of records
+                // per second. Coalesce expensive innerText reads while keeping
+                // the wait entirely in-page (zero extension round-trips).
+                if (checkTimer) return
+                checkTimer = setTimeout(() => {
+                  checkTimer = 0
+                  if (document.body?.innerText?.includes(text)) finish(true)
+                }, 25)
+              })
+              const timer = setTimeout(() => finish(false), timeoutMs)
+              observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true })
+            })
+          },
+          args: [input.condition.text, timeout],
+        }).catch(() => [{ result: false }])
+        if (found) return { waited: { satisfied: true, at: { time: Date.now(), url: "", title: "" } } }
       }
       throw Object.assign(new Error("wait_for timeout"), { tag: "BrowserTimeout", retryable: true })
     }
@@ -347,7 +395,8 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
         const els = [...document.querySelectorAll(sel)].slice(0, max ?? 20)
         return els.map(el => {
           const r = el.getBoundingClientRect()
-          return { rect: { x: r.x, y: r.y, width: r.width, height: r.height }, center: { x: r.x + r.width / 2, y: r.y + r.height / 2 }, visibility: r.width > 0 && r.height > 0 ? "visible" : "hidden", display: getComputedStyle(el).display, position: getComputedStyle(el).position, text: el.textContent?.slice(0, 200) ?? "" }
+          const style = getComputedStyle(el)
+          return { rect: { x: r.x, y: r.y, width: r.width, height: r.height }, center: { x: r.x + r.width / 2, y: r.y + r.height / 2 }, visibility: r.width > 0 && r.height > 0 ? "visible" : "hidden", display: style.display, position: style.position, text: el.textContent?.slice(0, 200) ?? "" }
         })
       }, args: [selector, input.maxResults ?? 20] }).catch(() => [{ result: [] }])
       const matches = results?.[0]?.result ?? []
@@ -398,17 +447,8 @@ async function resolveTargetToCoords(tabId, target) {
 }
 
 async function resolveActiveTabId() {
-  const [active] = await chrome.tabs.query({ active: true, currentWindow: true })
+  const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
   return active?.id ?? null
-}
-
-async function waitForTabComplete(tabId, timeoutMs) {
-  const start = Date.now()
-  while (Date.now() - start < timeoutMs) {
-    const tab = await chrome.tabs.get(tabId).catch(() => null)
-    if (tab?.status === "complete") return
-    await new Promise(r => setTimeout(r, 200))
-  }
 }
 
 // ---- listeners -------------------------------------------------------------
@@ -427,6 +467,7 @@ chrome.runtime.onStartup.addListener(() => {
 // onInstalled/onStartup fired. Establish the native Port on every worker boot;
 // getNativePort()/connect() are idempotent, so this costs no duplicate process.
 try { getNativePort().connect() } catch {}
+void getActiveTabIconController().start()
 
 // Native host -> extension commands (primary)
 if (chrome.runtime.onConnectNative) {
@@ -484,20 +525,9 @@ chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
   }
 })
 
-// Debugger events -> forward to content.js / native host as needed
-chrome.debugger.onEvent.addListener((source, method, params) => {
-  // Forward screencast frames etc to host if recording
-})
+// connectNative() itself keeps an MV3 service worker alive on supported Chrome
+// versions, and active chrome.debugger sessions do as well. Do not wake the
+// extension on a synthetic 30s alarm when its native port already supplies the
+// intended lifetime signal.
 
-chrome.debugger.onDetach.addListener((source, reason) => {
-  console.log("[sw] debugger detached", source, reason)
-})
-
-// Keep service worker alive during native port session (offscreen fallback if needed)
-// We use chrome.alarms as keepalive if available, otherwise rely on Port lifetime.
-try {
-  chrome.alarms?.create("keepalive", { periodInMinutes: 0.5 })
-  chrome.alarms?.onAlarm.addListener(a => { if (a.name === "keepalive") void chrome.runtime.getPlatformInfo(() => {}) })
-} catch {}
-
-export { getDebuggerManager, getNativePort, handleBrokerRequest, dispatchOperation, toBrokerErrorBody }
+export { getDebuggerManager, getNativePort, getActiveTabIconController, handleBrokerRequest, dispatchOperation, toBrokerErrorBody }

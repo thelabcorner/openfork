@@ -1,3 +1,5 @@
+import { ACTIVE_TAB_ICON_ATTRIBUTE, setActiveTabFavicon } from "./active-tab-favicon"
+
 // opencode chrome overlay — closed shadow content script (ISOLATED world, document_start)
 // Implements chrome-attach/overlay-api v2: shadow host, cursor choreography, HIDE/SHOW barrier.
 //
@@ -336,7 +338,9 @@
 
   function setHidden(hidden: boolean): void {
     hiddenForCapture = hidden
-    ensureHost()
+    // Screenshot hygiene must be effectively free on pages where no opencode
+    // overlay has ever been shown. Do not construct shadow DOM merely to hide it.
+    if (!hostEl) return
     if (hostEl) hostEl.style.display = hidden ? "none" : ""
   }
 
@@ -377,6 +381,44 @@
   // to page events for control.
 
   const runtime = (globalThis as unknown as { chrome?: typeof chrome }).chrome?.runtime
+  let activeTabIconObserver: MutationObserver | null = null
+
+  function applyActiveTabIcon(active: boolean): void {
+    const iconUrl = runtime?.getURL?.("assets/icon48.png")
+    setActiveTabFavicon(document, active, iconUrl)
+    if (!active) {
+      activeTabIconObserver?.disconnect()
+      activeTabIconObserver = null
+      return
+    }
+    if (activeTabIconObserver || typeof MutationObserver !== "function") return
+
+    const root = document.head ?? document.documentElement
+    activeTabIconObserver = new MutationObserver((records) => {
+      let faviconChanged = false
+      for (const record of records) {
+        for (const node of [...record.addedNodes, ...record.removedNodes]) {
+          if (!(node instanceof HTMLLinkElement)) continue
+          if (node.hasAttribute(ACTIVE_TAB_ICON_ATTRIBUTE) || node.rel.toLowerCase().includes("icon")) {
+            faviconChanged = true
+            break
+          }
+        }
+        if (faviconChanged) break
+      }
+      if (!faviconChanged) return
+      const marker = document.querySelector<HTMLLinkElement>(`link[${ACTIVE_TAB_ICON_ATTRIBUTE}]`)
+      if (!marker) {
+        setActiveTabFavicon(document, true, iconUrl)
+        return
+      }
+      // A site that dynamically appends a new favicon can otherwise win the
+      // browser's "last icon declaration" selection. Reappend only in response
+      // to favicon mutations, not generic head churn.
+      if (marker.parentElement && marker.parentElement.lastElementChild !== marker) marker.parentElement.appendChild(marker)
+    })
+    activeTabIconObserver.observe(root, { childList: true })
+  }
 
   function handleMessage(
     msg: unknown,
@@ -421,7 +463,6 @@
       }
       case "opencode:clear": {
         pendingHighlight = []
-        ensureHost()
         outlineLayer?.replaceChildren()
         drawLayer?.replaceChildren()
         // cursor stays; caller can hide separately
@@ -439,8 +480,12 @@
         sendResponse?.({ ok: true, hidden: false })
         return false
       }
+      case "opencode:active-tab-icon": {
+        applyActiveTabIcon(m.active === true)
+        sendResponse?.({ ok: true, active: m.active === true })
+        return false
+      }
       case "opencode:ping": {
-        ensureHost()
         sendResponse?.({ pong: true, hasHost: !!hostEl, hidden: hiddenForCapture })
         return false
       }
@@ -468,23 +513,6 @@
     }
   }
 
-  // Early host creation helps first-paint cursor (no FOUC on first highlight)
-  if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", () => ensureHost(), { once: true })
-  } else {
-    ensureHost()
-  }
-
-  // Guard page lifecycle: restore on BFCache restore; teardown on detach
-  window.addEventListener("pageshow", () => {
-    if (!hostEl || !document.documentElement.contains(hostEl)) {
-      // page restored from BFCache without host
-      try {
-        ensureHost()
-      } catch {}
-    }
-  })
-
   if (runtime?.onMessage) {
     runtime.onMessage.addListener(handleMessage as never)
   }
@@ -492,7 +520,6 @@
   // Expose minimal debug probe for SW health checks (ISOLATED world only)
   // Never on window (page cannot reach); only inside isolated world closure.
 
-  // Also watch for late DOM churn after initial mount
-  window.addEventListener("scroll", scheduleRender, true)
-  window.addEventListener("resize", scheduleRender, true)
+  // Overlay DOM, MutationObserver, pagehide listener and animation machinery are
+  // all lazy: ordinary browsing pays only for this single message listener.
 })()

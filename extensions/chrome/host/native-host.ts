@@ -46,20 +46,64 @@ function encodeNativeMessage(value: unknown): Buffer {
 
 // Incremental stdin reader — yields complete JSON messages.
 class NativeMessageReader {
-  private buf = Buffer.alloc(0)
+  private static readonly INITIAL_CAPACITY = 64 * 1024
+  private static readonly MAX_RETAINED_CAPACITY = 1024 * 1024
+  private buf = Buffer.allocUnsafe(NativeMessageReader.INITIAL_CAPACITY)
+  private start = 0
+  private end = 0
+
   push(chunk: Buffer): unknown[] {
-    this.buf = Buffer.concat([this.buf, chunk])
+    this.ensureCapacity(chunk.byteLength)
+    chunk.copy(this.buf, this.end)
+    this.end += chunk.byteLength
+
     const msgs: unknown[] = []
-    while (this.buf.byteLength >= HEADER_BYTES) {
-      const len = this.buf.readUInt32LE(0)
+    let offset = this.start
+    while (this.end - offset >= HEADER_BYTES) {
+      const len = this.buf.readUInt32LE(offset)
       if (len > MAX_EXT_TO_HOST) throw new FramingError(`Frame ${len} exceeds ext->host limit`, "too_large")
       const needed = HEADER_BYTES + len
-      if (this.buf.byteLength < needed) break
-      const json = this.buf.subarray(HEADER_BYTES, needed).toString("utf8")
+      if (this.end - offset < needed) break
+      const json = this.buf.subarray(offset + HEADER_BYTES, offset + needed).toString("utf8")
       msgs.push(JSON.parse(json) as unknown)
-      this.buf = this.buf.subarray(needed)
+      offset += needed
+    }
+
+    this.start = offset
+    if (this.start === this.end) {
+      this.start = 0
+      this.end = 0
+      if (this.buf.byteLength > NativeMessageReader.MAX_RETAINED_CAPACITY) {
+        this.buf = Buffer.allocUnsafe(NativeMessageReader.INITIAL_CAPACITY)
+      }
+    } else if (this.start > 0 && this.start >= this.buf.byteLength / 2) {
+      this.buf.copyWithin(0, this.start, this.end)
+      this.end -= this.start
+      this.start = 0
     }
     return msgs
+  }
+
+  private ensureCapacity(incomingBytes: number): void {
+    const unread = this.end - this.start
+    const needed = unread + incomingBytes
+    if (needed <= this.buf.byteLength) {
+      if (this.end + incomingBytes > this.buf.byteLength && this.start > 0) {
+        this.buf.copyWithin(0, this.start, this.end)
+        this.end = unread
+        this.start = 0
+      }
+      return
+    }
+
+    let capacity = this.buf.byteLength
+    while (capacity < needed) capacity = Math.min(MAX_EXT_TO_HOST + HEADER_BYTES, capacity * 2)
+    if (capacity < needed) throw new FramingError(`Buffered native message exceeds ext->host limit`, "too_large")
+    const next = Buffer.allocUnsafe(capacity)
+    if (unread > 0) this.buf.copy(next, 0, this.start, this.end)
+    this.buf = next
+    this.start = 0
+    this.end = unread
   }
 }
 
@@ -82,10 +126,24 @@ interface HostConfig {
   callbackToken: string
 }
 
+// Once the long-poll relay has authenticated a desktop endpoint, every Chrome
+// operation response targets the same endpoint. Avoid probing multiple files
+// and reparsing JSON on every response; relay failures invalidate the cache so
+// a restarted Desktop instance can be rediscovered immediately.
+let cachedHostConfig: HostConfig | null = null
+
+function invalidateHostConfig(): void {
+  cachedHostConfig = null
+}
+
 function loadHostConfig(): HostConfig | null {
+  if (cachedHostConfig) return cachedHostConfig
   const envUrl = process.env.OPENCODE_BROWSER_CALLBACK_URL
   const envToken = process.env.OPENCODE_BROWSER_CALLBACK_TOKEN
-  if (envUrl && envToken) return { callbackUrl: envUrl, callbackToken: envToken }
+  if (envUrl && envToken) {
+    cachedHostConfig = { callbackUrl: envUrl, callbackToken: envToken }
+    return cachedHostConfig
+  }
 
   // Try reading from well-known file locations (desktop writes this)
   // On macOS/Linux: $XDG_STATE_HOME or ~/.local/state/opencode / ~/Library/Application Support/opencode
@@ -106,7 +164,10 @@ function loadHostConfig(): HostConfig | null {
     try {
       if (!existsSync(p)) continue
       const data = JSON.parse(readFileSync(p, "utf8")) as HostConfig
-      if (data.callbackUrl && data.callbackToken) return data
+      if (data.callbackUrl && data.callbackToken) {
+        cachedHostConfig = data
+        return cachedHostConfig
+      }
     } catch {}
   }
   return null
@@ -186,6 +247,7 @@ async function runDesktopRelay(origin: string, signal: AbortSignal): Promise<voi
       if (payload.message) process.stdout.write(encodeNativeMessage(payload.message))
     } catch (error) {
       registeredConfig = ""
+      invalidateHostConfig()
       if (!signal.aborted) {
         log("desktop relay retry", { error: String(error) })
         await sleep(RELAY_RETRY_MS)

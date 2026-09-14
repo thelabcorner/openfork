@@ -1,5 +1,27 @@
 "use strict";
 (() => {
+  // src/content/active-tab-favicon.ts
+  var ACTIVE_TAB_ICON_ATTRIBUTE = "data-opencode-active-tab-icon";
+  function setActiveTabFavicon(document2, active, iconUrl) {
+    const selector = `link[${ACTIVE_TAB_ICON_ATTRIBUTE}]`;
+    const existing = document2.querySelector(selector);
+    if (!active) {
+      existing?.remove();
+      return;
+    }
+    if (existing) {
+      if (document2.head && existing.parentElement !== document2.head) document2.head.appendChild(existing);
+      return;
+    }
+    if (!iconUrl) return;
+    const icon = document2.createElement("link");
+    icon.rel = "icon";
+    icon.type = "image/png";
+    icon.href = iconUrl;
+    icon.setAttribute(ACTIVE_TAB_ICON_ATTRIBUTE, "");
+    (document2.head ?? document2.documentElement).appendChild(icon);
+  }
+
   // src/content/content.ts
   (() => {
     const OVERLAY_ATTRIBUTE = "data-opencode-overlay";
@@ -293,7 +315,7 @@
     }
     function setHidden(hidden) {
       hiddenForCapture = hidden;
-      ensureHost();
+      if (!hostEl) return;
       if (hostEl) hostEl.style.display = hidden ? "none" : "";
     }
     function reactComponentName(el) {
@@ -320,6 +342,39 @@
       return null;
     }
     const runtime = globalThis.chrome?.runtime;
+    let activeTabIconObserver = null;
+    function applyActiveTabIcon(active) {
+      const iconUrl = runtime?.getURL?.("assets/icon48.png");
+      setActiveTabFavicon(document, active, iconUrl);
+      if (!active) {
+        activeTabIconObserver?.disconnect();
+        activeTabIconObserver = null;
+        return;
+      }
+      if (activeTabIconObserver || typeof MutationObserver !== "function") return;
+      const root = document.head ?? document.documentElement;
+      activeTabIconObserver = new MutationObserver((records) => {
+        let faviconChanged = false;
+        for (const record of records) {
+          for (const node of [...record.addedNodes, ...record.removedNodes]) {
+            if (!(node instanceof HTMLLinkElement)) continue;
+            if (node.hasAttribute(ACTIVE_TAB_ICON_ATTRIBUTE) || node.rel.toLowerCase().includes("icon")) {
+              faviconChanged = true;
+              break;
+            }
+          }
+          if (faviconChanged) break;
+        }
+        if (!faviconChanged) return;
+        const marker = document.querySelector(`link[${ACTIVE_TAB_ICON_ATTRIBUTE}]`);
+        if (!marker) {
+          setActiveTabFavicon(document, true, iconUrl);
+          return;
+        }
+        if (marker.parentElement && marker.parentElement.lastElementChild !== marker) marker.parentElement.appendChild(marker);
+      });
+      activeTabIconObserver.observe(root, { childList: true });
+    }
     function handleMessage(msg, _sender, sendResponse) {
       if (!msg || typeof msg !== "object") return;
       const m = msg;
@@ -354,7 +409,6 @@
         }
         case "opencode:clear": {
           pendingHighlight = [];
-          ensureHost();
           outlineLayer?.replaceChildren();
           drawLayer?.replaceChildren();
           sendResponse?.({ ok: true });
@@ -370,8 +424,12 @@
           sendResponse?.({ ok: true, hidden: false });
           return false;
         }
+        case "opencode:active-tab-icon": {
+          applyActiveTabIcon(m.active === true);
+          sendResponse?.({ ok: true, active: m.active === true });
+          return false;
+        }
         case "opencode:ping": {
-          ensureHost();
           sendResponse?.({ pong: true, hasHost: !!hostEl, hidden: hiddenForCapture });
           return false;
         }
@@ -397,23 +455,8 @@
           return;
       }
     }
-    if (document.readyState === "loading") {
-      document.addEventListener("DOMContentLoaded", () => ensureHost(), { once: true });
-    } else {
-      ensureHost();
-    }
-    window.addEventListener("pageshow", () => {
-      if (!hostEl || !document.documentElement.contains(hostEl)) {
-        try {
-          ensureHost();
-        } catch {
-        }
-      }
-    });
     if (runtime?.onMessage) {
       runtime.onMessage.addListener(handleMessage);
     }
-    window.addEventListener("scroll", scheduleRender, true);
-    window.addEventListener("resize", scheduleRender, true);
   })();
 })();

@@ -11,8 +11,7 @@
     "tabGroups",
     "storage",
     "downloads",
-    "nativeMessaging",
-    "offscreen"
+    "nativeMessaging"
   ],
   "host_permissions": ["<all_urls>"],
   "background": {
@@ -29,7 +28,7 @@
   ],
   "web_accessible_resources": [
     {
-      "resources": ["assets/cursor.svg", "assets/overlay.css"],
+      "resources": ["assets/cursor.svg", "assets/overlay.css", "assets/icon48.png"],
       "matches": ["<all_urls>"]
     }
   ],
