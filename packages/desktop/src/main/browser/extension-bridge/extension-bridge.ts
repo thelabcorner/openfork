@@ -45,11 +45,15 @@ export interface ExtensionTabRecord {
 }
 
 export interface ExtensionBridgeOptions {
+  /** Owning BrowserEngine window id; avoids materializing the webview registry on every Chrome request. */
+  windowId: string
   registry: GuestRegistry
   operations: BrowserOperations
   extensionHost: ExtensionHost
   /** Live mirror of extension tabs (from SW `chrome.tabs` + ownership map). */
   getExtensionTabs: () => ExtensionTabRecord[]
+  /** Indexed lookup supplied by BrowserEngine for per-operation lane routing. */
+  getExtensionTab?: (tabId: string) => ExtensionTabRecord | undefined
   /** Active extension tab id, if any (e.g. chrome.tabs.query active). */
   getExtensionActiveTabId?: () => string | null
   /** Replace the live Chrome tab mirror after extension operations return authoritative state. */
@@ -92,8 +96,6 @@ export function mapChromeErrorToTag(message: string): InstanceType<typeof Browse
 
 export class ExtensionBridge {
   private readonly options: ExtensionBridgeOptions
-  /** Tracks in-flight extension requests for abort coalescing. */
-  private readonly extensionFlights = new Map<string, { abort: () => void }>()
 
   constructor(options: ExtensionBridgeOptions) {
     this.options = options
@@ -104,6 +106,7 @@ export class ExtensionBridge {
   }
 
   hasTab(tabId: string): boolean {
+    if (this.options.getExtensionTab) return this.options.getExtensionTab(tabId) !== undefined
     return this.options.getExtensionTabs().some((t) => t.tabId === tabId)
   }
 
@@ -150,8 +153,12 @@ export class ExtensionBridge {
   }
 
   private getActiveExtensionTab(): ExtensionTabRecord | undefined {
-    const tabs = this.options.getExtensionTabs()
     const activeId = this.options.getExtensionActiveTabId?.() ?? null
+    if (activeId && this.options.getExtensionTab) {
+      const indexed = this.options.getExtensionTab(activeId)
+      if (indexed) return indexed
+    }
+    const tabs = this.options.getExtensionTabs()
     if (activeId) return tabs.find((t) => t.tabId === activeId) ?? tabs.find((t) => t.active)
     return tabs.find((t) => t.active)
   }
@@ -161,7 +168,6 @@ export class ExtensionBridge {
   // -------------------------------------------------------------------------
   async dispatch(tabId: string | undefined, operation: BrowserOperation, sessionId: string): Promise<Record<string, unknown>> {
     const lane = this.resolveLane(tabId, operation)
-    this.log("extension bridge dispatch", { lane, tabId, operation: operation.name, sessionId: sessionId.slice(0, 8) })
 
     // Status always succeeds and merges both lanes
     if (operation.name === "status") return this.dispatchStatus(sessionId, tabId)
@@ -205,16 +211,12 @@ export class ExtensionBridge {
     const envelope = {
       requestId,
       sessionId,
-      windowId: this.options.registry.list()[0]?.windowId ?? "unknown",
+      windowId: this.options.windowId,
       messageId: requestId,
       tabId,
       operation,
       timeoutMs,
     }
-    // Track for abort; cleared on settle.
-    const abortSignal = new AbortController()
-    this.extensionFlights.set(requestId, { abort: () => abortSignal.abort() })
-
     try {
       // Cooperative timeout races the native host send; host.ts InFlight timer handles the outer envelope,
       // but extension sends also need an inner bound so a stalled native host doesn't hang forever.
@@ -236,37 +238,44 @@ export class ExtensionBridge {
         throw new BrowserError("BrowserHostUnavailable", `Extension host transport failed: ${(error as Error).message}`, true, { lane: "extension" })
       }
       throw this.normalizeChromeError(error)
-    } finally {
-      this.extensionFlights.delete(requestId)
     }
   }
 
   private async dispatchStatus(_sessionId: string, _tabId?: string): Promise<Record<string, unknown>> {
-    // Merge webview + extension lanes; mirrors BrowserOperations.status but additive
-    const webviewStatus = await this.options.operations.dispatch(undefined, { name: "status", input: {} }, "").catch(() => null) as unknown as { status?: unknown; tabs?: SessionTabInfo[] } | null
-    if (this.isAvailable) {
-      await this.dispatchExtension(undefined, { name: "status", input: {} }, _sessionId).catch((error) => {
-        this.log("extension status refresh failed", { error: String(error) })
-      })
-    }
+    // The two status lanes are independent. Refresh them concurrently instead
+    // of serializing one complete desktop status traversal ahead of Chrome.
+    const [webviewStatus] = await Promise.all([
+      this.options.operations.dispatch(undefined, { name: "status", input: {} }, "").catch(() => null) as Promise<{ status?: unknown; tabs?: SessionTabInfo[] } | null>,
+      this.isAvailable
+        ? this.dispatchExtension(undefined, { name: "status", input: {} }, _sessionId).catch((error) => {
+            this.log("extension status refresh failed", { error: String(error) })
+            return null
+          })
+        : Promise.resolve(null),
+    ])
     const extensionTabs: WireGuestTabState[] = this.options.getExtensionTabs().map((t) => toExtensionWireTab(t, t.active ?? false))
     const webviewTabs: WireGuestTabState[] = (webviewStatus?.tabs ?? []) as unknown as WireGuestTabState[]
     // De-duplicate by tabId (extension wins on collision — same URL opened in both lanes)
     const seen = new Set<string>()
     const merged: WireGuestTabState[] = []
-    for (const tab of [...extensionTabs, ...webviewTabs]) {
+    for (const tab of extensionTabs) {
+      seen.add(tab.tabId)
+      merged.push(tab)
+    }
+    for (const tab of webviewTabs) {
       if (seen.has(tab.tabId)) continue
       seen.add(tab.tabId)
       merged.push(tab)
     }
+    const activeExtensionTab = this.getActiveExtensionTab()
     // Include chrome state optional so old sidecars ignore it (protocol v2 stable)
     return {
       status: (webviewStatus?.status ?? { connected: true, appearance: "system", recording: { active: false } }),
       tabs: merged,
       chrome: {
         attached: this.isAvailable,
-        activeTabId: this.getActiveExtensionTab()?.tabId ?? null,
-        url: this.getActiveExtensionTab()?.url ?? null,
+        activeTabId: activeExtensionTab?.tabId ?? null,
+        url: activeExtensionTab?.url ?? null,
         tabs: extensionTabs,
       },
     } as unknown as Record<string, unknown>
@@ -274,12 +283,8 @@ export class ExtensionBridge {
 
   /** Abort a request by its extension requestId (host.ts abort path). */
   abort(requestId: string): void {
-    const flight = this.extensionFlights.get(requestId)
-    if (flight) {
-      flight.abort()
-      this.extensionFlights.delete(requestId)
-      this.log("extension bridge abort", { requestId })
-    }
+    this.options.extensionHost.abort(requestId)
+    this.log("extension bridge abort", { requestId })
   }
 
   health(): { connected: boolean; chrome: boolean; lanes: Lane[] } {
@@ -298,6 +303,18 @@ export class ExtensionBridge {
   private captureExtensionState(operation: BrowserOperation, result: Record<string, unknown>, sessionId: string): void {
     const publish = this.options.onExtensionSnapshot
     if (!publish) return
+
+    // Click/type/screenshot/snapshot/query/etc. cannot change the Chrome tab
+    // mirror. Avoid cloning every tab and republishing identical state on the
+    // overwhelmingly common automation hot path.
+    if (
+      operation.name !== "status" &&
+      operation.name !== "open" &&
+      operation.name !== "navigate" &&
+      operation.name !== "close" &&
+      operation.name !== "claim" &&
+      operation.name !== "set_tab_owner"
+    ) return
 
     if (operation.name === "status") {
       const previous = new Map(this.options.getExtensionTabs().map((tab) => [tab.tabId, tab]))

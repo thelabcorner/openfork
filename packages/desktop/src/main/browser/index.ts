@@ -86,6 +86,7 @@ export class BrowserEngine {
   readonly extensionHost: ExtensionHost
   readonly extensionBridge: ExtensionBridge
   private readonly chromeTabsMirror: ExtensionTabRecord[] = []
+  private readonly chromeTabsById = new Map<string, ExtensionTabRecord>()
   private chromeActiveTabId: string | null = null
   private readonly options: BrowserEngineOptions
   private readonly hostId = randomUUID()
@@ -155,6 +156,7 @@ export class BrowserEngine {
       onConnectedChange: (connected) => {
         if (!connected) {
           this.chromeTabsMirror.length = 0
+          this.chromeTabsById.clear()
           this.chromeActiveTabId = null
         }
         if (this.started) this.host.reRegister()
@@ -162,13 +164,17 @@ export class BrowserEngine {
       logger: options.logger,
     })
     this.extensionBridge = new ExtensionBridge({
+      windowId: options.windowId,
       registry: this.registry,
       operations: this.operations,
       extensionHost: this.extensionHost,
       getExtensionTabs: () => this.chromeTabsMirror,
+      getExtensionTab: (tabId) => this.chromeTabsById.get(tabId),
       getExtensionActiveTabId: () => this.chromeActiveTabId,
       onExtensionSnapshot: (tabs, activeTabId) => {
         this.chromeTabsMirror.splice(0, this.chromeTabsMirror.length, ...tabs)
+        this.chromeTabsById.clear()
+        for (const tab of tabs) this.chromeTabsById.set(tab.tabId, tab)
         this.chromeActiveTabId = activeTabId
       },
       logger: options.logger,
@@ -253,7 +259,7 @@ export class BrowserEngine {
       muted: t.muted ?? false,
     }))
     const chromeAttached = this.extensionHost.isConnected || this.chromeTabsMirror.length > 0
-    const chromeActive = this.chromeTabsMirror.find((t) => t.tabId === this.chromeActiveTabId) ?? this.chromeTabsMirror.find((t) => t.active) ?? null
+    const chromeActive = (this.chromeActiveTabId ? this.chromeTabsById.get(this.chromeActiveTabId) : undefined) ?? this.chromeTabsMirror.find((t) => t.active) ?? null
     return {
       host: {
         connected: this.host.isConnected,

@@ -25,9 +25,10 @@ export function encodeNativeMessage(payload: unknown): Buffer {
   if (body.length > NATIVE_MESSAGE_MAX_BYTES) {
     throw new Error(`Native message exceeds ${NATIVE_MESSAGE_MAX_BYTES} bytes (${body.length}) — use HTTP broker path for screenshots`)
   }
-  const header = Buffer.alloc(NATIVE_MESSAGE_HEADER_SIZE)
-  header.writeUInt32LE(body.length, 0)
-  return Buffer.concat([header, body])
+  const frame = Buffer.allocUnsafe(NATIVE_MESSAGE_HEADER_SIZE + body.length)
+  frame.writeUInt32LE(body.length, 0)
+  body.copy(frame, NATIVE_MESSAGE_HEADER_SIZE)
+  return frame
 }
 
 export function decodeNativeFrames(buffer: Buffer): { messages: unknown[]; remainder: Buffer } {
@@ -84,7 +85,8 @@ export class ExtensionHost {
   private readonly options: ExtensionHostOptions
   private readonly pending = new Map<string, PendingRequest>()
   private readonly queue: ExtensionRelayMessage[] = []
-  private readonly pollWaiters: PollWaiter[] = []
+  private queueHead = 0
+  private readonly pollWaiters = new Set<PollWaiter>()
   private staleTimer: ReturnType<typeof setTimeout> | null = null
   private running = false
   private connected = false
@@ -102,7 +104,7 @@ export class ExtensionHost {
   }
 
   get queuedCount(): number {
-    return this.queue.length
+    return this.queue.length - this.queueHead
   }
 
   async start(): Promise<void> {
@@ -123,12 +125,13 @@ export class ExtensionHost {
       entry.resolve(hostUnavailable(entry.request.requestId, Date.now() - entry.startedAt, "Extension relay stopping"))
     }
     this.pending.clear()
-    this.queue.length = 0
+    this.clearQueue()
 
-    for (const waiter of this.pollWaiters.splice(0)) {
+    for (const waiter of this.pollWaiters) {
       clearTimeout(waiter.timer)
       waiter.resolve(null)
     }
+    this.pollWaiters.clear()
   }
 
   /** Native-host hello/poll heartbeat. BrowserHost calls this on authenticated relay traffic. */
@@ -145,7 +148,7 @@ export class ExtensionHost {
     if (this.staleTimer) clearTimeout(this.staleTimer)
     this.staleTimer = null
     this.failPending(reason)
-    this.queue.length = 0
+    this.clearQueue()
     this.log("extension relay disconnected", { reason })
   }
 
@@ -157,21 +160,20 @@ export class ExtensionHost {
   nextMessage(waitMs = NATIVE_EXTENSION_POLL_MS): Promise<ExtensionRelayMessage | null> {
     if (!this.running) return Promise.resolve(null)
     this.markConnected()
-    const queued = this.queue.shift()
+    const queued = this.dequeue()
     if (queued) return Promise.resolve(queued)
 
     const bounded = Math.max(100, Math.min(waitMs, NATIVE_EXTENSION_POLL_MS + 5_000))
     return new Promise((resolve) => {
       const waiter: PollWaiter = {
         timer: setTimeout(() => {
-          const index = this.pollWaiters.indexOf(waiter)
-          if (index >= 0) this.pollWaiters.splice(index, 1)
+          this.pollWaiters.delete(waiter)
           resolve(null)
         }, bounded),
         resolve,
       }
       waiter.timer.unref?.()
-      this.pollWaiters.push(waiter)
+      this.pollWaiters.add(waiter)
     })
   }
 
@@ -222,17 +224,44 @@ export class ExtensionHost {
         error: { tag: "BrowserControlInterrupted", message: "Extension request aborted by caller", retryable: true },
       })
     }
-    if (this.connected) this.enqueue({ type: "abort", requestId })
+    // If the request has not reached the native host yet, remove it instead of
+    // making Chrome receive a request immediately followed by its abort.
+    let removedQueuedRequest = false
+    for (let index = this.queueHead; index < this.queue.length; index++) {
+      const message = this.queue[index]
+      if (message?.type !== "request" || message.request.requestId !== requestId) continue
+      this.queue.splice(index, 1)
+      removedQueuedRequest = true
+      break
+    }
+    if (!removedQueuedRequest && this.connected) this.enqueue({ type: "abort", requestId })
   }
 
   private enqueue(message: ExtensionRelayMessage): void {
-    const waiter = this.pollWaiters.shift()
+    const waiter = this.pollWaiters.values().next().value as PollWaiter | undefined
     if (waiter) {
+      this.pollWaiters.delete(waiter)
       clearTimeout(waiter.timer)
       waiter.resolve(message)
       return
     }
     this.queue.push(message)
+  }
+
+  private dequeue(): ExtensionRelayMessage | undefined {
+    if (this.queueHead >= this.queue.length) return undefined
+    const message = this.queue[this.queueHead++]
+    // Amortized O(1) dequeue without retaining an ever-growing consumed prefix.
+    if (this.queueHead >= 64 && this.queueHead * 2 >= this.queue.length) {
+      this.queue.splice(0, this.queueHead)
+      this.queueHead = 0
+    }
+    return message
+  }
+
+  private clearQueue(): void {
+    this.queue.length = 0
+    this.queueHead = 0
   }
 
   private armStaleTimer(): void {
@@ -241,7 +270,7 @@ export class ExtensionHost {
       this.staleTimer = null
       this.setConnected(false)
       this.failPending("Extension relay heartbeat expired")
-      this.queue.length = 0
+      this.clearQueue()
       this.log("extension relay heartbeat expired")
     }, this.options.staleAfterMs ?? NATIVE_EXTENSION_STALE_MS)
     this.staleTimer.unref?.()

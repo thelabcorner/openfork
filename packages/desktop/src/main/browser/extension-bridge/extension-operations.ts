@@ -24,8 +24,8 @@ import type { BrowserOperation, BrokerRequest } from "../contracts"
 // |                       |                                              |    "target_closed"|"canceled_by_user"|…} |
 // | SendCommand           | `wc.debugger.sendCommand(method, params)`    | `chrome.debugger.sendCommand({tabId},     |
 // |                       | Promise resolves with result                 |    method, params, cb)` + lastError check |
-// | AutoAttach flatten    | manual via `Target.setAutoAttach`            | same CDP but routed via tabId+flatten:true|
-// | Target multiplex      | sessionId on ControlSessionManager           | attached.childSessions Map + flat routing |
+// | AutoAttach flatten    | opt-in when a consumer needs child targets   | disabled by default; no idle OOPIF event stream |
+// | Target multiplex      | sessionId on ControlSessionManager           | explicit sessionId routing when/if needed |
 // | Screenshot            | `wc.capturePage(rect)` (NativeImage)         | `Page.captureScreenshot({captureBeyondViewport})` |
 // |                       | + `Page.startScreencast` for recording       | + fallback `chrome.tabs.captureVisibleTab`  |
 // | Input emulation       | CDP Input.* via wc.debugger                  | same CDP via chrome.debugger               |

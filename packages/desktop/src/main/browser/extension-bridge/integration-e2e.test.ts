@@ -38,6 +38,7 @@ function harness(opts: { extensionTabs: ExtensionTabRecord[]; chromeConnected: b
   } as unknown as import("../operations").BrowserOperations
 
   const extSendCalls: unknown[] = []
+  const snapshotCalls: Array<{ tabs: ExtensionTabRecord[]; activeTabId: string | null }> = []
   const extensionHost = {
     isConnected: opts.chromeConnected,
     pendingCount: 0,
@@ -53,13 +54,15 @@ function harness(opts: { extensionTabs: ExtensionTabRecord[]; chromeConnected: b
   } as unknown as ExtensionHost
 
   const bridge = new ExtensionBridge({
+    windowId,
     registry,
     operations,
     extensionHost,
     getExtensionTabs: () => opts.extensionTabs,
     getExtensionActiveTabId: () => opts.extensionTabs.find((t) => t.active)?.tabId ?? null,
+    onExtensionSnapshot: (tabs, activeTabId) => snapshotCalls.push({ tabs, activeTabId }),
   })
-  return { bridge, extSendCalls }
+  return { bridge, extSendCalls, snapshotCalls }
 }
 
 // --- suite ------------------------------------------------------------------
@@ -85,6 +88,29 @@ describe("integration reconciliation", () => {
     const response = await responsePromise
     expect(response.ok).toBe(true)
     expect(relay.pendingCount).toBe(0)
+    await relay.stop()
+  })
+
+  test("aborting a request before native polling removes the queued request instead of executing then aborting", async () => {
+    const relay = new ExtensionHost({ staleAfterMs: 1000 })
+    await relay.start()
+    relay.markConnected({ transport: "test" })
+    const request = {
+      requestId: "relay-abort-before-poll",
+      sessionId,
+      windowId,
+      messageId: "relay-abort-msg",
+      timeoutMs: 1000,
+      operation: { name: "click", input: { target: { x: 1, y: 2 } } },
+    } as import("../contracts").BrokerRequest
+
+    const responsePromise = relay.send(request)
+    expect(relay.queuedCount).toBe(1)
+    relay.abort(request.requestId)
+    expect(relay.queuedCount).toBe(0)
+    const response = await responsePromise
+    expect(response.ok).toBe(false)
+    if (!response.ok) expect(response.error.tag).toBe("BrowserControlInterrupted")
     await relay.stop()
   })
 
@@ -138,6 +164,19 @@ describe("integration reconciliation", () => {
     expect(bridge.resolveLane("tab-unknown", { name: "snapshot", input: {} })).toBe("unavailable")
     // tabId absent prefers active extension tab when chrome:true
     expect(bridge.resolveLane(undefined, { name: "click", input: {} })).toBe("extension")
+  })
+
+  test("automation hot-path results do not clone/republish the Chrome tab mirror", async () => {
+    const { bridge, snapshotCalls } = harness({ extensionTabs: [makeTabRecord()], chromeConnected: true })
+    await bridge.dispatch("tab-1", { name: "click", input: { target: { x: 1, y: 2 } } }, sessionId)
+    await bridge.dispatch("tab-1", { name: "screenshot", input: {} }, sessionId)
+    expect(snapshotCalls).toHaveLength(0)
+  })
+
+  test("extension requests use the engine window id without enumerating webview tabs", async () => {
+    const { bridge, extSendCalls } = harness({ extensionTabs: [makeTabRecord()], chromeConnected: true })
+    await bridge.dispatch("tab-1", { name: "click", input: { target: { x: 1, y: 2 } } }, sessionId)
+    expect((extSendCalls[0] as { windowId: string }).windowId).toBe(windowId)
   })
 
   test("status merges both lanes, chrome tab wins on tabId collision", async () => {
