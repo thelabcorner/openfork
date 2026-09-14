@@ -1,6 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import { Deferred, Effect, Fiber, Ref } from "effect"
-import { resetForTesting, withShellSlot } from "../../src/tool/shell-concurrency"
+import {
+  classifyShellCommand,
+  configuredIoShellPermits,
+  defaultIoShellPermits,
+  IO_SHELL_ENV,
+  resetForTesting,
+  withShellSlot,
+} from "../../src/tool/shell-concurrency"
 import {
   configuredHeavyProcessPermits,
   defaultHeavyProcessPermits,
@@ -31,6 +38,7 @@ describe("shell concurrency", () => {
       const active = await Effect.runPromise(Ref.make(0))
       const peak = await Effect.runPromise(Ref.make(0))
       const worker = withShellSlot(
+        "bun test",
         Effect.gen(function* () {
           const current = yield* Ref.updateAndGet(active, (n) => n + 1)
           yield* Ref.update(peak, (max) => Math.max(max, current))
@@ -74,16 +82,16 @@ describe("shell concurrency", () => {
 
   test("invalid values fall back to the default bound", async () => {
     await withEnv("not-a-number", async () => {
-      const value = await Effect.runPromise(withShellSlot(Effect.succeed("ok")))
+      const value = await Effect.runPromise(withShellSlot("bun test", Effect.succeed("ok")))
       expect(value).toBe("ok")
     })
   })
 
   test("failures release the slot", async () => {
     await withEnv("1", async () => {
-      await expect(Effect.runPromise(withShellSlot(Effect.fail(new Error("boom"))))).rejects.toThrow("boom")
+      await expect(Effect.runPromise(withShellSlot("bun test", Effect.fail(new Error("boom"))))).rejects.toThrow("boom")
       // The permit must be free again: a second acquisition completes.
-      await Effect.runPromise(withShellSlot(Effect.void))
+      await Effect.runPromise(withShellSlot("bun test", Effect.void))
     })
   })
 
@@ -113,7 +121,7 @@ describe("shell concurrency", () => {
       const gate = await Effect.runPromise(Deferred.make<void>())
       const active = await Effect.runPromise(Ref.make(0))
       const peak = await Effect.runPromise(Ref.make(0))
-      const work = (wrapper: typeof withShellSlot) =>
+      const work = (wrapper: typeof withHeavyProcessSlot) =>
         wrapper(
           Effect.gen(function* () {
             const now = yield* Ref.updateAndGet(active, (n) => n + 1)
@@ -126,7 +134,7 @@ describe("shell concurrency", () => {
         Effect.scoped(
           Effect.gen(function* () {
             const fiber = yield* Effect.forkScoped(
-              Effect.all([work(withShellSlot), work(withHeavyProcessSlot)], {
+              Effect.all([work((effect) => withShellSlot("bun test", effect)), work(withHeavyProcessSlot)], {
                 concurrency: "unbounded",
                 discard: true,
               }),
@@ -142,6 +150,65 @@ describe("shell concurrency", () => {
     } finally {
       if (priorHeavy === undefined) delete process.env[HEAVY_TOOL_ENV]
       else process.env[HEAVY_TOOL_ENV] = priorHeavy
+      resetForTesting()
+    }
+  })
+
+  test("classifies only simple known waiting commands into the I/O pool", () => {
+    expect(classifyShellCommand("curl https://example.com")).toBe("io")
+    expect(classifyShellCommand("Start-Sleep -Seconds 30")).toBe("io")
+    expect(classifyShellCommand("docker logs -f app")).toBe("io")
+    expect(classifyShellCommand("kubectl wait --for=condition=ready pod/x")).toBe("io")
+    expect(classifyShellCommand("tail -f server.log")).toBe("io")
+    expect(classifyShellCommand("Get-Content server.log -Wait")).toBe("io")
+    expect(classifyShellCommand("bun test")).toBe("heavy")
+    expect(classifyShellCommand("npm run build")).toBe("heavy")
+    expect(classifyShellCommand("curl https://example.com | node parse.js")).toBe("heavy")
+    expect(classifyShellCommand("sleep 30 && bun test")).toBe("heavy")
+  })
+
+  test("I/O shell budget is wider but bounded", () => {
+    expect(defaultIoShellPermits(4)).toBe(4)
+    expect(defaultIoShellPermits(24)).toBe(6)
+    expect(defaultIoShellPermits(128)).toBe(8)
+    expect(configuredIoShellPermits({ [IO_SHELL_ENV]: "999" })).toBe(12)
+    expect(configuredIoShellPermits({ [IO_SHELL_ENV]: "0" })).toBe(defaultIoShellPermits())
+  })
+
+  test("waiting I/O commands do not consume the heavy-tool semaphore", async () => {
+    const priorHeavy = process.env[HEAVY_TOOL_ENV]
+    const priorIo = process.env[IO_SHELL_ENV]
+    process.env[HEAVY_TOOL_ENV] = "1"
+    process.env[IO_SHELL_ENV] = "2"
+    resetForTesting()
+    try {
+      const heavyGate = await Effect.runPromise(Deferred.make<void>())
+      const ioStarted = await Effect.runPromise(Deferred.make<void>())
+      await Effect.runPromise(
+        Effect.scoped(
+          Effect.gen(function* () {
+            const heavy = yield* Effect.forkScoped(withHeavyProcessSlot(Deferred.await(heavyGate)))
+            yield* Effect.sleep("20 millis")
+            const io = yield* Effect.forkScoped(
+              withShellSlot(
+                "sleep 30",
+                Effect.gen(function* () {
+                  yield* Deferred.succeed(ioStarted, undefined)
+                }),
+              ),
+            )
+            yield* Deferred.await(ioStarted).pipe(Effect.timeout("1 second"))
+            yield* Deferred.succeed(heavyGate, undefined)
+            yield* Fiber.join(heavy)
+            yield* Fiber.join(io)
+          }),
+        ),
+      )
+    } finally {
+      if (priorHeavy === undefined) delete process.env[HEAVY_TOOL_ENV]
+      else process.env[HEAVY_TOOL_ENV] = priorHeavy
+      if (priorIo === undefined) delete process.env[IO_SHELL_ENV]
+      else process.env[IO_SHELL_ENV] = priorIo
       resetForTesting()
     }
   })

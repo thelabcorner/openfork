@@ -697,6 +697,7 @@ export const ShellTool = Tool.define(
       // launches (runBackground below) are intentionally NOT gated — they are
       // few, long-lived, and user-visible, so they would squat slots forever.
       const code: number | null = yield* withShellSlot(
+        input.command,
         Effect.scoped(
           Effect.gen(function* () {
             yield* Effect.addFinalizer(closeSink)
