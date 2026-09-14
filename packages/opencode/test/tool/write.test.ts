@@ -112,6 +112,23 @@ describe("tool.write", () => {
       }),
     )
 
+    it.instance("auto-heals whole-file writes to existing CRLF and mixed-EOL files", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const crlf = path.join(test.directory, "crlf-existing.txt")
+        const mixed = path.join(test.directory, "mixed-existing.txt")
+        yield* Effect.promise(() =>
+          Promise.all([fs.writeFile(crlf, "a\r\nb\r\nc\r\n"), fs.writeFile(mixed, "a\nb\r\nc\r")]),
+        )
+
+        yield* run({ filePath: crlf, content: "A\nB\nC\n" })
+        yield* run({ filePath: mixed, content: "A\nB\nC\n" })
+
+        expect(yield* Effect.promise(() => fs.readFile(crlf, "utf8"))).toBe("A\r\nB\r\nC\r\n")
+        expect(yield* Effect.promise(() => fs.readFile(mixed, "utf8"))).toBe("A\nB\r\nC\r")
+      }),
+    )
+
     it.instance("preserves BOM when overwriting existing files", () =>
       Effect.gen(function* () {
         const test = yield* TestInstance
@@ -151,6 +168,35 @@ describe("tool.write", () => {
                 "node",
                 "-e",
                 "const fs = require('fs'); const file = process.argv[1]; let text = fs.readFileSync(file, 'utf8'); if (text.charCodeAt(0) === 0xfeff) text = text.slice(1); fs.writeFileSync(file, text, 'utf8')",
+                "$FILE",
+              ],
+            },
+          },
+        },
+      },
+    )
+
+    it.instance(
+      "re-heals line endings after a formatter normalizes them",
+      () =>
+        Effect.gen(function* () {
+          const test = yield* TestInstance
+          const filepath = path.join(test.directory, "formatted-eol.eoltest")
+          yield* Effect.promise(() => fs.writeFile(filepath, "a\nb\r\nc\r", "utf-8"))
+
+          yield* run({ filePath: filepath, content: "A\nB\nC\n" })
+
+          expect(yield* Effect.promise(() => fs.readFile(filepath, "utf-8"))).toBe("A\nB\r\nC\r")
+        }),
+      {
+        config: {
+          formatter: {
+            forceLf: {
+              extensions: [".eoltest"],
+              command: [
+                "node",
+                "-e",
+                "const fs = require('fs'); const file = process.argv[1]; const text = fs.readFileSync(file, 'utf8').replace(/\\r\\n|\\r/g, '\\n'); fs.writeFileSync(file, text, 'utf8')",
                 "$FILE",
               ],
             },
@@ -247,6 +293,17 @@ describe("tool.write", () => {
 
         const buf = yield* Effect.promise(() => fs.readFile(filepath))
         expect(buf.toString()).toBe(content)
+      }),
+    )
+
+    it.instance("preserves supplied EOLs when creating a new file", () =>
+      Effect.gen(function* () {
+        const test = yield* TestInstance
+        const filepath = path.join(test.directory, "new-crlf.txt")
+        const content = "Line 1\r\nLine 2\r\n"
+        yield* run({ filePath: filepath, content })
+
+        expect(yield* Effect.promise(() => fs.readFile(filepath, "utf8"))).toBe(content)
       }),
     )
   })

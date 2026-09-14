@@ -91,6 +91,26 @@ describe("Patch namespace", () => {
 
       expect(() => Patch.parsePatch(invalidPatch)).toThrow("Invalid patch format")
     })
+
+    test("normalizes CRLF patch transport without leaking carriage returns into hunk content", () => {
+      const patchText = [
+        "*** Begin Patch",
+        "*** Update File: test.txt",
+        "@@",
+        "-before",
+        "+after",
+        "*** End Patch",
+      ].join("\r\n")
+
+      const result = Patch.parsePatch(patchText)
+      expect(result.hunks).toHaveLength(1)
+      const hunk = result.hunks[0]
+      expect(hunk.type).toBe("update")
+      if (hunk.type === "update") {
+        expect(hunk.chunks[0]?.old_lines).toEqual(["before"])
+        expect(hunk.chunks[0]?.new_lines).toEqual(["after"])
+      }
+    })
   })
 
   describe("maybeParseApplyPatch", () => {
@@ -201,6 +221,28 @@ PATCH`
 
         const content = yield* Effect.promise(() => fs.readFile(filePath, "utf-8"))
         expect(content).toBe("line 1\nline 2 updated\nline 3\n")
+      }),
+    )
+
+    it.live("auto-heals patch transport newlines without normalizing a CRLF target", () =>
+      Effect.gen(function* () {
+        const filePath = path.join(tempDir, "windows-update.txt")
+        yield* Effect.promise(() => fs.writeFile(filePath, "line 1\r\nline 2\r\nline 3\r\n"))
+
+        const patchText = [
+          "*** Begin Patch",
+          `*** Update File: ${filePath}`,
+          "@@",
+          "-line 2",
+          "+line 2 updated",
+          "+inserted",
+          "*** End Patch",
+        ].join("\n")
+
+        yield* Patch.applyPatch(patchText)
+        expect(yield* Effect.promise(() => fs.readFile(filePath, "utf-8"))).toBe(
+          "line 1\r\nline 2 updated\r\ninserted\r\nline 3\r\n",
+        )
       }),
     )
 

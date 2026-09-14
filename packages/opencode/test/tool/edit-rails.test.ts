@@ -16,8 +16,9 @@ import {
   type StrategyResult,
 } from "../../src/tool/edit/strategy"
 import { applySpans } from "../../src/tool/edit/span"
+import { adaptReplacementTerminators } from "@opencode-ai/core/line-ending"
 import { assertSpansExplain } from "../../src/tool/edit/invariant"
-import { resolveMatch } from "../../src/tool/edit/match"
+import { resolveMatch, resolveReplacement } from "../../src/tool/edit/match"
 import { absorbDeletionNewline, healInput, stripCodeFence, stripReadPrefix } from "../../src/tool/edit/heal"
 import { enforce as enforcePriorRead, globalReadCache, ReadCache } from "../../src/tool/edit/prior-read"
 import { withRollback } from "../../src/tool/patch/rollback"
@@ -276,6 +277,43 @@ describe("edit strategy helpers (pure)", () => {
     // Line 3 ended CRLF, so the whole replacement is CRLF; lines 1 and 4 keep
     // their exact bytes.
     expect(after).toBe("one\nTWO\r\nTHREE\r\nfour\n")
+  })
+
+  test("replacement terminators are inferred locally without rewriting untouched mixed endings", () => {
+    const before = "one\ntwo\r\nthree\r\nfour\n"
+    const start = before.indexOf("two")
+    const end = before.indexOf("\r\nfour")
+    const replacement = adaptReplacementTerminators(before, start, end, "TWO\nTHREE")
+
+    // The replaced block had CRLF internally and its boundary line also ends
+    // CRLF. The unrelated LF lines before/after remain byte-identical.
+    expect(replacement).toBe("TWO\r\nTHREE")
+    expect(before.slice(0, start) + replacement + before.slice(end)).toBe("one\nTWO\r\nTHREE\r\nfour\n")
+  })
+
+  test("replacement preserves per-line mixed terminators positionally when line counts align", () => {
+    const before = "a\nb\r\nc\nd\r\n"
+    const start = before.indexOf("b")
+    const end = before.indexOf("\r\n", before.indexOf("d")) + 2
+    const replacement = adaptReplacementTerminators(before, start, end, "B\nC\nD\n")
+
+    expect(replacement).toBe("B\r\nC\nD\r\n")
+  })
+
+  test("exact replacement auto-heals newline encoding from the matched region", () => {
+    const before = "lf-before\nbefore\r\nrest\r\nlf-after\n"
+    const result = resolveReplacement(before, "before\nrest", "after\nrest")
+
+    expect(result.via).toBe("exact")
+    expect(applySpans(before, result.spans)).toBe("lf-before\nafter\r\nrest\r\nlf-after\n")
+  })
+
+  test("replaceAll auto-heals each mixed-EOL match independently", () => {
+    const before = "a\nb\n--\r\na\r\nb\r\n"
+    const result = resolveReplacement(before, "a\nb", "x\ny", true)
+
+    expect(result.applied).toBe(2)
+    expect(applySpans(before, result.spans)).toBe("x\ny\n--\r\nx\r\ny\r\n")
   })
 
   test("unicode-equivalent needles resolve with a warning", () => {

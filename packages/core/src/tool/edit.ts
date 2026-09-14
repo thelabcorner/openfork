@@ -18,6 +18,7 @@ import { PermissionV2 } from "../permission"
 import { ToolRegistry } from "./registry"
 import { Tool } from "./tool"
 import { Tools } from "./tools"
+import { adaptReplacementTerminators, findLogicalMatches } from "../line-ending"
 
 export const name = "edit"
 
@@ -39,10 +40,7 @@ export const Output = Schema.Struct({
 })
 export type Output = typeof Output.Type
 
-const normalizeLineEndings = (text: string) => text.replaceAll("\r\n", "\n")
-const detectLineEnding = (text: string): "\n" | "\r\n" => (text.includes("\r\n") ? "\r\n" : "\n")
-const convertToLineEnding = (text: string, ending: "\n" | "\r\n") =>
-  ending === "\n" ? normalizeLineEndings(text) : normalizeLineEndings(text).replaceAll("\n", "\r\n")
+const normalizeLineEndings = (text: string) => text.replaceAll("\r\n", "\n").replaceAll("\r", "\n")
 
 const splitBom = (text: string) =>
   text.startsWith("\uFEFF") ? { bom: true, text: text.slice(1) } : { bom: false, text }
@@ -50,17 +48,6 @@ const joinBom = (text: string, bom: boolean) => (bom ? `\uFEFF${text}` : text)
 const decodeUtf8 = (content: Uint8Array) => {
   const bom = content[0] === 0xef && content[1] === 0xbb && content[2] === 0xbf
   return { bom, content, text: new TextDecoder().decode(bom ? content.slice(3) : content) }
-}
-
-const countOccurrences = (content: string, search: string) => {
-  if (search === "") return content.length + 1
-  let count = 0
-  let offset = 0
-  while ((offset = content.indexOf(search, offset)) !== -1) {
-    count++
-    offset += search.length
-  }
-  return count
 }
 
 const previewLines = (value: string, prefix: "+" | "-") => {
@@ -159,10 +146,8 @@ const layer = Layer.effectDiscard(
                   }),
                 )
                 const source = decodeUtf8(yield* unableToEdit(fs.readFile(target.canonical)))
-                const ending = detectLineEnding(source.text)
-                const oldString = convertToLineEnding(input.oldString, ending)
-                const newString = convertToLineEnding(input.newString, ending)
-                const replacements = countOccurrences(source.text, oldString)
+                const matches = findLogicalMatches(source.text, input.oldString)
+                const replacements = matches.length
                 if (replacements === 0) {
                   return yield* new ToolFailure({
                     message:
@@ -176,10 +161,13 @@ const layer = Layer.effectDiscard(
                   })
                 }
 
-                const replaced =
-                  input.replaceAll === true
-                    ? source.text.replaceAll(oldString, newString)
-                    : source.text.replace(oldString, newString)
+                const selected = input.replaceAll === true ? matches : matches.slice(0, 1)
+                let replaced = source.text
+                for (let index = selected.length - 1; index >= 0; index--) {
+                  const match = selected[index]!
+                  const replacement = adaptReplacementTerminators(source.text, match.start, match.end, input.newString)
+                  replaced = replaced.slice(0, match.start) + replacement + replaced.slice(match.end)
+                }
                 const counts = diffLines(source.text, replaced).reduce(
                   (result, item) => ({
                     additions: result.additions + (item.added ? (item.count ?? 0) : 0),

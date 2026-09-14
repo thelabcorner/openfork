@@ -82,15 +82,20 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
         return yield* Effect.fail(new Error("patchText is required"))
       }
 
+      // Patch text is a line-oriented transport. Normalize its own separators
+      // before parsing; target files choose their line endings independently
+      // from local source context during derivation.
+      const patchText = Patch.normalizePatchText(params.patchText)
+
       // ── Parse: opencode format or git-style unified diff (auto-detected) ──
       const want = params.format ?? "auto"
-      const detected = Core.detectFormat(params.patchText)
+      const detected = Core.detectFormat(patchText)
       let hunks: Patch.Hunk[] = []
       let fmt: Core.PatchFormat
 
-      const parseNative = (): Patch.Hunk[] => Patch.parsePatch(params.patchText).hunks
+      const parseNative = (): Patch.Hunk[] => Patch.parsePatch(patchText).hunks
       const parseGit = (): Patch.Hunk[] => {
-        const h = Core.translateGitDiff(params.patchText)
+        const h = Core.translateGitDiff(patchText)
         if (!h) throw new Error("not a translatable git-style diff")
         return h
       }
@@ -100,7 +105,7 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
           fmt = "opencode"
           hunks = parseNative()
           if (hunks.length === 0) {
-            if (params.patchText.trim() === "*** Begin Patch\n*** End Patch") {
+            if (patchText.trim() === "*** Begin Patch\n*** End Patch") {
               return yield* Effect.fail(new Error("patch rejected: empty patch"))
             }
             return yield* Effect.fail(new Error(Core.noOpsError("opencode")))
@@ -115,7 +120,7 @@ export const runPatchEffect = Effect.fn("PatchExecutor.run")(function* (
       } catch (error) {
         const errFmt: Core.PatchFormat | null =
           want === "auto" ? detected : want === "opencode" ? "opencode" : "git"
-        return yield* Effect.fail(new Error(Core.instructiveParseError(errFmt, error, params.patchText)))
+        return yield* Effect.fail(new Error(Core.instructiveParseError(errFmt, error, patchText)))
       }
 
       const instance = yield* InstanceState.context

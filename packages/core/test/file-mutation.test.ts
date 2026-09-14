@@ -89,6 +89,35 @@ describe("FileMutation", () => {
     ),
   )
 
+  it.live("auto-heals whole-file text writes to existing positional line endings", () =>
+    withTmp((directory) =>
+      Effect.gen(function* () {
+        const crlfPath = path.join(directory, "crlf.txt")
+        const mixedPath = path.join(directory, "mixed.txt")
+        const createdPath = path.join(directory, "created-eol.txt")
+        yield* Effect.promise(() =>
+          Promise.all([
+            fs.writeFile(crlfPath, "a\r\nb\r\nc\r\n"),
+            fs.writeFile(mixedPath, "a\nb\r\nc\r"),
+          ]),
+        )
+        const mutation = yield* LocationMutation.Service
+        const files = yield* FileMutation.Service
+        const crlf = yield* mutation.resolve({ path: "crlf.txt" })
+        const mixed = yield* mutation.resolve({ path: "mixed.txt" })
+        const created = yield* mutation.resolve({ path: "created-eol.txt" })
+
+        yield* files.writeTextPreservingBom({ target: crlf, content: "A\nB\nC\n" })
+        yield* files.writeTextPreservingBom({ target: mixed, content: "A\nB\nC\n" })
+        yield* files.writeTextPreservingBom({ target: created, content: "A\r\nB\r\n" })
+
+        expect(yield* Effect.promise(() => fs.readFile(crlfPath, "utf8"))).toBe("A\r\nB\r\nC\r\n")
+        expect(yield* Effect.promise(() => fs.readFile(mixedPath, "utf8"))).toBe("A\nB\r\nC\r")
+        expect(yield* Effect.promise(() => fs.readFile(createdPath, "utf8"))).toBe("A\r\nB\r\n")
+      }).pipe(provide(directory)),
+    ),
+  )
+
   it.live("rejects create when a prospective target appears after resolution", () =>
     withTmp((directory) =>
       Effect.gen(function* () {

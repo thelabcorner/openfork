@@ -381,6 +381,49 @@ describe("EditTool", () => {
     ),
   )
 
+  it.live("infers line endings from the matched region in mixed-ending files", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "mixed.txt")
+        return Effect.promise(() => fs.writeFile(target, "lf-before\nbefore\r\nrest\r\nlf-after\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              executeTool(registry, call({ path: "mixed.txt", oldString: "before\nrest", newString: "after\nrest" })),
+            ),
+          ),
+          Effect.andThen(() => Effect.promise(() => fs.readFile(target, "utf8"))),
+          Effect.tap((content) => Effect.sync(() => expect(content).toBe("lf-before\nafter\r\nrest\r\nlf-after\n"))),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
+  it.live("replaceAll preserves each matched region's local EOL style", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const target = path.join(tmp.path, "mixed-all.txt")
+        return Effect.promise(() => fs.writeFile(target, "a\nb\n--\r\na\r\nb\r\n")).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              executeTool(
+                registry,
+                call({ path: "mixed-all.txt", oldString: "a\nb", newString: "x\ny", replaceAll: true }),
+              ),
+            ),
+          ),
+          Effect.andThen(() => Effect.promise(() => fs.readFile(target, "utf8"))),
+          Effect.tap((content) => Effect.sync(() => expect(content).toBe("x\ny\n--\r\nx\r\ny\r\n"))),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("rejects an in-place content change after matching but before conditional commit", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),

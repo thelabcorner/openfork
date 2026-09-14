@@ -5,6 +5,7 @@ import { Context, Effect, Layer, Schema } from "effect"
 import { dirname } from "path"
 import { KeyedMutex } from "./effect/keyed-mutex"
 import { FSUtil } from "./fs-util"
+import { adaptWriteTerminators } from "./line-ending"
 
 export interface Target {
   readonly canonical: string
@@ -79,7 +80,7 @@ export interface Interface {
   /** Create without replacing an existing target. */
   readonly create: (input: WriteInput) => Effect.Effect<WriteResult, TargetExistsError | FSUtil.Error>
   readonly write: (input: WriteInput) => Effect.Effect<WriteResult, FSUtil.Error>
-  /** Write text while retaining an existing UTF-8 BOM and emitting at most one BOM. */
+  /** Write text while retaining an existing UTF-8 BOM and auto-healing line endings from the target. */
   readonly writeTextPreservingBom: (input: TextWriteInput) => Effect.Effect<WriteResult, FSUtil.Error>
   /** Commit only if an existing target still has the expected bytes. */
   readonly writeIfUnchanged: (
@@ -160,9 +161,11 @@ const layer = Layer.effect(
           const current = yield* fs
             .readFile(input.target.canonical)
             .pipe(Effect.catchReason("PlatformError", "NotFound", () => Effect.succeed(undefined)))
+          const currentText = current === undefined ? undefined : splitBom(new TextDecoder().decode(current)).text
+          const content = currentText === undefined ? next.text : adaptWriteTerminators(currentText, next.text)
           yield* fs.writeWithDirs(
             input.target.canonical,
-            joinBom(next.text, Boolean(current && hasUtf8Bom(current)) || next.bom),
+            joinBom(content, Boolean(current && hasUtf8Bom(current)) || next.bom),
           )
           return writeResult(input.target, current !== undefined)
         }),

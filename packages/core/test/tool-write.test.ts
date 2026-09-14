@@ -155,6 +155,32 @@ describe("WriteTool", () => {
     ),
   )
 
+  it.live("auto-heals whole-file writes to the existing file's EOL encoding", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const crlf = path.join(tmp.path, "crlf.txt")
+        const mixed = path.join(tmp.path, "mixed.txt")
+        return Effect.promise(() =>
+          Promise.all([fs.writeFile(crlf, "a\r\nb\r\nc\r\n"), fs.writeFile(mixed, "a\nb\r\nc\r")]),
+        ).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                yield* settleTool(registry, call({ path: "crlf.txt", content: "A\nB\nC\n" }, "call-crlf"))
+                yield* settleTool(registry, call({ path: "mixed.txt", content: "A\nB\nC\n" }, "call-mixed"))
+                expect(yield* Effect.promise(() => fs.readFile(crlf, "utf8"))).toBe("A\r\nB\r\nC\r\n")
+                expect(yield* Effect.promise(() => fs.readFile(mixed, "utf8"))).toBe("A\nB\r\nC\r")
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("preserves exactly one BOM when overwriting existing files", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),

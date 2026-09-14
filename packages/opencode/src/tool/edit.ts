@@ -20,7 +20,6 @@ import { AppProcess } from "@opencode-ai/core/process"
 import { TypecheckScope } from "./typecheck-scope"
 import { runPatchEffect } from "./patch"
 import { assertTextContent, trimDiff } from "./patch/core"
-import { buildLineIndex, dominantTerminator, reterminate } from "./edit/line-index"
 import { resolveReplacement } from "./edit/match"
 import { applyEditStrategy, type BatchOpType as StrategyBatchOp } from "./edit/strategy"
 import { buildPlan, type EditPlan } from "./edit/plan"
@@ -324,15 +323,13 @@ const buildExactPlan = Effect.fn("EditTool.exactPlan")(function* (input: PlanInp
     throw new Error("No changes to apply: oldString and newString are identical.")
   }
 
-  // Model text is LF-normalized by healing; convert needle AND replacement
-  // to the file's dominant ending before matching (the Phase-1 conversion),
-  // so a CRLF file still matches exactly — including replaceAll, which is
-  // exact-only and would otherwise never match a CRLF file. Untouched file
-  // bytes are still never rewritten: only the needle and replacement move.
-  const ending = dominantTerminator(buildLineIndex(source.text))
-  const needle = reterminate(healedOld.value, ending)
-  const replacement = reterminate(healedNew.value, ending)
-  const resolved = resolveReplacement(source.text, needle, replacement, params.replaceAll)
+  // Input healing normalizes model transport newlines to logical LF. Matching
+  // then treats LF/CRLF/lone-CR as equivalent and the resolved span re-encodes
+  // replacement newlines from that exact region's surrounding separators.
+  // This is intentionally local: a mixed-ending file is never normalized by a
+  // whole-file "dominant EOL" guess.
+  const replacement = healedNew.value
+  const resolved = resolveReplacement(source.text, healedOld.value, replacement, params.replaceAll)
   warnings.push(...resolved.warnings)
 
   let spans = resolved.spans

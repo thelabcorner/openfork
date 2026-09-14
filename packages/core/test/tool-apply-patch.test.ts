@@ -202,6 +202,69 @@ describe("ApplyPatchTool", () => {
     ),
   )
 
+  it.live("preserves target EOLs independently from patch transport EOLs", () =>
+    Effect.acquireUseRelease(
+      Effect.promise(() => tmpdir()),
+      (tmp) => {
+        reset()
+        const lf = path.join(tmp.path, "lf.txt")
+        const crlf = path.join(tmp.path, "crlf.txt")
+        const mixed = path.join(tmp.path, "mixed.txt")
+        return Effect.promise(() =>
+          Promise.all([
+            fs.writeFile(lf, "one\ntwo\nthree\n"),
+            fs.writeFile(crlf, "one\r\ntwo\r\nthree\r\n"),
+            fs.writeFile(mixed, "lf-before\ntwo\r\nthree\r\nlf-after\n"),
+          ]),
+        ).pipe(
+          Effect.andThen(
+            withTool(tmp.path, (registry) =>
+              Effect.gen(function* () {
+                yield* executeTool(
+                  registry,
+                  call(
+                    [
+                      "*** Begin Patch",
+                      "*** Update File: lf.txt",
+                      "@@",
+                      "-two",
+                      "+TWO",
+                      "+inserted",
+                      "*** End Patch",
+                    ].join("\r\n"),
+                    "call-lf",
+                  ),
+                )
+                yield* executeTool(
+                  registry,
+                  call(
+                    "*** Begin Patch\n*** Update File: crlf.txt\n@@\n-two\n+TWO\n+inserted\n*** End Patch",
+                    "call-crlf",
+                  ),
+                )
+                yield* executeTool(
+                  registry,
+                  call(
+                    "*** Begin Patch\n*** Update File: mixed.txt\n@@\n-two\n-three\n+TWO\n+THREE\n*** End Patch",
+                    "call-mixed",
+                  ),
+                )
+                expect(yield* Effect.promise(() => fs.readFile(lf, "utf8"))).toBe("one\nTWO\ninserted\nthree\n")
+                expect(yield* Effect.promise(() => fs.readFile(crlf, "utf8"))).toBe(
+                  "one\r\nTWO\r\ninserted\r\nthree\r\n",
+                )
+                expect(yield* Effect.promise(() => fs.readFile(mixed, "utf8"))).toBe(
+                  "lf-before\nTWO\r\nTHREE\r\nlf-after\n",
+                )
+              }),
+            ),
+          ),
+        )
+      },
+      (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+    ),
+  )
+
   it.live("rejects moves before applying any hunk", () =>
     Effect.acquireUseRelease(
       Effect.promise(() => tmpdir()),

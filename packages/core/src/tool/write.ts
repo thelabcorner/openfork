@@ -24,7 +24,10 @@ export const Input = Schema.Struct({
     description:
       "File path to write. Relative paths resolve within the active Location. Absolute paths inside that Location are accepted; external absolute paths require external_directory approval.",
   }),
-  content: Schema.String.annotate({ description: "Content to write to the file" }),
+  content: Schema.String.annotate({
+    description:
+      "Content to write to the file. Existing files auto-heal supplied line endings to the target's current local/positional EOL style; new files preserve supplied EOLs.",
+  }),
 })
 
 export const Output = Schema.Struct({
@@ -56,7 +59,7 @@ const layer = Layer.effectDiscard(
         [name]: Tool.withPermission(
           Tool.make({
             description:
-              "Write content to one file. Relative paths resolve within the active Location. Absolute paths inside the Location are accepted. Explicit external absolute paths require external_directory approval before edit approval.",
+              "Write content to one file. Existing files auto-heal line endings from the target without normalizing mixed-EOL regions; new files preserve supplied EOLs. Relative paths resolve within the active Location. Absolute paths inside the Location are accepted. Explicit external absolute paths require external_directory approval before edit approval.",
             input: Input,
             output: Output,
             toModelOutput: ({ output }) => [{ type: "text", text: toModelOutput(output) }],

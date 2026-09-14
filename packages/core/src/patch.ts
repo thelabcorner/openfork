@@ -1,5 +1,7 @@
 export * as Patch from "./patch"
 
+import { applyLineReplacements, normalizeNewlines, splitLinesPreservingTerminators } from "./line-ending"
+
 export type Hunk =
   | { readonly type: "add"; readonly path: string; readonly contents: string }
   | { readonly type: "delete"; readonly path: string }
@@ -23,7 +25,7 @@ export interface FileUpdate {
 }
 
 export function parse(patchText: string): ReadonlyArray<Hunk> {
-  const lines = stripHeredoc(patchText.trim()).split("\n")
+  const lines = stripHeredoc(normalizeNewlines(patchText).trim()).split("\n")
   const begin = lines.findIndex((line) => line.trim() === "*** Begin Patch")
   const end = lines.findIndex((line) => line.trim() === "*** End Patch")
   if (begin === -1 || end === -1 || begin >= end) throw new Error("Invalid patch format: missing Begin/End markers")
@@ -70,13 +72,13 @@ export function parse(patchText: string): ReadonlyArray<Hunk> {
 
 export function derive(path: string, chunks: ReadonlyArray<UpdateFileChunk>, original: string): FileUpdate {
   const source = splitBom(original)
-  const lines = source.text.split("\n")
-  if (lines.at(-1) === "") lines.pop()
-  const replacements = computeReplacements(lines, path, chunks)
-  const updated = [...lines]
-  for (const [start, remove, insert] of replacements.toReversed()) updated.splice(start, remove, ...insert)
-  if (updated.at(-1) !== "") updated.push("")
-  const next = splitBom(updated.join("\n"))
+  const lines = splitLinesPreservingTerminators(source.text)
+  const replacements = computeReplacements(
+    lines.map((line) => line.text),
+    path,
+    chunks,
+  )
+  const next = splitBom(applyLineReplacements(lines, replacements))
   return { content: next.text, bom: source.bom || next.bom }
 }
 

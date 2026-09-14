@@ -25,10 +25,38 @@ describe("Patch", () => {
     ])
   })
 
+  test("treats CRLF patch text as transport rather than hunk content", () => {
+    const patch = [
+      "*** Begin Patch",
+      "*** Update File: update.txt",
+      "@@",
+      "-old",
+      "+new",
+      "*** End Patch",
+    ].join("\r\n")
+    expect(Patch.parse(patch)).toEqual([
+      {
+        type: "update",
+        path: "update.txt",
+        chunks: [{ oldLines: ["old"], newLines: ["new"], changeContext: undefined, endOfFile: undefined }],
+        movePath: undefined,
+      },
+    ])
+  })
+
   test("derives fuzzy line updates while preserving BOM", () => {
     const update = Patch.derive("update.txt", [{ oldLines: ["  old   "], newLines: ["new"] }], "\uFEFFold\n")
     expect(update).toEqual({ content: "new\n", bom: true })
     expect(Patch.joinBom(update.content, update.bom)).toBe("\uFEFFnew\n")
+  })
+
+  test("derives updates without normalizing CRLF or unrelated mixed endings", () => {
+    expect(Patch.derive("update.txt", [{ oldLines: ["old"], newLines: ["new", "inserted"] }], "a\r\nold\r\nz\r\n").content).toBe(
+      "a\r\nnew\r\ninserted\r\nz\r\n",
+    )
+    expect(Patch.derive("update.txt", [{ oldLines: ["old", "next"], newLines: ["new", "NEXT"] }], "lf\nold\r\nnext\r\ntail\n").content).toBe(
+      "lf\nnew\r\nNEXT\r\ntail\n",
+    )
   })
 
   test("matches EOF-anchored chunks from the end", () => {

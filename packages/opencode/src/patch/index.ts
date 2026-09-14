@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import * as path from "path"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { applyLineReplacements, splitLinesPreservingTerminators } from "@opencode-ai/core/line-ending"
 import * as Bom from "../util/bom"
 
 export const PatchSchema = Schema.Struct({
@@ -182,8 +183,18 @@ function stripHeredoc(input: string): string {
   return input
 }
 
+/**
+ * Patch syntax is line-oriented. CRLF/lone-CR here are transport separators,
+ * not file-content policy: target-file line endings are inferred at apply time.
+ * Fast path returns the original string when no CR is present.
+ */
+export function normalizePatchText(text: string): string {
+  if (!text.includes("\r")) return text
+  return text.replaceAll("\r\n", "\n").replaceAll("\r", "\n")
+}
+
 export function parsePatch(patchText: string): { hunks: Hunk[] } {
-  const cleaned = stripHeredoc(patchText.trim())
+  const cleaned = stripHeredoc(normalizePatchText(patchText).trim())
   const lines = cleaned.split("\n")
   const hunks: Hunk[] = []
   let i = 0
@@ -271,7 +282,7 @@ export function maybeParseApplyPatch(
   // Bash heredoc form: bash -lc 'apply_patch <<"EOF" ...'
   if (argv.length === 3 && argv[0] === "bash" && argv[1] === "-lc") {
     // Simple extraction - in real implementation would need proper bash parsing
-    const script = argv[2]
+    const script = normalizePatchText(argv[2])
     const heredocMatch = script.match(/apply_patch\s*<<['"](\w+)['"]\s*\n([\s\S]*?)\n\1/)
 
     if (heredocMatch) {
@@ -310,24 +321,24 @@ export function deriveNewContentsFromChunks(
   originalText: string,
 ): ApplyPatchFileUpdate {
   const originalContent = Bom.split(originalText)
+  const physicalLines = splitLinesPreservingTerminators(originalContent.text)
+  const replacements = computeReplacements(
+    physicalLines.map((line) => line.text),
+    filePath,
+    chunks,
+  )
+  let newContent = applyLineReplacements(physicalLines, replacements)
 
-  let originalLines = originalContent.text.split("\n")
-
-  // Drop trailing empty element for consistent line counting
-  if (originalLines.length > 0 && originalLines[originalLines.length - 1] === "") {
-    originalLines.pop()
+  // Preserve this legacy API's historical "updated files end in a newline"
+  // contract, but infer the physical separator from the target instead of
+  // hard-coding LF. The modern patch tool preserves a missing final newline.
+  if (newContent !== "" && !newContent.endsWith("\n") && !newContent.endsWith("\r")) {
+    const ending = physicalLines.findLast((line) => line.terminator !== "")?.terminator ?? "\n"
+    newContent += ending
   }
 
-  const replacements = computeReplacements(originalLines, filePath, chunks)
-  let newLines = applyReplacements(originalLines, replacements)
-
-  // Ensure trailing newline
-  if (newLines.length === 0 || newLines[newLines.length - 1] !== "") {
-    newLines.push("")
-  }
-
-  const next = Bom.split(newLines.join("\n"))
-  const newContent = next.text
+  const next = Bom.split(newContent)
+  newContent = next.text
 
   // Generate unified diff
   const unifiedDiff = generateUnifiedDiff(originalContent.text, newContent)
@@ -393,25 +404,6 @@ function computeReplacements(
   replacements.sort((a, b) => a[0] - b[0])
 
   return replacements
-}
-
-function applyReplacements(lines: string[], replacements: Array<[number, number, string[]]>): string[] {
-  // Apply replacements in reverse order to avoid index shifting
-  const result = [...lines]
-
-  for (let i = replacements.length - 1; i >= 0; i--) {
-    const [startIdx, oldLen, newSegment] = replacements[i]
-
-    // Remove old lines
-    result.splice(startIdx, oldLen)
-
-    // Insert new lines
-    for (let j = 0; j < newSegment.length; j++) {
-      result.splice(startIdx + j, 0, newSegment[j])
-    }
-  }
-
-  return result
 }
 
 // Normalize Unicode punctuation to ASCII equivalents (like Rust's normalize_unicode)

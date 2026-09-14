@@ -6,7 +6,7 @@
 // layer owns files, permissions, and dispatch.
 
 import { parsePatch as parseUnifiedDiff } from "diff"
-import { seekSequence } from "../../patch"
+import { normalizePatchText, seekSequence } from "../../patch"
 import type { Hunk, UpdateFileChunk } from "../../patch"
 
 export type PatchFormat = "opencode" | "git"
@@ -58,7 +58,7 @@ function stripGitPrefix(name: string | undefined): string | null {
  *   Patch.deriveNewContentsFromChunks (throws on mismatch → nothing is written).
  */
 export function translateGitDiff(patchText: string): Hunk[] | null {
-  const cleaned = stripHeredoc(patchText.trim())
+  const cleaned = stripHeredoc(normalizePatchText(patchText).trim())
   if (!looksLikeGitDiff(cleaned)) return null
 
   let parsed: ParsedGitFile[]

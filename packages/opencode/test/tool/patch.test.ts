@@ -364,6 +364,73 @@ describe("tool.patch", () => {
     { git: true },
   )
 
+  it.instance("CRLF patch transport cannot convert an LF target", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "lf-target.txt")
+      yield* writeText(target, "alpha\nbeta\ngamma\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: lf-target.txt",
+        "@@",
+        "-beta",
+        "+BETA",
+        "+inserted",
+        "*** End Patch",
+      ].join("\r\n")
+
+      yield* execute({ patchText: patch, apply: true }, ctx)
+      expect(yield* readText(target)).toBe("alpha\nBETA\ninserted\ngamma\n")
+    }),
+    { git: true },
+  )
+
+  it.instance("LF patch transport preserves a CRLF target", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "crlf-target.txt")
+      yield* writeText(target, "alpha\r\nbeta\r\ngamma\r\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: crlf-target.txt",
+        "@@",
+        "-beta",
+        "+BETA",
+        "+inserted",
+        "*** End Patch",
+      ].join("\n")
+
+      yield* execute({ patchText: patch, apply: true }, ctx)
+      expect(yield* readText(target)).toBe("alpha\r\nBETA\r\ninserted\r\ngamma\r\n")
+    }),
+    { git: true },
+  )
+
+  it.instance("patching one region of a mixed-ending file preserves surrounding bytes", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "mixed-target.txt")
+      yield* writeText(target, "lf-before\nfirst\r\nsecond\r\nlf-after\n")
+      const patch = [
+        "*** Begin Patch",
+        "*** Update File: mixed-target.txt",
+        "@@",
+        "-first",
+        "-second",
+        "+FIRST",
+        "+SECOND",
+        "*** End Patch",
+      ].join("\n")
+
+      yield* execute({ patchText: patch, apply: true }, ctx)
+      expect(yield* readText(target)).toBe("lf-before\nFIRST\r\nSECOND\r\nlf-after\n")
+    }),
+    { git: true },
+  )
+
   it.instance("git rename translates to a move (R)", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

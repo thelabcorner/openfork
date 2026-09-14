@@ -337,6 +337,20 @@ describe("tool.apply_patch freeform", () => {
     }),
   )
 
+  it.instance("preserves CRLF target endings even when apply_patch input uses LF", () =>
+    Effect.gen(function* () {
+      const test = yield* TestInstance
+      const { ctx } = makeCtx()
+      const target = path.join(test.directory, "crlf.txt")
+      yield* writeText(target, "one\r\ntwo\r\nthree\r\n")
+      const patchText =
+        "*** Begin Patch\n*** Update File: crlf.txt\n@@\n-two\n+TWO\n+inserted\n*** End Patch"
+
+      yield* execute({ patchText }, ctx)
+      expect(yield* readText(target)).toBe("one\r\nTWO\r\ninserted\r\nthree\r\n")
+    }),
+  )
+
   it.instance("moves file to a new directory", () =>
     Effect.gen(function* () {
       const test = yield* TestInstance

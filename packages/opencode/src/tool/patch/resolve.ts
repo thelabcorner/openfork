@@ -1,6 +1,7 @@
 import { MatchError, resolveMatch } from "../edit/match"
 import type { Match } from "../edit/span"
 import { buildLineIndex } from "../edit/line-index"
+import { adaptReplacementTerminators } from "@opencode-ai/core/line-ending"
 import { FUZZ } from "../edit/span"
 import { orderSpans, type Span } from "../edit/span"
 import type { UpdateFileChunk } from "../../patch"
@@ -245,7 +246,10 @@ export function deriveContent(
   filePath: string,
 ): { content: string; spans: Span[]; warnings: string[] } {
   const resolvedChunks = resolveChunks(content, chunks, filePath)
-  const spans = resolvedChunks.map((r) => r.span)
+  const spans = resolvedChunks.map((r) => ({
+    ...r.span,
+    replacement: adaptReplacementTerminators(content, r.span.start, r.span.end, r.span.replacement),
+  }))
   const warnings = resolvedChunks
     .filter((r) => r.fuzz !== 0)
     .map(

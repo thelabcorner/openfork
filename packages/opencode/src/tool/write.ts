@@ -16,6 +16,7 @@ import * as Bom from "@/util/bom"
 import { AppProcess } from "@opencode-ai/core/process"
 import { TypecheckScope } from "./typecheck-scope"
 import { globalReadCache, noteWrite as noteSessionWrite } from "./edit/prior-read"
+import { adaptWriteTerminators } from "@opencode-ai/core/line-ending"
 
 const MAX_PROJECT_DIAGNOSTICS_FILES = 5
 
@@ -53,7 +54,7 @@ export const WriteTool = Tool.define(
           const next = Bom.split(params.content)
           const desiredBom = source.bom || next.bom
           const contentOld = source.text
-          const contentNew = next.text
+          const contentNew = exists ? adaptWriteTerminators(source.text, next.text) : next.text
 
           const diff = trimDiff(createTwoFilesPatch(filepath, filepath, contentOld, contentNew))
           yield* ctx.ask({
@@ -68,7 +69,11 @@ export const WriteTool = Tool.define(
 
           yield* fs.writeWithDirs(filepath, Bom.join(contentNew, desiredBom))
           if (yield* format.file(filepath)) {
-            yield* Bom.syncFile(fs, filepath, desiredBom)
+            const formatted = yield* Bom.readFile(fs, filepath)
+            const healedFormatted = adaptWriteTerminators(contentNew, formatted.text)
+            if (formatted.bom !== desiredBom || healedFormatted !== formatted.text) {
+              yield* fs.writeWithDirs(filepath, Bom.join(healedFormatted, desiredBom))
+            }
           }
           yield* noteSessionWrite(globalReadCache, fs, ctx.sessionID, filepath)
           yield* events.publish(FileSystem.Event.Edited, { file: filepath })

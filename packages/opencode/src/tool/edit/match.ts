@@ -10,6 +10,7 @@ import {
   unescapeAggressive,
 } from "./text"
 import { replaceConflictHint } from "../conflict"
+import { adaptReplacementTerminators, findLogicalMatches } from "@opencode-ai/core/line-ending"
 
 export type Matcher = (content: string, find: string, lines: readonly Line[]) => Generator<Match, void, unknown>
 
@@ -20,13 +21,8 @@ const MAX_CANDIDATES_LISTED = 10
 // ── Matchers (offset-yielding) ───────────────────────────────────────────────
 
 export const ExactMatcher: Matcher = function* (content, find) {
-  if (find === "") return
-  let from = 0
-  for (;;) {
-    const idx = content.indexOf(find, from)
-    if (idx === -1) return
-    yield { start: idx, end: idx + find.length, fuzz: FUZZ.EXACT, via: "exact" }
-    from = idx + Math.max(1, find.length)
+  for (const match of findLogicalMatches(content, find)) {
+    yield { start: match.start, end: match.end, fuzz: FUZZ.EXACT, via: "exact" }
   }
 }
 
@@ -380,10 +376,17 @@ export function resolveReplacement(
     const lines = buildLineIndex(content)
     const spans: Span[] = []
     for (const m of ExactMatcher(content, oldString, lines)) {
-      spans.push({ start: m.start, end: m.end, replacement: newString })
+      spans.push({
+        start: m.start,
+        end: m.end,
+        replacement: adaptReplacementTerminators(content, m.start, m.end, newString),
+      })
     }
     if (spans.length === 0) {
-      throw new MatchError("not-found", "replaceAll requires an exact match; oldString was not found verbatim.")
+      throw new MatchError(
+        "not-found",
+        "replaceAll requires an exact logical match; oldString was not found (line-ending encoding is auto-healed).",
+      )
     }
     return { spans, warnings: [], via: "exact", applied: spans.length }
   }
@@ -391,7 +394,7 @@ export function resolveReplacement(
   const resolution = resolveMatch(content, oldString, { label: "oldString" })
   const { start, end } = resolution.match
   return {
-    spans: [{ start, end, replacement: newString }],
+    spans: [{ start, end, replacement: adaptReplacementTerminators(content, start, end, newString) }],
     warnings: resolution.warnings,
     via: resolution.match.via,
     applied: 1,
