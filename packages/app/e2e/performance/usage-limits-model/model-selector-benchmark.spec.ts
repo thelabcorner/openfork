@@ -1,9 +1,12 @@
 import type { Page } from "@playwright/test"
+import { base64Encode } from "@opencode-ai/core/util/encode"
 import { benchmark, expect } from "../benchmark"
 import { mockOpenCodeServer } from "../../utils/mock-server"
 import { expectAppVisible } from "../../utils/waits"
 
 const directory = "C:/OpenCode/ModelSelectorPerformance"
+const projectID = "proj_model_selector_perf"
+const sessionID = "ses_model_selector_perf"
 
 const modelCount = () => Number(process.env.MODEL_SELECTOR_BENCH_MODELS ?? 644)
 
@@ -23,7 +26,10 @@ function providerFixture(count: number) {
             cost: {
               input: 0.1 + (index % 23) / 10,
               output: 0.2 + (index % 31) / 10,
-              cache_read: 0.02 + (index % 11) / 100,
+              cache: {
+                read: 0.02 + (index % 11) / 100,
+                write: 0,
+              },
             },
             limit: { context: 32_000 + (index % 8) * 32_000 },
           },
@@ -59,7 +65,7 @@ benchmark.describe("performance: model selector", () => {
     await mockOpenCodeServer(page, {
       directory,
       project: {
-        id: "proj_model_selector_perf",
+        id: projectID,
         worktree: directory,
         vcs: "git",
         name: "ModelSelectorPerformance",
@@ -71,7 +77,17 @@ benchmark.describe("performance: model selector", () => {
         connected: ["bench"],
         default: { providerID: "bench", modelID: "model-0000" },
       },
-      sessions: [],
+      sessions: [
+        {
+          id: sessionID,
+          slug: "model-selector-performance",
+          projectID,
+          directory,
+          title: "Model selector performance",
+          version: "dev",
+          time: { created: 1_700_000_000_000, updated: 1_700_000_000_000 },
+        },
+      ],
       pageMessages: () => ({ items: [] }),
       fileList: (path) =>
         path ? [] : [{ name: "ModelSelectorPerformance", path: "ModelSelectorPerformance", absolute: directory, type: "directory", ignored: false }],
@@ -82,12 +98,11 @@ benchmark.describe("performance: model selector", () => {
       localStorage.setItem("opencode.global.dat:server", JSON.stringify({ projects: { local: [] } }))
     })
 
-    await page.goto("/")
-    const addProject = page.locator('[data-action="home-add-project-row"]')
-    await expectAppVisible(addProject)
-    await addProject.click()
-    await page.locator("[data-directory-path]").click()
-    await page.locator('[data-action="home-new-session"]').click()
+    // Benchmark the selector on a settled real-session route. The draft route
+    // intentionally bootstraps provider/agent state and can replace the
+    // composer control while opening, which measures route bootstrap races
+    // instead of selector work.
+    await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
     await expectAppVisible(page.locator('[data-component="prompt-input-v2"]'))
 
     // Let always-mounted composer resources settle so open-induced traffic is
