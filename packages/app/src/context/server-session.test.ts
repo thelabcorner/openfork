@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import type { retry } from "@opencode-ai/core/util/retry"
-import type { OpenCodeEvent, SessionApi } from "@opencode-ai/client/promise"
+import type { OpenCodeEvent, SessionApi, SessionMessageInfo } from "@opencode-ai/client/promise"
 import type { Message, OpencodeClient, Part, Session } from "@opencode-ai/sdk/v2/client"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
@@ -21,6 +21,7 @@ const session = (id: string, parentID?: string): Session => ({
 type UserMessage = Extract<Message, { role: "user" }>
 type AssistantMessage = Extract<Message, { role: "assistant" }>
 type TextPart = Extract<Part, { type: "text" }>
+type AssistantSessionMessageInfo = Extract<SessionMessageInfo, { type: "assistant" }>
 type MessageResponse = {
   data: { info: Message; parts: Part[] }[]
   response: { headers: Headers }
@@ -70,6 +71,9 @@ const response = (data: MessageResponse["data"] = [], cursor?: string): MessageR
 const singleResponse = (info: Message, parts: Part[] = []): SingleMessageResponse => ({ data: { info, parts } })
 
 const deferredResponse = () => Promise.withResolvers<MessageResponse>()
+
+const assistantSource = (value: SessionMessageInfo | undefined): AssistantSessionMessageInfo | undefined =>
+  value?.type === "assistant" ? value : undefined
 
 function messageClient(...responses: Array<MessageResponse | Promise<MessageResponse>>) {
   let index = 0
@@ -430,7 +434,7 @@ describe("server session", () => {
         agent: "build",
         model: { id: "model", providerID: "provider" },
         content: [{ type: "text", text: "" }],
-        time: { created: 2, firstTokenAt: 2 },
+        time: { created: 2 },
       },
     ])
 
@@ -492,11 +496,11 @@ describe("server session", () => {
       } as OpenCodeEvent)
 
     apply("background")
-    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({ type: "text", text: "" })
+    expect(assistantSource(ctx.store.data.session_message.child?.at(-1))?.content?.[0]).toEqual({ type: "text", text: "" })
 
     ctx.store.resume("child")
     apply("foreground")
-    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({ type: "text", text: "" })
+    expect(assistantSource(ctx.store.data.session_message.child?.at(-1))?.content?.[0]).toEqual({ type: "text", text: "" })
   })
 
   test("background sync cannot suspend an already active foreground session", async () => {
@@ -523,7 +527,10 @@ describe("server session", () => {
       data: { sessionID: "child", assistantMessageID: "msg_2_assistant", ordinal: 0, delta: "still-live" },
     } as OpenCodeEvent)
 
-    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({ type: "text", text: "still-live" })
+    expect(assistantSource(ctx.store.data.session_message.child?.at(-1))?.content?.[0]).toEqual({
+      type: "text",
+      text: "still-live",
+    })
   })
 
   test("stale foreground activation stays content-gated until hydration succeeds", async () => {
@@ -557,7 +564,7 @@ describe("server session", () => {
     ctx.store.resume("child")
     expect(ctx.store.acceptStreamContent("child")).toBe(false)
     apply("evt_before_hydration", "-unsafe")
-    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({ type: "text", text: "base" })
+    expect(assistantSource(ctx.store.data.session_message.child?.at(-1))?.content?.[0]).toEqual({ type: "text", text: "base" })
 
     await ctx.store.sync("child", { force: true })
     expect(ctx.store.acceptStreamContent("child")).toBe(true)
@@ -574,7 +581,7 @@ describe("server session", () => {
       },
     ])
     apply("evt_after_hydration", "-live")
-    expect(ctx.store.data.session_message.child?.at(-1)?.content?.[0]).toEqual({
+    expect(assistantSource(ctx.store.data.session_message.child?.at(-1))?.content?.[0]).toEqual({
       type: "text",
       text: "hydrated-live",
     })
