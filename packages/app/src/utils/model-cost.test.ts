@@ -8,6 +8,51 @@ import {
   sortByCheapness,
   type CheapnessModel,
 } from "./model-cost"
+import { normalizeModelName, similarity } from "./string-similarity"
+
+const published = (input = 1) => ({ input, output: input * 2, cache: { read: input / 10, write: 0 } })
+const unpriced = () => ({ input: 0, output: 0, cache: { read: 0, write: 0 } })
+
+function bruteFuzzy(models: CheapnessModel[], threshold = 0.75) {
+  const paid = models.filter((model) => model.cost.input > 0 || model.cost.output > 0)
+  const free = models.filter((model) => !(model.cost.input > 0 || model.cost.output > 0))
+  const donorByKey = new Map<string, CheapnessModel>()
+  for (const model of paid) {
+    const key = normalizeModelName(model.name || model.id)
+    if (!key) continue
+    const existing = donorByKey.get(key)
+    if (!existing || (existing.provider.id === "openrouter" && model.provider.id !== "openrouter")) donorByKey.set(key, model)
+  }
+  const donors = [...donorByKey].map(([key, model]) => ({ key, model }))
+  const groups = new Map<string, CheapnessModel[]>()
+  for (const model of free) {
+    const key = normalizeModelName(model.name || model.id)
+    if (!key) continue
+    const group = groups.get(key)
+    if (group) group.push(model)
+    else groups.set(key, [model])
+  }
+  const out = new Map<string, { cost: CheapnessModel["cost"]; score: number; donorId: string }>()
+  for (const [query, group] of groups) {
+    let best: { model: CheapnessModel; score: number } | undefined
+    for (const donor of donors) {
+      const score = similarity(query, donor.key)
+      if (score < threshold) continue
+      if (
+        !best ||
+        score > best.score ||
+        (score === best.score && best.model.provider.id === "openrouter" && donor.model.provider.id !== "openrouter")
+      ) {
+        best = { model: donor.model, score }
+      }
+    }
+    if (!best) continue
+    for (const model of group) {
+      if (!out.has(model.id)) out.set(model.id, { cost: best.model.cost, score: best.score, donorId: best.model.id })
+    }
+  }
+  return out
+}
 
 describe("model-cost fallback", () => {
   test("pricing fallback prefers non-openrouter and shares across providers", () => {
@@ -83,5 +128,39 @@ describe("model-cost fallback", () => {
     expect(compareByCheapness(hy3Free as never, otherFree as never, undefined, undefined, undefined, merged as never)).toBeLessThan(0)
     // Free tier still always outranks paid regardless of inferred value (§19 intact).
     expect(compareByCheapness(otherFree as never, paidModel as never, undefined, undefined, undefined, merged as never)).toBeLessThan(0)
+  })
+
+  test("indexed fuzzy pricing is exactly equivalent to the exhaustive donor scan", () => {
+    const models: CheapnessModel[] = []
+    for (let i = 0; i < 80; i++) {
+      const suffix = i.toString().padStart(2, "0")
+      models.push({
+        id: `atlas-${suffix}`,
+        name: `Atlas ${suffix} Standard`,
+        provider: { id: i % 7 === 0 ? "openrouter" : "vendor" },
+        cost: published(1 + i / 10),
+      })
+      models.push({
+        id: `atlas-${suffix}-community`,
+        name: `Atlas ${suffix} Standrd Community`,
+        provider: { id: "community" },
+        cost: unpriced(),
+      })
+      if (i % 5 === 0) {
+        models.push({
+          id: `atlas-${suffix}-replica`,
+          name: `Atlas ${suffix} Standard`,
+          provider: { id: "vendor-replica" },
+          cost: published(2 + i / 10),
+        })
+      }
+    }
+    models.push({ id: "single-a", name: "A", provider: { id: "community" }, cost: unpriced() })
+    models.push({ id: "single-b", name: "B", provider: { id: "vendor" }, cost: published() })
+    models.push({ id: "unrelated", name: "Quantum Zebra", provider: { id: "community" }, cost: unpriced() })
+
+    const expected = bruteFuzzy(models)
+    const actual = buildFuzzyPricingFallbackMap(models)
+    expect([...actual.entries()]).toEqual([...expected.entries()])
   })
 })

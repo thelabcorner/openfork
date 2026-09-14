@@ -1,5 +1,5 @@
 import { createMemo } from "solid-js"
-import { useLimits } from "@/hooks/use-limits"
+import { useLimits, type LimitsState } from "@/hooks/use-limits"
 
 /**
  * Pack pricing observed 2026-09-01 via `gsk me` / Genspark web: one pack
@@ -30,12 +30,14 @@ export type GensparkModelUsage = {
  * We derive credits/M from the model's dollar cost (via pricing fallback) and
  * estimate remaining requests as remainingCredits / creditsPerRequest.
  */
-export function useGensparkUsage() {
-  let limits: ReturnType<typeof useLimits> | undefined
-  try {
-    limits = useLimits()
-  } catch {
-    limits = undefined
+export function useGensparkUsage(options?: { limits?: LimitsState }) {
+  let limits: LimitsState | undefined = options?.limits
+  if (!limits) {
+    try {
+      limits = useLimits()
+    } catch {
+      limits = undefined
+    }
   }
   if (!limits) {
     return {

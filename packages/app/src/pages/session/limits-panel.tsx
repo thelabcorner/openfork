@@ -33,6 +33,7 @@ import {
   formatPercent,
   formatRemainingPercent,
   formatResetDate,
+  formatShortResetDate,
   formatAge,
   formatCountdownSeconds,
   displayWindowLabel,
@@ -195,16 +196,7 @@ function CountdownText(props: {
   // Short form (no weekday/time) to fit the reset column; the full date is
   // still one hover away via the title tooltip.
   if (props.mode === "date") {
-    const shortDate = () => {
-      if (!props.resetAt) return null
-      try {
-        return new Intl.DateTimeFormat(language.intl(), { month: "short", day: "numeric" }).format(
-          new Date(props.resetAt),
-        )
-      } catch {
-        return new Date(props.resetAt).toLocaleDateString()
-      }
-    }
+    const shortDate = createMemo(() => formatShortResetDate(props.resetAt, language.intl()) || null)
     return (
       <span
         class="truncate text-[9.5px] leading-none tabular-nums text-v2-text-text-faint"
@@ -1471,7 +1463,7 @@ export function LimitsPanelContent(props: { active?: Accessor<boolean> }) {
     refresh,
     isCoolingDown,
     cooldownRemainingMs,
-  } = useLimits({ now })
+  } = useLimits({ now, active: props.active })
   // Verdent free — client-side only (no server quota adapter). Count today's
   // verdent/*-free assistant messages from synced history; see utils/verdent-free-usage.ts.
   const verdentFreeHook = useVerdentFreeUsage({ now })

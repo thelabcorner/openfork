@@ -1,12 +1,12 @@
-import { For, Show } from "solid-js"
-import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
+import { createMemo, createSignal, For, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
 import type { UsageSummaryResponse } from "@opencode-ai/sdk/v2/client"
 import { formatNumber, formatTokens, formatUSD, hourLabel } from "./usage-format"
-import { UsageTooltipContent } from "./usage-chart"
+import { UsageFloatingTooltip, usageHoverPosition, type UsageHoverTooltipData } from "./usage-chart"
 
 const DOW_LABELS = ["Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 const HOUR_LABEL_EVERY = 3
+const HOURS = Array.from({ length: 24 }, (_, hour) => hour)
 
 /**
  * Day-of-week x hour-of-day punchcard.
@@ -24,12 +24,13 @@ const HOUR_LABEL_EVERY = 3
  */
 export function UsagePunchcard(props: { punchcard: UsageSummaryResponse["punchcard"] }) {
   const language = useLanguage()
+  const [hovered, setHovered] = createSignal<UsageHoverTooltipData | null>(null)
 
-  const max = () => {
+  const max = createMemo(() => {
     let value = 0
     for (const bucket of props.punchcard) value = Math.max(value, bucket.messages)
     return value
-  }
+  })
 
   const fillFor = (messages: number) => {
     if (messages <= 0) return "var(--usage-track, var(--v2-background-bg-layer-03))"
@@ -49,35 +50,34 @@ export function UsagePunchcard(props: { punchcard: UsageSummaryResponse["punchca
       when={props.punchcard.length === 7 * 24}
       fallback={<div class="py-3 text-center text-[10px] font-[440] text-v2-text-text-faint">—</div>}
     >
-      <div class="flex min-w-0 flex-col gap-1">
+      <div class="relative flex min-w-0 flex-col gap-1">
         <For each={DOW_LABELS}>
           {(label, dowIndex) => (
             <div class="flex min-w-0 items-center gap-1.5">
               <span class="w-6 shrink-0 text-[9px] font-[500] leading-3 text-v2-text-text-faint">{label}</span>
               <div class="flex min-w-0 flex-1 gap-[2px]">
-                <For each={Array.from({ length: 24 }, (_, hour) => hour)}>
+                <For each={HOURS}>
                   {(hour) => {
                     const cell = () => bucket(dowIndex(), hour)
                     return (
-                      <TooltipV2
-                        placement="top"
-                        class="min-w-0 flex-1"
-                        value={
-                          <UsageTooltipContent
-                            title={`${label} · ${hourLabel(hour)}`}
-                            rows={[
-                              { label: language.t("usage.table.turns"), value: formatNumber(cell().messages, language.intl()) },
-                              { label: language.t("usage.metric.cost"), value: formatUSD(cell().cost, language.intl()) },
-                              { label: language.t("usage.metric.tokens"), value: formatTokens(cell().tokens, language.intl()) },
-                            ]}
-                          />
-                        }
-                      >
-                        <div
-                          class="h-4 w-full rounded-[2px]"
-                          style={{ "background-color": fillFor(cell().messages) }}
-                        />
-                      </TooltipV2>
+                      <div
+                        class="h-4 min-w-0 flex-1 rounded-[2px]"
+                        style={{ "background-color": fillFor(cell().messages) }}
+                        onPointerEnter={(event) => {
+                          const value = cell()
+                          const position = usageHoverPosition(event.currentTarget)
+                          setHovered({
+                            ...position,
+                            title: `${label} · ${hourLabel(hour)}`,
+                            rows: [
+                              { label: language.t("usage.table.turns"), value: formatNumber(value.messages, language.intl()) },
+                              { label: language.t("usage.metric.cost"), value: formatUSD(value.cost, language.intl()) },
+                              { label: language.t("usage.metric.tokens"), value: formatTokens(value.tokens, language.intl()) },
+                            ],
+                          })
+                        }}
+                        onPointerLeave={() => setHovered(null)}
+                      />
                     )
                   }}
                 </For>
@@ -88,7 +88,7 @@ export function UsagePunchcard(props: { punchcard: UsageSummaryResponse["punchca
         <div class="flex min-w-0 items-center gap-1.5">
           <span class="w-6 shrink-0" />
           <div class="flex min-w-0 flex-1 gap-[2px]">
-            <For each={Array.from({ length: 24 }, (_, hour) => hour)}>
+            <For each={HOURS}>
               {(hour) => (
                 <span class="min-w-0 flex-1 text-center text-[8px] font-[440] leading-3 text-v2-text-text-faint">
                   {hour % HOUR_LABEL_EVERY === 0 ? hourLabel(hour) : ""}
@@ -97,6 +97,7 @@ export function UsagePunchcard(props: { punchcard: UsageSummaryResponse["punchca
             </For>
           </div>
         </div>
+        <UsageFloatingTooltip value={hovered()} />
       </div>
     </Show>
   )

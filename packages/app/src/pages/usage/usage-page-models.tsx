@@ -35,6 +35,8 @@ import { DetailRows, EmptyLine, Panel, RankRow, RuleGrid, Stat } from "./usage-p
  * price rather than alphabetically.
  */
 const LEADERBOARD_SIZE = 5
+const MODEL_TABLE_INITIAL_ROWS = 50
+const MODEL_TABLE_PAGE_ROWS = 200
 
 const TABLE_GRID = "grid-cols-[minmax(0,1fr)_50px_60px_68px_68px_62px_54px_46px]"
 
@@ -362,6 +364,7 @@ type SortColumn = "model" | "requests" | "tokens" | "cost" | "free" | "rate" | "
 function UsageModelsTable(props: { rows: ModelRow[] }) {
   const language = useLanguage()
   const [query, setQuery] = createSignal("")
+  const [rowLimit, setRowLimit] = createSignal(MODEL_TABLE_INITIAL_ROWS)
 
   const sort = createColumnSort<ModelRow, SortColumn>("cost", (row, column) => {
     switch (column) {
@@ -396,6 +399,8 @@ function UsageModelsTable(props: { rows: ModelRow[] }) {
     )
   })
   const sorted = createMemo(() => sort.sort(filtered()))
+  const visible = createMemo(() => sorted().slice(0, rowLimit()))
+  const hiddenCount = createMemo(() => Math.max(0, sorted().length - visible().length))
 
   return (
     <Panel
@@ -405,7 +410,10 @@ function UsageModelsTable(props: { rows: ModelRow[] }) {
           type="text"
           placeholder={language.t("usage.models.search")}
           value={query()}
-          onInput={(event) => setQuery(event.currentTarget.value)}
+          onInput={(event) => {
+            setQuery(event.currentTarget.value)
+            setRowLimit(MODEL_TABLE_INITIAL_ROWS)
+          }}
           class="h-5 w-40 rounded border-0 bg-[var(--usage-inset)] px-1.5 text-[10px] text-v2-text-text-base outline-none placeholder:text-v2-text-text-faint"
         />
       }
@@ -423,9 +431,18 @@ function UsageModelsTable(props: { rows: ModelRow[] }) {
       </div>
       <Show when={sorted().length > 0} fallback={<EmptyLine>{language.t("usage.models.empty")}</EmptyLine>}>
         <div class="flex flex-col">
-          <For each={sorted()}>
+          <For each={visible()}>
             {(row) => <ModelTableRow row={row} />}
           </For>
+          <Show when={hiddenCount() > 0}>
+            <button
+              type="button"
+              class="border-t border-[var(--usage-line)] px-3 py-2 text-left text-[10px] font-[560] text-v2-text-text-muted hover:bg-[var(--usage-hover)]"
+              onClick={() => setRowLimit((value) => value + MODEL_TABLE_PAGE_ROWS)}
+            >
+              {language.t("common.showMore", { count: Math.min(MODEL_TABLE_PAGE_ROWS, hiddenCount()) })}
+            </button>
+          </Show>
         </div>
       </Show>
     </Panel>

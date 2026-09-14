@@ -278,9 +278,12 @@ export type FuzzyPricingMatch = { cost: ModelCost; score: number; donorId: strin
  * prefers an exact match over a fuzzy one). Ties prefer non-openrouter donors,
  * mirroring `buildPricingFallbackMap`'s preference.
  *
- * O(unpriced × paid) — build once behind a memo gated on dialog-open/page-
- * mount (same pattern as the existing `pricingFallback` memos), never inside
- * a hot per-compare sort loop.
+ * Candidate admission uses exact q-gram prefix + length filtering over an
+ * inverted bigram index. For Dice threshold t and query bigram count A, any
+ * valid donor has B in [tA/(2-t), A(2-t)/t] and must overlap a prefix of
+ * A-ceil(t(A+Bmin)/2)+1 query grams. We order that prefix by donor frequency
+ * (rarest first), probe only those postings, then verify survivors with the
+ * original exact multiset-Dice function. No approximation or recall loss.
  */
 export function buildFuzzyPricingFallbackMap(models: CheapnessModel[], threshold = 0.75): Map<string, FuzzyPricingMatch> {
   const paid = models.filter((m) => hasPublishedPricing(m.cost))
@@ -299,6 +302,17 @@ export function buildFuzzyPricingFallbackMap(models: CheapnessModel[], threshold
     else if (existing.provider.id === "openrouter" && m.provider.id !== "openrouter") donorByKey.set(key, m)
   }
   const dedupedDonors = Array.from(donorByKey, ([key, model]) => ({ key, model, counts: bigramCounts(key) }))
+  const donorIndexByKey = new Map<string, number>()
+  const postings = new Map<string, Array<{ index: number; count: number }>>()
+  for (let index = 0; index < dedupedDonors.length; index++) {
+    const donor = dedupedDonors[index]!
+    donorIndexByKey.set(donor.key, index)
+    for (const [gram, count] of donor.counts) {
+      const list = postings.get(gram)
+      if (list) list.push({ index, count })
+      else postings.set(gram, [{ index, count }])
+    }
+  }
 
   // Group unpriced queries by normalized key so one similarity scan serves all
   // provider replicas of the same model (same 49× redundancy).
@@ -314,15 +328,58 @@ export function buildFuzzyPricingFallbackMap(models: CheapnessModel[], threshold
   const map = new Map<string, FuzzyPricingMatch>()
   for (const [query, { models: group, counts: qCounts }] of queryGroups) {
     let best: { model: CheapnessModel; score: number } | undefined
-    const qLen = query.length
-    for (const candidate of dedupedDonors) {
-      // Dice upper bound: max achievable is 2*min/(lenA+lenB). Skip if it
-      // cannot reach threshold — cheap string-length check before bigram work.
-      const cLen = candidate.key.length
-      if ((2 * Math.min(qLen, cLen)) / (qLen + cLen) < threshold) continue
+    let candidateIndices: number[]
+    let minDonorBigrams = 0
+    let maxDonorBigrams = Number.POSITIVE_INFINITY
+
+    if (threshold <= 0) {
+      // Preserve the public helper's edge-case semantics: score 0 qualifies.
+      candidateIndices = dedupedDonors.map((_, index) => index)
+    } else if (threshold > 1) {
+      candidateIndices = []
+    } else if (query.length < 2) {
+      const exactIndex = donorIndexByKey.get(query)
+      candidateIndices = exactIndex === undefined ? [] : [exactIndex]
+    } else {
+      const queryBigrams = query.length - 1
+      minDonorBigrams = Math.ceil((threshold * queryBigrams) / (2 - threshold) - 1e-12)
+      maxDonorBigrams = Math.floor((queryBigrams * (2 - threshold)) / threshold + 1e-12)
+      const minRequiredOverlap = Math.ceil((threshold * (queryBigrams + minDonorBigrams)) / 2 - 1e-12)
+      const prefixLength = Math.max(1, Math.min(queryBigrams, queryBigrams - minRequiredOverlap + 1))
+
+      // Prefix filtering is exact for any token order. Ordering query bigram
+      // occurrences by posting-list length simply makes that exact prefix as
+      // selective as possible for the current donor corpus.
+      const prefix: string[] = []
+      for (const [gram, count] of qCounts) for (let occurrence = 0; occurrence < count; occurrence++) prefix.push(gram)
+      prefix.sort(
+        (a, b) =>
+          (postings.get(a)?.length ?? 0) - (postings.get(b)?.length ?? 0) || a.localeCompare(b),
+      )
+
+      const candidates = new Set<number>()
+      for (let i = 0; i < prefixLength; i++) {
+        for (const posting of postings.get(prefix[i]!) ?? []) candidates.add(posting.index)
+      }
+      // Original exhaustive scan resolves equal-score/equal-provider-preference
+      // ties by donor insertion order. Numeric donor index restores that exact
+      // order after set-based candidate generation.
+      candidateIndices = [...candidates].sort((a, b) => a - b)
+    }
+
+    for (const index of candidateIndices) {
+      const candidate = dedupedDonors[index]!
+      if (threshold > 0 && query.length >= 2) {
+        const donorBigrams = candidate.key.length - 1
+        if (donorBigrams < minDonorBigrams || donorBigrams > maxDonorBigrams) continue
+      }
       const score = similarityWithCounts(query, qCounts, candidate.key, candidate.counts)
       if (score < threshold) continue
-      if (!best || score > best.score || (score === best.score && best.model.provider.id === "openrouter" && candidate.model.provider.id !== "openrouter")) {
+      if (
+        !best ||
+        score > best.score ||
+        (score === best.score && best.model.provider.id === "openrouter" && candidate.model.provider.id !== "openrouter")
+      ) {
         best = { model: candidate.model, score }
       }
     }

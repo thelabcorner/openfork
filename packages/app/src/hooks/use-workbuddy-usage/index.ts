@@ -1,6 +1,6 @@
 import { createMemo } from "solid-js"
 import type { Accessor } from "solid-js"
-import { useLimits } from "@/hooks/use-limits"
+import { useLimits, type LimitsState } from "@/hooks/use-limits"
 import { parseWorkBuddyKey, workBuddyCredits, workBuddyAccountCreditsExhausted, type ProviderResult } from "@/utils/limits-format"
 import { splitMultiAccountModelID } from "@/utils/model-account-identity"
 
@@ -103,7 +103,7 @@ export function splitWorkBuddyModelID(modelID: string): { id: string; accountID?
   return split.accountID ? { id: contextID, accountID: split.accountID } : { id: contextID }
 }
 
-export function useWorkBuddyUsage(options?: { now?: Accessor<number> }): WorkBuddyUsageState {
+export function useWorkBuddyUsage(options?: { now?: Accessor<number>; limits?: LimitsState }): WorkBuddyUsageState {
   /**
    * `useLimits` owns a network resource and a side-effecting `createEffect`, so
    * it must be instantiated ONCE per view — never per row. Callers that cannot
@@ -111,11 +111,13 @@ export function useWorkBuddyUsage(options?: { now?: Accessor<number> }): WorkBud
    * the picker is rendered from several places (composer, subagent picker,
    * stories) and a hard crash there takes down the whole popover.
    */
-  let limits: ReturnType<typeof useLimits> | undefined
-  try {
-    limits = useLimits(options)
-  } catch {
-    limits = undefined
+  let limits: LimitsState | undefined = options?.limits
+  if (!limits) {
+    try {
+      limits = useLimits({ now: options?.now })
+    } catch {
+      limits = undefined
+    }
   }
   const empty = () => undefined
   const noRate = () => undefined

@@ -1420,7 +1420,9 @@ function createModelSelectorController(input: {
     }
     for (const e of pricing) {
       for (const n of e.names) mix(n)
-      mix(`${e.pricing.input}|${e.pricing.output}|${e.pricing.cache.read}|${e.pricing.cache.write}`)
+      mix(
+        `${e.pricing.input}|${e.pricing.output}|${e.pricing.cache?.read ?? 0}|${e.pricing.cache?.write ?? 0}`,
+      )
     }
     return `p${profile.length}:r${pricing.length}:${(h >>> 0).toString(16).padStart(8, "0")}`
   }
@@ -1847,6 +1849,7 @@ function createModelSelectorController(input: {
     },
     recents: (models: ModelItem[]) => {
       const byKey = groupIndex()
+      const available = new Set(models.map(modelKey))
       const ordered: ModelItem[] = []
       const seen = new Set<string>()
       const recentItems = model.recent() ?? []
@@ -1860,7 +1863,7 @@ function createModelSelectorController(input: {
           group.variants.some((variant) => model.favorite.isFavorite(key(variant.item)))
         )
           continue
-        if (!models.some((item) => modelKey(item) === modelKey(group.canonical))) continue
+        if (!available.has(modelKey(group.canonical))) continue
         seen.add(group.key)
         ordered.push(group.canonical)
       }
@@ -1939,6 +1942,14 @@ function ModelSelectorPopoverV2View(props: {
   tables?: () => import("@/utils/model-usage-profile").UsageTables | undefined
 }) {
   const language = useLanguage()
+  const [store, setStore] = createStore({
+    open: props.defaultOpen ?? false,
+    search: persistedModelSearch,
+    active: "",
+    tooltip: "",
+    rail: "",
+    submenu: "",
+  })
   let local: ReturnType<typeof useLocal> | undefined
   try {
     local = useLocal()
@@ -1974,6 +1985,10 @@ function ModelSelectorPopoverV2View(props: {
       personal = undefined
     }
   }
+  const limitsNow = props.lightweight ? () => Date.now() : useNow(() => store.open)
+  const limits = props.lightweight
+    ? ({ providers: () => [] } as unknown as ReturnType<typeof useLimits>)
+    : useLimits({ now: limitsNow, active: () => store.open })
   // Ingest live messages into durable store while open - ensures very recent
   // samples (post-debounce window) still affect the tooltip/stretch bars.
   createEffect(() => {
@@ -1997,10 +2012,10 @@ function ModelSelectorPopoverV2View(props: {
         modelVariants: () => [],
         result: () => undefined,
       } as ReturnType<typeof useWorkBuddyUsage>)
-    : useWorkBuddyUsage()
+    : useWorkBuddyUsage({ limits })
   const verdent = props.lightweight
     ? ({ forModel: () => undefined, result: () => undefined } as ReturnType<typeof useVerdentUsage>)
-    : useVerdentUsage()
+    : useVerdentUsage({ limits })
   const genspark = props.lightweight
     ? ({
         remainingCredits: () => undefined,
@@ -2008,23 +2023,11 @@ function ModelSelectorPopoverV2View(props: {
         rateFor: () => undefined,
         result: () => undefined,
       } as unknown as ReturnType<typeof useGensparkUsage>)
-    : useGensparkUsage()
-  const [store, setStore] = createStore({
-    open: props.defaultOpen ?? false,
-    search: persistedModelSearch,
-    active: "",
-    tooltip: "",
-    rail: "",
-    submenu: "",
-  })
+    : useGensparkUsage({ limits })
   // Account labels for the model picker — the server's model names are cached
   // in Provider.list() and still carry the old numeric label until the cache is
   // invalidated after a vault edit. Quota's `verdentAccounts`/`workbuddyAccounts`
   // are live (read directly from the vault on every poll), so prefer those.
-  const limitsNow = props.lightweight ? () => Date.now() : useNow(() => store.open)
-  const limits = props.lightweight
-    ? ({ providers: () => [] } as unknown as ReturnType<typeof useLimits>)
-    : useLimits({ now: limitsNow } as any)
   const accountLabels = createMemo(() => {
     const map = new Map<string, string>()
     for (const p of limits.providers() ?? []) {
@@ -2378,14 +2381,22 @@ function ModelSelectorPopoverV2View(props: {
       )
       const telemetry = response.data ?? []
       if (telemetry.length === 0) return endpoints
+      const telemetryByName = new Map<string, (typeof telemetry)[number]>()
+      const telemetryBySlug = new Map<string, (typeof telemetry)[number] | null>()
+      for (const item of telemetry) {
+        // `find()` previously selected the first exact display-name match.
+        if (!telemetryByName.has(item.providerName)) telemetryByName.set(item.providerName, item)
+        if (!telemetryBySlug.has(item.providerSlug)) telemetryBySlug.set(item.providerSlug, item)
+        else telemetryBySlug.set(item.providerSlug, null)
+      }
       const enriched = endpoints.map((entry) => {
         // providerSlug is not globally unique across endpoint variants (for
         // example a provider can expose standard + fast rows under one slug).
         // Prefer the exact display identity; only accept a slug fallback when
         // it resolves to exactly one telemetry row, otherwise leave it unknown.
-        const exact = telemetry.find((item) => item.providerName === entry.providerName)
-        const slugMatches = exact ? [] : telemetry.filter((item) => item.providerSlug === entry.provider)
-        const value = exact ?? (slugMatches.length === 1 ? slugMatches[0] : undefined)
+        const exact = telemetryByName.get(entry.providerName)
+        const slug = exact ? undefined : telemetryBySlug.get(entry.provider)
+        const value = exact ?? (slug === null ? undefined : slug)
         const cacheHitPercent =
           value && Number.isFinite(Number(value.cacheHitPercent)) ? Number(value.cacheHitPercent) : undefined
         const throughputTps =
@@ -2512,6 +2523,7 @@ function ModelSelectorPopoverV2View(props: {
   const groups = createMemo(() => props.groups(railModels()))
   const favorites = createMemo(() => props.favorites(models()))
   const recents = createMemo(() => props.recents(models()))
+  const recentModelKeys = createMemo(() => new Set(recents().map(modelKey)))
   const showFavorites = () => favorites().length > 0 && (store.rail === "" || store.rail === favoritesRailKey)
   const showRecents = () => recents().length > 0 && (store.rail === "" || store.rail === recentRailKey)
   const showProviderGroups = () => store.rail !== favoritesRailKey && store.rail !== recentRailKey
@@ -2688,8 +2700,7 @@ function ModelSelectorPopoverV2View(props: {
     )
       return undefined
     if (store.rail === favoritesRailKey && !props.isFavorite(candidate)) return undefined
-    if (store.rail === recentRailKey && !recents().some((item) => modelKey(item) === modelKey(candidate)))
-      return undefined
+    if (store.rail === recentRailKey && !recentModelKeys().has(modelKey(candidate))) return undefined
     if (!store.open) return undefined
     return candidate
   })
@@ -2827,10 +2838,30 @@ function ModelSelectorPopoverV2View(props: {
     }
     return result
   })
+  const renderRowIndex = createMemo(() => {
+    const byNavKey = new Map<string, number>()
+    const snapshot = renderRows()
+    for (let i = 0; i < snapshot.length; i++) {
+      const row = snapshot[i]
+      if (row.kind === "item") byNavKey.set(row.navKey, i)
+    }
+    return byNavKey
+  })
   const rows = createMemo<NavRow[]>(() => [
     ...renderRows().flatMap((row) => (row.kind === "item" ? [{ navKey: row.navKey, item: row.item }] : [])),
     { navKey: manageKey },
   ])
+  const navigation = createMemo(() => {
+    const keys: string[] = []
+    const byKey = new Map<string, NavRow>()
+    const indexByKey = new Map<string, number>()
+    for (const row of rows()) {
+      indexByKey.set(row.navKey, keys.length)
+      keys.push(row.navKey)
+      byKey.set(row.navKey, row)
+    }
+    return { keys, byKey, indexByKey }
+  })
   const [scrollRoot, setScrollRoot] = createSignal<HTMLDivElement>()
   const virtualizer = createVirtualizer<HTMLDivElement, HTMLDivElement>({
     get count() {
@@ -2849,16 +2880,10 @@ function ModelSelectorPopoverV2View(props: {
       return (index: number) => snapshot[index]?.key ?? index
     },
     get rangeExtractor() {
-      const snapshot = renderRows()
-      const indexByNavKey = new Map<string, number>()
-      for (let i = 0; i < snapshot.length; i++) {
-        const row = snapshot[i]
-        if (row.kind === "item") indexByNavKey.set(row.navKey, i)
-      }
       return (range: Parameters<typeof defaultRangeExtractor>[0]) => {
         const indexes = defaultRangeExtractor(range)
         const active = store.active
-        const activeIndex = indexByNavKey.get(active) ?? -1
+        const activeIndex = renderRowIndex().get(active) ?? -1
         if (activeIndex < 0 || indexes.includes(activeIndex)) return indexes
         return [...indexes, activeIndex].sort((a, b) => a - b)
       }
@@ -2889,12 +2914,12 @@ function ModelSelectorPopoverV2View(props: {
   createEffect(() => {
     if (!store.open || !store.active) return
     const active = store.active
-    const index = renderRows().findIndex((row) => row.kind === "item" && row.navKey === active)
+    const index = renderRowIndex().get(active) ?? -1
     if (index < 0 || !scrollRoot()) return
     const range = virtualizer.range
     if (range && index >= range.startIndex && index <= range.endIndex) return
     queueMicrotask(() => {
-      const next = renderRows().findIndex((row) => row.kind === "item" && row.navKey === active)
+      const next = renderRowIndex().get(active) ?? -1
       if (next >= 0) virtualizer.scrollToIndex(next, { align: "auto" })
     })
   })
@@ -2932,7 +2957,7 @@ function ModelSelectorPopoverV2View(props: {
     for (const item of visibleUsageItems()) map.set(modelKey(item), usageFor(item))
     return map
   })
-  const navKeys = () => rows().map((row) => row.navKey)
+  const navKeys = () => navigation().keys
   createEffect(
     on(
       () => store.rail,
@@ -3053,7 +3078,7 @@ function ModelSelectorPopoverV2View(props: {
     })
   }
   const selectActive = () => {
-    const row = rows().find((row) => row.navKey === store.active)
+    const row = navigation().byKey.get(store.active)
     if (!row) return
     if (row.item) {
       selectModel(row.item)
@@ -3066,14 +3091,14 @@ function ModelSelectorPopoverV2View(props: {
     setStore({ tooltip: "", submenu: "" })
     const options = navKeys()
     if (options.length === 0) return
-    const index = options.indexOf(store.active)
+    const index = navigation().indexByKey.get(store.active) ?? -1
     const next =
       index === -1
         ? options[delta > 0 ? 0 : options.length - 1]
         : options[(index + delta + options.length) % options.length]
     setStore("active", next)
     queueMicrotask(() => {
-      const index = renderRows().findIndex((row) => row.kind === "item" && row.navKey === next)
+      const index = renderRowIndex().get(next) ?? -1
       const range = virtualizer.range
       if (index >= 0 && (!range || index < range.startIndex || index > range.endIndex)) {
         virtualizer.scrollToIndex(index, { align: "auto" })
@@ -3456,6 +3481,7 @@ function ModelSelectorPopoverV2View(props: {
               <Icon name="magnifying-glass" size="small" class="shrink-0" />
               <input
                 ref={(el) => (searchRef = el)}
+                data-model-selector-search
                 value={store.search}
                 placeholder={language.t("dialog.model.search.placeholder")}
                 class="h-7 min-w-0 flex-1 border-0 bg-transparent text-[13px] font-[440] leading-5 tracking-[-0.04px] text-v2-text-text-base outline-none placeholder:text-v2-text-text-faint"

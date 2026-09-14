@@ -1,4 +1,4 @@
-import { createSignal, For, Show } from "solid-js"
+import { createMemo, createSignal, For, Show } from "solid-js"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { useLanguage } from "@/context/language"
 import type { UsageSummaryResponse } from "@opencode-ai/sdk/v2/client"
@@ -44,18 +44,58 @@ export function UsageTooltipContent(props: { title: string; rows: { label: strin
   )
 }
 
+export type UsageHoverTooltipData = {
+  x: number
+  y: number
+  title: string
+  rows: { label: string; value: string }[]
+}
+
+/**
+ * One shared floating tooltip for dense chart grids. A 168-cell punchcard plus
+ * a 120-day heatmap used to instantiate up to 288 TooltipV2/floating-ui
+ * managers at tab mount even though only one cell can be hovered at a time.
+ * Dense grids now pay one tooltip manager-equivalent and keep cell hover work
+ * entirely dormant until pointer intent.
+ */
+export function UsageFloatingTooltip(props: { value: UsageHoverTooltipData | null }) {
+  return (
+    <Show when={props.value}>
+      {(value) => (
+        <div
+          class="pointer-events-none fixed z-[120] -translate-x-1/2 -translate-y-full rounded-md border border-v2-border-border-muted bg-v2-background-bg-overlay px-2 py-1.5 shadow-[var(--v2-elevation-raised)]"
+          style={{ left: `${value().x}px`, top: `${value().y}px` }}
+        >
+          <UsageTooltipContent title={value().title} rows={value().rows} />
+        </div>
+      )}
+    </Show>
+  )
+}
+
+export function usageHoverPosition(target: HTMLElement) {
+  const rect = target.getBoundingClientRect()
+  const viewportWidth = window.innerWidth
+  // Tooltip content is deliberately compact (~140-220px). Keep its center
+  // away from viewport edges without measuring/mutating layout at mount time.
+  return {
+    x: Math.max(110, Math.min(viewportWidth - 110, rect.left + rect.width / 2)),
+    y: Math.max(12, rect.top - 6),
+  }
+}
+
 /** Smooth area chart for period buckets (cost or tokens over time), with a hover crosshair + tooltip. */
 export function UsageAreaChart(props: { periods: Summary["periods"]; metric: Metric; resolution: "hour" | "day" }) {
   const language = useLanguage()
   const [hoverIndex, setHoverIndex] = createSignal<number | null>(null)
 
   const list = () => props.periods
-  const max = () => {
+  const max = createMemo(() => {
     let value = 0
     for (const period of list()) value = Math.max(value, valueFor(period, props.metric))
     return value
-  }
-  const points = () => {
+  })
+  const points = createMemo(() => {
     const data = list()
     const count = data.length
     if (count === 0) return []
@@ -64,9 +104,9 @@ export function UsageAreaChart(props: { periods: Summary["periods"]; metric: Met
       const y = HEIGHT - PAD_Y - (max() > 0 ? (valueFor(period, props.metric) / max()) * (HEIGHT - PAD_Y * 2) : 0)
       return { x, y, period }
     })
-  }
-  const pointsAttr = () => points().map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")
-  const areaPath = () => {
+  })
+  const pointsAttr = createMemo(() => points().map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" "))
+  const areaPath = createMemo(() => {
     const pts = points()
     if (pts.length === 0) return ""
     const base = HEIGHT - PAD_Y
@@ -74,7 +114,7 @@ export function UsageAreaChart(props: { periods: Summary["periods"]; metric: Met
     const last = pts[pts.length - 1]
     const mid = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" L ")
     return `M ${first.x.toFixed(1)},${first.y.toFixed(1)} L ${mid} L ${last.x.toFixed(1)},${base.toFixed(1)} L ${first.x.toFixed(1)},${base.toFixed(1)} Z`
-  }
+  })
 
   const handleMove = (event: MouseEvent & { currentTarget: SVGSVGElement }) => {
     const count = list().length
@@ -195,12 +235,12 @@ export function UsageHeroAreaChart(props: { periods: Summary["periods"]; metric:
   const [hoverIndex, setHoverIndex] = createSignal<number | null>(null)
 
   const list = () => props.periods
-  const max = () => {
+  const max = createMemo(() => {
     let value = 0
     for (const period of list()) value = Math.max(value, heroValueFor(period, props.metric))
     return value
-  }
-  const points = () => {
+  })
+  const points = createMemo(() => {
     const data = list()
     const count = data.length
     if (count === 0) return []
@@ -209,9 +249,9 @@ export function UsageHeroAreaChart(props: { periods: Summary["periods"]; metric:
       const y = HERO_HEIGHT - HERO_PAD_Y - (max() > 0 ? (heroValueFor(period, props.metric) / max()) * (HERO_HEIGHT - HERO_PAD_Y * 2) : 0)
       return { x, y, period }
     })
-  }
-  const pointsAttr = () => points().map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" ")
-  const areaPath = () => {
+  })
+  const pointsAttr = createMemo(() => points().map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" "))
+  const areaPath = createMemo(() => {
     const pts = points()
     if (pts.length === 0) return ""
     const base = HERO_HEIGHT - HERO_PAD_Y
@@ -219,7 +259,7 @@ export function UsageHeroAreaChart(props: { periods: Summary["periods"]; metric:
     const last = pts[pts.length - 1]
     const mid = pts.map((p) => `${p.x.toFixed(1)},${p.y.toFixed(1)}`).join(" L ")
     return `M ${first.x.toFixed(1)},${first.y.toFixed(1)} L ${mid} L ${last.x.toFixed(1)},${base.toFixed(1)} L ${first.x.toFixed(1)},${base.toFixed(1)} Z`
-  }
+  })
 
   const handleMove = (event: MouseEvent & { currentTarget: SVGSVGElement }) => {
     const count = list().length
@@ -250,21 +290,21 @@ export function UsageHeroAreaChart(props: { periods: Summary["periods"]; metric:
         ? formatTokens(value, language.intl())
         : formatNumber(value, language.intl())
 
-  const gridLines = () => {
+  const gridLines = createMemo(() => {
     const top = max()
     return Array.from({ length: HERO_GRID_LINES + 1 }, (_, i) => {
       const value = top > 0 ? (top / HERO_GRID_LINES) * (HERO_GRID_LINES - i) : 0
       const y = HERO_PAD_Y + ((HERO_HEIGHT - HERO_PAD_Y * 2) / HERO_GRID_LINES) * i
       return { value, y }
     })
-  }
+  })
 
-  const xLabels = () => {
+  const xLabels = createMemo(() => {
     const pts = points()
     if (pts.length < 2) return []
     const mid = pts[Math.floor((pts.length - 1) / 2)]
     return [pts[0], mid, pts[pts.length - 1]]
-  }
+  })
 
   return (
     <Show
@@ -519,7 +559,11 @@ const CELL = 12
 /** GitHub-contribution-style monthly token/cost heatmap from day buckets. */
 export function UsageHeatmap(props: { days: Summary["days"]; metric: Metric }) {
   const language = useLanguage()
-  const cells = () => {
+  const [hovered, setHovered] = createSignal<UsageHoverTooltipData | null>(null)
+  const dateFormatter = createMemo(() =>
+    new Intl.DateTimeFormat(language.intl(), { weekday: "short", month: "short", day: "numeric" }),
+  )
+  const cells = createMemo(() => {
     const days = props.days.slice(-HEATMAP_MAX_DAYS)
     const max = Math.max(...days.map((day) => valueFor(day, props.metric)), 1)
     return days.map((day) => ({
@@ -530,8 +574,8 @@ export function UsageHeatmap(props: { days: Summary["days"]; metric: Metric }) {
       tokens: day.tokens,
       level: Math.min(4, Math.ceil((valueFor(day, props.metric) / max) * 4)),
     }))
-  }
-  const weeks = () => {
+  })
+  const weeks = createMemo(() => {
     const list = cells()
     if (list.length === 0) return []
     const firstDay = new Date(list[0].start).getDay()
@@ -547,7 +591,7 @@ export function UsageHeatmap(props: { days: Summary["days"]; metric: Metric }) {
     }
     if (week.length > 0) weeks.push(week)
     return weeks
-  }
+  })
   const fillFor = (level: number) =>
     level === 0
       ? "var(--usage-track, var(--v2-background-bg-layer-03))"
@@ -558,50 +602,48 @@ export function UsageHeatmap(props: { days: Summary["days"]; metric: Metric }) {
       when={cells().length > 0}
       fallback={<div class="py-1 text-[10px] font-[440] text-v2-text-text-faint">—</div>}
     >
-      <div class="flex gap-[3px]">
-        <For each={weeks()}>
-          {(week) => (
-            <div class="flex flex-col gap-[2px]">
-              <For each={week}>
-                {(cell) => (
-                  <Show
-                    when={cell.start > 0}
-                    fallback={
-                      <div
-                        class="rounded-[2px]"
-                        style={{ width: `${CELL}px`, height: `${CELL}px`, "background-color": fillFor(0) }}
-                      />
-                    }
-                  >
-                    <TooltipV2
-                      placement="top"
-                      value={
-                        <UsageTooltipContent
-                          title={new Date(cell.start).toLocaleDateString(language.intl(), {
-                            weekday: "short",
-                            month: "short",
-                            day: "numeric",
-                          })}
-                          rows={[
-                            { label: language.t("usage.table.turns"), value: formatNumber(cell.messages, language.intl()) },
-                            { label: language.t("usage.table.sessions"), value: formatNumber(cell.sessions, language.intl()) },
-                            { label: language.t("usage.metric.cost"), value: formatUSD(cell.cost, language.intl()) },
-                            { label: language.t("usage.metric.tokens"), value: formatTokens(cell.tokens, language.intl()) },
-                          ]}
+      <div class="relative">
+        <div class="flex gap-[3px]">
+          <For each={weeks()}>
+            {(week) => (
+              <div class="flex flex-col gap-[2px]">
+                <For each={week}>
+                  {(cell) => (
+                    <Show
+                      when={cell.start > 0}
+                      fallback={
+                        <div
+                          class="rounded-[2px]"
+                          style={{ width: `${CELL}px`, height: `${CELL}px`, "background-color": fillFor(0) }}
                         />
                       }
                     >
                       <div
                         class="rounded-[2px]"
                         style={{ width: `${CELL}px`, height: `${CELL}px`, "background-color": fillFor(cell.level) }}
+                        onPointerEnter={(event) => {
+                          const position = usageHoverPosition(event.currentTarget)
+                          setHovered({
+                            ...position,
+                            title: dateFormatter().format(new Date(cell.start)),
+                            rows: [
+                              { label: language.t("usage.table.turns"), value: formatNumber(cell.messages, language.intl()) },
+                              { label: language.t("usage.table.sessions"), value: formatNumber(cell.sessions, language.intl()) },
+                              { label: language.t("usage.metric.cost"), value: formatUSD(cell.cost, language.intl()) },
+                              { label: language.t("usage.metric.tokens"), value: formatTokens(cell.tokens, language.intl()) },
+                            ],
+                          })
+                        }}
+                        onPointerLeave={() => setHovered(null)}
                       />
-                    </TooltipV2>
-                  </Show>
-                )}
-              </For>
-            </div>
-          )}
-        </For>
+                    </Show>
+                  )}
+                </For>
+              </div>
+            )}
+          </For>
+        </div>
+        <UsageFloatingTooltip value={hovered()} />
       </div>
     </Show>
   )

@@ -143,10 +143,26 @@ export function formatRemainingPercent(value: number | null): number | null {
   return Math.max(0, Math.min(100, value))
 }
 
+const resetDateFormatters = new Map<string, Intl.DateTimeFormat>()
+const shortResetDateFormatters = new Map<string, Intl.DateTimeFormat>()
+
+function cachedDateFormatter(
+  cache: Map<string, Intl.DateTimeFormat>,
+  locale: string | undefined,
+  options: Intl.DateTimeFormatOptions,
+) {
+  const key = locale ?? ""
+  const existing = cache.get(key)
+  if (existing) return existing
+  const formatter = new Intl.DateTimeFormat(locale, options)
+  cache.set(key, formatter)
+  return formatter
+}
+
 export function formatResetDate(ms: number | null, locale?: string): string {
   if (ms === null || ms === undefined || !Number.isFinite(ms) || ms <= 0) return ""
   try {
-    return new Intl.DateTimeFormat(locale, {
+    return cachedDateFormatter(resetDateFormatters, locale, {
       weekday: "short",
       month: "short",
       day: "numeric",
@@ -155,6 +171,15 @@ export function formatResetDate(ms: number | null, locale?: string): string {
     }).format(new Date(ms))
   } catch {
     return new Date(ms).toLocaleString()
+  }
+}
+
+export function formatShortResetDate(ms: number | null, locale?: string): string {
+  if (ms === null || ms === undefined || !Number.isFinite(ms) || ms <= 0) return ""
+  try {
+    return cachedDateFormatter(shortResetDateFormatters, locale, { month: "short", day: "numeric" }).format(new Date(ms))
+  } catch {
+    return new Date(ms).toLocaleDateString()
   }
 }
 

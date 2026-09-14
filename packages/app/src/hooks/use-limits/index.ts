@@ -1,6 +1,6 @@
-import { createEffect, createMemo, createResource, createSignal, onCleanup } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from "solid-js"
 import type { Accessor } from "solid-js"
-import { useServerSDK } from "@/context/server-sdk"
+import { useServerSDK, type ServerSDK } from "@/context/server-sdk"
 import { useForkUsage } from "@/context/fork-usage"
 import { useOpenRouterFreeUsage } from "@/hooks/use-openrouter-free-usage"
 import {
@@ -35,6 +35,75 @@ const REFRESH_FLOOR_MS = 5_000
 // 429, where the pane would otherwise re-enable immediately.
 const CLAUDE_429_BACKOFF_MS = 300_000
 
+type QuotaProviderList = {
+  providers: Array<{ providerId: string; providerName: string; configured: boolean }>
+}
+
+type SharedQuotaTransport = {
+  providers?: { at: number; value: QuotaProviderList }
+  providersInFlight?: Promise<QuotaProviderList>
+  quotas: Map<string, { at: number; value: { data?: unknown; error?: unknown } }>
+  quotaInFlight: Map<string, Promise<{ data?: unknown; error?: unknown }>>
+}
+
+// `useLimits()` is intentionally reusable by several surfaces, but those
+// surfaces frequently coexist (composer arc + model dialog + limits tab). The
+// backend quota cache protects upstream providers; it does NOT remove duplicate
+// renderer -> server HTTP requests. Share only the transport layer here, keyed
+// by the actual ServerSDK object, while keeping each consumer's reactive
+// projection independent. This preserves fine-grained invalidation without a
+// giant global memo.
+const sharedTransports = new WeakMap<ServerSDK, SharedQuotaTransport>()
+const PROVIDER_LIST_DEDUPE_MS = 5_000
+const QUOTA_DEDUPE_MS = 1_000
+
+function sharedTransport(server: ServerSDK) {
+  const existing = sharedTransports.get(server)
+  if (existing) return existing
+  const created: SharedQuotaTransport = { quotas: new Map(), quotaInFlight: new Map() }
+  sharedTransports.set(server, created)
+  return created
+}
+
+async function fetchProvidersShared(server: ServerSDK): Promise<QuotaProviderList> {
+  const state = sharedTransport(server)
+  const cached = state.providers
+  if (cached && Date.now() - cached.at < PROVIDER_LIST_DEDUPE_MS) return cached.value
+  if (state.providersInFlight) return state.providersInFlight
+  const request = server.client.quota
+    .providers({ throwOnError: true })
+    .then((response) => {
+      const value = response.data as QuotaProviderList
+      state.providers = { at: Date.now(), value }
+      return value
+    })
+    .finally(() => {
+      state.providersInFlight = undefined
+    })
+  state.providersInFlight = request
+  return request
+}
+
+async function fetchQuotaShared(server: ServerSDK, providerID: string) {
+  const state = sharedTransport(server)
+  const cached = state.quotas.get(providerID)
+  if (cached && Date.now() - cached.at < QUOTA_DEDUPE_MS) return cached.value
+  const pending = state.quotaInFlight.get(providerID)
+  if (pending) return pending
+  const request = server.client.quota
+    .get({ providerID }, { throwOnError: false })
+    .then((response) => {
+      const value = response as { data?: unknown; error?: unknown }
+      state.quotas.set(providerID, { at: Date.now(), value })
+      return value
+    })
+    .finally(() => {
+      state.quotaInFlight.delete(providerID)
+    })
+  state.quotaInFlight.set(providerID, request)
+  return request
+}
+
 /**
  * Dedicated limits-system hook: owns provider fetching, filtering
  * (configured-only), sorting, enrichment (worst-remaining + tone), the
@@ -49,8 +118,9 @@ const CLAUDE_429_BACKOFF_MS = 300_000
  *   and paints its card immediately; the slowest provider no longer blocks the
  *   entire pane (no `Promise.all` barrier).
  */
-export function useLimits(options?: { now?: Accessor<number> }) {
+export function useLimits(options?: { now?: Accessor<number>; active?: Accessor<boolean> }) {
   const now = options?.now ?? Date.now
+  const active = options?.active ?? (() => true)
   const sdk = useServerSDK()
   const forkUsage = useForkUsage()
   // Shared singleton poller — adds no extra network traffic.
@@ -60,12 +130,7 @@ export function useLimits(options?: { now?: Accessor<number> }) {
   const [lastRefreshedAt, setLastRefreshedAt] = createSignal(0)
   const [lastRateLimitedAt, setLastRateLimitedAt] = createSignal(0)
 
-  const cooldownRemainingMs = () => {
-    const floor = Math.max(0, REFRESH_FLOOR_MS - (now() - lastRefreshedAt()))
-    const since429 = now() - lastRateLimitedAt()
-    const claudeBackoff = lastRateLimitedAt() > 0 ? Math.max(0, CLAUDE_429_BACKOFF_MS - since429) : 0
-    return Math.max(floor, claudeBackoff, providerCooldownRemainingMs())
-  }
+  const cooldownRemainingMs = () => Math.max(0, cooldownUntil() - now())
   const isCoolingDown = () => cooldownRemainingMs() > 0
 
   const lastGoodQuotas = new Map<string, ProviderResult>()
@@ -131,10 +196,9 @@ export function useLimits(options?: { now?: Accessor<number> }) {
   }
 
   const [providersRes] = createResource(
-    () => tick(),
+    () => (active() ? tick() : undefined),
     async () => {
-      const response = await sdk().client.quota.providers({ throwOnError: true })
-      return response.data as { providers: Array<{ providerId: string; providerName: string; configured: boolean }> }
+      return fetchProvidersShared(sdk())
     },
   )
   const providerData = createMemo(() => {
@@ -186,6 +250,7 @@ export function useLimits(options?: { now?: Accessor<number> }) {
   let fetchGeneration = 0
 
   createEffect(() => {
+    if (!active()) return
     const data = providerData()
     const currentTick = tick()
     if (!data) return
@@ -234,7 +299,7 @@ export function useLimits(options?: { now?: Accessor<number> }) {
       // so it's cheap. We just don't clear the map before fetches complete.
       const fetchOne = async () => {
         try {
-          const response = await sdk().client.quota.get({ providerID: entry.providerId }, { throwOnError: false })
+          const response = await fetchQuotaShared(sdk(), entry.providerId)
           let result: ProviderResult
           if (!response.data) {
             const message = describeResponseError(response.error)
@@ -343,12 +408,22 @@ export function useLimits(options?: { now?: Accessor<number> }) {
    * locally like Zen/NVIDIA) contribute 0 — a missing value means "refresh
    * is useful now", never "never refresh".
    */
-  const providerCooldownRemainingMs = createMemo(() => {
+  const providerCooldownUntil = createMemo(() => {
     const list = providers()
     if (!list) return 0
-    const latest = list.reduce((max, p) => Math.max(max, p.result.nextRefreshAt ?? 0), 0)
-    return Math.max(0, latest - now())
+    return list.reduce((max, p) => Math.max(max, p.result.nextRefreshAt ?? 0), 0)
   })
+
+  // Structural quota/provider changes recompute the absolute deadline. A
+  // once-per-second `now()` tick only performs one subtraction instead of
+  // rescanning every provider/window projection.
+  const cooldownUntil = createMemo(() =>
+    Math.max(
+      lastRefreshedAt() > 0 ? lastRefreshedAt() + REFRESH_FLOOR_MS : 0,
+      lastRateLimitedAt() > 0 ? lastRateLimitedAt() + CLAUDE_429_BACKOFF_MS : 0,
+      providerCooldownUntil(),
+    ),
+  )
 
   const isLoading = () => {
     // If we have cached data to show, don't block on network
@@ -379,15 +454,16 @@ export function useLimits(options?: { now?: Accessor<number> }) {
   }
 
   const onFocus = () => {
-    if (document.hidden || isCoolingDown()) return
+    if (!active() || document.hidden || isCoolingDown()) return
     setTimeout(() => {
-      if (!document.hidden && !isCoolingDown()) refresh()
+      if (active() && !document.hidden && !isCoolingDown()) refresh()
     }, 200)
   }
-  if (typeof window !== "undefined") {
+  onMount(() => {
+    if (typeof window === "undefined") return
     window.addEventListener("focus", onFocus)
     onCleanup(() => window.removeEventListener("focus", onFocus))
-  }
+  })
 
   return {
     providers,

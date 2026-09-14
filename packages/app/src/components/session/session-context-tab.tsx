@@ -1,7 +1,7 @@
-import { createMemo, createEffect, createSignal, on, onCleanup, For, Show } from "solid-js"
+import { createMemo, createEffect, createSignal, on, onCleanup, untrack, For, Show } from "solid-js"
 import type { Accessor, JSX } from "solid-js"
 import { useSync } from "@/context/sync"
-import { checksum } from "@opencode-ai/core/util/encode"
+import { sampledChecksum } from "@opencode-ai/core/util/encode"
 import { findLast } from "@opencode-ai/core/util/array"
 import { same } from "@/utils/same"
 import { Icon } from "@opencode-ai/ui/icon"
@@ -43,6 +43,11 @@ import {
   type ModelCostRate,
 } from "./session-context-model-metrics"
 import { createSessionContextFormatter } from "./session-context-format"
+import {
+  boundedPartsText,
+  newestRawMessages,
+  RAW_MESSAGE_PAGE_SIZE,
+} from "./session-context-raw"
 import { MetricCell, Section } from "./insights-primitives"
 
 const emptyLiveProgress: LiveGenerationProgress = { generatedSeconds: 0, toolSeconds: 0 }
@@ -147,7 +152,11 @@ function RawMessageContent(props: { message: Message; getParts: (id: string) => 
     return {
       name: `${props.message.role}-${props.message.id}.json`,
       contents,
-      cacheKey: checksum(contents),
+      // Raw tool/message payloads can be multi-megabyte. File cache identity
+      // does not justify another O(bytes) hash walk immediately after the
+      // unavoidable JSON serialization; use the same bounded sampler as the
+      // editor/file-tab path for large content.
+      cacheKey: sampledChecksum(contents),
     }
   })
 
@@ -246,6 +255,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     emptyMessages,
     { equals: same },
   )
+  const getParts = (id: string) => (sync().data.part[id] ?? []) as Part[]
 
   const userMessages = createMemo(
     () => messages().filter((m) => m.role === "user") as UserMessage[],
@@ -264,17 +274,6 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     { equals: same },
   )
 
-  // Reading the whole part store makes this pane invalidate for every
-  // session's streaming delta. Keep a narrow projection of only the active
-  // session's message parts instead.
-  const sessionParts = createMemo<Record<string, Part[] | undefined>>((previous) => {
-    if (!active()) return previous
-    const all = sync().data.part
-    const result: Record<string, Part[] | undefined> = {}
-    for (const message of messages()) result[message.id] = all[message.id] as Part[] | undefined
-    return result
-  }, emptySessionParts)
-
   const providerList = createMemo<SessionProviderList>((previous) => {
     if (!active()) return previous
     return [...providers.all().values()]
@@ -283,6 +282,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const ctx = createMemo(() => getSessionContext(messages(), providerList()))
   const formatter = createMemo(() => createSessionContextFormatter(language.intl()))
   const [rawOpen, setRawOpen] = createSignal<string[]>([])
+  const [rawLimit, setRawLimit] = createSignal(RAW_MESSAGE_PAGE_SIZE)
+  const rawMessages = createMemo(() => newestRawMessages(messages(), rawLimit()))
+  const hiddenRawCount = createMemo(() => Math.max(0, messages().length - rawMessages().length))
 
   // Reset accordion open state + gate live timer on session/tab switch (prevents
   // stale teardown and effect churn for inactive tabs after keep-mounted shell).
@@ -290,7 +292,10 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     on(
       () => params.id,
       (current, previous) => {
-        if (current !== previous) setRawOpen([])
+        if (current !== previous) {
+          setRawOpen([])
+          setRawLimit(RAW_MESSAGE_PAGE_SIZE)
+        }
       },
     ),
   )
@@ -391,7 +396,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const liveDelta = createMemo<LiveGenerationProgress>(() => {
     const msg = liveMessage()
     if (!msg) return emptyLiveProgress
-    return liveGenerationProgress(msg, sessionParts()[msg.id], now())
+    // Subscribe only to the running assistant. A token must not invalidate a
+    // projection containing every historical Part[] in the session.
+    return liveGenerationProgress(msg, getParts(msg.id), now())
   })
 
   const liveDeltaFor = (metrics: ModelContextMetrics): LiveGenerationProgress => {
@@ -420,6 +427,43 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     return trimmed
   })
 
+  // Context analytics need full historical parts, but not at token frequency.
+  // Snapshot part-array references at message-metadata boundaries only. The
+  // callback is untracked so text/reasoning deltas in one live part do not
+  // trigger O(history) cost/timing/breakdown scans on the renderer thread.
+  const metricsStamp = createMemo(() =>
+    messages()
+      .map((message) => {
+        if (message.role !== "assistant") return `${message.id}:${message.role}:${message.time.created}`
+        return [
+          message.id,
+          message.role,
+          message.providerID,
+          message.modelID,
+          message.cost,
+          message.tokens.input,
+          message.tokens.output,
+          message.tokens.reasoning,
+          message.tokens.cache.read,
+          message.tokens.cache.write,
+          message.time.created,
+          message.time.completed ?? "",
+          message.time.firstTokenAt ?? "",
+          message.time.requestSentAt ?? "",
+        ].join(":")
+      })
+      .join("|"),
+  )
+  const analyticsParts = createMemo<Record<string, Part[] | undefined>>(
+    on(metricsStamp, () => {
+      if (!active()) return emptySessionParts
+      const result: Record<string, Part[] | undefined> = {}
+      for (const message of untrack(messages)) result[message.id] = untrack(() => getParts(message.id))
+      return result
+    }),
+    emptySessionParts,
+  )
+
   const providerLabel = createMemo(() => {
     const c = ctx()
     if (!c) return "—"
@@ -434,13 +478,13 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
   const breakdown = createMemo(
     on(
-      () => [ctx()?.message.id, ctx()?.input, messages().length, systemPrompt(), sessionParts()] as const,
+      () => [ctx()?.message.id, ctx()?.input, metricsStamp(), systemPrompt(), analyticsParts()] as const,
       () => {
         const c = ctx()
         if (!c?.input) return []
         return estimateSessionContextBreakdown({
           messages: messages(),
-          parts: sessionParts(),
+          parts: analyticsParts(),
           input: c.input,
           systemPrompt: systemPrompt(),
         })
@@ -469,8 +513,8 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
   const aggregate = createMemo(
     on(
-      () => [messages(), sessionParts(), providerList()] as const,
-      ([msgs, parts, list]) => aggregateSessionContextByModel(msgs, parts, list),
+      () => [metricsStamp(), analyticsParts(), providerList()] as const,
+      ([, parts, list]) => aggregateSessionContextByModel(untrack(messages), parts, list),
     ),
   )
 
@@ -661,8 +705,6 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   let scroll: HTMLDivElement | undefined
   let frame: number | undefined
   let pending: { x: number; y: number } | undefined
-  const getParts = (id: string) => (sync().data.part[id] ?? []) as Part[]
-
   const [ledger, setLedger] = createSignal<ContextLedger | null>(null)
   const [ledgerBusy, setLedgerBusy] = createSignal<string | null>(null)
   const [ledgerError, setLedgerError] = createSignal<string | null>(null)
@@ -735,6 +777,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     if (!limit || tokens === undefined) return null
     return (tokens / limit) * 100
   })
+  const ledgerByMessage = createMemo(
+    () => new Map((ledger()?.entries ?? []).map((entry) => [entry.messageID, entry] as const)),
+  )
 
   const restoreScroll = () => {
     const el = scroll
@@ -950,25 +995,15 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
       props.parts.filter((part): part is Extract<Part, { type: "tool" }> => part.type === "tool"),
     )
 
-    const bodyText = createMemo(() => {
-      const text = props.parts
-        .filter(
-          (part): part is Extract<Part, { type: "text" }> => part.type === "text" && !part.synthetic && !part.ignored,
-        )
-        .map((part) => part.text)
-        .join("\n\n")
-        .trim()
-      return text || undefined
-    })
+    const bodyText = createMemo(() =>
+      boundedPartsText(props.parts, (part) =>
+        part.type === "text" && !part.synthetic && !part.ignored ? part.text : undefined,
+      ),
+    )
 
-    const reasoningText = createMemo(() => {
-      const text = props.parts
-        .filter((part): part is Extract<Part, { type: "reasoning" }> => part.type === "reasoning")
-        .map((part) => part.text)
-        .join("\n\n")
-        .trim()
-      return text || undefined
-    })
+    const reasoningText = createMemo(() =>
+      boundedPartsText(props.parts, (part) => (part.type === "reasoning" ? part.text : undefined)),
+    )
 
     const partFallback = createMemo(() => {
       if (bodyText() || reasoningText() || toolCalls().length > 0) return []
@@ -1082,7 +1117,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
       return getParts(props.message.id)
     }, [] as Part[])
     const preview = createMemo(() => messagePreviewText(parts()))
-    const entry = createMemo(() => ledger()?.entries.find((item) => item.messageID === props.message.id))
+    const entry = createMemo(() => ledgerByMessage().get(props.message.id))
     const isOpen = () => rawOpen().includes(props.message.id)
 
     return (
@@ -1585,7 +1620,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                     <button
                       type="button"
                       class="rounded px-1.5 py-1 text-[9px] font-[520] leading-3 text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
-                      onClick={() => setRawOpen(messages().map((message) => message.id))}
+                      onClick={() => setRawOpen(rawMessages().map((message) => message.id))}
                     >
                       {language.t("context.ledger.expandAll")}
                     </button>
@@ -1608,12 +1643,21 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
                   </div>
                 }
               >
+                <Show when={hiddenRawCount() > 0}>
+                  <button
+                    type="button"
+                    class="flex w-full items-center justify-center border-b border-v2-border-border-muted px-2.5 py-1.5 text-[9px] font-[520] leading-3 text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base"
+                    onClick={() => setRawLimit((value) => value + RAW_MESSAGE_PAGE_SIZE)}
+                  >
+                    {language.t("common.loadMore")} ({Math.min(RAW_MESSAGE_PAGE_SIZE, hiddenRawCount())})
+                  </button>
+                </Show>
                 <Accordion
                   multiple
                   value={rawOpen()}
                   onChange={(value) => setRawOpen(Array.isArray(value) ? value : value ? [value] : [])}
                 >
-                  <For each={messages()}>{(message) => <RawMessage message={message} />}</For>
+                  <For each={rawMessages()}>{(message) => <RawMessage message={message} />}</For>
                 </Accordion>
               </Show>
 

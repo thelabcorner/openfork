@@ -1,6 +1,6 @@
 import { createMemo } from "solid-js"
 import type { Accessor } from "solid-js"
-import { useLimits } from "@/hooks/use-limits"
+import { useLimits, type LimitsState } from "@/hooks/use-limits"
 import { splitMultiAccountModelID } from "@/utils/model-account-identity"
 import type { WorkBuddyModelUsage } from "@/hooks/use-workbuddy-usage"
 
@@ -46,12 +46,14 @@ export function splitVerdentModelID(modelID: string): { id: string; accountID?: 
   return split.accountID ? { id: base, accountID: split.accountID } : { id: base }
 }
 
-export function useVerdentUsage(options?: { now?: Accessor<number> }) {
-  let limits: ReturnType<typeof useLimits> | undefined
-  try {
-    limits = useLimits(options as any)
-  } catch {
-    limits = undefined
+export function useVerdentUsage(options?: { now?: Accessor<number>; limits?: LimitsState }) {
+  let limits: LimitsState | undefined = options?.limits
+  if (!limits) {
+    try {
+      limits = useLimits({ now: options?.now })
+    } catch {
+      limits = undefined
+    }
   }
   const empty = () => undefined
   if (!limits) {

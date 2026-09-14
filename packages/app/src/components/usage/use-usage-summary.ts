@@ -17,6 +17,10 @@ export type UsageWindowDef = (typeof USAGE_WINDOWS)[number]
 
 export const USAGE_WINDOW_MAP = new Map<string, UsageWindowDef>(USAGE_WINDOWS.map((window) => [window.key, window]))
 
+export function usageSummaryCacheKey(windowKey: string, projectID: string | null) {
+  return `${windowKey}\u0000${projectID ?? ""}`
+}
+
 // Client-side memo so switching back to a previously-viewed range (or
 // reopening the panel) renders instantly instead of round-tripping the server.
 const CLIENT_CACHE_TTL_MS = 30_000
@@ -29,12 +33,18 @@ export function createUsageSummary(input: {
 }) {
   const serverSDK = useServerSDK()
   let activeController: AbortController | undefined
+  let seenRefreshRevision = input.refreshTick()
   const [summary] = createResource(
-    () => `${input.windowDef().key}\u0000${input.projectID() ?? ""}\u0000${input.refreshTick()}`,
-    async (key) => {
+    () => ({ key: usageSummaryCacheKey(input.windowDef().key, input.projectID()), refresh: input.refreshTick() }),
+    async ({ key, refresh }) => {
       activeController?.abort()
       const cached = clientCache.get(key)
-      if (cached && Date.now() - cached.at < CLIENT_CACHE_TTL_MS) return cached.data
+      const forceRefresh = refresh !== seenRefreshRevision
+      seenRefreshRevision = refresh
+      // Refresh is an invalidation signal, not part of the logical cache key.
+      // Otherwise every manual refresh creates a permanently distinct cache
+      // entry and switching back to the same window can never reuse it.
+      if (!forceRefresh && cached && Date.now() - cached.at < CLIENT_CACHE_TTL_MS) return cached.data
       const controller = new AbortController()
       activeController = controller
       const [windowKey, projectID] = key.split("\u0000")

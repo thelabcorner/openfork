@@ -1,4 +1,4 @@
-import { createMemo, For, Show } from "solid-js"
+import { createMemo, createSignal, For, Show } from "solid-js"
 import type { UsageSummaryResponse } from "@opencode-ai/sdk/v2/client"
 import { useLanguage } from "@/context/language"
 import {
@@ -12,6 +12,8 @@ import {
 import { DetailRows, EmptyLine, Panel, RankRow, RuleGrid, Stat } from "./usage-page-primitives"
 
 type Metric = "cost" | "tokens"
+const MODEL_TABLE_INITIAL_ROWS = 50
+const MODEL_TABLE_PAGE_ROWS = 200
 
 const AGENT_META: Record<string, { label: string; detail: string }> = {
   title: { label: "Title generation", detail: "Names new sessions" },
@@ -52,6 +54,7 @@ const samplePeriods = <T,>(items: readonly T[], limit = 120) => {
  */
 export function UsagePageMaintenance(props: { data: UsageSummaryResponse; metric: Metric }) {
   const language = useLanguage()
+  const [modelLimit, setModelLimit] = createSignal(MODEL_TABLE_INITIAL_ROWS)
   const maintenance = () => props.data.maintenance
   const totals = () => maintenance().totals
   const spend = () => totals().cost + totals().estimatedCost
@@ -83,6 +86,8 @@ export function UsagePageMaintenance(props: { data: UsageSummaryResponse; metric
         : (a, b) => b.totalTokens - a.totalTokens || b.cost + b.estimatedCost - (a.cost + a.estimatedCost),
     ),
   )
+  const visibleModels = createMemo(() => models().slice(0, modelLimit()))
+  const hiddenModels = createMemo(() => Math.max(0, models().length - visibleModels().length))
 
   return (
     <div class="flex flex-col gap-3">
@@ -252,7 +257,7 @@ export function UsagePageMaintenance(props: { data: UsageSummaryResponse; metric
                 <span class="text-right">{language.t("usage.table.tokens")}</span>
                 <span class="text-right">{language.t("usage.table.cost")}</span>
               </div>
-              <For each={models()}>
+              <For each={visibleModels()}>
                 {(model) => {
                   const meta = agentMeta(model.agent)
                   return (
@@ -283,6 +288,15 @@ export function UsagePageMaintenance(props: { data: UsageSummaryResponse; metric
                   )
                 }}
               </For>
+              <Show when={hiddenModels() > 0}>
+                <button
+                  type="button"
+                  class="w-full border-t border-[var(--usage-line)] px-3 py-2 text-left text-[10px] font-[560] text-v2-text-text-muted hover:bg-[var(--usage-hover)]"
+                  onClick={() => setModelLimit((value) => value + MODEL_TABLE_PAGE_ROWS)}
+                >
+                  {language.t("common.showMore", { count: Math.min(MODEL_TABLE_PAGE_ROWS, hiddenModels()) })}
+                </button>
+              </Show>
             </div>
           </div>
         </Show>

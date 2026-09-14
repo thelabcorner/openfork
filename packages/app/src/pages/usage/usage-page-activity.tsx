@@ -1,4 +1,4 @@
-import { createEffect, createMemo, For, Show } from "solid-js"
+import { createEffect, createMemo, createSignal, For, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
 import type { UsageSummaryResponse } from "@opencode-ai/sdk/v2/client"
 import { UsageHeatmap } from "@/components/usage/usage-chart"
@@ -20,6 +20,8 @@ type Metric = "cost" | "tokens"
 
 const DOW_LABELS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
 const DAY_MS = 24 * 60 * 60 * 1000
+const SESSION_TABLE_INITIAL_ROWS = 50
+const SESSION_TABLE_PAGE_ROWS = 200
 
 /**
  * Activity, rebuilt from nothing.
@@ -180,6 +182,7 @@ type SessionSortColumn = "session" | "project" | "turns" | "models" | "tokens" |
  */
 function UsageSessionsTable(props: { sessions: UsageSummaryResponse["sessions"] }) {
   const language = useLanguage()
+  const [rowLimit, setRowLimit] = createSignal(SESSION_TABLE_INITIAL_ROWS)
   type Row = UsageSummaryResponse["sessions"][number]
 
   const sort = createColumnSort<Row, SessionSortColumn>("tokens", (session, column) => {
@@ -203,6 +206,8 @@ function UsageSessionsTable(props: { sessions: UsageSummaryResponse["sessions"] 
     }
   })
   const sorted = createMemo(() => sort.sort([...props.sessions]))
+  const visible = createMemo(() => sorted().slice(0, rowLimit()))
+  const hiddenCount = createMemo(() => Math.max(0, sorted().length - visible().length))
 
   return (
     <Panel
@@ -227,7 +232,7 @@ function UsageSessionsTable(props: { sessions: UsageSummaryResponse["sessions"] 
       </div>
       <Show when={sorted().length > 0} fallback={<EmptyLine>{language.t("usage.sessions.empty")}</EmptyLine>}>
         <div class="flex flex-col">
-          <For each={sorted()}>
+          <For each={visible()}>
             {(session) => (
               <div
                 class={`grid ${SESSION_GRID} items-center gap-1 border-b border-[var(--usage-line)] px-3 py-1.5 last:border-0 hover:bg-[var(--usage-hover)]`}
@@ -257,6 +262,15 @@ function UsageSessionsTable(props: { sessions: UsageSummaryResponse["sessions"] 
               </div>
             )}
           </For>
+          <Show when={hiddenCount() > 0}>
+            <button
+              type="button"
+              class="border-t border-[var(--usage-line)] px-3 py-2 text-left text-[10px] font-[560] text-v2-text-text-muted hover:bg-[var(--usage-hover)]"
+              onClick={() => setRowLimit((value) => value + SESSION_TABLE_PAGE_ROWS)}
+            >
+              {language.t("common.showMore", { count: Math.min(SESSION_TABLE_PAGE_ROWS, hiddenCount()) })}
+            </button>
+          </Show>
         </div>
       </Show>
     </Panel>
