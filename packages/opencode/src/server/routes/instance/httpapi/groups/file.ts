@@ -75,6 +75,7 @@ export const MentionResult = Schema.Union([
 ]).annotate({ identifier: "MentionResult" })
 
 export const FindSearchResponse = Schema.Struct({
+  base: Schema.String,
   results: Schema.Array(MentionResult),
   hasMore: Schema.Boolean,
   total: Schema.Number,

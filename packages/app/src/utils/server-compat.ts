@@ -632,7 +632,17 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
           },
           { signal: value.signal },
         )
-        return located(result.data ?? { results: [], hasMore: false, total: 0 }, value.location)
+        const page = result.data
+        const base = page?.base ?? directory(value.location) ?? ""
+        return located(
+          {
+            base,
+            results: page?.results ?? [],
+            hasMore: page?.hasMore ?? false,
+            total: page?.total ?? 0,
+          },
+          value.location,
+        )
       },
     },
     integration: {

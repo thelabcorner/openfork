@@ -76,6 +76,7 @@ import { createSessionLineage } from "@/pages/session/session-lineage"
 import { SessionPage, SessionRouteErrorBoundary, TargetSessionCenterRoute, TargetSessionRouteContent } from "@/pages/session"
 import { NewHome } from "@/pages/home"
 import { UsagePage } from "@/pages/usage-page"
+import { MarkdownTargetActions } from "@/components/markdown-target-actions"
 import { LegacyHome } from "@/pages/home/legacy-home"
 import MobileLayout from "@/pages/layout-mobile"
 
@@ -653,6 +654,10 @@ export function AppInterface(props: {
                   <PermissionProvider>
                     <NotificationProvider>
                       <ServerShell>
+                        {/* Global affordance for paths/URLs in markdown. Sits
+                            above the layout arms so its delegated listeners are
+                            not torn down when a route swaps. */}
+                        <MarkdownTargetActions />
                         {/* PWA renders the mobile arm regardless of the layout flag;
                             web/desktop keep the legacy/new arms byte-identical. */}
                         {pwa ? (

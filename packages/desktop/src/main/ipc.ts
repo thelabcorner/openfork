@@ -34,6 +34,18 @@ const pickerFilters = (ext?: string[]) => {
   return [{ name: nativeT("desktop.dialog.files"), extensions: ext }]
 }
 const pickedFiles = createPickedFileAuthorizations()
+
+async function filesystemPathExists(path: string) {
+  try {
+    await stat(path)
+    return true
+  } catch (error) {
+    const code = error && typeof error === "object" && "code" in error ? (error as { code?: unknown }).code : undefined
+    if (code === "ENOENT" || code === "ENOTDIR") return false
+    throw error
+  }
+}
+
 type Deps = {
   killSidecar: () => Promise<void> | void
   relaunch: () => void
@@ -235,18 +247,20 @@ export function registerIpcHandlers(deps: Deps) {
     openLocalFileURL(url)
   })
   ipcMain.handle("open-path", async (_event: IpcMainInvokeEvent, path: string, app?: string) => {
-    if (!app) return shell.openPath(path)
+    if (!app) {
+      const error = await shell.openPath(path)
+      if (error) throw new Error(error)
+      return
+    }
     await new Promise<void>((resolve, reject) => {
       const [cmd, args] =
         process.platform === "darwin" ? (["open", ["-a", app, path]] as const) : ([app, [path]] as const)
       execFile(cmd, args, (err) => (err ? reject(err) : resolve()))
     })
   })
+  ipcMain.handle("path-exists", async (_event: IpcMainInvokeEvent, path: string) => filesystemPathExists(path))
   ipcMain.handle("reveal-path", async (_event: IpcMainInvokeEvent, path: string) => {
-    const exists = await stat(path).then(
-      () => true,
-      () => false,
-    )
+    const exists = await filesystemPathExists(path)
     if (!exists) return false
     shell.showItemInFolder(path)
     return true

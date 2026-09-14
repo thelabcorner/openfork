@@ -58,4 +58,20 @@ describe("normalizeMentionPage", () => {
     expect(result.size).toBe(0)
     expect(result.lineCount).toBe(0)
   })
+
+  test("preserves the server-authoritative workspace base", () => {
+    const page = normalizeMentionPage({
+      base: "D:\\canonical\\presGEN_v2",
+      results: [
+        {
+          kind: "file" as const,
+          path: "lane4-scratch/v3prod/sink_ab.mjs",
+          type: "file" as const,
+        },
+      ],
+      hasMore: false,
+    })
+
+    expect(page.base).toBe("D:\\canonical\\presGEN_v2")
+  })
 })

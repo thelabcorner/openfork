@@ -49,6 +49,7 @@ export function toMentionOptions(results: MentionResult[], recentPaths: readonly
 type WireNumber = number | string
 
 interface WireMentionPage {
+  base?: string
   results: Array<
     | {
         kind: "symbol"
@@ -58,10 +59,10 @@ interface WireMentionPage {
         symbolKind: string
         positions?: WireNumber[]
       }
-    | {
-        kind: "file"
-        path: string
-        type?: "file" | "directory"
+     | {
+         kind: "file"
+         path: string
+         type?: "file" | "directory"
         positions?: WireNumber[]
         baseOffset?: WireNumber
         size?: WireNumber
@@ -75,8 +76,9 @@ interface WireMentionPage {
 // Normalizes a /find/search page into the app-internal contract: OpenAPI numeric
 // string-sentinels coerced, and file-row match positions projected from
 // full-path coordinates onto the basename the row renders.
-export function normalizeMentionPage(page: WireMentionPage): { results: MentionResult[]; hasMore: boolean } {
+export function normalizeMentionPage(page: WireMentionPage): { base?: string; results: MentionResult[]; hasMore: boolean } {
   return {
+    base: page.base,
     results: page.results.map((entry): MentionResult => {
       if (entry.kind === "symbol") {
         return {
@@ -95,10 +97,10 @@ export function normalizeMentionPage(page: WireMentionPage): { results: MentionR
           : entry.positions?.map(Number)
       const type = entry.type ?? (/[\\/]$/.test(entry.path) ? "directory" : "file")
       const isDir = type === "directory"
-      return {
-        kind: "file",
-        path: entry.path,
-        type,
+       return {
+         kind: "file",
+         path: entry.path,
+         type,
         positions,
         // Preserved so consumers rendering the FULL path as label can re-project
         // basename-relative positions back into label space (see prompt-input-v2).

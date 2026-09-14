@@ -66,6 +66,8 @@ export type MentionResult =
     }
 
 export interface MentionSearchPage {
+  /** Canonical server-side workspace root reported by newer servers. */
+  base?: string
   results: MentionResult[]
   hasMore: boolean
 }

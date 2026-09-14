@@ -251,6 +251,9 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
     async revealPath(path: string) {
       return window.api.revealPath(path)
     },
+    async pathExists(path: string) {
+      return window.api.pathExists(path)
+    },
 
     storage,
     draftStore: createDraftStore({

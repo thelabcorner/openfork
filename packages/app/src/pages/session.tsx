@@ -23,7 +23,6 @@ import {
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createMediaQuery } from "@solid-primitives/media"
 import { createResizeObserver } from "@solid-primitives/resize-observer"
-import { debounce } from "@solid-primitives/scheduled"
 import { useLocal } from "@/context/local"
 import { FileProvider, selectionFromLines, useFile, type FileSelection, type SelectedLineRange } from "@/context/file"
 import { createStore } from "solid-js/store"
@@ -50,6 +49,7 @@ import { CommentsProvider, useComments } from "@/context/comments"
 import { useCommand } from "@/context/command"
 import { DirectoryDataProvider } from "@/pages/directory-layout"
 import { useServerSync } from "@/context/server-sync"
+import { basename, pathCandidates, setMarkdownPathResolver } from "@/components/markdown-path-resolve"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
 import { ModelsProvider } from "@/context/models"
@@ -80,6 +80,7 @@ import {
 } from "@/pages/session/composer"
 import { createSessionTabs, createSizing, shouldShowFileTree, createSwitchGate } from "@/pages/session/helpers"
 import { safeQueryData } from "@/utils/safe-query-data"
+import { createSessionVcsRefreshController } from "@/pages/session/session-vcs-refresh"
 import { pathKey } from "@/utils/path-key"
 import { MessageTimeline } from "@/pages/session/timeline/message-timeline"
 import { createTimelineModel } from "@/pages/session/timeline/model"
@@ -505,6 +506,21 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   const language = useLanguage()
   const sdk = useSDK()
   const fileOps = createMemo(() => createFileOpsPort(sdk().client))
+
+  // The markdown path/URL toolbar is mounted app-wide, above this directory
+  // scope, so it cannot reach the file index itself. Publish a resolver while
+  // this session is on screen so written paths ("patch_dist.mjs") can be
+  // matched to real files before any reveal/open.
+  onCleanup(
+    setMarkdownPathResolver(async (written) => {
+      const directory = sdk().directory
+      // Search on the filename: the index matches leading path segments poorly
+      // when prose writes a partial path, and ranking re-applies the full text.
+      const page = await file.searchMentions(basename(written), { limit: 50, symbols: false })
+      const matches = page.results.flatMap((entry) => (entry.kind === "file" ? [entry.path] : []))
+      return pathCandidates({ written, directory, canonicalDirectory: page.base, matches })
+    }),
+  )
   const serverSDK = useServerSDK()
   const settings = useSettings()
   const platform = usePlatform()
@@ -1022,32 +1038,57 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
 
   const mobileChanges = createMemo(() => !isDesktop() && store.mobileTab === "changes")
   const wantsVcs = createMemo(() => sync().project?.vcs === "git")
+  // Working-tree diffs are an on-demand view concern, not session lifecycle
+  // state. A hidden Changes pane must not turn every watcher burst / completed
+  // agent turn into a `git diff` request. The project explorer has its own
+  // separately-gated git-status store; this accessor is intentionally limited
+  // to surfaces that actually render `vcsDiffs()`.
+  const vcsConsumerVisible = createMemo(
+    () =>
+      wantsVcs() &&
+      (mobileChanges() || (desktopFileTreeOpen() && layout.fileTree.tab() === "changes")),
+  )
   const vcsKey = createMemo(
     () =>
       ["session-vcs", sdk().directory, sync().data.vcs?.branch ?? "", sync().data.vcs?.default_branch ?? ""] as const,
   )
-  // Maximal: vcs diff is not on critical path - never create the query on
-  // mount so harness doesn't count 14s git status in elapsedMs. Placeholder
-  // [] is rendered instantly; fetch only on explicit refresh (panel open).
-  const vcsQuery = {
-    data: [] as never[],
-    isPending: false,
-    isFetching: false,
-    isSuccess: true,
-  }
-  const refreshVcs = debounce(() => {
-    void queryClient
-      .fetchQuery({
-        queryKey: [...vcsKey(), "git"] as const,
-        queryFn: () =>
-          sdk()
-            .api.vcs.diff({ location: { directory: sdk().directory }, mode: "working" })
-            .then((r) => r.data)
-            .catch(() => []),
-        staleTime: 60_000,
+  // Disabled means constructing the reactive query performs zero Git work.
+  // `fetchQuery()` below populates this same key on demand, so a successful
+  // visible refresh updates the Changes surface instead of writing into a cache
+  // that a static placeholder can never observe.
+  const vcsQuery = createQuery(() => ({
+    queryKey: [...vcsKey(), "git"] as const,
+    queryFn: () => sdk().api.vcs.diff({ location: { directory: sdk().directory }, mode: "working" }).then((r) => r.data),
+    enabled: false,
+    staleTime: 0,
+  }))
+  const vcsRefresh = createSessionVcsRefreshController({
+    visible: vcsConsumerVisible,
+    identity: () => vcsKey().join("\u0000"),
+    request: () => {
+      const key = vcsKey()
+      const directory = sdk().directory
+      return queryClient.fetchQuery({
+        queryKey: [...key, "git"] as const,
+        queryFn: () => sdk().api.vcs.diff({ location: { directory }, mode: "working" }).then((r) => r.data),
+        staleTime: 0,
       })
-      .catch(() => {})
-  }, 100)
+    },
+  })
+  const invalidateVcs = () => vcsRefresh.invalidate()
+  createEffect(
+    on(vcsConsumerVisible, () => vcsRefresh.visibleChanged()),
+  )
+  createEffect(
+    on(
+      vcsKey,
+      () => {
+        vcsRefresh.invalidate()
+      },
+      { defer: true },
+    ),
+  )
+  onCleanup(() => vcsRefresh.dispose())
   /**
    * JSDOC: TanStack Solid-Query suspension guard for VCS diffs.
    *
@@ -1194,6 +1235,10 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       // but the match might be deep in assistant content.
       requestAnimationFrame(() => {
         if (!sessionFind.open() || !scroller) return
+        // The virtualizer may have mounted a previously absent turn. Invalidate
+        // container membership before scanning so the active result cannot be
+        // resolved against the previous viewport's cached row set.
+        textHighlighter.invalidate()
         textHighlighter.scan(scroller)
         const container = textHighlighter.getActiveContainer()
         if (container) {
@@ -1248,27 +1293,21 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       () => sessionFind.open(),
       (open) => {
         if (!open || !scroller) return
-        const rescan = () => {
-          if (sessionFind.open() && scroller) textHighlighter.scan(scroller)
-        }
-        const scrollCleanup = makeEventListener(scroller, "scroll", rescan, { passive: true })
-        // Debounced MutationObserver: during streaming, mutations fire hundreds
-        // of times per second. Debounce to batch them into periodic rescans.
-        let mutationTimer: ReturnType<typeof setTimeout> | undefined
-        const debouncedRescan = () => {
-          if (mutationTimer !== undefined) clearTimeout(mutationTimer)
-          mutationTimer = setTimeout(() => {
-            mutationTimer = undefined
-            rescan()
-          }, 100)
-        }
-        const observer = new MutationObserver(debouncedRescan)
+        const scrollCleanup = makeEventListener(scroller, "scroll", () => textHighlighter.onScroll(), { passive: true })
+        // Mutation invalidation is turn-local and internally throttled/coalesced.
+        // The old 100ms callback rescanned every visible turn after every
+        // markdown morph, while scroll events independently scheduled still more
+        // scans. A mutation now evicts only the owning turn's cached ranges;
+        // virtualizer membership changes invalidate the container list.
+        const observer = new MutationObserver((records) => {
+          if (!sessionFind.open()) return
+          for (const record of records) textHighlighter.invalidate(record.target)
+        })
         observer.observe(scroller, { childList: true, subtree: true })
-        requestAnimationFrame(rescan)
+        textHighlighter.scan(scroller)
         onCleanup(() => {
           scrollCleanup()
           observer.disconnect()
-          if (mutationTimer !== undefined) clearTimeout(mutationTimer)
         })
       },
     ),
@@ -1356,8 +1395,11 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
         ? (details.properties as Record<string, unknown>)
         : undefined
     const file = typeof props?.file === "string" ? props.file : undefined
-    if (!file || file.startsWith(".git/")) return
-    refreshVcs()
+    if (file?.startsWith(".git/")) return
+    // A broad filesystem.changed event may not carry one path; it still makes
+    // a previously rendered working-tree snapshot stale. Hidden consumers only
+    // retain this boolean and perform zero git work.
+    invalidateVcs()
   })
   onCleanup(stopVcs)
 
@@ -1479,7 +1521,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       () => sync().data.session_status[params.id ?? ""]?.type,
       (next, prev) => {
         if (next !== "idle" || prev === undefined || prev === "idle") return
-        refreshVcs()
+        invalidateVcs()
       },
       { defer: true },
     ),
@@ -1699,15 +1741,17 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
   }
   // Find must see the whole session, not just whatever page happens to be
   // loaded — otherwise matches appear/disappear as the user scrolls up and
-  // pulls in more history, which reads as broken. Pull every older page in
-  // while find is open; `loadOlder` already dedupes concurrent calls.
+  // pulls in more history, which reads as broken. Crucially, merely opening an
+  // empty find bar is NOT permission to hydrate an arbitrarily long history.
+  // Start that work only after there is an actual query; `loadOlder` already
+  // dedupes concurrent calls and the loop stops when the bar closes.
   let findHistoryLoadID: string | undefined
   const loadAllSessionHistoryForFind = async () => {
     const id = params.id
     if (!id || findHistoryLoadID === id) return
     findHistoryLoadID = id
     try {
-      while (params.id === id && sessionFind.open() && historyMore()) {
+      while (params.id === id && sessionFind.searching() && historyMore()) {
         await loadOlder()
       }
     } finally {
@@ -1715,9 +1759,12 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
     }
   }
   createEffect(
-    on(sessionFind.open, (open) => {
-      if (open) void loadAllSessionHistoryForFind()
-    }),
+    on(
+      () => sessionFind.searching(),
+      (searching) => {
+        if (searching) void loadAllSessionHistoryForFind()
+      },
+    ),
   )
 
   const onHistoryScroll = () => {

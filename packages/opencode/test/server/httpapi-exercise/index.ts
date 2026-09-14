@@ -115,6 +115,22 @@ const scenarios: Scenario[] = [
       },
       "status",
     ),
+  http.protected
+    .post("/global/reset-local-data", "global.resetLocalData")
+    .global()
+    .mutating()
+    .at(() => ({ path: "/global/reset-local-data", body: { confirmation: "RESET" } }))
+    .json(200, (body) => {
+      object(body)
+      check(body.success === true, "local data reset should report success")
+      check(typeof body.sessionsDeleted === "number", "local data reset should report deleted sessions")
+      check(typeof body.compacted === "boolean", "local data reset should report compaction state")
+    }),
+  http.protected
+    .post("/global/reset-local-data", "global.resetLocalData.invalidConfirmation")
+    .global()
+    .at(() => ({ path: "/global/reset-local-data", body: { confirmation: "DELETE" } }))
+    .json(400, object, "status"),
   http.protected.get("/path", "path.get").json(200, (body, ctx) => {
     object(body)
     check(body.directory === ctx.directory, "directory should resolve from x-opencode-directory")
@@ -354,6 +370,19 @@ const scenarios: Scenario[] = [
       headers: ctx.headers(),
     }))
     .json(200, array),
+  http.protected
+    .get("/find/search", "find.search")
+    .seeded((ctx) => ctx.file("hello.txt", "hello\n"))
+    .at((ctx) => ({
+      path: `/find/search?${new URLSearchParams({ query: "hello", symbols: "false" })}`,
+      headers: ctx.headers(),
+    }))
+    .json(200, (body, ctx) => {
+      object(body)
+      check(body.base === ctx.directory, "mention search should expose the authoritative instance directory")
+      array(body.results)
+      check(body.results.some((row: any) => row?.kind === "file" && row.path === "hello.txt"), "mention search should return the seeded file")
+    }),
   http.protected
     .get("/find/symbol", "find.symbols")
     .seeded((ctx) => ctx.file("hello.ts", "export const hello = 1\n"))

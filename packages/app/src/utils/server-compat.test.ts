@@ -330,6 +330,23 @@ describe("createCompatibleApi", () => {
     expect(url.searchParams.get("limit")).toBe("20")
   })
 
+  test("synthesizes an authoritative mention-search base for older V1 servers", async () => {
+    const { api, requests } = setup("v1")
+    const result = await api.find.search({ location: { directory: "/repo" }, query: "sink_ab.mjs", limit: 50 })
+
+    const url = new URL(requests[0]!.url)
+    expect(url.pathname).toBe("/find/search")
+    expect(result.data).toEqual({ base: "/repo", results: [], hasMore: false, total: 0 })
+  })
+
+  test("falls back to the compatibility client's directory when find.search omits location", async () => {
+    const { api } = setup("v1")
+    const result = await api.find.search({ query: "sink_ab.mjs", limit: 50 })
+
+    expect(result.data.base).toBe("/repo")
+    expect(result.location.directory).toBe("/repo")
+  })
+
   test("routes V1 permission replies through the requested directory", async () => {
     const { api, requests } = setup("v1")
     await api.permission.reply({
