@@ -1,8 +1,8 @@
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 220" role="img" aria-labelledby="title desc">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 240" role="img" aria-labelledby="title desc">
   <title id="title">OpenFork</title>
-  <desc id="desc">OpenFork wordmark in white on an inset black panel.</desc>
-  <rect x="60" y="34" width="840" height="152" fill="#000000"/>
-  <g fill="#ffffff" transform="translate(120 36)">
+  <desc id="desc">OpenFork wordmark in white on a black background.</desc>
+  <rect width="960" height="240" fill="#000000"/>
+  <g fill="#ffffff" transform="translate(184.863 59.906) scale(0.82)">
     <path d="M55.3846 36.4286H18.4615V91.7143H55.3846V36.4286ZM73.8462 110.143H0V18H73.8462V110.143Z"/>
     <path d="M110.462 91.7143H147.385V36.4286H110.462V91.7143ZM165.846 110.143H110.462V128.571H92V18H165.846V110.143Z"/>
     <path d="M258.846 73.2857H203.462V91.7143H258.846V110.143H185V18H258.846V73.2857ZM203.462 54.8571H240.385V36.4286H203.462V54.8571Z"/>
