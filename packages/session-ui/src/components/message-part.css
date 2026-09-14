@@ -1819,13 +1819,13 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
 [data-component="question-answers"] {
   display: flex;
   flex-direction: column;
-  gap: 10px;
+  gap: 16px;
   padding: 6px 0 8px;
 
   [data-slot="question-answer-item"] {
     display: flex;
     flex-direction: column;
-    gap: 3px;
+    gap: 2px;
     min-width: 0;
   }
 
@@ -1834,6 +1834,7 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
     align-items: center;
     gap: 6px;
     min-width: 0;
+    padding-left: 5px;
   }
 
   [data-slot="question-answer-index"] {
@@ -1885,6 +1886,7 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
   }
 
   [data-slot="question-text"] {
+    padding-left: 5px;
     color: var(--v2-text-text-base);
     font-size: 12.5px;
     font-weight: 500;
@@ -1895,8 +1897,12 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
   [data-slot="question-answer-options"] {
     display: flex;
     flex-direction: column;
+    /* Shrink-to-fit rows: a stretched row paints its highlight across the whole
+       transcript pane, which turns an all-selected question into a block of
+       full-bleed bars. Hugging the content keeps the emphasis on the text. */
+    align-items: flex-start;
     gap: 1px;
-    margin: 1px 0 0;
+    margin: 5px 0 0;
     padding: 0;
     list-style: none;
   }
@@ -1908,8 +1914,9 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
     align-items: center;
     gap: 7px;
     min-width: 0;
-    min-height: 20px;
-    padding: 0 4px;
+    max-width: 100%;
+    min-height: 21px;
+    padding: 0 8px 0 5px;
     border-radius: 4px;
     opacity: 0.55;
 
@@ -1924,8 +1931,8 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
     align-items: center;
     justify-content: center;
     flex-shrink: 0;
-    width: 10px;
-    height: 10px;
+    width: 11px;
+    height: 11px;
     border: 1px solid var(--v2-border-border-strong);
 
     &[data-type="checkbox"] {
@@ -1947,14 +1954,15 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
     }
 
     [data-component="icon"] {
-      width: 8px;
-      height: 8px;
+      width: 9px;
+      height: 9px;
     }
   }
 
   [data-slot="question-answer-option-label"] {
     flex-shrink: 0;
-    max-width: 52%;
+    min-width: 168px;
+    max-width: 340px;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1970,7 +1978,7 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
 
   [data-slot="question-answer-option-description"] {
     min-width: 0;
-    flex: 1;
+    flex: 0 1 auto;
     overflow: hidden;
     text-overflow: ellipsis;
     white-space: nowrap;
@@ -1983,10 +1991,11 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
   [data-slot="question-answer-detail"] {
     display: flex;
     flex-direction: column;
-    gap: 1px;
-    margin-top: 2px;
-    padding: 3px 0 3px 7px;
-    border-left: 2px solid var(--v2-border-border-muted);
+    gap: 2px;
+    margin-top: 8px;
+    margin-left: 5px;
+    padding: 2px 0 2px 8px;
+    border-left: 2px solid var(--v2-border-border-strong);
   }
 
   [data-slot="question-answer-detail-label"] {
@@ -2005,6 +2014,35 @@ body[data-new-layout] [data-component="context-tool-group-trigger"] {
     line-height: 17px;
     white-space: pre-wrap;
     overflow-wrap: anywhere;
+  }
+}
+
+/* Descriptions must start on one edge, and the widest label differs per
+   question, so the label track has to size itself rather than guess a width.
+   Subgrid lets every row share the list's tracks while staying a real box that
+   can paint its own selected-row background. The flex rules above remain the
+   fallback. */
+@supports (grid-template-columns: subgrid) {
+  [data-component="question-answers"] {
+    [data-slot="question-answer-options"] {
+      display: grid;
+      grid-template-columns: max-content max-content minmax(0, 1fr);
+      column-gap: 7px;
+      width: max-content;
+      max-width: 100%;
+    }
+
+    [data-slot="question-answer-option"] {
+      display: grid;
+      grid-column: 1 / -1;
+      grid-template-columns: subgrid;
+      column-gap: 7px;
+    }
+
+    [data-slot="question-answer-option-label"] {
+      min-width: 0;
+      max-width: none;
+    }
   }
 }
 

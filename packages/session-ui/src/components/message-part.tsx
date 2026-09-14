@@ -52,7 +52,7 @@ import { getDirectory as _getDirectory, getFilename } from "@opencode-ai/core/ut
 import { SessionThroughput } from "@opencode-ai/core/session/throughput"
 import { AttachmentCardV2 } from "../v2/components/attachment-card-v2"
 import { CommentCardV2 } from "../v2/components/comment-card-v2"
-import { checksum } from "@opencode-ai/core/util/encode"
+import { checksum, sampledChecksum } from "@opencode-ai/core/util/encode"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { IconButton } from "@opencode-ai/ui/icon-button"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
@@ -67,6 +67,7 @@ import { partDefaultOpen } from "./part-default-open"
 import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
+import { hasTextPrefix } from "./text-prefix"
 import { SmartToolOutput } from "./tool-output"
 import { ShellTimer } from "./shell-timer"
 import { parseShellOutput, ShellOutput } from "./shell-output"
@@ -327,7 +328,7 @@ function createPacedValue(getValue: () => string, live?: () => boolean) {
       sync(text)
       return
     }
-    if (!text.startsWith(shown) || text.length <= shown.length) {
+    if (!hasTextPrefix(text, shown) || text.length <= shown.length) {
       sync(text)
       return
     }
@@ -347,7 +348,7 @@ function createPacedValue(getValue: () => string, live?: () => boolean) {
       sync(text)
       return
     }
-    if (!text.startsWith(shown) || text.length < shown.length) {
+    if (!hasTextPrefix(text, shown) || text.length < shown.length) {
       clear()
       sync(text)
       return
@@ -917,8 +918,13 @@ export function renderable(part: PartType, showReasoningSummaries = true) {
     if (part.tool === "question") return part.state.status !== "pending" && part.state.status !== "running"
     return true
   }
-  if (part.type === "text") return !!part.text?.trim()
-  if (part.type === "reasoning") return showReasoningSummaries && !!part.text?.trim()
+  // `trim()` walks both ends of the entire accumulated stream and allocates a
+  // trimmed string. This predicate runs while constructing the active timeline
+  // turn on every content update, so a long answer made a simple "is this
+  // visible?" check O(total streamed text) per token. `\S` short-circuits at
+  // the first real character (normally the first byte) and allocates nothing.
+  if (part.type === "text") return /\S/.test(part.text ?? "")
+  if (part.type === "reasoning") return showReasoningSummaries && /\S/.test(part.text ?? "")
   return !!PART_MAPPING[part.type]
 }
 
@@ -1498,7 +1504,7 @@ function contextItemBody(part: ToolPart, output: string, fileComponent: ValidCom
             file={{
               name: display.path,
               contents: display.text,
-              cacheKey: checksum(display.text),
+              cacheKey: sampledChecksum(display.text),
             }}
             overflow="scroll"
           />
@@ -2507,7 +2513,7 @@ ToolRegistry.register({
                     file={{
                       name: info().path,
                       contents: info().text,
-                      cacheKey: checksum(info().text),
+                      cacheKey: sampledChecksum(info().text),
                     }}
                     overflow="scroll"
                     onRendered={props.onContentRendered}
@@ -3118,7 +3124,7 @@ ToolRegistry.register({
                   file={{
                     name: props.input.filePath,
                     contents: props.input.content,
-                    cacheKey: checksum(props.input.content),
+                    cacheKey: sampledChecksum(props.input.content),
                   }}
                   overflow="scroll"
                   onRendered={props.onContentRendered}
@@ -3422,7 +3428,12 @@ ToolRegistry.register({
       if (count === 0) return ""
       if (!completed()) return `${count} ${i18n.t(count > 1 ? "ui.common.question.other" : "ui.common.question.one")}`
       const picked = questions().flatMap((question, index) => resolve(question, index).selections)
-      if (picked.length > 0) return picked.join(" · ")
+      // Every pick across every question runs off the end of the collapsed row,
+      // so show a gist and count the rest.
+      if (picked.length > 0) {
+        const shown = picked.slice(0, 3).join(" · ")
+        return picked.length > 3 ? `${shown} +${picked.length - 3}` : shown
+      }
       return i18n.t("ui.question.subtitle.answered", { count })
     })
 
@@ -3481,7 +3492,9 @@ ToolRegistry.register({
                             </span>
                             <span data-slot="question-answer-option-label">{option.label}</span>
                             <Show when={option.description}>
-                              <span data-slot="question-answer-option-description">{option.description}</span>
+                              <span data-slot="question-answer-option-description" title={option.description}>
+                                {option.description}
+                              </span>
                             </Show>
                           </li>
                         )}
