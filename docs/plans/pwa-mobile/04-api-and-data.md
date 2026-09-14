@@ -99,12 +99,13 @@ Out of scope per handoff §1: file explorer (`/file` list, write/delete/rename/m
 
 ### 2.1 Transport: SSE, decisively
 
-- The instance event stream is `GET /event`, success type `text/event-stream` (groups/event.ts:14–16). There is **no** general-purpose WebSocket event channel: the only declared WS upgrade is PTY connect with ticket auth (httpapi/server.ts:143,160–163); `websocket-tracker.ts` merely tracks sockets to close them on shutdown (websocket-tracker.ts:17–46).
-- Wire shape: each frame is `event: message` with `data: {"id","type","properties"}`; the SSE `id:` field is deliberately left `undefined` (handlers/event.ts:30–37) ⇒ **no `Last-Event-ID` resume**. Reconnect = refetch, not replay (§2.3).
-- Liveness: initial `server.connected` frame (:98) + `server.heartbeat` every 10 s (:91–94). On mobile, heartbeat absence > ~25 s = treat socket dead; iOS kills sockets quickly in background, so expect reconnect storms on foreground — cheap because reconnect is refetch-based.
-- Server filters frames per directory/workspace before send (:63–67) and ends the stream on `server.instance.disposed` (:89).
-- Battery/budget rationale: one long-lived GET vs WS framing + ping/pong protocol; EventSource auto-reconnect is native; and since we must refetch state after reconnect anyway (no resume cursor), WS's bidirectionality buys nothing. WS remains the right transport only if a future terminal/PTY feature ships (already exists server-side).
-- Cross-project: subscribe `/global/event` once for all-directory badges (frame carries directory/project/workspace, groups/global.ts:35–48); open per-directory `/event` lazily only for the open session's directory.
+- Modern mobile uses the native server-wide `GET /api/event` SSE endpoint. Older servers fall back to `/global/event`; capability discovery chooses exactly one feed instead of keeping both sockets alive.
+- Native SSE frames carry replay cursors in the SSE `id:` field. The server keeps a bounded replay ring keyed by an epoch/sequence cursor; reconnects send `Last-Event-ID` and receive the missing suffix before live delivery when that suffix is still reconstructible.
+- `server.connected` is a liveness/control frame, not a hydration signal. `server.heartbeat` proves a quiet connection remains healthy. `server.stream.gap` is the explicit repair signal used when the requested cursor is foreign/evicted or replay would exceed the bounded handoff budget.
+- All three transport controls are members of the native protocol schema. This matters because generated clients validate stream frames; heartbeat/gap cannot be out-of-schema side channels without risking a healthy stream being rejected by its own SDK.
+- The generated SDK owns ordinary reconnect retry with capped jittered exponential backoff and preserves the last successfully validated cursor. Mobile also persists the cursor across a rare outer stream-generation restart, so a transport restart still resumes instead of immediately snapshotting.
+- While the PWA is visible it keeps one native stream. When hidden, mobile flushes its bounded renderer queue and closes the socket so a suspended phone cannot become shared-server subscriber pressure. Foreground opens a fresh stream with the saved cursor and consumes the replay suffix.
+- Native EventV2 is server-global and covers rows created through legacy Session handlers as well: V1/V2 session paths project into the same `SessionTable`, and the compatibility bridge publishes legacy-origin mutations onto native EventV2. `/global/event` is therefore an old-server compatibility transport, not an additional feed required beside `/api/event` on a V2-capable server.
 
 ### 2.2 Cache integration pattern (match the existing app)
 
@@ -113,16 +114,20 @@ The desktop/web app already defines the pattern a PWA inherits for free (server-
 - tanstack-query keys are `[scope, directory, name]` tuples (e.g. :107, :150, :208) — PWA keeps identical keys so extracted hooks keep working.
 - Live data lives in Solid stores fed by an event listener applying reducers per event type (:553–672); queries are used for boot/reference data and invalidated from events (mcp/resources/tools invalidations :642–647).
 - Burst coalescing: a refresh queue dedupes per-directory re-bootstraps (:371–376); rAF-deferred stream start (:689–704).
-- PWA delta: same machinery, plus (a) suspend the stream on `visibilitychange hidden` (fork-usage.tsx already listens to visibility :67), resume+refetch on foreground; (b) tighter `staleTime` defaults on metered connections; (c) `refetchOnReconnect` left ON for queries (the app disables it only for the active-sessions seed query, :154–167).
+- PWA delta: renderer ingress is explicitly bounded by event count and retained bytes. Adjacent deltas for one stream are accumulated as fragments and materialized once at drain; local overflow marks the affected session stale and repairs only that session rather than applying TCP backpressure to the shared event stream. Hidden reconstructible deltas are intentionally skipped and repaired on foreground if replay/local projection cannot supply them.
 
 ### 2.3 Backfill-on-reconnect semantics (evidence-based)
 
-Because SSE frames carry no usable cursor (§2.1), the app's own reconnect story is **state-refetch, not replay**: on `server.connected` it re-runs bootstrap for every active directory (server-sync.tsx:610–616 pushes all active dirs through the refresh queue; global events like `config.updated` refetch bootstrap :603–609). A PWA copies this exactly:
+Reconnect is now **replay-first, repair-on-explicit-gap**:
 
-1. Foreground/online → reopen SSE.
-2. On `server.connected`: invalidate `[scope, dir, "loadSessions"]` + active-sessions + open session's messages/todos/status; let tanstack-query refetch what's mounted.
-3. Timeline gap-filling uses the messages cursor API: fetch pages with `before` until overlap with cached newest message (§1.2 pagination).
-4. Do **not** build on `/sync/history` for UI backfill: it is the workspace-sync delta protocol over durable EventTable rows ("keys are aggregate IDs… values are last known sequence ID", groups/sync.ts:83–95; SQL diff query handlers/sync.ts:72–85) — designed for opencode↔workspace replication (`/sync/start|replay|steal`), not client catch-up. Cite it as future multi-device work, not PWA scope.
+1. Visible reconnect/foreground → open the selected SSE feed with the saved `Last-Event-ID` cursor.
+2. `server.connected` confirms liveness only; it does not trigger list/message/status hydration.
+3. Native replay delivers the cursor suffix before live events. Event IDs are deduplicated defensively in the renderer so an outer restart cannot apply the same publication twice.
+4. If the bounded replay ring cannot reconstruct the requested suffix, the server emits `server.stream.gap`. That is the authoritative broad-repair boundary: refresh session metadata, active runtime snapshot, and the currently open message history.
+5. Renderer-local loss is narrower than a transport gap. Queue overflow/background delta suppression repairs only the active session whose reconstructible content was skipped.
+6. Timeline snapshots still use the messages API when an authoritative active-session repair is required; `/sync/history` remains the workspace-sync durability protocol and is not the UI reconnect mechanism.
+
+This split is deliberate: ordinary network churn pays for replay, not global hydration, while bounded exceptional state loss has an explicit exact repair path.
 
 ---
 

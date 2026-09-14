@@ -1,6 +1,6 @@
 import { For, Show, createMemo, createSignal } from "solid-js"
 import { Chip, Fields, Row, Rows } from "./primitives"
-import { parseToolText, type ToolTextBlock } from "./parse"
+import { boundedToolPreview, bytes, parseToolText, type ToolTextBlock } from "./parse"
 import { parseShellOutput } from "./ansi"
 
 /**
@@ -25,12 +25,15 @@ import { parseShellOutput } from "./ansi"
 const CLAMP_LINES = 40
 
 export function ToolText(props: { output: string }) {
-  // One implementation of "resolve line rewrites, drop the escapes".
-  const clean = createMemo(() => parseShellOutput(props.output).text)
+  const [full, setFull] = createSignal(false)
+  const source = createMemo(() => (full() ? { text: props.output, truncated: false, sourceChars: props.output.length } : boundedToolPreview(props.output)))
+  // One implementation of "resolve line rewrites, drop the escapes". For jumbo
+  // output this operates on a bounded head+tail preview until the user explicitly
+  // requests the full body.
+  const clean = createMemo(() => parseShellOutput(source().text).text)
   const parsed = createMemo(() => parseToolText(clean()))
   const lines = createMemo(() => clean().split("\n").length)
-  const [full, setFull] = createSignal(false)
-  const clamped = () => lines() > CLAMP_LINES && !full()
+  const clamped = () => (lines() > CLAMP_LINES || source().truncated) && !full()
 
   return (
     <div class="ttext">
@@ -86,7 +89,7 @@ export function ToolText(props: { output: string }) {
             setFull(true)
           }}
         >
-          Show all {lines()} lines
+          {source().truncated ? `Show full output (${bytes(source().sourceChars)})` : `Show all ${lines()} lines`}
         </button>
       </Show>
     </div>

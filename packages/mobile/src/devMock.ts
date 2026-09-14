@@ -18,6 +18,18 @@ const LARGE = (() => {
   } catch { return 0 }
 })()
 
+const CHAT_LARGE = (() => {
+  try {
+    const p = new URLSearchParams(location.search)
+    const value = p.get("chat")
+    if (!value) return 0
+    const n = parseInt(value, 10)
+    return Number.isFinite(n) && n > 0 ? Math.min(n, 5000) : 0
+  } catch {
+    return 0
+  }
+})()
+
 const baseMockSessions: Raw[] = [
   session({
     id: "s1",
@@ -140,7 +152,7 @@ const tool = (id: string, mid: string, name: string, title: string, status: "com
   state: { status, input: {}, title, time: { start: Date.now() - 60_000, end: Date.now() - 58_000 }, ...extra },
 })
 
-export const mockMessages = [
+const baseMockMessages = [
   {
     info: user({
       id: "m1",
@@ -210,6 +222,44 @@ export const mockMessages = [
     ] as any,
   },
 ]
+
+function expandMockMessages(base: typeof baseMockMessages, count: number) {
+  if (!mockEnabled || count <= base.length) return base
+  const out: any[] = [...base]
+  for (let i = base.length; i < count; i++) {
+    const id = `perf-m${i + 1}`
+    const isUser = i % 2 === 0
+    out.push({
+      info: isUser
+        ? user({
+            id,
+            sessionID: "s1",
+            role: "user",
+            time: { created: Date.now() - (count - i) * 1000 },
+            agent: "build",
+            model: { providerID: "anthropic", modelID: "claude-sonnet-4-5" },
+          })
+        : assistant({
+            id,
+            sessionID: "s1",
+            role: "assistant",
+            parentID: `perf-m${i}`,
+            modelID: "claude-sonnet-4-5",
+            providerID: "anthropic",
+            mode: "build",
+            agent: "build",
+            path: { cwd: "C:/dev/opencode", root: "C:/dev/opencode" },
+            cost: 0.001,
+            time: { created: Date.now() - (count - i) * 1000, completed: Date.now() - (count - i) * 1000 + 500 },
+            tokens: { input: 200, output: 80, reasoning: 0, cache: { read: 0, write: 0 } },
+          }),
+      parts: [text(`perf-p${i + 1}`, id, `${isUser ? "User" : "Assistant"} synthetic history row ${i + 1}: bounded representative prose for mobile timeline measurement.`)],
+    })
+  }
+  return out
+}
+
+export const mockMessages = expandMockMessages(baseMockMessages, CHAT_LARGE)
 
 const mockModel = (id: string, name: string, ctx: number, costIn: number, costOut: number, caps: { reasoning?: boolean; image?: boolean } = {}): any => ({
   id,

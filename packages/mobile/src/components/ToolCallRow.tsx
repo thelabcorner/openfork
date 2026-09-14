@@ -149,20 +149,22 @@ export function ToolCallRow(props: {
           </Accordion.Trigger>
         </Accordion.Header>
         <Accordion.Content class="tool-body-content">
-          <div class="tool-body">
-            <Show when={errorText()}>
-              {(error) => <ToolErrorPanel error={error()} />}
-            </Show>
-            <Show when={descriptor?.body}>
-              {(body) => <Dynamic component={body()} part={part()} killShell={props.killShell} />}
-            </Show>
-            <Show when={genericContent()}>
-              <ToolParams input={inputRecord()} />
-              <Show when={!errorText() && outputText()} keyed>
-                {(out) => <ToolText output={out} />}
+          <Show when={expanded()}>
+            <div class="tool-body">
+              <Show when={errorText()}>
+                {(error) => <ToolErrorPanel error={error()} />}
               </Show>
-            </Show>
-          </div>
+              <Show when={descriptor?.body}>
+                {(body) => <Dynamic component={body()} part={part()} killShell={props.killShell} />}
+              </Show>
+              <Show when={genericContent()}>
+                <ToolParams input={inputRecord()} />
+                <Show when={!errorText() && outputText()} keyed>
+                  {(out) => <ToolText output={out} />}
+                </Show>
+              </Show>
+            </div>
+          </Show>
         </Accordion.Content>
       </Accordion.Item>
     </Accordion>

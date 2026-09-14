@@ -76,6 +76,30 @@ export function bytes(value: number): string {
   return `${n >= 10 || i === 0 ? Math.round(n) : n.toFixed(1)} ${units[i]}`
 }
 
+export type BoundedToolPreview = {
+  text: string
+  truncated: boolean
+  sourceChars: number
+}
+
+/**
+ * Keeps eager tool-body parsing independent from a potentially multi-megabyte
+ * authoritative result. The head preserves setup/context, the tail preserves
+ * errors/final summaries, and explicit SGR resets prevent ANSI state from
+ * leaking across the omitted middle.
+ */
+export function boundedToolPreview(output: string, maxChars = 128 * 1024): BoundedToolPreview {
+  if (output.length <= maxChars) return { text: output, truncated: false, sourceChars: output.length }
+  const head = Math.floor(maxChars * 0.75)
+  const tail = maxChars - head
+  const omitted = output.length - maxChars
+  return {
+    text: `${output.slice(0, head)}\u001b[0m\n\n… ${bytes(omitted)} omitted …\n\n\u001b[0m${output.slice(-tail)}`,
+    truncated: true,
+    sourceChars: output.length,
+  }
+}
+
 /** Drops the trailing agent-facing hint paragraphs from a tool's output. */
 export function withoutHints(text: string): string {
   return text

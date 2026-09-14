@@ -10,13 +10,23 @@ type Rendered = { key: string; html: string }
 // the one block that's still growing."
 const htmlCache = new Map<string, string>()
 const MAX_CACHE = 400
+const MAX_CACHE_BYTES = 8 * 1024 * 1024
+let htmlCacheBytes = 0
 
 function cacheSet(key: string, html: string) {
-  if (htmlCache.size >= MAX_CACHE) {
+  const bytes = (key.length + html.length) * 2
+  const existing = htmlCache.get(key)
+  if (existing !== undefined) htmlCacheBytes -= (key.length + existing.length) * 2
+  while (htmlCache.size && (htmlCache.size >= MAX_CACHE || htmlCacheBytes + bytes > MAX_CACHE_BYTES)) {
     const oldest = htmlCache.keys().next().value
-    if (oldest !== undefined) htmlCache.delete(oldest)
+    if (oldest === undefined) break
+    const value = htmlCache.get(oldest)
+    if (value !== undefined) htmlCacheBytes -= (oldest.length + value.length) * 2
+    htmlCache.delete(oldest)
   }
+  if (bytes > MAX_CACHE_BYTES) return
   htmlCache.set(key, html)
+  htmlCacheBytes += bytes
 }
 
 function escapeHtml(s: string) {
@@ -39,7 +49,7 @@ async function renderBlock(block: Block): Promise<string> {
   return sanitizeMarkdown(await parseMarkdown(block.src))
 }
 
-export function Markdown(props: { text: string; streaming?: boolean }) {
+export function Markdown(props: { text: string; streaming?: boolean; appendFrom?: number; appendDelta?: string }) {
   const [rendered, setRendered] = createSignal<Rendered[]>([])
   let projectionRef: Projection | undefined
   let generation = 0
@@ -51,7 +61,7 @@ export function Markdown(props: { text: string; streaming?: boolean }) {
   createEffect(() => {
     const text = props.text
     const live = !!props.streaming
-    const next = project(projectionRef, text, live)
+    const next = project(projectionRef, text, live, props.appendFrom, props.appendDelta)
     projectionRef = next
     const myGeneration = ++generation
 

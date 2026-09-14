@@ -41,11 +41,14 @@ import {
   type MessageBundle,
 } from "./api"
 import { mockEnabled, mockMessages, mockProviders, mockQuota, mockSessions, mockArchived } from "./devMock"
-import { reduceMessageEvent } from "./messageStream"
+import { MessageStreamProjection } from "./messageStream"
+import { MessageEventQueue } from "./messageEventQueue"
 import { normalizeLegacyProviders } from "./providerCatalog"
+import { activeReconcilePlan, mapBounded, type MobileEventChannel } from "./activeReconcile"
 import { createModelPreferences, subProviderKeyFor } from "./modelPreferences"
 import { recordPersonalCosts } from "./model-ranking"
 import { createEndpointsFetcher } from "./openrouter-endpoints"
+import { sessionIDFromNavigationUrl } from "./navigation"
 
 type Page = "sessions" | "limits" | "settings"
 type ConnectionStatus = "disconnected" | "connecting" | "connected" | "error"
@@ -120,6 +123,10 @@ function PairingCodeInput(props: { value: string; onChange: (v: string) => void;
 
 export function App() {
   const launch = readLaunchConfig()
+  // `notificationclick` opens this exact path when no PWA window exists. Keep
+  // the target pending until a client is connected so cold push navigation does
+  // not race bootstrap or render a session shell without its message snapshot.
+  let pendingNavigationSessionID = sessionIDFromNavigationUrl(location.href, location.origin)
   const [state, setState] = createStore({
     serverUrl: launch.serverUrl ?? "",
     token: readStorage(DEVICE_TOKEN_KEY) ?? "",
@@ -157,6 +164,7 @@ export function App() {
   const [advancedOpen, setAdvancedOpen] = createSignal(false)
   const [howOpen, setHowOpen] = createSignal(false)
   const [deferredPrompt, setDeferredPrompt] = createSignal<any>(null)
+  const [messageStructureRevision, setMessageStructureRevision] = createSignal(0)
   const canClaim = () => state.pairing.trim().length === PAIR_CODE_LENGTH
   const canConnect = () => !state.pairing && !!state.token.trim() && !!state.serverUrl.trim()
   const submitDisabled = () => state.status === "connecting" || (!canClaim() && !canConnect())
@@ -165,6 +173,9 @@ export function App() {
 
   let client: OpencodeClient | undefined
   let eventsAbort: AbortController | undefined
+  let eventChannel: MobileEventChannel = "current"
+  let eventChannelResolved = false
+  const eventCursors = new Map<"current" | "compatibility", string>()
 
   // Model-selector preferences shared with the desktop through the server, so
   // this device shows the same provider rail order, favorites and routing pins.
@@ -175,7 +186,9 @@ export function App() {
   let messageRevision = 0
   let messageRequest = 0
   let streamFrame: number | undefined
-  const pendingMessageEvents: Array<{ type: string; props: any }> = []
+  const pendingMessageEvents = new MessageEventQueue()
+  const messageProjection = new MessageStreamProjection()
+  const staleMessageSessions = new Set<string>()
   const runtimeRevision = new Map<string, number>()
   const haptics = new WebHaptics({})
 
@@ -301,6 +314,10 @@ export function App() {
             { limit, order: "desc", ...(cursor ? { cursor } : {}) },
             { throwOnError: true },
           )
+          if (!opts.archived && !eventChannelResolved) {
+            eventChannel = "current"
+            eventChannelResolved = true
+          }
           const payload: any = res?.data ?? res
           const batch: any[] = payload?.data ?? payload ?? []
           const next: string | undefined = payload?.cursor?.next ?? res?.cursor?.next
@@ -316,17 +333,18 @@ export function App() {
           if (!next || batch.length < limit || all.length >= SOFT_CAP) break
           cursor = next
         }
-        if (all.length > 0) return [...new Map(all.map((s) => [s.id, s] as const)).values()]
-        if (!opts.archived) {
-          // V2 returned 0 actives but server had data — fall through to legacy rather than empty
-          if (
-            (await v2.list({ limit: 1, order: "desc" }, { throwOnError: true }).catch(() => null))?.data?.data?.length
-          )
-            throw new Error("v2 empty actives")
-          return []
-        }
+        // A successful V2 list is also our capability/protocol proof. An empty
+        // active result can legitimately mean every row is archived; falling
+        // through to legacy here would reopen the compatibility transport and
+        // keep its server-side bridge alive for no semantic benefit.
+        return [...new Map(all.map((s) => [s.id, s] as const)).values()]
       }
-    } catch {}
+    } catch {
+      if (!opts.archived && !eventChannelResolved) {
+        eventChannel = "compatibility"
+        eventChannelResolved = true
+      }
+    }
     // Fallback: legacy experimental offset pagination (supports archived:true server-side)
     const PAGE = 500
     const all: Session[] = []
@@ -368,6 +386,13 @@ export function App() {
   }
 
   const setRuntime = (sessionID: string, runtime: SessionRuntime) => {
+    const previous = runtimes[sessionID]
+    if (
+      previous?.status === runtime.status &&
+      previous.permissions === runtime.permissions &&
+      previous.questions === runtime.questions &&
+      previous.busySince === runtime.busySince
+    ) return
     runtimeRevision.set(sessionID, (runtimeRevision.get(sessionID) ?? 0) + 1)
     setRuntimes(sessionID, runtime)
   }
@@ -375,26 +400,20 @@ export function App() {
   const reconcileActiveSessions = async (source: OpencodeClient) => {
     const started = new Map(runtimeRevision)
     try {
-      const directories = [
-        ...new Set(
-          state.sessions.flatMap((session) => {
-            if (!session.directory) return []
-            const subpath = (session as any).path
-            return subpath
-              ? [
-                  session.directory,
-                  `${session.directory.replace(/[\\/]$/, "")}\\${String(subpath).replace(/^[\\/]/, "")}`,
-                ]
-              : [session.directory]
-          }),
-        ),
-      ]
-      const [currentResult, ...compatibilityResults] = await Promise.all([
-        source.v2.session.active({ throwOnError: true }).catch(() => undefined),
-        ...directories.map((directory) =>
+      const plan = activeReconcilePlan(state.sessions, eventChannel)
+      const currentResult =
+        plan.currentSnapshot
+          ? await source.v2.session.active({ throwOnError: true }).catch(() => undefined)
+          : undefined
+      let compatibilityResults: any[] = []
+      // Old/compatibility servers still expose status per directory. Bound the
+      // fanout instead of issuing hundreds of simultaneous requests from one
+      // phone; native V2 mode takes the single server-global active snapshot.
+      if (plan.legacyDirectories.length) {
+        compatibilityResults = await mapBounded(plan.legacyDirectories, 4, (directory) =>
           source.session.status({ directory }, { throwOnError: true }).catch(() => undefined),
-        ),
-      ])
+        )
+      }
       const current: Record<string, { type: "running" | "paused" }> =
         (currentResult as any)?.data?.data ?? (currentResult as any)?.data ?? {}
       const compatibility = Object.assign(
@@ -410,8 +429,12 @@ export function App() {
         ...current,
       }
       const known = new Set([...state.sessions, ...state.archivedSessions].map((session) => session.id))
+      const protocolByID = new Map([...state.sessions, ...state.archivedSessions].map((session) => [session.id, session.version] as const))
       if (Object.keys(active).some((sessionID) => !known.has(sessionID))) void refresh()
       for (const sessionID of new Set([...known, ...Object.keys(runtimes), ...Object.keys(active)])) {
+        // If the native active endpoint itself is unavailable, legacy directory
+        // snapshots cannot authoritatively declare a V2 row idle.
+        if (protocolByID.get(sessionID) === "v2" && !currentResult) continue
         // A status event received after this request began is newer than the snapshot.
         if ((runtimeRevision.get(sessionID) ?? 0) !== (started.get(sessionID) ?? 0)) continue
         const permissionsCount = permissions[sessionID]?.length ?? 0
@@ -473,6 +496,8 @@ export function App() {
       if (request !== messageRequest || sessionID !== state.activeSessionID || revision !== messageRevision) return
       if (response.data) {
         const bundles = response.data as MessageBundle[]
+        messageProjection.reset(bundles)
+        setMessageStructureRevision((value) => value + 1)
         setState("messages", bundles)
         // Feeds the model selector's personal $/request and cache-hit-rate
         // ranking. The desktop learns this from a durable cross-session store;
@@ -488,31 +513,68 @@ export function App() {
   const flushMessageEvents = () => {
     if (streamFrame !== undefined) cancelAnimationFrame(streamFrame)
     streamFrame = undefined
-    if (!pendingMessageEvents.length) return
-    const events = pendingMessageEvents.splice(0)
-    let messages = state.messages
+    const events = pendingMessageEvents.drain()
+    if (!events.length) return
     let changed = false
-    let stale = false
+    let topologyChanged = false
+    let structureChanged = false
+    const changedMessages = new Set<number>()
     let hapticText = ""
     for (const event of events) {
-      const result = reduceMessageEvent(messages, event.type, event.props)
-      messages = result.messages
+      const result = messageProjection.apply(event.type, event.props)
       changed ||= result.changed
-      stale ||= !!result.stale
+      topologyChanged ||= !!result.topology
+      structureChanged ||= !!result.structure
+      if (result.messageIndex !== undefined) changedMessages.add(result.messageIndex)
+      if (result.stale) {
+        const sessionID = eventSessionID(event.props)
+        if (sessionID) staleMessageSessions.add(sessionID)
+      }
       if (event.type.endsWith(".delta")) hapticText += event.props.delta ?? ""
     }
     if (changed) {
       messageRevision++
-      setState("messages", messages)
+      if (topologyChanged) {
+        // Structural mutations are rare and can shift indexes. Publish one
+        // detached snapshot at that boundary, then return to per-message writes.
+        setState("messages", messageProjection.messages.slice())
+      } else {
+        // Token-rate work updates only the exact changed message. The Solid
+        // store's outer history topology stays stable, so historical rows and
+        // history-wide memos do not wake merely because one tail part grew.
+        for (const index of changedMessages) {
+          const bundle = messageProjection.messages[index]
+          if (bundle) setState("messages", index, bundle)
+        }
+      }
+      if (structureChanged) setMessageStructureRevision((value) => value + 1)
       if (hapticText) triggerDeltaHaptic(hapticText)
     }
-    if (stale && state.activeSessionID) void refreshMessages(state.activeSessionID)
+    const active = state.activeSessionID
+    if (active && staleMessageSessions.has(active)) {
+      staleMessageSessions.delete(active)
+      void refreshMessages(active)
+    }
   }
 
   const queueMessageEvent = (type: string, props: any) => {
     const isDelta = type.endsWith(".delta")
     if (!isDelta) flushMessageEvents()
-    pendingMessageEvents.push({ type, props })
+    if (isDelta && document.visibilityState !== "visible") {
+      // Reconstructible content must not accumulate while rAF is suspended.
+      // Replay remains authoritative; if this renderer intentionally skips
+      // content, mark only the visible session for repair on foreground.
+      const sessionID = eventSessionID(props)
+      if (sessionID) staleMessageSessions.add(sessionID)
+      return
+    }
+    const admission = pendingMessageEvents.push({ type, props })
+    if (!admission.accepted) {
+      for (const sessionID of admission.staleSessions) staleMessageSessions.add(sessionID)
+      if (streamFrame !== undefined) cancelAnimationFrame(streamFrame)
+      streamFrame = undefined
+      return
+    }
     if (!isDelta) {
       flushMessageEvents()
       return
@@ -523,8 +585,12 @@ export function App() {
   // Declared above every reader: `refreshPermissions` and the event loop
   // both call it, and both sit earlier in this function.
   const [autoAcceptSessions, setAutoAcceptSessions] = createSignal<Set<string>>(new Set())
+  const permissionRefreshes = new Map<string, Promise<void>>()
+  const permissionRefreshDirty = new Set<string>()
+  const questionRefreshes = new Map<string, Promise<void>>()
+  const questionRefreshDirty = new Set<string>()
 
-  const refreshPermissions = async (sessionID: string) => {
+  const refreshPermissionsOnce = async (sessionID: string) => {
     if (!client) return
     try {
       const res = await (client.session as any).permission.list({ sessionID }, { throwOnError: true })
@@ -551,7 +617,23 @@ export function App() {
       setPermissions(sessionID, [])
     }
   }
-  const refreshQuestions = async (sessionID: string) => {
+  const refreshPermissions = (sessionID: string) => {
+    const current = permissionRefreshes.get(sessionID)
+    if (current) {
+      permissionRefreshDirty.add(sessionID)
+      return current
+    }
+    const work = (async () => {
+      do {
+        permissionRefreshDirty.delete(sessionID)
+        await refreshPermissionsOnce(sessionID)
+      } while (permissionRefreshDirty.delete(sessionID))
+    })().finally(() => permissionRefreshes.delete(sessionID))
+    permissionRefreshes.set(sessionID, work)
+    return work
+  }
+
+  const refreshQuestionsOnce = async (sessionID: string) => {
     if (!client) return
     try {
       const res = await (client.session as any).question.list({ sessionID }, { throwOnError: true })
@@ -561,6 +643,21 @@ export function App() {
       console.error("refreshQuestions failed", sessionID, e)
       setQuestions(sessionID, [])
     }
+  }
+  const refreshQuestions = (sessionID: string) => {
+    const current = questionRefreshes.get(sessionID)
+    if (current) {
+      questionRefreshDirty.add(sessionID)
+      return current
+    }
+    const work = (async () => {
+      do {
+        questionRefreshDirty.delete(sessionID)
+        await refreshQuestionsOnce(sessionID)
+      } while (questionRefreshDirty.delete(sessionID))
+    })().finally(() => questionRefreshes.delete(sessionID))
+    questionRefreshes.set(sessionID, work)
+    return work
   }
 
   const loadProviders = async () => {
@@ -815,6 +912,66 @@ export function App() {
 
   const eventSessionID = (props: any) => props?.sessionID ?? props?.sessionId ?? props?.info?.id
   const seenEventIDs = new Set<string>()
+  let gapRepair: Promise<void> | undefined
+
+  const upsertSessionInfo = (info: any) => {
+    if (!info?.id) return false
+    const normalized = info.location ? mapV2ToSession(info) : (info as Session)
+    const index = state.sessions.findIndex((session) => session.id === normalized.id)
+    const archived = !!(normalized.time as any)?.archived
+    if (archived) {
+      if (index >= 0) setState("sessions", (sessions) => sessions.filter((session) => session.id !== normalized.id))
+      const archivedIndex = state.archivedSessions.findIndex((session) => session.id === normalized.id)
+      if (archivedIndex >= 0) setState("archivedSessions", archivedIndex, normalized)
+      return true
+    }
+    const projected = {
+      ...(index >= 0 ? state.sessions[index] : {}),
+      ...normalized,
+      // `version: "v2"` is the mobile protocol marker used by the current
+      // list projection; native EventV2 session payloads themselves carry the
+      // server's application version, so retain the protocol marker here.
+      ...(eventChannel === "current" ? { version: "v2" } : {}),
+    } as Session
+    if (index >= 0) setState("sessions", index, projected)
+    else setState("sessions", (sessions) => [projected, ...sessions])
+    return true
+  }
+
+  const deleteSessionInfo = (sessionID: string) => {
+    setState("sessions", (sessions) => sessions.filter((session) => session.id !== sessionID))
+    setState("archivedSessions", (sessions) => sessions.filter((session) => session.id !== sessionID))
+    runtimeRevision.delete(sessionID)
+    setRuntimes(sessionID, undefined!)
+    if (sessionID === state.activeSessionID) setState("activeSessionID", undefined)
+  }
+
+  const projectStepMetadata = (sessionID: string, props: any) => {
+    const index = state.sessions.findIndex((session) => session.id === sessionID)
+    if (index < 0) return
+    const current = state.sessions[index]!
+    setState("sessions", index, {
+      ...current,
+      ...(typeof props.cost === "number" ? { cost: props.cost } : {}),
+      ...(props.tokens ? { tokens: props.tokens } : {}),
+      time: { ...current.time, updated: props.timestamp ?? Date.now() },
+    })
+  }
+
+  const repairStreamGap = () => {
+    if (gapRepair || !client) return gapRepair
+    const source = client
+    gapRepair = Promise.all([
+      refresh(),
+      reconcileActiveSessions(source),
+      state.activeSessionID ? refreshMessages(state.activeSessionID) : Promise.resolve(),
+    ])
+      .then(() => undefined)
+      .finally(() => {
+        gapRepair = undefined
+      })
+    return gapRepair
+  }
 
   const handleServerEvent = (event: unknown) => {
     if (!event || typeof event !== "object" || !("type" in event)) return
@@ -829,26 +986,27 @@ export function App() {
     const sessionID = eventSessionID(props)
 
     if (type === "server.connected") {
-      void Promise.all([refresh(), reconcileActiveSessions(client!), reconcilePushSubscription(client!)])
+      // Liveness only. Replay follows this frame on a resumed connection; a
+      // successful socket is not evidence that global/session state is stale.
+      return
+    }
+    if (type === "server.stream.gap") {
+      // The replay ring explicitly told us it cannot reconstruct the missing
+      // suffix. This is the exceptional authoritative-repair boundary.
+      void repairStreamGap()
       return
     }
 
-    if (
-      type === "session.created" ||
-      type === "session.updated" ||
-      type === "session.deleted" ||
-      type === "session.moved"
-    ) {
-      void refresh()
-      if (type === "session.deleted" && sessionID) {
-        runtimeRevision.delete(sessionID)
-        setRuntimes(sessionID, undefined!)
-        if (sessionID === state.activeSessionID) setState("activeSessionID", undefined)
-      }
+    if (type === "session.created" || type === "session.updated") {
+      if (!upsertSessionInfo(props.info)) void refresh()
     }
+    if (type === "session.deleted" && sessionID) deleteSessionInfo(sessionID)
+    // Older compatibility servers can emit a move event without the resulting
+    // Session payload. Keep the snapshot fallback only for that information-
+    // incomplete structural mutation.
+    if (type === "session.moved" && !upsertSessionInfo(props.info)) void refresh()
     if (type.startsWith("message.")) {
       if (sessionID === state.activeSessionID) queueMessageEvent(type, props)
-      if (type === "message.updated" && props.info?.time?.completed) void refresh()
     }
     if (type.startsWith("session.next.")) {
       // Any session.next activity except terminal step means generating.
@@ -856,27 +1014,21 @@ export function App() {
       // deltas, and resumed — the gap between prompt and first delta would
       // otherwise show idle until the first token.
       if (sessionID && !type.endsWith(".ended") && !type.endsWith(".failed")) {
-        setRuntime(sessionID, {
-          status: "generating",
-          permissions: permissions[sessionID]?.length ?? 0,
-          questions: questions[sessionID]?.length ?? 0,
-          busySince: runtimes[sessionID]?.busySince ?? Date.now(),
-        })
+        const current = runtimes[sessionID]
+        if (current?.status !== "generating") {
+          setRuntime(sessionID, {
+            status: "generating",
+            permissions: permissions[sessionID]?.length ?? 0,
+            questions: questions[sessionID]?.length ?? 0,
+            busySince: current?.busySince ?? Date.now(),
+          })
+        }
       }
       if (sessionID === state.activeSessionID) {
         queueMessageEvent(type, props)
-        if (
-          type === "session.next.step.ended" ||
-          type === "session.next.step.failed" ||
-          type === "session.next.tool.success" ||
-          type === "session.next.tool.failed"
-        ) {
-          window.setTimeout(() => void refreshMessages(sessionID), 120)
-        }
-        // Session list's time.updated/cost/tokens are driven by refresh()
-        // on session.updated, but V2 only emits session.next.* — refresh
-        // the list on step boundaries so the sessions page doesn't lag.
-        if (type === "session.next.step.started" || type === "session.next.step.ended") void refresh()
+      }
+      if (sessionID && (type === "session.next.step.ended" || type === "session.next.step.failed")) {
+        projectStepMetadata(sessionID, props)
       }
     }
     if (type.includes("permission") && sessionID) {
@@ -923,46 +1075,36 @@ export function App() {
     }
   }
 
-  const waitForReconnect = (signal: AbortSignal, delay = 500) =>
-    new Promise<void>((resolve) => {
-      const timeout = window.setTimeout(resolve, delay)
-      signal.addEventListener(
-        "abort",
-        () => {
-          clearTimeout(timeout)
-          resolve()
-        },
-        { once: true },
-      )
-    })
-
   const runEventLoop = async (source: OpencodeClient, signal: AbortSignal, channel: "current" | "compatibility") => {
-    let delay = 500
+    let restartDelay = 250
     while (!signal.aborted) {
       try {
-        await openEvents(source, signal, channel, handleServerEvent)
-        delay = 500
+        await openEvents(source, signal, channel, handleServerEvent, {
+          lastEventId: eventCursors.get(channel),
+          onCursor: (id) => eventCursors.set(channel, id),
+        })
+        restartDelay = 250
       } catch {
-        // Live events have no replay. Reopening plus authoritative snapshots
-        // below repairs state whether the stream failed or ended normally.
+        // Generated SSE owns ordinary network retry/replay. Reaching this catch
+        // means the stream itself exited; restart only the transport, never
+        // snapshots. Keep the cursor across this outer generation as well.
       }
       if (signal.aborted) return
-      await waitForReconnect(signal, delay)
-      if (signal.aborted) return
-      await Promise.all([
-        refresh(),
-        reconcileActiveSessions(source),
-        state.activeSessionID ? refreshMessages(state.activeSessionID) : Promise.resolve(),
-      ])
-      delay = Math.min(delay * 2, 10_000)
+      await new Promise<void>((resolve) => {
+        const jitter = Math.floor(Math.random() * Math.max(1, restartDelay / 3))
+        const timeout = window.setTimeout(resolve, restartDelay + jitter)
+        signal.addEventListener("abort", () => { clearTimeout(timeout); resolve() }, { once: true })
+      })
+      restartDelay = Math.min(restartDelay * 2, 10_000)
     }
   }
 
   const startEventLoop = (source: OpencodeClient) => {
     eventsAbort?.abort()
+    eventsAbort = undefined
+    if (document.visibilityState !== "visible") return
     eventsAbort = new AbortController()
-    void runEventLoop(source, eventsAbort.signal, "current")
-    void runEventLoop(source, eventsAbort.signal, "compatibility")
+    void runEventLoop(source, eventsAbort.signal, eventChannel)
   }
 
   /** Drops everything scoped to one server process. */
@@ -999,6 +1141,12 @@ export function App() {
       // nothing stale to clear and nothing worth interrupting the user about.
       if (instance.state === "adopted" || instance.state === "changed")
         writeStorage(INSTANCE_ID_KEY, instance.instanceID)
+      // connect() performs an authoritative bootstrap, so transport cursors
+      // from a previous explicit connection/instance are unnecessary and can
+      // only manufacture an avoidable replay-gap repair.
+      eventCursors.clear()
+      eventChannel = "current"
+      eventChannelResolved = false
       client = nextClient
       writeStorage(SERVER_URL_KEY, serverUrl)
       if (state.token) writeStorage(DEVICE_TOKEN_KEY, state.token)
@@ -1013,9 +1161,18 @@ export function App() {
       // Best-effort and off the critical path: the locally cached preferences
       // document already renders, this only reconciles it with the desktop's.
       void modelPreferences.load()
+      void reconcilePushSubscription(nextClient)
       await reconcileActiveSessions(nextClient)
 
       startEventLoop(nextClient)
+      // Subscribe before hydrating a cold deep-link target: events that land
+      // during its message snapshot are then replayed/projected instead of
+      // falling into a stream-start race window.
+      const navigationTarget = pendingNavigationSessionID
+      if (navigationTarget) {
+        pendingNavigationSessionID = undefined
+        await selectSession(navigationTarget)
+      }
     } catch (error) {
       client = undefined
       const raw = error instanceof Error ? error.message : "Connection failed"
@@ -1069,15 +1226,51 @@ export function App() {
   }
 
   const selectSession = async (sessionID: string) => {
+    // Push/deep links can name an archived session or an older session outside
+    // the list soft-cap. Resolve only that row on demand; ordinary list clicks
+    // hit the fast path with no extra request.
+    if (
+      !mockEnabled &&
+      !state.sessions.some((session) => session.id === sessionID) &&
+      !state.archivedSessions.some((session) => session.id === sessionID)
+    ) {
+      if (!client) {
+        pendingNavigationSessionID = sessionID
+        return false
+      }
+      let resolved = false
+      if (eventChannel === "current") {
+        try {
+          const response: any = await client.v2.session.get({ sessionID }, { throwOnError: true })
+          const info = response?.data?.data ?? response?.data
+          if (info) resolved = upsertSessionInfo(info)
+        } catch {}
+      }
+      if (!resolved) {
+        try {
+          const response: any = await client.session.get({ sessionID }, { throwOnError: true })
+          if (response?.data) resolved = upsertSessionInfo(response.data)
+        } catch {}
+      }
+      if (!resolved) {
+        setState("error", "The session from this notification is no longer available.")
+        return false
+      }
+    }
     if (streamFrame !== undefined) cancelAnimationFrame(streamFrame)
     streamFrame = undefined
-    pendingMessageEvents.length = 0
+    pendingMessageEvents.discard()
+    staleMessageSessions.clear()
     messageRevision++
     messageRequest++
-    setState({ activeSessionID: sessionID, messages: mockEnabled ? (mockMessages as MessageBundle[]) : [] })
+    const initialMessages = mockEnabled ? (mockMessages as MessageBundle[]) : []
+    messageProjection.reset(initialMessages)
+    setMessageStructureRevision((value) => value + 1)
+    setState({ activeSessionID: sessionID, messages: initialMessages })
     triggerHaptic("soft")
-    if (mockEnabled) return
+    if (mockEnabled) return true
     await Promise.all([refreshMessages(sessionID), refreshPermissions(sessionID), refreshQuestions(sessionID)])
+    return true
   }
 
   const createSession = async () => {
@@ -1106,9 +1299,6 @@ export function App() {
       questions: questions[sid]?.length ?? 0,
       busySince: Date.now(),
     })
-    // Ensure list shows active immediately even before SSE arrives
-    void refresh()
-    void reconcileActiveSessions(client!)
     try {
       // The session's stored model is what the server would otherwise use, but
       // the OpenRouter upstream pin is not part of it: `ModelRef` has no field
@@ -1128,8 +1318,8 @@ export function App() {
         },
         { throwOnError: true },
       )
-      // Don't block on full snapshot — SSE will stream deltas token-by-token
-      void refreshMessages()
+      // The native/compat stream owns the incremental projection. Successful
+      // prompt admission is not a reason to re-fetch the entire active history.
       triggerHaptic("soft")
     } catch (e) {
       setState({ draft: text, error: e instanceof Error ? e.message : "Send failed" })
@@ -1351,40 +1541,54 @@ export function App() {
     }
     const resumeSync = () => {
       if (!client || state.status !== "connected" || document.visibilityState !== "visible") return
-      // Mobile browsers commonly suspend SSE while backgrounded. Restarting
-      // on foreground and reconciling snapshots closes that unobservable gap.
-      startEventLoop(client)
-      void Promise.all([
-        refresh(),
-        reconcileActiveSessions(client),
-        state.activeSessionID ? refreshMessages(state.activeSessionID) : Promise.resolve(),
-      ])
+      if (!eventsAbort || eventsAbort.signal.aborted) startEventLoop(client)
+      const active = state.activeSessionID
+      if (active && staleMessageSessions.has(active)) {
+        staleMessageSessions.delete(active)
+        void refreshMessages(active)
+      }
+    }
+    const visibilitySync = () => {
+      if (document.visibilityState === "visible") {
+        resumeSync()
+        return
+      }
+      // A background phone should not remain an expensive live subscriber.
+      // First project the already-admitted bounded tail so the cursor and UI
+      // agree, then close the socket. Foreground creates a fresh subscription
+      // carrying Last-Event-ID and receives only the replay suffix.
+      flushMessageEvents()
+      eventsAbort?.abort()
+      eventsAbort = undefined
     }
     const pushNavigate = (e: Event) => {
       const url = (e as CustomEvent<{ url: string }>).detail?.url
       if (!url) return
-      const match = new URL(url, location.origin).pathname.match(/\/session\/([^/]+)/)
-      if (match) {
-        setState({ page: "sessions", activeSessionID: match[1] })
-        triggerHaptic("selection")
+      const sessionID = sessionIDFromNavigationUrl(url, location.origin)
+      if (!sessionID) return
+      setState("page", "sessions")
+      if (!client && !mockEnabled) {
+        pendingNavigationSessionID = sessionID
+        return
       }
+      void selectSession(sessionID)
     }
     window.addEventListener("beforeinstallprompt", handler as any)
     window.addEventListener("online", resumeSync)
     window.addEventListener("opencode:push-navigate", pushNavigate)
-    document.addEventListener("visibilitychange", resumeSync)
+    document.addEventListener("visibilitychange", visibilitySync)
     const activePoll = window.setInterval(() => {
       if (!client || state.status !== "connected" || document.visibilityState !== "visible") return
-      // The stream is live-only and can lose events on mobile network changes.
-      // This cheap process-local snapshot is a safety net, not the primary feed.
+      // Low-frequency runtime reconciliation is a safety net for compatibility
+      // servers/status events, not reconnect repair. Keep it lifecycle-visible.
       void reconcileActiveSessions(client)
-    }, 15_000)
+    }, 60_000)
     onCleanup(() => {
       clearInterval(activePoll)
       window.removeEventListener("beforeinstallprompt", handler as any)
       window.removeEventListener("online", resumeSync)
       window.removeEventListener("opencode:push-navigate", pushNavigate)
-      document.removeEventListener("visibilitychange", resumeSync)
+      document.removeEventListener("visibilitychange", visibilitySync)
     })
     if (mockEnabled) {
       // Dev visual-QA mode: render the connected UI against fake data.
@@ -1426,7 +1630,11 @@ export function App() {
       setRuntimes("s1", { status: "generating", permissions: 0, questions: 0, busySince: Date.now() - 37_000 })
       setRuntimes("s2", { status: "waiting_permission", permissions: 1, questions: 0 })
       setPermissions("s2", [{ id: "p1", sessionID: "s2", action: "bash", resources: ["bun install"] }] as any)
-      if (!new URLSearchParams(location.search).has("large")) void selectSession("s1")
+      if (!new URLSearchParams(location.search).has("large")) {
+        const navigationTarget = pendingNavigationSessionID
+        pendingNavigationSessionID = undefined
+        void selectSession(navigationTarget ?? "s1")
+      }
       return
     }
     if (state.pairing) void connectFromPair()
@@ -1635,6 +1843,7 @@ export function App() {
             <ChatView
               session={sess()}
               messages={state.messages}
+              messageStructureRevision={messageStructureRevision()}
               runtimeStatus={activeRuntime().status}
               busySince={activeRuntime().busySince}
               contextTotal={contextTotals()[sess().id] ?? 0}

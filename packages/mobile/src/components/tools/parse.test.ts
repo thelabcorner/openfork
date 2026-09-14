@@ -1,5 +1,6 @@
 import { describe, expect, test } from "bun:test"
 import {
+  boundedToolPreview,
   looksLikeMarkdown,
   parseGit,
   parseJobBlock,
@@ -105,6 +106,23 @@ describe("parseToolText", () => {
   test("preserves the alignment of a fixed-width table", () => {
     const table = "Job                Status\njob_1              running"
     expect(parseToolText(table).blocks).toEqual([{ kind: "text", text: table }])
+  })
+})
+
+describe("boundedToolPreview", () => {
+  test("does not copy or truncate ordinary output", () => {
+    expect(boundedToolPreview("abc", 10)).toEqual({ text: "abc", truncated: false, sourceChars: 3 })
+  })
+
+  test("bounds jumbo parsing input while retaining both ends", () => {
+    const source = `HEAD-${"x".repeat(1000)}-TAIL`
+    const preview = boundedToolPreview(source, 100)
+    expect(preview.truncated).toBe(true)
+    expect(preview.sourceChars).toBe(source.length)
+    expect(preview.text.length).toBeLessThan(180)
+    expect(preview.text.startsWith("HEAD-")).toBe(true)
+    expect(preview.text.endsWith("-TAIL")).toBe(true)
+    expect(preview.text).toContain("omitted")
   })
 })
 

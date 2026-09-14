@@ -3,6 +3,7 @@ import type { ToolPart } from "@opencode-ai/sdk/v2/client"
 import { CopyChip, LiveTimer, Section, inputString, stripAnsi } from "./shared"
 import { parseShellOutput, type ParsedShellOutput, type ShellOutputStyle } from "./ansi"
 import { tokenizeCommand } from "./command"
+import { boundedToolPreview, bytes } from "./parse"
 
 export function shellMeta(part: ToolPart): Record<string, unknown> {
   return ((part.state as { metadata?: Record<string, unknown> }).metadata ?? {}) as Record<string, unknown>
@@ -33,7 +34,11 @@ export function ShellExitBadge(props: { part: ToolPart }) {
     // Fall back to a trailing "Exit code: N" line some servers emit in output.
     const status = props.part.state.status
     if (status !== "completed") return undefined
-    const match = /exit(?:\s+code)?[: ]+(\d+)\s*$/i.exec(stripAnsi((props.part.state as { output?: string }).output ?? "").trimEnd())
+    const output = (props.part.state as { output?: string }).output ?? ""
+    // Exit status is a tail property. Never run the ANSI stripper over an 8 MiB
+    // result merely to decorate a collapsed header.
+    const tail = output.length > 4096 ? output.slice(-4096) : output
+    const match = /exit(?:\s+code)?[: ]+(\d+)\s*$/i.exec(stripAnsi(tail).trimEnd())
     return match ? Number(match[1]) : undefined
   })
   return (
@@ -170,22 +175,32 @@ export function OutputBlock(props: { parsed: () => ParsedShellOutput; text: () =
 export function ShellToolBody(props: { part: ToolPart }) {
   const command = createMemo(() => inputString(props.part, "command", "script", "description") ?? "")
   const background = createMemo(() => shellMeta(props.part).background === true)
+  const [renderFullOutput, setRenderFullOutput] = createSignal(false)
 
-  const source = createMemo(() => {
+  const authoritativeSource = createMemo(() => {
     const state = props.part.state
     return state.status === "error" ? (state as { error?: string }).error : (state as { output?: string }).output
+  })
+  const source = createMemo(() => {
+    const output = authoritativeSource() ?? ""
+    return renderFullOutput()
+      ? { text: output, truncated: false, sourceChars: output.length }
+      : boundedToolPreview(output)
   })
 
   // No stripAnsi here: parseShellOutput consumes the escapes and turns them
   // into styled runs. It also resolves carriage-return line redraws, which
   // stripAnsi never did — that is what collapsed npm/vitest progress spam.
-  const parsed = createMemo(() => parseShellOutput(source() ?? ""))
+  const parsed = createMemo(() => parseShellOutput(source().text))
   const text = createMemo(() => parsed().text)
-  const hasOutput = () => text().trim().length > 0
+  const hasOutput = () => (authoritativeSource()?.length ?? 0) > 0
 
-  // The copy affordance offers what a terminal would: the command and its
-  // output, not the escape codes.
-  const copyText = createMemo(() => `$ ${command()}${hasOutput() ? "\n\n" + text() : ""}`)
+  // Keep the authoritative result available without precomputing another giant
+  // parsed string. CopyChip calls this accessor only on an explicit click.
+  const copyText = () => {
+    const output = authoritativeSource() ?? ""
+    return `$ ${command()}${output ? "\n\n" + stripAnsi(output) : ""}`
+  }
 
   return (
     <div class="shell-body" dir="ltr">
@@ -210,7 +225,20 @@ export function ShellToolBody(props: { part: ToolPart }) {
 
       <Show when={hasOutput()}>
         <Section label="Output">
-          <OutputBlock parsed={parsed} text={text} />
+          <>
+            <OutputBlock parsed={parsed} text={text} />
+            <Show when={source().truncated}>
+              <button
+                class="shell-more"
+                onClick={(event) => {
+                  event.stopPropagation()
+                  setRenderFullOutput(true)
+                }}
+              >
+                Render full output ({bytes(source().sourceChars)})
+              </button>
+            </Show>
+          </>
         </Section>
       </Show>
 

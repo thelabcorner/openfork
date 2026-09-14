@@ -67,11 +67,11 @@ export function SessionsView(props: {
     Object.values(props.runtimes).reduce((n, r) => n + r.permissions + r.questions, 0),
   )
 
-  const generatingIDs = createMemo(() =>
+  const generatingIDs = createMemo(() => new Set(
     filtered()
       .filter((s) => props.runtimes[s.id]?.status === "generating" || props.runtimes[s.id]?.status === "retry" || (props.runtimes[s.id]?.permissions ?? 0) > 0 || (props.runtimes[s.id]?.questions ?? 0) > 0)
       .map((s) => s.id),
-  )
+  ))
 
   const projectById = createMemo(() => {
     const m = new Map<string, Project>()
@@ -121,8 +121,8 @@ export function SessionsView(props: {
   )
 
   // Separate generating from rest for Recent so Active stays pinned at top (not virtualized — tiny)
-  const recentRest = createMemo(() => filtered().filter((s) => !(tab() === "recent" && !search() && generatingIDs().includes(s.id))))
-  const recentGenerating = createMemo(() => filtered().filter((s) => tab() === "recent" && !search() && generatingIDs().includes(s.id)))
+  const recentRest = createMemo(() => filtered().filter((s) => !(tab() === "recent" && !search() && generatingIDs().has(s.id))))
+  const recentGenerating = createMemo(() => filtered().filter((s) => tab() === "recent" && !search() && generatingIDs().has(s.id)))
 
   const ROW_H = 74
   const HEADER_H = 32
@@ -181,7 +181,7 @@ export function SessionsView(props: {
       </div>
 
       <div class="view-scroll">
-        <Show when={tab() === "recent" && !search() && generatingIDs().length > 0}>
+        <Show when={tab() === "recent" && !search() && generatingIDs().size > 0}>
           <div class="list-section-label">Active</div>
           <For each={recentGenerating()}>{row}</For>
           <div class="list-section-label">All</div>
@@ -230,7 +230,7 @@ export function SessionsView(props: {
             }
           >
             {/* Recent / Archived — virtualized rest. For <80 items the VirtualList auto-falls back to plain For. */}
-            <Show when={tab() === "recent" && !search() && generatingIDs().length > 0} fallback={
+            <Show when={tab() === "recent" && !search() && generatingIDs().size > 0} fallback={
               <VirtualList
                 items={filtered()}
                 estimateSize={ROW_H}

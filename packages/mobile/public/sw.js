@@ -45,7 +45,23 @@ self.addEventListener("push", (event) => {
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close()
-  const target = new URL(event.notification.data?.navigate ?? "/", self.location.origin).href
+  const requested = new URL(event.notification.data?.navigate ?? "/", self.location.origin)
+  // `/session/:id` is also an API route on same-origin deployments. Opening it
+  // as a document can therefore return session JSON instead of the PWA shell.
+  // Normalize notification session targets onto the root document and carry
+  // only the session id in the query string. Warm and cold clicks now use the
+  // exact same non-conflicting URL contract.
+  const session = requested.pathname.match(/^\/session\/([^/]+)\/?$/)?.[1]
+  const target = (() => {
+    if (!session) return requested.href
+    const app = new URL("/", self.location.origin)
+    try {
+      app.searchParams.set("session", decodeURIComponent(session))
+    } catch {
+      app.searchParams.set("session", session)
+    }
+    return app.href
+  })()
   event.waitUntil(
     (async () => {
       const windows = await self.clients.matchAll({ type: "window", includeUncontrolled: true })

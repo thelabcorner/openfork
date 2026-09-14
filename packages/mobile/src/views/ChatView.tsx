@@ -6,7 +6,7 @@ import type {
   Session,
   SnapshotFileDiff,
 } from "@opencode-ai/sdk/v2/client"
-import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount } from "solid-js"
+import { For, Index, Show, createEffect, createMemo, createSignal, onCleanup, onMount, untrack } from "solid-js"
 import type { MessageBundle } from "../api"
 import type { KillShellFn } from "../components/tools/registry"
 import type { ModelPickerExtras } from "../components/ModelPicker"
@@ -23,6 +23,7 @@ import type { RuntimeStatus } from "../components/SessionStatus"
 import { SessionStatusDot } from "../components/SessionStatus"
 import { Sheet } from "../components/Sheet"
 import { TelemetrySheet } from "../components/TelemetrySheet"
+import { VirtualList } from "../components/VirtualList"
 import { formatCost, formatTokens, shortModel } from "../format"
 import {
     IconArrowDown,
@@ -36,10 +37,12 @@ import {
 } from "../icons"
 
 type ChatSheet = "model" | "telemetry" | "agents" | "diff" | "permission" | "question" | "overflow" | null
+const CHAT_WINDOW_THRESHOLD = 160
 
 export function ChatView(props: {
   session: Session
   messages: MessageBundle[]
+  messageStructureRevision: number
   runtimeStatus: RuntimeStatus
   busySince?: number
   contextTotal: number
@@ -189,23 +192,62 @@ export function ChatView(props: {
   })
 
   const toolCallCount = createMemo(() =>
-    props.messages.reduce((n, m) => n + m.parts.filter((p) => p.type === "tool").length, 0),
+    {
+      // Token deltas replace one bundle but do not change message/part
+      // membership. Depend on the explicit structural revision, then inspect
+      // history untracked so one growing text part cannot trigger O(history)
+      // analytics work at token rate.
+      props.messageStructureRevision
+      return untrack(() => props.messages.reduce((n, m) => n + m.parts.filter((p) => p.type === "tool").length, 0))
+    },
   )
 
   const agents = createMemo<AgentEntry[]>(() => {
-    const list: AgentEntry[] = []
-    props.messages.forEach((bundle, bi) => {
-      bundle.parts.forEach((part) => {
-        if (part.type !== "subtask") return
-        const isLastBundle = bi === props.messages.length - 1
-        const running = isLastBundle && props.runtimeStatus === "generating"
-        list.push({ part, running })
+    props.messageStructureRevision
+    const generating = props.runtimeStatus === "generating"
+    return untrack(() => {
+      const list: AgentEntry[] = []
+      props.messages.forEach((bundle, bi) => {
+        bundle.parts.forEach((part) => {
+          if (part.type !== "subtask") return
+          const isLastBundle = bi === props.messages.length - 1
+          const running = isLastBundle && generating
+          list.push({ part, running })
+        })
       })
+      return list
     })
-    return list
   })
 
   const diffs = createMemo<SnapshotFileDiff[]>(() => props.session.summary?.diffs ?? [])
+
+  // The production fetch is deliberately capped at 100 messages, so the common
+  // mobile path should not pay a virtualizer tax. Keep a structural-only row
+  // projection ready for pathological/future deep history, however: token-rate
+  // bundle replacement must not rebuild 5k row descriptors or invalidate the
+  // virtualizer's measurements.
+  const messageRows = createMemo(() => {
+    props.messageStructureRevision
+    return untrack(() => props.messages.map((message, index) => ({ id: message.info.id, index })))
+  })
+  const useVirtualTimeline = createMemo(() => messageRows().length > CHAT_WINDOW_THRESHOLD)
+  const renderMessageAt = (index: number) => {
+    const bundle = () => props.messages[index]
+    return (
+      <Show when={bundle()}>
+        {(current) => (
+          <MessageGroup
+            info={current().info}
+            parts={current().parts}
+            isLast={index === props.messages.length - 1}
+            expandedParts={expandedParts()}
+            onTogglePart={togglePart}
+            killShell={props.killShell}
+          />
+        )}
+      </Show>
+    )
+  }
 
 
 
@@ -320,18 +362,32 @@ export function ChatView(props: {
               </div>
             }
           >
-            <Index each={props.messages}>
-              {(bundle, i) => (
-                <MessageGroup
-                  info={bundle().info}
-                  parts={bundle().parts}
-                  isLast={i === props.messages.length - 1}
-                  expandedParts={expandedParts()}
-                  onTogglePart={togglePart}
-                  killShell={props.killShell}
-                />
-              )}
-            </Index>
+            <Show
+              when={useVirtualTimeline()}
+              fallback={
+                <Index each={props.messages}>
+                  {(bundle, i) => (
+                    <MessageGroup
+                      info={bundle().info}
+                      parts={bundle().parts}
+                      isLast={i === props.messages.length - 1}
+                      expandedParts={expandedParts()}
+                      onTogglePart={togglePart}
+                      killShell={props.killShell}
+                    />
+                  )}
+                </Index>
+              }
+            >
+              <VirtualList
+                items={messageRows()}
+                scrollRef={() => scrollRef}
+                estimateSize={(row) => (untrack(() => props.messages[row.index]?.info.role) === "user" ? 88 : 148)}
+                overscan={8}
+                getKey={(row) => row.id}
+                renderItem={(row) => renderMessageAt(row.index)}
+              />
+            </Show>
           </Show>
         </div>
       </div>

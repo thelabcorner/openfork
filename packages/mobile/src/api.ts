@@ -252,11 +252,26 @@ export async function openEvents(
   signal: AbortSignal,
   channel: "current" | "compatibility",
   onEvent: (event: unknown) => void,
+  state?: { lastEventId?: string; onCursor?: (id: string) => void },
 ) {
-  const options = { signal, sseMaxRetryAttempts: 0 }
-  // Current sessions publish native events through /api/event. Desktop can
-  // still run compatibility sessions, whose cross-directory feed is
-  // /global/event. Mobile displays both, so it must consume both feeds.
+  // Keep one generated SSE stream instance alive across transient failures.
+  // The SDK retains its Last-Event-ID inside that instance, so reconnects can
+  // consume the server replay suffix instead of throwing the cursor away and
+  // forcing the app to hydrate snapshots. Backoff is jittered/capped by the
+  // generated transport; abort remains the lifecycle boundary.
+  const options = {
+    signal,
+    ...(state?.lastEventId ? { headers: { "Last-Event-ID": state.lastEventId } } : {}),
+    sseDefaultRetryDelay: 500,
+    sseMaxRetryDelay: 10_000,
+    onSseEvent: (frame: { id?: string }) => {
+      if (frame.id) state?.onCursor?.(frame.id)
+    },
+  }
+  // Modern servers publish the shared SessionTable through native /api/event,
+  // including rows created by legacy session handlers. Older compatibility
+  // servers use /global/event. App bootstrap capability-selects exactly one
+  // channel, avoiding duplicate sockets and legacy bridge work on V2 servers.
   const response = channel === "current" ? await client.v2.event.subscribe(options) : await client.global.event(options)
   for await (const event of response.stream) {
     if (signal.aborted) return

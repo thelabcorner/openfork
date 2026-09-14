@@ -37,7 +37,15 @@ function segmentParts(parts: Part[]): Segment[] {
   return segments
 }
 
-function ReasoningBlock(props: { id: string; text: string; streaming: boolean; expanded: boolean; onToggle: () => void }) {
+function ReasoningBlock(props: {
+  id: string
+  text: string
+  streaming: boolean
+  appendFrom?: number
+  appendDelta?: string
+  expanded: boolean
+  onToggle: () => void
+}) {
   const expanded = () => props.streaming || props.expanded
   const lines = createMemo(() => (props.text ? props.text.split("\n").length : 0))
   const hasText = () => props.text.trim().length > 0
@@ -53,7 +61,12 @@ function ReasoningBlock(props: { id: string; text: string; streaming: boolean; e
       <Show when={expanded()}>
         <div class="msg-reasoning-body">
           <Show when={hasText()} fallback={<div class="reasoning-shimmer"><span class="dot" /><span class="dot" /><span class="dot" /></div>}>
-            <Markdown text={props.text} streaming={props.streaming} />
+            <Markdown
+              text={props.text}
+              streaming={props.streaming}
+              appendFrom={props.appendFrom}
+              appendDelta={props.appendDelta}
+            />
           </Show>
         </div>
       </Show>
@@ -85,7 +98,12 @@ function SegmentBlock(props: {
     return (
       <Show when={(part() as Extract<Part, { type: "text" }>).text.trim()}>
         <div class="assistant-text">
-          <Markdown text={(part() as Extract<Part, { type: "text" }>).text} streaming={props.streaming} />
+          <Markdown
+            text={(part() as Extract<Part, { type: "text" }>).text}
+            streaming={props.streaming}
+            appendFrom={(part() as any).__mobileAppendFrom}
+            appendDelta={(part() as any).__mobileAppendDelta}
+          />
           <Show when={props.streaming}><span class="stream-caret" aria-hidden="true" /></Show>
         </div>
       </Show>
@@ -98,6 +116,8 @@ function SegmentBlock(props: {
         id={reasoning().id}
         text={reasoning().text}
         streaming={props.streaming}
+        appendFrom={(reasoning() as any).__mobileAppendFrom}
+        appendDelta={(reasoning() as any).__mobileAppendDelta}
         expanded={props.expandedParts.has(reasoning().id)}
         onToggle={() => props.onTogglePart(reasoning().id)}
       />
