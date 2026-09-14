@@ -328,7 +328,99 @@ should be written before the tool ships, not after.
 
 ---
 
-## 9. Revised phasing
+## 9. C8 - The custom tool becomes an agent-authored lazy tool (new since the last pass)
+
+A capability landed after this review was first written that changes the library half of the plan: the
+registry now has a first-class lazy exposure policy and a stable broker.
+
+Verified ground truth (checked against the tree before writing this):
+
+- tool/tool.ts:60-69 - Tool.Def.exposure?: default | lazy. Lazy tools stay registered
+  internally but are omitted from the provider manifest.
+- tool/access.ts - one provider-visible broker, id tool, with a fixed tiny schema
+  (action: list | describe | call). On call it fires the tool.execute.before/after plugin
+  hooks for the delegated tool and passes the original Tool.Context straight through, so the
+  delegated tool's own ctx.ask permission evaluation still runs. Six builtins already register
+  lazy: archive, checkpoint, json, refactor, sqlite, sympy, test.
+- tool/registry.ts - refreshCustom() rebuilds the broker catalog atomically; the swap only
+  affects the *next* resolve.
+- session/tools.ts:51-53 - explicit @tool-id mentions pre-seed the lazy tool's schema into the
+  turn tail (max 4 mentions / 48k chars).
+
+This is a *second* compound tool over tool-shaped things, sitting next to Code Mode's execute.
+
+**What changes.**
+
+1. **Promotion becomes cheap and the admission gate becomes real.** A saved function that has passed
+   its cold-start validation can be promoted to a lazy Tool.Def whose execute closure cold-invokes
+   the revision (gateway-backed once P1 lands), registered through refreshCustom(). Lazy exposure
+   keeps the promotion cache-neutral, which removes C7's last objection to *names becoming visible*.
+   The tool ID is derived from the function name plus the revision hash short-form
+   (custom_sqlite-analyzer_a1b2c3), so an edit mints a new ID and the old registration dies with its
+   revision: R1's hash-keyed trust falls out of the permission namespace instead of needing bespoke
+   pattern syntax. Tool.Def also cannot express a mutable draft, so the lazy surface only ever
+   contains validated functions - the gate is enforced by the type of thing the broker will carry, not
+   by prose.
+2. **Tail injection goes from mechanism to fallback.** C3's anchors-retrieval block is no longer the
+   discovery story; it is the fallback for libraries too large for tool list output. Ordering:
+   @mention pre-seed (exact intent) > tool list/describe (model-driven) > find/tail injection
+   (long-tail libraries). What ships in P2 is a lazy-registration surface plus reuse of the existing
+   @mention pre-seed - *not* an autonomous per-turn retrieval channel. Tail injection is deferred
+   behind reuse-rate evidence, because retrieval that fires every turn is exactly how we would
+   re-create the skills prefix bloat this review complains about.
+3. **tool is one broker too many.** Long-term there should be one capability gateway and one
+   model-facing front door over registry tools, MCP tools, and custom functions, with lazy/deferred
+   exposure as the shared primitive. For now, adding a third surface would be premature convergence:
+   tool and execute have different trust postures (execute children are MCP-gated; lazy tools
+   may run native code), and merging them before the P1 gateway exists would bake a split permission
+   model into the seam that is supposed to remove it. Recorded as an open decision, not silently
+   shipped.
+
+**Deliberately rejected: a create_tool tool.** Letting the agent mint new tool IDs at runtime through
+an action on custom (or a standalone create_tool tool) looks like the obvious way to use the lazy
+registry, and it is wrong twice over. First, it is a prefix-mutation trap: a freshly registered
+default-exposure tool invalidates the cached tool prefix on the next resolve, and a freshly registered
+lazy one rewrites the broker catalog mid-conversation. C7 exists because we already ship that bug in
+Code Mode; create_tool would industrialize it. Second, persistence is an attack surface, not a
+convenience: the R2/R3 rules (provenance, first-call gates) are written against *filesystem* state,
+because .opencode/custom/ is committed, reviewable, and diffable. In-memory registration has no diff,
+no review, no git propagation story, and no provenance anchor. Admission to the lazy surface therefore
+stays exactly where C2 put it: save-to-disk plus cold-start validation, with promotion as a
+side effect.
+
+Corollary: promoted tools are **rebuild-derived state**. They are reconstructed from the filesystem on
+every refreshCustom() / state build, not registered imperatively per session. This is what keeps
+staleness (a function edited by hand between sessions) and cross-session trust coherent without a
+registry migration story.
+
+**What has to be true before this ships** (all four are P2-gating, none is optional):
+
+- *ID stability across turns.* The promote/demote set must be identical across every resolve inside a
+  turn unless the library actually changed. refreshCustom() gives atomic swap, not stability; the
+  promote path must be rebuild-deterministic (sorted IDs, no timestamps in descriptions).
+- *The C7 test extended to the broker.* Assert that promote/demote of any function leaves the
+  provider-visible manifest byte-identical: the tool def's description and JSON schema unchanged,
+  and registry.ids() unchanged.
+- *One-directional exposure.* The model can discover and call promoted functions through tool; it
+  cannot promote, demote, or redefine a lazy registration through tool. Promotion happens via
+  custom actions (a manage subaction) or by editing files. Otherwise the model can stealth-promote
+  arbitrary saved code onto the ambient surface and C2's zero-ceremony save becomes a registry write
+  with no gate at all.
+- *Mentions are not authorization.* Permission.disabled() is already consulted by the pre-seed path,
+  and the delegated call re-runs the target's own permission evaluation via ctx.ask. The promoted
+  def's execute closure must carry the hash-keyed custom_execute check from R1; being mentioned or
+  listed must never substitute for it.
+
+**Relationship to the pre-lazy plan, stated once:** P0 and P1 are untouched - the runtime and the
+gateway do not care how their results are surfaced. C3 is amended (broker-first discovery, tail
+injection deferred to evidence). What the lazy primitive does *not* do: it does not rescue the library
+from the SkillsBench result. Lazy registration makes a validated function cheap to *reach*; it does
+not make the model better at deciding what is worth saving, and the C1 kill criterion stands exactly
+as written.
+
+---
+
+## 10. Revised phasing
 
 ```text
 P0  Runtime, no persistence                                    <- ships alone, useful alone
@@ -364,7 +456,7 @@ the gateway is what makes the runtime worth more than `shell` - without it, `cus
 
 ---
 
-## 10. Resolved open questions
+## 11. Resolved open questions
 
 **Q1 - JS/TS Workbench semantics.** Deferred out of P0 entirely (C6). When it returns, the ranked
 options in prior section 11.3 stand, with one addition that doc did not consider: because the scratch
@@ -404,7 +496,7 @@ systems and two permission models is the outcome to avoid.
 
 ---
 
-## 11. What to measure
+## 12. What to measure
 
 The prior section 35's performance targets are fine. Add the three that decide whether the feature is
 real:
@@ -428,7 +520,7 @@ is the most likely way this feature goes wrong in practice.
 
 ---
 
-## 12. Decisions still open for the product owner
+## 13. Decisions still open for the product owner
 
 1. **Model-facing name.** `custom` is what was requested and it reads well against the library. But a
    tool name is a retrieval cue, and `custom` is semantically empty at the moment the model is deciding
@@ -441,7 +533,7 @@ is the most likely way this feature goes wrong in practice.
 
 ---
 
-## 13. References
+## 14. References
 
 - Cloudflare, "Code Mode: the better way to use MCP" - https://blog.cloudflare.com/code-mode/
 - Cloudflare, "Code Mode: give agents an entire API in 1,000 tokens" - https://blog.cloudflare.com/code-mode-mcp/
