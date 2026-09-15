@@ -17,7 +17,7 @@
 | 00 | [`00-executive-summary.md`](./00-executive-summary.md) | coordinator | pending |
 | 01 | [`01-entrypoint-chain.md`](01-entrypoint-chain.md) | entry-chain | pending |
 | 02 | [`02-main-process.md`](02-main-process.md) | main-proc | pending |
-| 03 | [`03-vite-renderer.md`](03-vite-renderer.md) | vite-lane | pending |
+| 03 | [`03-vite-renderer.md`](03-vite-renderer.md) | vite-lane | closed + revalidated 2026-09-15 |
 | 04 | [`04-backend-link.md`](04-backend-link.md) | backend-link | pending |
 | 05 | [`05-methodology-trials.md`](05-methodology-trials.md) | metrics-harness | pending |
 

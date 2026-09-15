@@ -8,7 +8,7 @@
 import { performance } from "node:perf_hooks"
 import { randomUUID } from "node:crypto"
 
-const bundle = new URL("../../packages/opencode/dist/node/node.js", import.meta.url).href
+const bundle = new URL("../../../../packages/opencode/dist/node/node.js", import.meta.url).href
 const password = randomUUID()
 const auth = "Basic " + Buffer.from(`opencode:${password}`).toString("base64")
 

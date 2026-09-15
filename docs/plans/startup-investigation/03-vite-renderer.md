@@ -84,3 +84,107 @@ Shared-cache state at time of writing: `.vite/deps_temp_{10b0a9f8,2096a261,431b0
 - **metrics-harness**: your c1 cleared the shared cache; as of now it is still cold (only orphaned temp dirs remain) — factor into any further trials. My numbers cross-check yours: isolated cold delta ≈ +21s vs your cold≈warm wall-clock ⇒ overlap conclusion holds.
 - **main-proc**: nothing in renderer config blocks main-process boot; `opencode:copy-server-assets` copies `.wasm`s synchronously in `writeBundle` (build phase, not dev-server path).
 - Coordinator: items 2/3/5 are cheap, high-confidence fixes; item 2 needs an app-owner decision on shiki usage.
+
+## 2026-09-14 follow-up closeout
+
+The August measurements above remain useful historical evidence, but the startup
+graph changed substantially during the September optimization campaign. In
+particular, the original static-import crawler was found to over-traverse some
+transformed output, so the old ~10-17s "renderer graph" figures must not be
+compared directly with the corrected probe below.
+
+### Landed architecture changes
+
+- Desktop `predev` no longer compiles the unused V2 CLI and force-rebuilds the
+  V1 sidecar on every launch. The current warm V1 `predev` measured **828.9ms**.
+- The renderer entry is now a small bootstrap which begins sidecar/default-server
+  IPC before lazy-loading `src/renderer/app-shell.tsx`. This overlaps backend
+  startup with the expensive application graph instead of serializing them.
+- Tailwind v4 candidate discovery is explicitly limited to the five runtime
+  source trees (`ui/src`, `app/src`, `session-ui/src`, `desktop/src`,
+  `mobile/src`) instead of walking the monorepo. The source-narrowing change was
+  validated against the previous production stylesheet with identical bytes and
+  SHA-256.
+- `shiki` is excluded from dependency prebundling and worker/dynamic-import deps
+  that otherwise trigger late optimizer reloads are declared explicitly.
+
+### Persistent Tailwind dev cache
+
+Unchanged desktop dev-server restarts now reuse the fully compiled Tailwind
+stylesheet through a dev-only virtual Vite module. A cache hit bypasses the CSS
+and Tailwind transform pipeline entirely. The cache is keyed by the git/source
+state of all five candidate trees plus build-config salts. Dirty/untracked files
+are content-hashed; a content-hash filesystem fallback is used if git is
+unavailable.
+
+Every real Tailwind compile is bracketed by source fingerprints. The compiled
+stylesheet is persisted only when the pre/post fingerprints and source
+generation agree, preventing a watcher-latency race from caching CSS generated
+from a stale source snapshot. Any source add/change/unlink disables the virtual
+cache for the running server, removes the persistent cache, and returns the
+stylesheet to normal Tailwind/Vite HMR for the remainder of that process.
+
+Controlled warm app-shell crawl on the same warmed dependency cache:
+
+| condition | config | create | listen | app-shell crawl | total |
+|---|---:|---:|---:|---:|---:|
+| Tailwind cache miss | 627ms | 63ms | 69ms | **6289ms** | **7118ms** |
+| Tailwind cache hit | 623ms | 65ms | 65ms | **4899ms** | **5725ms** |
+
+The hit saves **1393ms total (19.6%)** and **1390ms of crawl time (22.1%)** in
+the final A/B measurement. The virtual stylesheet module itself transformed in
+**4.73ms**, while the controlled miss spent **3531.86ms** transforming
+`packages/app/src/index.css`; other graph work overlaps that CSS transform, so
+the full 3.5s does not appear one-for-one in total wall time.
+
+Correctness gates completed:
+
+- cached CSS payload matched the normal compiled dev stylesheet byte-for-byte;
+- adversarial add/remove test generated a temporary `mt-[123px]` utility after
+  invalidation and removed it again after the source disappeared;
+- the race guard rejected an intentionally unstable cache capture during that
+  transition, then persisted only after the tree stabilized;
+- production `electron-vite` config contains **zero** Tailwind-cache plugins;
+- full desktop production build completed successfully (4929 renderer modules,
+  renderer build **45.33s** on the measured machine).
+
+The remaining app-shell cost is no longer dominated by one obviously removable
+startup mistake. Further work should be profile-driven and target the remaining
+large eager application/provider graph rather than weakening cache correctness.
+
+## 2026-09-15 startup/sidebar closeout probe
+
+The September 15 pass moved the remaining startup work away from backend
+contention and into the renderer/Vite frontier. The key runtime invariant now is
+that first sidebar rows can paint with the transport scheduler completely idle;
+post-paint backend work is admitted only by active/interactive demand instead of
+passive row visibility.
+
+Final corrected Vite JS-API probes used `/app-shell.tsx` as the renderer-root
+entry. The earlier `/src/renderer/...` form is invalid for this config because
+`packages/desktop/src/renderer` is already Vite's renderer root.
+
+| probe | config | create | listen | sync entry crawl | modules | deferred sidebar crawl | deferred modules | second crawl |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| `final-app-shell-20260915` | 657ms | 134ms | 488ms | **6208ms** | **221** | n/a | n/a | 52ms |
+| `final-app-shell-plus-sidebar-20260915` | 658ms | 135ms | 454ms | **3491ms** | **220** | **269ms** | **170** | 51ms |
+
+The two sync crawl timings should be read as a warm-machine range, not an A/B
+claim: the second run benefits from filesystem/source transform warmth after the
+first. The stable structural finding is the split itself: the full chat sidebar
+body is not in the initial app-shell graph. The app-shell graph is now roughly
+**220-221 synchronous modules**, while the deferred sidebar pane is roughly
+**170 modules** when requested.
+
+The remaining large dev-time spans in the corrected probe are still renderer
+transform/evaluation work. In the final split probe, `/app-shell.tsx` took
+**584ms**, `packages/app/src/app.tsx` took **1327ms**, and the sync graph
+finished after **220 modules**. `chat-sidebar-pane-state.ts` remained in the
+initial graph as a tiny pure helper, while rich metrics modules stayed behind
+interaction/live hydration.
+
+Production validation on the current tree succeeded via the repository-local
+Electron-Vite install from `packages/desktop`: main SSR **32.86s**, preload
+**78ms**, renderer **4948 modules / 41.90s**, exit code 0. Existing non-fatal
+bundle warnings remain around CodeMirror/theme dynamic+static chunking and a
+wasm sourcemap filename collision.

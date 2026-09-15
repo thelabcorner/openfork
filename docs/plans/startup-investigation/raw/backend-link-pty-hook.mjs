@@ -4,7 +4,7 @@
 import { createRequire } from "node:module"
 import { pathToFileURL } from "node:url"
 
-const req = createRequire(new URL("../../packages/desktop/package.json", import.meta.url))
+const req = createRequire(new URL("../../../../packages/desktop/package.json", import.meta.url))
 
 export async function resolve(specifier, context, next) {
   if (specifier === "@lydell/node-pty") {

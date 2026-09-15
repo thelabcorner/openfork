@@ -30,9 +30,9 @@ param(
 
 $ErrorActionPreference = 'Continue'
 $harnessDir = $PSScriptRoot
-$repoRoot = (Resolve-Path (Join-Path $harnessDir '..\..\..')).Path
+$repoRoot = (Resolve-Path (Join-Path $harnessDir '..\..\..\..\..')).Path
 $desktopDir = Join-Path $repoRoot 'packages\desktop'
-$rawDir = Join-Path $repoRoot 'startup-investigation\raw'
+$rawDir = Join-Path $repoRoot 'docs\plans\startup-investigation\raw'
 $logDir = Join-Path $harnessDir 'logs'
 $cpuDir = Join-Path $harnessDir 'cpu'
 $trialsPath = Join-Path $rawDir 'trials.jsonl'
@@ -102,7 +102,10 @@ $sampler = Start-Process -FilePath 'pwsh' -ArgumentList @('-NoProfile', '-File',
 
 # markers: name -> regex ; first matching line records elapsed ms (regexes derived from w1.log actual lines)
 $markers = [ordered]@{
-  t_predev_done_ms   = '(?i)Copied @opencode-ai/cli'
+  # V1 ends predev in build-node (either rebuilt or freshness-hit); V2 ends in
+  # the local CLI copy. Keep this marker compatible with both mutually-exclusive
+  # backend modes rather than assuming the old always-build-both pipeline.
+  t_predev_done_ms   = '(?i)(Build skipped \(up to date\)|Build complete|Copied local OpenFork CLI)'
   t_main_built_ms    = '(?i)main process built successfully'
   t_preload_built_ms = '(?i)preload scripts built successfully'
   t_vite_ready_ms    = '(?i)dev server running for the electron renderer'
@@ -112,6 +115,7 @@ $markers = [ordered]@{
   t_electron_console_ms = 'INFO:CONSOLE'
 }
 $markerHits = @{}
+$startupDiagnostics = [ordered]@{}
 $out = $proc.StandardOutput
 $err = $proc.StandardError
 $outTask = $out.ReadLineAsync()
@@ -131,6 +135,18 @@ while ($true) {
     $line = if ($idx -eq 0) { $outTask.Result } else { $errTask.Result }
     if ($null -eq $line) { $streamEnded = $true; break }
     Write-Stamped $streamName $line
+    if ($line -match '\[startup-diagnostic\]\s+(\{.*\})') {
+      try {
+        $diagnostic = $Matches[1] | ConvertFrom-Json -AsHashtable
+        if ($diagnostic.name -and -not $startupDiagnostics.Contains($diagnostic.name)) {
+          $startupDiagnostics[$diagnostic.name] = $diagnostic
+        }
+      } catch {
+        # Keep the raw stamped line even if a future console wrapper changes the
+        # shape. Trial collection must never fail because optional diagnostics
+        # became unparsable.
+      }
+    }
     foreach ($k in $markers.Keys) {
       if (-not $markerHits.ContainsKey($k) -and $line -match $markers[$k]) { $markerHits[$k] = $sw.ElapsedMilliseconds }
     }
@@ -211,6 +227,7 @@ $rec = [ordered]@{
   cpuLoadPct         = @{ before = $cpuBefore; avg = $cpuAvg; max = $cpuMax }
   viteCache          = @{ before = $viteBefore; after = $viteAfter; clearedForCold = $coldCleared }
   markers            = $markerHits
+  startupDiagnostics = $startupDiagnostics
   timeout            = $timedOut
   streamEnded        = $streamEnded
   leftovers          = $leftovers
