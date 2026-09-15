@@ -251,20 +251,6 @@ const main = Effect.gen(function* () {
   autopsyMark("whenReady-done") // STARTUP-AUTOPSY
   if (!TEST_ONBOARDING) migrate()
   autopsyMark("migrate-done") // STARTUP-AUTOPSY
-  yield* Effect.promise(() => cleanupStoreFiles(app.getPath("userData"))).pipe(
-    Effect.tap((result) =>
-      Effect.sync(() => {
-        if (result.deleted.length === 0) return
-        logger.log("cleaned scoped store files", { count: result.deleted.length, scanned: result.scanned })
-      }),
-    ),
-    Effect.catch((error) =>
-      Effect.sync(() => {
-        logger.warn("failed to clean scoped store files", error)
-      }),
-    ),
-  )
-  autopsyMark("store-cleanup-done") // STARTUP-AUTOPSY
   app.setAsDefaultProtocolClient("opencode")
   registerRendererProtocol()
   wireWebviewHardening(resolveGuestPreloadPath())
@@ -378,6 +364,17 @@ const main = Effect.gen(function* () {
   autopsyMark("windows-restore-start") // STARTUP-AUTOPSY
   const windows = restoreMainWindows()
   autopsyMark("windows-created", { count: windows.length }) // STARTUP-AUTOPSY
+  // Retention cleanup is housekeeping, not a prerequisite for a usable window.
+  // Run it after window creation so a large userData directory cannot extend
+  // the critical path. It only targets legacy scoped .dat stores.
+  void cleanupStoreFiles(app.getPath("userData"))
+    .then((result) => {
+      if (result.deleted.length > 0) {
+        logger.log("cleaned scoped store files", { count: result.deleted.length, scanned: result.scanned })
+      }
+      autopsyMark("store-cleanup-done") // STARTUP-AUTOPSY
+    })
+    .catch((error) => logger.warn("failed to clean scoped store files", error))
   if (windows.length) createMenu(menuDeps)
   const loadingTask = yield* Effect.gen(function* () {
     logger.log("sidecar connection started", { version: SIDECAR_VERSION })

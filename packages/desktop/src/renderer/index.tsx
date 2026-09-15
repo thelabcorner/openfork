@@ -1,36 +1,69 @@
 // @refresh reload
 
-import {
-  ACCEPTED_FILE_EXTENSIONS,
-  AppBaseProviders,
-  AppInterface,
-  loadLocaleDict,
-  normalizeLocale,
-  type Locale,
-  type Platform,
-  PlatformProvider,
-  createDraftStore,
-  ServerConnection,
-  useCommand,
-  useWslServers,
-  useLanguage,
-} from "@opencode-ai/app"
+import type { Platform } from "../../../app/src/context/platform"
+import type { ServerConnection } from "../../../app/src/context/server"
 import type { UpdaterState } from "@opencode-ai/app/updater"
-import * as Sentry from "@sentry/solid"
-import { createMemoryHistory, MemoryRouter, type BaseRouterProps } from "@solidjs/router"
-import { createEffect, createMemo, createResource, createSignal, onCleanup, Show } from "solid-js"
+import { createResource, createSignal, lazy, Show, Suspense } from "solid-js"
 import { render } from "solid-js/web"
 import pkg from "../../package.json"
-import { t } from "./i18n"
-import { initializationData } from "./initialization"
-import { DesktopFirstLaunchOnboarding } from "./onboarding"
 import { resetZoom, setPinchZoomEnabled, webviewZoom, zoomIn, zoomOut } from "./webview-zoom"
 import { windowFullscreen } from "./window-fullscreen"
-import { availableStartupServer, readyWslConnections } from "./wsl/connections"
 import { createDesktopStorage } from "./storage"
-import "./styles.css"
-import { Splash } from "@opencode-ai/ui/logo"
-import { useTheme } from "@opencode-ai/ui/theme/context"
+
+function createLazyDesktopDraftStore(): NonNullable<Platform["draftStore"]> {
+  let store: Promise<NonNullable<Platform["draftStore"]>> | undefined
+  const load = () => {
+    store ??= import("../../../app/src/utils/draft-store").then(({ createDraftStore }) =>
+      createDraftStore({
+        get: window.api.draftGet,
+        set: window.api.draftSet,
+        remove: window.api.draftDelete,
+        putBlob: (blob) => blob.arrayBuffer().then(window.api.draftBlobPut),
+        getBlob: (id) => window.api.draftBlobGet(id).then((data) => data && new Blob([data])),
+      }),
+    )
+    return store
+  }
+
+  return {
+    getItem: (key) => load().then((value) => value.getItem(key)),
+    setItem: (key, value) => load().then((item) => item.setItem(key, value)),
+    removeItem: (key) => load().then((value) => value.removeItem(key)),
+    putBlob: (blob) => load().then((value) => value.putBlob(blob)),
+    flush: () => load().then((value) => value.flush()),
+  }
+}
+
+function initSentryAfterFirstPaint() {
+  if (!import.meta.env.VITE_SENTRY_DSN) return
+  void import("@sentry/solid").then((Sentry) =>
+    Sentry.init({
+      dsn: import.meta.env.VITE_SENTRY_DSN,
+      environment: import.meta.env.VITE_SENTRY_ENVIRONMENT ?? import.meta.env.MODE,
+      release: import.meta.env.VITE_SENTRY_RELEASE ?? `desktop@${pkg.version}`,
+      initialScope: {
+        tags: {
+          platform: "desktop",
+        },
+      },
+      integrations: (integrations) =>
+        integrations.filter(
+          (i) =>
+            i.name !== "Breadcrumbs" &&
+            !(
+              import.meta.env.OPENCODE_CHANNEL === "prod" &&
+              (i.name === "GlobalHandlers" || i.name === "BrowserApiErrors")
+            ),
+        ),
+    }),
+  )
+}
+
+const startupLog = (name: string) => {
+  if (!import.meta.env.DEV) return
+  console.info(`[startup-perf] ${JSON.stringify({ name, ms: Math.round(performance.now() * 100) / 100 })}`)
+}
+startupLog("desktop.bootstrap.module")
 
 // ── Desktop outside Electron (5173 preview) ─────────────────────────────────
 // 5173 is electron-vite’s renderer dev server, NOT the mobile PWA. The PWA
@@ -62,6 +95,14 @@ if (typeof window !== "undefined" && !(window as unknown as { api?: unknown }).a
   ) as unknown as typeof window.api
 }
 
+// Start downloading/transforming the heavy shell as soon as the tiny bootstrap
+// has established its Electron-or-preview API contract. Window identity is
+// still required before we *mount* the shell (it selects the correct persisted
+// route), but it must not serialize the shell graph behind that IPC round-trip.
+const desktopAppShellModule = import("./app-shell")
+const DesktopAppShell = lazy(() => desktopAppShellModule)
+startupLog("desktop.app-shell.requested")
+
 window.addEventListener(
   "error",
   (event) => {
@@ -78,30 +119,7 @@ window.addEventListener("contextmenu", (event) => {
 
 const root = document.getElementById("root")
 if (import.meta.env.DEV && !(root instanceof HTMLElement)) {
-  throw new Error(t("desktop.error.dev.rootNotFound"))
-}
-
-if (import.meta.env.VITE_SENTRY_DSN) {
-  Sentry.init({
-    dsn: import.meta.env.VITE_SENTRY_DSN,
-    environment: import.meta.env.VITE_SENTRY_ENVIRONMENT ?? import.meta.env.MODE,
-    release: import.meta.env.VITE_SENTRY_RELEASE ?? `desktop@${pkg.version}`,
-    initialScope: {
-      tags: {
-        platform: "desktop",
-      },
-    },
-    integrations: (integrations) => {
-      return integrations.filter(
-        (i) =>
-          i.name !== "Breadcrumbs" &&
-          !(
-            import.meta.env.OPENCODE_CHANNEL === "prod" &&
-            (i.name === "GlobalHandlers" || i.name === "BrowserApiErrors")
-          ),
-      )
-    },
-  })
+  throw new Error("Desktop renderer root not found")
 }
 
 const [updaterState, setUpdaterState] = createSignal<UpdaterState>({ status: "disabled" })
@@ -124,34 +142,6 @@ const emitDeepLinks = (urls: string[]) => {
 const listenForDeepLinks = () => {
   void window.api.consumeInitialDeepLinks().then((urls) => emitDeepLinks(urls))
   return window.api.onDeepLink((urls) => emitDeepLinks(urls))
-}
-
-function windowLastActiveUrlKey(windowID: string) {
-  return `opencode.desktop.window.${windowID}.last-active-url`
-}
-
-function getLastActiveUrl(windowID: string) {
-  if (typeof localStorage !== "object") return "/"
-  try {
-    const value = localStorage.getItem(windowLastActiveUrlKey(windowID))
-    if (value?.startsWith("/") && !value.startsWith("//")) return value
-  } catch {}
-  return "/"
-}
-
-function setLastActiveUrl(windowID: string, value: string) {
-  if (typeof localStorage !== "object") return
-  try {
-    localStorage.setItem(windowLastActiveUrlKey(windowID), value)
-  } catch {}
-}
-
-function DesktopMemoryRouter(props: BaseRouterProps & { windowID: string }) {
-  const history = createMemoryHistory()
-  const initialUrl = getLastActiveUrl(props.windowID)
-  if (initialUrl !== "/") history.set({ value: initialUrl, replace: true, scroll: false })
-  onCleanup(history.listen((value) => setLastActiveUrl(props.windowID, value)))
-  return <MemoryRouter {...props} history={history} />
 }
 
 const createPlatform = (windowState: DesktopWindowState): Platform => {
@@ -198,11 +188,14 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
     },
 
     async openAttachmentPickerDialog(opts, onFile) {
+      const extensions =
+        opts?.extensions ??
+        (await import("../../../app/src/constants/file-picker")).ACCEPTED_FILE_EXTENSIONS
       const result = await window.api.openFilePicker({
         multiple: opts?.multiple ?? false,
         title: opts?.title,
         defaultPath: opts?.defaultPath,
-        extensions: opts?.extensions ?? ACCEPTED_FILE_EXTENSIONS,
+        extensions,
       })
       if (!result) return
       try {
@@ -254,15 +247,16 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
     async pathExists(path: string) {
       return window.api.pathExists(path)
     },
+    ...(typeof window.api.resolveExistingPath === "function"
+      ? {
+          async resolveExistingPath(paths: readonly string[]) {
+            return window.api.resolveExistingPath(Array.from(paths))
+          },
+        }
+      : {}),
 
     storage,
-    draftStore: createDraftStore({
-      get: window.api.draftGet,
-      set: window.api.draftSet,
-      remove: window.api.draftDelete,
-      putBlob: (blob) => blob.arrayBuffer().then(window.api.draftBlobPut),
-      getBlob: (id) => window.api.draftBlobGet(id).then((data) => data && new Blob([data])),
-    }),
+    draftStore: createLazyDesktopDraftStore(),
 
     updater: {
       state: updaterState,
@@ -309,7 +303,7 @@ const createPlatform = (windowState: DesktopWindowState): Platform => {
     getDefaultServer: async () => {
       const url = await window.api.getDefaultServerUrl().catch(() => null)
       if (!url) return null
-      return ServerConnection.Key.make(url)
+      return url as ServerConnection.Key
     },
 
     setDefaultServer: async (url: string | null) => {
@@ -358,124 +352,76 @@ window.api.onMenuCommand((id) => {
 listenForDeepLinks()
 
 function LoadingSplash() {
+  const dark = document.documentElement.dataset.colorScheme === "dark"
   return (
-    <div class="h-dvh w-screen flex flex-col items-center justify-center bg-background-base">
-      <Splash class="w-16 h-20 opacity-50 animate-pulse" />
+    <div
+      class="h-dvh w-screen flex flex-col items-center justify-center bg-background-base"
+      style={{
+        position: "fixed",
+        inset: "0",
+        display: "flex",
+        "flex-direction": "column",
+        "align-items": "center",
+        "justify-content": "center",
+        width: "100vw",
+        height: "100vh",
+        background: dark ? "#080808" : "#fafafa",
+      }}
+    >
+      <svg
+        viewBox="0 0 80 100"
+        fill="none"
+        xmlns="http://www.w3.org/2000/svg"
+        aria-hidden="true"
+        style={{ width: "48px", height: "60px", color: dark ? "#e8e8e8" : "#1b1b1b", opacity: "0.52" }}
+      >
+        <path d="M60 80H20V40H60V80Z" fill="currentColor" opacity="0.45" />
+        <path d="M60 20H20V80H60V20ZM80 100H0V0H80V100Z" fill="currentColor" />
+      </svg>
     </div>
   )
 }
 
 function DesktopRoot(props: { windowState: DesktopWindowState }) {
   const platform = createPlatform(props.windowState)
-  const loadLocale = async () => {
-    const current = await platform.storage?.("opencode.global.dat").getItem("language")
-    const legacy = current ? undefined : await platform.storage?.().getItem("language.v1")
-    const raw = current ?? legacy
-    if (!raw) return
-    const locale = raw.match(/"locale"\s*:\s*"([^"]+)"/)?.[1]
-    if (!locale) return
-    const next = normalizeLocale(locale)
-    if (next !== "en") await loadLocaleDict(next)
-    return next satisfies Locale
-  }
-
-  // Fetch sidecar credentials (available immediately, before health check)
-  const [sidecar] = createResource(() => window.api.awaitInitialization())
-
-  const [defaultServer] = createResource(() => platform.getDefaultServer?.())
-  const [locale] = createResource(loadLocale)
-  const router = (props: BaseRouterProps) => (
-    <DesktopMemoryRouter {...props} windowID={platform.windowID ?? "browser"} />
-  )
-  const onboarding = Promise.withResolvers<void>()
-
-  function Inner() {
-    const cmd = useCommand()
-    menuTrigger = (id) => cmd.trigger(id)
-
-    const theme = useTheme()
-
-    createEffect(() => {
-      theme.themeId()
-      theme.mode()
-      const bg = getComputedStyle(document.documentElement).getPropertyValue("--background-base").trim()
-      if (bg) {
-        void window.api.setBackgroundColor(bg)
-      }
-    })
-
-    return null
-  }
-
-  function App() {
-    const wslServers = useWslServers()
-    const language = useLanguage()
-    const ready = createMemo(
-      () => !defaultServer.loading && !sidecar.loading && !locale.loading && !wslServers.isLoading,
-    )
-    const servers = createMemo(() => {
-      const data = initializationData(sidecar)
-      const list: ServerConnection.Any[] = []
-      if (data) {
-        list.push({
-          displayName: language.t("desktop.server.local"),
-          type: "sidecar",
-          variant: "base",
-          http: {
-            url: data.url,
-            username: data.username ?? undefined,
-            password: data.password ?? undefined,
-          },
-        })
-      }
-      list.push(...readyWslConnections(wslServers.data, language.t("wsl.server.label")))
-      return list
-    })
-    const effectiveDefaultServer = createMemo(() =>
-      ServerConnection.Key.make(availableStartupServer(defaultServer.latest, wslServers.data)),
-    )
-    return (
-      <Show when={ready()} fallback={<LoadingSplash />}>
-        <Show when={effectiveDefaultServer()} keyed>
-          {(key) => (
-            <AppInterface
-              defaultServer={key}
-              servers={servers()}
-              router={router}
-              startup={onboarding.promise}
-              serverScoped={
-                <DesktopFirstLaunchOnboarding
-                  initialUrl={getLastActiveUrl(platform.windowID ?? "browser")}
-                  onLoaded={onboarding.resolve}
-                />
-              }
-            >
-              <Inner />
-            </AppInterface>
-          )}
-        </Show>
-      </Show>
-    )
-  }
-
   return (
-    <PlatformProvider value={platform}>
-      <AppBaseProviders
-        locale={locale.latest}
-        onNativeTranslations={(bundle) => void window.api.setNativeTranslations(bundle).catch(() => undefined)}
-      >
-        <Show when={true}>{(_) => <App />}</Show>
-      </AppBaseProviders>
-    </PlatformProvider>
+    <Suspense fallback={<LoadingSplash />}>
+      <DesktopAppShell
+        platform={platform}
+        windowID={platform.windowID ?? "browser"}
+        sidecar={startupSidecar}
+        defaultServer={startupDefaultServer}
+        onboardingPending={startupOnboardingPending}
+        fallback={<LoadingSplash />}
+        setMenuTrigger={(trigger) => {
+          menuTrigger = trigger
+        }}
+      />
+    </Suspense>
   )
 }
+
+// None of these operations depends on the window id. Starting them at module
+// evaluation overlaps backend readiness and persistent-store IPC with the
+// window-id lookup and app-shell transform instead of creating a serial chain.
+const startupSidecar = window.api.awaitInitialization()
+const startupDefaultServer = window.api
+  .getDefaultServerUrl()
+  .then((url) => (url ? (url as ServerConnection.Key) : null))
+  .catch(() => null)
+const startupOnboardingPending = window.api.isFirstLaunchOnboardingPending().catch(() => false)
+void startupSidecar.then(() => startupLog("desktop.sidecar.ready"))
+void startupDefaultServer.then(() => startupLog("desktop.default-server.ready"))
+void startupOnboardingPending.then(() => startupLog("desktop.onboarding-check.ready"))
 
 render(() => {
   const [windowState] = createResource(async () => {
     const api = window.api as typeof window.api & {
       getWindowID?: () => Promise<string>
     }
-    return { id: await api.getWindowID?.() }
+    const id = await api.getWindowID?.()
+    startupLog("desktop.window-id.ready")
+    return { id }
   })
 
   return (
@@ -484,3 +430,14 @@ render(() => {
     </Show>
   )
 }, root!)
+
+// The document contains a dependency-free splash so Electron's first paint is
+// never an empty background while Vite/bootstrap JS is still loading. Solid's
+// fallback above is now mounted and self-styled, so hand off immediately.
+document.getElementById("oc-bootstrap-splash")?.remove()
+document.getElementById("oc-bootstrap-style")?.remove()
+startupLog("desktop.bootstrap.solid-mounted")
+requestAnimationFrame(() => {
+  startupLog("desktop.bootstrap.first-frame")
+  initSentryAfterFirstPaint()
+})

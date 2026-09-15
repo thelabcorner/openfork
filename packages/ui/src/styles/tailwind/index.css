@@ -1,7 +1,20 @@
 @layer theme, base, components, utilities;
 
 @import "tailwindcss/theme.css" layer(theme);
-@import "tailwindcss/utilities.css" layer(utilities) source("../../../../");
+@import "tailwindcss/utilities.css" layer(utilities) source(none);
+
+/*
+ * This stylesheet is consumed only by packages/app. That app is embedded by
+ * desktop/mobile and composes UI from ui + session-ui, so those five source
+ * trees are the complete Tailwind candidate surface. Scanning ../../../../
+ * used to walk every package in the monorepo, including the backend, SDKs,
+ * generators, fixtures, and tests that can never contribute app classes.
+ */
+@source "../..";
+@source "../../../../app/src";
+@source "../../../../session-ui/src";
+@source "../../../../desktop/src";
+@source "../../../../mobile/src";
 @import "./utilities.css";
 
 @import "../index.css";

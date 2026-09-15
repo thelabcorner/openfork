@@ -1,7 +1,11 @@
 import { ServerConnection, useServer, useSettings, useTabs } from "@opencode-ai/app"
 import { onMount } from "solid-js"
 
-export function DesktopFirstLaunchOnboarding(props: { initialUrl: string; onLoaded: () => void }) {
+export function DesktopFirstLaunchOnboarding(props: {
+  initialUrl: string
+  pending: Promise<boolean>
+  onLoaded: () => void
+}) {
   const server = useServer()
   const settings = useSettings()
   const tabs = useTabs()
@@ -12,16 +16,15 @@ export function DesktopFirstLaunchOnboarding(props: { initialUrl: string; onLoad
 
   async function runFirstLaunchOnboarding() {
     try {
+      const [existingInstall, pending] = await Promise.all([window.api.isOldLayoutEligible(), props.pending])
+      settings.general.setOldLayoutEligible(existingInstall)
+      settings.general.initializeAgentVisibility(existingInstall)
+      if (!pending) return
+      if (!server.isLocal()) return
+
       await Promise.all(
         [server.ready.promise, tabs.ready.promise, tabs.recentReady.promise].map((p) => p ?? Promise.resolve()),
       )
-      const existingInstall = await window.api.isOldLayoutEligible()
-      settings.general.setOldLayoutEligible(existingInstall)
-      settings.general.initializeAgentVisibility(existingInstall)
-      if (!server.isLocal()) return
-
-      const pending = await window.api.isFirstLaunchOnboardingPending()
-      if (!pending) return
 
       const shouldTrigger =
         !existingInstall &&
@@ -38,7 +41,7 @@ export function DesktopFirstLaunchOnboarding(props: { initialUrl: string; onLoad
         servers: server.list.map(ServerConnection.key),
       })
 
-      const directory = await (api.finishFirstLaunchOnboarding?.(shouldTrigger) ?? Promise.resolve(null))
+      const directory = await window.api.finishFirstLaunchOnboarding(shouldTrigger)
       if (!shouldTrigger || !directory) return
 
       console.info("[desktop-onboarding] starting first launch draft", { directory })

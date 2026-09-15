@@ -3,6 +3,7 @@ import { defineConfig } from "electron-vite"
 import appPlugin from "@opencode-ai/app/vite"
 import * as fs from "node:fs/promises"
 import { fileURLToPath, pathToFileURL } from "node:url"
+import { tailwindDevCachePlugins } from "./scripts/tailwind-dev-cache"
 
 const OPENCODE_SERVER_DIST = fileURLToPath(new URL("../opencode/dist/node", import.meta.url))
 const OPENCODE_SERVER_FILE = fileURLToPath(new URL("../opencode/dist/node/node.js", import.meta.url))
@@ -115,7 +116,7 @@ const require = __cjs_mod__.createRequire(import.meta.url);
     },
   },
   renderer: {
-    plugins: [appPlugin, sentry],
+    plugins: [command === "serve" && tailwindDevCachePlugins(), appPlugin, sentry],
     publicDir: "../../../app/public",
     root: "src/renderer",
     // Keep Shiki's language registry out of Vite's dependency prebundle. The

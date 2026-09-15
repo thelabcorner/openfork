@@ -15,7 +15,13 @@ const outFile = path.join(dir, "dist/node/node.js")
 const compressWorkerFile = path.join(dir, "dist/node/compress-worker.js")
 const decompressWorkerFile = path.join(dir, "dist/node/decompress-worker.js")
 const stampFile = path.join(dir, "dist/node/.build-stamp")
-const stamp = `${Script.version}\0${Script.channel}`
+// Preview Script.version values contain the current UTC minute. That value is
+// useful as build metadata, but it is not an input fingerprint: including it
+// here invalidated an otherwise-current sidecar every minute. Source mtimes
+// below already decide when a preview artifact must be rebuilt. Explicit/release
+// versions remain part of the freshness contract because they are stable inputs.
+const stampVersion = process.env.OPENCODE_VERSION ?? (Script.preview ? `preview:${Script.channel}` : Script.version)
+const stamp = `${stampVersion}\0${Script.channel}`
 
 if (process.env.OPENCODE_FORCE_NODE_BUILD !== "1" && (await isFresh())) {
   console.log("Build skipped (up to date)")
