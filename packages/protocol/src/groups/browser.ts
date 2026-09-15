@@ -65,6 +65,14 @@ export type BrokerError = Schema.Schema.Type<typeof BrokerError>
 
 // --- host registration -------------------------------------------------------
 
+export const VisualHostCapabilities = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  snapeyeProtocolVersion: Schema.Literal(1),
+  operations: Schema.Array(Schema.Literals(["capture", "diff", "record"])),
+  features: Schema.optional(Schema.Array(Schema.Literals(["history", "artifact"]))),
+})
+export type VisualHostCapabilities = Schema.Schema.Type<typeof VisualHostCapabilities>
+
 export const HostCapabilities = Schema.Struct({
   maxSnapshotBytes: Schema.Number,
   maxResultBytes: Schema.Number,
@@ -73,6 +81,12 @@ export const HostCapabilities = Schema.Struct({
   cdp: Schema.Boolean,
   /** Additive protocol-v2 capability: a real-Chrome extension lane is currently reachable. */
   chrome: Schema.optional(Schema.Literal(true)),
+  /**
+   * Additive protocol-v2 capability. `true` is the early capture/diff-only
+   * spelling; structured hosts advertise the exact SnapEye protocol and
+   * operation set without requiring a browser protocol bump.
+   */
+  visual: Schema.optional(Schema.Union([Schema.Literal(true), VisualHostCapabilities])),
 })
 export type HostCapabilities = Schema.Schema.Type<typeof HostCapabilities>
 
@@ -355,6 +369,405 @@ export const ScreenshotInput = Schema.Struct({
   fullPage: Schema.optional(Schema.Boolean),
   timeoutMs: Schema.optional(Schema.Number),
 })
+
+// --- deterministic visual observation (SnapEye) -----------------------------
+
+// Keep the model-facing contract inside the documented SnapEye v0.4 envelope
+// and add bounds around the few browser-owned knobs SnapEye intentionally leaves
+// configurable (notably filmstrip geometry and MediaRecorder bitrate). This is
+// a trust boundary, not merely input cosmetics: an enormous filmstrip gap can
+// otherwise manufacture a very large canvas after the recording frame budget
+// has already done its job.
+// These intentionally mirror Desktop's SnapEye path-safety identifiers so bad
+// identity never crosses the broker boundary merely to be rejected later by
+// the host store. Baseline names may contain single dots; `..` is forbidden.
+const VisualName = Schema.String.check(
+  Schema.isPattern(/^(?!.*\.\.)[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/),
+)
+const VisualRunId = Schema.String.check(
+  Schema.isPattern(/^[A-Za-z0-9_-]{1,64}$/),
+)
+const VisualSelector = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(4096))
+const VisualWaitMs = Schema.Number.check(
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(60_000),
+)
+const VisualTimeoutMs = Schema.Number.check(
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(60_000),
+)
+const VisualOperationTimeoutMs = Schema.Number.check(
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(120_000),
+)
+const VisualInspectionTimeoutMs = Schema.Number.check(
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(30_000),
+)
+const VisualScale = Schema.Number.check(
+  Schema.isGreaterThanOrEqualTo(0.1),
+  Schema.isLessThanOrEqualTo(2),
+)
+const VisualSelectorList = Schema.Array(VisualSelector).check(Schema.isMaxLength(64))
+const VisualAttributeName = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))
+const VisualAttributeNames = Schema.Array(VisualAttributeName).check(Schema.isMaxLength(32))
+const VisualRedactionAttributes = Schema.Array(Schema.Struct({
+  selector: VisualSelector,
+  names: VisualAttributeNames,
+})).check(Schema.isMaxLength(64))
+const VisualDurationMs = PositiveInt.check(Schema.isLessThanOrEqualTo(15_000))
+const VisualFps = Schema.Number.check(
+  Schema.isGreaterThanOrEqualTo(1),
+  Schema.isLessThanOrEqualTo(30),
+)
+// MediaRecorder buffers its chunks in the renderer before the host sees the
+// artifact. 20 Mbps for the maximum 15 s record is ~37.5 MB before container
+// overhead, leaving useful headroom under the 64 MiB per-artifact host ceiling.
+const VisualBitrate = PositiveInt.check(Schema.isLessThanOrEqualTo(20_000_000))
+const VisualFilmstripCells = PositiveInt.check(Schema.isLessThanOrEqualTo(150))
+const VisualFilmstripColumns = PositiveInt.check(Schema.isLessThanOrEqualTo(150))
+const VisualFilmstripWidth = PositiveInt.check(Schema.isLessThanOrEqualTo(4096))
+const VisualFilmstripGap = NonNegativeInt.check(Schema.isLessThanOrEqualTo(128))
+const VisualFilmstripBackground = Schema.String.check(Schema.isMinLength(1), Schema.isMaxLength(128))
+const VisualThreshold = Schema.Number.check(
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(1),
+)
+const VisualTileSize = PositiveInt.check(Schema.isLessThanOrEqualTo(1024))
+const VisualGapTiles = NonNegativeInt.check(Schema.isLessThanOrEqualTo(64))
+const VisualRegionDimension = Schema.Number.check(
+  Schema.isGreaterThanOrEqualTo(0),
+  Schema.isLessThanOrEqualTo(1_000_000),
+)
+const VisualMaxRegions = NonNegativeInt.check(Schema.isLessThanOrEqualTo(256))
+
+export const VisualTarget = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("document") }),
+  Schema.Struct({ kind: Schema.Literal("css"), selector: VisualSelector }),
+  Schema.Struct({ kind: Schema.Literal("element"), target: ElementTarget }),
+])
+export type VisualTarget = Schema.Schema.Type<typeof VisualTarget>
+
+export const VisualWaitFor = Schema.Union([VisualWaitMs, VisualSelector])
+
+export const VisualRedaction = Schema.Struct({
+  blocks: Schema.optional(VisualSelectorList),
+  attributes: Schema.optional(VisualRedactionAttributes),
+})
+export type VisualRedaction = Schema.Schema.Type<typeof VisualRedaction>
+
+export const VisualBaseInput = {
+  tabId: Schema.optional(Schema.String),
+  name: VisualName,
+  runId: Schema.optional(VisualRunId),
+  target: Schema.optional(VisualTarget),
+  stabilize: Schema.optional(Schema.Boolean),
+  waitFor: Schema.optional(VisualWaitFor),
+  waitTimeout: Schema.optional(VisualTimeoutMs),
+  settle: Schema.optional(Schema.Boolean),
+  settleTimeout: Schema.optional(VisualTimeoutMs),
+  scale: Schema.optional(VisualScale),
+  svg: Schema.optional(Schema.Boolean),
+  redact: Schema.optional(VisualRedaction),
+  timeoutMs: Schema.optional(VisualOperationTimeoutMs),
+}
+
+export const VisualCaptureInput = Schema.Struct(VisualBaseInput)
+export type VisualCaptureInput = Schema.Schema.Type<typeof VisualCaptureInput>
+
+export const VisualDiffInput = Schema.Struct({
+  ...VisualBaseInput,
+  threshold: Schema.optional(VisualThreshold),
+  includeAA: Schema.optional(Schema.Boolean),
+  diffMask: Schema.optional(Schema.Boolean),
+  tileSize: Schema.optional(VisualTileSize),
+  gapTiles: Schema.optional(VisualGapTiles),
+  minRegionCssSide: Schema.optional(VisualRegionDimension),
+  minRegionCssArea: Schema.optional(VisualRegionDimension),
+  maxRegions: Schema.optional(VisualMaxRegions),
+})
+export type VisualDiffInput = Schema.Schema.Type<typeof VisualDiffInput>
+
+export const VisualRecordInput = Schema.Struct({
+  ...VisualBaseInput,
+  duration: Schema.optional(VisualDurationMs),
+  fps: Schema.optional(VisualFps),
+  format: Schema.optional(Schema.Literals(["gif", "video", "both"])),
+  bitrate: Schema.optional(VisualBitrate),
+  filmstripMaxCells: Schema.optional(VisualFilmstripCells),
+  filmstripMaxColumns: Schema.optional(VisualFilmstripColumns),
+  filmstripMaxWidth: Schema.optional(VisualFilmstripWidth),
+  filmstripGap: Schema.optional(VisualFilmstripGap),
+  filmstripBackground: Schema.optional(VisualFilmstripBackground),
+})
+export type VisualRecordInput = Schema.Schema.Type<typeof VisualRecordInput>
+
+export const VisualTargetMetadata = Schema.Struct({
+  selector: Schema.optional(Schema.String),
+  descriptor: Schema.optional(Schema.String),
+})
+
+export const VisualImageMetadata = Schema.Struct({
+  coordinateSpace: Schema.Literal("target-css-px"),
+  cssWidth: Schema.Number,
+  cssHeight: Schema.Number,
+  pixelWidth: Schema.Number,
+  pixelHeight: Schema.Number,
+  scale: Schema.Number,
+})
+
+export const VisualArtifactPaths = Schema.Struct({
+  baseline: Schema.optional(Schema.String),
+  current: Schema.optional(Schema.String),
+  svg: Schema.optional(Schema.String),
+  diff: Schema.optional(Schema.String),
+  frames: Schema.optional(Schema.String),
+  gif: Schema.optional(Schema.String),
+  video: Schema.optional(Schema.String),
+})
+
+export const VisualEnvironment = Schema.Struct({
+  schemaVersion: Schema.Literal(1),
+  lane: Schema.Literals(["webview", "extension"]),
+  platform: Schema.String,
+  engine: Schema.Literal("chromium"),
+  engineMajor: Schema.optional(Schema.Number),
+  appearance: Schema.optional(Schema.Literals(["system", "light", "dark"])),
+  snapeyeVersion: Schema.optional(Schema.String),
+  snapdomVersion: Schema.optional(Schema.String),
+  redactionPolicySha256: Schema.optional(Schema.String),
+})
+
+export const VisualDiffRegion = Schema.Struct({
+  x: Schema.Number,
+  y: Schema.Number,
+  width: Schema.Number,
+  height: Schema.Number,
+  aggregate: Schema.Boolean,
+})
+
+export const VisualDiffMetadata = Schema.Struct({
+  changed: Schema.Boolean,
+  changedRatio: Schema.Number,
+  regionCount: Schema.Number,
+  regionsTruncated: Schema.Boolean,
+  regions: Schema.Array(VisualDiffRegion),
+})
+
+export const VisualFilmstripCell = Schema.Struct({
+  cell: Schema.Number,
+  frameIndex: Schema.Number,
+  timestampMs: Schema.Number,
+  x: Schema.Number,
+  y: Schema.Number,
+})
+
+export const VisualFilmstripMetadata = Schema.Struct({
+  file: Schema.Literal("frames.png"),
+  columns: Schema.Number,
+  rows: Schema.Number,
+  cellWidth: Schema.Number,
+  cellHeight: Schema.Number,
+  gap: Schema.Number,
+  width: Schema.Number,
+  height: Schema.Number,
+  cells: Schema.Array(VisualFilmstripCell),
+})
+
+export const VisualRecordMetadata = Schema.Struct({
+  durationRequestedMs: Schema.Number,
+  durationActualMs: Schema.Number,
+  fpsRequested: Schema.Number,
+  fpsActual: Schema.Number,
+  frameCount: Schema.Number,
+  timestampsMs: Schema.Array(Schema.Number),
+  format: Schema.Literals(["gif", "video", "both"]),
+  filmstrip: VisualFilmstripMetadata,
+})
+
+export const VisualErrorPayload = Schema.Struct({
+  code: Schema.String,
+  message: Schema.String,
+  details: Schema.optional(Schema.Unknown),
+})
+
+export const VisualCaptureResult = Schema.Union([
+  Schema.Struct({
+    schemaVersion: Schema.Literal(1),
+    protocolVersion: Schema.Literal(1),
+    runId: Schema.String,
+    status: Schema.Literal("ok"),
+    operation: Schema.Literal("capture"),
+    name: Schema.String,
+    target: VisualTargetMetadata,
+    startedAt: Schema.optional(Schema.String),
+    finishedAt: Schema.optional(Schema.String),
+    image: VisualImageMetadata,
+    timing: Schema.Struct({ captureMs: Schema.Number }),
+    artifacts: VisualArtifactPaths,
+    opencode: Schema.optional(VisualEnvironment),
+  }),
+  Schema.Struct({
+    schemaVersion: Schema.Literal(1),
+    protocolVersion: Schema.Literal(1),
+    runId: Schema.String,
+    status: Schema.Literal("error"),
+    operation: Schema.Literal("capture"),
+    name: Schema.optional(Schema.String),
+    target: Schema.optional(VisualTargetMetadata),
+    startedAt: Schema.optional(Schema.String),
+    finishedAt: Schema.optional(Schema.String),
+    error: VisualErrorPayload,
+    opencode: Schema.optional(VisualEnvironment),
+  }),
+])
+
+export const VisualDiffResult = Schema.Union([
+  Schema.Struct({
+    schemaVersion: Schema.Literal(1),
+    protocolVersion: Schema.Literal(1),
+    runId: Schema.String,
+    status: Schema.Literal("ok"),
+    operation: Schema.Literal("diff"),
+    name: Schema.String,
+    target: VisualTargetMetadata,
+    startedAt: Schema.optional(Schema.String),
+    finishedAt: Schema.optional(Schema.String),
+    image: VisualImageMetadata,
+    timing: Schema.Struct({ captureMs: Schema.Number }),
+    diff: VisualDiffMetadata,
+    artifacts: VisualArtifactPaths,
+    opencode: Schema.optional(VisualEnvironment),
+  }),
+  Schema.Struct({
+    schemaVersion: Schema.Literal(1),
+    protocolVersion: Schema.Literal(1),
+    runId: Schema.String,
+    status: Schema.Literal("error"),
+    operation: Schema.Literal("diff"),
+    name: Schema.optional(Schema.String),
+    target: Schema.optional(VisualTargetMetadata),
+    startedAt: Schema.optional(Schema.String),
+    finishedAt: Schema.optional(Schema.String),
+    error: VisualErrorPayload,
+    opencode: Schema.optional(VisualEnvironment),
+  }),
+])
+
+export const VisualRecordResult = Schema.Union([
+  Schema.Struct({
+    schemaVersion: Schema.Literal(1),
+    protocolVersion: Schema.Literal(1),
+    runId: Schema.String,
+    status: Schema.Literal("ok"),
+    operation: Schema.Literal("record"),
+    name: Schema.String,
+    target: VisualTargetMetadata,
+    startedAt: Schema.optional(Schema.String),
+    finishedAt: Schema.optional(Schema.String),
+    image: VisualImageMetadata,
+    record: VisualRecordMetadata,
+    artifacts: VisualArtifactPaths,
+    opencode: Schema.optional(VisualEnvironment),
+  }),
+  Schema.Struct({
+    schemaVersion: Schema.Literal(1),
+    protocolVersion: Schema.Literal(1),
+    runId: Schema.String,
+    status: Schema.Literal("error"),
+    operation: Schema.Literal("record"),
+    name: Schema.optional(Schema.String),
+    target: Schema.optional(VisualTargetMetadata),
+    startedAt: Schema.optional(Schema.String),
+    finishedAt: Schema.optional(Schema.String),
+    error: VisualErrorPayload,
+    opencode: Schema.optional(VisualEnvironment),
+  }),
+])
+
+export const VisualCaptureOutput = Schema.Struct({ visual: VisualCaptureResult })
+export const VisualDiffOutput = Schema.Struct({ visual: VisualDiffResult })
+export const VisualRecordOutput = Schema.Struct({ visual: VisualRecordResult })
+
+export const VisualHistoryInput = Schema.Struct({
+  maxRuns: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(100))),
+  maxBaselines: Schema.optional(PositiveInt.check(Schema.isLessThanOrEqualTo(200))),
+  timeoutMs: Schema.optional(VisualInspectionTimeoutMs),
+})
+export type VisualHistoryInput = Schema.Schema.Type<typeof VisualHistoryInput>
+
+export const VisualArtifactKind = Schema.Literals([
+  "baseline",
+  "baseline_metadata",
+  "current",
+  "svg",
+  "diff",
+  "frames",
+  "gif",
+  "video",
+  "result",
+])
+export type VisualArtifactKind = Schema.Schema.Type<typeof VisualArtifactKind>
+
+export const VisualArtifactInput = Schema.Union([
+  Schema.Struct({
+    source: Schema.Literal("baseline"),
+    name: VisualName,
+    artifact: Schema.optional(Schema.Literals(["image", "metadata"])),
+    timeoutMs: Schema.optional(VisualInspectionTimeoutMs),
+  }),
+  Schema.Struct({
+    source: Schema.Literal("run"),
+    runId: VisualRunId,
+    artifact: Schema.Literals(["current", "svg", "diff", "frames", "gif", "video", "result"]),
+    timeoutMs: Schema.optional(VisualInspectionTimeoutMs),
+  }),
+])
+export type VisualArtifactInput = Schema.Schema.Type<typeof VisualArtifactInput>
+
+export const VisualBaselineSummary = Schema.Struct({
+  name: Schema.String,
+  imagePath: Schema.String,
+  metadataPath: Schema.optional(Schema.String),
+  byteLength: Schema.Number,
+  capturedAt: Schema.optional(Schema.String),
+  lane: Schema.optional(Schema.Literals(["webview", "extension"])),
+  engineMajor: Schema.optional(Schema.Number),
+  redactionPolicySha256: Schema.optional(Schema.String),
+})
+
+export const VisualRunSummary = Schema.Struct({
+  runId: Schema.String,
+  resultPath: Schema.String,
+  status: Schema.Literals(["ok", "error"]),
+  operation: Schema.Literals(["capture", "diff", "record", "unknown"]),
+  name: Schema.optional(Schema.String),
+  finishedAt: Schema.optional(Schema.String),
+  changed: Schema.optional(Schema.Boolean),
+  frameCount: Schema.optional(Schema.Number),
+  artifacts: Schema.Array(VisualArtifactKind),
+})
+
+export const VisualHistoryOutput = Schema.Struct({
+  history: Schema.Struct({
+    root: Schema.Literal(".snapeye"),
+    baselines: Schema.Array(VisualBaselineSummary),
+    runs: Schema.Array(VisualRunSummary),
+  }),
+})
+export type VisualHistoryOutput = Schema.Schema.Type<typeof VisualHistoryOutput>
+
+export const VisualArtifactDescriptor = Schema.Struct({
+  kind: VisualArtifactKind,
+  path: Schema.String,
+  mime: Schema.String,
+  byteLength: Schema.Number,
+})
+
+export const VisualArtifactOutput = Schema.Struct({
+  artifact: Schema.NullOr(VisualArtifactDescriptor),
+})
+export type VisualArtifactOutput = Schema.Schema.Type<typeof VisualArtifactOutput>
 
 export const AnnotationTone = Schema.Literals(["neutral", "info", "success", "warning", "danger"])
 export type AnnotationTone = Schema.Schema.Type<typeof AnnotationTone>
@@ -806,6 +1219,11 @@ export const BrowserOperation = Schema.Union([
   Schema.Struct({ name: Schema.Literal("set_appearance"), input: SetAppearanceInput }),
   Schema.Struct({ name: Schema.Literal("snapshot"), input: SnapshotInput }),
   Schema.Struct({ name: Schema.Literal("screenshot"), input: ScreenshotInput }),
+  Schema.Struct({ name: Schema.Literal("visual_capture"), input: VisualCaptureInput }),
+  Schema.Struct({ name: Schema.Literal("visual_diff"), input: VisualDiffInput }),
+  Schema.Struct({ name: Schema.Literal("visual_record"), input: VisualRecordInput }),
+  Schema.Struct({ name: Schema.Literal("visual_history"), input: VisualHistoryInput }),
+  Schema.Struct({ name: Schema.Literal("visual_artifact"), input: VisualArtifactInput }),
   Schema.Struct({ name: Schema.Literal("click"), input: ClickInput }),
   Schema.Struct({ name: Schema.Literal("type"), input: TypeInput }),
   Schema.Struct({ name: Schema.Literal("press"), input: PressInput }),

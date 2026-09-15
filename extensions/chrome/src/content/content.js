@@ -1,4 +1,3 @@
-"use strict";
 (() => {
   // src/content/active-tab-favicon.ts
   var ACTIVE_TAB_ICON_ATTRIBUTE = "data-opencode-active-tab-icon";
@@ -10,10 +9,12 @@
       return;
     }
     if (existing) {
-      if (document2.head && existing.parentElement !== document2.head) document2.head.appendChild(existing);
+      if (document2.head && existing.parentElement !== document2.head)
+        document2.head.appendChild(existing);
       return;
     }
-    if (!iconUrl) return;
+    if (!iconUrl)
+      return;
     const icon = document2.createElement("link");
     icon.rel = "icon";
     icon.type = "image/png";
@@ -131,7 +132,8 @@
     }
   `;
     function ensureHost() {
-      if (hostEl && shadow && outlineLayer && cursorEl) return;
+      if (hostEl && shadow && outlineLayer && cursorEl)
+        return;
       if (hostEl && !shadow) {
         hostEl.remove();
         hostEl = null;
@@ -194,8 +196,7 @@
             if (hostEl && !document.documentElement.contains(hostEl)) {
               try {
                 document.documentElement.appendChild(hostEl);
-              } catch {
-              }
+              } catch {}
             }
           });
           domObserver.observe(document.documentElement, { childList: true });
@@ -223,8 +224,7 @@
       domObserver?.disconnect();
       try {
         hostEl?.remove();
-      } catch {
-      }
+      } catch {}
       hostEl = null;
       shadow = null;
       outlineLayer = null;
@@ -249,7 +249,8 @@
       };
     }
     function scheduleRender() {
-      if (rafHandle !== null) return;
+      if (rafHandle !== null)
+        return;
       rafHandle = requestAnimationFrame(() => {
         rafHandle = null;
         flush();
@@ -257,7 +258,8 @@
     }
     function flush() {
       ensureHost();
-      if (!outlineLayer || !cursorEl) return;
+      if (!outlineLayer || !cursorEl)
+        return;
       if (pendingHighlight.length > 0) {
         for (const item of pendingHighlight) {
           const rect = clampRect(item.rect);
@@ -285,20 +287,24 @@
           const y = Math.round(c.y);
           cursorEl.style.transform = `translate3d(${x}px, ${y}px, 0)`;
           cursorEl.style.opacity = "1";
-          if (activeTimeout !== null) window.clearTimeout(activeTimeout);
+          if (activeTimeout !== null)
+            window.clearTimeout(activeTimeout);
           activeTimeout = window.setTimeout(() => {
-            if (cursorEl) cursorEl.style.opacity = "0.35";
+            if (cursorEl)
+              cursorEl.style.opacity = "0.35";
             activeTimeout = null;
           }, CURSOR_ACTIVE_MS);
           if (c.phase === "click" && c.sequence !== lastSequence) {
             lastSequence = c.sequence ?? Date.now();
-            if (pingEl) pingEl.remove();
+            if (pingEl)
+              pingEl.remove();
             pingEl = document.createElement("span");
             pingEl.className = "click-ping animate-status-ping";
             pingEl.setAttribute("aria-hidden", "true");
             cursorEl.appendChild(pingEl);
             window.setTimeout(() => {
-              if (pingEl && !pingEl.isConnected) pingEl = null;
+              if (pingEl && !pingEl.isConnected)
+                pingEl = null;
               else if (pingEl) {
                 pingEl.remove();
                 pingEl = null;
@@ -315,27 +321,30 @@
     }
     function setHidden(hidden) {
       hiddenForCapture = hidden;
-      if (!hostEl) return;
-      if (hostEl) hostEl.style.display = hidden ? "none" : "";
+      if (!hostEl)
+        return;
+      if (hostEl)
+        hostEl.style.display = hidden ? "none" : "";
     }
     function reactComponentName(el) {
-      const key = Object.keys(el).find(
-        (k) => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$")
-      );
-      if (!key) return null;
+      const key = Object.keys(el).find((k) => k.startsWith("__reactFiber$") || k.startsWith("__reactInternalInstance$"));
+      if (!key)
+        return null;
       const fiber = el[key];
       let cur = fiber;
-      for (let d = 0; d < 40 && cur && typeof cur === "object" && cur !== null; d++) {
+      for (let d = 0;d < 40 && cur && typeof cur === "object" && cur !== null; d++) {
         const f = cur;
         const t = f.type;
         if (typeof t === "function") {
           const fn = t;
           const n = fn.displayName || fn.name;
-          if (n) return n;
+          if (n)
+            return n;
         } else if (t && typeof t === "object") {
           const o = t;
           const n = o.displayName || o.name || o.render?.displayName || o.render?.name;
-          if (n) return n;
+          if (n)
+            return n;
         }
         cur = f.return;
       }
@@ -351,39 +360,45 @@
         activeTabIconObserver = null;
         return;
       }
-      if (activeTabIconObserver || typeof MutationObserver !== "function") return;
+      if (activeTabIconObserver || typeof MutationObserver !== "function")
+        return;
       const root = document.head ?? document.documentElement;
       activeTabIconObserver = new MutationObserver((records) => {
         let faviconChanged = false;
         for (const record of records) {
           for (const node of [...record.addedNodes, ...record.removedNodes]) {
-            if (!(node instanceof HTMLLinkElement)) continue;
+            if (!(node instanceof HTMLLinkElement))
+              continue;
             if (node.hasAttribute(ACTIVE_TAB_ICON_ATTRIBUTE) || node.rel.toLowerCase().includes("icon")) {
               faviconChanged = true;
               break;
             }
           }
-          if (faviconChanged) break;
+          if (faviconChanged)
+            break;
         }
-        if (!faviconChanged) return;
+        if (!faviconChanged)
+          return;
         const marker = document.querySelector(`link[${ACTIVE_TAB_ICON_ATTRIBUTE}]`);
         if (!marker) {
           setActiveTabFavicon(document, true, iconUrl);
           return;
         }
-        if (marker.parentElement && marker.parentElement.lastElementChild !== marker) marker.parentElement.appendChild(marker);
+        if (marker.parentElement && marker.parentElement.lastElementChild !== marker)
+          marker.parentElement.appendChild(marker);
       });
       activeTabIconObserver.observe(root, { childList: true });
     }
     function handleMessage(msg, _sender, sendResponse) {
-      if (!msg || typeof msg !== "object") return;
+      if (!msg || typeof msg !== "object")
+        return;
       const m = msg;
       switch (m.type) {
         case "opencode:cursor": {
           const x = typeof m.x === "number" ? m.x : 0;
           const y = typeof m.y === "number" ? m.y : 0;
           const phase = m.phase === "click" ? "click" : "move";
-          const sequence = typeof m.sequence === "number" ? m.sequence : void 0;
+          const sequence = typeof m.sequence === "number" ? m.sequence : undefined;
           pendingCursor = { x, y, phase, sequence };
           scheduleRender();
           sendResponse?.({ ok: true });
@@ -392,15 +407,17 @@
         case "opencode:highlight": {
           if (m.clear) {
             pendingHighlight = [];
-            if (outlineLayer) outlineLayer.replaceChildren();
-            if (drawLayer) drawLayer.replaceChildren();
+            if (outlineLayer)
+              outlineLayer.replaceChildren();
+            if (drawLayer)
+              drawLayer.replaceChildren();
           }
           const rect = m.rect;
           if (rect && typeof rect.x === "number" && typeof rect.y === "number") {
             pendingHighlight.push({
               rect,
-              label: typeof m.label === "string" ? m.label : void 0,
-              tone: typeof m.tone === "string" ? m.tone : void 0
+              label: typeof m.label === "string" ? m.label : undefined,
+              tone: typeof m.tone === "string" ? m.tone : undefined
             });
             scheduleRender();
           }
@@ -439,8 +456,10 @@
           let found = null;
           if (x >= 0 && y >= 0) {
             for (const el of document.elementsFromPoint(x, y)) {
-              if (!(el instanceof Element)) continue;
-              if (el.hasAttribute?.(OVERLAY_ATTRIBUTE)) continue;
+              if (!(el instanceof Element))
+                continue;
+              if (el.hasAttribute?.(OVERLAY_ATTRIBUTE))
+                continue;
               const n = reactComponentName(el);
               if (n) {
                 found = n;

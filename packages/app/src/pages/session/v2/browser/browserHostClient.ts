@@ -131,6 +131,85 @@ export interface BrowserAnnotationResult {
   createdAt: string
 }
 
+export type VisualArtifactKind =
+  | "baseline"
+  | "baseline_metadata"
+  | "current"
+  | "svg"
+  | "diff"
+  | "frames"
+  | "gif"
+  | "video"
+  | "result"
+
+export type VisualArtifactInput =
+  | { source: "baseline"; name: string; artifact?: "image" | "metadata"; timeoutMs?: number }
+  | {
+      source: "run"
+      runId: string
+      artifact: "current" | "svg" | "diff" | "frames" | "gif" | "video" | "result"
+      timeoutMs?: number
+    }
+
+export interface VisualArtifactDescriptor {
+  kind: VisualArtifactKind
+  path: string
+  mime: string
+  byteLength: number
+}
+
+export interface VisualBaselineSummary {
+  name: string
+  imagePath: string
+  metadataPath?: string
+  byteLength: number
+  capturedAt?: string
+  lane?: "webview" | "extension"
+  engineMajor?: number
+  redactionPolicySha256?: string
+}
+
+export interface VisualRunSummary {
+  runId: string
+  resultPath: string
+  status: "ok" | "error"
+  operation: "capture" | "diff" | "record" | "unknown"
+  name?: string
+  finishedAt?: string
+  changed?: boolean
+  frameCount?: number
+  artifacts: VisualArtifactKind[]
+}
+
+export interface VisualHistory {
+  root: ".snapeye"
+  baselines: VisualBaselineSummary[]
+  runs: VisualRunSummary[]
+}
+
+export interface VisualArtifactPreview {
+  descriptor: VisualArtifactDescriptor
+  bytes: Uint8Array
+  sha256: string
+}
+
+export interface VisualApprovalExpectation {
+  currentSha256: string
+  resultSha256: string
+  baselineSha256: string
+  baselineMetadataSha256: string | null
+}
+
+export interface VisualApprovalOutput {
+  baseline: VisualBaselineSummary
+  sourceRunId: string
+}
+
+export interface VisualProjectContext {
+  sessionId: string
+  directory: string
+}
+
 interface BrowserAPI {
   getState: () => Promise<BrowserState>
   openTab: (url: string, opts?: { activate?: boolean; newTab?: boolean }) => Promise<{ tabId: string }>
@@ -158,6 +237,10 @@ interface BrowserAPI {
   onHostState: (cb: (state: { connected: boolean }) => void) => () => void
   startAnnotation: (tabId: string) => Promise<BrowserAnnotationResult | null>
   cancelAnnotation: (tabId: string) => Promise<void>
+  visualHistory: (context: VisualProjectContext, input?: { maxRuns?: number; maxBaselines?: number; timeoutMs?: number }) => Promise<VisualHistory>
+  visualArtifact: (context: VisualProjectContext, input: VisualArtifactInput) => Promise<VisualArtifactDescriptor | null>
+  visualArtifactPreview: (context: VisualProjectContext, input: VisualArtifactInput) => Promise<VisualArtifactPreview | null>
+  visualApproveRun: (context: VisualProjectContext, runId: string, expected: VisualApprovalExpectation) => Promise<VisualApprovalOutput>
 }
 
 const DISCONNECTED_STATE: BrowserHostState = {
@@ -440,6 +523,11 @@ export const browserHostClient = {
   setAnnotationTarget(target: BrowserAnnotationTarget | null) {
     setAnnotationTarget(target)
   },
+  visualProjectContext(): VisualProjectContext | null {
+    const target = annotationTarget()
+    if (!target?.sessionID || !target.directory) return null
+    return { sessionId: target.sessionID, directory: target.directory }
+  },
   get guest() {
     return (tabId: string): BrowserGuestState => {
       const guests = hostState().guests
@@ -554,6 +642,30 @@ export const browserHostClient = {
 
   startAnnotation: (tabId: string) => rawBrowser()?.startAnnotation(tabId) ?? Promise.resolve(null),
   cancelAnnotation: (tabId: string) => rawBrowser()?.cancelAnnotation(tabId) ?? Promise.resolve(),
+  visualHistory: (input: { maxRuns?: number; maxBaselines?: number; timeoutMs?: number } = {}) => {
+    const api = rawBrowser()
+    const context = browserHostClient.visualProjectContext()
+    if (!api || !context) return Promise.resolve({ root: ".snapeye" as const, baselines: [], runs: [] })
+    return api.visualHistory(context, input)
+  },
+  visualArtifact: (input: VisualArtifactInput) => {
+    const api = rawBrowser()
+    const context = browserHostClient.visualProjectContext()
+    if (!api || !context) return Promise.resolve(null)
+    return api.visualArtifact(context, input)
+  },
+  visualArtifactPreview: (input: VisualArtifactInput) => {
+    const api = rawBrowser()
+    const context = browserHostClient.visualProjectContext()
+    if (!api || !context) return Promise.resolve(null)
+    return api.visualArtifactPreview(context, input)
+  },
+  visualApproveRun: (runId: string, expected: VisualApprovalExpectation) => {
+    const api = rawBrowser()
+    const context = browserHostClient.visualProjectContext()
+    if (!api || !context) return Promise.reject(new Error("Visual workflow requires an active Desktop project session"))
+    return api.visualApproveRun(context, runId, expected)
+  },
 }
 
 export { noop }

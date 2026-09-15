@@ -15,16 +15,29 @@ import { AnnotationController } from "./annotation"
 import { BrowserTabLifecycle } from "./tab-lifecycle"
 import { ExtensionHost } from "./extension-bridge/extension-host"
 import { ExtensionBridge, type ExtensionTabRecord } from "./extension-bridge/extension-bridge"
+import { VisualObservationCoordinator } from "./visual/coordinator"
+import { runVisualRpcWire } from "./visual/rpc"
+import { WebviewVisualController } from "./visual/webview-controller"
 import {
   BROWSER_PROTOCOL_VERSION,
   type Appearance,
   type BrowserAnnotationResult,
+  type BrowserDispatchContext,
+  type BrowserOperation,
   type BrowserState,
   type ExtensionInfo,
   type HostCapabilities,
   type HostOwner,
   type HumanInputSignal,
   type RendererGuestTabState,
+  type VisualApprovalOutput,
+  type VisualApprovalExpectation,
+  type VisualArtifactInput,
+  type VisualArtifactOutput,
+  type VisualArtifactPreview,
+  type VisualHistoryInput,
+  type VisualHistoryOutput,
+  type VisualProjectContext,
   type WireGuestTabState,
   rangeTargets,
 } from "./contracts"
@@ -76,6 +89,10 @@ export interface BrowserRenderApi {
   setExtensionEnabled: (tabId: string, extensionId: string, enabled: boolean) => Promise<void>
   startAnnotation: (tabId: string) => Promise<BrowserAnnotationResult | null>
   cancelAnnotation: (tabId: string) => void
+  visualHistory: (context: VisualProjectContext, input?: VisualHistoryInput) => Promise<VisualHistoryOutput["history"]>
+  visualArtifact: (context: VisualProjectContext, input: VisualArtifactInput) => Promise<VisualArtifactOutput["artifact"]>
+  visualArtifactPreview: (context: VisualProjectContext, input: VisualArtifactInput) => Promise<VisualArtifactPreview | null>
+  visualApproveRun: (context: VisualProjectContext, runId: string, expected: VisualApprovalExpectation) => Promise<VisualApprovalOutput>
 }
 export class BrowserEngine {
   readonly arbiter = new ControlArbiter()
@@ -84,6 +101,8 @@ export class BrowserEngine {
   readonly operations: BrowserOperations
   readonly host: BrowserHost
   readonly annotation = new AnnotationController()
+  readonly visual = new VisualObservationCoordinator()
+  readonly visualWebview = new WebviewVisualController(this.visual)
   private readonly tabLifecycle = new BrowserTabLifecycle()
   // Chrome-attach extension lane (optional — present when extension-bridge is bundled)
   readonly extensionHost: ExtensionHost
@@ -105,6 +124,12 @@ export class BrowserEngine {
       supportedAppearances: ["system", "light", "dark"],
       supportsRecording: true,
       cdp: true,
+      visual: {
+        schemaVersion: 1,
+        snapeyeProtocolVersion: 1,
+        operations: ["capture", "diff", "record"],
+        features: ["history", "artifact"],
+      },
       // chrome flag advertised dynamically via getCapabilities; static fallback false
     }
     this.sessions = new ControlSessionManager({
@@ -132,6 +157,7 @@ export class BrowserEngine {
         this.arbiter.reset(runtimeTabId)
         this.sessions.detach(webContentsId).catch(() => undefined)
         this.annotation.cancel(runtimeTabId)
+        this.visualWebview.cancel(runtimeTabId, "Browser guest went away")
         this.host.emitHostEvent({ type: "guest.crashed", tabId: runtimeTabId, timestamp: new Date().toISOString() })
       },
       onHumanInput: (runtimeTabId, signal) => {
@@ -142,6 +168,7 @@ export class BrowserEngine {
     this.operations = new BrowserOperations({
       registry: this.registry,
       sessions: this.sessions,
+      visual: this.visualWebview,
       recordingDirectory: options.recordingDirectory,
       maxResultBytes: capabilities.maxResultBytes,
       getHostState: () => ({
@@ -163,6 +190,7 @@ export class BrowserEngine {
         if (tab.webContentsId != null) this.sessions.detach(tab.webContentsId).catch(() => undefined)
         this.pendingActivation.delete(tabId)
         this.annotation.cancel(tabId)
+        this.visualWebview.cancel(tabId, "Browser tab closed")
         this.options.broadcast("browser-tab-close", { tabId })
       },
       onTabClosed: (tabId) => {
@@ -189,6 +217,8 @@ export class BrowserEngine {
       registry: this.registry,
       operations: this.operations,
       extensionHost: this.extensionHost,
+      visual: this.visual,
+      getAppearance: () => this.registry.getAppearance(),
       getExtensionTabs: () => this.chromeTabsMirror,
       getExtensionTab: (tabId) => this.chromeTabsById.get(tabId),
       getExtensionActiveTabId: () => this.chromeActiveTabId,
@@ -208,6 +238,7 @@ export class BrowserEngine {
       getCapabilities: () => this.extensionBridge.hostHelloCapabilities(capabilities),
       getHealthExtra: () => this.extensionBridge.health() as { chrome: boolean; lanes: string[] },
       extensionRelay: this.extensionHost,
+      visualRpc: (request) => runVisualRpcWire(this.visual, request),
       sidecarProvider: options.sidecarProvider,
       getGuestSnapshot: () => {
         const active = this.registry.activeTab
@@ -217,7 +248,7 @@ export class BrowserEngine {
           url: active?.url ?? null,
         }
       },
-      dispatch: (tabId, operation, sessionId) => this.extensionBridge.dispatch(tabId, operation, sessionId),
+      dispatch: (tabId, operation, context) => this.extensionBridge.dispatch(tabId, operation, context),
       onConnectedChange: (connected) => {
         this.options.broadcast("browser-host-state", { connected })
         this.options.logger?.log("browser host connected", { connected })
@@ -240,7 +271,16 @@ export class BrowserEngine {
     // promise waits out the preemption window. Publish that immediate state now
     // instead of waiting until the promise resolves (at which point it is
     // already back to "none"), then publish the settled state if it changed.
-    const settled = this.arbiter.handleHumanInput(runtimeTabId, signal as HumanInputSignal)
+    const humanSignal = signal as HumanInputSignal
+    // Guest preload also sees the agent's own CDP-dispatched pointer/key echo.
+    // Consume that expected input first so agent automation cannot self-cancel
+    // a visual operation. Anything unmatched is genuine human authority.
+    if (this.arbiter.consumeExpectedAgentInput(runtimeTabId, humanSignal)) {
+      syncController()
+      return
+    }
+    this.visualWebview.cancel(runtimeTabId, "Human input interrupted visual operation")
+    const settled = this.arbiter.handleHumanInput(runtimeTabId, humanSignal)
     syncController()
     void settled.then(syncController)
   }
@@ -257,9 +297,11 @@ export class BrowserEngine {
     for (const timer of this.guestStateEventTimers.values()) clearTimeout(timer)
     this.guestStateEventTimers.clear()
     for (const tab of this.registry.list()) this.annotation.cancel(tab.runtimeTabId)
+    this.visualWebview.stop()
     this.registry.teardown()
     this.tabLifecycle.clear()
     await this.sessions.detachAll()
+    await this.visual.stop()
     await this.extensionHost.stop().catch(() => undefined)
     await this.host.stop()
   }
@@ -275,6 +317,12 @@ export class BrowserEngine {
       supportedAppearances: ["system", "light", "dark"],
       supportsRecording: true,
       cdp: true,
+      visual: {
+        schemaVersion: 1,
+        snapeyeProtocolVersion: 1,
+        operations: ["capture", "diff", "record"],
+        features: ["history", "artifact"],
+      },
     }
     const capabilities = this.extensionBridge.hostHelloCapabilities(baseCapabilities)
     // Extension lane state — merged into Chrome optional field (no protocol bump)
@@ -321,6 +369,31 @@ export class BrowserEngine {
             },
           }
         : {}),
+    }
+  }
+  /** Renderer/browser-chrome actions do not originate from an agent broker
+   * request. Give them an explicit host-local context instead of smuggling an
+   * empty session id through the broker dispatch API. Workspace-aware features
+   * can therefore reliably reject these calls by the absence of directory. */
+  private dispatchInternal(tabId: string | undefined, operation: BrowserOperation): Promise<Record<string, unknown>> {
+    const context: BrowserDispatchContext = {
+      requestId: "desktop-ui",
+      sessionId: "",
+      windowId: this.options.windowId,
+      messageId: "desktop-ui",
+      timeoutMs: 15_000,
+    }
+    return this.operations.dispatch(tabId, operation, context)
+  }
+  private visualRendererContext(input: VisualProjectContext, timeoutMs = 15_000): BrowserDispatchContext {
+    if (!input?.sessionId || !input?.directory) throw new Error("Visual workflow requires an active project session")
+    return {
+      requestId: `desktop-ui-visual-${randomUUID()}`,
+      sessionId: input.sessionId,
+      windowId: this.options.windowId,
+      directory: input.directory,
+      messageId: "desktop-ui-visual",
+      timeoutMs,
     }
   }
   /** Renderer-facing API (window.api.browser). */
@@ -371,6 +444,7 @@ export class BrowserEngine {
         this.tabLifecycle.markDetached(runtimeTabId, lifecycleGeneration)
         if (webContentsId !== undefined) this.sessions.detach(webContentsId).catch(() => undefined)
         this.annotation.cancel(runtimeTabId)
+        this.visualWebview.cancel(runtimeTabId, "Browser guest detached")
       }
       return { ok: true }
     },
@@ -399,15 +473,15 @@ export class BrowserEngine {
     },
     refreshTab: async (tabId) => {
       try {
-        await this.operations.dispatch(tabId, { name: "refresh", input: { tabId } }, "")
+        await this.dispatchInternal(tabId, { name: "refresh", input: { tabId } })
       } catch {
         const activeId = this.registry.activeTab?.runtimeTabId
-        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "refresh", input: { tabId: activeId } }, "").catch(() => undefined)
+        if (activeId && activeId !== tabId) await this.dispatchInternal(activeId, { name: "refresh", input: { tabId: activeId } }).catch(() => undefined)
       }
     },
     duplicateTab: async (tabId) => {
       try {
-        const result = (await this.operations.dispatch(tabId, { name: "duplicate", input: { tabId } }, "")) as {
+        const result = (await this.dispatchInternal(tabId, { name: "duplicate", input: { tabId } })) as {
           duplicated?: { tabId?: string; url?: string }
         }
         return { tabId: result.duplicated?.tabId ?? tabId, url: result.duplicated?.url ?? "" }
@@ -417,50 +491,50 @@ export class BrowserEngine {
     },
     setTabMuted: async (tabId, muted) => {
       try {
-        await this.operations.dispatch(tabId, { name: "set_muted", input: { tabId, muted } }, "")
+        await this.dispatchInternal(tabId, { name: "set_muted", input: { tabId, muted } })
       } catch {
         const activeId = this.registry.activeTab?.runtimeTabId
-        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "set_muted", input: { tabId: activeId, muted } }, "").catch(() => undefined)
+        if (activeId && activeId !== tabId) await this.dispatchInternal(activeId, { name: "set_muted", input: { tabId: activeId, muted } }).catch(() => undefined)
       }
     },
     openDevtools: async (tabId) => {
       try {
-        await this.operations.dispatch(tabId, { name: "open_devtools", input: { tabId } }, "")
+        await this.dispatchInternal(tabId, { name: "open_devtools", input: { tabId } })
       } catch {
         const activeId = this.registry.activeTab?.runtimeTabId
-        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "open_devtools", input: { tabId: activeId } }, "").catch(() => undefined)
+        if (activeId && activeId !== tabId) await this.dispatchInternal(activeId, { name: "open_devtools", input: { tabId: activeId } }).catch(() => undefined)
       }
     },
     hardReload: async (tabId) => {
       try {
-        await this.operations.dispatch(tabId, { name: "hard_reload", input: { tabId } }, "")
+        await this.dispatchInternal(tabId, { name: "hard_reload", input: { tabId } })
       } catch {
         const activeId = this.registry.activeTab?.runtimeTabId
-        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "hard_reload", input: { tabId: activeId } }, "").catch(() => undefined)
+        if (activeId && activeId !== tabId) await this.dispatchInternal(activeId, { name: "hard_reload", input: { tabId: activeId } }).catch(() => undefined)
       }
     },
     clearCookies: async (tabId) => {
       try {
-        await this.operations.dispatch(tabId, { name: "clear_cookies", input: { tabId } }, "")
+        await this.dispatchInternal(tabId, { name: "clear_cookies", input: { tabId } })
       } catch {
         const activeId = this.registry.activeTab?.runtimeTabId
-        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "clear_cookies", input: { tabId: activeId } }, "").catch(() => undefined)
+        if (activeId && activeId !== tabId) await this.dispatchInternal(activeId, { name: "clear_cookies", input: { tabId: activeId } }).catch(() => undefined)
       }
     },
     clearCache: async (tabId) => {
       try {
-        await this.operations.dispatch(tabId, { name: "clear_cache", input: { tabId } }, "")
+        await this.dispatchInternal(tabId, { name: "clear_cache", input: { tabId } })
       } catch {
         const activeId = this.registry.activeTab?.runtimeTabId
-        if (activeId && activeId !== tabId) await this.operations.dispatch(activeId, { name: "clear_cache", input: { tabId: activeId } }, "").catch(() => undefined)
+        if (activeId && activeId !== tabId) await this.dispatchInternal(activeId, { name: "clear_cache", input: { tabId: activeId } }).catch(() => undefined)
       }
     },
     setAppearance: async (appearance) => {
-      await this.operations.dispatch(undefined, { name: "set_appearance", input: { appearance } }, "")
+      await this.dispatchInternal(undefined, { name: "set_appearance", input: { appearance } })
     },
     listExtensions: async (tabId) => {
       try {
-        const result = (await this.operations.dispatch(tabId, { name: "extensions_list", input: { tabId } }, "")) as {
+        const result = (await this.dispatchInternal(tabId, { name: "extensions_list", input: { tabId } })) as {
           extensions?: ExtensionInfo[]
         }
         return result.extensions ?? []
@@ -469,7 +543,7 @@ export class BrowserEngine {
         const activeId = this.registry.activeTab?.runtimeTabId
         if (activeId && activeId !== tabId) {
           try {
-            const fallback = (await this.operations.dispatch(activeId, { name: "extensions_list", input: { tabId: activeId } }, "")) as {
+            const fallback = (await this.dispatchInternal(activeId, { name: "extensions_list", input: { tabId: activeId } })) as {
               extensions?: ExtensionInfo[]
             }
             return fallback.extensions ?? []
@@ -481,10 +555,9 @@ export class BrowserEngine {
       }
     },
     setExtensionEnabled: async (tabId, extensionId, enabled) => {
-      await this.operations.dispatch(
+      await this.dispatchInternal(
         tabId,
         { name: "extension_set_enabled", input: { tabId, extensionId, enabled } },
-        "",
       )
     },
     startAnnotation: (tabId) => {
@@ -496,6 +569,7 @@ export class BrowserEngine {
       // Starting an annotation session is the human taking control of this tab.
       // Bump the epoch so any in-flight agent automation on it aborts
       // immediately, and pin the controller to human for the session.
+      this.visualWebview.cancel(tabId, "Human took control of the browser tab")
       this.arbiter.acquireHumanControl(tabId)
       tab.controller = this.arbiter.controller(tabId)
       this.registry.sync(tabId)
@@ -522,6 +596,16 @@ export class BrowserEngine {
         this.registry.sync(tabId)
       }
     },
+    visualHistory: async (context, input = {}) =>
+      this.visual.history(this.visualRendererContext(context, input.timeoutMs ?? 10_000), input),
+    visualArtifact: async (context, input) =>
+      this.visual.artifact(this.visualRendererContext(context, input.timeoutMs ?? 10_000), input),
+    visualArtifactPreview: async (context, input) => {
+      const preview = await this.visual.artifactPreview(this.visualRendererContext(context, input.timeoutMs ?? 15_000), input)
+      return preview ? { descriptor: preview.descriptor, bytes: new Uint8Array(preview.bytes), sha256: preview.sha256 } : null
+    },
+    visualApproveRun: async (context, runId, expected) =>
+      this.visual.approveRun(this.visualRendererContext(context, 15_000), runId, expected),
   }
   /** User-authority close (D9): preempt the arbiter + detach the CDP session so
    * an in-flight agent op aborts (never hangs), then destroy and emit tab.closed. */
@@ -542,6 +626,7 @@ export class BrowserEngine {
     this.sessions.detach(tab.webContentsId ?? -1).catch(() => undefined)
     this.pendingActivation.delete(tabId)
     this.annotation.cancel(tabId)
+    this.visualWebview.cancel(tabId, "Browser tab closed by user")
     this.registry.remove(tabId)
     this.tabLifecycle.finishClose(tabId, tab.lifecycleGeneration)
     this.host.emitHostEvent({ type: "tab.closed", tabId, timestamp: new Date().toISOString() })

@@ -102,4 +102,59 @@ describe("browserHostClient state identity", () => {
     expect(after.guests.find((g) => g.tabId === "b")).toBe(guestB)
     expect(after.guests.find((g) => g.tabId === "a")).not.toBe(guestA)
   })
+
+  test("visual project calls are bound to the active session context and preserve binary previews", async () => {
+    const calls: Array<{ method: string; context: unknown; payload?: unknown }> = []
+    const bytes = new Uint8Array([1, 2, 3, 4])
+    ;(window as unknown as { api: unknown }).api = {
+      browser: {
+        visualHistory: async (context: unknown, input: unknown) => {
+          calls.push({ method: "history", context, payload: input })
+          return { root: ".snapeye", baselines: [], runs: [] }
+        },
+        visualArtifact: async (context: unknown, input: unknown) => {
+          calls.push({ method: "artifact", context, payload: input })
+          return { kind: "current", path: ".snapeye/runs/r1/current.png", mime: "image/png", byteLength: 4 }
+        },
+        visualArtifactPreview: async (context: unknown, input: unknown) => {
+          calls.push({ method: "preview", context, payload: input })
+          return {
+            descriptor: { kind: "current", path: ".snapeye/runs/r1/current.png", mime: "image/png", byteLength: 4 },
+            bytes,
+            sha256: "a".repeat(64),
+          }
+        },
+        visualApproveRun: async (context: unknown, runId: string, expected: unknown) => {
+          calls.push({ method: "approve", context, payload: { runId, expected } })
+          return {
+            baseline: { name: "panel", imagePath: ".snapeye/baselines/panel.png", byteLength: 4 },
+            sourceRunId: runId,
+          }
+        },
+      },
+    }
+
+    browserHostClient.setAnnotationTarget({ sessionID: "ses_visual", directory: "C:/project" } as never)
+    expect(browserHostClient.visualProjectContext()).toEqual({ sessionId: "ses_visual", directory: "C:/project" })
+    expect(await browserHostClient.visualHistory({ maxRuns: 5 })).toEqual({ root: ".snapeye", baselines: [], runs: [] })
+    const input = { source: "run", runId: "r1", artifact: "current" } as const
+    expect((await browserHostClient.visualArtifact(input))?.path).toBe(".snapeye/runs/r1/current.png")
+    const preview = await browserHostClient.visualArtifactPreview(input)
+    expect(preview?.bytes).toEqual(bytes)
+    expect(preview?.sha256).toBe("a".repeat(64))
+    const expected = {
+      currentSha256: "a".repeat(64),
+      resultSha256: "b".repeat(64),
+      baselineSha256: "c".repeat(64),
+      baselineMetadataSha256: "d".repeat(64),
+    }
+    expect((await browserHostClient.visualApproveRun("r1", expected)).sourceRunId).toBe("r1")
+    expect(calls.map((call) => call.method)).toEqual(["history", "artifact", "preview", "approve"])
+    for (const call of calls) expect(call.context).toEqual({ sessionId: "ses_visual", directory: "C:/project" })
+
+    browserHostClient.setAnnotationTarget(null)
+    expect(browserHostClient.visualProjectContext()).toBeNull()
+    expect(await browserHostClient.visualHistory()).toEqual({ root: ".snapeye", baselines: [], runs: [] })
+    await expect(browserHostClient.visualApproveRun("r1", expected)).rejects.toThrow("active Desktop project session")
+  })
 })

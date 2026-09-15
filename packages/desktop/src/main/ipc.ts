@@ -28,7 +28,7 @@ import { createDesktopDraftStore } from "./draft-store"
 import { nativeT } from "./native-translations"
 import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
 import { RendererTrust } from "./browser/renderer-trust"
-import type { HostOwner } from "./browser/contracts"
+import type { HostOwner, VisualApprovalExpectation } from "./browser/contracts"
 const pickerFilters = (ext?: string[]) => {
   if (!ext || ext.length === 0) return undefined
   return [{ name: nativeT("desktop.dialog.files"), extensions: ext }]
@@ -460,6 +460,22 @@ export function registerBrowserIpcHandlers(engine: BrowserEngine, trust: Rendere
   ipcMain.handle("browser-cancel-annotation", (event, tabId: string) => {
     if (!trusted(event)) throw new Error("Untrusted browser sender")
     engine.api.cancelAnnotation(tabId)
+  })
+  ipcMain.handle("browser-visual-history", (event, context, input) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.visualHistory(context, input)
+  })
+  ipcMain.handle("browser-visual-artifact", (event, context, input) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.visualArtifact(context, input)
+  })
+  ipcMain.handle("browser-visual-artifact-preview", (event, context, input) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.visualArtifactPreview(context, input)
+  })
+  ipcMain.handle("browser-visual-approve-run", (event, context, runId: string, expected: VisualApprovalExpectation) => {
+    if (!trusted(event)) throw new Error("Untrusted browser sender")
+    return engine.api.visualApproveRun(context, runId, expected)
   })
   // Chrome pairing (native host manifest) — exposed as window.api.chrome
   ipcMain.handle("chrome-get-status", (event) => {

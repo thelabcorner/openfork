@@ -1,7 +1,7 @@
 import { afterAll, beforeAll, expect, test } from "bun:test"
 import { createServer } from "node:http"
 import { BrowserHost } from "./host"
-import type { BrokerResponse, BrowserOperation, HostCapabilities } from "./contracts"
+import type { BrokerResponse, BrowserDispatchContext, BrowserOperation, HostCapabilities } from "./contracts"
 
 const capabilities: HostCapabilities = {
   maxSnapshotBytes: 256 * 1024,
@@ -18,7 +18,7 @@ const makeHost = async (
   dispatch: (
     tabId: string | undefined,
     operation: BrowserOperation,
-    sessionId: string,
+    context: BrowserDispatchContext,
   ) => Promise<Record<string, unknown>>,
 ) => {
   const h = new BrowserHost({
@@ -44,6 +44,7 @@ const post = (base: string, path: string, body: unknown, headers: Record<string,
 const envelope = (overrides: Record<string, unknown> = {}) => ({
   requestId: "req-test",
   sessionId: "sess-test",
+  windowId: "test-window",
   messageId: "msg-test",
   timeoutMs: 5_000,
   operation: { name: "status", input: {} },
@@ -51,7 +52,7 @@ const envelope = (overrides: Record<string, unknown> = {}) => ({
 })
 
 beforeAll(async () => {
-  const started = await makeHost(async (_tabId, _operation, _sessionId) => ({ status: { ok: true } }))
+  const started = await makeHost(async (_tabId, _operation, _context) => ({ status: { ok: true } }))
   host = started.host
   url = started.url
 })
@@ -81,6 +82,54 @@ test("accepts a valid bearer token and dispatches the operation", async () => {
     expect(body.result).toEqual({ status: { ok: true } })
     expect(typeof body.elapsedMs).toBe("number")
   }
+})
+
+test("preserves complete trusted request provenance in BrowserDispatchContext", async () => {
+  let seen: BrowserDispatchContext | undefined
+  const contextual = await makeHost(async (_tabId, _operation, context) => {
+    seen = context
+    return { ok: true }
+  })
+  try {
+    const response = await post(
+      contextual.url,
+      "/v1/browser/request",
+      envelope({
+        requestId: "req-context",
+        workspaceId: "ws-42",
+        directory: "/workspace/project",
+        messageId: "msg-context",
+        toolCallId: "tool-context",
+        timeoutMs: 4321,
+      }),
+      { authorization: `Bearer ${contextual.host.callbackUrlToken}` },
+    )
+    expect(response.status).toBe(200)
+    expect(seen).toMatchObject({
+      requestId: "req-context",
+      sessionId: "sess-test",
+      windowId: "test-window",
+      workspaceId: "ws-42",
+      directory: "/workspace/project",
+      messageId: "msg-context",
+      toolCallId: "tool-context",
+      timeoutMs: 4321,
+    })
+    expect(seen?.signal).toBeInstanceOf(AbortSignal)
+    expect(seen?.signal?.aborted).toBe(false)
+  } finally {
+    await contextual.host.stop()
+  }
+})
+
+test("rejects a valid-shaped request addressed to a different browser window", async () => {
+  const response = await post(url, "/v1/browser/request", envelope({ windowId: "other-window" }), {
+    authorization: `Bearer ${host.callbackUrlToken}`,
+  })
+  expect(response.status).toBe(200)
+  const body = (await response.json()) as BrokerResponse
+  expect(body.ok).toBe(false)
+  if (!body.ok) expect(body.error.tag).toBe("BrowserOperationFailed")
 })
 
 test("responds an error envelope for an invalid body (HTTP 200)", async () => {
@@ -113,7 +162,11 @@ test("times out a slow operation with BrowserTimeout and still answers HTTP 200"
 })
 
 test("abort interrupts an in-flight operation with BrowserControlInterrupted", async () => {
-  const hanging = await makeHost(async () => new Promise<Record<string, unknown>>(() => undefined))
+  let signal: AbortSignal | undefined
+  const hanging = await makeHost(async (_tabId, _operation, context) => {
+    signal = context.signal
+    return new Promise<Record<string, unknown>>(() => undefined)
+  })
   try {
     const requestId = "req-abort"
     const pending = post(hanging.url, "/v1/browser/request", envelope({ requestId, timeoutMs: 60_000 }), {
@@ -133,6 +186,7 @@ test("abort interrupts an in-flight operation with BrowserControlInterrupted", a
     const body = (await response.json()) as BrokerResponse
     expect(body.ok).toBe(false)
     if (!body.ok) expect(body.error.tag).toBe("BrowserControlInterrupted")
+    expect(signal?.aborted).toBe(true)
   } finally {
     await hanging.host.stop()
   }
@@ -555,10 +609,10 @@ test("hello registration is session-agnostic (no sessionId/workspaceId/directory
   }
 })
 
-test("forwards the requesting sessionId into dispatch", async () => {
+test("forwards the requesting sessionId inside dispatch context", async () => {
   let seenSessionId: string | undefined
-  const forwarding = await makeHost(async (_tabId, _operation, sessionId) => {
-    seenSessionId = sessionId
+  const forwarding = await makeHost(async (_tabId, _operation, context) => {
+    seenSessionId = context.sessionId
     return { status: { ok: true } }
   })
   try {

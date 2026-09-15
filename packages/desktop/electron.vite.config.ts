@@ -7,6 +7,7 @@ import { fileURLToPath, pathToFileURL } from "node:url"
 const OPENCODE_SERVER_DIST = fileURLToPath(new URL("../opencode/dist/node", import.meta.url))
 const OPENCODE_SERVER_FILE = fileURLToPath(new URL("../opencode/dist/node/node.js", import.meta.url))
 const APP_SRC = fileURLToPath(new URL("../app/src", import.meta.url))
+const SAFE_GIFENC = fileURLToPath(new URL("../browser-visual/src/gifenc-safe.ts", import.meta.url))
 
 const channel = (() => {
   const raw = process.env.OPENCODE_CHANNEL
@@ -87,6 +88,12 @@ const require = __cjs_mod__.createRequire(import.meta.url);
     ],
   },
   preload: {
+    resolve: {
+      // SnapEye's default top-level gifenc import includes an MPL-derived
+      // PnnQuant quantizer. Replace only that public module import with our
+      // deterministic safe adapter; its MIT LZW primitives remain exact-pinned.
+      alias: [{ find: /^gifenc$/, replacement: SAFE_GIFENC }],
+    },
     build: {
       rollupOptions: {
         input: {
@@ -95,6 +102,10 @@ const require = __cjs_mod__.createRequire(import.meta.url);
           // preload attribute; the path is handed to the renderer through
           // window.api.browser.getGuestPreloadPath().
           preview: "src/guest/preview-preload.ts",
+          // Heavy SnapEye/SnapDOM kernel. Main reads this bundle lazily and
+          // injects it into Electron's isolated preload world only on first
+          // visual use; never statically import it from preview-preload.ts.
+          "visual-runtime": "src/guest/visual-runtime.ts",
         },
         output: {
           format: "cjs",

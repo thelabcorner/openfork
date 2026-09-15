@@ -19,12 +19,14 @@ import {
   BrowserDebuggerConflictError,
   BrowserStaleRefError,
   BrowserNotAReactAppError,
+  BrowserPermissionDeniedError,
   BrowserError,
   type BrowserError as BrowserErrorType,
 } from "../errors"
-import type { BrowserOperation, HostCapabilities, WireGuestTabState, SessionTabInfo } from "../contracts"
-import { BROWSER_PROTOCOL_VERSION } from "../contracts"
+import type { Appearance, BrowserDispatchContext, BrowserOperation, BrokerRequest, HostCapabilities, WireGuestTabState, SessionTabInfo, VisualCaptureInput, VisualDiffInput, VisualRecordInput } from "../contracts"
+import { BROWSER_PROTOCOL_VERSION, canDispatchTab } from "../contracts"
 import type { ExtensionHost } from "./extension-host"
+import type { VisualObservationCoordinator } from "../visual/coordinator"
 
 // ---------------------------------------------------------------------------
 // Lane types
@@ -50,6 +52,8 @@ export interface ExtensionBridgeOptions {
   registry: GuestRegistry
   operations: BrowserOperations
   extensionHost: ExtensionHost
+  visual: VisualObservationCoordinator
+  getAppearance: () => Appearance
   /** Live mirror of extension tabs (from SW `chrome.tabs` + ownership map). */
   getExtensionTabs: () => ExtensionTabRecord[]
   /** Indexed lookup supplied by BrowserEngine for per-operation lane routing. */
@@ -166,11 +170,17 @@ export class ExtensionBridge {
   // -------------------------------------------------------------------------
   // Dispatch — single responder contract
   // -------------------------------------------------------------------------
-  async dispatch(tabId: string | undefined, operation: BrowserOperation, sessionId: string): Promise<Record<string, unknown>> {
+  async dispatch(tabId: string | undefined, operation: BrowserOperation, context: BrowserDispatchContext): Promise<Record<string, unknown>> {
+    if (operation.name === "visual_history") {
+      return { history: await this.options.visual.history(context, operation.input) }
+    }
+    if (operation.name === "visual_artifact") {
+      return { artifact: await this.options.visual.artifact(context, operation.input) }
+    }
     const lane = this.resolveLane(tabId, operation)
 
     // Status always succeeds and merges both lanes
-    if (operation.name === "status") return this.dispatchStatus(sessionId, tabId)
+    if (operation.name === "status") return this.dispatchStatus(context, tabId)
 
     // Create-path for `open` without tabId goes to the preferred creation lane
     if (operation.name === "open" && tabId === undefined) {
@@ -178,49 +188,93 @@ export class ExtensionBridge {
       // If createLane is extension but extension unavailable for creation, let it fall through to webview
       if (createLane === "extension") {
         try {
-          return await this.dispatchExtension(undefined, operation, sessionId)
+          return await this.dispatchExtension(undefined, operation, context)
         } catch (error) {
           // If extension creation fails with unavailable, fall back to webview
           if (isUnavailable(error)) {
-            return this.dispatchWebview(tabId, operation, sessionId)
+            return this.dispatchWebview(tabId, operation, context)
           }
           throw this.normalizeChromeError(error)
         }
       }
-      return this.dispatchWebview(tabId, operation, sessionId)
+      return this.dispatchWebview(tabId, operation, context)
     }
 
-    if (lane === "extension") return this.dispatchExtension(tabId, operation, sessionId)
-    if (lane === "webview") return this.dispatchWebview(tabId, operation, sessionId)
+    if (lane === "extension") return this.dispatchExtension(tabId, operation, context)
+    if (lane === "webview") return this.dispatchWebview(tabId, operation, context)
     throw new BrowserTabNotFoundError(tabId)
   }
 
-  private async dispatchWebview(tabId: string | undefined, operation: BrowserOperation, sessionId: string): Promise<Record<string, unknown>> {
+  private async dispatchWebview(tabId: string | undefined, operation: BrowserOperation, context: BrowserDispatchContext): Promise<Record<string, unknown>> {
     try {
-      return await this.options.operations.dispatch(tabId, operation, sessionId)
+      return await this.options.operations.dispatch(tabId, operation, context)
     } catch (error) {
       throw this.normalizeChromeError(error)
     }
   }
 
-  private async dispatchExtension(tabId: string | undefined, operation: BrowserOperation, sessionId: string): Promise<Record<string, unknown>> {
-    // Build a BrokerRequest envelope and send via native host framing.
-    // The extension SW mirrors the same contracts.ts BrokerRequest shape (byte-identical).
-    const requestId = `ext-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
-    const timeoutMs = (operation.input as { timeoutMs?: number })?.timeoutMs ?? 15000
-    const envelope = {
-      requestId,
-      sessionId,
-      windowId: this.options.windowId,
-      messageId: requestId,
-      tabId,
-      operation,
-      timeoutMs,
+  private async dispatchExtension(tabId: string | undefined, operation: BrowserOperation, context: BrowserDispatchContext): Promise<Record<string, unknown>> {
+    if (context.signal?.aborted) throw new BrowserControlInterruptedError("Browser request was already aborted")
+    // Preserve the ORIGINAL broker identity and project provenance across the
+    // Chrome lane. There is no second logical request here; native messaging is
+    // merely another carrier for the same request.
+    let extensionOperation: BrowserOperation = operation
+    let visualCapability: string | undefined
+    if (operation.name === "visual_capture" || operation.name === "visual_diff" || operation.name === "visual_record") {
+      const visualInput = operation.input as VisualCaptureInput | VisualDiffInput | VisualRecordInput
+      const extensionTab = tabId ? this.options.getExtensionTab?.(tabId) : this.getActiveExtensionTab()
+      if (!extensionTab) throw new BrowserError("BrowserTabNotFound", "Chrome tab is not available for visual capture", true)
+      if (canDispatchTab(extensionTab.owner ?? { kind: "user" }, context.sessionId) !== "ok") throw new BrowserPermissionDeniedError()
+      const grant = await this.options.visual.begin({
+        context,
+        lane: "extension",
+        tabId: extensionTab.tabId,
+        operation: operation.name === "visual_capture" ? "capture" : operation.name === "visual_diff" ? "diff" : "record",
+        name: visualInput.name,
+        ...(visualInput.runId ? { runId: visualInput.runId } : {}),
+        ...(visualInput.redact ? { redaction: visualInput.redact } : {}),
+        environment: {
+          appearance: this.options.getAppearance(),
+          snapeyeVersion: "0.4.0",
+          snapdomVersion: "3.0.0",
+        },
+      })
+      visualCapability = grant.capability
+      const privateInput = {
+          ...visualInput,
+          __opencodeVisual: {
+            capability: grant.capability,
+            runId: grant.runId,
+            maxChunkBytes: grant.maxChunkBytes,
+            redaction: grant.redaction,
+          },
+      } as unknown as VisualCaptureInput | VisualDiffInput | VisualRecordInput
+      extensionOperation = { name: operation.name, input: privateInput } as BrowserOperation
     }
+
+    const envelope: BrokerRequest = {
+      requestId: context.requestId,
+      sessionId: context.sessionId,
+      windowId: context.windowId,
+      ...(context.workspaceId !== undefined ? { workspaceId: context.workspaceId } : {}),
+      ...(context.directory !== undefined ? { directory: context.directory } : {}),
+      messageId: context.messageId,
+      ...(context.toolCallId !== undefined ? { toolCallId: context.toolCallId } : {}),
+      tabId,
+      operation: extensionOperation,
+      timeoutMs: context.timeoutMs,
+    }
+    const abort = () => this.options.extensionHost.abort(envelope.requestId)
+    context.signal?.addEventListener("abort", abort, { once: true })
     try {
+      // Close the race between the preflight check and listener registration.
+      if (context.signal?.aborted) {
+        abort()
+        throw new BrowserControlInterruptedError("Browser request was already aborted")
+      }
       // Cooperative timeout races the native host send; host.ts InFlight timer handles the outer envelope,
       // but extension sends also need an inner bound so a stalled native host doesn't hang forever.
-      const response = await this.options.extensionHost.send(envelope as never)
+      const response = await this.options.extensionHost.send(envelope)
       if (!response.ok) {
         // Error body already has canonical tag if the extension mapped it; else map chrome strings.
         const mapped = mapChromeErrorToTag(response.error.message)
@@ -230,7 +284,7 @@ export class ExtensionBridge {
         throw new BrowserError(tag, message, retryable, details as Record<string, unknown>)
       }
       const result = response.result as Record<string, unknown>
-      this.captureExtensionState(operation, result, sessionId)
+      this.captureExtensionState(operation, result, context.sessionId)
       return result
     } catch (error) {
       // Native host transport down → BrowserHostUnavailable so caller can retry via webview or fail fast
@@ -238,16 +292,19 @@ export class ExtensionBridge {
         throw new BrowserError("BrowserHostUnavailable", `Extension host transport failed: ${(error as Error).message}`, true, { lane: "extension" })
       }
       throw this.normalizeChromeError(error)
+    } finally {
+      context.signal?.removeEventListener("abort", abort)
+      if (visualCapability) await this.options.visual.abort(visualCapability)
     }
   }
 
-  private async dispatchStatus(_sessionId: string, _tabId?: string): Promise<Record<string, unknown>> {
+  private async dispatchStatus(context: BrowserDispatchContext, _tabId?: string): Promise<Record<string, unknown>> {
     // The two status lanes are independent. Refresh them concurrently instead
     // of serializing one complete desktop status traversal ahead of Chrome.
     const [webviewStatus] = await Promise.all([
-      this.options.operations.dispatch(undefined, { name: "status", input: {} }, "").catch(() => null) as Promise<{ status?: unknown; tabs?: SessionTabInfo[] } | null>,
+      this.options.operations.dispatch(undefined, { name: "status", input: {} }, context).catch(() => null) as Promise<{ status?: unknown; tabs?: SessionTabInfo[] } | null>,
       this.isAvailable
-        ? this.dispatchExtension(undefined, { name: "status", input: {} }, _sessionId).catch((error) => {
+        ? this.dispatchExtension(undefined, { name: "status", input: {} }, context).catch((error) => {
             this.log("extension status refresh failed", { error: String(error) })
             return null
           })

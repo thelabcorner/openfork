@@ -75,3 +75,4 @@ workbuddy-usage-forensics.tar.br
 .tmp-full-status.txt
 packages/opencode/.tmp-spad-*
 packages/opencode/.opencode-runtime-locks/
+packages/browser-visual/.interop-*/

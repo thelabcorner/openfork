@@ -19,6 +19,13 @@ import {
   QueryInput,
   SnapshotOutput,
   StatusOutput,
+  VisualCaptureInput,
+  VisualDiffInput,
+  VisualArtifactInput,
+  VisualArtifactOutput,
+  VisualHistoryInput,
+  VisualHistoryOutput,
+  VisualRecordInput,
 } from "../src/groups/browser"
 
 // Suspended schemas (A11yNode, and anything containing it) have a non-statically-
@@ -57,6 +64,132 @@ describe("browser wire: HostRegistration", () => {
     expect("sessionId" in decoded).toBe(false)
     expect("workspaceId" in decoded).toBe(false)
     expect("directory" in decoded).toBe(false)
+  })
+
+  test("accepts explicit SnapEye history/artifact feature advertisement without a protocol bump", async () => {
+    const decoded = await decode(HostRegistration, {
+      protocolVersion: 2,
+      hostId: "host-1",
+      hostEpoch: 3,
+      connectionId: "conn-1",
+      windowId: "win-1",
+      capabilities: {
+        maxSnapshotBytes: 1_000_000,
+        maxResultBytes: 256_000,
+        supportedAppearances: ["system", "light", "dark"],
+        supportsRecording: true,
+        cdp: true,
+        visual: {
+          schemaVersion: 1,
+          snapeyeProtocolVersion: 1,
+          operations: ["capture", "diff", "record"],
+          features: ["history", "artifact"],
+        },
+      },
+      guest: { attached: false, activeTabId: null, url: null },
+      callbackUrl: "http://127.0.0.1:54123",
+      callbackToken: "secret",
+    })
+    expect(decoded.capabilities.visual).toMatchObject({ features: ["history", "artifact"] })
+  })
+})
+
+describe("browser wire: SnapEye history/artifact inspection", () => {
+  test("decodes project-scoped history and artifact operations", async () => {
+    const history = await decode(BrowserOperation, { name: "visual_history", input: { maxRuns: 20, maxBaselines: 50 } })
+    expect(history.name).toBe("visual_history")
+    const artifact = await decode(BrowserOperation, {
+      name: "visual_artifact",
+      input: { source: "run", runId: "run_1", artifact: "diff" },
+    })
+    expect(artifact.name).toBe("visual_artifact")
+  })
+
+  test("rejects invalid history bounds and artifact discriminants", async () => {
+    await decodeFails(VisualHistoryInput, { maxRuns: 0 })
+    await decodeFails(VisualArtifactInput, { source: "baseline", name: "panel", artifact: "diff" })
+    await decodeFails(VisualArtifactInput, { source: "run", runId: "run1", artifact: "baseline" })
+    await decodeFails(VisualArtifactInput, { source: "filesystem", path: "C:/secret" })
+  })
+
+  test("decodes bounded relative history/artifact output shapes", async () => {
+    const history = await decode(VisualHistoryOutput, {
+      history: {
+        root: ".snapeye",
+        baselines: [{ name: "panel", imagePath: ".snapeye/baselines/panel.png", byteLength: 123 }],
+        runs: [{ runId: "run1", resultPath: ".snapeye/runs/run1/result.json", status: "ok", operation: "diff", changed: false, artifacts: ["result", "current"] }],
+      },
+    })
+    expect(history.history.root).toBe(".snapeye")
+    const artifact = await decode(VisualArtifactOutput, {
+      artifact: { kind: "diff", path: ".snapeye/runs/run1/diff.png", mime: "image/png", byteLength: 456 },
+    })
+    expect(artifact.artifact?.path).toBe(".snapeye/runs/run1/diff.png")
+    expect(await decode(VisualArtifactOutput, { artifact: null })).toEqual({ artifact: null })
+  })
+})
+
+describe("browser wire: bounded SnapEye operation inputs", () => {
+  test("accepts the documented recording ceiling and bounded review controls", async () => {
+    const decoded = await decode(VisualRecordInput, {
+      name: "motion_1",
+      target: { kind: "css", selector: "#app" },
+      duration: 15_000,
+      fps: 30,
+      scale: 2,
+      bitrate: 20_000_000,
+      filmstripMaxCells: 150,
+      filmstripMaxColumns: 150,
+      filmstripMaxWidth: 4096,
+      filmstripGap: 128,
+      filmstripBackground: "rgba(0, 0, 0, 0.5)",
+      redact: {
+        blocks: ["[data-secret]"],
+        attributes: [{ selector: "input[token]", names: ["value"] }],
+      },
+    })
+    expect(decoded.duration).toBe(15_000)
+    expect(decoded.fps).toBe(30)
+  })
+
+  test("rejects resource-amplifying record values before they reach Chromium", async () => {
+    await decodeFails(VisualRecordInput, { name: "motion", duration: 15_001 })
+    await decodeFails(VisualRecordInput, { name: "motion", fps: 31 })
+    await decodeFails(VisualRecordInput, { name: "motion", scale: 2.01 })
+    await decodeFails(VisualRecordInput, { name: "motion", bitrate: 20_000_001 })
+    await decodeFails(VisualRecordInput, { name: "motion", filmstripGap: 129 })
+    await decodeFails(VisualRecordInput, { name: "motion", filmstripMaxWidth: 4097 })
+  })
+
+  test("rejects invalid names, oversized selectors/redaction lists, and pathological diff controls", async () => {
+    await decodeFails(VisualCaptureInput, { name: "../escape" })
+    await decodeFails(VisualCaptureInput, {
+      name: "panel",
+      target: { kind: "css", selector: "x".repeat(4097) },
+    })
+    await decodeFails(VisualCaptureInput, {
+      name: "panel",
+      redact: { blocks: Array.from({ length: 65 }, (_, index) => `#secret-${index}`) },
+    })
+    await decodeFails(VisualDiffInput, { name: "panel", threshold: 1.01 })
+    await decodeFails(VisualDiffInput, { name: "panel", tileSize: 1025 })
+    await decodeFails(VisualDiffInput, { name: "panel", maxRegions: 257 })
+    await decodeFails(VisualCaptureInput, { name: "panel", runId: "../escape" })
+    await decodeFails(VisualCaptureInput, { name: "panel", runId: "run.with.dot" })
+    await decodeFails(VisualCaptureInput, { name: "panel", timeoutMs: 120_001 })
+    await decodeFails(VisualCaptureInput, { name: "panel", waitTimeout: 60_001 })
+    await decodeFails(VisualCaptureInput, { name: "a..b" })
+  })
+
+  test("bounds project visual inspection identities and result-set sizes at the wire", async () => {
+    expect((await decode(VisualHistoryInput, { maxRuns: 100, maxBaselines: 200, timeoutMs: 30_000 })).maxRuns).toBe(100)
+    await decodeFails(VisualHistoryInput, { maxRuns: 101 })
+    await decodeFails(VisualHistoryInput, { maxBaselines: 201 })
+    await decodeFails(VisualHistoryInput, { timeoutMs: 30_001 })
+    await decodeFails(VisualArtifactInput, { source: "run", runId: "../escape", artifact: "result" })
+    await decodeFails(VisualArtifactInput, { source: "run", runId: "run.with.dot", artifact: "result" })
+    await decodeFails(VisualArtifactInput, { source: "baseline", name: "a..b", artifact: "image" })
+    await decodeFails(VisualArtifactInput, { source: "baseline", name: "panel", artifact: "image", timeoutMs: 30_001 })
   })
 })
 

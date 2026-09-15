@@ -8,6 +8,8 @@ import {
   orphanOwnedTabs,
   resolveDispatch,
   sessionTabs,
+  supportsVisualFeature,
+  supportsVisualOperation,
   type ResolveDispatchResult,
   type SessionTabInfo,
   type TabRecord,
@@ -108,6 +110,61 @@ describe("resolveDispatch — window resolution", () => {
   test("status forwards without a tabId (broker enriches tabs after)", () => {
     const result = resolveDispatch({ request: statusRequest(), windowId: "win-1", tabs: [] })
     expect(result).toEqual({ kind: "forward", windowId: "win-1" })
+  })
+})
+
+describe("SnapEye capability advertisement", () => {
+  const base = baseHello.capabilities
+
+  test("missing capability supports no visual operations", () => {
+    expect(supportsVisualOperation(base, "capture")).toBe(false)
+    expect(supportsVisualOperation(base, "diff")).toBe(false)
+    expect(supportsVisualOperation(base, "record")).toBe(false)
+  })
+
+  test("legacy visual:true means capture/diff only", () => {
+    const capabilities = { ...base, visual: true as const }
+    expect(supportsVisualOperation(capabilities, "capture")).toBe(true)
+    expect(supportsVisualOperation(capabilities, "diff")).toBe(true)
+    expect(supportsVisualOperation(capabilities, "record")).toBe(false)
+  })
+
+  test("structured capability advertises the exact operation set", () => {
+    const capabilities = {
+      ...base,
+      visual: { schemaVersion: 1 as const, snapeyeProtocolVersion: 1 as const, operations: ["capture", "diff", "record"] as const },
+    }
+    expect(supportsVisualOperation(capabilities, "capture")).toBe(true)
+    expect(supportsVisualOperation(capabilities, "diff")).toBe(true)
+    expect(supportsVisualOperation(capabilities, "record")).toBe(true)
+  })
+
+  test("history/artifact require explicit structured feature advertisement", () => {
+    expect(supportsVisualFeature(base, "history")).toBe(false)
+    expect(supportsVisualFeature({ ...base, visual: true as const }, "history")).toBe(false)
+    const capabilities = {
+      ...base,
+      visual: {
+        schemaVersion: 1 as const,
+        snapeyeProtocolVersion: 1 as const,
+        operations: ["capture", "diff", "record"] as const,
+        features: ["history", "artifact"] as const,
+      },
+    }
+    expect(supportsVisualFeature(capabilities, "history")).toBe(true)
+    expect(supportsVisualFeature(capabilities, "artifact")).toBe(true)
+  })
+})
+
+describe("resolveDispatch — SnapEye project inspection", () => {
+  test("history and artifact forward at host scope without requiring an owned tab", () => {
+    for (const operation of [
+      { name: "visual_history", input: {} },
+      { name: "visual_artifact", input: { source: "baseline", name: "panel" } },
+    ]) {
+      const resolved = resolveDispatch({ request: request({ operation }), windowId: "win-1", tabs: [] })
+      expect(resolved).toEqual({ kind: "forward", windowId: "win-1" })
+    }
   })
 })
 
@@ -458,6 +515,81 @@ describe("BrowserHostBroker registry", () => {
 // --- dispatch forwarding ------------------------------------------------------
 
 describe("BrowserHostBroker dispatch", () => {
+  it.live("fails visual operations locally when the host does not advertise them", () =>
+    withHost({ type: "ok", result: { visual: { status: "ok" } } })((host) =>
+      Effect.gen(function* () {
+        const broker = yield* BrowserHostBroker.Service
+        yield* broker.register({ ...baseHello, callbackUrl: host.url })
+        yield* broker.pushEvent(stateChanged(agentTab("tab_a", "ses_1", { active: true })))
+        const response = yield* broker.dispatch(request({ operation: { name: "visual_capture", input: { name: "panel" } } }))
+        expect(response.ok).toBe(false)
+        if (!response.ok) {
+          expect(response.error.tag).toBe("BrowserUnsupportedOperation")
+          expect(response.error.retryable).toBe(false)
+        }
+      }),
+    ),
+  )
+
+  it.live("legacy visual:true rejects visual_record but structured capability allows it", () =>
+    withHost({ type: "ok", result: { visual: { status: "ok", operation: "record" } } })((host) =>
+      Effect.gen(function* () {
+        const broker = yield* BrowserHostBroker.Service
+        yield* broker.register({ ...baseHello, callbackUrl: host.url, capabilities: { ...baseHello.capabilities, visual: true as const } })
+        yield* broker.pushEvent(stateChanged(agentTab("tab_a", "ses_1", { active: true })))
+        const denied = yield* broker.dispatch(request({ operation: { name: "visual_record", input: { name: "motion" } } }))
+        expect(denied.ok).toBe(false)
+        if (!denied.ok) expect(denied.error.tag).toBe("BrowserUnsupportedOperation")
+
+        yield* broker.register({
+          ...baseHello,
+          callbackUrl: host.url,
+          capabilities: {
+            ...baseHello.capabilities,
+            visual: { schemaVersion: 1 as const, snapeyeProtocolVersion: 1 as const, operations: ["capture", "diff", "record"] as const },
+          },
+        })
+        const allowed = yield* broker.dispatch(request({ operation: { name: "visual_record", input: { name: "motion" } } }))
+        expect(allowed.ok).toBe(true)
+      }),
+    ),
+  )
+
+  it.live("visual history/artifact reject missing feature advertisement and forward when explicitly advertised", () =>
+    withHost({ type: "ok", result: { history: { root: ".snapeye", baselines: [], runs: [] } } })((host) =>
+      Effect.gen(function* () {
+        const broker = yield* BrowserHostBroker.Service
+        yield* broker.register({
+          ...baseHello,
+          callbackUrl: host.url,
+          capabilities: {
+            ...baseHello.capabilities,
+            visual: { schemaVersion: 1 as const, snapeyeProtocolVersion: 1 as const, operations: ["capture", "diff", "record"] as const },
+          },
+        })
+        const denied = yield* broker.dispatch(request({ operation: { name: "visual_history", input: {} } }))
+        expect(denied.ok).toBe(false)
+        if (!denied.ok) expect(denied.error.tag).toBe("BrowserUnsupportedOperation")
+
+        yield* broker.register({
+          ...baseHello,
+          callbackUrl: host.url,
+          capabilities: {
+            ...baseHello.capabilities,
+            visual: {
+              schemaVersion: 1 as const,
+              snapeyeProtocolVersion: 1 as const,
+              operations: ["capture", "diff", "record"] as const,
+              features: ["history", "artifact"] as const,
+            },
+          },
+        })
+        const allowed = yield* broker.dispatch(request({ operation: { name: "visual_history", input: {} } }))
+        expect(allowed.ok).toBe(true)
+      }),
+    ),
+  )
+
   it.live("forwards to the host and returns the ok envelope (status gains tabs)", () =>
     withHost({ type: "ok", result: { status: { connected: true } } })((host) =>
       Effect.gen(function* () {

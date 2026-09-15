@@ -71,6 +71,13 @@ const getBase = (appId: string): Configuration => ({
       to: "native/",
       filter: ["index.js", "index.d.ts", "build/Release/mac_window.node", "swift-build/**"],
     },
+    {
+      // SnapEye/SnapDOM/SnapDiff and the MIT gifenc stream/LZW primitives are
+      // bundled into the lazy browser visual runtime. Ship one canonical notice
+      // outside app.asar so installer/package recipients can inspect it directly.
+      from: "../browser-visual/THIRD_PARTY_NOTICES.txt",
+      to: "licenses/SnapEye-THIRD_PARTY_NOTICES.txt",
+    },
   ],
   mac: {
     category: "public.app-category.developer-tools",

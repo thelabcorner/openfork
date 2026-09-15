@@ -13,6 +13,11 @@ import { BrowserResizeTool } from "./browser/resize"
 import { BrowserSetAppearanceTool } from "./browser/set-appearance"
 import { BrowserSnapshotTool } from "./browser/snapshot"
 import { BrowserScreenshotTool } from "./browser/screenshot"
+import { BrowserVisualCaptureTool } from "./browser/visual-capture"
+import { BrowserVisualDiffTool } from "./browser/visual-diff"
+import { BrowserVisualRecordTool } from "./browser/visual-record"
+import { BrowserVisualHistoryTool } from "./browser/visual-history"
+import { BrowserVisualArtifactTool } from "./browser/visual-artifact"
 import { BrowserClickTool } from "./browser/click"
 import { BrowserTypeTool } from "./browser/type"
 import { BrowserPressTool } from "./browser/press"
@@ -41,6 +46,11 @@ const OPERATIONS = [
   "set_appearance",
   "snapshot",
   "screenshot",
+  "visual_capture",
+  "visual_diff",
+  "visual_record",
+  "visual_history",
+  "visual_artifact",
   "click",
   "type",
   "press",
@@ -87,6 +97,7 @@ type Metadata = {
 
 const OPERATION_GROUPS: ReadonlyArray<readonly [string, readonly Operation[]]> = [
   ["read", ["status", "snapshot", "screenshot", "query", "profiler_start", "profiler_stop", "react_inspect", "extensions_list"]],
+  ["visual", ["visual_capture", "visual_diff", "visual_record", "visual_history", "visual_artifact"]],
   ["navigate", ["open", "claim", "navigate", "close"]],
   ["interact", ["resize", "set_appearance", "click", "type", "press", "scroll", "wait_for", "highlight", "annotate"]],
   ["evaluate", ["evaluate", "open_devtools"]],
@@ -123,6 +134,11 @@ export const BrowserTool = Tool.define<
       set_appearance: BrowserSetAppearanceTool,
       snapshot: BrowserSnapshotTool,
       screenshot: BrowserScreenshotTool,
+      visual_capture: BrowserVisualCaptureTool,
+      visual_diff: BrowserVisualDiffTool,
+      visual_record: BrowserVisualRecordTool,
+      visual_history: BrowserVisualHistoryTool,
+      visual_artifact: BrowserVisualArtifactTool,
       click: BrowserClickTool,
       type: BrowserTypeTool,
       press: BrowserPressTool,
@@ -151,6 +167,11 @@ export const BrowserTool = Tool.define<
       set_appearance: Tool.init(infos.set_appearance),
       snapshot: Tool.init(infos.snapshot),
       screenshot: Tool.init(infos.screenshot),
+      visual_capture: Tool.init(infos.visual_capture),
+      visual_diff: Tool.init(infos.visual_diff),
+      visual_record: Tool.init(infos.visual_record),
+      visual_history: Tool.init(infos.visual_history),
+      visual_artifact: Tool.init(infos.visual_artifact),
       click: Tool.init(infos.click),
       type: Tool.init(infos.type),
       press: Tool.init(infos.press),
@@ -172,7 +193,7 @@ export const BrowserTool = Tool.define<
 
     return {
       description:
-        "One compact gateway for Desktop browser control. Operations: status, open, claim, navigate, resize, set_appearance, snapshot, screenshot, click, type, press, scroll, evaluate, wait_for, recording_start, recording_stop, close, query, highlight, annotate, profiler_start, profiler_stop, react_inspect, open_devtools, extensions_list. Use action=list for grouped discovery, action=describe for one operation's exact argument schema, and action=call to execute it. Legacy result text may say browser_open/browser_snapshot/etc.; treat those names as the corresponding operation through this tool.",
+        "One compact gateway for Desktop browser control. Operations include deterministic SnapEye visual verification through visual_capture, visual_diff, and visual_record in addition to status/open/navigation/snapshot/screenshot/interactions/evaluation/recording/profiling. Use action=list for grouped discovery, action=describe for one operation's exact argument schema, and action=call to execute it. Legacy result text may say browser_open/browser_snapshot/etc.; treat those names as the corresponding operation through this tool.",
       parameters: Parameters,
       jsonSchema: ProviderParameters,
       execute: (params, ctx) =>

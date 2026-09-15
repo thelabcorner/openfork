@@ -24,6 +24,7 @@
   "workspaces": {
     "packages": [
       "packages/app",
+      "packages/browser-visual",
       "packages/mobile",
       "packages/client",
       "packages/codemode",

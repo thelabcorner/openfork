@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json.schemastore.org/package.json",
+  "name": "@opencode-ai/browser-visual",
+  "version": "1.18.30",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "typecheck": "tsgo --noEmit",
+    "verify:chrome-generated": "bun ../../extensions/chrome/build.ts --check",
+    "verify:chromium": "bun ./script/chromium-fidelity.ts",
+    "verify:upstream": "bun ./script/upstream-interop.ts",
+    "verify:bundles": "bun run verify:chrome-generated && bun ./script/bundle-budgets.ts",
+    "verify:mv3": "bun run verify:chrome-generated && bun ./script/mv3-lifetime.ts",
+    "verify:all": "bun run typecheck && bun run verify:chrome-generated && bun run verify:chromium && bun run verify:upstream && bun ./script/mv3-lifetime.ts && bun ./script/bundle-budgets.ts"
+  },
+  "dependencies": {
+    "gifenc": "1.0.3",
+    "@zumer/snapdom": "3.0.0",
+    "@zumer/snapeye": "0.4.0"
+  },
+  "devDependencies": {
+    "@types/bun": "catalog:",
+    "@types/node": "catalog:",
+    "@typescript/native-preview": "catalog:",
+    "typescript": "catalog:",
+    "vite": "6.4.3"
+  }
+}

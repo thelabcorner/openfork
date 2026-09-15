@@ -149,6 +149,7 @@ The browser is a real fork-owned subsystem, not a link launcher.
 - Chrome DevTools Protocol automation;
 - agent and human ownership arbitration;
 - annotation overlays, element badges, cursor presentation, screenshots, and recording;
+- first-party visual capture, deterministic diffing, baseline review, and motion recording powered by [SnapEye](https://github.com/zumerlab/snapeye), with [SnapDOM](https://github.com/zumerlab/snapdom) and [SnapDiff](https://github.com/zumerlab/snapdiff) from [Zumerlab](https://github.com/zumerlab);
 - viewport sizing and device-style presentation controls;
 - exact-presentation fast paths and indexed host state;
 - reduced idle CDP work and listener admission;
@@ -354,6 +355,8 @@ The exact machine-readable workspace and ownership rules are maintained in [`kee
 OpenFork is licensed under the [MIT License](LICENSE).
 
 OpenFork is derived from [OpenCode](https://github.com/anomalyco/opencode) and retains the upstream copyright and license notices. Portions of the quota system are derived from [OpenChamber](https://github.com/openchamber/openchamber), also under MIT terms.
+
+OpenFork's first-party browser visual-observation workflow is built on [SnapEye](https://github.com/zumerlab/snapeye), [SnapDOM](https://github.com/zumerlab/snapdom), and [SnapDiff](https://github.com/zumerlab/snapdiff) from [Zumerlab](https://github.com/zumerlab), created and maintained by Juan and the Zumerlab project. Their work provides the deterministic DOM capture and visual-diff foundation that OpenFork integrates into its built-in browser and Chrome extension. Distribution-specific third-party notices are preserved in [`packages/browser-visual/THIRD_PARTY_NOTICES.txt`](packages/browser-visual/THIRD_PARTY_NOTICES.txt).
 
 <div align="center">
 

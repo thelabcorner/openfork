@@ -213,6 +213,23 @@ async function forwardResponseToDesktop(response: unknown): Promise<void> {
   if (!res?.ok) throw new Error(`extension response relay failed: ${res?.status ?? "no desktop"}`)
 }
 
+async function forwardVisualRpcToDesktop(request: unknown): Promise<unknown> {
+  const cfg = loadHostConfig()
+  if (!cfg) return { ok: false, id: "", error: { code: "VISUAL_HOST_UNAVAILABLE", message: "Desktop BrowserHost not reachable" } }
+  const res = await fetch(`${cfg.callbackUrl}/v1/browser/visual/rpc`, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      authorization: `Bearer ${cfg.callbackToken}`,
+    },
+    body: JSON.stringify(request),
+    signal: AbortSignal.timeout(30_000),
+  })
+  const body = await res.json().catch(() => null)
+  if (!res.ok) throw new Error(`visual rpc relay failed: ${res.status}`)
+  return body
+}
+
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms))
 
 async function runDesktopRelay(origin: string, signal: AbortSignal): Promise<void> {
@@ -346,6 +363,21 @@ async function handleMessage(raw: unknown) {
       }
       break
     }
+    case "artifact_rpc": {
+      try {
+        const response = await forwardVisualRpcToDesktop(msg.request)
+        process.stdout.write(encodeNativeMessage({ type: "artifact_rpc_result", response }))
+      } catch (e) {
+        const id = ((msg.request as Record<string, unknown> | undefined)?.id as string | undefined) ?? ""
+        try {
+          process.stdout.write(encodeNativeMessage({
+            type: "artifact_rpc_result",
+            response: { ok: false, id, error: { code: "VISUAL_HOST_UNAVAILABLE", message: String(e) } },
+          }))
+        } catch {}
+      }
+      break
+    }
     case "abort": {
       // Best-effort — desktop host handles abort via its own abort endpoint
       const cfg = loadHostConfig()
@@ -372,4 +404,4 @@ if (import.meta.main) {
   void main()
 }
 
-export { encodeNativeMessage, NativeMessageReader, FramingError, loadHostConfig, NATIVE_HOST_NAME, MAX_HOST_TO_EXT, MAX_EXT_TO_HOST }
+export { encodeNativeMessage, NativeMessageReader, FramingError, loadHostConfig, NATIVE_HOST_NAME, MAX_HOST_TO_EXT, MAX_EXT_TO_HOST, forwardVisualRpcToDesktop }

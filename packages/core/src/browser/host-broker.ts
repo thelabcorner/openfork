@@ -71,6 +71,13 @@ export interface HostCapabilities {
   readonly cdp: boolean
   /** Additive protocol-v2 capability; absent means no live Chrome-extension lane. */
   readonly chrome?: true
+  /** Additive protocol-v2 SnapEye capability; `true` is legacy capture/diff. */
+  readonly visual?: true | {
+    readonly schemaVersion: 1
+    readonly snapeyeProtocolVersion: 1
+    readonly operations: readonly ("capture" | "diff" | "record")[]
+    readonly features?: readonly ("history" | "artifact")[]
+  }
 }
 
 export interface HostGuestState {
@@ -500,6 +507,37 @@ export const sessionTabs = (
     .filter((tab) => tab.windowId === windowId && tab.owner.kind === "agent" && tab.owner.sessionId === sessionId)
     .sort((a, b) => b.lastActiveAt - a.lastActiveAt)
 
+export type VisualOperationCapability = "capture" | "diff" | "record"
+export type VisualFeatureCapability = "history" | "artifact"
+
+/**
+ * Capability check deliberately understands the early `visual:true` spelling.
+ * That legacy flag shipped before visual_record and therefore means only
+ * capture+diff; structured hosts must explicitly advertise record.
+ */
+export const supportsVisualOperation = (
+  capabilities: HostCapabilities,
+  operation: VisualOperationCapability,
+): boolean => {
+  const visual = capabilities.visual
+  if (visual === true) return operation === "capture" || operation === "diff"
+  return !!visual && visual.schemaVersion === 1 && visual.snapeyeProtocolVersion === 1 && visual.operations.includes(operation)
+}
+
+export const supportsVisualFeature = (
+  capabilities: HostCapabilities,
+  feature: VisualFeatureCapability,
+): boolean => {
+  const visual = capabilities.visual
+  return visual !== true && !!visual && visual.schemaVersion === 1 && visual.snapeyeProtocolVersion === 1 && visual.features?.includes(feature) === true
+}
+
+const requestedVisualOperation = (name: string): VisualOperationCapability | undefined =>
+  name === "visual_capture" ? "capture" : name === "visual_diff" ? "diff" : name === "visual_record" ? "record" : undefined
+
+const requestedVisualFeature = (name: string): VisualFeatureCapability | undefined =>
+  name === "visual_history" ? "history" : name === "visual_artifact" ? "artifact" : undefined
+
 // --- pure dispatch resolution (design §4; unit-tested without HTTP) -----------
 
 export type ResolveDispatchInput = {
@@ -559,8 +597,9 @@ export const resolveDispatch = (input: ResolveDispatchInput): ResolveDispatchRes
     return { kind: "forward", windowId, tabId: tab.tabId }
   }
 
-  // (3) status: host-level forward; broker enriches the full tab list after
-  if (request.operation.name === "status") {
+  // (3) host/project-level forward. Visual history/artifact inspection is
+  // scoped by trusted project provenance rather than browser-tab ownership.
+  if (request.operation.name === "status" || request.operation.name === "visual_history" || request.operation.name === "visual_artifact") {
     return { kind: "forward", windowId }
   }
 
@@ -898,6 +937,33 @@ const layer = Layer.effect(
       const requestId = request.requestId ?? crypto.randomUUID()
       const connection = resolveWindow(request)
       if (!connection) return unavailable(requestId, startedAt)
+
+      const visualOperation = requestedVisualOperation(request.operation.name)
+      if (visualOperation && !supportsVisualOperation(connection.registration.capabilities, visualOperation)) {
+        return errorResponse(
+          requestId,
+          {
+            tag: "BrowserUnsupportedOperation",
+            message: `The browser host does not advertise SnapEye ${visualOperation} support.`,
+            retryable: false,
+            details: { operation: visualOperation, visual: connection.registration.capabilities.visual ?? null },
+          },
+          startedAt,
+        )
+      }
+      const visualFeature = requestedVisualFeature(request.operation.name)
+      if (visualFeature && !supportsVisualFeature(connection.registration.capabilities, visualFeature)) {
+        return errorResponse(
+          requestId,
+          {
+            tag: "BrowserUnsupportedOperation",
+            message: `The browser host does not advertise SnapEye ${visualFeature} support.`,
+            retryable: false,
+            details: { feature: visualFeature, visual: connection.registration.capabilities.visual ?? null },
+          },
+          startedAt,
+        )
+      }
 
       const windowId = connection.registration.windowId
       const resolution = resolveDispatch({ request, windowId, tabs: [...tabs.values()] })

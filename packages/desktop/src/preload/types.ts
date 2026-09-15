@@ -2,7 +2,21 @@ import type { DesktopMenuAction } from "@opencode-ai/app/desktop-menu"
 import type { WslServersPlatform } from "@opencode-ai/app/wsl/types"
 import type { UpdaterState } from "@opencode-ai/app/updater"
 import type { DesktopNativeBundle } from "@opencode-ai/app/i18n/desktop-native"
-import type { BrowserAnnotationResult, BrowserPointerEvent, BrowserState, HostOwner, WireGuestTabState } from "../main/browser/contracts"
+import type {
+  BrowserAnnotationResult,
+  BrowserPointerEvent,
+  BrowserState,
+  HostOwner,
+  VisualApprovalOutput,
+  VisualApprovalExpectation,
+  VisualArtifactInput,
+  VisualArtifactOutput,
+  VisualArtifactPreview,
+  VisualHistoryInput,
+  VisualHistoryOutput,
+  VisualProjectContext,
+  WireGuestTabState,
+} from "../main/browser/contracts"
 export type { BrowserAnnotationResult } from "../main/browser/contracts"
 export type ChromePairingStatus = {
   installed: boolean
@@ -96,6 +110,10 @@ export type BrowserAPI = {
   onHostState: (cb: (state: { connected: boolean }) => void) => () => void
   startAnnotation: (tabId: string) => Promise<BrowserAnnotationResult | null>
   cancelAnnotation: (tabId: string) => Promise<void>
+  visualHistory: (context: VisualProjectContext, input?: VisualHistoryInput) => Promise<VisualHistoryOutput["history"]>
+  visualArtifact: (context: VisualProjectContext, input: VisualArtifactInput) => Promise<VisualArtifactOutput["artifact"]>
+  visualArtifactPreview: (context: VisualProjectContext, input: VisualArtifactInput) => Promise<VisualArtifactPreview | null>
+  visualApproveRun: (context: VisualProjectContext, runId: string, expected: VisualApprovalExpectation) => Promise<VisualApprovalOutput>
 }
 
 export type ElectronAPI = {

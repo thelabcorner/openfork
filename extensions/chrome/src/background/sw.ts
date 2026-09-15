@@ -8,18 +8,11 @@ import { DebuggerManager } from "./debugger.js"
 import { NativePortV2 } from "./native-port.js"
 import { ActiveTabIconController } from "./active-tab-icon.js"
 import { waitForTabComplete, waitForUrl } from "./tab-waits.js"
-
-const DEBUGGER_OPERATIONS = new Set([
-  "snapshot",
-  "screenshot",
-  "click",
-  "type",
-  "press",
-  "scroll",
-  "evaluate",
-  "resize",
-  "set_appearance",
-])
+import { operationNeedsDebugger } from "./dispatch-policy.js"
+import { interactiveElementsScanScript, resolveElementScript } from "@opencode-ai/browser-targeting"
+import { SnapshotRefRegistry } from "./snapshot-refs.js"
+import { VisualRuntimeLoader } from "./visual-runtime-loader.js"
+import { VisualRequestTracker, abortVisualRequestsForTab } from "./visual-lifecycle.js"
 
 // ---- helpers ---------------------------------------------------------------
 
@@ -46,6 +39,25 @@ let debuggerManager = null
 let nativePort = null
 let wsFallback = null // optional WS transport for WSL — see notes below
 let activeTabIconController = null
+const activeVisualRequests = new VisualRequestTracker()
+const snapshotRefs = new SnapshotRefRegistry(chrome.storage?.session)
+const visualRuntime = new VisualRuntimeLoader({
+  probe: async (tabId) => {
+    try {
+      const response = await chrome.tabs.sendMessage(tabId, { type: "opencode:visual-ready" })
+      return response?.ready === true && response?.version === 1
+    } catch {
+      return false
+    }
+  },
+  inject: async (tabId) => {
+    await chrome.scripting.executeScript({
+      target: { tabId },
+      files: ["src/content/visual.bundle.js"],
+      world: "ISOLATED",
+    })
+  },
+})
 
 function getDebuggerManager() {
   if (!debuggerManager) {
@@ -64,7 +76,7 @@ function getNativePort() {
       hostName: NATIVE_HOST_NAME,
       connectNative: (name) => chrome.runtime.connectNative(name),
       onRequest: (request) => { void handleBrokerRequest(request, "native") },
-      onAbort: (requestId) => console.debug("[sw:native] abort", { requestId }),
+      onAbort: (requestId) => { void abortBrokerRequest(requestId) },
       onDisconnect: (err) => {
         console.warn("[sw:native] disconnected", err)
         // Backoff reconnect for resilience (service worker may go idle)
@@ -131,7 +143,7 @@ async function handleBrokerRequest(raw, source) {
     }
     const req = raw
     requestId = req.requestId
-    const result = await dispatchOperation(req.tabId, req.operation, req.sessionId)
+    const result = await dispatchOperation(req)
     const resp = { ok: true, requestId, result, elapsedMs: Date.now() - startedAt }
     reply(source, resp)
   } catch (err) {
@@ -151,13 +163,14 @@ function reply(source, response) {
 
 // ---- per-operation CDP bridge ---------------------------------------------
 
-async function dispatchOperation(tabIdStr, operation, sessionId) {
+async function dispatchOperation(request) {
+  const { tabId: tabIdStr, operation, sessionId } = request
   const tabId = tabIdStr ? Number.parseInt(tabIdStr, 10) : await resolveActiveTabId()
   if (!Number.isFinite(tabId)) throw Object.assign(new Error(`Invalid tabId ${tabIdStr}`), { tag: "BrowserTabNotFound", retryable: true })
 
   const name = operation.name
   const input = operation.input ?? {}
-  const needsDebugger = DEBUGGER_OPERATIONS.has(name)
+  const needsDebugger = operationNeedsDebugger(name, input)
   const dm = needsDebugger ? getDebuggerManager() : debuggerManager
 
   // Attach only for operations that actually issue chrome.debugger commands.
@@ -219,6 +232,7 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
       return { assigned: { tabId: String(tabId), owner } }
     }
     case "navigate": {
+      await snapshotRefs.clear(tabId)
       await chrome.tabs.update(tabId, { url: input.url })
       await waitForTabComplete(chrome.tabs, tabId, input.timeoutMs ?? 15000)
       const tab = await chrome.tabs.get(tabId)
@@ -226,26 +240,40 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
     }
     case "close": {
       const closeId = input.tabId ? Number.parseInt(input.tabId, 10) : tabId
+      await snapshotRefs.clear(closeId)
       try { await debuggerManager?.detach(closeId) } catch {}
       await chrome.tabs.remove(closeId)
       return { closed: { tabId: String(closeId), wasActive: true, guestsRemaining: 0 } }
     }
     case "snapshot": {
-      // Use chrome.scripting to inject a11y scanner (fallback) + CDP Accessibility tree primary
-      let tree = []; let elements = []; let text = ""
+      // Use the same page scanner/selector synthesis as the built-in webview.
+      // Running it through CDP keeps the extension lane byte-for-byte aligned
+      // with Desktop's Runtime.evaluate semantics and gives us real versioned
+      // refs instead of the old `elements: []` placeholder.
+      const scan = await evaluatePage(dm, tabId, interactiveElementsScanScript())
+      if (!scan || typeof scan !== "object" || !Array.isArray(scan.elements)) {
+        throw Object.assign(new Error("Chrome snapshot scanner returned an invalid result"), { tag: "BrowserOperationFailed", retryable: true })
+      }
+      const elements = scan.elements
+      const refState = await snapshotRefs.replace(tabId, elements)
+      let tree = []
       try {
         const cdpTree = await dm.sendCommand(tabId, "Accessibility.getFullAXTree", {})
         tree = cdpTree?.nodes ?? []
-        text = tree.map(n => n.name?.value ?? "").join(" ")
       } catch {}
-      // Augment with scripting fallback if CDP tree empty
-      if (tree.length === 0) {
-        try {
-          const results = await chrome.scripting.executeScript({ target: { tabId }, func: () => document.documentElement?.outerHTML?.slice(0, 20000) ?? "" })
-          text = results?.[0]?.result ?? text
-        } catch {}
+      return {
+        snapshot: {
+          tabId: String(tabId),
+          url: typeof scan.url === "string" ? scan.url : (await chrome.tabs.get(tabId)).url ?? "",
+          tree,
+          elements,
+          text: typeof scan.text === "string" ? scan.text : "",
+          truncated: !!scan.truncated,
+          count: Number.isFinite(scan.count) ? scan.count : elements.length,
+          viewport: scan.viewport ?? { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 },
+          snapshotVersion: refState.version,
+        },
       }
-      return { snapshot: { tabId: String(tabId), url: (await chrome.tabs.get(tabId)).url ?? "", tree, elements, text: text.slice(0, 20000), truncated: text.length > 20000, count: elements.length, viewport: { width: 1280, height: 800, dpr: 1, scrollX: 0, scrollY: 0 }, snapshotVersion: Date.now() } }
     }
     case "screenshot": {
       // HIDE_FOR_TOOL_USE barrier (matches annotation-overlay.ts:801-812 + contracts screenshot invariant #5):
@@ -275,9 +303,120 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
       }
       return result
     }
+    case "visual_capture":
+    case "visual_diff":
+    case "visual_record": {
+      const visual = input.__opencodeVisual
+      if (
+        !visual ||
+        typeof visual.capability !== "string" ||
+        typeof visual.runId !== "string" ||
+        !Number.isSafeInteger(visual.maxChunkBytes) ||
+        visual.maxChunkBytes < 1
+      ) {
+        throw Object.assign(new Error("Visual operation is missing its Desktop capability"), { tag: "BrowserOperationFailed", retryable: false })
+      }
+      if (!activeVisualRequests.tryTrack(request.requestId, tabId)) {
+        throw Object.assign(new Error(`A visual operation is already active on tab ${tabId}`), {
+          tag: "BrowserOperationFailed",
+          retryable: true,
+        })
+      }
+      try {
+        const target = await resolveVisualTarget(dm, tabId, input.target)
+        const options = {
+          ...(input.stabilize !== undefined ? { stabilize: input.stabilize } : {}),
+          ...(input.waitFor !== undefined ? { waitFor: input.waitFor } : {}),
+          ...(input.waitTimeout !== undefined ? { waitTimeout: input.waitTimeout } : {}),
+          ...(input.settle !== undefined ? { settle: input.settle } : {}),
+          ...(input.settleTimeout !== undefined ? { settleTimeout: input.settleTimeout } : {}),
+          ...(input.scale !== undefined ? { scale: input.scale } : {}),
+          ...(input.svg !== undefined ? { svg: input.svg } : {}),
+          ...(name === "visual_diff"
+            ? {
+                diffOptions: {
+                  ...(input.threshold !== undefined ? { threshold: input.threshold } : {}),
+                  ...(input.includeAA !== undefined ? { includeAA: input.includeAA } : {}),
+                  ...(input.diffMask !== undefined ? { diffMask: input.diffMask } : {}),
+                },
+                regionOptions: {
+                  ...(input.tileSize !== undefined ? { tileSize: input.tileSize } : {}),
+                  ...(input.gapTiles !== undefined ? { gapTiles: input.gapTiles } : {}),
+                  ...(input.minRegionCssSide !== undefined ? { minRegionCssSide: input.minRegionCssSide } : {}),
+                  ...(input.minRegionCssArea !== undefined ? { minRegionCssArea: input.minRegionCssArea } : {}),
+                  ...(input.maxRegions !== undefined ? { maxRegions: input.maxRegions } : {}),
+                },
+              }
+            : {}),
+          ...(name === "visual_record"
+            ? {
+                ...(input.duration !== undefined ? { duration: input.duration } : {}),
+                ...(input.fps !== undefined ? { fps: input.fps } : {}),
+                ...(input.format !== undefined ? { format: input.format } : {}),
+                ...(input.bitrate !== undefined ? { bitrate: input.bitrate } : {}),
+                filmstripOptions: {
+                  ...(input.filmstripMaxCells !== undefined ? { maxCells: input.filmstripMaxCells } : {}),
+                  ...(input.filmstripMaxColumns !== undefined ? { maxColumns: input.filmstripMaxColumns } : {}),
+                  ...(input.filmstripMaxWidth !== undefined ? { maxWidth: input.filmstripMaxWidth } : {}),
+                  ...(input.filmstripGap !== undefined ? { gap: input.filmstripGap } : {}),
+                  ...(input.filmstripBackground !== undefined ? { background: input.filmstripBackground } : {}),
+                },
+              }
+            : {}),
+        }
+        // Use the same synchronous hide barrier as compositor screenshots in
+        // addition to SnapEye's reserved-selector hiding. The barrier protects
+        // against any current/future OpenCode shadow UI that is not represented
+        // by a known host selector.
+        try { await chrome.tabs.sendMessage(tabId, { type: "opencode:hide" }) } catch {}
+        await visualRuntime.ensure(tabId)
+        const response = await chrome.tabs.sendMessage(tabId, {
+          type: "opencode:visual-run",
+          command: {
+            requestId: request.requestId,
+            operation: name === "visual_capture" ? "capture" : name === "visual_diff" ? "diff" : "record",
+            name: input.name,
+            runId: visual.runId,
+            capability: visual.capability,
+            maxChunkBytes: visual.maxChunkBytes,
+            target,
+            redaction: visual.redaction,
+            options,
+          },
+        })
+        if (!response?.ok) {
+          const interruption = await visualInterruptionReason(request.requestId, tabId)
+          // `ensureVisualRuntime()` proved a responder existed immediately
+          // before this long-lived message. If Chrome later resolves it with no
+          // response, the isolated document context disappeared (navigation or
+          // tab teardown) while the visual operation was pending.
+          const lostContext = response == null
+          const interrupted = lostContext || response?.aborted === true || interruption !== undefined
+          throw Object.assign(new Error(
+            response?.error ?? (lostContext ? "Visual browser context disappeared" : "Chrome visual runtime failed"),
+          ), {
+            tag: interrupted ? "BrowserControlInterrupted" : "BrowserOperationFailed",
+            retryable: true,
+          })
+        }
+        return { visual: response.result }
+      } catch (error) {
+        const interruption = await visualInterruptionReason(request.requestId, tabId)
+        if (interruption) {
+          throw Object.assign(new Error(`Visual operation interrupted: ${interruption}`), {
+            tag: "BrowserControlInterrupted",
+            retryable: true,
+          })
+        }
+        throw error
+      } finally {
+        activeVisualRequests.untrack(request.requestId)
+        try { await chrome.tabs.sendMessage(tabId, { type: "opencode:show" }) } catch {}
+      }
+    }
     case "click": {
       const target = input.target
-      const coords = await resolveTargetToCoords(tabId, target)
+      const coords = await resolveTargetToCoords(dm, tabId, target)
       // Cursor choreography: move glide 160ms -> click pulse 40ms -> mousePressed/Released
       // Mirrors packages/desktop/src/main/browser/operations.ts desktop lane:
       //   emitPointer("move") -> sleep(160) -> emitPointer("click") -> sleep(40) -> mousePressed/Released
@@ -299,7 +438,7 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
     case "type": {
       const text = input.text ?? ""
       if (input.target) {
-        const c = await resolveTargetToCoords(tabId, input.target)
+        const c = await resolveTargetToCoords(dm, tabId, input.target)
         await dm.sendCommand(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", x: c.x, y: c.y, button: "left", clickCount: 1 })
         await dm.sendCommand(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", x: c.x, y: c.y, button: "left", clickCount: 1 })
       }
@@ -383,7 +522,7 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
     case "annotate": {
       const targets = input.targets ?? (input.target ? [{ target: input.target }] : [])
       for (const t of targets) {
-        const coords = await resolveTargetToCoords(tabId, t.target)
+        const coords = await resolveTargetToCoords(dm, tabId, t.target)
         try { await chrome.tabs.sendMessage(tabId, { type: "opencode:highlight", rect: { x: coords.x - 20, y: coords.y - 10, width: 40, height: 20 }, label: t.label, tone: t.tone }) } catch {}
       }
       if (input.clear) try { await chrome.tabs.sendMessage(tabId, { type: "opencode:clear" }) } catch {}
@@ -416,39 +555,122 @@ async function dispatchOperation(tabIdStr, operation, sessionId) {
   }
 }
 
-async function resolveTargetToCoords(tabId, target) {
-  if (!target) return { x: 100, y: 100 }
-  if (typeof target.x === "number" && typeof target.y === "number") return { x: target.x, y: target.y }
-  // Locator or ref — resolve via scripting
-  const locator = target.value ? target : target.locator
-  const selector = locator?.value
-  if (selector) {
-    try {
-      const [{ result }] = await chrome.scripting.executeScript({
-        target: { tabId },
-        func: (sel, type) => {
-          let el = null
-          if (type === "css") el = document.querySelector(sel)
-          else if (type === "text") el = [...document.querySelectorAll("*")].find(e => e.textContent?.includes(sel))
-          else if (type === "role") el = document.querySelector(`[role="${sel}"]`)
-          else if (type === "testid") el = document.querySelector(`[data-testid="${sel}"]`)
-          else el = document.querySelector(sel)
-          if (!el) return null
-          const r = el.getBoundingClientRect()
-          return { x: r.x + r.width / 2, y: r.y + r.height / 2 }
-        },
-        args: [selector, locator.type ?? "css"],
-      })
-      if (result) return result
-    } catch {}
+async function resolveTargetToCoords(dm, tabId, target) {
+  if (!target) throw browserTargetNotFound("A browser element target is required")
+  if (isRefTarget(target)) {
+    const { record } = await requireSnapshotRef(tabId, target)
+    return { x: record.x, y: record.y }
   }
-  // Ref fallback — try chrome.storage-stored snapshot refs (M2)
-  return { x: 100, y: 100 }
+  if (typeof target.x === "number" && typeof target.y === "number") {
+    return { x: Math.round(target.x), y: Math.round(target.y) }
+  }
+  const resolved = await resolveLiveTarget(dm, tabId, target)
+  return resolved.center
+}
+
+async function resolveVisualTarget(dm, tabId, target) {
+  if (!target || target.kind === "document") return undefined
+  if (target.kind === "css") {
+    if (typeof target.selector !== "string" || !target.selector) throw browserInvalidSelector("visual target requires a non-empty CSS selector")
+    return target.selector
+  }
+  if (target.kind !== "element" || !target.target) throw browserInvalidSelector("Unsupported visual target")
+  const elementTarget = target.target
+  if (isRefTarget(elementTarget)) {
+    const { record } = await requireSnapshotRef(tabId, elementTarget)
+    return record.selector
+  }
+  const manager = dm ?? getDebuggerManager()
+  if (!manager.isAttached(tabId)) await manager.attach(tabId)
+  const resolved = await resolveLiveTarget(manager, tabId, elementTarget)
+  if (typeof resolved.selector?.value !== "string" || !resolved.selector.value) {
+    throw browserTargetNotFound("Visual target could not be converted to a stable selector")
+  }
+  return resolved.selector.value
+}
+
+async function resolveLiveTarget(dm, tabId, target) {
+  const value = await evaluatePage(dm, tabId, resolveElementScript(target, false))
+  if (value && typeof value === "object" && typeof value.error === "string") throw browserInvalidSelector(value.error)
+  if (!value || typeof value !== "object" || !value.center) throw browserTargetNotFound()
+  return value
+}
+
+async function requireSnapshotRef(tabId, target) {
+  const state = await snapshotRefs.get(tabId)
+  const expected = state?.version ?? 0
+  if (!state || target.snapshotVersion !== state.version || !state.refs[target.ref]) {
+    const error = new Error(`Snapshot ref "${target.ref}" is stale (bound to snapshot ${target.snapshotVersion}, current snapshot ${expected}). Re-run browser snapshot and use the new ref.`)
+    Object.assign(error, {
+      tag: "BrowserStaleRefError",
+      retryable: false,
+      details: { ref: target.ref, expectedSnapshot: expected, actualSnapshot: target.snapshotVersion },
+    })
+    throw error
+  }
+  return { state, record: state.refs[target.ref] }
+}
+
+async function evaluatePage(dm, tabId, expression) {
+  const response = await dm.sendCommand(tabId, "Runtime.evaluate", {
+    expression,
+    awaitPromise: true,
+    returnByValue: true,
+  })
+  if (response?.exceptionDetails) {
+    const detail = response.exceptionDetails.exception?.description ?? response.exceptionDetails.text ?? "Runtime.evaluate failed"
+    throw Object.assign(new Error(String(detail)), { tag: "BrowserOperationFailed", retryable: true })
+  }
+  return response?.result?.value
+}
+
+function isRefTarget(target) {
+  return !!target && typeof target.ref === "string" && typeof target.snapshotVersion === "number"
+}
+
+function browserInvalidSelector(message) {
+  return Object.assign(new Error(message), { tag: "BrowserInvalidSelector", retryable: false })
+}
+
+function browserTargetNotFound(message = "Browser target was not found") {
+  return Object.assign(new Error(message), { tag: "BrowserTargetNotFound", retryable: true })
 }
 
 async function resolveActiveTabId() {
   const [active] = await chrome.tabs.query({ active: true, lastFocusedWindow: true })
   return active?.id ?? null
+}
+
+async function abortBrokerRequest(requestId) {
+  const tabId = activeVisualRequests.tabId(requestId)
+  if (tabId !== undefined) {
+    activeVisualRequests.interrupt(requestId, "caller-abort")
+    try { await chrome.tabs.sendMessage(tabId, { type: "opencode:visual-abort", requestId }) } catch {}
+  }
+  console.debug("[sw:native] abort", { requestId, visual: tabId !== undefined })
+}
+
+async function abortVisualTab(tabId, reason) {
+  const count = await abortVisualRequestsForTab(activeVisualRequests, tabId, reason, async (targetTabId, requestId) => {
+    await chrome.tabs.sendMessage(targetTabId, { type: "opencode:visual-abort", requestId })
+  })
+  if (count > 0) console.debug("[sw:visual] tab lifecycle abort", { tabId, reason, count })
+}
+
+async function visualInterruptionReason(requestId, tabId) {
+  const tracked = activeVisualRequests.interruption(requestId)
+  if (tracked) return tracked
+  // `tabs.sendMessage()` may reject because the tab disappeared before Chrome
+  // delivers tabs.onRemoved. Verify tab existence while the request is still
+  // tracked so that this scheduling race cannot degrade a user-authority close
+  // into a generic BrowserOperationFailed.
+  try {
+    await chrome.tabs.get(tabId)
+    return undefined
+  } catch {
+    activeVisualRequests.interrupt(requestId, "tab-removed")
+    return "tab-removed"
+  }
 }
 
 // ---- listeners -------------------------------------------------------------
@@ -469,6 +691,20 @@ chrome.runtime.onStartup.addListener(() => {
 try { getNativePort().connect() } catch {}
 void getActiveTabIconController().start()
 
+// Match the built-in webview lane's fail-closed lifecycle semantics. A visual
+// observation belongs to one document lifetime: navigation start or tab loss
+// invalidates it before the old isolated content world disappears. Dispatch's
+// finally block remains responsible for untracking and Desktop capability
+// revocation, so these listeners only signal cancellation and never publish a
+// competing terminal state.
+chrome.tabs.onUpdated.addListener((tabId, changeInfo) => {
+  if (changeInfo.status !== "loading" && typeof changeInfo.url !== "string") return
+  void abortVisualTab(tabId, "navigation")
+})
+chrome.tabs.onRemoved.addListener((tabId) => {
+  void abortVisualTab(tabId, "tab-removed")
+})
+
 // Native host -> extension commands (primary)
 if (chrome.runtime.onConnectNative) {
   // Not a real API; native host initiates connectNative from extension side only.
@@ -486,7 +722,7 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
       const startedAt = Date.now()
       try {
         if (!isBrokerRequest(m.request)) throw Object.assign(new Error("Invalid BrokerRequest"), { tag: "BrowserOperationFailed" })
-        const result = await dispatchOperation(m.request.tabId, m.request.operation, m.request.sessionId)
+        const result = await dispatchOperation(m.request)
         sendResponse({ ok: true, requestId: m.request.requestId, result, elapsedMs: Date.now() - startedAt })
       } catch (err) {
         sendResponse({ ok: false, requestId: m.request?.requestId ?? "", elapsedMs: Date.now() - startedAt, error: toBrokerErrorBody(err) })
@@ -494,10 +730,46 @@ chrome.runtime.onMessage.addListener((msg, sender, sendResponse) => {
     })()
     return true
   }
+  if (m.type === "opencode:visual-rpc" && m.request) {
+    // Only our own isolated content world may use the artifact side channel.
+    // Web pages do not have chrome.runtime access, but sender validation is a
+    // second boundary against cross-extension/external message confusion.
+    if (sender.id !== chrome.runtime.id || typeof sender.tab?.id !== "number") {
+      sendResponse({ ok: false, id: m.request?.id ?? "", error: { code: "VISUAL_SCOPE_VIOLATION", message: "Untrusted visual RPC sender" } })
+      return false
+    }
+    void getNativePort().artifactRpc(m.request, 30_000).then(
+      (response) => sendResponse(response),
+      (error) => sendResponse({ ok: false, id: m.request?.id ?? "", error: { code: "VISUAL_HOST_UNAVAILABLE", message: String(error) } }),
+    )
+    return true
+  }
+  if (m.type === "opencode:visual-wait" && typeof m.requestId === "string") {
+    const tabId = sender.tab?.id
+    const durationMs = Number(m.durationMs)
+    if (
+      sender.id !== chrome.runtime.id ||
+      typeof tabId !== "number" ||
+      activeVisualRequests.tabId(m.requestId) !== tabId ||
+      !Number.isFinite(durationMs) ||
+      durationMs < 0 ||
+      durationMs > 1_000
+    ) {
+      sendResponse({ ok: false, error: "Invalid visual frame-clock request" })
+      return false
+    }
+    setTimeout(() => sendResponse({ ok: true }), durationMs)
+    return true
+  }
   if (m.type === "opencode:abort" && m.requestId) {
-    // No per-op abort needed yet — placeholder for session abort propagation
-    sendResponse({ ok: true, aborted: true })
-    return false
+    // Keep the runtime-message fallback semantically identical to the native
+    // host's abort frame. For visual flights this reaches the isolated runtime;
+    // non-visual operations remain governed by their existing control path.
+    void abortBrokerRequest(String(m.requestId)).then(
+      () => sendResponse({ ok: true, aborted: true }),
+      (error) => sendResponse({ ok: false, aborted: false, error: String(error) }),
+    )
+    return true
   }
   if (m.type === "opencode:ping") {
     sendResponse({ pong: true, extensionId: chrome.runtime.id, version: chrome.runtime.getManifest().version })
@@ -511,7 +783,8 @@ chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
     void (async () => {
       const startedAt = Date.now()
       try {
-        const result = await dispatchOperation(msg.request.tabId, msg.request.operation, msg.request.sessionId)
+        if (!isBrokerRequest(msg.request)) throw Object.assign(new Error("Invalid BrokerRequest"), { tag: "BrowserOperationFailed" })
+        const result = await dispatchOperation(msg.request)
         sendResponse({ ok: true, requestId: msg.request.requestId, result, elapsedMs: Date.now() - startedAt })
       } catch (err) {
         sendResponse({ ok: false, requestId: msg.request?.requestId ?? "", elapsedMs: Date.now() - startedAt, error: toBrokerErrorBody(err) })

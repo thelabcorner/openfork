@@ -1,4 +1,4 @@
-import { For, Show, createMemo } from "solid-js"
+import { For, Show, createMemo, createSignal, lazy } from "solid-js"
 import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
@@ -15,6 +15,14 @@ import {
   type BrowserPanelV2State,
 } from "./browser-panel-v2-state"
 
+// SnapEye review is first-party, but still optional. Keep the entire artifact
+// browser/triptych/history UI out of the normal hosted-browser chunk until the
+// user explicitly opens it, just like the heavy SnapEye/SnapDOM capture kernel
+// is kept out of the ordinary guest preload/content script.
+const VisualInspector = lazy(() =>
+  import("./browser/VisualInspector").then((module) => ({ default: module.VisualInspector })),
+)
+
 /**
  * BrowserPanelV2 — the hosted-browser right pane. Compact header (tab title,
  * new-tab, collapse) above the full HostedBrowserWebview tab. The panel width is
@@ -29,6 +37,7 @@ export function BrowserPanelV2(props: {
   const hostState = browserHostClient.state
   const serverSync = useServerSync()
   const layout = useLayout()
+  const [visualOpen, setVisualOpen] = createSignal(false)
 
   // When a session route is mounted, share the resize delta proportionally
   // across its row (session pane + open right panels) instead of only
@@ -134,6 +143,17 @@ export function BrowserPanelV2(props: {
             icon={<IconV2 name="plus" />}
           />
         </TooltipV2>
+        <TooltipV2 value={language.t("browser.visual.title")}>
+          <IconButtonV2
+            type="button"
+            variant={visualOpen() ? "ghost" : "ghost-muted"}
+            size="small"
+            onClick={() => setVisualOpen((open) => !open)}
+            aria-label={language.t("browser.visual.title")}
+            aria-pressed={visualOpen()}
+            icon={<IconV2 name="compare" />}
+          />
+        </TooltipV2>
         <BrowserPanelV2SidebarToggle opened={props.opened} onToggle={props.onClose} />
       </div>
 
@@ -151,6 +171,10 @@ export function BrowserPanelV2(props: {
           </For>
         </Show>
       </div>
+
+      <Show when={visualOpen()}>
+        <VisualInspector onClose={() => setVisualOpen(false)} />
+      </Show>
 
       <ResizeHandle
         direction="horizontal"

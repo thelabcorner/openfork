@@ -4,7 +4,7 @@ mock.module("electron", () => ({ nativeTheme: { shouldUseDarkColors: false } }))
 
 import { ExtensionBridge, type ExtensionTabRecord } from "./extension-bridge"
 import { encodeNativeMessage, decodeNativeFrames, ExtensionHost } from "./extension-host"
-import { isBrokerRequest, BROWSER_PROTOCOL_VERSION, BROKER_REQUEST_PATH } from "../contracts"
+import { isBrokerRequest, BROWSER_PROTOCOL_VERSION, BROKER_REQUEST_PATH, type BrowserDispatchContext } from "../contracts"
 import { TAB_GROUP_EXTENSION_LANE, SCREENSHOT_OVERLAY_INVARIANT } from "./extension-operations"
 import { HOST_NAME, getManifestPath, buildManifest } from "./pairing"
 
@@ -12,13 +12,29 @@ import { HOST_NAME, getManifestPath, buildManifest } from "./pairing"
 
 const windowId = "win-integration"
 const sessionId = "sess-int-12345678"
+const context = (overrides: Partial<BrowserDispatchContext> = {}): BrowserDispatchContext => ({
+  requestId: "req-integration",
+  sessionId,
+  windowId,
+  workspaceId: "workspace-integration",
+  directory: "/workspace/integration",
+  messageId: "msg-integration",
+  toolCallId: "tool-integration",
+  timeoutMs: 15_000,
+  ...overrides,
+})
 
 function makeTabRecord(overrides: Partial<ExtensionTabRecord> = {}): ExtensionTabRecord {
   return { tabId: "tab-1", url: "https://example.com", title: "Example Domain", active: true, ...overrides }
 }
 
 // Mock registry + operations + extensionHost wiring for ExtensionBridge
-function harness(opts: { extensionTabs: ExtensionTabRecord[]; chromeConnected: boolean; webviewTabs?: { tabId: string }[] }) {
+function harness(opts: {
+  extensionTabs: ExtensionTabRecord[]
+  chromeConnected: boolean
+  webviewTabs?: { tabId: string }[]
+  sendImpl?: (req: any) => Promise<any>
+}) {
   const registry = {
     size: opts.webviewTabs?.length ?? 0,
     activeTab: opts.webviewTabs?.[0] ? { runtimeTabId: opts.webviewTabs[0].tabId } as never : undefined,
@@ -27,7 +43,7 @@ function harness(opts: { extensionTabs: ExtensionTabRecord[]; chromeConnected: b
   } as unknown as import("../guest").GuestRegistry
 
   const operations = {
-    dispatch: async (tabId: string | undefined, op: { name: string; input: unknown }, _sess: string) => {
+    dispatch: async (tabId: string | undefined, op: { name: string; input: unknown }, _context: BrowserDispatchContext) => {
       if (op.name === "status") return { status: { connected: true }, tabs: [] } as unknown as Record<string, unknown>
       if (op.name === "open") return { opened: { tabId: tabId ?? "tab-webview-new", url: (op.input as { url: string }).url } } as unknown as Record<string, unknown>
       if (op.name === "snapshot") return { snapshot: { tabId: tabId ?? "tab-1", elements: [{ ref: "e1" }] } } as unknown as Record<string, unknown>
@@ -38,12 +54,19 @@ function harness(opts: { extensionTabs: ExtensionTabRecord[]; chromeConnected: b
   } as unknown as import("../operations").BrowserOperations
 
   const extSendCalls: unknown[] = []
+  const extAbortCalls: string[] = []
+  const visualBeginCalls: unknown[] = []
+  const visualAbortCalls: string[] = []
+  const visualHistoryCalls: unknown[] = []
+  const visualArtifactCalls: unknown[] = []
   const snapshotCalls: Array<{ tabs: ExtensionTabRecord[]; activeTabId: string | null }> = []
   const extensionHost = {
     isConnected: opts.chromeConnected,
     pendingCount: 0,
+    abort: (requestId: string) => extAbortCalls.push(requestId),
     send: async (req: unknown) => {
       extSendCalls.push(req)
+      if (opts.sendImpl) return opts.sendImpl(req)
       const r = req as { operation: { name: string } }
       if (r.operation.name === "open") return { ok: true, requestId: (req as { requestId: string }).requestId, result: { opened: { tabId: "tab-ext-new", url: "https://example.com" } }, elapsedMs: 10 }
       if (r.operation.name === "snapshot") return { ok: true, requestId: (req as { requestId: string }).requestId, result: { snapshot: { tabId: "tab-1", elements: [{ ref: "e1-ext" }] } }, elapsedMs: 12 }
@@ -53,16 +76,43 @@ function harness(opts: { extensionTabs: ExtensionTabRecord[]; chromeConnected: b
     },
   } as unknown as ExtensionHost
 
+  const visual = {
+    begin: async (input: any) => {
+      visualBeginCalls.push(input)
+      return {
+        capability: `cap-${input.context.requestId}`,
+        runId: input.runId ?? `run-${input.context.requestId}`,
+        expiresAt: Date.now() + 30_000,
+        maxChunkBytes: 384 * 1024,
+        // Deliberately differ from the caller's raw policy. The extension must
+        // receive this host-normalized grant policy instead of re-normalizing.
+        redaction: { blocks: [".secret"], attributes: [{ selector: "input", names: ["value"] }] },
+      }
+    },
+    abort: async (capability: string) => { visualAbortCalls.push(capability) },
+    history: async (ctx: BrowserDispatchContext, input: unknown) => {
+      visualHistoryCalls.push({ ctx, input })
+      return { root: ".snapeye" as const, baselines: [], runs: [] }
+    },
+    artifact: async (ctx: BrowserDispatchContext, input: unknown) => {
+      visualArtifactCalls.push({ ctx, input })
+      return { kind: "diff" as const, path: ".snapeye/runs/run1/diff.png", mime: "image/png", byteLength: 42 }
+    },
+  } as unknown as import("../visual/coordinator").VisualObservationCoordinator
+
   const bridge = new ExtensionBridge({
     windowId,
     registry,
     operations,
     extensionHost,
+    visual,
+    getAppearance: () => "dark",
     getExtensionTabs: () => opts.extensionTabs,
+    getExtensionTab: (tabId) => opts.extensionTabs.find((tab) => tab.tabId === tabId),
     getExtensionActiveTabId: () => opts.extensionTabs.find((t) => t.active)?.tabId ?? null,
     onExtensionSnapshot: (tabs, activeTabId) => snapshotCalls.push({ tabs, activeTabId }),
   })
-  return { bridge, extSendCalls, snapshotCalls }
+  return { bridge, extSendCalls, extAbortCalls, visualBeginCalls, visualAbortCalls, visualHistoryCalls, visualArtifactCalls, snapshotCalls }
 }
 
 // --- suite ------------------------------------------------------------------
@@ -121,8 +171,7 @@ describe("integration reconciliation", () => {
     expect(BROKER_REQUEST_PATH).toBe("/v1/browser/request")
     // windowId must be required — missing should fail
     const missing = { ...req, windowId: undefined as unknown as string }
-    // isBrokerRequest does not actually check windowId today (bridge-api-v2 note: desired invariant), so we assert the shape we enforce in dispatch
-    expect((req as Record<string, unknown>)["windowId"]).toBe(windowId)
+    expect(isBrokerRequest(missing)).toBe(false)
   })
 
   test("native framing 4B LE header + 1 MiB host→ext cap, 64 MiB ext→host sanity", () => {
@@ -168,21 +217,143 @@ describe("integration reconciliation", () => {
 
   test("automation hot-path results do not clone/republish the Chrome tab mirror", async () => {
     const { bridge, snapshotCalls } = harness({ extensionTabs: [makeTabRecord()], chromeConnected: true })
-    await bridge.dispatch("tab-1", { name: "click", input: { target: { x: 1, y: 2 } } }, sessionId)
-    await bridge.dispatch("tab-1", { name: "screenshot", input: {} }, sessionId)
+    await bridge.dispatch("tab-1", { name: "click", input: { target: { x: 1, y: 2 } } }, context())
+    await bridge.dispatch("tab-1", { name: "screenshot", input: {} }, context())
     expect(snapshotCalls).toHaveLength(0)
   })
 
-  test("extension requests use the engine window id without enumerating webview tabs", async () => {
+  test("extension requests preserve the original broker identity and project provenance", async () => {
     const { bridge, extSendCalls } = harness({ extensionTabs: [makeTabRecord()], chromeConnected: true })
-    await bridge.dispatch("tab-1", { name: "click", input: { target: { x: 1, y: 2 } } }, sessionId)
-    expect((extSendCalls[0] as { windowId: string }).windowId).toBe(windowId)
+    const original = context({ requestId: "req-original", timeoutMs: 9876 })
+    await bridge.dispatch("tab-1", { name: "click", input: { target: { x: 1, y: 2 } } }, original)
+    expect(extSendCalls[0]).toMatchObject({
+      requestId: "req-original",
+      sessionId,
+      windowId,
+      workspaceId: "workspace-integration",
+      directory: "/workspace/integration",
+      messageId: "msg-integration",
+      toolCallId: "tool-integration",
+      timeoutMs: 9876,
+    })
+  })
+
+  test("visual history/artifact stay host-local and work without a browser tab", async () => {
+    const h = harness({ extensionTabs: [], chromeConnected: true })
+    const ctx = context({ requestId: "req-visual-inspect", directory: "/workspace/visual" })
+    const history = await h.bridge.dispatch(undefined, { name: "visual_history", input: { maxRuns: 7 } }, ctx)
+    expect(history).toEqual({ history: { root: ".snapeye", baselines: [], runs: [] } })
+    const artifact = await h.bridge.dispatch(undefined, {
+      name: "visual_artifact",
+      input: { source: "run", runId: "run1", artifact: "diff" },
+    }, ctx)
+    expect(artifact).toEqual({ artifact: { kind: "diff", path: ".snapeye/runs/run1/diff.png", mime: "image/png", byteLength: 42 } })
+    expect(h.extSendCalls).toHaveLength(0)
+    expect(h.visualBeginCalls).toHaveLength(0)
+    expect(h.visualHistoryCalls).toHaveLength(1)
+    expect(h.visualArtifactCalls).toHaveLength(1)
+    expect((h.visualHistoryCalls[0] as any).ctx.directory).toBe("/workspace/visual")
+  })
+
+  test("visual requests carry only host-minted capability/redaction state into Chrome and revoke it terminally", async () => {
+    const { bridge, extSendCalls, visualBeginCalls, visualAbortCalls } = harness({
+      extensionTabs: [makeTabRecord({ owner: { kind: "agent", sessionId } })],
+      chromeConnected: true,
+    })
+
+    await bridge.dispatch(
+      "tab-1",
+      {
+        name: "visual_capture",
+        input: {
+          name: "panel",
+          target: { kind: "css", selector: "#panel" },
+          redact: { blocks: ["#caller-policy"] },
+        },
+      },
+      context({ requestId: "req-visual" }),
+    )
+
+    expect(visualBeginCalls).toHaveLength(1)
+    expect(visualBeginCalls[0]).toMatchObject({
+      lane: "extension",
+      tabId: "tab-1",
+      operation: "capture",
+      name: "panel",
+      redaction: { blocks: ["#caller-policy"] },
+      environment: { appearance: "dark", snapeyeVersion: "0.4.0", snapdomVersion: "3.0.0" },
+    })
+    const sent = extSendCalls[0] as any
+    expect(sent).toMatchObject({
+      requestId: "req-visual",
+      sessionId,
+      windowId,
+      workspaceId: "workspace-integration",
+      directory: "/workspace/integration",
+      messageId: "msg-integration",
+      toolCallId: "tool-integration",
+    })
+    expect(sent.operation.input.__opencodeVisual).toEqual({
+      capability: "cap-req-visual",
+      runId: "run-req-visual",
+      maxChunkBytes: 384 * 1024,
+      redaction: { blocks: [".secret"], attributes: [{ selector: "input", names: ["value"] }] },
+    })
+    expect(visualAbortCalls).toEqual(["cap-req-visual"])
+  })
+
+  test("an already-aborted extension visual request never mints a capability or reaches Chrome", async () => {
+    const { bridge, extSendCalls, visualBeginCalls } = harness({
+      extensionTabs: [makeTabRecord({ owner: { kind: "agent", sessionId } })],
+      chromeConnected: true,
+    })
+    const abort = new AbortController()
+    abort.abort()
+
+    await expect(
+      bridge.dispatch(
+        "tab-1",
+        { name: "visual_diff", input: { name: "panel" } },
+        context({ requestId: "req-pre-aborted", signal: abort.signal }),
+      ),
+    ).rejects.toMatchObject({ name: "BrowserControlInterrupted" })
+
+    expect(visualBeginCalls).toHaveLength(0)
+    expect(extSendCalls).toHaveLength(0)
+  })
+
+  test("abort during extension visual_record interrupts control and revokes the capability", async () => {
+    let release!: (value: any) => void
+    const response = new Promise<any>((resolveResponse) => { release = resolveResponse })
+    const { bridge, extAbortCalls, visualAbortCalls } = harness({
+      extensionTabs: [makeTabRecord({ owner: { kind: "agent", sessionId } })],
+      chromeConnected: true,
+      sendImpl: async () => response,
+    })
+    const abort = new AbortController()
+    const pending = bridge.dispatch(
+      "tab-1",
+      { name: "visual_record", input: { name: "motion", duration: 15_000, fps: 10 } },
+      context({ requestId: "req-record-abort", signal: abort.signal }),
+    )
+    await Promise.resolve()
+    abort.abort()
+    release({
+      ok: false,
+      requestId: "req-record-abort",
+      elapsedMs: 1,
+      error: { tag: "BrowserControlInterrupted", message: "Extension request aborted by caller", retryable: true },
+    })
+
+    await expect(pending).rejects.toMatchObject({ name: "BrowserControlInterrupted" })
+    expect(extAbortCalls).toEqual(["req-record-abort"])
+    expect(visualAbortCalls).toEqual(["cap-req-record-abort"])
   })
 
   test("status merges both lanes, chrome tab wins on tabId collision", async () => {
     const extTab = makeTabRecord({ tabId: "dup", url: "https://example.com/a" })
     const { bridge } = harness({ extensionTabs: [extTab, makeTabRecord({ tabId: "tab-ext-2", url: "https://example.com/b" })], chromeConnected: true, webviewTabs: [{ tabId: "dup" }] })
-    const res = await bridge.dispatch(undefined, { name: "status", input: {} }, sessionId)
+    const res = await bridge.dispatch(undefined, { name: "status", input: {} }, context())
     const tabs = (res as { tabs: { tabId: string }[] }).tabs
     expect(tabs.find((t) => t.tabId === "dup")).toBeDefined()
     expect(new Set(tabs.map((t) => t.tabId)).size).toBe(tabs.length)
@@ -218,7 +389,7 @@ describe("integrated e2e — open https://example.com → snapshot → click →
     const { bridge, extSendCalls } = harness({ extensionTabs: [], chromeConnected: true })
 
     // 1) open example.com in Chrome — no tabId, extension lane creates
-    const opened = await bridge.dispatch(undefined, { name: "open", input: { url: "https://example.com" } }, sessionId)
+    const opened = await bridge.dispatch(undefined, { name: "open", input: { url: "https://example.com" } }, context())
     expect((opened as { opened: { url: string } }).opened.url).toBe("https://example.com")
     expect(extSendCalls.length).toBe(1)
 
@@ -227,11 +398,11 @@ describe("integrated e2e — open https://example.com → snapshot → click →
     const { bridge: bridge2 } = harness({ extensionTabs: [chromeTab], chromeConnected: true })
 
     // 2) snapshot — extension lane via chrome.debugger Accessibility.getFullAXTree (fallback chrome.scripting)
-    const snap = await bridge2.dispatch(chromeTab.tabId, { name: "snapshot", input: {} }, sessionId)
+    const snap = await bridge2.dispatch(chromeTab.tabId, { name: "snapshot", input: {} }, context())
     expect((snap as { snapshot: { elements: unknown[] } }).snapshot.elements.length).toBeGreaterThan(0)
 
     // 3) click — Input.dispatchMouseEvent + overlay cursor glide 160ms / click lead 40ms (overlay-ops pacing)
-    const click = await bridge2.dispatch(chromeTab.tabId, { name: "click", input: { target: { x: 100, y: 50 } } }, sessionId)
+    const click = await bridge2.dispatch(chromeTab.tabId, { name: "click", input: { target: { x: 100, y: 50 } } }, context())
     expect((click as { clicked: unknown }).clicked).toBeDefined()
     // Simulate cursor choreography calls (what overlay-ops content.js would receive)
     // Desktop bridge emits BrowserPointerEvent {phase:"move",x:100,y:50,sequence} then 160ms later phase:"click"
@@ -244,7 +415,7 @@ describe("integrated e2e — open https://example.com → snapshot → click →
 
     // 4) screenshot with overlay hygiene — hide → capture → show (barrier ack before capture)
     await fakeTabsSendMessage(chromeTab.tabId, { type: "opencode:hide" })
-    const shot = await bridge2.dispatch(chromeTab.tabId, { name: "screenshot", input: { tabId: chromeTab.tabId, format: "png" } }, sessionId)
+    const shot = await bridge2.dispatch(chromeTab.tabId, { name: "screenshot", input: { tabId: chromeTab.tabId, format: "png" } }, context())
     await fakeTabsSendMessage(chromeTab.tabId, { type: "opencode:show" })
     expect((shot as { screenshot: { data: string } }).screenshot.data).toBeDefined()
 

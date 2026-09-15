@@ -34,11 +34,13 @@ import {
   type BrokerRequest,
   type BrokerResponse,
   type BrokerResponseErrorBody,
+  type BrowserDispatchContext,
   type BrowserOperation,
   type HostCapabilities,
   type HostEvent,
 } from "./contracts"
 import type { ExtensionHost } from "./extension-bridge/extension-host"
+import { VISUAL_RPC_MAX_JSON_BYTES, VISUAL_RPC_PATH } from "./visual/rpc"
 
 const HELLO_PATH = "/api/browser/host/hello"
 const EVENT_PATH = "/api/browser/event"
@@ -75,15 +77,16 @@ export interface BrowserHostOptions {
   getHealthExtra?: () => { chrome: boolean; lanes: string[] }
   /** Desktop-side queue for the Chrome-launched Native Messaging host. */
   extensionRelay?: Pick<ExtensionHost, "markConnected" | "markDisconnected" | "nextMessage" | "acceptResponse">
+  /** Authenticated artifact side-channel. Returns a transport-safe response. */
+  visualRpc?: (request: unknown) => Promise<unknown>
   /** Latest sidecar endpoint+auth; null until the app server is ready. */
   sidecarProvider: () => { url: string; username: string; password: string } | null
   getGuestSnapshot: () => { attached: boolean; activeTabId: string | null; url: string | null }
-  /** Execute a broker operation; rejects with typed errors (./errors). The
-   * requesting session is passed so operations can attribute tab ownership. */
+  /** Execute a broker operation with the complete trusted request provenance. */
   dispatch: (
     tabId: string | undefined,
     operation: BrowserOperation,
-    sessionId: string,
+    context: BrowserDispatchContext,
   ) => Promise<Record<string, unknown>>
   /** Called for every settled request (for host events). */
   onSettled?: (request: BrokerRequest, response: BrokerResponse) => void
@@ -101,6 +104,7 @@ export interface BrowserHostOptions {
 interface InFlight {
   request: BrokerRequest
   timer: ReturnType<typeof setTimeout>
+  controller: AbortController
   /** Single owner of the HTTP response for this request. */
   respond: (response: BrokerResponse) => void
 }
@@ -175,6 +179,7 @@ export class BrowserHost {
     this.consecutiveFailures = 0
     for (const flight of this.inFlight.values()) {
       clearTimeout(flight.timer)
+      flight.controller.abort(new BrowserControlInterruptedError("Host stopping"))
       flight.respond(responseError(flight.request.requestId, 0, new BrowserControlInterruptedError("Host stopping")))
     }
     this.inFlight.clear()
@@ -298,6 +303,26 @@ export class BrowserHost {
         return
       }
 
+      if (method === "POST" && url.pathname === VISUAL_RPC_PATH) {
+        if (!authorizeRequest(req, this.callbackToken)) {
+          respondJson(res, 401, { ok: false, error: "Unauthorized" })
+          return
+        }
+        if (!this.options.visualRpc) {
+          respondJson(res, 503, { ok: false, error: "Visual artifact RPC unavailable" })
+          return
+        }
+        try {
+          const body = await readJson(req, VISUAL_RPC_MAX_JSON_BYTES)
+          const response = await this.options.visualRpc(body)
+          respondJson(res, 200, response)
+        } catch (error) {
+          const status = error instanceof RequestBodyTooLargeError ? 413 : 400
+          respondJson(res, status, { ok: false, error: error instanceof Error ? error.message : "Invalid visual RPC request" })
+        }
+        return
+      }
+
       if (method === "POST" && url.pathname === BROKER_REQUEST_PATH) {
         if (!authorizeRequest(req, this.callbackToken)) {
           respondJson(res, 401, { ok: false, error: "Unauthorized" })
@@ -332,9 +357,24 @@ export class BrowserHost {
       return
     }
     const request = body as BrokerRequest
+    if (request.windowId !== this.options.windowId) {
+      respondJson(
+        res,
+        200,
+        responseError(
+          request.requestId,
+          Date.now() - startedAt,
+          new BrowserOperationFailedError(`BrokerRequest windowId ${JSON.stringify(request.windowId)} does not match host window ${JSON.stringify(this.options.windowId)}`),
+        ),
+      )
+      return
+    }
+
+    const controller = new AbortController()
 
     const timer = setTimeout(() => {
       const flight = this.inFlight.get(request.requestId)
+      flight?.controller.abort(new BrowserTimeoutError("request", request.timeoutMs))
       flight?.respond(
         responseError(request.requestId, Date.now() - startedAt, new BrowserTimeoutError("request", request.timeoutMs)),
       )
@@ -342,6 +382,7 @@ export class BrowserHost {
     this.inFlight.set(request.requestId, {
       request,
       timer,
+      controller,
       respond: (response) => {
         const flight = this.inFlight.get(request.requestId)
         if (!flight || flight.timer !== timer) return
@@ -353,7 +394,18 @@ export class BrowserHost {
     })
 
     try {
-      const result = await this.options.dispatch(request.tabId, request.operation, request.sessionId)
+      const context: BrowserDispatchContext = {
+        requestId: request.requestId,
+        sessionId: request.sessionId,
+        windowId: request.windowId,
+        ...(request.workspaceId !== undefined ? { workspaceId: request.workspaceId } : {}),
+        ...(request.directory !== undefined ? { directory: request.directory } : {}),
+        messageId: request.messageId,
+        ...(request.toolCallId !== undefined ? { toolCallId: request.toolCallId } : {}),
+        timeoutMs: request.timeoutMs,
+        signal: controller.signal,
+      }
+      const result = await this.options.dispatch(request.tabId, request.operation, context)
       const response: BrokerResponse = {
         ok: true,
         requestId: request.requestId,
@@ -370,6 +422,7 @@ export class BrowserHost {
   private handleAbort(requestId: string, res: ServerResponse): void {
     const flight = this.inFlight.get(requestId)
     if (flight) {
+      flight.controller.abort(new BrowserControlInterruptedError("Request aborted by caller"))
       flight.respond(responseError(requestId, 0, new BrowserControlInterruptedError("Request aborted by caller")))
       this.log("browser request aborted", { requestId })
     }
@@ -589,11 +642,25 @@ const safeEqual = (left: string, right: string): boolean => {
   return timingSafeEqual(a, b)
 }
 
-const readJson = (req: IncomingMessage): Promise<unknown> =>
+const readJson = (req: IncomingMessage, maxBytes = Number.POSITIVE_INFINITY): Promise<unknown> =>
   new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
-    req.on("data", (chunk: Buffer) => chunks.push(chunk))
+    let bytes = 0
+    let tooLarge = false
+    req.on("data", (chunk: Buffer) => {
+      bytes += chunk.byteLength
+      if (bytes > maxBytes) {
+        tooLarge = true
+        chunks.length = 0
+        return
+      }
+      if (!tooLarge) chunks.push(chunk)
+    })
     req.on("end", () => {
+      if (tooLarge) {
+        reject(new RequestBodyTooLargeError(maxBytes))
+        return
+      }
       try {
         const text = Buffer.concat(chunks).toString("utf8")
         resolve(text ? (JSON.parse(text) as unknown) : null)
@@ -603,6 +670,13 @@ const readJson = (req: IncomingMessage): Promise<unknown> =>
     })
     req.on("error", reject)
   })
+
+class RequestBodyTooLargeError extends Error {
+  constructor(limit: number) {
+    super(`Request body exceeds ${limit} bytes`)
+    this.name = "RequestBodyTooLargeError"
+  }
+}
 
 const respondJson = (res: ServerResponse, status: number, body: unknown): void => {
   const payload = JSON.stringify(body)

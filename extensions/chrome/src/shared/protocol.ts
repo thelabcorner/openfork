@@ -29,6 +29,11 @@ export type BrokerOperationName =
   | "set_appearance"
   | "snapshot"
   | "screenshot"
+  | "visual_capture"
+  | "visual_diff"
+  | "visual_record"
+  | "visual_history"
+  | "visual_artifact"
   | "click"
   | "type"
   | "press"
@@ -124,6 +129,7 @@ export type ExtToHostMessage =
   | { type: "abort"; requestId: string }
   | { type: "event"; event: unknown }
   | { type: "ping"; nonce: string }
+  | { type: "artifact_rpc"; request: unknown }
 
 // Host -> extension
 export type HostToExtMessage =
@@ -132,6 +138,7 @@ export type HostToExtMessage =
   | { type: "event_ack"; ok: boolean }
   | { type: "pong"; nonce: string }
   | { type: "error"; code: BrowserErrorTag; message: string; requestId?: string }
+  | { type: "artifact_rpc_result"; response: unknown }
 
 // ---------------------------------------------------------------------------
 // WS fallback envelope (mirrors @vymalo/opencode-browser hello/ready/command/result/event/ping/pong)
@@ -160,6 +167,11 @@ const OPERATION_NAMES: readonly BrokerOperationName[] = [
   "set_appearance",
   "snapshot",
   "screenshot",
+  "visual_capture",
+  "visual_diff",
+  "visual_record",
+  "visual_history",
+  "visual_artifact",
   "click",
   "type",
   "press",
@@ -194,10 +206,14 @@ export const isRecord = (value: unknown): value is Record<string, unknown> =>
 
 export const isBrokerRequest = (value: unknown): value is BrokerRequest => {
   if (!isRecord(value)) return false
-  if (typeof value.requestId !== "string") return false
-  if (typeof value.sessionId !== "string") return false
-  if (typeof value.messageId !== "string") return false
-  if (typeof value.timeoutMs !== "number") return false
+  if (typeof value.requestId !== "string" || value.requestId.length === 0) return false
+  if (typeof value.sessionId !== "string" || value.sessionId.length === 0) return false
+  if (typeof value.windowId !== "string" || value.windowId.length === 0) return false
+  if (typeof value.messageId !== "string" || value.messageId.length === 0) return false
+  if (value.workspaceId !== undefined && typeof value.workspaceId !== "string") return false
+  if (value.directory !== undefined && typeof value.directory !== "string") return false
+  if (value.toolCallId !== undefined && typeof value.toolCallId !== "string") return false
+  if (typeof value.timeoutMs !== "number" || !Number.isFinite(value.timeoutMs) || value.timeoutMs <= 0) return false
   if (!isRecord(value.operation)) return false
   if (!isBrokerOperationName((value.operation as Record<string, unknown>).name)) return false
   if (!("input" in value.operation)) return false

@@ -23,6 +23,9 @@ export const BROKER_ABORT_PATH = "/v1/browser/request/:requestId/abort"
 
 export const BROWSER_PARTITION = "persist:opencode-browser-v1"
 export const HUMAN_INPUT_CHANNEL = "preview:human-input"
+export const VISUAL_RPC_CHANNEL = "preview:visual-rpc"
+export const VISUAL_RPC_RESPONSE_CHANNEL = "preview:visual-rpc-response"
+export const VISUAL_ABORT_CHANNEL = "preview:visual-abort"
 
 // --- human-in-the-loop annotation channels (guest preload <-> main) -----------
 // Renderer-driven, NOT part of the agent broker/MCP protocol above — a person
@@ -127,6 +130,13 @@ export interface HostCapabilities {
   cdp: true
   /** Additive flag — true when the ExtensionBridge native host is reachable. Optional so protocol 2 need not bump. */
   chrome?: true
+  /** Additive capability. `true` is the legacy capture/diff-only spelling. */
+  visual?: true | {
+    schemaVersion: 1
+    snapeyeProtocolVersion: 1
+    operations: readonly ("capture" | "diff" | "record")[]
+    features?: readonly ("history" | "artifact")[]
+  }
 }
 
 export interface HostGuestState {
@@ -217,6 +227,27 @@ export interface BrokerRequest {
   timeoutMs: number
 }
 
+/**
+ * Trusted Desktop-local provenance for one broker dispatch.
+ *
+ * This deliberately mirrors every non-operation field of BrokerRequest rather
+ * than collapsing the request to a session id. Browser features that cross a
+ * trust boundary (visual artifacts, downloads, future workspace-aware browser
+ * I/O) must be able to bind work to the exact originating request and project.
+ * `signal` is host-local and is never serialized onto the broker/native wire.
+ */
+export interface BrowserDispatchContext {
+  requestId: string
+  sessionId: string
+  windowId: string
+  workspaceId?: string
+  directory?: string
+  messageId: string
+  toolCallId?: string
+  timeoutMs: number
+  signal?: AbortSignal
+}
+
 export type BrokerResponse =
   | {
       ok: true
@@ -275,6 +306,8 @@ export interface RefTarget {
 export interface SnapshotRef {
   x: number
   y: number
+  /** Snapshot-time synthesized CSS used by visual observation and diagnostics. */
+  selector?: string
   locator?: Locator
 }
 
@@ -495,6 +528,11 @@ export type BrowserOperation =
   | { name: "set_appearance"; input: SetAppearanceInput }
   | { name: "snapshot"; input: SnapshotInput }
   | { name: "screenshot"; input: ScreenshotInput }
+  | { name: "visual_capture"; input: VisualCaptureInput }
+  | { name: "visual_diff"; input: VisualDiffInput }
+  | { name: "visual_record"; input: VisualRecordInput }
+  | { name: "visual_history"; input: VisualHistoryInput }
+  | { name: "visual_artifact"; input: VisualArtifactInput }
   | { name: "click"; input: ClickInput }
   | { name: "type"; input: TypeInput }
   | { name: "press"; input: PressInput }
@@ -609,6 +647,124 @@ export interface ScreenshotInput {
   quality?: number
   fullPage?: boolean
   timeoutMs?: number
+}
+export type VisualTarget =
+  | { kind: "document" }
+  | { kind: "css"; selector: string }
+  | { kind: "element"; target: ElementTarget }
+export interface VisualRedaction {
+  blocks?: string[]
+  attributes?: Array<{ selector: string; names: string[] }>
+}
+export interface VisualCaptureInput {
+  tabId?: string
+  name: string
+  runId?: string
+  target?: VisualTarget
+  stabilize?: boolean
+  waitFor?: number | string
+  waitTimeout?: number
+  settle?: boolean
+  settleTimeout?: number
+  scale?: number
+  svg?: boolean
+  redact?: VisualRedaction
+  timeoutMs?: number
+}
+export interface VisualDiffInput extends VisualCaptureInput {
+  threshold?: number
+  includeAA?: boolean
+  diffMask?: boolean
+  tileSize?: number
+  gapTiles?: number
+  minRegionCssSide?: number
+  minRegionCssArea?: number
+  maxRegions?: number
+}
+export interface VisualRecordInput extends VisualCaptureInput {
+  duration?: number
+  fps?: number
+  format?: "gif" | "video" | "both"
+  bitrate?: number
+  filmstripMaxCells?: number
+  filmstripMaxColumns?: number
+  filmstripMaxWidth?: number
+  filmstripGap?: number
+  filmstripBackground?: string
+}
+export interface VisualHistoryInput {
+  maxRuns?: number
+  maxBaselines?: number
+  timeoutMs?: number
+}
+export type VisualArtifactKind =
+  | "baseline"
+  | "baseline_metadata"
+  | "current"
+  | "svg"
+  | "diff"
+  | "frames"
+  | "gif"
+  | "video"
+  | "result"
+export type VisualArtifactInput =
+  | { source: "baseline"; name: string; artifact?: "image" | "metadata"; timeoutMs?: number }
+  | { source: "run"; runId: string; artifact: "current" | "svg" | "diff" | "frames" | "gif" | "video" | "result"; timeoutMs?: number }
+export interface VisualBaselineSummary {
+  name: string
+  imagePath: string
+  metadataPath?: string
+  byteLength: number
+  capturedAt?: string
+  lane?: "webview" | "extension"
+  engineMajor?: number
+  redactionPolicySha256?: string
+}
+export interface VisualRunSummary {
+  runId: string
+  resultPath: string
+  status: "ok" | "error"
+  operation: "capture" | "diff" | "record" | "unknown"
+  name?: string
+  finishedAt?: string
+  changed?: boolean
+  frameCount?: number
+  artifacts: VisualArtifactKind[]
+}
+export interface VisualHistoryOutput {
+  history: {
+    root: ".snapeye"
+    baselines: VisualBaselineSummary[]
+    runs: VisualRunSummary[]
+  }
+}
+export interface VisualArtifactDescriptor {
+  kind: VisualArtifactKind
+  path: string
+  mime: string
+  byteLength: number
+}
+export interface VisualArtifactOutput {
+  artifact: VisualArtifactDescriptor | null
+}
+export interface VisualProjectContext {
+  sessionId: string
+  directory: string
+}
+export interface VisualArtifactPreview {
+  descriptor: VisualArtifactDescriptor
+  bytes: Uint8Array
+  sha256: string
+}
+export interface VisualApprovalExpectation {
+  currentSha256: string
+  resultSha256: string
+  baselineSha256: string
+  baselineMetadataSha256: string | null
+}
+export interface VisualApprovalOutput {
+  baseline: VisualBaselineSummary
+  sourceRunId: string
 }
 export interface ClickInput {
   target: ElementTarget
@@ -815,6 +971,63 @@ export interface ScreenshotOutput {
     path?: string
   }
 }
+export interface VisualEnvironment {
+  schemaVersion: 1
+  lane: "webview" | "extension"
+  platform: string
+  engine: "chromium"
+  engineMajor?: number
+  appearance?: Appearance
+  snapeyeVersion?: string
+  snapdomVersion?: string
+  redactionPolicySha256?: string
+}
+export interface VisualResult {
+  schemaVersion: 1
+  protocolVersion: 1
+  runId: string
+  status: "ok" | "error"
+  operation: "capture" | "diff" | "record"
+  name?: string
+  target?: { selector?: string; descriptor?: string }
+  startedAt?: string
+  finishedAt?: string
+  image?: { coordinateSpace: "target-css-px"; cssWidth: number; cssHeight: number; pixelWidth: number; pixelHeight: number; scale: number }
+  timing?: { captureMs: number }
+  diff?: {
+    changed: boolean
+    changedRatio: number
+    regionCount: number
+    regionsTruncated: boolean
+    regions: Array<{ x: number; y: number; width: number; height: number; aggregate: boolean }>
+  }
+  record?: {
+    durationRequestedMs: number
+    durationActualMs: number
+    fpsRequested: number
+    fpsActual: number
+    frameCount: number
+    timestampsMs: number[]
+    format: "gif" | "video" | "both"
+    filmstrip: {
+      file: "frames.png"
+      columns: number
+      rows: number
+      cellWidth: number
+      cellHeight: number
+      gap: number
+      width: number
+      height: number
+      cells: Array<{ cell: number; frameIndex: number; timestampMs: number; x: number; y: number }>
+    }
+  }
+  artifacts?: Record<string, string | undefined>
+  error?: { code: string; message: string; details?: unknown }
+  opencode?: VisualEnvironment
+}
+export interface VisualCaptureOutput { visual: VisualResult }
+export interface VisualDiffOutput { visual: VisualResult }
+export interface VisualRecordOutput { visual: VisualResult }
 export interface ClickOutput {
   clicked: {
     target: ResolvedTarget
@@ -966,6 +1179,11 @@ const OPERATION_NAMES: readonly BrowserOperationName[] = [
   "set_appearance",
   "snapshot",
   "screenshot",
+  "visual_capture",
+  "visual_diff",
+  "visual_record",
+  "visual_history",
+  "visual_artifact",
   "click",
   "type",
   "press",
@@ -1048,10 +1266,14 @@ export const isElementTarget = (value: unknown): value is ElementTarget =>
 
 export const isBrokerRequest = (value: unknown): value is BrokerRequest => {
   if (!isRecord(value)) return false
-  if (typeof value.requestId !== "string") return false
-  if (typeof value.sessionId !== "string") return false
-  if (typeof value.messageId !== "string") return false
-  if (typeof value.timeoutMs !== "number") return false
+  if (typeof value.requestId !== "string" || value.requestId.length === 0) return false
+  if (typeof value.sessionId !== "string" || value.sessionId.length === 0) return false
+  if (typeof value.windowId !== "string" || value.windowId.length === 0) return false
+  if (typeof value.messageId !== "string" || value.messageId.length === 0) return false
+  if (value.workspaceId !== undefined && typeof value.workspaceId !== "string") return false
+  if (value.directory !== undefined && typeof value.directory !== "string") return false
+  if (value.toolCallId !== undefined && typeof value.toolCallId !== "string") return false
+  if (typeof value.timeoutMs !== "number" || !Number.isFinite(value.timeoutMs) || value.timeoutMs <= 0) return false
   if (!isRecord(value.operation)) return false
   if (!isBrowserOperationName(value.operation.name)) return false
   if (!("input" in value.operation)) return false

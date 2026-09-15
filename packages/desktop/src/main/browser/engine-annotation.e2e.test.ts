@@ -1,10 +1,16 @@
 import { expect, mock, test } from "bun:test"
+import { mkdtemp, readFile, rm } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
 import {
   ANNOTATION_CAPTURED_CHANNEL,
   ANNOTATION_PICKED_CHANNEL,
   HUMAN_INPUT_CHANNEL,
   type BrowserAnnotationPayload,
+  type BrowserDispatchContext,
 } from "./contracts"
+import { OpenCodeSnapEyeStore } from "./visual/store"
+import { SNAPEYE_ARTIFACTS } from "./visual/protocol"
 
 // End-to-end through the real BrowserEngine facade (NOT the bare
 // AnnotationController). Every other annotation test injects the controller's
@@ -31,6 +37,13 @@ mock.module("electron", () => {
 })
 
 const registry = new Map<number, ReturnType<typeof makeFakeWebContents>>()
+const dispatchContext = (sessionId: string): BrowserDispatchContext => ({
+  requestId: `engine-test-${sessionId}`,
+  sessionId,
+  windowId: "window-test",
+  messageId: "msg-engine-test",
+  timeoutMs: 15_000,
+})
 
 function makeFakeWebContents(id: number, type: "webview" | "window") {
   const handlers = new Map<string, Set<(event: unknown, ...args: unknown[]) => void>>()
@@ -250,6 +263,68 @@ test("crashed guest transitions logical lifecycle to detached and annotation ref
   await expect(engine.api.startAnnotation(requested.tabId)).resolves.toBe(null)
 })
 
+test("trusted renderer visual API lists, previews, and approves the exact reviewed diff bytes", async () => {
+  const root = await mkdtemp(join(tmpdir(), "opencode-engine-visual-ui-"))
+  try {
+    const store = await OpenCodeSnapEyeStore.create(root)
+    await store.writeBaseline("panel", {
+      image: new Uint8Array([1, 2, 3]),
+      meta: { schemaVersion: 1, name: "panel", capturedAt: "2026-09-15T01:00:00.000Z" },
+    })
+    const reviewed = new Uint8Array([137, 80, 78, 71, 10, 20])
+    await store.writeRunArtifact("reviewed", SNAPEYE_ARTIFACTS.current, reviewed)
+    await store.writeRunArtifact("reviewed", SNAPEYE_ARTIFACTS.diff, new Uint8Array([137, 80, 78, 71, 99]))
+    await store.commitResult("reviewed", {
+      schemaVersion: 1,
+      protocolVersion: 1,
+      runId: "reviewed",
+      status: "ok",
+      operation: "diff",
+      name: "panel",
+      finishedAt: "2026-09-15T02:00:00.000Z",
+      target: { selector: "#panel", descriptor: "#panel" },
+      image: { coordinateSpace: "target-css-px", cssWidth: 100, cssHeight: 50, pixelWidth: 100, pixelHeight: 50, scale: 1 },
+      diff: { changed: true, changedRatio: 0.1, regionCount: 1, regionsTruncated: false, regions: [] },
+      artifacts: { baseline: "../../baselines/panel.png", current: "current.png", diff: "diff.png" },
+      opencode: { schemaVersion: 1, lane: "webview", platform: process.platform, engine: "chromium", engineMajor: 140 },
+    })
+
+    const { engine } = makeEngine()
+    const context = { sessionId: "sess-visual-ui", directory: root }
+    const history = await engine.api.visualHistory(context)
+    expect(history.baselines.map((row) => row.name)).toEqual(["panel"])
+    expect(history.runs.map((row) => row.runId)).toEqual(["reviewed"])
+    expect(history.runs[0]?.changed).toBe(true)
+
+    const preview = await engine.api.visualArtifactPreview(context, {
+      source: "run",
+      runId: "reviewed",
+      artifact: "current",
+    })
+    const resultPreview = await engine.api.visualArtifactPreview(context, { source: "run", runId: "reviewed", artifact: "result" })
+    const baselinePreview = await engine.api.visualArtifactPreview(context, { source: "baseline", name: "panel" })
+    const baselineMetadataPreview = await engine.api.visualArtifactPreview(context, { source: "baseline", name: "panel", artifact: "metadata" })
+    expect(preview?.descriptor.path).toBe(".snapeye/runs/reviewed/current.png")
+    expect(Buffer.from(preview?.bytes ?? new Uint8Array())).toEqual(Buffer.from(reviewed))
+    expect(preview?.sha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(resultPreview?.sha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(baselinePreview?.sha256).toMatch(/^[a-f0-9]{64}$/)
+    expect(baselineMetadataPreview?.sha256).toMatch(/^[a-f0-9]{64}$/)
+
+    const approved = await engine.api.visualApproveRun(context, "reviewed", {
+      currentSha256: preview!.sha256,
+      resultSha256: resultPreview!.sha256,
+      baselineSha256: baselinePreview!.sha256,
+      baselineMetadataSha256: baselineMetadataPreview!.sha256,
+    })
+    expect(approved).toMatchObject({ sourceRunId: "reviewed", baseline: { name: "panel" } })
+    expect(await readFile(join(root, ".snapeye", "baselines", "panel.png"))).toEqual(Buffer.from(reviewed))
+    await expect(engine.api.visualHistory({ sessionId: "", directory: root })).rejects.toThrow("active project session")
+  } finally {
+    await rm(root, { recursive: true, force: true })
+  }
+})
+
 test("agent-opened tab is agent-owned on the first published attached state", async () => {
   const states: Array<{ tabId?: string; owner?: unknown }> = []
   const { engine, requests } = makeEngine((channel, payload) => {
@@ -258,7 +333,7 @@ test("agent-opened tab is agent-owned on the first published attached state", as
   const opened = engine.operations.dispatch(
     undefined,
     { name: "open", input: { url: "https://example.com", activate: true } },
-    "sess-first-publish",
+    dispatchContext("sess-first-publish"),
   )
   await Promise.resolve()
   const [request] = [...requests.entries()]
@@ -291,7 +366,7 @@ test("closing a pending agent open rejects it immediately instead of waiting for
   const opened = engine.operations.dispatch(
     undefined,
     { name: "open", input: { url: "https://example.com/pending", activate: true } },
-    "sess-cancel-pending",
+    dispatchContext("sess-cancel-pending"),
   )
   await Promise.resolve()
   const [request] = [...requests.entries()]
@@ -300,6 +375,70 @@ test("closing a pending agent open rejects it immediately instead of waiting for
 
   expect(engine.api.closeTab(tabId)).toEqual({ closed: true })
   await expect(opened).rejects.toMatchObject({ tag: "BrowserControlInterrupted" })
+})
+
+test("human takeover cancels visual work but an expected agent-input echo does not", async () => {
+  const { engine, requestTab } = makeEngine()
+  const requested = requestTab()
+  const guest = makeFakeWebContents(21, "webview")
+  guest.hostWebContents = registry.get(0)
+  engine.api.registerWebview(requested.tabId, 21, 0, requested.lifecycleGeneration)
+
+  const cancellations: Array<{ tabId: string; reason: string }> = []
+  const visual = (engine as unknown as {
+    visualWebview: { cancel: (tabId: string, reason?: string) => void }
+  }).visualWebview
+  const originalCancel = visual.cancel.bind(visual)
+  visual.cancel = (tabId, reason = "") => cancellations.push({ tabId, reason })
+
+  try {
+    const echoed = { kind: "pointer" as const, x: 10, y: 10, button: 0 }
+    engine.arbiter.expectAgentInput(requested.tabId, echoed)
+    guest.emitIpc(HUMAN_INPUT_CHANNEL, echoed)
+    expect(cancellations).toEqual([])
+
+    guest.emitIpc(HUMAN_INPUT_CHANNEL, { kind: "pointer", x: 11, y: 10, button: 0 })
+    expect(cancellations).toEqual([
+      { tabId: requested.tabId, reason: "Human input interrupted visual operation" },
+    ])
+    expect(engine.registry.get(requested.tabId)?.controller).toBe("human")
+  } finally {
+    visual.cancel = originalCancel
+  }
+})
+
+test("explicit annotation takeover and user-authority close cancel active visual work", async () => {
+  const { engine, requestTab } = makeEngine()
+  const requested = requestTab()
+  const guest = makeFakeWebContents(22, "webview")
+  guest.hostWebContents = registry.get(0)
+  engine.api.registerWebview(requested.tabId, 22, 0, requested.lifecycleGeneration)
+
+  const cancellations: Array<{ tabId: string; reason: string }> = []
+  const visual = (engine as unknown as {
+    visualWebview: { cancel: (tabId: string, reason?: string) => void }
+  }).visualWebview
+  const originalCancel = visual.cancel.bind(visual)
+  visual.cancel = (tabId, reason = "") => cancellations.push({ tabId, reason })
+
+  try {
+    const annotation = engine.api.startAnnotation(requested.tabId)
+    expect(cancellations.at(-1)).toEqual({
+      tabId: requested.tabId,
+      reason: "Human took control of the browser tab",
+    })
+    guest.emitPicked(validPayload())
+    await annotation
+    engine.api.cancelAnnotation(requested.tabId)
+
+    expect(engine.api.closeTab(requested.tabId)).toEqual({ closed: true })
+    expect(cancellations.at(-1)).toEqual({
+      tabId: requested.tabId,
+      reason: "Browser tab closed by user",
+    })
+  } finally {
+    visual.cancel = originalCancel
+  }
 })
 
 test("engine startAnnotation resolves a real result for a pick with no replacement", async () => {

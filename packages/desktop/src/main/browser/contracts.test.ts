@@ -14,7 +14,7 @@ import {
   type GuestTabState,
 } from "./contracts"
 
-test("isBrowserOperationName covers the 27 ops (canon {name} discriminator)", () => {
+test("isBrowserOperationName covers the canonical browser ops including SnapEye visual operations", () => {
   const names = [
     "status",
     "open",
@@ -25,6 +25,11 @@ test("isBrowserOperationName covers the 27 ops (canon {name} discriminator)", ()
     "set_appearance",
     "snapshot",
     "screenshot",
+    "visual_capture",
+    "visual_diff",
+    "visual_record",
+    "visual_history",
+    "visual_artifact",
     "click",
     "type",
     "press",
@@ -52,6 +57,7 @@ test("isBrokerRequest accepts claim / set_tab_owner envelopes with tabId", () =>
   const claim = {
     requestId: "req-1",
     sessionId: "sess-1",
+    windowId: "win-1",
     messageId: "msg-1",
     timeoutMs: 5_000,
     tabId: "tab_1",
@@ -61,6 +67,7 @@ test("isBrokerRequest accepts claim / set_tab_owner envelopes with tabId", () =>
   const setOwner = {
     requestId: "req-2",
     sessionId: "sess-1",
+    windowId: "win-1",
     messageId: "msg-2",
     timeoutMs: 5_000,
     operation: { name: "set_tab_owner", input: { tabId: "tab_1", owner: { kind: "user" } } },
@@ -122,6 +129,7 @@ test("isBrokerRequest accepts a valid canonical envelope ({name} op, input neste
   const request = {
     requestId: "req-1",
     sessionId: "sess-1",
+    windowId: "win-1",
     messageId: "msg-1",
     timeoutMs: 5_000,
     operation: { name: "click", input: { target: { type: "css", value: "#go" } } },

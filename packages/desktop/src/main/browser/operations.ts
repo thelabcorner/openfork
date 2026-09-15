@@ -15,6 +15,7 @@ import { join } from "node:path"
 import { nativeTheme } from "electron"
 import type { ControlSessionManager, SendCommand } from "./control-session"
 import type { GuestRecord, GuestRegistry } from "./guest"
+import type { WebviewVisualController } from "./visual/webview-controller"
 import {
   BrowserError,
   BrowserControlInterruptedError,
@@ -67,6 +68,7 @@ import {
   type AnnotateInput,
   type AnnotateOutput,
   type AnnotationTarget,
+  type BrowserDispatchContext,
   type BrowserOperation,
   type BrowserPointerEvent,
   type ClaimInput,
@@ -97,6 +99,9 @@ import {
   type ResolvedTarget,
   type ScreenshotInput,
   type ScreenshotOutput,
+  type VisualCaptureInput,
+  type VisualDiffInput,
+  type VisualRecordInput,
   type SetMutedInput,
   type SetTabOwnerInput,
   type SetTabOwnerOutput,
@@ -112,6 +117,7 @@ import { canClaimTab, canDispatchTab, isCoords, isLocator, isRefTarget } from ".
 export interface BrowserOperationsOptions {
   registry: GuestRegistry
   sessions: ControlSessionManager
+  visual: WebviewVisualController
   recordingDirectory: string
   maxResultBytes: number
   /** Broker-wire host state for the status op (connected + host identity). */
@@ -132,6 +138,7 @@ export interface BrowserOperationsOptions {
 interface SnapshotRef {
   x: number
   y: number
+  selector?: string
   locator?: Locator
 }
 type AnnotationScriptItem = Pick<AnnotationTarget, "label" | "tone"> & {
@@ -188,7 +195,8 @@ export class BrowserOperations {
     this.pendingOpens.delete(runtimeTabId)
     pending.resolve(tab)
   }
-  async dispatch(tabId: string | undefined, operation: BrowserOperation, sessionId: string): Promise<Record<string, unknown>> {
+  async dispatch(tabId: string | undefined, operation: BrowserOperation, context: BrowserDispatchContext): Promise<Record<string, unknown>> {
+    const sessionId = context.sessionId
     switch (operation.name) {
       case "status":
         return (await this.status(tabId)) as unknown as Record<string, unknown>
@@ -208,6 +216,12 @@ export class BrowserOperations {
         return (await this.snapshot(tabId)) as unknown as Record<string, unknown>
       case "screenshot":
         return (await this.screenshot(tabId, operation.input)) as unknown as Record<string, unknown>
+      case "visual_capture":
+        return (await this.visualRun(tabId, "capture", operation.input, context)) as unknown as Record<string, unknown>
+      case "visual_diff":
+        return (await this.visualRun(tabId, "diff", operation.input, context)) as unknown as Record<string, unknown>
+      case "visual_record":
+        return (await this.visualRun(tabId, "record", operation.input, context)) as unknown as Record<string, unknown>
       case "click":
         return (await this.click(tabId, operation.input)) as unknown as Record<string, unknown>
       case "type":
@@ -259,6 +273,21 @@ export class BrowserOperations {
       default:
         throw new BrowserUnsupportedOperationError(`Unknown operation`)
     }
+  }
+
+  private async visualRun(
+    tabId: string | undefined,
+    operation: "capture" | "diff" | "record",
+    input: VisualCaptureInput | VisualDiffInput | VisualRecordInput,
+    context: BrowserDispatchContext,
+  ): Promise<Record<string, unknown>> {
+    const tab = this.resolveTab(input.tabId ?? tabId)
+    const selector = await this.resolveVisualTargetSelector(tab, input.target)
+    const normalizedInput = {
+      ...input,
+      target: selector ? { kind: "css" as const, selector } : { kind: "document" as const },
+    }
+    return this.deps.visual.run(tab, operation, normalizedInput, context, this.deps.registry.getAppearance()) as unknown as Promise<Record<string, unknown>>
   }
   // --- status -----------------------------------------------------------------
   private async status(tabId: string | undefined): Promise<StatusOutput> {
@@ -622,7 +651,12 @@ export class BrowserOperations {
         const center = asPoint(raw["center"]) ?? { x: Math.round(rect.x + rect.width / 2), y: Math.round(rect.y + rect.height / 2) }
         const selector = asSelector(raw["selector"])
         const locator = raw["locator"] && isLocator(raw["locator"]) ? (raw["locator"] as Locator) : undefined
-        refs.set(ref, { x: center.x, y: center.y, locator })
+        refs.set(ref, {
+          x: center.x,
+          y: center.y,
+          ...(selector?.value ? { selector: selector.value } : {}),
+          ...(locator ? { locator } : {}),
+        })
         elements.push({
           ref,
           role: typeof raw["role"] === "string" ? raw["role"] : "generic",
@@ -1307,6 +1341,49 @@ export class BrowserOperations {
       }
     }
     throw new BrowserInvalidSelectorError("Unsupported target")
+  }
+  /**
+   * Resolve the richer OpenCode target contract to the one thing SnapEye needs:
+   * a stable CSS selector. This deliberately reuses the exact same selector
+   * synthesis/ref versioning as click/highlight rather than introducing a
+   * SnapEye-specific element engine.
+   */
+  private async resolveVisualTargetSelector(
+    tab: GuestRecord,
+    target: VisualCaptureInput["target"],
+  ): Promise<string | undefined> {
+    if (!target || target.kind === "document") return undefined
+    if (target.kind === "css") {
+      if (!target.selector) throw new BrowserInvalidSelectorError("Visual CSS target must not be empty")
+      return target.selector
+    }
+    const elementTarget = target.target
+    if (isRefTarget(elementTarget)) {
+      const version = this.deps.registry.get(tab.runtimeTabId)?.snapshotVersion ?? 0
+      if (elementTarget.snapshotVersion !== version) {
+        throw new BrowserStaleRefError(elementTarget.ref, version, elementTarget.snapshotVersion)
+      }
+      const ref = this.deps.registry.getSnapshotRefs(tab.runtimeTabId)?.get(elementTarget.ref) as SnapshotRef | undefined
+      if (!ref) throw new BrowserStaleRefError(elementTarget.ref, version, elementTarget.snapshotVersion)
+      if (ref.selector) return ref.selector
+      const fallback: ElementTarget = ref.locator ?? { x: ref.x, y: ref.y }
+      return this.resolveLiveVisualSelector(tab, fallback)
+    }
+    return this.resolveLiveVisualSelector(tab, elementTarget)
+  }
+
+  private async resolveLiveVisualSelector(tab: GuestRecord, target: ElementTarget): Promise<string> {
+    return this.withControl(tab, "visualTarget", async (send) => {
+      if (isRefTarget(target)) throw new BrowserInvalidSelectorError("Unexpected unresolved ref target")
+      const result = (await this.evaluate(send, resolveElementScript(target, false), true)) as
+        | { error: string }
+        | { selector?: { value?: string } }
+        | null
+      if (result && "error" in result) throw new BrowserInvalidSelectorError(result.error)
+      const selector = result?.selector?.value
+      if (!selector) throw new BrowserTargetNotFoundError("Visual target could not be converted to a stable CSS selector")
+      return selector
+    })
   }
   /** Build the in-page expression that finds the element for a target. */
   private async targetExpression(send: SendCommand, tab: GuestRecord, target: ElementTarget): Promise<string> {

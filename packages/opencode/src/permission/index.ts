@@ -213,7 +213,7 @@ export function disabled(tools: string[], ruleset: PermissionV1.Ruleset): Set<st
   const composite: Record<string, string[]> = {
     find: ["glob", "grep"],
     web: ["webfetch", "websearch"],
-    browser: ["browser.read", "browser.navigate", "browser.interact", "browser.evaluate", "browser.record"],
+    browser: ["browser.read", "browser.navigate", "browser.interact", "browser.evaluate", "browser.record", "browser.visual"],
   }
 
   const fullyDenied = (permission: string) => {

@@ -27,12 +27,14 @@ export interface NativePortOptions {
 export class NativePortV2 {
   private port: PortLike | null = null
   private readonly pending = new Map<string, { request: BrokerRequest; timer: ReturnType<typeof setTimeout>; resolve: (r: BrokerResponse) => void }>()
+  private readonly pendingArtifact = new Map<string, { timer: ReturnType<typeof setTimeout>; resolve: (r: unknown) => void }>()
   private connecting = false
 
   constructor(private readonly opts: NativePortOptions) {}
 
   get isConnected(): boolean { return this.port !== null }
   get pendingCount(): number { return this.pending.size }
+  get pendingArtifactCount(): number { return this.pendingArtifact.size }
 
   connect(): void {
     if (this.port || this.connecting) return
@@ -90,6 +92,31 @@ export class NativePortV2 {
     try { this.port?.postMessage({ type:"abort", requestId })} catch {}
   }
 
+  /** Visual artifact traffic is correlated separately from BrowserRequest. */
+  artifactRpc(request: { id: string }, timeoutMs = 30_000): Promise<unknown> {
+    if (!request?.id) return Promise.reject(new Error("visual artifact RPC requires an id"))
+    if (!this.port) this.connect()
+    const port = this.port
+    if (!port) return Promise.reject(new Error("Native host not connected"))
+    if (this.pendingArtifact.has(request.id)) return Promise.reject(new Error(`duplicate visual artifact RPC id ${request.id}`))
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        const entry = this.pendingArtifact.get(request.id)
+        if (!entry) return
+        this.pendingArtifact.delete(request.id)
+        resolve({ ok: false, id: request.id, error: { code: "VISUAL_TIMEOUT", message: `Visual artifact RPC ${request.id} timed out` } })
+      }, Math.max(1, timeoutMs))
+      this.pendingArtifact.set(request.id, { timer, resolve })
+      try {
+        port.postMessage({ type: "artifact_rpc", request })
+      } catch (error) {
+        clearTimeout(timer)
+        this.pendingArtifact.delete(request.id)
+        resolve({ ok: false, id: request.id, error: { code: "VISUAL_HOST_UNAVAILABLE", message: String(error) } })
+      }
+    })
+  }
+
   respond(response: BrokerResponse): void {
     try { this.port?.postMessage({ type: "response", response }) } catch (e) {
       this.opts.log?.("native response send failed", { error: String(e), requestId: response.requestId })
@@ -109,6 +136,14 @@ export class NativePortV2 {
       if (!entry) return
       clearTimeout(entry.timer); this.pending.delete(response.requestId)
       entry.resolve(response); this.opts.onResponse?.(response)
+    } else if (msg.type === "artifact_rpc_result" && msg.response) {
+      const response = msg.response as { id?: unknown }
+      if (typeof response.id !== "string") return
+      const entry = this.pendingArtifact.get(response.id)
+      if (!entry) return
+      clearTimeout(entry.timer)
+      this.pendingArtifact.delete(response.id)
+      entry.resolve(msg.response)
     } else if (msg.type === "pong" || msg.type === "hello_ack" || msg.type === "event_ack") {
       this.opts.log?.("native control", { type: msg.type })
     } else if (msg.type === "error") {
@@ -147,5 +182,10 @@ export class NativePortV2 {
       this.opts.onResponse?.(response)
     }
     this.pending.clear()
+    for (const [id, { timer, resolve }] of this.pendingArtifact) {
+      clearTimeout(timer)
+      resolve({ ok: false, id, error: { code: "VISUAL_HOST_UNAVAILABLE", message } })
+    }
+    this.pendingArtifact.clear()
   }
 }

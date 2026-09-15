@@ -60,6 +60,10 @@ const browserApi: BrowserAPI = {
   },
   startAnnotation: (tabId) => ipcRenderer.invoke("browser-start-annotation", tabId),
   cancelAnnotation: (tabId) => ipcRenderer.invoke("browser-cancel-annotation", tabId),
+  visualHistory: (context, input) => ipcRenderer.invoke("browser-visual-history", context, input),
+  visualArtifact: (context, input) => ipcRenderer.invoke("browser-visual-artifact", context, input),
+  visualArtifactPreview: (context, input) => ipcRenderer.invoke("browser-visual-artifact-preview", context, input),
+  visualApproveRun: (context, runId, expected) => ipcRenderer.invoke("browser-visual-approve-run", context, runId, expected),
 }
 
 const api: ElectronAPI = {
