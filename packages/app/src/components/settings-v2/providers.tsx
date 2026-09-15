@@ -1,16 +1,31 @@
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
 import { Tag } from "@opencode-ai/ui/v2/badge-v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
+import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitleGroup } from "@opencode-ai/ui/v2/dialog-v2"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
+import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { showToast } from "@/utils/toast"
 import { popularProviders, useProviders } from "@/hooks/use-providers"
-import { createMemo, type Accessor, type Component, For, Show } from "solid-js"
+import {
+  createEffect,
+  createMemo,
+  createResource,
+  createSignal,
+  type Accessor,
+  type Component,
+  For,
+  onCleanup,
+  Show,
+} from "solid-js"
+import { createStore } from "solid-js/store"
+import type { ConnectionCredentialInfo, IntegrationInfo } from "@opencode-ai/sdk/v2/client"
 import { useLanguage } from "@/context/language"
 import { useServerProtocol, useServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
 import { DialogConnectProvider, useProviderConnectController } from "../dialog-connect-provider"
 import { DialogCustomProvider } from "../dialog-custom-provider"
 import { SettingsListV2 } from "./parts/list"
+import { activeCredentialAccount, credentialAccounts } from "./provider-accounts"
 import "./settings-v2.css"
 
 type ProviderSource = "env" | "api" | "config" | "custom"
@@ -28,6 +43,7 @@ const PROVIDER_NOTES = [
 ] as const
 
 const PROVIDER_ICON_SIZE = 16
+const EMPTY_INTEGRATIONS = new Map<string, IntegrationInfo>()
 
 export const SettingsProvidersV2: Component<{
   directory: Accessor<string | undefined>
@@ -51,6 +67,65 @@ export const SettingsProvidersV2: Component<{
       .connected()
       .filter((p) => p.id !== "opencode" || Object.values(p.models).find((m) => m.cost?.input))
   })
+
+  const integrationRequest = createMemo(() => {
+    if (protocol() !== "v2") return
+    const ids = connected().map((provider) => provider.id)
+    return { ids, directory: props.directory() }
+  })
+  const [integrations, integrationActions] = createResource(
+    integrationRequest,
+    async ({ ids, directory }) => {
+      const location = directory ? { directory } : undefined
+      const entries = await Promise.all(
+        ids.map(async (providerID) => {
+          const info = await serverSdk()
+            .api.integration.get({ integrationID: providerID, location })
+            .then((result) => result.data)
+            .catch(() => undefined)
+          return info ? ([providerID, info] as const) : undefined
+        }),
+      )
+      return new Map(entries.filter((entry): entry is readonly [string, IntegrationInfo] => entry !== undefined))
+    },
+    { initialValue: EMPTY_INTEGRATIONS },
+  )
+
+  createEffect(() => {
+    if (protocol() !== "v2") return
+    const unsub = serverSdk().event.listen((envelope) => {
+      if (envelope.details.type !== "integration.connection.updated") return
+      void integrationActions.refetch()
+    })
+    onCleanup(unsub)
+  })
+
+  const integration = (providerID: string) => (integrations.latest ?? EMPTY_INTEGRATIONS).get(providerID)
+  const accounts = (providerID: string) => credentialAccounts(integration(providerID)?.connections ?? [])
+  const activeAccount = (providerID: string) => activeCredentialAccount(integration(providerID)?.connections ?? [])
+  const canAddAccount = (providerID: string) =>
+    integration(providerID)?.methods.some((method) => method.type !== "env") ?? false
+  const location = () => {
+    const directory = props.directory()
+    return directory ? { directory } : undefined
+  }
+
+  const refreshAccounts = async () => {
+    await Promise.allSettled([integrationActions.refetch(), serverSync().refreshProviders()])
+  }
+
+  const mutateAccount = async (run: () => Promise<unknown>) => {
+    const result = await run()
+      .then(() => ({ ok: true as const }))
+      .catch((error: unknown) => ({ ok: false as const, error }))
+    if (!result.ok) {
+      const message = result.error instanceof Error ? result.error.message : String(result.error)
+      showToast({ title: language.t("common.requestFailed"), description: message })
+      return false
+    }
+    await refreshAccounts()
+    return true
+  }
 
   const popular = createMemo(() => {
     const connectedIDs = new Set(connected().map((p) => p.id))
@@ -81,8 +156,7 @@ export const SettingsProvidersV2: Component<{
     return language.t("settings.providers.tag.other")
   }
 
-  const canDisconnect = (item: ProviderItem) =>
-    source(item) !== "env" && (protocol() === "v1" || !isConfigCustom(item.id))
+  const canDisconnect = (item: ProviderItem) => protocol() === "v1" && source(item) !== "env"
 
   const note = (id: string) => PROVIDER_NOTES.find((item) => item.match(id))?.key
 
@@ -142,6 +216,45 @@ export const SettingsProvidersV2: Component<{
       })
   }
 
+  const selectAccount = (credential: ConnectionCredentialInfo) =>
+    mutateAccount(() =>
+      serverSdk().client.v2.credential.select(
+        { credentialID: credential.id, location: location() },
+        { throwOnError: true },
+      ),
+    )
+
+  const renameAccount = (credential: ConnectionCredentialInfo) =>
+    dialog.show(() => (
+      <DialogRenameProviderAccount
+        credential={credential}
+        onSave={(label) =>
+          mutateAccount(() =>
+            serverSdk().client.v2.credential.update(
+              { credentialID: credential.id, label, location: location() },
+              { throwOnError: true },
+            ),
+          )
+        }
+      />
+    ))
+
+  const removeAccount = (provider: ProviderItem, credential: ConnectionCredentialInfo) =>
+    dialog.show(() => (
+      <DialogRemoveProviderAccount
+        provider={provider.name}
+        credential={credential}
+        onRemove={() =>
+          mutateAccount(() =>
+            serverSdk().client.v2.credential.remove(
+              { credentialID: credential.id, location: location() },
+              { throwOnError: true },
+            ),
+          )
+        }
+      />
+    ))
+
   return (
     <>
       <div class="settings-v2-tab-header">
@@ -159,34 +272,116 @@ export const SettingsProvidersV2: Component<{
               }
             >
               <For each={connected()}>
-                {(item) => (
-                  <div class="settings-v2-provider-row group">
-                    <div class="settings-v2-provider-lead">
-                      <ProviderIcon
-                        id={item.id}
-                        width={PROVIDER_ICON_SIZE}
-                        height={PROVIDER_ICON_SIZE}
-                        class="settings-v2-provider-icon shrink-0"
-                      />
-                      <div class="settings-v2-provider-main">
-                        <span class="settings-v2-provider-name truncate">{item.name}</span>
-                        <Tag>{type(item)}</Tag>
+                {(item) => {
+                  const providerAccounts = () => accounts(item.id)
+                  const active = () => activeAccount(item.id)
+                  const accountReady = () => protocol() === "v2" && integration(item.id) !== undefined
+                  return (
+                    <div class="settings-v2-provider-group">
+                      <div class="settings-v2-provider-row settings-v2-provider-row--header group">
+                        <div class="settings-v2-provider-lead">
+                          <ProviderIcon
+                            id={item.id}
+                            width={PROVIDER_ICON_SIZE}
+                            height={PROVIDER_ICON_SIZE}
+                            class="settings-v2-provider-icon shrink-0"
+                          />
+                          <div class="settings-v2-provider-main">
+                            <span class="settings-v2-provider-name truncate">{item.name}</span>
+                            <Show
+                              when={accountReady() && providerAccounts().length > 0}
+                              fallback={<Tag>{type(item)}</Tag>}
+                            >
+                              <Tag>
+                                {language.plural("settings.providers.accounts.count", providerAccounts().length)}
+                              </Tag>
+                            </Show>
+                          </div>
+                        </div>
+                        <Show
+                          when={protocol() === "v2"}
+                          fallback={
+                            <Show
+                              when={canDisconnect(item)}
+                              fallback={
+                                <span class="settings-v2-provider-env-hint">
+                                  {language.t("settings.providers.connected.environmentDescription")}
+                                </span>
+                              }
+                            >
+                              <ButtonV2
+                                size="normal"
+                                variant="ghost-muted"
+                                onClick={() => void disconnect(item.id, item.name)}
+                              >
+                                {language.t("common.disconnect")}
+                              </ButtonV2>
+                            </Show>
+                          }
+                        >
+                          <Show
+                            when={canAddAccount(item.id)}
+                            fallback={
+                              <Show when={accountReady() && providerAccounts().length === 0}>
+                                <span class="settings-v2-provider-env-hint">
+                                  {language.t("settings.providers.connected.environmentDescription")}
+                                </span>
+                              </Show>
+                            }
+                          >
+                            <ButtonV2 size="normal" variant="ghost-muted" icon="plus" onClick={() => connect(item.id)}>
+                              {language.t("settings.providers.accounts.add")}
+                            </ButtonV2>
+                          </Show>
+                        </Show>
                       </div>
+                      <Show when={protocol() === "v2" && providerAccounts().length > 0}>
+                        <div class="settings-v2-provider-accounts">
+                          <For each={providerAccounts()}>
+                            {(credential) => (
+                              <div class="settings-v2-provider-account-row" data-credential-id={credential.id}>
+                                <div class="settings-v2-provider-account-copy">
+                                  <div class="settings-v2-provider-account-title">
+                                    <span class="truncate">{credential.label}</span>
+                                    <Show when={active()?.id === credential.id}>
+                                      <Tag>{language.t("common.default")}</Tag>
+                                    </Show>
+                                  </div>
+                                  <span class="settings-v2-provider-account-meta">{credential.id}</span>
+                                </div>
+                                <div class="settings-v2-provider-account-actions">
+                                  <Show when={active()?.id !== credential.id}>
+                                    <ButtonV2
+                                      size="small"
+                                      variant="ghost-muted"
+                                      onClick={() => void selectAccount(credential)}
+                                    >
+                                      {language.t("settings.providers.accounts.setDefault")}
+                                    </ButtonV2>
+                                  </Show>
+                                  <ButtonV2
+                                    size="small"
+                                    variant="ghost-muted"
+                                    onClick={() => renameAccount(credential)}
+                                  >
+                                    {language.t("common.rename")}
+                                  </ButtonV2>
+                                  <ButtonV2
+                                    size="small"
+                                    variant="ghost-muted"
+                                    onClick={() => removeAccount(item, credential)}
+                                  >
+                                    {language.t("common.delete")}
+                                  </ButtonV2>
+                                </div>
+                              </div>
+                            )}
+                          </For>
+                        </div>
+                      </Show>
                     </div>
-                    <Show
-                      when={canDisconnect(item)}
-                      fallback={
-                        <span class="settings-v2-provider-env-hint">
-                          {language.t("settings.providers.connected.environmentDescription")}
-                        </span>
-                      }
-                    >
-                      <ButtonV2 size="normal" variant="ghost-muted" onClick={() => void disconnect(item.id, item.name)}>
-                        {language.t("common.disconnect")}
-                      </ButtonV2>
-                    </Show>
-                  </div>
-                )}
+                  )
+                }}
               </For>
             </Show>
           </SettingsListV2>
@@ -263,5 +458,113 @@ export const SettingsProvidersV2: Component<{
         </div>
       </div>
     </>
+  )
+}
+
+function DialogRenameProviderAccount(props: {
+  credential: ConnectionCredentialInfo
+  onSave: (label: string) => Promise<boolean>
+}) {
+  const dialog = useDialog()
+  const language = useLanguage()
+  const [form, setForm] = createStore({ label: props.credential.label })
+  const [busy, setBusy] = createSignal(false)
+
+  const save = async () => {
+    if (busy()) return
+    const label = form.label.trim()
+    if (!label || label === props.credential.label) {
+      dialog.close()
+      return
+    }
+    setBusy(true)
+    try {
+      if (await props.onSave(label)) dialog.close()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog fit class="settings-v2-account-dialog">
+      <DialogHeader hideClose={busy()}>
+        <DialogTitleGroup
+          title={language.t("settings.providers.accounts.rename.title")}
+          description={language.t("settings.providers.accounts.rename.description", {
+            account: props.credential.label,
+          })}
+        />
+      </DialogHeader>
+      <DialogBody class="settings-v2-account-dialog-body">
+        <TextInputV2
+          autofocus
+          appearance="large"
+          value={form.label}
+          disabled={busy()}
+          onInput={(event) => setForm("label", event.currentTarget.value)}
+          onKeyDown={(event) => {
+            if (event.key !== "Enter" || event.isComposing) return
+            event.preventDefault()
+            void save()
+          }}
+          placeholder={language.t("settings.providers.accounts.rename.placeholder")}
+        />
+      </DialogBody>
+      <DialogFooter>
+        <ButtonV2 variant="neutral" disabled={busy()} onClick={() => dialog.close()}>
+          {language.t("common.cancel")}
+        </ButtonV2>
+        <ButtonV2 variant="contrast" disabled={busy() || !form.label.trim()} onClick={() => void save()}>
+          {language.t("common.save")}
+        </ButtonV2>
+      </DialogFooter>
+    </Dialog>
+  )
+}
+
+function DialogRemoveProviderAccount(props: {
+  provider: string
+  credential: ConnectionCredentialInfo
+  onRemove: () => Promise<boolean>
+}) {
+  const dialog = useDialog()
+  const language = useLanguage()
+  const [busy, setBusy] = createSignal(false)
+
+  const remove = async () => {
+    if (busy()) return
+    setBusy(true)
+    try {
+      if (await props.onRemove()) dialog.close()
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <Dialog fit class="settings-v2-account-dialog">
+      <DialogHeader hideClose={busy()}>
+        <DialogTitleGroup
+          title={language.t("settings.providers.accounts.remove.title")}
+          description={language.t("settings.providers.accounts.remove.confirm", {
+            account: props.credential.label,
+            provider: props.provider,
+          })}
+        />
+      </DialogHeader>
+      <DialogBody class="settings-v2-account-dialog-body">
+        <p class="settings-v2-account-dialog-warning">
+          {language.t("settings.providers.accounts.remove.warning", { provider: props.provider })}
+        </p>
+      </DialogBody>
+      <DialogFooter>
+        <ButtonV2 variant="neutral" disabled={busy()} onClick={() => dialog.close()}>
+          {language.t("common.cancel")}
+        </ButtonV2>
+        <ButtonV2 variant="danger" disabled={busy()} onClick={() => void remove()}>
+          {language.t("settings.providers.accounts.remove.button")}
+        </ButtonV2>
+      </DialogFooter>
+    </Dialog>
   )
 }

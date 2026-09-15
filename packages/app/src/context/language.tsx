@@ -38,6 +38,7 @@ type PluralKey =
   | "chats.footer.active"
   | "chats.archived.count"
   | "projectExplorer.folder.count"
+  | "settings.providers.accounts.count"
 
 const pluralCountFormatters = new Map<string, Intl.NumberFormat>()
 /** Locale-grouped rendering of a plural string's `{{count}}` placeholder. */

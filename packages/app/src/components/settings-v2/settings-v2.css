@@ -268,9 +268,96 @@
   border-bottom: none;
 }
 
+.settings-v2-provider-group {
+  border-bottom: 0.5px solid var(--v2-border-border-base);
+}
+
+.settings-v2-provider-group:last-child {
+  border-bottom: none;
+}
+
+.settings-v2-provider-group > .settings-v2-provider-row {
+  border-bottom: none;
+}
+
+.settings-v2-provider-row--header {
+  padding-block: 14px;
+}
+
+.settings-v2-provider-accounts {
+  margin-inline-start: 26px;
+  border-top: 0.5px solid var(--v2-border-border-base);
+}
+
+.settings-v2-provider-account-row {
+  display: flex;
+  min-height: 40px;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding-block: 8px;
+  border-bottom: 0.5px solid var(--v2-border-border-base);
+}
+
+.settings-v2-provider-account-row:last-child {
+  border-bottom: none;
+}
+
+.settings-v2-provider-account-copy {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.settings-v2-provider-account-title {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  font-size: 13px;
+  font-weight: 530;
+  line-height: 16px;
+  color: var(--v2-text-text-base);
+}
+
+.settings-v2-provider-account-meta {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-family-mono);
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--v2-text-text-muted);
+}
+
+.settings-v2-provider-account-actions {
+  display: flex;
+  flex-shrink: 0;
+  align-items: center;
+  gap: 2px;
+}
+
 @media (min-width: 640px) {
   .settings-v2-provider-row {
     flex-wrap: nowrap;
+  }
+}
+
+@media (max-width: 639px) {
+  .settings-v2-provider-accounts {
+    margin-inline-start: 0;
+  }
+
+  .settings-v2-provider-account-row {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .settings-v2-provider-account-actions {
+    width: 100%;
+    flex-wrap: wrap;
   }
 }
 
@@ -338,6 +425,26 @@
   opacity: 0;
   transition: opacity 200ms ease;
   cursor: default;
+}
+
+.settings-v2-account-dialog-body {
+  display: flex;
+  width: 100%;
+  min-width: 0;
+  flex-direction: column;
+  padding: 16px;
+}
+
+.settings-v2-account-dialog-body [data-component="text-input-v2"] {
+  width: 100%;
+}
+
+.settings-v2-account-dialog-warning {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 440;
+  line-height: 20px;
+  color: var(--v2-text-text-muted);
 }
 
 .group:hover .settings-v2-provider-env-hint {
