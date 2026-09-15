@@ -55,6 +55,24 @@ function bruteFuzzy(models: CheapnessModel[], threshold = 0.75) {
 }
 
 describe("model-cost fallback", () => {
+  test("legacy pricing without a cache object stays rankable", () => {
+    const legacy = {
+      id: "legacy",
+      name: "Legacy",
+      provider: { id: "legacy-provider" },
+      cost: { input: 1, output: 2 },
+    }
+    const expensive = {
+      id: "expensive",
+      name: "Expensive",
+      provider: { id: "legacy-provider" },
+      cost: { input: 10, output: 20 },
+    }
+
+    expect(() => compareByCheapness(legacy as never, expensive as never)).not.toThrow()
+    expect(compareByCheapness(legacy as never, expensive as never)).toBeLessThan(0)
+  })
+
   test("pricing fallback prefers non-openrouter and shares across providers", () => {
     const models = [
       { id: "claude-sonnet", name: "Claude Sonnet", provider: { id: "anthropic" }, cost: { input: 3, output: 15, cache: { read: 0.3, write: 0 } } },

@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test"
-import { createModelSearchMatcher, matchesModelSearch } from "./dialog-select-model-search"
+import {
+  createModelSearchMatcher,
+  filterPreparedModelGroupsForSearch,
+  matchesModelSearch,
+  prepareModelGroupSearchFields,
+} from "./dialog-select-model-search"
 
 describe("matchesModelSearch", () => {
   test("does not match when prepared fields are temporarily unavailable", () => {
@@ -32,5 +37,48 @@ describe("matchesModelSearch", () => {
 
   test("does not match unrelated searches", () => {
     expect(matchesModelSearch("claude", ["GPT-5.5", "gpt-5.5", "OpenAI"])).toBe(false)
+  })
+
+  test("does not create compact matches across separate field boundaries", () => {
+    expect(matchesModelSearch("aib", ["AI", "B"])).toBe(false)
+  })
+})
+
+describe("filterPreparedModelGroupsForSearch", () => {
+  const canonical = { id: "claude-3.7-sonnet", name: "Claude-3.7 Sonnet", provider: { name: "Anthropic" } }
+  const dana = {
+    id: "claude-3.7-sonnet@wb-dana",
+    name: "Claude-3.7 Sonnet",
+    provider: { name: "Anthropic" },
+  }
+  const lee = {
+    id: "claude-3.7-sonnet@wb-lee",
+    name: "Claude-3.7 Sonnet",
+    provider: { name: "Anthropic" },
+  }
+  const groups = [
+    {
+      label: "Claude-3.7 Sonnet",
+      canonical,
+      variants: [
+        { accountID: "dana", item: dana },
+        { accountID: "lee", item: lee },
+      ],
+    },
+  ]
+  const fields = prepareModelGroupSearchFields(groups)
+
+  test("keeps provider and normalized punctuation matches canonical", () => {
+    expect(filterPreparedModelGroupsForSearch(groups, "anthropic", fields)).toEqual([canonical])
+    expect(filterPreparedModelGroupsForSearch(groups, "claude 37", fields)).toEqual([canonical])
+  })
+
+  test("expands only the matching account variant", () => {
+    expect(filterPreparedModelGroupsForSearch(groups, "dana", fields)).toEqual([dana])
+    expect(filterPreparedModelGroupsForSearch(groups, "wb lee", fields)).toEqual([lee])
+  })
+
+  test("canonical model matches stay collapsed even though variants share the model name", () => {
+    expect(filterPreparedModelGroupsForSearch(groups, "sonnet", fields)).toEqual([canonical])
   })
 })

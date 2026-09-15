@@ -285,7 +285,13 @@ export function priceWorkload(
 function tokenCost(workload: Workload, prices: ModelCost): number {
   // §5.2: C_{m,j} = (I_j P_I + K_j P_K + O_j P_O) / 1_000_000
   // §26.2: cached-write is NOT in the primary score — it models reuse, not creation.
-  return (workload.freshInputTokens * prices.input + workload.cachedReadTokens * prices.cache.read + workload.outputTokens * prices.output) / 1_000_000
+  // `Model.Cost` requires cache pricing in current schema versions, but stale
+  // provider snapshots / older servers can legitimately reach the renderer as
+  // `{ input, output }`. Treat missing cache-read pricing as uncached-input
+  // pricing rather than crashing the selector. This is conservative: a missing
+  // discount must never make a model look artificially cheaper.
+  const cacheRead = prices.cache?.read ?? prices.input
+  return (workload.freshInputTokens * prices.input + workload.cachedReadTokens * cacheRead + workload.outputTokens * prices.output) / 1_000_000
 }
 
 // ---------------------------------------------------------------------------

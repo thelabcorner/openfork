@@ -7,6 +7,7 @@ import { TextField } from "@opencode-ai/ui/text-field"
 import { type Component, For, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { useModels } from "@/context/models"
+import { ModelsProvider } from "@/context/models"
 import { popularProviders } from "@/hooks/use-providers"
 import { SettingsList } from "./settings-list"
 import { SettingsServerPicker, SettingsServerScope } from "./settings-server-picker"
@@ -35,7 +36,9 @@ const ListEmptyState: Component<{ message: string; filter: string }> = (props) =
 export const SettingsModels: Component = () => {
   return (
     <SettingsServerScope>
-      <SettingsModelsContent />
+      <ModelsProvider>
+        <SettingsModelsContent />
+      </ModelsProvider>
     </SettingsServerScope>
   )
 }

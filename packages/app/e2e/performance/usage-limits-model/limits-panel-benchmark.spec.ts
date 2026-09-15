@@ -1,4 +1,4 @@
-import type { Page, Route } from "@playwright/test"
+import type { CDPSession, Page, Route } from "@playwright/test"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { benchmark, expect } from "../benchmark"
 import { performanceBackendUrl } from "../performance-ports"
@@ -9,6 +9,12 @@ const directory = "C:/OpenCode/LimitsPerformance"
 const projectID = "proj_limits_perf"
 const sessionID = "ses_limits_perf"
 const backendURL = performanceBackendUrl()
+
+async function taskCpuMs(cdp: CDPSession) {
+  const result = await cdp.send("Performance.getMetrics")
+  const metric = (result.metrics as Array<{ name: string; value: number }>).find((entry) => entry.name === "TaskDuration")
+  return (metric?.value ?? 0) * 1_000
+}
 
 const providerCount = () => Number(process.env.LIMITS_BENCH_PROVIDERS ?? 50)
 const windowsPerProvider = () => Number(process.env.LIMITS_BENCH_WINDOWS ?? 6)
@@ -60,6 +66,8 @@ async function createSession(page: Page) {
 
 benchmark.describe("performance: limits pane", () => {
   benchmark("bounds provider rendering, countdown work, and quota request fanout", async ({ page, report }) => {
+    const cdp = await page.context().newCDPSession(page)
+    await cdp.send("Performance.enable")
     const providers = providerDefinitions(providerCount())
     const windowCount = windowsPerProvider()
     let providerListRequests = 0
@@ -174,6 +182,7 @@ benchmark.describe("performance: limits pane", () => {
     // DOM character-data changes caused by countdown text. Structural children
     // should remain stable; this is deliberately a renderer-level invariant.
     const limitsBody = firstProvider.locator("xpath=ancestor::*[@aria-hidden][1]")
+    const visibleCpuBefore = await taskCpuMs(cdp)
     const visibleMutations = await limitsBody.evaluate(async (node) => {
       let characterData = 0
       let childList = 0
@@ -188,12 +197,14 @@ benchmark.describe("performance: limits pane", () => {
       observer.disconnect()
       return { characterData, childList }
     })
+    const visibleTaskCpuMs = (await taskCpuMs(cdp)) - visibleCpuBefore
 
     // Move away from Limits without unmounting it. Its display clock and
     // transport must go idle while the Context tab is active.
     await panel.getByRole("tab", { name: /context/i }).click()
     await expect(panel.getByRole("tab", { name: /context/i })).toHaveAttribute("aria-selected", "true")
     const requestsBeforeHidden = { providers: providerListRequests, quotas: quotaRequests }
+    const hiddenCpuBefore = await taskCpuMs(cdp)
     const hiddenMutations = await limitsBody.evaluate(async (node) => {
       let characterData = 0
       let childList = 0
@@ -208,6 +219,7 @@ benchmark.describe("performance: limits pane", () => {
       observer.disconnect()
       return { characterData, childList }
     })
+    const hiddenTaskCpuMs = (await taskCpuMs(cdp)) - hiddenCpuBefore
 
     report(
       {
@@ -220,8 +232,11 @@ benchmark.describe("performance: limits pane", () => {
         quotaOpenDelta,
         visibleCharacterMutations: visibleMutations.characterData,
         visibleChildListMutations: visibleMutations.childList,
+        visiblePageTaskCpuMs: visibleTaskCpuMs,
         hiddenCharacterMutations: hiddenMutations.characterData,
         hiddenChildListMutations: hiddenMutations.childList,
+        hiddenPageTaskCpuMs: hiddenTaskCpuMs,
+        visibleMinusHiddenPageTaskCpuMs: Math.max(0, visibleTaskCpuMs - hiddenTaskCpuMs),
         hiddenProviderRequestDelta: providerListRequests - requestsBeforeHidden.providers,
         hiddenQuotaRequestDelta: quotaRequests - requestsBeforeHidden.quotas,
       },
@@ -234,5 +249,6 @@ benchmark.describe("performance: limits pane", () => {
     expect(hiddenMutations.childList).toBe(0)
     expect(providerListRequests - requestsBeforeHidden.providers).toBe(0)
     expect(quotaRequests - requestsBeforeHidden.quotas).toBe(0)
+    await cdp.detach()
   })
 })

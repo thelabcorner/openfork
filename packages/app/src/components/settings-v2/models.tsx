@@ -7,7 +7,7 @@ import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { type Component, For, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLanguage } from "@/context/language"
-import { useModels } from "@/context/models"
+import { ModelsProvider, useModels } from "@/context/models"
 import { useServerSDK } from "@/context/server-sdk"
 import { popularProviders } from "@/hooks/use-providers"
 import { stripUnlimitedSuffix } from "@/utils/model-badges"
@@ -20,7 +20,13 @@ type ModelItem = ReturnType<ReturnType<typeof useModels>["list"]>[number]
 
 const PROVIDER_ICON_SIZE = 16
 
-export const SettingsModelsV2: Component = () => {
+export const SettingsModelsV2: Component = () => (
+  <ModelsProvider>
+    <SettingsModelsV2Content />
+  </ModelsProvider>
+)
+
+const SettingsModelsV2Content: Component = () => {
   const language = useLanguage()
   const models = useModels()
   const serverSdk = useServerSDK()

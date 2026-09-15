@@ -52,7 +52,10 @@ import { AutoScroller, Feedback, PointerActivationConstraints } from "@dnd-kit/d
 import { RestrictToVerticalAxis } from "@dnd-kit/abstract/modifiers"
 import { RestrictToElement } from "@dnd-kit/dom/modifiers"
 import { arrayMove } from "@dnd-kit/helpers"
-import { createModelSearchMatcher, prepareModelSearchFields } from "./dialog-select-model-search"
+import {
+  filterPreparedModelGroupsForSearch,
+  prepareModelGroupSearchFields,
+} from "./dialog-select-model-search"
 import { applySectionOrder } from "./dialog-select-model-order"
 import { useForkUsage } from "@/context/fork-usage"
 import { useWorkBuddyUsage, type WorkBuddyModelUsage } from "@/hooks/use-workbuddy-usage"
@@ -74,7 +77,6 @@ import { percent as usagePercent, colorFor } from "./usage-gauge-v2"
 import { toneForRemaining } from "@/utils/limits-format"
 import {
   collapseAccountVariants,
-  expandForQuery,
   groupForModelID,
   indexModelGroups,
   type ModelGroup,
@@ -1809,22 +1811,7 @@ function createModelSelectorController(input: {
     openEdgeUsageCheck = false
     return sorted
   })
-  const searchableFields = createMemo(() => {
-    const fields = new Map<ModelItem, ReturnType<typeof prepareModelSearchFields>>()
-    for (const group of collapsedGroups()) {
-      fields.set(
-        group.canonical,
-        prepareModelSearchFields([
-          group.label,
-          group.canonical.name,
-          group.canonical.id,
-          group.canonical.provider.name,
-          ...group.variants.flatMap((variant) => [variant.accountID, variant.item.name, variant.item.id]),
-        ]),
-      )
-    }
-    return fields
-  })
+  const searchableFields = createMemo(() => prepareModelGroupSearchFields(collapsedGroups()))
 
   const key = (item: ModelItem) => ({ modelID: item.id, providerID: item.provider.id })
   // `model.current()` values are `{ id, providerID, ... }` — they carry NO
@@ -1870,20 +1857,7 @@ function createModelSelectorController(input: {
     models: (search: string) => {
       const query = search.trim()
       if (!query) return allModels()
-      const matches = createModelSearchMatcher(query)
-      const fields = searchableFields()
-      const matchedGroups = collapsedGroups().filter((group) => {
-        const prepared = fields.get(group.canonical)
-        return prepared ? matches(prepared) : false
-      })
-      const expanded = expandForQuery(matchedGroups, query)
-      // `expandForQuery` uses a substring check for account labels; retain the
-      // existing fuzzy matcher for regular model/provider queries.
-      return expanded.filter((item) => {
-        const group = groupIndex().get(modelKey(item))
-        const prepared = group ? fields.get(group.canonical) : undefined
-        return prepared ? matches(prepared) : false
-      })
+      return filterPreparedModelGroupsForSearch(collapsedGroups(), query, searchableFields())
     },
     groups: (models: ModelItem[]) => {
       const byProvider = new Map<string, ModelItem[]>()
@@ -2984,15 +2958,36 @@ function ModelSelectorPopoverV2View(props: {
   // only for mounted virtual rows; the full catalog must never be scanned just
   // because the selector opened.
   const [usageReady, setUsageReady] = createSignal(false)
-  onMount(() => {
+  createEffect(() => {
+    if (!store.open) {
+      setUsageReady(false)
+      return
+    }
+
+    // Optional usage bars must never compete with menu admission/first paint.
+    // Arm enrichment only after two frames of the *current* open and cancel it
+    // if the selector closes again. The former onMount/close idle callbacks
+    // could make usageReady=true while closed, pulling enrichment back into the
+    // next first paint and accumulating uncancelled callbacks over many cycles.
+    setUsageReady(false)
+    let frame1 = 0
+    let frame2 = 0
     let idleHandle: number | undefined
     let timeoutHandle: ReturnType<typeof setTimeout> | undefined
-    if (typeof requestIdleCallback === "function") {
-      idleHandle = requestIdleCallback(() => setUsageReady(true), { timeout: 200 })
-    } else {
-      timeoutHandle = setTimeout(() => setUsageReady(true), 0)
-    }
+    frame1 = requestAnimationFrame(() => {
+      frame1 = 0
+      frame2 = requestAnimationFrame(() => {
+        frame2 = 0
+        if (typeof requestIdleCallback === "function") {
+          idleHandle = requestIdleCallback(() => setUsageReady(true), { timeout: 200 })
+        } else {
+          timeoutHandle = setTimeout(() => setUsageReady(true), 0)
+        }
+      })
+    })
     onCleanup(() => {
+      if (frame1) cancelAnimationFrame(frame1)
+      if (frame2) cancelAnimationFrame(frame2)
       if (idleHandle !== undefined && typeof cancelIdleCallback === "function") cancelIdleCallback(idleHandle)
       if (timeoutHandle !== undefined) clearTimeout(timeoutHandle)
     })
@@ -3074,14 +3069,8 @@ function ModelSelectorPopoverV2View(props: {
     // Mirrors the open branch: both gates flip in one flush.
     batch(() => {
       setStore({ open: false, active: "", tooltip: "", submenu: "" })
-      setUsageReady(false)
       props.onExternalOpenChange?.(false)
     })
-    if (typeof requestIdleCallback === "function") {
-      requestIdleCallback(() => setUsageReady(true), { timeout: 200 })
-    } else {
-      setTimeout(() => setUsageReady(true), 0)
-    }
   }
   let closeAction: (() => void) | undefined
   let closeGeneration = 0

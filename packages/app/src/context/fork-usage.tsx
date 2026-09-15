@@ -1,10 +1,12 @@
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { createResource, createSignal, onCleanup, onMount } from "solid-js"
 import { useServerSDK } from "@/context/server-sdk"
-import { ForkClient, type ForkServer, type ForkWindowUsage } from "@/utils/fork-client"
+import type { ForkServer, ForkWindowUsage } from "@/utils/fork-client"
 
 const HEARTBEAT_MS = 60_000
 const EVENT_DEBOUNCE_MS = 3_000
+let forkClientRuntime: Promise<typeof import("@/utils/fork-client")> | undefined
+const loadForkClientRuntime = () => (forkClientRuntime ??= import("@/utils/fork-client"))
 
 /**
  * Single shared realtime OpenCode Go usage controller per server/window.
@@ -33,12 +35,18 @@ export const { use: useForkUsage, provider: ForkUsageProvider } = createSimpleCo
 
     const [credentials, { refetch: refetchCredentials }] = createResource(
       () => (armed() ? server() : undefined),
-      (value) => ForkClient.list(value).catch(() => undefined),
+      async (value) => {
+        const { ForkClient } = await loadForkClientRuntime()
+        return ForkClient.list(value).catch(() => undefined)
+      },
       { initialValue: undefined },
     )
     const [usage, { refetch: refetchUsage }] = createResource(
       () => (armed() ? server() : undefined),
-      (value) => ForkClient.usage(value).catch(() => undefined),
+      async (value) => {
+        const { ForkClient } = await loadForkClientRuntime()
+        return ForkClient.usage(value).catch(() => undefined)
+      },
       { initialValue: undefined },
     )
 

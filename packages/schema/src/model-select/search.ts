@@ -11,22 +11,28 @@ export const compactModelSearch = (value: string) => normalizeModelSearch(value)
 
 const searchTokens = (value: string) => normalizeModelSearch(value).split(" ").filter(Boolean)
 
-export const prepareModelSearchFields = (values: string[]) =>
-  values.map((value) => {
-    const normalized = normalizeModelSearch(value)
-    return { normalized, compact: normalized.replaceAll(" ", "") }
-  })
+export type PreparedModelSearchFields = { normalized: string; compact: string }
+
+// Search fields are structural and are prepared once per model/catalog
+// revision. Join them with a sentinel that normalization can never emit so a
+// query cannot accidentally match across two field boundaries. This preserves
+// the previous field-wise substring semantics while turning the hot matcher
+// from tokens × fields scans into two native string searches per token.
+export const prepareModelSearchFields = (values: string[]): PreparedModelSearchFields => {
+  const normalized = values.map(normalizeModelSearch)
+  return {
+    normalized: normalized.join("\0"),
+    compact: normalized.map((value) => value.replaceAll(" ", "")).join("\0"),
+  }
+}
 
 export const createModelSearchMatcher = (query: string) => {
   const tokens = searchTokens(query)
   if (tokens.length === 0) return () => true
-  const compactTokens = tokens.map((token) => token.replaceAll(" ", ""))
 
-  return (fields: ReturnType<typeof prepareModelSearchFields> | undefined) =>
+  return (fields: PreparedModelSearchFields | undefined) =>
     !!fields &&
-    tokens.every((token, index) =>
-      fields.some((field) => field.normalized.includes(token) || field.compact.includes(compactTokens[index])),
-    )
+    tokens.every((token) => fields.normalized.includes(token) || fields.compact.includes(token))
 }
 
 export const matchesModelSearch = (query: string, values: string[]) =>
