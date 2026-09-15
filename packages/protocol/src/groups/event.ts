@@ -44,15 +44,43 @@ const transportControls = [
       }),
     }).annotate({ identifier: "V2Event.server.stream.gap" }),
   },
+  {
+    type: "server.stream.session-stale",
+    schema: Schema.Struct({
+      ...fields,
+      type: Schema.Literal("server.stream.session-stale"),
+      data: Schema.Struct({ sessionID: Schema.String }),
+    }).annotate({ identifier: "V2Event.server.stream.session-stale" }),
+  },
+  {
+    type: "server.stream.progress",
+    schema: Schema.Struct({
+      ...fields,
+      type: Schema.Literal("server.stream.progress"),
+      // This control frame is the intentional exception to the usual
+      // sequence-free control rule: the SSE `id:` acknowledges reconstructible
+      // content deliberately suppressed for this subscriber. `latest` mirrors
+      // that cursor for diagnostics; it is not durable domain state.
+      data: Schema.Struct({ latest: Schema.Int }),
+    }).annotate({ identifier: "V2Event.server.stream.progress" }),
+  },
 ] as const
 
-const schema = <const Definitions extends ReadonlyArray<Definition>>(definitions: Definitions) =>
-  Schema.Union([
-    ...definitions,
-    ...transportControls
-      .filter((control) => !definitions.some((definition) => definition.type === control.type))
-      .map((control) => control.schema),
+const transportControlTypes = new Set(transportControls.map((control) => control.type as string))
+
+const withoutTransportControls = <const Definitions extends ReadonlyArray<Definition>>(definitions: Definitions) =>
+  definitions.filter((definition) => !transportControlTypes.has(definition.type)) as Array<Definitions[number]>
+
+const schema = <const Definitions extends ReadonlyArray<Definition>>(definitions: Definitions) => {
+  return Schema.Union([
+    // Transport controls are wire contracts, not ordinary manifest domain
+    // events. Prefer their explicit schemas when a manifest definition shares
+    // the same type (notably server.connected, whose native control carries the
+    // replay epoch). Otherwise codegen can silently erase transport-only fields.
+    ...withoutTransportControls(definitions),
+    ...transportControls.map((control) => control.schema),
   ]).annotate({ identifier: "V2Event" })
+}
 
 const make = <const Definitions extends ReadonlyArray<Definition>>(definitions: Definitions) => {
   const EventSchema = schema(definitions)

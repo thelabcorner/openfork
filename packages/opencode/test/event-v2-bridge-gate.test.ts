@@ -3,7 +3,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Effect, Schema } from "effect"
 import { GlobalBus } from "@/bus/global"
-import { EventV2Bridge, hasLegacyConsumer, registerLegacyTransport } from "@/event-v2-bridge"
+import { EventV2Bridge, hasLegacyConsumer, hasLegacySyncConsumer, registerLegacyTransport } from "@/event-v2-bridge"
 import { testEffect } from "./lib/effect"
 
 /**
@@ -26,6 +26,12 @@ const Probe = EventV2.define({
   schema: { n: Schema.Number },
 })
 
+const DurableProbe = EventV2.define({
+  type: "bridge.gate.durable-probe",
+  durable: { version: 1, aggregate: "aggregateID" },
+  schema: { aggregateID: Schema.String, n: Schema.Number },
+})
+
 const it = testEffect(LayerNode.compile(LayerNode.group([EventV2Bridge.node])))
 
 /**
@@ -41,8 +47,13 @@ function spyOnEmit<A>(body: Effect.Effect<A, any, any>) {
     const emitted: Array<{ channel: string; type?: string; n?: number }> = []
     const original = GlobalBus.emit.bind(GlobalBus)
     const patched = ((channel: any, event: any) => {
-      if (event?.payload?.type === "bridge.gate.probe") {
-        emitted.push({ channel, type: event.payload.type, n: event.payload.properties?.n })
+      const type = event?.payload?.type
+      if (type === "bridge.gate.probe" || type === "bridge.gate.durable-probe" || type === "sync") {
+        emitted.push({
+          channel,
+          type,
+          n: type === "sync" ? event.payload.syncEvent?.data?.n : event.payload.properties?.n,
+        })
       }
       return original(channel, event)
     }) as typeof GlobalBus.emit
@@ -79,10 +90,12 @@ describe("bridge allocation gate", () => {
       GlobalBus.on("event", listener)
       try {
         expect(hasLegacyConsumer()).toBe(true)
+        expect(hasLegacySyncConsumer()).toBe(true)
       } finally {
         GlobalBus.off("event", listener)
       }
       expect(hasLegacyConsumer()).toBe(false)
+      expect(hasLegacySyncConsumer()).toBe(false)
     }),
   )
 
@@ -125,11 +138,45 @@ describe("bridge allocation gate", () => {
         )
         // The defect: the old gate saw the replay listener and emitted anyway.
         expect(emitted).toEqual([])
-        // Native sequencing is unaffected: the bridge ring still advanced.
-        expect(events.replayLatest()).toBeGreaterThan(0)
+        // `/api/event` owns native replay independently. With no compatibility
+        // `/event` subscriber, the bridge ring itself stays completely idle.
+        expect(events.replayLatest()).toBe(0)
       } finally {
         GlobalBus.off("event.replay", capture)
       }
+    }),
+  )
+
+  it.effect("captures replay only while a compatibility range is connected", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      yield* events.publish(Probe, { n: 0 })
+      expect(events.replayLatest()).toBe(0)
+
+      const first = events.replayConnect()
+      expect(first.after).toBe(0)
+      yield* events.publish(Probe, { n: 1 })
+      expect(events.replayLatest()).toBe(1)
+
+      const second = events.replayConnect()
+      expect(second.epoch).toBe(first.epoch)
+      expect(second.after).toBe(1)
+      yield* events.publish(Probe, { n: 2 })
+      expect(events.replayLatest()).toBe(2)
+
+      first.release()
+      yield* events.publish(Probe, { n: 3 })
+      expect(events.replayLatest()).toBe(3)
+      second.release()
+
+      // Idle publishes are not retained. The next compatibility range starts a
+      // fresh epoch/window rather than pretending it can replay the idle gap.
+      yield* events.publish(Probe, { n: 4 })
+      expect(events.replayLatest()).toBe(3)
+      const next = events.replayConnect()
+      expect(next.epoch).not.toBe(first.epoch)
+      expect(next.after).toBe(0)
+      next.release()
     }),
   )
 
@@ -151,6 +198,85 @@ describe("bridge allocation gate", () => {
       } finally {
         unregister()
         connected = false
+      }
+    }),
+  )
+
+  it.effect("interest-aware transport emits compatibility without duplicate durable sync", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      let connected = true
+      let listeners = 0
+      const transportListener = () => {}
+      GlobalBus.on("event", transportListener)
+      listeners = 1
+      const unregister = registerLegacyTransport({
+        isActive: () => connected,
+        listenerCount: () => listeners,
+        needsSync: () => false,
+      })
+      try {
+        expect(hasLegacyConsumer()).toBe(true)
+        expect(hasLegacySyncConsumer()).toBe(false)
+        const { emitted } = yield* spyOnEmit(
+          events.publish(DurableProbe, { aggregateID: "agg_desktop", n: 1 }),
+        )
+        expect(emitted.map((event) => event.type)).toEqual(["bridge.gate.durable-probe"])
+      } finally {
+        unregister()
+        listeners = 0
+        connected = false
+        GlobalBus.off("event", transportListener)
+      }
+    }),
+  )
+
+  it.effect("direct in-process consumer keeps durable sync enabled beside an interest-aware transport", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const transportListener = () => {}
+      const directListener = () => {}
+      GlobalBus.on("event", transportListener)
+      GlobalBus.on("event", directListener)
+      const unregister = registerLegacyTransport({
+        isActive: () => true,
+        listenerCount: () => 1,
+        needsSync: () => false,
+      })
+      try {
+        expect(hasLegacyConsumer()).toBe(true)
+        expect(hasLegacySyncConsumer()).toBe(true)
+        const { emitted } = yield* spyOnEmit(
+          events.publish(DurableProbe, { aggregateID: "agg_direct", n: 2 }),
+        )
+        expect(emitted.map((event) => event.type)).toEqual(["bridge.gate.durable-probe", "sync"])
+      } finally {
+        unregister()
+        GlobalBus.off("event", directListener)
+        GlobalBus.off("event", transportListener)
+      }
+    }),
+  )
+
+  it.effect("sync-capable transport keeps durable sync enabled while active", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const transportListener = () => {}
+      GlobalBus.on("event", transportListener)
+      const unregister = registerLegacyTransport({
+        isActive: () => true,
+        listenerCount: () => 1,
+        needsSync: () => true,
+      })
+      try {
+        expect(hasLegacySyncConsumer()).toBe(true)
+        const { emitted } = yield* spyOnEmit(
+          events.publish(DurableProbe, { aggregateID: "agg_sync", n: 3 }),
+        )
+        expect(emitted.map((event) => event.type)).toEqual(["bridge.gate.durable-probe", "sync"])
+      } finally {
+        unregister()
+        GlobalBus.off("event", transportListener)
       }
     }),
   )

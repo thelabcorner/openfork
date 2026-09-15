@@ -115,6 +115,9 @@ import type {
   GlobalDisposeErrors,
   GlobalDisposeResponses,
   GlobalEventErrors,
+  GlobalEventInterestErrors,
+  GlobalEventInterestInput,
+  GlobalEventInterestResponses,
   GlobalEventResponses,
   GlobalHealthErrors,
   GlobalHealthResponses,
@@ -122,8 +125,12 @@ import type {
   GlobalPreferencesGetResponses,
   GlobalPreferencesUpdateErrors,
   GlobalPreferencesUpdateResponses,
+  GlobalProjectsErrors,
+  GlobalProjectsResponses,
   GlobalResetLocalDataErrors,
   GlobalResetLocalDataResponses,
+  GlobalSessionRootsErrors,
+  GlobalSessionRootsResponses,
   GlobalUpgradeErrors,
   GlobalUpgradeResponses,
   GoalAddEvidenceErrors,
@@ -1870,6 +1877,74 @@ export class Global extends HeyApiClient {
   public event<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
     return (options?.client ?? this.client).sse.get<GlobalEventResponses, GlobalEventErrors, ThrowOnError>({
       url: "/global/event",
+      ...options,
+    })
+  }
+
+  /**
+   * Update event stream interest
+   *
+   * Update the foreground session set for one SSE subscriber so reconstructible background content can be suppressed upstream.
+   */
+  public eventInterest<ThrowOnError extends boolean = false>(
+    parameters?: {
+      globalEventInterestInput?: GlobalEventInterestInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ key: "globalEventInterestInput", map: "body" }] }])
+    return (options?.client ?? this.client).post<GlobalEventInterestResponses, GlobalEventInterestErrors, ThrowOnError>(
+      {
+        url: "/global/event/interest",
+        ...options,
+        ...params,
+        headers: {
+          "Content-Type": "application/json",
+          ...options?.headers,
+          ...params.headers,
+        },
+      },
+    )
+  }
+
+  /**
+   * List recent root sessions without instance bootstrap
+   *
+   * List recent non-archived root sessions for one directory directly from durable session storage. This read-only startup surface intentionally does not materialize directory config, plugins, providers, or tools.
+   */
+  public sessionRoots<ThrowOnError extends boolean = false>(
+    parameters: {
+      directory: string
+      limit?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "directory" },
+            { in: "query", key: "limit" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<GlobalSessionRootsResponses, GlobalSessionRootsErrors, ThrowOnError>({
+      url: "/global/session/roots",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * List projects without instance bootstrap
+   *
+   * List durable project metadata without materializing directory config, plugins, providers, or tools. Intended for startup navigation/catalog hydration.
+   */
+  public projects<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<GlobalProjectsResponses, GlobalProjectsErrors, ThrowOnError>({
+      url: "/global/project",
       ...options,
     })
   }
@@ -8064,6 +8139,7 @@ export class Session3 extends HeyApiClient {
   public list<ThrowOnError extends boolean = false>(
     parameters?: {
       workspace?: string
+      roots?: boolean | "true" | "false"
       limit?: number
       order?: "asc" | "desc"
       search?: string
@@ -8080,6 +8156,7 @@ export class Session3 extends HeyApiClient {
         {
           args: [
             { in: "query", key: "workspace" },
+            { in: "query", key: "roots" },
             { in: "query", key: "limit" },
             { in: "query", key: "order" },
             { in: "query", key: "search" },

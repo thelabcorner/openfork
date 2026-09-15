@@ -8,6 +8,8 @@ import {
   MAX_PENDING_EVENT_COUNT,
   resumeStreamAfterPageShow,
   shouldDispatchSessionStreamFrame,
+  streamContentSessionsForVisibility,
+  streamInterestUpdatePriority,
 } from "./server-sdk"
 import type { OpenCodeEvent } from "@opencode-ai/client/promise"
 import type { SessionMessageInfo } from "@opencode-ai/client/promise"
@@ -23,6 +25,21 @@ describe("resumeStreamAfterPageShow", () => {
     resumeStreamAfterPageShow({ persisted: true } as PageTransitionEvent, start)
 
     expect(starts).toBe(1)
+  })
+})
+
+describe("streamContentSessionsForVisibility", () => {
+  test("advertises zero timeline interest while the renderer is hidden", () => {
+    const sessions = ["ses_a", "ses_b"]
+    expect(streamContentSessionsForVisibility(sessions, false)).toBe(sessions)
+    expect(streamContentSessionsForVisibility(sessions, true)).toEqual([])
+  })
+})
+
+describe("streamInterestUpdatePriority", () => {
+  test("does not spend the critical reserve on stream-interest bookkeeping", () => {
+    expect(streamInterestUpdatePriority(["ses_visible"])).toBe("interactive")
+    expect(streamInterestUpdatePriority([])).toBe("background")
   })
 })
 
@@ -322,8 +339,18 @@ describe("enqueueServerEvent", () => {
     }
 
     expect(queue.size).toBe(1)
+    expect(queue.snapshot()).toMatchObject({
+      size: 1,
+      pushed: 4096,
+      coalesced: 4095,
+      maxSize: 1,
+      maxPendingDeltas: 1,
+      droppedContent: 0,
+      globalRepairs: 0,
+    })
     expect(queue.take(128)[0]?.payload.current?.data).toMatchObject({ delta: "x".repeat(4096) })
     expect(queue.size).toBe(0)
+    expect(queue.snapshot()).toMatchObject({ size: 0, drained: 1 })
   })
 
   test("compacts unread session.next deltas before renderer dispatch", () => {
@@ -467,6 +494,7 @@ describe("enqueueServerEvent", () => {
     expect(queue.take(8)).toEqual([])
     expect(dropped).toEqual(["session"])
     expect(queue.size).toBe(0)
+    expect(queue.snapshot()).toMatchObject({ droppedContent: 1, globalRepairs: 0 })
   })
 
   test("content pressure preserves unrelated lifecycle backlog", () => {

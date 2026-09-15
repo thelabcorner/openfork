@@ -5,7 +5,7 @@ import { Session } from "@opencode-ai/schema/session"
 import { Project } from "@opencode-ai/schema/project"
 import { AbsolutePath, NonNegativeInt, PositiveInt, RelativePath, statics } from "@opencode-ai/schema/schema"
 import { Workspace } from "@opencode-ai/schema/workspace"
-import { Context, Effect, Encoding, Result, Schema, Struct } from "effect"
+import { Context, Effect, Encoding, Result, Schema, SchemaGetter, Struct } from "effect"
 import { HttpApiEndpoint, HttpApiGroup, HttpApiMiddleware, HttpApiSchema, OpenApi } from "effect/unstable/httpapi"
 import {
   CheckpointEpochError,
@@ -74,6 +74,13 @@ const CheckpointCreatePayload = Schema.Struct({
   label: Schema.optional(Schema.String),
 })
 
+const QueryBoolean = Schema.Literals(["true", "false"]).pipe(
+  Schema.decodeTo(Schema.Boolean, {
+    decode: SchemaGetter.transform((value) => value === "true"),
+    encode: SchemaGetter.transform((value) => (value ? "true" : "false")),
+  }),
+)
+
 const CheckpointDiffResponse = Schema.Struct({
   from: Schema.String,
   to: Schema.String,
@@ -85,6 +92,9 @@ const CheckpointDiffResponse = Schema.Struct({
 
 const SessionsQueryFields = {
   workspace: Workspace.ID.pipe(Schema.optional),
+  roots: QueryBoolean.pipe(Schema.optional).annotate({
+    description: "Return only root sessions (sessions without a parent).",
+  }),
   limit: Schema.NumberFromString.pipe(Schema.decodeTo(PositiveInt), Schema.optional).annotate({
     description: "Maximum number of sessions to return. Defaults to the newest 50 sessions.",
   }),

@@ -1,6 +1,13 @@
 import { ConfigV1 } from "@opencode-ai/core/v1/config/config"
 import { EventV2 } from "@opencode-ai/core/event"
+import {
+  STREAM_INTEREST_MAX_SESSION_CHARS,
+  STREAM_INTEREST_MAX_SESSIONS,
+  STREAM_INTEREST_MAX_SUBSCRIBER_CHARS,
+} from "@opencode-ai/core/session-stream-content"
 import { EventManifest } from "@/event-manifest"
+import { Session } from "@/session/session"
+import { Project } from "@/project/project"
 import { InstanceDisposed } from "@/server/event"
 import "@opencode-ai/core/account"
 import "@/server/event"
@@ -33,6 +40,46 @@ const SyncEventSchemas = EventManifest.Latest.values()
   })
   .toArray()
 
+const ManifestEventTypes = new Set(EventManifest.Latest.values().map((definition) => definition.type).toArray())
+const GlobalTransportControlSchemas = [
+  {
+    type: "server.heartbeat",
+    schema: Schema.Struct({ id: EventV2.ID, type: Schema.Literal("server.heartbeat"), properties: Schema.Struct({}) }),
+  },
+  {
+    type: "server.stream.gap",
+    schema: Schema.Struct({
+      id: EventV2.ID,
+      type: Schema.Literal("server.stream.gap"),
+      properties: Schema.Struct({
+        requested: Schema.Number,
+        oldest: Schema.optional(Schema.Number),
+        latest: Schema.Number,
+      }),
+    }),
+  },
+  {
+    type: "server.stream.session-stale",
+    schema: Schema.Struct({
+      id: EventV2.ID,
+      type: Schema.Literal("server.stream.session-stale"),
+      properties: Schema.Struct({ sessionID: Schema.String }),
+    }),
+  },
+  {
+    type: "server.stream.progress",
+    schema: Schema.Struct({
+      id: EventV2.ID,
+      type: Schema.Literal("server.stream.progress"),
+      properties: Schema.Struct({ latest: Schema.Number }),
+    }),
+  },
+] as const
+
+const MissingGlobalTransportControlSchemas = GlobalTransportControlSchemas.filter(
+  (control) => !ManifestEventTypes.has(control.type),
+).map((control) => control.schema)
+
 const GlobalEventSchema = Schema.Struct({
   directory: Schema.String,
   project: Schema.optional(Schema.String),
@@ -43,6 +90,7 @@ const GlobalEventSchema = Schema.Struct({
         Schema.Struct({ id: EventV2.ID, type: Schema.Literal(definition.type), properties: definition.data }),
       )
       .toArray(),
+    ...MissingGlobalTransportControlSchemas,
     InstanceDisposed,
     ...SyncEventSchemas,
   ]),
@@ -70,6 +118,24 @@ const GlobalResetLocalDataResult = Schema.Struct({
   sessionsDeleted: Schema.Number,
   memoriesDeleted: Schema.Number,
   compacted: Schema.Boolean,
+})
+
+export const GlobalSessionRootsQuery = Schema.Struct({
+  directory: Schema.String,
+  limit: Schema.optional(
+    Schema.NumberFromString.check(Schema.isInt(), Schema.isGreaterThanOrEqualTo(1), Schema.isLessThanOrEqualTo(500)),
+  ),
+})
+
+export const GlobalEventInterestInput = Schema.Struct({
+  subscriber: Schema.String.check(Schema.isMaxLength(STREAM_INTEREST_MAX_SUBSCRIBER_CHARS)),
+  sessions: Schema.Array(
+    Schema.String.check(Schema.isMaxLength(STREAM_INTEREST_MAX_SESSION_CHARS)),
+  ).check(Schema.isMaxLength(STREAM_INTEREST_MAX_SESSIONS)),
+}).annotate({ identifier: "GlobalEventInterestInput" })
+
+const GlobalEventInterestResult = Schema.Struct({ updated: Schema.Boolean }).annotate({
+  identifier: "GlobalEventInterestResult",
 })
 
 // Model-selector preferences shared by every client of this server (desktop
@@ -123,6 +189,9 @@ export const ModelPreferencesPatch = Schema.Struct({
 export const GlobalPaths = {
   health: "/global/health",
   event: "/global/event",
+  eventInterest: "/global/event/interest",
+  sessionRoots: "/global/session/roots",
+  projects: "/global/project",
   config: "/global/config",
   preferences: "/global/preferences",
   dispose: "/global/dispose",
@@ -149,6 +218,42 @@ export const GlobalApi = HttpApi.make("global").add(
           identifier: "global.event",
           summary: "Get global events",
           description: "Subscribe to global events from the OpenCode system using server-sent events.",
+        }),
+      ),
+      HttpApiEndpoint.post("eventInterest", GlobalPaths.eventInterest, {
+        payload: GlobalEventInterestInput,
+        success: GlobalEventInterestResult,
+        }).annotateMerge(
+          OpenApi.annotations({
+            // Keep this operation flat under `global` in generated SDKs. A
+            // dotted `global.event.interest` identifier creates a nested Event
+            // client that collides with the existing event clients and causes
+            // generator renumbering (`Event2`, `Event3`).
+            identifier: "global.eventInterest",
+            summary: "Update event stream interest",
+          description:
+            "Update the foreground session set for one SSE subscriber so reconstructible background content can be suppressed upstream.",
+        }),
+      ),
+      HttpApiEndpoint.get("sessionRoots", GlobalPaths.sessionRoots, {
+        query: GlobalSessionRootsQuery,
+        success: described(Schema.Array(Session.Info), "Recent root sessions"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.sessionRoots",
+          summary: "List recent root sessions without instance bootstrap",
+          description:
+            "List recent non-archived root sessions for one directory directly from durable session storage. This read-only startup surface intentionally does not materialize directory config, plugins, providers, or tools.",
+        }),
+      ),
+      HttpApiEndpoint.get("projects", GlobalPaths.projects, {
+        success: described(Schema.Array(Project.Info), "Projects"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.projects",
+          summary: "List projects without instance bootstrap",
+          description:
+            "List durable project metadata without materializing directory config, plugins, providers, or tools. Intended for startup navigation/catalog hydration.",
         }),
       ),
       HttpApiEndpoint.get("configGet", GlobalPaths.config, {

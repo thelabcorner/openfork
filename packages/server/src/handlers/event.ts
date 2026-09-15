@@ -14,6 +14,20 @@ import * as Sse from "effect/unstable/encoding/Sse"
 import { Api } from "../api"
 import { serializeEvent, wireEvent, type WireEvent } from "../event-serializer"
 import { EventTrace } from "@opencode-ai/core/event-trace"
+import {
+  STREAM_PROGRESS_EVENT,
+  STREAM_SESSION_STALE_EVENT,
+  isSessionStreamContentEvent,
+  sessionStreamContentSessionID,
+} from "@opencode-ai/core/session-stream-content"
+import {
+  eventStreamAllowsSession,
+  eventStreamInterestFromHeaders,
+  markEventStreamSessionSuppressed,
+  registerEventStreamInterest,
+  unregisterEventStreamInterest,
+  type EventStreamInterest,
+} from "../event-interest"
 
 export const ringCapacity = 4096
 // Replay is emitted as a pull-driven stream prefix and never occupies this
@@ -54,6 +68,24 @@ export const subscriberFrameMaxBytes = ringMaxBytes + subscriberEnvelopeBytes
 type SequencedWireEvent = { sequence?: number; event: WireEvent; bytes?: number }
 type SequencedEvent = { sequence: number; event: EventV2.Payload }
 
+const streamStaleEvent = (sessionID: string): WireEvent => ({
+  id: EventV2.ID.create(),
+  type: STREAM_SESSION_STALE_EVENT,
+  data: { sessionID },
+})
+
+const streamProgressEvent = (sequence: number): SequencedWireEvent => ({
+  sequence,
+  event: { id: EventV2.ID.create(), type: STREAM_PROGRESS_EVENT, data: { latest: sequence } },
+})
+
+function suppressedSession(state: EventStreamInterest | undefined, event: EventV2.Payload) {
+  if (!state || !isSessionStreamContentEvent(event.type)) return
+  const sessionID = sessionStreamContentSessionID(event)
+  if (!sessionID || eventStreamAllowsSession(state, sessionID)) return
+  return sessionID
+}
+
 function sequencedDeltaOptions() {
   const deltas = createEventDeltaAccumulator<EventV2.Payload>()
   return {
@@ -84,10 +116,13 @@ const sequencedWireBytes = (item: SequencedWireEvent) =>
   subscriberEnvelopeBytes + (item.bytes ?? estimateEventBytes(item.event))
 
 function eventData(data: object, sequence?: string): Sse.Event {
-  const started = performance.now()
+  const tracing = EventTrace.active()
+  const started = tracing ? performance.now() : 0
   const frame = serializeEvent(data)
-  EventTrace.timing("native.serializeMs", performance.now() - started)
-  EventTrace.sum("native.serializeBytes", frame.length)
+  if (tracing) {
+    EventTrace.timing("native.serializeMs", performance.now() - started)
+    EventTrace.sum("native.serializeBytes", frame.length)
+  }
   return {
     _tag: "Event",
     event: "message",
@@ -113,8 +148,11 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
     return handlers.handleRaw("event.subscribe", () =>
       Effect.gen(function* () {
         const request = yield* HttpServerRequest.HttpServerRequest
+        const initialInterest = eventStreamInterestFromHeaders(request.headers)
         const output = Stream.unwrap(
           Effect.gen(function* () {
+            const interest = registerEventStreamInterest(initialInterest?.subscriber, initialInterest?.sessions)
+            yield* Effect.addFinalizer(() => Effect.sync(() => unregisterEventStreamInterest(interest)))
             const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<SequencedWireEvent>({
               capacity: subscriberCapacity,
               maxBytes: ringMaxBytes,
@@ -122,8 +160,55 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
               sizeOf: sequencedWireBytes,
               typeOf: (item) => item.event.type,
             })
+            let pendingProgress: number | undefined
+            let progressTimer: ReturnType<typeof setTimeout> | undefined
+            let closed = false
+            const flushProgress = () => {
+              const sequence = pendingProgress
+              if (sequence === undefined || closed) return
+              pendingProgress = undefined
+              const accepted = subscriber.offer(streamProgressEvent(sequence))
+              EventTrace.count(accepted ? "native.interestProgressOffered" : "native.interestProgressFailed")
+            }
+            const scheduleProgress = () => {
+              if (progressTimer !== undefined || closed) return
+              // Cursor progress is transport bookkeeping, not UI state. A short
+              // coalescing window turns hundreds of hidden token fragments into
+              // at most ~10 tiny cursor frames/sec while keeping reconnect cursors
+              // well inside the bounded replay ring.
+              progressTimer = setTimeout(() => {
+                progressTimer = undefined
+                flushProgress()
+              }, 100)
+            }
+            const recordSuppressed = (sessionID: string, sequence: number) => {
+              pendingProgress = pendingProgress === undefined ? sequence : Math.max(pendingProgress, sequence)
+              EventTrace.count("native.interestSuppressed")
+              if (markEventStreamSessionSuppressed(interest, sessionID)) {
+                const accepted = subscriber.offer({ event: streamStaleEvent(sessionID) })
+                EventTrace.count(accepted ? "native.interestStaleOffered" : "native.interestStaleFailed")
+              }
+              scheduleProgress()
+            }
+            yield* Effect.addFinalizer(() =>
+              Effect.sync(() => {
+                closed = true
+                if (progressTimer !== undefined) clearTimeout(progressTimer)
+                progressTimer = undefined
+              }),
+            )
             const coalescer = createEventCoalescer<SequencedEvent>(
               (item) => {
+                const sessionID = suppressedSession(interest, item.event)
+                if (sessionID) {
+                  // Interest may change while this item waits in the coalescer.
+                  // Re-check at the last responsible moment before projection.
+                  recordSuppressed(sessionID, item.sequence)
+                  return
+                }
+                // A cursor acknowledgement for skipped content must precede the
+                // next real domain sequence on the wire.
+                flushProgress()
                 const accepted = subscriber.offer({
                   sequence: item.sequence,
                   event: wireEvent(item.event),
@@ -134,6 +219,16 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
               sequencedDeltaOptions(),
             )
             const offerCoalescer = (item: SequencedEvent) => {
+              const sessionID = suppressedSession(interest, item.event)
+              if (sessionID) {
+                // Flush any older admitted event before recording a newer
+                // suppressed sequence, otherwise a progress cursor could overtake
+                // an event still buffered inside the coalescer.
+                coalescer.flush()
+                recordSuppressed(sessionID, item.sequence)
+                return
+              }
+              flushProgress()
               EventTrace.count("native.coalescerIn")
               coalescer.offer(item)
             }
@@ -182,14 +277,42 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
                 },
               }]
             } else {
-              replayPrefix = coalesceEventBatch<SequencedEvent>(
-                replayResult.frames.map((frame) => ({ sequence: frame.sequence, event: frame.event })),
-                sequencedDeltaOptions(),
-              ).map((item) => ({
-                sequence: item.sequence,
-                event: wireEvent(item.event),
-                bytes: estimateEventBytes(item.event),
-              }))
+              replayPrefix = []
+              let segment: SequencedEvent[] = []
+              let replayProgress: number | undefined
+              const flushSegment = () => {
+                if (segment.length === 0) return
+                replayPrefix.push(
+                  ...coalesceEventBatch<SequencedEvent>(segment, sequencedDeltaOptions()).map((item) => ({
+                    sequence: item.sequence,
+                    event: wireEvent(item.event),
+                    bytes: estimateEventBytes(item.event),
+                  })),
+                )
+                segment = []
+              }
+              const flushReplayProgress = () => {
+                if (replayProgress === undefined) return
+                replayPrefix.push(streamProgressEvent(replayProgress))
+                replayProgress = undefined
+              }
+              for (const frame of replayResult.frames) {
+                const item = { sequence: frame.sequence, event: frame.event }
+                const sessionID = suppressedSession(interest, item.event)
+                if (!sessionID) {
+                  flushReplayProgress()
+                  segment.push(item)
+                  continue
+                }
+                flushSegment()
+                EventTrace.count("native.interestReplaySuppressed")
+                if (markEventStreamSessionSuppressed(interest, sessionID)) {
+                  replayPrefix.push({ event: streamStaleEvent(sessionID) })
+                }
+                replayProgress = item.sequence
+              }
+              flushSegment()
+              flushReplayProgress()
             }
             // The replay prefix is not offered to `subscriber`: doing so used to
             // consume almost the full 8 MiB live byte budget before the response
@@ -201,6 +324,7 @@ export const EventHandler = HttpApiBuilder.group(Api, "server.event", (handlers)
             }
             replaying = false
             coalescer.flush()
+            flushProgress()
             const live = subscriber.stream.pipe(
               Stream.takeUntil((item) => item.event.type === "server.instance.disposed"),
             )

@@ -96,4 +96,31 @@ describe("eventStreamFetch", () => {
     await eventStreamFetch(base, credentials)(new Request("http://localhost:4096/session"))
     expect(receivedUrl).toBe("http://localhost:4096/session")
   })
+
+  test("attaches a stable subscriber and the current foreground session set", async () => {
+    let received: Request | undefined
+    const base = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      received = input instanceof Request ? new Request(input, init) : new Request(input, init)
+      return Promise.resolve(new Response("ok"))
+    }) as typeof fetch
+    const sessions = new Set(["ses_b", "ses_a", "ses_b"])
+    await eventStreamFetch(base, credentials, { subscriber: "sub_1", sessions: () => sessions })(
+      "http://localhost:4096/api/event",
+    )
+    expect(received?.headers.get("x-opencode-stream-subscriber")).toBe("sub_1")
+    expect(JSON.parse(received?.headers.get("x-opencode-stream-sessions") ?? "null")).toEqual(["ses_a", "ses_b"])
+  })
+
+  test("never adds stream-interest headers to ordinary API traffic", async () => {
+    let received: Request | undefined
+    const base = ((input: Parameters<typeof fetch>[0], init?: RequestInit) => {
+      received = input instanceof Request ? new Request(input, init) : new Request(input, init)
+      return Promise.resolve(new Response("ok"))
+    }) as typeof fetch
+    await eventStreamFetch(base, credentials, { subscriber: "sub_1", sessions: () => ["ses_a"] })(
+      "http://localhost:4096/api/session",
+    )
+    expect(received?.headers.has("x-opencode-stream-subscriber")).toBe(false)
+    expect(received?.headers.has("x-opencode-stream-sessions")).toBe(false)
+  })
 })

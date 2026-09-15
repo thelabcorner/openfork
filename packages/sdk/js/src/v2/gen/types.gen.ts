@@ -1746,6 +1746,36 @@ export type GlobalEvent = {
           [key: string]: unknown
         }
       }
+    | {
+        id: string
+        type: "server.heartbeat"
+        properties: {
+          [key: string]: unknown
+        }
+      }
+    | {
+        id: string
+        type: "server.stream.gap"
+        properties: {
+          requested: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+          oldest?: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+          latest: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        }
+      }
+    | {
+        id: string
+        type: "server.stream.session-stale"
+        properties: {
+          sessionID: string
+        }
+      }
+    | {
+        id: string
+        type: "server.stream.progress"
+        properties: {
+          latest: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
+        }
+      }
     | EventServerInstanceDisposed
     | SyncEventSessionCreated
     | SyncEventSessionUpdated
@@ -1786,6 +1816,26 @@ export type GlobalEvent = {
     | SyncEventSessionNextPaused
     | SyncEventSessionNextResumed
     | SyncEventSessionNextRenamed
+}
+
+export type GlobalEventInterestInput = {
+  subscriber: string
+  sessions: Array<string>
+}
+
+export type GlobalEventInterestResult = {
+  updated: boolean
+}
+
+export type Project = {
+  id: string
+  worktree: string
+  vcs?: ProjectVcs
+  name?: string
+  icon?: ProjectIcon
+  commands?: ProjectCommands
+  time: ProjectTime
+  sandboxes: Array<string>
 }
 
 /**
@@ -2865,17 +2915,6 @@ export type McpServerNotFoundError = {
   message: string
 }
 
-export type Project = {
-  id: string
-  worktree: string
-  vcs?: ProjectVcs
-  name?: string
-  icon?: ProjectIcon
-  commands?: ProjectCommands
-  time: ProjectTime
-  sandboxes: Array<string>
-}
-
 export type ProjectNotFoundError = {
   _tag: "ProjectNotFoundError"
   projectID: string
@@ -3595,10 +3634,12 @@ export type V2Event =
   | WorkspaceStatus
   | WorktreeReady
   | WorktreeFailed
-  | ServerConnected
-  | ServerHeartbeat
-  | ServerStreamGap
   | GlobalDisposed
+  | V2EventServerConnected
+  | V2EventServerHeartbeat
+  | V2EventServerStreamGap
+  | V2EventServerStreamSessionStale
+  | V2EventServerStreamProgress
 
 export type V2EventStream = string
 
@@ -4660,6 +4701,16 @@ export type PtyTicketConnectToken = {
 export type SessionGroupMember = {
   id: string
   title: string
+  slug?: string
+  projectID?: string
+  directory?: string
+  parentID?: string
+  version?: string
+  time?: {
+    created: number
+    updated: number
+    archived?: number
+  }
   locked: boolean
   origin: "user" | "auto_subagent" | "plugin"
   originPlugin?: string
@@ -7311,57 +7362,6 @@ export type WorktreeFailed = {
   }
 }
 
-export type ServerConnected = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  type: "server.connected"
-  durable?: {
-    aggregateID: string
-    seq: number
-    version: number
-  }
-  location?: LocationRef
-  data: {
-    epoch?: string
-  }
-}
-
-export type ServerHeartbeat = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  type: "server.heartbeat"
-  durable?: {
-    aggregateID: string
-    seq: number
-    version: number
-  }
-  location?: LocationRef
-  data: Record<string, never>
-}
-
-export type ServerStreamGap = {
-  id: string
-  metadata?: {
-    [key: string]: unknown
-  }
-  type: "server.stream.gap"
-  durable?: {
-    aggregateID: string
-    seq: number
-    version: number
-  }
-  location?: LocationRef
-  data: {
-    requested: number
-    oldest?: number
-    latest: number
-  }
-}
-
 export type GlobalDisposed = {
   id: string
   metadata?: {
@@ -7376,6 +7376,93 @@ export type GlobalDisposed = {
   location?: LocationRef
   data: {
     [key: string]: unknown
+  }
+}
+
+export type V2EventServerConnected = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  type: "server.connected"
+  data: {
+    epoch?: string
+  }
+}
+
+export type V2EventServerHeartbeat = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  type: "server.heartbeat"
+  data: {
+    [key: string]: unknown
+  }
+}
+
+export type V2EventServerStreamGap = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  type: "server.stream.gap"
+  data: {
+    requested: number
+    oldest?: number
+    latest: number
+  }
+}
+
+export type V2EventServerStreamSessionStale = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  type: "server.stream.session-stale"
+  data: {
+    sessionID: string
+  }
+}
+
+export type V2EventServerStreamProgress = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  type: "server.stream.progress"
+  data: {
+    latest: number
   }
 }
 
@@ -8967,6 +9054,84 @@ export type GlobalEventResponses = {
 }
 
 export type GlobalEventResponse = GlobalEventResponses[keyof GlobalEventResponses]
+
+export type GlobalEventInterestData = {
+  body?: GlobalEventInterestInput
+  path?: never
+  query?: never
+  url: "/global/event/interest"
+}
+
+export type GlobalEventInterestErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalEventInterestError = GlobalEventInterestErrors[keyof GlobalEventInterestErrors]
+
+export type GlobalEventInterestResponses = {
+  /**
+   * GlobalEventInterestResult
+   */
+  200: GlobalEventInterestResult
+}
+
+export type GlobalEventInterestResponse = GlobalEventInterestResponses[keyof GlobalEventInterestResponses]
+
+export type GlobalSessionRootsData = {
+  body?: never
+  path?: never
+  query: {
+    directory: string
+    limit?: string
+  }
+  url: "/global/session/roots"
+}
+
+export type GlobalSessionRootsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalSessionRootsError = GlobalSessionRootsErrors[keyof GlobalSessionRootsErrors]
+
+export type GlobalSessionRootsResponses = {
+  /**
+   * Recent root sessions
+   */
+  200: Array<Session>
+}
+
+export type GlobalSessionRootsResponse = GlobalSessionRootsResponses[keyof GlobalSessionRootsResponses]
+
+export type GlobalProjectsData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/global/project"
+}
+
+export type GlobalProjectsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalProjectsError = GlobalProjectsErrors[keyof GlobalProjectsErrors]
+
+export type GlobalProjectsResponses = {
+  /**
+   * Projects
+   */
+  200: Array<Project>
+}
+
+export type GlobalProjectsResponse = GlobalProjectsResponses[keyof GlobalProjectsResponses]
 
 export type GlobalConfigGetData = {
   body?: never
@@ -15663,6 +15828,7 @@ export type V2SessionListData = {
   path?: never
   query?: {
     workspace?: string
+    roots?: boolean | "true" | "false"
     limit?: number
     order?: "asc" | "desc"
     search?: string

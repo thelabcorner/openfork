@@ -24,6 +24,14 @@ export interface Interface extends EventV2.Interface {
   readonly replayLatest: () => number
   readonly replayEpoch: string
   readonly sequenceOf: (event: EventV2.Payload) => number | undefined
+  /**
+   * Open one compatibility `/event` replay range. The first subscriber after an
+   * idle period starts a fresh epoch and returns the exact sequence boundary at
+   * connect time. Fresh subscribers replay only events published after `after`,
+   * which closes the capture-before-live-listener setup race without sending
+   * unrelated pre-connect history.
+   */
+  readonly replayConnect: () => { readonly epoch: string; readonly after: number; readonly release: () => void }
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/EventV2Bridge") {}
@@ -49,17 +57,55 @@ export const REPLAY_MAX_BYTES = 8 * 1024 * 1024
  * least one CONNECTED subscriber. Probes are closures registered per handler
  * group, so several servers in one process stay independent.
  */
-const legacyTransports = new Set<() => boolean>()
+type LegacyTransportProbe = {
+  readonly isActive: () => boolean
+  /** Number of `GlobalBus("event")` listeners owned by this transport. */
+  readonly listenerCount: () => number
+  /** Whether this transport's current replay generation requires durable sync envelopes. */
+  readonly needsSync: () => boolean
+}
+
+const legacyTransports = new Set<LegacyTransportProbe>()
+
+type LegacyTransportInput = (() => boolean) | {
+  readonly isActive: () => boolean
+  readonly listenerCount?: () => number
+  readonly needsSync?: () => boolean
+}
+
+function normalizeLegacyTransport(input: LegacyTransportInput): LegacyTransportProbe {
+  if (typeof input === "function") {
+    // Historical callers are conservatively treated as sync-capable. They do
+    // not expose their listener count, so direct-listener accounting remains
+    // conservative as well.
+    return { isActive: input, listenerCount: () => 0, needsSync: input }
+  }
+  return {
+    isActive: input.isActive,
+    listenerCount: input.listenerCount ?? (() => 0),
+    needsSync: input.needsSync ?? input.isActive,
+  }
+}
 
 /**
  * Register a legacy transport liveness probe. Returns the unregister
  * function; call it when the owning handler group is released.
  */
-export function registerLegacyTransport(isActive: () => boolean): () => void {
-  legacyTransports.add(isActive)
+export function registerLegacyTransport(input: LegacyTransportInput): () => void {
+  const probe = normalizeLegacyTransport(input)
+  legacyTransports.add(probe)
   return () => {
-    legacyTransports.delete(isActive)
+    legacyTransports.delete(probe)
   }
+}
+
+function directLegacyListenerCount() {
+  let transportListeners = 0
+  for (const probe of legacyTransports) {
+    if (!probe.isActive()) continue
+    transportListeners += Math.max(0, probe.listenerCount())
+  }
+  return Math.max(0, GlobalBus.listenerCount("event") - transportListeners)
 }
 
 /**
@@ -71,8 +117,24 @@ export function registerLegacyTransport(isActive: () => boolean): () => void {
  * capture sink, never a delivery path.
  */
 export function hasLegacyConsumer(): boolean {
-  if (GlobalBus.listenerCount("event") > 0) return true
-  for (const isActive of legacyTransports) if (isActive()) return true
+  if (directLegacyListenerCount() > 0) return true
+  for (const probe of legacyTransports) if (probe.isActive()) return true
+  return false
+}
+
+/**
+ * Durable `sync` envelopes are a second representation of the same durable
+ * event. Interest-aware desktop SSE clients explicitly do not consume them,
+ * while control-plane/TUI/older subscribers still do. Keep compatibility
+ * envelopes available to every legacy consumer, but manufacture the duplicate
+ * durable envelope only when at least one real consumer needs it.
+ */
+export function hasLegacySyncConsumer(): boolean {
+  // Direct in-process listeners cannot advertise capabilities, so fail safe.
+  if (directLegacyListenerCount() > 0) return true
+  for (const probe of legacyTransports) {
+    if (probe.isActive() && probe.needsSync()) return true
+  }
   return false
 }
 
@@ -80,11 +142,32 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2.Service
-    const replay = new EventReplayBuffer<EventV2.Payload>(REPLAY_CAPACITY, {
-      maxBytes: REPLAY_MAX_BYTES,
-      sizeOf: estimateEventBytes,
+    const makeReplayGeneration = () => ({
+      replay: new EventReplayBuffer<EventV2.Payload>(REPLAY_CAPACITY, {
+        maxBytes: REPLAY_MAX_BYTES,
+        sizeOf: estimateEventBytes,
+      }),
+      sequences: new WeakMap<object, number>(),
     })
-    const sequences = new WeakMap<object, number>()
+    let replayGeneration = makeReplayGeneration()
+    let replaySubscribers = 0
+
+    const replayConnect = () => {
+      if (replaySubscribers === 0) replayGeneration = makeReplayGeneration()
+      replaySubscribers += 1
+      const generation = replayGeneration
+      const after = generation.replay.latest()
+      let released = false
+      return {
+        epoch: generation.replay.epoch,
+        after,
+        release: () => {
+          if (released) return
+          released = true
+          replaySubscribers = Math.max(0, replaySubscribers - 1)
+        },
+      }
+    }
 
     const publish: EventV2.Interface["publish"] = (definition, data, options) =>
       Effect.gen(function* () {
@@ -104,10 +187,14 @@ const layer = Layer.effect(
 
     const unsubscribe = yield* events.listen((event) =>
       Effect.gen(function* () {
-        // Record before the legacy bridge can early-return. Native SSE
-        // subscribers use this same sequence map, so every published event has
-        // a stable cursor even when no legacy GlobalBus listener is installed.
-        sequences.set(event, replay.append(event))
+        // `/api/event` owns its own replay ring in packages/server. This bridge
+        // ring exists only for the compatibility `/event` transport, so do not
+        // duplicate byte estimation + retention for every token while no such
+        // subscriber exists. A replay lease is opened before that transport's
+        // live listener/replay handoff, preserving its reconnect window exactly.
+        if (replaySubscribers > 0) {
+          replayGeneration.sequences.set(event, replayGeneration.replay.append(event))
+        }
         EventTrace.count("bridge.published")
         EventTrace.histogram("bridge.type", event.type)
         // Native /api/event subscribers do not consume the legacy GlobalBus.
@@ -134,6 +221,11 @@ const layer = Layer.effect(
           EventTrace.count("bridge.legacyEnvelopes")
           return
         }
+        if (!hasLegacySyncConsumer()) {
+          EventTrace.count("bridge.syncSkipped")
+          EventTrace.count("bridge.legacyEnvelopes")
+          return
+        }
         EventTrace.count("bridge.legacyEnvelopes", 2)
         GlobalBus.emit("event", {
           directory: event.location?.directory ?? ctx?.directory,
@@ -157,10 +249,13 @@ const layer = Layer.effect(
     return Service.of({
       ...events,
       publish,
-      replaySince: (after, filter) => replay.since(after, filter),
-      replayLatest: () => replay.latest(),
-      replayEpoch: replay.epoch,
-      sequenceOf: (event) => sequences.get(event),
+      replayConnect,
+      replaySince: (after, filter) => replayGeneration.replay.since(after, filter),
+      replayLatest: () => replayGeneration.replay.latest(),
+      get replayEpoch() {
+        return replayGeneration.replay.epoch
+      },
+      sequenceOf: (event) => replayGeneration.sequences.get(event),
     })
   }),
 )

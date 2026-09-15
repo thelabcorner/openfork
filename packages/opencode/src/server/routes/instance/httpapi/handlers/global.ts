@@ -3,6 +3,7 @@ import { GlobalBus, type GlobalEvent as GlobalBusEvent } from "@/bus/global"
 import { registerLegacyTransport } from "@/event-v2-bridge"
 import { EffectBridge } from "@/effect/bridge"
 import { EventV2 } from "@opencode-ai/core/event"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { EventReplayBuffer, estimateEventBytes, parseEventSequence } from "@opencode-ai/core/event-replay"
 import {
   coalesceEventBatch,
@@ -11,6 +12,21 @@ import {
   mergeEventDeltas,
 } from "@opencode-ai/core/event-coalescer"
 import { EventTrace } from "@opencode-ai/core/event-trace"
+import {
+  STREAM_PROGRESS_EVENT,
+  STREAM_SESSION_STALE_EVENT,
+  isSessionStreamContentEvent,
+  sessionStreamContentSessionID,
+} from "@opencode-ai/core/session-stream-content"
+import {
+  eventStreamAllowsSession,
+  eventStreamInterestFromHeaders,
+  markEventStreamSessionSuppressed,
+  registerEventStreamInterest,
+  unregisterEventStreamInterest,
+  updateEventStreamInterest,
+  type EventStreamInterest,
+} from "@opencode-ai/server/event-interest"
 import { Installation } from "@/installation"
 import { disposeAllInstancesAndEmitGlobalDisposed, emitGlobalDisposed } from "@/server/global-lifecycle"
 import { InstanceStore } from "@/project/instance-store"
@@ -22,16 +38,50 @@ import { HttpServerRequest, HttpServerResponse } from "effect/unstable/http"
 import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { ModelPreferences } from "@/preference/model-preferences"
+import { Session } from "@/session/session"
+import { Project } from "@/project/project"
 import { bumpUsageCache } from "@/fork/usage-cache"
 import { resetUsageSummaryCache } from "@/usage/usage"
 import { serializeLegacyEvent } from "@/server/event-serialization"
 import { RootHttpApi } from "../api"
-import { GlobalUpgradeInput, ModelPreferencesPatch } from "../groups/global"
+import { GlobalSessionRootsQuery, GlobalUpgradeInput, ModelPreferencesPatch } from "../groups/global"
 
 // `sequence` is optional because control frames (heartbeat, gap) are not
 // replayable domain state: they must not mint or reuse a Last-Event-ID cursor.
 // Only frames carrying a sequence get an `id:` on the wire.
 type SequencedGlobalEvent = { sequence?: number; event: GlobalBusEvent }
+
+const streamStaleGlobalEvent = (sessionID: string): SequencedGlobalEvent => ({
+  event: {
+    directory: "global",
+    payload: { id: EventV2.ID.create(), type: STREAM_SESSION_STALE_EVENT, properties: { sessionID } },
+  },
+})
+
+const streamProgressGlobalEvent = (sequence: number): SequencedGlobalEvent => ({
+  sequence,
+  event: {
+    directory: "global",
+    payload: { id: EventV2.ID.create(), type: STREAM_PROGRESS_EVENT, properties: { latest: sequence } },
+  },
+})
+
+function suppressedGlobalSession(state: EventStreamInterest | undefined, event: GlobalBusEvent) {
+  const type = event.payload?.type
+  if (!state || typeof type !== "string" || !isSessionStreamContentEvent(type)) return
+  const sessionID = sessionStreamContentSessionID({ type, properties: event.payload.properties })
+  if (!sessionID || eventStreamAllowsSession(state, sessionID)) return
+  return sessionID
+}
+
+// The desktop interest protocol is also a capability signal. Interest-aware
+// renderers consume the ordinary compatibility event and explicitly discard the
+// parallel durable `sync` envelope. Keep `sync` for legacy/control-plane/CLI
+// subscribers that do not advertise interest support, but do not serialize and
+// transmit it to a desktop that can never consume it.
+function suppressGlobalSync(state: EventStreamInterest | undefined, event: GlobalBusEvent) {
+  return state?.sessions !== undefined && event.payload?.type === "sync"
+}
 
 // Exported so tests can assert replay policy against the real ring constants.
 export const RING_CAPACITY = 4096
@@ -90,10 +140,25 @@ function newReplayGeneration(): ReplayGeneration {
  */
 class GlobalReplayGate {
   private subscribers = 0
+  private listeners = 0
+  // Once a sync-capable subscriber participates in one replay generation, keep
+  // generating sync until the whole generation retires. Otherwise an old client
+  // could disconnect briefly while an interest-aware desktop keeps the epoch
+  // alive, then reconnect with a cursor whose missing interval never contained
+  // the sync envelopes it expects.
+  private syncRequiredForGeneration = false
   private generation = newReplayGeneration()
 
   get active() {
     return this.subscribers > 0
+  }
+
+  get listenerCount() {
+    return this.listeners
+  }
+
+  get syncRequired() {
+    return this.syncRequiredForGeneration
   }
 
   /** Current generation. Only meaningful while a subscriber is connected. */
@@ -118,6 +183,7 @@ class GlobalReplayGate {
       // generation is never replaced, so an overlapping reconnect shares the
       // same ring and the same monotonic sequence space.
       this.generation = newReplayGeneration()
+      this.syncRequiredForGeneration = false
     }
     this.subscribers += 1
     const generation = this.generation
@@ -131,13 +197,34 @@ class GlobalReplayGate {
       },
     }
   }
+
+
+  /**
+   * Track the actual GlobalBus listener owned by a response body. This is
+   * intentionally separate from `subscribers`: the response scope can be alive
+   * before its stream listener is installed, and subtracting subscriber count
+   * from GlobalBus.listenerCount would then hide unrelated direct consumers.
+   */
+  listenerConnected(needsSync: boolean) {
+    this.listeners += 1
+    if (needsSync) this.syncRequiredForGeneration = true
+    let released = false
+    return () => {
+      if (released) return
+      released = true
+      this.listeners = Math.max(0, this.listeners - 1)
+    }
+  }
 }
 
 function eventData(data: object, sequence?: string): Sse.Event {
-  const started = performance.now()
+  const tracing = EventTrace.active()
+  const started = tracing ? performance.now() : 0
   const frame = serializeLegacyEvent(data)
-  EventTrace.timing("global.serializeMs", performance.now() - started)
-  EventTrace.sum("global.serializeBytes", frame.length)
+  if (tracing) {
+    EventTrace.timing("global.serializeMs", performance.now() - started)
+    EventTrace.sum("global.serializeBytes", frame.length)
+  }
   return {
     _tag: "Event",
     event: "message",
@@ -149,6 +236,7 @@ function eventData(data: object, sequence?: string): Sse.Event {
 function eventResponse(gate: GlobalReplayGate) {
   return Effect.gen(function* () {
     const request = yield* HttpServerRequest.HttpServerRequest
+    const initialInterest = eventStreamInterestFromHeaders(request.headers)
     // Opening a connected range must happen BEFORE the replay read below so
     // capture is live for the whole window this client's cursor covers.
     const { generation, release } = gate.connect()
@@ -169,6 +257,8 @@ function eventResponse(gate: GlobalReplayGate) {
     // before the returned stream emits its first frame.
     const output = Stream.unwrap(
       Effect.gen(function* () {
+        const interest = registerEventStreamInterest(initialInterest?.subscriber, initialInterest?.sessions)
+        yield* Effect.addFinalizer(() => Effect.sync(() => unregisterEventStreamInterest(interest)))
         const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<SequencedGlobalEvent>({
           // Replay bypasses this queue and is pulled directly by the response
           // stream. This capacity is therefore a live-backlog bound only. Keep
@@ -184,8 +274,58 @@ function eventResponse(gate: GlobalReplayGate) {
           sizeOf: (item) => SUBSCRIBER_ENVELOPE_BYTES + estimateEventBytes(item.event),
           typeOf: (item) => (typeof item.event.payload?.type === "string" ? item.event.payload.type : "unknown"),
         })
+        let pendingProgress: number | undefined
+        let progressTimer: ReturnType<typeof setTimeout> | undefined
+        let closed = false
+        const flushProgress = () => {
+          const sequence = pendingProgress
+          if (sequence === undefined || closed) return
+          pendingProgress = undefined
+          const accepted = subscriber.offer(streamProgressGlobalEvent(sequence))
+          EventTrace.count(accepted ? "global.interestProgressOffered" : "global.interestProgressFailed")
+        }
+        const scheduleProgress = () => {
+          if (progressTimer !== undefined || closed) return
+          progressTimer = setTimeout(() => {
+            progressTimer = undefined
+            flushProgress()
+          }, 100)
+        }
+        const recordProgress = (sequence: number) => {
+          pendingProgress = pendingProgress === undefined ? sequence : Math.max(pendingProgress, sequence)
+          scheduleProgress()
+        }
+        const recordSuppressed = (sessionID: string, sequence: number) => {
+          recordProgress(sequence)
+          EventTrace.count("global.interestSuppressed")
+          if (markEventStreamSessionSuppressed(interest, sessionID)) {
+            const accepted = subscriber.offer(streamStaleGlobalEvent(sessionID))
+            EventTrace.count(accepted ? "global.interestStaleOffered" : "global.interestStaleFailed")
+          }
+        }
+        const recordSyncSuppressed = (sequence: number) => {
+          recordProgress(sequence)
+          EventTrace.count("global.interestSyncSuppressed")
+        }
+        yield* Effect.addFinalizer(() =>
+          Effect.sync(() => {
+            closed = true
+            if (progressTimer !== undefined) clearTimeout(progressTimer)
+            progressTimer = undefined
+          }),
+        )
         const coalescer = createEventCoalescer<SequencedGlobalEvent>(
           (item) => {
+            if (suppressGlobalSync(interest, item.event) && item.sequence !== undefined) {
+              recordSyncSuppressed(item.sequence)
+              return
+            }
+            const sessionID = suppressedGlobalSession(interest, item.event)
+            if (sessionID && item.sequence !== undefined) {
+              recordSuppressed(sessionID, item.sequence)
+              return
+            }
+            flushProgress()
             const accepted = subscriber.offer(item)
             EventTrace.count(accepted ? "global.subscriberOffered" : "global.subscriberFailed")
           },
@@ -199,6 +339,18 @@ function eventResponse(gate: GlobalReplayGate) {
           },
         )
         const offerCoalescer = (item: SequencedGlobalEvent) => {
+          if (suppressGlobalSync(interest, item.event) && item.sequence !== undefined) {
+            coalescer.flush()
+            recordSyncSuppressed(item.sequence)
+            return
+          }
+          const sessionID = suppressedGlobalSession(interest, item.event)
+          if (sessionID && item.sequence !== undefined) {
+            coalescer.flush()
+            recordSuppressed(sessionID, item.sequence)
+            return
+          }
+          flushProgress()
           EventTrace.count("global.coalescerIn")
           coalescer.offer(item)
         }
@@ -214,10 +366,18 @@ function eventResponse(gate: GlobalReplayGate) {
         // Register before server.connected is observable, not when concat starts
         // pulling its second stream. Scope cleanup also covers an unread response.
         yield* Effect.acquireRelease(
-          Effect.sync(() => GlobalBus.on("event", listener)),
-          () =>
+          Effect.sync(() => {
+            // Header absence means an older/pass-through subscriber. It consumes
+            // durable `sync` frames and therefore permanently marks this replay
+            // generation sync-complete for reconnect safety.
+            const releaseListener = gate.listenerConnected(initialInterest?.sessions === undefined)
+            GlobalBus.on("event", listener)
+            return releaseListener
+          }),
+          (releaseListener) =>
             Effect.sync(() => {
               GlobalBus.off("event", listener)
+              releaseListener()
               coalescer.dispose()
             }),
         )
@@ -258,17 +418,49 @@ function eventResponse(gate: GlobalReplayGate) {
             },
           }]
         } else {
-          replayPrefix = coalesceEventBatch<SequencedGlobalEvent>(
-            replayResult.frames.map((frame) => ({ sequence: frame.sequence, event: frame.event })),
-            {
-              keyOf: (item) => eventDeltaKey(item.event.payload),
-              orderBy: (item) => item.sequence ?? 0,
-              merge: (previous, next) => {
-                const payload = mergeEventDeltas(previous.event.payload, next.event.payload)
-                return payload ? { sequence: next.sequence, event: { ...next.event, payload } } : undefined
-              },
-            },
-          )
+          replayPrefix = []
+          let segment: SequencedGlobalEvent[] = []
+          let replayProgress: number | undefined
+          const coalesceSegment = () => {
+            if (segment.length === 0) return
+            replayPrefix.push(
+              ...coalesceEventBatch<SequencedGlobalEvent>(segment, {
+                keyOf: (item) => eventDeltaKey(item.event.payload),
+                orderBy: (item) => item.sequence ?? 0,
+                merge: (previous, next) => {
+                  const payload = mergeEventDeltas(previous.event.payload, next.event.payload)
+                  return payload ? { sequence: next.sequence, event: { ...next.event, payload } } : undefined
+                },
+              }),
+            )
+            segment = []
+          }
+          const flushReplayProgress = () => {
+            if (replayProgress === undefined) return
+            replayPrefix.push(streamProgressGlobalEvent(replayProgress))
+            replayProgress = undefined
+          }
+          for (const frame of replayResult.frames) {
+            const item: SequencedGlobalEvent = { sequence: frame.sequence, event: frame.event }
+            if (suppressGlobalSync(interest, item.event)) {
+              coalesceSegment()
+              EventTrace.count("global.interestReplaySyncSuppressed")
+              replayProgress = item.sequence
+              continue
+            }
+            const sessionID = suppressedGlobalSession(interest, item.event)
+            if (!sessionID) {
+              flushReplayProgress()
+              segment.push(item)
+              continue
+            }
+            coalesceSegment()
+            EventTrace.count("global.interestReplaySuppressed")
+            if (markEventStreamSessionSuppressed(interest, sessionID)) replayPrefix.push(streamStaleGlobalEvent(sessionID))
+            replayProgress = item.sequence
+          }
+          coalesceSegment()
+          flushReplayProgress()
         }
         // Replay is historical state and is streamed directly below. Keeping it
         // out of the live subscriber queue removes the reconnect failure mode
@@ -279,6 +471,7 @@ function eventResponse(gate: GlobalReplayGate) {
         }
         replaying = false
         coalescer.flush()
+        flushProgress()
 
         const events = subscriber.stream.pipe(
           Stream.map(({ event, sequence }) =>
@@ -333,6 +526,8 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
   Effect.gen(function* () {
     const config = yield* Config.Service
     const installation = yield* Installation.Service
+    const sessions = yield* Session.Service
+    const projects = yield* Project.Service
     const bridge = yield* EffectBridge.make()
     const gate = new GlobalReplayGate()
     // Capture is registered for the route's lifetime but only APPENDS while a
@@ -353,7 +548,11 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     // Tell the bridge that a legacy consumer exists only while a /global/event
     // client is actually connected. Registration is not consumption, so the
     // capture listener above must not keep the bridge allocating.
-    const unregisterTransport = registerLegacyTransport(() => gate.active)
+    const unregisterTransport = registerLegacyTransport({
+      isActive: () => gate.active,
+      listenerCount: () => gate.listenerCount,
+      needsSync: () => gate.syncRequired,
+    })
     yield* Effect.addFinalizer(() => Effect.sync(unregisterTransport))
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
@@ -362,6 +561,32 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
 
     const event = Effect.fn("GlobalHttpApi.event")(function* () {
       return yield* eventResponse(gate)
+    })
+
+    const eventInterest = Effect.fn("GlobalHttpApi.eventInterest")(function* (ctx: {
+      payload: { readonly subscriber: string; readonly sessions: readonly string[] }
+    }) {
+      return { updated: updateEventStreamInterest(ctx.payload.subscriber, ctx.payload.sessions) }
+    })
+
+    const sessionRoots = Effect.fn("GlobalHttpApi.sessionRoots")(function* (ctx: {
+      query: typeof GlobalSessionRootsQuery.Type
+    }) {
+      const directory = FSUtil.resolve(ctx.query.directory)
+      const rows = yield* sessions.listGlobal({
+        directory,
+        roots: true,
+        archived: false,
+        limit: ctx.query.limit ?? 50,
+      })
+      // `listGlobal` enriches rows with project metadata for cross-project UIs.
+      // Startup consumers need only Session.Info and should not pay for or bind
+      // themselves to that extra response shape.
+      return rows.map(({ project: _project, ...session }) => session)
+    })
+
+    const projectList = Effect.fn("GlobalHttpApi.projects")(function* () {
+      return yield* projects.list()
     })
 
     const configGet = Effect.fn("GlobalHttpApi.configGet")(function* () {
@@ -435,6 +660,9 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     return handlers
       .handle("health", health)
       .handleRaw("event", event)
+      .handle("eventInterest", eventInterest)
+      .handle("sessionRoots", sessionRoots)
+      .handle("projects", projectList)
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)
       .handle("preferencesGet", preferencesGet)

@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "b3e906b5-ed7c-45e9-9663-84796a3f908b",
+  "id": "645ba5ee-4c4c-4e7f-b2ff-6e9c87b9ffac",
   "prevIds": [
-    "477cd681-a8cd-4635-8e56-8b02290cfdcc"
+    "b3e906b5-ed7c-45e9-9663-84796a3f908b"
   ],
   "ddl": [
     {
@@ -6273,6 +6273,28 @@
       "where": null,
       "origin": "manual",
       "name": "session_project_idx",
+      "entityType": "indexes",
+      "table": "session"
+    },
+    {
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        },
+        {
+          "value": "directory",
+          "isExpression": false
+        },
+        {
+          "value": "time_updated",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "(\"session\".\"parent_id\" is null)",
+      "origin": "manual",
+      "name": "session_project_directory_root_updated_idx",
       "entityType": "indexes",
       "table": "session"
     },

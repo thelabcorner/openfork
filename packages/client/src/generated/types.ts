@@ -180,6 +180,7 @@ export type AgentsListOutput = {
 export type SessionsListInput = {
   readonly workspace?: {
     readonly workspace?: string | undefined
+    readonly roots?: boolean | undefined
     readonly limit?: number | undefined
     readonly order?: "asc" | "desc" | undefined
     readonly search?: string | undefined
@@ -188,8 +189,20 @@ export type SessionsListInput = {
     readonly subpath?: string | undefined
     readonly cursor?: string | undefined
   }["workspace"]
+  readonly roots?: {
+    readonly workspace?: string | undefined
+    readonly roots?: boolean | undefined
+    readonly limit?: number | undefined
+    readonly order?: "asc" | "desc" | undefined
+    readonly search?: string | undefined
+    readonly directory?: string | undefined
+    readonly project?: string | undefined
+    readonly subpath?: string | undefined
+    readonly cursor?: string | undefined
+  }["roots"]
   readonly limit?: {
     readonly workspace?: string | undefined
+    readonly roots?: boolean | undefined
     readonly limit?: number | undefined
     readonly order?: "asc" | "desc" | undefined
     readonly search?: string | undefined
@@ -200,6 +213,7 @@ export type SessionsListInput = {
   }["limit"]
   readonly order?: {
     readonly workspace?: string | undefined
+    readonly roots?: boolean | undefined
     readonly limit?: number | undefined
     readonly order?: "asc" | "desc" | undefined
     readonly search?: string | undefined
@@ -210,6 +224,7 @@ export type SessionsListInput = {
   }["order"]
   readonly search?: {
     readonly workspace?: string | undefined
+    readonly roots?: boolean | undefined
     readonly limit?: number | undefined
     readonly order?: "asc" | "desc" | undefined
     readonly search?: string | undefined
@@ -220,6 +235,7 @@ export type SessionsListInput = {
   }["search"]
   readonly directory?: {
     readonly workspace?: string | undefined
+    readonly roots?: boolean | undefined
     readonly limit?: number | undefined
     readonly order?: "asc" | "desc" | undefined
     readonly search?: string | undefined
@@ -230,6 +246,7 @@ export type SessionsListInput = {
   }["directory"]
   readonly project?: {
     readonly workspace?: string | undefined
+    readonly roots?: boolean | undefined
     readonly limit?: number | undefined
     readonly order?: "asc" | "desc" | undefined
     readonly search?: string | undefined
@@ -240,6 +257,7 @@ export type SessionsListInput = {
   }["project"]
   readonly subpath?: {
     readonly workspace?: string | undefined
+    readonly roots?: boolean | undefined
     readonly limit?: number | undefined
     readonly order?: "asc" | "desc" | undefined
     readonly search?: string | undefined
@@ -250,6 +268,7 @@ export type SessionsListInput = {
   }["subpath"]
   readonly cursor?: {
     readonly workspace?: string | undefined
+    readonly roots?: boolean | undefined
     readonly limit?: number | undefined
     readonly order?: "asc" | "desc" | undefined
     readonly search?: string | undefined

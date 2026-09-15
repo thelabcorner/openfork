@@ -21,10 +21,14 @@ test("invalid events still fail schema validation", () => {
 test("validates and serializes native transport control frames", () => {
   const connected = { id: "evt_connected", type: "server.connected", data: { epoch: "epoch-a" } }
   const heartbeat = { id: "evt_heartbeat", type: "server.heartbeat", data: {} }
-  const event = { id: "evt_gap", type: "server.stream.gap", data: { requested: 1, latest: 4 } }
+  const gap = { id: "evt_gap", type: "server.stream.gap", data: { requested: 1, latest: 4 } }
+  const stale = { id: "evt_stale", type: "server.stream.session-stale", data: { sessionID: "ses_1" } }
+  const progress = { id: "evt_progress", type: "server.stream.progress", data: { latest: 9 } }
   expect(JSON.parse(serializeEvent(connected))).toEqual(connected)
   expect(JSON.parse(serializeEvent(heartbeat))).toEqual(heartbeat)
-  expect(JSON.parse(serializeEvent(event))).toEqual(event)
+  expect(JSON.parse(serializeEvent(gap))).toEqual(gap)
+  expect(JSON.parse(serializeEvent(stale))).toEqual(stale)
+  expect(JSON.parse(serializeEvent(progress))).toEqual(progress)
 })
 
 test("additional subscribers do not re-encode the same published object", () => {

@@ -68,10 +68,13 @@ const SUBSCRIBER_ENVELOPE_BYTES = 48
 export const SUBSCRIBER_FRAME_MAX_BYTES = MAX_REPLAY_BYTES + SUBSCRIBER_ENVELOPE_BYTES
 
 function eventData(data: object, sequence?: string): Sse.Event {
-  const started = performance.now()
+  const tracing = EventTrace.active()
+  const started = tracing ? performance.now() : 0
   const frame = serializeLegacyEvent(data)
-  EventTrace.timing("legacy.serializeMs", performance.now() - started)
-  EventTrace.sum("legacy.serializeBytes", frame.length)
+  if (tracing) {
+    EventTrace.timing("legacy.serializeMs", performance.now() - started)
+    EventTrace.sum("legacy.serializeBytes", frame.length)
+  }
   return {
     _tag: "Event",
     event: "message",
@@ -89,10 +92,10 @@ function eventResponse(events: EventV2Bridge.Interface) {
     const request = yield* HttpServerRequest.HttpServerRequest
     const instance = yield* InstanceState.context
     const workspaceID = yield* InstanceState.workspaceID
+    const lastEventID = request.headers["last-event-id"]
     // Request-derived context must be read here, not inside the stream: the
     // body stream runs after this effect returns and no longer has access to
     // per-request services.
-    const cursor = parseEventSequence(request.headers["last-event-id"], events.replayEpoch)
 
     // Every resource below is created inside `Stream.unwrap`, so its lifetime
     // is bound to the response body stream instead of the request scope. The
@@ -100,6 +103,14 @@ function eventResponse(events: EventV2Bridge.Interface) {
     // response value is handed back to the server.
     const output = Stream.unwrap(
       Effect.gen(function* () {
+        // Activate compatibility replay capture before installing the live
+        // listener. `after` is the exact connect boundary, so a fresh client
+        // replays events that race into this setup window without receiving
+        // arbitrary history from before it connected.
+        const replayConnection = events.replayConnect()
+        yield* Effect.addFinalizer(() => Effect.sync(replayConnection.release))
+        const cursor = parseEventSequence(lastEventID, replayConnection.epoch)
+        const replayAfter = cursor === undefined ? replayConnection.after : cursor
         const subscriber = yield* EventV2.makeByteBoundedSubscriberQueue<SequencedLegacyEvent>({
           capacity: SUBSCRIBER_CAPACITY,
           maxBytes: EventV2Bridge.REPLAY_MAX_BYTES,
@@ -143,7 +154,7 @@ function eventResponse(events: EventV2Bridge.Interface) {
         )
         yield* Effect.addFinalizer(() => unsubscribe)
         yield* Effect.addFinalizer(() => Effect.sync(coalescer.dispose))
-        const replay = events.replaySince(cursor, matches)
+        const replay = events.replaySince(replayAfter, matches)
         const replayCutoff = replay.latest
         EventTrace.event({
           phase: "sse.reconnect",
@@ -229,20 +240,20 @@ function eventResponse(events: EventV2Bridge.Interface) {
 
         const replayStream = Stream.fromIterable(replayPrefix).pipe(
           Stream.map(({ sequence, event }) =>
-            eventData(event, sequence === undefined ? undefined : `${events.replayEpoch}:${sequence}`),
+            eventData(event, sequence === undefined ? undefined : `${replayConnection.epoch}:${sequence}`),
           ),
         )
         const liveStream = live.pipe(
           Stream.map(({ sequence, event }) =>
-            eventData(event, sequence === undefined ? undefined : `${events.replayEpoch}:${sequence}`),
+            eventData(event, sequence === undefined ? undefined : `${replayConnection.epoch}:${sequence}`),
           ),
         )
         const domain = replayStream.pipe(Stream.concat(liveStream))
 
         return Stream.make(
           eventData(
-            { id: eventID(), type: "server.connected", properties: { epoch: events.replayEpoch } },
-            cursor === undefined ? `${events.replayEpoch}:${replay.latest}` : undefined,
+            { id: eventID(), type: "server.connected", properties: { epoch: replayConnection.epoch } },
+            cursor === undefined ? `${replayConnection.epoch}:${replayConnection.after}` : undefined,
           ),
         ).pipe(
           Stream.concat(domain.pipe(Stream.merge(heartbeat, { haltStrategy: "left" }))),
