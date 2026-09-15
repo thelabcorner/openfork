@@ -68,6 +68,9 @@ const DirectoryLayout = lazy(() => import("@/pages/directory-layout"))
 const DraftRoute = lazy(() => import("@/pages/draft-route"))
 const LegacyHome = lazy(() => import("@/pages/home/legacy-home").then((m) => ({ default: m.LegacyHome })))
 const UsagePage = lazy(() => import("@/pages/usage-page").then((m) => ({ default: m.UsagePage })))
+const SettingsPage = lazy(() =>
+  import("@/components/settings-v2/settings-screen").then((m) => ({ default: m.SettingsScreen })),
+)
 const TargetSessionCenterRoute = lazy(() =>
   import("@/pages/session").then((m) => ({ default: m.TargetSessionCenterRoute })),
 )
@@ -634,6 +637,7 @@ function Routes(props: { serverScoped?: JSX.Element }) {
         <Route path="/server/:serverKey/group/:groupId/session/:sessionId" component={GroupTabRoute} />
         <Route path="/server/:serverKey/group/:groupId" component={GroupTabRoute} />
       </Show>
+      <Route path="/settings" component={SettingsPage} />
       <Route path="/new-session" component={DraftRoute} />
     </>
   )

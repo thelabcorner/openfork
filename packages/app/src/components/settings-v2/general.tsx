@@ -16,6 +16,7 @@ import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useUpdaterAction } from "../updater-action"
 import { useSettings } from "@/context/settings"
+import { useSettingsNavigation } from "./navigation"
 import { useServerSync } from "@/context/server-sync"
 import { useServerSDK } from "@/context/server-sdk"
 import { showToast } from "@/utils/toast"
@@ -1023,6 +1024,7 @@ export const SettingsGeneralV2: Component<{
   const platform = usePlatform()
   const dialog = useDialog()
   const settings = useSettings()
+  const settingsNavigation = useSettingsNavigation()
   const mobile = createMediaQuery("(max-width: 767px)")
   const updater = useUpdaterAction()
   const permissionScope = createPermissionScopeController(() => props.sessionID)
@@ -1051,8 +1053,9 @@ export const SettingsGeneralV2: Component<{
       description={language.t("settings.general.row.newInterface.description")}
       checked={settings.general.newLayoutDesigns()}
       onChange={(checked) => {
-        settings.general.setNewLayoutDesigns(checked)
         if (checked) return
+        settingsNavigation.close()
+        settings.general.setNewLayoutDesigns(false)
         void import("@/components/dialog-settings").then((module) => {
           void dialog.show(() => <module.DialogSettings />)
         })

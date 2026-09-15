@@ -31,6 +31,7 @@ import { decode64 } from "@/utils/base64"
 import { playSoundById, SOUND_OPTIONS } from "@/utils/sound"
 import { ExternalLink } from "./external-link"
 import { SettingsList } from "./settings-list"
+import { useSettingsNavigation } from "./settings-v2/navigation"
 
 let demoSoundState = {
   cleanup: undefined as (() => void) | undefined,
@@ -90,6 +91,7 @@ export const SettingsGeneral: Component = () => {
   const dialog = useDialog()
   const params = useParams()
   const settings = useSettings()
+  const settingsNavigation = useSettingsNavigation()
 
   const updater = useUpdaterAction()
 
@@ -270,9 +272,8 @@ export const SettingsGeneral: Component = () => {
               onChange={(checked) => {
                 settings.general.setNewLayoutDesigns(checked)
                 if (!checked) return
-                void import("@/components/settings-v2").then((module) => {
-                  void dialog.show(() => <module.DialogSettings />)
-                })
+                dialog.close()
+                settingsNavigation.open()
               }}
             />
           </div>
