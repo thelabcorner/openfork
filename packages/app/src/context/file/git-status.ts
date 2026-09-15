@@ -16,10 +16,13 @@ type GitStatusStoreOptions = {
   onError: (message: string) => void
   /** Debounce window for coalescing watcher invalidations (default 150ms). */
   refreshDelayMs?: number
+  /** Maximum time a sustained watcher burst may defer a refresh (default 750ms). */
+  refreshMaxWaitMs?: number
 }
 
 const LRU_MAX = 5
 const DEFAULT_REFRESH_DELAY_MS = 150
+const DEFAULT_REFRESH_MAX_WAIT_MS = 750
 
 const toKind = (status: LegacyStatus["status"]): Kind =>
   status === "added" ? "add" : status === "deleted" ? "del" : "mix"
@@ -39,6 +42,8 @@ export function createGitStatusStore(options: GitStatusStoreOptions) {
   const [status, setStatus] = createSignal<ReadonlyMap<string, Kind>>()
 
   let dirty = false
+  let dirtySince: number | undefined
+  let lastInvalidatedAt = 0
   let timer: ReturnType<typeof setTimeout> | undefined
   let inflight: { scope: string; promise: Promise<void> } | undefined
   let disposed = false
@@ -89,14 +94,28 @@ export function createGitStatusStore(options: GitStatusStoreOptions) {
 
   const refresh = () => {
     const scope = options.scope()
-    if (disposed || timer || inflight?.scope === scope) return
+    if (disposed || inflight?.scope === scope) return
     if (!dirty) return
+    const now = Date.now()
+    dirtySince ??= now
+    const quietDelay = options.refreshDelayMs ?? DEFAULT_REFRESH_DELAY_MS
+    const maxWait = Math.max(quietDelay, options.refreshMaxWaitMs ?? DEFAULT_REFRESH_MAX_WAIT_MS)
+    const quietRemaining = Math.max(0, quietDelay - Math.max(0, now - lastInvalidatedAt))
+    const maxRemaining = Math.max(0, maxWait - Math.max(0, now - dirtySince))
+    const delay = Math.min(quietRemaining, maxRemaining)
+
+    // This is intentionally a trailing debounce, not the old first-event
+    // throttle. Every watcher invalidation moves the quiet-period deadline,
+    // while maxWait guarantees a continuously-writing process cannot postpone
+    // status indefinitely.
+    if (timer) clearTimeout(timer)
     timer = setTimeout(() => {
       timer = undefined
       if (disposed) return
       dirty = false
+      dirtySince = undefined
       startFetch(options.scope())
-    }, options.refreshDelayMs ?? DEFAULT_REFRESH_DELAY_MS)
+    }, delay)
   }
 
   /** Load the current scope's status, reusing the cache when present. */
@@ -115,6 +134,9 @@ export function createGitStatusStore(options: GitStatusStoreOptions) {
   /** Mark a single changed path dirty and schedule a debounced re-query. */
   const invalidate = (path: string, options?: { schedule?: boolean }) => {
     if (!path) return
+    const now = Date.now()
+    dirtySince ??= now
+    lastInvalidatedAt = now
     dirty = true
     if (options?.schedule !== false) refresh()
   }
@@ -124,6 +146,7 @@ export function createGitStatusStore(options: GitStatusStoreOptions) {
     if (timer) clearTimeout(timer)
     timer = undefined
     dirty = false
+    dirtySince = undefined
   }
 
   return { status, ensure, invalidate, dispose }

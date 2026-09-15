@@ -33,10 +33,8 @@ export type TreeSnapshot = {
 
 type TreeStoreOptions = {
   scope: () => string
-  /** Shared scheduler identity, normally the owning sidecar/server URL. */
-  schedulerKey?: () => string
   normalizeDir: (input: string) => string
-  list: (input: string) => Promise<FileNode[]>
+  list: (input: string, priority: "interactive" | "background") => Promise<FileNode[]>
   onError: (message: string) => void
   cache?: {
     maxScopes?: number
@@ -54,8 +52,9 @@ const DIRECTORY_LIST_CONCURRENCY = 4
 const BACKGROUND_LIST_CONCURRENCY = DIRECTORY_LIST_CONCURRENCY - 1
 const MAX_QUEUED_LIST_REQUESTS = 1024
 const MAX_QUEUED_BACKGROUND_REQUESTS = 256
-const MAX_SHARED_QUEUED_LIST_REQUESTS = 2048
 const MAX_CHILD_CACHE_ENTRIES = 8192
+const WARM_SNAPSHOT_MAX_NODES = 1024
+const WARM_SNAPSHOT_MAX_DIRECTORIES = 96
 
 /**
  * Outcome of an expandAll run. `truncated` is the signal that used to be
@@ -75,115 +74,6 @@ export type ExpandAllResult = {
 }
 // Cancellation is not an authoritative empty directory response.
 const CANCELLED_LIST: FileNode[] = []
-
-type SharedListPriority = "interactive" | "background"
-type SharedListJob = {
-  task: () => Promise<FileNode[]>
-  priority: SharedListPriority
-  cancelled: () => boolean
-  resolve: (nodes: FileNode[]) => void
-  reject: (error: unknown) => void
-}
-
-type SharedListGate = {
-  active: number
-  activeBackground: number
-  queue: SharedListJob[]
-  pump: () => void
-  /** Clock stamp of the last lookup, so eviction can prefer the coldest gate. */
-  lastUsed: number
-}
-
-const sharedListGates = new Map<string, SharedListGate>()
-const MAX_SHARED_GATES = 32
-let sharedGateClock = 0
-
-/**
- * Live size of the scheduler gate identity map. Exported so tests can assert
- * the map stays bounded; it is a diagnostic, not part of the store's behaviour.
- */
-export const sharedListGateCount = () => sharedListGates.size
-
-/**
- * Bound the identity map. Keys are sidecar URLs, so cycling sidecars would
- * otherwise accumulate entries forever.
- *
- * Eviction prefers gates that own no work. The old loop scanned for a single
- * `active === 0 && queue.length === 0` candidate and gave up when every gate
- * was busy, so the map grew without bound exactly when it was under load.
- * Idle gates go oldest-first; if none is idle we still evict the coldest
- * rather than grow unboundedly. An evicted gate's in-flight jobs keep running
- * against the object they closed over, so the only cost of a forced eviction
- * is a brief window where a fresh gate for the same URL runs alongside the old
- * one (momentary over-concurrency for that URL, never a lost or dropped job).
- */
-const evictSharedListGates = (protectedKey: string) => {
-  let excess = sharedListGates.size - MAX_SHARED_GATES
-  if (excess <= 0) return
-  const idle = (gate: SharedListGate) => (gate.active === 0 && gate.queue.length === 0 ? 0 : 1)
-  const ordered = [...sharedListGates.entries()]
-    .filter(([key]) => key !== protectedKey)
-    .sort((left, right) => {
-      const byIdle = idle(left[1]) - idle(right[1])
-      if (byIdle !== 0) return byIdle
-      return left[1].lastUsed - right[1].lastUsed
-    })
-  for (const [key] of ordered) {
-    if (excess <= 0) break
-    sharedListGates.delete(key)
-    excess -= 1
-  }
-}
-
-const sharedListGate = (key: string) => {
-  const existing = sharedListGates.get(key)
-  if (existing) {
-    existing.lastUsed = ++sharedGateClock
-    return existing
-  }
-  const gate: SharedListGate = {
-    active: 0,
-    activeBackground: 0,
-    queue: [],
-    lastUsed: ++sharedGateClock,
-    pump() {
-      // Drop superseded jobs before looking for a permit. This keeps a search
-      // keystroke from leaving thousands of cancelled directories in the
-      // shared sidecar queue until some unrelated request completes.
-      for (let index = gate.queue.length - 1; index >= 0; index--) {
-        const stale = gate.queue[index]
-        if (!stale || !stale.cancelled()) continue
-        gate.queue.splice(index, 1)
-stale.resolve(CANCELLED_LIST)
-      }
-      while (gate.active < DIRECTORY_LIST_CONCURRENCY && gate.queue.length > 0) {
-        const interactive = gate.queue.findIndex((job) => job.priority === "interactive")
-        if (interactive === -1 && gate.activeBackground >= BACKGROUND_LIST_CONCURRENCY) break
-        const index = interactive === -1 ? 0 : interactive
-        const job = gate.queue.splice(index, 1)[0]!
-        if (job.cancelled()) {
-job.resolve(CANCELLED_LIST)
-          continue
-        }
-        gate.active += 1
-        if (job.priority === "background") gate.activeBackground += 1
-        void Promise.resolve()
-          .then(job.task)
-          .then(job.resolve, job.reject)
-          .finally(() => {
-            gate.active -= 1
-            if (job.priority === "background") gate.activeBackground -= 1
-            gate.pump()
-          })
-      }
-    },
-  }
-  // A renderer can briefly connect to many sidecars. Keep the identity map
-  // bounded, preferring gates that own no work.
-  sharedListGates.set(key, gate)
-  evictSharedListGates(key)
-  return gate
-}
 
 async function mapLimited<A, B>(
   items: readonly A[],
@@ -214,7 +104,6 @@ const scopeCache = new Map<string, TreeSnapshot>()
 
 export function createFileTreeStore(options: TreeStoreOptions) {
   let currentScope = options.scope()
-  const sharedGate = sharedListGate(options.schedulerKey?.() ?? "default")
 
   // Per-project LRU cache of tree snapshots, keyed by project scope. On a
   // scope switch we save the outgoing project's state here and restore the
@@ -466,7 +355,7 @@ export function createFileTreeStore(options: TreeStoreOptions) {
     task: () => Promise<FileNode[]>,
     options: { generation: number; priority: ListPriority },
   ) => {
-if (disposed) return Promise.resolve(CANCELLED_LIST)
+    if (disposed) return Promise.resolve(CANCELLED_LIST)
     return new Promise<FileNode[]>((resolve, reject) => {
       let settled = false
       const finish = () => {
@@ -482,42 +371,23 @@ if (disposed) return Promise.resolve(CANCELLED_LIST)
             finish()
             return
           }
-          const runShared = new Promise<FileNode[]>((resolveShared, rejectShared) => {
-            const sharedJob: SharedListJob = {
-              task,
-              priority: options.priority,
-              cancelled: () => disposed || options.generation !== generation,
-              resolve: resolveShared,
-              reject: rejectShared,
-            }
-            if (sharedGate.queue.length >= MAX_SHARED_QUEUED_LIST_REQUESTS) {
-              const oldestBackground = sharedGate.queue.findIndex((entry) => entry.priority === "background")
-              if (oldestBackground >= 0) {
-sharedGate.queue.splice(oldestBackground, 1)[0]?.resolve(CANCELLED_LIST)
-              } else if (options.priority === "background") {
-resolveShared(CANCELLED_LIST)
-                return
-              } else {
-sharedGate.queue.shift()!.resolve(CANCELLED_LIST)
-              }
-            }
-            sharedGate.queue.push(sharedJob)
-            sharedGate.pump()
-          })
-          void runShared
+          void Promise.resolve()
+            .then(() => {
+              if (disposed || options.generation !== generation) return CANCELLED_LIST
+              return task()
+            })
             .then(
               (value) => {
                 settled = true
+                finish()
                 resolve(value)
               },
               (error) => {
                 settled = true
+                finish()
                 reject(error)
               },
             )
-            .finally(() => {
-              finish()
-            })
         },
         cancel: () => {
           if (settled) return
@@ -530,7 +400,7 @@ sharedGate.queue.shift()!.resolve(CANCELLED_LIST)
         if (oldest >= 0) queuedListRequests.splice(oldest, 1)[0]!.cancel()
         else return resolve(CANCELLED_LIST)
       }
-if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCELLED_LIST)
+      if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCELLED_LIST)
       queuedListRequests.push(job)
       pumpListRequests()
     })
@@ -547,6 +417,81 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
       // 0/1 and every directory compares unequal, so the entire tree re-lists.
       loadedEpoch: staleEpoch(),
     }))
+
+  /**
+   * Small cross-process warm-start snapshot. Keep only the visible spine
+   * (root + expanded descendants) and hard-cap it so persistence can never
+   * turn a large repository into a multi-megabyte JSON/IPC/GC event.
+   *
+   * Every directory is deliberately persisted as NOT loaded. Its cached
+   * children are paint hints only: a consumer may render them immediately,
+   * while listDir() still revalidates against the authoritative filesystem.
+   */
+  const warmSnapshot = (
+    maxNodes = WARM_SNAPSHOT_MAX_NODES,
+    maxDirectories = WARM_SNAPSHOT_MAX_DIRECTORIES,
+  ): TreeSnapshot => {
+    const node: Record<string, FileNode> = {}
+    const dir: Record<string, DirectoryState> = {}
+    const queue = [""]
+    const seen = new Set<string>()
+    let nodes = 0
+
+    while (queue.length > 0 && seen.size < Math.max(1, maxDirectories) && nodes < Math.max(1, maxNodes)) {
+      const directory = queue.shift()!
+      if (seen.has(directory)) continue
+      seen.add(directory)
+      const state = tree.dir[directory]
+      if (!state?.children) continue
+
+      const children: string[] = []
+      for (const path of state.children) {
+        if (nodes >= maxNodes) break
+        const child = tree.node[path]
+        if (!child) continue
+        node[path] = child
+        children.push(path)
+        nodes += 1
+        if (child.type === "directory" && tree.dir[path]?.expanded) queue.push(path)
+      }
+      dir[directory] = {
+        expanded: directory === "" ? true : state.expanded,
+        loaded: false,
+        loading: false,
+        children,
+      }
+    }
+
+    if (!dir[""]) dir[""] = { expanded: true, loaded: false, loading: false, children: [] }
+    return { node, dir, nodeCount: nodes, stale: true, loadedEpoch: 0 }
+  }
+
+  /**
+   * Seed a cold store from a persisted paint-hint snapshot. Never overwrite
+   * an authoritative answer (including a real empty root); an in-flight cold
+   * request may continue and will replace these stale rows when it completes.
+   */
+  const seedWarmSnapshot = (snap: TreeSnapshot) => {
+    if (disposed || tree.dir[""]?.children !== undefined) return false
+    const nextDir: Record<string, DirectoryState> = {}
+    for (const [directory, state] of Object.entries(snap.dir ?? {})) {
+      nextDir[directory] = {
+        expanded: directory === "" ? true : Boolean(state.expanded),
+        loaded: false,
+        loading: false,
+        children: state.children?.filter((path) => snap.node[path] !== undefined),
+      }
+    }
+    if (!nextDir[""]) nextDir[""] = { expanded: true, loaded: false, loading: false, children: [] }
+    restore({
+      node: { ...snap.node },
+      dir: nextDir,
+      nodeCount: Object.keys(snap.node).length,
+      stale: true,
+      loadedEpoch: 0,
+    })
+    return true
+  }
 
   const restore = (snap: TreeSnapshot) => {
     childCache.clear()
@@ -651,7 +596,7 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
       // empty listing, so a future edit that removed the redundant guard in
       // the completion path would silently wipe a directory's children.
       if (disposed || options.scope() !== directory || requestGeneration !== generation) return Promise.resolve(CANCELLED_LIST)
-      return options.list(dir)
+      return options.list(dir, opts?.priority ?? "interactive")
     }, { generation: requestGeneration, priority: opts?.priority ?? "interactive" })
       .then((nodes) => {
         if (nodes === CANCELLED_LIST) {
@@ -891,7 +836,6 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
       queuedListRequests.splice(index, 1)
       job.cancel()
     }
-    sharedGate.pump()
     return generation
   }
 
@@ -965,7 +909,6 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
     disposed = true
     generation += 1
     while (queuedListRequests.length > 0) queuedListRequests.shift()!.cancel()
-    sharedGate.pump()
   }
 
   // Called by the consumer when the project scope changes. Saves the outgoing
@@ -1035,5 +978,7 @@ if (queuedListRequests.length >= MAX_QUEUED_LIST_REQUESTS) return resolve(CANCEL
     dispose,
     switchScope,
     persist,
+    warmSnapshot,
+    seedWarmSnapshot,
   }
 }

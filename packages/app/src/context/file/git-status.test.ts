@@ -4,7 +4,11 @@ import { createGitStatusStore } from "./git-status"
 
 type Status = { path: string; status: "added" | "deleted" | "modified" }
 
-function makeStore(opts?: { fetch?: () => Promise<Status[]> }) {
+function makeStore(opts?: {
+  fetch?: () => Promise<Status[]>
+  refreshDelayMs?: number
+  refreshMaxWaitMs?: number
+}) {
   return createRoot(() => {
     const [scope, setScope] = createSignal("/repo")
     const store = createGitStatusStore({
@@ -12,13 +16,15 @@ function makeStore(opts?: { fetch?: () => Promise<Status[]> }) {
       normalize: (input: string) => input.replaceAll("\\", "/").replace(/^\/+|\/+$/g, ""),
       fetchStatus: () => opts?.fetch?.() ?? Promise.resolve([]),
       onError: () => {},
-      refreshDelayMs: 0,
+      refreshDelayMs: opts?.refreshDelayMs ?? 0,
+      refreshMaxWaitMs: opts?.refreshMaxWaitMs,
     })
     return { store, setScope }
   })
 }
 
 const flush = () => new Promise((resolve) => setTimeout(resolve, 0))
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms))
 
 describe("createGitStatusStore", () => {
   test("fetches full status on first ensure and exposes it", async () => {
@@ -74,6 +80,59 @@ describe("createGitStatusStore", () => {
     await flush()
     // Debounced: the burst coalesces into one refresh.
     expect(fetches).toBe(2)
+  })
+
+  test("uses a trailing quiet-period debounce instead of scanning mid-burst", async () => {
+    let fetches = 0
+    const { store } = makeStore({
+      refreshDelayMs: 30,
+      refreshMaxWaitMs: 120,
+      fetch: () => {
+        fetches++
+        return Promise.resolve([])
+      },
+    })
+    store.ensure()
+    await flush()
+    expect(fetches).toBe(1)
+
+    store.invalidate("a.ts")
+    await sleep(20)
+    store.invalidate("b.ts")
+    await sleep(20)
+
+    // More than one debounce interval has elapsed since the first event, but
+    // the latest event is still inside its quiet period. The old first-event
+    // throttle would already have launched a second full-repo status scan.
+    expect(fetches).toBe(1)
+
+    await sleep(20)
+    expect(fetches).toBe(2)
+  })
+
+  test("bounded max-wait refreshes even when watcher activity never goes quiet", async () => {
+    let fetches = 0
+    const { store } = makeStore({
+      refreshDelayMs: 50,
+      refreshMaxWaitMs: 80,
+      fetch: () => {
+        fetches++
+        return Promise.resolve([])
+      },
+    })
+    store.ensure()
+    await flush()
+    expect(fetches).toBe(1)
+
+    for (let i = 0; i < 5; i++) {
+      store.invalidate(`burst-${i}.ts`)
+      await sleep(18)
+    }
+    await sleep(10)
+
+    // The 50ms quiet period was continuously reset, but the 80ms max-wait
+    // forces one bounded refresh rather than starving the status UI forever.
+    expect(fetches).toBeGreaterThanOrEqual(2)
   })
 
   test("can record hidden invalidations without scheduling until visible", async () => {

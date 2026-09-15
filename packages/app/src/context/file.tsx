@@ -9,6 +9,7 @@ import { useSDK } from "./sdk"
 import { useSync } from "./sync"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
+import { usePlatform } from "@/context/platform"
 import { createPathHelpers } from "./file/path"
 import { normalizeMentionPage } from "@/components/prompt-input/at-mention-search"
 import {
@@ -25,12 +26,14 @@ import {
 import { createFileViewCache } from "./file/view-cache"
 import { useServerSDK } from "./server-sdk"
 import { SessionRouteKey, SessionStateKey } from "@/utils/server-scope"
-import { createFileTreeStore } from "./file/tree-store"
+import { createFileTreeStore, type TreeSnapshot } from "./file/tree-store"
 import { invalidateFromWatcher } from "./file/watcher"
 import { createStaleDrain, WATCHER_DIR_QUEUE_MAX } from "./file/stale-drain"
 import { createGitStatusStore } from "./file/git-status"
+import { mentionSearchEndpointUnavailable } from "./file/mention-search-compat"
 import { normalizeFileTreeV2Path } from "@/components/file-tree-v2-model"
 import { perf } from "@/context/perf"
+import { Persist } from "@/utils/persist"
 import {
   selectionFromLines,
   type FileState,
@@ -71,6 +74,16 @@ export interface MentionSearchPage {
   results: MentionResult[]
   hasMore: boolean
 }
+
+type MentionSearchOptions = {
+  limit?: number
+  offset?: number
+  signal?: AbortSignal
+  symbols?: boolean
+  /** Surface transport/index failures instead of degrading them to an empty page. */
+  strict?: boolean
+}
+
 export {
   evictContentLru,
   getFileContentBytesTotal,
@@ -87,6 +100,9 @@ const WATCHER_FILE_QUEUE_MAX = 256
 const WATCHER_FILE_REFRESH_DELAY_MS = 80
 const WATCHER_FILE_REFRESH_CONCURRENCY = 2
 const DEFAULT_MAX_CONTENT_SCOPES = 5
+const TREE_WARM_CACHE_KEY = "file-tree-warm-v1"
+const TREE_WARM_CACHE_MAX_AGE_MS = 3 * 24 * 60 * 60 * 1000
+const TREE_WARM_CACHE_MAX_BYTES = 512 * 1024
 
 // Module-level (not per-store), mirroring tree-store's scopeCache: keeps a project's
 // loaded file *content* across a scope switch and across a FileProvider remount, not
@@ -128,6 +144,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     const serverSDK = useServerSDK()
     const language = useLanguage()
     const layout = useLayout()
+    const platform = usePlatform()
 
     const scope = createMemo(() => sdk().directory)
     const path = createPathHelpers(scope)
@@ -162,6 +179,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       fileTimer: undefined as ReturnType<typeof setTimeout> | undefined,
       fileQueue: new Set<string>(),
     }
+    const treeConsumerVisible = () => layout.fileTree.opened() || layout.projectExplorer.opened()
 
     // Reactive watcher-stale flags. These used to be plain object fields, so
     // arming them never scheduled the recovery effect: with the pane already
@@ -177,12 +195,15 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
     // the old recovery self-sustaining.
     const tree = createFileTreeStore({
       scope,
-      schedulerKey: () => serverSDK().url,
       normalizeDir: path.normalizeDir,
-      list: (dir) =>
-        sdk()
-          .client.file.list({ path: dir })
-          .then((x) => x.data ?? []),
+      list: (dir, priority) => {
+        const directory = scope()
+        const key = `file-tree:${directory}:${dir}`
+        if (priority === "interactive") serverSDK().requests.promote(key, "interactive")
+        return serverSDK()
+          .requests.schedule(priority, () => sdk().client.file.list({ path: dir }), { key, kind: "file-tree" })
+          .then((x) => x.data ?? [])
+      },
       onError: (message) => {
         showToast({
           variant: "error",
@@ -190,15 +211,100 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
           description: message,
         })
       },
+    })
+
+    // Cross-process stale-while-revalidate cache for the explorer's visible
+    // spine. The in-memory tree cache below survives route/provider remounts,
+    // but not an Electron restart. Persist only a hard-bounded paint hint and
+    // never mark it loaded: the authoritative file.list still runs in the
+    // normal QoS lane and replaces these rows when it completes.
+    let warmCacheLoadGeneration = 0
+    let warmCacheWriteTimer: ReturnType<typeof setTimeout> | undefined
+    let warmCacheIdleHandle: number | undefined
+    const warmCacheTarget = (directory: string) => Persist.serverWorkspace(serverSDK().scope, directory, TREE_WARM_CACHE_KEY)
+    const warmCacheStore = (directory: string) => {
+      const target = warmCacheTarget(directory)
+      const storage = platform.storage?.(target.storage)
+      return storage ? { target, storage } : undefined
+    }
+    const decodeWarmSnapshot = (raw: string): TreeSnapshot | undefined => {
+      try {
+        const value = JSON.parse(raw) as { version?: number; savedAt?: number; snapshot?: TreeSnapshot }
+        if (value.version !== 1 || typeof value.savedAt !== "number" || !value.snapshot) return
+        if (Date.now() - value.savedAt > TREE_WARM_CACHE_MAX_AGE_MS) return
+        if (!value.snapshot.node || !value.snapshot.dir || typeof value.snapshot.node !== "object" || typeof value.snapshot.dir !== "object") return
+        return value.snapshot
+      } catch {
+        return
+      }
+    }
+    const hydrateWarmTree = (directory: string) => {
+      const entry = warmCacheStore(directory)
+      if (!entry) return
+      const generation = ++warmCacheLoadGeneration
+      void Promise.resolve(entry.storage.getItem(entry.target.key))
+        .then((raw) => {
+          if (providerDisposed || generation !== warmCacheLoadGeneration || scope() !== directory) return
+          if (typeof raw !== "string" || raw.length === 0 || raw.length > TREE_WARM_CACHE_MAX_BYTES) return
+          const snap = decodeWarmSnapshot(raw)
+          if (!snap) return
+          tree.seedWarmSnapshot(snap)
+        })
+        .catch(() => undefined)
+    }
+    const flushWarmTree = (directory = scope()) => {
+      const entry = warmCacheStore(directory)
+      if (!entry || providerDisposed || scope() !== directory || !tree.isLoaded("")) return
+      const payload = JSON.stringify({ version: 1, savedAt: Date.now(), snapshot: tree.warmSnapshot(768, 96) })
+      if (payload.length > TREE_WARM_CACHE_MAX_BYTES) return
+      void Promise.resolve(entry.storage.setItem(entry.target.key, payload)).catch(() => undefined)
+    }
+    const scheduleWarmTreeWrite = () => {
+      if (warmCacheWriteTimer !== undefined) clearTimeout(warmCacheWriteTimer)
+      warmCacheWriteTimer = setTimeout(() => {
+        warmCacheWriteTimer = undefined
+        const directory = scope()
+        if (typeof window.requestIdleCallback === "function") {
+          warmCacheIdleHandle = window.requestIdleCallback(
+            () => {
+              warmCacheIdleHandle = undefined
+              flushWarmTree(directory)
+            },
+            { timeout: 750 },
+          )
+          return
+        }
+        flushWarmTree(directory)
+      }, 250)
+    }
+
+    createEffect(() => {
+      const directory = scope()
+      if (!treeConsumerVisible()) return
+      // Re-run for a newly visible scope, but never repeatedly read storage for
+      // ordinary tree mutations within the same mounted provider.
+      untrack(() => hydrateWarmTree(directory))
+    })
+
+    createEffect(() => {
+      scope()
+      tree.nodeRevision()
+      if (!tree.isLoaded("")) return
+      untrack(scheduleWarmTreeWrite)
     })
 
     const gitStatus = createGitStatusStore({
       scope,
       normalize: normalizeFileTreeV2Path,
-      fetchStatus: () =>
-        sdk()
-          .client.file.status()
-          .then((x) => x.data ?? []),
+      fetchStatus: () => {
+        const directory = scope()
+        return serverSDK()
+          .requests.schedule("background", () => sdk().client.file.status(), {
+            key: `git-status:${directory}`,
+            kind: "git-status",
+          })
+          .then((x) => x.data ?? [])
+      },
       onError: (message) => {
         showToast({
           variant: "error",
@@ -207,8 +313,6 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         })
       },
     })
-
-    const treeConsumerVisible = () => layout.fileTree.opened() || layout.projectExplorer.opened()
 
     const evictContent = (keep?: Set<string>) => {
       evictContentLru(keep, (target) => {
@@ -265,17 +369,28 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       }
     })
 
-    // Keep the status snapshot aligned with the active project. The status
-    // store itself deduplicates cached scopes and ignores completions from an
-    // old scope; this effect makes the initial load and scope switches
-    // observable instead of waiting for a consumer to remember `ensure()`.
+    // Git decorations are auxiliary. A cold full-repo status scan must not
+    // race the root file listing or the first explorer paint. Wait until the
+    // tree has something paintable (persisted stale rows or an authoritative
+    // root response), then admit status work from the browser idle queue. The
+    // timeout prevents a permanently busy renderer from starving decorations.
     createEffect(() => {
-      // A hidden session still records the boolean dirty bit, but it should
-      // not start a full git-status scan for every watcher burst. Re-entering
-      // the explorer runs this effect again; the status store sees the dirty
-      // cache and schedules one debounced refresh then.
       scope()
-      if (treeConsumerVisible()) gitStatus.ensure()
+      if (!treeConsumerVisible()) return
+      if (tree.dirState("")?.children === undefined) return
+
+      let idle: number | undefined
+      let timer: ReturnType<typeof setTimeout> | undefined
+      const run = () => gitStatus.ensure()
+      if (typeof window.requestIdleCallback === "function") {
+        idle = window.requestIdleCallback(run, { timeout: 900 })
+      } else {
+        timer = setTimeout(run, 120)
+      }
+      onCleanup(() => {
+        if (idle !== undefined) window.cancelIdleCallback?.(idle)
+        if (timer !== undefined) clearTimeout(timer)
+      })
     })
 
     const viewCache = createFileViewCache(serverSDK().scope)
@@ -326,25 +441,33 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       })
     }
 
-    const load = (input: string, options?: { force?: boolean }) => {
+    const load = (input: string, options?: { force?: boolean; priority?: "interactive" | "background" }) => {
       if (providerDisposed) return Promise.resolve()
       const file = path.normalize(input)
       if (!file) return Promise.resolve()
 
       const directory = scope()
       const key = `${directory}\n${file}`
+      const requestKey = `file-read:${directory}:${file}`
+      const priority = options?.priority ?? "interactive"
       ensure(file)
 
       const current = store.file[file]
       if (!options?.force && current?.loaded) return Promise.resolve()
 
       const pending = inflight.get(key)
-      if (pending) return pending
+      if (pending) {
+        serverSDK().requests.promote(requestKey, priority)
+        return pending
+      }
 
       setLoading(file)
 
-      const promise = sdk()
-        .client.file.read({ path: file })
+      const promise = serverSDK()
+        .requests.schedule(priority, () => sdk().client.file.read({ path: file }), {
+          key: requestKey,
+          kind: "file-read",
+        })
         .then((x) => {
           if (providerDisposed || scope() !== directory) return
           const content = x.data
@@ -366,24 +489,36 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       return promise
     }
 
-    const search = (query: string, dirs: "true" | "false", options?: { limit?: number; signal?: AbortSignal }) =>
-      serverSDK()
-        .api.file.find(
-          {
-            location: { directory: sdk().directory },
-            query,
-            type: dirs === "true" ? undefined : "file",
-            limit: options?.limit,
-          },
-          { signal: options?.signal },
+    const search = (
+      query: string,
+      dirs: "true" | "false",
+      options?: { limit?: number; signal?: AbortSignal; strict?: boolean },
+    ) => {
+      const directory = sdk().directory
+      return serverSDK()
+        .requests.schedule(
+          "interactive",
+          () =>
+            serverSDK().api.file.find(
+              {
+                location: { directory },
+                query,
+                type: dirs === "true" ? undefined : "file",
+                limit: options?.limit,
+              },
+              { signal: options?.signal },
+            ),
+          { signal: options?.signal, key: `file-search:${directory}`, kind: "file-search" },
         )
         .then(
           (x) => x.data.map((entry) => path.normalize(entry.path)),
           (error) => {
             if (options?.signal?.aborted) throw error
+            if (options?.strict) throw error
             return []
           },
         )
+    }
 
     // /find/search (index-backed mention search) with graceful degradation to the
     // legacy file find for older servers; the unavailable flag sticks so a 404
@@ -392,7 +527,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
 
     const searchMentionsFallback = (
       query: string,
-      options?: { limit?: number; offset?: number; signal?: AbortSignal; symbols?: boolean },
+      options?: MentionSearchOptions,
     ): Promise<MentionSearchPage> =>
       search(query, "true", options).then((paths) => ({
         results: paths.map((path): MentionResult => {
@@ -407,22 +542,35 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
 
     const searchMentions = (
       query: string,
-      options?: { limit?: number; offset?: number; signal?: AbortSignal; symbols?: boolean },
+      options?: MentionSearchOptions,
     ): Promise<MentionSearchPage> => {
       if (mentionsIndexUnavailable) return searchMentionsFallback(query, options)
+      const directory = sdk().directory
       return serverSDK()
-        .api.find.search({
-          location: { directory: sdk().directory },
-          query,
-          limit: options?.limit,
-          offset: options?.offset,
-          symbols: options?.symbols,
-          signal: options?.signal,
-        })
+        .requests.schedule(
+          "interactive",
+          () =>
+            serverSDK().api.find.search({
+              location: { directory },
+              query,
+              limit: options?.limit,
+              offset: options?.offset,
+              symbols: options?.symbols,
+              signal: options?.signal,
+            }),
+          { signal: options?.signal, key: `mention-search:${directory}`, kind: "mention-search" },
+        )
         .then(
           (x) => normalizeMentionPage(x.data),
           (error) => {
             if (options?.signal?.aborted) throw error
+            // Only a real compatibility response should permanently disable the
+            // indexed endpoint. A transient disconnect/5xx used to poison this
+            // session forever and silently discard the canonical search base.
+            if (!mentionSearchEndpointUnavailable(error)) {
+              if (options?.strict) throw error
+              return searchMentionsFallback(query, options)
+            }
             mentionsIndexUnavailable = true
             return searchMentionsFallback(query, options)
           },
@@ -475,7 +623,7 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
         const worker = async () => {
           while (!watcherRefresh.disposed && cursor < next.length) {
             const file = next[cursor++]
-            if (file) await load(file, { force: true })
+            if (file) await load(file, { force: true, priority: "background" })
           }
         }
         const workers = Array.from({ length: Math.min(WATCHER_FILE_REFRESH_CONCURRENCY, next.length) }, () => worker())
@@ -618,10 +766,16 @@ export const { use: useFile, provider: FileProvider } = createSimpleContext({
       withPath(input, (file) => view().setSelectedLines(file, range))
 
     onCleanup(() => {
+      // Capture the last authoritative visible spine before disposal flips the
+      // guard used by flushWarmTree(). This write is async, but snapshot/JSON
+      // capture happens synchronously while the tree is still intact.
+      if (treeConsumerVisible()) flushWarmTree()
       providerDisposed = true
       watcherRefresh.disposed = true
       if (watcherRefresh.timer) clearTimeout(watcherRefresh.timer)
       if (watcherRefresh.fileTimer) clearTimeout(watcherRefresh.fileTimer)
+      if (warmCacheWriteTimer !== undefined) clearTimeout(warmCacheWriteTimer)
+      if (warmCacheIdleHandle !== undefined) window.cancelIdleCallback?.(warmCacheIdleHandle)
       if (staleAll() || staleDrain.pending() || watcherRefresh.queue.size > 0 || watcherRefresh.stale.size > 0) {
         // Persist the loss of precise watcher paths so a provider remount
         // cannot present a silently stale cached tree as authoritative.

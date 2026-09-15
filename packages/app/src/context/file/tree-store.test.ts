@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test"
 import { createRoot, createSignal } from "solid-js"
 import type { FileNode } from "@opencode-ai/sdk/v2"
-import { createFileTreeStore, sharedListGateCount, type TreeSnapshot } from "./tree-store"
+import { createFileTreeStore, type TreeSnapshot } from "./tree-store"
 
 const fs: Record<string, { name: string; type: "file" | "directory" }[]> = {
   "": [
@@ -63,13 +63,43 @@ function makeStore(opts?: { cache?: { maxScopes?: number; maxNodes?: number; max
 }
 
 describe("file tree store search + expand/collapse helpers", () => {
+  test("warm snapshot is bounded, visible immediately, and never considered authoritative", async () => {
+    const { store } = makeStore()
+    await store.listDir("")
+    store.expandDir("src", { list: false })
+    await store.listDir("src")
+    const warm = store.warmSnapshot(2, 8)
+    expect(warm.nodeCount).toBeLessThanOrEqual(2)
+    expect(warm.dir[""]?.loaded).toBe(false)
+
+    const seeded = createRoot(() =>
+      createFileTreeStore({
+        scope: () => "/seeded",
+        normalizeDir: (input) => input,
+        list: async () => [],
+        onError: () => {},
+        cache: { store: new Map() },
+      }),
+    )
+    expect(seeded.seedWarmSnapshot(warm)).toBe(true)
+    expect(seeded.children("").length).toBeGreaterThan(0)
+    expect(seeded.isLoaded("")).toBe(false)
+  })
+
+  test("warm snapshot never overwrites an authoritative root response", async () => {
+    const { store } = makeStore()
+    const warm = store.warmSnapshot()
+    await store.listDir("")
+    expect(store.seedWarmSnapshot(warm)).toBe(false)
+    expect(store.children("").map((node) => node.path)).toEqual(["src", "package.json"])
+  })
+
   test("queue overflow preserves cached children instead of applying an empty response", async () => {
     let blocked = false
     let release!: () => void
     const barrier = new Promise<void>((resolve) => { release = resolve })
     const store = createRoot(() => createFileTreeStore({
       scope: () => "/overflow",
-      schedulerKey: () => "overflow-regression",
       normalizeDir: (input) => input,
       list: async () => {
         if (blocked) await barrier
@@ -150,7 +180,6 @@ describe("file tree store search + expand/collapse helpers", () => {
     const store = createRoot(() =>
       createFileTreeStore({
         scope: () => "/node-version",
-        schedulerKey: () => "node-version-regression",
         normalizeDir: (input) => input,
         list: async () => [
           { path: "same.ts", name: "same.ts", absolute: "/node-version/same.ts", type: "file", ignored: false },
@@ -375,7 +404,6 @@ describe("per-project LRU tree cache", () => {
     const store = createRoot(() =>
       createFileTreeStore({
         scope: () => "/idle",
-        schedulerKey: () => "idle-no-prewarm",
         normalizeDir: (input) => input,
         list: async () => {
           calls++
@@ -467,7 +495,6 @@ describe("per-project LRU tree cache", () => {
     const store = createRoot(() =>
       createFileTreeStore({
         scope: () => "/truncate",
-        schedulerKey: () => "truncate-regression",
         normalizeDir: (input) => input,
         // Slow enough that queued requests actually accumulate: with 4 running at
     // once, a synchronous burst of 1100 leaves well past the 1024 cap waiting
@@ -525,7 +552,6 @@ describe("per-project LRU tree cache", () => {
     const store = createRoot(() =>
       createFileTreeStore({
         scope: () => "/sentinel",
-        schedulerKey: () => "sentinel-regression",
         normalizeDir: (input) => input,
         list: async (dir: string) => {
           if (hold) await barrier
@@ -584,7 +610,6 @@ describe("per-project LRU tree cache", () => {
     const store = createRoot(() =>
       createFileTreeStore({
         scope: () => "/wide",
-        schedulerKey: () => "wide-regression",
         normalizeDir: (input: string) => input,
         list: (dir: string) => Promise.resolve(wide[dir] ?? []),
         onError: () => {},
@@ -604,52 +629,6 @@ describe("per-project LRU tree cache", () => {
     expect(store.dirState("tiny0")?.loaded).toBe(true)
     expect(store.dirState("tiny0")?.children).toEqual(["tiny0/only.ts"])
     store.dispose()
-  })
-
-  test("bounded scheduler gate map: many sidecar URLs do not grow the map without bound", async () => {
-    // Keys are sidecar URLs, so cycling sidecars used to accumulate forever.
-    // The old eviction only fired when it found a gate with `active === 0 &&
-    // queue.length === 0`; if every gate held work it found nothing and the map
-    // grew unbounded -- exactly under load. This asserts the invariant that
-    // actually matters: the map never exceeds its intended bound.
-    //
-    // NOTE ON WHAT THIS DOES AND DOES NOT PROVE: it asserts the bound holds
-    // while every gate is busy, which is the case the old code could not
-    // handle. I could not construct a runtime-observable difference between
-    // "evicted" and "retained" for a busy gate (an evicted gate's in-flight
-    // jobs keep running against the object they closed over), so this is a
-    // direct invariant assertion rather than a behavioural repro.
-    // Keys are sidecar URLs, so cycling sidecars used to accumulate forever.
-    // The old eviction only fired when it found a gate with `active === 0 &&
-    // queue.length === 0`; if every gate held work it found nothing and the map
-    // grew unbounded -- exactly under load.
-    let release!: () => void
-    const barrier = new Promise<void>((resolve) => { release = resolve })
-    const stores = Array.from({ length: 60 }, (_, index) =>
-      createRoot(() =>
-        createFileTreeStore({
-          scope: () => `/gate-${index}`,
-          // A distinct key per store, as distinct sidecar URLs would produce.
-          schedulerKey: () => `http://sidecar-${index}.local`,
-          normalizeDir: (input: string) => input,
-          // Each gate is left holding ACTIVE work, which is the case the old
-          // eviction could not handle.
-          list: async () => {
-            await barrier
-            return []
-          },
-          onError: () => {},
-          cache: { store: new Map<string, TreeSnapshot>() },
-        }),
-      ),
-    )
-    for (const store of stores) void store.listDir("")
-
-    expect(sharedListGateCount()).toBeLessThanOrEqual(32)
-
-    release()
-    for (const store of stores) store.dispose()
-    await Promise.all([])
   })
 
   test("persist() saves the current scope so a fresh store for the same scope seeds warm", async () => {

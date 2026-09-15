@@ -1,4 +1,4 @@
-import { createSignal, onCleanup, Show } from "solid-js"
+import { createSignal, lazy, onCleanup, Show, Suspense } from "solid-js"
 import { createStore } from "solid-js/store"
 import { debounce } from "@solid-primitives/scheduled"
 import { ResizeHandle, type ResizeHandlePairSide } from "@opencode-ai/ui/resize-handle"
@@ -10,7 +10,7 @@ import { useLanguage } from "@/context/language"
 import { showToast } from "@/utils/toast"
 import { ProjectExplorerTree, type ProjectExplorerTreeHandle } from "@/components/project-explorer-tree"
 import type { Kind } from "@/components/file-tree"
-import { ProjectExplorerEditorPane, type ProjectExplorerEditorPaneHandle } from "./project-explorer-editor-pane"
+import type { ProjectExplorerEditorPaneHandle } from "./project-explorer-editor-pane"
 import { notImplementedFileOpsPort, FileOpsNotImplementedError, type FileOpsPort } from "@/utils/file-ops-port"
 import { createProjectExplorerFavorites } from "@/utils/project-explorer-favorites"
 import {
@@ -20,6 +20,10 @@ import {
   PROJECT_EXPLORER_TREE_WIDTH_MIN,
   type ProjectExplorerPanelState,
 } from "./project-explorer-panel-state"
+
+const ProjectExplorerEditorPane = lazy(() =>
+  import("./project-explorer-editor-pane").then((m) => ({ default: m.ProjectExplorerEditorPane })),
+)
 
 /**
  * ProjectExplorerPanel — the left-docked project tree + editor pane.
@@ -67,6 +71,7 @@ export function ProjectExplorerPanel(props: {
 
   let treeHandle: ProjectExplorerTreeHandle | undefined
   let editorHandle: ProjectExplorerEditorPaneHandle | undefined
+  let pendingEditorPath: string | undefined
 
   const notImplementedToast = (error: unknown) => {
     if (!(error instanceof FileOpsNotImplementedError)) {
@@ -129,8 +134,19 @@ export function ProjectExplorerPanel(props: {
   })
 
   const openFile = (path: string) => {
+    pendingEditorPath = path
     props.state.openEditor()
-    void editorHandle?.openFile(path)
+    if (!editorHandle) return
+    pendingEditorPath = undefined
+    void editorHandle.openFile(path)
+  }
+
+  const bindEditorHandle = (handle: ProjectExplorerEditorPaneHandle) => {
+    editorHandle = handle
+    const path = pendingEditorPath
+    if (!path) return
+    pendingEditorPath = undefined
+    void handle.openFile(path)
   }
 
   const addToChat = (path: string) => {
@@ -355,20 +371,28 @@ export function ProjectExplorerPanel(props: {
           class="relative flex h-full min-h-0 shrink-0 flex-row"
           style={{ width: `${props.state.editorWidth()}px` }}
         >
-          <ProjectExplorerEditorPane
-            fileOps={fileOps()}
-            onCloseAll={props.state.closeEditor}
-            tree={{
-              reveal: (path) => treeHandle?.reveal(path),
-              startCreate: (parentDir, kind) => treeHandle?.startCreate(parentDir, kind),
-              startRename: (path) => treeHandle?.startRename(path),
-              startDelete: (path) => treeHandle?.startDelete(path),
-            }}
-            onAddToChat={(path) => addToChat(path)}
-            isFavorite={(path) => favorites.isFavorite(path)}
-            onToggleFavorite={(path) => favorites.toggle(path)}
-            ref={(handle) => (editorHandle = handle)}
-          />
+          <Suspense
+            fallback={
+              <div class="flex min-h-0 flex-1 items-center justify-center text-11-regular text-v2-text-text-faint">
+                {language.t("common.loading")}
+              </div>
+            }
+          >
+            <ProjectExplorerEditorPane
+              fileOps={fileOps()}
+              onCloseAll={props.state.closeEditor}
+              tree={{
+                reveal: (path) => treeHandle?.reveal(path),
+                startCreate: (parentDir, kind) => treeHandle?.startCreate(parentDir, kind),
+                startRename: (path) => treeHandle?.startRename(path),
+                startDelete: (path) => treeHandle?.startDelete(path),
+              }}
+              onAddToChat={(path) => addToChat(path)}
+              isFavorite={(path) => favorites.isFavorite(path)}
+              onToggleFavorite={(path) => favorites.toggle(path)}
+              ref={bindEditorHandle}
+            />
+          </Suspense>
           {/* Divider on the editor's right edge: editor|session. */}
           <Show when={props.editorPair}>
             {(pair) => (

@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, Show, untrack, type Accessor } from "solid-js"
+import { createEffect, createMemo, createSignal, For, lazy, onCleanup, Show, Suspense, untrack, type Accessor } from "solid-js"
 import { createVirtualizer, defaultRangeExtractor } from "@tanstack/solid-virtual"
 import type { FileNode } from "@opencode-ai/sdk/v2"
 import { FileIcon } from "@opencode-ai/ui/file-icon"
@@ -16,7 +16,7 @@ import {
   type FileTreeV2Row,
 } from "@/components/file-tree-v2-model"
 import type { ProjectExplorerFavorites } from "@/utils/project-explorer-favorites"
-import { ProjectExplorerTreeContextMenu } from "@/components/project-explorer-tree-context-menu"
+import type { ProjectExplorerNodeActions } from "@/components/project-explorer-tree-context-menu"
 import { createProjectExplorerSearchExpansion } from "@/components/project-explorer-search"
 import {
   startProjectExplorerSearch,
@@ -29,7 +29,12 @@ import {
   formatLineCount,
   formatRelativeTime,
 } from "@/components/prompt-input/at-row-meta"
+import { startupMark, startupTransportDiagnostic } from "@/utils/startup-perf"
 import "./project-explorer-tree.css"
+
+const ProjectExplorerTreeContextMenu = lazy(() =>
+  import("@/components/project-explorer-tree-context-menu").then((m) => ({ default: m.ProjectExplorerTreeContextMenu })),
+)
 
 type PendingCreate = { parentDir: string; kind: "file" | "directory" }
 
@@ -227,6 +232,14 @@ export function ProjectExplorerTree(props: {
     const state = file.tree.state("")
     if (state?.loaded || state?.loading) return
     untrack(() => void file.tree.list(""))
+  })
+
+  createEffect(() => {
+    const state = file.tree.state("")
+    if (!state?.loaded) return
+    const rows = file.tree.children("").length
+    startupMark("project-explorer.first-root", { rows })
+    startupTransportDiagnostic("project-explorer.first-root.transport")
   })
 
   const expanded = (path: string) => file.tree.state(path)?.expanded ?? false
@@ -470,6 +483,12 @@ export function ProjectExplorerTree(props: {
   let pendingSinglePath: string | null = null
   const [isDragging, setIsDragging] = createSignal(false)
   const [dragOverPath, setDragOverPath] = createSignal<string | undefined>(undefined)
+  const [contextMenuRequest, setContextMenuRequest] = createSignal<{
+    x: number
+    y: number
+    node: FileTreeV2Node
+    actions: ProjectExplorerNodeActions
+  }>()
 
   // Plain clicks on an already-multi-selected row must stay multi through
   // mousedown so a drag can carry the whole set. Collapse to single happens
@@ -490,12 +509,15 @@ export function ProjectExplorerTree(props: {
     // Collapse is handled on click so we keep pending alive through mouseUp
     // until click fires; drag start will clear it.
   }
-  const handleRowContextMenu = (path: string) => {
+  const handleRowContextMenu = (event: MouseEvent, node: FileTreeV2Node, actions: ProjectExplorerNodeActions) => {
+    const path = node.path
     if (path.startsWith("__creating__:")) return
     // If right-clicked row is already in a multi-selection, keep it (bulk menu).
     // Otherwise make it the sole selection — mirrors Finder / VS Code.
     if (!isSelected(path)) selectSingle(path)
     else setFocused(path)
+    event.preventDefault()
+    setContextMenuRequest({ x: event.clientX, y: event.clientY, node, actions })
   }
   const handleRowDragStart = (event: DragEvent, node: FileTreeV2Node) => {
     const path = node.path
@@ -889,7 +911,6 @@ export function ProjectExplorerTree(props: {
                             }
                             handleRowClick(e, row().node.path)
                           }}
-                          onContextMenu={() => handleRowContextMenu(row().node.path)}
                           onDragStart={(e: DragEvent) => handleRowDragStart(e, row().node)}
                           onDragEnd={handleRowDragEnd}
                           onDragOver={(e: DragEvent) =>
@@ -937,47 +958,57 @@ export function ProjectExplorerTree(props: {
                           : node.path.includes("/")
                             ? node.path.slice(0, node.path.lastIndexOf("/"))
                             : ""
+                      const actions: ProjectExplorerNodeActions = {
+                        favorited: node.originalPath ? props.favorites.isFavorite(node.originalPath) : false,
+                        onOpen: () => openRow(node),
+                        onMention: () => {
+                          if (isSelected(node.path) && selectedSet().size > 1) {
+                            const mentions: string[] = []
+                            for (const p of selectedSet()) {
+                              const n = rowByKey().get(p)?.node
+                              if (n) mentions.push(n.originalPath)
+                            }
+                            dispatchInChunks(mentions, (path) => props.onMention(path))
+                          } else props.onMention(node.originalPath)
+                        },
+                        onFavoriteToggle: () => props.favorites.toggle(node.originalPath),
+                        onRename: () => setRenaming(node.path),
+                        onDelete: () => {
+                          if (isSelected(node.path) && selectedSet().size > 1) setDeleting("__bulk__")
+                          else setDeleting(node.path)
+                        },
+                        onNewFile: () => {
+                          if (node.type === "directory") file.tree.expand(node.originalPath)
+                          setCreating({ parentDir: parentDirFor, kind: "file" })
+                        },
+                        onNewFolder: () => {
+                          if (node.type === "directory") file.tree.expand(node.originalPath)
+                          setCreating({ parentDir: parentDirFor, kind: "directory" })
+                        },
+                      }
                       return (
-                        <ProjectExplorerTreeContextMenu
-                          node={node}
-                          actions={{
-                            favorited: node.originalPath ? props.favorites.isFavorite(node.originalPath) : false,
-                            onOpen: () => openRow(node),
-                            onMention: () => {
-                              // Bulk: if node is part of multi-selection, mention all
-                              if (isSelected(node.path) && selectedSet().size > 1) {
-                                const mentions: string[] = []
-                                for (const p of selectedSet()) {
-                                  const n = rowByKey().get(p)?.node
-                                  if (n) mentions.push(n.originalPath)
-                                }
-                                dispatchInChunks(mentions, (path) => props.onMention(path))
-                              } else props.onMention(node.originalPath)
-                            },
-                            onFavoriteToggle: () => props.favorites.toggle(node.originalPath),
-                            onRename: () => setRenaming(node.path),
-                            onDelete: () => {
-                              if (isSelected(node.path) && selectedSet().size > 1) setDeleting("__bulk__")
-                              else setDeleting(node.path)
-                            },
-                            onNewFile: () => {
-                              if (node.type === "directory") file.tree.expand(node.originalPath)
-                              setCreating({ parentDir: parentDirFor, kind: "file" })
-                            },
-                            onNewFolder: () => {
-                              if (node.type === "directory") file.tree.expand(node.originalPath)
-                              setCreating({ parentDir: parentDirFor, kind: "directory" })
-                            },
-                          }}
-                        >
+                        <div class="block w-full min-w-0" onContextMenu={(event) => handleRowContextMenu(event, node, actions)}>
                           {rowElement}
-                        </ProjectExplorerTreeContextMenu>
+                        </div>
                       )
                     }}
                   </Show>
                 </div>
               )}
             </For>
+            <Show when={contextMenuRequest()} keyed>
+              {(request) => (
+                <Suspense>
+                  <ProjectExplorerTreeContextMenu
+                    request={request}
+                    open
+                    onOpenChange={(open) => {
+                      if (!open) setContextMenuRequest(undefined)
+                    }}
+                  />
+                </Suspense>
+              )}
+            </Show>
             <Show when={loading() && visibleRows().length > 0 && !searching()}>
               <div class="pointer-events-none sticky bottom-0 flex items-center gap-2 border-t border-v2-border-border-base bg-v2-background-bg-base/80 px-3 py-1.5 text-11-regular text-v2-text-text-faint backdrop-blur">
                 <Spinner class="size-3 shrink-0" />
