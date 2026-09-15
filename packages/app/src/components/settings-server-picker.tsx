@@ -4,7 +4,6 @@ import { Icon } from "@opencode-ai/ui/icon"
 import { QueryClientProvider } from "@tanstack/solid-query"
 import { createMemo, For, type ParentProps, Show } from "solid-js"
 import { ServerHealthIndicator, ServerRow } from "@/components/server/server-row"
-import { ModelsProvider } from "@/context/models"
 import { ServerConnection } from "@/context/server"
 import { ServerSDKProvider } from "@/context/server-sdk"
 import { ServerSyncProvider } from "@/context/server-sync"
@@ -32,7 +31,7 @@ function SettingsServerDataProviders(props: ParentProps<{ server: ServerConnecti
     <QueryClientProvider client={serverCtx().queryClient}>
       <ServerSDKProvider server={() => props.server}>
         <ServerSyncProvider>
-          <ModelsProvider>{props.children}</ModelsProvider>
+          {props.children}
         </ServerSyncProvider>
       </ServerSDKProvider>
     </QueryClientProvider>

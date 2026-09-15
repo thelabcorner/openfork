@@ -7,9 +7,8 @@ import { IconButton } from "@opencode-ai/ui/icon-button"
 import { List } from "@opencode-ai/ui/list"
 import { TextField } from "@opencode-ai/ui/text-field"
 import { useMutation } from "@tanstack/solid-query"
-import { showToast } from "@/utils/toast"
 import { useNavigate } from "@solidjs/router"
-import { createEffect, createMemo, createResource, Show } from "solid-js"
+import { createEffect, createMemo, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { ServerHealthIndicator, ServerRow } from "@/components/server/server-row"
 import { useGlobal } from "@/context/global"
@@ -20,6 +19,7 @@ import { detectServerProtocol } from "@/utils/server-protocol"
 import { type ServerHealth, useCheckServerHealth } from "@/utils/server-health"
 import { useSettings } from "@/context/settings"
 import { useTabs } from "@/context/tabs"
+import { useServerManagementState } from "@/components/server-management-state"
 
 const DEFAULT_USERNAME = "opencode"
 
@@ -38,44 +38,6 @@ interface ServerFormProps {
   onPasswordChange: (value: string) => void
   onSubmit: () => void
   onBack: () => void
-}
-
-function showRequestError(language: ReturnType<typeof useLanguage>, err: unknown) {
-  showToast({
-    variant: "error",
-    title: language.t("common.requestFailed"),
-    description: err instanceof Error ? err.message : String(err),
-  })
-}
-
-function useDefaultServer() {
-  const language = useLanguage()
-  const platform = usePlatform()
-  const [defaultKey, defaultUrlActions] = createResource(
-    async () => {
-      try {
-        const key = await platform.getDefaultServer?.()
-        if (!key) return null
-        return key
-      } catch (err) {
-        showRequestError(language, err)
-        return null
-      }
-    },
-    { initialValue: null },
-  )
-
-  const canDefault = createMemo(() => !!platform.getDefaultServer && !!platform.setDefaultServer)
-  const setDefault = async (key: ServerConnection.Key | null) => {
-    try {
-      await platform.setDefaultServer?.(key)
-      defaultUrlActions.mutate(key)
-    } catch (err) {
-      showRequestError(language, err)
-    }
-  }
-
-  return { defaultKey: () => defaultKey.latest, canDefault, setDefault }
 }
 
 function useServerPreview() {
@@ -197,7 +159,8 @@ export function useServerManagementController(options: { onSelect?: () => void; 
   const global = useGlobal()
   const platform = usePlatform()
   const language = useLanguage()
-  const { defaultKey, canDefault, setDefault } = useDefaultServer()
+  const serverManagement = useServerManagementState()
+  const { defaultKey, canDefault, setDefault } = serverManagement
   const { previewStatus } = useServerPreview()
   const checkServerHealth = useCheckServerHealth()
   const [store, setStore] = createStore({
@@ -527,19 +490,6 @@ export function useServerManagementController(options: { onSelect?: () => void; 
     resetEdit()
   })
 
-  async function handleRemove(key: ServerConnection.Key) {
-    try {
-      if (key.startsWith("wsl:")) await platform.wslServers?.removeServer(key)
-      tabs.removeServer(key)
-      server.remove(key)
-      if ((await platform.getDefaultServer?.()) === key) {
-        await setDefault(null)
-      }
-    } catch (err) {
-      showRequestError(language, err)
-    }
-  }
-
   return {
     defaultKey,
     canDefault,
@@ -562,7 +512,7 @@ export function useServerManagementController(options: { onSelect?: () => void; 
     startEdit,
     resetForm,
     submitForm,
-    handleRemove,
+    handleRemove: serverManagement.remove,
     handleFormChange: () => (isAddMode() ? handleAddChange : handleEditChange),
     handleFormNameChange: () => (isAddMode() ? handleAddNameChange : handleEditNameChange),
     handleFormUsernameChange: () => (isAddMode() ? handleAddUsernameChange : handleEditUsernameChange),
