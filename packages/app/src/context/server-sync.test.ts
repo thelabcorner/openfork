@@ -9,13 +9,75 @@ import type {
 } from "@opencode-ai/client/promise"
 import { QueryClient } from "@tanstack/solid-query"
 import { canDisposeDirectory, pickDirectoriesToEvict } from "./global-sync/eviction"
-import { estimateRootSessionTotal, loadRootSessions } from "./global-sync/session-load"
-import { loadActiveSessionsQuery, loadMcpQuery, loadMcpResourcesQuery, seedActiveSessionStatuses } from "./server-sync"
+import {
+  estimateRootSessionTotal,
+  loadRootSessions,
+  loadRootSessionsFast,
+  rootSessionFastPathUnavailable,
+} from "./global-sync/session-load"
+import {
+  createActiveSessionInfoWarmup,
+  createDirectoryBootstrapGate,
+  loadActiveSessionsQuery,
+  loadMcpQuery,
+  loadMcpResourcesQuery,
+  seedActiveSessionStatuses,
+} from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
 
 type McpApi = ServerApi["mcp"]
+
+const deferred = <T,>() => {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((next, fail) => {
+    resolve = next
+    reject = fail
+  })
+  return { promise, resolve, reject }
+}
+
+describe("directory bootstrap gate", () => {
+  test("serializes directory waves and releases the next wave after completion", async () => {
+    const gate = createDirectoryBootstrapGate()
+    const hold = deferred<void>()
+    const order: string[] = []
+
+    const first = gate.run(async () => {
+      order.push("a:start")
+      await hold.promise
+      order.push("a:end")
+    })
+    const second = gate.run(async () => {
+      order.push("b:start")
+      order.push("b:end")
+    })
+
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(order).toEqual(["a:start"])
+    expect(gate.snapshot()).toEqual({ active: 1, queued: 1, maxActive: 1 })
+
+    hold.resolve()
+    await Promise.all([first, second])
+    expect(order).toEqual(["a:start", "a:end", "b:start", "b:end"])
+    expect(gate.snapshot()).toEqual({ active: 0, queued: 0, maxActive: 1 })
+  })
+
+  test("a failed wave cannot poison later directory bootstrap work", async () => {
+    const gate = createDirectoryBootstrapGate()
+    const first = gate.run(async () => {
+      throw new Error("expected")
+    })
+    const second = gate.run(async () => "next")
+
+    await expect(first).rejects.toThrow("expected")
+    await expect(second).resolves.toBe("next")
+    expect(gate.snapshot()).toEqual({ active: 0, queued: 0, maxActive: 1 })
+  })
+})
 
 describe("MCP queries", () => {
   test("loads current servers for the requested location", async () => {
@@ -66,6 +128,42 @@ describe("MCP queries", () => {
 })
 
 describe("active session query", () => {
+  test("serializes background active-session info hydration", async () => {
+    const first = deferred<void>()
+    const calls: string[] = []
+    const warmup = createActiveSessionInfoWarmup(async (sessionID) => {
+      calls.push(`${sessionID}:start`)
+      if (sessionID === "a") await first.promise
+      calls.push(`${sessionID}:end`)
+    })
+
+    const done = warmup.push(["a", "b", "a"])
+
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(calls).toEqual(["a:start"])
+    expect(warmup.pending()).toBe(2)
+
+    first.resolve()
+    await done
+
+    expect(calls).toEqual(["a:start", "a:end", "b:start", "b:end"])
+    expect(warmup.pending()).toBe(0)
+  })
+
+  test("continues active-session info hydration after an error", async () => {
+    const calls: string[] = []
+    const warmup = createActiveSessionInfoWarmup(async (sessionID) => {
+      calls.push(sessionID)
+      if (sessionID === "a") throw new Error("expected")
+    })
+
+    await warmup.push(["a", "b"])
+
+    expect(calls).toEqual(["a", "b"])
+    expect(warmup.pending()).toBe(0)
+  })
+
   test("loads active sessions immediately and once per server cache", async () => {
     let calls = 0
     const queryClient = new QueryClient()
@@ -157,6 +255,34 @@ describe("loadRootSessions", () => {
         limit: 25,
       }),
     ).rejects.toThrow("failed")
+  })
+
+  test("uses the global bootstrap-free root-session surface", async () => {
+    const calls: unknown[] = []
+    const result = await loadRootSessionsFast({
+      client: {
+        global: {
+          sessionRoots: async (query: unknown) => {
+            calls.push(query)
+            return { data: [sessionInfo("session-fast")] }
+          },
+        },
+      } as unknown as OpencodeClient,
+      directory: "dir",
+      limit: 50,
+    })
+
+    expect(calls).toEqual([{ directory: "dir", limit: "50" }])
+    expect(result.data).toEqual([expect.objectContaining({ id: "session-fast", directory: "dir" })])
+    expect(result.limited).toBe(true)
+  })
+
+  test("only treats missing-method responses as fast-path compatibility misses", () => {
+    expect(rootSessionFastPathUnavailable({ status: 404 })).toBe(true)
+    expect(rootSessionFastPathUnavailable({ response: { status: 405 } })).toBe(true)
+    expect(rootSessionFastPathUnavailable(new Error("missing", { cause: { status: 404 } }))).toBe(true)
+    expect(rootSessionFastPathUnavailable({ status: 500 })).toBe(false)
+    expect(rootSessionFastPathUnavailable(new Error("network"))).toBe(false)
   })
 })
 

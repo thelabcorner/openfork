@@ -19,7 +19,11 @@ import { message as cleanMessage } from "@/utils/diffs"
 import { sessionNotFoundError } from "@/utils/server-errors"
 import { rootSession } from "@/utils/session-route"
 import { normalizeSessionInfo } from "@/utils/session"
-import { createRequestGate } from "@/utils/request-gate"
+import {
+  createServerRequestScheduler,
+  type ServerRequestPriority,
+  type ServerRequestScheduler,
+} from "@/utils/server-request-scheduler"
 import {
   compareMessages,
   messageKey,
@@ -217,7 +221,12 @@ function reconcileFetched<T extends { id: string }>(
   return options.compare ? items.sort(options.compare) : items
 }
 
-type ServerSessionOptions = { retry?: typeof retry; protocol?: Promise<"v1" | "v2"> }
+type ServerSessionOptions = {
+  retry?: typeof retry
+  protocol?: Promise<"v1" | "v2">
+  requests?: ServerRequestScheduler
+  onStreamInterestChanged?: (sessions: readonly string[]) => void
+}
 
 export function createServerSession(
   client: OpencodeClient,
@@ -227,6 +236,17 @@ export function createServerSession(
 ) {
   const sessionApi = messageApi ? (sessionApiOrOptions as SessionApi) : undefined
   const options = messageApi ? currentOptions : (sessionApiOrOptions as ServerSessionOptions | undefined)
+  const requestScheduler =
+    options?.requests ?? createServerRequestScheduler({ concurrency: 4, backgroundConcurrency: 2, criticalReserve: 1 })
+  const requestLane = (sessionID: string) => `session:${sessionID}`
+  const scheduleRequest = <T>(
+    sessionID: string,
+    priority: ServerRequestPriority,
+    kind: string,
+    run: () => Promise<T>,
+  ) => requestScheduler.schedule(priority, run, { key: requestLane(sessionID), kind })
+  const promoteSessionRequests = (sessionID: string, priority: ServerRequestPriority) =>
+    requestScheduler.promote(requestLane(sessionID), priority)
   const [data, setData] = createStore({
     info: {} as Record<string, Session | undefined>,
     session_status: {} as Record<string, SessionStatus>,
@@ -252,10 +272,6 @@ export function createServerSession(
   })
   const requests = new Map<string, Promise<Session>>()
   const inflight = new Map<string, Promise<void>>()
-  // Bounds how many distinct sessions' sync() can be actually fetching at
-  // once, so spam-switching through many tabs doesn't fire an unbounded
-  // burst of concurrent request pairs at the server. See request-gate.ts.
-  const gated = createRequestGate(4)
   const inflightTodo = new Map<string, Promise<void>>()
   const optimistic = new Map<string, Map<string, OptimisticItem>>()
   const v2 = createV2SessionReducer()
@@ -270,6 +286,7 @@ export function createServerSession(
   // resolves that background status (see `prefetch` and `release`/`resume`).
   const activated = new Set<string>()
   const stale = new Set<string>()
+  const publishStreamInterest = () => options?.onStreamInterestChanged?.([...activated].sort())
   const deleteMessageParts = (
     cache: { part: Record<string, Part[] | undefined>; part_text_accum_delta: Record<string, string | undefined> },
     messageID: string,
@@ -360,18 +377,24 @@ export function createServerSession(
     return session
   }
 
-  const resolve = (sessionID: string, options?: { force?: boolean }) => {
+  const resolve = (sessionID: string, options?: { force?: boolean; priority?: ServerRequestPriority }) => {
+    const priority = options?.priority ?? "interactive"
     const cached = data.info[sessionID]
     if (cached && !options?.force) return Promise.resolve(cached)
     const pending = requests.get(sessionID)
-    if (pending) return pending
+    if (pending) {
+      promoteSessionRequests(sessionID, priority)
+      return pending
+    }
     const active = generation(sessionID)
-    const request = sessionApi
-      ? sessionApi.get({ sessionID }).then(normalizeSessionInfo)
-      : client.session.get({ sessionID }).then((result) => {
-          if (!result.data) throw sessionNotFoundError(sessionID)
-          return result.data
-        })
+    const request = scheduleRequest(sessionID, priority, "session-info", () =>
+      sessionApi
+        ? sessionApi.get({ sessionID }).then(normalizeSessionInfo)
+        : client.session.get({ sessionID }).then((result) => {
+            if (!result.data) throw sessionNotFoundError(sessionID)
+            return result.data
+          }),
+    )
     const resolved = request.then((result) => {
       if (generations.get(sessionID) !== active) return result
       return remember(result)
@@ -608,12 +631,33 @@ export function createServerSession(
       }),
     )
 
-  const fetchMessages = async (sessionID: string, limit: number, before?: string, onAttempt?: () => void) => {
+  const setSessionStatus = (sessionID: string, status: SessionStatus) => {
+    if (status.type === "idle") {
+      setData(
+        "session_status",
+        produce((draft) => {
+          delete draft[sessionID]
+        }),
+      )
+      return
+    }
+    setData("session_status", sessionID, reconcile(status))
+  }
+
+  const fetchMessages = async (
+    sessionID: string,
+    limit: number,
+    before?: string,
+    onAttempt?: () => void,
+    priority: ServerRequestPriority = "interactive",
+  ) => {
     if (messageApi && (await options?.protocol) !== "v1") {
       const request = (cursor?: string) =>
         (options?.retry ?? retry)(() => {
           onAttempt?.()
-          return messageApi.list(cursor ? { sessionID, limit, cursor } : { sessionID, limit, order: "desc" })
+          return scheduleRequest(sessionID, priority, "session-messages", () =>
+            messageApi.list(cursor ? { sessionID, limit, cursor } : { sessionID, limit, order: "desc" }),
+          )
         })
       const first = await request(before)
       const pages = [first]
@@ -639,7 +683,9 @@ export function createServerSession(
     }
     const response = await (options?.retry ?? retry)(() => {
       onAttempt?.()
-      return client.session.messages({ sessionID, limit, before })
+      return scheduleRequest(sessionID, priority, "session-messages", () =>
+        client.session.messages({ sessionID, limit, before }),
+      )
     })
     const items = (response.data ?? []).filter((item) => !!item?.info?.id)
     return {
@@ -655,11 +701,16 @@ export function createServerSession(
     }
   }
 
-  const fetchMessage = async (sessionID: string, messageID: string, onAttempt?: () => void) => {
+  const fetchMessage = async (
+    sessionID: string,
+    messageID: string,
+    onAttempt?: () => void,
+    priority: ServerRequestPriority = "interactive",
+  ) => {
     if (sessionApi && (await options?.protocol) !== "v1") {
       const response = await (options?.retry ?? retry)(() => {
         onAttempt?.()
-        return sessionApi.message({ sessionID, messageID })
+        return scheduleRequest(sessionID, priority, "session-message", () => sessionApi.message({ sessionID, messageID }))
       })
       const normalized = normalizeSessionMessages(sessionID, [response])
       const message = normalized.messages[0]
@@ -668,7 +719,7 @@ export function createServerSession(
     }
     const response = await (options?.retry ?? retry)(() => {
       onAttempt?.()
-      return client.session.message({ sessionID, messageID })
+      return scheduleRequest(sessionID, priority, "session-message", () => client.session.message({ sessionID, messageID }))
     })
     if (!response.data?.info?.id) throw new Error(`Message not found: ${messageID}`)
     return {
@@ -821,7 +872,13 @@ export function createServerSession(
     })
   }
 
-  const loadMessages = async (sessionID: string, limit: number, before?: string, mode?: "replace" | "prepend") => {
+  const loadMessages = async (
+    sessionID: string,
+    limit: number,
+    before?: string,
+    mode?: "replace" | "prepend",
+    priority: ServerRequestPriority = "interactive",
+  ) => {
     if (meta.loading[sessionID]) return
     const active = generation(sessionID)
     const load: MessageLoadState = {
@@ -841,7 +898,7 @@ export function createServerSession(
     setMeta("loading", sessionID, true)
     let applied = false
     try {
-      const page = await fetchMessages(sessionID, limit, before, () => resetMessageLoad(sessionID, load))
+      const page = await fetchMessages(sessionID, limit, before, () => resetMessageLoad(sessionID, load), priority)
       const first = page.session.reduce<Message | undefined>(
         (oldest, message) => (!oldest || compareMessages(message, oldest) < 0 ? message : oldest),
         undefined,
@@ -868,8 +925,11 @@ export function createServerSession(
           ),
         ]
         const fetchedParents = await mapAsyncLimited(parentIDs, (parentID) =>
-          fetchMessage(sessionID, parentID, () =>
-            resetMessageLoad(sessionID, load, messageLoadBaseline(load, parentID)),
+          fetchMessage(
+            sessionID,
+            parentID,
+            () => resetMessageLoad(sessionID, load, messageLoadBaseline(load, parentID)),
+            priority,
           ).catch((error) => {
             const cause = error instanceof Error && typeof error.cause === "object" ? error.cause : undefined
             if (cause && "status" in cause && cause.status === 404) {
@@ -927,7 +987,7 @@ export function createServerSession(
 
   const sync = async (
     sessionID: string,
-    options?: { force?: boolean; messageLimit?: number; activate?: boolean },
+    options?: { force?: boolean; messageLimit?: number; activate?: boolean; priority?: ServerRequestPriority },
   ) => {
     touch(sessionID)
     // Fetching/hydrating a session is not the same lifecycle fact as showing
@@ -946,6 +1006,7 @@ export function createServerSession(
       resume(sessionID)
     }
     const foreground = options?.activate !== false
+    const priority = options?.priority ?? (foreground ? "critical" : "background")
     let force = options?.force === true
 
     // A foreground repair is stronger than an ordinary cache sync. If another
@@ -956,14 +1017,14 @@ export function createServerSession(
     while (true) {
       const pending = inflight.get(sessionID)
       if (pending) {
+        promoteSessionRequests(sessionID, priority)
         await pending
         if (!foreground || !activated.has(sessionID) || !stale.has(sessionID)) return
         force = true
         continue
       }
 
-      await runInflight(inflight, sessionID, () =>
-        gated(async () => {
+      await runInflight(inflight, sessionID, async () => {
           const repairing = foreground && activated.has(sessionID) && stale.has(sessionID)
           const effectiveForce = force || repairing
           const cached = data.message[sessionID] !== undefined && meta.limit[sessionID] !== undefined
@@ -972,7 +1033,13 @@ export function createServerSession(
           const messagePromise =
             cached && !effectiveForce
               ? Promise.resolve()
-              : loadMessages(sessionID, options?.messageLimit ?? meta.limit[sessionID] ?? initialMessagePageSize)
+              : loadMessages(
+                  sessionID,
+                  options?.messageLimit ?? meta.limit[sessionID] ?? initialMessagePageSize,
+                  undefined,
+                  undefined,
+                  priority,
+                )
 
           if (repairing && messageLoads.has(sessionID) && activated.has(sessionID)) {
             // loadMessages installs its reconciliation state synchronously before
@@ -982,12 +1049,14 @@ export function createServerSession(
             suspended.delete(sessionID)
           }
 
-          await Promise.all([resolve(sessionID, effectiveForce ? { ...options, force: true } : options), messagePromise])
+          await Promise.all([
+            resolve(sessionID, { force: effectiveForce, priority }),
+            messagePromise,
+          ])
 
           if (repairing) stale.delete(sessionID)
           if (activated.has(sessionID) && !stale.has(sessionID)) suspended.delete(sessionID)
-        }),
-      )
+      })
 
       if (!foreground || !activated.has(sessionID) || !stale.has(sessionID)) return
       force = true
@@ -995,10 +1064,11 @@ export function createServerSession(
   }
 
   const release = (sessionID: string) => {
-    activated.delete(sessionID)
+    const changed = activated.delete(sessionID)
     suspended.add(sessionID)
     refreshCacheBytes(sessionID)
     touch(sessionID)
+    if (changed) publishStreamInterest()
   }
 
   // Timeline activity is a local lifecycle fact, not a network-sync fact.
@@ -1008,9 +1078,11 @@ export function createServerSession(
   // events while suspended, so admitting new deltas before hydration can splice
   // them onto the wrong text/tool state. Keep it gated until sync() clears stale.
   const resume = (sessionID: string) => {
+    const changed = !activated.has(sessionID)
     activated.add(sessionID)
     if (stale.has(sessionID)) suspended.add(sessionID)
     else suspended.delete(sessionID)
+    if (changed) publishStreamInterest()
   }
 
   // Called by the SSE reader before it allocates/enqueues a high-frequency
@@ -1051,7 +1123,7 @@ export function createServerSession(
     void sync(sessionID, { force: true, activate: true }).catch(() => {})
   }
 
-  const prefetch = async (sessionID: string, limit: number) => {
+  const prefetchNow = async (sessionID: string, limit: number) => {
     touch(sessionID)
     // Prefetch is explicitly background work. Gate content before waiting for
     // any existing request or starting a new one; otherwise an inactive tab can
@@ -1066,12 +1138,28 @@ export function createServerSession(
       if (!activated.has(sessionID)) refreshCacheBytes(sessionID)
       return
     }
-    await runInflight(inflight, sessionID, () => loadMessages(sessionID, limit))
+    await runInflight(inflight, sessionID, () => loadMessages(sessionID, limit, undefined, undefined, "background"))
     if (!activated.has(sessionID)) {
       suspended.add(sessionID)
       refreshCacheBytes(sessionID)
       touch(sessionID)
     }
+  }
+
+  // One speculative message hydration at a time per server. UI surfaces used
+  // to maintain independent queues (chat metrics, tab hover, legacy sidebar),
+  // which composed into concurrent directory instance initialization despite
+  // the transport scheduler's background cap. Keep this admission rule at the
+  // shared authority instead. Foreground sync() deliberately bypasses this
+  // tail, so navigation/repair can overtake queued warmups.
+  let prefetchTail: Promise<void> = Promise.resolve()
+  const prefetch = (sessionID: string, limit: number) => {
+    const result = prefetchTail.then(() => prefetchNow(sessionID, limit))
+    prefetchTail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
   }
 
   const eventSessionID = (event: { type: string; properties?: unknown }) => {
@@ -1095,6 +1183,13 @@ export function createServerSession(
     )
       return properties.part.sessionID
   }
+
+  const metadataEventRequiresInfoHydration = (type: string) =>
+    type === "session.renamed" ||
+    type === "session.moved" ||
+    type === "session.forked" ||
+    type.startsWith("session.revert.") ||
+    type.startsWith("session.next.revert.")
 
   const projectV2 = (reduction: V2SessionReduction) => {
     reduction.touched.forEach((messageID) => messageLoads.get(reduction.sessionID)?.touchedSource.add(messageID))
@@ -1193,8 +1288,8 @@ export function createServerSession(
 
   const hydrateV2Message = (sessionID: string, messageID: string) => {
     if (!sessionApi) return
-    void sessionApi
-      .message({ sessionID, messageID })
+    const priority: ServerRequestPriority = activated.has(sessionID) ? "critical" : "background"
+    void scheduleRequest(sessionID, priority, "session-message", () => sessionApi.message({ sessionID, messageID }))
       .then((message) => {
         const current = data.session_message[sessionID] ?? []
         const messages = [...current.filter((item) => item.id !== message.id), message].sort(compareMessages)
@@ -1261,15 +1356,15 @@ export function createServerSession(
     //   if (info) remember({ ...info, time: { ...info.time, archived: event.created, updated: event.created } })
     //   evict([sessionID])
     // }
-    if (event.type === "session.execution.started") setData("session_status", sessionID, { type: "busy" })
+    if (event.type === "session.execution.started") setSessionStatus(sessionID, { type: "busy" })
     if (
       event.type === "session.execution.succeeded" ||
       event.type === "session.execution.failed" ||
       event.type === "session.execution.interrupted"
     )
-      setData("session_status", sessionID, { type: "idle" })
+      setSessionStatus(sessionID, { type: "idle" })
     if (event.type === "session.retry.scheduled")
-      setData("session_status", sessionID, {
+      setSessionStatus(sessionID, {
         type: "retry",
         attempt: event.data.attempt,
         message: event.data.error.message,
@@ -1309,13 +1404,7 @@ export function createServerSession(
       if (
         !content &&
         !data.info[eventID] &&
-        event.type !== "session.created" &&
-        event.type !== "session.updated" &&
-        event.type !== "session.deleted" &&
-        // `session.diff` is already a complete ID-keyed snapshot. Resolving the
-        // Session just to retain it turns a passive background diff notification
-        // into an unnecessary HTTP request and can amplify multi-session bursts.
-        event.type !== "session.diff"
+        metadataEventRequiresInfoHydration(event.type)
       )
         void resolve(eventID).catch(() => {})
     }
@@ -1348,7 +1437,7 @@ export function createServerSession(
       }
       case "session.status": {
         const props = event.properties as { sessionID: string; status: SessionStatus }
-        setData("session_status", props.sessionID, reconcile(props.status))
+        setSessionStatus(props.sessionID, props.status)
         return
       }
       case "session.diff": {
@@ -1626,9 +1715,10 @@ export function createServerSession(
     resolve,
     lineage: {
       peek: peekLineage,
-      async resolve(sessionID: string) {
-        const session = await resolve(sessionID)
-        return { session, root: await rootSession(session, resolve) }
+      async resolve(sessionID: string, options?: { priority?: ServerRequestPriority }) {
+        const priority = options?.priority ?? "interactive"
+        const session = await resolve(sessionID, { priority })
+        return { session, root: await rootSession(session, (id) => resolve(id, { priority })) }
       },
     },
     sync,
@@ -1708,7 +1798,7 @@ export function createServerSession(
         setData(produce((draft) => deleteMessageParts(draft, input.messageID)))
       },
     },
-    async todo(sessionID: string, request?: { force?: boolean }) {
+    async todo(sessionID: string, request?: { force?: boolean; priority?: ServerRequestPriority }) {
       touch(sessionID)
       if (data.todo[sessionID] !== undefined && !request?.force) return
       if ((await options?.protocol) === "v2") {
@@ -1717,7 +1807,11 @@ export function createServerSession(
       }
       return runInflight(inflightTodo, sessionID, () => {
         const active = generation(sessionID)
-        return (options?.retry ?? retry)(() => client.session.todo({ sessionID })).then((result) => {
+        return (options?.retry ?? retry)(() =>
+          scheduleRequest(sessionID, request?.priority ?? "interactive", "session-todo", () =>
+            client.session.todo({ sessionID }),
+          ),
+        ).then((result) => {
           if (generations.get(sessionID) !== active) return
           setData("todo", sessionID, reconcile(result.data ?? [], { key: "id" }))
         })
@@ -1733,7 +1827,9 @@ export function createServerSession(
       async loadMore(sessionID: string, count = historyMessagePageSize) {
         touch(sessionID)
         if (meta.loading[sessionID] || meta.complete[sessionID] || !meta.cursor[sessionID]) return
-        await runInflight(inflight, sessionID, () => loadMessages(sessionID, count, meta.cursor[sessionID], "prepend"))
+        await runInflight(inflight, sessionID, () =>
+          loadMessages(sessionID, count, meta.cursor[sessionID], "prepend", "interactive"),
+        )
       },
     },
     evict(sessionID: string) {

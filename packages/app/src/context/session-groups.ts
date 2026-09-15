@@ -1,4 +1,4 @@
-import type { SessionGroupDetail, SessionGroupInfo, SessionGroupMember } from "@opencode-ai/sdk/v2/client"
+import type { Session, SessionGroupDetail, SessionGroupInfo, SessionGroupMember } from "@opencode-ai/sdk/v2/client"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { queryOptions, useMutation, useQuery, useQueryClient } from "@tanstack/solid-query"
 import { createEffect, createMemo, createSignal } from "solid-js"
@@ -22,6 +22,29 @@ export type SessionGroupEntry = {
   time: {
     created: number
     updated: number
+  }
+}
+
+/**
+ * Convert the lightweight projection carried by modern session-group detail
+ * responses into an ephemeral Session suitable for structural navigation.
+ *
+ * Do not insert this value into the shared session cache: the projection is
+ * intentionally narrower than an authoritative session fetch. Older servers do
+ * not provide these fields, in which case callers can retain their historical
+ * resolve() compatibility fallback.
+ */
+export function sessionGroupMemberSession(member: SessionGroupMember): Session | undefined {
+  if (!member.slug || !member.projectID || !member.directory || !member.version || !member.time) return
+  return {
+    id: member.id,
+    slug: member.slug,
+    projectID: member.projectID,
+    directory: member.directory,
+    parentID: member.parentID,
+    title: member.title,
+    version: member.version,
+    time: member.time,
   }
 }
 

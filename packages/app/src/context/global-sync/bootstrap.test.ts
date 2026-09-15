@@ -76,6 +76,53 @@ function directoryState() {
 }
 
 describe("bootstrapDirectory", () => {
+  test("critical session hydration completes before auxiliary bootstrap admission", async () => {
+    const [store, setStore] = directoryState()
+    let releaseBackground!: () => void
+    const backgroundBarrier = new Promise<void>((resolve) => (releaseBackground = resolve))
+    const calls: string[] = []
+    let admitted = false
+
+    await bootstrapDirectory({
+      directory: "/project",
+      scope: ServerScope.local,
+      mcp: false,
+      global: {
+        config: {} satisfies Config,
+        path: { state: "", config: "", worktree: "/project", directory: "/project", home: "/home" },
+        project: [{ id: "project", worktree: "/project" } as Project],
+        provider,
+      },
+      sdk: {} as OpencodeClient,
+      api,
+      store,
+      setStore,
+      vcsCache: { setStore() {} } as unknown as VcsCache,
+      loadSessions: async () => {
+        calls.push("sessions")
+      },
+      translate: (key) => key,
+      queryClient: new QueryClient(),
+      protocol: Promise.resolve("v2"),
+      runBackgroundBootstrap: async (work) => {
+        admitted = true
+        await backgroundBarrier
+        return work()
+      },
+    })
+
+    // bootstrapDirectory intentionally launches its staged work in the
+    // background. Give the critical paint gate + test fallback delay time to
+    // elapse while keeping auxiliary admission blocked.
+    await new Promise((resolve) => setTimeout(resolve, 70))
+    expect(calls).toEqual(["sessions"])
+    expect(store.status).toBe("complete")
+    expect(admitted).toBe(true)
+
+    releaseBackground()
+    await new Promise((resolve) => setTimeout(resolve, 40))
+  })
+
   test("uses legacy MCP endpoints while refreshing a v1 directory", async () => {
     const legacyConfigReads: string[] = []
     const mcpReads: string[] = []
@@ -236,6 +283,36 @@ describe("query keys", () => {
     expect([...loadProvidersQuery(remote, null, api).queryKey]).toEqual(["https://debian.example", null, "providers"])
   })
 
+  test("canonicalizes Windows directory spellings in directory-scoped query keys", () => {
+    const client = {} as Parameters<typeof loadPathQuery>[2]
+    const catalog = {} as CatalogApi
+    const agents = {} as AgentApi
+    const references = {} as ReferenceApi
+    const windows = "C:\\Users\\demo\\repo\\"
+    const canonical = "C:/Users/demo/repo"
+
+    expect([...loadPathQuery(ServerScope.local, windows, client).queryKey]).toEqual([
+      ServerScope.local,
+      canonical,
+      "path",
+    ])
+    expect([...loadProvidersQuery(ServerScope.local, windows, catalog).queryKey]).toEqual([
+      ServerScope.local,
+      canonical,
+      "providers",
+    ])
+    expect([...loadAgentsQuery(ServerScope.local, windows, agents).queryKey]).toEqual([
+      ServerScope.local,
+      canonical,
+      "agents",
+    ])
+    expect([...loadReferencesQuery(ServerScope.local, windows, references).queryKey]).toEqual([
+      ServerScope.local,
+      canonical,
+      "references",
+    ])
+  })
+
   test("loads the current provider and model catalog", async () => {
     const calls: unknown[] = []
     const api = {
@@ -311,6 +388,59 @@ describe("query keys", () => {
     const result = await new QueryClient().fetchQuery(loadProjectsQuery(ServerScope.local, api))
 
     expect(result.map((project) => project.id)).toEqual(["a", "b"])
+  })
+
+  test("prefers the bootstrap-free global project catalog when available", async () => {
+    let instanceCalls = 0
+    let globalCalls = 0
+    const projectApi = {
+      list: async () => {
+        instanceCalls++
+        return [{ id: "instance", worktree: "/instance", time: { created: 1, updated: 1 }, sandboxes: [] }]
+      },
+    } as unknown as ProjectApi
+    const globalClient = {
+      global: {
+        projects: async () => {
+          globalCalls++
+          return {
+            data: [{ id: "global", worktree: "/global", time: { created: 1, updated: 1 }, sandboxes: [] }],
+          }
+        },
+      },
+    } as unknown as OpencodeClient
+
+    const result = await new QueryClient().fetchQuery(
+      loadProjectsQuery(ServerScope.local, projectApi, undefined, "critical", globalClient),
+    )
+
+    expect(result.map((project) => project.id)).toEqual(["global"])
+    expect(globalCalls).toBe(1)
+    expect(instanceCalls).toBe(0)
+  })
+
+  test("falls back to the instance project endpoint on older servers", async () => {
+    let instanceCalls = 0
+    const projectApi = {
+      list: async () => {
+        instanceCalls++
+        return [{ id: "fallback", worktree: "/fallback", time: { created: 1, updated: 1 }, sandboxes: [] }]
+      },
+    } as unknown as ProjectApi
+    const globalClient = {
+      global: {
+        projects: async () => {
+          throw { status: 404 }
+        },
+      },
+    } as unknown as OpencodeClient
+
+    const result = await new QueryClient().fetchQuery(
+      loadProjectsQuery(ServerScope.local, projectApi, undefined, "critical", globalClient),
+    )
+
+    expect(result.map((project) => project.id)).toEqual(["fallback"])
+    expect(instanceCalls).toBe(1)
   })
 
   test("loads references from the current location-scoped endpoint", async () => {

@@ -4,6 +4,7 @@ import type { OpenCodeEvent, SessionApi, SessionMessageInfo } from "@opencode-ai
 import type { Message, OpencodeClient, Part, Session } from "@opencode-ai/sdk/v2/client"
 import { createServerSession } from "./server-session"
 import type { ServerApi } from "@/utils/server"
+import { createServerRequestScheduler } from "@/utils/server-request-scheduler"
 
 type MessageApi = ServerApi["message"]
 
@@ -166,6 +167,52 @@ function setup(sessions: Record<string, Session>) {
 }
 
 describe("server session", () => {
+  test("publishes the active timeline set only when stream interest changes", () => {
+    const interests: string[][] = []
+    const store = createServerSession(messageClient(response()), {
+      onStreamInterestChanged: (sessions) => interests.push([...sessions]),
+    })
+
+    store.resume("ses_b")
+    store.resume("ses_b")
+    store.resume("ses_a")
+    store.release("missing")
+    store.release("ses_b")
+    store.release("ses_b")
+
+    expect(interests).toEqual([["ses_b"], ["ses_a", "ses_b"], ["ses_a"]])
+  })
+
+  test("promotes queued background hydration when that session becomes foreground", async () => {
+    const scheduler = createServerRequestScheduler({ concurrency: 1, backgroundConcurrency: 1, criticalReserve: 0 })
+    const blocker = Promise.withResolvers<void>()
+    const order: string[] = []
+    const held = scheduler.schedule("interactive", () => blocker.promise, { kind: "test-blocker" })
+    const client = {
+      session: {
+        get: async () => {
+          order.push("session-info")
+          return { data: session("child") }
+        },
+        messages: async () => {
+          order.push("session-messages")
+          return response()
+        },
+      },
+    } as unknown as OpencodeClient
+    const store = createServerSession(client, { requests: scheduler })
+
+    const background = store.sync("child", { activate: false })
+    await Promise.resolve()
+    const unrelated = scheduler.schedule("interactive", async () => order.push("unrelated"), { kind: "file-read" })
+    const foreground = store.sync("child")
+
+    blocker.resolve()
+    await Promise.all([held, background, foreground, unrelated])
+    expect(order.slice(0, 2).sort()).toEqual(["session-info", "session-messages"])
+    expect(order.at(-1)).toBe("unrelated")
+  })
+
   test("background stream interest marks cached content stale without retaining unknown sessions", () => {
     const store = createServerSession(messageClient(response()))
 
@@ -207,6 +254,70 @@ describe("server session", () => {
     expect(ctx.get).toHaveLength(0)
     await Promise.resolve()
     expect(ctx.get).toHaveLength(0)
+  })
+
+  test("does not resolve passive metadata-only events for uncached sessions", async () => {
+    const ctx = setup({ child: session("child") })
+    const todos = [{ id: "todo", title: "review", status: "pending" }]
+    const permission = { id: "perm", sessionID: "child", action: "read", resources: ["src/**"] }
+    const question = { id: "question", sessionID: "child", prompt: "Continue?" }
+
+    ctx.store.apply({ type: "session.status", properties: { sessionID: "child", status: { type: "busy" } } })
+    ctx.store.apply({ type: "todo.updated", properties: { sessionID: "child", todos } })
+    ctx.store.apply({ type: "permission.asked", properties: permission })
+    ctx.store.apply({ type: "question.asked", properties: question })
+
+    expect(ctx.store.data.session_status.child).toEqual({ type: "busy" })
+    expect(ctx.store.data.todo.child).toEqual(todos)
+    expect(ctx.store.data.permission.child).toEqual([permission])
+    expect(ctx.store.data.question.child).toEqual([question])
+    expect(ctx.get).toHaveLength(0)
+    await Promise.resolve()
+    expect(ctx.get).toHaveLength(0)
+  })
+
+  test("passive metadata storms do not fan out session-info requests", async () => {
+    const ctx = setup({})
+
+    for (let index = 0; index < 250; index++) {
+      const sessionID = `passive-${index}`
+      ctx.store.apply({ type: "session.status", properties: { sessionID, status: { type: "busy" } } })
+      ctx.store.apply({ type: "todo.updated", properties: { sessionID, todos: [{ id: `todo-${index}` }] } })
+      ctx.store.apply({ type: "permission.asked", properties: { id: `perm-${index}`, sessionID } })
+      ctx.store.apply({ type: "question.asked", properties: { id: `question-${index}`, sessionID } })
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    expect(ctx.get).toHaveLength(0)
+    expect(Object.keys(ctx.store.data.session_status)).toHaveLength(250)
+    expect(Object.keys(ctx.store.data.todo)).toHaveLength(250)
+    expect(Object.keys(ctx.store.data.permission)).toHaveLength(250)
+    expect(Object.keys(ctx.store.data.question)).toHaveLength(250)
+  })
+
+  test("terminal idle status removes passive retained state", () => {
+    const ctx = setup({})
+    const apply = (input: object) => ctx.store.applyV2(input as OpenCodeEvent)
+
+    apply({ id: "started", type: "session.execution.started", data: { sessionID: "passive" } })
+    expect(ctx.store.data.session_status.passive).toEqual({ type: "busy" })
+
+    apply({ id: "done", type: "session.execution.succeeded", data: { sessionID: "passive" } })
+
+    expect(ctx.store.data.session_status.passive).toBeUndefined()
+    expect(ctx.store.data.session_working("passive")).toBe(false)
+  })
+
+  test("still resolves legacy session-info mutations that lack a full info payload", async () => {
+    const ctx = setup({ child: session("child") })
+
+    ctx.store.apply({ type: "session.renamed", properties: { sessionID: "child", title: "new title" } })
+
+    await Promise.resolve()
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    expect(ctx.get).toEqual([{ sessionID: "child" }])
+    expect(ctx.store.get("child")?.id).toBe("child")
   })
   test("projects V2 session events into current and legacy message state", () => {
     const ctx = setup({ child: session("child") })
@@ -469,6 +580,58 @@ describe("server session", () => {
       id: "msg_2_assistant",
       content: [{ type: "text", text: "" }],
     })
+  })
+
+  test("serializes speculative prefetches across sessions", async () => {
+    const firstPage = deferredResponse()
+    const secondPage = deferredResponse()
+    const client = messageClient(firstPage.promise, secondPage.promise)
+    const store = createServerSession(client)
+    store.remember(session("first"))
+    store.remember(session("second"))
+
+    const first = store.prefetch("first", 20)
+    const second = store.prefetch("second", 20)
+    await client.requested(1)
+    await Promise.resolve()
+
+    expect(client.requests).toHaveLength(1)
+    expect(client.requests[0]).toMatchObject({ sessionID: "first" })
+
+    firstPage.resolve(response())
+    await first
+    await client.requested(2)
+    expect(client.requests[1]).toMatchObject({ sessionID: "second" })
+
+    secondPage.resolve(response())
+    await second
+  })
+
+  test("foreground sync overtakes a queued speculative prefetch", async () => {
+    const firstPage = deferredResponse()
+    const foregroundPage = deferredResponse()
+    const client = messageClient(firstPage.promise, foregroundPage.promise)
+    const store = createServerSession(client)
+    store.remember(session("first"))
+    store.remember(session("second"))
+
+    const first = store.prefetch("first", 20)
+    const queued = store.prefetch("second", 20)
+    await client.requested(1)
+
+    const foreground = store.sync("second")
+    await client.requested(2)
+    expect(client.requests[1]).toMatchObject({ sessionID: "second" })
+
+    foregroundPage.resolve(response())
+    await foreground
+    firstPage.resolve(response())
+    await first
+    await queued
+
+    // The queued warmup observes the foreground-hydrated cache and does not
+    // issue a third message request.
+    expect(client.requests).toHaveLength(2)
   })
 
   test("background sync hydrates without activating content projection", async () => {

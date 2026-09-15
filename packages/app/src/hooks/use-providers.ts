@@ -23,6 +23,14 @@ export function useProviders(directory: Accessor<string | undefined>) {
   const serverSync = useServerSync()
   const params = useParams()
   const dir = () => (directory ? directory() : decode64(params.dir))
+  // Global provider/model discovery is not startup infrastructure. Most
+  // session surfaces use a directory-scoped catalog, while the few truly
+  // global consumers (legacy layout/settings) opt into the global query simply
+  // by asking useProviders() without a directory.
+  createEffect(() => {
+    if (dir()) return
+    serverSync().providers.ensure()
+  })
   const providers = () => {
     const value = dir()
     const projectStore = value ? serverSync().child(value, { bootstrap: false })[0] : undefined

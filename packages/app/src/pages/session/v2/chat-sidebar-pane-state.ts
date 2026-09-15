@@ -1,4 +1,5 @@
 import { createStore } from "solid-js/store"
+import type { Session } from "@opencode-ai/sdk/v2/client"
 import { Persist, persisted } from "@/utils/persist"
 import { clampSize } from "@/utils/resizable-size"
 
@@ -11,6 +12,33 @@ const CHAT_SIDEBAR_RECENT_LIMIT_STEP = 5
 
 export const CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN = 5
 const CHAT_SIDEBAR_ARCHIVED_LIMIT_STEP = 5
+
+export type ChatSidebarAggregateMetrics = {
+  cost?: number
+  cacheHitPercent?: number | null
+  model?: { modelID: string; variant?: string }
+}
+
+/**
+ * Metrics already materialized on the session row by the server projector.
+ * These are full-history aggregates and therefore both cheaper and more
+ * authoritative than re-aggregating a bounded client-side message prefetch.
+ */
+export function chatSidebarAggregateMetrics(
+  session: Pick<Session, "cost" | "tokens" | "model">,
+): ChatSidebarAggregateMetrics {
+  const tokens = session.tokens
+  const denominator = tokens ? tokens.cache.read + tokens.input : undefined
+  return {
+    cost: session.cost,
+    cacheHitPercent:
+      denominator === undefined ? undefined : denominator <= 0 ? null : Math.round((tokens!.cache.read / denominator) * 1000) / 10,
+    model: session.model ? { modelID: session.model.id, variant: session.model.variant } : undefined,
+  }
+}
+
+export const shouldAutoHydrateChatSidebarMetrics = (input: { selected?: boolean; working: boolean }) =>
+  !!input.selected || input.working
 
 export function createChatSidebarPaneState() {
   const [store, setStore, , ready] = persisted(

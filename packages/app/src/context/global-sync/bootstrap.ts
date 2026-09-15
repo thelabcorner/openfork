@@ -36,6 +36,7 @@ import type { State, VcsCache } from "./types"
 import type { ServerSession } from "../server-session"
 import {
   cmp,
+  directoryKey,
   normalizeAgentList,
   normalizePermissionRequest,
   normalizeProjectInfo,
@@ -49,6 +50,8 @@ import { ScopedKey, type ServerScope } from "@/utils/server-scope"
 import { normalizeSessionInfo } from "@/utils/session"
 import type { ServerProtocol } from "@/utils/server-protocol"
 import type { ServerApi } from "@/utils/server"
+import { startupSpan } from "@/utils/startup-perf"
+import type { ServerRequestPriority, ServerRequestScheduler } from "@/utils/server-request-scheduler"
 
 type GlobalStore = {
   ready: boolean
@@ -99,6 +102,38 @@ export function clearProviderRev(scope: ServerScope, directory: string) {
 
 function runAll(list: Array<() => Promise<unknown>>) {
   return Promise.allSettled(list.map((item) => item()))
+}
+
+function runAfterBackgroundQuiet<T>(work: () => Promise<T>, minDelayMs: number, idleTimeoutMs: number) {
+  if (typeof requestIdleCallback !== "function") {
+    // Keep non-browser/test semantics intentionally short. Chromium is where
+    // module-fetch idle can be mistaken for genuine startup idle.
+    return new Promise<T>((resolve) => setTimeout(() => void work().then(resolve), 20))
+  }
+  return new Promise<T>((resolve) => {
+    setTimeout(() => {
+      requestIdleCallback(() => void work().then(resolve), { timeout: idleTimeoutMs })
+    }, minDelayMs)
+  })
+}
+
+const scheduleRequest = <T>(
+  requests: ServerRequestScheduler | undefined,
+  priority: ServerRequestPriority,
+  kind: string,
+  run: () => Promise<T>,
+  key?: string,
+) => (requests ? requests.schedule(priority, run, { kind, key }) : Promise.resolve().then(run))
+
+function endpointStatus(error: unknown) {
+  if (!error || typeof error !== "object") return undefined
+  if ("status" in error) return Number((error as { status?: unknown }).status)
+  const response = "response" in error ? (error as { response?: unknown }).response : undefined
+  if (response && typeof response === "object" && "status" in response)
+    return Number((response as { status?: unknown }).status)
+  const cause = error instanceof Error && error.cause && typeof error.cause === "object" ? error.cause : undefined
+  if (cause && "status" in cause) return Number((cause as { status?: unknown }).status)
+  return undefined
 }
 
 // Concurrency-limited variant: a flat Promise.allSettled of 15 fetches per
@@ -154,12 +189,20 @@ function showErrors(input: {
   })
 }
 
-export const loadGlobalConfigQuery = (scope: ServerScope, sdk: OpencodeClient, protocol?: Promise<ServerProtocol>) =>
+export const loadGlobalConfigQuery = (
+  scope: ServerScope,
+  sdk: OpencodeClient,
+  protocol?: Promise<ServerProtocol>,
+  requests?: ServerRequestScheduler,
+  priority: ServerRequestPriority = "interactive",
+) =>
   queryOptions({
     queryKey: [scope, "config"],
     queryFn: async () => {
       if ((await protocol) !== "v1") return {}
-      return retry(() => sdk.global.config.get().then((x) => x.data!))
+      return retry(() =>
+        scheduleRequest(requests, priority, "global-config", () => sdk.global.config.get()).then((x) => x.data!),
+      )
     },
   })
 
@@ -190,12 +233,28 @@ type PermissionApi = ServerApi["permission"]
 type QuestionApi = ServerApi["question"]
 type VcsApi = ServerApi["vcs"]
 
-export const loadProjectsQuery = (scope: ServerScope, api: ProjectApi) =>
+export const loadProjectsQuery = (
+  scope: ServerScope,
+  api: ProjectApi,
+  requests?: ServerRequestScheduler,
+  priority: ServerRequestPriority = "interactive",
+  globalClient?: OpencodeClient,
+) =>
   queryOptions({
     queryKey: [scope, "project"],
     queryFn: () =>
       retry(() =>
-        api.list().then((projects) => {
+        scheduleRequest(requests, priority, "project-list", async () => {
+          if (globalClient) {
+            try {
+              return (await globalClient.global.projects()).data ?? []
+            } catch (error) {
+              const status = endpointStatus(error)
+              if (status !== 404 && status !== 405) throw error
+            }
+          }
+          return api.list()
+        }).then((projects) => {
           return projects
             .filter((p) => !!p?.id)
             .filter((p) => !!p.worktree && !p.worktree.includes("opencode-test"))
@@ -216,18 +275,26 @@ export async function bootstrapGlobal(input: {
   formatMoreCount: (count: number) => string
   setGlobalStore: SetStoreFunction<GlobalStore>
   queryClient: QueryClient
+  requests?: ServerRequestScheduler
 }) {
   const slow = [
-    () => input.queryClient.fetchQuery(loadGlobalConfigQuery(input.scope, input.serverSDK, input.protocol)),
     () =>
       input.queryClient.fetchQuery(
-        loadProvidersQuery(input.scope, null, input.serverAPI, input.serverSDK, input.protocol),
+        loadGlobalConfigQuery(input.scope, input.serverSDK, input.protocol, input.requests, "interactive"),
       ),
-    () => input.queryClient.fetchQuery(loadPathQuery(input.scope, null, input.serverSDK, input.protocol)),
     () =>
-      input.queryClient
-        .fetchQuery(loadProjectsQuery(input.scope, input.serverAPI.project))
-        .then((data) => input.setGlobalStore("project", data)),
+      input.queryClient.fetchQuery(
+        loadPathQuery(input.scope, null, input.serverSDK, input.protocol, input.requests, "interactive"),
+      ),
+    () => {
+      const startedAt = performance.now()
+      return input.queryClient
+        .fetchQuery(loadProjectsQuery(input.scope, input.serverAPI.project, input.requests, "critical", input.serverSDK))
+        .then((data) => {
+          startupSpan("sidebar.project-catalog-ready", startedAt, { projects: data.length })
+          input.setGlobalStore("project", data)
+        })
+    },
   ]
   await runAll(slow)
   // showErrors({
@@ -271,12 +338,15 @@ function warmSessions(input: {
   store: Store<State>
   setStore: SetStoreFunction<State>
   api: SessionApi
+  requests?: ServerRequestScheduler
 }) {
   const known = new Set(input.store.session.map((item) => item.id))
   const ids = [...new Set(input.ids)].filter((id) => !!id && !known.has(id))
   if (ids.length === 0) return Promise.resolve()
   return resolveSessionsLimited(ids, (sessionID) =>
-    retry(() => input.api.get({ sessionID })).then((session) =>
+    retry(() =>
+      scheduleRequest(input.requests, "background", "session-info", () => input.api.get({ sessionID }), `session:${sessionID}`),
+    ).then((session) =>
       mergeSession(input.setStore, normalizeSessionInfo(session)),
     ),
   )
@@ -288,9 +358,11 @@ export const loadProvidersQuery = (
   sdk: CatalogApi,
   legacy?: OpencodeClient,
   protocol?: Promise<ServerProtocol>,
+  requests?: ServerRequestScheduler,
+  priority: ServerRequestPriority = "background",
 ) =>
   queryOptions({
-    queryKey: [scope, directory, "providers"],
+    queryKey: [scope, directory === null ? null : directoryKey(directory), "providers"],
     staleTime: 5 * 60_000,
     gcTime: 10 * 60_000,
     refetchOnMount: false,
@@ -300,7 +372,7 @@ export const loadProvidersQuery = (
     queryFn: () =>
       retry(async () => {
         if ((await protocol) === "v1" && legacy) {
-          const result = await legacy.provider.list()
+          const result = await scheduleRequest(requests, priority, "provider-list", () => legacy.provider.list())
           return normalizeProviderList(result.data!)
         }
         const location = directory ? { location: { directory } } : undefined
@@ -308,9 +380,11 @@ export const loadProvidersQuery = (
         const modelApi = sdk.models ?? sdk.model
         if (!providerApi || !modelApi) throw new Error("Provider/model catalog API unavailable")
         const [providers, models, defaultModel] = await Promise.all([
-          providerApi.list(location),
-          modelApi.list(location),
-          modelApi.default?.(location) ?? Promise.resolve({ location: location?.location ?? {}, data: null }),
+          scheduleRequest(requests, priority, "provider-list", () => providerApi.list(location)),
+          scheduleRequest(requests, priority, "model-list", () => modelApi.list(location)),
+          modelApi.default
+            ? scheduleRequest(requests, priority, "model-default", () => modelApi.default!(location))
+            : Promise.resolve({ location: location?.location ?? {}, data: null }),
         ])
         return normalizeProviderList(providers.data, models.data, defaultModel.data)
       }),
@@ -334,9 +408,11 @@ export const loadAgentsQuery = (
   sdk: AgentListApi,
   legacy?: OpencodeClient,
   protocol?: Promise<ServerProtocol>,
+  requests?: ServerRequestScheduler,
+  priority: ServerRequestPriority = "background",
 ) =>
   queryOptions({
-    queryKey: [scope, directory, "agents"],
+    queryKey: [scope, directoryKey(directory), "agents"],
     staleTime: 5 * 60_000,
     gcTime: 10 * 60_000,
     refetchOnMount: false,
@@ -345,8 +421,13 @@ export const loadAgentsQuery = (
     retry: 1,
     queryFn: () =>
       retry(async () => {
-        if ((await protocol) === "v1" && legacy) return normalizeAgentList((await legacy.app.agents()).data ?? [])
-        return sdk.list({ location: { directory } }).then((result) => normalizeAgentList(result.data))
+        if ((await protocol) === "v1" && legacy)
+          return scheduleRequest(requests, priority, "agent-list", () => legacy.app.agents()).then((result) =>
+            normalizeAgentList(result.data ?? []),
+          )
+        return scheduleRequest(requests, priority, "agent-list", () => sdk.list({ location: { directory } })).then(
+          (result) => normalizeAgentList(result.data),
+        )
       }),
   })
 
@@ -355,10 +436,12 @@ export const loadCommands = (
   api: CommandListApi,
   legacy?: OpencodeClient,
   protocol?: Promise<ServerProtocol>,
+  requests?: ServerRequestScheduler,
+  priority: ServerRequestPriority = "background",
 ): Promise<CommandInfo[]> =>
   retry(async () => {
     if ((await protocol) === "v1" && legacy) {
-      return ((await legacy.command.list()).data ?? []).map((command) => {
+      return ((await scheduleRequest(requests, priority, "command-list", () => legacy.command.list())).data ?? []).map((command) => {
         const [providerID, id] = command.model?.split("/") ?? []
         return {
           name: command.name,
@@ -371,7 +454,9 @@ export const loadCommands = (
         }
       })
     }
-    return api.list({ location: { directory } }).then((result) => result.data)
+    return scheduleRequest(requests, priority, "command-list", () => api.list({ location: { directory } })).then(
+      (result) => result.data,
+    )
   })
 
 export const loadPathQuery = (
@@ -379,13 +464,19 @@ export const loadPathQuery = (
   directory: string | null,
   sdk: OpencodeClient,
   protocol?: Promise<ServerProtocol>,
+  requests?: ServerRequestScheduler,
+  priority: ServerRequestPriority = "interactive",
 ) =>
   queryOptions<Path>({
-    queryKey: [scope, directory, "path"],
+    queryKey: [scope, directory === null ? null : directoryKey(directory), "path"],
     queryFn: async () => {
       if ((await protocol) !== "v1")
         return { state: "", config: "", worktree: "", directory: directory ?? "", home: "" }
-      return retry(() => sdk.path.get({ directory: directory ?? undefined }).then((result) => result.data!))
+      return retry(() =>
+        scheduleRequest(requests, priority, "path-get", () => sdk.path.get({ directory: directory ?? undefined })).then(
+          (result) => result.data!,
+        ),
+      )
     },
   })
 
@@ -395,13 +486,20 @@ export const loadReferencesQuery = (
   api: ReferenceListApi,
   legacy?: OpencodeClient,
   protocol?: Promise<ServerProtocol>,
+  requests?: ServerRequestScheduler,
+  priority: ServerRequestPriority = "background",
 ) =>
   queryOptions<ReferenceInfo[]>({
-    queryKey: [scope, directory, "references"] as const,
+    queryKey: [scope, directoryKey(directory), "references"] as const,
     queryFn: () =>
       retry(async () => {
-        if ((await protocol) === "v1" && legacy) return (await legacy.v2.reference.list()).data?.data ?? []
-        return api.list({ location: { directory } }).then((result) => result.data)
+        if ((await protocol) === "v1" && legacy)
+          return scheduleRequest(requests, priority, "reference-list", () => legacy.v2.reference.list()).then(
+            (result) => result.data?.data ?? [],
+          )
+        return scheduleRequest(requests, priority, "reference-list", () => api.list({ location: { directory } })).then(
+          (result) => result.data,
+        )
       }).catch(() => []),
     placeholderData: [],
   })
@@ -436,6 +534,24 @@ export async function bootstrapDirectory(input: {
   queryClient: QueryClient
   session?: ServerSession
   protocol?: Promise<ServerProtocol>
+  requests?: ServerRequestScheduler
+  /**
+   * Per-server admission seam for the expensive directory metadata wave.
+   * Critical session hydration runs before this callback and is never gated.
+   * The caller may serialize these waves across directories while this module
+   * keeps same-directory work internally concurrent.
+   */
+  runBackgroundBootstrap?: <T>(work: () => Promise<T>) => Promise<T>
+  /**
+   * Called only after the critical session list and the first auxiliary
+   * bootstrap tier have settled. Child-store path/provider/LSP/reference
+   * observers use this seam so they cannot create a second metadata burst
+   * while the route's critical session request is still competing for slots.
+   */
+  onBackgroundReady?: () => void
+  /** Called after the initial MCP status/resource tier settles so reactive MCP
+   * queries can be enabled without racing the staged bootstrap. */
+  onMcpReady?: () => void
 }) {
   const loading = input.store.status !== "complete"
   const seededProject = projectID(input.directory, input.global.project)
@@ -460,18 +576,30 @@ export async function bootstrapDirectory(input: {
     const deferred = [
       () =>
         input.queryClient
-          .ensureQueryData(loadAgentsQuery(input.scope, input.directory, input.api.agent, input.sdk, input.protocol))
+          .ensureQueryData(
+            loadAgentsQuery(
+              input.scope,
+              input.directory,
+              input.api.agent,
+              input.sdk,
+              input.protocol,
+              input.requests,
+              "background",
+            ),
+          )
           .then((data) => input.setStore("agent", data)),
       () =>
         retry(async () => {
           if ((await input.protocol) !== "v1") return
-          return input.sdk.config.get().then((x) => input.setStore("config", reconcile(x.data!, { merge: false })))
+          return scheduleRequest(input.requests, "background", "directory-config", () => input.sdk.config.get()).then((x) =>
+            input.setStore("config", reconcile(x.data!, { merge: false })),
+          )
         }),
       () =>
         retry(() =>
           (async () => {
             if ((await input.protocol) !== "v1") return
-            const x = await input.sdk.session.status()
+            const x = await scheduleRequest(input.requests, "background", "session-status", () => input.sdk.session.status())
             if (!input.session) {
               input.setStore("session_status", x.data!)
               return
@@ -490,19 +618,23 @@ export async function bootstrapDirectory(input: {
               input.session.set("session_status", sessionID, reconcile(status))
             }
             await resolveSessionsLimited(Object.keys(statuses), (sessionID) =>
-              input.session!.resolve(sessionID).catch(() => undefined),
+              input.session!.resolve(sessionID, { priority: "background" }).catch(() => undefined),
             )
           })(),
         ),
       !seededProject &&
         (() =>
-          retry(() => input.api.project.current({ location: { directory: input.directory } })).then((project) =>
-            input.setStore("project", project.id),
-          )),
+          retry(() =>
+            scheduleRequest(input.requests, "background", "project-current", () =>
+              input.api.project.current({ location: { directory: input.directory } }),
+            ),
+          ).then((project) => input.setStore("project", project.id))),
       !seededPath &&
         (() =>
           input.queryClient
-            .ensureQueryData(loadPathQuery(input.scope, input.directory, input.sdk, input.protocol))
+            .ensureQueryData(
+              loadPathQuery(input.scope, input.directory, input.sdk, input.protocol, input.requests, "background"),
+            )
             .then((data) => {
               const next = projectID(data.directory ?? input.directory, input.global.project)
               if (next) input.setStore("project", next)
@@ -510,7 +642,7 @@ export async function bootstrapDirectory(input: {
       () =>
         retry(async () => {
           if ((await input.protocol) !== "v1") return
-          return input.sdk.vcs.get().then((result) => {
+          return scheduleRequest(input.requests, "background", "vcs-get", () => input.sdk.vcs.get()).then((result) => {
             const next = { branch: result.data?.branch, default_branch: result.data?.default_branch }
             input.setStore("vcs", next)
             if (next) input.vcsCache.setStore("value", next)
@@ -518,19 +650,31 @@ export async function bootstrapDirectory(input: {
         }),
       input.mcp &&
         (() =>
-          loadCommands(input.directory, input.api.command, input.sdk, input.protocol).then((commands) =>
+          loadCommands(input.directory, input.api.command, input.sdk, input.protocol, input.requests, "background").then((commands) =>
             input.setStore("command", commands),
           )),
       () =>
         input.queryClient.fetchQuery(
-          loadReferencesQuery(input.scope, input.directory, input.api.reference, input.sdk, input.protocol),
+          loadReferencesQuery(
+            input.scope,
+            input.directory,
+            input.api.reference,
+            input.sdk,
+            input.protocol,
+            input.requests,
+            "background",
+          ),
         ),
       () =>
         retry(() =>
           (async () => {
-            if ((await input.protocol) === "v1") return (await input.sdk.permission.list()).data ?? []
-            return input.api.permission.request
-              .list({ location: { directory: input.directory } })
+            if ((await input.protocol) === "v1")
+              return scheduleRequest(input.requests, "background", "permission-list", () => input.sdk.permission.list()).then(
+                (result) => result.data ?? [],
+              )
+            return scheduleRequest(input.requests, "background", "permission-list", () =>
+              input.api.permission.request.list({ location: { directory: input.directory } }),
+            )
               .then((result) => result.data.map(normalizePermissionRequest))
           })().then((permissions) => {
             const ids = permissions.map((permission) => permission.sessionID)
@@ -538,8 +682,14 @@ export async function bootstrapDirectory(input: {
               permissions.filter((permission) => !!permission.id && !!permission.sessionID),
             )
             const warm = input.session
-              ? resolveSessionsLimited(ids, (sessionID) => input.session!.resolve(sessionID))
-              : warmSessions({ ids, store: input.store, setStore: input.setStore, api: input.api.session })
+              ? resolveSessionsLimited(ids, (sessionID) => input.session!.resolve(sessionID, { priority: "background" }))
+              : warmSessions({
+                  ids,
+                  store: input.store,
+                  setStore: input.setStore,
+                  api: input.api.session,
+                  requests: input.requests,
+                })
             return warm.then(() =>
               batch(() => {
                 const current = input.session?.data.permission ?? input.store.permission
@@ -564,9 +714,13 @@ export async function bootstrapDirectory(input: {
       () =>
         retry(() =>
           (async () => {
-            if ((await input.protocol) === "v1") return (await input.sdk.question.list()).data ?? []
-            return input.api.question.request
-              .list({ location: { directory: input.directory } })
+            if ((await input.protocol) === "v1")
+              return scheduleRequest(input.requests, "background", "question-list", () => input.sdk.question.list()).then(
+                (result) => result.data ?? [],
+              )
+            return scheduleRequest(input.requests, "background", "question-list", () =>
+              input.api.question.request.list({ location: { directory: input.directory } }),
+            )
               .then((result) => result.data)
           })().then((questions) => {
             const ids = questions.map((question) => question.sessionID)
@@ -574,8 +728,14 @@ export async function bootstrapDirectory(input: {
               questions.filter((question) => !!question.id && !!question.sessionID) as QuestionRequest[],
             )
             const warm = input.session
-              ? resolveSessionsLimited(ids, (sessionID) => input.session!.resolve(sessionID))
-              : warmSessions({ ids, store: input.store, setStore: input.setStore, api: input.api.session })
+              ? resolveSessionsLimited(ids, (sessionID) => input.session!.resolve(sessionID, { priority: "background" }))
+              : warmSessions({
+                  ids,
+                  store: input.store,
+                  setStore: input.setStore,
+                  api: input.api.session,
+                  requests: input.requests,
+                })
             return warm.then(() =>
               batch(() => {
                 const current = input.session?.data.question ?? input.store.question
@@ -602,12 +762,12 @@ export async function bootstrapDirectory(input: {
       input.mcp &&
         (() =>
           input.queryClient.fetchQuery(
-            loadMcpQuery(input.scope, input.directory, input.api.mcp, input.sdk, input.protocol),
+            loadMcpQuery(input.scope, input.directory, input.api.mcp, input.sdk, input.protocol, input.requests),
           )),
       input.mcp &&
         (() =>
           input.queryClient.fetchQuery(
-            loadMcpResourcesQuery(input.scope, input.directory, input.api.mcp, input.sdk, input.protocol),
+            loadMcpResourcesQuery(input.scope, input.directory, input.api.mcp, input.sdk, input.protocol, input.requests),
           )),
     ].filter(Boolean) as (() => Promise<any>)[]
 
@@ -622,24 +782,39 @@ export async function bootstrapDirectory(input: {
     const scheduleMcp = () => runAllLimited(mcpDeferred, 2).then((mcpErrs) => errors(mcpErrs))
     let slowErrs = criticalErrs
     if (deferred.length > 0) {
-      const deferredErrs =
-        typeof requestIdleCallback === "function"
-          ? await new Promise<unknown[]>((resolve) => requestIdleCallback(() => scheduleDeferred().then(resolve), { timeout: 300 }))
-          : await new Promise<unknown[]>((resolve) => setTimeout(() => scheduleDeferred().then(resolve), 20))
+      // Critical sessions are already loaded and status is complete here.
+      // Enforce a real post-critical quiet window before auxiliary catalogs/VCS
+      // can touch the sidecar. requestIdleCallback alone is insufficient: while
+      // Chromium waits on Vite/module I/O its main thread is "idle" even though
+      // startup is still very much in progress.
+      const admittedDeferred = () =>
+        input.runBackgroundBootstrap
+          ? input.runBackgroundBootstrap(async () => {
+              const result = await scheduleDeferred()
+              // Enable the child-store reactive metadata observers while this
+              // directory still owns the admission lane. Their path/reference
+              // reads are usually cache hits after the tier above; provider/LSP
+              // can enqueue before the next directory begins initialization.
+              input.onBackgroundReady?.()
+              return result
+            })
+          : scheduleDeferred().then((result) => {
+              input.onBackgroundReady?.()
+              return result
+            })
+      const deferredErrs = await runAfterBackgroundQuiet(admittedDeferred, loading ? 650 : 120, 350)
       slowErrs = [...slowErrs, ...(Array.isArray(deferredErrs) ? (deferredErrs as unknown[]) : [])]
-      // MCP after deferred, even later (background tooling) — keep short in
-      // tests (no rIC, 20ms) so 80ms assertion window still captures it.
-      if (mcpDeferred.length > 0) {
-        const mcpErrs =
-          typeof requestIdleCallback === "function"
-            ? await new Promise<unknown[]>((resolve) => requestIdleCallback(() => scheduleMcp().then(resolve), { timeout: 600 }))
-            : await new Promise<unknown[]>((resolve) => setTimeout(() => scheduleMcp().then(resolve), 20))
-        slowErrs = [...slowErrs, ...(Array.isArray(mcpErrs) ? (mcpErrs as unknown[]) : [])]
-      }
-    } else if (mcpDeferred.length > 0) {
-      const mcpErrs = await scheduleMcp().then(errors)
-      slowErrs = [...slowErrs, ...mcpErrs]
+    } else {
+      input.onBackgroundReady?.()
     }
+
+    // MCP after deferred, even later (background tooling) — keep short in
+    // tests (no rIC, 20ms) so 80ms assertion window still captures it.
+    if (mcpDeferred.length > 0) {
+      const mcpErrs = await runAfterBackgroundQuiet(scheduleMcp, deferred.length > 0 ? 180 : 0, 600)
+      slowErrs = [...slowErrs, ...(Array.isArray(mcpErrs) ? (mcpErrs as unknown[]) : [])]
+    }
+    input.onMcpReady?.()
     if (slowErrs.length > 0) {
       console.error("Failed to finish bootstrap instance", slowErrs[0])
       const project = getFilename(input.directory)

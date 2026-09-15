@@ -2,7 +2,7 @@ import type { Session } from "@opencode-ai/sdk/v2/client"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type InfiniteData, useInfiniteQuery, useQuery, useQueryClient } from "@tanstack/solid-query"
 import { DateTime } from "luxon"
-import { type Accessor, createEffect, createMemo, type JSX, startTransition } from "solid-js"
+import { createEffect, createMemo, startTransition } from "solid-js"
 import { createStore, produce } from "solid-js/store"
 import { useCommand } from "@/context/command"
 import {
@@ -17,8 +17,6 @@ import { useSessionGroups } from "@/context/session-groups"
 import { ServerConnection } from "@/context/server"
 import { sessionHasOpenTab, useTabs } from "@/context/tabs"
 import { compareSessionTime, displayName, errorMessage, projectForSession } from "@/pages/layout/helpers"
-import { useSessionTabAvatarState } from "@/pages/layout/project-avatar-state"
-import { type ProjectAvatarStatus } from "@opencode-ai/ui/v2/project-avatar-v2"
 import { pathKey } from "@/utils/path-key"
 import { showToast } from "@/utils/toast"
 import { DialogSessionGroupName } from "@/components/dialog-session-group"
@@ -26,23 +24,11 @@ import { Binary } from "@opencode-ai/core/util/binary"
 import { archiveHomeSession, loadArchivedHomeSessions, type HomeArchivedPage, unarchiveHomeSession } from "../home-session-archive"
 import type { HomeController } from "./home-controller"
 import { projectPersistentSessionGroups } from "./home-session-grouping"
+import type { HomeSessionGroup, HomeSessionRecord, OpenSessionOptions } from "./home-session-types"
+export { homeSessionSearchKey } from "./home-session-key"
 
 const HOME_SESSION_LIMIT = 64
-export type HomeSessionRecord = {
-  session: Session
-  project: LocalProject
-  projectName: string
-}
-
-export type HomeSessionGroup = {
-  id: string
-  title: string
-  sessions: HomeSessionRecord[]
-  isUserGroup: boolean
-  kind?: "user" | "subagent" | "plugin"
-}
-
-export type OpenSessionOptions = { background?: boolean }
+export type { HomeSessionGroup, HomeSessionRecord, OpenSessionOptions } from "./home-session-types"
 
 export function createHomeSessionsController(home: HomeController) {
   const tabs = useTabs()
@@ -444,10 +430,6 @@ function buildHomeSessionRecords(input: {
     })
 }
 
-export function homeSessionSearchKey(record: HomeSessionRecord) {
-  return `${pathKey(record.session.directory)}:${record.session.id}`
-}
-
 function groupSessions(records: HomeSessionRecord[], language: ReturnType<typeof useLanguage>): HomeSessionGroup[] {
   const now = DateTime.local()
   const yesterday = now.minus({ days: 1 })
@@ -491,27 +473,3 @@ function mergeGroupSessions(
 }
 
 export type HomeSessionsController = ReturnType<typeof createHomeSessionsController>
-
-export function HomeSessionStatusController(props: {
-  server: Accessor<ServerConnection.Key>
-  record: HomeSessionRecord
-  isOpenTab: (record: HomeSessionRecord) => boolean
-  render: (state: {
-    unread: Accessor<boolean>
-    status: Accessor<ProjectAvatarStatus | undefined>
-    loading: Accessor<boolean>
-    open: Accessor<boolean>
-  }) => JSX.Element
-}) {
-  const avatar = useSessionTabAvatarState(
-    props.server,
-    () => props.record.session.directory,
-    () => props.record.session.id,
-  )
-  return props.render({
-    unread: avatar.unread,
-    status: avatar.status,
-    loading: avatar.loading,
-    open: () => props.isOpenTab(props.record),
-  })
-}

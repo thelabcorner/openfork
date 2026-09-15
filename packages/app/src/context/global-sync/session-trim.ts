@@ -39,7 +39,6 @@ export function trimSessions(
   const all = input
     .filter((s) => !!s?.id)
     .filter((s) => !s.time?.archived)
-    .sort((a, b) => cmp(a.id, b.id))
   const roots = all.filter((s) => !s.parentID)
   roots.sort(compareSessionRecent)
   const children = all.filter((s) => !!s.parentID)

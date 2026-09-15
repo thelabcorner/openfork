@@ -222,6 +222,64 @@ describe("createChildStoreManager", () => {
     }
   })
 
+  test("holds MCP queries while a requested directory is still bootstrapping", () => {
+    let manager: ReturnType<typeof createChildStoreManager> | undefined
+    const offset = querySingles.length
+    const mcpLoads: string[] = []
+
+    const dispose = createOwner((owner) => {
+      manager = createChildStoreManager({
+        owner,
+        scope: ServerScope.local,
+        persist,
+        isBooting: () => false,
+        isLoadingSessions: () => false,
+        onBootstrap() {},
+        onMcp(directory) {
+          mcpLoads.push(directory)
+        },
+        onDispose() {},
+        translate: (key) => key,
+        queryOptions: queryOptionsApi,
+        global: { provider },
+      })
+    })
+
+    try {
+      const [store] = manager!.child("/project", { bootstrap: false, mcp: true })
+      const created = querySingles.slice(offset)
+      const query = () => created.find((entry) => entry().queryKey?.[1] === "mcp")!()
+      const resourceQuery = () => created.find((entry) => entry().queryKey?.[1] === "mcpResources")!()
+
+      expect(store.status).toBe("loading")
+      expect(store.mcp_ready).toBe(false)
+      expect(query().enabled).toBe(false)
+      expect(resourceQuery().enabled).toBe(false)
+      expect(mcpLoads).toEqual([])
+
+      // Another consumer may have already started bootstrap, which changes the
+      // store from loading -> partial before MCP demand arrives. Partial is
+      // still inside the staged startup window and must remain gated too.
+      manager!.disableMcp("/project")
+      ;(store as { status: State["status"] }).status = "partial"
+      manager!.child("/project", { bootstrap: false, mcp: true })
+      expect(query().enabled).toBe(false)
+      expect(resourceQuery().enabled).toBe(false)
+      expect(store.mcp_ready).toBe(false)
+      expect(mcpLoads).toEqual([])
+
+      manager!.enableMcpQueries("/project")
+      expect(query().enabled).toBe(true)
+      expect(resourceQuery().enabled).toBe(true)
+      expect(store.mcp).toEqual({ demo: { status: "disabled" } })
+      // Initial bootstrap owns command/MCP hydration; onMcp is only for late
+      // demand after a directory has already completed bootstrap.
+      expect(mcpLoads).toEqual([])
+    } finally {
+      dispose()
+    }
+  })
+
   test("keeps non-bootstrapping children passive until a real directory access", () => {
     let manager: ReturnType<typeof createChildStoreManager> | undefined
     const offset = querySingles.length
@@ -261,11 +319,19 @@ describe("createChildStoreManager", () => {
       expect(bootstraps).toEqual([])
 
       manager.child("/project")
+      // A real route access starts directory bootstrap, but auxiliary query
+      // observers stay passive until the bootstrap's critical/background seam.
+      expect(queries[0]?.().enabled).toBe(false)
+      expect(queries[3]?.().enabled).toBe(false)
+      expect(queries[4]?.().enabled).toBe(false)
+      expect(queries[5]?.().enabled).toBe(false)
+      expect(bootstraps).toEqual(["/project"])
+
+      manager.enableQueries("/project")
       expect(queries[0]?.().enabled).toBe(true)
       expect(queries[3]?.().enabled).toBe(true)
       expect(queries[4]?.().enabled).toBe(true)
       expect(queries[5]?.().enabled).toBe(true)
-      expect(bootstraps).toEqual(["/project"])
 
       manager.child("/project", { bootstrap: false })
       expect(queries[0]?.().enabled).toBe(true)

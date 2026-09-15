@@ -45,7 +45,8 @@ export function createChildStoreManager(input: {
   const ownerPins = new WeakMap<object, Set<string>>()
   const disposers = new Map<string, () => void>()
   const mcpDirectories = new Set<string>()
-  const mcpToggles = new Map<string, (enabled: boolean) => void>()
+  const mcpRequestToggles = new Map<string, (requested: boolean) => void>()
+  const mcpQueryToggles = new Map<string, (enabled: boolean) => void>()
   const activeDirectories = new Set<string>()
   const activationToggles = new Map<string, (enabled: boolean) => void>()
 
@@ -120,7 +121,8 @@ export function createChildStoreManager(input: {
     iconCache.delete(key)
     lifecycle.delete(key)
     mcpDirectories.delete(key)
-    mcpToggles.delete(key)
+    mcpRequestToggles.delete(key)
+    mcpQueryToggles.delete(key)
     activeDirectories.delete(key)
     activationToggles.delete(key)
     const dispose = disposers.get(key)
@@ -186,6 +188,7 @@ export function createChildStoreManager(input: {
         createRoot((dispose) => {
           const initialMeta = meta[0].value
           const initialIcon = icon[0].value
+          const [mcpRequested, setMcpRequested] = createSignal(false)
           const [mcpEnabled, setMcpEnabled] = createSignal(false)
           const [instanceQueriesEnabled, setInstanceQueriesEnabled] = createSignal(false)
           // Deferred tier: lsp + references are not on critical paint and can
@@ -243,7 +246,7 @@ export function createChildStoreManager(input: {
             permission: {},
             question: {},
             get mcp_ready() {
-              return !mcpQuery.isLoading
+              return !mcpRequested() || (mcpEnabled() && !mcpQuery.isLoading)
             },
             get mcp() {
               return mcpQuery.isLoading ? {} : (mcpQuery.data ?? {})
@@ -266,7 +269,8 @@ export function createChildStoreManager(input: {
           })
           children[key] = child
           disposers.set(key, dispose)
-          mcpToggles.set(key, setMcpEnabled)
+          mcpRequestToggles.set(key, setMcpRequested)
+          mcpQueryToggles.set(key, setMcpEnabled)
           activationToggles.set(key, (value: boolean) => {
             setInstanceQueriesEnabled(value)
             if (!value) {
@@ -350,8 +354,21 @@ export function createChildStoreManager(input: {
   function enableMcp(directory: string, key: DirectoryKey, childStore: [Store<State>, SetStoreFunction<State>]) {
     if (mcpDirectories.has(key)) return
     mcpDirectories.add(key)
-    mcpToggles.get(key)?.(true)
-    if (childStore[0].status !== "loading") input.onMcp(directory, childStore[1])
+    mcpRequestToggles.get(key)?.(true)
+    // Initial directory acquisition must not let MCP jump ahead of the staged
+    // bootstrap and wake an expensive backend instance during the critical
+    // startup window. bootstrapDirectory fetches the initial MCP snapshot in
+    // its late tier and then calls enableMcpQueries(). Later MCP demand on an
+    // already-complete child remains immediate.
+    if (childStore[0].status !== "complete") return
+    mcpQueryToggles.get(key)?.(true)
+    input.onMcp(directory, childStore[1])
+  }
+
+  function enableMcpQueries(directory: string) {
+    const key = directoryKey(directory)
+    if (!mcpDirectories.has(key)) return
+    mcpQueryToggles.get(key)?.(true)
   }
 
   // Passive Home/project metadata reads must not initialize the directory.
@@ -361,13 +378,25 @@ export function createChildStoreManager(input: {
   function activate(key: DirectoryKey) {
     if (activeDirectories.has(key)) return
     activeDirectories.add(key)
+  }
+
+  /**
+   * Directory activation and auxiliary query activation are intentionally two
+   * different phases. A real route access should bootstrap the session list
+   * immediately, but path/provider/LSP/reference queries are secondary UI data
+   * and must not race that critical request on startup.
+   */
+  function enableQueries(directory: string) {
+    const key = directoryKey(directory)
+    if (!activeDirectories.has(key)) return
     activationToggles.get(key)?.(true)
   }
 
   function disableMcp(directory: string) {
     const key = directoryKey(directory)
     if (!mcpDirectories.delete(key)) return
-    mcpToggles.get(key)?.(false)
+    mcpRequestToggles.get(key)?.(false)
+    mcpQueryToggles.get(key)?.(false)
   }
 
   function projectMeta(directory: string, patch: ProjectMeta) {
@@ -411,6 +440,8 @@ export function createChildStoreManager(input: {
     pinned,
     mcp: (directory: string) => mcpDirectories.has(directoryKey(directory)),
     active: (directory: string) => activeDirectories.has(directoryKey(directory)),
+    enableQueries,
+    enableMcpQueries,
     disableMcp,
     disposeDirectory,
     runEviction,

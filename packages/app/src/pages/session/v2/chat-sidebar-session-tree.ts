@@ -1,5 +1,5 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
-import type { SessionGroupEntry } from "@/context/session-groups"
+import { sessionGroupMemberSession, type SessionGroupEntry } from "@/context/session-groups"
 
 export type ChatSidebarSessionTreeRow = {
   session: Session
@@ -68,7 +68,7 @@ export function buildChatSidebarSessionTreeRows(input: {
     let order = 0
     for (const group of ownershipOrder) {
       for (const member of group.sessions) {
-        const session = rootByID.get(member.id) ?? input.sessionByID(member.id)
+        const session = rootByID.get(member.id) ?? input.sessionByID(member.id) ?? sessionGroupMemberSession(member)
         if (!session || session.time?.archived != null) continue
         sessionByID.set(session.id, session)
         if (!ownerBySession.has(session.id)) ownerBySession.set(session.id, group)
@@ -119,12 +119,30 @@ export function buildChatSidebarSessionTreeRows(input: {
     })
   }
 
-  // Unanchored groups remain ordinary visual containers.
+  // Unanchored groups remain ordinary visual containers. Index the first
+  // owning group once, then walk the root list once to preserve root ordering.
+  // The previous implementation filtered the entire root array for every
+  // group, turning large sidebars into O(groups * roots) work on each memo
+  // recomputation.
+  const ordinaryOwner = new Map<string, SessionGroupEntry>()
   for (const group of orderedGroups) {
     if (group.anchorSessionID && (group.kind === "subagent" || group.kind === "plugin")) continue
-    const memberIDs = new Set(group.sessions.map((member) => member.id))
-    const members = roots.filter((session) => memberIDs.has(session.id) && !claimedRoots.has(session.id))
-    if (members.length === 0) continue
+    for (const member of group.sessions) {
+      if (!ordinaryOwner.has(member.id)) ordinaryOwner.set(member.id, group)
+    }
+  }
+  const ordinaryMembers = new Map<SessionGroupEntry, Session[]>()
+  for (const session of roots) {
+    if (claimedRoots.has(session.id)) continue
+    const group = ordinaryOwner.get(session.id)
+    if (!group) continue
+    const bucket = ordinaryMembers.get(group)
+    if (bucket) bucket.push(session)
+    else ordinaryMembers.set(group, [session])
+  }
+  for (const group of orderedGroups) {
+    const members = ordinaryMembers.get(group)
+    if (!members) continue
     for (let index = 0; index < members.length; index++) {
       const session = members[index]
       claimedRoots.add(session.id)

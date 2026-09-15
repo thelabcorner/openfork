@@ -27,7 +27,13 @@ import {
 } from "./global-sync/bootstrap"
 import { createChildStoreManager } from "./global-sync/child-store"
 import { applyDirectoryEvent, applyGlobalEvent } from "./global-sync/event-reducer"
-import { estimateRootSessionTotal, loadRootSessions, loadRootSessionsV1 } from "./global-sync/session-load"
+import {
+  estimateRootSessionTotal,
+  loadRootSessions,
+  loadRootSessionsFast,
+  loadRootSessionsV1,
+  rootSessionFastPathUnavailable,
+} from "./global-sync/session-load"
 import { trimSessions } from "./global-sync/session-trim"
 import type { ProjectMeta } from "./global-sync/types"
 import { SESSION_RECENT_LIMIT } from "./global-sync/types"
@@ -45,7 +51,7 @@ import { createRefCountMap } from "@/utils/refcount"
 import { useGlobal } from "./global"
 import { ServerConnection, useServer } from "./server"
 import type { ServerScope } from "@/utils/server-scope"
-import { createHomeSessionIndexCache } from "./global-sync/home-session-index"
+import { createHomeSessionIndexCache, homeSessionIndexRefreshRelevant } from "./global-sync/home-session-index"
 import { persisted } from "@/utils/persist"
 import type { ServerApi } from "@/utils/server"
 import type {
@@ -61,6 +67,7 @@ import { toggleMcp } from "./global-sync/mcp"
 import { createServerSession, type ServerSession } from "./server-session"
 import { perf } from "./perf"
 import { phaseTrace } from "./phase-trace"
+import type { ServerRequestPriority, ServerRequestScheduler } from "@/utils/server-request-scheduler"
 
 type GlobalStore = {
   ready: boolean
@@ -138,6 +145,7 @@ export const loadMcpQuery = (
   api: McpListApi,
   legacy?: OpencodeClient,
   protocol?: Promise<"v1" | "v2">,
+  requests?: ServerRequestScheduler,
 ): ApiQueryOptions<Record<string, McpServer["status"]>, readonly [ServerScope, string, "mcp"]> =>
   queryOptions<
     Record<string, McpServer["status"]>,
@@ -145,7 +153,7 @@ export const loadMcpQuery = (
     Record<string, McpServer["status"]>,
     readonly [ServerScope, string, "mcp"]
   >({
-    queryKey: [scope, directory, "mcp"] as const,
+    queryKey: [scope, directoryKey(directory), "mcp"] as const,
     staleTime: 5 * 60_000,
     gcTime: 10 * 60_000,
     refetchOnMount: false,
@@ -153,9 +161,12 @@ export const loadMcpQuery = (
     refetchOnWindowFocus: false,
     retry: 1,
     queryFn: async () => {
-      if ((await protocol) === "v1" && legacy) return (await legacy.mcp.status()).data ?? {}
-      return api
-        .list({ location: { directory } })
+      if ((await protocol) === "v1" && legacy)
+        return requests
+          ? requests.schedule("background", () => legacy.mcp.status(), { kind: "mcp-list" }).then((result) => result.data ?? {})
+          : (await legacy.mcp.status()).data ?? {}
+      const request = () => api.list({ location: { directory } })
+      return (requests ? requests.schedule("background", request, { kind: "mcp-list" }) : request())
         .then((result) => Object.fromEntries(result.data.map((server) => [server.name, server.status])))
     },
   })
@@ -166,6 +177,7 @@ export const loadMcpResourcesQuery = (
   api: McpResourceApi,
   legacy?: OpencodeClient,
   protocol?: Promise<"v1" | "v2">,
+  requests?: ServerRequestScheduler,
 ): ApiQueryOptions<Record<string, McpResource>, readonly [ServerScope, string, "mcpResources"]> =>
   queryOptions<
     Record<string, McpResource>,
@@ -173,7 +185,7 @@ export const loadMcpResourcesQuery = (
     Record<string, McpResource>,
     readonly [ServerScope, string, "mcpResources"]
   >({
-    queryKey: [scope, directory, "mcpResources"] as const,
+    queryKey: [scope, directoryKey(directory), "mcpResources"] as const,
     staleTime: 5 * 60_000,
     gcTime: 10 * 60_000,
     refetchOnMount: false,
@@ -182,15 +194,18 @@ export const loadMcpResourcesQuery = (
     retry: 1,
     queryFn: async () => {
       if ((await protocol) === "v1" && legacy) {
+        const response = requests
+          ? await requests.schedule("background", () => legacy.experimental.resource.list(), { kind: "mcp-resources" })
+          : await legacy.experimental.resource.list()
         return Object.fromEntries(
-          Object.entries((await legacy.experimental.resource.list()).data ?? {}).map(([key, resource]) => [
+          Object.entries(response.data ?? {}).map(([key, resource]) => [
             key,
             { ...resource, server: resource.client },
           ]),
         )
       }
-      return api.resource
-        .catalog({ location: { directory } })
+      const request = () => api.resource.catalog({ location: { directory } })
+      return (requests ? requests.schedule("background", request, { kind: "mcp-resources" }) : request())
         .then((result) =>
           Object.fromEntries(result.data.resources.map((resource) => [`${resource.server}:${resource.uri}`, resource])),
         )
@@ -198,25 +213,37 @@ export const loadMcpResourcesQuery = (
     placeholderData: {},
   })
 
-export const loadLspQuery = (scope: ServerScope, directory: string, sdk: OpencodeClient) =>
+export const loadLspQuery = (
+  scope: ServerScope,
+  directory: string,
+  sdk: OpencodeClient,
+  requests?: ServerRequestScheduler,
+) =>
   queryOptions({
-    queryKey: [scope, directory, "lsp"] as const,
+    queryKey: [scope, directoryKey(directory), "lsp"] as const,
     staleTime: 5 * 60_000,
     gcTime: 10 * 60_000,
     refetchOnMount: false,
     refetchOnReconnect: false,
     refetchOnWindowFocus: false,
     retry: 1,
-    queryFn: () => sdk.lsp.status().then((r) => r.data ?? []),
+    queryFn: () => {
+      const request = () => sdk.lsp.status()
+      return (requests ? requests.schedule("background", request, { kind: "lsp-status" }) : request()).then((r) => r.data ?? [])
+    },
   })
 
 export const loadActiveSessionsQuery = (
   scope: ServerScope,
   api: SessionActiveApi,
+  requests?: ServerRequestScheduler,
 ): ApiQueryOptions<SessionActiveOutput, readonly [ServerScope, "activeSessions"]> =>
   queryOptions<SessionActiveOutput, Error, SessionActiveOutput, readonly [ServerScope, "activeSessions"]>({
     queryKey: [scope, "activeSessions"] as const,
-    queryFn: () => api.active(),
+    queryFn: () =>
+      requests
+        ? requests.schedule("interactive", () => api.active(), { kind: "session-active" })
+        : api.active(),
     enabled: true,
     staleTime: Number.POSITIVE_INFINITY,
     gcTime: Number.POSITIVE_INFINITY,
@@ -236,6 +263,67 @@ export function seedActiveSessionStatuses(
   }
 }
 
+export function createActiveSessionInfoWarmup(resolve: (sessionID: string) => Promise<unknown>) {
+  const pending = new Set<string>()
+  let tail = Promise.resolve()
+  return {
+    push(sessionIDs: Iterable<string>) {
+      for (const sessionID of sessionIDs) {
+        if (!sessionID || pending.has(sessionID)) continue
+        pending.add(sessionID)
+        tail = tail
+          .then(() => resolve(sessionID))
+          .catch(() => undefined)
+          .finally(() => pending.delete(sessionID))
+          .then(() => undefined)
+      }
+      return tail
+    },
+    pending() {
+      return pending.size
+    },
+  }
+}
+
+/**
+ * Serializes the expensive auxiliary bootstrap wave across directories while
+ * leaving each admitted directory free to use its own bounded internal
+ * concurrency. The server coalesces same-directory requests behind one
+ * Instance initialization; overlapping *different* directories is the costly
+ * case because each can independently load config/plugins/LSP state.
+ */
+export function createDirectoryBootstrapGate() {
+  let tail: Promise<void> = Promise.resolve()
+  let queued = 0
+  let active = 0
+  let maxActive = 0
+
+  const run = <T,>(work: () => Promise<T>): Promise<T> => {
+    queued += 1
+    const result = tail.then(async () => {
+      queued -= 1
+      active += 1
+      maxActive = Math.max(maxActive, active)
+      try {
+        return await work()
+      } finally {
+        active -= 1
+      }
+    })
+    // A failed metadata wave must never poison the queue behind it.
+    tail = result.then(
+      () => undefined,
+      () => undefined,
+    )
+    return result
+  }
+
+  return {
+    run,
+    snapshot: () => ({ active, queued, maxActive }),
+  }
+}
+
 function normalizeActiveSessionStatus(status: SessionActiveOutput[string] | SessionStatus | undefined): SessionStatus | undefined {
   const type = (status as { type?: string } | undefined)?.type
   if (type === "running") return { type: "busy" }
@@ -249,21 +337,31 @@ function makeQueryOptionsApi(
   serverAPI: ServerApi,
   sdkFor: (dir: PathKey) => OpencodeClient,
   protocol: Promise<"v1" | "v2">,
+  requests: ServerRequestScheduler,
 ) {
   return {
-    globalConfig: () => loadGlobalConfigQuery(scope, serverSDK(), protocol),
-    projects: () => loadProjectsQuery(scope, serverAPI.project),
+    globalConfig: () => loadGlobalConfigQuery(scope, serverSDK(), protocol, requests, "interactive"),
+    projects: () => loadProjectsQuery(scope, serverAPI.project, requests, "interactive", serverSDK()),
     providers: (directory: PathKey | null) =>
-      loadProvidersQuery(scope, directory, serverAPI, directory ? sdkFor(directory) : serverSDK(), protocol),
+      loadProvidersQuery(
+        scope,
+        directory,
+        serverAPI,
+        directory ? sdkFor(directory) : serverSDK(),
+        protocol,
+        requests,
+        "background",
+      ),
     path: (directory: PathKey | null) =>
-      loadPathQuery(scope, directory, directory ? sdkFor(directory) : serverSDK(), protocol),
-    agents: (directory: PathKey) => loadAgentsQuery(scope, directory, serverAPI.agent, sdkFor(directory), protocol),
+      loadPathQuery(scope, directory, directory ? sdkFor(directory) : serverSDK(), protocol, requests, "interactive"),
+    agents: (directory: PathKey) =>
+      loadAgentsQuery(scope, directory, serverAPI.agent, sdkFor(directory), protocol, requests, "background"),
     references: (directory: PathKey) =>
-      loadReferencesQuery(scope, directory, serverAPI.reference, sdkFor(directory), protocol),
-    mcp: (directory: PathKey) => loadMcpQuery(scope, directory, serverAPI.mcp, sdkFor(directory), protocol),
+      loadReferencesQuery(scope, directory, serverAPI.reference, sdkFor(directory), protocol, requests, "background"),
+    mcp: (directory: PathKey) => loadMcpQuery(scope, directory, serverAPI.mcp, sdkFor(directory), protocol, requests),
     mcpResources: (directory: PathKey) =>
-      loadMcpResourcesQuery(scope, directory, serverAPI.mcp, sdkFor(directory), protocol),
-    lsp: (directory: PathKey) => loadLspQuery(scope, directory, sdkFor(directory)),
+      loadMcpResourcesQuery(scope, directory, serverAPI.mcp, sdkFor(directory), protocol, requests),
+    lsp: (directory: PathKey) => loadLspQuery(scope, directory, sdkFor(directory), requests),
     sessions: (directory: PathKey) => ({ queryKey: [scope, directory, "loadSessions"] as const }),
     // No tool-def query is registered today (tool calls render from streamed ToolParts), but the
     // query key is the contract `tool.reloaded` invalidates so a future /experimental/tool fetch
@@ -282,6 +380,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const booting = new Map<string, Promise<void>>()
   const sessionLoads = new Map<string, Promise<void>>()
   const sessionMeta = new Map<string, { limit: number }>()
+  const directoryBootstrapGate = createDirectoryBootstrapGate()
 
   const sdkFor = (directory: string) => {
     const key = directoryKey(directory)
@@ -297,7 +396,12 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const session = createServerSession(serverSDK.client, serverSDK.api.session, serverSDK.api.message, {
     protocol: serverSDK.protocol,
+    requests: serverSDK.requests,
+    onStreamInterestChanged: serverSDK.event.setStreamContentSessions,
   })
+  const activeSessionInfoWarmup = createActiveSessionInfoWarmup((sessionID) =>
+    session.resolve(sessionID, { priority: "background" }),
+  )
   // Push the foreground-content gate up to the SSE reader. The session store is
   // still the authority: rejecting a cached background delta marks that session
   // stale so resume()/sync() repairs exactly what was skipped.
@@ -312,18 +416,14 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     serverSDK.api,
     sdkFor,
     serverSDK.protocol,
+    serverSDK.requests,
   )
 
   const [catalogEnabled, setCatalogEnabled] = createSignal(false)
-  onMount(() => {
-    // Optimized: 30ms is enough to let the route's Suspense settle; the prior
-    // 400ms artificially inflated every session nav's critical path and made
-    // the global providers fetch land in the middle of the per-directory
-    // burst (705ms trace). Providers are still bg-preferred but no longer
-    // block paint; cache (5min staleTime) makes the follow-up instant.
-    const timer = window.setTimeout(() => setCatalogEnabled(true), 30)
-    onCleanup(() => window.clearTimeout(timer))
-  })
+  const ensureProviderCatalog = () => {
+    if (catalogEnabled()) return
+    setCatalogEnabled(true)
+  }
   const [configQuery, providerQuery, pathQuery] = useQueries(() => ({
     queries: [
       queryOptionsApi.globalConfig(),
@@ -337,9 +437,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         if ((await serverSDK.protocol) === "v1") {
           const statuses = (await serverSDK.client.session.status()).data ?? {}
           seedActiveSessionStatuses(session, statuses)
-          for (const sessionID of Object.keys(statuses)) {
-            void session.resolve(sessionID).catch(() => undefined)
-          }
+          void activeSessionInfoWarmup.push(Object.keys(statuses))
           return Object.fromEntries(
             Object.entries(statuses).flatMap(([sessionID, status]) =>
               status.type === "idle" ? [] : [[sessionID, { type: "running" as const }]],
@@ -348,12 +446,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         }
         const active = await serverSDK.api.session.active()
         seedActiveSessionStatuses(session, active)
-        for (const sessionID of Object.keys(active)) {
-          void session.resolve(sessionID).catch(() => undefined)
-        }
+        void activeSessionInfoWarmup.push(Object.keys(active))
         return active
       },
-    }),
+    }, serverSDK.requests),
   )
 
   const [globalStore, setGlobalStore] = createStore<GlobalStore>({
@@ -453,6 +549,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         formatMoreCount: (count) => language.t("common.moreCountSuffix", { count }),
         setGlobalStore: setBootStore,
         queryClient,
+        requests: serverSDK.requests,
       })
       bootedAt = Date.now()
       return bootedAt
@@ -486,7 +583,14 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       void bootstrapInstance(directory)
     },
     onMcp: (directory, setStore) => {
-      void loadCommands(directory, serverSDK.api.command, sdkFor(directory), serverSDK.protocol)
+      void loadCommands(
+        directory,
+        serverSDK.api.command,
+        sdkFor(directory),
+        serverSDK.protocol,
+        serverSDK.requests,
+        "background",
+      )
         .then((commands) => setStore("command", commands))
         .catch((err) => {
           if (isCancelledRequestError(err)) return
@@ -511,10 +615,20 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     },
   })
 
-  async function loadSessions(directory: string, options?: { limit?: number; shrinkTo?: number }) {
+  async function loadSessions(
+    directory: string,
+    options?: { limit?: number; shrinkTo?: number; priority?: ServerRequestPriority },
+  ) {
     const key = directoryKey(directory)
+    const priority = options?.priority ?? "interactive"
+    const requestKey = `session-list:${key}`
     const pending = sessionLoads.get(key)
     if (pending) {
+      // A project that began as speculative startup hydration can become the
+      // foreground Chat project before its queued request starts. Promote the
+      // existing transport job instead of making the user wait behind the old
+      // background ordering.
+      serverSDK.requests.promote(requestKey, priority)
       await pending
       return loadSessions(directory, options)
     }
@@ -559,17 +673,24 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       .fetchQuery({
         ...queryOptionsApi.sessions(key),
         queryFn: () =>
-          serverSDK.protocol
-            .then((protocol) =>
-              protocol === "v1"
-                ? loadRootSessionsV1({ client: sdkFor(directory), directory, limit })
-                : loadRootSessions({ api: serverSDK.api.session, directory, limit }),
+          serverSDK.requests
+            .schedule(
+              priority,
+              () =>
+                loadRootSessionsFast({ client: serverSDK.client, directory, limit }).catch((error) => {
+                  if (!rootSessionFastPathUnavailable(error)) throw error
+                  return serverSDK.protocol.then((protocol) =>
+                    protocol === "v1"
+                      ? loadRootSessionsV1({ client: sdkFor(directory), directory, limit })
+                      : loadRootSessions({ api: serverSDK.api.session, directory, limit }),
+                  )
+                }),
+              { key: requestKey, kind: "session-list" },
             )
             .then((x) => {
               const nonArchived = (x.data ?? [])
                 .filter((s) => !!s?.id)
                 .filter((s) => !s.time?.archived)
-                .sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0))
               const limit = Math.max(store.limit, options?.limit ?? 0, sessionMeta.get(key)?.limit ?? 0)
               const childSessions = store.session.filter((s) => !!s.parentID)
               const next = trimSessions([...nonArchived, ...childSessions], {
@@ -644,6 +765,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
         queryClient,
         session,
         protocol: serverSDK.protocol,
+        requests: serverSDK.requests,
+        runBackgroundBootstrap: directoryBootstrapGate.run,
+        onBackgroundReady: () => children.enableQueries(key),
+        onMcpReady: () => children.enableMcpQueries(key),
       })
     })
 
@@ -701,7 +826,8 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       if (event.type === "session.created" || event.type === "session.updated" || event.type === "session.deleted") {
         time("home", () => homeSessions.apply(event))
       }
-      time("home", () => homeSessions.refresh(event.type, connectedRepair))
+      if (homeSessionIndexRefreshRelevant(event.type))
+        time("home", () => homeSessions.refresh(event.type, connectedRepair))
     }
     if (eventType === "integration.connection.updated") void refreshProviders()
 
@@ -877,6 +1003,9 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     // bootstrap,
     updateConfig: updateConfigMutation.mutateAsync,
     project: projectApi,
+    providers: {
+      ensure: ensureProviderCatalog,
+    },
     session,
     homeSessions,
     mcp: {

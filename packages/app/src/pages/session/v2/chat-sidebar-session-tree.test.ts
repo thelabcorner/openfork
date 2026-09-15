@@ -6,10 +6,12 @@ import { buildChatSidebarSessionTreeRows } from "./chat-sidebar-session-tree"
 const session = (id: string, parentID?: string): Session =>
   ({
     id,
+    slug: id,
     parentID,
     title: id,
     directory: "C:/repo",
     projectID: "project",
+    version: "1",
     time: { created: 1, updated: 1 },
   }) as Session
 
@@ -64,6 +66,47 @@ describe("buildChatSidebarSessionTreeRows", () => {
     ])
     expect(rows[0]?.visibleCount).toBe(3)
     expect(rows[0]?.first).toBe(true)
+  })
+
+  test("uses group-member session projections without requiring a session-info cache lookup", () => {
+    const root = session("root")
+    const child = session("child", root.id)
+    const subagents = group({
+      id: "subagents-projected",
+      kind: "subagent",
+      anchorSessionID: root.id,
+      sessionIds: [root.id, child.id],
+      sessions: [root, child].map((item, position) => ({
+        id: item.id,
+        title: item.title,
+        slug: item.slug,
+        projectID: item.projectID,
+        directory: item.directory,
+        parentID: item.parentID,
+        version: item.version,
+        time: item.time,
+        position,
+        locked: item.id !== root.id,
+        origin: "auto_subagent" as const,
+        timeAdded: position,
+      })),
+    })
+
+    const lookups: string[] = []
+    const rows = buildChatSidebarSessionTreeRows({
+      roots: [root],
+      groups: [subagents],
+      sessionByID: (id) => {
+        lookups.push(id)
+        return undefined
+      },
+    })
+
+    expect(rows.map((row) => [row.session.id, row.depth])).toEqual([
+      [root.id, 0],
+      [child.id, 1],
+    ])
+    expect(lookups).toEqual([child.id])
   })
 
   test("keeps unresolved descendants reachable once their own session info exists even if an intermediate parent is missing", () => {

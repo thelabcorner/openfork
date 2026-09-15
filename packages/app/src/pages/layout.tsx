@@ -748,10 +748,14 @@ export default function LegacyLayout(props: ParentProps) {
     sync.child(directory, { bootstrap: false })
     const cached = untrack(() => {
       if (!sync.session.peek(session.id)) {
-        void sync.session.resolve(session.id).catch(() => {})
+        void sync.session
+          .resolve(session.id, { priority: priority === "high" ? "interactive" : "background" })
+          .catch(() => {})
       }
       if (!sync.session.lineage.peek(session.id)) {
-        void sync.session.lineage.resolve(session.id).catch(() => {})
+        void sync.session.lineage
+          .resolve(session.id, { priority: priority === "high" ? "interactive" : "background" })
+          .catch(() => {})
       }
       return !sync.session.shouldPrefetch(session.id, prefetchChunk)
     })

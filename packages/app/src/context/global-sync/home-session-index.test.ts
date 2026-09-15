@@ -10,6 +10,7 @@ import {
   loadHomeSessionIndex,
   homeSessionIndexSessions,
   homeSessionIndexRefresh,
+  homeSessionIndexRefreshRelevant,
   parseHomeSessionIndex,
   retainHomeSessions,
 } from "./home-session-index"
@@ -154,6 +155,14 @@ describe("Home V2 session index", () => {
     expect(homeSessionIndexRefresh("server.connected", true, true)).toEqual({ connected: true, refetch: true })
     expect(homeSessionIndexRefresh("global.disposed", true).refetch).toBe(true)
     expect(homeSessionIndexRefresh("session.next.moved", true).refetch).toBe(true)
+  })
+
+  test("classifies only Home refetch-affecting event types", () => {
+    expect(homeSessionIndexRefreshRelevant("server.connected")).toBe(true)
+    expect(homeSessionIndexRefreshRelevant("global.disposed")).toBe(true)
+    expect(homeSessionIndexRefreshRelevant("session.next.moved")).toBe(true)
+    expect(homeSessionIndexRefreshRelevant("session.status")).toBe(false)
+    expect(homeSessionIndexRefreshRelevant("permission.asked")).toBe(false)
   })
 
   test("removes a session from the loaded Home index", () => {

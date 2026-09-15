@@ -93,6 +93,10 @@ export function homeSessionIndexRefresh(event: Event["type"], connected: boolean
   }
 }
 
+export function homeSessionIndexRefreshRelevant(event: Event["type"]) {
+  return event === "server.connected" || event === "global.disposed" || event === "session.next.moved"
+}
+
 export function createHomeSessionIndexCache(queryClient: QueryClient, server: string) {
   const indexKey = homeSessionIndexKey(server)
   const eventsKey = homeSessionEventsKey(server)

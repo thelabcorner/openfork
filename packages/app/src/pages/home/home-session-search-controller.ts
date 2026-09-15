@@ -8,16 +8,18 @@ import { makeEventListener } from "@solid-primitives/event-listener"
 import { createEffect, createMemo, onCleanup } from "solid-js"
 import { createStore } from "solid-js/store"
 import type { HomeController } from "./home-controller"
-import { homeSessionSearchKey, type HomeSessionRecord, type HomeSessionsController } from "./home-sessions-controller"
+import type { HomeSessionRecord, OpenSessionOptions } from "./home-session-types"
 import { pathKey } from "@/utils/path-key"
-import { splitHighlight, type HighlightSegment } from "./home-search-highlight"
-import { searchWithDeadline } from "./home-search-deadline"
-import {
-  normalizeSessionSearchResponse,
-  type SessionSearchMessageMatch,
-  type SessionSearchResult,
-} from "./home-session-search-response"
+import type { HighlightSegment } from "./home-search-highlight"
+import type { SessionSearchMessageMatch, SessionSearchResult } from "./home-session-search-response"
 import { useSessionGroups } from "@/context/session-groups"
+
+let searchDeadlineRuntime: Promise<typeof import("./home-search-deadline")> | undefined
+const loadSearchDeadlineRuntime = () => (searchDeadlineRuntime ??= import("./home-search-deadline"))
+let searchResponseRuntime: Promise<typeof import("./home-session-search-response")> | undefined
+const loadSearchResponseRuntime = () => (searchResponseRuntime ??= import("./home-session-search-response"))
+let searchHighlightRuntime: Promise<typeof import("./home-search-highlight")> | undefined
+const loadSearchHighlightRuntime = () => (searchHighlightRuntime ??= import("./home-search-highlight"))
 
 const SEARCH_DEBOUNCE_MS = 200
 const SEARCH_CACHE_TTL_MS = 60_000
@@ -76,7 +78,9 @@ export type HomeSessionSearchHost = {
 }
 
 type HomeSessionSearchSource = {
-  session: Pick<HomeSessionsController["session"], "open">
+  session: {
+    open: (session: Session, options?: OpenSessionOptions) => void
+  }
 }
 
 export function createHomeSessionSearchController(
@@ -103,6 +107,7 @@ export function createHomeSessionSearchController(
   let requestID = 0
   let inFlight: AbortController | undefined
   const cache = new Map<string, { at: number; result: SessionSearchResult }>()
+  const messageSegments = new Map<string, HighlightSegment[]>()
 
   const query = createMemo(() => state.value.trim())
   const projectByID = createMemo(
@@ -124,7 +129,7 @@ export function createHomeSessionSearchController(
     const sessionsHit: HomeSearchHit[] = state.sessions.map((session) => {
       const project = projectFor(session)
       return {
-        key: homeSessionSearchKey({ session, project, projectName: "" }),
+        key: `${pathKey(session.directory)}:${session.id}`,
         kind: "session" as const,
         session,
         project,
@@ -143,7 +148,7 @@ export function createHomeSessionSearchController(
         project,
         projectName: displayName(project),
         groupName: sessionGroupMap().get(message.sessionID),
-        segments: splitHighlight(message.snippet, message.matchedTerms),
+        segments: messageSegments.get(message.messageID) ?? [],
       }
     })
     return [...sessionsHit, ...messagesHit]
@@ -238,7 +243,7 @@ export function createHomeSessionSearchController(
     const cacheKey = `${conn ? ServerConnection.key(conn) : ""}\0${project?.worktree ?? ""}\0${value}`
     const cached = cache.get(cacheKey)
     if (cached && Date.now() - cached.at < SEARCH_CACHE_TTL_MS) {
-      applyResult(cached.result, id)
+      await applyResult(cached.result, id)
       return
     }
     abortInFlight()
@@ -246,6 +251,7 @@ export function createHomeSessionSearchController(
     inFlight = controller
     const startedAt = performance.now()
     try {
+      const { searchWithDeadline } = await loadSearchDeadlineRuntime()
       const outcome = await searchWithDeadline(controller, SEARCH_TIMEOUT_MS, SEARCH_TIMEOUT_REASON, (signal) =>
         searchEndpoint(ctx?.sdk.client, value, signal, project),
       )
@@ -275,7 +281,7 @@ export function createHomeSessionSearchController(
         })
       }
       cache.set(cacheKey, { at: Date.now(), result: outcome.value })
-      applyResult(outcome.value, id)
+      await applyResult(outcome.value, id)
     } catch (cause) {
       if (id !== requestID || !open()) return
       const elapsedMs = Math.round(performance.now() - startedAt)
@@ -291,8 +297,17 @@ export function createHomeSessionSearchController(
     }
   }
 
-  function applyResult(result: SessionSearchResult, id: number) {
+  async function applyResult(result: SessionSearchResult, id: number) {
     if (id !== requestID || !open()) return
+    const messages = dedupeMessages(result.messageMatches.filter((match) => !!match.directory)).slice(0, MAX_MESSAGE_RESULTS)
+    messageSegments.clear()
+    if (messages.length > 0) {
+      const { splitHighlight } = await loadSearchHighlightRuntime()
+      if (id !== requestID || !open()) return
+      for (const message of messages) {
+        messageSegments.set(message.messageID, splitHighlight(message.snippet, message.matchedTerms))
+      }
+    }
     setState({
       loading: false,
       error: undefined,
@@ -301,7 +316,7 @@ export function createHomeSessionSearchController(
         if (!directory) return []
         return [{ ...session, directory } as Session]
       }).slice(0, MAX_SESSION_RESULTS),
-      messages: dedupeMessages(result.messageMatches.filter((match) => !!match.directory)).slice(0, MAX_MESSAGE_RESULTS),
+      messages,
       highlighted: "",
     })
   }
@@ -387,16 +402,17 @@ function searchEndpoint(
   project: { worktree: string } | undefined,
 ): Promise<SessionSearchResult> {
   if (!client) return Promise.resolve({ titleMatches: [], messageMatches: [] })
-  return (client as SessionSearchEndpoint).v2.session
-    .search(
+  return Promise.all([
+    (client as SessionSearchEndpoint).v2.session.search(
       {
         query,
         limit: String(MAX_SESSION_RESULTS + MAX_MESSAGE_RESULTS),
         ...(project ? { directory: project.worktree } : {}),
       },
       { signal },
-    )
-    .then(normalizeSessionSearchResponse)
+    ),
+    loadSearchResponseRuntime(),
+  ]).then(([response, runtime]) => runtime.normalizeSessionSearchResponse(response))
 }
 
 // One session may surface multiple message hits (BM25-ranked, highest first);

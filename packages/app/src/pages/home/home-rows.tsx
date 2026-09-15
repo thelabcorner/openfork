@@ -12,11 +12,8 @@ import { displayName, getProjectAvatarSource } from "@/pages/layout/helpers"
 import { sessionTitle } from "@/utils/session-title"
 import { getRelativeTime } from "@/utils/time"
 import { shouldOpenSessionInBackground } from "../home-session-open"
-import {
-  HomeSessionStatusController,
-  type HomeSessionRecord,
-  type OpenSessionOptions,
-} from "./home-sessions-controller"
+import { HomeSessionStatusController } from "./home-session-status-controller"
+import type { HomeSessionRecord, OpenSessionOptions } from "./home-session-types"
 import { SessionContextMenu } from "@/components/session-menu/session-context-menu"
 
 // Shared home row/list-item presentation, consumed by HomeProjectsView,

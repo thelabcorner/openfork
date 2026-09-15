@@ -23,10 +23,32 @@ import { createSessionKeyReader, ensureSessionKey, pruneSessionKeys } from "./la
 import { requireServerKey } from "@/utils/session-route"
 import { type DraftTab, useTabs } from "./tabs"
 import { closeSessionTab, openSessionTab, previewSessionTab, type SessionTabs } from "./layout-tabs"
+import { planStartupSessionHydration } from "./startup-session-hydration"
+import { startupMark, startupSpan } from "@/utils/startup-perf"
+import { loadChatSidebarPane } from "@/pages/session/v2/chat-sidebar-preload"
+import { findChatProject } from "@/utils/chat-project"
 
 export { createSessionKeyReader, ensureSessionKey, pruneSessionKeys }
 
 export type { ProjectAvatarVariant }
+
+export function getProjectAvatarVariant(key?: string): ProjectAvatarVariant {
+  if (key === "mint") return "cyan"
+  if (key === "lime") return "green"
+  if (
+    key === "orange" ||
+    key === "yellow" ||
+    key === "cyan" ||
+    key === "green" ||
+    key === "red" ||
+    key === "pink" ||
+    key === "blue" ||
+    key === "purple" ||
+    key === "gray"
+  )
+    return key
+  return "gray"
+}
 
 const AVATAR_COLOR_KEYS = ["pink", "mint", "orange", "purple", "cyan", "lime"] as const
 const DEFAULT_SIDEBAR_WIDTH = 344
@@ -41,7 +63,12 @@ export const DEFAULT_SESSION_CONTEXT_TAB: SessionContextTab = "context"
 const DEFAULT_MODELS_PANEL_OPENED = false
 const DEFAULT_LIMITS_PANEL_OPENED = false
 const DEFAULT_CHATS_PANEL_OPENED = false
-const PROJECT_SESSION_LOAD_CONCURRENCY = 4
+// The server-scoped request scheduler admits at most two background requests at
+// once. Matching that limit here avoids manufacturing two additional promises
+// that can do nothing except sit in the global queue; throughput is unchanged,
+// while queue depth/microtask churn stay lower during startup.
+const PROJECT_SESSION_LOAD_CONCURRENCY = 2
+const FOREGROUND_SESSION_LOAD_HEAD_START_MS = 120
 export type AvatarColorKey = (typeof AVATAR_COLOR_KEYS)[number]
 
 async function forEachLimited<T>(items: readonly T[], work: (item: T) => Promise<unknown>, concurrency: number) {
@@ -67,24 +94,6 @@ export function getAvatarColors(key?: string) {
     background: "var(--surface-info-base)",
     foreground: "var(--text-base)",
   }
-}
-
-export function getProjectAvatarVariant(key?: string): ProjectAvatarVariant {
-  if (key === "mint") return "cyan"
-  if (key === "lime") return "green"
-  if (
-    key === "orange" ||
-    key === "yellow" ||
-    key === "cyan" ||
-    key === "green" ||
-    key === "red" ||
-    key === "pink" ||
-    key === "blue" ||
-    key === "purple" ||
-    key === "gray"
-  )
-    return key
-  return "gray"
 }
 
 type SessionView = {
@@ -663,24 +672,135 @@ export const { use: useLayout, provider: LayoutProvider } = createSimpleContext(
 
     let sessionFrame: number | undefined
     let sessionTimer: number | undefined
+    let sessionIdle: number | undefined
+    let startupChatRetryTimer: number | undefined
+    let sessionHydrationCancelled = false
+    let startupChatLoadedWorktree: string | undefined
+    let startupChatLoadingWorktree: string | undefined
+
+    const loadStartupChat = (worktree: string, attempt = 0) => {
+      const key = pathKey(worktree)
+      if (sessionHydrationCancelled) return
+      if (startupChatLoadedWorktree === key || startupChatLoadingWorktree === key) return
+      startupChatLoadingWorktree = key
+      const startedAt = performance.now()
+      startupMark("sidebar.chat-foreground-load-start", { worktree })
+      void serverSync()
+        .project.loadSessions(worktree, { priority: "critical" })
+        .then(() => {
+          if (startupChatLoadingWorktree === key) startupChatLoadingWorktree = undefined
+          startupChatLoadedWorktree = key
+          startupSpan("sidebar.chat-foreground-load-complete", startedAt, { attempt })
+        })
+        .catch(() => {
+          if (startupChatLoadingWorktree === key) startupChatLoadingWorktree = undefined
+          if (sessionHydrationCancelled || attempt >= 2) return
+          if (startupChatRetryTimer !== undefined) window.clearTimeout(startupChatRetryTimer)
+          startupChatRetryTimer = window.setTimeout(() => {
+            startupChatRetryTimer = undefined
+            loadStartupChat(worktree, attempt + 1)
+          }, 250 * (attempt + 1))
+        })
+    }
+
+    createEffect(() => {
+      if (!ready() || !store.chats.panelOpened) return
+      const canonical = findChatProject(serverSync().data.project)
+      if (!canonical?.worktree) return
+      loadStartupChat(canonical.worktree)
+    })
 
     onMount(() => {
-      sessionFrame = requestAnimationFrame(() => {
-        sessionFrame = undefined
-        sessionTimer = window.setTimeout(() => {
-          sessionTimer = undefined
+      const layoutReady = ready.promise ?? Promise.resolve()
+      void layoutReady.then(() => {
+        startupMark("sidebar.layout-persist-ready", { open: store.chats.panelOpened })
+        if (!store.chats.panelOpened) return
+        startupMark("sidebar.module-preload-start")
+        void loadChatSidebarPane().then(() => startupMark("sidebar.module-preload-complete"))
+      })
+
+      const persistedReady = server.ready.promise ?? Promise.resolve()
+      void persistedReady.then(async () => {
+        if (sessionHydrationCancelled) return
+        startupMark("sidebar.persisted-projects-ready", { projects: server.projects.list().length })
+
+        // Persisted project state is asynchronous. Reading projects during the
+        // component's first onMount could observe the empty initial store and
+        // permanently miss startup hydration if storage completed after the
+        // old one-shot rAF/setTimeout retry. Use the provider's actual ready
+        // contract instead of timing heuristics.
+        const initial = planStartupSessionHydration(server.projects.list(), server.projects.last())
+        const foreground = initial.foreground
+        const foregroundStartedAt = performance.now()
+        if (foreground) startupMark("sidebar.foreground-load-start")
+        const foregroundLoad = foreground
+          ? serverSync().project.loadSessions(foreground.worktree, { priority: "critical" })
+          : Promise.resolve()
+        if (foreground) {
+          void foregroundLoad.then(() =>
+            startupSpan("sidebar.foreground-load-complete", foregroundStartedAt),
+          ).catch(() => startupMark("sidebar.foreground-load-failed"))
+        }
+
+        // Give the session list that can produce the first visible sidebar
+        // rows a small uncontended head start. Never let a slow/remote project
+        // serialize all background hydration indefinitely.
+        if (foreground) {
+          await Promise.race([
+            foregroundLoad.catch(() => undefined),
+            new Promise<void>((resolve) => window.setTimeout(resolve, FOREGROUND_SESSION_LOAD_HEAD_START_MS)),
+          ])
+        }
+        if (sessionHydrationCancelled) return
+
+        // Browser-idle is not equivalent to startup-idle: while the renderer
+        // is awaiting Vite transforms/network module fetches, requestIdleCallback
+        // can fire and start background HTTP work against the same sidecar. If
+        // the chat sidebar is restored open, its module is guaranteed startup
+        // work, so let that transform/evaluation frontier finish first. The
+        // memoized loader is shared with the render path and does not duplicate
+        // the request.
+        if (store.chats.panelOpened) {
+          await loadChatSidebarPane().catch(() => undefined)
+          if (sessionHydrationCancelled) return
+        }
+
+        const hydrateBackground = () => {
+          if (sessionHydrationCancelled) return
+          const plan = planStartupSessionHydration(server.projects.list(), foreground?.worktree)
           void forEachLimited(
-            server.projects.list(),
-            (project) => serverSync().project.loadSessions(project.worktree),
+            plan.background,
+            (project) => serverSync().project.loadSessions(project.worktree, { priority: "background" }),
             PROJECT_SESSION_LOAD_CONCURRENCY,
           )
-        }, 0)
+        }
+
+        sessionFrame = requestAnimationFrame(() => {
+          sessionFrame = undefined
+          if (typeof window.requestIdleCallback === "function") {
+            sessionIdle = window.requestIdleCallback(
+              () => {
+                sessionIdle = undefined
+                hydrateBackground()
+              },
+              { timeout: 900 },
+            )
+            return
+          }
+          sessionTimer = window.setTimeout(() => {
+            sessionTimer = undefined
+            hydrateBackground()
+          }, 120)
+        })
       })
     })
 
     onCleanup(() => {
+      sessionHydrationCancelled = true
       if (sessionFrame !== undefined) cancelAnimationFrame(sessionFrame)
       if (sessionTimer !== undefined) window.clearTimeout(sessionTimer)
+      if (sessionIdle !== undefined) window.cancelIdleCallback?.(sessionIdle)
+      if (startupChatRetryTimer !== undefined) window.clearTimeout(startupChatRetryTimer)
     })
 
     // Cross-tree resize coordination: the hosted browser panel lives outside

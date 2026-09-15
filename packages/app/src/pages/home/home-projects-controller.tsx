@@ -1,7 +1,6 @@
 import { useDirectoryPicker } from "@/components/directory-picker"
-import { useServerManagementController } from "@/components/dialog-select-server"
+import { useServerManagementState } from "@/components/server-management-state"
 import { useSettingsCommand } from "@/components/settings-dialog"
-import { DialogServerV2 } from "@/components/settings-v2/dialog-server-v2"
 import { type LocalProject } from "@/context/layout"
 import { useLanguage } from "@/context/language"
 import { useNotification } from "@/context/notification"
@@ -22,7 +21,7 @@ export function createHomeProjectsController(home: HomeController) {
   const language = useLanguage()
   const notification = useNotification()
   const openSettings = useSettingsCommand()
-  const serverManagement = useServerManagementController({ navigateOnAdd: false })
+  const serverManagement = useServerManagementState()
   const [_state, setState, _, ready] = persisted(
     Persist.global("home.servers", ["home.servers.v1"]),
     createStore({ collapsed: {} as Record<string, boolean> }),
@@ -60,8 +59,12 @@ export function createHomeProjectsController(home: HomeController) {
       defaultKey: serverManagement.defaultKey,
       setDefault: (conn: ServerConnection.Any | undefined) =>
         serverManagement.setDefault(conn ? ServerConnection.key(conn) : null),
-      remove: (conn: ServerConnection.Any) => serverManagement.handleRemove(ServerConnection.key(conn)),
-      edit: (conn: ServerConnection.Http) => dialog.show(() => <DialogServerV2 mode="edit" server={conn} />),
+      remove: (conn: ServerConnection.Any) => serverManagement.remove(ServerConnection.key(conn)),
+      edit: (conn: ServerConnection.Http) => {
+        void import("@/components/settings-v2/dialog-server-v2").then(({ DialogServerV2 }) => {
+          void dialog.show(() => <DialogServerV2 mode="edit" server={conn} />)
+        })
+      },
       focus: home.selection.focusServer,
     },
     project: {

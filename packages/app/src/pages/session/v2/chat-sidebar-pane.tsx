@@ -3,10 +3,14 @@ import {
   createMemo,
   createSignal,
   For,
+  getOwner,
+  lazy,
   Match,
   onCleanup,
   onMount,
+  runWithOwner,
   Show,
+  Suspense,
   Switch,
   type Accessor,
   type JSX,
@@ -18,11 +22,9 @@ import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
-import { KeybindV2 } from "@opencode-ai/ui/v2/keybind-v2"
 import { Spinner } from "@opencode-ai/ui/spinner"
 import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
 import { ProjectAvatar } from "@opencode-ai/ui/v2/project-avatar-v2"
-import { ResizeHandle } from "@opencode-ai/ui/resize-handle"
 import { useLanguage } from "@/context/language"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { getProjectAvatarVariant, useLayout, type LocalProject } from "@/context/layout"
@@ -32,22 +34,13 @@ import { usePermission } from "@/context/permission"
 import { usePlatform } from "@/context/platform"
 import { useServerSDK } from "@/context/server-sdk"
 import { ServerConnection } from "@/context/server"
-import { useGlobal } from "@/context/global"
-import { sessionHasOpenTab, useTabs } from "@/context/tabs"
-import { createHomeSessionSearchController, type HomeSearchHit } from "@/pages/home/home-session-search-controller"
-import {
-  HomeSessionLeadingController,
-  HomeSessionProjectName,
-  HomeSessionTitle,
-  isBackgroundOpen,
-} from "@/pages/home/home-rows"
-import type { HomeSessionRecord, OpenSessionOptions } from "@/pages/home/home-sessions-controller"
-import { getRelativeTime } from "@/utils/time"
 import { useProviders } from "@/hooks/use-providers"
 import { useSessionGroups } from "@/context/session-groups"
 import { sessionTitle } from "@/utils/session-title"
 import { pathKey } from "@/utils/path-key"
-import { createRequestGate } from "@/utils/request-gate"
+import { startupMark, startupTransportDiagnostic } from "@/utils/startup-perf"
+
+startupMark("sidebar.module-evaluated")
 import { buildChatSidebarSessionTreeRows } from "./chat-sidebar-session-tree"
 import {
   compareSessionTime,
@@ -56,20 +49,30 @@ import {
   displayName,
   sortedRootSessions,
 } from "@/pages/layout/helpers"
+import type { SessionModelPickerRequest } from "@/components/session-menu/session-model-picker-runtime"
+const SidebarSessionContextMenu = lazy(() =>
+  import("@/components/session-menu/session-context-menu").then((m) => ({ default: m.SessionContextMenu })),
+)
+const SessionModelPicker = lazy(() =>
+  import("@/components/session-menu/session-model-picker-runtime").then((m) => ({ default: m.SessionModelPicker })),
+)
+const ChatSidebarSearchResults = lazy(() =>
+  import("./chat-sidebar-search-results").then((m) => ({ default: m.ChatSidebarSearchResults })),
+)
+const ChatSidebarArchivedBody = lazy(() =>
+  import("./chat-sidebar-archived-body").then((m) => ({ default: m.ChatSidebarArchivedBody })),
+)
+const SidebarResizeHandle = lazy(() =>
+  import("@opencode-ai/ui/resize-handle").then((m) => ({ default: m.ResizeHandle })),
+)
+type ChatSidebarSearchRuntime = import("./chat-sidebar-search-runtime").ChatSidebarSearchRuntime
+let chatSidebarSearchRuntimeModule: Promise<typeof import("./chat-sidebar-search-runtime")> | undefined
+const loadChatSidebarSearchRuntime = () =>
+  (chatSidebarSearchRuntimeModule ??= import("./chat-sidebar-search-runtime"))
 import {
-  aggregateSessionContextByModel,
-  liveGenerationProgress,
-} from "@/components/session/session-context-model-metrics"
-import { getSessionContext } from "@/components/session/session-context-metrics"
-import { computeMeasuredRate } from "@/components/prompt-input/live-generation-rate-math"
-import {
-  SessionContextMenu,
-  SessionModelPicker,
-  type SessionModelPickerRequest,
-} from "@/components/session-menu/session-context-menu"
-import {
-  CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN,
   CHAT_SIDEBAR_RECENT_LIMIT_MIN,
+  chatSidebarAggregateMetrics,
+  shouldAutoHydrateChatSidebarMetrics,
   type ChatSidebarPaneState,
 } from "./chat-sidebar-pane-state"
 import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
@@ -77,6 +80,26 @@ import { findChatProject, isChatProjectAlias, isReservedChatProjectPath } from "
 import type { AssistantMessage, Session } from "@opencode-ai/sdk/v2/client"
 
 type ProviderList = ReturnType<ReturnType<typeof useProviders>["all"]> extends Map<string, infer P> ? P[] : never
+
+type ChatSidebarMetricsRuntime = {
+  aggregateSessionContextByModel: typeof import("@/components/session/session-context-model-metrics")["aggregateSessionContextByModel"]
+  liveGenerationProgress: typeof import("@/components/session/session-context-model-metrics")["liveGenerationProgress"]
+  getSessionContext: typeof import("@/components/session/session-context-metrics")["getSessionContext"]
+  computeMeasuredRate: typeof import("@/components/prompt-input/live-generation-rate-math")["computeMeasuredRate"]
+}
+
+let chatSidebarMetricsRuntime: Promise<ChatSidebarMetricsRuntime> | undefined
+const loadChatSidebarMetricsRuntime = () =>
+  (chatSidebarMetricsRuntime ??= Promise.all([
+    import("@/components/session/session-context-model-metrics"),
+    import("@/components/session/session-context-metrics"),
+    import("@/components/prompt-input/live-generation-rate-math"),
+  ]).then(([modelMetrics, contextMetrics, rateMath]) => ({
+    aggregateSessionContextByModel: modelMetrics.aggregateSessionContextByModel,
+    liveGenerationProgress: modelMetrics.liveGenerationProgress,
+    getSessionContext: contextMetrics.getSessionContext,
+    computeMeasuredRate: rateMath.computeMeasuredRate,
+  })))
 
 /** Compact relative stamp ("2h", "3d", "now") for any epoch-ms timestamp. */
 function relativeStamp(ts: number | undefined, now: number): string {
@@ -160,6 +183,7 @@ export function ChatSidebarPane(props: {
   opened: boolean
   onClose: () => void
 }): JSX.Element {
+  startupMark("sidebar.component-mounted")
   const language = useLanguage()
   const layout = useLayout()
   const serverSync = useServerSync()
@@ -181,6 +205,21 @@ export function ChatSidebarPane(props: {
   const [minuteNow, setMinuteNow] = createSignal(Date.now())
   const minuteTick = setInterval(() => setMinuteNow(Date.now()), 30_000)
   onCleanup(() => clearInterval(minuteTick))
+
+  // The resize handle is an invisible interaction affordance, not first-paint
+  // content. Mount it one frame later so its geometry/runtime graph cannot
+  // block the sidebar's initial render.
+  const [resizeReady, setResizeReady] = createSignal(false)
+  let resizeFrame = 0
+  onMount(() => {
+    resizeFrame = requestAnimationFrame(() => {
+      resizeFrame = 0
+      setResizeReady(true)
+    })
+  })
+  onCleanup(() => {
+    if (resizeFrame) cancelAnimationFrame(resizeFrame)
+  })
 
   // One picker for the pane. Keeping it outside every row's TooltipV2 avoids
   // changing a tooltip trigger from one child to two while its context menu is
@@ -287,33 +326,44 @@ export function ChatSidebarPane(props: {
       const rows = [project.worktree, ...(project.sandboxes ?? [])].flatMap((dir) => sliceOf(dir))
       projectRows.set(project.worktree, rows.sort(compareSessionTime))
     }
-    return { projects, recentPool: [...recentPool].sort(compareSessionTime), projectRows }
+    const recent = [...recentPool].sort(compareSessionTime)
+    if (recent.length > 0) {
+      startupMark("sidebar.first-rows", { rows: recent.length, projects: projects.length })
+      startupTransportDiagnostic("sidebar.first-rows.transport")
+    }
+    const projectByID = new Map(projects.flatMap((project) => (project.id ? [[project.id, project] as const] : [])))
+    return { projects, projectByID, recentPool: recent, projectRows }
   })
 
-  // Root-session queries are intentionally cheap. Anchored structural groups
-  // (native subagents and plugin-owned worker trees) are the explicit signal
-  // that missing member info is useful in navigation, so hydrate only the small
-  // amount of missing Session *info* for groups whose anchor is visible. `resolve` does not
-  // fetch message history, and the gate prevents a restored workspace with many
-  // historical subagents from turning one render into a request burst.
-  const treeInfoGate = createRequestGate(4)
+  const visibleRootIDs = createMemo(() => new Set(baseGroups().recentPool.map((session) => session.id)))
+  const visibleStructuralGroups = createMemo(() => {
+    const roots = visibleRootIDs()
+    return sessionGroups
+      .list()
+      .filter(
+        (group) =>
+          (group.kind === "subagent" || group.kind === "plugin") &&
+          !!group.anchorSessionID &&
+          roots.has(group.anchorSessionID),
+      )
+  })
+
+  // Modern group-detail responses include a lightweight session projection, so
+  // structural children can render without turning a tiny navigation row into a
+  // full per-directory instance bootstrap. Keep the old resolve path only as a
+  // compatibility fallback for older servers whose group members lack that
+  // projection.
   const treeInfoPending = new Set<string>()
   const treeInfoFailedAt = new Map<string, number>()
   createEffect(() => {
-    const visibleRoots = new Set(baseGroups().recentPool.map((session) => session.id))
-    for (const group of sessionGroups.list()) {
-      if (
-        (group.kind !== "subagent" && group.kind !== "plugin") ||
-        !group.anchorSessionID ||
-        !visibleRoots.has(group.anchorSessionID)
-      )
-        continue
+    for (const group of visibleStructuralGroups()) {
       for (const member of group.sessions) {
+        if (member.slug && member.projectID && member.directory && member.version && member.time) continue
         if (serverSync().session.peek(member.id) || treeInfoPending.has(member.id)) continue
         const failedAt = treeInfoFailedAt.get(member.id)
         if (failedAt !== undefined && Date.now() - failedAt < 30_000) continue
         treeInfoPending.add(member.id)
-        void treeInfoGate(() => serverSync().session.resolve(member.id))
+        void serverSync().session.resolve(member.id, { priority: "background" })
           .then(
             () => treeInfoFailedAt.delete(member.id),
             () => treeInfoFailedAt.set(member.id, Date.now()),
@@ -328,7 +378,7 @@ export function ChatSidebarPane(props: {
   // cached; stableGroups below then finds nothing visibly changed and keeps
   // every row component alive.
   const groups = createMemo<ChatSessionGroup[]>(() => {
-    const { projects, recentPool, projectRows } = baseGroups()
+    const { projects, projectByID, recentPool, projectRows } = baseGroups()
     const result: ChatSessionGroup[] = []
 
     if (recentPool.length > 0) {
@@ -346,7 +396,7 @@ export function ChatSidebarPane(props: {
       const rows = pinWorkingFirst(projectRows.get(project.worktree) ?? [])
       if (rows.length === 0 && project.id !== "chats") continue
       const [store] = serverSync().child(project.worktree, { bootstrap: false })
-      const meta = (rows[0] ? projectForSession(rows[0], projects) : undefined) ?? project
+      const meta = (rows[0] ? projectForSession(rows[0], projects, projectByID) : undefined) ?? project
       result.push({
         key: pathKey(project.worktree),
         label: displayName(project),
@@ -405,21 +455,10 @@ export function ChatSidebarPane(props: {
 
   const workingCount = createMemo(() => {
     const seen = new Set<string>()
-    const visibleRoots = new Set(baseGroups().recentPool.map((session) => session.id))
-    for (const group of groups()) {
-      for (const session of group.sessions) {
-        if (isWorking(session)) seen.add(session.id)
-      }
-    }
+    for (const session of baseGroups().recentPool) if (isWorking(session)) seen.add(session.id)
     // Structural members may be absent from the loaded root slices. Once their
     // anchor is part of this pane, include their work state in the global badge.
-    for (const group of sessionGroups.list()) {
-      if (
-        (group.kind !== "subagent" && group.kind !== "plugin") ||
-        !group.anchorSessionID ||
-        !visibleRoots.has(group.anchorSessionID)
-      )
-        continue
+    for (const group of visibleStructuralGroups()) {
       for (const member of group.sessions) if (isWorking(member)) seen.add(member.id)
     }
     return seen.size
@@ -529,9 +568,12 @@ export function ChatSidebarPane(props: {
   // exactly the groups this pane renders.
   const archivedDirectories = createMemo(() => {
     const dirs: string[] = []
+    const seen = new Set<string>()
     for (const project of layout.projects.list()) {
       for (const dir of [project.worktree, ...(project.sandboxes ?? [])]) {
-        if (dirs.some((existing) => pathKey(existing) === pathKey(dir))) continue
+        const key = pathKey(dir)
+        if (seen.has(key)) continue
+        seen.add(key)
         dirs.push(dir)
       }
     }
@@ -603,10 +645,10 @@ export function ChatSidebarPane(props: {
   const prefetchSession = (session: Session) => {
     if (!session.id || !session.directory) return
     try {
-      void serverSync()
-        .ensureDirSyncContext(session.directory)
-        .session.prefetch(session.id, 20)
-        .catch(() => {})
+      // DirectorySync.session.prefetch is a pure pass-through to this global
+      // session store. Avoid constructing a directory context just to warm a
+      // session before navigation.
+      void serverSync().session.prefetch(session.id, 20).catch(() => {})
     } catch {
       // ignore
     }
@@ -616,46 +658,40 @@ export function ChatSidebarPane(props: {
   // Hydrate each row once when it scrolls into view instead of fetching every
   // visible session up front; session.prefetch dedupes and rate-limits itself.
   const hydrated = new Set<string>()
+  const metricsQueue: Session[] = []
+  let metricsActive = false
+  let metricsDisposed = false
+
+  const pumpMetrics = () => {
+    if (metricsDisposed || metricsActive) return
+    const session = metricsQueue.shift()
+    if (!session) return
+    metricsActive = true
+    // Secondary row metrics deliberately use one producer slot. The global
+    // request scheduler still owns transport priority, but keeping this producer
+    // bounded prevents a viewport full of rows from manufacturing a background
+    // queue that competes with project/session housekeeping immediately after
+    // first paint.
+    void serverSync()
+      .session.prefetch(session.id, 200)
+      .catch(() => hydrated.delete(session.id))
+      .finally(() => {
+        metricsActive = false
+        pumpMetrics()
+      })
+  }
+
   const hydrateMetrics = (session: Session) => {
     if (!session.id || !session.directory || hydrated.has(session.id)) return
     hydrated.add(session.id)
-    try {
-      void serverSync()
-        .ensureDirSyncContext(session.directory)
-        .session.prefetch(session.id, 200)
-        .catch(() => hydrated.delete(session.id))
-    } catch {
-      hydrated.delete(session.id)
-    }
+    metricsQueue.push(session)
+    pumpMetrics()
   }
 
-  // One pane-level IntersectionObserver drives per-row metrics hydration —
-  // N rows each constructing their own observer multiplied observer count by
-  // row count and remount-amplified churn whenever rows were recreated. Rows
-  // register their element; first intersection unobserves and fires that
-  // row's hydrate exactly once, same semantics as the old per-row observers.
-  const hydrationTargets = new Map<Element, () => void>()
-  const hydrationObserver = new IntersectionObserver(
-    (entries) => {
-      for (const entry of entries) {
-        if (!entry.isIntersecting) continue
-        const hydrate = hydrationTargets.get(entry.target)
-        hydrationObserver.unobserve(entry.target)
-        hydrationTargets.delete(entry.target)
-        hydrate?.()
-      }
-    },
-    { rootMargin: "60px" },
-  )
-  onCleanup(() => hydrationObserver.disconnect())
-  const observeHydration = (el: Element, hydrate: () => void) => {
-    hydrationTargets.set(el, hydrate)
-    hydrationObserver.observe(el)
-    onCleanup(() => {
-      hydrationObserver.unobserve(el)
-      hydrationTargets.delete(el)
-    })
-  }
+  onCleanup(() => {
+    metricsDisposed = true
+    metricsQueue.length = 0
+  })
 
   const navigate = useNavigate()
 
@@ -664,59 +700,41 @@ export function ChatSidebarPane(props: {
     navigate(`/${base64Encode(dir)}/session`)
   }
 
-  // Homepage inline session search, reused via its controller (no fork). The
-  // host adapter mirrors the HomeController surface for this pane's server
-  // context; project selection stays unscoped so results span every project,
-  // matching the pane's cross-project list.
-  const globalCtx = useGlobal()
-  const tabs = useTabs()
-  const searchServerKey = createMemo(() => {
-    try {
-      const conn = serverSDK().server
-      return conn ? ServerConnection.key(conn) : ("" as ServerConnection.Key)
-    } catch {
-      return "" as ServerConnection.Key
-    }
+  // Search is interactive, not first-paint content. Keep a tiny local input
+  // buffer and instantiate the real Home search controller only on first focus
+  // or input. runWithOwner is required because the dynamically imported
+  // controller installs Solid effects/cleanup and reads app contexts.
+  const searchOwner = getOwner()
+  const [searchRuntime, setSearchRuntime] = createSignal<ChatSidebarSearchRuntime>()
+  const [searchDraft, setSearchDraft] = createSignal("")
+  let searchRuntimePending: Promise<ChatSidebarSearchRuntime | undefined> | undefined
+  let searchRootElement: HTMLDivElement | undefined
+  let searchInputElement: HTMLInputElement | undefined
+  let searchFocused = false
+  let searchDisposed = false
+
+  const ensureSearchRuntime = () => {
+    const current = searchRuntime()
+    if (current) return Promise.resolve(current)
+    if (searchRuntimePending) return searchRuntimePending
+    searchRuntimePending = loadChatSidebarSearchRuntime().then((module) => {
+      if (searchDisposed || !searchOwner) return undefined
+      const runtime = runWithOwner(searchOwner, () => module.createChatSidebarSearchRuntime({ prefetchSession }))
+      if (!runtime || searchDisposed) return undefined
+      if (searchRootElement) runtime.search.element.setRoot(searchRootElement)
+      if (searchInputElement) runtime.search.element.setInput(searchInputElement)
+      const draft = searchDraft()
+      if (draft) runtime.search.query.input(draft)
+      if (searchFocused) runtime.search.query.focus()
+      setSearchRuntime(runtime)
+      return runtime
+    })
+    return searchRuntimePending
+  }
+
+  onCleanup(() => {
+    searchDisposed = true
   })
-  const search = createHomeSessionSearchController(
-    {
-      project: {
-        list: () => layout.projects.list(),
-        selected: () => undefined,
-      },
-      server: {
-        list: globalCtx.servers.list,
-        focused: () => serverSDK().server,
-        focusedContext: () => {
-          try {
-            const conn = serverSDK().server
-            return conn ? globalCtx.ensureServerCtx(conn) : undefined
-          } catch {
-            return undefined
-          }
-        },
-      },
-    },
-    {
-      session: {
-        open: (session: Session, options?: OpenSessionOptions) => {
-          prefetchSession(session)
-          if (!session.id || !session.directory) return
-          if (options?.background) {
-            const server = searchServerKey()
-            if (!server) return
-            tabs.addSessionTab({ server, sessionId: session.id })
-            return
-          }
-          navigate(`/${base64Encode(session.directory)}/session/${session.id}`)
-        },
-      },
-    },
-    // mod+f belongs to session.find on this surface.
-    { registerFocusCommand: false },
-  )
-  const searchIsOpenTab = (record: HomeSessionRecord) =>
-    sessionHasOpenTab(tabs.store, searchServerKey(), record.session)
 
   return (
     <div
@@ -777,139 +795,115 @@ export function ChatSidebarPane(props: {
 
       {/* ── Session search — zinc inset field ─────────────────── */}
       <div class="shrink-0 bg-v2-background-bg-base px-2 pb-2 pt-2">
-        <div ref={search.element.setRoot} data-component="chats-session-search" class="relative z-30 w-full">
-          <Show when={search.query.open()}>
+        <div
+          ref={(element) => {
+            searchRootElement = element
+            searchRuntime()?.search.element.setRoot(element)
+          }}
+          data-component="chats-session-search"
+          class="relative z-30 w-full"
+        >
+          <Show when={searchRuntime()} keyed>
+            {(runtime) => <Show when={runtime.search.query.open()}>
             <div
               data-component="chats-session-search-panel"
               class="absolute flex flex-col overflow-hidden rounded-[10px] bg-v2-background-bg-base shadow-[var(--v2-elevation-floating)]"
               style={{ top: "-4px", left: "-4px", width: "calc(100% + 8px)" }}
             >
               <div class="flex flex-col pt-8">
-                <div id="chats-session-search-results" role="listbox" class="flex flex-col pt-1">
-                  <Show when={!search.result.loading()} fallback={<ChatsSearchLoading language={language} />}>
-                    <Show
-                      when={!search.result.error()}
-                      fallback={<ChatsSearchError language={language} detail={search.result.error()} />}
+                <Suspense
+                  fallback={
+                    <div
+                      class="flex flex-col gap-px px-3 py-2"
+                      aria-busy="true"
+                      aria-label={language.t("common.loading")}
                     >
-                      <Show
-                        when={search.result.list().length > 0}
-                        fallback={
-                          <p class="my-1 px-3 pb-2 text-[13px] leading-4 tracking-[-0.04px] text-v2-text-text-muted [font-weight:440]">
-                            {search.result.noResultsLabel()}
-                          </p>
-                        }
-                      >
-                        <ScrollView class="max-h-[min(420px,50vh)]" viewportRef={search.element.setList}>
-                          <div class="flex flex-col pb-1">
-                            <For each={search.result.list()}>
-                              {(hit, index) => {
-                                const previous = index() > 0 ? search.result.list()[index() - 1] : undefined
-                                return (
-                                  <>
-                                    <Show when={hit.kind === "session" && (!previous || previous.kind !== "session")}>
-                                      <ChatsSearchGroupHeader
-                                        label={language.t("home.sessions.search.sessions")}
-                                        count={search.result.sessions().length}
-                                        countLabel={language.plural(
-                                          "home.sessions.search.sessionsResult",
-                                          search.result.sessions().length,
-                                        )}
-                                      />
-                                    </Show>
-                                    <Show when={hit.kind === "message" && (!previous || previous.kind !== "message")}>
-                                      <ChatsSearchGroupHeader
-                                        label={language.t("home.sessions.search.messages")}
-                                        count={search.result.messages().length}
-                                        countLabel={language.plural(
-                                          "home.sessions.search.messagesResult",
-                                          search.result.messages().length,
-                                        )}
-                                      />
-                                    </Show>
-                                    <Show
-                                      when={hit.kind === "session"}
-                                      fallback={
-                                        hit.kind === "message" ? (
-                                          <ChatsSearchMessageRow
-                                            language={language}
-                                            hit={hit}
-                                            selected={search.result.active() === hit.key}
-                                            server={searchServerKey}
-                                            isOpenTab={searchIsOpenTab}
-                                            onHighlight={search.result.highlight}
-                                            onSelect={search.result.select}
-                                          />
-                                        ) : null
-                                      }
-                                    >
-                                      <ChatsSearchRow
-                                        hit={hit}
-                                        selected={search.result.active() === hit.key}
-                                        server={searchServerKey}
-                                        isOpenTab={searchIsOpenTab}
-                                        onHighlight={search.result.highlight}
-                                        onSelect={search.result.select}
-                                      />
-                                    </Show>
-                                  </>
-                                )
-                              }}
-                            </For>
-                          </div>
-                        </ScrollView>
-                        <ChatsSearchHints language={language} />
-                      </Show>
-                    </Show>
-                  </Show>
-                </div>
+                      <For each={[0, 1, 2]}>
+                        {() => <div class="h-7 rounded-[6px] bg-v2-background-bg-layer-02 animate-pulse" />}
+                      </For>
+                    </div>
+                  }
+                >
+                  <ChatSidebarSearchResults
+                    language={language}
+                    search={runtime.search}
+                    server={runtime.serverKey}
+                    isOpenTab={runtime.isOpenTab}
+                  />
+                </Suspense>
               </div>
             </div>
+            </Show>}
           </Show>
           <label class="relative z-20 flex h-[26px] w-full items-center gap-1.5 rounded-[7px] border border-v2-border-border-base/60 bg-v2-background-bg-layer-01 px-1.5 text-v2-icon-icon-muted shadow-[inset_0_1px_1px_var(--v2-alpha-dark-6),inset_0_0.5px_0.5px_var(--v2-alpha-dark-4)] transition-[border-color,background-color,box-shadow] duration-150 hover:border-v2-border-border-base hover:bg-v2-background-bg-layer-02 focus-within:border-v2-border-border-strong focus-within:bg-v2-background-bg-base focus-within:shadow-[0_0_0_2px_var(--v2-alpha-dark-8)]">
             <IconV2 name="magnifying-glass" size="small" class="shrink-0 opacity-80" />
             <input
-              ref={search.element.setInput}
+              ref={(element) => {
+                searchInputElement = element
+                searchRuntime()?.search.element.setInput(element)
+              }}
               class="relative z-20 min-w-0 flex-1 border-0 bg-transparent text-[12px] font-[440] leading-none tracking-[-0.01em] text-v2-text-text-base outline-0 placeholder:text-v2-text-text-faint/70 [&::-webkit-search-cancel-button]:hidden [&::-webkit-search-decoration]:hidden"
               type="text"
-              value={search.query.value()}
+              value={searchRuntime()?.search.query.value() ?? searchDraft()}
               placeholder={language.t("chats.search.placeholder")}
               aria-label={language.t("chats.search.placeholder")}
-              aria-expanded={search.query.open()}
+              aria-expanded={searchRuntime()?.search.query.open() ?? false}
               aria-controls="chats-session-search-results"
               aria-autocomplete="list"
               aria-activedescendant={
-                search.result.active() && search.query.open()
-                  ? `chats-session-search-option-${search.result.active()}`
+                searchRuntime()?.search.result.active() && searchRuntime()?.search.query.open()
+                  ? `chats-session-search-option-${searchRuntime()!.search.result.active()}`
                   : undefined
               }
-              onFocus={search.query.focus}
-              onInput={(event) => search.query.input(event.currentTarget.value)}
+              onFocus={() => {
+                searchFocused = true
+                void ensureSearchRuntime()
+              }}
+              onBlur={() => {
+                searchFocused = false
+              }}
+              onInput={(event) => {
+                const value = event.currentTarget.value
+                setSearchDraft(value)
+                const runtime = searchRuntime()
+                if (runtime) {
+                  runtime.search.query.input(value)
+                  return
+                }
+                // The loader replays the latest draft exactly once when it
+                // resolves. Do not attach one continuation per keystroke while
+                // the chunk is in flight; that would manufacture a microtask
+                // burst and repeatedly reset the search debounce.
+                void ensureSearchRuntime()
+              }}
               onKeyDown={(event) => {
+                const runtime = searchRuntime()
                 if (event.key === "Escape") {
                   event.preventDefault()
-                  search.query.close()
+                  if (runtime) runtime.search.query.close()
+                  else setSearchDraft("")
                   event.currentTarget.blur()
                   return
                 }
-                if (!search.query.open() || search.result.list().length === 0) return
+                if (!runtime || !runtime.search.query.open() || runtime.search.result.list().length === 0) return
                 if (event.altKey || event.metaKey) return
                 if (event.key === "ArrowDown") {
                   event.preventDefault()
-                  search.result.move(1)
+                  runtime.search.result.move(1)
                   return
                 }
                 if (event.key === "ArrowUp") {
                   event.preventDefault()
-                  search.result.move(-1)
+                  runtime.search.result.move(-1)
                   return
                 }
                 if (event.key === "Enter" && !event.isComposing) {
                   event.preventDefault()
-                  search.result.selectActive()
+                  runtime.search.result.selectActive()
                 }
               }}
             />
-            <Show when={search.query.value()}>
+            <Show when={searchRuntime()?.search.query.value() ?? searchDraft()}>
               <IconButtonV2
                 type="button"
                 variant="ghost-muted"
@@ -918,8 +912,16 @@ export function ChatSidebarPane(props: {
                 icon={<IconV2 name="close" size="large" class="text-v2-icon-icon-muted" />}
                 aria-label={language.t("chats.search.placeholder")}
                 onClick={() => {
-                  search.query.close()
-                  search.query.focus()
+                  setSearchDraft("")
+                  const runtime = searchRuntime()
+                  if (runtime) {
+                    runtime.search.query.close()
+                    runtime.search.query.focus()
+                    return
+                  }
+                  searchInputElement?.focus()
+                  searchFocused = true
+                  void ensureSearchRuntime()
                 }}
               />
             </Show>
@@ -1023,13 +1025,13 @@ export function ChatSidebarPane(props: {
                                   removes the duplicate "group title → same
                                   session title" layer and leaves the useful
                                   parent → indented-child hierarchy intact. */}
-                              <Show when={item.first && groupEntry() && !isStructuralTree()}>
+                              <Show when={item.first && !isStructuralTree() ? groupEntry() : undefined} keyed>
                                 {(entry) => (
                                   <button
                                     type="button"
                                     class="group/session-collection flex h-7 w-full items-center gap-1.5 rounded-md px-2 text-start text-[10px] text-v2-text-text-muted transition-colors hover:bg-v2-background-bg-layer-01 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
                                     aria-expanded={isExpanded(collapseKey())}
-                                    aria-label={`${entry().name}, ${visibleCount()} sessions`}
+                                    aria-label={`${entry.name}, ${visibleCount()} sessions`}
                                     onClick={() => toggleExpanded(collapseKey())}
                                   >
                                     <IconV2
@@ -1040,7 +1042,7 @@ export function ChatSidebarPane(props: {
                                     />
                                     <IconV2 name="layers" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted opacity-70" />
                                     <span class="min-w-0 flex-1 truncate font-[560] text-v2-text-text-muted transition-colors group-hover/session-collection:text-v2-text-text-base">
-                                      {entry().name}
+                                      {entry.name}
                                     </span>
                                     <Show when={working()}>
                                       <span
@@ -1093,7 +1095,6 @@ export function ChatSidebarPane(props: {
                                     if (params.id !== id) setPendingSessionId(id)
                                   }}
                                   hydrate={() => hydrateMetrics(session())}
-                                  observeHydration={observeHydration}
                                   archiveSession={() => archiveSession(session())}
                                   prefetchSession={() => prefetchSession(session())}
                                   onChangeModel={openModelPicker}
@@ -1207,62 +1208,36 @@ export function ChatSidebarPane(props: {
           </button>
 
           <Show when={props.state.isArchivedExpanded()}>
-            <div id="chats-group-archived" class="flex flex-col px-1.5 pt-0.5">
-              <Show
-                when={!archivedState.loading}
-                fallback={<ChatsArchivedLoading label={language.t("chats.archived.loading")} />}
-              >
-                <Show
-                  when={!archivedState.error}
-                  fallback={<ChatsArchivedError onRetry={() => void fetchArchived()} />}
+            <Suspense
+              fallback={
+                <div
+                  class="flex flex-col gap-px px-2 py-1"
+                  aria-busy="true"
+                  aria-label={language.t("chats.archived.loading")}
                 >
-                  <Show
-                    when={archivedState.rows.length > 0}
-                    fallback={
-                      <p class="px-2 py-1.5 text-[11px] leading-none text-v2-text-text-faint">
-                        {language.t("chats.archived.empty")}
-                      </p>
-                    }
-                  >
-                    <For each={archivedState.rows.slice(0, props.state.archivedLimit())}>
-                      {(session) => (
-                        <ArchivedRow
-                          session={session}
-                          minuteNow={minuteNow}
-                          selected={activeSessionId() === session.id}
-                          pending={pendingSessionId() === session.id}
-                          onPending={(id) => {
-                            if (params.id !== id) setPendingSessionId(id)
-                          }}
-                          unarchiveSession={() => unarchiveSession(session)}
-                        />
-                      )}
-                    </For>
-                    {/* The full archived list is held client-side, so both
-                        controls below are exact — no estimates like the
-                        server-paged groups. */}
-                    <Show when={archivedState.rows.length > props.state.archivedLimit()}>
-                      <button
-                        type="button"
-                        class="ms-[26px] flex h-6 items-center rounded-md pe-2 text-start text-[10px] leading-none text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-muted focus-visible:outline-none"
-                        onClick={() => props.state.showMoreArchived()}
-                      >
-                        {language.t("chats.archived.showMore")}
-                      </button>
-                    </Show>
-                    <Show when={props.state.archivedLimit() > CHAT_SIDEBAR_ARCHIVED_LIMIT_MIN}>
-                      <button
-                        type="button"
-                        class="ms-[26px] flex h-6 items-center rounded-md pe-2 text-start text-[10px] leading-none text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:text-v2-text-text-muted focus-visible:outline-none"
-                        onClick={() => props.state.showLessArchived()}
-                      >
-                        {language.t("chats.archived.showLess")}
-                      </button>
-                    </Show>
-                  </Show>
-                </Show>
-              </Show>
-            </div>
+                  <For each={[0, 1]}>
+                    {() => <div class="h-[26px] rounded-md bg-v2-background-bg-layer-02 animate-pulse" />}
+                  </For>
+                </div>
+              }
+            >
+              <ChatSidebarArchivedBody
+                rows={archivedState.rows}
+                loading={archivedState.loading}
+                error={archivedState.error}
+                limit={props.state.archivedLimit()}
+                minuteNow={minuteNow}
+                activeSessionId={activeSessionId() ?? undefined}
+                pendingSessionId={pendingSessionId() ?? undefined}
+                onPending={(id) => {
+                  if (params.id !== id) setPendingSessionId(id)
+                }}
+                onRetry={() => void fetchArchived()}
+                onUnarchive={unarchiveSession}
+                onShowMore={props.state.showMoreArchived}
+                onShowLess={props.state.showLessArchived}
+              />
+            </Suspense>
           </Show>
         </section>
       </ScrollView>
@@ -1277,234 +1252,24 @@ export function ChatSidebarPane(props: {
         </div>
       </Show>
 
-      <ResizeHandle
-        direction="horizontal"
-        edge="end"
-        size={props.state.sidebarWidth()}
-        min={200}
-        max={420}
-        onResize={props.state.resizeSidebar}
-        pair={resizePair()}
-        class="!absolute !inset-y-0 !right-0"
-      />
+      <Show when={resizeReady()}>
+        <Suspense fallback={null}>
+          <SidebarResizeHandle
+            direction="horizontal"
+            edge="end"
+            size={props.state.sidebarWidth()}
+            min={200}
+            max={420}
+            onResize={props.state.resizeSidebar}
+            pair={resizePair()}
+            class="!absolute !inset-y-0 !right-0"
+          />
+        </Suspense>
+      </Show>
       <Show when={modelPicker()} keyed>
         {(request) => <SessionModelPicker {...request} onClose={() => setModelPicker(null)} />}
       </Show>
     </div>
-  )
-}
-
-function ChatsSearchGroupHeader(props: { label: string; count: number; countLabel: string }) {
-  return (
-    <div role="group" aria-label={props.countLabel} class="my-1 flex h-6 items-center justify-between pl-3 pr-2.5">
-      <p class="text-[13px] leading-4 tracking-[-0.04px] text-v2-text-text-muted [font-weight:440]">{props.label}</p>
-      <span
-        aria-hidden="true"
-        class="rounded-[4px] bg-v2-background-bg-layer-02 px-1.5 py-px text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440] tabular-nums"
-      >
-        {props.count}
-      </span>
-    </div>
-  )
-}
-
-function ChatsSearchHints(props: { language: ReturnType<typeof useLanguage> }) {
-  return (
-    <div class="flex items-center justify-end gap-2 border-t border-v2-border-border-muted px-2.5 py-1.5">
-      <span class="flex items-center gap-1">
-        <KeybindV2 keys={["↑", "↓"]} variant="ghost" />
-        <span class="text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440]">
-          {props.language.t("home.sessions.search.hint.navigate")}
-        </span>
-      </span>
-      <span class="flex items-center gap-1">
-        <KeybindV2 keys={["↵"]} variant="ghost" />
-        <span class="text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440]">
-          {props.language.t("home.sessions.search.hint.open")}
-        </span>
-      </span>
-      <span class="flex items-center gap-1">
-        <KeybindV2 keys={["esc"]} variant="ghost" />
-        <span class="text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440]">
-          {props.language.t("home.sessions.search.hint.close")}
-        </span>
-      </span>
-    </div>
-  )
-}
-
-function ChatsSearchLoading(props: { language: ReturnType<typeof useLanguage> }) {
-  return (
-    <div class="flex flex-col gap-px px-3 py-2" aria-busy="true" aria-label={props.language.t("common.loading")}>
-      <For each={[0, 1, 2]}>{() => <div class="h-7 rounded-[6px] bg-v2-background-bg-layer-02 animate-pulse" />}</For>
-    </div>
-  )
-}
-
-function ChatsSearchError(props: { language: ReturnType<typeof useLanguage>; detail?: string }) {
-  return (
-    <div class="px-2.5 pb-2.5 pt-1" role="alert">
-      <div class="flex flex-col gap-1 rounded-[8px] border border-v2-state-border-danger/40 bg-v2-state-bg-danger/10 px-3 py-2.5">
-        <div class="flex items-center gap-2">
-          <span aria-hidden="true" class="size-1.5 shrink-0 rounded-full bg-v2-state-border-danger" />
-          <p class="text-[13px] leading-4 tracking-[-0.04px] text-v2-text-text-base [font-weight:530]">
-            {props.language.t("home.sessions.search.error")}
-          </p>
-        </div>
-        <p class="pl-5 text-[12px] leading-4 tracking-[-0.04px] text-v2-text-text-muted [font-weight:440]">
-          {props.detail || props.language.t("home.sessions.search.error.description")}
-        </p>
-      </div>
-    </div>
-  )
-}
-
-type ChatsSearchRowProps = {
-  server: Accessor<ServerConnection.Key>
-  isOpenTab: (record: HomeSessionRecord) => boolean
-  onHighlight: (hit: HomeSearchHit) => void
-  onSelect: (hit: HomeSearchHit, options?: OpenSessionOptions) => void
-}
-
-function ChatsSearchRow(
-  props: ChatsSearchRowProps & {
-    hit: HomeSearchHit
-    selected: boolean
-  },
-) {
-  const title = createMemo(() => sessionTitle(props.hit.session.title) || props.hit.session.id)
-  const projectName = () => props.hit.projectName
-  const key = () => props.hit.key
-
-  return (
-    <button
-      type="button"
-      id={`chats-session-search-option-${key()}`}
-      data-key={key()}
-      data-component="chats-session-search-row"
-      role="option"
-      aria-selected={props.selected}
-      class={`
-        flex h-9 w-full shrink-0 cursor-default items-center gap-2 border-0 py-2 pl-3 pr-2.5 text-left
-        transition-[background-color] duration-[120ms] ease-in-out
-        hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none
-      `}
-      classList={{ "bg-v2-overlay-simple-overlay-hover": props.selected, group: !!projectName() }}
-      onMouseEnter={() => props.onHighlight(props.hit)}
-      onMouseDown={(event) => {
-        if (event.button === 1) event.preventDefault()
-      }}
-      onClick={(event) => props.onSelect(props.hit, { background: isBackgroundOpen(event) })}
-      onAuxClick={(event) => {
-        if (!isBackgroundOpen(event)) return
-        event.preventDefault()
-        props.onSelect(props.hit, { background: true })
-      }}
-    >
-      <HomeSessionLeadingController
-        server={props.server}
-        isOpenTab={props.isOpenTab}
-        record={{
-          session: props.hit.session,
-          project: props.hit.project,
-          projectName: props.hit.projectName,
-        }}
-        revealProjectOnHover={!!projectName()}
-      />
-      <div class="flex min-w-0 flex-1 items-center gap-1.5">
-        <HomeSessionTitle title={title()} showProjectName={!!projectName()} search />
-        <Show when={projectName()}>
-          <HomeSessionProjectName name={props.hit.projectName} search />
-        </Show>
-        <Show when={props.hit.groupName}>
-          <span class="shrink-0 rounded-[4px] bg-v2-background-bg-layer-02 px-1.5 py-px text-[11px] text-v2-text-text-faint transition-[background-color] duration-[120ms] ease-in-out">
-            {props.hit.groupName}
-          </span>
-        </Show>
-      </div>
-    </button>
-  )
-}
-
-function ChatsSearchMessageRow(
-  props: ChatsSearchRowProps & {
-    language: ReturnType<typeof useLanguage>
-    hit: Extract<HomeSearchHit, { kind: "message" }>
-    selected: boolean
-  },
-) {
-  const title = createMemo(() => sessionTitle(props.hit.session.title) || props.hit.session.id)
-  const projectName = () => props.hit.projectName
-  const key = () => props.hit.key
-  const time = createMemo(() =>
-    getRelativeTime(new Date(props.hit.message.time.created).toISOString(), props.language.t),
-  )
-
-  return (
-    <button
-      type="button"
-      id={`chats-session-search-option-${key()}`}
-      data-key={key()}
-      data-component="chats-session-search-message-row"
-      role="option"
-      aria-selected={props.selected}
-      class={`
-        flex min-h-9 w-full shrink-0 cursor-default items-center gap-2 border-0 py-1.5 pl-3 pr-2.5 text-left
-        transition-[background-color] duration-[120ms] ease-in-out
-        hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover focus-visible:outline-none
-      `}
-      classList={{ "bg-v2-overlay-simple-overlay-hover": props.selected, group: !!projectName() }}
-      onMouseEnter={() => props.onHighlight(props.hit)}
-      onMouseDown={(event) => {
-        if (event.button === 1) event.preventDefault()
-      }}
-      onClick={(event) => props.onSelect(props.hit, { background: isBackgroundOpen(event) })}
-      onAuxClick={(event) => {
-        if (!isBackgroundOpen(event)) return
-        event.preventDefault()
-        props.onSelect(props.hit, { background: true })
-      }}
-    >
-      <HomeSessionLeadingController
-        server={props.server}
-        isOpenTab={props.isOpenTab}
-        record={{
-          session: props.hit.session,
-          project: props.hit.project,
-          projectName: props.hit.projectName,
-        }}
-        revealProjectOnHover={!!projectName()}
-      />
-      <div class="flex min-w-0 flex-1 flex-col gap-0.5">
-        <div class="flex min-w-0 items-center gap-1.5">
-          <HomeSessionTitle title={title()} showProjectName={!!projectName()} search />
-          <Show when={projectName()}>
-            <HomeSessionProjectName name={props.hit.projectName} search />
-          </Show>
-          <Show when={props.hit.groupName}>
-            <span class="shrink-0 rounded-[4px] bg-v2-background-bg-layer-02 px-1.5 py-px text-[11px] text-v2-text-text-faint transition-[background-color] duration-[120ms] ease-in-out">
-              {props.hit.groupName}
-            </span>
-          </Show>
-          <span class="ml-auto shrink-0 pl-2 text-[11px] leading-4 tracking-[-0.04px] text-v2-text-text-faint [font-weight:440] tabular-nums">
-            {time()}
-          </span>
-        </div>
-        <p class="min-w-0 overflow-hidden text-ellipsis whitespace-nowrap text-[12px] leading-4 tracking-[-0.04px] text-v2-text-text-muted [font-weight:440]">
-          <For each={props.hit.segments}>
-            {(segment) =>
-              segment.match ? (
-                <mark class="rounded-[3px] bg-v2-state-bg-info/70 px-[1px] text-v2-text-text-base [font-weight:530]">
-                  {segment.text}
-                </mark>
-              ) : (
-                segment.text
-              )
-            }
-          </For>
-        </p>
-      </div>
-    </button>
   )
 }
 
@@ -1523,7 +1288,6 @@ function ChatRow(props: {
   pending?: boolean
   onPending?: (id: string) => void
   hydrate: () => void
-  observeHydration: (el: Element, hydrate: () => void) => void
   archiveSession: () => Promise<void>
   prefetchSession: () => void
   onChangeModel: (request: SessionModelPickerRequest) => void
@@ -1559,6 +1323,46 @@ function ChatRow(props: {
   const hasQuestions = createMemo(() => pendingQuestions().length > 0)
   const needsAttention = createMemo(() => hasPermissions() || hasQuestions())
   const hasTreeDisclosure = createMemo(() => props.treeExpanded !== undefined && !!props.onToggleTree)
+  const [metricsRuntime, setMetricsRuntime] = createSignal<ChatSidebarMetricsRuntime>()
+  const aggregateMetrics = createMemo(() => chatSidebarAggregateMetrics(props.session))
+  let disposed = false
+  let metricsHoverTimer: ReturnType<typeof setTimeout> | undefined
+  onCleanup(() => {
+    disposed = true
+    if (metricsHoverTimer !== undefined) clearTimeout(metricsHoverTimer)
+  })
+  const activateMetrics = () => {
+    if (metricsHoverTimer !== undefined) {
+      clearTimeout(metricsHoverTimer)
+      metricsHoverTimer = undefined
+    }
+    props.hydrate()
+    if (metricsRuntime()) return
+    void loadChatSidebarMetricsRuntime()
+      .then((runtime) => {
+        if (!disposed) setMetricsRuntime(runtime)
+      })
+      .catch(() => undefined)
+  }
+  const scheduleHoverMetrics = () => {
+    if (metricsHoverTimer !== undefined) return
+    // TooltipV2 waits 400ms before opening. Start richer history hydration
+    // shortly before then, but cancel incidental pointer sweeps across rows so
+    // merely moving through the sidebar cannot manufacture a prefetch herd.
+    metricsHoverTimer = setTimeout(() => {
+      metricsHoverTimer = undefined
+      activateMetrics()
+    }, 250)
+  }
+  const cancelHoverMetrics = () => {
+    if (metricsHoverTimer === undefined) return
+    clearTimeout(metricsHoverTimer)
+    metricsHoverTimer = undefined
+  }
+  createEffect(() => {
+    if (!shouldAutoHydrateChatSidebarMetrics({ selected: props.selected, working: isWorking() })) return
+    activateMetrics()
+  })
   const isAutoAccepting = createMemo(() => {
     try {
       return permissionState().isAutoAccepting(props.session.id, currentDir)
@@ -1578,20 +1382,38 @@ function ChatRow(props: {
   const totals = createMemo<
     { generatedSeconds: number; toolSeconds: number; cost: number; cacheHitPercent: number | null } | undefined
   >(() => {
+    const runtime = metricsRuntime()
+    const aggregate = aggregateMetrics()
+    if (!runtime)
+      return {
+        generatedSeconds: 0,
+        toolSeconds: 0,
+        cost: aggregate.cost ?? 0,
+        cacheHitPercent: aggregate.cacheHitPercent ?? null,
+      }
     try {
-      const session = aggregateSessionContextByModel(messages(), sessionData().part, []).session
+      const session = runtime.aggregateSessionContextByModel(messages(), sessionData().part, []).session
       return {
         generatedSeconds: session.generatedSeconds,
         toolSeconds: session.toolSeconds,
-        cost: session.cost,
-        cacheHitPercent: session.cacheHitPercent,
+        cost: aggregate.cost ?? session.cost,
+        cacheHitPercent: aggregate.cacheHitPercent === undefined ? session.cacheHitPercent : aggregate.cacheHitPercent,
       }
     } catch {
-      return undefined
+      return {
+        generatedSeconds: 0,
+        toolSeconds: 0,
+        cost: aggregate.cost ?? 0,
+        cacheHitPercent: aggregate.cacheHitPercent ?? null,
+      }
     }
   })
 
-  const contextPercent = createMemo(() => getSessionContext(messages(), props.providers())?.usage ?? null)
+  const contextPercent = createMemo(() => {
+    const runtime = metricsRuntime()
+    if (!runtime) return null
+    return runtime.getSessionContext(messages(), props.providers())?.usage ?? null
+  })
 
   const modelInfo = createMemo(() => {
     const list = messages()
@@ -1601,11 +1423,13 @@ function ChatRow(props: {
       const assistant = msg as AssistantMessage
       return { modelID: assistant.modelID, variant: assistant.variant }
     }
-    return undefined
+    return aggregateMetrics().model
   })
 
   const live = createMemo(() => {
     if (!isWorking()) return undefined
+    const runtime = metricsRuntime()
+    if (!runtime) return undefined
     const list = messages()
     const parts = sessionData().part
     let active: AssistantMessage | undefined
@@ -1625,12 +1449,12 @@ function ChatRow(props: {
       }
     try {
       const activeParts = parts[active.id]
-      const progress = liveGenerationProgress(active, activeParts, props.now())
+      const progress = runtime.liveGenerationProgress(active, activeParts, props.now())
       const turnSeconds = progress.generatedSeconds + progress.toolSeconds
       return {
         turnSeconds,
         accumulatedSeconds: (accumulated?.generatedSeconds ?? 0) + (accumulated?.toolSeconds ?? 0) + turnSeconds,
-        rate: computeMeasuredRate(activeParts, props.now())?.rate ?? null,
+        rate: runtime.computeMeasuredRate(activeParts, props.now())?.rate ?? null,
       }
     } catch {
       return { turnSeconds: 0, accumulatedSeconds: 0, rate: null }
@@ -1647,6 +1471,7 @@ function ChatRow(props: {
     }
   })
   const navigate = useNavigate()
+  const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number }>()
   const handleOpen = (opts?: { background?: boolean }) => {
     const dir = currentDir || props.session.directory || ""
     if (!dir || !props.session.id) return
@@ -1664,14 +1489,6 @@ function ChatRow(props: {
     props.onPending?.(props.session.id)
     navigate(`/${slug()}/session/${props.session.id}`)
   }
-
-  // Fire metrics hydration once, when the row first becomes visible — via the
-  // pane's shared observer instead of a per-row IntersectionObserver instance.
-  let rowEl: HTMLDivElement | undefined
-  onMount(() => {
-    if (!rowEl) return
-    props.observeHydration(rowEl, props.hydrate)
-  })
 
   // Rich hover card — mirrors model-tooltip v2 density + image-1.png (title + project/branch rows)
   const hoverProjectName = () => {
@@ -1696,7 +1513,8 @@ function ChatRow(props: {
   }
 
   return (
-    <TooltipV2
+    <>
+      <TooltipV2
       placement="right"
       gutter={8}
       contentClass="!p-0 overflow-hidden rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-layer-01 shadow-[var(--v2-elevation-floating)]"
@@ -1774,23 +1592,15 @@ function ChatRow(props: {
         </div>
       }
     >
-      <SessionContextMenu
-        where="chats"
-        session={props.session}
-        server={serverKey()}
-        inGroupId={props.inGroupId}
-        onOpen={handleOpen}
-        onArchive={() => void props.archiveSession()}
-        onChangeModel={props.onChangeModel}
-        onNewSessionInProject={props.onNewSessionInProject}
-        onOpenProjectInExplorer={props.onOpenProjectInExplorer}
-        onCopyProjectPath={props.onCopyProjectPath}
-        onForkConversation={props.onForkConversation}
-      >
         <div
-          ref={rowEl}
           class="group/session relative min-w-0 rounded-md transition-colors hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 has-[data-selected]:bg-v2-background-bg-layer-02 [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
           style={{ "margin-inline-start": `${Math.min(Math.max(props.depth ?? 0, 0), 8) * 14}px` }}
+          onPointerEnter={scheduleHoverMetrics}
+          onPointerLeave={cancelHoverMetrics}
+          onContextMenu={(event) => {
+            event.preventDefault()
+            setContextMenu({ x: event.clientX, y: event.clientY })
+          }}
         >
           <Show when={(props.depth ?? 0) > 0}>
             <span
@@ -1810,7 +1620,10 @@ function ChatRow(props: {
             data-selected={props.selected ? "" : undefined}
             aria-current={props.selected ? "page" : undefined}
             onPointerDown={warm}
-            onFocus={warm}
+            onFocus={() => {
+              warm()
+              activateMetrics()
+            }}
             onClick={(event: MouseEvent) => {
               if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button === 1) return
               props.onPending?.(props.session.id)
@@ -2069,135 +1882,30 @@ function ChatRow(props: {
             </div>
           </A>
         </div>
-      </SessionContextMenu>
-    </TooltipV2>
-  )
-}
-
-function ChatsArchivedLoading(props: { label: string }) {
-  return (
-    <div class="flex flex-col gap-px px-2 py-1" aria-busy="true" aria-label={props.label}>
-      <For each={[0, 1]}>{() => <div class="h-[26px] rounded-md bg-v2-background-bg-layer-02 animate-pulse" />}</For>
-    </div>
-  )
-}
-
-function ChatsArchivedError(props: { onRetry: () => void }) {
-  const language = useLanguage()
-  return (
-    <div class="flex items-center justify-between gap-2 px-2 py-1.5" role="alert">
-      <span class="flex min-w-0 items-center gap-1.5">
-        <span aria-hidden="true" class="size-1.5 shrink-0 rounded-full bg-v2-state-border-danger" />
-        <span class="min-w-0 truncate text-[11px] leading-none text-v2-text-text-muted">
-          {language.t("chats.archived.error")}
-        </span>
-      </span>
-      <button
-        type="button"
-        class="shrink-0 rounded-md px-1.5 py-0.5 text-[10px] leading-none text-v2-text-text-faint transition-colors hover:bg-v2-background-bg-layer-02 hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-02 focus-visible:text-v2-text-text-muted focus-visible:outline-none"
-        onClick={() => props.onRetry()}
-      >
-        {language.t("chats.archived.retry")}
-      </button>
-    </div>
-  )
-}
-
-/**
- * Archived rows reuse the ChatRow silhouette (same paddings, line heights and
- * hover treatment) but stay dimmed at rest like palette archived rows, show
- * WHEN the session was archived instead of live metrics, and surface Unarchive
- * as the primary action — revealed on hover/focus exactly where active rows
- * reveal Archive, so the two states mirror each other without reflow.
- */
-function ArchivedRow(props: {
-  session: Session
-  minuteNow: () => number
-  selected?: boolean
-  pending?: boolean
-  onPending?: (id: string) => void
-  unarchiveSession: () => Promise<void>
-}): JSX.Element {
-  const language = useLanguage()
-
-  const title = () => sessionTitle(props.session.title)
-  const slug = () => base64Encode(props.session.directory || "")
-  // Server-known model ref — no message hydration needed for a dimmed row.
-  const modelInfo = () => props.session.model
-
-  const [busy, setBusy] = createSignal(false)
-  const unarchive = async (event: MouseEvent) => {
-    event.preventDefault()
-    event.stopPropagation()
-    if (busy()) return
-    setBusy(true)
-    try {
-      await props.unarchiveSession()
-    } finally {
-      setBusy(false)
-    }
-  }
-
-  return (
-    <div class="group/session relative min-w-0 rounded-md opacity-70 transition-[background-color,opacity] duration-[120ms] hover:bg-v2-background-bg-layer-01 hover:opacity-100 focus-within:bg-v2-background-bg-layer-01 focus-within:opacity-100 has-[data-selected]:bg-v2-background-bg-layer-02 has-[data-selected]:opacity-100">
-      <A
-        href={`/${slug()}/session/${props.session.id}`}
-        class="relative flex min-w-0 flex-col gap-[3px] rounded-md py-[5px] pe-1.5 ps-2 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[5px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:content-[''] data-[selected]:text-v2-text-text-base data-[selected]:before:absolute data-[selected]:before:inset-y-[5px] data-[selected]:before:start-0 data-[selected]:before:w-[2px] data-[selected]:before:rounded-full data-[selected]:before:bg-v2-background-bg-accent data-[selected]:before:content-['']"
-        data-selected={props.selected ? "" : undefined}
-        aria-current={props.selected ? "page" : undefined}
-        onClick={(event: MouseEvent) => {
-          if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button === 1) return
-          props.onPending?.(props.session.id)
-        }}
-      >
-        {/* Line 1 — archive glyph, title, unarchive-on-hover (mirrors ChatRow's
-            timestamp↔archive swap so nothing shifts between the two states) */}
-        <div class="flex min-w-0 items-center gap-1.5">
-          <span class="flex size-3 shrink-0 items-center justify-center">
-            <Show
-              when={props.pending}
-              fallback={<IconV2 name="archive" size="small" class="size-3 text-v2-icon-icon-muted" />}
-            >
-              <LoaderV2 class="size-3" aria-hidden="true" />
-            </Show>
-          </span>
-
-          <span class="min-w-0 flex-1 truncate text-[12px] leading-[16px]">{title()}</span>
-
-          <div class="flex shrink-0 items-center">
-            <span class="text-[10px] leading-none tabular-nums text-v2-text-text-muted group-hover/session:hidden group-focus-within/session:hidden">
-              {relativeStamp(props.session.time?.archived, props.minuteNow())}
-            </span>
-            <TooltipV2 value={language.t("chats.archived.unarchive")} placement="top">
-              <button
-                type="button"
-                aria-label={language.t("chats.archived.unarchive")}
-                disabled={busy()}
-                class="hidden size-4 items-center justify-center rounded text-v2-icon-icon-muted transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-icon-icon-base group-hover/session:flex group-focus-within/session:flex"
-                onClick={unarchive}
-              >
-                <Show when={!busy()} fallback={<LoaderV2 class="size-3" aria-hidden="true" />}>
-                  <IconV2 name="archive" size="small" class="size-3 rotate-180" />
-                </Show>
-              </button>
-            </TooltipV2>
-          </div>
-        </div>
-
-        {/* Line 2 — fixed-height so every archived row matches, whether or not
-            the session carries a server-known model ref */}
-        <div class="flex min-h-[10px] min-w-0 items-center gap-1.5 ps-[18px]">
-          <Show when={modelInfo()}>
-            {(model) => (
-              <span class="min-w-0 truncate text-[10px] leading-none text-v2-text-text-faint opacity-70">
-                {model().id}
-                <Show when={model().variant}>{(variant) => ` · ${variant()}`}</Show>
-              </span>
-            )}
-          </Show>
-          <span class="min-w-0 flex-1" />
-        </div>
-      </A>
-    </div>
+      </TooltipV2>
+      <Show when={contextMenu()} keyed>
+        {(cursor) => (
+          <Suspense fallback={null}>
+            <SidebarSessionContextMenu
+              cursor={cursor}
+              where="chats"
+              session={props.session}
+              server={serverKey()}
+              inGroupId={props.inGroupId}
+              onOpenChange={(open) => {
+                if (!open) setContextMenu(undefined)
+              }}
+              onOpen={handleOpen}
+              onArchive={() => void props.archiveSession()}
+              onChangeModel={props.onChangeModel}
+              onNewSessionInProject={props.onNewSessionInProject}
+              onOpenProjectInExplorer={props.onOpenProjectInExplorer}
+              onCopyProjectPath={props.onCopyProjectPath}
+              onForkConversation={props.onForkConversation}
+            />
+          </Suspense>
+        )}
+      </Show>
+    </>
   )
 }
