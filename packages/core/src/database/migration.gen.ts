@@ -62,5 +62,7 @@ export const migrations = (
     import("./migration/20260913232150_session_message_tool_overlay"),
     import("./migration/20260913233022_event_payload_chunks"),
     import("./migration/20260913235645_event_payload_meta"),
+    import("./migration/20260914162730_session_root_startup_index"),
+    import("./migration/20260914183600_session_directory_root_created_index"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

@@ -763,6 +763,12 @@ export default {
         `CREATE INDEX \`session_message_tool_overlay_message_idx\` ON \`session_message_tool_overlay\` (\`message_id\`);`,
       )
       yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_project_directory_root_updated_idx\` ON \`session\` (\`project_id\`,\`directory\`,\`time_updated\`) WHERE ("session"."parent_id" is null);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_directory_root_created_id_idx\` ON \`session\` (\`directory\`,\`time_created\`,\`id\`) WHERE ("session"."parent_id" is null);`,
+      )
       yield* tx.run(`CREATE INDEX \`session_workspace_idx\` ON \`session\` (\`workspace_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_group_idx\` ON \`session\` (\`group_id\`);`)

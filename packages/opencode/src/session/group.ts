@@ -165,7 +165,21 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
             .orderBy(asc(SessionGroupTable.position))
             .all()
           const memberRows = yield* backfill
-            .select({ member: SessionGroupMemberTable, session: { id: SessionTable.id, title: SessionTable.title } })
+            .select({
+              member: SessionGroupMemberTable,
+              session: {
+                id: SessionTable.id,
+                slug: SessionTable.slug,
+                projectID: SessionTable.project_id,
+                directory: SessionTable.directory,
+                parentID: SessionTable.parent_id,
+                title: SessionTable.title,
+                version: SessionTable.version,
+                timeCreated: SessionTable.time_created,
+                timeUpdated: SessionTable.time_updated,
+                timeArchived: SessionTable.time_archived,
+              },
+            })
             .from(SessionGroupMemberTable)
             .innerJoin(SessionTable, eq(SessionGroupMemberTable.session_id, SessionTable.id))
             .orderBy(asc(SessionGroupMemberTable.position), asc(SessionGroupMemberTable.time_added))
@@ -762,11 +776,32 @@ function fromGroupRow(row: typeof SessionGroupTable.$inferSelect): Info {
 
 function fromMemberRow(row: {
   member: typeof SessionGroupMemberTable.$inferSelect
-  session: { id: string; title: string }
+  session: {
+    id: string
+    slug: string
+    projectID: string
+    directory: string
+    parentID: string | null
+    title: string
+    version: string
+    timeCreated: number
+    timeUpdated: number
+    timeArchived: number | null
+  }
 }): Member {
   return {
     id: row.session.id,
+    slug: row.session.slug,
+    projectID: row.session.projectID,
+    directory: row.session.directory,
+    parentID: row.session.parentID ?? undefined,
     title: row.session.title,
+    version: row.session.version,
+    time: {
+      created: DateTime.makeUnsafe(row.session.timeCreated),
+      updated: DateTime.makeUnsafe(row.session.timeUpdated),
+      archived: row.session.timeArchived === null ? undefined : DateTime.makeUnsafe(row.session.timeArchived),
+    },
     locked: row.member.locked,
     origin: row.member.origin,
     originPlugin: row.member.origin_plugin ?? undefined,

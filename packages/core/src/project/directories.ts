@@ -60,7 +60,7 @@ export class Service extends Context.Service<Service, Interface>()("@opencode/Pr
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
-    const db = (yield* Database.Service).db
+    const { db, readDb } = yield* Database.Service
 
     const create = Effect.fn("ProjectDirectories.create")(function* (input: CreateInput, tx?: Transaction) {
       const insert = (tx ?? db)
@@ -98,7 +98,7 @@ const layer = Layer.effect(
     })
 
     const list = Effect.fn("ProjectDirectories.list")(function* (projectID: ProjectSchema.ID) {
-      const rows = yield* db
+      const rows = yield* readDb
         .select({ directory: ProjectDirectoryTable.directory, strategy: ProjectDirectoryTable.strategy })
         .from(ProjectDirectoryTable)
         .where(eq(ProjectDirectoryTable.project_id, projectID))
@@ -113,7 +113,7 @@ const layer = Layer.effect(
       directory: AbsolutePath
     }) {
       return (
-        (yield* db
+        (yield* readDb
           .select({ directory: ProjectDirectoryTable.directory })
           .from(ProjectDirectoryTable)
           .where(
@@ -131,7 +131,7 @@ const layer = Layer.effect(
       projectID: ProjectSchema.ID
       directory: AbsolutePath
     }) {
-      const row = yield* db
+      const row = yield* readDb
         .select({ directory: ProjectDirectoryTable.directory, strategy: ProjectDirectoryTable.strategy })
         .from(ProjectDirectoryTable)
         .where(

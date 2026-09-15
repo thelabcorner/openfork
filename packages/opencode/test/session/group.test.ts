@@ -116,7 +116,18 @@ it.instance("never exposes membership-empty groups", () =>
 
     yield* groups.addSession({ groupId: group.id, sessionId: session.id })
     expect((yield* groups.list()).some((item) => item.id === group.id)).toBe(true)
-    expect((yield* groups.listWithSessions()).find((item) => item.group.id === group.id)?.sessions).toHaveLength(1)
+    const members = (yield* groups.listWithSessions()).find((item) => item.group.id === group.id)?.sessions
+    expect(members).toHaveLength(1)
+    expect(members?.[0]).toMatchObject({
+      id: session.id,
+      slug: session.slug,
+      projectID: session.projectID,
+      directory: session.directory,
+      title: session.title,
+      version: session.version,
+    })
+    expect(members?.[0]?.time?.created.epochMilliseconds).toBe(session.time.created)
+    expect(members?.[0]?.time?.updated.epochMilliseconds).toBeGreaterThanOrEqual(session.time.updated)
 
     yield* groups.removeSession({ groupId: group.id, sessionId: session.id })
     expect((yield* groups.list()).some((item) => item.id === group.id)).toBe(false)

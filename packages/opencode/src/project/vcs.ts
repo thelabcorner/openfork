@@ -1,5 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { Effect, Layer, Context, Schema, Scope } from "effect"
+import { Deferred, Effect, Layer, Context, Schema, Scope } from "effect"
 import { formatPatch, structuredPatch } from "diff"
 import { InstanceState } from "@/effect/instance-state"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
@@ -11,6 +11,7 @@ import { VcsEvent } from "@opencode-ai/schema/vcs-event"
 const PATCH_CONTEXT_LINES = 2_147_483_647
 const MAX_PATCH_BYTES = 10_000_000
 const MAX_TOTAL_PATCH_BYTES = 10_000_000
+const STATUS_UNTRACKED_STAT_CONCURRENCY = 4
 type DiffOptions = {
   readonly context?: number
 }
@@ -282,7 +283,7 @@ export interface Interface {
   readonly init: () => Effect.Effect<void>
   readonly branch: () => Effect.Effect<string | undefined>
   readonly defaultBranch: () => Effect.Effect<string | undefined>
-  readonly status: () => Effect.Effect<FileStatus[]>
+  readonly status: (options?: { readonly stats?: boolean }) => Effect.Effect<FileStatus[]>
   readonly diff: (mode: Mode, options?: DiffOptions) => Effect.Effect<FileDiff[]>
   readonly diffRaw: () => Effect.Effect<string>
   readonly apply: (input: ApplyInput) => Effect.Effect<ApplyResult, PatchApplyError>
@@ -295,12 +296,46 @@ interface State {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/Vcs") {}
 
+/**
+ * Join concurrent identical VCS status reads without caching the completed
+ * result. The worker is owned by the service scope rather than by the first
+ * HTTP caller, so cancellation of that caller cannot abort the shared Git
+ * operation and strand later joiners.
+ */
+export function createVcsStatusSingleFlight<A>(scope: Scope.Scope) {
+  const pending = new Map<string, Deferred.Deferred<A>>()
+
+  return (key: string, task: Effect.Effect<A>): Effect.Effect<A> =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        const existing = pending.get(key)
+        if (existing) return yield* restore(Deferred.await(existing))
+
+        const deferred = Deferred.makeUnsafe<A>()
+        pending.set(key, deferred)
+        yield* Effect.gen(function* () {
+          const exit = yield* Effect.exit(task)
+          // `doneUnsafe` can resume waiters re-entrantly. Remove the key first,
+          // then complete synchronously with no Effectful yield between these
+          // statements. No competing fiber can interleave in that gap, and a
+          // resumed caller cannot observe the just-finished Deferred as cache.
+          if (pending.get(key) === deferred) pending.delete(key)
+          Deferred.doneUnsafe(deferred, exit)
+        }).pipe(Effect.forkIn(scope, { startImmediately: true }))
+
+        return yield* restore(Deferred.await(deferred))
+      }),
+    )
+}
+
 const layer: Layer.Layer<Service, never, Git.Service | EventV2Bridge.Service> = Layer.effect(
   Service,
   Effect.gen(function* () {
     const git = yield* Git.Service
     const events = yield* EventV2Bridge.Service
     const scope = yield* Scope.Scope
+    const statusSingleFlight = createVcsStatusSingleFlight<FileStatus[]>(scope)
+    const rawStatusSingleFlight = createVcsStatusSingleFlight<Git.Item[]>(scope)
 
     const state = yield* InstanceState.make<State>(
       Effect.fn("Vcs.state")(function* (ctx) {
@@ -345,29 +380,72 @@ const layer: Layer.Layer<Service, never, Git.Service | EventV2Bridge.Service> = 
       defaultBranch: Effect.fn("Vcs.defaultBranch")(function* () {
         return yield* InstanceState.use(state, (x) => x.root?.name)
       }),
-      status: Effect.fn("Vcs.status")(function* () {
+      status: Effect.fn("Vcs.status")(function* (options?: { readonly stats?: boolean }) {
         const ctx = yield* InstanceState.context
         if (ctx.project.vcs !== "git") return []
-        const ref = (yield* git.hasHead(ctx.directory)) ? "HEAD" : undefined
-        const [list, stats] = yield* Effect.all(
-          [git.status(ctx.directory), ref ? git.stats(ctx.directory, ref) : Effect.succeed([])],
-          { concurrency: 2 },
-        )
-        const map = nums(stats)
-        return yield* Effect.forEach(
-          list.toSorted((a, b) => a.file.localeCompare(b.file)),
-          (item) =>
-            Effect.gen(function* () {
-              const stat =
-                map.get(item.file) ??
-                (item.status === "added" ? yield* git.statUntracked(ctx.worktree, item.file) : undefined)
-              return {
-                file: item.file,
-                additions: stat?.additions ?? 0,
-                deletions: stat?.deletions ?? 0,
-                status: item.status,
-              } satisfies FileStatus
-            }),
+        const includeStats = options?.stats !== false
+        const key = `${ctx.directory}\0${includeStats ? "stats" : "summary"}`
+        return yield* statusSingleFlight(
+          key,
+          Effect.gen(function* () {
+            // Summary and detailed consumers can overlap (Explorer + VCS panel).
+            // Share the expensive raw `git status` process across both result
+            // modes; each mode still computes/returns its own exact projection.
+            const rawStatus = rawStatusSingleFlight(ctx.directory, git.status(ctx.directory))
+            const [list, stats] = includeStats
+              ? yield* Effect.all(
+                  [
+                    rawStatus,
+                    Effect.gen(function* () {
+                      if (!(yield* git.hasHead(ctx.directory))) return []
+                      return yield* git.stats(ctx.directory, "HEAD")
+                    }),
+                  ],
+                  { concurrency: 2 },
+                )
+              : [yield* rawStatus, [] as Git.Stat[]]
+            const sorted = list.toSorted((a, b) => a.file.localeCompare(b.file))
+            if (!includeStats) {
+              // Explorer summary mode has no per-file I/O left. Keep this as one
+              // tight synchronous map instead of constructing/running an Effect for
+              // every row (large generated trees commonly have 1k+ status entries).
+              return sorted.map(
+                (item) =>
+                  ({
+                    file: item.file,
+                    additions: 0,
+                    deletions: 0,
+                    status: item.status,
+                  }) satisfies FileStatus,
+              )
+            }
+            const map = nums(stats)
+            const missing = sorted.filter((item) => item.status === "added" && !map.has(item.file))
+            const fallback = yield* Effect.forEach(
+              missing,
+              (item) =>
+                git
+                  .statUntracked(ctx.worktree, item.file)
+                  .pipe(Effect.map((stat) => [item.file, stat] as const)),
+              {
+                // Detailed status is not on the Project Explorer hot path, but
+                // it should not serialize hundreds of independent Git process
+                // starts. Only rows that actually need an untracked fallback
+                // enter this pool; tracked rows stay in the synchronous map below.
+                concurrency: STATUS_UNTRACKED_STAT_CONCURRENCY,
+              },
+            )
+            for (const [file, stat] of fallback) if (stat) map.set(file, stat)
+            return sorted.map(
+              (item) =>
+                ({
+                  file: item.file,
+                  additions: map.get(item.file)?.additions ?? 0,
+                  deletions: map.get(item.file)?.deletions ?? 0,
+                  status: item.status,
+                }) satisfies FileStatus,
+            )
+          }),
         )
       }),
       diff: Effect.fn("Vcs.diff")(function* (mode: Mode, options?: DiffOptions) {

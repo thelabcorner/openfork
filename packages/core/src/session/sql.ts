@@ -13,7 +13,7 @@ import { WorkspaceV2 } from "../workspace"
 import { Timestamps } from "../database/schema.sql"
 import type { SystemContext } from "../system-context/index"
 import { AgentV2 } from "../agent"
-import { sql } from "drizzle-orm"
+import { isNull, sql } from "drizzle-orm"
 import type { Revert } from "@opencode-ai/schema/revert"
 
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
@@ -81,6 +81,26 @@ export const SessionTable = sqliteTable(
   },
   (table) => [
     index("session_project_idx").on(table.project_id),
+    // Startup/sidebar hot path:
+    //   WHERE project_id=? AND directory=? AND parent_id IS NULL
+    //   ORDER BY time_updated DESC LIMIT ?
+    //
+    // Keep this partial so child sessions do not bloat an index used only for
+    // root-session navigation. SQLite can scan the final time_updated key in
+    // reverse order, avoiding the temporary sort used by session_project_idx.
+    index("session_project_directory_root_updated_idx")
+      .on(table.project_id, table.directory, table.time_updated)
+      .where(isNull(table.parent_id)),
+    // V2 sidebar/session-list hot path:
+    //   WHERE directory=? AND parent_id IS NULL
+    //   ORDER BY time_created DESC, id DESC LIMIT ?
+    //
+    // V2 list semantics intentionally remain creation-ordered. Include `id`
+    // because it is the stable pagination tie-breaker, allowing SQLite to serve
+    // the root-only first page directly from the partial index.
+    index("session_directory_root_created_id_idx")
+      .on(table.directory, table.time_created, table.id)
+      .where(isNull(table.parent_id)),
     index("session_workspace_idx").on(table.workspace_id),
     index("session_parent_idx").on(table.parent_id),
     index("session_group_idx").on(table.group_id),

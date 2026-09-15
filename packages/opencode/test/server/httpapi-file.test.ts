@@ -3,6 +3,7 @@ import { Context, Effect } from "effect"
 import path from "path"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import { FilePaths } from "../../src/server/routes/instance/httpapi/groups/file"
+import { InstancePaths } from "../../src/server/routes/instance/httpapi/groups/instance"
 import { resetDatabase } from "../fixture/db"
 import { disposeAllInstances, tmpdir } from "../fixture/fixture"
 import { pollWithTimeout } from "../lib/effect"
@@ -34,10 +35,11 @@ describe("file HttpApi", () => {
     await using tmp = await tmpdir({ git: true })
     await Bun.write(path.join(tmp.path, "hello.txt"), "hello")
 
-    const [list, content, status] = await Promise.all([
+    const [list, content, status, detailedStatus] = await Promise.all([
       request(FilePaths.list, tmp.path, { path: "." }),
       request(FilePaths.content, tmp.path, { path: "hello.txt" }),
       request(FilePaths.status, tmp.path),
+      request(InstancePaths.vcsStatus, tmp.path),
     ])
 
     expect(list.status).toBe(200)
@@ -49,7 +51,23 @@ describe("file HttpApi", () => {
     expect(await content.json()).toMatchObject({ type: "text", content: "hello" })
 
     expect(status.status).toBe(200)
-    expect(await status.json()).toEqual([])
+    expect(await status.json()).toContainEqual({
+      path: "hello.txt",
+      added: 0,
+      removed: 0,
+      status: "added",
+    })
+
+    // The Explorer-compatible summary endpoint deliberately skips numstat work,
+    // while the detailed VCS endpoint preserves exact line counts for callers
+    // that actually consume them.
+    expect(detailedStatus.status).toBe(200)
+    expect(await detailedStatus.json()).toContainEqual({
+      file: "hello.txt",
+      additions: 1,
+      deletions: 0,
+      status: "added",
+    })
   })
 
   test("serves search endpoints", async () => {

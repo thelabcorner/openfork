@@ -44,6 +44,20 @@ export interface Member extends Schema.Schema.Type<typeof Member> {}
 export const Member = Schema.Struct({
   id: Schema.String,
   title: Schema.String,
+  /** Lightweight session projection used by navigation/sidebar surfaces.
+   * Optional for wire compatibility with servers that predate this projection. */
+  slug: optional(Schema.String),
+  projectID: optional(Schema.String),
+  directory: optional(Schema.String),
+  parentID: optional(Schema.String),
+  version: optional(Schema.String),
+  time: optional(
+    Schema.Struct({
+      created: DateTimeUtcFromMillis,
+      updated: DateTimeUtcFromMillis,
+      archived: optional(DateTimeUtcFromMillis),
+    }),
+  ),
   locked: Schema.Boolean,
   origin: MemberOrigin,
   originPlugin: optional(Schema.String),

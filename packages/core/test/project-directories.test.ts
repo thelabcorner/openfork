@@ -44,6 +44,19 @@ describe("ProjectDirectories", () => {
     }),
   )
 
+  it.effect("reads membership and entries after creation", () =>
+    Effect.gen(function* () {
+      yield* setup()
+      const service = yield* ProjectDirectories.Service
+
+      expect(yield* service.contains({ projectID, directory })).toBe(false)
+      expect(yield* service.get({ projectID, directory })).toBeUndefined()
+      expect(yield* service.create({ projectID, directory })).toBe(true)
+      expect(yield* service.contains({ projectID, directory })).toBe(true)
+      expect(yield* service.get({ projectID, directory })).toEqual({ directory, strategy: undefined })
+    }),
+  )
+
   it.effect("replaces the strategy when requested", () =>
     Effect.gen(function* () {
       yield* setup()

@@ -3,7 +3,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { parsePatch } from "diff"
-import { Deferred, Effect, Layer } from "effect"
+import { Deferred, Effect, Fiber, Layer } from "effect"
 import fs from "fs/promises"
 import path from "path"
 import {
@@ -16,7 +16,7 @@ import {
 import { EventV2Bridge } from "../../src/event-v2-bridge"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Git } from "../../src/git"
-import { Vcs } from "@/project/vcs"
+import { createVcsStatusSingleFlight, Vcs } from "@/project/vcs"
 import { testEffect } from "../lib/effect"
 
 // ---------------------------------------------------------------------------
@@ -98,6 +98,80 @@ describe("Vcs", () => {
         expect(typeof branch).toBe("string")
       }),
     { git: true },
+  )
+
+  it.live("single-flights identical concurrent status work without caching completion", () =>
+    Effect.gen(function* () {
+      const scope = yield* Effect.scope
+      const singleFlight = createVcsStatusSingleFlight<number>(scope)
+      let runs = 0
+      const run = () =>
+        singleFlight(
+          "repo\0summary",
+          Effect.gen(function* () {
+            runs += 1
+            yield* Effect.sleep("20 millis")
+            return runs
+          }),
+        )
+
+      const joined = yield* Effect.all([run(), run(), run(), run()], { concurrency: 4 })
+      expect(joined).toEqual([1, 1, 1, 1])
+      expect(runs).toBe(1)
+
+      const next = yield* run()
+      expect(next).toBe(2)
+      expect(runs).toBe(2)
+    }),
+  )
+
+  it.live("keeps shared status work alive when the first caller is interrupted", () =>
+    Effect.gen(function* () {
+      const scope = yield* Effect.scope
+      const singleFlight = createVcsStatusSingleFlight<number>(scope)
+      const started = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let runs = 0
+      const task = Effect.gen(function* () {
+        runs += 1
+        yield* Deferred.succeed(started, undefined)
+        yield* Deferred.await(release)
+        return 42
+      })
+
+      const first = yield* singleFlight("repo\0summary", task).pipe(Effect.forkChild)
+      yield* Deferred.await(started)
+      yield* Fiber.interrupt(first)
+
+      const second = yield* singleFlight("repo\0summary", task).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(runs).toBe(1)
+      yield* Deferred.succeed(release, undefined)
+      expect(yield* Fiber.join(second)).toBe(42)
+      expect(runs).toBe(1)
+    }),
+  )
+
+  it.live("does not coalesce status modes with different keys", () =>
+    Effect.gen(function* () {
+      const scope = yield* Effect.scope
+      const singleFlight = createVcsStatusSingleFlight<string>(scope)
+      const release = yield* Deferred.make<void>()
+      let runs = 0
+      const run = (value: string) =>
+        Effect.gen(function* () {
+          runs += 1
+          yield* Deferred.await(release)
+          return value
+        })
+
+      const summary = yield* singleFlight("repo\0summary", run("summary")).pipe(Effect.forkChild)
+      const stats = yield* singleFlight("repo\0stats", run("stats")).pipe(Effect.forkChild)
+      yield* Effect.yieldNow
+      expect(runs).toBe(2)
+      yield* Deferred.succeed(release, undefined)
+      expect(yield* Effect.all([Fiber.join(summary), Fiber.join(stats)])).toEqual(["summary", "stats"])
+    }),
   )
 
   it.instance("branch() returns undefined for non-git directories", () =>

@@ -114,7 +114,7 @@ const layer = Layer.effect(
     const projectDirectories = yield* ProjectDirectories.Service
     const events = yield* EventV2Bridge.Service
     const flags = yield* RuntimeFlags.Service
-    const { db } = yield* Database.Service
+    const { db, readDb } = yield* Database.Service
 
     const git = Effect.fnUntraced(
       function* (args: string[], opts?: { cwd?: string }) {
@@ -343,9 +343,17 @@ const layer = Layer.effect(
       const root = AbsolutePath.make(FSUtil.resolve(chatsRoot()))
       yield* fs.ensureDir(root).pipe(Effect.orDie)
 
-      const existing = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, projectID)).get().pipe(Effect.orDie)
+      const existing = yield* readDb
+        .select()
+        .from(ProjectTable)
+        .where(eq(ProjectTable.id, projectID))
+        .get()
+        .pipe(Effect.orDie)
       const now = Date.now()
       const changed = !existing || existing.worktree !== root || existing.name !== CHAT_PROJECT_NAME
+      const directoryRecorded = changed
+        ? false
+        : yield* projectDirectories.contains({ projectID, directory: root })
 
       const row = changed
         ? yield* db
@@ -377,7 +385,11 @@ const layer = Layer.effect(
             .pipe(Effect.orDie)
         : existing
 
-      yield* saveProjectDirectory({ projectID, directory: root })
+      // Project.list() is a critical sidebar read. Do not acquire SQLite's
+      // shared writer merely to execute INSERT ... ON CONFLICT DO NOTHING on
+      // every catalog fetch. Repair the synthetic directory row only when the
+      // project changed or the mapping is genuinely absent.
+      if (changed || !directoryRecorded) yield* saveProjectDirectory({ projectID, directory: root })
       const info = fromRow(row)
       if (changed) yield* emitUpdated(info)
       return info
@@ -385,12 +397,12 @@ const layer = Layer.effect(
 
     const list = Effect.fn("Project.list")(function* () {
       yield* ensureChatProject()
-      return (yield* db.select().from(ProjectTable).all().pipe(Effect.orDie)).map(fromRow)
+      return (yield* readDb.select().from(ProjectTable).all().pipe(Effect.orDie)).map(fromRow)
     })
 
     const get = Effect.fn("Project.get")(function* (id: ProjectV2.ID) {
       if (id === ProjectV2.ID.make(CHAT_PROJECT_ID)) return yield* ensureChatProject()
-      const row = yield* db.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get().pipe(Effect.orDie)
+      const row = yield* readDb.select().from(ProjectTable).where(eq(ProjectTable.id, id)).get().pipe(Effect.orDie)
       return row ? fromRow(row) : undefined
     })
 

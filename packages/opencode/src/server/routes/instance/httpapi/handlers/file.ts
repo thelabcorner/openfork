@@ -337,7 +337,14 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
 
     const status = Effect.fn("FileHttpApi.status")(function* () {
       const vcs = yield* Vcs.Service
-      const list = yield* vcs.status()
+      // Project Explorer consumes only path + status. Asking the detailed VCS
+      // service for numstat here made every untracked file spawn its own
+      // `git diff --no-index --numstat /dev/null <file>` process. Large generated
+      // or probe trees therefore turned one background HTTP request into hundreds
+      // of sequential child processes inside the sidecar. Keep the detailed
+      // instance VCS endpoint unchanged; this compatibility/file-tree surface
+      // deliberately requests O(1)-process summary status.
+      const list = yield* vcs.status({ stats: false })
       return list.map((item) => ({
         path: item.file,
         added: item.additions,

@@ -11,6 +11,7 @@ import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { Flag } from "@opencode-ai/core/flag/flag"
+import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { registerAdapter } from "../../src/control-plane/adapters"
 import type { WorkspaceAdapter } from "../../src/control-plane/types"
@@ -22,6 +23,7 @@ import { Project } from "../../src/project/project"
 import { HttpApiApp } from "../../src/server/routes/instance/httpapi/server"
 import * as HttpSessionError from "../../src/server/routes/instance/httpapi/handlers/session-errors"
 import { ExperimentalPaths } from "../../src/server/routes/instance/httpapi/groups/experimental"
+import { GlobalPaths } from "../../src/server/routes/instance/httpapi/groups/global"
 import { SessionPaths } from "../../src/server/routes/instance/httpapi/groups/session"
 import { Session } from "@/session/session"
 import { MessageID, PartID, SessionID, type SessionID as SessionIDType } from "../../src/session/schema"
@@ -331,6 +333,29 @@ describe("session HttpApi", () => {
         const listed = yield* requestJson<Session.Info[]>(`${SessionPaths.list}?roots=true`, { headers })
         expect(listed.map((item) => item.id)).toContain(parent.id)
         expect(Object.hasOwn(listed[0]!, "parentID")).toBe(false)
+
+        const v2RootPageResponse = yield* request(
+          `/api/session?${new URLSearchParams({
+            directory: test.directory,
+            roots: "true",
+            order: "desc",
+            limit: "10",
+          })}`,
+          { headers },
+        )
+        expect(v2RootPageResponse.status).toBe(200)
+        const v2RootPage = yield* json<{ data: Session.Info[]; cursor: { next?: string } }>(v2RootPageResponse)
+        expect(v2RootPage.data.map((item) => item.id)).toContain(parent.id)
+        expect(v2RootPage.data.map((item) => item.id)).not.toContain(child.id)
+        expect(v2RootPage.data.every((item) => !item.parentID)).toBe(true)
+        expect(v2RootPage.cursor.next).toBeTruthy()
+        expect(JSON.parse(Buffer.from(v2RootPage.cursor.next!, "base64url").toString("utf8"))).toMatchObject({
+          directory: test.directory,
+          // Opaque cursors preserve the encoded query representation; parsing
+          // the cursor through SessionsCursor decodes this back to boolean true.
+          roots: "true",
+          order: "desc",
+        })
 
         expect(yield* requestJson<Record<string, unknown>>(SessionPaths.status, { headers })).toEqual({})
 
@@ -943,6 +968,13 @@ describe("session HttpApi", () => {
         const globalQuery = new URLSearchParams({ directory: hint })
         const global = yield* requestJson<Session.Info[]>(`${ExperimentalPaths.session}?${globalQuery}`, { headers })
         expect(global.map((item) => item.id)).toContain(created.id)
+
+        const bootstrapFreeQuery = new URLSearchParams({ directory: hint, limit: "50" })
+        const bootstrapFree = yield* requestJson<Session.Info[]>(`${GlobalPaths.sessionRoots}?${bootstrapFreeQuery}`)
+        expect(bootstrapFree.map((item) => item.id)).toContain(created.id)
+
+        const projects = yield* requestJson<Project.Info[]>(GlobalPaths.projects)
+        expect(projects.some((project) => FSUtil.resolve(project.worktree) === FSUtil.resolve(test.directory))).toBe(true)
       }),
     { git: true, config: { formatter: false, lsp: false, share: "disabled" } },
   )

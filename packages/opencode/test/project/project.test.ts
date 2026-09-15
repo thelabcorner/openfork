@@ -5,7 +5,7 @@ import path from "path"
 import { tmpdirScoped } from "../fixture/fixture"
 import { GlobalBus } from "../../src/bus/global"
 import { Database } from "@opencode-ai/core/database/database"
-import { ProjectTable } from "@opencode-ai/core/project/sql"
+import { ProjectDirectoryTable, ProjectTable } from "@opencode-ai/core/project/sql"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import { WorkspaceTable } from "@opencode-ai/core/control-plane/workspace.sql"
 import { eq } from "drizzle-orm"
@@ -655,6 +655,51 @@ describe("Project.list and Project.get", () => {
       const project = yield* Project.Service
       const found = yield* project.get(ProjectV2.ID.make("nonexistent"))
       expect(found).toBeUndefined()
+    }),
+  )
+
+  it.live("repairs a missing Chats directory mapping without rewriting an existing one", () =>
+    Effect.gen(function* () {
+      const project = yield* Project.Service
+      const { db } = yield* Database.Service
+
+      const first = yield* project.list()
+      const chats = first.find((item) => item.id === ProjectV2.ID.make("chats"))
+      expect(chats).toBeDefined()
+
+      const rows = yield* db
+        .select()
+        .from(ProjectDirectoryTable)
+        .where(eq(ProjectDirectoryTable.project_id, ProjectV2.ID.make("chats")))
+        .all()
+        .pipe(Effect.orDie)
+      expect(rows).toHaveLength(1)
+
+      // A warm critical catalog read preserves the already-correct mapping.
+      yield* project.list()
+      const warmRows = yield* db
+        .select()
+        .from(ProjectDirectoryTable)
+        .where(eq(ProjectDirectoryTable.project_id, ProjectV2.ID.make("chats")))
+        .all()
+        .pipe(Effect.orDie)
+      expect(warmRows).toEqual(rows)
+
+      // If a partial migration/external cleanup loses only the mapping, the
+      // next catalog read repairs it rather than assuming the cache is perfect.
+      yield* db
+        .delete(ProjectDirectoryTable)
+        .where(eq(ProjectDirectoryTable.project_id, ProjectV2.ID.make("chats")))
+        .run()
+        .pipe(Effect.orDie)
+      yield* project.list()
+      const repaired = yield* db
+        .select()
+        .from(ProjectDirectoryTable)
+        .where(eq(ProjectDirectoryTable.project_id, ProjectV2.ID.make("chats")))
+        .all()
+        .pipe(Effect.orDie)
+      expect(repaired).toHaveLength(1)
     }),
   )
 })
