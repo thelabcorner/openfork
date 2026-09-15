@@ -23,6 +23,7 @@ const TARGET_SELECTOR = "code[data-inline-code-kind]"
 const SELF_SELECTOR = '[data-component="markdown-target-actions"]'
 const CLOSE_DELAY_MS = 140
 const COPIED_RESET_MS = 1400
+const RESOLVED_PATH_CACHE_MS = 1500
 
 function ActionButton(props: { label: string; onClick: () => void; children: JSX.Element; active?: boolean }) {
   return (
@@ -67,6 +68,15 @@ export function MarkdownTargetActions() {
 
   let closeTimer: ReturnType<typeof setTimeout> | undefined
   let copiedTimer: ReturnType<typeof setTimeout> | undefined
+  let locateGeneration = 0
+  let locating: { value: string; promise: Promise<string | undefined> } | undefined
+  let resolved: { value: string; path: string; at: number } | undefined
+
+  const resetLocation = () => {
+    locateGeneration++
+    locating = undefined
+    resolved = undefined
+  }
 
   const cancelClose = () => {
     if (!closeTimer) return
@@ -76,6 +86,7 @@ export function MarkdownTargetActions() {
 
   const close = () => {
     cancelClose()
+    resetLocation()
     setAnchor(undefined)
     setRect(undefined)
     setTarget(undefined)
@@ -153,15 +164,29 @@ export function MarkdownTargetActions() {
    * should fall through to the next candidate instead of dead-ending.
    */
   const locate = async (current: MarkdownTarget) => {
-    const candidates = await resolveMarkdownCandidates(current.value)
-    if (candidates.length === 0) {
-      showToast({ title: language.t("markdown.target.missing"), description: current.value })
+    const now = performance.now()
+    if (resolved?.value === current.value && now - resolved.at <= RESOLVED_PATH_CACHE_MS) return resolved.path
+    if (locating?.value === current.value) return locating.promise
+
+    const generation = locateGeneration
+    const promise = (async () => {
+      const candidates = await resolveMarkdownCandidates(current.value)
+      if (candidates.length === 0) {
+        showToast({ title: language.t("markdown.target.missing"), description: current.value })
+        return undefined
+      }
+      const found = await firstExistingPath(candidates, platform.pathExists, platform.resolveExistingPath)
+      if (found) {
+        if (generation === locateGeneration) resolved = { value: current.value, path: found, at: performance.now() }
+        return found
+      }
+      showToast({ title: language.t("markdown.target.missing"), description: candidates[0] })
       return undefined
-    }
-    const found = await firstExistingPath(candidates, platform.pathExists)
-    if (found) return found
-    showToast({ title: language.t("markdown.target.missing"), description: candidates[0] })
-    return undefined
+    })().finally(() => {
+      if (locating?.promise === promise) locating = undefined
+    })
+    locating = { value: current.value, promise }
+    return promise
   }
 
   const reveal = () => {
@@ -191,15 +216,23 @@ export function MarkdownTargetActions() {
     platform.openExternal(current.value)
   }
 
-  const activate = (element: HTMLElement) => {
+  const refreshTarget = (element: HTMLElement) => {
     const kind = element.dataset.inlineCodeKind as MarkdownTargetKind | undefined
-    if (kind !== "path" && kind !== "url") return
+    if (kind !== "path" && kind !== "url") return false
     const parsed = parseMarkdownTarget(kind, element.textContent ?? "")
-    if (!parsed) return
-    if (element === anchor()) return
-    setAnchor(element)
+    if (!parsed) return false
+    const current = target()
+    if (current?.kind === parsed.kind && current.raw === parsed.raw && current.value === parsed.value) return true
+    resetLocation()
     setTarget(parsed)
     setCopied(false)
+    return true
+  }
+
+  const activate = (element: HTMLElement) => {
+    if (!refreshTarget(element)) return
+    if (element === anchor()) return
+    setAnchor(element)
     setRect(element.getBoundingClientRect())
   }
 
@@ -236,6 +269,10 @@ export function MarkdownTargetActions() {
         close()
         return
       }
+      if (!refreshTarget(element)) {
+        close()
+        return
+      }
       const next = element.getBoundingClientRect()
       if (next.bottom < 0 || next.top > window.innerHeight) {
         close()
@@ -246,6 +283,21 @@ export function MarkdownTargetActions() {
     sync()
     makeEventListener(window, "scroll", sync, { capture: true, passive: true })
     makeEventListener(window, "resize", sync)
+
+    // A completed markdown block can still be morphed while the pointer stays
+    // stationary (cache replacement, route/session updates, re-decoration).
+    // Observe only the active span's parent so a stale toolbar can never act on
+    // text that has already changed underneath it. MutationObserver batches the
+    // callback per microtask, keeping this off the normal timeline hot path.
+    const observer = new MutationObserver(sync)
+    observer.observe(element.parentElement ?? element, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["data-inline-code-kind"],
+    })
+    onCleanup(() => observer.disconnect())
   })
 
   const position = createMemo((): JSX.CSSProperties | undefined => {

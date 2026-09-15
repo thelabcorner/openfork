@@ -53,6 +53,9 @@ type PlatformBase = {
   /** Test whether a local path exists, without revealing or opening it (desktop only) */
   pathExists?(path: string): Promise<boolean>
 
+  /** Resolve the first existing path with one desktop bridge round-trip. */
+  resolveExistingPath?(paths: readonly string[]): Promise<string | null>
+
   /** Reload the renderer without restarting the sidecar (desktop) or full app (web) */
   refresh(): Promise<void>
 

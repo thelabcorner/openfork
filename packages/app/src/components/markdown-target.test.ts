@@ -27,6 +27,14 @@ describe("parseMarkdownTarget paths", () => {
     })
   })
 
+  test("splits hash-style line and column locations", () => {
+    expect(parseMarkdownTarget("path", "src/app.ts#L42C7")).toMatchObject({
+      value: "src/app.ts",
+      line: 42,
+      column: 7,
+    })
+  })
+
   test("splits a line suffix off a windows path without eating the drive", () => {
     expect(parseMarkdownTarget("path", "C:\\repo\\main.rs:120")).toMatchObject({
       value: "C:\\repo\\main.rs",

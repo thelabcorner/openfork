@@ -35,6 +35,9 @@ describe("inlineCodeKind", () => {
     expect(inlineCodeKind(`~/.config/opencode`)).toBe("path")
     expect(inlineCodeKind(`@opencode-ai/app`)).toBe("path")
     expect(inlineCodeKind(`session/status`)).toBe("path")
+    expect(inlineCodeKind(`app.ts:42`)).toBe("path")
+    expect(inlineCodeKind(`README.md:12:4`)).toBe("path")
+    expect(inlineCodeKind(`README.md#L42`)).toBe("path")
   })
 
   test("detects urls", () => {

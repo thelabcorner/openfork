@@ -16,6 +16,9 @@
 const WINDOWS_DRIVE = /^[A-Za-z]:[\\/]/
 const WINDOWS_UNC = /^(?:\\\\|\/\/)/
 
+const isHomeRelativePath = (value: string) =>
+  value === "~" || value.startsWith("~/") || value.startsWith("~\\")
+
 export function isAbsolutePath(value: string): boolean {
   if (!value) return false
   if (value.startsWith("/")) return true
@@ -60,11 +63,26 @@ export function basename(value: string): string {
   return slash === -1 ? end : end.slice(slash + 1)
 }
 
-const normalize = (value: string) =>
-  value
-    .replace(/[\\/]+/g, "/")
-    .replace(/^\/+|\/+$/g, "")
-    .toLowerCase()
+const separatorCode = (code: number) => code === 47 || code === 92
+
+/**
+ * Canonical comparison form for index matching.
+ *
+ * Search-index paths are already slash-normalized in the overwhelmingly common
+ * case. Avoid paying two regex replacements for every candidate and only take
+ * the slower collapse path when mixed/repeated separators actually occur.
+ */
+const normalize = (value: string) => {
+  let start = 0
+  let end = value.length
+  while (start < end && separatorCode(value.charCodeAt(start))) start++
+  while (end > start && separatorCode(value.charCodeAt(end - 1))) end--
+  if (start === end) return ""
+
+  const body = start === 0 && end === value.length ? value : value.slice(start, end)
+  if (!body.includes("\\") && !body.includes("//")) return body.toLowerCase()
+  return body.replace(/[\\/]+/g, "/").toLowerCase()
+}
 
 const depth = (value: string) => {
   if (!value) return 0
@@ -77,27 +95,41 @@ function rankEntries<T>(written: string, candidates: readonly T[], pathOf: (cand
   if (!written || candidates.length === 0) return []
   const target = normalize(written)
   if (!target) return []
-  const targetName = basename(target)
-  const exact: Array<{ candidate: T; depth: number; index: number }> = []
-  const suffixed: Array<{ candidate: T; depth: number; index: number }> = []
-  const named: Array<{ candidate: T; depth: number; index: number }> = []
+  const targetSlash = target.lastIndexOf("/")
+  const targetName = targetSlash === -1 ? target : target.slice(targetSlash + 1)
+  const exact: T[] = []
+  const suffixed: T[][] = []
+  const named: T[][] = []
+
+  const pushByDepth = (groups: T[][], candidate: T, candidateDepth: number) => {
+    const group = groups[candidateDepth]
+    if (group) group.push(candidate)
+    else groups[candidateDepth] = [candidate]
+  }
 
   for (let index = 0; index < candidates.length; index++) {
     const candidate = candidates[index]!
     const value = normalize(pathOf(candidate))
     if (!value) continue
-    const ranked = { candidate, depth: depth(value), index }
-    if (value === target) exact.push(ranked)
-    else if (value.endsWith(`/${target}`)) suffixed.push(ranked)
-    else if (basename(value) === targetName) named.push(ranked)
+    if (value === target) {
+      exact.push(candidate)
+      continue
+    }
+
+    const candidateDepth = depth(value)
+    if (value.endsWith(`/${target}`)) {
+      pushByDepth(suffixed, candidate, candidateDepth)
+      continue
+    }
+    const slash = value.lastIndexOf("/")
+    const name = slash === -1 ? value : value.slice(slash + 1)
+    if (name === targetName) pushByDepth(named, candidate, candidateDepth)
   }
 
-  const byDepth = (a: { depth: number; index: number }, b: { depth: number; index: number }) =>
-    a.depth - b.depth || a.index - b.index
-  exact.sort(byDepth)
-  suffixed.sort(byDepth)
-  named.sort(byDepth)
-  return [...exact, ...suffixed, ...named].map((entry) => entry.candidate)
+  const out = exact.slice()
+  for (const group of suffixed) if (group) out.push(...group)
+  for (const group of named) if (group) out.push(...group)
+  return out
 }
 
 /**
@@ -148,6 +180,14 @@ export function pathCandidates(input: {
     return out
   }
 
+  // Home-relative paths are rooted by the desktop process, not by the project.
+  // Keep the tilde intact so the native bridge can expand it against the real
+  // user home instead of accidentally constructing `<workspace>/~/.config/...`.
+  if (isHomeRelativePath(written)) {
+    push(written)
+    return out
+  }
+
   // When prose includes a relative subpath, it is more specific than fuzzy
   // basename hits. Newer servers expose their canonical workspace root once
   // per page, so try that exact relative path first even if duplicate filenames
@@ -178,8 +218,10 @@ export function pathCandidates(input: {
 export async function firstExistingPath(
   candidates: readonly string[],
   exists?: (path: string) => Promise<boolean>,
+  resolveMany?: (paths: readonly string[]) => Promise<string | null | undefined>,
 ): Promise<string | undefined> {
   if (candidates.length === 0) return undefined
+  if (resolveMany) return (await resolveMany(candidates)) ?? undefined
   if (!exists) return candidates[0]
   let successfulProbe = false
   let lastError: unknown
@@ -202,7 +244,7 @@ export async function firstExistingPath(
 /** Produces the ordered candidates for a written path. */
 export type MarkdownPathResolver = (written: string) => Promise<string[]>
 
-let current: MarkdownPathResolver | undefined
+const resolvers: MarkdownPathResolver[] = []
 
 /**
  * The toolbar is mounted app-wide but the file index is session-scoped, so the
@@ -210,9 +252,11 @@ let current: MarkdownPathResolver | undefined
  * across scopes for a context it cannot see.
  */
 export function setMarkdownPathResolver(resolver: MarkdownPathResolver | undefined): () => void {
-  current = resolver
+  if (!resolver) return () => undefined
+  resolvers.push(resolver)
   return () => {
-    if (current === resolver) current = undefined
+    const index = resolvers.lastIndexOf(resolver)
+    if (index !== -1) resolvers.splice(index, 1)
   }
 }
 
@@ -221,6 +265,10 @@ export function resolveMarkdownCandidates(written: string): Promise<string[]> {
   if (isAbsolutePath(written)) {
     return Promise.resolve([normalizeSeparators(written, preferredSeparator(written))])
   }
+  const current = resolvers.at(-1)
   if (!current) return Promise.resolve([])
-  return current(written).catch(() => [])
+  // Do not turn a transport/index failure into a false "file missing" result.
+  // Callers already have an infrastructure-error path and should be allowed to
+  // distinguish it from a successful search that genuinely found nothing.
+  return current(written)
 }

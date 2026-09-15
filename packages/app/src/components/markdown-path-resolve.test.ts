@@ -8,6 +8,8 @@ import {
   pathCandidates,
   pickPathMatch,
   rankPathMatches,
+  resolveMarkdownCandidates,
+  setMarkdownPathResolver,
 } from "./markdown-path-resolve"
 
 describe("isAbsolutePath", () => {
@@ -121,6 +123,55 @@ describe("rankPathMatches", () => {
   test("does not match a filename that merely shares a suffix", () => {
     expect(pickPathMatch("iff.mjs", index)).toBeUndefined()
   })
+
+  test("stays equivalent to the original rank semantics across a generated corpus", () => {
+    const referenceNormalize = (value: string) =>
+      value
+        .replace(/[\\/]+/g, "/")
+        .replace(/^\/+|\/+$/g, "")
+        .toLowerCase()
+    const referenceDepth = (value: string) => (value ? value.split("/").length : 0)
+    const reference = (written: string, candidates: readonly string[]) => {
+      const target = referenceNormalize(written)
+      if (!target) return []
+      const targetName = basename(target)
+      const exact: Array<{ value: string; depth: number; index: number }> = []
+      const suffixed: Array<{ value: string; depth: number; index: number }> = []
+      const named: Array<{ value: string; depth: number; index: number }> = []
+      candidates.forEach((candidate, candidateIndex) => {
+        const value = referenceNormalize(candidate)
+        if (!value) return
+        const entry = { value: candidate, depth: referenceDepth(value), index: candidateIndex }
+        if (value === target) exact.push(entry)
+        else if (value.endsWith(`/${target}`)) suffixed.push(entry)
+        else if (basename(value) === targetName) named.push(entry)
+      })
+      const byDepth = (a: { depth: number; index: number }, b: { depth: number; index: number }) =>
+        a.depth - b.depth || a.index - b.index
+      return [...exact.sort(byDepth), ...suffixed.sort(byDepth), ...named.sort(byDepth)].map((entry) => entry.value)
+    }
+
+    const separators = ["/", "\\"]
+    const candidates = Array.from({ length: 180 }, (_, index) => {
+      const separator = separators[index % separators.length]!
+      const depth = (index % 6) + 1
+      const prefix = Array.from({ length: depth }, (_, part) => `d${(index + part) % 13}`).join(separator)
+      const name = index % 5 === 0 ? "README.md" : index % 3 === 0 ? "shared.ts" : `file-${index % 29}.mjs`
+      return `${prefix}${separator}${index % 7 === 0 ? name.toUpperCase() : name}`
+    })
+    const written = [
+      "README.md",
+      "shared.ts",
+      "d1/shared.ts",
+      "D2\\SHARED.TS",
+      "file-7.mjs",
+      "d5/file-12.mjs",
+      "absent.ts",
+      ...candidates.filter((_, index) => index % 17 === 0),
+    ]
+
+    for (const value of written) expect(rankPathMatches(value, candidates)).toEqual(reference(value, candidates))
+  })
 })
 
 describe("pathCandidates", () => {
@@ -128,6 +179,17 @@ describe("pathCandidates", () => {
 
   test("an absolute mention is taken at its word", () => {
     expect(pathCandidates({ written: "C:\\a\\b.md", directory, matches: ["x/b.md"] })).toEqual(["C:\\a\\b.md"])
+  })
+
+  test("keeps home-relative mentions out of the project root", () => {
+    expect(
+      pathCandidates({
+        written: "~/.config/opencode/opencode.json",
+        directory,
+        canonicalDirectory: "D:\\canonical\\presGEN_v2",
+        matches: [],
+      }),
+    ).toEqual(["~/.config/opencode/opencode.json"])
   })
 
   test("ranks index hits first, normalized, then the literal mention", () => {
@@ -249,5 +311,50 @@ describe("firstExistingPath", () => {
     })
     expect(found).toBeUndefined()
     expect(calls).toBe(2)
+  })
+
+  test("uses one bulk resolver when the desktop bridge supports it", async () => {
+    let legacyCalls = 0
+    let bulkCalls = 0
+    const found = await firstExistingPath(
+      ["missing", "real", "never"],
+      async () => {
+        legacyCalls++
+        return false
+      },
+      async (paths) => {
+        bulkCalls++
+        expect(paths).toEqual(["missing", "real", "never"])
+        return "real"
+      },
+    )
+    expect(found).toBe("real")
+    expect(bulkCalls).toBe(1)
+    expect(legacyCalls).toBe(0)
+  })
+})
+
+describe("markdown resolver registry", () => {
+  test("falls back to the previous resolver when an overlapping scope unmounts", async () => {
+    const disposeOuter = setMarkdownPathResolver(async (written) => [`outer/${written}`])
+    const disposeInner = setMarkdownPathResolver(async (written) => [`inner/${written}`])
+    try {
+      await expect(resolveMarkdownCandidates("file.ts")).resolves.toEqual(["inner/file.ts"])
+      disposeInner()
+      await expect(resolveMarkdownCandidates("file.ts")).resolves.toEqual(["outer/file.ts"])
+    } finally {
+      disposeInner()
+      disposeOuter()
+    }
+  })
+
+  test("preserves resolver infrastructure failures", async () => {
+    const error = new Error("mention index transport failed")
+    const dispose = setMarkdownPathResolver(async () => Promise.reject(error))
+    try {
+      await expect(resolveMarkdownCandidates("file.ts")).rejects.toBe(error)
+    } finally {
+      dispose()
+    }
   })
 })

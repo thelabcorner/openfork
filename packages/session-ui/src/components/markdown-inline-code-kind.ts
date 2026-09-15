@@ -1888,6 +1888,37 @@ const pathFileNamePrefixes = new Set([
   "zshrc",
 ])
 
+const digit = (code: number) => code >= 48 && code <= 57
+
+function digitRunStart(text: string, end: number) {
+  let index = end
+  while (index > 0 && digit(text.charCodeAt(index - 1))) index--
+  return index === end ? -1 : index
+}
+
+/** Start offset of `:line[:column]` or `#Lline[Ccolumn]`, -1 when absent. */
+function pathLocationStart(text: string) {
+  const tail = digitRunStart(text, text.length)
+  if (tail < 1) return -1
+  const marker = text.charCodeAt(tail - 1)
+
+  // :42 / :42:7
+  if (marker === 58) {
+    const line = digitRunStart(text, tail - 1)
+    return line > 0 && text.charCodeAt(line - 1) === 58 ? line - 1 : tail - 1
+  }
+
+  // #L42
+  if ((marker === 76 || marker === 108) && tail > 1 && text.charCodeAt(tail - 2) === 35) return tail - 2
+
+  // #L42C7
+  if (marker !== 67 && marker !== 99) return -1
+  const line = digitRunStart(text, tail - 1)
+  if (line < 2) return -1
+  const l = text.charCodeAt(line - 1)
+  return (l === 76 || l === 108) && text.charCodeAt(line - 2) === 35 ? line - 2 : -1
+}
+
 export function inlineCodeKind(text: string): "path" | "url" | undefined {
   if (/^https?:\/\//i.test(text)) return "url"
   if (/^[a-z][a-z0-9+.-]*:\/\//i.test(text)) return
@@ -1895,7 +1926,14 @@ export function inlineCodeKind(text: string): "path" | "url" | undefined {
   if (/^\/[a-z][a-z0-9-]*$/i.test(text)) return
   if (/\s/.test(text)) return
   if (/[()\[\]{}*+=<>|&^"';]/.test(text)) return
-  if (/[/\\]/.test(text) || /^\.\.?[/\\]/.test(text) || hasPathExtension(text) || hasPathFileName(text)) return "path"
+  if (/[/\\]/.test(text) || /^\.\.?[/\\]/.test(text)) return "path"
+
+  // Bare filenames with editor locations (`app.ts:42`, `README.md#L42`) need
+  // classification against the filename, not the location suffix. The manual
+  // backward scan avoids a regex/allocation on the common no-location path.
+  const location = pathLocationStart(text)
+  const filename = location > 0 ? text.slice(0, location) : text
+  if (hasPathExtension(filename) || hasPathFileName(filename)) return "path"
 }
 
 function hasPathExtension(text: string) {

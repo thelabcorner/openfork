@@ -3,8 +3,11 @@ import { ServerConnection } from "@/context/server"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { lazy } from "solid-js"
-import { DialogSelectDirectory } from "./dialog-select-directory"
 import { directoryPickerKind } from "./directory-picker-policy"
+
+const DialogSelectDirectory = lazy(() =>
+  import("./dialog-select-directory").then((module) => ({ default: module.DialogSelectDirectory })),
+)
 
 const DialogSelectDirectoryV2 = lazy(() =>
   import("./dialog-select-directory-v2").then((module) => ({ default: module.DialogSelectDirectoryV2 })),

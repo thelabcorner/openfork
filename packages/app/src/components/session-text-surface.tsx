@@ -1,4 +1,5 @@
-import { createSignal, type ParentProps } from "solid-js"
+import { Show, type ParentProps } from "solid-js"
+import { createStore } from "solid-js/store"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { useLanguage } from "@/context/language"
@@ -8,22 +9,19 @@ import { useServer } from "@/context/server"
 import { useTabs } from "@/context/tabs"
 import { showToast } from "@/utils/toast"
 import { SelectionToolbar } from "./selection-toolbar"
-
-function isEditableTarget(el: Element | null): el is HTMLInputElement | HTMLTextAreaElement | HTMLElement {
-  if (!el) return false
-  if (el instanceof HTMLTextAreaElement) return !el.disabled && !el.readOnly
-  if (el instanceof HTMLInputElement) return !el.disabled && !el.readOnly && el.type !== "checkbox" && el.type !== "radio"
-  return (el as HTMLElement).isContentEditable
-}
-
-function hasSelection() {
-  const sel = typeof window !== "undefined" ? window.getSelection() : null
-  return !!sel && !sel.isCollapsed && sel.toString().trim().length > 0
-}
-
-function selectedText() {
-  return window.getSelection()?.toString() ?? ""
-}
+import { ContextMenuCursorTrigger } from "./context-menu-cursor-trigger"
+import {
+  captureContextMenuSelection,
+  contextMenuHasSelection,
+  contextMenuSelectionText,
+  type ContextMenuSelectionSnapshot,
+} from "./context-menu-selection"
+import {
+  copyContextMenuSelection,
+  cutContextMenuSelection,
+  pasteContextMenuClipboard,
+  selectAllContextMenuTarget,
+} from "./context-menu-actions"
 
 async function writeClipboard(text: string) {
   try {
@@ -32,17 +30,6 @@ async function writeClipboard(text: string) {
   } catch {
     return document.execCommand("copy")
   }
-}
-
-function insertAtCursor(target: HTMLInputElement | HTMLTextAreaElement | HTMLElement, text: string) {
-  if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
-    const start = target.selectionStart ?? target.value.length
-    const end = target.selectionEnd ?? target.value.length
-    target.setRangeText(text, start, end, "end")
-    target.dispatchEvent(new Event("input", { bubbles: true }))
-    return
-  }
-  document.execCommand("insertText", false, text)
 }
 
 /**
@@ -68,78 +55,27 @@ export function SessionTextSurface(props: ParentProps<{ containerRef?: () => HTM
   const container = () => props.containerRef?.() ?? surfaceRef
 
   // Context-menu state — controlled DropdownMenu at cursor position.
-  // Using a hidden fixed trigger avoids Kobalte's ContextMenu `display: contents`
+  // Using a hidden trigger avoids Kobalte's ContextMenu `display: contents`
   // large-area trigger bug where `excludedElements: [triggerRef]` prevents
   // DismissableLayer from closing on left-click outside Content but still inside
-  // the trigger area (the whole session viewport). The hidden 1px trigger
-  // ensures `pointerdown outside` correctly dismisses.
-  const [target, setTarget] = createSignal<Element | null>(null)
-  const [open, setOpen] = createSignal(false)
-  const [anchor, setAnchor] = createSignal<{ x: number; y: number }>({ x: 0, y: 0 })
-  let triggerRef: HTMLButtonElement | undefined
-  const editable = () => isEditableTarget(target())
-  const selectable = () => hasSelection()
+  // the trigger area (the whole session viewport). Portal the 1px trigger to the
+  // document so viewport client coordinates cannot be rebased by contained panes.
+  const [menu, setMenu] = createStore<{
+    open: boolean
+    request?: { x: number; y: number; selection: ContextMenuSelectionSnapshot }
+  }>({ open: false })
 
   const handleContextMenu = (e: MouseEvent) => {
     const targetEl = e.target as Element | null
     if (targetEl?.closest('[data-component="menu-v2-content"]')) return
-    setTarget(targetEl)
-    setAnchor({ x: e.clientX, y: e.clientY })
+    const selection = captureContextMenuSelection(targetEl)
     e.preventDefault()
     e.stopPropagation()
-    setOpen(true)
-  }
-
-  const copy = () => {
-    const text = selectedText()
-    if (text) void writeClipboard(text).then(() => showToast({ title: language.t("common.copy"), variant: "success" }))
-  }
-  const cut = () => {
-    const el = target()
-    const text = selectedText()
-    if (!text || !editable()) return
-    void writeClipboard(text).then(() => {
-      if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-        const start = el.selectionStart ?? 0
-        const end = el.selectionEnd ?? 0
-        el.setRangeText("", start, end, "end")
-        el.dispatchEvent(new Event("input", { bubbles: true }))
-      } else {
-        document.execCommand("delete")
-      }
-    })
-  }
-  const paste = () => {
-    const el = target()
-    if (!el || !isEditableTarget(el)) return
-    void navigator.clipboard
-      .readText()
-      .then((text) => {
-        if (text) insertAtCursor(el, text)
-      })
-      .catch(() => {
-        document.execCommand("paste")
-      })
-  }
-  const selectAll = () => {
-    const el = target()
-    if (el instanceof HTMLInputElement || el instanceof HTMLTextAreaElement) {
-      el.select()
-      return
-    }
-    if (el instanceof HTMLElement && el.isContentEditable) {
-      const range = document.createRange()
-      range.selectNodeContents(el)
-      const sel = window.getSelection()
-      sel?.removeAllRanges()
-      sel?.addRange(range)
-      return
-    }
-    document.execCommand("selectAll")
+    setMenu({ open: true, request: { x: e.clientX, y: e.clientY, selection } })
   }
 
   const addToChat = (textOverride?: string) => {
-    const text = (textOverride ?? selectedText()).trim()
+    const text = (textOverride ?? "").trim()
     if (!text) {
       showToast({ title: language.t("projectExplorer.contextMenu.noActiveChat"), variant: "error" })
       return
@@ -175,7 +111,7 @@ export function SessionTextSurface(props: ParentProps<{ containerRef?: () => HTM
   }
 
   const newSessionWithSelection = (textOverride?: string) => {
-    const text = (textOverride ?? selectedText()).trim()
+    const text = (textOverride ?? "").trim()
     if (!text) return
     const dir = sdk().directory
     // tabs.newDraft navigates itself; prompt is seeded as initial draft prompt
@@ -184,7 +120,7 @@ export function SessionTextSurface(props: ParentProps<{ containerRef?: () => HTM
   }
 
   const addToNotes = (textOverride?: string) => {
-    const text = (textOverride ?? selectedText()).trim()
+    const text = (textOverride ?? "").trim()
     if (!text) return
     // Premium stub: notes file not yet backed — copy with toast so action is never dead.
     // When the notes backend lands, replace with file-ops create + real persistence.
@@ -194,7 +130,7 @@ export function SessionTextSurface(props: ParentProps<{ containerRef?: () => HTM
   }
 
   const copySelection = (textOverride?: string) => {
-    const text = textOverride ?? selectedText()
+    const text = textOverride ?? ""
     if (text) void writeClipboard(text)
   }
 
@@ -215,96 +151,87 @@ export function SessionTextSurface(props: ParentProps<{ containerRef?: () => HTM
         ref={surfaceRef}
         data-session-surface
         onContextMenu={handleContextMenu}
-        onPointerDown={(e: PointerEvent) => setTarget(e.target as Element)}
         style={{ display: "contents" }}
       >
         {props.children}
-        <MenuV2 open={open()} onOpenChange={setOpen} placement="right-start" gutter={2} shift={2} flip overflowPadding={8}>
-          <MenuV2.Trigger
-            ref={(el: HTMLButtonElement) => {
-              triggerRef = el
-            }}
-            style={
-              {
-                position: "fixed",
-                left: `${anchor().x}px`,
-                top: `${anchor().y}px`,
-                width: "1px",
-                height: "1px",
-                opacity: "0",
-                "pointer-events": "none",
-                padding: "0",
-                border: "0",
-              } as any
-            }
-            aria-hidden="true"
-            tabIndex={-1}
-          />
-          <MenuV2.Portal>
-            <MenuV2.Content>
-              {/* Session actions — only meaningful with a selection */}
-              <MenuV2.Item disabled={!selectable()} onSelect={() => addToChat()}>
-                <span class="flex items-center gap-2 w-full">
-                  <span data-slot="menu-v2-item-icon">
-                    <Icon name="chats" size="small" />
-                  </span>
-                  {language.t("projectExplorer.contextMenu.addToChat")}
-                </span>
-              </MenuV2.Item>
-              <MenuV2.Item disabled={!selectable()} onSelect={() => newSessionWithSelection()}>
-                <span class="flex items-center gap-2 w-full">
-                  <span data-slot="menu-v2-item-icon">
-                    <Icon name="plus" size="small" />
-                  </span>
-                  {language.t("command.session.new")}
-                </span>
-              </MenuV2.Item>
-              <MenuV2.Item disabled={!selectable()} onSelect={() => addToNotes()}>
-                <span class="flex items-center gap-2 w-full">
-                  <span data-slot="menu-v2-item-icon">
-                    <Icon name="edit" size="small" />
-                  </span>
-                  {language.t("selection.toolbar.addToNotes")}
-                </span>
-              </MenuV2.Item>
-              <MenuV2.Separator />
-              {/* Edit operations — identical to GenericContextMenuProvider */}
-              <MenuV2.Item disabled={!selectable()} onSelect={() => copySelection()}>
-                <span class="flex items-center gap-2 w-full">
-                  <span data-slot="menu-v2-item-icon">
-                    <Icon name="outline-copy" size="small" />
-                  </span>
-                  {language.t("common.copy")}
-                </span>
-              </MenuV2.Item>
-              <MenuV2.Item disabled={!editable() || !selectable()} onSelect={cut}>
-                <span class="flex items-center gap-2 w-full">
-                  <span data-slot="menu-v2-item-icon">
-                    <Icon name="edit" size="small" />
-                  </span>
-                  {language.t("common.cut")}
-                </span>
-              </MenuV2.Item>
-              <MenuV2.Item disabled={!editable()} onSelect={paste}>
-                <span class="flex items-center gap-2 w-full">
-                  <span data-slot="menu-v2-item-icon">
-                    <Icon name="outline-copy" size="small" />
-                  </span>
-                  {language.t("common.paste")}
-                </span>
-              </MenuV2.Item>
-              <MenuV2.Separator />
-              <MenuV2.Item onSelect={selectAll}>
-                <span class="flex items-center gap-2 w-full">
-                  <span data-slot="menu-v2-item-icon">
-                    <Icon name="expand" size="small" />
-                  </span>
-                  {language.t("common.selectAll")}
-                </span>
-              </MenuV2.Item>
-            </MenuV2.Content>
-          </MenuV2.Portal>
-        </MenuV2>
+        <Show when={menu.open && menu.request} keyed>
+          {(request) => {
+            const text = contextMenuSelectionText(request.selection)
+            const selectable = contextMenuHasSelection(request.selection) && text.trim().length > 0
+            const editable = !!request.selection.editable
+            return (
+              <MenuV2
+                open={menu.open}
+                onOpenChange={(open) => setMenu("open", open)}
+                placement="right-start"
+                gutter={2}
+                shift={2}
+                flip
+                overflowPadding={8}
+              >
+                <ContextMenuCursorTrigger x={request.x} y={request.y} />
+                <MenuV2.Portal>
+                  <MenuV2.Content>
+                    <MenuV2.Item disabled={!selectable} onSelect={() => addToChat(text)}>
+                      <span class="flex items-center gap-2 w-full">
+                        <span data-slot="menu-v2-item-icon"><Icon name="chats" size="small" /></span>
+                        {language.t("projectExplorer.contextMenu.addToChat")}
+                      </span>
+                    </MenuV2.Item>
+                    <MenuV2.Item disabled={!selectable} onSelect={() => newSessionWithSelection(text)}>
+                      <span class="flex items-center gap-2 w-full">
+                        <span data-slot="menu-v2-item-icon"><Icon name="plus" size="small" /></span>
+                        {language.t("command.session.new")}
+                      </span>
+                    </MenuV2.Item>
+                    <MenuV2.Item disabled={!selectable} onSelect={() => addToNotes(text)}>
+                      <span class="flex items-center gap-2 w-full">
+                        <span data-slot="menu-v2-item-icon"><Icon name="edit" size="small" /></span>
+                        {language.t("selection.toolbar.addToNotes")}
+                      </span>
+                    </MenuV2.Item>
+                    <MenuV2.Separator />
+                    <MenuV2.Item
+                      disabled={!selectable}
+                      onSelect={() => {
+                        void copyContextMenuSelection(request.selection).then((copied) => {
+                          if (copied) showToast({ title: language.t("common.copy"), variant: "success" })
+                        })
+                      }}
+                    >
+                      <span class="flex items-center gap-2 w-full">
+                        <span data-slot="menu-v2-item-icon"><Icon name="outline-copy" size="small" /></span>
+                        {language.t("common.copy")}
+                      </span>
+                    </MenuV2.Item>
+                    <MenuV2.Item
+                      disabled={!editable || !selectable}
+                      onSelect={() => void cutContextMenuSelection(request.selection)}
+                    >
+                      <span class="flex items-center gap-2 w-full">
+                        <span data-slot="menu-v2-item-icon"><Icon name="edit" size="small" /></span>
+                        {language.t("common.cut")}
+                      </span>
+                    </MenuV2.Item>
+                    <MenuV2.Item disabled={!editable} onSelect={() => void pasteContextMenuClipboard(request.selection)}>
+                      <span class="flex items-center gap-2 w-full">
+                        <span data-slot="menu-v2-item-icon"><Icon name="outline-copy" size="small" /></span>
+                        {language.t("common.paste")}
+                      </span>
+                    </MenuV2.Item>
+                    <MenuV2.Separator />
+                    <MenuV2.Item onSelect={() => selectAllContextMenuTarget(request.selection)}>
+                      <span class="flex items-center gap-2 w-full">
+                        <span data-slot="menu-v2-item-icon"><Icon name="expand" size="small" /></span>
+                        {language.t("common.selectAll")}
+                      </span>
+                    </MenuV2.Item>
+                  </MenuV2.Content>
+                </MenuV2.Portal>
+              </MenuV2>
+            )
+          }}
+        </Show>
       </div>
     </>
   )

@@ -29,13 +29,18 @@ import { nativeT } from "./native-translations"
 import { BrowserEngine, resolveGuestPreloadPath } from "./browser"
 import { RendererTrust } from "./browser/renderer-trust"
 import type { HostOwner, VisualApprovalExpectation } from "./browser/contracts"
+import { expandHomePath, firstExistingPath } from "./path-resolution"
 const pickerFilters = (ext?: string[]) => {
   if (!ext || ext.length === 0) return undefined
   return [{ name: nativeT("desktop.dialog.files"), extensions: ext }]
 }
 const pickedFiles = createPickedFileAuthorizations()
 
-async function filesystemPathExists(path: string) {
+function expandFilesystemPath(path: string) {
+  return expandHomePath(path, app.getPath("home"))
+}
+
+async function filesystemPathExistsResolved(path: string) {
   try {
     await stat(path)
     return true
@@ -44,6 +49,14 @@ async function filesystemPathExists(path: string) {
     if (code === "ENOENT" || code === "ENOTDIR") return false
     throw error
   }
+}
+
+async function filesystemPathExists(path: string) {
+  return filesystemPathExistsResolved(expandFilesystemPath(path))
+}
+
+async function firstExistingFilesystemPath(paths: readonly string[]) {
+  return firstExistingPath(paths, filesystemPathExistsResolved, expandFilesystemPath)
 }
 
 type Deps = {
@@ -68,12 +81,17 @@ type Deps = {
   setNativeTranslations: (bundle: DesktopNativeBundle) => void
 }
 export function registerIpcHandlers(deps: Deps) {
-  const drafts = createDesktopDraftStore(join(app.getPath("userData"), "drafts.sqlite"))
+  // Draft persistence is not required to create or paint a window. Opening the
+  // SQLite store performs schema setup plus an orphan-blob sweep, so paying it
+  // during IPC registration made startup cost grow with draft history. Create
+  // it on the first draft operation instead.
+  let drafts: ReturnType<typeof createDesktopDraftStore> | undefined
+  const draftStore = () => (drafts ??= createDesktopDraftStore(join(app.getPath("userData"), "drafts.sqlite")))
   const updaterSubscriptions = createUpdaterSubscriptions()
   app.once("will-quit", updaterSubscriptions.clear)
-  app.on("before-quit", () => drafts.flush())
-  app.once("will-quit", () => drafts.close())
-  app.on("browser-window-created", (_event, win) => win.on("session-end", () => drafts.flush()))
+  app.on("before-quit", () => drafts?.flush())
+  app.once("will-quit", () => drafts?.close())
+  app.on("browser-window-created", (_event, win) => win.on("session-end", () => drafts?.flush()))
   ipcMain.handle("kill-sidecar", () => deps.killSidecar())
   ipcMain.handle("await-initialization", () => deps.awaitInitialization())
   ipcMain.handle("consume-initial-deep-links", () => deps.consumeInitialDeepLinks())
@@ -178,12 +196,12 @@ export function registerIpcHandlers(deps: Deps) {
     const store = getStore(name)
     return Object.keys(store.store).length
   })
-  ipcMain.handle("draft-get", (_event, key: string) => drafts.get(key))
-  ipcMain.handle("draft-set", (_event, key: string, value: string) => drafts.set(key, value))
-  ipcMain.handle("draft-delete", (_event, key: string) => drafts.set(key, null))
-  ipcMain.handle("draft-blob-put", (_event, data: ArrayBuffer) => drafts.putBlob(new Uint8Array(data)))
+  ipcMain.handle("draft-get", (_event, key: string) => draftStore().get(key))
+  ipcMain.handle("draft-set", (_event, key: string, value: string) => draftStore().set(key, value))
+  ipcMain.handle("draft-delete", (_event, key: string) => draftStore().set(key, null))
+  ipcMain.handle("draft-blob-put", (_event, data: ArrayBuffer) => draftStore().putBlob(new Uint8Array(data)))
   ipcMain.handle("draft-blob-get", (_event, id: string) => {
-    const data = drafts.getBlob(id)
+    const data = draftStore().getBlob(id)
     return data ? data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength) : null
   })
   ipcMain.handle(
@@ -247,6 +265,7 @@ export function registerIpcHandlers(deps: Deps) {
     openLocalFileURL(url)
   })
   ipcMain.handle("open-path", async (_event: IpcMainInvokeEvent, path: string, app?: string) => {
+    path = expandFilesystemPath(path)
     if (!app) {
       const error = await shell.openPath(path)
       if (error) throw new Error(error)
@@ -259,8 +278,12 @@ export function registerIpcHandlers(deps: Deps) {
     })
   })
   ipcMain.handle("path-exists", async (_event: IpcMainInvokeEvent, path: string) => filesystemPathExists(path))
+  ipcMain.handle("resolve-existing-path", async (_event: IpcMainInvokeEvent, paths: string[]) =>
+    firstExistingFilesystemPath(Array.isArray(paths) ? paths : []),
+  )
   ipcMain.handle("reveal-path", async (_event: IpcMainInvokeEvent, path: string) => {
-    const exists = await filesystemPathExists(path)
+    path = expandFilesystemPath(path)
+    const exists = await filesystemPathExistsResolved(path)
     if (!exists) return false
     shell.showItemInFolder(path)
     return true

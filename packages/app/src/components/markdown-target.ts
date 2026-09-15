@@ -24,6 +24,8 @@ const TRAILING_PUNCTUATION = /[.,;:!?)\]}>'"`]+$/
 const SURROUNDING_QUOTES = /^(['"`])(.*)\1$/s
 /** `file.ts:12` / `file.ts:12:34`. Anchored to digits, so `C:\dir` never matches. */
 const LINE_SUFFIX = /:(\d+)(?::(\d+))?$/
+/** GitHub/editor-style `file.ts#L12` / `file.ts#L12C34`. */
+const HASH_LINE_SUFFIX = /#L(\d+)(?:C(\d+))?$/i
 
 export function parseMarkdownTarget(kind: MarkdownTargetKind, text: string): MarkdownTarget | undefined {
   const raw = text.trim()
@@ -54,7 +56,7 @@ export function parseMarkdownTarget(kind: MarkdownTargetKind, text: string): Mar
   let line: number | undefined
   let column: number | undefined
   if (!separator) {
-    const match = LINE_SUFFIX.exec(cleaned)
+    const match = LINE_SUFFIX.exec(cleaned) ?? HASH_LINE_SUFFIX.exec(cleaned)
     const head = match ? cleaned.slice(0, match.index) : ""
     // Only treat it as a location when something path-like precedes it;
     // otherwise a bare `12:30` would lose its text.

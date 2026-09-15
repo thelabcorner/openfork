@@ -256,10 +256,16 @@ function ensureCodeWrapper(block: HTMLPreElement, labels: CopyLabels) {
   }
 }
 
-function markCodeLinks(root: HTMLDivElement) {
+function decorateInlineCode(root: HTMLDivElement) {
   const codeNodes = Array.from(root.querySelectorAll(":not(pre) > code"))
   for (const code of codeNodes) {
-    const href = codeUrl(code.textContent ?? "")
+    if (!(code instanceof HTMLElement)) continue
+    const text = code.textContent ?? ""
+    delete code.dataset.inlineCodeKind
+    const kind = inlineCodeKind(text)
+    if (kind) code.dataset.inlineCodeKind = kind
+
+    const href = codeUrl(text)
     const parentLink =
       code.parentElement instanceof HTMLAnchorElement && code.parentElement.classList.contains("external-link")
         ? code.parentElement
@@ -285,16 +291,6 @@ function markCodeLinks(root: HTMLDivElement) {
   }
 }
 
-function markInlineCode(root: HTMLDivElement) {
-  const codeNodes = Array.from(root.querySelectorAll(":not(pre) > code"))
-  for (const code of codeNodes) {
-    if (!(code instanceof HTMLElement)) continue
-    delete code.dataset.inlineCodeKind
-    const kind = inlineCodeKind(code.textContent ?? "")
-    if (kind) code.dataset.inlineCodeKind = kind
-  }
-}
-
 let newLayout: boolean | undefined
 
 function decorate(root: HTMLDivElement, labels: CopyLabels, live = false) {
@@ -306,8 +302,9 @@ function decorate(root: HTMLDivElement, labels: CopyLabels, live = false) {
   if (live) return
   if (newLayout === undefined) newLayout = document.body.hasAttribute("data-new-layout")
   if (!newLayout) return
-  markInlineCode(root)
-  markCodeLinks(root)
+  // Path classification and URL decoration walk the same inline-code nodes.
+  // Keep them in one DOM traversal and read textContent once per node.
+  decorateInlineCode(root)
 }
 
 function setupCodeCopy(root: HTMLDivElement, getLabels: () => CopyLabels) {
