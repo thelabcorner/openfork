@@ -5,7 +5,6 @@ import { useLanguage } from "@/context/language"
 import { ServerConnection } from "@/context/server"
 import { tabKey, useTabs } from "@/context/tabs"
 import { displayName, projectForSession } from "@/pages/layout/helpers"
-import { createRequestGate } from "@/utils/request-gate"
 import { tabSessionState } from "./titlebar-tab-state"
 import { TitlebarTabContextMenu } from "./titlebar-tab-context-menu"
 import "./titlebar-tab-popover.css"
@@ -22,9 +21,6 @@ const SKIP_WINDOW = 500
 export const GROUP_PREVIEW_PAGE = 80
 export const TAB_PREVIEW_RESOLVE_CONCURRENCY = 4
 let lastClosedAt = 0
-// One global preview lane is deliberate: rapidly sweeping across several tabs
-// must not multiply metadata hydration concurrency by 4 per popover instance.
-const previewResolveGate = createRequestGate(TAB_PREVIEW_RESOLVE_CONCURRENCY)
 
 export interface TabPreviewGroupSession {
   id: string
@@ -105,7 +101,7 @@ export function TabPreviewPopover(props: {
       const failedAt = resolveFailedAt.get(member.id)
       if (failedAt !== undefined && Date.now() - failedAt < 30_000) continue
       resolving.add(member.id)
-      void previewResolveGate(() => ctx.sync.session.resolve(member.id))
+      void ctx.sync.session.resolve(member.id, { priority: "background" })
         .then(
           () => resolveFailedAt.delete(member.id),
           () => resolveFailedAt.set(member.id, Date.now()),

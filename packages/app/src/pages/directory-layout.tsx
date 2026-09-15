@@ -5,6 +5,7 @@ import { useLocation, useNavigate, useParams } from "@solidjs/router"
 import { type Accessor, createEffect, createMemo, onCleanup, type ParentProps, Show, untrack } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { LocalProvider } from "@/context/local"
+import { ModelsProvider } from "@/context/models"
 import { SDKProvider, useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { decode64 } from "@/utils/base64"
@@ -101,7 +102,9 @@ export function DirectoryDataProvider(
           onSessionHref={href}
           onKillShell={killShell}
         >
-          <LocalProvider>{props.children}</LocalProvider>
+          <ModelsProvider directory={directory}>
+            <LocalProvider>{props.children}</LocalProvider>
+          </ModelsProvider>
         </DataProvider>
       )}
     </Show>

@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, getOwner, onCleanup, runWithOwner, Show, type ParentProps } from "solid-js"
+import { createEffect, createMemo, createSignal, getOwner, lazy, onCleanup, runWithOwner, Show, Suspense, type ParentProps } from "solid-js"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { useLanguage } from "@/context/language"
@@ -7,7 +7,6 @@ import { useGlobal } from "@/context/global"
 import { ServerConnection } from "@/context/server"
 import type { Session } from "@opencode-ai/sdk/v2"
 import { useSessionGroups } from "@/context/session-groups"
-import { DialogSessionGroupName, DialogSessionGroupPicker } from "../dialog-session-group"
 import { showToast } from "@/utils/toast"
 import { tabSessionState } from "../titlebar-tab-state"
 import {
@@ -21,16 +20,9 @@ import type { MenuSectionDef } from "./menu-model"
 import { MenuSectionsRenderer } from "./menu-renderer"
 import { usePermission } from "@/context/permission"
 import { usePlatform } from "@/context/platform"
-import { useLocal } from "@/context/local"
 import { base64Encode } from "@opencode-ai/core/util/encode"
 import { Identifier } from "@/utils/id"
-import { createPromptSession, type PromptModel, type PromptSession } from "@/context/prompt-state"
-import { ServerSDKProvider } from "@/context/server-sdk"
-import { ServerSyncProvider } from "@/context/server-sync"
-import { ModelsProvider } from "@/context/models"
-import { SDKProvider } from "@/context/sdk"
-import { DirectoryDataProvider } from "@/pages/directory-layout"
-import { DialogRenameSession } from "@/components/dialog-rename-session"
+import type { PromptModel, PromptSession } from "@/context/prompt-state"
 import { displayName, getProjectAvatarSource } from "@/pages/layout/helpers"
 import { useDirectoryPicker } from "@/components/directory-picker"
 import { getProjectAvatarVariant } from "@/context/layout"
@@ -38,8 +30,22 @@ import { pathKey } from "@/utils/path-key"
 import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
 import { findChatProject, isChatProjectAlias, isReservedChatProjectPath } from "@/utils/chat-project"
 import { isSessionPinned, toggleSessionPin } from "@/utils/pinned-sessions"
-import { fetchSessionExport, sessionExportFilename, downloadSessionExport } from "@/utils/session-export"
-import type { ServerScope } from "@/utils/server-scope"
+import type { SessionModelPickerRequest } from "./session-model-picker-runtime"
+import { ContextMenuCursorTrigger } from "@/components/context-menu-cursor-trigger"
+
+const SessionModelPicker = lazy(() =>
+  import("./session-model-picker-runtime").then((m) => ({ default: m.SessionModelPicker })),
+)
+
+const DEFAULT_VARIANTS = ["default", "low", "medium", "high", "xhigh"] as const
+let promptRuntime: Promise<typeof import("@/context/prompt-state")> | undefined
+const loadPromptRuntime = () => (promptRuntime ??= import("@/context/prompt-state"))
+let groupDialogRuntime: Promise<typeof import("../dialog-session-group")> | undefined
+const loadGroupDialogRuntime = () => (groupDialogRuntime ??= import("../dialog-session-group"))
+let renameDialogRuntime: Promise<typeof import("@/components/dialog-rename-session")> | undefined
+const loadRenameDialogRuntime = () => (renameDialogRuntime ??= import("@/components/dialog-rename-session"))
+let sessionExportRuntime: Promise<typeof import("@/utils/session-export")> | undefined
+const loadSessionExportRuntime = () => (sessionExportRuntime ??= import("@/utils/session-export"))
 
 const promptFromSession = (sess: Session | undefined): PromptModel | undefined => {
   const model = sess?.model
@@ -66,6 +72,13 @@ export type SessionContextMenuProps = ParentProps<{
   where: SessionMenuWhere
   session?: Session | undefined
   server?: ServerConnection.Key
+  /**
+   * Cursor-anchored popup mode for virtualized/list hosts that cannot afford a
+   * MenuV2.Context owner around every row. Supplying this renders one controlled
+   * popup at the click position; the host can lazy-mount this component only
+   * after a contextmenu event and unmount it when onOpenChange(false) fires.
+   */
+  cursor?: { x: number; y: number }
   /** Optional lifecycle hook for hosts that need to keep an enclosing hover
    * surface mounted while the portalled context menu is open. */
   onOpenChange?: (open: boolean) => void
@@ -88,12 +101,7 @@ export type SessionContextMenuProps = ParentProps<{
   onCreateGroup?: (name: string, sessionIds?: string[]) => Promise<string> | void
 }>
 
-export type SessionModelPickerRequest = {
-  session: Session
-  server?: ServerConnection.Key
-  serverScope: ServerScope
-  anchor: { top: number; left: number }
-}
+export type { SessionModelPickerRequest } from "./session-model-picker-runtime"
 
 /**
  * Unified session right-click menu — one shared architecture for tabs, home, and chats.
@@ -214,32 +222,35 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const sess = props.session
     const ctx = serverCtx()
     if (!sid || !sess || !ctx) return
-    void dialog.show(() => (
-      <DialogRenameSession
-        initial={sess.title ?? ""}
-        onSubmit={(title) => {
-          ctx.sync.session.remember({ ...sess, title })
-          void ctx.sdk.api.session
-            .rename({ sessionID: sid, title })
-            .then(() => showToast({ title: language.t("toast.session.rename.success.title"), variant: "success" }))
-            .catch((err: unknown) => {
-              ctx.sync.session.remember({ ...sess, title: sess.title })
-              showToast({
-                title: language.t("toast.session.rename.failed.title"),
-                description: err instanceof Error ? err.message : undefined,
-                variant: "error",
+    void loadRenameDialogRuntime().then(({ DialogRenameSession }) =>
+      dialog.show(() => (
+        <DialogRenameSession
+          initial={sess.title ?? ""}
+          onSubmit={(title) => {
+            ctx.sync.session.remember({ ...sess, title })
+            void ctx.sdk.api.session
+              .rename({ sessionID: sid, title })
+              .then(() => showToast({ title: language.t("toast.session.rename.success.title"), variant: "success" }))
+              .catch((err: unknown) => {
+                ctx.sync.session.remember({ ...sess, title: sess.title })
+                showToast({
+                  title: language.t("toast.session.rename.failed.title"),
+                  description: err instanceof Error ? err.message : undefined,
+                  variant: "error",
+                })
               })
-            })
-        }}
-      />
-    ))
+          }}
+        />
+      )),
+    )
   }
 
   const exportJson = () => {
     const sid = sessionID()
     const ctx = serverCtx()
     if (!sid || !ctx) return
-    void fetchSessionExport({ sessionID: sid, client: ctx.sdk.client })
+    void loadSessionExportRuntime().then(({ fetchSessionExport, sessionExportFilename, downloadSessionExport }) =>
+      fetchSessionExport({ sessionID: sid, client: ctx.sdk.client })
       .then(async (data) => {
         const saved = await downloadSessionExport(
           sessionExportFilename(data.info),
@@ -258,7 +269,8 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
           description: err instanceof Error ? err.message : language.t("toast.session.export.failed.description"),
           variant: "error",
         })
-      })
+      }),
+    )
   }
 
   const changeProject = createMemo(() => {
@@ -366,68 +378,60 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const id = props.groupId
     const group = id ? sessionGroups.byID(id) : undefined
     if (!id || !group) return
-    void dialog.show(() => (
-      <DialogSessionGroupName
-        initial={group.name}
-        onSubmit={(name) => {
-          void sessionGroups.renameGroup({ id, name }).catch((error: unknown) =>
-            showToast({
-              title: language.t("sessionGroup.rename"),
-              description: error instanceof Error ? error.message : undefined,
-              variant: "error",
-            }),
-          )
-        }}
-      />
-    ))
+    void loadGroupDialogRuntime().then(({ DialogSessionGroupName }) =>
+      dialog.show(() => (
+        <DialogSessionGroupName
+          initial={group.name}
+          onSubmit={(name) => {
+            void sessionGroups.renameGroup({ id, name }).catch((error: unknown) =>
+              showToast({
+                title: language.t("sessionGroup.rename"),
+                description: error instanceof Error ? error.message : undefined,
+                variant: "error",
+              }),
+            )
+          }}
+        />
+      )),
+    )
   }
   const addSessions = () => {
     const sid = sessionID()
     const current = props.groupId
     if (!sid || !current) return
     const choices = sessionGroups.groups().filter((group) => group.id !== current && group.kind === "user")
-    void dialog.show(() => (
-      <DialogSessionGroupPicker
-        groups={choices.map((group) => ({ id: group.id, name: group.name }))}
-        onSelect={(groupId) => {
-          void sessionGroups.addSessionToGroup({ groupId, sessionId: sid }).catch((error: unknown) =>
-            showToast({
-              title: language.t("sessionGroup.addSessions"),
-              description: error instanceof Error ? error.message : undefined,
-              variant: "error",
-            }),
-          )
-        }}
-        onCreate={() => onCreateGroupDialog()}
-      />
-    ))
+    void loadGroupDialogRuntime().then(({ DialogSessionGroupPicker }) =>
+      dialog.show(() => (
+        <DialogSessionGroupPicker
+          groups={choices.map((group) => ({ id: group.id, name: group.name }))}
+          onSelect={(groupId) => {
+            void sessionGroups.addSessionToGroup({ groupId, sessionId: sid }).catch((error: unknown) =>
+              showToast({
+                title: language.t("sessionGroup.addSessions"),
+                description: error instanceof Error ? error.message : undefined,
+                variant: "error",
+              }),
+            )
+          }}
+          onCreate={() => onCreateGroupDialog()}
+        />
+      )),
+    )
   }
 
-  // These contexts are available at different levels in the provider tree:
-  // - PermissionProvider is at the App root (TabsProvider -> PermissionProvider), so it's available in titlebar/home/chats.
-  // - LocalProvider is only inside DirectoryLayout / SessionRoute (per-directory), so titlebar (NewAppLayout) is *outside* it and useLocal() would throw.
-  // - PromptProvider is also route-scoped. We already avoid it via createPromptSession.
-  // Make them optional so the menu still renders (with those sections disabled/hidden) even when the provider is missing.
+  // PermissionProvider is available at the app root. SessionContextMenu itself
+  // only has three hosts (titlebar, home, Chat sidebar), all outside the routed
+  // LocalProvider. Keep model/prompt runtime work demand-loaded by the actions
+  // that actually need it instead of importing the entire directory graph here.
   let permission: ReturnType<typeof usePermission> | undefined
   try {
     permission = usePermission()
   } catch {
     permission = undefined
   }
-  let local: ReturnType<typeof useLocal> | undefined
-  try {
-    local = useLocal()
-  } catch {
-    local = undefined
-  }
 
-  const [modelPicker, setModelPicker] = createSignal<{
-    session: Session
-    server?: ServerConnection.Key
-    promptModel: PromptSession["model"]
-    anchor: { top: number; left: number }
-  } | null>(null)
-  const [contextOpen, setContextOpen] = createSignal(false)
+  const [modelPicker, setModelPicker] = createSignal<SessionModelPickerRequest | null>(null)
+  const [contextOpen, setContextOpen] = createSignal(!!props.cursor)
   const [surfaceHolds, setSurfaceHolds] = createSignal(0)
   let reportedOpen = false
 
@@ -459,15 +463,6 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
 
   const currentVariant = createMemo(() => props.session?.model?.variant ?? undefined)
   const currentModelLabel = createMemo(() => props.session?.model?.id)
-  const availableVariants = createMemo(() => {
-    if (!local) return ["default", "low", "medium", "high", "xhigh"]
-    try {
-      const list = local.model.variant.list()
-      return list.length > 0 ? ["default", ...list] : ["default", "low", "medium", "high", "xhigh"]
-    } catch {
-      return ["default", "low", "medium", "high", "xhigh"]
-    }
-  })
 
   const owner = getOwner()
   let cachedPrompt: { key: string; value: PromptSession } | undefined
@@ -481,6 +476,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       await cachedPrompt.value.ready.promise
       return cachedPrompt.value
     }
+    const { createPromptSession } = await loadPromptRuntime()
     const created = runWithOwner(owner, () =>
       createPromptSession(ctx.sdk.scope, { dir: base64Encode(sess.directory), id: sid }),
     )
@@ -488,12 +484,6 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     cachedPrompt = { key, value: created }
     await created.ready.promise
     return created
-  }
-
-  const promptFromLocal = (): PromptModel | undefined => {
-    const item = local?.model.current()
-    if (!item) return undefined
-    return { providerID: item.provider.id, modelID: item.id }
   }
 
   const changeModel = () => {
@@ -509,25 +499,9 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       props.onChangeModel({ session: sess, server: props.server, serverScope: ctx.sdk.scope, anchor })
       return
     }
-    void holdSurface(async () => {
-      const ps = await ensurePromptSession()
-      const model = ps?.model
-      if (!model) return
-      // Same picker the composer footer uses (ModelSelectorPopoverV2), always —
-      // NOT the full "Select model" dialog (DialogSelectModel). Opened via an
-      // invisible auto-clicked trigger anchored where "Change model" was
-      // clicked, since this action has no visible trigger of its own.
-      // Tabs/home/chats live *outside* the routed DirectoryLayout, so
-      // useLocal()/useSDK() (which ModelSelectorPopoverV2 needs) aren't
-      // ambiently available there — SessionModelPopoverHost mounts a
-      // directory-scoped provider subtree on demand when that's the case.
-      setModelPicker({
-        session: sess,
-        server: props.server,
-        promptModel: model,
-        anchor,
-      })
-    })
+    const ctx = serverCtx()
+    if (!ctx) return
+    setModelPicker({ session: sess, server: props.server, serverScope: ctx.sdk.scope, anchor })
   }
 
   const selectVariant = (variant: string | undefined) => {
@@ -535,7 +509,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       const ps = await ensurePromptSession()
       const m = ps?.model
       if (!m) return
-      const current = m.current() ?? promptFromSession(props.session) ?? promptFromLocal()
+      const current = m.current() ?? promptFromSession(props.session)
       if (!current) return
       m.set({ providerID: current.providerID, modelID: current.modelID, variant: variant ?? null })
       showToast({ title: language.t("command.model.variant.cycle"), variant: "success" })
@@ -576,14 +550,13 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const ctx = global.ensureServerCtx(conn)
     const model = await holdSurface(async () => {
       const ps = await ensurePromptSession()
-      return ps?.model.current() ?? promptFromSession(sess) ?? promptFromLocal()
+      return ps?.model.current() ?? promptFromSession(sess)
     })
-    const agent = local?.agent.current()
     const messageID = Identifier.ascending("message")
     const input: PokePromptInput = {
       sessionID: sid,
       id: messageID,
-      agent: agent?.name ?? "build",
+      agent: "build",
       model: model
         ? { providerID: model.providerID, modelID: model.modelID, variant: model.variant ?? undefined }
         : undefined,
@@ -611,7 +584,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const ctx = global.ensureServerCtx(conn)
     const model = await holdSurface(async () => {
       const ps = await ensurePromptSession()
-      return ps?.model.current() ?? promptFromSession(sess) ?? promptFromLocal()
+      return ps?.model.current() ?? promptFromSession(sess)
     })
     if (!model) {
       showToast({
@@ -643,20 +616,22 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
   const onCreateGroupDialog = () => {
     const sid = sessionID()
     if (!sid) return
-    // If host provided onCreateGroup, use it via dialog that forwards name + sid
-    if (props.onCreateGroup) {
-      void dialog.show(() => <DialogSessionGroupName onSubmit={(name) => void props.onCreateGroup?.(name, [sid])} />)
-      return
-    }
-    void dialog.show(() => (
-      <DialogSessionGroupName
-        onSubmit={(name) =>
-          void sessionGroups
-            .createGroup(name)
-            .then((g) => sessionGroups.addSessionToGroup({ groupId: g.id, sessionId: sid }))
-        }
-      />
-    ))
+    void loadGroupDialogRuntime().then(({ DialogSessionGroupName }) => {
+      // If host provided onCreateGroup, use it via dialog that forwards name + sid.
+      if (props.onCreateGroup) {
+        dialog.show(() => <DialogSessionGroupName onSubmit={(name) => void props.onCreateGroup?.(name, [sid])} />)
+        return
+      }
+      dialog.show(() => (
+        <DialogSessionGroupName
+          onSubmit={(name) =>
+            void sessionGroups
+              .createGroup(name)
+              .then((g) => sessionGroups.addSessionToGroup({ groupId: g.id, sessionId: sid }))
+          }
+        />
+      ))
+    })
   }
 
   const sections = createMemo<MenuSectionDef[]>(() =>
@@ -676,7 +651,7 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
       isPinned: isPinned(),
       currentVariant: currentVariant(),
       currentModelLabel: currentModelLabel(),
-      availableVariants: availableVariants(),
+      availableVariants: [...DEFAULT_VARIANTS],
       onCreateGroupDialog,
       actions: {
         open: props.onOpen ? () => props.onOpen?.({ background: false }) : undefined,
@@ -732,225 +707,52 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
 
   return (
     <>
-      <MenuV2.Context onOpenChange={setContextOpen}>
-        <MenuV2.Context.Trigger
-          class="block h-full w-full min-w-0"
-          as="div"
-          data-model-picker-open={modelPicker() ? "" : undefined}
-        >
-          {props.children}
-        </MenuV2.Context.Trigger>
-        <MenuV2.Context.Portal>
-          <MenuV2.Context.Content>
-            <MenuSectionsRenderer sections={sections()} />
-          </MenuV2.Context.Content>
-        </MenuV2.Context.Portal>
-      </MenuV2.Context>
+      <Show
+        when={props.cursor}
+        keyed
+        fallback={
+          <MenuV2.Context onOpenChange={setContextOpen}>
+            <MenuV2.Context.Trigger
+              class="block h-full w-full min-w-0"
+              as="div"
+              data-model-picker-open={modelPicker() ? "" : undefined}
+            >
+              {props.children}
+            </MenuV2.Context.Trigger>
+            <MenuV2.Context.Portal>
+              <MenuV2.Context.Content>
+                <MenuSectionsRenderer sections={sections()} />
+              </MenuV2.Context.Content>
+            </MenuV2.Context.Portal>
+          </MenuV2.Context>
+        }
+      >
+        {(cursor) => (
+          <MenuV2
+            open={contextOpen()}
+            onOpenChange={setContextOpen}
+            placement="right-start"
+            gutter={2}
+            shift={2}
+            flip
+            overflowPadding={8}
+          >
+            <ContextMenuCursorTrigger x={cursor.x} y={cursor.y} />
+            <MenuV2.Portal>
+              <MenuV2.Content>
+                <MenuSectionsRenderer sections={sections()} />
+              </MenuV2.Content>
+            </MenuV2.Portal>
+          </MenuV2>
+        )}
+      </Show>
       <Show when={modelPicker()} keyed>
         {(state) => (
-          <SessionModelPopoverHost
-            session={state.session}
-            server={state.server}
-            promptModel={state.promptModel}
-            anchor={state.anchor}
-            onClose={() => setModelPicker(null)}
-          />
+          <Suspense>
+            <SessionModelPicker {...state} onClose={() => setModelPicker(null)} />
+          </Suspense>
         )}
       </Show>
     </>
-  )
-}
-
-/**
- * Resolves the picker's model context: reuse the ambient LocalProvider when
- * this menu instance already lives inside one (the tab for the currently
- * open directory), otherwise mount a self-contained directory+server-scoped
- * provider subtree (same pattern as app.tsx's ResolvedDraftRoute) so
- * useLocal()/useSDK() work for a session in a *different* or no-longer-routed
- * directory (titlebar tabs, home, chats).
- */
-function SessionModelPopoverHost(props: {
-  session: Session
-  server?: ServerConnection.Key
-  promptModel: PromptSession["model"]
-  anchor: { top: number; left: number }
-  onClose: () => void
-}) {
-  let ambientLocal: ReturnType<typeof useLocal> | undefined
-  try {
-    ambientLocal = useLocal()
-  } catch {
-    ambientLocal = undefined
-  }
-
-  if (ambientLocal) {
-    return (
-      <ModelWrapperPopover
-        session={props.session}
-        promptModel={props.promptModel}
-        anchor={props.anchor}
-        onClose={props.onClose}
-      />
-    )
-  }
-
-  return (
-    <ScopedLocalProvider session={props.session} server={props.server}>
-      <ModelWrapperPopover
-        session={props.session}
-        promptModel={props.promptModel}
-        anchor={props.anchor}
-        onClose={props.onClose}
-      />
-    </ScopedLocalProvider>
-  )
-}
-
-/**
- * Stable host for menus rendered inside volatile row wrappers (for example a
- * TooltipV2). Prompt state and providers are created only while the picker is
- * open, under this host's owner rather than the row that issued the request.
- */
-export function SessionModelPicker(props: SessionModelPickerRequest & { onClose: () => void }) {
-  const prompt = createPromptSession(props.serverScope, {
-    dir: base64Encode(props.session.directory),
-    id: props.session.id,
-  })
-  const [ready, setReady] = createSignal(prompt.ready())
-  let disposed = false
-
-  if (!ready()) {
-    void Promise.resolve(prompt.ready.promise)
-      .then(() => {
-        if (!disposed) setReady(true)
-      })
-      .catch(() => {
-        if (!disposed) props.onClose()
-      })
-  }
-  onCleanup(() => {
-    disposed = true
-  })
-
-  return (
-    <Show when={ready()}>
-      <SessionModelPopoverHost
-        session={props.session}
-        server={props.server}
-        promptModel={prompt.model}
-        anchor={props.anchor}
-        onClose={props.onClose}
-      />
-    </Show>
-  )
-}
-
-function ScopedLocalProvider(props: ParentProps<{ session: Session; server?: ServerConnection.Key }>) {
-  const global = useGlobal()
-  const conn = createMemo(() =>
-    props.server ? global.servers.list().find((item) => ServerConnection.key(item) === props.server) : undefined,
-  )
-  const directory = () => props.session.directory
-  const server = () => props.server
-
-  return (
-    <ServerSDKProvider server={conn}>
-      <ServerSyncProvider server={conn}>
-        <ModelsProvider directory={directory}>
-          <SDKProvider directory={directory}>
-            <DirectoryDataProvider directory={directory} server={server}>
-              {props.children}
-            </DirectoryDataProvider>
-          </SDKProvider>
-        </ModelsProvider>
-      </ServerSyncProvider>
-    </ServerSDKProvider>
-  )
-}
-
-/**
- * Wraps the session's PromptSession model as a ModelState (the shape
- * ModelSelectorPopoverV2 expects), reads/writes always target *this*
- * session's model — never the ambient LocalProvider's own current
- * session/directory (which may be unrelated when scoped by ScopedLocalProvider,
- * or even when reused ambiently: the ambient LocalProvider's `current()` is
- * keyed by the routed session id, not necessarily this row's session).
- */
-function ModelWrapperPopover(props: {
-  session: Session
-  promptModel: PromptSession["model"]
-  anchor: { top: number; left: number }
-  onClose: () => void
-}) {
-  const local = useLocal()
-  const localModel = local.model
-  const wrapper = {
-    ...localModel,
-    current: () => {
-      const selected = props.promptModel.current() ?? promptFromSession(props.session)
-      if (!selected) return localModel.current()
-      return (
-        localModel.list().find((item) => item.provider.id === selected.providerID && item.id === selected.modelID) ??
-        localModel.current()
-      )
-    },
-    set: (
-      value: { providerID: string; modelID: string; variant?: string } | undefined,
-      opts?: { recent?: boolean },
-    ) => {
-      props.promptModel.set(value)
-      localModel.set(value, opts)
-    },
-  }
-
-  return <SessionModelPopover model={wrapper} anchor={props.anchor} onClose={props.onClose} />
-}
-
-/**
- * Mounts the exact composer-footer picker (ModelSelectorPopoverV2 from
- * dialog-select-model.tsx) via an invisible, auto-clicked trigger — the
- * context menu action has no persistent visible trigger button of its own.
- */
-function SessionModelPopover(props: {
-  model: ReturnType<typeof useLocal>["model"]
-  anchor: { top: number; left: number }
-  onClose: () => void
-}) {
-  const [Comp, setComp] = createSignal<typeof import("@/components/dialog-select-model").ModelSelectorPopoverV2>()
-  void import("@/components/dialog-select-model").then((mod) => setComp(() => mod.ModelSelectorPopoverV2))
-
-  return (
-    <Show when={Comp()} keyed>
-      {(C) => {
-        return (
-          <C
-            model={props.model}
-            defaultOpen
-            onClose={props.onClose}
-            trigger={(triggerProps) => (
-              <button
-                {...triggerProps}
-                type="button"
-                ref={(el: HTMLButtonElement) => {
-                  const forwardRef = (triggerProps as { ref?: (el: HTMLButtonElement) => void }).ref
-                  if (typeof forwardRef === "function") forwardRef(el)
-                }}
-                style={{
-                  position: "fixed",
-                  top: `${props.anchor.top}px`,
-                  left: `${props.anchor.left}px`,
-                  width: "1px",
-                  height: "1px",
-                  opacity: 0,
-                  "pointer-events": "none",
-                }}
-                tabIndex={-1}
-                aria-hidden="true"
-              />
-            )}
-          />
-        )
-      }}
-    </Show>
   )
 }

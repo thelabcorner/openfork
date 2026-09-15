@@ -516,7 +516,7 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       const directory = sdk().directory
       // Search on the filename: the index matches leading path segments poorly
       // when prose writes a partial path, and ranking re-applies the full text.
-      const page = await file.searchMentions(basename(written), { limit: 50, symbols: false })
+      const page = await file.searchMentions(basename(written), { limit: 50, symbols: false, strict: true })
       const matches = page.results.flatMap((entry) => (entry.kind === "file" ? [entry.path] : []))
       return pathCandidates({ written, directory, canonicalDirectory: page.base, matches })
     }),

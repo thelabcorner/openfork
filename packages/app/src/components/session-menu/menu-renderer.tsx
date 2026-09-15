@@ -1,9 +1,10 @@
-import { createSignal, For, Show } from "solid-js"
+import { createSignal, For, lazy, Show, Suspense } from "solid-js"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { Icon } from "@opencode-ai/ui/v2/icon"
 import { ProjectAvatar } from "@opencode-ai/ui/v2/project-avatar-v2"
-import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import type { MenuItemDef, MenuSectionDef } from "./menu-model"
+
+const ScrollView = lazy(() => import("@opencode-ai/ui/scroll-view").then((m) => ({ default: m.ScrollView })))
 
 export function MenuSectionsRenderer(props: { sections: MenuSectionDef[] }) {
   return (
@@ -181,9 +182,17 @@ function SubmenuContent(props: { item: Extract<MenuItemDef, { kind: "submenu" }>
         )}
       </Show>
       <Show when={props.item.search} fallback={<For each={props.item.items}>{(sub) => <MenuItemRenderer item={sub} />}</For>}>
-        <ScrollView class="max-h-[224px]">
-          <For each={radios()}>{(sub) => <MenuItemRenderer item={sub} />}</For>
-        </ScrollView>
+        <Suspense
+          fallback={
+            <div class="max-h-[224px] overflow-y-auto">
+              <For each={radios()}>{(sub) => <MenuItemRenderer item={sub} />}</For>
+            </div>
+          }
+        >
+          <ScrollView class="max-h-[224px]">
+            <For each={radios()}>{(sub) => <MenuItemRenderer item={sub} />}</For>
+          </ScrollView>
+        </Suspense>
         <For each={pinned()}>{(sub) => <MenuItemRenderer item={sub} />}</For>
       </Show>
     </>

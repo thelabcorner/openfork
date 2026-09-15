@@ -1,9 +1,7 @@
 import "@/index.css"
-import * as Sentry from "@sentry/solid"
 import { I18nProvider } from "@opencode-ai/ui/context"
 import { DialogProvider } from "@opencode-ai/ui/context/dialog"
 import { FileComponentProvider } from "@opencode-ai/ui/context/file"
-import { File } from "@opencode-ai/session-ui/file"
 import { Font } from "@opencode-ai/ui/font"
 import { Splash } from "@opencode-ai/ui/logo"
 import { ThemeProvider } from "@opencode-ai/ui/theme/context"
@@ -13,14 +11,10 @@ import {
   Navigate,
   Route,
   Router,
-  useLocation,
   useNavigate,
-  useParams,
-  useSearchParams,
 } from "@solidjs/router"
 import { QueryClient, QueryClientProvider } from "@tanstack/solid-query"
 import { Effect } from "effect"
-import { base64Encode } from "@opencode-ai/core/util/encode"
 import {
   type Component,
   createEffect,
@@ -33,6 +27,7 @@ import {
   type JSX,
   lazy,
   onCleanup,
+  onMount,
   type ParentProps,
   Show,
   Suspense,
@@ -40,147 +35,121 @@ import {
 import { Dynamic } from "solid-js/web"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { CommandProvider, useCommand, type CommandOption } from "@/context/command"
-import { CommentsProvider } from "@/context/comments"
-import { FileProvider } from "@/context/file"
 import { ForkUsageProvider } from "@/context/fork-usage"
 import { SessionGroupsProvider } from "@/context/session-groups"
 import { GoalsProvider } from "@/context/goals"
 import { ServerSDKProvider } from "@/context/server-sdk"
-import { ServerSyncProvider, useServerSync } from "@/context/server-sync"
+import { ServerSyncProvider } from "@/context/server-sync"
 import { GlobalProvider, useGlobal } from "@/context/global"
-import { HighlightsProvider } from "@/context/highlights"
 import { LanguageProvider, type Locale, useLanguage } from "@/context/language"
 import { LayoutProvider } from "@/context/layout"
-import { ModelsProvider } from "@/context/models"
 import { NotificationProvider } from "@/context/notification"
 import { PermissionProvider } from "@/context/permission"
 import { usePlatform } from "@/context/platform"
-import { PwaPairEntry } from "@/components/pwa/pair-entry"
-import { PromptProvider } from "@/context/prompt"
 import { ServerConnection, ServerProvider, serverName, useServer } from "@/context/server"
 import { SettingsProvider, useSettings } from "@/context/settings"
-import { TabsProvider, useTabs, type DraftTab } from "@/context/tabs"
-import { SDKProvider, useSDK } from "@/context/sdk"
+import { TabsProvider } from "@/context/tabs"
 import { WslServersProvider } from "@/wsl/context"
 import { PersonalUsageIngest, PersonalUsageProvider } from "@/context/personal-usage"
-import DirectoryLayout, { DirectoryDataProvider } from "@/pages/directory-layout"
-import LegacyLayout from "@/pages/layout"
 import NewLayout from "@/pages/layout-new"
-import { RoutePlaceholder } from "@/components/route-loading-fallback"
+import { RoutePlaceholder } from "@/components/route-placeholder"
 import { GenericContextMenuProvider } from "@/components/generic-context-menu"
-import { ErrorPage } from "./pages/error"
 import { useCheckServerHealth } from "./utils/server-health"
-import { legacySessionHref, legacySessionServer, parseServerKey, requireServerKey, sessionHref } from "./utils/session-route"
-import { createSessionLineage } from "@/pages/session/session-lineage"
+import { requireServerKey } from "./utils/session-route"
 
-import { SessionPage, SessionRouteErrorBoundary, TargetSessionCenterRoute, TargetSessionRouteContent } from "@/pages/session"
-import { NewHome } from "@/pages/home"
-import { UsagePage } from "@/pages/usage-page"
-import { MarkdownTargetActions } from "@/components/markdown-target-actions"
-import { LegacyHome } from "@/pages/home/legacy-home"
-import MobileLayout from "@/pages/layout-mobile"
+// Route-only surfaces are deliberately split out of the startup graph. In Vite
+// dev, static imports are transformed on every server restart even when the
+// route is never visited; session/usage/mobile in particular pull in large
+// editor, markdown, terminal, browser, and analytics subgraphs. Keep the home
+// and active desktop shell eager so first paint does not pay an extra chunk hop.
+const LegacyLayout = lazy(() => import("@/pages/layout"))
+const MobileLayout = lazy(() => import("@/pages/layout-mobile"))
+const DirectoryLayout = lazy(() => import("@/pages/directory-layout"))
+const DraftRoute = lazy(() => import("@/pages/draft-route"))
+const LegacyHome = lazy(() => import("@/pages/home/legacy-home").then((m) => ({ default: m.LegacyHome })))
+const UsagePage = lazy(() => import("@/pages/usage-page").then((m) => ({ default: m.UsagePage })))
+const TargetSessionCenterRoute = lazy(() =>
+  import("@/pages/session").then((m) => ({ default: m.TargetSessionCenterRoute })),
+)
+const SessionRoute = lazy(() =>
+  import("./app-session-routes").then((m) => ({ default: m.SessionRouteController })),
+)
+const TargetSessionRoute = lazy(() =>
+  import("./app-session-routes").then((m) => ({ default: m.TargetSessionRouteController })),
+)
+const LegacyTargetSessionRoute = lazy(() =>
+  import("./app-session-routes").then((m) => ({ default: m.LegacyTargetSessionRouteController })),
+)
+const GroupTabRoute = lazy(() =>
+  import("./app-session-routes").then((m) => ({ default: m.GroupTabRouteController })),
+)
+const NewLayoutLegacySessionRedirect = lazy(() =>
+  import("./app-session-routes").then((m) => ({ default: m.NewLayoutLegacySessionRedirectController })),
+)
+const File = lazy(() => import("@opencode-ai/session-ui/file").then((m) => ({ default: m.File })))
+const NewHome = lazy(() => import("@/pages/home").then((m) => ({ default: m.NewHome })))
+const PwaPairEntry = lazy(() => import("@/components/pwa/pair-entry").then((m) => ({ default: m.PwaPairEntry })))
+const MarkdownTargetActions = lazy(() =>
+  import("@/components/markdown-target-actions").then((m) => ({ default: m.MarkdownTargetActions })),
+)
+const DeferredHighlightsProvider = lazy(() =>
+  import("@/context/highlights").then((m) => ({ default: m.HighlightsProvider })),
+)
+const ErrorPage = lazy(() => import("./pages/error").then((m) => ({ default: m.ErrorPage })))
 
-import NewSession from "@/pages/new-session"
-const GroupTabPage = lazy(() => import("@/pages/group-tab"))
-
-const SessionRoute = () => {
-  const settings = useSettings()
-  const params = useParams()
-  const [search] = useSearchParams<{ draftId?: string; prompt?: string }>()
-  const sdk = useSDK()
-  const server = useServer()
-  const tabs = useTabs()
-
-  if (params.id && settings.general.newLayoutDesigns()) {
-    const sessionID = params.id
-    const persisted = tabs.store.filter((item) => item.type === "session")
-    return <Navigate href={sessionHref(legacySessionServer(persisted, sessionID, server.key), sessionID)} />
-  }
-
-  // When the new layout is enabled, the legacy new-session route (/:dir/session with no id)
-  // is replaced by a draft at /new-session?draftId=…
-  createEffect(() => {
-    if (!settings.general.newLayoutDesigns()) return
-    if (params.id || search.draftId) return
-    if (!tabs.ready() || !sdk().directory) return
-    tabs.newDraft({ server: server.key, directory: sdk().directory }, search.prompt)
-  })
-
+function ErrorSurface(props: { error: unknown }) {
   return (
-    <SessionRouteErrorBoundary sessionID={params.id}>
-      <SessionPage />
-    </SessionRouteErrorBoundary>
+    <Suspense fallback={<div class="h-dvh w-screen bg-background-base" />}>
+      <ErrorPage error={props.error} />
+    </Suspense>
   )
 }
 
-function TargetServerRoute(props: ParentProps) {
-  const params = useParams<{ serverKey: string; id: string }>()
-  const global = useGlobal()
-  const serverKey = createMemo(() => parseServerKey(params.serverKey))
-  const conn = createMemo(() => {
-    const key = serverKey()
-    if (!key) return
-    return global.servers.list().find((item) => ServerConnection.key(item) === key)
+function DeferredMarkdownTargetActions() {
+  const [ready, setReady] = createSignal(false)
+  onMount(() => {
+    const idle = globalThis.requestIdleCallback?.(() => setReady(true), { timeout: 750 })
+    if (idle !== undefined) {
+      onCleanup(() => globalThis.cancelIdleCallback?.(idle))
+      return
+    }
+    const timer = globalThis.setTimeout(() => setReady(true), 0)
+    onCleanup(() => globalThis.clearTimeout(timer))
   })
-
   return (
-    // Owns the server-identity remount. Session changes must NOT remount this
-    // subtree (SessionRouteErrorBoundary resets and createSessionLineage
-    // re-resolves reactively instead); both rely on this key for server changes.
-    <Show when={serverKey()} keyed fallback={<ErrorPage error={new Error("Invalid server route")} />}>
-      <ServerSDKProvider server={conn}>
-        <ServerSyncProvider server={conn}>
-          <GoalsProvider>
-            <ForkUsageProvider>
-              <PersonalUsageIngest />
-              {props.children}
-            </ForkUsageProvider>
-          </GoalsProvider>
-        </ServerSyncProvider>
-      </ServerSDKProvider>
+    <Show when={ready()}>
+      <Suspense>
+        <MarkdownTargetActions />
+      </Suspense>
     </Show>
   )
 }
 
-const TargetSessionRoute = () => (
-  <TargetServerRoute>
-    <TargetSessionRouteContent />
-  </TargetServerRoute>
-)
-
-function LegacyTargetSessionRoute() {
-  const params = useParams<{ serverKey: string; id: string }>()
-  const serverKey = createMemo(() => parseServerKey(params.serverKey))
-  return (
-    <TargetServerRoute>
-      <Show when={serverKey()} keyed fallback={<ErrorPage error={new Error("Invalid server route")} />}>
-        {(key) => (
-          <SessionRouteErrorBoundary sessionID={params.id} serverKey={key}>
-            <LegacyTargetSessionRedirect />
-          </SessionRouteErrorBoundary>
-        )}
-      </Show>
-    </TargetServerRoute>
-  )
-}
-
-function LegacyTargetSessionRedirect() {
-  const params = useParams<{ id: string }>()
-  const navigate = useNavigate()
-  const sync = useServerSync()
-  const current = createSessionLineage(
-    () => params.id,
-    () => sync().session.lineage,
-  )
-
-  createEffect(() => {
-    const directory = current()?.session.directory
-    if (!directory) return
-    navigate(legacySessionHref(directory, params.id), { replace: true })
+/**
+ * Release-note discovery is a side effect, not application infrastructure.
+ * There are currently no useHighlights() consumers; the provider only checks
+ * the persisted version and, on an upgrade, fetches changelog metadata before
+ * eventually opening a dialog. Keep that whole branch out of first paint.
+ *
+ * Do not use requestIdleCallback alone here: Chromium can report idle while it
+ * is blocked on Vite/network module discovery. A real elapsed-time embargo
+ * guarantees release-note work cannot join the startup transform wave.
+ */
+function DeferredHighlightsRuntime() {
+  const [ready, setReady] = createSignal(false)
+  onMount(() => {
+    const timer = globalThis.setTimeout(() => setReady(true), 1500)
+    onCleanup(() => globalThis.clearTimeout(timer))
   })
-
-  return null
+  return (
+    <Show when={ready()}>
+      <Suspense>
+        <DeferredHighlightsProvider>{null}</DeferredHighlightsProvider>
+      </Suspense>
+    </Show>
+  )
 }
+
 
 // Wraps the non-draft routes. They are gated on (and keyed to) the globally selected
 // server via ServerKey, then provide the server-scoped shell for that server.
@@ -211,64 +180,6 @@ function LegacyServerLayout(props: ParentProps<{ serverScoped?: JSX.Element }>) 
   )
 }
 
-function DraftRoute() {
-  const [search] = useSearchParams<{ draftId?: string }>()
-  const settings = useSettings()
-  const tabs = useTabs()
-  const draft = createMemo(() =>
-    search.draftId ? tabs.store.find((tab): tab is DraftTab => tab.type === "draft" && tab.draftID === search.draftId) : undefined,
-  )
-  const draftKey = createMemo(() => {
-    const found = draft()
-    return found ? `${found.server}\0${found.directory}\0${found.draftID}` : undefined
-  })
-  return (
-    <Show when={tabs.ready()} fallback={<RoutePlaceholder />}>
-      <Show when={draftKey()} keyed fallback={<Navigate href="/" />}>
-        {(_) => {
-          const found = draft()!
-          return (
-            <Show
-              when={settings.general.newLayoutDesigns()}
-              fallback={<Navigate href={`/${base64Encode(found.directory)}/session`} />}
-            >
-              <ResolvedDraftRoute draft={found} />
-            </Show>
-          )
-        }}
-      </Show>
-    </Show>
-  )
-}
-
-function ResolvedDraftRoute(props: { draft: DraftTab }) {
-  const global = useGlobal()
-  const conn = createMemo(() => global.servers.list().find((item) => ServerConnection.key(item) === props.draft.server))
-  const directory = () => props.draft.directory
-  const serverKey = () => props.draft.server
-
-  return (
-    <Show when={`${props.draft.server}\0${props.draft.directory}`} keyed>
-      <ServerSDKProvider server={conn}>
-        <ServerSyncProvider server={conn}>
-          <ForkUsageProvider>
-            <PersonalUsageIngest />
-            <ModelsProvider directory={directory}>
-              <SDKProvider directory={directory}>
-                <DirectoryDataProvider directory={directory} server={serverKey}>
-                  <DraftProviders>
-                    <NewSession />
-                  </DraftProviders>
-                </DirectoryDataProvider>
-              </SDKProvider>
-            </ModelsProvider>
-          </ForkUsageProvider>
-        </ServerSyncProvider>
-      </ServerSDKProvider>
-    </Show>
-  )
-}
-
 function UiI18nBridge(props: ParentProps) {
   const language = useLanguage()
   return (
@@ -279,6 +190,7 @@ function UiI18nBridge(props: ParentProps) {
     </I18nProvider>
   )
 }
+
 
 function LayoutCompatibility(props: ParentProps) {
   const global = useGlobal()
@@ -309,11 +221,14 @@ declare global {
     __OPENCODE__?: {
       deepLinks?: string[]
     }
-    api?: {
-      setTitlebar?: (theme: { mode: "light" | "dark"; scheme?: "system" | "light" | "dark" }) => Promise<void>
-      exportDebugLogs?: () => Promise<string>
-    }
   }
+}
+
+function setNativeTitlebarTheme(theme: { mode: "light" | "dark"; scheme?: "system" | "light" | "dark" }) {
+  const bridge = (window as typeof window & {
+    api?: { setTitlebar?: (value: typeof theme) => Promise<void> }
+  }).api
+  void bridge?.setTitlebar?.(theme)
 }
 
 const sharedQueryClient = new QueryClient({
@@ -355,7 +270,8 @@ function SharedProviders(props: ParentProps) {
       <BodyDesignClass />
       <CommandProvider>
         <DesktopCommands />
-        <HighlightsProvider>{props.children}</HighlightsProvider>
+        <DeferredHighlightsRuntime />
+        {props.children}
       </CommandProvider>
     </>
   )
@@ -394,7 +310,7 @@ function ServerScopedProviders(props: ServerScopedShellProps) {
   return (
     <LayoutProvider>
       {props.serverScoped}
-      <ModelsProvider directory={props.directory}>{props.children}</ModelsProvider>
+      {props.children}
     </LayoutProvider>
   )
 }
@@ -429,18 +345,6 @@ function MobileAppLayout(props: ParentProps<{ serverScoped?: JSX.Element }>) {
   )
 }
 
-// The draft page only renders the prompt composer, so it drops TerminalProvider.
-// FileProvider and CommentsProvider stay because PromptInput uses file search and comment context.
-function DraftProviders(props: ParentProps) {
-  return (
-    <FileProvider>
-      <PromptProvider>
-        <CommentsProvider>{props.children}</CommentsProvider>
-      </PromptProvider>
-    </FileProvider>
-  )
-}
-
 export function AppBaseProviders(
   props: ParentProps<{
     locale?: Locale
@@ -452,15 +356,15 @@ export function AppBaseProviders(
       <Font />
       <ThemeProvider
         onThemeApplied={(_, mode, scheme) => {
-          void window.api?.setTitlebar?.({ mode, scheme })
+          setNativeTitlebarTheme({ mode, scheme })
         }}
       >
         <LanguageProvider locale={props.locale} onNativeTranslations={props.onNativeTranslations}>
           <UiI18nBridge>
             <ErrorBoundary
               fallback={(error) => {
-                Sentry.captureException(error)
-                return <ErrorPage error={error} />
+                void import("@sentry/solid").then((Sentry) => Sentry.captureException(error))
+                return <ErrorSurface error={error} />
               }}
             >
               <QueryProvider>
@@ -578,7 +482,9 @@ function ConnectionError(props: { onRetry?: () => void; onServerSelected?: (key:
       </div>
       {/* PWA pairing fallback: manual 6-char code entry on the connect surface (task p3). */}
       <Show when={pwa}>
-        <PwaPairEntry />
+        <Suspense>
+          <PwaPairEntry />
+        </Suspense>
       </Show>
 
       <Show when={others().length > 0}>
@@ -657,7 +563,7 @@ export function AppInterface(props: {
                         {/* Global affordance for paths/URLs in markdown. Sits
                             above the layout arms so its delegated listeners are
                             not torn down when a route swaps. */}
-                        <MarkdownTargetActions />
+                        <DeferredMarkdownTargetActions />
                         {/* PWA renders the mobile arm regardless of the layout flag;
                             web/desktop keep the legacy/new arms byte-identical. */}
                         {pwa ? (
@@ -730,50 +636,5 @@ function Routes(props: { serverScoped?: JSX.Element }) {
       </Show>
       <Route path="/new-session" component={DraftRoute} />
     </>
-  )
-}
-
-function GroupTabRoute() {
-  const params = useParams<{ serverKey: string; groupId: string; sessionId?: string }>()
-  const global = useGlobal()
-  const serverKey = createMemo(() => parseServerKey(params.serverKey))
-  const conn = createMemo(() => {
-    const key = serverKey()
-    if (!key) return
-    return global.servers.list().find((item) => ServerConnection.key(item) === key)
-  })
-
-  return (
-    <Show when={serverKey()} keyed fallback={<ErrorPage error={new Error("Invalid group route")} />}>
-      <ServerSDKProvider server={conn}>
-        <ServerSyncProvider server={conn}>
-          <ForkUsageProvider>
-            <PersonalUsageIngest />
-            <Suspense fallback={<RoutePlaceholder />}>
-              <GroupTabPage />
-            </Suspense>
-          </ForkUsageProvider>
-        </ServerSyncProvider>
-      </ServerSDKProvider>
-    </Show>
-  )
-}
-
-function NewLayoutLegacySessionRedirect() {
-  const server = useServer()
-  const tabs = useTabs()
-  const params = useParams<{ id: string }>()
-
-  return (
-    <Navigate
-      href={sessionHref(
-        legacySessionServer(
-          tabs.store.filter((item) => item.type === "session"),
-          params.id,
-          server.key,
-        ),
-        params.id,
-      )}
-    />
   )
 }

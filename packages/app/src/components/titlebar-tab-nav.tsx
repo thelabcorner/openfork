@@ -1,4 +1,4 @@
-import { createEffect, createMemo, createSignal, For, onCleanup, Show, type Ref } from "solid-js"
+import { createEffect, createMemo, createSignal, For, lazy, onCleanup, Show, Suspense, type Ref } from "solid-js"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import { createMutation } from "@tanstack/solid-query"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
@@ -14,8 +14,13 @@ import type { GroupTab } from "@/context/tabs"
 import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
 import { sessionApiOf } from "./titlebar-tab-actions"
 import { tabSessionState } from "./titlebar-tab-state"
-import { TabPreviewPopover, type TabPreviewGroupSession } from "./titlebar-tab-popover"
+import type { TabPreviewGroupSession } from "./titlebar-tab-popover"
 import "./titlebar-tab-nav.css"
+
+const PREVIEW_BOOTSTRAP_DELAY = 450
+const TabPreviewPopover = lazy(() =>
+  import("./titlebar-tab-popover").then((module) => ({ default: module.TabPreviewPopover })),
+)
 
 // MouseEvent.button uses 1 for the middle/wheel button.
 const MIDDLE_MOUSE_BUTTON = 1
@@ -88,7 +93,28 @@ export function TabNavItem(props: {
   const serverLabel = () => props.serverLabel?.()
 
   const [popoverOpen, setPopoverOpen] = createSignal(false)
+  const [previewRuntimeRequested, setPreviewRuntimeRequested] = createSignal(false)
+  let previewBootstrapTimer: ReturnType<typeof setTimeout> | undefined
   const previewBlocked = () => !!props.dragging || editing() || !!props.pressed || !props.session()
+
+  const cancelPreviewBootstrap = () => {
+    if (previewBootstrapTimer === undefined) return
+    clearTimeout(previewBootstrapTimer)
+    previewBootstrapTimer = undefined
+  }
+
+  const bootstrapPreview = () => {
+    if (previewRuntimeRequested() || previewBlocked() || !groupSessions()?.length) return
+    cancelPreviewBootstrap()
+    previewBootstrapTimer = setTimeout(() => {
+      previewBootstrapTimer = undefined
+      if (previewBlocked() || !groupSessions()?.length || !tabRoot?.matches(":hover")) return
+      setPreviewRuntimeRequested(true)
+      setPopoverOpen(true)
+    }, PREVIEW_BOOTSTRAP_DELAY)
+  }
+
+  onCleanup(cancelPreviewBootstrap)
 
   const selectTitle = () => {
     const range = document.createRange()
@@ -170,6 +196,11 @@ export function TabNavItem(props: {
       data-active={props.active}
       data-dragging={props.dragging}
       data-state={props.active || props.pressed ? "pressed" : undefined}
+      onPointerEnter={bootstrapPreview}
+      onPointerLeave={() => {
+        cancelPreviewBootstrap()
+        if (!previewRuntimeRequested()) setPopoverOpen(false)
+      }}
       onMouseDown={(event) => {
         if (event.button !== MIDDLE_MOUSE_BUTTON) return
         event.preventDefault()
@@ -329,24 +360,28 @@ export function TabNavItem(props: {
   )
 
   return (
-    <TabPreviewPopover
-      trigger={tab}
-      open={popoverOpen() && !previewBlocked() && !!groupSessions()?.length}
-      onOpenChange={(value) => {
-        if (value && previewBlocked()) return
-        setPopoverOpen(value)
-      }}
-      data={{
-        projectName: projectName(),
-        title: props.session()?.title,
-        path: previewPath(),
-        serverName: serverLabel(),
-        groupSessions: groupSessions(),
-      }}
-      server={props.server}
-      serverCtx={props.serverCtx}
-      currentSessionID={sessionID()}
-    />
+    <Show when={previewRuntimeRequested()} fallback={tab}>
+      <Suspense fallback={tab}>
+        <TabPreviewPopover
+          trigger={tab}
+          open={popoverOpen() && !previewBlocked() && !!groupSessions()?.length}
+          onOpenChange={(value) => {
+            if (value && previewBlocked()) return
+            setPopoverOpen(value)
+          }}
+          data={{
+            projectName: projectName(),
+            title: props.session()?.title,
+            path: previewPath(),
+            serverName: serverLabel(),
+            groupSessions: groupSessions(),
+          }}
+          server={props.server}
+          serverCtx={props.serverCtx}
+          currentSessionID={sessionID()}
+        />
+      </Suspense>
+    </Show>
   )
 }
 

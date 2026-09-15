@@ -12,9 +12,12 @@ import {
   type JSX,
   startTransition,
   For,
+  lazy,
+  Suspense,
 } from "solid-js"
-import { Dialog as Kobalte } from "@kobalte/core/dialog"
 import { makeEventListener } from "@solid-primitives/event-listener"
+
+const DialogLayer = lazy(() => import("./dialog-layer").then((m) => ({ default: m.DialogLayer })))
 
 type DialogElement = () => JSX.Element
 
@@ -87,36 +90,21 @@ function init() {
         const [closing, setClosingSignal] = createSignal(false)
         setClosing = setClosingSignal
         return (
-          <Kobalte
-            modal={stack().at(-1)?.id === id}
-            open={!closing()}
-            onOpenChange={(open: boolean) => {
-              if (open || stack().at(-1)?.id !== id) return
-              close(id)
-            }}
-          >
-            <Kobalte.Portal>
-              <Kobalte.Overlay
-                data-component="dialog-overlay"
-                style={{ "z-index": String(zIndex) }}
-                onClick={() => close(id)}
-              />
-              <div
-                data-dialog-layer={layer}
-                style={{
-                  position: "fixed",
-                  inset: "0",
-                  "z-index": String(zIndex),
-                  display: "flex",
-                  "align-items": "center",
-                  "justify-content": "center",
-                  "pointer-events": "none",
-                }}
-              >
-                {element()}
-              </div>
-            </Kobalte.Portal>
-          </Kobalte>
+          <Suspense>
+            <DialogLayer
+              modal={stack().at(-1)?.id === id}
+              open={!closing()}
+              layer={layer}
+              zIndex={zIndex}
+              onOpenChange={(open: boolean) => {
+                if (open || stack().at(-1)?.id !== id) return
+                close(id)
+              }}
+              onOverlayClick={() => close(id)}
+            >
+              {element()}
+            </DialogLayer>
+          </Suspense>
         )
       }),
     )

@@ -108,7 +108,7 @@ function SessionTabEntry(props: {
       const ctx = props.serverCtx()
       return ctx ? { id: props.tab.sessionId, ctx } : null
     },
-    ({ id, ctx }) => ctx.sync.session.resolve(id).catch(() => undefined),
+    ({ id, ctx }) => ctx.sync.session.resolve(id, { priority: "critical" }).catch(() => undefined),
   )
   const session = createMemo(() => cachedSession() ?? loadedSession())
   const missingSession = createMemo(() => !!props.serverCtx() && !loadedSession.loading && !session())
@@ -121,7 +121,11 @@ function SessionTabEntry(props: {
     const value = session()
     if (!ctx || !value) return
     hoverPrefetchStarted = true
-    void ctx.sync.ensureDirSyncContext(value.directory).session.prefetch(value.id, 20).catch(() => {})
+    // Session message hydration is server-scoped and keyed by session ID. The
+    // directory sync facade's prefetch method is only a pass-through to this
+    // store, so constructing/refcounting a directory context on every tab hover
+    // was pure allocation/client churn.
+    void ctx.sync.session.prefetch(value.id, 20).catch(() => {})
   }
 
   const rename = async (title: string) => {

@@ -191,6 +191,13 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
   const [store, setStore, _, ready] = persisted(
     {
       ...Persist.serverGlobal(input.sdk.scope, "permission", ["permission.v3"]),
+      // Auto-accept preferences are not required to draw the shell. Desktop
+      // storage is asynchronous; starting this read during provider mount adds
+      // IPC/JSON/store hydration to the renderer startup wave. Permission
+      // events are already held on `ready.promise` below, so deferring the read
+      // preserves authorization semantics while moving persistence off first
+      // paint.
+      defer: true,
       migrate(value) {
         if (!value || typeof value !== "object" || Array.isArray(value)) return value
 
@@ -214,7 +221,10 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
   function enableConfiguredDirectory(directory: string) {
     if (input.sdk.protocolKind() !== "v1") return
     if (meta.disposed || !ready()) return
-    const [childStore] = input.sync.child(directory)
+    // Permission is an observer of directory config, not a directory lifecycle
+    // owner. The active route/bootstrap path populates config; reading the
+    // preference here must not initialize plugins/LSP/config for a workspace.
+    const [childStore] = input.sync.child(directory, { bootstrap: false })
     if (childStore.config.permission !== "allow") return
     const key = directoryAcceptKey(directory)
     if (store.autoAccept[key] !== undefined) return
@@ -465,7 +475,7 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
     },
     isPermissionAllowAll(directory: string) {
       if (meta.disposed) return false
-      const [childStore] = input.sync.child(directory)
+      const [childStore] = input.sync.child(directory, { bootstrap: false })
       return childStore.config.permission === "allow"
     },
   }
@@ -477,7 +487,7 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
     enableConfiguredDirectory,
     permissionsEnabled(directory: string) {
       if (meta.disposed) return false
-      const [childStore] = input.sync.child(directory)
+      const [childStore] = input.sync.child(directory, { bootstrap: false })
       return hasPermissionPromptRules(childStore.config.permission)
     },
   }

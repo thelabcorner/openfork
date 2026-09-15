@@ -7,6 +7,7 @@ import { createEffect, createMemo, createSignal, For, onCleanup, onMount, Show }
 import { createStore } from "solid-js/store"
 import { useLanguage } from "@/context/language"
 import { pendingWork } from "@/utils/pending-work"
+export { RoutePlaceholder } from "./route-placeholder"
 
 function queryLabel(query: { queryKey: readonly unknown[] }) {
   return query.queryKey
@@ -30,10 +31,6 @@ function queryPhase(query: { state: { fetchStatus: string; status: string; data?
   if (query.state.fetchStatus === "fetching") return query.state.data === undefined ? "fetching" : "refetching"
   if (query.state.status === "pending") return "disabled"
   return "idle"
-}
-
-export function RoutePlaceholder() {
-  return <div class="flex-1 min-h-0 w-full" />
 }
 
 export function RouteLoadingFallback() {

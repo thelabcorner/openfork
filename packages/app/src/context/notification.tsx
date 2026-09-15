@@ -279,7 +279,15 @@ function createServerNotificationState(input: {
   const currentSession = input.sessionID
 
   const [store, setStore, _, ready] = persisted(
-    Persist.serverGlobal(serverSDK().scope, "notification", ["notification.v1"]),
+    {
+      ...Persist.serverGlobal(serverSDK().scope, "notification", ["notification.v1"]),
+      // Notification history is visual enrichment, not a first-paint input.
+      // Defer desktop storage IPC/JSON hydration until after paint. The event
+      // listener below explicitly holds early events on `ready.promise`, so a
+      // late snapshot can never overwrite a notification that arrived during
+      // startup.
+      defer: true,
+    },
     createStore({
       list: [] as Notification[],
     }),
@@ -381,7 +389,12 @@ function createServerNotificationState(input: {
     return sessionID === activeSession
   }
 
-  const handleSessionIdle = (directory: string, event: { properties: { sessionID?: string } }, time: number) => {
+  const handleSessionIdle = (
+    directory: string,
+    event: { properties: { sessionID?: string } },
+    time: number,
+    viewed: boolean,
+  ) => {
     const sessionID = event.properties.sessionID
     void lookup(directory, sessionID).then((session) => {
       if (meta.disposed) return
@@ -400,7 +413,7 @@ function createServerNotificationState(input: {
       append({
         directory,
         time,
-        viewed: viewedInCurrentSession(directory, sessionID),
+        viewed,
         type: "turn-complete",
         session: sessionID,
       })
@@ -471,11 +484,27 @@ function createServerNotificationState(input: {
 
     const directory = e.name
     const time = Date.now()
-    if (event.type === "session.idle") {
-      handleSessionIdle(directory, event, time)
+    const sessionID = event.properties.sessionID
+    const viewed = event.type === "session.idle" ? viewedInCurrentSession(directory, sessionID) : false
+    const apply = () => {
+      if (meta.disposed) return
+      if (event.type === "session.idle") {
+        handleSessionIdle(directory, event, time, viewed)
+        return
+      }
+      handleSessionError(directory, event, time)
+    }
+
+    if (ready()) {
+      apply()
       return
     }
-    handleSessionError(directory, event, time)
+    const pending = ready.promise
+    if (!pending) {
+      apply()
+      return
+    }
+    void pending.then(apply, apply)
   })
   onCleanup(() => {
     meta.disposed = true

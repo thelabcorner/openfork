@@ -1,9 +1,7 @@
-import { createEffect, lazy, onCleanup, Show, Suspense, type ParentProps } from "solid-js"
-import { RoutePlaceholder } from "@/components/route-loading-fallback"
+import { createEffect, createSignal, lazy, onCleanup, onMount, Show, Suspense, type ParentProps } from "solid-js"
+import { RoutePlaceholder } from "@/components/route-placeholder"
 import { createStore } from "solid-js/store"
 import { createMediaQuery } from "@solid-primitives/media"
-import { DebugBar } from "@/components/debug-bar"
-import { TabsInfoPopup } from "@/components/help-button"
 import { Titlebar, type TitlebarUpdate } from "@/components/titlebar"
 import { useLayout } from "@/context/layout"
 import { SDKProvider } from "@/context/sdk"
@@ -11,21 +9,41 @@ import { usePlatform } from "@/context/platform"
 import { setV2Toast, ToastRegion } from "@/utils/toast"
 import { createBrowserPanelV2State } from "@/pages/session/v2/browser-panel-v2-state"
 import { createChatSidebarPaneState } from "@/pages/session/v2/chat-sidebar-pane-state"
-import { LimitsPanel } from "@/pages/session/limits-panel"
+import { loadChatSidebarPane } from "@/pages/session/v2/chat-sidebar-preload"
 import { createLimitsPanelState } from "@/pages/session/limits-panel-state"
 
 const BrowserPanelV2 = lazy(() =>
   import("@/pages/session/v2/browser-panel-v2").then((m) => ({ default: m.BrowserPanelV2 })),
 )
 
-const ChatSidebarPane = lazy(() =>
-  import("@/pages/session/v2/chat-sidebar-pane").then((m) => ({ default: m.ChatSidebarPane })),
+const ChatSidebarPane = lazy(() => loadChatSidebarPane().then((m) => ({ default: m.ChatSidebarPane })))
+
+const LimitsPanel = lazy(() =>
+  import("@/pages/session/limits-panel").then((m) => ({ default: m.LimitsPanel })),
 )
+
+const DebugBar = lazy(() => import("@/components/debug-bar").then((m) => ({ default: m.DebugBar })))
+const TabsInfoPopup = lazy(() => import("@/components/help-button").then((m) => ({ default: m.TabsInfoPopup })))
 
 export default function NewLayout(props: ParentProps) {
   const platform = usePlatform()
   const layout = useLayout()
   const [state, setState] = createStore({ debugTools: true })
+  const [secondaryChromeReady, setSecondaryChromeReady] = createSignal(false)
+
+  // Help/promotional chrome and dev instrumentation are not prerequisites for
+  // navigation or session interaction. Loading them in the initial shell made
+  // their drawers, media, tooltips and observers compete with first paint.
+  // Keep behavior intact, but let the primary shell win the startup race.
+  onMount(() => {
+    const idle = window.requestIdleCallback?.(() => setSecondaryChromeReady(true), { timeout: 1000 })
+    if (idle !== undefined) {
+      onCleanup(() => window.cancelIdleCallback?.(idle))
+      return
+    }
+    const timer = window.setTimeout(() => setSecondaryChromeReady(true), 0)
+    onCleanup(() => window.clearTimeout(timer))
+  })
 
   createEffect(() => setV2Toast(true))
 
@@ -118,11 +136,15 @@ export default function NewLayout(props: ParentProps) {
             {props.children}
           </Suspense>
         </main>
-        <div class="my-2 me-2 min-h-0 shrink-0 self-stretch" classList={{ hidden: !limitsVisible() }}>
-          <SDKProvider directory={limitsDirectory}>
-            <LimitsPanel state={limitsPanelState} opened={limitsVisible()} onClose={() => layout.limits.close()} />
-          </SDKProvider>
-        </div>
+        <Show when={limitsVisible()}>
+          <div class="my-2 me-2 min-h-0 shrink-0 self-stretch">
+            <Suspense fallback={<RoutePlaceholder />}>
+              <SDKProvider directory={limitsDirectory}>
+                <LimitsPanel state={limitsPanelState} opened onClose={() => layout.limits.close()} />
+              </SDKProvider>
+            </Suspense>
+          </div>
+        </Show>
         <Show when={browserVisible()}>
           <Suspense fallback={<RoutePlaceholder />}>
             <BrowserPanelV2
@@ -133,8 +155,12 @@ export default function NewLayout(props: ParentProps) {
           </Suspense>
         </Show>
       </div>
-      {import.meta.env.DEV && state.debugTools && <DebugBar inline />}
-      <TabsInfoPopup />
+      <Show when={secondaryChromeReady()}>
+        <Suspense>
+          {import.meta.env.DEV && state.debugTools && <DebugBar inline />}
+          <TabsInfoPopup />
+        </Suspense>
+      </Show>
       <ToastRegion v2 />
     </div>
   )
