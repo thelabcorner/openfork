@@ -1,0 +1,198 @@
+name: dev-pre-release
+
+# OpenFork dev pre-release packaging.
+#
+# GitHub-hosted runners ONLY (ubuntu-latest). This workflow deliberately does
+# not use the `[self-hosted, homelab]` runner that `.github/workflows/ci.yml`
+# targets.
+#
+# This is the dev-channel counterpart to the upstream `publish.yml` that
+# `script/release` dispatches (`gh workflow run publish.yml`) and that
+# `script/publish.ts` drives for npm / desktop releases. That file is not
+# present in this fork, so the entry point is this workflow instead:
+#   - it packages the CLI from the same `packages/opencode/script/build.ts`
+#     that `script/publish.ts` invokes (here with `--single`, so the
+#     GitHub-hosted runner builds its own linux-x64 target);
+#   - it intentionally does NOT run `script/publish.ts`, which requires npm,
+#     AUR, and desktop signing secrets that a dev pre-release must not need.
+# A dev pre-release is always created as a GitHub pre-release.
+#
+# Trigger:  push to `main`, or `gh workflow run dev-pre-release.yml`.
+# Output:   opencode-dev-linux-x64.tar.gz + generated release notes that
+#           enumerate every changed package, file, and commit in the range.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Optional explicit dev version (default 0.0.0-dev.<run>+<sha>)"
+        required: false
+        type: string
+
+concurrency:
+  group: dev-pre-release-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  notes:
+    name: Compose dev version and release notes
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
+      base: ${{ steps.version.outputs.base }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve dev version and commit range
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          SHA_SHORT="$(git rev-parse --short HEAD)"
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION="0.0.0-dev.${GITHUB_RUN_NUMBER}+${SHA_SHORT}"
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          if [ "${{ github.event_name }}" = "push" ] && git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
+            echo "base=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "base=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate release notes enumerating all changes
+        shell: bash
+        env:
+          BASE: ${{ steps.version.outputs.base }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "# OpenFork dev pre-release ${VERSION}"
+            echo
+            echo "Triggered by \`${{ github.event_name }}\` on \`${GITHUB_REF_NAME}\` at [${{ github.sha }}](${{ github.server_url }}/${{ github.repository }}/commit/${{ github.sha }})."
+            echo "Commit range: \`${BASE}..${GITHUB_SHA}\`."
+            echo
+            echo "## Commits"
+            echo
+            git log --no-merges --pretty=format:'- [`%h`]('"${{ github.server_url }}/${{ github.repository }}"'/commit/%H) %s' "${BASE}..${GITHUB_SHA}" || true
+            echo
+            echo
+            echo "## Changed packages (file count)"
+            echo
+            git diff --name-only "${BASE}" "${GITHUB_SHA}" \
+              | awk -F/ '{ if ($1=="packages") print $2; else if ($1=="docs") print "docs"; else if ($1=="script") print "script"; else if ($1==".github") print ".github"; else print $1 }' \
+              | sort | uniq -c | sort -rn \
+              | awk '{ printf "- `%s`: %s file(s)\n", $2, $1 }'
+            echo
+            echo "## Benchmarks and release scripts touched"
+            echo
+            git diff --name-only "${BASE}" "${GITHUB_SHA}" \
+              | grep -E '^(benchmarks/|script/(release|publish)|packages/[^/]+/script/)' \
+              | sed 's/^/- `/' | sed 's/$/`/' || echo "- (none in this range)"
+            echo
+            echo "## All changed files"
+            echo
+            echo '```'
+            git diff --name-status "${BASE}" "${GITHUB_SHA}" || true
+            echo '```'
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Upload release notes
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: release-notes.md
+
+  build-cli:
+    name: Build and package CLI (ubuntu-latest)
+    needs: notes
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CI: "true"
+      HUSKY: "0"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Build opencode CLI (single target)
+        env:
+          OPENCODE_VERSION: ${{ needs.notes.outputs.version }}
+          OPENCODE_CHANNEL: dev
+        run: bun ./packages/opencode/script/build.ts --single
+
+      - name: Package CLI archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="opencode-dev-linux-x64"
+          rm -rf "packages/opencode/dist/${NAME}"
+          mkdir -p "packages/opencode/dist/${NAME}"
+          cp -r packages/opencode/dist/opencode-linux-x64/bin "packages/opencode/dist/${NAME}/bin"
+          tar -czf "packages/opencode/dist/${NAME}.tar.gz" -C "packages/opencode/dist/${NAME}" bin
+          ls -la "packages/opencode/dist/${NAME}.tar.gz"
+
+      - name: Upload CLI archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-dev-linux-x64
+          path: packages/opencode/dist/opencode-dev-linux-x64.tar.gz
+
+  release:
+    name: Create dev pre-release
+    needs: [notes, build-cli]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download release notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+
+      - name: Download CLI archive
+        uses: actions/download-artifact@v4
+        with:
+          name: opencode-dev-linux-x64
+          path: assets
+
+      - name: Publish GitHub pre-release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ needs.notes.outputs.tag }}" \
+            assets/*.tar.gz \
+            --prerelease \
+            --target "${{ github.sha }}" \
+            --title "OpenFork dev pre-release ${{ needs.notes.outputs.version }}" \
+            --notes-file release-notes.md
+
+      - name: Job summary
+        run: |
+          {
+            echo "## OpenFork dev pre-release ${{ needs.notes.outputs.version }}"
+            echo
+            echo "- Tag: \`${{ needs.notes.outputs.tag }}\`"
+            echo "- Runner: \`ubuntu-latest\` (GitHub-hosted; homelab/self-hosted never used)"
+            echo "- Artifact: \`opencode-dev-linux-x64.tar.gz\`"
+            echo
+            cat release-notes.md
+          } >> "$GITHUB_STEP_SUMMARY"

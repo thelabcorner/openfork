@@ -28,6 +28,7 @@ describe("classifyConflict", () => {
     expect(classifyConflict("packages/opencode/src/fork/credentials.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/core/src/goal/automation.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/core/src/goal/auditor.ts", PRUNE)).toBe("fork-ours")
+    expect(classifyConflict("packages/core/src/goal/creation-policy.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/schema/src/goal.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/opencode/src/tool/goal.ts", PRUNE)).toBe("fork-ours")
     expect(classifyConflict("packages/app/src/components/goal-composer-shelf.tsx", PRUNE)).toBe("fork-ours")

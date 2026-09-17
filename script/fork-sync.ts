@@ -750,6 +750,21 @@ function cmdVerify(tag?: string): number {
       },
     },
     {
+      name: "goal agent creation provenance",
+      run: () => {
+        const missing: string[] = []
+        if (!fileContains("packages/core/src/goal/creation-policy.ts", "export function authorize")) missing.push("Core Goal creation authorization policy")
+        if (!fileContains("packages/core/src/goal/agent.ts", 'input.action === "create"')) missing.push("GoalAgent create action")
+        if (!fileContains("packages/core/src/goal/agent.ts", "sessions.get(sessionID)")) missing.push("Session-derived Goal ownership")
+        if (!fileContains("packages/core/src/goal/agent.ts", "GoalCreationPolicy.authorize")) missing.push("GoalAgent trusted authorization gate")
+        if (!fileContains("packages/core/src/tool/tool.ts", "userTurn")) missing.push("V2 trusted tool user-turn context")
+        if (!fileContains("packages/core/src/session/runner/llm.ts", "userTurn")) missing.push("V2 runner provenance seam")
+        if (!fileContains("packages/opencode/src/tool/goal.ts", "turnProvenance")) missing.push("V1 Goal provenance adapter")
+        if (!fileContains("packages/core/src/goal/index.ts", "sourceMessageID")) missing.push("Goal creation source-message audit attribution")
+        return missing.length > 0 ? `Goal agent creation provenance missing: ${missing.join(", ")}` : undefined
+      },
+    },
+    {
       name: "shared special-agent completion protocol",
       run: () => {
         const missing: string[] = []

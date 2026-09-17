@@ -9,8 +9,14 @@
 import { deviceAuthorization, readAgentToken, writeAgentToken, type DevAgentToken } from "./agent-token"
 import { AGENT_DEVICE_NAME, AGENT_TOKEN_VERSION } from "./constants"
 
-/** Cheap, authenticated, and side-effect free: a 401 here means the token is dead. */
-const PROBE_PATH = "/config"
+/**
+ * Cheap, authenticated, bootstrap-free, and side-effect free: a 401 here
+ * means the token is dead. Never probe an instance-scoped route such as
+ * `/config` — without a directory that route falls back to process.cwd() and
+ * can initialize plugins/config/watchers for an otherwise unused $HOME
+ * instance on every desktop launch.
+ */
+const PROBE_PATH = "/global/health"
 
 export type ProvisionOutcome =
   | { ok: true; reused: boolean; token: DevAgentToken }

@@ -23,6 +23,12 @@ const stampFile = path.join(dir, "dist/node/.build-stamp")
 const stampVersion = process.env.OPENCODE_VERSION ?? (Script.preview ? `preview:${Script.channel}` : Script.version)
 const stamp = `${stampVersion}\0${Script.channel}`
 
+// Identity headers present the released version line, not the synthetic preview
+// build stamp, so dev sidecars still satisfy the Console free-tier version gate.
+const releaseVersion = Script.preview
+  ? ((await Bun.file(path.join(dir, "package.json")).json()) as { version: string }).version
+  : Script.version
+
 if (process.env.OPENCODE_FORCE_NODE_BUILD !== "1" && (await isFresh())) {
   console.log("Build skipped (up to date)")
 } else {
@@ -45,6 +51,7 @@ if (process.env.OPENCODE_FORCE_NODE_BUILD !== "1" && (await isFresh())) {
     define: {
       OPENCODE_MODELS_DEV: generated.modelsData,
       OPENCODE_VERSION: `'${Script.version}'`,
+      OPENCODE_RELEASE_VERSION: JSON.stringify(releaseVersion),
       OPENCODE_CHANNEL: `'${Script.channel}'`,
       OPENCODE_CHUNKDB_COMPRESS_WORKER_PATH: JSON.stringify("./compress-worker.js"),
       OPENCODE_CHUNKDB_DECOMPRESS_WORKER_PATH: JSON.stringify("./decompress-worker.js"),
