@@ -307,7 +307,9 @@ async function openGoalLauncher(page: Page) {
   await menu.click()
   const chooser = page.getByText("Goal Mode", { exact: true })
   const setup = page.getByText("New Goal", { exact: true })
-  await expect(chooser.or(setup)).toBeVisible()
+  // Both can be on screen at once (header label + "New Goal" action): the
+  // helper only needs the launcher to have opened.
+  await expect(chooser.or(setup).first()).toBeVisible()
   return { chooser, setup }
 }
 
@@ -327,7 +329,7 @@ test("drafts are repairable and can traverse the user-visible lifecycle", async 
   await expect(shelf).toContainText("Repairable Goal")
   await expect(shelf).toContainText("draft")
   await shelf.getByRole("button", { name: /Repairable Goal/ }).click()
-  const popover = page.locator('[data-component="popover-content"]').filter({ hasText: "Repairable Goal" })
+  const popover = shelf.locator('[data-slot="goal-panel"]')
   await expect(popover.getByText("Goal setup", { exact: true })).toBeVisible()
   await expect(popover.getByRole("button", { name: "Start Goal", exact: true })).toBeDisabled()
 
@@ -352,8 +354,8 @@ test("drafts are repairable and can traverse the user-visible lifecycle", async 
   await expectAppVisible(page.locator('[data-component="prompt-input-v2"]'))
   await expect(page.locator('[data-component="goal-composer-shelf"]')).toContainText("Repairable Goal")
   await page.locator('[data-component="goal-composer-shelf"]').getByRole("button", { name: /Repairable Goal/ }).click()
-  const reloadedPopover = page.locator('[data-component="popover-content"]').filter({ hasText: "Repairable Goal" })
-  await expect(reloadedPopover.getByText("active", { exact: true })).toBeVisible()
+  const reloadedPopover = page.locator('[data-component="goal-composer-shelf"] [data-slot="goal-panel"]')
+  await expect(reloadedPopover.getByRole("button", { name: "Cancel Goal" })).toBeVisible()
 
   await reloadedPopover.getByRole("button", { name: "Cancel Goal" }).click()
   await expect(page.getByRole("button", { name: "Goal", exact: true })).toBeVisible()
@@ -413,7 +415,7 @@ test("quick Goal arming prepares durable Goal state before the first worker prom
   await goal.click()
   await expect(goal).toHaveAttribute("data-goal-armed", "true")
   await input.fill("Implement the quick Goal ordering contract")
-  await composer.getByRole("button", { name: "Send" }).click()
+  await composer.getByRole("button", { name: "Send", exact: true }).click()
 
   await expect.poll(() => server.operations.includes("worker.prompt")).toBe(true)
   expect(server.operations.slice(0, 4)).toEqual(["goal.create", "goal.focus", "goal.start", "worker.prompt"])
@@ -462,7 +464,7 @@ test("persists the auditor model per Goal through the real model picker", async 
 
   const shelf = page.locator('[data-component="goal-composer-shelf"]')
   await shelf.getByRole("button", { name: /Audited Goal/ }).click()
-  const goalPopover = page.locator('[data-component="popover-content"]').filter({ hasText: "Audited Goal" })
+  const goalPopover = shelf.locator('[data-slot="goal-panel"]')
   const picker = goalPopover.locator('[data-action="goal-auditor-model"]')
   await expect(picker).toContainText("Inherit worker model")
   await picker.click()
@@ -517,7 +519,8 @@ test("a verified Goal can complete only when every criterion has evidence", asyn
     verdict: "pass",
     createdAt: now,
   })
-  await page.keyboard.press("Escape")
+  // Collapsing and reopening is the refresh boundary that reloads evidence.
+  await shelf.getByRole("button", { name: "Collapse Goal" }).click()
   await shelf.getByRole("button", { name: /Verified Goal/ }).click()
   await expect(page.getByRole("button", { name: "Complete Goal" })).toBeEnabled()
   await page.getByRole("button", { name: "Complete Goal" }).click()

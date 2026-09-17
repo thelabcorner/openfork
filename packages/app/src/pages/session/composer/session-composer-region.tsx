@@ -1,4 +1,5 @@
 import { Show, type JSX } from "solid-js"
+import { GoalComposerShelf } from "@/components/goal-composer-shelf"
 import { useLanguage } from "@/context/language"
 import { useSettings } from "@/context/settings"
 import { SessionPermissionDock } from "@/pages/session/composer/session-permission-dock"
@@ -52,6 +53,12 @@ export function SessionComposerRegion(props: {
         </Show>
 
         <Show when={controller.showComposer()}>
+          {/* Goal sits at the top of the dock stack: it outranks the todo list
+              it generates, and shares that dock's full width so the two read as
+              one column instead of a floating pill over a bar. */}
+          <Show when={controller.sessionID()}>
+            {(id) => <GoalComposerShelf sessionID={id()} promptText={controller.draftText} />}
+          </Show>
           <Show when={controller.dock()}>
             <div
               classList={{

@@ -28,8 +28,6 @@ export type GoalArmIntent = {
 }
 
 export type GoalCreateAndFocusInput = {
-  projectID: string
-  workspaceID?: string
   title: string
   objective: string
   criteria: string[]
@@ -167,27 +165,10 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
     }
 
     const createAndFocus = async (sessionID: string, input: GoalCreateAndFocusInput) => {
-      const { start = true, ...payload } = input
-      const created = await sdk().create(payload, { throwOnError: true })
-      if (!created.data) throw new Error("Goal create returned no data")
-      let detail = created.data
-      await sdk().focus({ sessionID, goalID: detail.goal.id, role: "owner" }, { throwOnError: true })
-      setState("focused", sessionID, {
-        focus: { sessionID, goalID: detail.goal.id, role: "owner", focusedAt: Date.now() },
-        detail,
-      })
-      if (start) {
-        if (detail.criteria.length === 0) throw new Error("Add at least one acceptance criterion before starting this Goal")
-        const started = await sdk().transition(
-          { goalID: detail.goal.id, expectedRevision: detail.goal.revision, action: "start" },
-          { throwOnError: true },
-        )
-        if (started.data) {
-          detail = started.data
-          setState("focused", sessionID, "detail", detail)
-        }
-      }
-      return detail
+      const response = await sdk().prepare({ sessionID, ...input }, { throwOnError: true })
+      if (!response.data) throw new Error("Goal prepare returned no data")
+      setState("focused", sessionID, response.data)
+      return response.data.detail
     }
 
     const quickTitle = (objective: string) => {
@@ -199,8 +180,6 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
     const quickStart = async (
       sessionID: string,
       input: {
-        projectID: string
-        workspaceID?: string
         objective: string
         mode?: GoalArmIntent["mode"]
       },
@@ -224,8 +203,6 @@ export const { use: useGoals, provider: GoalsProvider } = createSimpleContext({
       }
 
       return createAndFocus(sessionID, {
-        projectID: input.projectID,
-        workspaceID: input.workspaceID,
         title: quickTitle(input.objective),
         objective: input.objective,
         // Quick mode stays zero-friction while retaining the same evidence gate

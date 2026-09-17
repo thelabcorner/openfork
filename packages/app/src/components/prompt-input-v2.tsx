@@ -80,7 +80,7 @@ import { buildArcModel, type ArcModel } from "@/components/prompt-input/limit-ar
 import { LimitArcCard, LimitArcGlyph } from "@/components/prompt-input/limit-arc-view"
 import { showToast } from "@/utils/toast"
 import { PromptInputV2, type PromptInputV2Suggestion } from "@opencode-ai/session-ui/v2/prompt-input"
-import { GoalComposerLauncher, GoalComposerShelf } from "@/components/goal-composer-shelf"
+import { GoalComposerLauncher } from "@/components/goal-composer-shelf"
 import { goalArmKey, useGoals } from "@/context/goals"
 import { SettingsModelPickerV2, type SettingsModelRef } from "@/components/settings-v2/parts/model-picker"
 import {
@@ -174,11 +174,6 @@ export function PromptInputV2Composer(props: PromptInputV2ComposerProps) {
         }
         revisionControl={<PromptInputV2RevisionControl controller={props.controller} sessionID={sessionID()} />}
         submitControl={<PromptInputV2SendControl controller={props.controller} />}
-        goalShelf={
-          <Show when={sessionID()}>
-            {(id) => <GoalComposerShelf sessionID={id()} promptText={() => props.controller.value()} />}
-          </Show>
-        }
         footerControl={<PromptInputV2LiveRate value={props.controller.liveRate()} />}
         modelControl={
           <PromptInputV2ModelControl
@@ -1464,18 +1459,21 @@ export function usePromptInputV2Controller(props: PromptInputV2ControllerProps):
   // Not-yet-created ("draft") sessions get their own local flag rather than
   // binding to permission.isAutoAcceptingDirectory: that would enable
   // auto-accept for every future chat in this directory, not just the one
-  // being composed. On submit, createPromptSubmit promotes this onto the
-  // freshly created session only (see submit.ts's shouldAutoAccept).
-  const [draftAutoAccept, setDraftAutoAccept] = createSignal(false)
+  // being composed. Until the user overrides it, the draft reflects the
+  // configured new-session default (settings.general
+  // autoAcceptPermissionsDefault), which also honors an explicit
+  // directory-wide choice. On submit, createPromptSubmit materializes the
+  // effective value onto the freshly created session only.
+  const [draftAutoAccept, setDraftAutoAccept] = createSignal<boolean | undefined>(undefined)
   const accepting = createMemo(() => {
     const id = props.controls.session.id
-    if (!id) return draftAutoAccept()
+    if (!id) return draftAutoAccept() ?? permission.autoAcceptForNewSession(sdk().directory)
     return permission.isAutoAccepting(id, sdk().directory)
   })
   const toggleAutoAccept = () => {
     const id = props.controls.session.id
     if (!id) {
-      setDraftAutoAccept((value) => !value)
+      setDraftAutoAccept(!accepting())
       return
     }
     permission.toggleAutoAccept(id, sdk().directory)

@@ -112,6 +112,14 @@ export const SessionQuestionCard: Component<{ controller: SessionQuestionControl
       focusRow(index)
       return
     }
+    // Backspace/Delete empties the whole answer — the keyboard counterpart to
+    // the footer's Clear, so an accidental pick never forces a dismissal.
+    if (plain && (event.key === "Backspace" || event.key === "Delete")) {
+      if (question().selected() === 0) return
+      event.preventDefault()
+      question().clearAnswer()
+      return
+    }
     // Escape hands focus back to the composer rather than discarding the question.
     if (plain && event.key === "Escape") {
       event.preventDefault()
@@ -128,6 +136,8 @@ export const SessionQuestionCard: Component<{ controller: SessionQuestionControl
 
   const hint = createMemo(() => {
     if (options().length === 0) return language.t("session.question.hint.freeform")
+    // Undoing is only worth explaining once there is a selection to undo.
+    if (question().selected() > 0) return language.t("session.question.hint.selected")
     if (!question().customAllowed()) return language.t("session.question.hint.selectOnly")
     return multiple() ? language.t("session.question.hint.multiple") : language.t("session.question.hint.single")
   })
@@ -243,7 +253,11 @@ export const SessionQuestionCard: Component<{ controller: SessionQuestionControl
                     // Roving tabindex: one stop for the whole list.
                     tabIndex={question().cursor() === i() || (question().cursor() < 0 && i() === 0) ? 0 : -1}
                     disabled={sending()}
-                    title={option.description || option.label}
+                    title={
+                      picked()
+                        ? language.t("session.question.deselect")
+                        : option.description || option.label
+                    }
                     onFocus={() => question().setCursor(i())}
                     onClick={() => select(i())}
                     class="group flex h-[26px] w-full shrink-0 items-center gap-2 rounded-[6px] px-1.5 text-start outline-none transition-colors hover:bg-v2-overlay-simple-overlay-hover focus-visible:bg-v2-overlay-simple-overlay-hover disabled:pointer-events-none disabled:opacity-50"
@@ -265,13 +279,21 @@ export const SessionQuestionCard: Component<{ controller: SessionQuestionControl
                         {option.description}
                       </span>
                     </Show>
-                    <Show when={i() < 9}>
-                      <KeybindV2
-                        keys={[String(i() + 1)]}
-                        variant="ghost"
-                        class="ml-auto shrink-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100"
-                      />
-                    </Show>
+                    {/* A picked row trades its digit hint for the gesture that
+                        undoes it, so "click again to remove" is discoverable
+                        without a tooltip. */}
+                    <span class="ml-auto flex shrink-0 items-center opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100">
+                      <Show
+                        when={picked()}
+                        fallback={
+                          <Show when={i() < 9}>
+                            <KeybindV2 keys={[String(i() + 1)]} variant="ghost" />
+                          </Show>
+                        }
+                      >
+                        <Icon name="close" size="small" class="size-2.5 text-v2-text-text-faint" />
+                      </Show>
+                    </span>
                   </button>
                 )
               }}
@@ -295,6 +317,23 @@ export const SessionQuestionCard: Component<{ controller: SessionQuestionControl
         </Show>
 
         <div class="ml-auto flex shrink-0 items-center gap-1">
+          {/* Only rendered once there is something to undo, so the resting
+              footer stays quiet. */}
+          <Show when={question().selected() > 0}>
+            <button
+              type="button"
+              disabled={sending()}
+              title={language.t("session.question.clearHint")}
+              onClick={() => question().clearAnswer()}
+              class="flex h-[18px] items-center gap-1 rounded-[4px] px-1.5 text-[10px] font-[500] leading-4 text-v2-text-text-faint transition-colors hover:bg-v2-overlay-simple-overlay-hover hover:text-v2-text-text-base disabled:pointer-events-none disabled:opacity-40"
+            >
+              <Icon name="close" size="small" class="size-2.5" />
+              {language.t("session.question.clear")}
+              <Show when={multiple() && question().selected() > 1}>
+                <span class="tabular-nums text-v2-text-text-faint">{question().selected()}</span>
+              </Show>
+            </button>
+          </Show>
           <button
             type="button"
             disabled={sending()}

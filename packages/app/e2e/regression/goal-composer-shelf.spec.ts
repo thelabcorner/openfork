@@ -164,13 +164,15 @@ test("renders Goal Mode as a stable premium shelf above PromptInputV2", async ({
   await expect(shelf).toContainText("Ship Goal Mode")
   await expect(shelf).toContainText("3/5")
 
+  // The Goal card is a dock sibling, not a floating pill: it shares the dock
+  // column's width with the todo list and the composer it sits above.
   const [composerBox, shelfBox] = await Promise.all([composer.boundingBox(), shelf.boundingBox()])
   if (!composerBox || !shelfBox) throw new Error("Goal shelf/composer bounds unavailable")
-  expect(shelfBox.height).toBe(36)
-  expect(shelfBox.width).toBeLessThanOrEqual(680)
-  expect(shelfBox.x).toBeGreaterThanOrEqual(composerBox.x)
-  expect(shelfBox.x + shelfBox.width).toBeLessThanOrEqual(composerBox.x + composerBox.width)
-  expect(shelfBox.y + shelfBox.height).toBeLessThanOrEqual(composerBox.y - 8)
+  // 42px summary row + the card hairline on each edge.
+  expect(shelfBox.height).toBe(44)
+  expect(Math.round(shelfBox.x)).toBe(Math.round(composerBox.x))
+  expect(Math.round(shelfBox.width)).toBe(Math.round(composerBox.width))
+  expect(shelfBox.y + shelfBox.height).toBeLessThanOrEqual(composerBox.y)
 
   const shelfStyle = await shelf.evaluate((element) => {
     const style = getComputedStyle(element)
@@ -181,37 +183,41 @@ test("renders Goal Mode as a stable premium shelf above PromptInputV2", async ({
     }
   })
   expect(shelfStyle.borderRadius).toBe("10px")
-  expect(shelfStyle.display).toBe("flex")
+  expect(shelfStyle.display).toBe("block")
   expect(shelfStyle.background).not.toBe("rgba(0, 0, 0, 0)")
 
   await page.screenshot({ path: testInfo.outputPath("goal-shelf-dark.png") })
 
   await shelf.getByRole("button", { name: /Ship Goal Mode/ }).click()
-  const popover = page.locator('[data-component="popover-content"]').filter({ hasText: "Acceptance criteria" })
-  await expect(popover).toBeVisible()
-  await expect(popover).toContainText("Autonomous turns survive process recovery")
-  await expect(popover).toContainText("Verify premium shelf UX")
-  await expect(popover).toContainText("Auto")
-  await expect(popover).toContainText("Auditor")
-  await expect(popover).toContainText("Inherit worker model")
-  await expect(popover).toContainText("One acceptance criterion remains pending.")
-  await expect(popover).toContainText("Next cycle")
-  await expect(popover).toContainText("Finish the remaining shelf stability criterion and capture verification evidence.")
-  await expect(popover).toContainText("ses_goal_worker")
-  await expect(popover.getByRole("button", { name: "Manual" })).not.toBeFocused()
+  const panel = shelf.locator('[data-slot="goal-panel"]')
+  await expect(panel).toContainText("Acceptance criteria")
+  await expect(panel).toContainText("Autonomous turns survive process recovery")
+  await expect(panel).toContainText("Verify premium shelf UX")
+  await expect(panel).toContainText("Auto")
+  await expect(panel).toContainText("Auditor")
+  await expect(panel).toContainText("Inherit worker model")
+  await expect(panel).toContainText("One acceptance criterion remains pending.")
+  await expect(panel).toContainText("Next cycle")
+  await expect(panel).toContainText("Finish the remaining shelf stability criterion and capture verification evidence.")
+  await expect(panel.getByRole("button", { name: "Manual" })).not.toBeFocused()
 
-  const popoverBox = await popover.boundingBox()
-  if (!popoverBox) throw new Error("Goal popover bounds unavailable")
-  const popoverStyle = await popover.evaluate((element) => {
-    const style = getComputedStyle(element)
-    return { width: style.width, borderRadius: style.borderRadius }
-  })
-  expect(popoverStyle.width).toBe("370px")
-  expect(popoverStyle.borderRadius).toBe("8px")
-  expect(popoverBox.width).toBeGreaterThan(340)
-  expect(popoverBox.width).toBeLessThanOrEqual(370)
-  expect(popoverBox.y + popoverBox.height).toBeLessThanOrEqual(shelfBox.y)
-  await page.screenshot({ path: testInfo.outputPath("goal-popover-dark.png") })
+  await page.screenshot({ path: testInfo.outputPath("goal-panel-open-dark.png") })
+
+  // Activity is secondary detail: folded away until it is asked for.
+  await expect(panel).not.toContainText("ses_goal_worker")
+  await panel.getByRole("button", { name: "Activity" }).click()
+  await expect(panel).toContainText("ses_goal_worker")
+
+  const [expandedBox, panelBox] = await Promise.all([shelf.boundingBox(), panel.boundingBox()])
+  if (!expandedBox || !panelBox) throw new Error("Goal panel bounds unavailable")
+  expect(expandedBox.height).toBeGreaterThan(44)
+  expect(Math.round(panelBox.width)).toBe(Math.round(shelfBox.width) - 2)
+  expect(expandedBox.y + expandedBox.height).toBeLessThanOrEqual(composerBox.y)
+  await page.screenshot({ path: testInfo.outputPath("goal-panel-dark.png") })
+
+  // Collapsing returns the card to the single dense summary row.
+  await shelf.getByRole("button", { name: "Collapse Goal" }).click()
+  await expect.poll(async () => Math.round((await shelf.boundingBox())?.height ?? 0)).toBe(44)
 })
 
 test("places the inactive Goal entrypoint between add and agent as an icon-only control", async ({ page }) => {

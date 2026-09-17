@@ -176,7 +176,12 @@ export function createSessionQuestionController(input: { request: Accessor<Quest
     if (store.sending) return
     const target = index()
     if (!multiple()) {
-      setStore("answers", target, [label])
+      // Re-picking the current answer clears it. A misclick on a single-choice
+      // question would otherwise be unrecoverable without rejecting the whole
+      // request, so the same gesture that chose an option also undoes it.
+      setStore("answers", target, (answer = []) =>
+        answer.length === 1 && answer[0] === label ? [] : [label],
+      )
       return
     }
     setStore("answers", target, (answer = []) =>
@@ -184,8 +189,24 @@ export function createSessionQuestionController(input: { request: Accessor<Quest
     )
   }
 
+  /** How many options the current question has selected. */
+  const selected = createMemo(() => store.answers[index()]?.length ?? 0)
+
+  /** Drops every selection for the current question, leaving details untouched. */
+  const clearAnswer = () => {
+    if (store.sending) return
+    const target = index()
+    if ((store.answers[target]?.length ?? 0) === 0) return
+    setStore("answers", target, [])
+  }
+
   const answeredAt = (target: number) => {
     if ((store.answers[target]?.length ?? 0) > 0) return true
+    // A question that refuses custom answers discards details on the way out
+    // (see `normalizeReply`), so text alone is not an answer there. Without
+    // this, clearing a selection while details linger would leave Submit lit
+    // and send nothing.
+    if (!questionCustomAllowed(questions()[target])) return false
     // The live composer is authoritative for the question being shown.
     const text = target === index() ? details() : (store.drafts[target]?.text ?? "")
     return text.trim().length > 0
@@ -282,6 +303,8 @@ export function createSessionQuestionController(input: { request: Accessor<Quest
     details,
     picked,
     toggle,
+    selected,
+    clearAnswer,
     answeredAt,
     canAdvance,
     goto,

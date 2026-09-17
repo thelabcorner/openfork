@@ -55,8 +55,6 @@ export type PromptInputV2Props = {
   goalControl?: JSX.Element
   /** App-owned prompt transformation controls rendered beside Goal. */
   revisionControl?: JSX.Element
-  /** Persistent app-owned Goal shelf rendered above the composer, independent of the prompt popover machine. */
-  goalShelf?: JSX.Element
   /** Optional app-owned submit affordance. The session-ui default remains the
    * plain send/stop button; products can progressively disclose richer send
    * policy without coupling this package to those policies. */
@@ -132,11 +130,6 @@ export function PromptInputV2(props: PromptInputV2Props) {
           event.currentTarget.value = ""
         }}
       />
-      <Show when={props.goalShelf}>
-        <div data-slot="goal-control" class="absolute inset-x-0 -top-2 z-30 -translate-y-full">
-          {props.goalShelf}
-        </div>
-      </Show>
       <Show when={state.popover.type !== "closed"}>
         <PromptInputV2Popover
           emptyLabel={i18n.t("ui.promptInput.noMatchingItems")}

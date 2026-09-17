@@ -79,20 +79,23 @@ export function createSessionComposerRegionController(input: {
     })
   })
 
+  /** Flattened composer draft, shared by the handoff cache and the Goal card. */
+  const draftText = createMemo(() =>
+    input.prompt
+      .current()
+      .map((part) => {
+        if (part.type === "file") return `[file:${part.path}]`
+        if (part.type === "agent") return `@${part.name}`
+        if (part.type === "image") return `[image:${part.filename}]`
+        return part.content
+      })
+      .join("")
+      .trim(),
+  )
+
   createEffect(() => {
     if (!input.prompt.ready()) return
-    setSessionHandoff(input.sessionKey(), {
-      prompt: input.prompt
-        .current()
-        .map((part) => {
-          if (part.type === "file") return `[file:${part.path}]`
-          if (part.type === "agent") return `@${part.name}`
-          if (part.type === "image") return `[image:${part.filename}]`
-          return part.content
-        })
-        .join("")
-        .trim(),
-    })
+    setSessionHandoff(input.sessionKey(), { prompt: draftText() })
   })
 
   createEffect(() => {
@@ -119,6 +122,8 @@ export function createSessionComposerRegionController(input: {
   return {
     state: input.state,
     question,
+    sessionID: input.sessionID,
+    draftText,
     centered: input.centered,
     todo: input.todo,
     followup: input.followup,
