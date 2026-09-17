@@ -296,8 +296,7 @@ const layer = Layer.effect(
           )
         }
 
-        const unsubscribe = yield* events.listen((event) => {
-          if (event.location?.directory !== ctx.directory) return Effect.void
+        const unsubscribe = yield* events.listenDirectoryAll(ctx.directory, (event) => {
           return Effect.sync(() => {
             for (const hook of hooks) {
               void hook["event"]?.({ event: { id: event.id, type: event.type, properties: event.data } as any })

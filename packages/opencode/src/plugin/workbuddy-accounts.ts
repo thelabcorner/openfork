@@ -11,6 +11,7 @@ import {
   writeFileSync,
 } from "fs"
 import { WorkBuddyEntitlementGovernor, type EntitlementState } from "./workbuddy-governor"
+import { workBuddyClientHeaders, workBuddyUserAgent } from "./workbuddy-identity"
 
 /** Credential shape written by WorkBuddy/CodeBuddy desktop or OAuth enrollment. */
 export type Credential = {
@@ -340,7 +341,8 @@ export async function startWorkBuddyOAuth(realm: WorkBuddyOAuthRealm = "global")
       "X-Requested-With": "XMLHttpRequest",
       Origin: origin,
       Referer: `${origin}/`,
-      "User-Agent": "CLI/2.63.2 CodeBuddy/2.63.2",
+      "User-Agent": workBuddyUserAgent(),
+      ...workBuddyClientHeaders(),
     },
     body: "{}",
   })
@@ -367,7 +369,11 @@ export async function pollWorkBuddyOAuth(state: string, vault: AccountVault): Pr
     throw new Error("WorkBuddy OAuth flow expired; start it again")
   }
   const base = oauthBackend(flow.realm)
-  const headers: Record<string, string> = { Accept: "application/json" }
+  const headers: Record<string, string> = {
+    Accept: "application/json",
+    "User-Agent": workBuddyUserAgent(),
+    ...workBuddyClientHeaders(),
+  }
   const cookie = cookieHeader(flow.cookies)
   if (cookie) headers.Cookie = cookie
   const response = await fetch(`${base}/v2/plugin/auth/token?state=${encodeURIComponent(state)}`, { headers })
@@ -501,7 +507,44 @@ export class AccountRegistry {
     const saved = this.vault.importCredential(credential, source)
     const account = this.accountFrom(saved, "desktop-import", Date.now())
     this.accountsById.set(account.id, account)
+    // An explicit user import is a deliberate re-authorization: previously
+    // learned account blocks (dead token, auth_forbidden quarantine) must not
+    // survive it.
+    account.governor.clearLearnedBlocks()
     return account
+  }
+
+  /**
+   * Heal a dead vault credential from a fresher desktop login with the SAME
+   * stable identity.
+   *
+   * The vault stays authoritative for healthy accounts (a switched desktop
+   * `.info` never overwrites a working vault token — see `discover()`), but
+   * when the vault token for the CURRENT desktop login is dead and the
+   * desktop holds a different, fresher token for that same identity, keeping
+   * the stale copy is just failure persistence. This adopts the desktop token
+   * pair for that one account only: it never creates accounts (additive
+   * desktop import in `discover()` already covers new identities) and never
+   * mints a new enrollment epoch (a heal is not a re-enrollment, so a learned
+   * QUOTA_EXHAUSTED survives it). Returns true when a heal happened.
+   */
+  tryHealFromDesktop(account: WorkBuddyAccount): boolean {
+    for (const path of candidateFiles(this.explicitFiles)) {
+      const credential = parseCredentialFile(path)
+      if (!credential || !credential.uid) continue
+      if (stableAccountIdentity(credential) !== account.id) continue
+      if (credential.accessToken === account.credential.accessToken) return false
+      const saved = this.vault.importCredential(credential, path)
+      // Preserve object identity for transports that already captured the
+      // credential reference during a concurrent generation.
+      Object.assign(account.credential, saved)
+      account.authPath = saved.path
+      account.source = "vault"
+      account.governor.clearLearnedBlocks()
+      this.accountsById.set(account.id, account)
+      return true
+    }
+    return false
   }
 
   /** Add one OAuth-enrolled credential; explicit re-enrollment creates a new epoch. */
@@ -517,6 +560,10 @@ export class AccountRegistry {
     Object.assign(account.credential, saved)
     account.authPath = saved.path
     account.source = "vault"
+    // Explicit re-enrollment is a deliberate re-authorization: previously
+    // learned account blocks (dead token, auth_forbidden quarantine) must not
+    // survive it.
+    account.governor.clearLearnedBlocks()
     this.accountsById.set(account.id, account)
     return account
   }
@@ -628,7 +675,13 @@ export class AccountRouter {
       // just paid ones: Tencent's server runs its own balance check before
       // every generation regardless of a model's published rate, so a
       // 0-credit account 402s even on a nominally free promotional model.
+      // AUTH_INVALID and ACCOUNT_FORBIDDEN break affinity the same way: a
+      // session pinned to a dead token or to a Tencent-restricted account
+      // would otherwise fail every turn while healthy accounts sit in the
+      // pool unused.
       const blocked = metrics.state === "QUOTA_EXHAUSTED" ||
+                      metrics.state === "AUTH_INVALID" ||
+                      metrics.state === "ACCOUNT_FORBIDDEN" ||
                       !account.governor.canAdmitModel(requestedModel, now) ||
                       !!(metrics.cooldownUntil && now < metrics.cooldownUntil) ||
                       !account.governor.hasKnownCredits()
@@ -641,20 +694,37 @@ export class AccountRouter {
 
     const eligible = accounts.filter((account) => {
       const state = account.governor.metrics().state as EntitlementState
-      if (state === "QUOTA_EXHAUSTED") return false
+      // ACCOUNT_FORBIDDEN is excluded outright rather than kept as a
+      // fallback: a generation would be rejected at admission anyway, and
+      // the caller surfaces an all-forbidden pool as its own diagnosis.
+      if (state === "QUOTA_EXHAUSTED" || state === "ACCOUNT_FORBIDDEN") return false
       if (!account.governor.canAdmitModel(requestedModel)) return false
       if (account.catalog && !account.catalog.ids.has(requestedModel)) return false
       return true
     })
     if (!eligible.length) return undefined
+    // Prefer accounts whose vault token is not known-dead; a 0-credit account is
+    // deprioritized rather than excluded outright, because the cached balance
+    // (pushed opportunistically by the quota adapter, see
+    // `WorkBuddyEntitlementGovernor.setPackageCredits`) can be stale — trying
+    // it is still better than a hard "no eligible account" failure when it's
+    // the only option.
+    //
+    // AUTH_INVALID follows the same prefer-not-exclude rule one level
+    // stronger: dead-auth accounts are skipped while ANY healthy account
+    // exists, but remain the fallback pool when every account is invalid —
+    // otherwise a single-account user with a transient 401 would get "no
+    // eligible account" instead of a refresh-and-retry that could heal them.
+    const healthy = eligible.filter((account) => account.governor.metrics().state !== "AUTH_INVALID")
+    const authFallback = healthy.length > 0 ? healthy : eligible
     // Prefer accounts we KNOW have package credit left; a 0-credit account is
     // deprioritized rather than excluded outright, because the cached balance
     // (pushed opportunistically by the quota adapter, see
     // `WorkBuddyEntitlementGovernor.setPackageCredits`) can be stale — trying
     // it is still better than a hard "no eligible account" failure when it's
     // the only option.
-    const funded = eligible.filter((account) => account.governor.hasKnownCredits())
-    const pool = funded.length > 0 ? funded : eligible
+    const funded = authFallback.filter((account) => account.governor.hasKnownCredits())
+    const pool = funded.length > 0 ? funded : authFallback
     pool.sort((a, b) => {
       const am = a.governor.metrics()
       const bm = b.governor.metrics()

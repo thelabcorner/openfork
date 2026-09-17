@@ -98,6 +98,9 @@ import {
   canonicalModelId,
   consumptionFrom,
   emptyModelRuntime,
+  isAccountForbidden,
+  isBalanceExhausted,
+  isValidationError,
   parseErrorCode,
   recordTimestamp,
   type ModelEntitlementReport,
@@ -114,6 +117,13 @@ export type GenerationPhase = "ADMITTED" | "COMMITTED" | "FAILED"
  * `models` map instead. The value is kept in the union only so an
  * old-schema persisted file from before this change parses without a type
  * error; the constructor treats it as unknown/READY on load.
+ *
+ * ACCOUNT_FORBIDDEN is the quarantine for Tencent's account-level
+ * `auth_forbidden` verdict (codes 11140/11142, official client taxonomy).
+ * Unlike AUTH_INVALID it cannot be cleared by refreshing — verified live
+ * 2026-09-16: a fresh token pair still received 11140 — so it is time-boxed
+ * (`forbiddenUntil`) and re-probed after the cooldown instead of being
+ * retried on every generation.
  */
 export type EntitlementState =
   | "READY"
@@ -121,9 +131,10 @@ export type EntitlementState =
   | "WINDOW_LIMITED"
   | "QUOTA_EXHAUSTED"
   | "AUTH_INVALID"
+  | "ACCOUNT_FORBIDDEN"
   | "UPSTREAM_DEGRADED"
 
-export type AdmissionKind = "window" | "quota" | "cooldown" | "queue" | "cancel" | "duplicate"
+export type AdmissionKind = "window" | "quota" | "cooldown" | "queue" | "cancel" | "duplicate" | "forbidden"
 
 export class AdmissionError extends Error {
   constructor(
@@ -166,6 +177,18 @@ export function planGeneration(params: {
   return { refreshBeforeAttempt: false, canRetry: false, done: true }
 }
 
+/**
+ * Outcome of one credential re-auth attempt as the governor sees it.
+ *
+ * `rejected` is the only AUTH_INVALID-qualifying failure: the refresh
+ * endpoint answered 401/403, so the saved refresh token is dead. Network
+ * errors, 5xx, timeouts, or a missing refresh token are transient and must
+ * never exile an account. Mirrors the official client's own mapping
+ * (`isAuthenticationInvalidError` → UnauthorizedError, everything else →
+ * SignError).
+ */
+export type RefreshResult = { ok: true } | { ok: false; rejected: boolean }
+
 export type RunGenerationOpts = {
   priority: number
   /** Stable per-generation label for observability. */
@@ -176,8 +199,12 @@ export type RunGenerationOpts = {
   session?: string
   /** Reads credential expiry at call time (closure over live cred). */
   isExpired: () => boolean
-  /** Singleflight token refresh (closure over live cred). */
-  refresh: () => Promise<boolean>
+  /**
+   * Singleflight token refresh (closure over live cred). `rejected: true`
+   * means the backend answered 401/403 on the refresh token — the only case
+   * that may persist AUTH_INVALID. Transient failures must not.
+   */
+  refresh: () => Promise<RefreshResult>
   /** One upstream request. Re-reads the live cred for headers. */
   transport: () => Promise<Response>
   /** Optional cancellation from the OpenFork/client response lifecycle. */
@@ -200,6 +227,14 @@ const DEFAULT_LAUNCH_BURST = Number(process.env.WORKBUDDY_LAUNCH_BURST) || 4
 const DEFAULT_LAUNCH_PER_SEC = Number(process.env.WORKBUDDY_LAUNCH_PER_SEC) || 4
 const MAX_INFLIGHT = 24
 const TRANSIENT_CAP_MS = 60_000
+/**
+ * How long a forbidden account is quarantined before OpenFork lets it try one
+ * generation again. The restriction is Tencent-side (`auth_forbidden`) and
+ * may be lifted at any time, so recovery is a timed probe rather than a
+ * permanent exile — but it must never become a hammering loop. One hour keeps
+ * our rejected-request footprint on a restricted account minimal.
+ */
+const DEFAULT_FORBIDDEN_COOLDOWN_MS = Number(process.env.WORKBUDDY_FORBIDDEN_COOLDOWN_MS) || 60 * 60_000
 const PRESSURE_THRESHOLD = 3
 
 // Weighted-fair queueing weights by priority: lower = admitted sooner.
@@ -248,6 +283,7 @@ type Persisted = {
   resetAt: number | null
   limitedEpoch: string | null
   at: number
+  forbiddenUntil?: number | null
   models?: Record<string, PersistedModelEntitlement>
 }
 
@@ -326,6 +362,8 @@ export type GovernorOptions = {
   maxConcurrent?: number
   launchBurst?: number
   launchPerSec?: number
+  /** Test override for the auth_forbidden quarantine window. */
+  forbiddenCooldownMs?: number
 }
 
 export class WorkBuddyEntitlementGovernor {
@@ -355,6 +393,9 @@ export class WorkBuddyEntitlementGovernor {
   private limitedEpoch: string | undefined
   private readonly generationKeys = new Set<string>()
   private readonly models = new Map<string, ModelEntitlementRuntime>()
+  /** Epoch ms until which the account is quarantined as auth_forbidden. */
+  private forbiddenUntil = 0
+  private readonly forbiddenCooldownMs: number
 
   /**
    * Pushed opportunistically by the quota adapter after a package-balance
@@ -379,6 +420,8 @@ export class WorkBuddyEntitlementGovernor {
   private committed = 0
   private failed = 0
   private authRecoveries = 0
+  /** Last observed 401/403 transport failure (in-memory diagnostic). */
+  private lastAuthFailure: { at: number; status: number; code?: number } | null = null
 
   constructor(options: GovernorOptions = {}) {
     this.entitlementFile = options.persistenceFile ?? ENTITLEMENT_FILE_OVERRIDE ?? DEFAULT_ENTITLEMENT_FILE
@@ -388,6 +431,7 @@ export class WorkBuddyEntitlementGovernor {
     this.launchPerSec = this.defaultLaunchPerSec
     this.launchCapacity = Math.max(1, options.launchBurst ?? DEFAULT_LAUNCH_BURST)
     this.launchTokens = this.launchCapacity
+    this.forbiddenCooldownMs = Math.max(1_000, options.forbiddenCooldownMs ?? DEFAULT_FORBIDDEN_COOLDOWN_MS)
 
     // Learn-once: restore a persisted hard/window limit so a fresh OpenFork
     // session enforces it without re-probing Tencent.
@@ -396,6 +440,18 @@ export class WorkBuddyEntitlementGovernor {
     if (p.state === "QUOTA_EXHAUSTED") {
       this.state = "QUOTA_EXHAUSTED"
       this.limitedEpoch = p.limitedEpoch ?? undefined
+    } else if (p.state === "AUTH_INVALID") {
+      // A dead vault token stays dead across restarts: without this, every
+      // fresh process retries the revoked credential, burns a refresh, fails
+      // with 401 again, and pins the session via affinity. Healing happens
+      // only through success (clears to READY), explicit re-enrollment, or
+      // desktop heal — never by restarting.
+      this.state = "AUTH_INVALID"
+    } else if (p.state === "ACCOUNT_FORBIDDEN" && p.forbiddenUntil && p.forbiddenUntil > Date.now()) {
+      // A Tencent-side account restriction survives restarts for its
+      // cooldown window; after that the account gets one fresh probe.
+      this.state = "ACCOUNT_FORBIDDEN"
+      this.forbiddenUntil = p.forbiddenUntil
     }
     for (const [model, saved] of Object.entries(p.models ?? {})) {
       const runtime = emptyModelRuntime()
@@ -448,6 +504,7 @@ export class WorkBuddyEntitlementGovernor {
         state: this.state,
         resetAt: this.resetAt ?? null,
         limitedEpoch: this.limitedEpoch ?? null,
+        forbiddenUntil: this.forbiddenUntil || null,
         at: Date.now(),
         models,
       }))
@@ -658,6 +715,16 @@ export class WorkBuddyEntitlementGovernor {
     const now = Date.now()
     if (signal?.aborted) return Promise.reject(new AdmissionError(499, 0, "generation canceled before admission", "cancel"))
 
+    // An auth_forbidden quarantine is account-level and trumps per-model
+    // state: Tencent rejected the whole account, not this request.
+    this.expireForbidden(now)
+    if (this.state === "ACCOUNT_FORBIDDEN") {
+      const ra = Math.max(1, Math.ceil((this.forbiddenUntil - now) / 1000))
+      return Promise.reject(
+        new AdmissionError(403, ra, `WorkBuddy has restricted this account (auth_forbidden); next probe in ${ra}s`, "forbidden"),
+      )
+    }
+
     // A learned promotional limit blocks only this account+model bucket.
     if (!this.canAdmitModel(model, now)) {
       const runtime = this.runtimeFor(model)
@@ -770,11 +837,25 @@ export class WorkBuddyEntitlementGovernor {
         if (opts.signal?.aborted) throw new AdmissionError(499, 0, "generation canceled", "cancel")
         const plan = planGeneration({ credExpired: opts.isExpired(), first, refreshedThisGeneration })
         if (plan.refreshBeforeAttempt) {
-          const ok = await opts.refresh()
+          const refreshed = await opts.refresh()
           refreshedThisGeneration = true
           if (opts.signal?.aborted) throw new AdmissionError(499, 0, "generation canceled", "cancel")
-          if (!ok && first && (first.status === 401 || first.status === 403)) {
-            this.state = "AUTH_INVALID"
+          if (!refreshed.ok && first && (first.status === 401 || first.status === 403)) {
+            // The first attempt was rejected and refresh did not produce a
+            // usable token; `res` is that first response. Only a refresh the
+            // backend *rejected* (401/403 on X-Refresh-Token) is definitive
+            // evidence of a dead credential — a transient refresh failure
+            // (network/5xx/timeout/no refresh token) must not be persisted as
+            // AUTH_INVALID. Auth_forbidden was already quarantined by
+            // observe(), and validation rejections never poison.
+            const secondRaw = res ? await safeBody(res) : ""
+            const secondCode = parseErrorCode(secondRaw)
+            this.lastAuthFailure = {
+              at: Date.now(),
+              status: res?.status ?? first.status,
+              ...(secondCode !== undefined ? { code: secondCode } : {}),
+            }
+            if (refreshed.rejected && !isValidationError(secondRaw) && !isAccountForbidden(secondRaw)) this.setState("AUTH_INVALID")
             this.failed++
             return { res: res!, committed: false, lease: { release: releaseLease } }
           }
@@ -786,7 +867,9 @@ export class WorkBuddyEntitlementGovernor {
         if (outcome.ok) {
           this.committed++
           if (refreshedThisGeneration) this.authRecoveries++
-          if (this.state === "AUTH_INVALID") this.state = "READY"
+          // A real generation is the only thing that can refute a chat-level
+          // account restriction or a dead-token verdict.
+          if (this.state === "AUTH_INVALID" || this.state === "ACCOUNT_FORBIDDEN") this.clearLearnedBlocks()
           this.relievePressure()
           // The lease remains active until the caller drains or cancels the body.
           if (res.body) {
@@ -798,7 +881,23 @@ export class WorkBuddyEntitlementGovernor {
         }
         if (res.status === 401 || res.status === 403) {
           if (refreshedThisGeneration) {
-            this.state = "AUTH_INVALID"
+            const raw = await safeBody(res)
+            const code = parseErrorCode(raw)
+            // observe() already quarantined an auth_forbidden account; a
+            // thinking-echo validation rejection never poisons state.
+            if (!isAccountForbidden(raw)) {
+              this.lastAuthFailure = { at: Date.now(), status: res.status, ...(code !== undefined ? { code } : {}) }
+              if (!isValidationError(raw)) this.setState("AUTH_INVALID")
+            }
+            this.failed++
+            return { res: res!, committed: false, lease: { release: releaseLease } }
+          }
+          // Fail fast on rejections a refresh cannot fix: an auth_forbidden
+          // account needs the Tencent restriction lifted (verified live: a
+          // refreshed token pair still gets 11140), and a validation
+          // rejection needs a different body. Retrying would only double it.
+          const firstRaw = await safeBody(res)
+          if (isAccountForbidden(firstRaw) || isValidationError(firstRaw)) {
             this.failed++
             return { res: res!, committed: false, lease: { release: releaseLease } }
           }
@@ -824,6 +923,14 @@ export class WorkBuddyEntitlementGovernor {
     if (outcome.status === 429) {
       const raw = await safeBody(res)
       const code = parseErrorCode(raw)
+      // Balance exhaustion (14018 et al.) arrives wrapped in HTTP 429 but is
+      // `quota_balance_exhausted` in the official taxonomy — it must not fall
+      // into the transient cooldown path and hammer the gateway.
+      if (isBalanceExhausted(raw)) {
+        this.limitedEpoch = this.limitedEpoch ?? "unknown-enrollment"
+        this.setState("QUOTA_EXHAUSTED")
+        return
+      }
       const resetAt = parseResetAt(raw, retryAfter)
       const isHardFrequency = code === 6000 || code === 6004 || /usage exceeds frequency limit|frequency window limit/i.test(raw)
       if (isHardFrequency && code !== 14003 && resetAt) {
@@ -864,7 +971,21 @@ export class WorkBuddyEntitlementGovernor {
       this.state = "UPSTREAM_DEGRADED"
       this.applyPressure()
     } else if (outcome.status === 401 || outcome.status === 403) {
-      this.state = "AUTH_INVALID"
+      const raw = await safeBody(res)
+      const code = parseErrorCode(raw)
+      // auth_forbidden (11140/11142) is account-scoped per the official
+      // taxonomy and cannot be cleared by refreshing — quarantine it.
+      if (isAccountForbidden(raw)) {
+        this.markAccountForbidden(code)
+        return
+      }
+      // Otherwise record the diagnostic only. The AUTH_INVALID verdict is
+      // deliberately deferred to runGeneration's terminal branches, which
+      // know whether a refresh was attempted and whether the backend
+      // *rejected* it: a 401 followed by a transient refresh failure must
+      // leave the account READY, and thinking-echo validation rejections
+      // never poison it at all.
+      this.lastAuthFailure = { at: Date.now(), status: outcome.status, ...(code !== undefined ? { code } : {}) }
     }
   }
 
@@ -873,16 +994,79 @@ export class WorkBuddyEntitlementGovernor {
     this.packageCreditsRemaining = Number.isFinite(remaining) ? Math.max(0, remaining) : null
   }
 
+  /**
+   * Clear a learned AUTH_INVALID after the credential was explicitly
+   * re-enrolled or healed from the desktop login. Ordinary bearer rotation
+   * does not call this — only a deliberate user action does. Note the session
+   * endpoint (`/v2/plugin/accounts`) still answers 200 for a *forbidden*
+   * account, so proactive validation must use this method — not
+   * `clearLearnedBlocks` — or it would lift the chat-level quarantine.
+   */
+  clearAuthInvalid() {
+    if (this.state === "AUTH_INVALID") this.setState("READY")
+    this.lastAuthFailure = null
+  }
+
+  /**
+   * Quarantine this account after Tencent classified the chat service as
+   * `auth_forbidden` (codes 11140/11142). Time-boxed: after the cooldown the
+   * account gets one fresh probe, because the restriction may be lifted.
+   */
+  markAccountForbidden(code?: number) {
+    this.forbiddenUntil = Date.now() + this.forbiddenCooldownMs
+    if (code !== undefined) this.lastAuthFailure = { at: Date.now(), status: 403, code }
+    this.setState("ACCOUNT_FORBIDDEN")
+  }
+
+  /** True while the account is inside the auth_forbidden quarantine window. */
+  isAccountForbidden(now = Date.now()): boolean {
+    this.expireForbidden(now)
+    return this.state === "ACCOUNT_FORBIDDEN"
+  }
+
+  private expireForbidden(now: number): boolean {
+    if (this.state !== "ACCOUNT_FORBIDDEN") return false
+    if (now < this.forbiddenUntil) return false
+    this.forbiddenUntil = 0
+    this.setState("READY")
+    return true
+  }
+
+  /**
+   * Clear every learned account block after a deliberate re-authorization
+   * (re-enroll, explicit desktop import, desktop heal) or after a generation
+   * actually succeeds. A fresh credential deserves a fresh chance, and only a
+   * real generation can refute a chat-level restriction.
+   */
+  clearLearnedBlocks() {
+    this.forbiddenUntil = 0
+    if (this.state === "AUTH_INVALID" || this.state === "ACCOUNT_FORBIDDEN") this.setState("READY")
+    this.lastAuthFailure = null
+  }
+
+  /**
+   * Record a verified true-auth failure and persist it. This is the single
+   * producer for learned AUTH_INVALID outside the generation retry path
+   * (used by proactive validation). Account-forbidden codes never reach this
+   * method — they have their own quarantine (`markAccountForbidden`).
+   */
+  markAuthInvalid(status: number, code?: number) {
+    this.lastAuthFailure = { at: Date.now(), status, ...(code !== undefined ? { code } : {}) }
+    this.setState("AUTH_INVALID")
+  }
+
   /** True unless we have POSITIVE evidence the account's package balance is at 0. */
   hasKnownCredits(): boolean {
     return this.packageCreditsRemaining === null || this.packageCreditsRemaining > 0
   }
 
   metrics() {
+    this.expireForbidden(Date.now())
     const reports = this.modelReports()
     return {
       state: this.state,
       resetAt: this.resetAt ?? null,
+      forbiddenUntil: this.forbiddenUntil || null,
       maxConcurrent: this.maxConcurrent,
       launchPerSec: Number(this.launchPerSec.toFixed(2)),
       active: this.active,
@@ -896,6 +1080,8 @@ export class WorkBuddyEntitlementGovernor {
       amplification: this.generations ? Number((this.attempts / this.generations).toFixed(3)) : 1,
       cooldownUntil: this.cooldownUntil,
       hardLimited: this.state === "QUOTA_EXHAUSTED",
+      authInvalid: this.state === "AUTH_INVALID",
+      lastAuthFailure: this.lastAuthFailure,
       packageCreditsRemaining: this.packageCreditsRemaining,
       models: Object.fromEntries(reports.map((report) => [report.model, report])),
     }

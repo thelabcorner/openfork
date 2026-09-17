@@ -1,8 +1,18 @@
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
 import type { Model } from "@opencode-ai/sdk/v2"
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "http"
-import { randomBytes } from "crypto"
-import { AdmissionError, type RunGenerationOpts } from "./workbuddy-governor"
+import { createHash, randomBytes } from "crypto"
+import { AdmissionError, type RefreshResult, type RunGenerationOpts } from "./workbuddy-governor"
+import { workBuddyClientHeaders, workBuddyUserAgent } from "./workbuddy-identity"
+import {
+  isAccountForbidden,
+  isBalanceExhausted,
+  isValidationError,
+  parseErrorCode,
+  parseErrorMessage,
+  WORKBUDDY_REQUEST_ILLEGAL_CODE,
+  WORKBUDDY_THINKING_ROUNDTRIP_CODE,
+} from "./workbuddy-model-entitlement"
 import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
 import {
   AccountRegistry,
@@ -31,15 +41,33 @@ export function setTestBackend(url: string | undefined) {
  * The local proxy hop is the user's own machine. It must NEVER be routed through
  * an HTTP(S) proxy (some environments set HTTP_PROXY/HTTPS_PROXY globally, and
  * undici will otherwise send 127.0.0.1 traffic through it, breaking the loopback
- * listener). Ensure loopback hosts are exempt from any proxy in the environment.
+ * listener).
+ *
+ * Gateway hosts are included for parity with the official client: its
+ * `CommonHeaderHttpInterceptor` sets `proxy = false` on every REST call, so
+ * WorkBuddy traffic never traverses an environment proxy. Routing ours through
+ * one would both change the egress IP seen by Tencent and hand a third-party
+ * proxy the request metadata for no benefit.
  */
 function ensureLoopbackProxyBypass() {
-  const loopback = ["127.0.0.1", "localhost", "[::1]"]
+  const hosts = [
+    "127.0.0.1",
+    "localhost",
+    "[::1]",
+    "www.workbuddy.ai",
+    "staging.workbuddy.ai",
+    "www.workbuddy.cn",
+    "www.codebuddy.cn",
+    "www.codebuddy.ai",
+    "copilot.tencent.com",
+    "staging-copilot.tencent.com",
+    "staging-codebuddy.tencent.com",
+  ]
   for (const key of ["no_proxy", "NO_PROXY"]) {
     const cur = process.env[key]
     const set = new Set((cur ?? "").split(",").map((s) => s.trim()).filter(Boolean))
     let changed = false
-    for (const h of loopback) if (!set.has(h)) { set.add(h); changed = true }
+    for (const h of hosts) if (!set.has(h)) { set.add(h); changed = true }
     if (changed) process.env[key] = [...set].join(",")
   }
 }
@@ -99,7 +127,13 @@ export function resetWorkBuddyProfile() { wbProfileData.clear() }
 
 const PROVIDER_ID = "workbuddy"
 const NPM = "@ai-sdk/openai-compatible"
-const USER_AGENT = "codebuddy2openai/2.0"
+/**
+ * Official desktop user agent (see workbuddy-identity.ts). The previous
+ * self-branded `codebuddy2openai/2.0` string was the loudest
+ * "third-party reverse proxy" signal we emitted; the composed first-party UA
+ * is also accepted by the `/v3/config` gate (verified live 2026-09-16).
+ */
+const USER_AGENT = workBuddyUserAgent()
 const REQUEST_TIMEOUT_MS = 5 * 60_000
 const DISCOVERY_TTL_MS = 5 * 60_000
 
@@ -157,16 +191,16 @@ async function ensureExtraServer(port: number, token: string): Promise<void> {
  *
  * The endpoint is User-Agent gated. A generic UA is answered with a trimmed
  * payload containing only `enterpriseId` and a couple of feature flags and NO
- * models; the CLI's own `workbuddy-ai/<version>` UA returns the full product
- * configuration (`data.models` + `data.agents`). Discovery therefore has to
- * present that UA or it silently gets an empty catalog.
+ * models; a first-party UA returns the full product configuration
+ * (`data.models` + `data.agents`). Discovery therefore has to present the
+ * desktop's own composed UA (see workbuddy-identity.ts), verified live
+ * 2026-09-16 to return the full catalog.
  *
  * The previous `/console/enterprises/personal/models` path was never a real
  * route - it 500s at the gateway - which is why OpenFork fell back to a
  * hardcoded list that drifted from what the app shows.
  */
 const CONFIG_PATH = "/v3/config"
-const CATALOG_USER_AGENT = "workbuddy-ai/5.4.2"
 
 /**
  * Realm routing is driven by the credential's own `auth.domain`.
@@ -306,67 +340,174 @@ function isExpired(cred: Credential): boolean {
   return cred.expiresAt > 0 && Date.now() >= cred.expiresAt - 60_000
 }
 
-/** Headers for an upstream call. Never log the result of this function. */
-function upstreamHeaders(cred: Credential, extra?: Record<string, string>): Record<string, string> {
+/** Headers for an upstream POST. Never log the result of this function. */
+export function upstreamHeaders(cred: Credential, extra?: Record<string, string>): Record<string, string> {
   return {
     "Content-Type": "application/json",
-    Accept: "application/json",
+    Accept: "application/json, text/plain, */*",
     Authorization: `Bearer ${cred.accessToken}`,
-    "X-User-Id": cred.uid,
-    "X-Enterprise-Id": cred.enterpriseId,
-    "X-Tenant-Id": cred.enterpriseId,
-    "X-Domain": cred.domain,
+    ...(cred.uid ? { "X-User-Id": cred.uid } : {}),
+    // The official client omits identity headers when the value is empty;
+    // sending `X-Enterprise-Id: ""` was a gratuitous anomaly.
+    ...(cred.enterpriseId ? { "X-Enterprise-Id": cred.enterpriseId, "X-Tenant-Id": cred.enterpriseId } : {}),
+    ...(cred.domain ? { "X-Domain": cred.domain } : {}),
     "User-Agent": USER_AGENT,
+    ...workBuddyClientHeaders(),
     ...extra,
+  }
+}
+
+/** GET variant: no body, so no Content-Type (official clients omit it). */
+export function upstreamGetHeaders(cred: Credential, extra?: Record<string, string>): Record<string, string> {
+  const headers = upstreamHeaders(cred, extra)
+  delete headers["Content-Type"]
+  return headers
+}
+
+/** Random UUID-shaped value derived from a seed. */
+function deterministicUuid(seed: string): string {
+  const bytes = createHash("sha1").update(seed).digest("hex").slice(0, 32).split("")
+  bytes[12] = "5"
+  bytes[16] = ((parseInt(bytes[16]!, 16) & 0x3) | 0x8).toString(16)
+  const hex = bytes.join("")
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`
+}
+
+/**
+ * `X-Request-ID`, exactly as the official `CommonHeaderHttpInterceptor`
+ * stamps it on every REST call (32 hex chars; falls back to the trace id when
+ * one exists). `X-Trace-ID` is deliberately NOT sent: the official client only
+ * adds it when a real trace context is active, and fabricating one would claim
+ * tracing participation we do not have.
+ */
+export function upstreamTraceHeaders(): Record<string, string> {
+  return { "X-Request-ID": randomBytes(16).toString("hex") }
+}
+
+/**
+ * Conversation-lifecycle headers every official model request carries
+ * (`X-Conversation-ID`, `X-Conversation-Request-ID`,
+ * `X-Conversation-Message-ID`, `X-Request-ID`, `X-Agent-Intent`,
+ * `X-Agent-Type`). The official client generates these locally from its
+ * session/message UUIDs, so ours follow the same scheme: conversation
+ * identity is stable per (account, OpenCode session), message identity per
+ * request.
+ */
+export function upstreamConversationHeaders(accountId: string, session: string): Record<string, string> {
+  const messageId = randomBytes(16).toString("hex")
+  return {
+    "X-Conversation-ID": deterministicUuid(`${accountId}:${session}`),
+    "X-Conversation-Request-ID": deterministicUuid(`${accountId}:${session}:${messageId}`),
+    "X-Conversation-Message-ID": messageId,
+    "X-Request-ID": messageId,
+    "X-Agent-Intent": "craft",
+    "X-Agent-Type": "main",
   }
 }
 
 // --- refresh (singleflight, account-local) ----------------------------------
 
-const refreshInflight = new Map<string, Promise<boolean>>()
+/**
+ * Result of one credential re-auth attempt against Tencent's refresh endpoint.
+ *
+ * `rejected` is deliberately distinct from `transient`: the backend answered
+ * 401/403 on `X-Refresh-Token`, which means the saved refresh token is dead.
+ * Network/5xx/timeout failures must never be persisted as AUTH_INVALID — that
+ * is how a network blip becomes a phantom sign-out.
+ */
+export type AccountRefreshOutcome = "refreshed" | "rejected" | "transient" | "unavailable"
 
-async function refresh(account: WorkBuddyAccount): Promise<boolean> {
+const refreshInflight = new Map<string, Promise<AccountRefreshOutcome>>()
+
+/**
+ * Headers for the refresh call, mirroring the official client exactly
+ * (`cli/dist/codebuddy.js`, `AccountScopedExternalLinkAuthenticationProvider
+ * .refreshSession`): X-Domain + X-Refresh-Token + X-Auth-Refresh-Source and
+ * NO `Authorization`. The stale bearer is the thing being replaced; sending
+ * it can trip the backend's own 401 gate before X-Refresh-Token is read.
+ */
+function refreshHeaders(cred: Credential): Record<string, string> {
+  const headers = upstreamHeaders(cred, {
+    "X-Refresh-Token": cred.refreshToken,
+    "X-Auth-Refresh-Source": "plugin",
+    ...upstreamTraceHeaders(),
+  })
+  // The stale bearer is the thing being replaced; the official client never
+  // sends Authorization on refresh.
+  delete headers.Authorization
+  return headers
+}
+
+/**
+ * Renew this account's access token from its saved refresh token, persisting
+ * the rotated pair to the OpenFork vault. The desktop `.info` file is never
+ * written. Failure classification follows the official client's own mapping
+ * (`isAuthenticationInvalidError`): 401/403 on the refresh call is the only
+ * "rejected" verdict; everything else is transient.
+ */
+async function refresh(account: WorkBuddyAccount): Promise<AccountRefreshOutcome> {
   const cred = account.credential
-  if (!cred.refreshToken) return false
+  // The official WorkBuddy platform treats "no refresh token" as a valid
+  // state (ApiKey-style credentials) and skips token renewal entirely.
+  if (!cred.refreshToken) return "unavailable"
+  let res: Response
   try {
-    const res = await fetch(`${backendFor(cred)}/v2/plugin/auth/token/refresh`, {
+    res = await fetch(`${backendFor(cred)}/v2/plugin/auth/token/refresh`, {
       method: "POST",
-      headers: upstreamHeaders(cred, {
-        "X-Refresh-Token": cred.refreshToken,
-        "X-Auth-Refresh-Source": "plugin",
-      }),
+      headers: refreshHeaders(cred),
       body: "{}",
       signal: AbortSignal.timeout(20_000),
     })
-    if (!res.ok) return false
-    const body = (await res.json()) as any
-    const token = body?.data?.accessToken
-    if (typeof token !== "string" || !token) return false
-    cred.accessToken = token
-    if (typeof body?.data?.refreshToken === "string" && body.data.refreshToken) {
-      cred.refreshToken = body.data.refreshToken
-    }
-    if (typeof body?.data?.expiresIn === "number" && body.data.expiresIn > 0) {
-      cred.expiresAt = Date.now() + body.data.expiresIn * 1000
-    }
-    // The OpenFork vault, not the desktop .info file, owns this account's
-    // refresh-token lifecycle. This prevents the next registry scan from
-    // replacing a fresh in-memory token with stale desktop contents.
-    accountRegistry.persistCredential(account)
-    return true
   } catch {
-    return false
+    return "transient"
   }
+  if (res.status === 401 || res.status === 403) return "rejected"
+  if (!res.ok) return "transient"
+  const body = (await res.json().catch(() => undefined)) as any
+  const token = body?.data?.accessToken
+  // A 200 without a token is not evidence the refresh token is dead (the
+  // official client raises a SignError here, not UnauthorizedError).
+  if (typeof token !== "string" || !token) return "transient"
+  cred.accessToken = token
+  if (typeof body?.data?.refreshToken === "string" && body.data.refreshToken) {
+    cred.refreshToken = body.data.refreshToken
+  }
+  if (typeof body?.data?.expiresIn === "number" && body.data.expiresIn > 0) {
+    cred.expiresAt = Date.now() + body.data.expiresIn * 1000
+  }
+  // The OpenFork vault, not the desktop .info file, owns this account's
+  // refresh-token lifecycle. This prevents the next registry scan from
+  // replacing a fresh in-memory token with stale desktop contents.
+  accountRegistry.persistCredential(account)
+  return "refreshed"
 }
 
 /** Singleflight: concurrent generations share one refresh for ONE account. */
-function singleflightRefresh(account: WorkBuddyAccount): Promise<boolean> {
+function singleflightRefresh(account: WorkBuddyAccount): Promise<AccountRefreshOutcome> {
   const key = account.id
   const existing = refreshInflight.get(key)
   if (existing) return existing
   const p = refresh(account).finally(() => refreshInflight.delete(key))
   refreshInflight.set(key, p)
   return p
+}
+
+/**
+ * The plugin's single owner for automatic credential re-auth: every refresh
+ * consumer collapses onto one upstream call per account, and the vault always
+ * reflects the token the transports observe. A refresh token the backend has
+ * rejected cannot be renewed programmatically — Tencent's login is an
+ * interactive browser OAuth state flow — so that case is surfaced as a clear
+ * error and the explicit "Add WorkBuddy account" / desktop-import actions stay
+ * the user-facing recovery path.
+ */
+export function reauthenticateAccount(account: WorkBuddyAccount): Promise<AccountRefreshOutcome> {
+  return singleflightRefresh(account)
+}
+
+/** Governor-facing adapter: transient failures never imply a rejected token. */
+function toRefreshResult(outcome: AccountRefreshOutcome): RefreshResult {
+  return outcome === "refreshed" ? { ok: true } : { ok: false, rejected: outcome === "rejected" }
 }
 
 // ------------------------------------------------------------------- sse / quirks
@@ -491,40 +632,223 @@ function completionFrom(acc: Accumulated, requestedModel: string) {
 }
 
 // --------------------------------------------------------------- error semantics
+//
+// Tencent's numeric `code` is authoritative; the HTTP status is transport.
+// Classification follows the official client's own taxonomy
+// (cli/dist/codebuddy.js `classifyErrorDetail`): 11140/11142 are
+// `auth_forbidden` (account-level restriction, HTTP 403), 401 is
+// `auth_expired`, and 11155 is a request-shape validation rejection (HTTP
+// 400). 11140 is NOT request-shaped: live bisection 2026-09-16 showed an
+// affected account failing every model — including a minimal system+user
+// body — while other accounts succeeded with identical requests, and a
+// freshly refreshed token pair still received 11140. Branching on HTTP
+// status alone would misclassify it either as "not authorized" (wrong: the
+// session endpoint answers 200) or as an illegal body (wrong: only switching
+// account or clearing the Tencent restriction helps). Every branch below
+// therefore checks the Tencent code FIRST.
 
-type UpstreamFailure = { status: number; code?: string; message: string }
+type UpstreamFailure = { status: number; code?: number; message: string; raw: string }
 
-function classify(status: number, raw: string): UpstreamFailure {
-  const code = raw.match(/"code"\s*:\s*("?\d+"?)/)?.[1]?.replace(/"/g, "")
-  const message = raw.match(/"msg"\s*:\s*"([^"]{0,200})"/)?.[1]
-  return { status, code, message: message ?? `upstream returned HTTP ${status}` }
+export function classify(status: number, raw: string): UpstreamFailure {
+  return {
+    status,
+    code: parseErrorCode(raw),
+    message: parseErrorMessage(raw, `upstream returned HTTP ${status}`),
+    raw,
+  }
+}
+
+export type WorkBuddyErrorContext = {
+  /** Disambiguated account label (nickname/email) when the failing account is known. */
+  accountLabel?: string
+  /** Stable account id tail for disambiguation when nicknames collide. */
+  accountId?: string
+  /** Bare upstream model id (account suffix and #ctx- alias already stripped). */
+  model?: string
+  /** True when a token refresh was attempted for this generation and failed. */
+  refreshAttempted?: boolean
 }
 
 /** Map backend conditions onto distinct OpenCode-relevant classes. */
-function toClientError(failure: UpstreamFailure): { status: number; body: any } {
-  const detail = failure.code ? `[${failure.code}] ${failure.message}` : failure.message
-  if (failure.status === 401 || failure.status === 403) {
+export function toClientError(
+  failure: UpstreamFailure,
+  ctx: WorkBuddyErrorContext = {},
+): { status: number; body: any } {
+  const detail = failure.code !== undefined ? `[${failure.code}] ${failure.message}` : failure.message
+  const account = ctx.accountLabel ?? (ctx.accountId ? `account …${ctx.accountId.slice(-4)}` : "this account")
+  const model = ctx.model ? ` for model ${ctx.model}` : ""
+  if (isAccountForbidden(failure.raw)) {
     return {
-      status: 401,
-      body: { error: { message: `WorkBuddy session is not authorized. Open the WorkBuddy desktop app and confirm you are signed in. ${detail}`, type: "authentication_error" } },
+      status: 403,
+      body: {
+        error: {
+          message:
+            `WorkBuddy has restricted ${account} (code ${failure.code ?? WORKBUDDY_REQUEST_ILLEGAL_CODE}, auth_forbidden)${model}. ` +
+            `This is a Tencent-side account restriction, not a request or token problem — verified live: the account fails ` +
+            `every model (even a minimal request) while other signed-in accounts succeed, and re-authenticating does not clear it. ` +
+            `Switch to another account (model@wb-…) or contact WorkBuddy support about the restriction. ${detail}`,
+          type: "account_forbidden",
+        },
+      },
     }
   }
-  if (failure.status === 402 || /insufficient credit|积分不足|credit/i.test(failure.message)) {
+  if (failure.code === WORKBUDDY_THINKING_ROUNDTRIP_CODE || (/reasoning_content/i.test(failure.raw) && /thinking mode/i.test(failure.raw))) {
+    return {
+      status: 400,
+      body: {
+        error: {
+          message:
+            `WorkBuddy requires the previous turn's reasoning to be echoed back in thinking mode (code 11155)${model} on ${account}. ` +
+            `OpenFork repairs history automatically before forwarding — if you see this, the previous turn genuinely ` +
+            `carried no reasoning (e.g. a reason-free tool-call turn) or history was rewritten mid-session ` +
+            `(model switch, compaction). ${detail} Retry the turn; if it persists on a thinking model, report the ` +
+            `model id and whether the previous turn used tools.`,
+          type: "invalid_request_error",
+        },
+      },
+    }
+  }
+  if (failure.status === 401 || failure.status === 403) {
+    const refreshNote = ctx.refreshAttempted
+      ? "A token refresh was attempted and failed — OpenFork's saved vault token for this account is stale. "
+      : ""
+    return {
+      status: 401,
+      body: {
+        error: {
+          message:
+            `WorkBuddy session is not authorized for ${account}${model}. ${refreshNote}${detail} ` +
+            `Re-enroll that account ("Add WorkBuddy account") or run "Import current WorkBuddy desktop login", then retry. ` +
+            `Opening the desktop app alone does not refresh OpenFork's saved vault token.`,
+          type: "authentication_error",
+        },
+      },
+    }
+  }
+  if (failure.status === 402 || isBalanceExhausted(failure.raw) || /insufficient credit|积分不足|credit/i.test(failure.message)) {
     return {
       status: 402,
-      body: { error: { message: `WorkBuddy credits exhausted for this account. ${detail}`, type: "quota_exceeded" } },
+      body: { error: { message: `WorkBuddy credits exhausted for ${account}${model}. ${detail}`, type: "quota_exceeded" } },
     }
   }
   if (failure.status === 429) {
-    return { status: 429, body: { error: { message: `WorkBuddy rate limit reached. ${detail}`, type: "rate_limit_error" } } }
+    return { status: 429, body: { error: { message: `WorkBuddy rate limit reached for ${account}${model}. ${detail}`, type: "rate_limit_error" } } }
   }
   if (/model \[.*\](service info|not found|is invalid)|service info/i.test(failure.message)) {
-    return { status: 404, body: { error: { message: `Model is not available on this WorkBuddy account. ${detail}`, type: "model_not_found" } } }
+    return { status: 404, body: { error: { message: `Model${ctx.model ? ` ${ctx.model}` : ""} is not available on ${account}. ${detail}`, type: "model_not_found" } } }
   }
   if (failure.status >= 500) {
-    return { status: 502, body: { error: { message: `WorkBuddy upstream failure. ${detail}`, type: "upstream_error" } } }
+    return { status: 502, body: { error: { message: `WorkBuddy upstream failure for ${account}${model}. ${detail}`, type: "upstream_error" } } }
   }
-  return { status: failure.status || 502, body: { error: { message: `WorkBuddy request failed. ${detail}`, type: "upstream_error" } } }
+  return { status: failure.status || 502, body: { error: { message: `WorkBuddy request failed for ${account}${model}. ${detail}`, type: "upstream_error" } } }
+}
+
+/**
+ * Build the Tencent `/v2/chat/completions` body.
+ *
+ * Tencent's validator is strict (it rejects non-streaming with 11101 and a
+ * missing leading system message with 11128). Only fields proven against the
+ * live backend by the probe scripts (`script/probe-*.mjs`: model, messages,
+ * stream, stream_options, max_tokens, tools, tool_choice) plus the standard
+ * OpenAI sampling fields are forwarded. Everything else the AI SDK may send —
+ * `reasoning_effort`, `response_format`, `user`, and OpenFork's own
+ * `context_window_tokens` routing hint (`#ctx-` alias) — is deliberately
+ * dropped; context selection stays a client-side `limit.context` on the
+ * exposed Model and never goes on the wire.
+ */
+const UPSTREAM_PASSTHROUGH = [
+  "tools",
+  "tool_choice",
+  "temperature",
+  "top_p",
+  "stop",
+  "presence_penalty",
+  "frequency_penalty",
+  "max_tokens",
+  "max_completion_tokens",
+] as const
+
+export function buildUpstreamBody(payload: any, messages: any[], requestedModel: string): Record<string, unknown> {
+  const body: Record<string, unknown> = {
+    model: requestedModel,
+    messages,
+    // Non-streaming is rejected upstream, so always stream and fold if needed.
+    stream: true,
+    stream_options: { include_usage: true },
+  }
+  for (const key of UPSTREAM_PASSTHROUGH) {
+    if (payload?.[key] !== undefined) body[key] = payload[key]
+  }
+  return body
+}
+
+// -------------------------------------------- thinking-mode history repair (11155)
+//
+// Tencent requires the previous turn's `reasoning_content` to be echoed back
+// whenever the conversation is in thinking mode (code 11155; mirrors
+// DeepSeek's echo requirement — QwenLM/qwen-code#3579, Tencent ask/2211416,
+// where the field is specifically lost around tool-call turns). The standard
+// chain preserves it (stored reasoning part -> AI SDK `reasoning_content` ->
+// verbatim forward), but three shapes arrive without it and would 11155:
+//
+//   1. tool-call turns the model answered with no thinking text (no
+//      `reasoning_content` was ever produced, yet thinking mode is on);
+//   2. history rewritten mid-session (model/account switch degrades reasoning
+//      to text in `toModelMessagesEffect`'s differentModel path; compaction
+//      summaries never had thinking);
+//   3. exotic clients sending the thinking under a non-canonical key.
+//
+// The proxy owns the Tencent translation, so it repairs here — one point,
+// downstream of every core path — instead of touching the shared core
+// projection every provider relies on. The repair is strictly additive and
+// gated on positive thinking-mode evidence, so non-thinking traffic is
+// byte-identical to before.
+
+/** True when the catalog marks this bare model id as a reasoning model. */
+export function isReasoningModel(modelId: string): boolean {
+  const id = modelId.toLowerCase()
+  for (const cache of discoveryCache.values()) {
+    for (const entry of cache.catalog) {
+      if (entry.id.toLowerCase() === id && entry.reasoning) return true
+    }
+  }
+  for (const entry of [...GLOBAL_CATALOG, ...CN_CATALOG]) {
+    if (entry.id.toLowerCase() === id && entry.reasoning) return true
+  }
+  return false
+}
+
+/** Test-only: prime the live-catalog side of `isReasoningModel`. */
+export function setDiscoveryCacheForTest(accountId: string, catalog: CatalogEntry[]): void {
+  discoveryCache.set(accountId, { at: Date.now(), catalog })
+}
+
+/**
+ * Positive thinking-mode evidence: some assistant turn already carries
+ * `reasoning_content`, or the requested model is a known reasoning model.
+ * Both directions matter — the echo case (1) and the thinker-with-silent-
+ * history case (2) above.
+ */
+export function detectThinkingMode(messages: any[], requestedModel: string): boolean {
+  if (isReasoningModel(requestedModel)) return true
+  return messages.some(
+    (m) => m?.role === "assistant" && typeof m?.reasoning_content === "string",
+  )
+}
+
+/**
+ * Ensure every assistant message carries `reasoning_content`. Existing values
+ * are preserved byte-identical (never rewritten); a non-canonical `reasoning`
+ * string is adopted when present; otherwise the field defaults to `""`.
+ * Non-assistant messages and message order are untouched, so the 11128
+ * system-first invariant cannot shift.
+ */
+export function repairHistoryForThinking(messages: any[]): any[] {
+  return messages.map((m) => {
+    if (!m || m.role !== "assistant" || typeof m.reasoning_content === "string") return m
+    const adopted = typeof (m as any).reasoning === "string" ? (m as any).reasoning : ""
+    return { ...m, reasoning_content: adopted }
+  })
 }
 
 // ------------------------------------------------------------------ http server
@@ -583,9 +907,27 @@ const discoveryCache = new Map<string, { at: number; catalog: CatalogEntry[] }>(
  * `workbuddy-ai/<version>` UA or it answers with a payload that has no models.
  */
 async function discoverCatalog(cred: Credential): Promise<CatalogEntry[] | null> {
+  return (await discoverCatalogDetailed(cred)).entries
+}
+
+/**
+ * Catalog discovery that also reports whether every attempted source rejected
+ * the credential (401/403) as opposed to merely failing (network, 5xx, empty
+ * payload). The boolean is the demand-driven auth signal consumed by
+ * `catalogFor` → `validateAccountAuth`: no new probe endpoint, no timers, no
+ * generation entitlement burned.
+ */
+async function discoverCatalogDetailed(cred: Credential): Promise<{
+  entries: CatalogEntry[] | null
+  unauthorized: boolean
+}> {
   // Parallelize the two catalog sources - worst-case 15s not 30s
   const [fromConfig, fromEnterprise] = await Promise.all([discoverFromConfig(cred), discoverFromEnterprise(cred)])
-  return fromConfig ?? fromEnterprise
+  const attempted = cred.enterpriseId ? [fromConfig, fromEnterprise] : [fromConfig]
+  return {
+    entries: fromConfig.entries ?? fromEnterprise.entries,
+    unauthorized: attempted.length > 0 && attempted.every((source) => source.unauthorized),
+  }
 }
 
 /**
@@ -770,18 +1112,21 @@ function familyFor(id: string, vendor?: unknown): string {
   return "unknown"
 }
 
+/** One catalog source fetch: entries on success, plus whether auth rejected it. */
+type ConfigSourceResult = { entries: CatalogEntry[] | null; unauthorized: boolean }
+
 /** Primary source: the product configuration the WorkBuddy app itself uses. */
-async function discoverFromConfig(cred: Credential): Promise<CatalogEntry[] | null> {
+async function discoverFromConfig(cred: Credential): Promise<ConfigSourceResult> {
   try {
     const res = await fetch(`${backendFor(cred)}${CONFIG_PATH}`, {
       // The UA is the gate: without the CLI's own UA this returns no models.
-      headers: upstreamHeaders(cred, { "User-Agent": CATALOG_USER_AGENT }),
+      headers: upstreamGetHeaders(cred),
       signal: AbortSignal.timeout(15_000),
     })
-    if (!res.ok) return null
-    return parseConfigPayload((await res.json()) as any)
+    if (!res.ok) return { entries: null, unauthorized: res.status === 401 || res.status === 403 }
+    return { entries: parseConfigPayload((await res.json()) as any), unauthorized: false }
   } catch {
-    return null
+    return { entries: null, unauthorized: false }
   }
 }
 
@@ -789,22 +1134,127 @@ async function discoverFromConfig(cred: Credential): Promise<CatalogEntry[] | nu
  * Secondary source, used only for enterprise accounts. The CLI layers this over
  * the global config when the credential carries an enterpriseId.
  */
-async function discoverFromEnterprise(cred: Credential): Promise<CatalogEntry[] | null> {
+async function discoverFromEnterprise(cred: Credential): Promise<ConfigSourceResult> {
   const enterpriseId = cred.enterpriseId
-  if (!enterpriseId) return null
+  // Not attempted (no enterprise) is NOT unauthorized — the combiner in
+  // discoverCatalogDetailed only counts attempted sources.
+  if (!enterpriseId) return { entries: null, unauthorized: false }
   try {
     const res = await fetch(
       `${backendFor(cred)}/console/enterprises/${encodeURIComponent(enterpriseId)}/config/models`,
       {
-        headers: upstreamHeaders(cred, { "User-Agent": CATALOG_USER_AGENT }),
+        headers: upstreamGetHeaders(cred),
         signal: AbortSignal.timeout(15_000),
       },
     )
-    if (!res.ok) return null
-    return parseConfigPayload((await res.json()) as any)
+    if (!res.ok) return { entries: null, unauthorized: res.status === 401 || res.status === 403 }
+    return { entries: parseConfigPayload((await res.json()) as any), unauthorized: false }
   } catch {
-    return null
+    return { entries: null, unauthorized: false }
   }
+}
+
+// ------------------------------------------------- proactive auth validation (Tier 0)
+//
+// AUTH_INVALID was previously learned only after a real generation burned a
+// 401 — every new dead token cost a wasted generation, and catalog/quota
+// 401s were invisible to the governor. This is the owned validation
+// procedure: a cheap, bootstrap-free account-session read (Tier 0
+// authentication validation — never an Instance, never generation
+// entitlement), with the same refresh-then-judge semantics as generations.
+// The single producer of learned auth state stays the account governor;
+// the quota adapter deliberately stays out (it has no refresh ownership —
+// see its file header) and only READS the fact via workBuddyLimitSnapshot.
+
+export type AuthVerdict = "valid" | "invalid" | "unknown"
+
+/**
+ * Account-session endpoint the official client itself validates against
+ * (`GET {endpoint}/v2/plugin/accounts`; ASAR `getAccountSnapshot`, called from
+ * `refreshSession` and after login). Verified live against `www.workbuddy.ai`
+ * 2026-09-16: HTTP 200 `{code:0,data:{accounts:[…]}}`.
+ */
+const ACCOUNTS_PATH = "/v2/plugin/accounts"
+
+/**
+ * Single cheap authenticated read: ok / auth-rejected / anything else.
+ * A 2xx with an unexpected payload is "error", never "ok" — a malformed
+ * answer must not be mistaken for a healthy session.
+ */
+async function probeAccountSession(cred: Credential): Promise<"ok" | "unauthorized" | "error"> {
+  try {
+    const res = await fetch(`${backendFor(cred)}${ACCOUNTS_PATH}`, {
+      headers: upstreamGetHeaders(cred),
+      signal: AbortSignal.timeout(15_000),
+    })
+    if (!res.ok) return res.status === 401 || res.status === 403 ? "unauthorized" : "error"
+    const body = (await res.json().catch(() => undefined)) as any
+    return Array.isArray(body?.data?.accounts) ? "ok" : "error"
+  } catch {
+    return "error"
+  }
+}
+
+const AUTH_VALIDATION_COOLDOWN_MS = 30_000
+
+/**
+ * Singleflight + throttle for proactive validation.
+ *
+ * `catalogFor` runs discovery for every account on every provider refresh;
+ * when a credential is dead, the failure path used to re-probe (and
+ * re-attempt refresh) on every invocation. The verdict is already
+ * materialized on the account governor, so repeats inside the window return
+ * it without any network work: a definitively rejected credential must not
+ * become a retry loop, and a network blip must not become one either.
+ * `valid` is never throttled — the next real read is the recomputation.
+ */
+const authValidationInflight = new Map<string, Promise<AuthVerdict>>()
+const authValidationVerdicts = new Map<string, { verdict: AuthVerdict; until: number }>()
+
+export function validateAccountAuth(account: WorkBuddyAccount): Promise<AuthVerdict> {
+  const key = account.id
+  const existing = authValidationInflight.get(key)
+  if (existing) return existing
+  const cached = authValidationVerdicts.get(key)
+  if (cached && Date.now() < cached.until) return Promise.resolve(cached.verdict)
+  const run = probeAndLearnAuth(account)
+    .then((verdict) => {
+      if (verdict === "valid") authValidationVerdicts.delete(key)
+      else authValidationVerdicts.set(key, { verdict, until: Date.now() + AUTH_VALIDATION_COOLDOWN_MS })
+      return verdict
+    })
+    .finally(() => authValidationInflight.delete(key))
+  authValidationInflight.set(key, run)
+  return run
+}
+
+/**
+ * Validate one account's vault credential without spending generation
+ * entitlement. Mirrors generation semantics (refresh-if-expired, then one
+ * refresh + re-probe on rejection) and folds the verdict into the governor:
+ * valid clears a learned AUTH_INVALID, invalid persists it, unknown (network
+ * / 5xx) changes nothing — a blip must never exile an account.
+ */
+async function probeAndLearnAuth(account: WorkBuddyAccount): Promise<AuthVerdict> {
+  const cred = account.credential
+  if (isExpired(cred)) await singleflightRefresh(account)
+  const first = await probeAccountSession(cred)
+  if (first === "ok") {
+    account.governor.clearAuthInvalid()
+    return "valid"
+  }
+  if (first === "error") return "unknown"
+  // Unauthorized: one refresh + re-probe before learning anything. A single
+  // 401 is not yet a verdict (clock skew, rotation race).
+  await singleflightRefresh(account)
+  const second = await probeAccountSession(cred)
+  if (second === "ok") {
+    account.governor.clearAuthInvalid()
+    return "valid"
+  }
+  if (second === "error") return "unknown"
+  account.governor.markAuthInvalid(401)
+  return "invalid"
 }
 
 /**
@@ -863,12 +1313,28 @@ async function catalogFor(account: WorkBuddyAccount | undefined): Promise<Catalo
   const now = Date.now()
   if (cached && now - cached.at < DISCOVERY_TTL_MS) { if (WB_PROFILE) wbMark("catalogFor:cacheHit", _catStart); return cached.catalog }
   if (cred) {
-    const live = await discoverCatalog(cred)
-    if (live && live.length) {
-      const merged = mergeCatalog(staticCatalog, live)
+    const probed = await discoverCatalogDetailed(cred)
+    if (probed.entries && probed.entries.length) {
+      const merged = mergeCatalog(staticCatalog, probed.entries)
       discoveryCache.set(key, { at: now, catalog: merged })
       if (account) account.catalog = { ids: new Set(merged.map((entry) => entry.id)), updatedAt: now }
       return merged
+    }
+    if (account && probed.unauthorized) {
+      // Demand-driven auth validation on the existing catalog traffic: no new
+      // timers, no extra requests on the happy path, no generation
+      // entitlement burned. A healed credential (refresh inside validation)
+      // gets one immediate discovery retry so the picker heals in the same
+      // pass instead of serving stale static data for 5 more minutes.
+      if ((await validateAccountAuth(account)) === "valid") {
+        const retry = await discoverCatalog(cred)
+        if (retry && retry.length) {
+          const merged = mergeCatalog(staticCatalog, retry)
+          discoveryCache.set(key, { at: now, catalog: merged })
+          account.catalog = { ids: new Set(merged.map((entry) => entry.id)), updatedAt: now }
+          return merged
+        }
+      }
     }
   }
   if (cached) return cached.catalog // last-known-good for THIS account
@@ -905,6 +1371,10 @@ function priorityFor(payload: any, messages: any[]): number {
 function decodeAccountModel(requestedModel: string): { model: string; accountId?: string; contextWindowTokens?: number } {
   const split = splitAccountModelID(requestedModel, [{ id: "workbuddy", accountPrefix: "wb-", aliasMarkers: ["#ctx-"] }])
   const context = decodeWorkBuddyContextModel(split.baseModelID)
+  // NOTE: `contextWindowTokens` is intentionally NEVER sent upstream (see
+  // buildUpstreamBody) — it only selects the client-side `limit.context`.
+  // Stripping the `#ctx-` alias here is still load-bearing: the bare catalog
+  // id is what Tencent validates, and an unstripped alias is rejected.
   return {
     model: context.model,
     ...(split.accountID ? { accountId: split.accountID } : {}),
@@ -932,12 +1402,22 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
   const selection = accountRouter.select(session, requestedModel, explicitAccount)
   if (!selection) {
     const accounts = accountRegistry.all()
-    return sendJson(res, accounts.length ? 429 : 401, {
+    // An all-forbidden pool is a distinct, actionable diagnosis: the session
+    // endpoint answers 200 for a restricted account, so the default account
+    // message would send the user to sign in again for something
+    // re-authentication cannot clear.
+    const allForbidden = accounts.length > 0 && accounts.every((account) => account.governor.isAccountForbidden())
+    const status = accounts.length === 0 ? 401 : allForbidden ? 403 : 429
+    const message =
+      accounts.length === 0
+        ? "No signed-in WorkBuddy desktop session found. Sign in to the WorkBuddy desktop app, then retry."
+        : allForbidden
+          ? "Every signed-in WorkBuddy account is currently restricted by WorkBuddy (auth_forbidden, code 11140). This is a Tencent-side account restriction — re-authenticating does not clear it. Add or switch to another WorkBuddy account, or contact WorkBuddy support."
+          : `No eligible WorkBuddy account currently supports ${requestedModel}; choose an account or wait for its entitlement window.`
+    return sendJson(res, status, {
       error: {
-        message: accounts.length
-          ? `No eligible WorkBuddy account currently supports ${requestedModel}; choose an account or wait for its entitlement window.`
-          : "No signed-in WorkBuddy desktop session found. Sign in to the WorkBuddy desktop app, then retry.",
-        type: accounts.length ? "account_unavailable" : "authentication_error",
+        message,
+        type: accounts.length === 0 ? "authentication_error" : allForbidden ? "account_forbidden" : "account_unavailable",
       },
     })
   }
@@ -949,23 +1429,16 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
   if (messages.length === 0 || messages[0]?.role !== "system") {
     messages.unshift({ role: "system", content: "You are a helpful assistant." })
   }
+  // Backend contract (code 11155): in thinking mode every assistant turn must
+  // echo `reasoning_content`. Repair additively (see repairHistoryForThinking);
+  // non-thinking traffic passes through untouched.
+  if (detectThinkingMode(messages, requestedModel)) {
+    const repaired = repairHistoryForThinking(messages)
+    messages.length = 0
+    messages.push(...repaired)
+  }
 
-  const body: Record<string, unknown> = {
-    model: requestedModel,
-    messages,
-    // Non-streaming is rejected upstream, so always stream and fold if needed.
-    stream: true,
-    stream_options: { include_usage: true },
-  }
-  if (decoded.contextWindowTokens !== undefined) body.context_window_tokens = decoded.contextWindowTokens
-  // Pass through the OpenAI fields the backend understands.
-  for (const key of [
-    "tools", "tool_choice", "temperature", "top_p", "stop",
-    "presence_penalty", "frequency_penalty", "reasoning_effort",
-    "max_tokens", "max_completion_tokens", "response_format", "user", "context_window_tokens", "contextWindowTokens",
-  ]) {
-    if (payload?.[key] !== undefined) body[key] = payload[key]
-  }
+  const body = buildUpstreamBody(payload, messages, requestedModel)
 
   const cancellation = new AbortController()
   const abortOnClientClose = () => {
@@ -980,13 +1453,17 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
   const transport: RunGenerationOpts["transport"] = () =>
     fetch(`${backendFor(cred)}/v2/chat/completions`, {
       method: "POST",
-      headers: upstreamHeaders(cred),
+      headers: upstreamHeaders(cred, upstreamConversationHeaders(account.id, session)),
       body: JSON.stringify(body),
       signal: AbortSignal.any([cancellation.signal, AbortSignal.timeout(REQUEST_TIMEOUT_MS)]),
     })
 
   let result
   let _govStart2 = WB_PROFILE ? performance.now() : 0
+  // Tracks whether the governor attempted a token refresh for this
+  // generation, so a terminal 401 can say so instead of implying the user
+  // never signed in.
+  let refreshAttempted = false
   try {
     // The ACCOUNT governor owns admission, the generation-commit point, and the
     // single auth-recovery retry. handleCompletions never re-issues a generation.
@@ -996,7 +1473,10 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
       model: requestedModel,
       session,
       isExpired: () => isExpired(cred),
-      refresh: () => singleflightRefresh(account),
+      refresh: () => {
+        refreshAttempted = true
+        return singleflightRefresh(account).then(toRefreshResult)
+      },
       transport,
       signal: cancellation.signal,
       enrollmentEpoch: cred.enrollmentEpoch,
@@ -1014,8 +1494,10 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
             ? "canceled"
             : e.kind === "duplicate"
               ? "duplicate_request"
-              : "rate_limit_error"
-      const status = e.kind === "quota" ? 402 : e.kind === "queue" ? 503 : e.kind === "cancel" ? 499 : e.kind === "duplicate" ? 409 : 429
+              : e.kind === "forbidden"
+                ? "account_forbidden"
+                : "rate_limit_error"
+      const status = e.kind === "quota" ? 402 : e.kind === "queue" ? 503 : e.kind === "cancel" ? 499 : e.kind === "duplicate" ? 409 : e.kind === "forbidden" ? 403 : 429
       if (res.writableEnded || res.destroyed) return
       return sendJson(res, status, { error: { message: e.message, type } }, headers)
     }
@@ -1028,7 +1510,32 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
   const upstream = result.res
   if (!upstream.ok || !upstream.body) {
     const raw = await upstream.text().catch(() => "")
-    const mapped = toClientError(classify(upstream.status, raw))
+    const accountLabel = account.nickname.trim() || account.uid || account.id
+    // The vault token is dead but the desktop app may have signed in again
+    // since (same stable id, fresher token). Heal additively so the NEXT
+    // request succeeds; this request still reports the failure that happened.
+    let healed = false
+    // Desktop heal is for dead tokens only: account-forbidden and
+    // validation rejections carry no token signal, so they must not trigger
+    // it (a heal cannot clear a Tencent-side account restriction).
+    if ((upstream.status === 401 || upstream.status === 403) && !isValidationError(raw) && !isAccountForbidden(raw)) {
+      try {
+        healed = accountRegistry.tryHealFromDesktop(account)
+      } catch {
+        healed = false
+      }
+    }
+    const mapped = toClientError(classify(upstream.status, raw), {
+      accountLabel,
+      accountId: account.id,
+      model: requestedModel,
+      refreshAttempted,
+    })
+    if (healed) {
+      const note =
+        " The current desktop login was newer than OpenFork's saved token, so it has been re-imported — retry the request."
+      mapped.body.error.message = `${mapped.body.error.message}${note}`
+    }
     // Non-success responses are terminal at the HTTP-header boundary; unlike
     // successful SSE responses they are not handed to the body-draining path.
     // Release the account lease here so an auth/quota/429 response cannot pin

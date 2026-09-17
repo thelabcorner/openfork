@@ -1,6 +1,12 @@
 import { Effect } from "effect"
 import { AccountVault, accountLabels, stableAccountIdentity, type Credential } from "@/plugin/workbuddy-accounts"
-import { discoverWorkBuddyCatalog, workBuddyLimitSnapshot, recordWorkBuddyPackageCredits } from "@/plugin/workbuddy"
+import {
+  discoverWorkBuddyCatalog,
+  upstreamTraceHeaders,
+  workBuddyLimitSnapshot,
+  recordWorkBuddyPackageCredits,
+} from "@/plugin/workbuddy"
+import { workBuddyClientHeaders, workBuddyUserAgent } from "@/plugin/workbuddy-identity"
 import { asObject, buildResult, toNumber, toUsageWindow } from "../format"
 import type { Adapter } from "../registry"
 import type { UsageWindow } from "../schema"
@@ -100,13 +106,19 @@ function backendFor(cred: Credential): string {
 
 function headersFor(cred: Credential): Record<string, string> {
   return {
-    Accept: "application/json, text/plain, */*",
+    // The desktop's own billing/account `httpService` defaults to
+    // `Accept: application/json` (not the axios-style wildcard used for model
+    // calls), and forwards the user's locale.
+    Accept: "application/json",
     "Content-Type": "application/json",
+    "Accept-Language": Intl.DateTimeFormat().resolvedOptions().locale || "en-US",
     Authorization: `Bearer ${cred.accessToken}`,
-    "X-User-Id": cred.uid,
-    "X-Enterprise-Id": cred.enterpriseId,
-    "X-Tenant-Id": cred.enterpriseId,
-    "X-Domain": cred.domain,
+    ...(cred.uid ? { "X-User-Id": cred.uid } : {}),
+    ...(cred.enterpriseId ? { "X-Enterprise-Id": cred.enterpriseId, "X-Tenant-Id": cred.enterpriseId } : {}),
+    ...(cred.domain ? { "X-Domain": cred.domain } : {}),
+    "User-Agent": workBuddyUserAgent(),
+    ...workBuddyClientHeaders(),
+    ...upstreamTraceHeaders(),
   }
 }
 

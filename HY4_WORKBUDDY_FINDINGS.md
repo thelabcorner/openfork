@@ -306,3 +306,210 @@ Non-inference validation remains green:
 - the OpenFork CLI starts and exposes the `models` command;
 - offline governor, lease-lifetime, cancellation, account-vault, OAuth-enrollment, proxy-translation, and loopback tests pass;
 - the live e2e result remains **unknown until the authoritative reset window has elapsed** or a separately entitled account is explicitly enrolled and tested.
+
+## ASAR verification of the official auth / re-auth path (2026-09-16)
+
+Source read directly from the installed bundle (WorkBuddy AI 5.5.2):
+`resources/app.asar` (`main/file-authentication-storage.js`,
+`main/credential-protection.js`, `main/legacy-auth-session-migrator.js`) and
+the unpacked CLI bundle `resources/app.asar.unpacked/cli/dist/codebuddy.js`.
+
+### Official client behavior (authoritative for our translation layer)
+
+- Login: `POST {endpoint}/v2/plugin/auth/state?platform=workbuddy-ai` → open
+  the returned `authUrl` in a browser → poll
+  `GET /v2/plugin/auth/token?state=…` → `GET /v2/plugin/account`.
+- Refresh: `POST {endpoint}/v2/plugin/auth/token/refresh` with
+  `X-Refresh-Token` and `X-Auth-Refresh-Source: plugin` (plus `X-Domain`) and
+  deliberately **no `Authorization`** header. `data.data` carries the next
+  `accessToken` / `refreshToken` / `expiresIn`; expiry is derived from
+  `expiresIn` when absent.
+- Session validation / post-refresh confirmation:
+  `GET /v2/plugin/accounts` (`getAccountSnapshot`), confirmed live against
+  `www.workbuddy.ai` (HTTP 200 `{code:0,data:{accounts:[…]}}`).
+- Failure taxonomy: only HTTP 401/403 means "credential rejected"; every
+  other failure (network, 5xx, empty payload) is transient. Poll-specific
+  retry codes are 11217 / 12151.
+- Storage: `{sharedDataPath}/auth/workbuddy-desktop-ai.info`, written under a
+  file lock with atomic replace and a logout-marker protocol. Credential
+  fields are encrypted at rest only when the host supplies a symmetric key
+  (`main/credential-protection.js`); otherwise the file is plaintext JSON.
+
+### OpenFork ownership after this verification
+
+- The plugin's `AccountVault` stays the single durable credential owner; the
+  desktop `.info` is an import/heal source only and is never written.
+- `reauthenticateAccount(account)` is the single automatic re-auth entry
+  point: account-local singleflight, official header shape, persisted
+  rotation. A backend-rejected refresh cannot be renewed programmatically —
+  Tencent's login is an interactive browser OAuth state flow — so desktop
+  heal plus the explicit import/OAuth methods remain the fallback.
+- `validateAccountAuth` is the Tier 0 proactive check against
+  `/v2/plugin/accounts`. It is singleflighted and throttles non-valid
+  verdicts for 30 s so a rejected credential (or a network blip) cannot
+  become a retry loop; `valid` clears learned `AUTH_INVALID`.
+- `WorkBuddyEntitlementGovernor` remains the single producer of learned auth
+  state. Only a refresh the backend rejected (401/403) persists
+  `AUTH_INVALID`; transient refresh failures never do. Validation rejections
+  never poison the account. Account-forbidden verdicts quarantine separately
+  (see the error-classification findings below).
+
+### Error-classification findings (2026-09-16, corrected by live bisection)
+
+- Code 11140 ("request illegal") and 11142 are **not** request-shape errors.
+  The official client's own `classifyErrorDetail` maps them to
+  `{category:"auth", subcategory:"auth_forbidden"}`. Live bisection on
+  2026-09-16 proved the rejection is account-scoped: an affected account
+  (`southsidehype111`, plus `xhuebusiness` and `4wgmsymbzr`) answered 11140
+  for **every** model — including a minimal `system`+`user` body with no
+  tools, reasoning, or sampling params — while other accounts succeeded with
+  byte-identical requests. A freshly refreshed token pair still received
+  11140, and `/v2/plugin/accounts` answered 200 for restricted accounts, so
+  neither re-auth nor token inspection can detect it. Community reports
+  ("workbuddy 账号不能用了 11140") match: reinstall/relogin/cache-clear do not
+  help. OpenFork therefore classifies 11140/11142 as `ACCOUNT_FORBIDDEN`:
+  quarantined for 15 minutes (`WORKBUDDY_FORBIDDEN_COOLDOWN_MS`), admission
+  rejected with 403 `account_forbidden`, sessions auto-rotated to healthy
+  accounts, and the error states plainly that this is a Tencent-side
+  restriction that re-authentication does not clear.
+- Blast radius (2026-09-16, all accounts probed with a minimal `hy4-preview`
+  request): **restricted** = `southsidehype111`, `xhuebusiness@gmail.com`,
+  `4wgmsymbzr-art` (403/11140); `arcfit.dev@gmail.com` rate-limited (429, not
+  forbidden); the other eleven accounts still stream 200. Every restricted
+  account had its vault credential rewritten that same day (i.e. was in
+  active use); every healthy account's last write was 2026-08-29…09-06.
+- The **official WorkBuddy desktop app** on a fresh login for
+  `xhuebusiness@gmail.com` also returns 11140 (trace
+  `8358005b27c94906860c2590ff54d215`, "Service encountered an error"),
+  confirming this is account-level state that a re-login does not clear.
+- Candidate detection signals (unproven — server-side risk control is not in
+  any client bundle): first-party attestation the official client carries and
+  the plugin does not — the **Qimei36 device fingerprint**
+  (`@tencent/qimei-node`, injected into the agent subprocess env), the
+  **`X-Private-Data`** header, the conversation-lifecycle headers
+  (`X-Conversation-ID`, `X-Root-Request-ID`, …), Aegis/universal-report
+  telemetry, plus behavioural correlates (multi-account fan-out from one
+  machine/IP, free-model farming, retry storms). TLS/HTTP fingerprint
+  differences are possible but secondary.
+- A controlled experiment ruled out request shape and branding entirely: the
+  official 18,884-char `cli-agent-prompt` (with its `<content_policy>`), the
+  full official header extras (`X-Product`, `X-IDE-*`, `X-Agent-Intent`,
+  `X-Conversation-*`, `X-Request-ID`, `X-Trace-ID`), `temperature: 1`, and a
+  desktop-like `User-Agent` — plus sweeps with the official
+  `workbuddy-ai/5.4.2` UA, no UA, no identity headers, and no `X-Domain` —
+  every combination returned 11140 on the restricted account for both
+  `deepseek-v4.1-flash` and `glm-5.2`, while the identical request returned
+  200 (SSE) on a healthy control. There is no prompt, branding, or header
+  fix that can unblock a restricted account.
+- The 403 envelope carries a server `displayMsg`: "内容未通过安全审核，请调整后重试。"
+  ("The content did not pass the safety review. Please adjust and retry."),
+  which OpenFork now surfaces in the error text. It is nevertheless not
+  prompt-triggered: a trivial "Say OK" request fails identically on a
+  restricted account while other accounts accept byte-identical requests,
+  and the official client's own taxonomy still classifies 11140 as
+  `auth_forbidden`. Credits are ruled out (the restricted account still holds
+  174.3 + 100 credits, vs 246.3 + 100 on a healthy one), as are tokens
+  (`/v2/plugin/auth/token/refresh` 200, `/v2/plugin/accounts` 200 with
+  `pluginEnabled: true`). Community reports in the same window describe
+  exactly this: WorkBuddy International is enforcing against reverse-proxy
+  consumption ("WorkBuddy国际版反代开始封号了"; the official client also
+  stops working on flagged accounts), and multiple Tencent community threads
+  on 11140 remain unresolved after reinstall and relogin. Escalation requires
+  the account's UIN/UID plus the request id returned with the error
+  (e.g. `d2b21222-326b-46c7-a499-c879cb6deae7`); the official FAQ directs
+  users to `workbuddy_ai@tencent.com` (CN docs: `workbuddy@tencent.com`).
+- Code 11155 requires the previous turn's `reasoning_content` to be echoed in
+  thinking mode. The proxy backfills it additively, matching the vendor's own
+  `ReasoningContentBackfillRule` (visible in the CLI bundle and the bundled
+  model catalog's `compat.requiresReasoningContentOnAssistantMessages`).
+
+### Live evidence and scope
+- A real Global account was refreshed through the production
+  `reauthenticateAccount` path: outcome `refreshed`, token pair rotated and
+  persisted to the vault, `validateAccountAuth` returned `valid`
+  (`packages/opencode/script/probe-workbuddy-refresh.ts`).
+- Scope: measured on `www.workbuddy.ai` only. CN realms and staging share the
+  same official provider code path but were not live-tested here.
+- Residual: the vault stores tokens as 0600 plaintext JSON. The official
+  app's at-rest codec key is host/Electron-derived and unavailable to an
+  out-of-process plugin, so OS-keychain integration is not attempted.
+
+## Upstream discriminator audit (2026-09-16)
+
+Goal: nothing the provider emits should gratuitously identify OpenFork as a
+third-party reverse proxy. Changed at the plugin boundary (new
+`workbuddy-identity.ts` resolves the installed app/CLI first):
+
+- **User-Agent**: replaced the self-branded `codebuddy2openai/2.0` with the
+  official composition `WorkBuddy/<app> WorkBuddy AI/<app> CLI/<cli>`
+  (`UserAgentHttpInterceptor.buildUserAgent`), resolved from
+  `resources/install-manifest.json` + `cli/package.json`. Verified live: the
+  `/v3/config` UA gate still returns the full catalog, and chat still streams
+  HTTP 200 on healthy accounts.
+- **Static application headers**: `X-Product: SaaS`,
+  `X-IDE-Type/Name: WorkBuddy`, `X-IDE-Version: <appVersion>`.
+- **Conversation lifecycle** every official model request carries:
+  `X-Conversation-ID` (stable per account+session), `X-Conversation-Request-ID`,
+  `X-Conversation-Message-ID`, `X-Request-ID`, `X-Agent-Intent: craft`,
+  `X-Agent-Type: main`; refresh/billing also carry `X-Request-ID`/`X-Trace-ID`.
+- **Anomalies removed**: empty `X-User-Id`/`X-Enterprise-Id`/`X-Tenant-Id`
+  headers are omitted like the official client; GETs no longer send
+  `Content-Type`; `Accept` matches the axios-style default; OAuth login calls
+  and the quota/billing adapter now use the same identity.
+- **Footprint**: the `auth_forbidden` probe interval rose 15 min → 1 h
+  (`WORKBUDDY_FORBIDDEN_COOLDOWN_MS`) so restricted accounts are not hammered
+  with rejected requests.
+- **Also fixed**: HTTP 429 with code 14018 ("Credits exhausted") is now
+  classified as `quota_balance_exhausted` instead of a transient cooldown.
+
+Deliberately NOT done: forging per-device attestation (Qimei36, machineId,
+`X-Private-Data`) or synthesising first-party telemetry — that is
+circumventing enforcement, not removing fingerprints.
+
+#### Second pass — full ASAR verification (same day)
+
+Sources re-read: `cli/dist/codebuddy.js` (native model path, interceptors,
+OpenAI SDK vendored code) and `main/application-manifest.js` (desktop
+`httpService`, `AuthService`).
+
+- The native model path goes through the CLI's **axios** stack
+  (`maxBodyLength`/`maxContentLength` config, `delete authorization`/`user-agent`
+  then interceptor re-add), **not** the Stainless OpenAI SDK. The SDK path
+  exists only for custom/local models and explicitly **strips** `x-stainless-*`
+  and internal headers when `CODEBUDDY_SKIP_INTERNAL_HEADERS` is set — so
+  adding Stainless headers would have been wrong.
+- `CommonHeaderHttpInterceptor` is authoritative for trace identity: it always
+  sets `X-Request-ID` (32 hex, falling back to `X-Trace-ID` when a trace
+  context exists) and sets `proxy = false` on every call. We now send only
+  `X-Request-ID` and route gateway hosts around environment proxies via
+  `no_proxy` (matching `proxy = false`; also keeps egress IPs consistent).
+- `X-Product` differs per subsystem in the official app: model/REST calls use
+  `deploymentType ?? "SaaS"` (CLI interceptor) while desktop activity calls
+  hard-code `"WorkBuddy"`. Chat keeps `SaaS` (the CLI value the model path
+  uses).
+- Desktop billing/account calls use a separate `httpService` whose defaults
+  are `Accept: application/json` + `Accept-Language` (user locale). The quota
+  adapter now matches, and stamps the shared `X-Request-ID`.
+- `X-Session-ID` and `X-Product-Version` constants exist but are never set on
+  model requests, so we don't send them either. `traceparent`/`tracestate`
+  appear only inside the OTel internals, not on REST calls.
+- Final wire capture through the production proxy shows exactly: `accept`,
+  `accept-encoding`, `authorization`, `connection`, `content-type`,
+  `user-agent` (official composition), `x-agent-intent`, `x-agent-type`,
+  `x-conversation-id/-request-id/-message-id`, `x-domain`, `x-ide-*`,
+  `x-product`, `x-request-id`, `x-user-id` — no self-branding, no empty
+  identity headers, no fabricated trace id. Real gateway: healthy account 200
+  SSE, restricted account 403 `account_forbidden` with the 1 h probe window.
+
+Known remaining ambiguity: `accept-encoding` is the host runtime's default
+(`gzip, deflate, br, zstd`) rather than axios's list; billing runs against a
+desktop-called endpoint whose exact UA cannot be captured without
+MITM-ing the Electron app, so it uses the same first-party UA as everything
+else.
+
+Residual signals that cannot be fixed in this codebase: host TLS/HTTP
+fingerprint (Bun/undici HTTP/1.1 vs Electron Chromium), absence of device
+attestation and client telemetry, tool-schema/system-prompt content
+differences, and behavioural patterns (many accounts from one machine/IP,
+free-model usage, bursty agent loops). Closing those would require either a
+native client stack or not using the integration this way.

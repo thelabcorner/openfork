@@ -1548,7 +1548,9 @@ async function handleCompletions(req: IncomingMessage, res: ServerResponse, payl
       model: requestedModel,
       session: sessionHeader,
       isExpired: () => false,
-      refresh: async () => false,
+      // Verdent has no programmatic token-renewal flow: a surviving 401 after
+      // the governor's single retry is definitive for this token source.
+      refresh: async () => ({ ok: false, rejected: true }),
       transport: async () => {
         const res = await fetch(verdentProxyEndpoint(), {
           method: "POST",

@@ -277,10 +277,157 @@ export function buildModelEntitlementReport(model: string, runtime: ModelEntitle
   }
 }
 
-/** Extracts Tencent's structured `code` field (e.g. 6004, 14003) from a raw JSON error body. */
+/**
+ * Tencent's "request illegal" code. Official client taxonomy: auth_forbidden.
+ *
+ * Verified against the bundled official client
+ * (`cli/dist/codebuddy.js` `classifyErrorDetail`): 11140 and 11142 map to
+ * `{category:"auth", subcategory:"auth_forbidden"}`, and
+ * `isAuthRequiredLikeError` treats 403 + these codes as an auth-class
+ * failure. Live bisection 2026-09-16 proved the rejection is account-scoped,
+ * not request-shaped: an affected account failed every model (including a
+ * minimal system+user request with no tools or params) while other accounts
+ * succeeded with byte-identical requests, and a fresh token pair from
+ * `/v2/plugin/auth/token/refresh` still received 11140.
+ */
+export const WORKBUDDY_REQUEST_ILLEGAL_CODE = 11140
+
+/** All codes the official taxonomy classifies as `auth_forbidden`. */
+export const WORKBUDDY_FORBIDDEN_CODES: readonly number[] = [11140, 11142]
+
+/**
+ * Tencent's thinking-mode round-trip code: "the reasoning content from the
+ * previous turn must be passed back in thinking mode". Mirrors DeepSeek's
+ * thinking-mode echo requirement (QwenLM/qwen-code#3579, Tencent ask/2211416:
+ * the field is specifically lost around tool-call turns). Arrives as HTTP 400.
+ */
+export const WORKBUDDY_THINKING_ROUNDTRIP_CODE = 11155
+
+function numericCode(value: unknown): number | undefined {
+  if (typeof value === "number" && Number.isFinite(value)) return value
+  if (typeof value === "string" && /^-?\d+$/.test(value.trim())) return Number(value.trim())
+  return undefined
+}
+
+/**
+ * Extracts Tencent's structured `code` field (e.g. 6004, 14003, 11140) from a
+ * raw JSON error body.
+ *
+ * Prefers the innermost Tencent code: some failures arrive wrapped (JSON-RPC
+ * `{"code":-32603,...,"data":{...,"code":11140,"statusCode":403}}`, observed
+ * live in workbuddy2api#2), where the outer code is transport framing and the
+ * inner `data.code` is the authoritative Tencent verdict. A first-match regex
+ * would return the wrapper (-32603) and lose the real code.
+ */
 export function parseErrorCode(raw: string): number | undefined {
-  const m = raw.match(/"code"\s*:\s*"?(\d+)"?/)
-  return m ? Number(m[1]) : undefined
+  if (raw) {
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      const deep = (node: unknown): number | undefined => {
+        if (!node || typeof node !== "object") return undefined
+        const record = node as Record<string, unknown>
+        // Tencent nests payloads under `data` (JSON-RPC wrapper); some
+        // endpoints wrap errors as `{error:{data:{code,…}}}`.
+        for (const key of ["data", "error", "cause"]) {
+          const nested = record[key]
+          if (nested && typeof nested === "object") {
+            const inner = deep(nested)
+            if (inner !== undefined) return inner
+          }
+        }
+        return numericCode(record.code) ?? numericCode(record.error_code ?? record.errorCode)
+      }
+      const code = deep(parsed)
+      if (code !== undefined) return code
+    } catch {
+      // Not JSON — fall through to the regex scan below.
+    }
+    const matches = [...raw.matchAll(/"code"\s*:\s*"?(-?\d+)"?/g)]
+    const last = matches.length ? matches[matches.length - 1]?.[1] : undefined
+    if (last !== undefined) return Number(last)
+  }
+  return undefined
+}
+
+/** Extracts Tencent's human message (`msg` / `message` / wrapped `details`). */
+export function parseErrorMessage(raw: string, fallback: string): string {
+  if (raw) {
+    try {
+      const parsed: unknown = JSON.parse(raw)
+      const deep = (node: unknown): string | undefined => {
+        if (!node || typeof node !== "object") return undefined
+        const record = node as Record<string, unknown>
+        for (const key of ["data", "error", "cause"]) {
+          const nested = record[key]
+          if (nested && typeof nested === "object") {
+            const inner = deep(nested)
+            if (inner) return inner
+          }
+        }
+        // Tencent attaches a localized, user-facing explanation to some
+        // errors (e.g. 11140 carries "The content did not pass the safety
+        // review. Please adjust and retry."); it is strictly more useful
+        // than the raw code text, so prefer it.
+        const display = record.displayMsg
+        if (display && typeof display === "object") {
+          const text = (display as Record<string, unknown>).en ?? (display as Record<string, unknown>).zh
+          if (typeof text === "string" && text.trim()) return text.slice(0, 300)
+        }
+        for (const key of ["msg", "message", "details", "detail"]) {
+          const value = record[key]
+          if (typeof value === "string" && value.trim()) return value.slice(0, 300)
+        }
+        return undefined
+      }
+      const message = deep(parsed)
+      if (message) return message
+    } catch {
+      // Not JSON — fall through to the regex scan below.
+    }
+    const msg = raw.match(/"msg"\s*:\s*"([^"]{0,200})"/)?.[1]
+    if (msg) return msg
+    const message = raw.match(/"message"\s*:\s*"([^"]{0,200})"/)?.[1]
+    if (message) return message
+  }
+  return fallback
+}
+
+/**
+ * True when Tencent rejected the request because the account is forbidden
+ * (official taxonomy `auth_forbidden`). Account-scoped, not request-shaped:
+ * see the WORKBUDDY_REQUEST_ILLEGAL_CODE doc for the live evidence.
+ */
+export function isAccountForbidden(raw: string): boolean {
+  const code = parseErrorCode(raw)
+  if (code !== undefined && WORKBUDDY_FORBIDDEN_CODES.includes(code)) return true
+  return /request illegal/i.test(raw)
+}
+
+/**
+ * True when Tencent rejected the request because the account balance is
+ * exhausted. The official taxonomy maps 14001, 14002, 14012–14014 and 14018
+ * to `quota_balance_exhausted`; the gateway wraps them in HTTP 429, so they
+ * must be recognised by code rather than by status (14018 observed live on
+ * 2026-09-16 inside an `{error:{data:{code}}}` envelope).
+ */
+export function isBalanceExhausted(raw: string): boolean {
+  const code = parseErrorCode(raw)
+  if (code === 14001 || code === 14002 || code === 14018) return true
+  if (code !== undefined && code >= 14012 && code <= 14014) return true
+  return /credits? (are )?exhausted|insufficient credit|积分不足/i.test(raw)
+}
+
+/**
+ * True for request-shape/backend validation rejections that must NEVER be
+ * treated as auth failures and must never trigger a token refresh: 11155
+ * (thinking-mode reasoning echo). A refresh cannot fix an illegal body —
+ * retrying one just doubles the failure. Account-forbidden codes are NOT
+ * validation errors; they are handled separately via `isAccountForbidden`.
+ */
+export function isValidationError(raw: string): boolean {
+  const code = parseErrorCode(raw)
+  if (code === WORKBUDDY_THINKING_ROUNDTRIP_CODE) return true
+  return /reasoning_content/i.test(raw) && /thinking mode|passed back/i.test(raw)
 }
 
 /**
