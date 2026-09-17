@@ -3,6 +3,7 @@ export * as SessionTitle from "./title"
 import { LLM, LLMClient, Message, SystemPart, Tool, toDefinitions } from "@opencode-ai/llm"
 import { eq } from "drizzle-orm"
 import { Context, DateTime, Effect, Layer, Ref, Schema, Scope } from "effect"
+import * as Stream from "effect/Stream"
 import { AgentV2 } from "../agent"
 import { Catalog } from "../catalog"
 import { Config } from "../config"
@@ -13,6 +14,7 @@ import { llmClient } from "../effect/app-node-platform"
 import { Integration } from "../integration"
 import { ModelV2 } from "../model"
 import { ProviderV2 } from "../provider"
+import { SpecialAgentSession } from "../special-agent-session"
 import { type ToolChoiceCapabilityIdentity } from "../tool-choice-compatibility"
 import {
   collectUntilTerminalTool,
@@ -153,6 +155,7 @@ const layer = Layer.effect(
     const integrations = yield* Integration.Service
     const models = yield* SessionRunnerModel.Service
     const events = yield* EventV2.Service
+    const specialAgents = yield* SpecialAgentSession.Service
     const db = (yield* Database.Service).db
     const scope = yield* Scope.Scope
     const pending = yield* Ref.make(new Map<SessionSchema.ID, PendingEntry>())
@@ -311,6 +314,25 @@ const layer = Layer.effect(
         routeID: model.route.id,
         routeProtocol: String(model.route.protocol),
       }
+      const modelRef = { providerID: ProviderV2.ID.make(model.provider), id: ModelV2.ID.make(model.id) } satisfies ModelV2.Ref
+      const transcriptID = yield* specialAgents
+        .provision({
+          ownerKind: SpecialAgentSession.OWNER_SESSION,
+          ownerID: session.id,
+          agent: "session_title",
+          parentSessionID: session.id,
+          title: `Title · ${session.title}`,
+          model: modelRef,
+        })
+        .pipe(
+          Effect.mapError(
+            (error) =>
+              new UnavailableError({
+                sessionID: session.id,
+                message: `Unable to provision title Session: ${error.message}`,
+              }),
+          ),
+        )
       const request = LLM.request({
         model,
         system: [SystemPart.make(system)],
@@ -331,26 +353,71 @@ const layer = Layer.effect(
         generation: { maxTokens: boundedMaxTokens(model, TITLE_MAX_TOKENS), temperature: 0.2 },
       })
       const generate = (current: typeof request, preferred: "required" | "auto") =>
-        generateAdaptive({
-          identity: capability,
-          requested: preferred,
-          generate: (toolChoice) =>
-            collectUntilTerminalTool(llm.stream(LLM.updateRequest(current, { toolChoice })), GENERATED_TITLE_TOOL).pipe(
-              Effect.flatMap((response) =>
-                response
-                  ? Effect.succeed(response)
-                  : Effect.fail(new Error("Title generation ended without a terminal response")),
+        Effect.gen(function* () {
+          const publisher = specialAgents.publisher({ sessionID: transcriptID, agent: "session_title", model: modelRef })
+          publisher.setRequestSentAt(yield* DateTime.now)
+          const startedAt = Date.now()
+          const generated = yield* generateAdaptive({
+            identity: capability,
+            requested: preferred,
+            generate: (toolChoice) =>
+              collectUntilTerminalTool(
+                llm
+                  .stream(LLM.updateRequest(current, { toolChoice }))
+                  .pipe(Stream.tap((event) => publisher.publish(event))),
+                GENERATED_TITLE_TOOL,
+              ).pipe(
+                Effect.flatMap((response) =>
+                  response
+                    ? Effect.succeed(response)
+                    : Effect.fail(new Error("Title generation ended without a terminal response")),
+                ),
               ),
+          }).pipe(
+            Effect.mapError(
+              (error) =>
+                new UnavailableError({
+                  sessionID: session.id,
+                  message: `Title generation failed: ${error.message}`,
+                }),
             ),
-        }).pipe(
-          Effect.mapError(
-            (error) =>
-              new UnavailableError({
-                sessionID: session.id,
-                message: `Title generation failed: ${error.message}`,
-              }),
-          ),
-        )
+          )
+          const reported = generated.response.usage
+          const cacheRead = Math.max(0, reported?.cacheReadInputTokens ?? 0)
+          const cacheWrite = Math.max(0, reported?.cacheWriteInputTokens ?? 0)
+          const reasoning = Math.max(0, reported?.reasoningTokens ?? 0)
+          const tokens = {
+            input: Math.max(0, (reported?.inputTokens ?? 0) - cacheRead - cacheWrite),
+            output: Math.max(0, (reported?.outputTokens ?? 0) - reasoning),
+            reasoning,
+            cache: { read: cacheRead, write: cacheWrite },
+          }
+          const completedAt = Date.now()
+          yield* specialAgents.settleTurn({
+            sessionID: transcriptID,
+            publisher,
+            response: generated.response,
+            tokens,
+          })
+          yield* specialAgents.recordMaintenance({
+            agent: "session_title",
+            providerID: modelRef.providerID,
+            modelID: modelRef.id,
+            sessionID: session.id,
+            costEstimated: reported === undefined,
+            tokens: {
+              input: tokens.input,
+              cacheRead: tokens.cache.read,
+              cacheWrite: tokens.cache.write,
+              output: tokens.output,
+              reasoning: tokens.reasoning,
+            },
+            totalTokens: reported?.totalTokens ?? tokens.input + tokens.output + reasoning,
+            startedAt,
+            completedAt,
+          })
+          return generated
+        })
 
       let preferred: "required" | "auto" = "required"
       const terminal = yield* runTerminalCompletion({
@@ -483,6 +550,7 @@ export const node = makeLocationNode({
     SessionRunnerModel.node,
     Database.node,
     EventV2.node,
+    SpecialAgentSession.node,
   ],
 })
 

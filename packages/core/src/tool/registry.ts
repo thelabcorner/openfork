@@ -17,6 +17,11 @@ export type ExecuteInput = {
   readonly sessionID: SessionSchema.ID
   readonly agent: AgentV2.ID
   readonly assistantMessageID: SessionMessage.ID
+  readonly userTurn?: {
+    readonly userMessageID: string
+    readonly userText: string
+    readonly previousAssistantText?: string
+  }
   readonly call: ToolCall
 }
 
@@ -64,6 +69,7 @@ const registryLayer = Layer.effect(
         agent: input.agent,
         assistantMessageID: input.assistantMessageID,
         toolCallID: input.call.id,
+        userTurn: input.userTurn,
       }).pipe(
         Effect.map((output) => ({ output })),
         Effect.catchTag("LLM.ToolFailure", (failure) =>

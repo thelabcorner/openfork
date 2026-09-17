@@ -135,6 +135,23 @@ export interface Interface {
       repository: Repository
       paths: readonly RelativePath[]
     }) => Effect.Effect<ReadonlySet<RelativePath>, OperationError>
+    /**
+     * Git-authoritative inventory for a project-relative scope.
+     *
+     * `tracked` reads the index (`ls-files --cached`, cheap, no disk walk);
+     * `untracked` walks the worktree (`ls-files --others --exclude-standard`).
+     * Together they are the exact domain Snapshot stages, including dotfiles
+     * and tracked files under generated folders that a UI watcher ignores.
+     */
+    readonly list: (input: {
+      repository: Repository
+      scope: RelativePath
+    }) => Effect.Effect<
+      { readonly tracked: readonly RelativePath[]; readonly untracked: readonly RelativePath[] },
+      OperationError
+    >
+    /** Tracked paths only (`ls-files --cached`); no worktree walk. */
+    readonly tracked: (input: { repository: Repository }) => Effect.Effect<readonly RelativePath[], OperationError>
   }
   readonly tree: {
     readonly capture: (input: {
@@ -422,7 +439,7 @@ const layer = Layer.effect(
           ),
         )
       yield* fs
-        .copyFile(path.join(input.seed.gitDirectory, "index"), path.join(input.gitDirectory, "index"))
+        .copyFileAtomic(path.join(input.seed.gitDirectory, "index"), path.join(input.gitDirectory, "index"))
         .pipe(Effect.catch(() => Effect.void))
       return repository
     })
@@ -526,6 +543,37 @@ const layer = Layer.effect(
           .filter(Boolean)
           .map((file) => RelativePath.make(file)),
       )
+    })
+
+    const listIndexFiles = Effect.fn("Git.index.list")(function* (input: {
+      repository: Repository
+      scope: RelativePath
+    }) {
+      const list = (args: string[]) =>
+        repositoryOperation("list_files", input.repository, args).pipe(
+          Effect.map((result) =>
+            result.text
+              .split("\0")
+              .filter(Boolean)
+              .map((item) => RelativePath.make(item)),
+          ),
+        )
+      const [tracked, untracked] = yield* Effect.all(
+        [
+          list(["ls-files", "--cached", "--full-name", "-z", "--", input.scope]),
+          list(["ls-files", "--others", "--exclude-standard", "--full-name", "-z", "--", input.scope]),
+        ],
+        { concurrency: 2 },
+      )
+      return { tracked, untracked }
+    })
+
+    const trackedIndexFiles = Effect.fn("Git.index.tracked")(function* (input: { repository: Repository }) {
+      const result = yield* repositoryOperation("list_files", input.repository, ["ls-files", "--cached", "-z"])
+      return result.text
+        .split("\0")
+        .filter(Boolean)
+        .map((item) => RelativePath.make(item))
     })
 
     const writeTree = Effect.fn("Git.tree.write")(function* (repository: Repository) {
@@ -973,7 +1021,7 @@ const layer = Layer.effect(
       sync: { fetchRemotes: fetch, fetchBranch, checkoutRemoteBranch: checkout, resetHard: reset },
       change: { capture, apply, discard },
       worktree: { create: worktreeCreate, remove: worktreeRemove, list: worktreeList },
-      index: { refresh, ignored },
+      index: { refresh, ignored, list: listIndexFiles, tracked: trackedIndexFiles },
       tree: {
         capture: captureTree,
         write: writeTree,

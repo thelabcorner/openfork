@@ -53,10 +53,11 @@ const makeLayer = (
         }),
       ),
     ),
-    // Watcher events are not exercised here; only listen() is consumed.
+    // Watcher events are not exercised here; only the subscription is consumed.
     Layer.provide(
       Layer.succeed(EventV2.Service, {
         listen: () => Effect.succeed(() => {}),
+        listenLocation: () => Effect.succeed(() => {}),
       } as unknown as EventV2.Interface),
     ),
     Layer.provide(
@@ -154,7 +155,9 @@ describe("SearchIndex", () => {
         }).pipe(Effect.provide(makeLayer(tmp.path, dataDir, ["one.ts", "dir/two.ts"])), Effect.scoped),
       )
 
-      // Second instance over the same db: no reseed (chunks exist), base loads.
+      // Second instance over the same db: the freshness marker is recent, so no
+      // authoritative walk and no reseed; the persisted base loads as-is.
+      let walks = 0
       await run(
         Effect.gen(function* () {
           const index = yield* SearchIndex.Service
@@ -163,8 +166,109 @@ describe("SearchIndex", () => {
           expect(paths.has("one.ts")).toBe(true)
           expect(paths.has("dir/two.ts")).toBe(true)
           expect(paths.has("dir")).toBe(true)
-        }).pipe(Effect.provide(makeLayer(tmp.path, dataDir, [])), Effect.scoped),
+        }).pipe(Effect.provide(makeLayer(tmp.path, dataDir, [], { onSeed: () => walks++ })), Effect.scoped),
       )
+      // Negative invariant: a fresh index must not re-enumerate the tree.
+      expect(walks).toBe(0)
+    } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  }, 20_000)
+
+  test("reconciles stale persisted paths written while unwatched", async () => {
+    const tmp = await tmpdir()
+    try {
+      const dataDir = path.join(tmp.path, "data")
+      await run(
+        Effect.gen(function* () {
+          const index = yield* SearchIndex.Service
+          const seeded = yield* Effect.promise(() => pollUntil(async () => (await load(index)).paths.length >= 2))
+          expect(seeded).toBe(true)
+          yield* index.seal()
+        }).pipe(Effect.provide(makeLayer(tmp.path, dataDir, ["old/one.ts"])), Effect.scoped),
+      )
+
+      // Age the freshness marker so the next open performs an authoritative
+      // reconciliation instead of trusting the persisted base chunks.
+      await run(
+        Effect.gen(function* () {
+          const store = yield* ChunkStore.Service
+          yield* store.putMeta("indexedAt", String(Date.now() - SearchIndex.RECONCILE_TTL_MS - 1_000))
+        }).pipe(
+          Effect.provide(ChunkStore.layerFromPath(ChunkStore.dbPathFor(tmp.path, dataDir))),
+          Effect.scoped,
+        ),
+      )
+
+      await run(
+        Effect.gen(function* () {
+          const index = yield* SearchIndex.Service
+          const paths = new Set((yield* Effect.promise(() => load(index))).paths.map((entry) => entry.path))
+          // The moved/created path is authoritative again...
+          expect(paths.has("new/two.ts")).toBe(true)
+          expect(paths.has("new")).toBe(true)
+          // ...and the ghost directory/files that no longer exist are gone.
+          expect(paths.has("old/one.ts")).toBe(false)
+          expect(paths.has("old")).toBe(false)
+        }).pipe(Effect.provide(makeLayer(tmp.path, dataDir, ["new/two.ts"])), Effect.scoped),
+      )
+    } finally {
+      await tmp[Symbol.asyncDispose]()
+    }
+  }, 20_000)
+
+  test("reconcile compacts a fragmented store", async () => {
+    const tmp = await tmpdir()
+    try {
+      const dataDir = path.join(tmp.path, "data")
+      const seededFiles = ["src/seed.ts", ...Array.from({ length: 70 }, (_, i) => `src/file-${i}.ts`)]
+      await run(
+        Effect.gen(function* () {
+          const index = yield* SearchIndex.Service
+          const seeded = yield* Effect.promise(() => pollUntil(async () => (await load(index)).paths.length >= 2))
+          expect(seeded).toBe(true)
+          // Simulate watcher deltas: one sealed chunk per edit.
+          for (let i = 0; i < 70; i++) {
+            yield* index.upsert({ path: `src/file-${i}.ts`, isDir: false })
+            yield* index.seal()
+          }
+        }).pipe(Effect.provide(makeLayer(tmp.path, dataDir, ["src/seed.ts"])), Effect.scoped),
+      )
+
+      const countChunks = () =>
+        Effect.runPromise(
+          Effect.gen(function* () {
+            const store = yield* ChunkStore.Service
+            return yield* store.count()
+          }).pipe(
+            Effect.provide(ChunkStore.layerFromPath(ChunkStore.dbPathFor(tmp.path, dataDir))),
+            Effect.scoped,
+          ),
+        )
+
+      expect(await countChunks()).toBeGreaterThan(30)
+
+      // Age the marker so the next open reconciles and rewrites the fragments.
+      await run(
+        Effect.gen(function* () {
+          const store = yield* ChunkStore.Service
+          yield* store.putMeta("indexedAt", String(Date.now() - SearchIndex.RECONCILE_TTL_MS - 1_000))
+        }).pipe(
+          Effect.provide(ChunkStore.layerFromPath(ChunkStore.dbPathFor(tmp.path, dataDir))),
+          Effect.scoped,
+        ),
+      )
+
+      await run(
+        Effect.gen(function* () {
+          const index = yield* SearchIndex.Service
+          const paths = new Set((yield* Effect.promise(() => load(index))).paths.map((entry) => entry.path))
+          for (const file of seededFiles) expect(paths.has(file)).toBe(true)
+        }).pipe(Effect.provide(makeLayer(tmp.path, dataDir, seededFiles)), Effect.scoped),
+      )
+
+      // The reconcile rewrote the delta chunks into a bounded base.
+      expect(await countChunks()).toBeLessThan(10)
     } finally {
       await tmp[Symbol.asyncDispose]()
     }

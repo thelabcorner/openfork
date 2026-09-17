@@ -36,6 +36,7 @@ import {
   backfillCooldownMs,
   inspectSealerBacklog,
   runPassV2,
+  semanticScanCooldownMs,
   shouldDrainFreelist,
 } from "../../src/database/chunk-sealer"
 import { rehydrateEvents, CdbRehydrateError } from "../../src/event"
@@ -204,6 +205,17 @@ describe("ChunkDB crash recovery", () => {
     expect(backfillCooldownMs(10_000)).toBe(5_000)
     expect(backfillCooldownMs(60_000)).toBe(30_000)
     expect(backfillCooldownMs(600_000)).toBe(30_000)
+  })
+
+  test("FOREGROUND PRIORITY: mismatch-only semantic scans back off exponentially", () => {
+    expect(semanticScanCooldownMs(1, 100)).toBe(5_000)
+    expect(semanticScanCooldownMs(2, 100)).toBe(10_000)
+    expect(semanticScanCooldownMs(3, 100)).toBe(20_000)
+    expect(semanticScanCooldownMs(4, 100)).toBe(30_000)
+    expect(semanticScanCooldownMs(20, 100)).toBe(30_000)
+    // A genuinely expensive pass keeps its thermal budget even on the first
+    // no-progress streak rather than immediately retrying at the 5s floor.
+    expect(semanticScanCooldownMs(1, 60_000)).toBe(30_000)
   })
 
   test("RECLAIM POLICY: large freelists stay in accelerated drain while normal slack does not", () => {

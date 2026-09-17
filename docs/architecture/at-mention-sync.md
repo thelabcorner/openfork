@@ -404,7 +404,7 @@ box, so most file results — however well-scored — never render. Replaced by:
 
 | failure | mitigation |
 |---|---|
-| Watcher miss (atomic-save rename: tmp write then rename-over) | debounce batch coalesces; tmp files covered by `Ignore.PATTERNS` (extend with `**/*.tmp`, `**/*~` if needed). If a create is lost entirely: **reconcile on popover open** — when the app opens the popup with an empty query, server triggers a bounded freshness pass (background rg re-walk if `now − lastIndexUpdate > TTL`). Event-driven (user action), **not polling**. |
+| Watcher miss (atomic-save rename: tmp write then rename-over) | debounce batch coalesces; tmp files covered by `Ignore.PATTERNS` (extend with `**/*.tmp`, `**/*~` if needed). If a create is lost entirely: **reconcile on service open** — the persistent `SearchIndex` re-enumerates and diffs when its `indexedAt` marker is missing or older than the freshness grace, under the existing machine-wide cold-seed lease (`packages/core/src/search/index-service.ts`). Triggered by service construction, **not polling** and not by a popover request. |
 | Ignore-rule changes | `.gitignore`/`.ignore` change events → recompile matcher + re-walk (rare, cheap). |
 | Huge directories | keep the rg 100k-file cap on non-git seed walks; watcher events dropped early for ignored paths; batch apply bounds churn. |
 | Network mounts / unsupported backend | `hasNativeBinding()` guard (watcher.ts:51) → fall back to reconcile-on-open; log once. |
@@ -439,7 +439,14 @@ Result: new/renamed/deleted/untracked files appear within ~150–250 ms; no poll
 no DB; no protocol change.
 
 **P1 — index hardening + fast matching:**
-- Reconcile-on-open safety net (bounded re-walk when stale; §4.7).
+- Reconcile-on-open safety net (bounded re-walk when stale; §4.7). **Implemented
+  in the owning service, not the popover:** `SearchIndex` reconciles a persisted
+  index whose `indexedAt` marker is missing or older than a 30s grace, sharing
+  the cold-seed lease so concurrent hosts run one walk. It also rewrites the
+  store into a compacted base when watcher deltas have fragmented it or when
+  removals have accumulated a large tombstone blob, so later opens load a
+  bounded base instead of replaying all history. Removals are skipped when
+  the walk hits the rg limit (truncated enumeration is not proof of absence).
 - `.gitignore`/`.ignore` recompile + re-walk on change.
 - Rename detection in batch (delete+create, same basename).
 - Win32 case normalization (lowercase index keys).

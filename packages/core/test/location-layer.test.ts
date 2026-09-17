@@ -8,7 +8,7 @@ import { AgentV2 } from "@opencode-ai/core/agent"
 import { Catalog } from "@opencode-ai/core/catalog"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { LocationServiceMap } from "@opencode-ai/core/location-services"
+import { canonicalLocationRef, LocationServiceMap } from "@opencode-ai/core/location-services"
 import { Location } from "@opencode-ai/core/location"
 import { PluginV2 } from "@opencode-ai/core/plugin"
 import { ModelV2 } from "@opencode-ai/core/model"
@@ -55,6 +55,28 @@ describe("LocationServiceMap", () => {
             expect(Equal.equals(constructed, decoded)).toBe(true)
             expect(Hash.hash(constructed)).toBe(Hash.hash(decoded))
             expect(yield* locations.contextEffect(constructed)).toBe(yield* locations.contextEffect(decoded))
+          }),
+        ),
+      ),
+    ),
+  )
+
+  it.live("canonicalizes filesystem aliases before location cache lookup", () =>
+    Effect.acquireRelease(
+      Effect.promise(() => tmpdir()),
+      (dir) => Effect.promise(() => dir[Symbol.asyncDispose]()),
+    ).pipe(
+      Effect.flatMap((dir) =>
+        Effect.scoped(
+          Effect.gen(function* () {
+            const locations = yield* LocationServiceMap.Service
+            const canonical = Location.Ref.make({ directory: AbsolutePath.make(dir.path) })
+            const aliasPath =
+              process.platform === "win32" ? dir.path.replaceAll("\\", "/") : `${dir.path}${path.sep}.`
+            const alias = Location.Ref.make({ directory: AbsolutePath.make(aliasPath) })
+
+            expect(canonicalLocationRef(alias).directory).toBe(canonicalLocationRef(canonical).directory)
+            expect(yield* locations.contextEffect(canonical)).toBe(yield* locations.contextEffect(alias))
           }),
         ),
       ),

@@ -1,4 +1,5 @@
 import { Effect, Layer, LayerMap } from "effect"
+import { AbsolutePath } from "@opencode-ai/schema"
 import { AgentV2 } from "./agent"
 import { AISDK } from "./aisdk"
 import { Catalog } from "./catalog"
@@ -22,6 +23,7 @@ import { PluginV2 } from "./plugin"
 import { PluginInternal } from "./plugin/internal"
 import { Policy } from "./policy"
 import { ProjectCopy } from "./project/copy"
+import { ProjectInventory } from "./project-inventory"
 import { Pty } from "./pty"
 import { QuestionV2 } from "./question"
 import { Reference } from "./reference"
@@ -42,6 +44,7 @@ import { ToolOutputStore } from "./tool-output-store"
 import { Checkpoint } from "./checkpoint"
 import { PromptRevisor } from "./prompt-revisor"
 import { GoalAuditor } from "./goal/auditor"
+import { FSUtil } from "./fs-util"
 
 export { LocationServiceMap } from "./location-service-map"
 
@@ -59,6 +62,7 @@ export const locationServices = LayerNode.group([
   PluginInternal.node,
   ProjectCopy.node,
   ProjectCopy.refreshNode,
+  ProjectInventory.node,
   FileSystemSearch.node,
   FileSystem.node,
   FileIndex.node,
@@ -93,9 +97,25 @@ export const locationServices = LayerNode.group([
 export type LocationServices = LayerNode.Output<typeof locationServices>
 export type LocationError = LayerNode.Error<typeof locationServices>
 
+/**
+ * Location service identity is filesystem identity, not caller spelling.
+ *
+ * On Windows the same directory commonly arrives with both slash styles (and
+ * sometimes different casing). Feeding those raw refs directly into LayerMap
+ * creates independent long-lived location graphs: duplicate watchers, plugin
+ * instances, indexes, snapshot/checkpoint services, and background work. Keep
+ * the normalization at the cache boundary so every caller shares one graph.
+ * `FSUtil.resolve` also collapses `.`/`..` and resolves symlinks when possible
+ * on other platforms, preventing the same class of aliasing there.
+ */
+export function canonicalLocationRef(ref: Location.Ref): Location.Ref {
+  const directory = AbsolutePath.make(FSUtil.resolve(ref.directory))
+  return Location.Ref.make({ directory, workspaceID: ref.workspaceID })
+}
+
 const locationServiceNodeNames = [
   "Location", "Policy", "Config", "AgentV2", "CommandV2", "Reference", "Integration", "Catalog", "AISDK",
-  "PluginV2", "PluginInternal", "ProjectCopy", "ProjectCopy.refresh", "FileSystemSearch", "FileSystem", "FileIndex",
+  "PluginV2", "PluginInternal", "ProjectCopy", "ProjectCopy.refresh", "ProjectInventory", "FileSystemSearch", "FileSystem", "FileIndex",
   "FileIndexWatcher", "Watcher", "Pty", "SkillV2", "SystemContextRegistry", "SystemContextBuiltIns", "LocationMutation",
   "FileMutation", "PermissionV2", "ToolOutputStore", "ToolRegistry", "ToolRegistry.tools", "Image", "SkillGuidance",
   "ReferenceGuidance", "SessionTodo", "QuestionV2", "ReadToolFileSystem", "BuiltInTools", "SessionRunnerModel",
@@ -107,8 +127,9 @@ export function buildLocationServiceMap(
 ): Layer.Layer<LocationServiceMap.Service> {
   return Layer.effect(
     LocationServiceMap.Service,
-    LayerMap.make(
-      (ref: Location.Ref) => {
+    Effect.gen(function* () {
+      const map = yield* LayerMap.make(
+        (ref: Location.Ref) => {
         const missing = locationServices.dependencies.flatMap((node, index) =>
           node ? [] : [locationServiceNodeNames[index] ?? `index:${index}`],
         )
@@ -145,9 +166,21 @@ export function buildLocationServiceMap(
           ),
           Layer.provide(LayerNode.compile(location.hoisted)),
         )
-      },
-      { idleTimeToLive: "60 minutes" },
-    ),
+        },
+        { idleTimeToLive: "60 minutes" },
+      )
+
+      // LayerMap keys complex objects by structural hash/equality, so rebuilding
+      // an equivalent canonical Location.Ref is sufficient to collapse aliases.
+      // Preserve the underlying rcMap for observability/introspection while
+      // ensuring *every* cache operation crosses the same canonical boundary.
+      return {
+        ...map,
+        get: (ref: Location.Ref) => map.get(canonicalLocationRef(ref)),
+        contextEffect: (ref: Location.Ref) => map.contextEffect(canonicalLocationRef(ref)),
+        invalidate: (ref: Location.Ref) => map.invalidate(canonicalLocationRef(ref)),
+      }
+    }),
   )
 }
 

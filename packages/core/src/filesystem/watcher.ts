@@ -23,6 +23,32 @@ const SUBSCRIBE_TIMEOUT_MS = 10_000
 const MAX_PENDING_UPDATES = 4096
 const DRAIN_CHUNK_SIZE = 64
 
+// Process-local ownership registry for successfully established project-root
+// subscriptions. Consumers that want to reuse a completed project materialization
+// must not infer watcher liveness from feature flags or native binding presence:
+// neither proves that this directory is actually being observed. Refcounts keep
+// this correct if more than one location graph temporarily refers to the same
+// canonical root during a migration or reload.
+const activeRoots = new Map<string, number>()
+
+function rootKey(directory: string) {
+  const resolved = path.resolve(directory).replaceAll("\\", "/")
+  return process.platform === "win32" ? resolved.toLowerCase() : resolved
+}
+
+function retainRoot(directory: string) {
+  const key = rootKey(directory)
+  activeRoots.set(key, (activeRoots.get(key) ?? 0) + 1)
+  let released = false
+  return () => {
+    if (released) return
+    released = true
+    const next = (activeRoots.get(key) ?? 1) - 1
+    if (next <= 0) activeRoots.delete(key)
+    else activeRoots.set(key, next)
+  }
+}
+
 export const Event = FileSystemWatcher.Event
 
 const watcher = lazy((): typeof import("@parcel/watcher") | undefined => {
@@ -51,6 +77,15 @@ function protecteds(dir: string) {
 }
 
 export const hasNativeBinding = () => !!watcher()
+
+/** Number of live native project-root subscriptions for this canonical path. */
+export const activeRootCount = (directory: string) => activeRoots.get(rootKey(directory)) ?? 0
+
+/**
+ * Whether the owning Core watcher has successfully subscribed this project
+ * root. This is runtime ownership state, not a feature/configuration guess.
+ */
+export const hasActiveRoot = (directory: string) => activeRootCount(directory) > 0
 
 /**
  * Collapse exact-duplicate notifications (same path AND same type) within one
@@ -102,6 +137,7 @@ const layer = Layer.effect(
     const context = yield* Effect.context()
     const runFork = Effect.runForkWith(context)
     const subscriptions: ParcelWatcher.AsyncSubscription[] = []
+    const releaseRoots: Array<() => void> = []
     const pending = new Map<string, { path: string; type: string }>()
     let draining = false
     let stopped = false
@@ -158,10 +194,63 @@ const layer = Layer.effect(
     yield* Effect.addFinalizer(() =>
       Effect.promise(() => Promise.allSettled(subscriptions.map((subscription) => subscription.unsubscribe()))),
     )
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        for (const release of releaseRoots.splice(0)) release()
+      }),
+    )
+
+    // Some default ignore rules match directories/files a project genuinely
+    // tracks (`.opencode/`, `packages/desktop/`, a root `bin/`, a tracked
+    // `*.log`). A watcher that hides tracked files is a freshness bug, not an
+    // optimization, so the ignore set is derived from the tracked set:
+    // patterns that would hide tracked files are dropped from the native list,
+    // and the exact directories/files are whitelisted for the callback guard.
+    // Refreshed when the git control subscription reports a ref change. Volume
+    // stays bounded: generated `node_modules`/`dist` tracks nothing and remains
+    // ignored.
+    let trackedWhitelist: string[] = []
+    let nativeIgnore: readonly string[] = Ignore.PATTERNS
+    let refreshingWhitelist = false
+    const refreshTrackedWhitelist = Effect.fnUntraced(function* () {
+      if (location.vcs?.type !== "git") {
+        trackedWhitelist = []
+        nativeIgnore = Ignore.PATTERNS
+        return
+      }
+      const repository = yield* git.repo.discover(location.directory)
+      if (!repository) {
+        trackedWhitelist = []
+        nativeIgnore = Ignore.PATTERNS
+        return
+      }
+      const tracked = yield* git.index
+        .tracked({ repository })
+        .pipe(Effect.catch(() => Effect.succeed([] as readonly string[])))
+      const watchCoverage = Ignore.coverage(tracked)
+      nativeIgnore = watchCoverage.native
+      trackedWhitelist = watchCoverage.whitelist.flatMap((pattern) => [
+        pattern,
+        path.join(location.directory, pattern).replaceAll("\\", "/"),
+      ])
+    })
+    yield* refreshTrackedWhitelist().pipe(Effect.catchCause(() => Effect.void))
+
+    const refreshWhitelistSoon = () => {
+      if (refreshingWhitelist) return
+      refreshingWhitelist = true
+      runFork(
+        refreshTrackedWhitelist().pipe(
+          Effect.ensuring(Effect.sync(() => (refreshingWhitelist = false))),
+          Effect.catchCause(() => Effect.void),
+        ),
+      )
+    }
 
     const callback = (gitDirectory?: string): ParcelWatcher.SubscribeCallback => (_error, updates) => {
       if (stopped) return
       if (updates.length === 0) return
+      if (gitDirectory) refreshWhitelistSoon()
       // Parcel's ignore option is evaluated by the native backend, but some
       // backends still report descendants of ignored folders during a burst
       // (notably branch switches on Windows). Filter those hints at the
@@ -170,8 +259,13 @@ const layer = Layer.effect(
       // changes to refresh project state.
       const filtered = updates.filter((update) => {
         if (gitDirectory) return isGitControlPath(path.relative(gitDirectory, update.path))
-        return !Ignore.match(path.relative(location.directory, update.path), { extra: callbackIgnore }) &&
-          !Ignore.match(update.path, { extra: callbackIgnore })
+        return (
+          !Ignore.match(path.relative(location.directory, update.path), {
+            extra: callbackIgnore,
+            whitelist: trackedWhitelist,
+          }) &&
+          !Ignore.match(update.path, { extra: callbackIgnore, whitelist: trackedWhitelist })
+        )
       })
       if (filtered.length === 0) return
       // Parcel already batches native notifications. Publish the batch from a
@@ -193,10 +287,15 @@ const layer = Layer.effect(
       drain()
     }
 
-    const subscribe = (directory: string, ignore: string[], gitDirectory?: string) => {
+    const subscribe = (directory: string, ignore: string[], gitDirectory?: string, projectRoot = false) => {
       const pending = w.subscribe(directory, callback(gitDirectory), { ignore, backend })
       return Effect.promise(() => pending).pipe(
-        Effect.tap((subscription) => Effect.sync(() => subscriptions.push(subscription))),
+        Effect.tap((subscription) =>
+          Effect.sync(() => {
+            subscriptions.push(subscription)
+            if (projectRoot) releaseRoots.push(retainRoot(directory))
+          }),
+        ),
         Effect.timeout(SUBSCRIBE_TIMEOUT_MS),
         Effect.catchCause((cause) => {
           pending.then((subscription) => subscription.unsubscribe()).catch(() => {})
@@ -212,12 +311,15 @@ const layer = Layer.effect(
     callbackIgnore = [...new Set([...configIgnore, ...protecteds(location.directory)])]
     // Watch any project root, git or not (operator decision: the old `location.vcs &&` guard
     // from f95f877e5f deliberately skipped non-git roots; do not re-add it). Ignore patterns
-    // (Ignore.PATTERNS + config `watcher.ignore` + protected paths) bound event volume.
+    // (tracked-aware subset of Ignore.PATTERNS + config `watcher.ignore` + protected paths)
+    // bound event volume while keeping every tracked directory observable.
     if (yield* Flag.OPENCODE_EXPERIMENTAL_FILEWATCHER) {
       yield* Effect.forkScoped(
         subscribe(
           location.directory,
-          [...new Set([...Ignore.PATTERNS, ...configIgnore, ...protecteds(location.directory)])],
+          [...new Set([...nativeIgnore, ...configIgnore, ...protecteds(location.directory)])],
+          undefined,
+          true,
         ),
       )
     }

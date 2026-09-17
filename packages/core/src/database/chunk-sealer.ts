@@ -94,6 +94,16 @@ const MAINTENANCE_INTERVAL_MS = 10 * 60 * 1000
 const CHUNKDB_BACKFILL_COOLDOWN_RATIO = 0.5
 const CHUNKDB_BACKFILL_COOLDOWN_MIN_MS = 1_000
 const CHUNKDB_BACKFILL_COOLDOWN_MAX_MS = 30_000
+// Semantic pruning can discover a large run of historical candidates whose
+// current projections no longer prove safe compaction. Those are useful
+// fail-closed scans, but they make ZERO storage progress. Treating `hasMore`
+// alone as a reason for 1s back-to-back passes made startup maintenance scan
+// hundreds of stale aggregates while interactive sessions were running.
+// Consecutive no-progress scans therefore back off exponentially, capped at the
+// same 30s thermal ceiling as productive backfill. Productive semantic work
+// resets the streak and keeps the fast drain path.
+const CHUNKDB_SEMANTIC_SCAN_COOLDOWN_MIN_MS = 5_000
+const CHUNKDB_SEMANTIC_SCAN_COOLDOWN_MAX_MS = 30_000
 // Failure backoff: a failed pass doubles the wait (exponential, capped) so a
 // broken DB isn't hammered; reset on success.
 const BACKOFF_BASE_MS = 10 * 60 * 1000
@@ -152,6 +162,28 @@ export function backfillCooldownMs(passDurationMs: number): number {
     CHUNKDB_BACKFILL_COOLDOWN_MIN_MS,
     Math.min(CHUNKDB_BACKFILL_COOLDOWN_MAX_MS, Math.ceil(passDurationMs * CHUNKDB_BACKFILL_COOLDOWN_RATIO)),
   )
+}
+
+export function semanticPruneProgress(outcome: SemanticPruneOutcome): number {
+  return (
+    outcome.compacted +
+    outcome.indexBackfilled +
+    outcome.dependencyBackfilled +
+    outcome.checkpointRowsMigrated +
+    outcome.canonicalValuesDeleted
+  )
+}
+
+/** Delay for semantic passes that found more work but made no durable progress.
+ * The elapsed pass time still contributes to the thermal budget; the streak
+ * adds pressure-sensitive exponential backoff for repeated stale projections. */
+export function semanticScanCooldownMs(noProgressStreak: number, passDurationMs: number): number {
+  const streak = Math.max(1, Math.floor(noProgressStreak))
+  const exponential = Math.min(
+    CHUNKDB_SEMANTIC_SCAN_COOLDOWN_MAX_MS,
+    CHUNKDB_SEMANTIC_SCAN_COOLDOWN_MIN_MS * 2 ** Math.min(16, streak - 1),
+  )
+  return Math.max(backfillCooldownMs(passDurationMs), exponential)
 }
 
 /** Optional tuning knobs for a sealer pass (epoch-3 storage-frontier-v3). */
@@ -1038,10 +1070,13 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
           let previousHitCap: boolean = false
           let reclaimDraining = false
           let backoffMs = BACKOFF_BASE_MS
+          let semanticNoProgressStreak = 0
           for (;;) {
             const draining: boolean = previousHitCap && backfillAllowed
             const cap: number = draining ? CHUNKDB_BACKFILL_MAX_ROWS_PER_PASS : MAX_ROWS_PER_PASS
             const started = Date.now()
+            let semanticScanBacklog = false
+            let semanticScanWaitMs = 0
             if (Flag.OPENCODE_SEAL_PRUNE) {
               type SemanticLoopOutcome =
                 | { readonly kind: "ok"; readonly value: SemanticPruneOutcome }
@@ -1085,13 +1120,28 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               if (pruned.inspected > 0) {
                 yield* Effect.logInfo("ChunkDB semantic prune pass complete", { filename, ...pruned })
               }
+              const semanticProgress = semanticPruneProgress(pruned)
+              if (semanticProgress > 0) semanticNoProgressStreak = 0
               // Semantic elimination has priority over representation-level
               // compression. If we just proved and compacted snapshots, start
               // another semantic pass before the normal sealer can frame/ref the
               // remaining JSON and hide its entity key from candidate discovery.
-              if (pruned.compacted > 0 || pruned.hasMore) {
+              //
+              // Crucially, `hasMore` by itself is NOT progress. Projection-
+              // mismatch-only passes used to loop here at the 1s minimum and
+              // starve both the normal sealer and foreground work. A no-progress
+              // backlog instead shares this cycle with representation sealing,
+              // then receives an adaptive 5s -> 10s -> 20s -> 30s cool-off.
+              if (pruned.compacted > 0 || (semanticProgress > 0 && pruned.hasMore)) {
                 yield* Effect.sleep(Duration.millis(backfillCooldownMs(Date.now() - started)))
                 continue
+              }
+              if (pruned.hasMore) {
+                semanticNoProgressStreak += 1
+                semanticScanBacklog = true
+                semanticScanWaitMs = semanticScanCooldownMs(semanticNoProgressStreak, Date.now() - started)
+              } else {
+                semanticNoProgressStreak = 0
               }
             }
             const outcome: SealerPassOutcome = yield* runSealerPass(db, { maxRowsPerPass: cap }).pipe(
@@ -1143,7 +1193,7 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
             // ratio is sane instead of waiting ten minutes between ~160MB
             // maintenance reclaims. This also repairs a DB that finished its
             // backfill in a previous process before this policy existed.
-            if (!previousHitCap) {
+            if (!previousHitCap && !semanticScanBacklog) {
               const reclaim = yield* reclaimSpace(db, "drain")
               reclaimDraining = reclaim.needsMore
               if (reclaim.reclaimedPages > 0) {
@@ -1160,11 +1210,14 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               reclaimDraining = false
             }
 
-            const wait = previousHitCap && backfillAllowed
+            const regularWait = previousHitCap && backfillAllowed
               ? backfillCooldownMs(Date.now() - started)
               : reclaimDraining
                 ? CHUNKDB_RECLAIM_DRAIN_SLEEP_MS
                 : MAINTENANCE_INTERVAL_MS
+            const wait = semanticScanBacklog
+              ? Math.max(semanticScanWaitMs, previousHitCap && backfillAllowed ? regularWait : 0)
+              : regularWait
             yield* Effect.sleep(Duration.millis(wait))
           }
                 }),

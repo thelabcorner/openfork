@@ -31,6 +31,7 @@ import { SessionInput } from "../input"
 import { SessionMessage } from "../message"
 import { SessionSchema } from "../schema"
 import { SessionStore } from "../store"
+import { SessionTelemetry } from "../telemetry"
 import { SessionTitle } from "../title"
 import { type RunError, Service } from "./index"
 import { SessionRunnerModel } from "./model"
@@ -44,6 +45,7 @@ import { GoalAutomation } from "../../goal/automation"
 import { GoalAuditor } from "../../goal/auditor"
 import { makeLocationNode } from "../../effect/app-node"
 import { llmClient } from "../../effect/app-node-platform"
+import { UsageRecord } from "../../usage/record"
 
 function tokenCount(tokens: {
   readonly input: number
@@ -55,6 +57,27 @@ function tokenCount(tokens: {
   // every provider-reported token class so caching cannot accidentally make an
   // unattended run appear cheaper than the context it is actually consuming.
   return tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+}
+
+function toolUserTurn(messages: readonly SessionMessage.Message[]) {
+  const userIndex = messages.findLastIndex((message) => message.type === "user")
+  if (userIndex < 0) return undefined
+  const user = messages[userIndex]
+  if (!user || user.type !== "user") return undefined
+  const previousAssistant = messages.slice(0, userIndex).findLast((message) => message.type === "assistant")
+  const previousAssistantText =
+    previousAssistant?.type === "assistant"
+      ? previousAssistant.content
+          .filter((part): part is SessionMessage.AssistantText => part.type === "text")
+          .map((part) => part.text)
+          .join("\n")
+          .trim()
+      : ""
+  return {
+    userMessageID: user.id,
+    userText: user.text,
+    ...(previousAssistantText ? { previousAssistantText } : {}),
+  }
 }
 
 /**
@@ -116,6 +139,8 @@ const layer = Layer.effect(
     const tools = yield* ToolRegistry.Service
     const models = yield* SessionRunnerModel.Service
     const store = yield* SessionStore.Service
+    const telemetry = yield* SessionTelemetry.Service
+    const usageRecord = yield* UsageRecord.Service
     const title = yield* SessionTitle.Service
     const location = yield* Location.Service
     const systemContext = yield* SystemContextRegistry.Service
@@ -234,7 +259,8 @@ const layer = Layer.effect(
       const system =
         initialized ??
         (yield* SessionContextEpoch.prepare(db, events, loadSystemContext(session.id, agent), session.id, readDb))
-      const model = yield* models.resolve(session)
+      const resolvedModel = yield* models.resolveWithInfo(session)
+      const model = resolvedModel.model
       // History is a committed-state read and can be large. Keep it off the
       // primary writer connection so another Session's durable projection does
       // not delay provider dispatch.
@@ -250,6 +276,7 @@ const layer = Layer.effect(
         entries = yield* state.history.entries(system.baselineSeq)
       }
       const context = entries.map((entry) => entry.message)
+      const userTurn = toolUserTurn(context)
       const isLastStep = agent.info?.steps !== undefined && currentStep >= agent.info.steps
       const toolMaterialization = isLastStep ? undefined : yield* tools.materialize(agent.info?.permissions)
       const promptCacheKey = /^ses_[0-9a-f]{64}$/.test(session.id) ? session.id.slice(4) : session.id
@@ -295,8 +322,14 @@ const layer = Layer.effect(
         snapshot: Deferred.await(startSnapshot),
       })
       const withPublication = Semaphore.makeUnsafe(1).withPermit
+      let firstTokenAt: number | undefined
+      let streamedAt: number | undefined
       const publish = (event: LLMEvent, outputPaths: ReadonlyArray<string> = []) =>
-        withPublication(publisher.publish(event, outputPaths))
+        withPublication(
+          publisher.publish(event, outputPaths).pipe(
+            Effect.andThen(telemetry.observe({ sessionID: session.id, event })),
+          ),
+        )
       let overflowFailure: ProviderErrorEvent | undefined
       const providerStream = llm.stream(request).pipe(
         Stream.runForEach((event) =>
@@ -307,6 +340,14 @@ const layer = Layer.effect(
             // per-session publication order is preserved by the withPublication semaphore.
             yield* Effect.yieldNow
             if (overflowFailure || publisher.hasProviderError()) return
+            if (
+              firstTokenAt === undefined &&
+              (event.type === "text-start" ||
+                event.type === "text-delta" ||
+                event.type === "reasoning-start" ||
+                event.type === "reasoning-delta")
+            )
+              firstTokenAt = DateTime.toEpochMillis(yield* DateTime.now)
             if (LLMEvent.is.providerError(event)) {
               if (isContextOverflowFailure(event) && !publisher.hasAssistantStarted()) {
                 overflowFailure = event
@@ -327,6 +368,7 @@ const layer = Layer.effect(
                   sessionID: session.id,
                   agent: agent.id,
                   assistantMessageID,
+                  userTurn,
                   call: event,
                 }),
               ).pipe(
@@ -357,7 +399,19 @@ const layer = Layer.effect(
           // The lazily published Step.Started event can arrive after the
           // provider spent most of the request generating, so it must not
           // anchor rate denominators.
-          publisher.setRequestSentAt(yield* DateTime.now)
+          const requestSentAt = yield* DateTime.now
+          publisher.setRequestSentAt(requestSentAt)
+          yield* telemetry.begin({
+            sessionID: session.id,
+            requestSentAt: DateTime.toEpochMillis(requestSentAt),
+            model: {
+              providerID: model.provider,
+              modelID: model.id,
+              name: resolvedModel.name,
+              ...(session.model?.variant === undefined ? {} : { variant: session.model.variant }),
+              ...(model.defaults?.limits?.context === undefined ? {} : { contextLimit: model.defaults.limits.context }),
+            },
+          })
           const stream = yield* restore(providerStream).pipe(Effect.exit)
           const failure =
             stream._tag === "Failure" ? Option.getOrUndefined(Cause.findErrorOption(stream.cause)) : undefined
@@ -383,7 +437,9 @@ const layer = Layer.effect(
             !publisher.hasProviderError() &&
             publisher.hasAssistantStarted()
           ) {
+            streamedAt = DateTime.toEpochMillis(yield* DateTime.now)
             yield* withPublication(publisher.streamed())
+            yield* telemetry.streamed(session.id, streamedAt)
           }
           if (stream._tag === "Failure" && Cause.hasInterrupts(stream.cause)) yield* FiberSet.clear(toolFibers)
           const settled = yield* restore(awaitToolFibers(toolFibers)).pipe(Effect.exit)
@@ -416,11 +472,13 @@ const layer = Layer.effect(
                     .files({ from: resolvedStartSnapshot, to: endSnapshot })
                     .pipe(Effect.catch(() => Effect.succeed(undefined)))
                 : undefined
+            const completedAt = yield* DateTime.now
+            const assistantMessageID = yield* publisher.startAssistant()
             yield* withPublication(
               events.publish(SessionEvent.Step.Ended, {
                 sessionID: session.id,
-                timestamp: yield* DateTime.now,
-                assistantMessageID: yield* publisher.startAssistant(),
+                timestamp: completedAt,
+                assistantMessageID,
                 finish: stepSettlement.finish,
                 cost: 0,
                 tokens: stepSettlement.tokens,
@@ -428,14 +486,47 @@ const layer = Layer.effect(
                 files,
               }),
             )
+            yield* telemetry.settle({
+              sessionID: session.id,
+              assistantMessageID,
+              completedAt: DateTime.toEpochMillis(completedAt),
+              cost: 0,
+              tokens: stepSettlement.tokens,
+            })
+            yield* usageRecord.record({
+              messageID: assistantMessageID,
+              sessionID: session.id,
+              providerID: model.provider,
+              modelID: model.id,
+              variant: session.model?.variant,
+              agent: agent.id,
+              createdAt: DateTime.toEpochMillis(requestSentAt),
+              requestSentAt: DateTime.toEpochMillis(requestSentAt),
+              firstTokenAt,
+              streamedAt,
+              completedAt: DateTime.toEpochMillis(completedAt),
+              cost: 0,
+              tokens: {
+                input: stepSettlement.tokens.input,
+                cacheRead: stepSettlement.tokens.cache.read,
+                cacheWrite: stepSettlement.tokens.cache.write,
+                output: stepSettlement.tokens.output,
+                reasoning: stepSettlement.tokens.reasoning,
+              },
+            })
           }
-          if (publisher.hasProviderError())
+          if (publisher.hasProviderError()) {
             yield* withPublication(publisher.failUnsettledTools("Tool execution interrupted"))
+            yield* telemetry.fail(session.id)
+          }
           if (stream._tag === "Success" && !publisher.hasProviderError())
             yield* withPublication(publisher.failUnsettledTools("Provider did not return a tool result", true))
-          if (stream._tag === "Failure") return yield* Effect.failCause(stream.cause)
+          if (stream._tag === "Failure") {
+            yield* telemetry.fail(session.id)
+            return yield* Effect.failCause(stream.cause)
+          }
           if (settled._tag === "Failure" && Cause.hasInterrupts(settled.cause))
-            return yield* Effect.failCause(settled.cause)
+            return yield* telemetry.fail(session.id).pipe(Effect.andThen(Effect.failCause(settled.cause)))
           return {
             needsContinuation: !publisher.hasProviderError() && needsContinuation,
             step: currentStep,
@@ -624,6 +715,8 @@ export const node = makeLocationNode({
     GoalAutomation.node,
     GoalAuditor.node,
     Database.node,
+    SessionTelemetry.node,
+    UsageRecord.node,
     SessionTitle.node,
   ],
 })

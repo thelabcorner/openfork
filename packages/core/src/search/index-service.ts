@@ -29,6 +29,18 @@ const METADATA_CHUNK_SIZE = 256
 const LINE_COUNT_MAX_BYTES = 512 * 1024
 const COLD_SEED_LOCK_STALE_MS = 60_000
 const COLD_SEED_LOCK_TIMEOUT_MS = 10 * 60 * 1000
+// A persisted index younger than this is trusted without a fresh authoritative
+// walk. The value only coalesces near-simultaneous hosts building the same
+// location service; a genuine process restart (branch switch, external move
+// while closed) is older than the grace and reconciles.
+export const RECONCILE_TTL_MS = 30_000
+const INDEXED_AT_KEY = "indexedAt"
+// Reconcile rewrites the base when watcher deltas have fragmented the store or
+// when removals have accumulated a tombstone blob large enough that every later
+// seal would re-serialize it. Both keep loadRaw() proportional to the live set
+// on subsequent opens instead of to history.
+const COMPACT_CHUNK_THRESHOLD = 64
+const COMPACT_TOMBSTONE_THRESHOLD = 1024
 const BINARY_EXT_RE =
   /\.(png|jpe?g|gif|webp|avif|ico|bmp|woff2?|ttf|otf|eot|pdf|zip|tar|gz|tgz|bz2|xz|7z|rar|mp4|mp3|mov|avi|mkv|wasm|pyc|class|o|so|dll|exe|bin|dat|lock)$/i
 
@@ -247,6 +259,77 @@ const serviceLayer = Layer.effect(
       if (statTargets.length > 0) yield* queueMetadata(statTargets, statTargets.length <= 64)
     })
 
+    // Authoritative tree enumeration shared by cold seeding and reopen
+    // reconciliation. `seed` records every enumerated file; `reconcile` diffs
+    // the live tree against the persisted base so moves/deletes that happened
+    // while no watcher was running (process down, branch switch, network mount)
+    // cannot keep serving paths that no longer exist. Only net-new files are
+    // recorded, so unchanged rows keep their persisted Tier-2 metadata instead
+    // of being re-stat'd on every open.
+    const walkAndApply = (mode: "seed" | "reconcile") =>
+      Effect.gen(function* () {
+        const walkLimit = location.vcs ? Number.MAX_SAFE_INTEGER : 100_000
+        const found = new Set<string>()
+        yield* ripgrep
+          .find({
+            cwd: location.directory,
+            pattern: "*",
+            limit: walkLimit,
+            onEntry: (entry) => Effect.sync(() => found.add(String(entry.path))),
+          })
+          .pipe(Effect.orDie, Effect.asVoid)
+        if (mode === "seed") {
+          for (const file of found) record({ path: file, isDir: false })
+        } else {
+          // `ripgrep.find` stops feeding onEntry at `limit`; a result that
+          // reaches the cap is not proof the rest of the tree is gone. Only a
+          // complete walk may delete, otherwise a huge repo would have its
+          // truncated tail tombstoned. Additions are always safe.
+          const complete = found.size < walkLimit
+          const dirs = new Set<string>()
+          for (const file of found) for (const ancestor of ancestors(file)) dirs.add(ancestor)
+          const current = snapshot()
+          const present = new Set(current.map((entry) => entry.path))
+          if (complete) {
+            for (const entry of current) {
+              if (entry.isDir ? dirs.has(entry.path) : found.has(entry.path)) continue
+              deleteEntry(entry.path)
+            }
+          }
+          for (const file of found) if (!present.has(file)) record({ path: file, isDir: false })
+        }
+        if (pending.size > 0) yield* seal.pipe(Effect.ignore)
+      })
+
+    // Rewrites the persisted base from the live snapshot: one chunk per CHUNK_SIZE
+    // entries per kind instead of the accumulated delta chunks, and tombstones
+    // are cleared. Called only while holding the reconcile lease so a concurrent
+    // host never observes a half-cleared store (the freshness marker is published
+    // only after this completes).
+    const compact = Effect.gen(function* () {
+      const paths = snapshot()
+      const files: Uint8Array[] = []
+      const dirs: Uint8Array[] = []
+      for (const entry of paths) (entry.isDir ? dirs : files).push(new TextEncoder().encode(entry.path))
+      files.sort(compareBytes)
+      dirs.sort(compareBytes)
+      yield* store.clear()
+      tombstones.clear()
+      yield* store.putMeta("tombstones", "[]").pipe(Effect.ignore)
+      // fileMeta entries survive compaction (paths unchanged); re-persist as-is.
+      yield* store.putMeta("fileMeta", JSON.stringify([...fileMeta])).pipe(Effect.ignore)
+      const chunks: ChunkStore.ChunkInput[] = []
+      for (const [kind, entries] of [
+        [KIND_FILE, files],
+        [KIND_DIR, dirs],
+      ] as const)
+        for (let i = 0; i < entries.length; i += CHUNK_SIZE)
+          chunks.push({ kind, entries: entries.slice(i, i + CHUNK_SIZE) })
+      if (chunks.length > 0) yield* store.append(chunks)
+      sealed.clear()
+      yield* loadRaw
+    })
+
     // Cold seeding is a MACHINE-WIDE operation for this physical index DB. ACP,
     // Desktop, and other hosts can construct the same project service at nearly
     // the same time. Without election they all see an empty DB and independently
@@ -256,9 +339,25 @@ const serviceLayer = Layer.effect(
     // lease. Contenders wait cheaply, then re-read the chunks written by the
     // winner and skip discovery. This prevents N-host cold-start CPU and duplicate
     // chunk amplification without introducing a process-specific XDG namespace.
-    if (rawFileChunks.length === 0 && rawDirChunks.length === 0) {
-      const dbPath = ChunkStore.dbPathFor(root, global.data)
-      const lockDir = path.join(path.dirname(dbPath), ".opencode-runtime-locks")
+    //
+    // The same lease serializes reopen reconciliation: a persisted index written
+    // while no watcher was running cannot be trusted, so when the freshness
+    // marker is missing or older than RECONCILE_TTL_MS the elected owner
+    // re-enumerates the tree and applies the diff. Near-simultaneous hosts share
+    // the winner's result instead of each running their own walk.
+    const dbPath = ChunkStore.dbPathFor(root, global.data)
+    const lockDir = path.join(path.dirname(dbPath), ".opencode-runtime-locks")
+    const readIndexedAt = store.getMeta(INDEXED_AT_KEY).pipe(
+      Effect.catch(() => Effect.succeed(undefined as string | undefined)),
+      Effect.map((raw) => {
+        const value = raw === undefined ? Number.NaN : Number(raw)
+        return Number.isFinite(value) ? value : undefined
+      }),
+    )
+    const freshEnough = (hasChunks: boolean, at: number | undefined) =>
+      hasChunks && at !== undefined && Date.now() - at < RECONCILE_TTL_MS
+    const persistedChunks = rawFileChunks.length > 0 || rawDirChunks.length > 0
+    if (!freshEnough(persistedChunks, yield* readIndexedAt)) {
       yield* Effect.scoped(
         Flock.effect(`search-index-cold-seed:${dbPath}`, {
           dir: lockDir,
@@ -269,25 +368,32 @@ const serviceLayer = Layer.effect(
         }).pipe(
           Effect.andThen(
             Effect.gen(function* () {
-              // Another process may have completed the seed while this host was
+              // Another process may have seeded/reconciled while this host was
               // waiting for ownership. Re-read under the lease before doing any
               // expensive discovery.
               yield* loadRaw
-              if (rawFileChunks.length > 0 || rawDirChunks.length > 0) return
+              const hasChunks = rawFileChunks.length > 0 || rawDirChunks.length > 0
+              if (freshEnough(hasChunks, yield* readIndexedAt)) return
 
-              yield* ripgrep
-                .find({
-                  cwd: location.directory,
-                  pattern: "*",
-                  limit: location.vcs ? Number.MAX_SAFE_INTEGER : 100_000,
-                  onEntry: (entry) => Effect.sync(() => record({ path: String(entry.path), isDir: false })),
-                })
-                .pipe(Effect.orDie, Effect.asVoid)
+              const mode = hasChunks ? "reconcile" : "seed"
+              yield* walkAndApply(mode)
 
-              // Persist the structural seed BEFORE releasing ownership. That is
+              // A reconcile removes ghosts, and those tombstones plus the one
+              // delta chunk per watcher batch are what make later opens slow:
+              // `readRaw` pays for every accumulated chunk. Rewriting the base
+              // here keeps every later loadRaw() proportional to the live set.
+              const chunkCount = rawFileChunks.length + rawDirChunks.length
+              if (tombstones.size > COMPACT_TOMBSTONE_THRESHOLD || chunkCount > COMPACT_CHUNK_THRESHOLD) {
+                yield* compact
+              } else {
+                yield* store.putMeta("tombstones", JSON.stringify([...tombstones])).pipe(Effect.ignore)
+              }
+
+              // Persist the freshness marker BEFORE releasing ownership. That is
               // what makes the next contender's loadRaw() an O(chunks) path
-              // instead of another full repository walk.
-              if (pending.size > 0) yield* seal.pipe(Effect.ignore)
+              // instead of another full repository walk; it is written after
+              // compaction so a fresh marker proves the store is not mid-rewrite.
+              yield* store.putMeta(INDEXED_AT_KEY, String(Date.now())).pipe(Effect.ignore)
             }),
           ),
         ),
@@ -421,30 +527,7 @@ const serviceLayer = Layer.effect(
           deleteEntry(entryPath)
         }),
       seal: () => seal,
-      compact: () =>
-        Effect.gen(function* () {
-          const paths = snapshot()
-          const files: Uint8Array[] = []
-          const dirs: Uint8Array[] = []
-          for (const entry of paths) (entry.isDir ? dirs : files).push(new TextEncoder().encode(entry.path))
-          files.sort(compareBytes)
-          dirs.sort(compareBytes)
-          yield* store.clear()
-          tombstones.clear()
-          yield* store.putMeta("tombstones", "[]").pipe(Effect.ignore)
-          // fileMeta entries survive compaction (paths unchanged); re-persist as-is.
-          yield* store.putMeta("fileMeta", JSON.stringify([...fileMeta])).pipe(Effect.ignore)
-          const chunks: ChunkStore.ChunkInput[] = []
-          for (const [kind, entries] of [
-            [KIND_FILE, files],
-            [KIND_DIR, dirs],
-          ] as const)
-            for (let i = 0; i < entries.length; i += CHUNK_SIZE)
-              chunks.push({ kind, entries: entries.slice(i, i + CHUNK_SIZE) })
-          if (chunks.length > 0) yield* store.append(chunks)
-          sealed.clear()
-          yield* loadRaw
-        }),
+      compact: () => compact,
     })
   }),
 )

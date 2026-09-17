@@ -164,10 +164,45 @@ const layer = Layer.effect(
       return Config.latest(yield* config.entries(), "snapshots") !== false
     })
 
+    const indexValid = Effect.fnUntraced(function* () {
+      const index = path.join(gitDirectory, "index")
+      if (!(yield* fs.exists(index))) return true
+      return yield* fs.readFile(index).pipe(
+        Effect.map((bytes) => Buffer.from(bytes).subarray(0, 4).toString("latin1") === "DIRC"),
+        Effect.catch(() => Effect.succeed(false)),
+      )
+    })
+
+    // Self-heal a missing/corrupt shadow index. One clobbered write otherwise
+    // makes every capture fail with `index file corrupt` indefinitely.
+    const healIndex = Effect.fnUntraced(function* (repository: Git.Repository) {
+      if (yield* indexValid()) return
+      yield* Effect.logWarning("snapshot git index invalid; rebuilding", { git: gitDirectory })
+      yield* fs.remove(path.join(gitDirectory, "index")).pipe(Effect.ignore)
+      const sourceIndex = source ? path.join(source.gitDirectory, "index") : undefined
+      const seeded =
+        sourceIndex && (yield* fs.exists(sourceIndex))
+          ? yield* fs
+              .copyFileAtomic(sourceIndex, path.join(gitDirectory, "index"))
+              .pipe(Effect.as(true), Effect.catch(() => Effect.succeed(false)))
+          : false
+      if (seeded) return
+      yield* appProcess
+        .run(
+          ChildProcess.make(
+            "git",
+            ["--git-dir", gitDirectory, "--work-tree", worktree, "add", "--all", "--sparse", "--", "."],
+            { cwd: worktree, extendEnv: true },
+          ),
+        )
+        .pipe(Effect.ignore)
+    })
+
     const capture = Effect.fn("Snapshot.capture")(function* () {
       if (!(yield* enabled())) return undefined
       return yield* Effect.gen(function* () {
         const repo = yield* repository()
+        yield* healIndex(repo)
         return ID.make(
           yield* git.tree.capture({
             repository: repo,
@@ -227,6 +262,7 @@ const layer = Layer.effect(
     const preview = Effect.fn("Snapshot.preview")(function* (input: PreviewInput) {
       if (!(yield* enabled())) return yield* new Error({ operation: "preview", message: "Snapshots are disabled" })
       const repo = yield* repository().pipe(Effect.mapError((cause) => failure("preview", cause)))
+      yield* healIndex(repo).pipe(Effect.catch(() => Effect.void))
       const files = yield* plan("preview", input)
       const current = yield* git.tree
         .capture({

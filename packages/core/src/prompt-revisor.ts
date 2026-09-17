@@ -11,8 +11,10 @@ import {
   ToolRuntime,
   toDefinitions,
   type Model,
+  type LLMEvent,
 } from "@opencode-ai/llm"
-import { Cause, Context, Effect, Layer, Schema } from "effect"
+import { Cause, Context, DateTime, Effect, Layer, Schema } from "effect"
+import * as Stream from "effect/Stream"
 import { AgentV2 } from "./agent"
 import { Catalog } from "./catalog"
 import { Config } from "./config"
@@ -25,6 +27,7 @@ import { RelativePath } from "./schema"
 import { SessionRunnerModel } from "./session/runner/model"
 import { SessionSchema } from "./session/schema"
 import { SessionStore } from "./session/store"
+import { SpecialAgentSession } from "./special-agent-session"
 import { SessionMessage } from "./session/message"
 import { SpecialAgentSessionContext } from "./special-agent-session-context"
 import { QuestionV2 } from "./question"
@@ -294,6 +297,13 @@ export interface RuntimeGenerateInput {
     readonly maxTokens?: number
     readonly temperature?: number
   }
+  /**
+   * Publication seam supplied by the owning special-agent session. Hosts that
+   * stream a provider turn MUST forward every event here so the turn is durable
+   * in the same transcript normal chat sessions use. Omitted while no durable
+   * transcript exists (for example draft-mode revision with no Session).
+   */
+  readonly publish?: (event: LLMEvent) => Effect.Effect<void>
 }
 
 export interface Runtime {
@@ -527,6 +537,7 @@ const layer = Layer.effect(
     const models = yield* SessionRunnerModel.Service
     const sessions = yield* SessionStore.Service
     const location = yield* Location.Service
+    const specialAgents = yield* SpecialAgentSession.Service
 
     const reconTools = {
       read: Tool.make({
@@ -667,7 +678,12 @@ const layer = Layer.effect(
           generation: { ...request.generation, ...(maxTokens === undefined ? {} : { maxTokens }) },
         })
         const run = (toolChoice: "required" | "auto" | "none") =>
-          collectUntilTerminalTool(llm.stream(LLM.updateRequest(base, { toolChoice })), "revised_prompt").pipe(
+          collectUntilTerminalTool(
+            llm
+              .stream(LLM.updateRequest(base, { toolChoice }))
+              .pipe(Stream.tap((event) => (request.publish ? request.publish(event) : Effect.void))),
+            "revised_prompt",
+          ).pipe(
             Effect.flatMap((response) =>
               response
                 ? Effect.succeed(response)
@@ -737,6 +753,76 @@ const layer = Layer.effect(
         (item): item is ModelV2.Ref => item !== undefined,
       )
       const model = yield* runtime.resolveModel({ candidates })
+      const modelRef = model.ref
+      // A revision attached to a real Session gets the same durable special-agent
+      // transcript every other host-owned agent uses. Draft-mode revisions have no
+      // owner Session, and a provision failure must degrade to an ephemeral
+      // rewrite rather than refusing the draft the user is looking at.
+      const transcriptID = session
+        ? yield* specialAgents
+            .provision({
+              ownerKind: SpecialAgentSession.OWNER_SESSION,
+              ownerID: session.id,
+              agent: "prompt_revisor",
+              parentSessionID: session.id,
+              title: `Prompt Revisor · ${session.title}`,
+              model: modelRef,
+            })
+            .pipe(
+              Effect.tapError((error) =>
+                Effect.logWarning("prompt revision continuing without a durable transcript", {
+                  sessionID: session.id,
+                  error: String(error),
+                }),
+              ),
+              Effect.catch(() => Effect.succeed(undefined)),
+            )
+        : undefined
+      const generateResponse = (request: RuntimeGenerateInput) =>
+        Effect.gen(function* () {
+          if (!transcriptID) return yield* runtime.generate(request)
+          const publisher = specialAgents.publisher({
+            sessionID: transcriptID,
+            agent: "prompt_revisor",
+            model: modelRef,
+          })
+          publisher.setRequestSentAt(yield* DateTime.now)
+          const startedAt = Date.now()
+          const response = yield* runtime.generate({
+            ...request,
+            publish: (event) => publisher.publish(event),
+          })
+          const reported = response.usage
+          const cacheRead = Math.max(0, reported?.cacheReadInputTokens ?? 0)
+          const cacheWrite = Math.max(0, reported?.cacheWriteInputTokens ?? 0)
+          const reasoning = Math.max(0, reported?.reasoningTokens ?? 0)
+          const tokens = {
+            input: Math.max(0, (reported?.inputTokens ?? 0) - cacheRead - cacheWrite),
+            output: Math.max(0, (reported?.outputTokens ?? 0) - reasoning),
+            reasoning,
+            cache: { read: cacheRead, write: cacheWrite },
+          }
+          yield* specialAgents.settleTurn({ sessionID: transcriptID, publisher, response, tokens })
+          yield* specialAgents.recordMaintenance({
+            agent: "prompt_revisor",
+            providerID: modelRef.providerID,
+            modelID: modelRef.id,
+            variant: modelRef.variant,
+            sessionID: runtimeSessionID,
+            costEstimated: reported === undefined,
+            tokens: {
+              input: tokens.input,
+              cacheRead,
+              cacheWrite,
+              output: tokens.output,
+              reasoning,
+            },
+            totalTokens: reported?.totalTokens ?? tokens.input + tokens.output + reasoning,
+            startedAt,
+            completedAt: Date.now(),
+          })
+          return response
+        })
       const entries = yield* config.entries()
       const policy = Config.latest(entries, "prompt_revisor_prompt")?.trim() || agent?.system || DEFAULT_PROMPT
       const system = `${policy}\n\n${PROTOCOL_PROMPT}`
@@ -1113,7 +1199,7 @@ const layer = Layer.effect(
             agentLabel: "prompt revisor",
             maxRepairs: MAX_TERMINAL_REPAIRS,
             generate: (terminalMessages, attempt) =>
-              runtime.generate({
+              generateResponse({
                 model,
                 sessionID: runtimeSessionID,
                 system,
@@ -1139,7 +1225,7 @@ const layer = Layer.effect(
 
         // Reconnaissance rounds may also commit revised_prompt, so they get the
         // same authoring budget rather than a tool-call-sized one.
-        const response = yield* runtime.generate({
+        const response = yield* generateResponse({
           model,
           sessionID: runtimeSessionID,
           system,
@@ -1159,7 +1245,7 @@ const layer = Layer.effect(
             detail: detail ?? (response.finishReason === "length" ? TRUNCATION_DETAIL : undefined),
             maxRepairs: MAX_TERMINAL_REPAIRS,
             generate: (terminalMessages, attempt) =>
-              runtime.generate({
+              generateResponse({
                 model,
                 sessionID: runtimeSessionID,
                 system,
@@ -1311,5 +1397,6 @@ export const node = makeLocationNode({
     SessionRunnerModel.node,
     SessionStore.node,
     Location.node,
+    SpecialAgentSession.node,
   ],
 })

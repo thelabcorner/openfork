@@ -875,6 +875,12 @@ export interface Interface {
   /** @deprecated Use `all()` and consume the returned stream. */
   readonly listen: (listener: Subscriber) => Effect.Effect<Unsubscribe>
   /**
+   * Subscribe synchronously to one event type across all locations. Use this
+   * instead of process-global `listen()` when a consumer only needs one type,
+   * so high-rate unrelated events never invoke its callback.
+   */
+  readonly listenType: <D extends Definition>(definition: D, listener: Subscriber<D>) => Effect.Effect<Unsubscribe>
+  /**
    * Subscribe synchronously to one event type at one exact Location. High-rate
    * location services should prefer this over `listen()` so events from another
    * project never invoke their callback just to be filtered out.
@@ -883,6 +889,25 @@ export interface Interface {
     definition: D,
     location: Location.Ref,
     listener: Subscriber<D>,
+  ) => Effect.Effect<Unsubscribe>
+  /**
+   * Subscribe to one event type for every workspace at a directory. This is
+   * the preferred replacement for process-global `listen()` + a directory
+   * check in per-project services.
+   */
+  readonly listenDirectory: <D extends Definition>(
+    definition: D,
+    directory: string,
+    listener: Subscriber<D>,
+  ) => Effect.Effect<Unsubscribe>
+  /**
+   * Subscribe to all event types at a directory. Intended for per-project
+   * plugin/event bridges that genuinely need the complete local event stream
+   * without paying process-global fanout for every other open project.
+   */
+  readonly listenDirectoryAll: (
+    directory: string,
+    listener: Subscriber,
   ) => Effect.Effect<Unsubscribe>
   /** Subscribe synchronously to one durable aggregate without process-global fanout. */
   readonly listenAggregate: (aggregateID: string, listener: Subscriber) => Effect.Effect<Unsubscribe>
@@ -1077,13 +1102,17 @@ export const layerWith = (options?: LayerOptions) =>
       const projectors = new Map<string, Subscriber[]>()
       // TODO: Bind durable projectors to exact type+version before supporting incompatible historical payloads.
       const listeners = new Array<Subscriber>()
+      const typeListeners = new Map<string, Subscriber[]>()
       const locatedListeners = new Map<string, Subscriber[]>()
+      const directoryListeners = new Map<string, Subscriber[]>()
+      const directoryTypeListeners = new Map<string, Subscriber[]>()
       const aggregateListeners = new Map<string, Subscriber[]>()
       const { db, readDb } = yield* Database.Service
       yield* cleanupOrphanedEventPayloads(db)
 
       const locatedKey = (type: string, location: Location.Ref) =>
         `${type}\0${location.directory}\0${location.workspaceID ?? ""}`
+      const directoryTypeKey = (type: string, directory: string) => `${type}\0${directory}`
 
       const getOrCreate = (definition: Definition) =>
         Effect.gen(function* () {
@@ -1451,6 +1480,23 @@ export const layerWith = (options?: LayerOptions) =>
               )
             }
           }
+          const typedListeners = typeListeners.get(event.type)
+          if (typedListeners?.length === 1) {
+            const listener = typedListeners[0]!
+            yield* observe(event, listener, () => removeFrom(typeListeners, event.type, listener))
+          } else if (typedListeners && typedListeners.length > 1) {
+            const snapshot = typedListeners.slice()
+            if (!isolateListeners) {
+              for (const listener of snapshot)
+                yield* observe(event, listener, () => removeFrom(typeListeners, event.type, listener))
+            } else {
+              yield* Effect.forEach(
+                snapshot,
+                (listener) => observe(event, listener, () => removeFrom(typeListeners, event.type, listener)),
+                { concurrency: 8, discard: true },
+              )
+            }
+          }
           if (event.location) {
             const key = locatedKey(event.type, event.location)
             const located = locatedListeners.get(key)
@@ -1473,6 +1519,27 @@ export const layerWith = (options?: LayerOptions) =>
                   { concurrency: 8, discard: true },
                 )
               }
+            }
+            const directory = event.location.directory
+            const typedDirectory = directoryTypeListeners.get(directoryTypeKey(event.type, directory))
+            if (typedDirectory?.length === 1) {
+              const listener = typedDirectory[0]!
+              yield* observe(event, listener, () =>
+                removeFrom(directoryTypeListeners, directoryTypeKey(event.type, directory), listener),
+              )
+            } else if (typedDirectory && typedDirectory.length > 1) {
+              for (const listener of typedDirectory.slice())
+                yield* observe(event, listener, () =>
+                  removeFrom(directoryTypeListeners, directoryTypeKey(event.type, directory), listener),
+                )
+            }
+            const directoryAll = directoryListeners.get(directory)
+            if (directoryAll?.length === 1) {
+              const listener = directoryAll[0]!
+              yield* observe(event, listener, () => removeFrom(directoryListeners, directory, listener))
+            } else if (directoryAll && directoryAll.length > 1) {
+              for (const listener of directoryAll.slice())
+                yield* observe(event, listener, () => removeFrom(directoryListeners, directory, listener))
             }
           }
           if (event.durable) {
@@ -1732,6 +1799,19 @@ export const layerWith = (options?: LayerOptions) =>
           })
         })
 
+      const listenType = <D extends Definition>(
+        definition: D,
+        listener: Subscriber<D>,
+      ): Effect.Effect<Unsubscribe> =>
+        Effect.sync(() => {
+          const key = definition.type
+          const list = typeListeners.get(key) ?? []
+          const subscriber = listener as Subscriber
+          list.push(subscriber)
+          typeListeners.set(key, list)
+          return Effect.sync(() => removeFrom(typeListeners, key, subscriber))
+        })
+
       const listenLocation = <D extends Definition>(
         definition: D,
         location: Location.Ref,
@@ -1750,6 +1830,31 @@ export const layerWith = (options?: LayerOptions) =>
             if (index >= 0) current.splice(index, 1)
             if (current.length === 0) locatedListeners.delete(key)
           })
+        })
+
+      const listenDirectory = <D extends Definition>(
+        definition: D,
+        directory: string,
+        listener: Subscriber<D>,
+      ): Effect.Effect<Unsubscribe> =>
+        Effect.sync(() => {
+          const key = directoryTypeKey(definition.type, directory)
+          const list = directoryTypeListeners.get(key) ?? []
+          const subscriber = listener as Subscriber
+          list.push(subscriber)
+          directoryTypeListeners.set(key, list)
+          return Effect.sync(() => removeFrom(directoryTypeListeners, key, subscriber))
+        })
+
+      const listenDirectoryAll = (
+        directory: string,
+        listener: Subscriber,
+      ): Effect.Effect<Unsubscribe> =>
+        Effect.sync(() => {
+          const list = directoryListeners.get(directory) ?? []
+          list.push(listener)
+          directoryListeners.set(directory, list)
+          return Effect.sync(() => removeFrom(directoryListeners, directory, listener))
         })
 
       const listenAggregate = (aggregateID: string, listener: Subscriber): Effect.Effect<Unsubscribe> =>
@@ -1773,7 +1878,10 @@ export const layerWith = (options?: LayerOptions) =>
         all: streamAll,
         durable,
         listen,
+        listenType,
         listenLocation,
+        listenDirectory,
+        listenDirectoryAll,
         listenAggregate,
         project,
         replay,

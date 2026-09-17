@@ -622,18 +622,33 @@ describe("SessionRunnerLLM", () => {
           decision: "continue",
           rationale: "The objective is not yet complete; continue implementation.",
           progressMade: false,
+          criteria: active.criteria.map((criterion) => ({
+            criterionID: criterion.id,
+            status: "pending",
+            evidence: "The criterion is not yet independently verified.",
+          })),
           continuationPrompt: "Implement the first remaining autonomous Goal task, then verify the affected behavior.",
         }),
         auditResponse("audit-goal-2", {
           decision: "continue",
           rationale: "Work remains after the first autonomous cycle.",
           progressMade: false,
+          criteria: active.criteria.map((criterion) => ({
+            criterionID: criterion.id,
+            status: "pending",
+            evidence: "The criterion remains pending independent verification.",
+          })),
           continuationPrompt: "Finish the second remaining Goal task without repeating the previous cycle, then capture evidence.",
         }),
         auditResponse("audit-goal-3", {
           decision: "continue",
           rationale: "The worker still has unfinished work, but no durable progress was recorded.",
           progressMade: false,
+          criteria: active.criteria.map((criterion) => ({
+            criterionID: criterion.id,
+            status: "pending",
+            evidence: "No new evidence proves the criterion yet.",
+          })),
           continuationPrompt: "Investigate why progress is not being recorded before attempting additional implementation.",
         }),
       ]
@@ -1617,7 +1632,14 @@ describe("SessionRunnerLLM", () => {
 
       expect(requests).toHaveLength(2)
       expect(requests[1]?.messages.map((message) => message.role)).toEqual(["user", "assistant", "tool"])
-      expect(authorizations).toMatchObject([{ sessionID, toolCallID: "call-echo" }])
+      expect(authorizations).toMatchObject([
+        {
+          sessionID,
+          toolCallID: "call-echo",
+          userTurn: { userText: "Echo this" },
+        },
+      ])
+      expect(authorizations[0]?.userTurn?.userMessageID).toStartWith("msg_")
       expect(executions).toEqual(["hello"])
       expect(yield* session.context(sessionID)).toMatchObject([
         { type: "user", text: "Echo this" },

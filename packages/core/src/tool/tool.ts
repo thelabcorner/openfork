@@ -11,6 +11,11 @@ export interface Context {
   readonly agent: AgentV2.ID
   readonly assistantMessageID: SessionMessage.ID
   readonly toolCallID: string
+  readonly userTurn?: {
+    readonly userMessageID: string
+    readonly userText: string
+    readonly previousAssistantText?: string
+  }
 }
 
 export type SchemaType<A> = Schema.Codec<A, any, never, never>

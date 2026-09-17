@@ -74,6 +74,9 @@ export type Error =
 export interface Interface {
   readonly resolve: (session: SessionSchema.Info) => Effect.Effect<Model, Error>
   readonly resolveRef: (ref: ModelV2.Ref) => Effect.Effect<Model, Error>
+  readonly resolveWithInfo: (
+    session: SessionSchema.Info,
+  ) => Effect.Effect<{ model: Model; name: string }, Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/SessionRunnerModel") {}
@@ -85,6 +88,7 @@ export const layerWith = (resolve: Interface["resolve"], resolveRef?: Interface[
     Service.of({
       resolve,
       resolveRef: resolveRef ?? (() => Effect.die("SessionRunnerModel.resolveRef is unavailable in this test layer")),
+      resolveWithInfo: (session) => resolve(session).pipe(Effect.map((model) => ({ model, name: model.id }))),
     }),
   )
 
@@ -211,8 +215,7 @@ export const locationLayer = Layer.effect(
         connection ? yield* integrations.connection.resolve(connection) : undefined,
       )
     })
-    return Service.of({
-      resolve: Effect.fn("SessionRunnerModel.resolve")(function* (session) {
+    const resolveWithInfo = Effect.fn("SessionRunnerModel.resolveWithInfo")(function* (session: SessionSchema.Info) {
         // Location plugins populate and filter the catalog asynchronously during layer startup.
         const defaultModel = session.model ? undefined : yield* catalog.model.default()
         const selected = session.model
@@ -232,12 +235,16 @@ export const locationLayer = Layer.effect(
         const connection = yield* integrations.connection.active(
           provider?.integrationID ?? Integration.ID.make(selected.providerID),
         )
-        return yield* resolve(
+        const model = yield* resolve(
           session,
           selected,
           connection ? yield* integrations.connection.resolve(connection) : undefined,
         )
-      }),
+        return { model, name: selected.name }
+      })
+    return Service.of({
+      resolve: (session) => resolveWithInfo(session).pipe(Effect.map((value) => value.model)),
+      resolveWithInfo,
       resolveRef,
     })
   }),

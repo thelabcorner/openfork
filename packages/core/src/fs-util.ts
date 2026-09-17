@@ -3,7 +3,7 @@ import { dirname, isAbsolute, join, relative, resolve as pathResolve, sep } from
 import { realpathSync } from "fs"
 import * as NFS from "fs/promises"
 import { lookup } from "mime-types"
-import { Context, Effect, FileSystem, Layer, Schema } from "effect"
+import { Context, Effect, FileSystem, Layer, Schedule, Schema } from "effect"
 import type { PlatformError } from "effect/PlatformError"
 import { Glob } from "./util/glob"
 import { serviceUse } from "./effect/service-use"
@@ -37,6 +37,13 @@ export namespace FSUtil {
     readonly writeJson: (path: string, data: unknown, mode?: number) => Effect.Effect<void, Error>
     readonly ensureDir: (path: string) => Effect.Effect<void, Error>
     readonly writeWithDirs: (path: string, content: string | Uint8Array, mode?: number) => Effect.Effect<void, Error>
+    /**
+     * Copy `source` over `target` atomically: write a sibling temp file, then
+     * rename over the target. A crashed or racing copy can therefore never leave
+     * a truncated/zeroed target (a plain `copyFile` can, which corrupts the
+     * shared snapshot git index).
+     */
+    readonly copyFileAtomic: (source: string, target: string) => Effect.Effect<void, Error>
     readonly readDirectoryEntries: (path: string) => Effect.Effect<DirEntry[], Error>
     readonly resolve: (path: string) => Effect.Effect<string>
     readonly findUp: (target: string, start: string, stop?: string) => Effect.Effect<string[], Error>
@@ -145,6 +152,17 @@ export namespace FSUtil {
         if (mode) yield* fs.chmod(path, mode)
       })
 
+      const copyFileAtomic = Effect.fn("FileSystem.copyFileAtomic")(function* (source: string, target: string) {
+        const temp = `${target}.${process.pid}.${Math.random().toString(36).slice(2)}.tmp`
+        yield* fs.copyFile(source, temp)
+        yield* fs.rename(temp, target).pipe(
+          // Windows MoveFileEx transiently fails with EPERM/EBUSY while a sibling
+          // rename or an open handle holds the target; retry briefly, then clean up.
+          Effect.retry({ times: 8, schedule: Schedule.spaced("20 millis") }),
+          Effect.catch((cause) => fs.remove(temp).pipe(Effect.ignore, Effect.andThen(Effect.fail(cause)))),
+        )
+      })
+
       const glob = Effect.fn("FileSystem.glob")(function* (pattern: string, options?: Glob.Options) {
         return yield* Effect.tryPromise({
           try: () => Glob.scan(pattern, options),
@@ -210,6 +228,7 @@ export namespace FSUtil {
         writeJson,
         ensureDir,
         writeWithDirs,
+        copyFileAtomic,
         findUp,
         up,
         globUp,
