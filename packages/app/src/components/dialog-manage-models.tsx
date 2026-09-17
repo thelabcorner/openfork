@@ -12,7 +12,7 @@ import { Switch as SwitchV2 } from "@opencode-ai/ui/v2/switch-v2"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { stripUnlimitedSuffix } from "@/utils/model-badges"
 import { useFilteredList } from "@opencode-ai/ui/hooks"
-import { createMemo, For, Show, type Component } from "solid-js"
+import { createEffect, createMemo, For, Show, type Component } from "solid-js"
 import { useLocal } from "@/context/local"
 import { popularProviders } from "@/hooks/use-providers"
 import { useLanguage } from "@/context/language"
@@ -148,6 +148,9 @@ export const DialogManageModelsV2: Component = () => {
   } catch {
     personal = undefined
   }
+  createEffect(() => {
+    void personal?.ensure()
+  })
   const personalCosts = createMemo(() => {
     const map = personal?.personalCosts()
     if (!map || map.size === 0) return undefined

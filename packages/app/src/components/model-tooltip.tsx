@@ -1,10 +1,8 @@
-import { createMemo, Show, type Component, type JSX } from "solid-js"
+import { createEffect, createMemo, Show, type Component, type JSX } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { DEEPSEEK_PEAK_RATES, deepSeekRatePeriod, isDeepSeekPeakPricedModel, type DeepSeekRate } from "@/utils/model-peak-pricing"
 import { stripUnlimitedSuffix, hasPublishedPricing } from "@/utils/model-badges"
 import { blendedCost, evaluateModelUsageYield, FALLBACK_WORKLOAD_CORPUS } from "@/utils/model-usage-yield"
-import { buildHitRateIndex, buildModelCostIndex } from "@/utils/model-usage-history"
-import { useSync } from "@/context/sync"
 import { usePersonalUsage } from "@/context/personal-usage"
 import { splitModelIDForProvider } from "@/utils/model-account-identity"
 
@@ -306,34 +304,17 @@ export const ModelTooltip: Component<{
       fingerprint: "fallback-16-aug26",
     }
   })
-  // Best-effort personal index — prefers durable learner, falls back to
-  // ephemeral scan for storybook / tests without the provider.
-  let syncForTooltip: ReturnType<typeof useSync> | undefined
-  try {
-    syncForTooltip = useSync()
-  } catch {
-    syncForTooltip = undefined
-  }
   let personalForCtx: ReturnType<typeof usePersonalUsage> | undefined
   try {
     personalForCtx = usePersonalUsage()
   } catch {
     personalForCtx = undefined
   }
+  createEffect(() => {
+    void personalForCtx?.ensure()
+  })
   const personalForTooltip = createMemo(() => {
-    const key = `${props.model.provider.id ?? "unknown"}:${props.model.id}`
-    // Durable first (survives LRU / restart)
-    const durable = personalForCtx?.getCost(props.model.provider.id ?? "unknown", props.model.id)
-    if (durable) return durable
-    if (!syncForTooltip) return undefined
-    try {
-      const idx = buildModelCostIndex(syncForTooltip().data.message)
-      const entry = idx.get(key)
-      if (!entry) return undefined
-      return { cost: entry.sum / entry.count, count: entry.count }
-    } catch {
-      return undefined
-    }
+    return personalForCtx?.getCost(props.model.provider.id ?? "unknown", props.model.id)
   })
   const hitRateForTooltip = createMemo(() => {
     const directDurable = personalForCtx?.getHitRate(props.model.provider.id ?? "unknown", props.model.id)
@@ -353,31 +334,7 @@ export const ModelTooltip: Component<{
         if (cnt > 0) return sum / cnt
       }
     }
-    if (!syncForTooltip) return undefined
-    try {
-      const idx = buildHitRateIndex(syncForTooltip().data.message)
-      const key = `${props.model.provider.id ?? "unknown"}:${props.model.id}`
-      const direct = idx.get(key)
-      if (direct) {
-        const denom = direct.input + direct.cacheRead
-        if (denom > 0 && direct.count >= 3) return direct.cacheRead / denom
-      }
-      let sum = 0
-      let cnt = 0
-      for (const [k, entry] of idx.entries()) {
-        if (k.endsWith(`:${props.model.id}`)) {
-          const denom = entry.input + entry.cacheRead
-          if (denom > 0 && entry.count >= 3) {
-            sum += entry.cacheRead / denom
-            cnt++
-          }
-        }
-      }
-      if (cnt > 0) return sum / cnt
-      return undefined
-    } catch {
-      return undefined
-    }
+    return undefined
   })
   const derivedYield = createMemo(() => {
     if (props.yield) return props.yield

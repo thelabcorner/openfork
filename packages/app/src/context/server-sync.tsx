@@ -4,6 +4,7 @@ import type {
   Path,
   Project,
   ProviderAuthResponse,
+  Session,
   SessionStatus,
 } from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
@@ -43,7 +44,7 @@ import { queryOptions, useMutation, useQueries, useQuery, useQueryClient } from 
 import type { SolidQueryOptions } from "@tanstack/solid-query"
 import { createRefreshQueue } from "./global-sync/queue"
 import { directoryKey } from "./global-sync/utils"
-import { PathKey } from "@/utils/path-key"
+import { pathKey, PathKey } from "@/utils/path-key"
 import { createDirSyncContext } from "./directory-sync"
 import { createSimpleContext } from "@opencode-ai/ui/context"
 import { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
@@ -68,6 +69,8 @@ import { createServerSession, type ServerSession } from "./server-session"
 import { perf } from "./perf"
 import { phaseTrace } from "./phase-trace"
 import type { ServerRequestPriority, ServerRequestScheduler } from "@/utils/server-request-scheduler"
+import type { Info as SessionTelemetryInfo } from "@opencode-ai/schema/session-telemetry"
+import { SessionID } from "@opencode-ai/schema/session-id"
 
 type GlobalStore = {
   ready: boolean
@@ -77,7 +80,33 @@ type GlobalStore = {
   provider: NormalizedProviderListResponse
   provider_auth: ProviderAuthResponse
   config: Config
+  /** Compact global observability projection; never owns message/part content. */
+  telemetry: Record<string, SessionTelemetryInfo | undefined>
   reload: undefined | "pending" | "complete"
+}
+
+type SessionProjectIndex = Pick<Project, "id" | "worktree" | "sandboxes">
+
+/**
+ * Resolve the loaded directory store that should own a session row.
+ *
+ * Most sessions live exactly at a project root or sandbox. Chat is the notable
+ * exception: its project root is a catalog/routing identity while each session
+ * can live in a generated scratch directory. In that case projectID is the
+ * authoritative association and the canonical project root owns the sidebar
+ * row. Unknown projects conservatively stay keyed by their actual directory.
+ */
+export function sessionIndexDirectory(
+  info: Pick<Session, "directory" | "projectID">,
+  projects: readonly SessionProjectIndex[],
+) {
+  const project = info.projectID ? projects.find((item) => item.id === info.projectID) : undefined
+  if (!project) return info.directory
+
+  const directory = pathKey(info.directory)
+  if (pathKey(project.worktree) === directory) return project.worktree
+  const sandbox = project.sandboxes?.find((item) => pathKey(item) === directory)
+  return sandbox ?? project.worktree
 }
 
 type McpListApi = {
@@ -434,16 +463,6 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
   const activeSessionsQuery = useQuery(() =>
     loadActiveSessionsQuery(serverSDK.scope, {
       active: async () => {
-        if ((await serverSDK.protocol) === "v1") {
-          const statuses = (await serverSDK.client.session.status()).data ?? {}
-          seedActiveSessionStatuses(session, statuses)
-          void activeSessionInfoWarmup.push(Object.keys(statuses))
-          return Object.fromEntries(
-            Object.entries(statuses).flatMap(([sessionID, status]) =>
-              status.type === "idle" ? [] : [[sessionID, { type: "running" as const }]],
-            ),
-          )
-        }
         const active = await serverSDK.api.session.active()
         seedActiveSessionStatuses(session, active)
         void activeSessionInfoWarmup.push(Object.keys(active))
@@ -458,6 +477,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     },
     project: [],
     provider_auth: {},
+    telemetry: {},
     // JSDOC: Suspension-safe query getters (route-level black-screen fix).
     // `@tanstack/solid-query` uses an internal `createResource()` per query.
     // Reading `.data` while the resource is unresolved (isPending true)
@@ -481,6 +501,76 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const queryClient = useQueryClient()
   const homeSessions = createHomeSessionIndexCache(queryClient, ServerConnection.key(serverSDK.server))
+
+  // One bootstrap request for every newly visible session ID, coalesced across
+  // rows/groups into batches. This deliberately is not a query per row: dense
+  // sidebars should own one telemetry transport and expose O(1) lookups.
+  const telemetryKnown = new Set<string>()
+  const telemetryPending = new Set<string>()
+  let telemetryFlushTimer: ReturnType<typeof setTimeout> | undefined
+  let telemetryUnsupported = false
+
+  type SessionTelemetryWire = Omit<SessionTelemetryInfo, "sessionID"> & { sessionID: string }
+  const applyTelemetry = (items: Iterable<SessionTelemetryWire>) => {
+    batch(() => {
+      for (const wire of items) {
+        const item: SessionTelemetryInfo = { ...wire, sessionID: SessionID.make(wire.sessionID) }
+        telemetryKnown.add(wire.sessionID)
+        setGlobalStore("telemetry", wire.sessionID, reconcile(item))
+      }
+    })
+  }
+
+  const flushTelemetry = async () => {
+    telemetryFlushTimer = undefined
+    if (telemetryUnsupported || telemetryPending.size === 0) return
+    const ids = Array.from(telemetryPending)
+    telemetryPending.clear()
+    for (let offset = 0; offset < ids.length; offset += 500) {
+      const sessions = ids.slice(offset, offset + 500)
+      try {
+        const response = await serverSDK.requests.schedule(
+          "background",
+          () =>
+            serverSDK.client.global.sessionTelemetry({
+              globalSessionTelemetryInput: { sessions },
+            }),
+          { key: `session-telemetry:${sessions.join(",")}`, kind: "session-telemetry" },
+        )
+        const data = response.data ?? {}
+        applyTelemetry(Object.values(data))
+        // Missing rows are still a completed lookup (new/never-run sessions).
+        for (const id of sessions) telemetryKnown.add(id)
+      } catch (error) {
+        const status = Number(
+          (error as { status?: unknown })?.status ??
+            (error as { response?: { status?: unknown } })?.response?.status ??
+            (error as { cause?: { status?: unknown } })?.cause?.status,
+        )
+        if (status === 404 || status === 405) {
+          telemetryUnsupported = true
+          return
+        }
+        for (const id of sessions) telemetryPending.add(id)
+      }
+    }
+  }
+
+  const ensureTelemetry = (sessionIDs: Iterable<string>) => {
+    if (telemetryUnsupported) return
+    let added = false
+    for (const id of sessionIDs) {
+      if (!id || telemetryKnown.has(id) || telemetryPending.has(id)) continue
+      telemetryPending.add(id)
+      added = true
+    }
+    if (!added || telemetryFlushTimer !== undefined) return
+    telemetryFlushTimer = setTimeout(() => void flushTelemetry(), 0)
+  }
+  onCleanup(() => {
+    if (telemetryFlushTimer !== undefined) clearTimeout(telemetryFlushTimer)
+    telemetryPending.clear()
+  })
   const refreshProviders = () =>
     queryClient.refetchQueries({
       predicate: (query) => query.queryKey[0] === serverSDK.scope && query.queryKey[2] === "providers",
@@ -797,6 +887,66 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     })
   }
 
+  const findLoadedSession = (sessionID: string) => {
+    const cached = session.get(sessionID)
+    if (cached) return cached
+    for (const [store] of Object.values(children.children)) {
+      const info = store.session.find((item) => item.id === sessionID)
+      if (info) return info
+    }
+  }
+
+  /**
+   * Keep directory-scoped root indexes coherent with the server-scoped session
+   * cache after a move. This is intentionally local and bounded: we touch only
+   * already-materialized child stores and never trigger a project-wide refetch.
+   * The store manager caps the number of children, while each root slice is
+   * itself bounded, so a rare user move stays dramatically cheaper than
+   * invalidating every project/session query.
+   */
+  const reindexSession = (info: Session) => {
+    const targetKey = directoryKey(sessionIndexDirectory(info, globalStore.project))
+    let indexed = false
+
+    batch(() => {
+      for (const [key, existing] of Object.entries(children.children)) {
+        const [store, setStore] = existing
+        const current = store.session.find((item) => item.id === info.id)
+
+        if (key === targetKey) {
+          indexed = true
+          applyDirectoryEvent({
+            event: { type: current ? "session.updated" : "session.created", properties: { info } },
+            directory: key,
+            store,
+            setStore,
+            push: queue.push,
+            retainedLimit: sessionMeta.get(key)?.limit,
+            sessionContent: false,
+            permission: session.data.permission,
+            loadLsp() {},
+          })
+          continue
+        }
+
+        if (!current) continue
+        applyDirectoryEvent({
+          event: { type: "session.deleted", properties: { info: current } },
+          directory: key,
+          store,
+          setStore,
+          push: queue.push,
+          retainedLimit: sessionMeta.get(key)?.limit,
+          sessionContent: false,
+          permission: session.data.permission,
+          loadLsp() {},
+        })
+      }
+    })
+
+    return indexed
+  }
+
   const unsub = serverSDK.event.listen((e) => {
     const directory = e.name
     const key = directoryKey(directory)
@@ -806,6 +956,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       eventType === "server.connected" &&
       !!(event.properties as { repair?: boolean } | undefined)?.repair
     const recent = bootingRoot || Date.now() - bootedAt < 1500
+    const nativeMove = event.current?.type === "session.next.moved" ? event.current : undefined
+    // Capture before applyV2: the server-scoped cache can legitimately evict
+    // cold metadata while a still-visible directory row remains materialized.
+    const moveSource = nativeMove ? findLoadedSession(nativeMove.data.sessionID) : undefined
     perf.event()
 
     if (event.current) {
@@ -814,6 +968,21 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     }
     const nativeSessionEvent = isNativeSessionEvent(event.current?.type)
     if (!nativeSessionEvent) time("apply", () => session.apply(event), sessionOf(event))
+
+    if (nativeMove) {
+      let info = session.get(nativeMove.data.sessionID)
+      if (!info && moveSource) {
+        info = session.remember({
+          ...moveSource,
+          projectID: nativeMove.data.projectID ?? moveSource.projectID,
+          workspaceID: nativeMove.data.location.workspaceID,
+          directory: nativeMove.data.location.directory,
+          path: nativeMove.data.subdirectory,
+          time: { ...moveSource.time, updated: nativeMove.data.timestamp },
+        })
+      }
+      if (info) reindexSession(info)
+    }
 
     // Stream deltas have already been reduced into the shared session store.
     // They cannot affect directory metadata, home indexing, invalidation, or
@@ -849,6 +1018,10 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     // JSDOC: Read `.data` only after confirming `!isPending`, else the
     // internal `createResource()` suspends and the route hangs.
     if (directory === "global") {
+      if (eventType === "session.telemetry.updated") {
+        const items = (event.properties as { items?: SessionTelemetryInfo[] } | undefined)?.items ?? []
+        applyTelemetry(items)
+      }
       if (eventType === "server.connected" && !activeSessionsQuery.isPending && activeSessionsQuery.data === undefined && !activeSessionsQuery.isFetching)
         void activeSessionsQuery.refetch()
       applyGlobalEvent({
@@ -877,9 +1050,12 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
       return
     }
 
+    // Keep the compatibility event on its existing path. Current servers emit
+    // session.next.moved (handled above); older clients may still surface the
+    // legacy session.moved family through OpenCodeEvent.
     if (event.current?.type === "session.moved") {
       const info = session.get(event.current.data.sessionID)
-      if (info) indexSession(info)
+      if (info) reindexSession(info)
     }
     if (event.current?.type === "session.forked")
       void session
@@ -965,6 +1141,7 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
 
   const projectApi = {
     loadSessions,
+    reindexSession,
     meta(directory: string, patch: ProjectMeta) {
       children.projectMeta(directory, patch)
     },
@@ -1005,6 +1182,13 @@ export function createServerSyncContextInner(serverSDK: ServerSDK) {
     project: projectApi,
     providers: {
       ensure: ensureProviderCatalog,
+    },
+    telemetry: {
+      ensure: ensureTelemetry,
+      get: (sessionID: string) => globalStore.telemetry[sessionID],
+      get unsupported() {
+        return telemetryUnsupported
+      },
     },
     session,
     homeSessions,

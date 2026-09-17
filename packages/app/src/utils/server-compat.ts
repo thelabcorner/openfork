@@ -399,6 +399,14 @@ function createV1Api(input: CompatibleInput): CompatibleApi {
         return sessionInfo(result.data)
       },
       async active() {
+        // Hybrid/current servers expose the bootstrap-free V2 active-session
+        // surface even while protocol compatibility is still reported as v1.
+        // Prefer it so a server-scoped status read never falls through the
+        // legacy workspace router to process.cwd(). Genuine old servers simply
+        // reject this request and retain the legacy fallback below.
+        try {
+          return await input.current.session.active()
+        } catch {}
         const result = await legacy().session.status()
         return Object.fromEntries(
           Object.entries(result.data ?? {}).flatMap(([sessionID, status]) =>

@@ -223,41 +223,18 @@ export function useLimits(options?: { now?: Accessor<number>; active?: Accessor<
   const providerData = createMemo(() => {
     const latest = providersRes.latest
     const isReady = providersRes.state === "ready" || providersRes.state === "refreshing"
-    // If we have a persistent cache and providers endpoint is still loading/error,
-    // serve the cached provider list instantly (stale-while-revalidate).
-    if (!isReady || !latest) {
-      if (providersRes.error) {
-        // Try persistent cache first
-        if (initialCache && initialCache.providers.length > 0) {
-          return { providers: initialCache.providers }
-        }
-        return {
-          providers: [
-            { providerId: "opencode-zen", providerName: "OpenCode Zen", configured: true },
-            { providerId: "claude", providerName: "Claude", configured: true },
-          ],
-        }
-      }
-      if (initialCache && !isReady) {
-        // providers endpoint still loading - use cached list for instant paint
-        if (initialCache.providers.length > 0) return { providers: initialCache.providers }
-      }
-      return undefined
+    // If we have a persistent cache and providers endpoint is still loading or
+    // errored, serve the cached provider list instantly (stale-while-revalidate).
+    if ((!isReady || !latest) && initialCache && initialCache.providers.length > 0) {
+      return { providers: initialCache.providers }
     }
-    // Claude Code is a machine account. Always surface it (and force configured)
-    // regardless of what the server reports. The presence of local creds on the
-    // backend is authoritative for visibility.
-    const hasClaude = latest.providers.some((p) => p.providerId === "claude")
-    let providers = hasClaude
-      ? latest.providers.map((p) => (p.providerId === "claude" ? { ...p, configured: true } : p))
-      : [...latest.providers, { providerId: "claude", providerName: "Claude", configured: true }]
-    // OpenCode Zen free quota is IP-based and requires no enrollment.
-    // Always inject it so the Limits pane shows local free usage even if the
-    // server's provider list is stale or the DB snapshot is empty.
-    if (!providers.some((p) => p.providerId === "opencode-zen")) {
-      providers = [...providers, { providerId: "opencode-zen", providerName: "OpenCode Zen", configured: true }]
-    }
-    return { providers }
+    if (!isReady || !latest) return undefined
+    // The server's quota registry owns provider visibility and `configured`:
+    // each adapter checks local credentials, and the Claude adapter already
+    // implements the machine-account rule (a present local credential is enough
+    // to show the card). The Limits pane is a projection, so it must not force
+    // `configured` or inject providers the server did not report.
+    return { providers: latest.providers }
   })
 
   // Incremental quota map - each provider updates independently

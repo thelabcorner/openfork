@@ -1,4 +1,4 @@
-import { createMemo, createResource, createSignal, ErrorBoundary, For, Match, Show, Switch } from "solid-js"
+import { createEffect, createMemo, createResource, createSignal, ErrorBoundary, For, Match, Show, Switch } from "solid-js"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
@@ -83,6 +83,9 @@ export function ModelsPanelContent() {
   } catch {
     personal = undefined
   }
+  createEffect(() => {
+    void personal?.ensure()
+  })
   const personalCosts = createMemo(() => {
     const map = personal?.personalCosts()
     if (!map || map.size === 0) return undefined

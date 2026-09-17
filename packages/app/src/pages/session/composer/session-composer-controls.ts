@@ -46,11 +46,6 @@ export function createPromptInputController(input: {
     staleTime: 5 * 60_000,
     placeholderData: [],
   }))
-  const globalProvidersQuery = createQuery(() => ({
-    ...input.queryOptions.providers(null),
-    enabled: catalogEnabled(),
-    staleTime: 5 * 60_000,
-  }))
   const providersQuery = createQuery(() => ({
     ...input.queryOptions.providers(pathKey(sdk().directory)),
     enabled: catalogEnabled(),
@@ -85,8 +80,7 @@ export function createPromptInputController(input: {
          */
         loading:
           (local.agent.visible() && agentsQuery.isPending) ||
-          providersQuery.isPending ||
-          globalProvidersQuery.isPending,
+          providersQuery.isPending,
       },
       session: {
         id: input.sessionID(),

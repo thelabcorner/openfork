@@ -14,6 +14,8 @@ const row = (args: Partial<UsageModelRow> & { providerID: string; modelID: strin
   cacheSavings: args.cacheSavings ?? 0,
   durationMs: args.durationMs ?? 0,
   durationRecords: args.durationRecords ?? 0,
+  generationMs: args.generationMs ?? 0,
+  generationRecords: args.generationRecords ?? 0,
 })
 
 describe("groupModelsByName", () => {

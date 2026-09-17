@@ -50,7 +50,7 @@ import { ServerConnection, ServerProvider, serverName, useServer } from "@/conte
 import { SettingsProvider, useSettings } from "@/context/settings"
 import { TabsProvider } from "@/context/tabs"
 import { WslServersProvider } from "@/wsl/context"
-import { PersonalUsageIngest, PersonalUsageProvider } from "@/context/personal-usage"
+import { PersonalUsageProvider } from "@/context/personal-usage"
 import NewLayout from "@/pages/layout-new"
 import { RoutePlaceholder } from "@/components/route-placeholder"
 import { GenericContextMenuProvider } from "@/components/generic-context-menu"
@@ -160,16 +160,15 @@ function SelectedServerProviders(props: ParentProps) {
   return (
     <ServerKey>
       <ServerSDKProvider>
-        <ServerSyncProvider>
-          <GoalsProvider>
-            <SessionGroupsProvider>
-              <ForkUsageProvider>
-                <PersonalUsageIngest />
-                {props.children}
-              </ForkUsageProvider>
-            </SessionGroupsProvider>
-          </GoalsProvider>
-        </ServerSyncProvider>
+        <PersonalUsageProvider>
+          <ServerSyncProvider>
+            <GoalsProvider>
+              <SessionGroupsProvider>
+                <ForkUsageProvider>{props.children}</ForkUsageProvider>
+              </SessionGroupsProvider>
+            </GoalsProvider>
+          </ServerSyncProvider>
+        </PersonalUsageProvider>
       </ServerSDKProvider>
     </ServerKey>
   )
@@ -372,13 +371,11 @@ export function AppBaseProviders(
             >
               <QueryProvider>
                 <WslServersProvider>
-                  <PersonalUsageProvider>
-                    <DialogProvider>
-                      <FileComponentProvider component={File}>
-                        <GenericContextMenuProvider>{props.children}</GenericContextMenuProvider>
-                      </FileComponentProvider>
-                    </DialogProvider>
-                  </PersonalUsageProvider>
+                  <DialogProvider>
+                    <FileComponentProvider component={File}>
+                      <GenericContextMenuProvider>{props.children}</GenericContextMenuProvider>
+                    </FileComponentProvider>
+                  </DialogProvider>
                 </WslServersProvider>
               </QueryProvider>
             </ErrorBoundary>

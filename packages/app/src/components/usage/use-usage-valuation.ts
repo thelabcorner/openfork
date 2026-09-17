@@ -1,8 +1,6 @@
 import { createMemo, type Accessor } from "solid-js"
 import { useQuery } from "@tanstack/solid-query"
-import type { NormalizedProviderListResponse } from "@opencode-ai/session-ui/context"
-import { useServerSync } from "@/context/server-sync"
-import { safeQueryData } from "@/utils/safe-query-data"
+import { useServerSDK } from "@/context/server-sdk"
 import {
   buildFuzzyPricingFallbackMap,
   buildPricingFallbackMap,
@@ -27,8 +25,6 @@ export type ValuationProvider = {
     | undefined
   >
 }
-
-const EMPTY_CATALOG: NormalizedProviderListResponse = { all: new Map(), connected: [], default: {} }
 
 export type UsageValuation = {
   catalog: Accessor<CheapnessModel[]>
@@ -113,13 +109,38 @@ function sameIdentities(
 export function createUsageValuation(
   rows: Accessor<readonly SubsidyUsageRow[]>,
   scopedProviders: Accessor<readonly ValuationProvider[]> = () => [],
+  options: { globalCatalog?: boolean } = {},
 ): UsageValuation {
-  const serverSync = useServerSync()
-  const providerQuery = useQuery(() => serverSync().queryOptions.providers(null))
+  const serverSDK = useServerSDK()
+  const pricingQuery = useQuery(() => ({
+    queryKey: [serverSDK().scope, "usage", "pricing-catalog"],
+    enabled: options.globalCatalog !== false,
+    staleTime: 5 * 60_000,
+    queryFn: async () =>
+      (await serverSDK().client.usage.pricingCatalog({ throwOnError: true })).data ?? { models: [] },
+  }))
 
   const catalog = createMemo(() => {
-    const global = safeQueryData(providerQuery, EMPTY_CATALOG)
-    return toCatalog(mergeProviders(global.all.values(), scopedProviders()))
+    const map = new Map<string, CheapnessModel>()
+    if (options.globalCatalog !== false) {
+      for (const model of pricingQuery.data?.models ?? []) {
+        map.set(`${model.providerID}:${model.modelID}`, {
+          id: model.modelID,
+          name: model.name.replace("(latest)", "").trim(),
+          family: model.family,
+          provider: { id: model.providerID, name: model.providerName },
+          cost: model.cost,
+        })
+      }
+    }
+    // Explicit workspace providers override the process-global pricing entry
+    // for that exact identity. Session detail views therefore preserve custom
+    // workspace naming/rates without making directory-agnostic Usage depend on
+    // workspace provider initialization.
+    for (const model of toCatalog(mergeProviders([], scopedProviders()))) {
+      map.set(`${model.provider.id}:${model.id}`, model)
+    }
+    return [...map.values()]
   })
 
   const catalogByKey = createMemo(() => {

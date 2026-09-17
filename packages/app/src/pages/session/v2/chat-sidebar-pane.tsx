@@ -1,6 +1,7 @@
 import {
   createEffect,
   createMemo,
+  createRoot,
   createSignal,
   For,
   getOwner,
@@ -16,12 +17,13 @@ import {
   type JSX,
 } from "solid-js"
 import { createStore } from "solid-js/store"
+import { Portal } from "solid-js/web"
 import { A, useIsRouting, useNavigate, useParams } from "@solidjs/router"
 import { base64Encode } from "@opencode-ai/core/util/encode"
+import { showToast } from "@/utils/toast"
 import { ScrollView } from "@opencode-ai/ui/scroll-view"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
-import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { Spinner } from "@opencode-ai/ui/spinner"
 import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
 import { ProjectAvatar } from "@opencode-ai/ui/v2/project-avatar-v2"
@@ -34,7 +36,6 @@ import { usePermission } from "@/context/permission"
 import { usePlatform } from "@/context/platform"
 import { useServerSDK } from "@/context/server-sdk"
 import { ServerConnection } from "@/context/server"
-import { useProviders } from "@/hooks/use-providers"
 import { useSessionGroups } from "@/context/session-groups"
 import { sessionTitle } from "@/utils/session-title"
 import { pathKey } from "@/utils/path-key"
@@ -72,34 +73,13 @@ const loadChatSidebarSearchRuntime = () =>
 import {
   CHAT_SIDEBAR_RECENT_LIMIT_MIN,
   chatSidebarAggregateMetrics,
-  shouldAutoHydrateChatSidebarMetrics,
+  chatSidebarRootSessionVisible,
   type ChatSidebarPaneState,
 } from "./chat-sidebar-pane-state"
 import { CHAT_PROJECT_NAME } from "@opencode-ai/core/project/chat"
 import { findChatProject, isChatProjectAlias, isReservedChatProjectPath } from "@/utils/chat-project"
-import type { AssistantMessage, Session } from "@opencode-ai/sdk/v2/client"
-
-type ProviderList = ReturnType<ReturnType<typeof useProviders>["all"]> extends Map<string, infer P> ? P[] : never
-
-type ChatSidebarMetricsRuntime = {
-  aggregateSessionContextByModel: typeof import("@/components/session/session-context-model-metrics")["aggregateSessionContextByModel"]
-  liveGenerationProgress: typeof import("@/components/session/session-context-model-metrics")["liveGenerationProgress"]
-  getSessionContext: typeof import("@/components/session/session-context-metrics")["getSessionContext"]
-  computeMeasuredRate: typeof import("@/components/prompt-input/live-generation-rate-math")["computeMeasuredRate"]
-}
-
-let chatSidebarMetricsRuntime: Promise<ChatSidebarMetricsRuntime> | undefined
-const loadChatSidebarMetricsRuntime = () =>
-  (chatSidebarMetricsRuntime ??= Promise.all([
-    import("@/components/session/session-context-model-metrics"),
-    import("@/components/session/session-context-metrics"),
-    import("@/components/prompt-input/live-generation-rate-math"),
-  ]).then(([modelMetrics, contextMetrics, rateMath]) => ({
-    aggregateSessionContextByModel: modelMetrics.aggregateSessionContextByModel,
-    liveGenerationProgress: modelMetrics.liveGenerationProgress,
-    getSessionContext: contextMetrics.getSessionContext,
-    computeMeasuredRate: rateMath.computeMeasuredRate,
-  })))
+import type { Session } from "@opencode-ai/sdk/v2/client"
+import type { Info as SessionTelemetryInfo, Phase as SessionTelemetryPhase } from "@opencode-ai/schema/session-telemetry"
 
 /** Compact relative stamp ("2h", "3d", "now") for any epoch-ms timestamp. */
 function relativeStamp(ts: number | undefined, now: number): string {
@@ -147,6 +127,49 @@ function contextTone(percent: number) {
   return { bar: "bg-v2-icon-icon-muted", text: "text-v2-text-text-faint" }
 }
 
+const TELEMETRY_CHARS_PER_TOKEN = 4
+const TELEMETRY_MIN_RATE_WINDOW_MS = 600
+const TELEMETRY_MAX_PLAUSIBLE_RATE = 1_000
+
+function telemetryContextPercent(value: SessionTelemetryInfo | undefined) {
+  const context = value?.context
+  const limit = context?.model.contextLimit
+  if (!context || !limit || limit <= 0) return null
+  const tokens = context.tokens
+  const total = tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+  if (total <= 0) return null
+  return Math.round((total / limit) * 100)
+}
+
+/**
+ * O(1) live sidebar projection. The server accumulates closed generation/tool
+ * spans incrementally; the shared pane clock contributes only the currently
+ * open semantic phase. No message or Part[] reads occur here.
+ */
+function telemetryLive(value: SessionTelemetryInfo | undefined, now: number): ChatRowLive | undefined {
+  if (!value || value.phase === "idle") return undefined
+  const step = value.step
+  const openMs = value.phaseStartedAt === undefined ? 0 : Math.max(0, now - value.phaseStartedAt)
+  const generationOpen = value.phase === "generating" || value.phase === "reasoning" ? openMs : 0
+  const toolOpen = value.phase === "tool" ? openMs : 0
+  const stepGeneratedMs = (step?.generatedMs ?? 0) + generationOpen
+  const stepToolMs = (step?.toolMs ?? 0) + toolOpen
+  const accumulatedMs = value.generatedMs + value.toolMs + generationOpen + toolOpen
+  const estimatedTokens = ((step?.visibleChars ?? 0) + (step?.reasoningChars ?? 0)) / TELEMETRY_CHARS_PER_TOKEN
+  const rateActive = value.phase === "generating" || value.phase === "reasoning"
+  const rawRate =
+    rateActive && stepGeneratedMs >= TELEMETRY_MIN_RATE_WINDOW_MS && estimatedTokens > 0
+      ? estimatedTokens / (stepGeneratedMs / 1000)
+      : null
+  const rate = rawRate !== null && rawRate <= TELEMETRY_MAX_PLAUSIBLE_RATE ? Math.round(rawRate * 10) / 10 : null
+  return {
+    phase: value.phase,
+    turnSeconds: (stepGeneratedMs + stepToolMs) / 1000,
+    accumulatedSeconds: accumulatedMs / 1000,
+    rate,
+  }
+}
+
 type ChatSessionGroup = {
   key: string
   label: string
@@ -154,6 +177,54 @@ type ChatSessionGroup = {
   project?: LocalProject
   sessions: Session[]
   total: number
+}
+
+type ChatRowTotals = {
+  generatedSeconds: number
+  toolSeconds: number
+  cost: number
+  cacheHitPercent: number | null
+}
+
+type ChatRowLive = {
+  turnSeconds: number
+  accumulatedSeconds: number
+  rate: number | null
+  phase: SessionTelemetryPhase
+}
+
+type ChatSidebarTooltipPlacement = "top" | "right" | "bottom"
+
+type ChatSidebarTooltipIntent = {
+  anchor: HTMLElement
+  placement: ChatSidebarTooltipPlacement
+  sessionID?: string
+  text?: string
+}
+
+type ChatRowRuntime = {
+  session: Accessor<Session>
+  currentDir: Accessor<string>
+  isWorking: Accessor<boolean>
+  unseenCount: Accessor<number>
+  hasError: Accessor<boolean>
+  pendingPermissionCount: Accessor<number>
+  pendingQuestionCount: Accessor<number>
+  hasPermissions: Accessor<boolean>
+  hasQuestions: Accessor<boolean>
+  needsAttention: Accessor<boolean>
+  isAutoAccepting: Accessor<boolean>
+  totals: Accessor<ChatRowTotals | undefined>
+  contextPercent: Accessor<number | null>
+  modelInfo: Accessor<{ modelID: string; name?: string; variant?: string } | undefined>
+  modelLabel: Accessor<string | undefined>
+  live: Accessor<ChatRowLive | undefined>
+  serverKey: Accessor<ReturnType<typeof ServerConnection.key> | undefined>
+}
+
+type ChatRowRuntimeLease = {
+  runtime: ChatRowRuntime
+  release: () => void
 }
 
 const sameRows = (a: Session[], b: Session[]) => {
@@ -184,12 +255,16 @@ export function ChatSidebarPane(props: {
   onClose: () => void
 }): JSX.Element {
   startupMark("sidebar.component-mounted")
+  const paneOwner = getOwner()
+  if (!paneOwner) throw new Error("ChatSidebarPane must be created within a reactive owner")
   const language = useLanguage()
   const layout = useLayout()
   const serverSync = useServerSync()
   const serverSDK = useServerSDK()
   const dialog = useDialog()
   const platform = usePlatform()
+  const notification = useNotification()
+  const permission = usePermission()
   const sessionGroups = useSessionGroups()
 
   // One shared ticker for every live timer in the pane — per-row intervals
@@ -237,10 +312,14 @@ export function ChatSidebarPane(props: {
     if (modelPickerFrame) cancelAnimationFrame(modelPickerFrame)
   })
 
-  // Model context limits are provider-global, so resolving the catalog once for
-  // the pane avoids one provider query per row.
-  const providers = useProviders(() => layout.projects.list()[0]?.worktree)
-  const providerList = createMemo(() => [...providers.all().values()] as ProviderList)
+  const permissionState = createMemo(() => permission.ensureServerState(ServerConnection.key(serverSDK().server)))
+  const paneServerKey = createMemo(() => {
+    try {
+      return serverSDK().server ? ServerConnection.key(serverSDK().server) : undefined
+    } catch {
+      return undefined
+    }
+  })
 
   const isExpanded = (key: string) => !props.state.isGroupCollapsed(key)
   const toggleExpanded = (key: string) => props.state.toggleGroup(key)
@@ -281,8 +360,54 @@ export function ChatSidebarPane(props: {
   // Stage 1 — pure grouping. Deliberately reads NO working-state signals: a
   // working flip must re-run only the cheap pinning pass in `groups` below,
   // never the filters and sorts here. Each directory's root slice is also
-  // computed once per run and shared by both the recent merge and the project
-  // group — previously the worktree slice was filtered + sorted a second time.
+  // memoized independently so a session metadata update in one repository
+  // cannot make every other opened repository/sandbox filter + sort again.
+  // Project aggregates are memoized on top of those slices; the only global
+  // work left here is the cross-project Recent merge/sort.
+  const directorySlices = new Map<string, Accessor<Session[]>>()
+  const projectSlices = new Map<string, Accessor<Session[]>>()
+  const directorySlice = (dir: string, projectID?: string) => {
+    const key = `${pathKey(dir)}\u0000${projectID ?? ""}`
+    const cached = directorySlices.get(key)
+    if (cached) return cached
+    const created = runWithOwner(paneOwner, () =>
+      createMemo(() => {
+        const sessions = (serverSync().child(dir, { bootstrap: false })[0].session ?? []).map((session) =>
+          withDirectory(session, dir),
+        )
+        return projectID
+          ? sessions.filter((session) => chatSidebarRootSessionVisible(session, dir, projectID)).sort(compareSessionTime)
+          : sortedRootSessions({ session: sessions, path: { directory: dir } }, 0)
+      }),
+    )!
+    directorySlices.set(key, created)
+    return created
+  }
+  const projectSlice = (project: LocalProject) => {
+    const key = [
+      pathKey(project.worktree),
+      project.id ?? "",
+      ...(project.sandboxes ?? []).map((sandbox) => pathKey(sandbox)),
+    ].join("\u0000")
+    const cached = projectSlices.get(key)
+    if (cached) return cached
+    const created = runWithOwner(paneOwner, () =>
+      createMemo(() => {
+        const rows = [
+          ...directorySlice(project.worktree, project.id)(),
+          ...(project.sandboxes ?? []).flatMap((sandbox) => directorySlice(sandbox)()),
+        ]
+        return rows.sort(compareSessionTime)
+      }),
+    )!
+    projectSlices.set(key, created)
+    return created
+  }
+  onCleanup(() => {
+    directorySlices.clear()
+    projectSlices.clear()
+  })
+
   const baseGroups = createMemo(() => {
     const opened = layout.projects.list()
     const canonicalChat = findChatProject(serverSync().data.project)
@@ -298,33 +423,12 @@ export function ChatSidebarPane(props: {
           ...opened.filter((project) => !isChatProjectAlias(project, canonicalChat)),
         ]
       : opened.filter((project) => project.id !== "chats" && !isReservedChatProjectPath(project.worktree))
-    const now = Date.now()
-    const slices = new Map<string, Session[]>()
-    const sliceOf = (dir: string) => {
-      const cached = slices.get(dir)
-      if (cached) return cached
-      // searchsmith seam: pre-filter roots here (before sortedRootSessions
-      // sorts) when search needs to scope the pane's listing.
-      const rows = sortedRootSessions(
-        {
-          session: (serverSync().child(dir, { bootstrap: false })[0].session ?? []).map((session) =>
-            withDirectory(session, dir),
-          ),
-          path: { directory: dir },
-        },
-        now,
-      )
-      slices.set(dir, rows)
-      return rows
-    }
     const recentPool: Session[] = []
-    for (const project of projects) {
-      for (const dir of [project.worktree, ...(project.sandboxes ?? [])]) recentPool.push(...sliceOf(dir))
-    }
     const projectRows = new Map<string, Session[]>()
     for (const project of projects) {
-      const rows = [project.worktree, ...(project.sandboxes ?? [])].flatMap((dir) => sliceOf(dir))
-      projectRows.set(project.worktree, rows.sort(compareSessionTime))
+      const rows = projectSlice(project)()
+      recentPool.push(...rows)
+      projectRows.set(project.worktree, rows)
     }
     const recent = [...recentPool].sort(compareSessionTime)
     if (recent.length > 0) {
@@ -440,6 +544,16 @@ export function ChatSidebarPane(props: {
     })
   })
 
+  // Bootstrap compact metrics once for every session this pane can render.
+  // Duplicates across Recent/project/tree groups collapse in the server-scoped
+  // telemetry cache and its request batcher.
+  createEffect(() => {
+    const ids = new Set<string>()
+    for (const group of stableGroups()) for (const session of group.sessions) ids.add(session.id)
+    for (const group of visibleStructuralGroups()) for (const member of group.sessions) ids.add(member.id)
+    serverSync().telemetry.ensure(ids)
+  })
+
   const sessionTreeRows = (rows: Session[]) =>
     buildChatSidebarSessionTreeRows({
       roots: rows,
@@ -536,6 +650,9 @@ export function ChatSidebarPane(props: {
     }
   })
 
+  // Archiving removes a row from every live group, so it reads as destructive even though it
+  // is recoverable. Previously it succeeded silently and failed silently -- the row just
+  // vanished, or appeared to do nothing. Confirm the result and carry the inverse action.
   const archiveSession = async (session: Session) => {
     if (!session.id) return
     try {
@@ -544,11 +661,23 @@ export function ChatSidebarPane(props: {
         directory: session.directory,
         time: { archived: Date.now() },
       })
-      // Hygiene: let a later un-archive re-hydrate metrics from scratch
-      // instead of trusting a prefetch that predates the archive.
-      hydrated.delete(session.id)
+      showToast({
+        title: language.t("chats.archive.done.title"),
+        description: sessionTitle(session.title),
+        actions: [
+          {
+            label: language.t("chats.archive.undo"),
+            // unarchiveSession already surfaces its own failure toast and rethrows.
+            onClick: () => void unarchiveSession(session).catch(() => {}),
+          },
+        ],
+      })
     } catch {
-      // ignore
+      showToast({
+        variant: "error",
+        title: language.t("chats.archive.failed.title"),
+        description: language.t("chats.archive.failed.description"),
+      })
     }
   }
 
@@ -633,9 +762,15 @@ export function ChatSidebarPane(props: {
         time: { archived: null },
       })
       setArchivedState("rows", (rows) => rows.filter((row) => row.id !== session.id))
-      hydrated.delete(session.id)
-    } catch {
-      // ignore — row stays put; the user can retry
+    } catch (error) {
+      // A failed unarchive looks identical to "nothing happened", so say so explicitly, then
+      // rethrow so callers (the undo action) can react to the failure too.
+      showToast({
+        variant: "error",
+        title: language.t("chats.unarchive.failed.title"),
+        description: language.t("chats.archive.failed.description"),
+      })
+      throw error
     }
   }
 
@@ -654,43 +789,423 @@ export function ChatSidebarPane(props: {
     }
   }
 
-  // Cost/metrics need messages+parts, which background sessions don't have.
-  // Hydrate each row once when it scrolls into view instead of fetching every
-  // visible session up front; session.prefetch dedupes and rate-limits itself.
-  const hydrated = new Set<string>()
-  const metricsQueue: Session[] = []
-  let metricsActive = false
-  let metricsDisposed = false
+  // A session can be presented in both Recent and its project group. Keep the
+  // presentation DOM independent, but share all expensive session-derived
+  // reactive state between those copies. This preserves the exact UX while
+  // preventing duplicate working/notification/permission/message/metrics
+  // computation graphs for the same session identity.
+  const rowRuntimeEntries = new Map<
+    string,
+    {
+      runtime: ChatRowRuntime
+      refs: number
+      update: (session: Session) => void
+      dispose: () => void
+    }
+  >()
 
-  const pumpMetrics = () => {
-    if (metricsDisposed || metricsActive) return
-    const session = metricsQueue.shift()
-    if (!session) return
-    metricsActive = true
-    // Secondary row metrics deliberately use one producer slot. The global
-    // request scheduler still owns transport priority, but keeping this producer
-    // bounded prevents a viewport full of rows from manufacturing a background
-    // queue that competes with project/session housekeeping immediately after
-    // first paint.
-    void serverSync()
-      .session.prefetch(session.id, 200)
-      .catch(() => hydrated.delete(session.id))
-      .finally(() => {
-        metricsActive = false
-        pumpMetrics()
+  const createRowRuntimeEntry = (initial: Session) =>
+    createRoot((dispose) => {
+      const sessionID = initial.id
+      const [fallbackSession, setFallbackSession] = createSignal(initial)
+      const session = () => serverSync().session.peek(sessionID) ?? fallbackSession()
+      const currentDir = () => session().directory || fallbackSession().directory || ""
+      const sessionData = () => serverSync().session.data
+      const isWorking = createMemo(() => sessionData().session_working(sessionID))
+      const unseenCount = createMemo(() => notification.session.unseenCount(sessionID))
+      const hasError = createMemo(() => notification.session.unseenHasError(sessionID))
+      const pendingPermissionCount = createMemo(() => {
+        const pending = sessionData().permission[sessionID] ?? []
+        const directory = currentDir()
+        let count = 0
+        for (const item of pending) if (!permissionState().autoResponds(item, directory)) count += 1
+        return count
       })
-  }
+      const pendingQuestionCount = createMemo(() => (sessionData().question[sessionID] ?? []).length)
+      const hasPermissions = createMemo(() => pendingPermissionCount() > 0)
+      const hasQuestions = createMemo(() => pendingQuestionCount() > 0)
+      const needsAttention = createMemo(() => hasPermissions() || hasQuestions())
+      const isAutoAccepting = createMemo(() => {
+        try {
+          return permissionState().isAutoAccepting(sessionID, currentDir())
+        } catch {
+          return false
+        }
+      })
+      const telemetry = createMemo(() => serverSync().telemetry.get(sessionID))
+      const aggregateMetrics = createMemo(() => chatSidebarAggregateMetrics(session()))
+      const totals = createMemo<ChatRowTotals | undefined>(() => {
+        const aggregate = aggregateMetrics()
+        const projected = telemetry()
+        return {
+          generatedSeconds: (projected?.generatedMs ?? 0) / 1000,
+          toolSeconds: (projected?.toolMs ?? 0) / 1000,
+          cost: aggregate.cost ?? 0,
+          cacheHitPercent: aggregate.cacheHitPercent ?? null,
+        }
+      })
+      const contextPercent = createMemo(() => telemetryContextPercent(telemetry()))
+      const modelInfo = createMemo(() => {
+        const projected = telemetry()
+        const model = projected?.context?.model ?? projected?.model
+        if (model) return { modelID: model.modelID, name: model.name, variant: model.variant }
+        const fallback = aggregateMetrics().model
+        return fallback ? { ...fallback, name: undefined } : undefined
+      })
+      const modelLabel = createMemo(() => {
+        const info = modelInfo()
+        if (!info) return undefined
+        return info.name ?? info.modelID.split("@")[0] ?? info.modelID
+      })
+      const live = createMemo<ChatRowLive | undefined>(() => {
+        if (!isWorking()) return undefined
+        return telemetryLive(telemetry(), now())
+      })
 
-  const hydrateMetrics = (session: Session) => {
-    if (!session.id || !session.directory || hydrated.has(session.id)) return
-    hydrated.add(session.id)
-    metricsQueue.push(session)
-    pumpMetrics()
+      return {
+        runtime: {
+          session,
+          currentDir,
+          isWorking,
+          unseenCount,
+          hasError,
+          pendingPermissionCount,
+          pendingQuestionCount,
+          hasPermissions,
+          hasQuestions,
+          needsAttention,
+          isAutoAccepting,
+          totals,
+          contextPercent,
+          modelInfo,
+          modelLabel,
+          live,
+          serverKey: paneServerKey,
+        } satisfies ChatRowRuntime,
+        update: (next: Session) => setFallbackSession(next),
+        dispose,
+      }
+    }, paneOwner)
+
+  const leaseRowRuntime = (session: Session): ChatRowRuntimeLease => {
+    let entry = rowRuntimeEntries.get(session.id)
+    if (!entry) {
+      const created = createRowRuntimeEntry(session)
+      entry = { ...created, refs: 0 }
+      rowRuntimeEntries.set(session.id, entry)
+    }
+    entry.update(session)
+    entry.refs += 1
+    let released = false
+    return {
+      runtime: entry.runtime,
+      release: () => {
+        if (released) return
+        released = true
+        const current = rowRuntimeEntries.get(session.id)
+        if (current !== entry) return
+        current.refs -= 1
+        if (current.refs > 0) return
+        rowRuntimeEntries.delete(session.id)
+        current.dispose()
+      },
+    }
   }
 
   onCleanup(() => {
-    metricsDisposed = true
-    metricsQueue.length = 0
+    for (const entry of rowRuntimeEntries.values()) entry.dispose()
+    rowRuntimeEntries.clear()
+  })
+
+  // Dense sidebars cannot afford one Kobalte/floating-ui controller per
+  // tooltip anchor. Follow the model selector's proven architecture instead:
+  // one pane-level intent controller, one portal, one positioning RAF, and at
+  // most one MutationObserver (only while a dynamic plain-text tooltip is
+  // actually open). Rows publish metadata through data attributes; pointer and
+  // focus intent is handled here via event delegation.
+  let paneElement: HTMLDivElement | undefined
+  let sharedTooltipElement: HTMLDivElement | undefined
+  let tooltipOpenTimer: ReturnType<typeof setTimeout> | undefined
+  let tooltipPositionFrame = 0
+  let pendingTooltip: ChatSidebarTooltipIntent | undefined
+  let suppressedTooltipAnchor: HTMLElement | undefined
+  let lastTooltipClosedAt = 0
+  let describedTooltipAnchor: HTMLElement | undefined
+  let tooltipTextObserver: MutationObserver | undefined
+  const sharedTooltipID = "chat-sidebar-shared-tooltip"
+  const [sharedTooltip, setSharedTooltip] = createSignal<ChatSidebarTooltipIntent>()
+  const [sharedTooltipText, setSharedTooltipText] = createSignal("")
+  const [sharedTooltipPosition, setSharedTooltipPosition] = createSignal<{ x: number; y: number }>()
+
+  const clearTooltipDescription = () => {
+    const anchor = describedTooltipAnchor
+    if (!anchor) return
+    const tokens = (anchor.getAttribute("aria-describedby") ?? "")
+      .split(/\s+/)
+      .filter((token) => token && token !== sharedTooltipID)
+    if (tokens.length) anchor.setAttribute("aria-describedby", tokens.join(" "))
+    else anchor.removeAttribute("aria-describedby")
+    describedTooltipAnchor = undefined
+  }
+
+  const describeTooltipAnchor = (anchor: HTMLElement) => {
+    clearTooltipDescription()
+    const tokens = new Set((anchor.getAttribute("aria-describedby") ?? "").split(/\s+/).filter(Boolean))
+    tokens.add(sharedTooltipID)
+    anchor.setAttribute("aria-describedby", [...tokens].join(" "))
+    describedTooltipAnchor = anchor
+  }
+
+  const stopTooltipTextObserver = () => {
+    tooltipTextObserver?.disconnect()
+  }
+
+  const syncTooltipText = (intent: ChatSidebarTooltipIntent) => {
+    stopTooltipTextObserver()
+    if (intent.sessionID) {
+      setSharedTooltipText("")
+      return
+    }
+    const read = () => setSharedTooltipText(intent.anchor.dataset.chatTooltipText ?? intent.text ?? "")
+    read()
+    const Observer = intent.anchor.ownerDocument.defaultView?.MutationObserver ?? globalThis.MutationObserver
+    tooltipTextObserver ??= new Observer(() => {
+      const current = sharedTooltip()
+      if (!current || current.sessionID) return
+      setSharedTooltipText(current.anchor.dataset.chatTooltipText ?? current.text ?? "")
+    })
+    tooltipTextObserver.observe(intent.anchor, {
+      attributes: true,
+      attributeFilter: ["data-chat-tooltip-text"],
+    })
+  }
+
+  const closeSharedTooltip = (anchor?: HTMLElement) => {
+    if (pendingTooltip && (!anchor || pendingTooltip.anchor === anchor)) pendingTooltip = undefined
+    if (tooltipOpenTimer !== undefined) {
+      clearTimeout(tooltipOpenTimer)
+      tooltipOpenTimer = undefined
+    }
+    const current = sharedTooltip()
+    if (anchor && current?.anchor !== anchor) return
+    if (!current) return
+    clearTooltipDescription()
+    stopTooltipTextObserver()
+    setSharedTooltip(undefined)
+    setSharedTooltipPosition(undefined)
+    lastTooltipClosedAt = performance.now()
+  }
+
+  const updateSharedTooltipPosition = () => {
+    const intent = sharedTooltip()
+    if (!intent) return
+    const anchor = intent.anchor
+    if (!anchor.isConnected || !paneElement?.contains(anchor)) {
+      closeSharedTooltip(anchor)
+      return
+    }
+    const rect = anchor.getBoundingClientRect()
+    const paneRect = paneElement.getBoundingClientRect()
+    if (
+      rect.width === 0 ||
+      rect.height === 0 ||
+      rect.bottom <= paneRect.top ||
+      rect.top >= paneRect.bottom ||
+      rect.right <= paneRect.left ||
+      rect.left >= paneRect.right
+    ) {
+      closeSharedTooltip(anchor)
+      return
+    }
+
+    const measured = sharedTooltipElement?.getBoundingClientRect()
+    const width = Math.max(1, measured?.width || (intent.sessionID ? 260 : 120))
+    const height = Math.max(1, measured?.height || (intent.sessionID ? 150 : 24))
+    const margin = 12
+    const gutter = intent.sessionID ? 8 : 6
+    let x = rect.left + (rect.width - width) / 2
+    let y = rect.top - height - gutter
+
+    if (intent.placement === "right") {
+      x = rect.right + gutter
+      y = rect.top
+      if (x + width > window.innerWidth - margin) x = rect.left - width - gutter
+    } else if (intent.placement === "bottom") {
+      y = rect.bottom + gutter
+      if (y + height > window.innerHeight - margin) y = rect.top - height - gutter
+    } else if (y < margin) {
+      y = rect.bottom + gutter
+    }
+
+    x = Math.min(Math.max(margin, x), Math.max(margin, window.innerWidth - width - margin))
+    y = Math.min(Math.max(margin, y), Math.max(margin, window.innerHeight - height - margin))
+    const current = sharedTooltipPosition()
+    const next = { x: Math.round(x), y: Math.round(y) }
+    if (current?.x === next.x && current.y === next.y) return
+    setSharedTooltipPosition(next)
+  }
+
+  const queueSharedTooltipPosition = () => {
+    if (tooltipPositionFrame) return
+    tooltipPositionFrame = requestAnimationFrame(() => {
+      tooltipPositionFrame = 0
+      updateSharedTooltipPosition()
+    })
+  }
+
+  const showSharedTooltip = (intent: ChatSidebarTooltipIntent) => {
+    if (!intent.anchor.isConnected || suppressedTooltipAnchor === intent.anchor) return
+    pendingTooltip = undefined
+    if (tooltipOpenTimer !== undefined) {
+      clearTimeout(tooltipOpenTimer)
+      tooltipOpenTimer = undefined
+    }
+    const current = sharedTooltip()
+    if (current?.anchor === intent.anchor && current.sessionID === intent.sessionID) {
+      syncTooltipText(intent)
+      queueSharedTooltipPosition()
+      return
+    }
+    describeTooltipAnchor(intent.anchor)
+    syncTooltipText(intent)
+    setSharedTooltip(intent)
+    setSharedTooltipPosition(undefined)
+    // Paint immediately from the cheap fallback size so an occluded/throttled
+    // Electron renderer never waits on requestAnimationFrame just to make the
+    // tooltip visible. The portal ref schedules one RAF afterward to refine
+    // placement using the measured dimensions.
+    updateSharedTooltipPosition()
+  }
+
+  const scheduleSharedTooltip = (intent: ChatSidebarTooltipIntent) => {
+    if (suppressedTooltipAnchor === intent.anchor) return
+    const current = sharedTooltip()
+    if (current?.anchor === intent.anchor) return
+    if (tooltipOpenTimer !== undefined) clearTimeout(tooltipOpenTimer)
+    pendingTooltip = intent
+    // Match TooltipV2's 400ms initial intent while preserving the familiar
+    // fast handoff between neighboring tooltip targets.
+    const skipDelay = !!current || performance.now() - lastTooltipClosedAt < 300
+    if (skipDelay) {
+      showSharedTooltip(intent)
+      return
+    }
+    tooltipOpenTimer = setTimeout(() => {
+      tooltipOpenTimer = undefined
+      if (pendingTooltip !== intent) return
+      showSharedTooltip(intent)
+    }, 400)
+  }
+
+  const tooltipAnchorFrom = (target: EventTarget | null) => {
+    if (!(target instanceof Element)) return undefined
+    const anchor = target.closest<HTMLElement>("[data-chat-tooltip-text],[data-chat-tooltip-session]")
+    if (!anchor || !paneElement?.contains(anchor)) return undefined
+    return anchor
+  }
+
+  const tooltipIntentFrom = (anchor: HTMLElement): ChatSidebarTooltipIntent | undefined => {
+    const sessionID = anchor.dataset.chatTooltipSession
+    const text = anchor.dataset.chatTooltipText
+    if (!sessionID && text === undefined) return undefined
+    const requested = anchor.dataset.chatTooltipPlacement
+    const placement: ChatSidebarTooltipPlacement =
+      requested === "right" || requested === "bottom" || requested === "top"
+        ? requested
+        : sessionID
+          ? "right"
+          : "top"
+    return { anchor, placement, sessionID, text }
+  }
+
+  const handleTooltipPointerOver = (event: PointerEvent) => {
+    const next = tooltipAnchorFrom(event.target)
+    const previous = tooltipAnchorFrom(event.relatedTarget)
+    if (!next || next === previous) return
+    if (suppressedTooltipAnchor && suppressedTooltipAnchor !== next) suppressedTooltipAnchor = undefined
+    const intent = tooltipIntentFrom(next)
+    if (intent) scheduleSharedTooltip(intent)
+  }
+
+  const handleTooltipPointerOut = (event: PointerEvent) => {
+    const previous = tooltipAnchorFrom(event.target)
+    const next = tooltipAnchorFrom(event.relatedTarget)
+    if (!previous || previous === next) return
+    if (suppressedTooltipAnchor === previous) suppressedTooltipAnchor = undefined
+    if (next) {
+      const intent = tooltipIntentFrom(next)
+      if (intent) scheduleSharedTooltip(intent)
+      return
+    }
+    closeSharedTooltip(previous)
+  }
+
+  const handleTooltipFocusIn = (event: FocusEvent) => {
+    const anchor = tooltipAnchorFrom(event.target)
+    if (!anchor) return
+    const intent = tooltipIntentFrom(anchor)
+    if (intent) scheduleSharedTooltip(intent)
+  }
+
+  const handleTooltipFocusOut = (event: FocusEvent) => {
+    const previous = tooltipAnchorFrom(event.target)
+    const next = tooltipAnchorFrom(event.relatedTarget)
+    if (!previous || previous === next) return
+    if (next) {
+      const intent = tooltipIntentFrom(next)
+      if (intent) scheduleSharedTooltip(intent)
+      return
+    }
+    closeSharedTooltip(previous)
+  }
+
+  const suppressTooltipFrom = (target: EventTarget | null) => {
+    const anchor = tooltipAnchorFrom(target)
+    if (!anchor) return
+    suppressedTooltipAnchor = anchor
+    closeSharedTooltip(anchor)
+  }
+
+  const sharedTooltipRuntime = createMemo(() => {
+    const sessionID = sharedTooltip()?.sessionID
+    return sessionID ? rowRuntimeEntries.get(sessionID)?.runtime : undefined
+  })
+
+  const sharedTooltipSession = createMemo(() => sharedTooltipRuntime()?.session())
+  const sharedTooltipProjectName = () => {
+    const session = sharedTooltipSession()
+    if (!session) return ""
+    const name = (session as Session & { projectName?: string }).projectName
+    if (name) return name
+    const dir = session.directory || sharedTooltipRuntime()?.currentDir() || ""
+    const segs = dir.replace(/\\/g, "/").split("/").filter(Boolean)
+    return segs[segs.length - 1] ?? dir
+  }
+  const sharedTooltipBranch = () => {
+    const session = sharedTooltipSession() as (Session & { branch?: string; vcsBranch?: string }) | undefined
+    return session?.branch ?? session?.vcsBranch ?? "main"
+  }
+
+  createEffect(() => {
+    void sharedTooltip()
+    queueSharedTooltipPosition()
+  })
+
+  onMount(() => {
+    const reposition = () => queueSharedTooltipPosition()
+    paneElement?.addEventListener("scroll", reposition, true)
+    window.addEventListener("resize", reposition)
+    onCleanup(() => {
+      paneElement?.removeEventListener("scroll", reposition, true)
+      window.removeEventListener("resize", reposition)
+    })
+  })
+
+  onCleanup(() => {
+    if (tooltipOpenTimer !== undefined) clearTimeout(tooltipOpenTimer)
+    if (tooltipPositionFrame) cancelAnimationFrame(tooltipPositionFrame)
+    clearTooltipDescription()
+    stopTooltipTextObserver()
   })
 
   const navigate = useNavigate()
@@ -738,27 +1253,41 @@ export function ChatSidebarPane(props: {
 
   return (
     <div
+      ref={(element) => {
+        paneElement = element
+      }}
       id="chat-sidebar-pane"
-      class="relative my-2 ms-2 flex min-h-0 shrink-0 select-none flex-col self-stretch overflow-hidden rounded-[8px] border border-v2-border-border-base/50 bg-v2-background-bg-base shadow-[0_1px_2px_0_var(--v2-alpha-dark-6),0_1px_3px_0_var(--v2-alpha-dark-4),0_0_0_0.5px_var(--v2-alpha-dark-8)]"
+      class="relative my-2 ms-2 flex min-h-0 shrink-0 select-none flex-col self-stretch overflow-hidden rounded-[7px] border border-v2-border-border-base/60 bg-v2-background-bg-base shadow-[0_1px_2px_0_var(--v2-alpha-dark-6),0_1px_3px_0_var(--v2-alpha-dark-4),0_0_0_0.5px_var(--v2-alpha-dark-8)]"
       style={{ width: `${props.state.sidebarWidth()}px` }}
       data-chat-sidebar-pane
+      onPointerOver={handleTooltipPointerOver}
+      onPointerOut={handleTooltipPointerOut}
+      onFocusIn={handleTooltipFocusIn}
+      onFocusOut={handleTooltipFocusOut}
+      onPointerDown={(event: PointerEvent) => suppressTooltipFrom(event.target)}
+      onKeyDown={(event: KeyboardEvent) => {
+        if (event.key === "Enter" || event.key === " ") suppressTooltipFrom(event.target)
+      }}
+      onContextMenu={(event) => suppressTooltipFrom(event.target)}
     >
       {/* ── Title bar — zinc/IDE dense header ─────────────────── */}
-      <div class="flex h-9 shrink-0 items-center gap-1.5 border-b border-v2-border-border-muted/50 px-2.5">
-        <span class="text-[10px] font-[600] uppercase leading-none tracking-[0.08em] text-v2-text-text-muted">
+      <div class="flex h-8 shrink-0 items-center gap-1.5 border-b border-v2-border-border-muted/60 bg-v2-background-bg-base px-2">
+        <span class="select-none text-[10px] font-[620] uppercase leading-none tracking-[0.09em] text-v2-text-text-muted">
           {language.t("chats.title")}
         </span>
         <Show when={workingCount() > 0}>
-          <TooltipV2 value={language.plural("chats.footer.active", workingCount())} placement="bottom">
-            <span class="flex items-center gap-1 rounded-full bg-v2-state-bg-success px-1.5 py-0.5 text-[9px] font-[560] leading-none tabular-nums text-v2-state-fg-success">
-              <span class="size-1 animate-pulse rounded-full bg-v2-state-fg-success" />
-              {workingCount()}
-            </span>
-          </TooltipV2>
+          <span
+            data-chat-tooltip-text={language.plural("chats.footer.active", workingCount())}
+            data-chat-tooltip-placement="bottom"
+            class="flex items-center gap-1 rounded-[4px] bg-v2-state-bg-success px-1 py-[2px] text-[9px] font-[600] leading-none tabular-nums text-v2-state-fg-success ring-1 ring-inset ring-v2-state-fg-success/20"
+          >
+            <span class="size-1 animate-pulse rounded-full bg-v2-state-fg-success" />
+            {workingCount()}
+          </span>
         </Show>
 
         <div class="ms-auto flex items-center gap-0.5">
-          <TooltipV2 value={language.t("usage.panel.title")} placement="bottom">
+          <span class="flex" data-chat-tooltip-text={language.t("usage.panel.title")} data-chat-tooltip-placement="bottom">
             <IconButtonV2
               type="button"
               variant="ghost-muted"
@@ -767,8 +1296,8 @@ export function ChatSidebarPane(props: {
               aria-label={language.t("usage.panel.title")}
               icon={<IconV2 name="usage" />}
             />
-          </TooltipV2>
-          <TooltipV2 value={language.t("command.session.new")} placement="bottom">
+          </span>
+          <span class="flex" data-chat-tooltip-text={language.t("command.session.new")} data-chat-tooltip-placement="bottom">
             <IconButtonV2
               type="button"
               variant="ghost-muted"
@@ -777,8 +1306,8 @@ export function ChatSidebarPane(props: {
               aria-label={language.t("command.session.new")}
               icon={<IconV2 name="plus" />}
             />
-          </TooltipV2>
-          <TooltipV2 value={language.t("common.collapse")} placement="bottom">
+          </span>
+          <span class="flex" data-chat-tooltip-text={language.t("common.collapse")} data-chat-tooltip-placement="bottom">
             <IconButtonV2
               type="button"
               variant="ghost-muted"
@@ -789,12 +1318,12 @@ export function ChatSidebarPane(props: {
               aria-controls="chat-sidebar-pane"
               icon={<IconV2 name="close" />}
             />
-          </TooltipV2>
+          </span>
         </div>
       </div>
 
       {/* ── Session search — zinc inset field ─────────────────── */}
-      <div class="shrink-0 bg-v2-background-bg-base px-2 pb-2 pt-2">
+      <div class="shrink-0 bg-v2-background-bg-base px-2 pb-1.5 pt-1.5">
         <div
           ref={(element) => {
             searchRootElement = element
@@ -835,7 +1364,7 @@ export function ChatSidebarPane(props: {
             </div>
             </Show>}
           </Show>
-          <label class="relative z-20 flex h-[26px] w-full items-center gap-1.5 rounded-[7px] border border-v2-border-border-base/60 bg-v2-background-bg-layer-01 px-1.5 text-v2-icon-icon-muted shadow-[inset_0_1px_1px_var(--v2-alpha-dark-6),inset_0_0.5px_0.5px_var(--v2-alpha-dark-4)] transition-[border-color,background-color,box-shadow] duration-150 hover:border-v2-border-border-base hover:bg-v2-background-bg-layer-02 focus-within:border-v2-border-border-strong focus-within:bg-v2-background-bg-base focus-within:shadow-[0_0_0_2px_var(--v2-alpha-dark-8)]">
+          <label class="relative z-20 flex h-[24px] w-full items-center gap-1.5 rounded-[6px] border border-v2-border-border-base/60 bg-v2-background-bg-layer-01 px-1.5 text-v2-icon-icon-muted shadow-[inset_0_1px_1px_var(--v2-alpha-dark-6),inset_0_0.5px_0.5px_var(--v2-alpha-dark-4)] transition-[border-color,background-color,box-shadow] duration-150 hover:border-v2-border-border-base hover:bg-v2-background-bg-layer-02 focus-within:border-v2-border-border-strong focus-within:bg-v2-background-bg-base focus-within:shadow-[0_0_0_2px_var(--v2-alpha-dark-8)]">
             <IconV2 name="magnifying-glass" size="small" class="shrink-0 opacity-80" />
             <input
               ref={(element) => {
@@ -943,13 +1472,13 @@ export function ChatSidebarPane(props: {
           <div class="flex flex-col pb-2">
             <For each={stableGroups()}>
               {(group, index) => (
-                <section class="flex flex-col pt-2.5 first:pt-0">
+                <section class="flex flex-col pt-1.5 first:pt-0">
                   <button
                     type="button"
                     onClick={() => toggleExpanded(group.key)}
                     aria-expanded={isExpanded(group.key)}
                     aria-controls={`chats-group-${index()}`}
-                    class="group/head sticky top-0 z-10 flex h-6 shrink-0 items-center gap-1.5 bg-v2-background-bg-base px-2.5 text-left transition-colors hover:bg-v2-background-bg-layer-01 focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none"
+                    class="group/head sticky top-0 z-10 flex h-[22px] shrink-0 items-center gap-1.5 border-y border-transparent bg-v2-background-bg-base/95 px-2 text-left backdrop-blur-[6px] transition-colors hover:border-y-v2-border-border-muted/40 hover:bg-v2-background-bg-layer-01 focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none"
                   >
                     <IconV2
                       name="chevron-down"
@@ -980,33 +1509,33 @@ export function ChatSidebarPane(props: {
                       {group.total}
                     </span>
                     <Show when={group.directory}>
-                      <TooltipV2 value={language.t("command.session.new")} placement="top">
-                        <span
-                          role="button"
-                          tabIndex={0}
-                          class="inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-v2-text-text-faint hover:bg-v2-background-bg-layer-03 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
-                          aria-label={language.t("command.session.new")}
-                          onClick={(event) => {
+                      <span
+                        role="button"
+                        tabIndex={0}
+                        data-chat-tooltip-text={language.t("command.session.new")}
+                        data-chat-tooltip-placement="top"
+                        class="inline-flex size-5 shrink-0 cursor-pointer items-center justify-center rounded-md text-v2-text-text-faint hover:bg-v2-background-bg-layer-03 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-v2-border-border-base"
+                        aria-label={language.t("command.session.new")}
+                        onClick={(event) => {
+                          event.stopPropagation()
+                          event.preventDefault()
+                          navigateToNewSession(group.directory)
+                        }}
+                        onKeyDown={(event) => {
+                          if (event.key === "Enter" || event.key === " ") {
                             event.stopPropagation()
                             event.preventDefault()
                             navigateToNewSession(group.directory)
-                          }}
-                          onKeyDown={(event) => {
-                            if (event.key === "Enter" || event.key === " ") {
-                              event.stopPropagation()
-                              event.preventDefault()
-                              navigateToNewSession(group.directory)
-                            }
-                          }}
-                        >
-                          <IconV2 name="plus" size="small" />
-                        </span>
-                      </TooltipV2>
+                          }
+                        }}
+                      >
+                        <IconV2 name="plus" size="small" />
+                      </span>
                     </Show>
                   </button>
 
                   <Show when={isExpanded(group.key)}>
-                    <nav id={`chats-group-${index()}`} class="flex flex-col px-1.5 pb-2">
+                    <nav id={`chats-group-${index()}`} class="flex flex-col gap-px px-1 pb-1.5 pt-0.5">
                       <For each={sessionTreeRows(group.sessions)}>
                         {(item) => {
                           const session = () => item.session
@@ -1087,14 +1616,12 @@ export function ChatSidebarPane(props: {
                                       : undefined
                                   }
                                   selected={activeSessionId() === session().id}
-                                  now={now}
                                   minuteNow={minuteNow}
-                                  providers={providerList}
+                                  runtimeLease={leaseRowRuntime}
                                   pending={pendingSessionId() === session().id}
                                   onPending={(id) => {
                                     if (params.id !== id) setPendingSessionId(id)
                                   }}
-                                  hydrate={() => hydrateMetrics(session())}
                                   archiveSession={() => archiveSession(session())}
                                   prefetchSession={() => prefetchSession(session())}
                                   onChangeModel={openModelPicker}
@@ -1137,7 +1664,7 @@ export function ChatSidebarPane(props: {
                             void serverSync().project.loadSessions(group.directory)
                           }}
                         >
-                          {language.t("chats.showMore")}
+                          {language.plural("chats.showMoreCount", group.total - group.sessions.length)}
                         </button>
                       </Show>
                       <Show
@@ -1200,11 +1727,13 @@ export function ChatSidebarPane(props: {
             <span class="min-w-0 flex-1 truncate text-[10px] font-[560] uppercase leading-none tracking-[0.06em] text-v2-text-text-faint transition-colors group-hover/head:text-v2-text-text-muted">
               {language.t("chats.archived.group")}
             </span>
-            <TooltipV2 value={language.plural("chats.archived.count", archivedState.rows.length)} placement="top">
-              <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70">
-                {archivedState.rows.length}
-              </span>
-            </TooltipV2>
+            <span
+              data-chat-tooltip-text={language.plural("chats.archived.count", archivedState.rows.length)}
+              data-chat-tooltip-placement="top"
+              class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70"
+            >
+              {archivedState.rows.length}
+            </span>
           </button>
 
           <Show when={props.state.isArchivedExpanded()}>
@@ -1244,7 +1773,7 @@ export function ChatSidebarPane(props: {
 
       {/* ── Footer summary ────────────────────────────────────── */}
       <Show when={totalSessions() > 0}>
-        <div class="flex h-6 shrink-0 items-center justify-between border-t border-v2-border-border-muted px-2.5 text-[10px] leading-none text-v2-text-text-faint">
+        <div class="flex h-[22px] shrink-0 items-center justify-between border-t border-v2-border-border-muted/70 bg-v2-background-bg-layer-01/40 px-2.5 text-[9.5px] font-[500] leading-none tracking-[0.02em] text-v2-text-text-faint">
           <span class="tabular-nums">{language.plural("chats.footer.sessions", totalSessions())}</span>
           <Show when={workingCount() > 0}>
             <span class="tabular-nums">{language.plural("chats.footer.active", workingCount())}</span>
@@ -1269,6 +1798,134 @@ export function ChatSidebarPane(props: {
       <Show when={modelPicker()} keyed>
         {(request) => <SessionModelPicker {...request} onClose={() => setModelPicker(null)} />}
       </Show>
+      <Portal>
+        <Show when={sharedTooltip()}>
+          {(intent) => (
+            <Show when={sharedTooltipPosition()}>
+              {(position) => (
+                <div
+                  ref={(element) => {
+                    sharedTooltipElement = element
+                    queueSharedTooltipPosition()
+                  }}
+                  id={sharedTooltipID}
+                  role="tooltip"
+                  data-component="tooltip-v2"
+                  data-chat-sidebar-shared-tooltip
+                  class={
+                    intent().sessionID
+                      ? "!p-0 overflow-hidden rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-layer-01 shadow-[var(--v2-elevation-floating)]"
+                      : undefined
+                  }
+                  style={
+                    {
+                      position: "fixed",
+                      left: `${position().x}px`,
+                      top: `${position().y}px`,
+                      "pointer-events": "none",
+                      "z-index": 1000,
+                      "max-width": "calc(100vw - 30px)",
+                      "max-height": "calc(100vh - 30px)",
+                    } as JSX.CSSProperties
+                  }
+                >
+                  <Show when={intent().sessionID && sharedTooltipRuntime()} fallback={sharedTooltipText()}>
+                    <Show when={sharedTooltipRuntime()}>
+                      {(runtime) => {
+                        const session = () => runtime().session()
+                        const currentDir = () => runtime().currentDir()
+                        const totals = runtime().totals
+                        const contextPercent = runtime().contextPercent
+                        const modelInfo = runtime().modelInfo
+                        const modelLabel = runtime().modelLabel
+                        const isAutoAccepting = runtime().isAutoAccepting
+                        return (
+                          <div class="flex w-[260px] flex-col gap-2.5 px-3 py-2.5">
+                            <div class="flex min-w-0 items-center gap-2">
+                              <span class="flex size-5 shrink-0 items-center justify-center rounded-md bg-v2-background-bg-layer-02 text-[10px] font-[700] leading-none text-v2-text-text-muted">
+                                {(sharedTooltipProjectName()[0] ?? "•").toUpperCase()}
+                              </span>
+                              <span class="min-w-0 flex-1 truncate text-[12px] font-[600] leading-4 tracking-[-0.01em] text-v2-text-text-base">
+                                {sessionTitle(session().title) || sharedTooltipProjectName()}
+                              </span>
+                              <span class="shrink-0 text-[11px] leading-none tabular-nums text-v2-text-text-faint">
+                                {relativeLabel(session(), minuteNow())}
+                              </span>
+                            </div>
+                            <div class="h-px bg-v2-border-border-muted" />
+                            <div class="flex flex-col gap-1.5">
+                              <div class="flex min-w-0 items-center gap-1.5 text-[11px] leading-4">
+                                <IconV2 name="folder" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
+                                <span class="min-w-0 flex-1 truncate text-v2-text-text-muted">
+                                  {sharedTooltipProjectName()}
+                                </span>
+                                <span class="shrink-0 truncate text-[11px] text-v2-text-text-faint">
+                                  {currentDir() ? currentDir().replace(/\\/g, "/").split("/").slice(-2).join("/") : ""}
+                                </span>
+                              </div>
+                              <div class="flex items-center gap-1.5 text-[11px] leading-4">
+                                <IconV2 name="branch" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
+                                <span class="text-v2-text-text-muted">{sharedTooltipBranch()}</span>
+                                <Show when={modelInfo()}>
+                                  {(info) => (
+                                    <span class="ml-auto flex min-w-0 items-center gap-1 truncate text-v2-text-text-faint">
+                                      <IconV2 name="cache" size="small" class="size-2.5 shrink-0 opacity-60" />
+                                      <span class="truncate">{modelLabel()}</span>
+                                      <Show when={info().variant}>{(variant) => <span class="shrink-0">· {variant()}</span>}</Show>
+                                    </span>
+                                  )}
+                                </Show>
+                              </div>
+                            </div>
+                            <Show
+                              when={
+                                totals() &&
+                                ((totals()!.cost ?? 0) > 0 ||
+                                  contextPercent() !== null ||
+                                  totals()!.cacheHitPercent !== null)
+                              }
+                            >
+                              <div class="h-px bg-v2-border-border-muted" />
+                              <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-none tabular-nums">
+                                <Show when={(totals()?.cost ?? 0) > 0}>
+                                  <span class="text-v2-text-text-base">{formatCost(totals()!.cost)}</span>
+                                </Show>
+                                <Show when={contextPercent() !== null}>
+                                  <span class="flex items-center gap-1 text-v2-text-text-muted">
+                                    <span class="h-[3px] w-8 overflow-hidden rounded-full bg-v2-background-bg-layer-03">
+                                      <span
+                                        class={`block h-full rounded-full ${contextTone(contextPercent()!).bar}`}
+                                        style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }}
+                                      />
+                                    </span>
+                                    {contextPercent()}%
+                                  </span>
+                                </Show>
+                                <Show when={totals()?.cacheHitPercent !== null}>
+                                  <span class="flex items-center gap-1 text-v2-text-text-faint">
+                                    <IconV2 name="cache" size="small" class="size-3 opacity-60" />
+                                    {totals()!.cacheHitPercent}%
+                                  </span>
+                                </Show>
+                                <Show when={isAutoAccepting()}>
+                                  <span class="ml-auto flex items-center gap-1 rounded-[3.5px] bg-v2-state-bg-info px-1 py-0.5 text-[9px] font-[600] leading-none text-v2-state-fg-info">
+                                    <IconV2 name="shield-check" size="small" class="size-2.5" />
+                                    Auto
+                                  </span>
+                                </Show>
+                              </div>
+                            </Show>
+                          </div>
+                        )
+                      }}
+                    </Show>
+                  </Show>
+                </div>
+              )}
+            </Show>
+          )}
+        </Show>
+      </Portal>
     </div>
   )
 }
@@ -1282,12 +1939,10 @@ function ChatRow(props: {
   treeCount?: number
   onToggleTree?: () => void
   selected?: boolean
-  now: () => number
   minuteNow: () => number
-  providers: () => ProviderList
+  runtimeLease: (session: Session) => ChatRowRuntimeLease
   pending?: boolean
   onPending?: (id: string) => void
-  hydrate: () => void
   archiveSession: () => Promise<void>
   prefetchSession: () => void
   onChangeModel: (request: SessionModelPickerRequest) => void
@@ -1297,179 +1952,34 @@ function ChatRow(props: {
   onForkConversation?: () => void
 }): JSX.Element {
   const language = useLanguage()
-  const serverSync = useServerSync()
-  const serverSDK = useServerSDK()
-  const notification = useNotification()
-  const permission = usePermission()
-  const platform = usePlatform()
+  const lease = props.runtimeLease(props.session)
+  const runtime = lease.runtime
+  onCleanup(lease.release)
 
   const title = () => sessionTitle(props.session.title)
   // A group may legitimately contain sessions from more than one project.
   // Always route/actions against the member's own directory; the containing
   // project group is only a fallback for legacy rows that lack one.
   const currentDir = props.session.directory || props.directory || ""
-  const sessionData = () => serverSync().session.data
-  const isWorking = createMemo(() => sessionData().session_working(props.session.id))
-  const unseenCount = createMemo(() => notification.session.unseenCount(props.session.id))
-  const hasError = createMemo(() => notification.session.unseenHasError(props.session.id))
-
-  const permissionState = createMemo(() => permission.ensureServerState(ServerConnection.key(serverSDK().server)))
-  const pendingPermissions = createMemo(() => {
-    const pending = sessionData().permission[props.session.id] ?? []
-    return pending.filter((item) => !permissionState().autoResponds(item, currentDir))
-  })
-  const pendingQuestions = createMemo(() => sessionData().question[props.session.id] ?? [])
-  const hasPermissions = createMemo(() => pendingPermissions().length > 0)
-  const hasQuestions = createMemo(() => pendingQuestions().length > 0)
-  const needsAttention = createMemo(() => hasPermissions() || hasQuestions())
+  const isWorking = runtime.isWorking
+  const unseenCount = runtime.unseenCount
+  const hasError = runtime.hasError
+  const pendingPermissionCount = runtime.pendingPermissionCount
+  const pendingQuestionCount = runtime.pendingQuestionCount
+  const hasPermissions = runtime.hasPermissions
+  const hasQuestions = runtime.hasQuestions
+  const needsAttention = runtime.needsAttention
+  const isAutoAccepting = runtime.isAutoAccepting
+  const totals = runtime.totals
+  const contextPercent = runtime.contextPercent
+  const modelInfo = runtime.modelInfo
+  const modelLabel = runtime.modelLabel
+  const live = runtime.live
   const hasTreeDisclosure = createMemo(() => props.treeExpanded !== undefined && !!props.onToggleTree)
-  const [metricsRuntime, setMetricsRuntime] = createSignal<ChatSidebarMetricsRuntime>()
-  const aggregateMetrics = createMemo(() => chatSidebarAggregateMetrics(props.session))
-  let disposed = false
-  let metricsHoverTimer: ReturnType<typeof setTimeout> | undefined
-  onCleanup(() => {
-    disposed = true
-    if (metricsHoverTimer !== undefined) clearTimeout(metricsHoverTimer)
-  })
-  const activateMetrics = () => {
-    if (metricsHoverTimer !== undefined) {
-      clearTimeout(metricsHoverTimer)
-      metricsHoverTimer = undefined
-    }
-    props.hydrate()
-    if (metricsRuntime()) return
-    void loadChatSidebarMetricsRuntime()
-      .then((runtime) => {
-        if (!disposed) setMetricsRuntime(runtime)
-      })
-      .catch(() => undefined)
-  }
-  const scheduleHoverMetrics = () => {
-    if (metricsHoverTimer !== undefined) return
-    // TooltipV2 waits 400ms before opening. Start richer history hydration
-    // shortly before then, but cancel incidental pointer sweeps across rows so
-    // merely moving through the sidebar cannot manufacture a prefetch herd.
-    metricsHoverTimer = setTimeout(() => {
-      metricsHoverTimer = undefined
-      activateMetrics()
-    }, 250)
-  }
-  const cancelHoverMetrics = () => {
-    if (metricsHoverTimer === undefined) return
-    clearTimeout(metricsHoverTimer)
-    metricsHoverTimer = undefined
-  }
-  createEffect(() => {
-    if (!shouldAutoHydrateChatSidebarMetrics({ selected: props.selected, working: isWorking() })) return
-    activateMetrics()
-  })
-  const isAutoAccepting = createMemo(() => {
-    try {
-      return permissionState().isAutoAccepting(props.session.id, currentDir)
-    } catch {
-      return false
-    }
-  })
-
-  const messages = createMemo(() => sessionData().message[props.session.id] ?? [])
-
-  /**
-   * Historical totals deliberately do NOT read `now()` — only the live turn
-   * below does, so the per-second tick re-runs a cheap memo instead of
-   * re-aggregating the whole session once a second for every visible row.
-   * Guarded: one malformed session must never take down the whole pane.
-   */
-  const totals = createMemo<
-    { generatedSeconds: number; toolSeconds: number; cost: number; cacheHitPercent: number | null } | undefined
-  >(() => {
-    const runtime = metricsRuntime()
-    const aggregate = aggregateMetrics()
-    if (!runtime)
-      return {
-        generatedSeconds: 0,
-        toolSeconds: 0,
-        cost: aggregate.cost ?? 0,
-        cacheHitPercent: aggregate.cacheHitPercent ?? null,
-      }
-    try {
-      const session = runtime.aggregateSessionContextByModel(messages(), sessionData().part, []).session
-      return {
-        generatedSeconds: session.generatedSeconds,
-        toolSeconds: session.toolSeconds,
-        cost: aggregate.cost ?? session.cost,
-        cacheHitPercent: aggregate.cacheHitPercent === undefined ? session.cacheHitPercent : aggregate.cacheHitPercent,
-      }
-    } catch {
-      return {
-        generatedSeconds: 0,
-        toolSeconds: 0,
-        cost: aggregate.cost ?? 0,
-        cacheHitPercent: aggregate.cacheHitPercent ?? null,
-      }
-    }
-  })
-
-  const contextPercent = createMemo(() => {
-    const runtime = metricsRuntime()
-    if (!runtime) return null
-    return runtime.getSessionContext(messages(), props.providers())?.usage ?? null
-  })
-
-  const modelInfo = createMemo(() => {
-    const list = messages()
-    for (let i = list.length - 1; i >= 0; i--) {
-      const msg = list[i]
-      if (msg.role !== "assistant") continue
-      const assistant = msg as AssistantMessage
-      return { modelID: assistant.modelID, variant: assistant.variant }
-    }
-    return aggregateMetrics().model
-  })
-
-  const live = createMemo(() => {
-    if (!isWorking()) return undefined
-    const runtime = metricsRuntime()
-    if (!runtime) return undefined
-    const list = messages()
-    const parts = sessionData().part
-    let active: AssistantMessage | undefined
-    for (let i = list.length - 1; i >= 0; i--) {
-      const msg = list[i]
-      if (msg.role === "assistant" && !msg.time.completed) {
-        active = msg as AssistantMessage
-        break
-      }
-    }
-    const accumulated = totals()
-    if (!active)
-      return {
-        turnSeconds: 0,
-        accumulatedSeconds: (accumulated?.generatedSeconds ?? 0) + (accumulated?.toolSeconds ?? 0),
-        rate: null,
-      }
-    try {
-      const activeParts = parts[active.id]
-      const progress = runtime.liveGenerationProgress(active, activeParts, props.now())
-      const turnSeconds = progress.generatedSeconds + progress.toolSeconds
-      return {
-        turnSeconds,
-        accumulatedSeconds: (accumulated?.generatedSeconds ?? 0) + (accumulated?.toolSeconds ?? 0) + turnSeconds,
-        rate: runtime.computeMeasuredRate(activeParts, props.now())?.rate ?? null,
-      }
-    } catch {
-      return { turnSeconds: 0, accumulatedSeconds: 0, rate: null }
-    }
-  })
 
   const slug = () => base64Encode(currentDir || props.session.directory || "")
   const warm = () => props.prefetchSession()
-  const serverKey = createMemo(() => {
-    try {
-      return serverSDK().server ? ServerConnection.key(serverSDK().server) : undefined
-    } catch {
-      return undefined
-    }
-  })
+  const serverKey = runtime.serverKey
   const navigate = useNavigate()
   const [contextMenu, setContextMenu] = createSignal<{ x: number; y: number }>()
   const handleOpen = (opts?: { background?: boolean }) => {
@@ -1490,113 +2000,13 @@ function ChatRow(props: {
     navigate(`/${slug()}/session/${props.session.id}`)
   }
 
-  // Rich hover card — mirrors model-tooltip v2 density + image-1.png (title + project/branch rows)
-  const hoverProjectName = () => {
-    try {
-      const name = (props.session as unknown as { projectName?: string }).projectName as string | undefined
-      if (name) return name
-      const dir = currentDir || props.session.directory || ""
-      const segs = dir.replace(/\\/g, "/").split("/").filter(Boolean)
-      return segs[segs.length - 1] ?? dir
-    } catch {
-      return currentDir || props.session.directory || ""
-    }
-  }
-  const hoverBranch = () => {
-    try {
-      const meta =
-        (props.session as unknown as { branch?: string; vcsBranch?: string }).branch ??
-        (props.session as unknown as { vcsBranch?: string }).vcsBranch
-      if (meta) return meta
-    } catch {}
-    return "main"
-  }
-
   return (
     <>
-      <TooltipV2
-      placement="right"
-      gutter={8}
-      contentClass="!p-0 overflow-hidden rounded-[10px] border border-v2-border-border-muted bg-v2-background-bg-layer-01 shadow-[var(--v2-elevation-floating)]"
-      value={
-        <div class="flex w-[260px] flex-col gap-2.5 px-3 py-2.5">
-          <div class="flex min-w-0 items-center gap-2">
-            <span class="flex size-5 shrink-0 items-center justify-center rounded-md bg-v2-background-bg-layer-02 text-[10px] font-[700] leading-none text-v2-text-text-muted">
-              {(hoverProjectName()[0] ?? "•").toUpperCase()}
-            </span>
-            <span class="min-w-0 flex-1 truncate text-[12px] font-[600] leading-4 tracking-[-0.01em] text-v2-text-text-base">
-              {title() || hoverProjectName()}
-            </span>
-            <span class="shrink-0 text-[11px] leading-none tabular-nums text-v2-text-text-faint">
-              {relativeLabel(props.session, props.minuteNow())}
-            </span>
-          </div>
-          <div class="h-px bg-v2-border-border-muted" />
-          <div class="flex flex-col gap-1.5">
-            <div class="flex min-w-0 items-center gap-1.5 text-[11px] leading-4">
-              <IconV2 name="folder" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
-              <span class="min-w-0 flex-1 truncate text-v2-text-text-muted">{hoverProjectName()}</span>
-              <span class="shrink-0 truncate text-[11px] text-v2-text-text-faint">
-                {currentDir ? currentDir.replace(/\\/g, "/").split("/").slice(-2).join("/") : ""}
-              </span>
-            </div>
-            <div class="flex items-center gap-1.5 text-[11px] leading-4">
-              <IconV2 name="branch" size="small" class="size-3 shrink-0 text-v2-icon-icon-muted" />
-              <span class="text-v2-text-text-muted">{hoverBranch()}</span>
-              <Show when={modelInfo()}>
-                {(info) => (
-                  <span class="ml-auto flex min-w-0 items-center gap-1 truncate text-v2-text-text-faint">
-                    <IconV2 name="cache" size="small" class="size-2.5 shrink-0 opacity-60" />
-                    <span class="truncate">{info().modelID}</span>
-                    <Show when={info().variant}>{(v) => <span class="shrink-0">· {v()}</span>}</Show>
-                  </span>
-                )}
-              </Show>
-            </div>
-          </div>
-          <Show
-            when={
-              totals() && ((totals()!.cost ?? 0) > 0 || contextPercent() !== null || totals()!.cacheHitPercent !== null)
-            }
-          >
-            <div class="h-px bg-v2-border-border-muted" />
-            <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-[11px] leading-none tabular-nums">
-              <Show when={(totals()?.cost ?? 0) > 0}>
-                <span class="text-v2-text-text-base">{formatCost(totals()!.cost)}</span>
-              </Show>
-              <Show when={contextPercent() !== null}>
-                <span class="flex items-center gap-1 text-v2-text-text-muted">
-                  <span class="h-[3px] w-8 overflow-hidden rounded-full bg-v2-background-bg-layer-03">
-                    <span
-                      class={`block h-full rounded-full ${contextTone(contextPercent()!).bar}`}
-                      style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }}
-                    />
-                  </span>
-                  {contextPercent()}%
-                </span>
-              </Show>
-              <Show when={totals()?.cacheHitPercent !== null}>
-                <span class="flex items-center gap-1 text-v2-text-text-faint">
-                  <IconV2 name="cache" size="small" class="size-3 opacity-60" />
-                  {totals()!.cacheHitPercent}%
-                </span>
-              </Show>
-              <Show when={isAutoAccepting()}>
-                <span class="ml-auto flex items-center gap-1 rounded-[3.5px] bg-v2-state-bg-info px-1 py-0.5 text-[9px] font-[600] leading-none text-v2-state-fg-info">
-                  <IconV2 name="shield-check" size="small" class="size-2.5" />
-                  Auto
-                </span>
-              </Show>
-            </div>
-          </Show>
-        </div>
-      }
-    >
-        <div
-          class="group/session relative min-w-0 rounded-md transition-colors hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 has-[data-selected]:bg-v2-background-bg-layer-02 [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
+      <div
+          data-chat-tooltip-session={props.session.id}
+          data-chat-tooltip-placement="right"
+          class="group/session relative w-full min-w-0 rounded-[5px] transition-[background-color,box-shadow] duration-100 hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 has-[.active]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] has-[data-selected]:bg-v2-background-bg-layer-02 has-[data-selected]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
           style={{ "margin-inline-start": `${Math.min(Math.max(props.depth ?? 0, 0), 8) * 14}px` }}
-          onPointerEnter={scheduleHoverMetrics}
-          onPointerLeave={cancelHoverMetrics}
           onContextMenu={(event) => {
             event.preventDefault()
             setContextMenu({ x: event.clientX, y: event.clientY })
@@ -1616,14 +2026,11 @@ function ChatRow(props: {
           </Show>
           <A
             href={`/${slug()}/session/${props.session.id}`}
-            class="relative flex min-w-0 flex-col gap-[3px] rounded-md py-[5px] pe-1.5 ps-2 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[5px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:content-[''] data-[selected]:text-v2-text-text-base data-[selected]:before:absolute data-[selected]:before:inset-y-[5px] data-[selected]:before:start-0 data-[selected]:before:w-[2px] data-[selected]:before:rounded-full data-[selected]:before:bg-v2-background-bg-accent data-[selected]:before:content-['']"
+            class="relative flex w-full min-w-0 flex-col gap-[2px] rounded-[5px] py-[4px] pe-1.5 ps-1.5 text-v2-text-text-muted transition-colors focus-visible:outline-none group-hover/session:text-v2-text-text-base [&.active]:text-v2-text-text-base [&.active]:before:absolute [&.active]:before:inset-y-[3px] [&.active]:before:start-0 [&.active]:before:w-[2px] [&.active]:before:rounded-e-full [&.active]:before:bg-v2-background-bg-accent [&.active]:before:shadow-[0_0_6px_var(--v2-background-bg-accent)] [&.active]:before:content-[''] data-[selected]:text-v2-text-text-base data-[selected]:before:absolute data-[selected]:before:inset-y-[3px] data-[selected]:before:start-0 data-[selected]:before:w-[2px] data-[selected]:before:rounded-e-full data-[selected]:before:bg-v2-background-bg-accent data-[selected]:before:shadow-[0_0_6px_var(--v2-background-bg-accent)] data-[selected]:before:content-['']"
             data-selected={props.selected ? "" : undefined}
             aria-current={props.selected ? "page" : undefined}
             onPointerDown={warm}
-            onFocus={() => {
-              warm()
-              activateMetrics()
-            }}
+            onFocus={warm}
             onClick={(event: MouseEvent) => {
               if (event.ctrlKey || event.metaKey || event.shiftKey || event.altKey || event.button === 1) return
               props.onPending?.(props.session.id)
@@ -1684,7 +2091,7 @@ function ChatRow(props: {
                 </Show>
               </span>
 
-              <span class="min-w-0 flex-1 truncate text-[12px] leading-[16px]">{title()}</span>
+              <span class="min-w-0 flex-1 truncate text-[11.5px] font-[460] leading-[15px] tracking-[-0.01em] group-has-[data-selected]/session:font-[560]">{title()}</span>
 
               <Show when={hasTreeDisclosure() && (props.treeCount ?? 0) > 1}>
                 <span
@@ -1725,20 +2132,24 @@ function ChatRow(props: {
               </Show>
 
               <Show when={hasPermissions()}>
-                <TooltipV2 value={language.t("chats.badge.permission")} placement="top">
-                  <span class="flex shrink-0 items-center gap-0.5 rounded bg-v2-state-bg-warning px-1 py-[1px] text-[9px] font-[560] leading-none tabular-nums text-v2-state-fg-warning">
-                    <IconV2 name="shield" size="small" class="size-2.5" />
-                    {pendingPermissions().length}
-                  </span>
-                </TooltipV2>
+                <span
+                  data-chat-tooltip-text={language.t("chats.badge.permission")}
+                  data-chat-tooltip-placement="top"
+                  class="flex shrink-0 items-center gap-0.5 rounded bg-v2-state-bg-warning px-1 py-[1px] text-[9px] font-[560] leading-none tabular-nums text-v2-state-fg-warning"
+                >
+                  <IconV2 name="shield" size="small" class="size-2.5" />
+                  {pendingPermissionCount()}
+                </span>
               </Show>
               <Show when={hasQuestions()}>
-                <TooltipV2 value={language.t("chats.badge.question")} placement="top">
-                  <span class="flex shrink-0 items-center gap-0.5 rounded bg-v2-state-bg-info px-1 py-[1px] text-[9px] font-[560] leading-none tabular-nums text-v2-state-fg-info">
-                    <IconV2 name="help" size="small" class="size-2.5" />
-                    {pendingQuestions().length}
-                  </span>
-                </TooltipV2>
+                <span
+                  data-chat-tooltip-text={language.t("chats.badge.question")}
+                  data-chat-tooltip-placement="top"
+                  class="flex shrink-0 items-center gap-0.5 rounded bg-v2-state-bg-info px-1 py-[1px] text-[9px] font-[560] leading-none tabular-nums text-v2-state-fg-info"
+                >
+                  <IconV2 name="help" size="small" class="size-2.5" />
+                  {pendingQuestionCount()}
+                </span>
               </Show>
 
               {/* Archive replaces the timestamp on hover so the row never reflows */}
@@ -1746,40 +2157,42 @@ function ChatRow(props: {
                 <span class="text-[10px] leading-none tabular-nums text-v2-text-text-muted group-hover/session:hidden">
                   {relativeLabel(props.session, props.minuteNow())}
                 </span>
-                <TooltipV2 value={language.t("common.archive")} placement="top">
-                  <button
-                    type="button"
-                    aria-label={language.t("common.archive")}
-                    class="hidden size-4 items-center justify-center rounded text-v2-icon-icon-muted transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-icon-icon-base group-hover/session:flex"
-                    onClick={(event) => {
-                      event.preventDefault()
-                      event.stopPropagation()
-                      void props.archiveSession()
-                    }}
-                  >
-                    <IconV2 name="archive" size="small" class="size-3" />
-                  </button>
-                </TooltipV2>
+                <button
+                  type="button"
+                  aria-label={language.t("common.archive")}
+                  data-chat-tooltip-text={language.t("common.archive")}
+                  data-chat-tooltip-placement="top"
+                  class="hidden size-4 items-center justify-center rounded text-v2-icon-icon-muted transition-colors hover:bg-v2-background-bg-layer-03 hover:text-v2-icon-icon-base group-hover/session:flex"
+                  onClick={(event) => {
+                    event.preventDefault()
+                    event.stopPropagation()
+                    void props.archiveSession()
+                  }}
+                >
+                  <IconV2 name="archive" size="small" class="size-3" />
+                </button>
               </div>
             </div>
 
             {/* Line 2 — left metrics (truncate) + right timer (pinned, never squeezed) */}
-            <div class="flex min-w-0 items-center gap-1.5 ps-[18px]">
+            <div class="flex min-w-0 items-center gap-1.5 ps-[18px] opacity-[0.92] transition-opacity group-hover/session:opacity-100">
               <div class="flex min-w-0 flex-1 items-center gap-1.5 overflow-hidden">
                 <Show when={contextPercent() !== null}>
-                  <TooltipV2 value={language.t("chats.metric.context")} placement="top">
-                    <span class="flex shrink-0 items-center gap-1">
-                      <span class="h-[3px] w-6 overflow-hidden rounded-full bg-v2-background-bg-layer-03">
-                        <span
-                          class={`block h-full rounded-full transition-[width] duration-500 ${contextTone(contextPercent()!).bar}`}
-                          style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }}
-                        />
-                      </span>
-                      <span class={`text-[10px] leading-none tabular-nums ${contextTone(contextPercent()!).text}`}>
-                        {contextPercent()}%
-                      </span>
+                  <span
+                    data-chat-tooltip-text={language.t("chats.metric.context")}
+                    data-chat-tooltip-placement="top"
+                    class="flex shrink-0 items-center gap-1"
+                  >
+                    <span class="h-[3px] w-6 overflow-hidden rounded-full bg-v2-background-bg-layer-03">
+                      <span
+                        class={`block h-full rounded-full transition-[width] duration-500 ${contextTone(contextPercent()!).bar}`}
+                        style={{ width: `${Math.min(100, Math.max(2, contextPercent()!))}%` }}
+                      />
                     </span>
-                  </TooltipV2>
+                    <span class={`text-[10px] leading-none tabular-nums ${contextTone(contextPercent()!).text}`}>
+                      {contextPercent()}%
+                    </span>
+                  </span>
                 </Show>
 
                 <Show when={(totals()?.cost ?? 0) > 0}>
@@ -1789,29 +2202,33 @@ function ChatRow(props: {
                 </Show>
 
                 <Show when={totals()?.cacheHitPercent !== null && totals()?.cacheHitPercent !== undefined}>
-                  <TooltipV2 value={language.t("context.tooltip.cacheHit")} placement="top">
-                    <span class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70">
-                      <IconV2 name="cache" size="small" class="size-2.5 opacity-70" />
-                      <span>{totals()!.cacheHitPercent}%</span>
-                    </span>
-                  </TooltipV2>
+                  <span
+                    data-chat-tooltip-text={language.t("context.tooltip.cacheHit")}
+                    data-chat-tooltip-placement="top"
+                    class="flex shrink-0 items-center gap-1 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70"
+                  >
+                    <IconV2 name="cache" size="small" class="size-2.5 opacity-70" />
+                    <span>{totals()!.cacheHitPercent}%</span>
+                  </span>
                 </Show>
 
                 <Show when={modelInfo()}>
                   {(info) => (
                     <span class="min-w-0 flex-1 truncate text-[10px] leading-none text-v2-text-text-faint opacity-70">
-                      {info().modelID}
+                      {modelLabel()}
                       <Show when={info().variant}>{(variant) => ` · ${variant()}`}</Show>
                     </span>
                   )}
                 </Show>
 
                 <Show when={isAutoAccepting()}>
-                  <TooltipV2 value={language.t("chats.badge.autoAccept")} placement="top">
-                    <span class="flex shrink-0 items-center rounded-[3.5px] bg-v2-state-bg-info px-0.5 py-[1px] text-[9px] font-[560] leading-none text-v2-state-fg-info">
-                      <IconV2 name="shield-check" size="small" class="size-2.5" />
-                    </span>
-                  </TooltipV2>
+                  <span
+                    data-chat-tooltip-text={language.t("chats.badge.autoAccept")}
+                    data-chat-tooltip-placement="top"
+                    class="flex shrink-0 items-center rounded-[3.5px] bg-v2-state-bg-info px-0.5 py-[1px] text-[9px] font-[560] leading-none text-v2-state-fg-info"
+                  >
+                    <IconV2 name="shield-check" size="small" class="size-2.5" />
+                  </span>
                 </Show>
               </div>
 
@@ -1819,11 +2236,13 @@ function ChatRow(props: {
                 when={isWorking()}
                 fallback={
                   <Show when={(totals()?.generatedSeconds ?? 0) + (totals()?.toolSeconds ?? 0) > 1}>
-                    <TooltipV2 value={language.t("chats.timer.accumulated")} placement="top">
-                      <span class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70">
-                        {formatDuration((totals()!.generatedSeconds ?? 0) + (totals()!.toolSeconds ?? 0))}
-                      </span>
-                    </TooltipV2>
+                    <span
+                      data-chat-tooltip-text={language.t("chats.timer.accumulated")}
+                      data-chat-tooltip-placement="top"
+                      class="shrink-0 text-[10px] leading-none tabular-nums text-v2-text-text-faint opacity-70"
+                    >
+                      {formatDuration((totals()!.generatedSeconds ?? 0) + (totals()!.toolSeconds ?? 0))}
+                    </span>
                   </Show>
                 }
               >
@@ -1834,13 +2253,10 @@ function ChatRow(props: {
                  text nodes update in place each tick. Inner Switch swaps
                  between generating / tools / waiting premium states instead of
                  showing 0s. */}
-                <TooltipV2
-                  value={
-                    <span>
-                      {`${language.t("chats.timer.accumulated")} · ${formatDuration(live()?.accumulatedSeconds ?? 0)}`}
-                    </span>
-                  }
-                  placement="top"
+                <span
+                  data-chat-tooltip-text={`${language.t("chats.timer.accumulated")} · ${formatDuration(live()?.accumulatedSeconds ?? 0)}`}
+                  data-chat-tooltip-placement="top"
+                  class="flex shrink-0"
                 >
                   <Switch>
                     <Match when={hasPermissions() || hasQuestions()}>
@@ -1877,12 +2293,11 @@ function ChatRow(props: {
                       </span>
                     </Match>
                   </Switch>
-                </TooltipV2>
+                </span>
               </Show>
             </div>
           </A>
         </div>
-      </TooltipV2>
       <Show when={contextMenu()} keyed>
         {(cursor) => (
           <Suspense fallback={null}>

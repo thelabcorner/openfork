@@ -2,6 +2,7 @@ import { createStore } from "solid-js/store"
 import type { Session } from "@opencode-ai/sdk/v2/client"
 import { Persist, persisted } from "@/utils/persist"
 import { clampSize } from "@/utils/resizable-size"
+import { pathKey } from "@/utils/path-key"
 
 export const CHAT_SIDEBAR_PANE_WIDTH_DEFAULT = 280
 export const CHAT_SIDEBAR_PANE_WIDTH_MIN = 200
@@ -39,6 +40,18 @@ export function chatSidebarAggregateMetrics(
 
 export const shouldAutoHydrateChatSidebarMetrics = (input: { selected?: boolean; working: boolean }) =>
   !!input.selected || input.working
+
+/**
+ * A canonical project root owns sessions associated with that project even
+ * when their physical working directory is intentionally project-local (for
+ * example generated Chat scratch directories). Sandbox slices do not pass a
+ * projectID and therefore remain exact-directory scoped.
+ */
+export function chatSidebarRootSessionVisible(session: Session, directory: string, projectID?: string) {
+  if (session.parentID || session.time?.archived) return false
+  if (pathKey(session.directory) === pathKey(directory)) return true
+  return !!projectID && session.projectID === projectID
+}
 
 export function createChatSidebarPaneState() {
   const [store, setStore, , ready] = persisted(

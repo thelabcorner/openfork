@@ -52,6 +52,7 @@ import type { ServerProtocol } from "@/utils/server-protocol"
 import type { ServerApi } from "@/utils/server"
 import { startupSpan } from "@/utils/startup-perf"
 import type { ServerRequestPriority, ServerRequestScheduler } from "@/utils/server-request-scheduler"
+import type { Info as SessionTelemetryInfo } from "@opencode-ai/schema/session-telemetry"
 
 type GlobalStore = {
   ready: boolean
@@ -60,6 +61,7 @@ type GlobalStore = {
   provider: NormalizedProviderListResponse
   provider_auth: ProviderAuthResponse
   config: Config
+  telemetry: Record<string, SessionTelemetryInfo | undefined>
   reload: undefined | "pending" | "complete"
 }
 
@@ -472,6 +474,26 @@ export const loadPathQuery = (
     queryFn: async () => {
       if ((await protocol) !== "v1")
         return { state: "", config: "", worktree: "", directory: directory ?? "", home: "" }
+      // Global bootstrap only needs immutable process path metadata. Asking the
+      // instance-scoped /path route with no directory makes server middleware
+      // fall back to process.cwd(), which on desktop is commonly $HOME; that
+      // used to bootstrap config/plugins/watchers for an otherwise unused home
+      // instance before the real project even opened. Newer servers expose the
+      // same metadata on bootstrap-free /global/health. Keep /path as a strict
+      // compatibility fallback for older servers.
+      if (directory === null) {
+        try {
+          const health = await scheduleRequest(requests, priority, "global-path", () => sdk.global.health())
+          const path = (health.data as { path?: Path } | undefined)?.path
+          if (path?.home) return path
+        } catch (error) {
+          const status = endpointStatus(error)
+          if (status !== 404 && status !== 405) {
+            // A malformed/old health payload is equivalent to unsupported here;
+            // the compatibility /path call below remains authoritative.
+          }
+        }
+      }
       return retry(() =>
         scheduleRequest(requests, priority, "path-get", () => sdk.path.get({ directory: directory ?? undefined })).then(
           (result) => result.data!,

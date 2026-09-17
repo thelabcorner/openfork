@@ -1,15 +1,12 @@
-import { Match, Show, Switch, createMemo, type ComponentProps, type JSX } from "solid-js"
+import { Match, Show, Switch, createEffect, createMemo, type ComponentProps, type JSX } from "solid-js"
 import { ProgressCircle } from "@opencode-ai/ui/progress-circle"
 import { ProgressCircleV2 } from "@opencode-ai/ui/v2/progress-circle-v2"
 import { Button } from "@opencode-ai/ui/button"
 import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 
-import { useSync } from "@/context/sync"
 import { useLanguage } from "@/context/language"
-import { useProviders } from "@/hooks/use-providers"
-import { useSDK } from "@/context/sdk"
-import { getSessionContext } from "@/components/session/session-context-metrics"
+import { useServerSync } from "@/context/server-sync"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { useLayout } from "@/context/layout"
 
@@ -29,17 +26,17 @@ function ContextTooltipRow(props: { name: JSX.Element; value: JSX.Element }) {
 }
 
 export function SessionContextUsage(props: SessionContextUsageProps) {
-  const sync = useSync()
+  const serverSync = useServerSync()
   const layout = useLayout()
   const language = useLanguage()
-  const sdk = useSDK()
-  const providers = useProviders(() => sdk().directory)
   const { params } = useSessionLayout()
 
   const variant = createMemo(() => props.variant ?? "button")
   const buttonAppearance = createMemo(() => props.buttonAppearance ?? "default")
-  const messages = createMemo(() => (params.id ? (sync().data.message[params.id] ?? []) : []))
-  const info = createMemo(() => (params.id ? sync().session.get(params.id) : undefined))
+  const info = createMemo(() => (params.id ? serverSync().session.get(params.id) : undefined))
+  createEffect(() => {
+    if (params.id) serverSync().telemetry.ensure([params.id])
+  })
 
   const usd = createMemo(
     () =>
@@ -49,7 +46,15 @@ export function SessionContextUsage(props: SessionContextUsageProps) {
       }),
   )
 
-  const context = createMemo(() => getSessionContext(messages(), [...providers.all().values()]))
+  const context = createMemo(() => {
+    if (!params.id) return undefined
+    const settled = serverSync().telemetry.get(params.id)?.context
+    if (!settled) return undefined
+    const tokens = settled.tokens
+    const total = tokens.input + tokens.output + tokens.reasoning + tokens.cache.read + tokens.cache.write
+    const limit = settled.model.contextLimit
+    return { total, usage: limit && limit > 0 ? Math.round((total / limit) * 100) : null }
+  })
   const cost = createMemo(() => {
     return usd().format(info()?.cost ?? 0)
   })

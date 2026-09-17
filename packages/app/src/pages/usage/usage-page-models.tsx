@@ -40,8 +40,8 @@ const MODEL_TABLE_PAGE_ROWS = 200
 
 const TABLE_GRID = "grid-cols-[minmax(0,1fr)_50px_60px_68px_68px_62px_54px_46px]"
 
-const tokensPerSecond = (breakdown: TokenBreakdown, durationMs: number) =>
-  durationMs > 0 ? ((breakdown.output + breakdown.reasoning) / durationMs) * 1000 : 0
+const tokensPerSecond = (breakdown: TokenBreakdown, generationMs: number) =>
+  generationMs > 0 ? ((breakdown.output + breakdown.reasoning) / generationMs) * 1000 : 0
 
 const cacheHitRateOf = (breakdown: TokenBreakdown) => {
   const denominator = breakdown.input + breakdown.cacheRead
@@ -98,7 +98,7 @@ export function UsagePageModels(props: {
         ratePerMillion: effective.cost.input + effective.cost.output,
         rateInferred: effective.borrowed,
         freeValue,
-        throughput: tokensPerSecond(group.tokenBreakdown, group.durationMs),
+        throughput: tokensPerSecond(group.tokenBreakdown, group.generationMs),
         cacheHitRate: cacheHitRateOf(group.tokenBreakdown),
       }
     })
@@ -119,7 +119,7 @@ export function UsagePageModels(props: {
   )
   const fastest = createMemo(() =>
     [...rows()]
-      .filter((row) => row.group.durationRecords > 0 && row.throughput > 0)
+      .filter((row) => row.group.generationRecords > 0 && row.throughput > 0)
       .sort((a, b) => b.throughput - a.throughput)
       .slice(0, LEADERBOARD_SIZE),
   )
@@ -234,10 +234,10 @@ function UsageProvidersPanel(props: { data: UsageSummaryResponse; providerName: 
         messages: provider.messages,
         sessions: provider.sessions,
         throughput:
-          provider.durationMs > 0
-            ? ((provider.tokens.output + provider.tokens.reasoning) / provider.durationMs) * 1000
+          provider.generationMs > 0
+            ? ((provider.tokens.output + provider.tokens.reasoning) / provider.generationMs) * 1000
             : 0,
-        durationRecords: provider.durationRecords,
+        generationRecords: provider.generationRecords,
       }
     })
     return list.sort((a, b) => b.tokens - a.tokens)
@@ -253,7 +253,7 @@ function UsageProvidersPanel(props: { data: UsageSummaryResponse; providerName: 
               <RankRow
                 leading={<ProviderIcon id={row.id} class="size-3 shrink-0 opacity-50" />}
                 label={props.providerName(row.id)}
-                detail={row.durationRecords > 0 ? formatTokensPerSecond(row.throughput, language.intl()) : undefined}
+                detail={row.generationRecords > 0 ? formatTokensPerSecond(row.throughput, language.intl()) : undefined}
                 fraction={max() > 0 ? row.tokens / max() : 0}
                 value={formatTokens(row.tokens, language.intl())}
                 tooltip={
@@ -264,7 +264,7 @@ function UsageProvidersPanel(props: { data: UsageSummaryResponse; providerName: 
                       { label: language.t("usage.metric.tokens"), value: formatTokens(row.tokens, language.intl()) },
                       { label: language.t("usage.table.turns"), value: formatNumber(row.messages, language.intl()) },
                       { label: language.t("usage.table.sessions"), value: formatNumber(row.sessions, language.intl()) },
-                      ...(row.durationRecords > 0
+                      ...(row.generationRecords > 0
                         ? [
                             {
                               label: language.t("usage.metric.tokensPerSecond"),
@@ -348,7 +348,7 @@ function ModelDetail(props: { row: ModelRow }) {
         { label: language.t("usage.table.outputTokens"), value: formatTokensExact(breakdown().output, language.intl()) },
         { label: language.t("usage.table.cacheReadTokens"), value: formatTokensExact(breakdown().cacheRead, language.intl()) },
         { label: language.t("usage.metric.cacheHitRate"), value: formatPercent(row().cacheHitRate, language.intl()) },
-        ...(row().group.durationRecords > 0
+        ...(row().group.generationRecords > 0
           ? [{ label: language.t("usage.metric.tokensPerSecond"), value: formatTokensPerSecond(row().throughput, language.intl()) }]
           : []),
       ]}
@@ -474,7 +474,7 @@ function ModelTableRow(props: { row: ModelRow }) {
           ? `${row().rateInferred ? "~" : ""}${formatUSDCompact(row().ratePerMillion, language.intl())}`
           : "—"}
       </Cell>
-      <Cell muted>{row().group.durationRecords > 0 ? formatNumber(row().throughput, language.intl()) : "—"}</Cell>
+      <Cell muted>{row().group.generationRecords > 0 ? formatNumber(row().throughput, language.intl()) : "—"}</Cell>
       <Cell muted>{formatPercent(row().cacheHitRate, language.intl())}</Cell>
     </div>
   )

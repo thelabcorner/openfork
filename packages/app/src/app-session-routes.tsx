@@ -2,7 +2,7 @@ import { Navigate, useNavigate, useParams, useSearchParams } from "@solidjs/rout
 import { createEffect, createMemo, lazy, Show, Suspense, type ParentProps } from "solid-js"
 import { ForkUsageProvider } from "@/context/fork-usage"
 import { GoalsProvider } from "@/context/goals"
-import { PersonalUsageIngest } from "@/context/personal-usage"
+import { PersonalUsageProvider } from "@/context/personal-usage"
 import { ServerConnection, useServer } from "@/context/server"
 import { ServerSDKProvider } from "@/context/server-sdk"
 import { ServerSyncProvider, useServerSync } from "@/context/server-sync"
@@ -78,14 +78,13 @@ function TargetServerRoute(props: ParentProps) {
   return (
     <Show when={serverKey()} keyed fallback={<ErrorSurface error={new Error("Invalid server route")} />}>
       <ServerSDKProvider server={conn}>
-        <ServerSyncProvider server={conn}>
-          <GoalsProvider>
-            <ForkUsageProvider>
-              <PersonalUsageIngest />
-              {props.children}
-            </ForkUsageProvider>
-          </GoalsProvider>
-        </ServerSyncProvider>
+        <PersonalUsageProvider>
+          <ServerSyncProvider server={conn}>
+            <GoalsProvider>
+              <ForkUsageProvider>{props.children}</ForkUsageProvider>
+            </GoalsProvider>
+          </ServerSyncProvider>
+        </PersonalUsageProvider>
       </ServerSDKProvider>
     </Show>
   )
@@ -146,14 +145,15 @@ export function GroupTabRouteController() {
   return (
     <Show when={serverKey()} keyed fallback={<ErrorSurface error={new Error("Invalid group route")} />}>
       <ServerSDKProvider server={conn}>
-        <ServerSyncProvider server={conn}>
-          <ForkUsageProvider>
-            <PersonalUsageIngest />
-            <Suspense fallback={<RoutePlaceholder />}>
-              <GroupTabPage />
-            </Suspense>
-          </ForkUsageProvider>
-        </ServerSyncProvider>
+        <PersonalUsageProvider>
+          <ServerSyncProvider server={conn}>
+            <ForkUsageProvider>
+              <Suspense fallback={<RoutePlaceholder />}>
+                <GroupTabPage />
+              </Suspense>
+            </ForkUsageProvider>
+          </ServerSyncProvider>
+        </PersonalUsageProvider>
       </ServerSDKProvider>
     </Show>
   )

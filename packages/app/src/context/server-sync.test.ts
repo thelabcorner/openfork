@@ -22,6 +22,7 @@ import {
   loadMcpQuery,
   loadMcpResourcesQuery,
   seedActiveSessionStatuses,
+  sessionIndexDirectory,
 } from "./server-sync"
 import { ServerScope } from "@/utils/server-scope"
 import { createServerSession } from "./server-session"
@@ -311,6 +312,30 @@ describe("estimateRootSessionTotal", () => {
 
   test("keeps exact total when limited fetch is under limit", () => {
     expect(estimateRootSessionTotal({ count: 9, limit: 10, limited: true })).toBe(9)
+  })
+})
+
+describe("sessionIndexDirectory", () => {
+  const projects = [
+    { id: "project-a", worktree: "/project-a", sandboxes: ["/project-a-sandbox"] },
+    { id: "chats", worktree: "/chat-root", sandboxes: [] },
+  ]
+
+  test("keeps exact project roots and sandboxes", () => {
+    expect(sessionIndexDirectory({ projectID: "project-a", directory: "/project-a" }, projects)).toBe("/project-a")
+    expect(sessionIndexDirectory({ projectID: "project-a", directory: "/project-a-sandbox" }, projects)).toBe(
+      "/project-a-sandbox",
+    )
+  })
+
+  test("indexes generated project-local directories under their canonical project", () => {
+    expect(sessionIndexDirectory({ projectID: "chats", directory: "/chat-root/sessions/ses_123" }, projects)).toBe(
+      "/chat-root",
+    )
+  })
+
+  test("preserves the actual directory when project metadata is unavailable", () => {
+    expect(sessionIndexDirectory({ projectID: "unknown", directory: "/unindexed" }, projects)).toBe("/unindexed")
   })
 })
 

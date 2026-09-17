@@ -1,6 +1,7 @@
 import { createMemo, createEffect, createSignal, on, onCleanup, untrack, For, Show } from "solid-js"
 import type { Accessor, JSX } from "solid-js"
 import { useSync } from "@/context/sync"
+import { useServerSync } from "@/context/server-sync"
 import { sampledChecksum } from "@opencode-ai/core/util/encode"
 import { findLast } from "@opencode-ai/core/util/array"
 import { same } from "@/utils/same"
@@ -35,7 +36,6 @@ import { getSessionContext } from "./session-context-metrics"
 import { estimateSessionContextBreakdown, type SessionContextBreakdownKey } from "./session-context-breakdown"
 import {
   aggregateSessionContextByModel,
-  liveGenerationProgress,
   modelKey,
   type CostBreakdown,
   type LiveGenerationProgress,
@@ -235,6 +235,7 @@ type ContextLedger = {
 
 export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const sync = useSync()
+  const serverSync = useServerSync()
   const language = useLanguage()
   const sdk = useSDK()
   const platform = usePlatform()
@@ -314,6 +315,10 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
     return undefined
   })
   const liveMessageID = createMemo(() => liveMessage()?.id)
+  createEffect(() => {
+    if (!active() || !params.id) return
+    serverSync().telemetry.ensure([params.id])
+  })
 
   // Compaction runs server-side as an ordinary streaming assistant turn tagged
   // mode/agent "compaction", so the message store is the only truthful progress
@@ -394,11 +399,17 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   )
 
   const liveDelta = createMemo<LiveGenerationProgress>(() => {
-    const msg = liveMessage()
-    if (!msg) return emptyLiveProgress
-    // Subscribe only to the running assistant. A token must not invalidate a
-    // projection containing every historical Part[] in the session.
-    return liveGenerationProgress(msg, getParts(msg.id), now())
+    if (!params.id || !liveMessage()) return emptyLiveProgress
+    const telemetry = serverSync().telemetry.get(params.id)
+    if (!telemetry?.step || telemetry.phase === "idle") return emptyLiveProgress
+    const openMs = telemetry.phaseStartedAt === undefined ? 0 : Math.max(0, now() - telemetry.phaseStartedAt)
+    return {
+      generatedSeconds:
+        (telemetry.step.generatedMs +
+          (telemetry.phase === "generating" || telemetry.phase === "reasoning" ? openMs : 0)) /
+        1000,
+      toolSeconds: (telemetry.step.toolMs + (telemetry.phase === "tool" ? openMs : 0)) / 1000,
+    }
   })
 
   const liveDeltaFor = (metrics: ModelContextMetrics): LiveGenerationProgress => {
@@ -567,7 +578,13 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
       ]
     }),
   )
-  const valuation = createUsageValuation(valuationRows, () => providerList() ?? emptyProviderList)
+  // The session's directory-scoped provider catalog is authoritative for the
+  // models this view can execute. Do not start a second directory-less global
+  // provider query merely for valuation; on legacy compatibility routes that
+  // request falls back to process.cwd() and boots an unrelated $HOME instance.
+  const valuation = createUsageValuation(valuationRows, () => providerList() ?? emptyProviderList, {
+    globalCatalog: false,
+  })
   const subsidy = () => valuation.subsidy()
   const subsidyByModel = createMemo(
     () => new Map(subsidy().rows.map((row) => [`${row.providerID}:${row.modelID}`, row])),
