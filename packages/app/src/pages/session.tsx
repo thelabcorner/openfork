@@ -1885,8 +1885,6 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
         prepare: async (next) => {
           if (!next.goal) return
           await goals.quickStart(next.sessionID, {
-            projectID: next.goal.projectID,
-            workspaceID: next.goal.workspaceID,
             objective: next.goal.objective,
             mode: next.goal.mode,
           })

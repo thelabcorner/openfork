@@ -7,6 +7,9 @@ import { useGlobal } from "@/context/global"
 import { ServerConnection } from "@/context/server"
 import type { Session } from "@opencode-ai/sdk/v2"
 import { useSessionGroups } from "@/context/session-groups"
+import { useProviders } from "@/hooks/use-providers"
+import { useForkUsage } from "@/context/fork-usage"
+import { accountShortLabel, splitMultiAccountModelID } from "@/utils/model-account-identity"
 import { showToast } from "@/utils/toast"
 import { tabSessionState } from "../titlebar-tab-state"
 import {
@@ -117,6 +120,11 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
   const platform = usePlatform()
   const pickDirectory = useDirectoryPicker()
   const sessionGroups = useSessionGroups()
+  // Directory-scoped catalog (same scoping the prompt surfaces use) so the menu resolves
+  // model ids without opting into the global provider query. forkUsage supplies the
+  // account/key labels without pulling in quota polling.
+  const providers = useProviders(() => props.session?.directory)
+  const forkUsage = useForkUsage()
 
   const sessionID = createMemo(() => props.session?.id)
   const serverCtx = createMemo(() => {
@@ -278,20 +286,6 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
     const ctx = serverCtx()
     if (!sess || !ctx) return undefined
     const current = pathKey(sess.directory)
-    const moveSessionTo = (worktree: string) => {
-      const sid = sessionID()
-      if (!sid || pathKey(worktree) === pathKey(sess.directory)) return
-      void ctx.sdk.client.experimental.controlPlane
-        .moveSession({ sessionID: sid, destination: { directory: worktree }, moveChanges: false })
-        .then(() => showToast({ title: language.t("toast.session.move.success.title"), variant: "success" }))
-        .catch((err: unknown) => {
-          showToast({
-            title: language.t("toast.session.move.failed.title"),
-            description: err instanceof Error ? err.message : undefined,
-            variant: "error",
-          })
-        })
-    };
     // Same options as the new-session project selector. Chat is resolved from
     // the server project catalog so a renderer never manufactures a local path
     // for a remote server (or guesses USERPROFILE on Windows).
@@ -315,15 +309,82 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
           ...known.filter((project) => !isChatProjectAlias(project, canonical)),
         ]
       : known.filter((project) => project.id !== "chats" && !isReservedChatProjectPath(project.worktree))
+
+    const belongsTo = (session: Session | undefined, project: ProjectOption | undefined) => {
+      if (!session || !project) return false
+      // projectID is authoritative for generated Chat scratch directories and
+      // other locations that are intentionally not equal to the project root.
+      if (session.projectID && project.id) return session.projectID === project.id
+      const directory = pathKey(session.directory)
+      return (
+        pathKey(project.worktree) === directory ||
+        project.sandboxes?.some((sandbox) => pathKey(sandbox) === directory) === true
+      )
+    }
+
+    const moveSessionTo = (worktree: string) => {
+      const sid = sessionID()
+      const target = source.find((project) => pathKey(project.worktree) === pathKey(worktree))
+      if (!sid || belongsTo(sess, target) || (!target && pathKey(worktree) === current)) return
+
+      void (async () => {
+        try {
+          await ctx.sdk.client.experimental.controlPlane.moveSession({
+            sessionID: sid,
+            destination: { directory: worktree },
+            moveChanges: false,
+          })
+        } catch (err) {
+          showToast({
+            title: language.t("toast.session.move.failed.title"),
+            description: err instanceof Error ? err.message : undefined,
+            variant: "error",
+          })
+          return
+        }
+
+        // The move endpoint returns no relocated session payload. Usually the
+        // session.next.moved stream event has already repaired the shared cache;
+        // if transport delivery is a beat behind, one tiny forced metadata GET
+        // gives us the server-assigned location (critical for Chat scratch dirs)
+        // without reloading every project's session list.
+        let info = ctx.sync.session.peek(sid)
+        const associated = target
+          ? belongsTo(info, target)
+          : !!info && pathKey(info.directory) === pathKey(worktree)
+        if (!associated) {
+          try {
+            info = await ctx.sync.session.resolve(sid, { force: true })
+          } catch {
+            info = undefined
+          }
+        }
+
+        if (info) {
+          const indexed = ctx.sync.project.reindexSession(info)
+          // Newly-added projects may not have a passive child store yet. Only
+          // in that uncommon case hydrate the single selected project, then
+          // replay the local index repair. Existing-project moves stay request
+          // free once the move event has landed.
+          if (!indexed) {
+            await ctx.sync.project.loadSessions(worktree, { priority: "critical" }).catch(() => undefined)
+            const refreshed = ctx.sync.session.peek(sid)
+            if (refreshed) ctx.sync.project.reindexSession(refreshed)
+          }
+        }
+
+        showToast({ title: language.t("toast.session.move.success.title"), variant: "success" })
+      })()
+    }
+
     const projects = source.map((project) => {
       const label = displayName(project)
+      const selected = belongsTo(sess, project)
       return {
         worktree: project.worktree,
         label,
-        current:
-          pathKey(project.worktree) === current ||
-          project.sandboxes?.some((sandbox) => pathKey(sandbox) === current) === true,
-        disabled: pathKey(project.worktree) === current,
+        current: selected,
+        disabled: selected,
         avatar: {
           fallback: label,
           src: getProjectAvatarSource(project.id, project.icon),
@@ -462,7 +523,21 @@ export function SessionContextMenu(props: SessionContextMenuProps) {
   })
 
   const currentVariant = createMemo(() => props.session?.model?.variant ?? undefined)
-  const currentModelLabel = createMemo(() => props.session?.model?.id)
+  // The session stores an account-qualified id ("deepseek-v4.1-flash@zen-889db3308123").
+  // Show the catalog name plus the human account/key label instead of the raw internal
+  // ids. Both lookups degrade gracefully: if the catalog or credential list hasn't loaded
+  // yet we fall back to the base model id rather than the qualified one.
+  const currentModelLabel = createMemo(() => {
+    const model = props.session?.model
+    if (!model?.id) return undefined
+    const parts = splitMultiAccountModelID(model.id)
+    const catalogName = providers.all().get(model.providerID)?.models[parts.baseModelID]?.name
+    const name = catalogName ?? parts.baseModelID
+    if (!parts.accountID) return name
+    const account = forkUsage.credentials.latest?.find((credential) => credential.id === parts.accountID)
+    const accountName = account?.label ?? (parts.accountID === forkUsage.activeCredentialID() ? forkUsage.activeCredentialLabel() : undefined)
+    return accountName ? `${name} · ${accountShortLabel(accountName)}` : name
+  })
 
   const owner = getOwner()
   let cachedPrompt: { key: string; value: PromptSession } | undefined

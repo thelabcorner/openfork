@@ -14,6 +14,12 @@ export type MenuItemDef =
       id: string
       label: string
       disabled?: boolean
+      /**
+       * Optional second line rendered under the label. Use this instead of appending
+       * " — value" to the label: an inlined value (model id, disabled reason) forces
+       * the whole menu to the width of its longest string.
+       */
+      description?: string
       variant?: MenuItemVariant
       icon?: string
       onSelect: () => void
@@ -25,6 +31,7 @@ export type MenuItemDef =
       disabled?: boolean
       icon?: string
       items: MenuItemDef[]
+      description?: string
       search?: { placeholder: string }
     }
   | {

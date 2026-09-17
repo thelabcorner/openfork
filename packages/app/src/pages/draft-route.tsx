@@ -4,7 +4,7 @@ import { base64Encode } from "@opencode-ai/core/util/encode"
 import { CommentsProvider } from "@/context/comments"
 import { FileProvider } from "@/context/file"
 import { ForkUsageProvider } from "@/context/fork-usage"
-import { PersonalUsageIngest } from "@/context/personal-usage"
+import { PersonalUsageProvider } from "@/context/personal-usage"
 import { PromptProvider } from "@/context/prompt"
 import { ServerConnection } from "@/context/server"
 import { ServerSDKProvider } from "@/context/server-sdk"
@@ -38,20 +38,21 @@ function ResolvedDraftRoute(props: { draft: DraftTab }) {
   return (
     <Show when={`${props.draft.server}\0${props.draft.directory}`} keyed>
       <ServerSDKProvider server={conn}>
-        <ServerSyncProvider server={conn}>
-          <ForkUsageProvider>
-            <PersonalUsageIngest />
-            <SDKProvider directory={directory}>
-              <DirectoryDataProvider directory={directory} server={serverKey}>
-                <DraftProviders>
-                  <Suspense fallback={<RoutePlaceholder />}>
-                    <NewSession />
-                  </Suspense>
-                </DraftProviders>
-              </DirectoryDataProvider>
-            </SDKProvider>
-          </ForkUsageProvider>
-        </ServerSyncProvider>
+        <PersonalUsageProvider>
+          <ServerSyncProvider server={conn}>
+            <ForkUsageProvider>
+              <SDKProvider directory={directory}>
+                <DirectoryDataProvider directory={directory} server={serverKey}>
+                  <DraftProviders>
+                    <Suspense fallback={<RoutePlaceholder />}>
+                      <NewSession />
+                    </Suspense>
+                  </DraftProviders>
+                </DirectoryDataProvider>
+              </SDKProvider>
+            </ForkUsageProvider>
+          </ServerSyncProvider>
+        </PersonalUsageProvider>
       </ServerSDKProvider>
     </Show>
   )

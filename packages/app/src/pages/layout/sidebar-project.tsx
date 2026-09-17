@@ -12,6 +12,7 @@ import { useLanguage } from "@/context/language"
 import { useNotification } from "@/context/notification"
 import { ProjectIcon, SessionItem, type SessionItemProps } from "./sidebar-items"
 import { displayName, sortedRootSessions } from "./helpers"
+import { pathKey } from "@/utils/path-key"
 
 export type ProjectSidebarContext = {
   currentDir: Accessor<string>
@@ -19,6 +20,7 @@ export type ProjectSidebarContext = {
   sidebarOpened: Accessor<boolean>
   sidebarHovering: Accessor<boolean>
   hoverProject: Accessor<string | undefined>
+  workingDirectories: Accessor<ReadonlySet<string>>
   onProjectMouseEnter: (worktree: string, event: MouseEvent) => void
   onProjectMouseLeave: (worktree: string) => void
   onProjectFocus: (worktree: string) => void
@@ -302,14 +304,11 @@ export const SortableProject = (props: {
   }
 
   const projectStore = createMemo(() => serverSync().child(props.project.worktree, { bootstrap: false })[0])
-  const isWorking = createMemo(() =>
-    dirs().some((directory) => {
-      return Object.keys(serverSync().session.data.session_status).some((id) => {
-        if (serverSync().session.get(id)?.directory !== directory) return false
-        return serverSync().session.data.session_working(id)
-      })
-    }),
-  )
+  // Session working state is global to the server. Scanning every session from
+  // every project tile turns one status update into O(projects * sessions)
+  // reactive work. Layout indexes working directories once, so each tile only
+  // checks its own local/sandbox directory keys.
+  const isWorking = createMemo(() => dirs().some((directory) => props.ctx.workingDirectories().has(pathKey(directory))))
   const projectSessions = createMemo(() => sortedRootSessions(projectStore(), props.sortNow()))
   const workspaceSessions = (directory: string) => {
     const [data] = serverSync().child(directory, { bootstrap: false })

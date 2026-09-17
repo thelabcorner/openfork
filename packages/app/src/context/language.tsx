@@ -34,6 +34,7 @@ type PluralKey =
   | "home.sessions.archived.count"
   | "sessionGroup.sessions"
   | "chats.metric.messages"
+  | "chats.showMoreCount"
   | "chats.footer.sessions"
   | "chats.footer.active"
   | "chats.archived.count"

@@ -32,7 +32,7 @@ export const SidebarContent = (props: {
   onOpenHelp: () => void
   renderPanel: () => JSX.Element
 }): JSX.Element => {
-  const expanded = createMemo(() => !!props.mobile || props.opened())
+  const expanded = createMemo(() => props.opened())
   const placement = () => (props.mobile ? "bottom" : "right")
   let panel: HTMLDivElement | undefined
 
@@ -118,7 +118,7 @@ export const SidebarContent = (props: {
         classList={{ "flex-1 flex h-full min-h-0 min-w-0 overflow-hidden": true, "pointer-events-none": !expanded() }}
         aria-hidden={!expanded()}
       >
-        {props.renderPanel()}
+        <Show when={expanded()}>{props.renderPanel()}</Show>
       </div>
     </div>
   )

@@ -21,9 +21,26 @@ import { parseMarkdownTarget, type MarkdownTarget, type MarkdownTargetKind } fro
 /** Markdown decoration already tags these; see `markInlineCode` in session-ui. */
 const TARGET_SELECTOR = "code[data-inline-code-kind]"
 const SELF_SELECTOR = '[data-component="markdown-target-actions"]'
+const DELEGATE_SELECTOR = `${TARGET_SELECTOR},${SELF_SELECTOR}`
 const CLOSE_DELAY_MS = 140
 const COPIED_RESET_MS = 1400
 const RESOLVED_PATH_CACHE_MS = 1500
+
+type AnchorGeometry = {
+  left: number
+  top: number
+  bottom: number
+  viewportWidth: number
+  viewportHeight: number
+}
+
+const sameGeometry = (a: AnchorGeometry | undefined, b: AnchorGeometry) =>
+  !!a &&
+  a.left === b.left &&
+  a.top === b.top &&
+  a.bottom === b.bottom &&
+  a.viewportWidth === b.viewportWidth &&
+  a.viewportHeight === b.viewportHeight
 
 function ActionButton(props: { label: string; onClick: () => void; children: JSX.Element; active?: boolean }) {
   return (
@@ -59,7 +76,7 @@ export function MarkdownTargetActions() {
   const language = useLanguage()
 
   const [anchor, setAnchor] = createSignal<HTMLElement>()
-  const [rect, setRect] = createSignal<DOMRect>()
+  const [geometry, setGeometry] = createSignal<AnchorGeometry>()
   const [target, setTarget] = createSignal<MarkdownTarget>()
   const [copied, setCopied] = createSignal(false)
   // While the overflow menu is open the pointer is nowhere near the span, so
@@ -68,6 +85,11 @@ export function MarkdownTargetActions() {
 
   let closeTimer: ReturnType<typeof setTimeout> | undefined
   let copiedTimer: ReturnType<typeof setTimeout> | undefined
+  let positionFrame: number | undefined
+  let targetDirty = false
+  let observedAnchor: HTMLElement | undefined
+  let observer: MutationObserver | undefined
+  let viewportListenersActive = false
   let locateGeneration = 0
   let locating: { value: string; promise: Promise<string | undefined> } | undefined
   let resolved: { value: string; path: string; at: number } | undefined
@@ -84,11 +106,36 @@ export function MarkdownTargetActions() {
     closeTimer = undefined
   }
 
+  const cancelPositionFrame = () => {
+    if (positionFrame === undefined) return
+    cancelAnimationFrame(positionFrame)
+    positionFrame = undefined
+  }
+
+  const handleViewportChange = () => scheduleSync()
+  const attachViewportListeners = () => {
+    if (viewportListenersActive) return
+    viewportListenersActive = true
+    window.addEventListener("scroll", handleViewportChange, { capture: true, passive: true })
+    window.addEventListener("resize", handleViewportChange)
+  }
+  const detachViewportListeners = () => {
+    if (!viewportListenersActive) return
+    viewportListenersActive = false
+    window.removeEventListener("scroll", handleViewportChange, true)
+    window.removeEventListener("resize", handleViewportChange)
+  }
+
   const close = () => {
     cancelClose()
+    cancelPositionFrame()
+    detachViewportListeners()
+    targetDirty = false
+    observer?.disconnect()
+    observedAnchor = undefined
     resetLocation()
     setAnchor(undefined)
-    setRect(undefined)
+    setGeometry(undefined)
     setTarget(undefined)
     setCopied(false)
   }
@@ -104,6 +151,9 @@ export function MarkdownTargetActions() {
 
   onCleanup(() => {
     cancelClose()
+    cancelPositionFrame()
+    detachViewportListeners()
+    observer?.disconnect()
     if (copiedTimer) clearTimeout(copiedTimer)
   })
 
@@ -229,11 +279,83 @@ export function MarkdownTargetActions() {
     return true
   }
 
+  const syncActive = () => {
+    const element = anchor()
+    if (!element) return
+    if (!element.isConnected) {
+      close()
+      return
+    }
+    if (targetDirty) {
+      targetDirty = false
+      if (!refreshTarget(element)) {
+        close()
+        return
+      }
+    }
+
+    const box = element.getBoundingClientRect()
+    const viewportWidth = window.innerWidth
+    const viewportHeight = window.innerHeight
+    if (box.bottom < 0 || box.top > viewportHeight) {
+      close()
+      return
+    }
+    const next = {
+      left: box.left,
+      top: box.top,
+      bottom: box.bottom,
+      viewportWidth,
+      viewportHeight,
+    }
+    setGeometry((previous) => (sameGeometry(previous, next) ? previous : next))
+  }
+
+  const scheduleSync = (refresh = false) => {
+    if (refresh) targetDirty = true
+    if (!anchor() || positionFrame !== undefined) return
+    positionFrame = requestAnimationFrame(() => {
+      positionFrame = undefined
+      syncActive()
+    })
+  }
+
+  observer =
+    typeof MutationObserver === "function"
+      ? new MutationObserver(() => scheduleSync(true))
+      : undefined
+
+  const observeAnchor = (element: HTMLElement) => {
+    if (!observer || observedAnchor === element) return
+    observer.disconnect()
+    observedAnchor = element
+    // Observe the active node itself for text/kind changes, plus only the
+    // parent's direct child list so morphdom replacement is noticed without
+    // subscribing to an entire markdown subtree.
+    observer.observe(element, {
+      subtree: true,
+      childList: true,
+      characterData: true,
+      attributes: true,
+      attributeFilter: ["data-inline-code-kind"],
+    })
+    const parent = element.parentElement
+    if (parent) observer.observe(parent, { childList: true })
+  }
+
   const activate = (element: HTMLElement) => {
-    if (!refreshTarget(element)) return
-    if (element === anchor()) return
+    if (!refreshTarget(element)) {
+      close()
+      return
+    }
+    if (element === anchor()) {
+      scheduleSync()
+      return
+    }
     setAnchor(element)
-    setRect(element.getBoundingClientRect())
+    observeAnchor(element)
+    attachViewportListeners()
+    scheduleSync()
   }
 
   makeEventListener(document, "pointerover", (event: PointerEvent) => {
@@ -241,17 +363,20 @@ export function MarkdownTargetActions() {
     if (event.buttons !== 0) return
     const node = event.target
     if (!(node instanceof Element)) return
-    if (node.closest(SELF_SELECTOR)) {
-      cancelClose()
-      return
-    }
-    const code = node.closest(TARGET_SELECTOR)
-    if (!(code instanceof HTMLElement)) {
+    // One ancestor walk for the app-wide delegated hot path. The previous
+    // shape paid two `closest()` traversals for every pointerover in the app.
+    const hit = node.closest(DELEGATE_SELECTOR)
+    if (!hit) {
       scheduleClose()
       return
     }
+    if (hit.matches(SELF_SELECTOR)) {
+      cancelClose()
+      return
+    }
+    if (!(hit instanceof HTMLElement) || !hit.matches(TARGET_SELECTOR)) return
     cancelClose()
-    activate(code)
+    activate(hit)
   })
 
   makeEventListener(document, "keydown", (event: KeyboardEvent) => {
@@ -259,51 +384,15 @@ export function MarkdownTargetActions() {
     close()
   })
 
-  // Streaming markdown replaces nodes, and the transcript scrolls, so the
-  // anchor has to be re-measured rather than trusted once.
-  createEffect(() => {
-    const element = anchor()
-    if (!element) return
-    const sync = () => {
-      if (!element.isConnected) {
-        close()
-        return
-      }
-      if (!refreshTarget(element)) {
-        close()
-        return
-      }
-      const next = element.getBoundingClientRect()
-      if (next.bottom < 0 || next.top > window.innerHeight) {
-        close()
-        return
-      }
-      setRect(next)
-    }
-    sync()
-    makeEventListener(window, "scroll", sync, { capture: true, passive: true })
-    makeEventListener(window, "resize", sync)
-
-    // A completed markdown block can still be morphed while the pointer stays
-    // stationary (cache replacement, route/session updates, re-decoration).
-    // Observe only the active span's parent so a stale toolbar can never act on
-    // text that has already changed underneath it. MutationObserver batches the
-    // callback per microtask, keeping this off the normal timeline hot path.
-    const observer = new MutationObserver(sync)
-    observer.observe(element.parentElement ?? element, {
-      subtree: true,
-      childList: true,
-      characterData: true,
-      attributes: true,
-      attributeFilter: ["data-inline-code-kind"],
-    })
-    onCleanup(() => observer.disconnect())
-  })
+  // The active target owns one reusable viewport-listener pair. At rest there
+  // is no scroll/resize tax; while active, all sources collapse into at most
+  // one layout read per animation frame. Mutation is the only path that
+  // reparses target text.
 
   const position = createMemo((): JSX.CSSProperties | undefined => {
-    const box = rect()
+    const box = geometry()
     if (!box) return undefined
-    const left = Math.max(8, Math.min(box.left, window.innerWidth - 168))
+    const left = Math.max(8, Math.min(box.left, box.viewportWidth - 168))
     // Sit above the span so the text being read is never covered; drop below
     // only when there is no room up top.
     const above = box.top > 44

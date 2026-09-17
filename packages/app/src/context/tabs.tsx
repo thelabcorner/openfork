@@ -234,6 +234,13 @@ export const { use: useTabs, provider: TabsProvider } = createSimpleContext({
     const navigateTab = (tab: Tab) => {
       const href = tabHref(tab)
       setRecentKey(tabKey(tab))
+      // Titlebar tabs intentionally navigate on mousedown for lower perceived
+      // latency, while the drag sensor may call the same selection again from
+      // onDragStart. Do not feed an already-current URL back into Solid Router:
+      // under renderer load overlapping identical navigations can recurse
+      // through route redirects and hit the router's "Too many redirects"
+      // guard. `recentKey` is still refreshed above for home/tab history.
+      if (`${location.pathname}${location.search}` === href) return
       navigate(href)
     }
 

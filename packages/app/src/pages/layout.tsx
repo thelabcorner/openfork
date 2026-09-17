@@ -12,6 +12,7 @@ import {
   type Accessor,
 } from "solid-js"
 import { makeEventListener } from "@solid-primitives/event-listener"
+import { createMediaQuery } from "@solid-primitives/media"
 import { useNavigate, useParams } from "@solidjs/router"
 import { useLayout, LocalProject } from "@/context/layout"
 import { useServerSync } from "@/context/server-sync"
@@ -120,7 +121,6 @@ export default function LegacyLayout(props: ParentProps) {
   const permission = usePermission()
   const tabs = useTabs()
   const navigate = useNavigate()
-  const providers = useProviders(() => undefined)
   const dialog = useDialog()
   const command = useCommand()
   const theme = useTheme()
@@ -149,11 +149,18 @@ export default function LegacyLayout(props: ParentProps) {
   }
   const colorSchemeLabel = (scheme: ColorScheme) => language.t(colorSchemeKey[scheme])
   const currentDir = createMemo(() => route().dir)
+  const desktopSidebar = createMediaQuery("(min-width: 80rem)")
   const activeDirectory = createMemo(() => {
     const id = params.id
     if (!id) return currentDir()
     return serverSync().session.lineage.peek(id)?.session.directory ?? currentDir()
   })
+  // The getting-started provider check belongs to the active directory. A
+  // directory-less `useProviders()` would enable the legacy global provider
+  // query, whose `/provider` request falls back to process.cwd() and can boot a
+  // completely unrelated $HOME instance just to decide whether to show this
+  // banner.
+  const providers = useProviders(() => activeDirectory() || undefined)
 
   const [state, setState] = createStore({
     autoselect: !initialDirectory,
@@ -1936,6 +1943,17 @@ export default function LegacyLayout(props: ParentProps) {
     sidebarOpened: () => layout.sidebar.opened(),
     sidebarHovering,
     hoverProject: () => state.hoverProject,
+    workingDirectories: createMemo(() => {
+      const next = new Set<string>()
+      const statuses = serverSync().session.data.session_status
+      for (const [sessionID, status] of Object.entries(statuses)) {
+        if ((status?.type ?? "idle") === "idle") continue
+        const directory = serverSync().session.get(sessionID)?.directory
+        if (!directory) continue
+        next.add(pathKey(directory))
+      }
+      return next
+    }),
     onProjectMouseEnter: (worktree, event) => aim.enter(worktree, event),
     onProjectMouseLeave: (worktree) => aim.leave(worktree),
     onProjectFocus: (worktree) => aim.activate(worktree),
@@ -2265,7 +2283,7 @@ export default function LegacyLayout(props: ParentProps) {
   const sidebarContent = (mobile?: boolean) => (
     <SidebarContent
       mobile={mobile}
-      opened={() => layout.sidebar.opened()}
+      opened={() => (mobile ? layout.mobileSidebar.opened() : layout.sidebar.opened())}
       aimMove={aim.move}
       projects={projects}
       renderProject={(project) => (
@@ -2328,7 +2346,9 @@ export default function LegacyLayout(props: ParentProps) {
                 arm()
               }}
             >
-              <div class="@container w-full h-full contain-strict">{sidebarContent()}</div>
+              <div class="@container w-full h-full contain-strict">
+                <Show when={desktopSidebar()}>{sidebarContent()}</Show>
+              </div>
             </nav>
 
             <Show when={layout.sidebar.opened()}>
@@ -2378,7 +2398,7 @@ export default function LegacyLayout(props: ParentProps) {
                 }}
                 onClick={(e) => e.stopPropagation()}
               >
-                {sidebarContent(true)}
+                <Show when={!desktopSidebar()}>{sidebarContent(true)}</Show>
               </nav>
             </div>
 

@@ -492,7 +492,16 @@ export function Titlebar(props: { update?: TitlebarUpdate; debugTools?: { visibl
                   onNavigate={(tab, el) => {
                     const key = tabKey(tab)
                     const current = currentTab()
-                    if (!current || tabKey(current) !== key) setPendingTabKey(key)
+                    // mousedown selects first; a drag activation for the same
+                    // pointer can arrive immediately afterwards. Avoid doing
+                    // any second navigation/pending-state churn for an already
+                    // active tab. TabsProvider has the URL-level guard too,
+                    // making this cheap fast-path independent of router timing.
+                    if (current && tabKey(current) === key) {
+                      queueMicrotask(() => el?.scrollIntoView({ behavior: "instant" }))
+                      return
+                    }
+                    setPendingTabKey(key)
                     tabs.select(tab)
                     queueMicrotask(() => el?.scrollIntoView({ behavior: "instant" }))
                   }}

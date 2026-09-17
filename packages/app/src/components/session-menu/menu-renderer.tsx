@@ -25,6 +25,22 @@ export function MenuSectionsRenderer(props: { sections: MenuSectionDef[] }) {
 
 function MenuItemRenderer(props: { item: MenuItemDef }) {
   const iconName = (props.item as any).icon as string | undefined
+  const description = () => (props.item as any).description as string | undefined
+
+  // Label plus an optional secondary line, rendered stacked so a long value (resolved
+  // model name, account label, disabled reason) wraps inside the row instead of
+  // stretching the whole menu to its width. The row opts into the taller grid via
+  // `data-multiline` (see menu-v2.css).
+  const labelBlock = (label: string) => (
+    <Show when={description()} fallback={label}>
+      {(text) => (
+        <span class="flex min-w-0 flex-1 flex-col gap-px text-left">
+          <span class="min-w-0 truncate">{label}</span>
+          <span data-slot="menu-v2-item-description">{text()}</span>
+        </span>
+      )}
+    </Show>
+  )
 
   const renderWithIcon = (children: any) => (
     <span class="flex w-full min-w-0 items-center gap-[7px]">
@@ -49,12 +65,13 @@ function MenuItemRenderer(props: { item: MenuItemDef }) {
               fallback={
                 <Show when={(props.item as Extract<MenuItemDef, { kind: "item" }>).id !== "__separator"} fallback={<MenuV2.Separator />}>
                   <MenuV2.Item
-                    disabled={(props.item as Extract<MenuItemDef, { kind: "item" }>).disabled}
+                    data-multiline={description() ? "" : undefined}
+                  disabled={(props.item as Extract<MenuItemDef, { kind: "item" }>).disabled}
                     onSelect={(props.item as Extract<MenuItemDef, { kind: "item" }>).onSelect}
                   >
                     <Show
                       when={(props.item as Extract<MenuItemDef, { kind: "item" }>).variant === "danger"}
-                      fallback={renderWithIcon((props.item as Extract<MenuItemDef, { kind: "item" }>).label)}
+                      fallback={renderWithIcon(labelBlock((props.item as Extract<MenuItemDef, { kind: "item" }>).label))}
                     >
                       <span class="text-v2-state-text-danger flex w-full min-w-0 items-center gap-[7px]">
                         <Show when={iconName}>
@@ -62,7 +79,7 @@ function MenuItemRenderer(props: { item: MenuItemDef }) {
                             <Icon name={iconName as any} size="small" />
                           </span>
                         </Show>
-                        {(props.item as Extract<MenuItemDef, { kind: "item" }>).label}
+                        {labelBlock((props.item as Extract<MenuItemDef, { kind: "item" }>).label)}
                       </span>
                     </Show>
                   </MenuV2.Item>
@@ -121,8 +138,11 @@ function MenuItemRenderer(props: { item: MenuItemDef }) {
       }
     >
       <MenuV2.Sub gutter={0} overlap overflowPadding={8}>
-        <MenuV2.SubTrigger disabled={(props.item as Extract<MenuItemDef, { kind: "submenu" }>).disabled}>
-          {renderWithIcon((props.item as Extract<MenuItemDef, { kind: "submenu" }>).label)}
+        <MenuV2.SubTrigger
+          data-multiline={description() ? "" : undefined}
+          disabled={(props.item as Extract<MenuItemDef, { kind: "submenu" }>).disabled}
+        >
+          {renderWithIcon(labelBlock((props.item as Extract<MenuItemDef, { kind: "submenu" }>).label))}
         </MenuV2.SubTrigger>
         <MenuV2.Portal>
           <MenuV2.SubContent

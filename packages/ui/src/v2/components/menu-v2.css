@@ -53,6 +53,33 @@
   --menu-v2-badge-border: var(--v2-border-border-base);
   --menu-v2-hover: var(--v2-overlay-simple-overlay-hover);
 
+  /* Two-line items: label plus a secondary value (resolved model name, account
+   * label, disabled reason) that would otherwise be inlined into the label and
+   * stretch the whole menu to the width of its longest string. The row grows
+   * to fit both lines instead of staying pinned to the 25px single-line grid. */
+  &[data-multiline] {
+    height: auto;
+    min-height: 25px;
+    align-items: flex-start;
+    padding-top: 5px;
+    padding-bottom: 5px;
+
+    /* Stack the label over the secondary line rather than sitting them side by side. */
+    [data-slot="menu-v2-item-content"] {
+      align-items: stretch;
+      flex-direction: column;
+      gap: 2px;
+    }
+
+    /* Keep the leading icon and trailing indicators optically on the first line
+     * instead of centering them across the taller two-line box. */
+    [data-slot="menu-v2-item-icon"],
+    [data-slot="menu-v2-item-indicator"],
+    [data-slot="menu-v2-item-chevron"] {
+      margin-top: 1px;
+    }
+  }
+
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   text-rendering: geometricPrecision;
@@ -147,6 +174,21 @@
     width: 14px;
     height: 14px;
     color: var(--menu-v2-fg-muted);
+  }
+
+  /* Secondary line under a multiline item's label. Wraps to at most two lines so a
+   * long model id cannot grow the row without bound. */
+  [data-slot="menu-v2-item-description"] {
+    display: -webkit-box;
+    -webkit-box-orient: vertical;
+    -webkit-line-clamp: 2;
+    overflow: hidden;
+    font-size: 11px;
+    font-weight: 400;
+    line-height: 135%;
+    letter-spacing: -0.01px;
+    color: var(--menu-v2-fg-muted);
+    overflow-wrap: anywhere;
   }
 
   [data-slot="menu-v2-item-icon"] {

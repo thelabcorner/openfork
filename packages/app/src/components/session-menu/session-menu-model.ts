@@ -193,13 +193,14 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
   if (hasSession && !input.isGroup && (input.actions.changeModel || input.actions.selectVariant)) {
     const modelItems: MenuSectionDef["items"] = []
     if (input.actions.changeModel) {
-      const label = input.currentModelLabel
-        ? `${t("command.model.choose")} — ${input.currentModelLabel}`
-        : t("command.model.choose")
+      // The active model goes on its own line. Inlining it as "Choose model — <id>" made
+      // the whole context menu as wide as the account-qualified model id.
+      const modelLine = input.currentModelLabel
       modelItems.push({
         kind: "item",
         id: "changeModel",
-        label,
+        label: t("command.model.choose"),
+        description: modelLine,
         icon: "outline-sliders",
         onSelect: () => input.actions.changeModel?.(),
       })
@@ -381,9 +382,10 @@ export function createSessionMenuModel(input: SessionMenuModelInput): MenuSectio
       groupItems.push({
         kind: "item",
         id: "removeFromGroup",
-        label: input.membershipLocked
-          ? `${t("home.sessions.contextMenu.removeFromGroup")} — ${t("groupTab.lockedMembership")}`
-          : t("home.sessions.contextMenu.removeFromGroup"),
+        label: t("home.sessions.contextMenu.removeFromGroup"),
+        // The lock reason is a second line instead of "label — reason": inlined it forced
+        // every row in the menu to the width of this one sentence.
+        description: input.membershipLocked ? t("groupTab.lockedMembership") : undefined,
         disabled: input.membershipLocked || !input.actions.removeFromGroup,
         icon: "close",
         onSelect: () => input.actions.removeFromGroup?.(),
