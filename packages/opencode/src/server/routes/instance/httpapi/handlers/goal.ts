@@ -11,6 +11,7 @@ import {
   EvidencePayload,
   FocusPayload,
   ListQuery,
+  PreparePayload,
   StepPayload,
   TransitionPayload,
   UpdatePayload,
@@ -96,6 +97,11 @@ export const goalHandlers = HttpApiBuilder.group(InstanceHttpApi, "goal", (handl
       return HttpApiSchema.NoContent.make()
     })
 
+    const prepare = Effect.fn("GoalHttpApi.prepare")((ctx: {
+      params: { sessionID: SessionSchema.ID }
+      payload: typeof PreparePayload.Type
+    }) => mapError(goals.prepareForSession({ sessionID: ctx.params.sessionID, ...ctx.payload, actor: "user" })))
+
     return handlers
       .handle("list", list)
       .handle("create", create)
@@ -111,5 +117,6 @@ export const goalHandlers = HttpApiBuilder.group(InstanceHttpApi, "goal", (handl
       .handle("focused", focused)
       .handle("focus", focus)
       .handle("unfocus", unfocus)
+      .handle("prepare", prepare)
   }),
 )

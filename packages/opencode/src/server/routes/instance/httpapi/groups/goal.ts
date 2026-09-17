@@ -22,6 +22,7 @@ export const GoalPaths = {
   audit: `${root}/:goalID/audit`,
   focuses: `${root}/:goalID/focus`,
   sessionFocus: `/session/:sessionID/goal`,
+  sessionPrepare: `/session/:sessionID/goal/prepare`,
 } as const
 
 export const ListQuery = Schema.Struct({
@@ -101,6 +102,17 @@ export const EvidencePayload = Schema.Struct({
 export const FocusPayload = Schema.Struct({
   goalID: Goal.ID,
   role: Schema.optionalKey(Goal.FocusRole),
+})
+
+export const PreparePayload = Schema.Struct({
+  title: Schema.String,
+  objective: Schema.String,
+  constraints: Schema.optionalKey(Schema.Array(Schema.String)),
+  criteria: Schema.optionalKey(Schema.Array(Schema.String)),
+  steps: Schema.optionalKey(Schema.Array(StepDraft)),
+  continuationPolicy: Schema.optionalKey(Goal.ContinuationPolicy),
+  auditorPolicy: Schema.optionalKey(Goal.AuditorPolicy),
+  start: Schema.optionalKey(Schema.Boolean),
 })
 
 const errors = [HttpApiError.BadRequest, ApiNotFoundError, ConflictError] as const
@@ -185,6 +197,17 @@ export const GoalApi = HttpApi.make("goal")
           success: described(HttpApiSchema.NoContent, "Removed Goal focus"),
           error: errors,
         }).annotateMerge(OpenApi.annotations({ identifier: "goal.unfocus", summary: "Unfocus Goal for Session" })),
+        HttpApiEndpoint.post("prepare", GoalPaths.sessionPrepare, {
+          params: { sessionID: SessionSchema.ID },
+          payload: PreparePayload,
+          success: described(Schema.Struct({ focus: Goal.Focus, detail: Goal.Detail }), "Prepared focused Goal"),
+          error: errors,
+        }).annotateMerge(
+          OpenApi.annotations({
+            identifier: "goal.prepare",
+            summary: "Create, focus, and optionally start a Goal for a Session",
+          }),
+        ),
       )
       .annotateMerge(
         OpenApi.annotations({ title: "goal", description: "Fork-owned durable Goal orchestration routes." }),

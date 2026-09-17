@@ -105,6 +105,38 @@ export const GoalFocusTable = sqliteTable(
 )
 
 /**
+ * Stable host-owned auditor Session for one parent Session working one Goal.
+ * A parent can work many Goals over time, but each (parent, Goal) pair reuses
+ * exactly one auditor transcript. Auditor Sessions are children for navigation,
+ * not Goal focus owners.
+ */
+export const GoalAuditorSessionTable = sqliteTable(
+  "goal_auditor_session",
+  {
+    parent_session_id: text()
+      .$type<typeof SessionTable.$inferSelect.id>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    goal_id: text()
+      .$type<Goal.ID>()
+      .notNull()
+      .references(() => GoalTable.id, { onDelete: "cascade" }),
+    auditor_session_id: text()
+      .$type<typeof SessionTable.$inferSelect.id>()
+      .notNull()
+      .references(() => SessionTable.id, { onDelete: "cascade" }),
+    time_created: integer()
+      .notNull()
+      .$default(() => Date.now()),
+  },
+  (table) => [
+    primaryKey({ columns: [table.parent_session_id, table.goal_id] }),
+    uniqueIndex("goal_auditor_session_session_idx").on(table.auditor_session_id),
+    index("goal_auditor_session_goal_idx").on(table.goal_id),
+  ],
+)
+
+/**
  * Durable continuation cursor for Goal Mode.
  *
  * A reservation is written after a completed provider cycle and claimed before

@@ -6,6 +6,13 @@ import { SessionSchema } from "../session/schema"
 import { makeGlobalNode } from "../effect/app-node"
 import { Goal } from "./index"
 import { GoalSchema } from "./schema"
+import { GoalCreationPolicy } from "./creation-policy"
+import { SessionStore } from "../session/store"
+
+const Step = Schema.Struct({
+  title: Schema.String,
+  description: Schema.optionalKey(Schema.String),
+})
 
 const Evidence = Schema.Struct({
   type: Schema.String,
@@ -26,6 +33,7 @@ export const Input = Schema.Struct({
     "claim_step",
     "release_step",
     "verify",
+    "create",
   ]),
   expectedRevision: Schema.optionalKey(Schema.Number),
   criterionID: Schema.optionalKey(GoalModel.CriterionID),
@@ -35,6 +43,13 @@ export const Input = Schema.Struct({
   evidence: Schema.optionalKey(Evidence),
   blocker: Schema.optionalKey(Schema.String),
   verdict: Schema.optionalKey(Schema.Literals(["pass", "fail"])),
+  title: Schema.optionalKey(Schema.String),
+  objective: Schema.optionalKey(Schema.String),
+  constraints: Schema.optionalKey(Schema.Array(Schema.String)),
+  criteria: Schema.optionalKey(Schema.Array(Schema.String)),
+  steps: Schema.optionalKey(Schema.Array(Step)),
+  start: Schema.optionalKey(Schema.Boolean),
+  continuationMode: Schema.optionalKey(Schema.Literals(["manual", "auto_continue", "unattended"])),
 })
 export type Input = typeof Input.Type
 
@@ -46,7 +61,11 @@ export const Output = Schema.Struct({
 export type Output = typeof Output.Type
 
 export interface Interface {
-  readonly execute: (sessionID: SessionSchema.ID, input: Input) => Effect.Effect<Output, GoalSchema.Error>
+  readonly execute: (
+    sessionID: SessionSchema.ID,
+    input: Input,
+    turn?: GoalCreationPolicy.TurnProvenance,
+  ) => Effect.Effect<Output, GoalSchema.Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/GoalAgent") {}
@@ -55,6 +74,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const goals = yield* Goal.Service
+    const sessions = yield* SessionStore.Service
 
     const focused = Effect.fn("GoalAgent.focused")(function* (sessionID: SessionSchema.ID) {
       const current = yield* goals.focused(sessionID)
@@ -64,7 +84,88 @@ const layer = Layer.effect(
 
     const expected = (input: Input, actual: number) => input.expectedRevision ?? actual
 
-    const execute = Effect.fn("GoalAgent.execute")(function* (sessionID: SessionSchema.ID, input: Input) {
+    const execute = Effect.fn("GoalAgent.execute")(function* (
+      sessionID: SessionSchema.ID,
+      input: Input,
+      turn?: GoalCreationPolicy.TurnProvenance,
+    ) {
+      if (input.action === "create") {
+        const authorization = GoalCreationPolicy.authorize(turn)
+        if (!authorization.allowed) return yield* new GoalSchema.ValidationError({ reason: authorization.reason })
+        const session = yield* sessions.get(sessionID)
+        if (!session) return yield* new GoalSchema.ValidationError({ reason: `session does not exist: ${sessionID}` })
+        if (session.parentID !== undefined) {
+          return yield* new GoalSchema.ValidationError({
+            reason: "child Sessions cannot create Goals; ask the parent Session to create and own the Goal",
+          })
+        }
+        const objective = input.objective?.trim()
+        if (!objective) return yield* new GoalSchema.ValidationError({ reason: "create requires objective" })
+        const criteria = (input.criteria ?? []).map((item) => item.trim()).filter(Boolean)
+        if (criteria.length === 0) {
+          return yield* new GoalSchema.ValidationError({ reason: "create requires at least one acceptance criterion" })
+        }
+        if (input.continuationMode === "unattended" && !GoalCreationPolicy.explicitlyRequestsUnattended(turn!.userText)) {
+          return yield* new GoalSchema.ValidationError({
+            reason: "unattended Goal creation requires the user to explicitly request unattended Goal mode",
+          })
+        }
+
+        const existing = yield* goals.focused(sessionID)
+        const shouldStart = GoalCreationPolicy.explicitlyRequestsDraft(turn!.userText) ? false : (input.start ?? true)
+        if (existing) {
+          if (existing.detail.goal.objective !== objective) {
+            return yield* new GoalSchema.ValidationError({
+              reason: "this Session already has a different focused Goal; do not replace it implicitly",
+            })
+          }
+          if (["completed", "cancelled", "failed"].includes(existing.detail.goal.status)) {
+            return yield* new GoalSchema.ValidationError({
+              reason: `the matching focused Goal is already ${existing.detail.goal.status}; unfocus it before creating a new Goal`,
+            })
+          }
+          let detail = existing.detail
+          if (shouldStart && detail.goal.status === "draft") {
+            detail = yield* goals.transition({
+              id: detail.goal.id,
+              expectedRevision: detail.goal.revision,
+              action: "start",
+              actor: "agent",
+            })
+          }
+          return { action: input.action, goal: detail }
+        }
+
+        const quickTitle = () => {
+          const supplied = input.title?.trim()
+          if (supplied) return supplied
+          const line = objective.split(/\r?\n/, 1)[0]?.trim() || "Goal"
+          return line.length <= 72 ? line : `${line.slice(0, 69).trimEnd()}…`
+        }
+        let detail = yield* goals.create({
+          projectID: session.projectID,
+          workspaceID: session.location.workspaceID,
+          title: quickTitle(),
+          objective,
+          constraints: input.constraints,
+          criteria,
+          steps: input.steps,
+          continuationPolicy: { mode: input.continuationMode ?? "auto_continue" },
+          sourceMessageID: turn!.userMessageID,
+          actor: "agent",
+        })
+        yield* goals.focus({ goalID: detail.goal.id, sessionID, role: "owner", actor: "agent" })
+        if (shouldStart) {
+          detail = yield* goals.transition({
+            id: detail.goal.id,
+            expectedRevision: detail.goal.revision,
+            action: "start",
+            actor: "agent",
+          })
+        }
+        return { action: input.action, goal: detail }
+      }
+
       const current = yield* focused(sessionID)
       let detail = current.detail
       let evidence: GoalModel.Evidence | undefined
@@ -204,4 +305,4 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = makeGlobalNode({ service: Service, layer, deps: [Goal.node] })
+export const node = makeGlobalNode({ service: Service, layer, deps: [Goal.node, SessionStore.node] })

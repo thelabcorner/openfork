@@ -9,18 +9,23 @@ import { EventV2 } from "@opencode-ai/core/event"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { GoalV2 } from "@opencode-ai/core/goal"
 import { GoalAuditor } from "@opencode-ai/core/goal/auditor"
+import { GoalAuditorSessionTable } from "@opencode-ai/core/goal/sql"
 import { Location } from "@opencode-ai/core/location"
 import { ModelV2 } from "@opencode-ai/core/model"
 import { ProjectV2 } from "@opencode-ai/core/project"
 import { ProjectTable } from "@opencode-ai/core/project/sql"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
+import { SessionHistory } from "@opencode-ai/core/session/history"
 import { SessionRunnerModel } from "@opencode-ai/core/session/runner/model"
 import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionTable } from "@opencode-ai/core/session/sql"
+import { MaintenanceUsageTable } from "@opencode-ai/core/usage/sql"
 import { Config } from "@opencode-ai/core/config"
+import { and, eq } from "drizzle-orm"
 import { Effect, Layer } from "effect"
 import * as Stream from "effect/Stream"
+import * as TestClock from "effect/testing/TestClock"
 import { testEffect } from "../lib/effect"
 
 const projectID = ProjectV2.ID.make("goal-auditor-project")
@@ -44,6 +49,8 @@ const grepCalls: string[] = []
 const globCalls: string[] = []
 let configEntries: Config.Entry[] = []
 let resolvedRefs: ModelV2.Ref[] = []
+let currentCriteria: ReadonlyArray<{ id: string }> = []
+let readClockAdvanceMs = 0
 
 const llmClient = Layer.succeed(
   LLMClient.Service,
@@ -66,10 +73,12 @@ const fileEntry = FileSystem.Entry.make({ path: RelativePath.make("src/feature.t
 const filesystem = Layer.succeed(
   FileSystem.Service,
   FileSystem.Service.of({
-    read: ({ path }) => {
-      readCalls.push(path)
-      return Effect.succeed({ content: new TextEncoder().encode("export const shipped = true\n"), mime: "text/plain" })
-    },
+    read: ({ path }) =>
+      Effect.gen(function* () {
+        readCalls.push(path)
+        if (readClockAdvanceMs > 0) yield* TestClock.adjust(readClockAdvanceMs)
+        return { content: new TextEncoder().encode("export const shipped = true\n"), mime: "text/plain" }
+      }),
     grep: (input) => {
       grepCalls.push(input.pattern)
       return Effect.succeed([
@@ -141,6 +150,14 @@ const verdict = (id: string, decision: "continue" | "complete" | "blocked" = "co
       rationale:
         decision === "complete" ? "All requested work is supported by evidence." : "Verified work remains actionable.",
       progressMade,
+      criteria: currentCriteria.map((criterion) => ({
+        criterionID: criterion.id,
+        status: decision === "complete" ? "passed" : "pending",
+        evidence:
+          decision === "complete"
+            ? "Repository evidence independently verifies this acceptance criterion."
+            : "This criterion is not yet independently verified.",
+      })),
       ...(decision === "blocked"
         ? {
             blocker: "External credential required",
@@ -161,6 +178,8 @@ const setup = Effect.gen(function* () {
   globCalls.length = 0
   configEntries = []
   resolvedRefs = []
+  currentCriteria = []
+  readClockAdvanceMs = 0
 
   const { db } = yield* Database.Service
   yield* db
@@ -203,6 +222,7 @@ const focusedGoal = (options: { maxAttempts?: number; configuredModel?: boolean 
     const active = yield* goals
       .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
       .pipe(Effect.orDie)
+    currentCriteria = active.criteria
     yield* goals.focus({ goalID: active.goal.id, sessionID }).pipe(Effect.orDie)
     return active
   })
@@ -211,7 +231,7 @@ describe("GoalAuditor", () => {
   it.effect("performs read-only reconnaissance before committing audit_verdict", () =>
     Effect.gen(function* () {
       yield* setup
-      yield* focusedGoal({ configuredModel: true })
+      const active = yield* focusedGoal({ configuredModel: true })
       configEntries = [
         new Config.Document({
           type: "document",
@@ -256,6 +276,118 @@ describe("GoalAuditor", () => {
         decision: "continue",
         continuationPrompt: "Finish the remaining implementation and verify the exact acceptance criterion.",
       })
+
+      const { readDb } = yield* Database.Service
+      const child = yield* readDb
+        .select()
+        .from(SessionTable)
+        .where(eq(SessionTable.id, result.auditorSessionID))
+        .get()
+        .pipe(Effect.orDie)
+      expect(child).toMatchObject({
+        id: result.auditorSessionID,
+        parent_id: sessionID,
+        metadata: {
+          specialAgent: "goal_auditor",
+          goalID: active.goal.id,
+          parentSessionID: sessionID,
+        },
+      })
+
+      const history = yield* SessionHistory.load(readDb, result.auditorSessionID)
+      expect(history.some((message) => message.type === "system" && message.text.includes("[GOAL AUDIT CYCLE]"))).toBe(true)
+      const assistants = history.filter((message) => message.type === "assistant")
+      expect(assistants).toHaveLength(2)
+      expect(
+        assistants.flatMap((message) =>
+          message.type === "assistant"
+            ? message.content
+                .filter((part) => part.type === "tool")
+                .map((part) => ({ name: part.name, status: part.state.status }))
+            : [],
+        ),
+      ).toEqual([
+        { name: "read", status: "completed" },
+        { name: "grep", status: "completed" },
+        { name: "glob", status: "completed" },
+        { name: "audit_verdict", status: "completed" },
+      ])
+
+      const usage = yield* readDb
+        .select()
+        .from(MaintenanceUsageTable)
+        .where(eq(MaintenanceUsageTable.session_id, result.auditorSessionID))
+        .all()
+        .pipe(Effect.orDie)
+      expect(usage).toHaveLength(2)
+      expect(usage.every((row) => row.agent === "goal-auditor" && row.total_tokens > 0)).toBe(true)
+    }),
+  )
+
+  it.effect("reuses exactly one host-owned auditor Session for the same parent and Goal", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const active = yield* focusedGoal()
+      generateResponses = [verdict("first", "continue", true)]
+      const first = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(first.ok).toBe(true)
+      if (!first.ok) return
+
+      generateResponses = [verdict("second", "continue", false)]
+      const second = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(second.ok).toBe(true)
+      if (!second.ok) return
+      expect(second.auditorSessionID).toBe(first.auditorSessionID)
+
+      const goals = yield* GoalV2.Service
+      expect(
+        yield* goals.auditorSessionFor({ parentSessionID: sessionID, goalID: active.goal.id }),
+      ).toBe(first.auditorSessionID)
+      expect(yield* goals.isAuditorSession(first.auditorSessionID)).toBe(true)
+      expect(yield* goals.focused(first.auditorSessionID)).toBeUndefined()
+
+      const { readDb } = yield* Database.Service
+      const links = yield* readDb
+        .select()
+        .from(GoalAuditorSessionTable)
+        .where(
+          and(
+            eq(GoalAuditorSessionTable.parent_session_id, sessionID),
+            eq(GoalAuditorSessionTable.goal_id, active.goal.id),
+          ),
+        )
+        .all()
+        .pipe(Effect.orDie)
+      expect(links).toHaveLength(1)
+      expect(links[0]?.auditor_session_id).toBe(first.auditorSessionID)
+    }),
+  )
+
+  it.effect("injects the privileged auditor reminder after two minutes before the next reasoning round", () =>
+    Effect.gen(function* () {
+      yield* setup
+      yield* focusedGoal()
+      readClockAdvanceMs = GoalAuditor.AUDITOR_REMINDER_INTERVAL_MS + 1
+      generateResponses = [
+        response({ id: "slow-read", name: "read", input: { path: "src/feature.ts" } }),
+        verdict("after-reminder", "continue", false),
+      ]
+
+      const result = yield* (yield* GoalAuditor.Service).evaluate({ sessionID, workerModel: workerRef })
+      expect(result.ok).toBe(true)
+      if (!result.ok) return
+      expect(generateRequests).toHaveLength(2)
+      const secondContext = JSON.stringify(generateRequests[1]!.messages)
+      expect(secondContext).toContain("GOAL AUDITOR REMINDER")
+      expect(secondContext).toContain("not the coding or implementation agent")
+      expect(secondContext).toContain("strictly read-only")
+
+      const { readDb } = yield* Database.Service
+      const history = yield* SessionHistory.load(readDb, result.auditorSessionID)
+      const reminders = history.filter(
+        (message) => message.type === "system" && message.text.includes("[GOAL AUDITOR REMINDER"),
+      )
+      expect(reminders).toHaveLength(1)
     }),
   )
 
@@ -322,6 +454,11 @@ describe("GoalAuditor", () => {
             decision: "continue",
             rationale: "More work remains.",
             progressMade: true,
+            criteria: currentCriteria.map((criterion) => ({
+              criterionID: criterion.id,
+              status: "pending",
+              evidence: "Still pending independent verification.",
+            })),
           },
         }),
         verdict("valid-after-payload-repair", "continue", true),
@@ -350,6 +487,11 @@ describe("GoalAuditor", () => {
             decision: "continue",
             rationale: "Verified work remains actionable.",
             progressMade: true,
+            criteria: currentCriteria.map((criterion) => ({
+              criterionID: criterion.id,
+              status: "pending",
+              evidence: "Still pending independent verification.",
+            })),
             continuationPrompt: "Finish the remaining implementation and verify the exact acceptance criterion.",
             confidence: 4.2,
           },
@@ -380,6 +522,11 @@ describe("GoalAuditor", () => {
             decision: "blocked",
             rationale: "Something is in the way.",
             progressMade: false,
+            criteria: currentCriteria.map((criterion) => ({
+              criterionID: criterion.id,
+              status: "pending",
+              evidence: "The suspected blocker prevents independent verification.",
+            })),
             continuationPrompt: "Probe the boundary and report what is required.",
           },
         })
@@ -404,6 +551,11 @@ describe("GoalAuditor", () => {
               decision: "continue",
               rationale: "More work remains.",
               progressMade: true,
+              criteria: currentCriteria.map((criterion) => ({
+                criterionID: criterion.id,
+                status: "pending",
+                evidence: "Still pending independent verification.",
+              })),
               continuationPrompt: "Finish the remaining implementation.",
             },
           },
@@ -430,7 +582,16 @@ describe("GoalAuditor", () => {
         response({
           id: `invalid-${Math.random()}`,
           name: "audit_verdict",
-          input: { decision: "continue", rationale: "More work remains.", progressMade: true },
+          input: {
+            decision: "continue",
+            rationale: "More work remains.",
+            progressMade: true,
+            criteria: currentCriteria.map((criterion) => ({
+              criterionID: criterion.id,
+              status: "pending",
+              evidence: "Still pending independent verification.",
+            })),
+          },
         })
       generateResponses = [invalid(), invalid()]
 

@@ -6,6 +6,7 @@ import { Database } from "@opencode-ai/core/database/database"
 import { EventV2 } from "@opencode-ai/core/event"
 import { GoalV2 } from "@opencode-ai/core/goal"
 import { GoalAutomation } from "@opencode-ai/core/goal/automation"
+import { GoalAgent } from "@opencode-ai/core/goal/agent"
 import {
   GoalAutomationTable,
   GoalCriterionTable,
@@ -25,7 +26,7 @@ import { Goal } from "@opencode-ai/schema/goal"
 import { testEffect } from "../lib/effect"
 
 const it = testEffect(
-  AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, GoalV2.node, GoalAutomation.node])),
+  AppNodeBuilder.build(LayerNode.group([Database.node, EventV2.node, GoalV2.node, GoalAutomation.node, GoalAgent.node])),
 )
 
 const projectA = ProjectV2.ID.make("goal-project-a")
@@ -37,23 +38,36 @@ const sessionA2 = SessionV2.ID.make("ses_goal_a2")
 const sessionOtherWorkspace = SessionV2.ID.make("ses_goal_other_workspace")
 const sessionB = SessionV2.ID.make("ses_goal_b")
 
-const continueAudit = (progressMade = false): GoalAutomation.AuditOutcome => ({
+const continueAudit = (criteria: ReadonlyArray<Goal.Criterion>, progressMade = false): GoalAutomation.AuditOutcome => ({
   ok: true,
   verdict: {
     decision: "continue",
     rationale: "Concrete Goal work remains.",
     progressMade,
+    criteria: criteria.map((criterion) => ({
+      criterionID: criterion.id,
+      status: "pending",
+      evidence: "This acceptance criterion is not yet independently verified.",
+    })),
     continuationPrompt: "Continue with the next concrete Goal task and verify it with evidence.",
   },
 })
 
-const blockedAudit = (blocker = "A required external decision is unavailable"): GoalAutomation.AuditOutcome => ({
+const blockedAudit = (
+  criteria: ReadonlyArray<Goal.Criterion>,
+  blocker = "A required external decision is unavailable",
+): GoalAutomation.AuditOutcome => ({
   ok: true,
   verdict: {
     decision: "blocked",
     rationale: blocker,
     blocker,
     progressMade: false,
+    criteria: criteria.map((criterion) => ({
+      criterionID: criterion.id,
+      status: "pending",
+      evidence: "The suspected blocker prevents independent verification.",
+    })),
     continuationPrompt: "Investigate the suspected blocker, attempt a safe workaround, and record concrete evidence either way.",
   },
 })
@@ -115,6 +129,126 @@ function createGoal(overrides: Partial<GoalV2.CreateInput> = {}) {
 }
 
 describe("Goal", () => {
+  it.effect("lets the agent create, focus, and start a Goal only from an authorized user turn", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const agent = yield* GoalAgent.Service
+      const goals = yield* GoalV2.Service
+
+      const result = yield* agent.execute(
+        sessionA,
+        {
+          action: "create",
+          objective: "Ship agent-assisted Goal setup.",
+          criteria: ["The Goal is created from the user's request", "The Goal is focused and active"],
+          constraints: ["Do not replace an unrelated focused Goal"],
+          steps: [{ title: "Implement", description: "Add the trusted creation path" }],
+        },
+        {
+          userMessageID: "msg_goal_agent_create",
+          userText: "Please create a goal for agent-assisted Goal setup and start it.",
+        },
+      )
+
+      expect(result.goal.goal.projectID).toBe(projectA)
+      expect(result.goal.goal.workspaceID).toBe(workspaceA)
+      expect(result.goal.goal.status).toBe("active")
+      expect(result.goal.goal.continuationPolicy.mode).toBe("auto_continue")
+      expect(result.goal.criteria).toHaveLength(2)
+      expect((yield* goals.focused(sessionA))?.focus.role).toBe("owner")
+      const created = (yield* goals.audit(result.goal.goal.id)).find((item) => item.type === "created")
+      expect(created?.actor).toBe("agent")
+      expect(created?.payload.sourceMessageID).toBe("msg_goal_agent_create")
+    }),
+  )
+
+  it.effect("rejects agent-initiated Goal creation without explicit user authorization", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const agent = yield* GoalAgent.Service
+      const exit = yield* agent
+        .execute(
+          sessionA,
+          { action: "create", objective: "Invent a Goal", criteria: ["Something happens"] },
+          { userMessageID: "msg_normal", userText: "Please fix the failing test." },
+        )
+        .pipe(Effect.exit)
+      expect(exit._tag).toBe("Failure")
+      expect(yield* (yield* GoalV2.Service).focused(sessionA)).toBeUndefined()
+    }),
+  )
+
+  it.effect("accepts a user confirmation after the agent proposes creating a Goal", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const agent = yield* GoalAgent.Service
+      const result = yield* agent.execute(
+        sessionA,
+        { action: "create", objective: "Stabilize the release", criteria: ["Release checks pass"] },
+        {
+          userMessageID: "msg_yes",
+          userText: "Yes, go ahead.",
+          previousAssistantText: "This is multi-step work. Should I create a Goal for the release and start it?",
+        },
+      )
+      expect(result.goal.goal.status).toBe("active")
+    }),
+  )
+
+  it.effect("keeps an agent-created Goal as a draft when the user explicitly says not to start it", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const result = yield* (yield* GoalAgent.Service).execute(
+        sessionA,
+        {
+          action: "create",
+          objective: "Prepare the migration plan",
+          criteria: ["The migration plan is complete"],
+          // Even a mistaken model-supplied true cannot override the user's no-start instruction.
+          start: true,
+        },
+        {
+          userMessageID: "msg_goal_draft",
+          userText: "Create a Goal draft for the migration plan, but don't start it yet.",
+        },
+      )
+      expect(result.goal.goal.status).toBe("draft")
+      expect((yield* (yield* GoalV2.Service).focused(sessionA))?.detail.goal.id).toBe(result.goal.goal.id)
+    }),
+  )
+
+  it.effect("does not replace a different focused Goal implicitly and keeps same-objective creation idempotent", () =>
+    Effect.gen(function* () {
+      yield* setup
+      const agent = yield* GoalAgent.Service
+      const provenance = {
+        userMessageID: "msg_goal_retry",
+        userText: "Create a goal for shipping the release.",
+      }
+      const first = yield* agent.execute(
+        sessionA,
+        { action: "create", objective: "Ship the release", criteria: ["Release shipped"] },
+        provenance,
+      )
+      const retry = yield* agent.execute(
+        sessionA,
+        { action: "create", objective: "Ship the release", criteria: ["Release shipped"] },
+        provenance,
+      )
+      expect(retry.goal.goal.id).toBe(first.goal.goal.id)
+
+      const rejected = yield* agent
+        .execute(
+          sessionA,
+          { action: "create", objective: "Different Goal", criteria: ["Different work complete"] },
+          { userMessageID: "msg_goal_different", userText: "Create a goal for different work." },
+        )
+        .pipe(Effect.exit)
+      expect(rejected._tag).toBe("Failure")
+      expect((yield* (yield* GoalV2.Service).focused(sessionA))?.detail.goal.id).toBe(first.goal.goal.id)
+    }),
+  )
+
   it.effect("creates durable normalized Goal state and emits a creation event", () =>
     Effect.gen(function* () {
       yield* setup
@@ -397,7 +531,7 @@ describe("Goal automation reservations", () => {
         sessionID: sessionA,
         origin: "user",
         tokens: 120,
-        audit: continueAudit(true),
+        audit: continueAudit(active.criteria, true),
       })
       expect(decision.continue).toBe(true)
       expect(decision.reservation?.id).toBeString()
@@ -426,7 +560,7 @@ describe("Goal automation reservations", () => {
       const created = yield* createGoal({ continuationPolicy: { mode: "unattended" } })
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
-      yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: continueAudit(true) })
+      yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: continueAudit(active.criteria, true) })
       const claimed = yield* automation.claim(sessionA)
       expect(claimed).toBeDefined()
 
@@ -453,7 +587,7 @@ describe("Goal automation reservations", () => {
       })
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
-      const first = yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: continueAudit(false) })
+      const first = yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: continueAudit(active.criteria, false) })
       const claimed = yield* automation.claim(sessionA)
       expect(first.reservation?.id).toBe(claimed?.id)
 
@@ -461,7 +595,7 @@ describe("Goal automation reservations", () => {
         sessionID: sessionA,
         origin: "automatic",
         reservationID: claimed!.id,
-        audit: continueAudit(false),
+        audit: continueAudit(active.criteria, false),
       })
       expect(stopped.continue).toBe(false)
       expect(stopped.reason).toContain("guardrail:no Goal-state progress")
@@ -490,12 +624,21 @@ describe("Goal automation reservations", () => {
             decision: "complete",
             rationale: "The worker result satisfies the objective and is ready for verification.",
             progressMade: true,
+            criteria: active.criteria.map((criterion) => ({
+              criterionID: criterion.id,
+              status: "passed",
+              evidence: `Auditor independently verified: ${criterion.description}`,
+            })),
           },
         },
       })
 
-      expect(decision).toMatchObject({ continue: false, reason: "auditor_complete" })
-      expect((yield* goals.get(created.goal.id)).goal.status).toBe("verifying")
+      expect(decision).toMatchObject({ continue: false, reason: "auditor_complete_verified" })
+      const verified = yield* goals.get(created.goal.id)
+      expect(verified.goal.status).toBe("completed")
+      expect(verified.criteria.every((criterion) => criterion.status === "passed")).toBe(true)
+      const auditorEvidence = yield* goals.evidence(created.goal.id)
+      expect(auditorEvidence.filter((item) => item.type === "auditor_verification")).toHaveLength(active.criteria.length)
     }),
   )
 
@@ -511,7 +654,7 @@ describe("Goal automation reservations", () => {
       const active = yield* goals.transition({ id: created.goal.id, expectedRevision: 0, action: "start" })
       yield* goals.focus({ goalID: active.goal.id, sessionID: sessionA })
 
-      const first = yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: blockedAudit() })
+      const first = yield* automation.afterTurn({ sessionID: sessionA, origin: "user", audit: blockedAudit(active.criteria) })
       expect(first.continue).toBe(true)
       expect(first.reservation?.prompt).toContain("1/3")
       expect(first.reservation?.prompt).toContain("Investigate the suspected blocker")
@@ -522,7 +665,7 @@ describe("Goal automation reservations", () => {
         sessionID: sessionA,
         origin: "automatic",
         reservationID: claimed!.id,
-        audit: blockedAudit(),
+        audit: blockedAudit(active.criteria),
       })
       expect(second.continue).toBe(true)
       expect(second.reservation?.prompt).toContain("2/3")
@@ -533,7 +676,7 @@ describe("Goal automation reservations", () => {
         sessionID: sessionA,
         origin: "automatic",
         reservationID: claimed!.id,
-        audit: blockedAudit("Need a user-provided deployment credential"),
+        audit: blockedAudit(active.criteria, "Need a user-provided deployment credential"),
       })
       expect(third).toMatchObject({ continue: false, reason: "auditor_blocked:3" })
       expect((yield* goals.get(created.goal.id)).goal).toMatchObject({

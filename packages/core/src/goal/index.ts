@@ -9,10 +9,15 @@ import { EventV2 } from "../event"
 import { ProjectTable } from "../project/sql"
 import { WorkspaceTable } from "../control-plane/workspace.sql"
 import { SessionTable } from "../session/sql"
+import { SessionSchema } from "../session/schema"
+import { SessionHostChild } from "../session/host-child"
+import { SessionV1 } from "../v1/session"
+import { SpecialAgentSession } from "../special-agent-session"
 import { GoalSchema } from "./schema"
 import { GoalStateMachine } from "./state-machine"
 import {
   GoalCriterionTable,
+  GoalAuditorSessionTable,
   GoalEvidenceTable,
   GoalEventTable,
   GoalFocusTable,
@@ -42,6 +47,20 @@ export interface CreateInput {
   readonly steps?: ReadonlyArray<{ readonly title: string; readonly description?: string }>
   readonly continuationPolicy?: GoalModel.ContinuationPolicy
   readonly auditorPolicy?: GoalModel.AuditorPolicy
+  readonly sourceMessageID?: string
+  readonly actor?: GoalModel.AuditActor
+}
+
+export interface PrepareForSessionInput {
+  readonly sessionID: typeof SessionTable.$inferSelect.id
+  readonly title: string
+  readonly objective: string
+  readonly constraints?: ReadonlyArray<string>
+  readonly criteria?: ReadonlyArray<string>
+  readonly steps?: ReadonlyArray<{ readonly title: string; readonly description?: string }>
+  readonly continuationPolicy?: GoalModel.ContinuationPolicy
+  readonly auditorPolicy?: GoalModel.AuditorPolicy
+  readonly start?: boolean
   readonly actor?: GoalModel.AuditActor
 }
 
@@ -118,6 +137,9 @@ export type Error = GoalSchema.Error
 
 export interface Interface {
   readonly create: (input: CreateInput) => Effect.Effect<Detail, GoalSchema.ValidationError>
+  readonly prepareForSession: (
+    input: PrepareForSessionInput,
+  ) => Effect.Effect<{ focus: Focus; detail: Detail }, GoalSchema.NotFoundError | GoalSchema.ValidationError>
   readonly get: (id: ID) => Effect.Effect<Detail, GoalSchema.NotFoundError>
   readonly list: (input: {
     projectID: typeof ProjectTable.$inferSelect.id
@@ -146,12 +168,34 @@ export interface Interface {
     sessionID: typeof SessionTable.$inferSelect.id,
   ) => Effect.Effect<{ focus: Focus; detail: Detail } | undefined>
   readonly focuses: (goalID: ID) => Effect.Effect<ReadonlyArray<Focus>>
+  readonly auditorSession: (input: {
+    parentSessionID: SessionSchema.ID
+    goalID: ID
+    model?: import("../model").ModelV2.Ref
+  }) => Effect.Effect<SessionSchema.ID, GoalSchema.NotFoundError | GoalSchema.ValidationError>
+  readonly auditorSessionFor: (input: {
+    parentSessionID: SessionSchema.ID
+    goalID: ID
+  }) => Effect.Effect<SessionSchema.ID | undefined>
+  readonly isAuditorSession: (sessionID: SessionSchema.ID) => Effect.Effect<boolean>
   readonly audit: (goalID: ID) => Effect.Effect<ReadonlyArray<GoalModel.AuditEvent>, GoalSchema.NotFoundError>
   readonly recordAuditorVerdict: (input: {
     goalID: ID
     verdict: GoalModel.AuditorVerdict
     model?: import("../model").ModelV2.Ref
   }) => Effect.Effect<void, GoalSchema.NotFoundError>
+  /**
+   * Apply one independent auditor judgment to durable Goal state. This is the
+   * authoritative server-side verification seam: the auditor only reports
+   * findings; Core reconciles criteria/evidence and owns lifecycle completion.
+   */
+  readonly reconcileAuditorVerdict: (input: {
+    goalID: ID
+    expectedRevision: number
+    verdict: GoalModel.AuditorVerdict
+    sessionID?: typeof SessionTable.$inferSelect.id
+    model?: import("../model").ModelV2.Ref
+  }) => Effect.Effect<{ detail: Detail; changed: boolean; completed: boolean }, GoalSchema.Error>
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/Goal") {}
@@ -163,6 +207,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const { db, readDb } = yield* Database.Service
     const events = yield* EventV2.Service
+    const specialAgents = yield* SpecialAgentSession.Service
 
     const detailTx = Effect.fnUntraced(function* (database: DatabaseExecutor, id: ID) {
       const row = yield* database
@@ -318,7 +363,10 @@ const layer = Layer.effect(
               goalID: id,
               type: "created",
               actor: input.actor ?? "user",
-              payload: { revision: 0 },
+              payload: {
+                revision: 0,
+                ...(input.sourceMessageID ? { sourceMessageID: input.sourceMessageID } : {}),
+              },
               now,
             })
             return yield* detailTx(tx, id).pipe(Effect.catchTag("Goal.NotFoundError", Effect.die))
@@ -326,6 +374,181 @@ const layer = Layer.effect(
         ).pipe(Effect.catchTag("SqlError", Effect.die))
       yield* events.publish(Event.Created, { goalID: id, info: detail.goal })
       return detail
+    })
+
+    const prepareForSession = Effect.fn("Goal.prepareForSession")(function* (input: PrepareForSessionInput) {
+      const title = requiredText(input.title, "title")
+      const objective = requiredText(input.objective, "objective")
+      if (!title.ok) return yield* new GoalSchema.ValidationError({ reason: title.reason })
+      if (!objective.ok) return yield* new GoalSchema.ValidationError({ reason: objective.reason })
+      const constraints = normalizeStrings(input.constraints ?? [])
+      if (!constraints.ok) return yield* new GoalSchema.ValidationError({ reason: constraints.reason })
+      const criteria = normalizeStrings(input.criteria ?? [])
+      if (!criteria.ok) return yield* new GoalSchema.ValidationError({ reason: criteria.reason })
+      const steps = normalizeSteps(input.steps ?? [])
+      if (!steps.ok) return yield* new GoalSchema.ValidationError({ reason: steps.reason })
+      const auditorPolicy = normalizeAuditorPolicy(input.auditorPolicy ?? {})
+      if (!auditorPolicy.ok) return yield* new GoalSchema.ValidationError({ reason: auditorPolicy.reason })
+      const start = input.start ?? true
+      if (start && criteria.value.length === 0) {
+        return yield* new GoalSchema.ValidationError({ reason: "a Goal needs at least one acceptance criterion before it can start" })
+      }
+      const now = Date.now()
+      const actor = input.actor ?? "user"
+
+      const result = yield* db
+        .transaction((tx) =>
+          Effect.gen(function* () {
+            const session = yield* tx
+              .select({
+                projectID: SessionTable.project_id,
+                workspaceID: SessionTable.workspace_id,
+                parentID: SessionTable.parent_id,
+              })
+              .from(SessionTable)
+              .where(eq(SessionTable.id, input.sessionID))
+              .get()
+              .pipe(Effect.orDie)
+            if (!session) return yield* new GoalSchema.ValidationError({ reason: `session does not exist: ${input.sessionID}` })
+            if (session.parentID) {
+              return yield* new GoalSchema.ValidationError({
+                reason: "child Sessions cannot own Goals; create or focus the Goal from the parent Session",
+              })
+            }
+
+            const existingFocus = yield* tx
+              .select()
+              .from(GoalFocusTable)
+              .where(eq(GoalFocusTable.session_id, input.sessionID))
+              .get()
+              .pipe(Effect.orDie)
+            if (existingFocus) {
+              const existing = yield* detailTx(tx, existingFocus.goal_id)
+              if (GoalStateMachine.isTerminal(existing.goal.status) || existing.goal.objective !== objective.value) {
+                return yield* new GoalSchema.ValidationError({ reason: "this Session already has a different focused Goal" })
+              }
+              let detail = existing
+              if (start && existing.goal.status === "draft") {
+                const updated = yield* tx
+                  .update(GoalTable)
+                  .set({ status: "active", revision: sql`${GoalTable.revision} + 1`, time_updated: now })
+                  .where(eq(GoalTable.id, existing.goal.id))
+                  .returning()
+                  .get()
+                  .pipe(Effect.orDie)
+                yield* appendAudit(tx, {
+                  goalID: existing.goal.id,
+                  type: "transitioned",
+                  actor,
+                  payload: { from: "draft", to: "active", action: "start", revision: updated.revision },
+                  now,
+                })
+                detail = yield* detailTx(tx, existing.goal.id)
+              }
+              return {
+                created: false as const,
+                focusChanged: false as const,
+                started: detail.goal.status === "active" && existing.goal.status === "draft",
+                focus: hydrateFocus(existingFocus),
+                detail,
+              }
+            }
+
+            const id = GoalModel.ID.create()
+            const status: GoalModel.Status = start ? "active" : "draft"
+            const revision = start ? 1 : 0
+            yield* tx
+              .insert(GoalTable)
+              .values({
+                id,
+                project_id: session.projectID,
+                workspace_id: session.workspaceID ?? null,
+                title: title.value,
+                objective: objective.value,
+                constraints: constraints.value,
+                status,
+                revision,
+                continuation_policy: input.continuationPolicy ?? { mode: "manual" as const },
+                auditor_policy: auditorPolicy.value,
+                time_created: now,
+                time_updated: now,
+              })
+              .run()
+              .pipe(Effect.orDie)
+            if (criteria.value.length > 0) {
+              yield* tx
+                .insert(GoalCriterionTable)
+                .values(
+                  criteria.value.map((description, position) => ({
+                    id: GoalModel.CriterionID.create(),
+                    goal_id: id,
+                    position,
+                    description,
+                  })),
+                )
+                .run()
+                .pipe(Effect.orDie)
+            }
+            if (steps.value.length > 0) {
+              yield* tx
+                .insert(GoalStepTable)
+                .values(
+                  steps.value.map((step, position) => ({
+                    id: GoalModel.StepID.create(),
+                    goal_id: id,
+                    position,
+                    title: step.title,
+                    description: step.description,
+                  })),
+                )
+                .run()
+                .pipe(Effect.orDie)
+            }
+            const focusRow = { session_id: input.sessionID, goal_id: id, role: "owner" as const, focused_at: now }
+            yield* tx.insert(GoalFocusTable).values(focusRow).run().pipe(Effect.orDie)
+            yield* appendAudit(tx, {
+              goalID: id,
+              type: "created",
+              actor,
+              payload: { revision: 0, preparedForSessionID: input.sessionID },
+              now,
+            })
+            yield* appendAudit(tx, {
+              goalID: id,
+              type: "focused",
+              actor,
+              payload: { sessionID: input.sessionID, role: "owner" },
+              now,
+            })
+            if (start) {
+              yield* appendAudit(tx, {
+                goalID: id,
+                type: "transitioned",
+                actor,
+                payload: { from: "draft", to: "active", action: "start", revision },
+                now,
+              })
+            }
+            return {
+              created: true as const,
+              focusChanged: true as const,
+              started: start,
+              focus: hydrateFocus(focusRow),
+              detail: yield* detailTx(tx, id),
+            }
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", Effect.die))
+
+      if (result.created) yield* events.publish(Event.Created, { goalID: result.detail.goal.id, info: result.detail.goal })
+      if (result.focusChanged)
+        yield* events.publish(Event.Focused, {
+          goalID: result.detail.goal.id,
+          sessionID: input.sessionID,
+          role: result.focus.role,
+        })
+      if (result.started) yield* events.publish(Event.Updated, { goalID: result.detail.goal.id, info: result.detail.goal })
+      return { focus: result.focus, detail: result.detail }
     })
 
     const get = Effect.fn("Goal.get")(function* (id: ID) {
@@ -892,12 +1115,26 @@ const layer = Layer.effect(
             return yield* new GoalSchema.ValidationError({ reason: `cannot focus a ${goal.status} Goal` })
           }
           const session = yield* tx
-            .select({ projectID: SessionTable.project_id, workspaceID: SessionTable.workspace_id })
+            .select({
+              projectID: SessionTable.project_id,
+              workspaceID: SessionTable.workspace_id,
+              parentID: SessionTable.parent_id,
+              metadata: SessionTable.metadata,
+            })
             .from(SessionTable)
             .where(eq(SessionTable.id, input.sessionID))
             .get()
             .pipe(Effect.orDie)
           if (!session) return yield* new GoalSchema.ValidationError({ reason: `session does not exist: ${input.sessionID}` })
+          const role = input.role ?? "owner"
+          if (session.parentID && session.metadata?.specialAgent === "goal_auditor") {
+            return yield* new GoalSchema.ValidationError({
+              reason: "Goal auditor Sessions cannot own or focus Goals",
+            })
+          }
+          if (session.parentID && role !== "worker") {
+            return yield* new GoalSchema.ValidationError({ reason: "child Sessions may only inherit Goals as workers" })
+          }
           if (session.projectID !== goal.project_id) {
             return yield* new GoalSchema.ValidationError({ reason: "Goal and Session belong to different projects" })
           }
@@ -911,7 +1148,6 @@ const layer = Layer.effect(
             .where(eq(GoalFocusTable.session_id, input.sessionID))
             .get()
             .pipe(Effect.orDie)
-          const role = input.role ?? "owner"
           if (existing?.goal_id === input.goalID && existing.role === role) {
             return { focus: hydrateFocus(existing), previousGoalID: undefined as ID | undefined, changed: false }
           }
@@ -1000,6 +1236,37 @@ const layer = Layer.effect(
       return { focus: hydrateFocus(row), detail }
     })
 
+    // Goal inheritance is owned by the Goal domain, not Session creation or the
+    // UI. Ordinary subagents inherit their parent's focused Goal as read/write
+    // workers before create() returns. Host-owned special agents (Goal Auditor,
+    // Prompt Revisor, Session Title, SPAD auditor) are explicitly excluded
+    // because their independent runtimes must never become Goal workers or
+    // mutate implementation state.
+    const unsubscribeSessionCreated = yield* events.listenType(SessionV1.Event.Created, (event) => {
+      const info = event.data.info
+      const parentID = info.parentID
+      if (!parentID || info.metadata?.specialAgent) return Effect.void
+      return Effect.gen(function* () {
+        const inherited = yield* focused(parentID)
+        if (!inherited || GoalStateMachine.isTerminal(inherited.detail.goal.status)) return
+        yield* focus({
+          goalID: inherited.detail.goal.id,
+          sessionID: info.id,
+          role: "worker",
+          actor: "system",
+        })
+      }).pipe(
+        Effect.catchCause((cause) =>
+          Effect.logError("failed to inherit focused Goal into child Session", {
+            sessionID: info.id,
+            parentSessionID: parentID,
+            cause,
+          }),
+        ),
+      )
+    })
+    yield* Effect.addFinalizer(() => unsubscribeSessionCreated)
+
     const focuses = Effect.fn("Goal.focuses")(function* (goalID: ID) {
       const rows = yield* readDb
         .select()
@@ -1009,6 +1276,116 @@ const layer = Layer.effect(
         .all()
         .pipe(Effect.orDie)
       return rows.map(hydrateFocus)
+    })
+
+    const auditorSessionFor = Effect.fn("Goal.auditorSessionFor")(function* (input: {
+      parentSessionID: SessionSchema.ID
+      goalID: ID
+    }) {
+      const row = yield* readDb
+        .select({ auditorSessionID: GoalAuditorSessionTable.auditor_session_id })
+        .from(GoalAuditorSessionTable)
+        .where(
+          and(
+            eq(GoalAuditorSessionTable.parent_session_id, input.parentSessionID),
+            eq(GoalAuditorSessionTable.goal_id, input.goalID),
+          ),
+        )
+        .get()
+        .pipe(Effect.orDie)
+      return row?.auditorSessionID
+    })
+
+    const isAuditorSession = Effect.fn("Goal.isAuditorSession")(function* (sessionID: SessionSchema.ID) {
+      const row = yield* readDb
+        .select({ sessionID: GoalAuditorSessionTable.auditor_session_id })
+        .from(GoalAuditorSessionTable)
+        .where(eq(GoalAuditorSessionTable.auditor_session_id, sessionID))
+        .get()
+        .pipe(Effect.orDie)
+      return row !== undefined
+    })
+
+    const auditorSession = Effect.fn("Goal.auditorSession")(function* (input: {
+      parentSessionID: SessionSchema.ID
+      goalID: ID
+      model?: import("../model").ModelV2.Ref
+    }) {
+      const existing = yield* auditorSessionFor(input)
+      if (existing) return existing
+
+      const [parent, goal] = yield* Effect.all([
+        readDb
+          .select({
+            id: SessionTable.id,
+            parentID: SessionTable.parent_id,
+            projectID: SessionTable.project_id,
+            workspaceID: SessionTable.workspace_id,
+          })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, input.parentSessionID))
+          .get()
+          .pipe(Effect.orDie),
+        readDb.select().from(GoalTable).where(eq(GoalTable.id, input.goalID)).get().pipe(Effect.orDie),
+      ])
+      if (!parent) return yield* new GoalSchema.ValidationError({ reason: `session does not exist: ${input.parentSessionID}` })
+      if (parent.parentID) {
+        return yield* new GoalSchema.ValidationError({
+          reason: "child Sessions cannot own Goals or Goal auditor Sessions",
+        })
+      }
+      if (!goal) return yield* new GoalSchema.NotFoundError({ goalID: input.goalID })
+      if (goal.project_id !== parent.projectID) {
+        return yield* new GoalSchema.ValidationError({ reason: "Goal and parent Session belong to different projects" })
+      }
+      if (goal.workspace_id && goal.workspace_id !== parent.workspaceID) {
+        return yield* new GoalSchema.ValidationError({ reason: "Goal and parent Session belong to different workspaces" })
+      }
+
+      // Session provisioning is owned by the shared special-agent service so the
+      // Goal Auditor, Prompt Revisor, and Session Title all create their durable
+      // transcript through one contract. Goal keeps only its domain relation row
+      // (parent, Goal) for reverse lookup and the audit trail.
+      const auditorSessionID = yield* specialAgents
+        .provision({
+          ownerKind: SpecialAgentSession.OWNER_GOAL,
+          ownerID: `${input.parentSessionID}\u0000${input.goalID}`,
+          agent: "goal_auditor",
+          parentSessionID: input.parentSessionID,
+          title: `Goal Auditor · ${goal.title}`,
+          ...(input.model ? { model: input.model } : {}),
+          metadata: { goalID: input.goalID, parentSessionID: input.parentSessionID },
+        })
+        .pipe(
+          Effect.mapError(
+            () => new GoalSchema.ValidationError({ reason: `session does not exist: ${input.parentSessionID}` }),
+          ),
+        )
+      const now = Date.now()
+      const inserted = yield* db
+        .insert(GoalAuditorSessionTable)
+        .values({
+          parent_session_id: input.parentSessionID,
+          goal_id: input.goalID,
+          auditor_session_id: auditorSessionID,
+          time_created: now,
+        })
+        .onConflictDoNothing()
+        .returning({ auditorSessionID: GoalAuditorSessionTable.auditor_session_id })
+        .get()
+        .pipe(Effect.orDie)
+      const linked = yield* auditorSessionFor(input)
+      if (!linked) return yield* Effect.die(`Goal auditor Session relation missing: ${input.parentSessionID}/${input.goalID}`)
+      if (inserted?.auditorSessionID === auditorSessionID) {
+        yield* appendAudit(db, {
+          goalID: input.goalID,
+          type: "auditor_session_linked",
+          actor: "system",
+          payload: { parentSessionID: input.parentSessionID, auditorSessionID },
+          now,
+        })
+      }
+      return linked
     })
 
     const audit = Effect.fn("Goal.audit")(function* (goalID: ID) {
@@ -1062,8 +1439,216 @@ const layer = Layer.effect(
         .pipe(Effect.catchTag("SqlError", Effect.die))
     })
 
+    const reconcileAuditorVerdict = Effect.fn("Goal.reconcileAuditorVerdict")(function* (input: {
+      goalID: ID
+      expectedRevision: number
+      verdict: GoalModel.AuditorVerdict
+      sessionID?: typeof SessionTable.$inferSelect.id
+      model?: import("../model").ModelV2.Ref
+    }) {
+      const now = Date.now()
+      const result = yield* db
+        .transaction((tx) =>
+          Effect.gen(function* () {
+            const current = yield* requireRow(tx, input.goalID)
+            yield* requireRevision(input.goalID, current.revision, input.expectedRevision)
+            if (GoalStateMachine.isTerminal(current.status)) {
+              return {
+                detail: yield* detailTx(tx, input.goalID),
+                changed: false,
+                completed: current.status === "completed",
+              }
+            }
+            if (current.status !== "active" && current.status !== "verifying") {
+              return yield* new GoalSchema.ValidationError({
+                reason: `auditor findings cannot be reconciled while Goal is ${current.status}`,
+              })
+            }
+
+            const criteriaRows = yield* tx
+              .select()
+              .from(GoalCriterionTable)
+              .where(eq(GoalCriterionTable.goal_id, input.goalID))
+              .orderBy(asc(GoalCriterionTable.position))
+              .all()
+              .pipe(Effect.orDie)
+            if (input.verdict.criteria.length !== criteriaRows.length) {
+              return yield* new GoalSchema.ValidationError({
+                reason: `auditor verdict must assess all ${criteriaRows.length} acceptance criteria`,
+              })
+            }
+            const assessmentByID = new Map(input.verdict.criteria.map((item) => [item.criterionID, item]))
+            if (assessmentByID.size !== criteriaRows.length || criteriaRows.some((row) => !assessmentByID.has(row.id))) {
+              return yield* new GoalSchema.ValidationError({ reason: "auditor verdict criteria do not match this Goal" })
+            }
+            if (
+              input.verdict.decision === "complete" &&
+              input.verdict.criteria.some((assessment) => assessment.status !== "passed")
+            ) {
+              return yield* new GoalSchema.ValidationError({
+                reason: "auditor complete requires every acceptance criterion to pass",
+              })
+            }
+
+            yield* appendAudit(tx, {
+              goalID: input.goalID,
+              type: "audited",
+              actor: "auditor",
+              payload: {
+                decision: input.verdict.decision,
+                rationale: input.verdict.rationale,
+                progressMade: input.verdict.progressMade,
+                criteria: input.verdict.criteria,
+                ...(input.verdict.confidence === undefined ? {} : { confidence: input.verdict.confidence }),
+                ...(input.verdict.decision === "blocked" ? { blocker: input.verdict.blocker } : {}),
+                ...(input.verdict.decision === "continue" || input.verdict.decision === "blocked"
+                  ? { continuationPrompt: input.verdict.continuationPrompt }
+                  : {}),
+                ...(input.model
+                  ? { model: { providerID: input.model.providerID, id: input.model.id, variant: input.model.variant } }
+                  : {}),
+              },
+              now,
+            })
+
+            let changed = false
+            for (const criterion of criteriaRows) {
+              const assessment = assessmentByID.get(criterion.id)!
+              if (criterion.status !== assessment.status) {
+                yield* tx
+                  .update(GoalCriterionTable)
+                  .set({ status: assessment.status })
+                  .where(eq(GoalCriterionTable.id, criterion.id))
+                  .run()
+                  .pipe(Effect.orDie)
+                yield* appendAudit(tx, {
+                  goalID: input.goalID,
+                  type: "criterion_updated",
+                  actor: "auditor",
+                  payload: {
+                    criterionID: criterion.id,
+                    from: criterion.status,
+                    to: assessment.status,
+                    source: "audit",
+                  },
+                  now,
+                })
+                changed = true
+              }
+
+              if (assessment.status === "passed") {
+                const existingEvidence = yield* tx
+                  .select({ id: GoalEvidenceTable.id })
+                  .from(GoalEvidenceTable)
+                  .where(
+                    and(
+                      eq(GoalEvidenceTable.goal_id, input.goalID),
+                      eq(GoalEvidenceTable.criterion_id, criterion.id),
+                      eq(GoalEvidenceTable.type, "auditor_verification"),
+                      eq(GoalEvidenceTable.verdict, "passed"),
+                      eq(GoalEvidenceTable.summary, assessment.evidence),
+                    ),
+                  )
+                  .limit(1)
+                  .get()
+                  .pipe(Effect.orDie)
+                if (!existingEvidence) {
+                  const evidenceID = GoalModel.EvidenceID.create()
+                  yield* tx
+                    .insert(GoalEvidenceTable)
+                    .values({
+                      id: evidenceID,
+                      goal_id: input.goalID,
+                      criterion_id: criterion.id,
+                      type: "auditor_verification",
+                      session_id: input.sessionID ?? null,
+                      summary: assessment.evidence,
+                      verdict: "passed",
+                      time_created: now,
+                    })
+                    .run()
+                    .pipe(Effect.orDie)
+                  yield* appendAudit(tx, {
+                    goalID: input.goalID,
+                    type: "evidence_added",
+                    actor: "auditor",
+                    payload: {
+                      evidenceID,
+                      criterionID: criterion.id,
+                      source: "audit",
+                      verdict: "passed",
+                    },
+                    now,
+                  })
+                  changed = true
+                }
+              }
+            }
+
+            let nextStatus: GoalModel.Status = current.status
+            let completed = false
+            if (input.verdict.decision === "complete") {
+              if (current.status === "active") {
+                yield* appendAudit(tx, {
+                  goalID: input.goalID,
+                  type: "transitioned",
+                  actor: "auditor",
+                  payload: { from: "active", to: "verifying", action: "request_verification", source: "audit" },
+                  now,
+                })
+              }
+              yield* appendAudit(tx, {
+                goalID: input.goalID,
+                type: "transitioned",
+                actor: "auditor",
+                payload: { from: "verifying", to: "completed", action: "verification_pass", source: "audit" },
+                now,
+              })
+              nextStatus = "completed"
+              completed = true
+              changed = true
+            } else if (current.status === "verifying") {
+              // Repair legacy/stale verifying Goals automatically. A non-complete
+              // audit means there is still work to do; the loop must return to
+              // active instead of getting stranded in verification.
+              yield* appendAudit(tx, {
+                goalID: input.goalID,
+                type: "transitioned",
+                actor: "auditor",
+                payload: { from: "verifying", to: "active", action: "verification_fail", source: "audit" },
+                now,
+              })
+              nextStatus = "active"
+              changed = true
+            }
+
+            if (changed) {
+              const updated = yield* tx
+                .update(GoalTable)
+                .set({
+                  status: nextStatus,
+                  blocker: nextStatus === "active" ? null : current.blocker,
+                  revision: sql`${GoalTable.revision} + 1`,
+                  time_updated: now,
+                  time_completed: completed ? now : current.time_completed,
+                })
+                .where(and(eq(GoalTable.id, input.goalID), eq(GoalTable.revision, input.expectedRevision)))
+                .returning({ revision: GoalTable.revision })
+                .get()
+                .pipe(Effect.orDie)
+              if (!updated) return yield* staleAfterCas(tx, input.goalID, input.expectedRevision)
+            }
+            return { detail: yield* detailTx(tx, input.goalID), changed, completed }
+          }),
+        )
+        .pipe(Effect.catchTag("SqlError", Effect.die))
+      if (result.changed) yield* events.publish(Event.Updated, { goalID: input.goalID, info: result.detail.goal })
+      return result
+    })
+
     return Service.of({
       create,
+      prepareForSession,
       get,
       list,
       update,
@@ -1078,8 +1663,12 @@ const layer = Layer.effect(
       unfocus,
       focused,
       focuses,
+      auditorSession,
+      auditorSessionFor,
+      isAuditorSession,
       audit,
       recordAuditorVerdict,
+      reconcileAuditorVerdict,
     })
   }),
 )
@@ -1261,4 +1850,8 @@ function normalizeAuditorPolicy(value: GoalModel.AuditorPolicy): Normalized<Goal
   }
 }
 
-export const node = makeGlobalNode({ service: Service, layer, deps: [Database.node, EventV2.node] })
+export const node = makeGlobalNode({
+  service: Service,
+  layer,
+  deps: [Database.node, EventV2.node, SessionHostChild.node, SpecialAgentSession.node],
+})

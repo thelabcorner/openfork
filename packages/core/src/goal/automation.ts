@@ -8,6 +8,7 @@ import { GoalAutomationTable } from "./sql"
 import { Database } from "../database/database"
 import { SessionSchema } from "../session/schema"
 import { makeGlobalNode } from "../effect/app-node"
+import type { ModelV2 } from "../model"
 
 export interface State {
   readonly startedAt: number
@@ -21,7 +22,14 @@ export interface State {
 }
 
 export type AuditOutcome =
-  | { readonly ok: true; readonly verdict: GoalModel.AuditorVerdict; readonly tokens?: number }
+  | {
+      readonly ok: true
+      readonly verdict: GoalModel.AuditorVerdict
+      readonly tokens?: number
+      readonly goalRevision?: number
+      readonly model?: ModelV2.Ref
+      readonly auditorSessionID?: SessionSchema.ID
+    }
   | { readonly ok: false; readonly error: string; readonly tokens?: number }
 
 export interface Reservation {
@@ -227,7 +235,7 @@ const layer = Layer.effect(
         yield* cancel(input.sessionID)
         return stop("no_focused_goal", initial())
       }
-      const detail = focused.detail
+      let detail = focused.detail
 
       const stored =
         input.origin === "automatic"
@@ -253,43 +261,47 @@ const layer = Layer.effect(
         }
       }
 
-      const base = input.origin === "automatic" && stored ? stateOf(stored) : initial()
-      const revisionProgressed = base.previousRevision === undefined || base.previousRevision !== detail.goal.revision
-      const audit = input.audit ?? ({ ok: false, error: "auditor result missing" } satisfies AuditOutcome)
-      const auditProgressed = audit.ok && audit.verdict.progressMade
-      const noProgressTurns =
-        revisionProgressed || auditProgressed
-          ? 0
-          : audit.ok && audit.verdict.decision === "continue"
-            ? base.noProgressTurns + 1
-            : base.noProgressTurns
-      const auditorBlockedStreak =
-        audit.ok && audit.verdict.decision === "blocked" ? base.auditorBlockedStreak + 1 : 0
-      const state: State = {
-        ...base,
-        consecutiveTurns: base.consecutiveTurns + 1,
-        noProgressTurns,
-        auditorBlockedStreak,
-        consumedTokens:
-          base.consumedTokens +
-          Math.max(0, Math.floor(input.tokens ?? 0)) +
-          Math.max(0, Math.floor(input.audit?.tokens ?? 0)),
-        previousRevision: detail.goal.revision,
-        lastAuditorDecision: audit.ok ? audit.verdict.decision : base.lastAuditorDecision,
-        lastAuditorRationale: audit.ok ? audit.verdict.rationale : audit.error,
-      }
       const policy = detail.goal.continuationPolicy
+      const base = input.origin === "automatic" && stored ? stateOf(stored) : initial()
 
       if (policy.mode === "manual") {
         yield* cancel(input.sessionID)
-        return stop("manual", state, detail)
+        return stop("manual", base, detail)
       }
       if (detail.goal.status !== "active" && detail.goal.status !== "verifying") {
         yield* cancel(input.sessionID)
-        return stop(`goal_${detail.goal.status}`, state, detail)
+        return stop(`goal_${detail.goal.status}`, base, detail)
+      }
+
+      const audit = input.audit ?? ({ ok: false, error: "auditor result missing" } satisfies AuditOutcome)
+      const stateFor = (serverProgressed = false): State => {
+        const revisionProgressed = base.previousRevision === undefined || base.previousRevision !== detail.goal.revision
+        const auditProgressed = audit.ok && audit.verdict.progressMade
+        const noProgressTurns =
+          revisionProgressed || auditProgressed || serverProgressed
+            ? 0
+            : audit.ok && audit.verdict.decision === "continue"
+              ? base.noProgressTurns + 1
+              : base.noProgressTurns
+        const auditorBlockedStreak =
+          audit.ok && audit.verdict.decision === "blocked" ? base.auditorBlockedStreak + 1 : 0
+        return {
+          ...base,
+          consecutiveTurns: base.consecutiveTurns + 1,
+          noProgressTurns,
+          auditorBlockedStreak,
+          consumedTokens:
+            base.consumedTokens +
+            Math.max(0, Math.floor(input.tokens ?? 0)) +
+            Math.max(0, Math.floor(input.audit?.tokens ?? 0)),
+          previousRevision: detail.goal.revision,
+          lastAuditorDecision: audit.ok ? audit.verdict.decision : base.lastAuditorDecision,
+          lastAuditorRationale: audit.ok ? audit.verdict.rationale : audit.error,
+        }
       }
 
       if (!audit.ok) {
+        const state = stateFor()
         yield* cancel(input.sessionID)
         yield* goals
           .transition({
@@ -303,19 +315,32 @@ const layer = Layer.effect(
         return stop(`auditor_error:${audit.error}`, state, detail)
       }
 
+      const reconciled = yield* goals
+        .reconcileAuditorVerdict({
+          goalID: detail.goal.id,
+          expectedRevision: audit.goalRevision ?? detail.goal.revision,
+          verdict: audit.verdict,
+          // Auditor-authored evidence should link to the durable auditor child
+          // transcript when available. Older/mocked audit producers fall back
+          // to the parent Session for backward compatibility.
+          sessionID: audit.auditorSessionID ?? input.sessionID,
+          model: audit.model,
+        })
+        .pipe(
+          Effect.map((value) => ({ ok: true as const, value })),
+          Effect.catchTag("Goal.StaleRevisionError", () => Effect.succeed({ ok: false as const, stale: true as const })),
+          Effect.catch(() => Effect.succeed({ ok: false as const, stale: false as const })),
+        )
+      if (!reconciled.ok) {
+        yield* cancel(input.sessionID)
+        return stop(reconciled.stale ? "auditor_stale" : "auditor_reconciliation_failed", base, detail)
+      }
+      detail = reconciled.value.detail
+      const state = stateFor(reconciled.value.changed)
+
       if (audit.verdict.decision === "complete") {
         yield* cancel(input.sessionID)
-        if (detail.goal.status === "active") {
-          yield* goals
-            .transition({
-              id: detail.goal.id,
-              expectedRevision: detail.goal.revision,
-              action: "request_verification",
-              actor: "auditor",
-            })
-            .pipe(Effect.catch(() => Effect.void))
-        }
-        return stop("auditor_complete", state, detail)
+        return stop(reconciled.value.completed ? "auditor_complete_verified" : "auditor_complete", state, detail)
       }
 
       const blockedThreshold = clamp(detail.goal.auditorPolicy.blockedThreshold ?? 3, 1, 16)

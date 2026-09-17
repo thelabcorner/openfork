@@ -99,6 +99,13 @@ const AuditorVerdictBase = {
   rationale: Schema.String,
   progressMade: Schema.Boolean,
   confidence: Schema.Number.pipe(optional),
+  criteria: Schema.Array(
+    Schema.Struct({
+      criterionID: CriterionID,
+      status: CriterionStatus,
+      evidence: Schema.String,
+    }).annotate({ identifier: "Goal.AuditorCriterionAssessment" }),
+  ),
 } as const
 
 /**
@@ -106,6 +113,9 @@ const AuditorVerdictBase = {
  * the next autonomous worker cycle. `continuationPrompt` is deliberately
  * decision-specific rather than optional on every verdict: if the auditor
  * authorizes more work, it must say what the next worker should actually do.
+ * `criteria` is the auditor's independent criterion-by-criterion verification
+ * result. Core, not the model, decides how those findings mutate durable Goal
+ * state and whether they are sufficient to complete the verification gate.
  */
 export const AuditorVerdict = Schema.Union([
   Schema.Struct({
@@ -195,6 +205,7 @@ export const AuditEventType = Schema.Literals([
   "step_updated",
   "evidence_added",
   "audited",
+  "auditor_session_linked",
   "focused",
   "unfocused",
 ]).annotate({ identifier: "Goal.AuditEventType" })
