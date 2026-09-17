@@ -9,6 +9,28 @@
 - A domain may keep a minimal public wire contract here when SDK generation needs it, but do not move the broader runtime model into Schema just because an event is public. `plugin.added` is the current example: Schema may own the minimum browser-safe event payload, while plugin runtime behavior stays outside Schema.
 - The root barrel exports canonical current domain contracts. Specialized event modules, manifests, infrastructure modules, and V1 contracts use direct entrypoints instead of becoming first-class root exports.
 
+## Projection contracts
+
+- Schema may define a compact browser-safe snapshot/event contract for a domain
+  projection, but the projection's computation and lifetime belong to the domain
+  service that owns the source events/state. Do not move runtime aggregation
+  into Schema or design a contract around a frontend reconstruction algorithm.
+- Summary/telemetry contracts should carry semantic state and already-materialized
+  scalars needed by consumers, not entire histories merely so each client can
+  re-derive the same answer.
+- Keep live projections bounded. Prefer coalesced snapshot/update contracts over
+  rebroadcasting raw text/reasoning deltas when consumers need only phase,
+  counters, timestamps, or rates.
+- Distinguish durable aggregates from ephemeral live overlays explicitly; a live
+  projection should not become a second history database.
+- A schema addition for UI telemetry or summaries is incomplete until the owning
+  domain service is identified. Do not shape contracts around a component's
+  current reconstruction algorithm; shape them around semantic state produced by
+  the server/core owner.
+- Contracts should make bottom-up ownership obvious: compact snapshots carry
+  already-materialized scalars and semantic phases, while full histories remain
+  explicit detail-surface data.
+
 ## Current Versus V1
 
 - Current contracts are unversioned: use names like `Session`, `Permission`, `Question`, and identifiers like `Permission.Request`.

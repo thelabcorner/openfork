@@ -8,6 +8,21 @@ This folder contains adapters behind that service boundary:
 - `native-request.ts` converts opencode's normalized session input into a native `@opencode-ai/llm` `LLMRequest`. It does not execute requests.
 - `native-runtime.ts` is the opt-in native runtime adapter. It decides whether a selected model is supported, builds the native request, bridges opencode tools into native executable tools, and delegates transport to `LLMClient` / `RequestExecutor`.
 
+## Outbound request identity
+
+Provider requests identify the client through headers owned by
+`LLMRequestPrep.prepare`: the canonical `User-Agent`
+(`opencode/<channel>/<version>/<client>` from `InstallationUserAgent`),
+`x-opencode-session`, `x-opencode-request`, `x-opencode-client`, and
+`x-opencode-project`.
+
+- Never compose the User-Agent locally in this folder or any other provider
+  request path. The OpenCode Console free-tier gate rejects the legacy
+  `opencode/<version>` identity and non-`ses_` session ids, so the canonical
+  formatter in `@opencode-ai/core/installation/version` is the only owner.
+- Special agents (Prompt Revisor, title generation, auditors) cross this same
+  seam; they do not get their own identity or headers.
+
 ## File Structure
 
 ```txt

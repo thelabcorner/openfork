@@ -1,5 +1,26 @@
 # Desktop package notes
 
+- The desktop app is the product integration surface, but the Electron renderer
+  is not the default owner of domain state. For cross-layer features, trace from
+  the authoritative server/domain producer through the sidecar/API into the UI
+  as required by the root `AGENTS.md`; do not design a backend around whatever
+  data happens to be easiest for a renderer component to fetch.
+- When a desktop performance issue involves server calls, verify the complete
+  Electron -> sidecar -> route middleware -> instance/service path. A fast UI
+  call can still trigger a full workspace bootstrap behind the sidecar.
+- Desktop-wide closure must exercise the real triggering state (including
+  multiple active sessions when relevant). Browser-only or idle-startup evidence
+  proves only that narrower scenario.
+- Desktop startup, pairing, liveness, mobile-dev, and status probes must use
+  bootstrap-free `/global/*` or other Tier 0/1 surfaces. Never probe an
+  instance-scoped route without an explicit directory just because it is already
+  authenticated and returns a small payload.
+- The desktop renderer may define product requirements, but it does not own
+  runtime/domain state. If the renderer needs a cross-session scalar, add or use
+  the bottom-up server/core projection first, then consume it in the UI.
+- A packaged-build, browser-only, or idle-startup profile cannot close a bug that
+  appears only in the real Electron chrome/sidebar/sidecar path under several
+  working sessions.
 - `bun run dev` (from this directory) is the fast, high-signal way to debug the desktop app: it builds and launches the real Electron shell against current source, streams main-process console output (IPC errors, engine logs, uncaught exceptions) directly to the terminal, and hot-reloads renderer changes. Prefer this over reasoning about behavior from source alone, and over testing a packaged/installed build — a packaged build only reflects whatever was true when it was built, so it can make an already-fixed bug look unfixed for no reason related to the fix itself. Main-process changes (anything under `src/main`) require killing and relaunching the process, not just reloading the window.
 - Desktop renderer is the same hybrid as `packages/app`: most new UI (prompt v2, session v2, file explorer v2, terminal v2) calls the **unified SDK** (`@opencode-ai/sdk/v2/client` via `useSDK().client`), while some legacy shims still use `@opencode-ai/client/promise`. If `sdk().client.experimental.*` is `undefined` at runtime, you regenerated the wrong package — see root `AGENTS.md` § Workspace / § API Surfaces. The EXE bundles whatever was last generated, so local Vite HMR success ≠ packaged-build success; always grep the generated file after `bun run build` in `packages/sdk/js`.
 - Renderer process should only call `window.api` from `src/preload`.

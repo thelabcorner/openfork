@@ -1,5 +1,52 @@
 # opencode package guide
 
+## Server ownership and instance bootstrap — architecture before endpoint reuse
+
+Read the repository-root `AGENTS.md` architecture rules before changing server
+routes, workspace routing, instance services, or any client-facing read path.
+
+- Classify every endpoint as Tier 0/1/2/3 before choosing middleware. Tier 0
+  global reads must never enter `InstanceStore`; Tier 1 durable-location reads
+  must not bootstrap the execution graph just because they have a directory.
+- Treat `InstanceContextMiddleware` as an expensive ownership boundary, not a
+  harmless way to obtain a directory. Today an instance load gates on config,
+  plugin initialization, and tool-reload state and can warm LSP/format/VCS/
+  snapshot/project services. An endpoint that does not require that graph must
+  not cross this boundary.
+- Never use a missing-directory `process.cwd()` fallback as server semantics.
+  Require an explicit location for workspace-owned operations or expose a
+  deliberately bootstrap-free global/durable endpoint.
+- Resource-named API groups are not sacred ownership boundaries. If a group
+  contains both cheap durable reads and runtime operations, split the group or
+  move the cheap read rather than forcing every sibling through instance
+  middleware.
+- Before adding a new UI workaround, inspect durable Session/Project rows and
+  existing execution events. Prefer one upstream materialized/incremental
+  projection over repeated client reconstruction from message history.
+- Server tests for Tier 0/1 reads should prove that the request creates **zero**
+  instances. Tier 2/3 tests should prove missing location does not silently
+  target cwd.
+
+### Incident-specific server lessons
+
+- `InstanceStore.load(...)` is not a directory lookup. It resolves project
+  identity and pays the instance bootstrap gate: config, plugin init, and
+  ToolReload start. Warmup may then materialize LSP, ShareNext, format, VCS,
+  snapshot, and project services. Do not cross this boundary for auth probes,
+  health checks, startup catalogs, durable session indexes, preferences,
+  pricing/usage metadata, or live sidebar telemetry.
+- The right fix for an accidental instance route is usually a different owner or
+  endpoint, not a frontend delay, a lower query priority, or a faster bootstrap.
+- Provider/model/catalog reads are Tier 2 only when they truly depend on an
+  explicit workspace config. Global pricing, usage, token validation, and durable
+  session telemetry belong on bootstrap-free Tier 0/1 services.
+- Validate deterministic session configuration at admission. Do not persist an
+  unrunnable session and rely on asynchronous prompt execution to discover it;
+  that is how a failed worker can become a retry storm.
+- Add attribution when creating full instances. Logs/tests should answer which
+  request created the instance, which explicit location it supplied, whether any
+  fallback was used, and which runtime service justified the load.
+
 ## HttpApi Surfaces and Client Generation — read before editing routes
 
 This package defines the **unified** `OpenCodeHttpApi` (`packages/opencode/src/server/routes/instance/httpapi/api.ts` = `ServerApi` from `@opencode-ai/protocol` + `InstanceHttpApi` + `RootHttpApi` + `EventApi` + `PtyConnect`). That is what the desktop/app actually calls.

@@ -13,3 +13,12 @@ Use these patterns for server and HttpApi middleware tests in this directory.
 - Use `tmpdirScoped({ git: true })` plus `Project.use.fromDirectory(dir)` for project-backed requests.
 - If a test needs persisted state without matching runtime state, keep direct database setup inside a narrowly named helper that explains that state.
 - Add comments for non-obvious test topology, especially tests involving both the local test server and a fake upstream server.
+- For Tier 0/1 routes, test the ownership invariant as well as the response:
+  instrument/stub `InstanceStore` and prove the request performs zero instance
+  loads. A successful response is not enough if middleware bootstrapped a
+  workspace behind it.
+- Add fail-closed coverage for missing directory/workspace on Tier 2/3 routes.
+  The request must not silently target `process.cwd()`.
+- When one route group mixes ownership tiers, include a test that demonstrates
+  the cheap endpoint does not inherit heavy sibling middleware; if that cannot
+  be expressed, the route boundary is probably wrong.

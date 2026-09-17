@@ -1,3 +1,16 @@
+## Ownership in shared components
+
+- Shared UI primitives should own presentation mechanics, not product-domain
+  fetching or workspace/runtime state.
+- For dense repeated surfaces, prefer one shared controller/observer/portal over
+  N per-item ownership graphs when the expensive resource is mutually exclusive
+  or pane-scoped. A shared timer is not sufficient if it still triggers N
+  expensive computations.
+- Keep rows/triggers lightweight and publish intent/identity to the shared owner.
+- Shared UI packages must not import app/server sync hooks, provider catalogs, or
+  workspace/session runtime services to obtain display metadata. Accept compact
+  props or context from the owning app/domain layer instead.
+
 ## Localization
 
 - NEVER hardcode user-visible English strings in production code. ALWAYS use an i18n key for component defaults, visible copy, placeholders, accessible labels, tooltips, dialogs, toasts, empty states, and displayed errors.

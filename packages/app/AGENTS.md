@@ -3,6 +3,57 @@
 - Prioritise, in this order: stability, simplicity, performance.
 - Before changing session or timeline code, record a production benchmark baseline and compare it after the change.
 
+## Data ownership — dense UI consumes projections, it does not reconstruct the runtime
+
+For session lists, sidebars, tab strips, badges, usage/context indicators, model
+metadata, and other cross-session surfaces, start at the authoritative server/
+domain producer before writing component logic. Follow the root `AGENTS.md`
+bottom-up architecture rules.
+
+- Do **not** call `session.prefetch(...)` or hydrate message/part history solely
+  to compute row metadata, telemetry, cost, context pressure, model identity,
+  thinking/generating/tool state, or rates. Navigation/detail views may warm
+  history intentionally; decoration must not depend on it.
+- Prefer fields already materialized on `Session` rows or a compact server-owned
+  projection updated from execution lifecycle events. A row lookup should be
+  O(1), not a message/part scan.
+- Do not infer semantic phases by exclusion from rendered artifacts when the
+  lifecycle has an authoritative reasoning/text/tool/status transition.
+- One shared clock is acceptable for formatting elapsed wall time. It must not
+  wake N history scans every tick.
+- Prefer one batched snapshot and one shared event subscription over one request
+  or stream per rendered row/session.
+- Unscoped provider/config/session calls are suspicious. If an endpoint is
+  workspace-owned, pass the explicit directory/workspace. If the UI genuinely
+  needs global data, use/design a bootstrap-free global surface rather than
+  relying on server cwd fallback.
+- A scheduler lane, serialized hydration queue, hover delay, lazy import, or
+  viewport gate is defense in depth, not a justification for work that should
+  not exist. Remove the unnecessary producer before optimizing its admission.
+- Performance verification for active-session UI must exercise multiple
+  simultaneously working sessions. An idle first-paint trace does not cover the
+  selected/working code path.
+
+### Frontend anti-patterns from the instance-bootstrap incident
+
+- Treat `useProviders(() => undefined)`, `queryOptions.providers(null)`, and any
+  directory-less SDK/query call as an explicit global-ownership decision. Do not
+  add one from layout, session rows, sidebars, hidden tabs, context panels,
+  dialogs, or mounted-but-invisible components unless the corresponding server
+  route is proven bootstrap-free and the global semantics are documented.
+- Session/context/sidebar metrics such as thinking state, TPS, context pressure,
+  cache-hit ratio, token counts, generated/tool time, model identity, and cost
+  must come from materialized `Session` rows or the compact session telemetry
+  projection. They must not trigger `session.prefetch(...)`, message/part scans,
+  provider catalog hydration, or dynamic metric modules solely to decorate rows.
+- Hidden UI is not free UI. Keep-mounted tabs and panels may preserve local view
+  state, but they must not keep global provider queries, session-history
+  hydration, per-row timers, or transport subscriptions alive for data the user
+  is not actively viewing.
+- If a UI fix requires a new scalar, first add or reuse a server/domain
+  projection and consume it as O(1) data. Do not reconstruct semantic execution
+  state by exclusion from rendered artifacts.
+
 ## Debugging
 
 - NEVER try to restart the app, or the server process, EVER.

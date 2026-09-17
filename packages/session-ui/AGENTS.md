@@ -1,3 +1,17 @@
+## Data / runtime boundary
+
+- Session UI components are presentation consumers, not owners of server/runtime
+  state. Do not add network fetches, workspace bootstrap, or hidden history
+  hydration to a reusable UI component just to derive display metadata.
+- Prefer narrow props/context backed by materialized or incremental domain
+  projections. Do not repeatedly scan full message/part history on a timer for a
+  value that can be supplied as a scalar or compact live snapshot.
+- Keep token-rate rendering local to the actively rendered content that actually
+  changes. Cross-session summaries belong upstream, not in every session row.
+- Reusable session UI may render telemetry passed to it, but it must not create
+  provider queries, workspace bootstraps, global event streams, or session
+  history hydration to derive row/sidebar metadata on its own.
+
 ## Localization
 
 - NEVER hardcode user-visible English strings in production code. ALWAYS use an i18n key for visible copy, placeholders, accessible labels, tooltips, menus, dialogs, empty states, and displayed errors.

@@ -19,6 +19,47 @@ This tree is desktop + sidecar only. Ignore and prune: console, stats, enterpris
 
 If these conflict, stop. Do not silently pick one.
 
+The repository now has a real `../../AGENTS.md`. Its architecture/ownership,
+concurrency, closure, API-surface, and dirty-worktree rules are repository-wide;
+this handoff guide adds documentation-specific constraints.
+
+## Architecture and performance handoffs
+
+Handoffs and closeouts must preserve the causal architecture, not just a list of
+patches and green tests.
+
+Use `ARCHITECTURE-OWNERSHIP-PLAYBOOK.md` as the long-form guide when a handoff
+involves storage/runtime/server/client/UI ownership, implicit bootstrap,
+concurrency, dense UI projections, or closure methodology.
+
+- For cross-layer work, document the path bottom-up from authoritative
+  storage/producer -> service -> middleware/route -> transport -> client -> UI.
+  Starting from the visible component and finding the cheapest existing API is
+  not an architecture analysis.
+- State the ownership tier (0-3 from root `AGENTS.md`) for every new/changed
+  server surface that matters to the campaign.
+- If a fix merely throttles, defers, serializes, caches, or viewport-gates an
+  expensive operation, explicitly ask whether the operation should exist at all.
+  Do not call admission control an ownership fix.
+- Closeout claims may cover only the scenarios actually exercised. An idle
+  startup trace cannot close an active-session concurrency path; a timeline-only
+  browser run cannot close desktop chrome/sidebar/sidecar behavior.
+- Include negative invariants in the acceptance gates: e.g. zero implicit
+  workspace instances, zero metric-only history hydration, bounded listener
+  count, no N-per-row request/subscription multiplication, and convergent
+  teardown.
+- When later runtime evidence contradicts a prior closeout, mark the old
+  conclusion superseded/limited rather than trying to preserve it. Evidence has
+  precedence over campaign narrative.
+- Carry important architecture lessons into the relevant `AGENTS.md`; a handoff
+  document alone is not an enforcement surface for agents working elsewhere in
+  the tree.
+- Every performance/architecture handoff should include a short process audit:
+  what assumption let the wrong ownership survive, why earlier tests did not
+  catch it, which negative invariant would have caught it, and which `AGENTS.md`
+  files now enforce the lesson. If that section is missing, the next agent will
+  likely repeat the same local optimization loop.
+
 ## Skills
 
 | Trigger | Skill |
