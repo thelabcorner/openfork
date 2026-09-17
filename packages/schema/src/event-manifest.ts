@@ -26,6 +26,7 @@ import { SessionCompactionEvent } from "./session-compaction-event"
 import { SessionGroup } from "./session-group"
 import { SessionEvent } from "./session-event"
 import { SessionStatusEvent } from "./session-status-event"
+import { SessionTelemetry } from "./session-telemetry"
 import { SessionTodo } from "./session-todo"
 import { SessionV1 } from "./session-v1"
 import { ToolEvent } from "./tool-event"
@@ -80,6 +81,7 @@ export const Definitions = Event.inventory(
   ...LegacyEvent.Definitions,
   ...Project.Event.Definitions,
   ...SessionStatusEvent.Definitions,
+  SessionTelemetry.Updated,
   ...QuestionV1.Event.Definitions,
   ...SessionCompactionEvent.Definitions,
   ...VcsEvent.Definitions,

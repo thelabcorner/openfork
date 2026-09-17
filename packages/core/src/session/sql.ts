@@ -15,6 +15,7 @@ import type { SystemContext } from "../system-context/index"
 import { AgentV2 } from "../agent"
 import { isNull, sql } from "drizzle-orm"
 import type { Revert } from "@opencode-ai/schema/revert"
+import type { SessionGroup } from "@opencode-ai/schema/session-group"
 
 type SessionMessageData = Omit<(typeof SessionMessage.Message)["Encoded"], "type" | "id">
 type V1MessageData = Omit<SessionV1.Info, "id" | "sessionID">
@@ -150,7 +151,7 @@ export const SessionGroupMemberTable = sqliteTable(
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     locked: integer({ mode: "boolean" }).notNull().default(false),
-    origin: text().$type<"user" | "auto_subagent" | "plugin">().notNull().default("user"),
+    origin: text().$type<SessionGroup.MemberOrigin>().notNull().default("user"),
     origin_plugin: text(),
     origin_ref: text(),
     position: integer().notNull().default(0),
@@ -254,6 +255,37 @@ export const SessionMessageLifecycleTable = sqliteTable("session_message_lifecyc
     .references(() => SessionMessageTable.id, { onDelete: "cascade" }),
   streamed_at: integer(),
   settlement: text({ mode: "json" }).$type<SessionMessageSettlement>(),
+})
+
+// Compact, one-row-per-session observability snapshot. Live token/text deltas
+// never write this table; SessionTelemetry keeps those in memory and persists
+// only provider-step settlement. This gives cold sidebar/global UI O(1) access
+// to context/TPS timing metadata without decoding messages or creating a
+// location/instance runtime.
+export const SessionTelemetryTable = sqliteTable("session_telemetry", {
+  session_id: text()
+    .$type<SessionSchema.ID>()
+    .primaryKey()
+    .references(() => SessionTable.id, { onDelete: "cascade" }),
+  assistant_message_id: text().$type<SessionMessage.ID>(),
+  provider_id: text(),
+  model_id: text(),
+  model_name: text(),
+  variant: text(),
+  context_limit: integer(),
+  request_sent_at: integer(),
+  first_token_at: integer(),
+  streamed_at: integer(),
+  completed_at: integer(),
+  cost_usd: real(),
+  tokens_input: integer().notNull().default(0),
+  tokens_output: integer().notNull().default(0),
+  tokens_reasoning: integer().notNull().default(0),
+  tokens_cache_read: integer().notNull().default(0),
+  tokens_cache_write: integer().notNull().default(0),
+  generated_ms: integer().notNull().default(0),
+  tool_ms: integer().notNull().default(0),
+  updated_at: integer().notNull(),
 })
 
 // Tool progress/settlement payloads are already durable in EventV2. Do not

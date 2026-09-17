@@ -127,6 +127,18 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`goal_auditor_session\` (
+          \`parent_session_id\` text NOT NULL,
+          \`goal_id\` text NOT NULL,
+          \`auditor_session_id\` text NOT NULL,
+          \`time_created\` integer NOT NULL,
+          CONSTRAINT \`goal_auditor_session_pk\` PRIMARY KEY(\`parent_session_id\`, \`goal_id\`),
+          CONSTRAINT \`fk_goal_auditor_session_parent_session_id_session_id_fk\` FOREIGN KEY (\`parent_session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_goal_auditor_session_goal_id_goal_id_fk\` FOREIGN KEY (\`goal_id\`) REFERENCES \`goal\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_goal_auditor_session_auditor_session_id_session_id_fk\` FOREIGN KEY (\`auditor_session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`goal_automation\` (
           \`session_id\` text PRIMARY KEY,
           \`goal_id\` text NOT NULL,
@@ -603,6 +615,31 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`session_telemetry\` (
+          \`session_id\` text PRIMARY KEY,
+          \`assistant_message_id\` text,
+          \`provider_id\` text,
+          \`model_id\` text,
+          \`model_name\` text,
+          \`variant\` text,
+          \`context_limit\` integer,
+          \`request_sent_at\` integer,
+          \`first_token_at\` integer,
+          \`streamed_at\` integer,
+          \`completed_at\` integer,
+          \`cost_usd\` real,
+          \`tokens_input\` integer DEFAULT 0 NOT NULL,
+          \`tokens_output\` integer DEFAULT 0 NOT NULL,
+          \`tokens_reasoning\` integer DEFAULT 0 NOT NULL,
+          \`tokens_cache_read\` integer DEFAULT 0 NOT NULL,
+          \`tokens_cache_write\` integer DEFAULT 0 NOT NULL,
+          \`generated_ms\` integer DEFAULT 0 NOT NULL,
+          \`tool_ms\` integer DEFAULT 0 NOT NULL,
+          \`updated_at\` integer NOT NULL,
+          CONSTRAINT \`fk_session_telemetry_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`todo\` (
           \`session_id\` text NOT NULL,
           \`content\` text NOT NULL,
@@ -648,6 +685,28 @@ export default {
           \`time_completed\` integer NOT NULL
         );
       `)
+      yield* tx.run(`
+        CREATE TABLE \`usage_record\` (
+          \`message_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`provider_id\` text NOT NULL,
+          \`model_id\` text NOT NULL,
+          \`variant\` text,
+          \`agent\` text,
+          \`mode\` text,
+          \`created_at\` integer,
+          \`request_sent_at\` integer,
+          \`first_token_at\` integer,
+          \`streamed_at\` integer,
+          \`completed_at\` integer NOT NULL,
+          \`cost_usd\` real,
+          \`input_tokens\` integer DEFAULT 0 NOT NULL,
+          \`cache_read_tokens\` integer DEFAULT 0 NOT NULL,
+          \`cache_write_tokens\` integer DEFAULT 0 NOT NULL,
+          \`output_tokens\` integer DEFAULT 0 NOT NULL,
+          \`reasoning_tokens\` integer DEFAULT 0 NOT NULL
+        );
+      `)
       yield* tx.run(
         `CREATE INDEX \`event_payload_chunk_time_created_idx\` ON \`event_payload_chunk\` (\`time_created\`);`,
       )
@@ -657,6 +716,10 @@ export default {
       yield* tx.run(`CREATE UNIQUE INDEX \`event_aggregate_seq_idx\` ON \`event\` (\`aggregate_id\`,\`seq\`);`)
       yield* tx.run(`CREATE INDEX \`event_aggregate_type_seq_idx\` ON \`event\` (\`aggregate_id\`,\`type\`,\`seq\`);`)
       yield* tx.run(`CREATE UNIQUE INDEX \`event_value_agg_sha_idx\` ON \`event_value\` (\`aggregate_id\`,\`sha256\`);`)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`goal_auditor_session_session_idx\` ON \`goal_auditor_session\` (\`auditor_session_id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`goal_auditor_session_goal_idx\` ON \`goal_auditor_session\` (\`goal_id\`);`)
       yield* tx.run(`CREATE INDEX \`goal_automation_goal_idx\` ON \`goal_automation\` (\`goal_id\`);`)
       yield* tx.run(
         `CREATE UNIQUE INDEX \`goal_automation_reservation_idx\` ON \`goal_automation\` (\`reservation_id\`);`,
@@ -779,6 +842,13 @@ export default {
       )
       yield* tx.run(
         `CREATE INDEX \`maintenance_usage_agent_completed_idx\` ON \`maintenance_usage\` (\`agent\`,\`time_completed\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`usage_record_completed_idx\` ON \`usage_record\` (\`completed_at\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`usage_record_session_completed_idx\` ON \`usage_record\` (\`session_id\`,\`completed_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`usage_record_model_completed_idx\` ON \`usage_record\` (\`provider_id\`,\`model_id\`,\`completed_at\`);`,
       )
     })
   },

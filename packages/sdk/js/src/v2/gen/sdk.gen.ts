@@ -131,6 +131,9 @@ import type {
   GlobalResetLocalDataResponses,
   GlobalSessionRootsErrors,
   GlobalSessionRootsResponses,
+  GlobalSessionTelemetryErrors,
+  GlobalSessionTelemetryInput,
+  GlobalSessionTelemetryResponses,
   GlobalUpgradeErrors,
   GlobalUpgradeResponses,
   GoalAddEvidenceErrors,
@@ -157,6 +160,8 @@ import type {
   GoalGetResponses,
   GoalListErrors,
   GoalListResponses,
+  GoalPrepareErrors,
+  GoalPrepareResponses,
   GoalStepErrors,
   GoalStepResponses,
   GoalStepStatus,
@@ -235,6 +240,18 @@ import type {
   ProviderOauthAuthorizeResponses,
   ProviderOauthCallbackErrors,
   ProviderOauthCallbackResponses,
+  ProviderSettingsConnectKeyErrors,
+  ProviderSettingsConnectKeyResponses,
+  ProviderSettingsCredentialRemoveErrors,
+  ProviderSettingsCredentialRemoveResponses,
+  ProviderSettingsCredentialSelectErrors,
+  ProviderSettingsCredentialSelectResponses,
+  ProviderSettingsCredentialUpdateErrors,
+  ProviderSettingsCredentialUpdateResponses,
+  ProviderSettingsListErrors,
+  ProviderSettingsListResponses,
+  ProviderSettingsModelsErrors,
+  ProviderSettingsModelsResponses,
   PtyConnectErrors,
   PtyConnectResponses,
   PtyConnectTokenErrors,
@@ -408,6 +425,10 @@ import type {
   TuiShowToastResponses,
   TuiSubmitPromptErrors,
   TuiSubmitPromptResponses,
+  UsageModelProfileErrors,
+  UsageModelProfileResponses,
+  UsagePricingCatalogErrors,
+  UsagePricingCatalogResponses,
   UsageSummaryErrors,
   UsageSummaryResponses,
   V2AgentListErrors,
@@ -572,6 +593,8 @@ import type {
   V2SessionSwitchAgentResponses,
   V2SessionSwitchModelErrors,
   V2SessionSwitchModelResponses,
+  V2SessionTelemetryErrors,
+  V2SessionTelemetryResponses,
   V2SessionWaitErrors,
   V2SessionWaitResponses,
   V2SkillListErrors,
@@ -1938,6 +1961,34 @@ export class Global extends HeyApiClient {
   }
 
   /**
+   * Get compact session telemetry without instance bootstrap
+   *
+   * Read bounded live/settled session telemetry directly from global memory and durable telemetry storage. This endpoint never materializes directory config, plugins, providers, tools, or a workspace runtime.
+   */
+  public sessionTelemetry<ThrowOnError extends boolean = false>(
+    parameters?: {
+      globalSessionTelemetryInput?: GlobalSessionTelemetryInput
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ key: "globalSessionTelemetryInput", map: "body" }] }])
+    return (options?.client ?? this.client).post<
+      GlobalSessionTelemetryResponses,
+      GlobalSessionTelemetryErrors,
+      ThrowOnError
+    >({
+      url: "/global/session/telemetry",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
    * List projects without instance bootstrap
    *
    * List durable project metadata without materializing directory config, plugins, providers, or tools. Intended for startup navigation/catalog hydration.
@@ -2021,6 +2072,221 @@ export class Global extends HeyApiClient {
   private _preferences?: Preferences
   get preferences(): Preferences {
     return (this._preferences ??= new Preferences({ client: this.client }))
+  }
+}
+
+export class Credential2 extends HeyApiClient {
+  /**
+   * Remove a server-level provider credential
+   */
+  public remove<ThrowOnError extends boolean = false>(
+    parameters: {
+      credentialID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "credentialID" }] }])
+    return (options?.client ?? this.client).delete<
+      ProviderSettingsCredentialRemoveResponses,
+      ProviderSettingsCredentialRemoveErrors,
+      ThrowOnError
+    >({
+      url: "/provider-settings/credential/{credentialID}",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Rename a server-level provider credential
+   */
+  public update<ThrowOnError extends boolean = false>(
+    parameters: {
+      credentialID: string
+      label?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "credentialID" },
+            { in: "body", key: "label" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).patch<
+      ProviderSettingsCredentialUpdateResponses,
+      ProviderSettingsCredentialUpdateErrors,
+      ThrowOnError
+    >({
+      url: "/provider-settings/credential/{credentialID}",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * Select a server-level provider credential
+   */
+  public select<ThrowOnError extends boolean = false>(
+    parameters: {
+      credentialID: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "path", key: "credentialID" }] }])
+    return (options?.client ?? this.client).post<
+      ProviderSettingsCredentialSelectResponses,
+      ProviderSettingsCredentialSelectErrors,
+      ThrowOnError
+    >({
+      url: "/provider-settings/credential/{credentialID}/select",
+      ...options,
+      ...params,
+    })
+  }
+}
+
+export class ProviderSettings extends HeyApiClient {
+  /**
+   * List server-level providers without workspace bootstrap
+   *
+   * List provider identities and global connection state from Models.dev, global configuration, credentials, and environment variables. This endpoint never materializes a workspace instance or plugin runtime.
+   */
+  public list<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      ProviderSettingsListResponses,
+      ProviderSettingsListErrors,
+      ThrowOnError
+    >({ url: "/provider-settings", ...options })
+  }
+
+  /**
+   * Store a server-level provider key
+   *
+   * Store a provider API key in the process-global credential store without creating a workspace instance.
+   */
+  public connectKey<ThrowOnError extends boolean = false>(
+    parameters: {
+      providerID: string
+      key?: string
+      label?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "providerID" },
+            { in: "body", key: "key" },
+            { in: "body", key: "label" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<
+      ProviderSettingsConnectKeyResponses,
+      ProviderSettingsConnectKeyErrors,
+      ThrowOnError
+    >({
+      url: "/provider-settings/{providerID}/key",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
+   * List models for server-level connected providers
+   *
+   * Return only the model identity metadata required by server-level model visibility settings, without workspace/provider runtime bootstrap.
+   */
+  public models<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<
+      ProviderSettingsModelsResponses,
+      ProviderSettingsModelsErrors,
+      ThrowOnError
+    >({ url: "/provider-settings/models", ...options })
+  }
+
+  private _credential?: Credential2
+  get credential(): Credential2 {
+    return (this._credential ??= new Credential2({ client: this.client }))
+  }
+}
+
+export class Usage2 extends HeyApiClient {
+  /**
+   * Get global usage summary
+   *
+   * Aggregate token and cost usage across every session in the database, bucketed by provider, model, variant, project, and time.
+   */
+  public summary<ThrowOnError extends boolean = false>(
+    parameters: {
+      since: number
+      until: number
+      resolution: "hour" | "day"
+      projectID?: string
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "query", key: "since" },
+            { in: "query", key: "until" },
+            { in: "query", key: "resolution" },
+            { in: "query", key: "projectID" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).get<UsageSummaryResponses, UsageSummaryErrors, ThrowOnError>({
+      url: "/usage/summary",
+      ...options,
+      ...params,
+    })
+  }
+
+  /**
+   * Get personal model usage profile
+   *
+   * Return compact per-model cost and cache-hit aggregates from recent settled generations without hydrating session history.
+   */
+  public modelProfile<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<UsageModelProfileResponses, UsageModelProfileErrors, ThrowOnError>({
+      url: "/usage/model-profile",
+      ...options,
+    })
+  }
+
+  /**
+   * Get the global usage pricing catalog
+   *
+   * Return model display metadata and base rate cards for usage valuation without loading workspace provider configuration.
+   */
+  public pricingCatalog<ThrowOnError extends boolean = false>(options?: Options<never, ThrowOnError>) {
+    return (options?.client ?? this.client).get<UsagePricingCatalogResponses, UsagePricingCatalogErrors, ThrowOnError>({
+      url: "/usage/pricing-catalog",
+      ...options,
+    })
   }
 }
 
@@ -6037,7 +6303,7 @@ export class SessionGroup extends HeyApiClient {
       groupID: string
       sessionId?: string
       locked?: boolean
-      origin?: "user" | "auto_subagent" | "plugin"
+      origin?: "user" | "auto_subagent" | "goal_auditor" | "special_agent" | "plugin"
       originPlugin?: string
       originRef?: string
     },
@@ -6710,6 +6976,56 @@ export class Goal extends HeyApiClient {
       },
     })
   }
+
+  /**
+   * Create, focus, and optionally start a Goal for a Session
+   */
+  public prepare<ThrowOnError extends boolean = false>(
+    parameters: {
+      sessionID: string
+      title?: string
+      objective?: string
+      constraints?: Array<string>
+      criteria?: Array<string>
+      steps?: Array<{
+        title: string
+        description?: string
+      }>
+      continuationPolicy?: GoalContinuationPolicy
+      auditorPolicy?: GoalAuditorPolicy
+      start?: boolean
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams(
+      [parameters],
+      [
+        {
+          args: [
+            { in: "path", key: "sessionID" },
+            { in: "body", key: "title" },
+            { in: "body", key: "objective" },
+            { in: "body", key: "constraints" },
+            { in: "body", key: "criteria" },
+            { in: "body", key: "steps" },
+            { in: "body", key: "continuationPolicy" },
+            { in: "body", key: "auditorPolicy" },
+            { in: "body", key: "start" },
+          ],
+        },
+      ],
+    )
+    return (options?.client ?? this.client).post<GoalPrepareResponses, GoalPrepareErrors, ThrowOnError>({
+      url: "/session/{sessionID}/goal/prepare",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
 }
 
 export class History extends HeyApiClient {
@@ -7356,42 +7672,6 @@ export class Tui extends HeyApiClient {
   private _control?: Control
   get control(): Control {
     return (this._control ??= new Control({ client: this.client }))
-  }
-}
-
-export class Usage2 extends HeyApiClient {
-  /**
-   * Get global usage summary
-   *
-   * Aggregate token and cost usage across every session in the database, bucketed by provider, model, variant, project, and time.
-   */
-  public summary<ThrowOnError extends boolean = false>(
-    parameters: {
-      since: number
-      until: number
-      resolution: "hour" | "day"
-      projectID?: string
-    },
-    options?: Options<never, ThrowOnError>,
-  ) {
-    const params = buildClientParams(
-      [parameters],
-      [
-        {
-          args: [
-            { in: "query", key: "since" },
-            { in: "query", key: "until" },
-            { in: "query", key: "resolution" },
-            { in: "query", key: "projectID" },
-          ],
-        },
-      ],
-    )
-    return (options?.client ?? this.client).get<UsageSummaryResponses, UsageSummaryErrors, ThrowOnError>({
-      url: "/usage/summary",
-      ...options,
-      ...params,
-    })
   }
 }
 
@@ -8263,6 +8543,30 @@ export class Session3 extends HeyApiClient {
   }
 
   /**
+   * Get lightweight session telemetry
+   *
+   * Retrieve compact per-session runtime telemetry without loading message history or materializing a workspace/location runtime.
+   */
+  public telemetry<ThrowOnError extends boolean = false>(
+    parameters?: {
+      sessionIDs?: Array<string>
+    },
+    options?: Options<never, ThrowOnError>,
+  ) {
+    const params = buildClientParams([parameters], [{ args: [{ in: "body", key: "sessionIDs" }] }])
+    return (options?.client ?? this.client).post<V2SessionTelemetryResponses, V2SessionTelemetryErrors, ThrowOnError>({
+      url: "/api/session/telemetry",
+      ...options,
+      ...params,
+      headers: {
+        "Content-Type": "application/json",
+        ...options?.headers,
+        ...params.headers,
+      },
+    })
+  }
+
+  /**
    * Get session
    *
    * Retrieve a session by ID.
@@ -9068,7 +9372,7 @@ export class Integration extends HeyApiClient {
   }
 }
 
-export class Credential2 extends HeyApiClient {
+export class Credential3 extends HeyApiClient {
   /**
    * Remove credential
    *
@@ -10014,6 +10318,14 @@ export class Host extends HeyApiClient {
         supportsRecording: boolean
         cdp: boolean
         chrome?: true
+        visual?:
+          | true
+          | {
+              schemaVersion: 1
+              snapeyeProtocolVersion: 1
+              operations: Array<"capture" | "diff" | "record">
+              features?: Array<"history" | "artifact">
+            }
       }
       guest?: {
         attached: boolean
@@ -10298,9 +10610,9 @@ export class V2 extends HeyApiClient {
     return (this._integration ??= new Integration({ client: this.client }))
   }
 
-  private _credential?: Credential2
-  get credential(): Credential2 {
-    return (this._credential ??= new Credential2({ client: this.client }))
+  private _credential?: Credential3
+  get credential(): Credential3 {
+    return (this._credential ??= new Credential3({ client: this.client }))
   }
 
   private _usage?: Usage3
@@ -10395,6 +10707,16 @@ export class OpencodeClient extends HeyApiClient {
   private _global?: Global
   get global(): Global {
     return (this._global ??= new Global({ client: this.client }))
+  }
+
+  private _providerSettings?: ProviderSettings
+  get providerSettings(): ProviderSettings {
+    return (this._providerSettings ??= new ProviderSettings({ client: this.client }))
+  }
+
+  private _usage?: Usage2
+  get usage(): Usage2 {
+    return (this._usage ??= new Usage2({ client: this.client }))
   }
 
   private _event?: Event
@@ -10540,11 +10862,6 @@ export class OpencodeClient extends HeyApiClient {
   private _tui?: Tui
   get tui(): Tui {
     return (this._tui ??= new Tui({ client: this.client }))
-  }
-
-  private _usage?: Usage2
-  get usage(): Usage2 {
-    return (this._usage ??= new Usage2({ client: this.client }))
   }
 
   private _prompt?: Prompt

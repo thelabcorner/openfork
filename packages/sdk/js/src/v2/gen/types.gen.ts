@@ -95,6 +95,7 @@ export type Event =
   | EventProjectUpdated
   | EventSessionStatus
   | EventSessionIdle
+  | EventSessionTelemetryUpdated
   | EventQuestionAsked
   | EventQuestionReplied
   | EventQuestionRejected
@@ -1652,6 +1653,66 @@ export type GlobalEvent = {
       }
     | {
         id: string
+        type: "session.telemetry.updated"
+        properties: {
+          items: Array<{
+            sessionID: string
+            phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+            phaseStartedAt?: number
+            updatedAt: number
+            model?: {
+              providerID: string
+              modelID: string
+              name?: string
+              variant?: string
+              contextLimit?: number
+            }
+            context?: {
+              model: {
+                providerID: string
+                modelID: string
+                name?: string
+                variant?: string
+                contextLimit?: number
+              }
+              tokens: {
+                input: number
+                output: number
+                reasoning: number
+                cache: {
+                  read: number
+                  write: number
+                }
+              }
+            }
+            step?: {
+              assistantMessageID?: string
+              requestSentAt?: number
+              firstTokenAt?: number
+              streamedAt?: number
+              completedAt?: number
+              visibleChars: number
+              reasoningChars: number
+              generatedMs: number
+              toolMs: number
+              cost?: number
+              tokens?: {
+                input: number
+                output: number
+                reasoning: number
+                cache: {
+                  read: number
+                  write: number
+                }
+              }
+            }
+            generatedMs: number
+            toolMs: number
+          }>
+        }
+      }
+    | {
+        id: string
         type: "question.asked"
         properties: {
           id: string
@@ -1825,6 +1886,67 @@ export type GlobalEventInterestInput = {
 
 export type GlobalEventInterestResult = {
   updated: boolean
+}
+
+export type GlobalSessionTelemetryInput = {
+  sessions: Array<string>
+}
+
+export type GlobalSessionTelemetryResult = {
+  [key: string]: {
+    sessionID: string
+    phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+    phaseStartedAt?: number
+    updatedAt: number
+    model?: {
+      providerID: string
+      modelID: string
+      name?: string
+      variant?: string
+      contextLimit?: number
+    }
+    context?: {
+      model: {
+        providerID: string
+        modelID: string
+        name?: string
+        variant?: string
+        contextLimit?: number
+      }
+      tokens: {
+        input: number
+        output: number
+        reasoning: number
+        cache: {
+          read: number
+          write: number
+        }
+      }
+    }
+    step?: {
+      assistantMessageID?: string
+      requestSentAt?: number
+      firstTokenAt?: number
+      streamedAt?: number
+      completedAt?: number
+      visibleChars: number
+      reasoningChars: number
+      generatedMs: number
+      toolMs: number
+      cost?: number
+      tokens?: {
+        input: number
+        output: number
+        reasoning: number
+        cache: {
+          read: number
+          write: number
+        }
+      }
+    }
+    generatedMs: number
+    toolMs: number
+  }
 }
 
 export type Project = {
@@ -3624,6 +3746,7 @@ export type V2Event =
   | ProjectUpdated
   | SessionStatus2
   | SessionIdle
+  | SessionTelemetryUpdated
   | QuestionAsked
   | QuestionReplied2
   | QuestionRejected2
@@ -4668,6 +4791,20 @@ export type ConfigV2ExperimentalPolicy = {
   resource: string
 }
 
+export type ConnectionCredentialInfo = {
+  type: "credential"
+  id: string
+  label: string
+  active?: boolean
+}
+
+export type ConnectionEnvInfo = {
+  type: "env"
+  name: string
+}
+
+export type ConnectionInfo = ConnectionCredentialInfo | ConnectionEnvInfo
+
 export type DeviceInfo = {
   id: string
   name: string
@@ -4712,7 +4849,7 @@ export type SessionGroupMember = {
     archived?: number
   }
   locked: boolean
-  origin: "user" | "auto_subagent" | "plugin"
+  origin: "user" | "auto_subagent" | "goal_auditor" | "special_agent" | "plugin"
   originPlugin?: string
   originRef?: string
   position: number | "NaN" | "Infinity" | "-Infinity" | "Infinity" | "-Infinity" | "NaN"
@@ -4779,6 +4916,7 @@ export type GoalAuditEventType =
   | "step_updated"
   | "evidence_added"
   | "audited"
+  | "auditor_session_linked"
   | "focused"
   | "unfocused"
 
@@ -5964,20 +6102,6 @@ export type IntegrationEnvMethod = {
   names: Array<string>
 }
 
-export type ConnectionCredentialInfo = {
-  type: "credential"
-  id: string
-  label: string
-  active?: boolean
-}
-
-export type ConnectionEnvInfo = {
-  type: "env"
-  name: string
-}
-
-export type ConnectionInfo = ConnectionCredentialInfo | ConnectionEnvInfo
-
 export type IntegrationInfo = {
   id: string
   name: string
@@ -6474,7 +6598,7 @@ export type FileEdited = {
   }
 }
 
-export type GoalContinuationPolicy3 = {
+export type GoalContinuationPolicy4 = {
   mode: GoalAutomationMode
   maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
@@ -6482,7 +6606,7 @@ export type GoalContinuationPolicy3 = {
   tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
 }
 
-export type GoalAuditorPolicy3 = {
+export type GoalAuditorPolicy4 = {
   model?: ModelRef
   blockedThreshold?: number | "NaN" | "Infinity" | "-Infinity"
   maxAttempts?: number | "NaN" | "Infinity" | "-Infinity"
@@ -6497,8 +6621,8 @@ export type GoalInfo1 = {
   constraints: Array<string>
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity"
-  continuationPolicy: GoalContinuationPolicy3
-  auditorPolicy: GoalAuditorPolicy3
+  continuationPolicy: GoalContinuationPolicy4
+  auditorPolicy: GoalAuditorPolicy4
   blocker?: string
   time: {
     created: number
@@ -7215,6 +7339,76 @@ export type SessionIdle = {
   data: {
     sessionID: string
     reason?: "aborted"
+  }
+}
+
+export type SessionTelemetryUpdated = {
+  id: string
+  metadata?: {
+    [key: string]: unknown
+  }
+  type: "session.telemetry.updated"
+  durable?: {
+    aggregateID: string
+    seq: number
+    version: number
+  }
+  location?: LocationRef
+  data: {
+    items: Array<{
+      sessionID: string
+      phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+      phaseStartedAt?: number
+      updatedAt: number
+      model?: {
+        providerID: string
+        modelID: string
+        name?: string
+        variant?: string
+        contextLimit?: number
+      }
+      context?: {
+        model: {
+          providerID: string
+          modelID: string
+          name?: string
+          variant?: string
+          contextLimit?: number
+        }
+        tokens: {
+          input: number
+          output: number
+          reasoning: number
+          cache: {
+            read: number
+            write: number
+          }
+        }
+      }
+      step?: {
+        assistantMessageID?: string
+        requestSentAt?: number
+        firstTokenAt?: number
+        streamedAt?: number
+        completedAt?: number
+        visibleChars: number
+        reasoningChars: number
+        generatedMs: number
+        toolMs: number
+        cost?: number
+        tokens?: {
+          input: number
+          output: number
+          reasoning: number
+          cache: {
+            read: number
+            write: number
+          }
+        }
+      }
+      generatedMs: number
+      toolMs: number
+    }>
   }
 }
 
@@ -8135,7 +8329,7 @@ export type EventFileEdited = {
   }
 }
 
-export type GoalContinuationPolicy4 = {
+export type GoalContinuationPolicy5 = {
   mode: GoalAutomationMode
   maxConsecutiveTurns?: number | "NaN" | "Infinity" | "-Infinity"
   maxNoProgressTurns?: number | "NaN" | "Infinity" | "-Infinity"
@@ -8143,7 +8337,7 @@ export type GoalContinuationPolicy4 = {
   tokenBudget?: number | "NaN" | "Infinity" | "-Infinity"
 }
 
-export type GoalAuditorPolicy4 = {
+export type GoalAuditorPolicy5 = {
   model?: ModelRef
   blockedThreshold?: number | "NaN" | "Infinity" | "-Infinity"
   maxAttempts?: number | "NaN" | "Infinity" | "-Infinity"
@@ -8158,8 +8352,8 @@ export type GoalInfo2 = {
   constraints: Array<string>
   status: GoalStatus
   revision: number | "NaN" | "Infinity" | "-Infinity"
-  continuationPolicy: GoalContinuationPolicy4
-  auditorPolicy: GoalAuditorPolicy4
+  continuationPolicy: GoalContinuationPolicy5
+  auditorPolicy: GoalAuditorPolicy5
   blocker?: string
   time: {
     created: number
@@ -8506,6 +8700,67 @@ export type EventSessionIdle = {
   properties: {
     sessionID: string
     reason?: "aborted"
+  }
+}
+
+export type EventSessionTelemetryUpdated = {
+  id: string
+  type: "session.telemetry.updated"
+  properties: {
+    items: Array<{
+      sessionID: string
+      phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+      phaseStartedAt?: number
+      updatedAt: number
+      model?: {
+        providerID: string
+        modelID: string
+        name?: string
+        variant?: string
+        contextLimit?: number
+      }
+      context?: {
+        model: {
+          providerID: string
+          modelID: string
+          name?: string
+          variant?: string
+          contextLimit?: number
+        }
+        tokens: {
+          input: number
+          output: number
+          reasoning: number
+          cache: {
+            read: number
+            write: number
+          }
+        }
+      }
+      step?: {
+        assistantMessageID?: string
+        requestSentAt?: number
+        firstTokenAt?: number
+        streamedAt?: number
+        completedAt?: number
+        visibleChars: number
+        reasoningChars: number
+        generatedMs: number
+        toolMs: number
+        cost?: number
+        tokens?: {
+          input: number
+          output: number
+          reasoning: number
+          cache: {
+            read: number
+            write: number
+          }
+        }
+      }
+      generatedMs: number
+      toolMs: number
+    }>
   }
 }
 
@@ -9025,6 +9280,13 @@ export type GlobalHealthResponses = {
   200: {
     healthy: true
     version: string
+    path?: {
+      home: string
+      state: string
+      config: string
+      worktree: string
+      directory: string
+    }
   }
 }
 
@@ -9107,6 +9369,31 @@ export type GlobalSessionRootsResponses = {
 }
 
 export type GlobalSessionRootsResponse = GlobalSessionRootsResponses[keyof GlobalSessionRootsResponses]
+
+export type GlobalSessionTelemetryData = {
+  body?: GlobalSessionTelemetryInput
+  path?: never
+  query?: never
+  url: "/global/session/telemetry"
+}
+
+export type GlobalSessionTelemetryErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type GlobalSessionTelemetryError = GlobalSessionTelemetryErrors[keyof GlobalSessionTelemetryErrors]
+
+export type GlobalSessionTelemetryResponses = {
+  /**
+   * Compact session telemetry snapshots
+   */
+  200: GlobalSessionTelemetryResult
+}
+
+export type GlobalSessionTelemetryResponse = GlobalSessionTelemetryResponses[keyof GlobalSessionTelemetryResponses]
 
 export type GlobalProjectsData = {
   body?: never
@@ -9324,6 +9611,648 @@ export type GlobalUpgradeResponses = {
 }
 
 export type GlobalUpgradeResponse = GlobalUpgradeResponses[keyof GlobalUpgradeResponses]
+
+export type ProviderSettingsListData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/provider-settings"
+}
+
+export type ProviderSettingsListErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderSettingsListError = ProviderSettingsListErrors[keyof ProviderSettingsListErrors]
+
+export type ProviderSettingsListResponses = {
+  /**
+   * Global provider settings catalog
+   */
+  200: {
+    providers: Array<{
+      id: string
+      name: string
+      source: "env" | "api" | "config" | "custom"
+      connected: boolean
+      hasPaidModels: boolean
+      connections: Array<ConnectionInfo>
+    }>
+  }
+}
+
+export type ProviderSettingsListResponse = ProviderSettingsListResponses[keyof ProviderSettingsListResponses]
+
+export type ProviderSettingsConnectKeyData = {
+  body?: {
+    key: string
+    label?: string
+  }
+  path: {
+    providerID: string
+  }
+  query?: never
+  url: "/provider-settings/{providerID}/key"
+}
+
+export type ProviderSettingsConnectKeyErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderSettingsConnectKeyError = ProviderSettingsConnectKeyErrors[keyof ProviderSettingsConnectKeyErrors]
+
+export type ProviderSettingsConnectKeyResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type ProviderSettingsConnectKeyResponse =
+  ProviderSettingsConnectKeyResponses[keyof ProviderSettingsConnectKeyResponses]
+
+export type ProviderSettingsModelsData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/provider-settings/models"
+}
+
+export type ProviderSettingsModelsErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderSettingsModelsError = ProviderSettingsModelsErrors[keyof ProviderSettingsModelsErrors]
+
+export type ProviderSettingsModelsResponses = {
+  /**
+   * Server-level connected model catalog
+   */
+  200: {
+    models: Array<{
+      providerID: string
+      providerName: string
+      modelID: string
+      name: string
+      family?: string
+      releaseDate: string
+    }>
+  }
+}
+
+export type ProviderSettingsModelsResponse = ProviderSettingsModelsResponses[keyof ProviderSettingsModelsResponses]
+
+export type ProviderSettingsCredentialRemoveData = {
+  body?: never
+  path: {
+    credentialID: string
+  }
+  query?: never
+  url: "/provider-settings/credential/{credentialID}"
+}
+
+export type ProviderSettingsCredentialRemoveErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderSettingsCredentialRemoveError =
+  ProviderSettingsCredentialRemoveErrors[keyof ProviderSettingsCredentialRemoveErrors]
+
+export type ProviderSettingsCredentialRemoveResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type ProviderSettingsCredentialRemoveResponse =
+  ProviderSettingsCredentialRemoveResponses[keyof ProviderSettingsCredentialRemoveResponses]
+
+export type ProviderSettingsCredentialUpdateData = {
+  body?: {
+    label: string
+  }
+  path: {
+    credentialID: string
+  }
+  query?: never
+  url: "/provider-settings/credential/{credentialID}"
+}
+
+export type ProviderSettingsCredentialUpdateErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderSettingsCredentialUpdateError =
+  ProviderSettingsCredentialUpdateErrors[keyof ProviderSettingsCredentialUpdateErrors]
+
+export type ProviderSettingsCredentialUpdateResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type ProviderSettingsCredentialUpdateResponse =
+  ProviderSettingsCredentialUpdateResponses[keyof ProviderSettingsCredentialUpdateResponses]
+
+export type ProviderSettingsCredentialSelectData = {
+  body?: never
+  path: {
+    credentialID: string
+  }
+  query?: never
+  url: "/provider-settings/credential/{credentialID}/select"
+}
+
+export type ProviderSettingsCredentialSelectErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type ProviderSettingsCredentialSelectError =
+  ProviderSettingsCredentialSelectErrors[keyof ProviderSettingsCredentialSelectErrors]
+
+export type ProviderSettingsCredentialSelectResponses = {
+  /**
+   * <No Content>
+   */
+  204: void
+}
+
+export type ProviderSettingsCredentialSelectResponse =
+  ProviderSettingsCredentialSelectResponses[keyof ProviderSettingsCredentialSelectResponses]
+
+export type UsageSummaryData = {
+  body?: never
+  path?: never
+  query: {
+    since: number
+    until: number
+    resolution: "hour" | "day"
+    projectID?: string
+  }
+  url: "/usage/summary"
+}
+
+export type UsageSummaryErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type UsageSummaryError = UsageSummaryErrors[keyof UsageSummaryErrors]
+
+export type UsageSummaryResponses = {
+  /**
+   * Global usage summary
+   */
+  200: {
+    since: number
+    until: number
+    resolution: "hour" | "day"
+    projectID: string
+    totals: {
+      sessions: number
+      messages: number
+      cost: number
+      estimatedCost: number
+      pricedRecords: number
+      unpricedRecords: number
+      tokens: {
+        input: number
+        cacheRead: number
+        cacheWrite: number
+        output: number
+        reasoning: number
+      }
+      durationMs: number
+      durationRecords: number
+      ttftMs: number
+      ttftRecords: number
+    }
+    rates: {
+      tokensPerSecond: number
+      avgTokensPerTurn: number
+      avgCostPerTurn: number
+      cacheHitRate: number
+      cacheSavings: number
+      cacheSavingsCoverage: number
+    }
+    mostUsedModel: {
+      providerID: string
+      modelID: string
+      variant: string
+      messages: number
+      cost: number
+      share: number
+    }
+    providers: Array<{
+      providerID: string
+      messages: number
+      sessions: number
+      cost: number
+      estimatedCost: number
+      unpricedRecords: number
+      tokens: {
+        input: number
+        cacheRead: number
+        cacheWrite: number
+        output: number
+        reasoning: number
+      }
+      share: number
+      durationMs: number
+      durationRecords: number
+      generationMs: number
+      generationRecords: number
+    }>
+    models: Array<{
+      providerID: string
+      modelID: string
+      variant: string
+      messages: number
+      cost: number
+      estimatedCost: number
+      unpricedRecords: number
+      tokens: {
+        input: number
+        cacheRead: number
+        cacheWrite: number
+        output: number
+        reasoning: number
+      }
+      share: number
+      cacheSavings: number
+      durationMs: number
+      durationRecords: number
+      generationMs: number
+      generationRecords: number
+    }>
+    variants: Array<{
+      variant: string
+      messages: number
+      cost: number
+      share: number
+    }>
+    projects: Array<{
+      projectID: string
+      name: string
+      sessions: number
+      messages: number
+      cost: number
+      tokens: number
+    }>
+    periods: Array<{
+      start: number
+      cost: number
+      tokens: number
+      messages: number
+    }>
+    days: Array<{
+      start: number
+      cost: number
+      tokens: number
+      messages: number
+      sessions: number
+    }>
+    dow: [
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+    ]
+    providerSeries: Array<{
+      key: string
+      cost: Array<number>
+      tokens: Array<number>
+      messages: Array<number>
+    }>
+    modelSeries: Array<{
+      key: string
+      cost: Array<number>
+      tokens: Array<number>
+      messages: Array<number>
+    }>
+    punchcard: Array<{
+      cost: number
+      tokens: number
+      messages: number
+    }>
+    sessions: Array<{
+      sessionID: string
+      title: string
+      projectID: string
+      projectName: string
+      messages: number
+      cost: number
+      tokens: number
+      models: number
+      start: number
+      end: number
+    }>
+    hours: [
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+      {
+        cost: number
+        tokens: number
+        messages: number
+      },
+    ]
+    pricing: {
+      coverage: number
+      mode: "recorded" | "estimated" | "mixed" | "unpriced"
+    }
+    maintenance: {
+      totals: {
+        requests: number
+        sessions: number
+        cost: number
+        estimatedCost: number
+        pricedRecords: number
+        estimatedRecords: number
+        unpricedRecords: number
+        tokens: {
+          input: number
+          cacheRead: number
+          cacheWrite: number
+          output: number
+          reasoning: number
+        }
+        totalTokens: number
+        durationMs: number
+        durationRecords: number
+      }
+      agents: Array<{
+        agent: string
+        requests: number
+        sessions: number
+        models: number
+        cost: number
+        estimatedCost: number
+        totalTokens: number
+        tokenShare: number
+        costShare: number
+      }>
+      models: Array<{
+        agent: string
+        providerID: string
+        modelID: string
+        variant: string
+        requests: number
+        cost: number
+        estimatedCost: number
+        totalTokens: number
+      }>
+      periods: Array<{
+        start: number
+        requests: number
+        cost: number
+        tokens: number
+      }>
+    }
+  }
+}
+
+export type UsageSummaryResponse = UsageSummaryResponses[keyof UsageSummaryResponses]
+
+export type UsageModelProfileData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/usage/model-profile"
+}
+
+export type UsageModelProfileErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type UsageModelProfileError = UsageModelProfileErrors[keyof UsageModelProfileErrors]
+
+export type UsageModelProfileResponses = {
+  /**
+   * Personal model usage profile
+   */
+  200: {
+    models: Array<{
+      providerID: string
+      modelID: string
+      costSamples: number
+      averageCost: number
+      cacheSamples: number
+      cacheHitRate: number
+    }>
+  }
+}
+
+export type UsageModelProfileResponse = UsageModelProfileResponses[keyof UsageModelProfileResponses]
+
+export type UsagePricingCatalogData = {
+  body?: never
+  path?: never
+  query?: never
+  url: "/usage/pricing-catalog"
+}
+
+export type UsagePricingCatalogErrors = {
+  /**
+   * Bad request
+   */
+  400: BadRequestError
+}
+
+export type UsagePricingCatalogError = UsagePricingCatalogErrors[keyof UsagePricingCatalogErrors]
+
+export type UsagePricingCatalogResponses = {
+  /**
+   * Global usage pricing catalog
+   */
+  200: {
+    models: Array<{
+      providerID: string
+      providerName: string
+      modelID: string
+      name: string
+      family?: string
+      cost: {
+        input: number
+        output: number
+        cache: {
+          read: number
+          write: number
+        }
+      }
+    }>
+  }
+}
+
+export type UsagePricingCatalogResponse = UsagePricingCatalogResponses[keyof UsagePricingCatalogResponses]
 
 export type EventSubscribeData = {
   body?: never
@@ -13576,7 +14505,7 @@ export type SessionGroupAddSessionData = {
   body?: {
     sessionId: string
     locked?: boolean
-    origin?: "user" | "auto_subagent" | "plugin"
+    origin?: "user" | "auto_subagent" | "goal_auditor" | "special_agent" | "plugin"
     originPlugin?: string
     originRef?: string
   }
@@ -14355,6 +15284,56 @@ export type GoalFocusResponses = {
 
 export type GoalFocusResponse = GoalFocusResponses[keyof GoalFocusResponses]
 
+export type GoalPrepareData = {
+  body?: {
+    title: string
+    objective: string
+    constraints?: Array<string>
+    criteria?: Array<string>
+    steps?: Array<{
+      title: string
+      description?: string
+    }>
+    continuationPolicy?: GoalContinuationPolicy
+    auditorPolicy?: GoalAuditorPolicy
+    start?: boolean
+  }
+  path: {
+    sessionID: string
+  }
+  query?: never
+  url: "/session/{sessionID}/goal/prepare"
+}
+
+export type GoalPrepareErrors = {
+  /**
+   * BadRequest | InvalidRequestError
+   */
+  400: EffectHttpApiErrorBadRequest | InvalidRequestError
+  /**
+   * NotFoundError
+   */
+  404: NotFoundError
+  /**
+   * ConflictError
+   */
+  409: ConflictError
+}
+
+export type GoalPrepareError = GoalPrepareErrors[keyof GoalPrepareErrors]
+
+export type GoalPrepareResponses = {
+  /**
+   * Prepared focused Goal
+   */
+  200: {
+    focus: GoalFocus
+    detail: GoalDetail
+  }
+}
+
+export type GoalPrepareResponse = GoalPrepareResponses[keyof GoalPrepareResponses]
+
 export type SyncCapabilitiesData = {
   body?: never
   path?: never
@@ -14965,381 +15944,6 @@ export type TuiControlResponseResponses = {
 }
 
 export type TuiControlResponseResponse = TuiControlResponseResponses[keyof TuiControlResponseResponses]
-
-export type UsageSummaryData = {
-  body?: never
-  path?: never
-  query: {
-    since: number
-    until: number
-    resolution: "hour" | "day"
-    projectID?: string
-  }
-  url: "/usage/summary"
-}
-
-export type UsageSummaryErrors = {
-  /**
-   * Bad request
-   */
-  400: BadRequestError
-}
-
-export type UsageSummaryError = UsageSummaryErrors[keyof UsageSummaryErrors]
-
-export type UsageSummaryResponses = {
-  /**
-   * Global usage summary
-   */
-  200: {
-    since: number
-    until: number
-    resolution: "hour" | "day"
-    projectID: string
-    totals: {
-      sessions: number
-      messages: number
-      cost: number
-      estimatedCost: number
-      pricedRecords: number
-      unpricedRecords: number
-      tokens: {
-        input: number
-        cacheRead: number
-        cacheWrite: number
-        output: number
-        reasoning: number
-      }
-      durationMs: number
-      durationRecords: number
-      ttftMs: number
-      ttftRecords: number
-    }
-    rates: {
-      tokensPerSecond: number
-      avgTokensPerTurn: number
-      avgCostPerTurn: number
-      cacheHitRate: number
-      cacheSavings: number
-      cacheSavingsCoverage: number
-    }
-    mostUsedModel: {
-      providerID: string
-      modelID: string
-      variant: string
-      messages: number
-      cost: number
-      share: number
-    }
-    providers: Array<{
-      providerID: string
-      messages: number
-      sessions: number
-      cost: number
-      estimatedCost: number
-      unpricedRecords: number
-      tokens: {
-        input: number
-        cacheRead: number
-        cacheWrite: number
-        output: number
-        reasoning: number
-      }
-      share: number
-      durationMs: number
-      durationRecords: number
-    }>
-    models: Array<{
-      providerID: string
-      modelID: string
-      variant: string
-      messages: number
-      cost: number
-      estimatedCost: number
-      unpricedRecords: number
-      tokens: {
-        input: number
-        cacheRead: number
-        cacheWrite: number
-        output: number
-        reasoning: number
-      }
-      share: number
-      cacheSavings: number
-      durationMs: number
-      durationRecords: number
-    }>
-    variants: Array<{
-      variant: string
-      messages: number
-      cost: number
-      share: number
-    }>
-    projects: Array<{
-      projectID: string
-      name: string
-      sessions: number
-      messages: number
-      cost: number
-      tokens: number
-    }>
-    periods: Array<{
-      start: number
-      cost: number
-      tokens: number
-      messages: number
-    }>
-    days: Array<{
-      start: number
-      cost: number
-      tokens: number
-      messages: number
-      sessions: number
-    }>
-    dow: [
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-    ]
-    providerSeries: Array<{
-      key: string
-      cost: Array<number>
-      tokens: Array<number>
-      messages: Array<number>
-    }>
-    modelSeries: Array<{
-      key: string
-      cost: Array<number>
-      tokens: Array<number>
-      messages: Array<number>
-    }>
-    punchcard: Array<{
-      cost: number
-      tokens: number
-      messages: number
-    }>
-    sessions: Array<{
-      sessionID: string
-      title: string
-      projectID: string
-      projectName: string
-      messages: number
-      cost: number
-      tokens: number
-      models: number
-      start: number
-      end: number
-    }>
-    hours: [
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-      {
-        cost: number
-        tokens: number
-        messages: number
-      },
-    ]
-    pricing: {
-      coverage: number
-      mode: "recorded" | "estimated" | "mixed" | "unpriced"
-    }
-    maintenance: {
-      totals: {
-        requests: number
-        sessions: number
-        cost: number
-        estimatedCost: number
-        pricedRecords: number
-        estimatedRecords: number
-        unpricedRecords: number
-        tokens: {
-          input: number
-          cacheRead: number
-          cacheWrite: number
-          output: number
-          reasoning: number
-        }
-        totalTokens: number
-        durationMs: number
-        durationRecords: number
-      }
-      agents: Array<{
-        agent: string
-        requests: number
-        sessions: number
-        models: number
-        cost: number
-        estimatedCost: number
-        totalTokens: number
-        tokenShare: number
-        costShare: number
-      }>
-      models: Array<{
-        agent: string
-        providerID: string
-        modelID: string
-        variant: string
-        requests: number
-        cost: number
-        estimatedCost: number
-        totalTokens: number
-      }>
-      periods: Array<{
-        start: number
-        requests: number
-        cost: number
-        tokens: number
-      }>
-    }
-  }
-}
-
-export type UsageSummaryResponse = UsageSummaryResponses[keyof UsageSummaryResponses]
 
 export type ExperimentalWorkspaceAdapterListData = {
   body?: never
@@ -15970,6 +16574,96 @@ export type V2SessionActiveResponses = {
 }
 
 export type V2SessionActiveResponse = V2SessionActiveResponses[keyof V2SessionActiveResponses]
+
+export type V2SessionTelemetryData = {
+  body: {
+    sessionIDs: Array<string>
+  }
+  path?: never
+  query?: never
+  url: "/api/session/telemetry"
+}
+
+export type V2SessionTelemetryErrors = {
+  /**
+   * InvalidRequestError
+   */
+  400: InvalidRequestError
+  /**
+   * UnauthorizedError
+   */
+  401: UnauthorizedError
+}
+
+export type V2SessionTelemetryError = V2SessionTelemetryErrors[keyof V2SessionTelemetryErrors]
+
+export type V2SessionTelemetryResponses = {
+  /**
+   * Success
+   */
+  200: {
+    data: {
+      [key: string]:
+        | unknown
+        | {
+            sessionID: unknown
+            phase: "idle" | "requesting" | "reasoning" | "generating" | "tool" | "retrying"
+            phaseStartedAt?: number | null
+            updatedAt: number
+            model?: {
+              providerID: string
+              modelID: string
+              name?: string | null
+              variant?: string | null
+              contextLimit?: number | null
+            } | null
+            context?: {
+              model: {
+                providerID: string
+                modelID: string
+                name?: string | null
+                variant?: string | null
+                contextLimit?: number | null
+              }
+              tokens: {
+                input: number
+                output: number
+                reasoning: number
+                cache: {
+                  read: number
+                  write: number
+                }
+              }
+            } | null
+            step?: {
+              assistantMessageID?: string | null
+              requestSentAt?: number | null
+              firstTokenAt?: number | null
+              streamedAt?: number | null
+              completedAt?: number | null
+              visibleChars: number
+              reasoningChars: number
+              generatedMs: number
+              toolMs: number
+              cost?: number | null
+              tokens?: {
+                input: number
+                output: number
+                reasoning: number
+                cache: {
+                  read: number
+                  write: number
+                }
+              } | null
+            } | null
+            generatedMs: number
+            toolMs: number
+          }
+    }
+  }
+}
+
+export type V2SessionTelemetryResponse = V2SessionTelemetryResponses[keyof V2SessionTelemetryResponses]
 
 export type V2SessionGetData = {
   body?: never
@@ -18739,6 +19433,14 @@ export type V2BrowserHostHelloData = {
       supportsRecording: boolean
       cdp: boolean
       chrome?: true
+      visual?:
+        | true
+        | {
+            schemaVersion: 1
+            snapeyeProtocolVersion: 1
+            operations: Array<"capture" | "diff" | "record">
+            features?: Array<"history" | "artifact">
+          }
     }
     guest: {
       attached: boolean
@@ -18891,6 +19593,14 @@ export type V2BrowserHostsResponses = {
         supportsRecording: boolean
         cdp: boolean
         chrome?: true
+        visual?:
+          | true
+          | {
+              schemaVersion: 1
+              snapeyeProtocolVersion: 1
+              operations: Array<"capture" | "diff" | "record">
+              features?: Array<"history" | "artifact">
+            }
       }
       guest: {
         attached: boolean

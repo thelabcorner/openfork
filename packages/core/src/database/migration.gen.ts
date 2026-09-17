@@ -64,5 +64,10 @@ export const migrations = (
     import("./migration/20260913235645_event_payload_meta"),
     import("./migration/20260914162730_session_root_startup_index"),
     import("./migration/20260914183600_session_directory_root_created_index"),
+    import("./migration/20260916025456_session_telemetry"),
+    import("./migration/20260916031203_session_telemetry_records"),
+    import("./migration/20260916032430_usage_records"),
+    import("./migration/20260916033126_session_telemetry_model_name"),
+    import("./migration/20260916221336_goal_auditor_session"),
   ])
 ).map((module) => module.default) satisfies DatabaseMigration.Migration[]

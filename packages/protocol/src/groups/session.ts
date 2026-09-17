@@ -24,6 +24,7 @@ import { Model } from "@opencode-ai/schema/model"
 import { Location } from "@opencode-ai/schema/location"
 import { Revert } from "@opencode-ai/schema/revert"
 import { SessionEvent } from "@opencode-ai/schema/session-event"
+import { SessionTelemetry } from "@opencode-ai/schema/session-telemetry"
 
 const CheckpointKind = Schema.Literals(["baseline", "turn", "manual", "pre-revert"])
 const CheckpointStatus = Schema.Literals(["capturing", "ready", "partial", "error", "aborted"])
@@ -273,6 +274,20 @@ export const makeSessionGroup = <I extends HttpApiMiddleware.AnyId, S>(sessionLo
           summary: "List active sessions",
           description:
             "Retrieve active sessions: foreground drains currently owned by this OpenCode process (type: running) and durable-paused sessions (type: paused). Sessions absent from the result are inactive.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.post("session.telemetry", "/api/session/telemetry", {
+        payload: Schema.Struct({ sessionIDs: Schema.Array(Session.ID) }),
+        success: Schema.Struct({ data: Schema.Record(Session.ID, SessionTelemetry.Info) }),
+        error: InvalidRequestError,
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "v2.session.telemetry",
+          summary: "Get lightweight session telemetry",
+          description:
+            "Retrieve compact per-session runtime telemetry without loading message history or materializing a workspace/location runtime.",
         }),
       ),
     )

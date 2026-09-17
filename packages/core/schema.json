@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "645ba5ee-4c4c-4e7f-b2ff-6e9c87b9ffac",
+  "id": "5b424cea-b4f6-40bd-8631-e3cd625e23d2",
   "prevIds": [
-    "b3e906b5-ed7c-45e9-9663-84796a3f908b"
+    "e86210e7-42bd-4312-90bf-92901fb8b0b3"
   ],
   "ddl": [
     {
@@ -52,6 +52,10 @@
     },
     {
       "name": "event_value",
+      "entityType": "tables"
+    },
+    {
+      "name": "goal_auditor_session",
       "entityType": "tables"
     },
     {
@@ -191,6 +195,10 @@
       "entityType": "tables"
     },
     {
+      "name": "session_telemetry",
+      "entityType": "tables"
+    },
+    {
       "name": "todo",
       "entityType": "tables"
     },
@@ -200,6 +208,10 @@
     },
     {
       "name": "maintenance_usage",
+      "entityType": "tables"
+    },
+    {
+      "name": "usage_record",
       "entityType": "tables"
     },
     {
@@ -881,6 +893,46 @@
       "name": "time_promoted",
       "entityType": "columns",
       "table": "event_value"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "parent_session_id",
+      "entityType": "columns",
+      "table": "goal_auditor_session"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "goal_id",
+      "entityType": "columns",
+      "table": "goal_auditor_session"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "auditor_session_id",
+      "entityType": "columns",
+      "table": "goal_auditor_session"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "goal_auditor_session"
     },
     {
       "type": "text",
@@ -3944,6 +3996,206 @@
     },
     {
       "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "assistant_message_id",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provider_id",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "model_id",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "model_name",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "variant",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "context_limit",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "request_sent_at",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "first_token_at",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "streamed_at",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "completed_at",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "real",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "cost_usd",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "tokens_input",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "tokens_output",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "tokens_reasoning",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "tokens_cache_read",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "tokens_cache_write",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "generated_ms",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "tool_ms",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "updated_at",
+      "entityType": "columns",
+      "table": "session_telemetry"
+    },
+    {
+      "type": "text",
       "notNull": true,
       "autoincrement": false,
       "default": null,
@@ -4253,6 +4505,186 @@
       "table": "maintenance_usage"
     },
     {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provider_id",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "model_id",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "variant",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "agent",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "mode",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_at",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "request_sent_at",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "first_token_at",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "streamed_at",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "completed_at",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "real",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "cost_usd",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "input_tokens",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "cache_read_tokens",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "cache_write_tokens",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "output_tokens",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "reasoning_tokens",
+      "entityType": "columns",
+      "table": "usage_record"
+    },
+    {
       "columns": [
         "project_id"
       ],
@@ -4296,6 +4728,51 @@
       "name": "fk_event_aggregate_id_event_sequence_aggregate_id_fk",
       "entityType": "fks",
       "table": "event"
+    },
+    {
+      "columns": [
+        "parent_session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_goal_auditor_session_parent_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "goal_auditor_session"
+    },
+    {
+      "columns": [
+        "goal_id"
+      ],
+      "tableTo": "goal",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_goal_auditor_session_goal_id_goal_id_fk",
+      "entityType": "fks",
+      "table": "goal_auditor_session"
+    },
+    {
+      "columns": [
+        "auditor_session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_goal_auditor_session_auditor_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "goal_auditor_session"
     },
     {
       "columns": [
@@ -4758,6 +5235,21 @@
       "onUpdate": "NO ACTION",
       "onDelete": "CASCADE",
       "nameExplicit": false,
+      "name": "fk_session_telemetry_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_telemetry"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
       "name": "fk_todo_session_id_session_id_fk",
       "entityType": "fks",
       "table": "todo"
@@ -4806,6 +5298,16 @@
       "name": "event_value_pk",
       "entityType": "pks",
       "table": "event_value"
+    },
+    {
+      "columns": [
+        "parent_session_id",
+        "goal_id"
+      ],
+      "nameExplicit": false,
+      "name": "goal_auditor_session_pk",
+      "entityType": "pks",
+      "table": "goal_auditor_session"
     },
     {
       "columns": [
@@ -5213,6 +5715,15 @@
         "session_id"
       ],
       "nameExplicit": false,
+      "name": "session_telemetry_pk",
+      "table": "session_telemetry",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
       "name": "session_share_pk",
       "table": "session_share",
       "entityType": "pks"
@@ -5224,6 +5735,15 @@
       "nameExplicit": false,
       "name": "maintenance_usage_pk",
       "table": "maintenance_usage",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "message_id"
+      ],
+      "nameExplicit": false,
+      "name": "usage_record_pk",
+      "table": "usage_record",
       "entityType": "pks"
     },
     {
@@ -5315,6 +5835,34 @@
       "name": "event_value_agg_sha_idx",
       "entityType": "indexes",
       "table": "event_value"
+    },
+    {
+      "columns": [
+        {
+          "value": "auditor_session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "goal_auditor_session_session_idx",
+      "entityType": "indexes",
+      "table": "goal_auditor_session"
+    },
+    {
+      "columns": [
+        {
+          "value": "goal_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "goal_auditor_session_goal_idx",
+      "entityType": "indexes",
+      "table": "goal_auditor_session"
     },
     {
       "columns": [
@@ -6301,6 +6849,28 @@
     {
       "columns": [
         {
+          "value": "directory",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "(\"session\".\"parent_id\" is null)",
+      "origin": "manual",
+      "name": "session_directory_root_created_id_idx",
+      "entityType": "indexes",
+      "table": "session"
+    },
+    {
+      "columns": [
+        {
           "value": "workspace_id",
           "isExpression": false
         }
@@ -6403,6 +6973,60 @@
       "name": "maintenance_usage_agent_completed_idx",
       "entityType": "indexes",
       "table": "maintenance_usage"
+    },
+    {
+      "columns": [
+        {
+          "value": "completed_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "usage_record_completed_idx",
+      "entityType": "indexes",
+      "table": "usage_record"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "completed_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "usage_record_session_completed_idx",
+      "entityType": "indexes",
+      "table": "usage_record"
+    },
+    {
+      "columns": [
+        {
+          "value": "provider_id",
+          "isExpression": false
+        },
+        {
+          "value": "model_id",
+          "isExpression": false
+        },
+        {
+          "value": "completed_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "usage_record_model_completed_idx",
+      "entityType": "indexes",
+      "table": "usage_record"
     },
     {
       "columns": [

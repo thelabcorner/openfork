@@ -351,6 +351,58 @@ describe("EventV2", () => {
     }),
   )
 
+  it.effect("routes directory listeners across workspaces without process-global fanout", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const directoryA = AbsolutePath.make("project-a")
+      const directoryB = AbsolutePath.make("project-b")
+      const locationA1 = { directory: directoryA, workspaceID: WorkspaceV2.ID.make("wrk_a1") }
+      const locationA2 = { directory: directoryA, workspaceID: WorkspaceV2.ID.make("wrk_a2") }
+      const locationB = { directory: directoryB, workspaceID: WorkspaceV2.ID.make("wrk_b") }
+      const typed = new Array<string>()
+      const all = new Array<string>()
+
+      const unsubscribeTyped = yield* events.listenDirectory(Message, directoryA, (event) =>
+        Effect.sync(() => typed.push(event.data.text)),
+      )
+      const unsubscribeAll = yield* events.listenDirectoryAll(directoryA, (event) =>
+        Effect.sync(() => all.push(`${event.type}:${(event.data as { text: string }).text}`)),
+      )
+
+      yield* events.publish(Message, { text: "workspace-one" }, { location: locationA1 })
+      yield* events.publish(Message, { text: "workspace-two" }, { location: locationA2 })
+      yield* events.publish(GlobalMessage, { text: "other-type" }, { location: locationA1 })
+      yield* events.publish(Message, { text: "other-directory" }, { location: locationB })
+      yield* unsubscribeTyped
+      yield* unsubscribeAll
+      yield* events.publish(Message, { text: "after-unsubscribe" }, { location: locationA1 })
+
+      expect(typed).toEqual(["workspace-one", "workspace-two"])
+      expect(all).toEqual([
+        `${Message.type}:workspace-one`,
+        `${Message.type}:workspace-two`,
+        `${GlobalMessage.type}:other-type`,
+      ])
+    }),
+  )
+
+  it.effect("routes type listeners without invoking them for unrelated event types", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const received = new Array<string>()
+      const unsubscribe = yield* events.listenType(Message, (event) =>
+        Effect.sync(() => received.push(event.data.text)),
+      )
+
+      yield* events.publish(GlobalMessage, { text: "ignored" })
+      yield* events.publish(Message, { text: "accepted" })
+      yield* unsubscribe
+      yield* events.publish(Message, { text: "after-unsubscribe" })
+
+      expect(received).toEqual(["accepted"])
+    }),
+  )
+
   it.effect("routes aggregate listeners only to the matching durable aggregate", () =>
     Effect.gen(function* () {
       const events = yield* EventV2.Service
