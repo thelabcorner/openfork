@@ -223,3 +223,115 @@ it.instance("inherits focused Goal into a child before first use and annotates i
     })
   }),
 )
+
+it.instance("couples the reusable Goal Auditor child into the parent subagent group as an irremovable member", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const groups = yield* SessionGroup.Service
+    const goals = yield* Goal.Service
+    const parent = yield* sessions.create({ title: "Audited Goal owner" })
+    const created = yield* goals
+      .create({
+        projectID: parent.projectID,
+        workspaceID: parent.workspaceID,
+        title: "Audited Goal",
+        objective: "Keep one durable auditor transcript",
+        criteria: ["Auditor is coupled to the parent Session"],
+        continuationPolicy: { mode: "auto_continue" },
+      })
+      .pipe(Effect.orDie)
+    const active = yield* goals
+      .transition({ id: created.goal.id, expectedRevision: created.goal.revision, action: "start" })
+      .pipe(Effect.orDie)
+    yield* goals.focus({ goalID: active.goal.id, sessionID: parent.id }).pipe(Effect.orDie)
+
+    const auditor = yield* goals.auditorSession({ parentSessionID: parent.id, goalID: active.goal.id }).pipe(Effect.orDie)
+    const reused = yield* goals.auditorSession({ parentSessionID: parent.id, goalID: active.goal.id }).pipe(Effect.orDie)
+    expect(reused).toBe(auditor)
+
+    // Group attachment is event-driven and intentionally outside child creation's
+    // critical path, matching ordinary automatic subagent grouping.
+    yield* Effect.sleep("25 millis")
+    const memberships = yield* groups.membershipsFor(auditor)
+    const detail = memberships.find((item) => item.sessions.some((member) => member.id === auditor))
+    expect(detail?.group).toMatchObject({ kind: "subagent", anchorSessionID: parent.id })
+    const parentMember = detail?.sessions.find((member) => member.id === parent.id)
+    const auditorMember = detail?.sessions.find((member) => member.id === auditor)
+    expect(parentMember).toMatchObject({ origin: "auto_subagent" })
+    expect(auditorMember).toMatchObject({
+      locked: true,
+      origin: "goal_auditor",
+      originRef: `goal:${active.goal.id}`,
+      parentID: parent.id,
+    })
+
+    if (!detail) throw new Error("Goal Auditor group was not attached")
+    const removal = yield* groups.removeSession({ groupId: detail.group.id, sessionId: auditor }).pipe(Effect.flip)
+    expect(removal._tag).toBe("SessionGroupMemberLockedError")
+  }),
+)
+
+it.instance("couples generic special-agent children as locked special_agent members", () =>
+  Effect.gen(function* () {
+    const sessions = yield* Session.Service
+    const groups = yield* SessionGroup.Service
+    const parent = yield* sessions.create({ title: "Special agent owner" })
+    const revisor = yield* sessions.create({
+      parentID: parent.id,
+      title: "Prompt Revisor",
+      metadata: { specialAgent: "prompt_revisor", specialAgentOwnerID: "owner-1" },
+    })
+    const titler = yield* sessions.create({
+      parentID: parent.id,
+      title: "Session Title",
+      metadata: { specialAgent: "session_title" },
+    })
+    const spadAuditor = yield* sessions.create({
+      parentID: parent.id,
+      title: "SPAD auditor",
+      metadata: { specialAgent: "spad_auditor", specialAgentOwnerKind: "session", specialAgentOwnerID: parent.id },
+    })
+
+    // Group attachment is event-driven and intentionally outside child creation's
+    // critical path, matching ordinary automatic subagent grouping.
+    yield* Effect.sleep("25 millis")
+
+    const revisorDetail = (yield* groups.membershipsFor(revisor.id)).find((item) =>
+      item.sessions.some((member) => member.id === revisor.id),
+    )
+    expect(revisorDetail?.group).toMatchObject({ kind: "subagent", anchorSessionID: parent.id })
+    expect(revisorDetail?.sessions.find((member) => member.id === parent.id)).toMatchObject({ origin: "auto_subagent" })
+    expect(revisorDetail?.sessions.find((member) => member.id === revisor.id)).toMatchObject({
+      locked: true,
+      origin: "special_agent",
+      originRef: "prompt_revisor:owner-1",
+      parentID: parent.id,
+    })
+
+    const titlerDetail = (yield* groups.membershipsFor(titler.id)).find((item) =>
+      item.sessions.some((member) => member.id === titler.id),
+    )
+    expect(titlerDetail?.group).toMatchObject({ kind: "subagent", anchorSessionID: parent.id })
+    expect(titlerDetail?.sessions.find((member) => member.id === titler.id)).toMatchObject({
+      locked: true,
+      origin: "special_agent",
+      originRef: `session_title:${titler.id}`,
+      parentID: parent.id,
+    })
+
+    const spadDetail = (yield* groups.membershipsFor(spadAuditor.id)).find((item) =>
+      item.sessions.some((member) => member.id === spadAuditor.id),
+    )
+    expect(spadDetail?.group).toMatchObject({ kind: "subagent", anchorSessionID: parent.id })
+    expect(spadDetail?.sessions.find((member) => member.id === spadAuditor.id)).toMatchObject({
+      locked: true,
+      origin: "special_agent",
+      originRef: `spad_auditor:${parent.id}`,
+      parentID: parent.id,
+    })
+
+    if (!revisorDetail) throw new Error("Prompt Revisor group was not attached")
+    const removal = yield* groups.removeSession({ groupId: revisorDetail.group.id, sessionId: revisor.id }).pipe(Effect.flip)
+    expect(removal._tag).toBe("SessionGroupMemberLockedError")
+  }),
+)

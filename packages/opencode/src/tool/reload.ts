@@ -290,10 +290,8 @@ const layer = Layer.effect(
         // instance's directory and to files inside any config dir's
         // {tool,tools,plugin,plugins} folder. This stream only fires where the core
         // watcher is active (OPENCODE_EXPERIMENTAL_FILEWATCHER + git root, e.g. desktop).
-        const unsubscribe = yield* events.listen((event) =>
+        const unsubscribe = yield* events.listenDirectory(Watcher.Event.Updated, ctx.directory, (event) =>
           Effect.gen(function* () {
-            if (event.type !== Watcher.Event.Updated.type) return
-            if (event.location?.directory !== ctx.directory) return
             const data = event.data as EventV2.Data<typeof Watcher.Event.Updated>
             if (!isWatchedFile(dirs, data.file)) return
             yield* Ref.update(dirty, (set) => new Set(set).add(data.file))

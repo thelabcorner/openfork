@@ -6,6 +6,7 @@ import { Device } from "@opencode-ai/core/device"
 import { EventV2 } from "@opencode-ai/core/event"
 import { Credential } from "@opencode-ai/core/credential"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 import { BrowserHostBroker } from "@opencode-ai/core/browser/host-broker"
 import { PushV2 } from "@opencode-ai/core/push"
 import { PermissionSaved } from "@opencode-ai/core/permission/saved"
@@ -38,6 +39,7 @@ const applicationServices = LayerNode.group([
   PtyTicket.node,
   Credential.node,
   SessionUsage.node,
+  SessionTelemetry.node,
   PtyEnvironment.node,
   LocationServiceMap.node,
   BrowserHostBroker.node,

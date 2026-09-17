@@ -35,6 +35,7 @@ import {
   jobMetaPathLegacy,
 } from "@/background/shell-jobs"
 import { withBackgroundProcessSlot } from "@/background/process-concurrency"
+import { Snapshot } from "@/snapshot"
 import { Identifier } from "@/id/id"
 import type { TaskPromptOps } from "./task"
 import { Scope } from "effect"
@@ -522,6 +523,7 @@ export const ShellTool = Tool.define(
     const plugin = yield* Plugin.Service
     const flags = yield* RuntimeFlags.Service
     const background = yield* BackgroundJob.Service
+    const snapshot = yield* Snapshot.Service
     const jobs = yield* ShellJobs.Service
     const scope = yield* Scope.Scope
     const defaultTimeoutMs = flags.bashDefaultTimeoutMs ?? 2 * 60 * 1000
@@ -1127,21 +1129,24 @@ export const ShellTool = Tool.define(
                     type: "shell",
                     title: params.command,
                     metadata,
-                  run: withBackgroundProcessSlot(
-                    runBackground(
-                      {
-                        shell,
-                        command: params.command,
-                        cwd,
-                        env,
-                        jobId,
-                        logPath,
-                        metaPath,
-                        notify: wantsNotify,
-                        timeoutMs,
-                      },
-                      ctx,
+                  run: snapshot.withMutation(
+                    withBackgroundProcessSlot(
+                      runBackground(
+                        {
+                          shell,
+                          command: params.command,
+                          cwd,
+                          env,
+                          jobId,
+                          logPath,
+                          metaPath,
+                          notify: wantsNotify,
+                          timeoutMs,
+                        },
+                        ctx,
+                      ),
                     ),
+                    "tool:shell:background",
                   ),
                   })
                   // The run effect (forked by start) registers the handle in

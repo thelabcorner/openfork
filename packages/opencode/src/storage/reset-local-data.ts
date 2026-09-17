@@ -43,6 +43,8 @@ export const RESET_TABLES_IN_ORDER = [
   "session_message_tool_overlay",
   "session_message_lifecycle",
   "session_message",
+  "session_telemetry",
+  "usage_record",
   "session",
   "session_group",
   "maintenance_usage",

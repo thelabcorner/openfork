@@ -17,6 +17,9 @@ import { controlHandlers } from "../../src/server/routes/instance/httpapi/handle
 import { controlPlaneHandlers } from "../../src/server/routes/instance/httpapi/handlers/control-plane"
 import { forkCredentialHandlers } from "../../src/server/routes/instance/httpapi/handlers/fork-credential"
 import { globalHandlers, MAX_REPLAY_FRAMES, SUBSCRIBER_HEADROOM } from "../../src/server/routes/instance/httpapi/handlers/global"
+import { providerSettingsHandlers } from "../../src/server/routes/instance/httpapi/handlers/provider-settings"
+import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
+import { Usage } from "../../src/usage/usage"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
 import { testEffect } from "../lib/effect"
@@ -50,7 +53,14 @@ const decoder = new TextDecoder()
 
 const apiLayer = HttpRouter.serve(
   HttpApiBuilder.layer(RootHttpApi).pipe(
-    Layer.provide([controlHandlers, controlPlaneHandlers, forkCredentialHandlers, globalHandlers]),
+    Layer.provide([
+      controlHandlers,
+      controlPlaneHandlers,
+      forkCredentialHandlers,
+      globalHandlers,
+      providerSettingsHandlers,
+      usageHandlers,
+    ]),
     Layer.provide([authorizationLayer, schemaErrorLayer]),
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
     HttpRouter.provideRequest(Layer.succeedContext(Context.empty() as Context.Context<unknown>)),
@@ -62,6 +72,13 @@ const apiLayer = HttpRouter.serve(
   Layer.provide(Layer.mock(Config.Service)({})),
   Layer.provide(Layer.mock(ForkCredentials.Service)({})),
   Layer.provide(Layer.mock(SessionUsage.Service)({})),
+  Layer.provide(
+    Layer.mock(Usage.Service)({
+      summary: () => Effect.die("unused usage summary"),
+      modelProfile: () => Effect.succeed({ models: [] }),
+      recordMaintenance: () => Effect.void,
+    }),
+  ),
   Layer.provide(Layer.mock(MoveSession.Service)({})),
   Layer.provide(
     Layer.mock(Installation.Service)({

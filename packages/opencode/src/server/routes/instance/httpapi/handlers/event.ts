@@ -142,7 +142,12 @@ function eventResponse(events: EventV2Bridge.Interface) {
         // lose an event. During this short synchronous setup window, new live
         // events are held separately and only the post-cutoff suffix is admitted
         // to the live queue.
-        const unsubscribe = yield* events.listen((event) =>
+        // This transport is scoped to one instance directory. Registering it
+        // on the process-global fanout made every token in every other project
+        // invoke this callback only to fail matches(), and each loopback SSE
+        // connection inflated the global EventV2 listener count. Route by
+        // directory first; retain the workspace check below for exactness.
+        const unsubscribe = yield* events.listenDirectoryAll(instance.directory, (event) =>
           Effect.sync(() => {
             if (!matches(event)) return
             const sequence = events.sequenceOf(event)

@@ -4,6 +4,7 @@ import { registerLegacyTransport } from "@/event-v2-bridge"
 import { EffectBridge } from "@/effect/bridge"
 import { EventV2 } from "@opencode-ai/core/event"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Global } from "@opencode-ai/core/global"
 import { EventReplayBuffer, estimateEventBytes, parseEventSequence } from "@opencode-ai/core/event-replay"
 import {
   coalesceEventBatch,
@@ -39,12 +40,18 @@ import { HttpApiBuilder } from "effect/unstable/httpapi"
 import * as Sse from "effect/unstable/encoding/Sse"
 import { ModelPreferences } from "@/preference/model-preferences"
 import { Session } from "@/session/session"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 import { Project } from "@/project/project"
 import { bumpUsageCache } from "@/fork/usage-cache"
 import { resetUsageSummaryCache } from "@/usage/usage"
 import { serializeLegacyEvent } from "@/server/event-serialization"
 import { RootHttpApi } from "../api"
-import { GlobalSessionRootsQuery, GlobalUpgradeInput, ModelPreferencesPatch } from "../groups/global"
+import {
+  GlobalSessionRootsQuery,
+  GlobalSessionTelemetryInput,
+  GlobalUpgradeInput,
+  ModelPreferencesPatch,
+} from "../groups/global"
 
 // `sequence` is optional because control frames (heartbeat, gap) are not
 // replayable domain state: they must not mint or reuse a Last-Event-ID cursor.
@@ -524,11 +531,6 @@ function eventResponse(gate: GlobalReplayGate) {
 
 export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handlers) =>
   Effect.gen(function* () {
-    const config = yield* Config.Service
-    const installation = yield* Installation.Service
-    const sessions = yield* Session.Service
-    const projects = yield* Project.Service
-    const bridge = yield* EffectBridge.make()
     const gate = new GlobalReplayGate()
     // Capture is registered for the route's lifetime but only APPENDS while a
     // subscriber is connected. Registering unconditionally keeps the
@@ -556,7 +558,18 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     yield* Effect.addFinalizer(() => Effect.sync(unregisterTransport))
 
     const health = Effect.fn("GlobalHttpApi.health")(function* () {
-      return { healthy: true as const, version: InstallationVersion }
+      const directory = FSUtil.resolve(process.cwd())
+      return {
+        healthy: true as const,
+        version: InstallationVersion,
+        path: {
+          home: Global.Path.home,
+          state: Global.Path.state,
+          config: Global.Path.config,
+          worktree: directory,
+          directory,
+        },
+      }
     })
 
     const event = Effect.fn("GlobalHttpApi.event")(function* () {
@@ -572,6 +585,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     const sessionRoots = Effect.fn("GlobalHttpApi.sessionRoots")(function* (ctx: {
       query: typeof GlobalSessionRootsQuery.Type
     }) {
+      const sessions = yield* Session.Service
       const directory = FSUtil.resolve(ctx.query.directory)
       const rows = yield* sessions.listGlobal({
         directory,
@@ -585,15 +599,26 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       return rows.map(({ project: _project, ...session }) => session)
     })
 
+    const sessionTelemetry = Effect.fn("GlobalHttpApi.sessionTelemetry")(function* (ctx: {
+      payload: typeof GlobalSessionTelemetryInput.Type
+    }) {
+      const telemetry = yield* SessionTelemetry.Service
+      return yield* telemetry.snapshot(ctx.payload.sessions)
+    })
+
     const projectList = Effect.fn("GlobalHttpApi.projects")(function* () {
+      const projects = yield* Project.Service
       return yield* projects.list()
     })
 
     const configGet = Effect.fn("GlobalHttpApi.configGet")(function* () {
+      const config = yield* Config.Service
       return yield* config.getGlobal()
     })
 
     const configUpdate = Effect.fn("GlobalHttpApi.configUpdate")(function* (ctx) {
+      const config = yield* Config.Service
+      const bridge = yield* EffectBridge.make()
       const result = yield* config.updateGlobal(ctx.payload)
       if (result.changed) bridge.fork(disposeAllInstancesAndEmitGlobalDisposed({ swallowErrors: true }))
       return result.info
@@ -629,6 +654,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
     })
 
     const upgrade = Effect.fn("GlobalHttpApi.upgrade")(function* (ctx: { payload: typeof GlobalUpgradeInput.Type }) {
+      const installation = yield* Installation.Service
       const method = yield* installation.method()
       if (method === "unknown") {
         return HttpServerResponse.jsonUnsafe(
@@ -662,6 +688,7 @@ export const globalHandlers = HttpApiBuilder.group(RootHttpApi, "global", (handl
       .handleRaw("event", event)
       .handle("eventInterest", eventInterest)
       .handle("sessionRoots", sessionRoots)
+      .handle("sessionTelemetry", sessionTelemetry)
       .handle("projects", projectList)
       .handle("configGet", configGet)
       .handle("configUpdate", configUpdate)

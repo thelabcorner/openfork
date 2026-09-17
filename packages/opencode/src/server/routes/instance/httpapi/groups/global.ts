@@ -8,6 +8,7 @@ import {
 import { EventManifest } from "@/event-manifest"
 import { Session } from "@/session/session"
 import { Project } from "@/project/project"
+import { SessionTelemetry } from "@opencode-ai/schema/session-telemetry"
 import { InstanceDisposed } from "@/server/event"
 import "@opencode-ai/core/account"
 import "@/server/event"
@@ -19,6 +20,19 @@ import { described } from "./metadata"
 const GlobalHealth = Schema.Struct({
   healthy: Schema.Literal(true),
   version: Schema.String,
+  // Bootstrap metadata that is intrinsically process-global. Keeping it on the
+  // bootstrap-free health surface avoids materializing an Instance merely to
+  // discover $HOME/state/config during desktop startup. Optional for wire
+  // compatibility with older generated clients/servers.
+  path: Schema.optional(
+    Schema.Struct({
+      home: Schema.String,
+      state: Schema.String,
+      config: Schema.String,
+      worktree: Schema.String,
+      directory: Schema.String,
+    }),
+  ),
 })
 
 const SyncEventSchemas = EventManifest.Latest.values()
@@ -127,6 +141,14 @@ export const GlobalSessionRootsQuery = Schema.Struct({
   ),
 })
 
+export const GlobalSessionTelemetryInput = Schema.Struct({
+  sessions: Schema.Array(Schema.String).check(Schema.isMaxLength(500)),
+}).annotate({ identifier: "GlobalSessionTelemetryInput" })
+
+const GlobalSessionTelemetryResult = Schema.Record(Schema.String, SessionTelemetry.Info).annotate({
+  identifier: "GlobalSessionTelemetryResult",
+})
+
 export const GlobalEventInterestInput = Schema.Struct({
   subscriber: Schema.String.check(Schema.isMaxLength(STREAM_INTEREST_MAX_SUBSCRIBER_CHARS)),
   sessions: Schema.Array(
@@ -191,6 +213,7 @@ export const GlobalPaths = {
   event: "/global/event",
   eventInterest: "/global/event/interest",
   sessionRoots: "/global/session/roots",
+  sessionTelemetry: "/global/session/telemetry",
   projects: "/global/project",
   config: "/global/config",
   preferences: "/global/preferences",
@@ -244,6 +267,17 @@ export const GlobalApi = HttpApi.make("global").add(
           summary: "List recent root sessions without instance bootstrap",
           description:
             "List recent non-archived root sessions for one directory directly from durable session storage. This read-only startup surface intentionally does not materialize directory config, plugins, providers, or tools.",
+        }),
+      ),
+      HttpApiEndpoint.post("sessionTelemetry", GlobalPaths.sessionTelemetry, {
+        payload: GlobalSessionTelemetryInput,
+        success: described(GlobalSessionTelemetryResult, "Compact session telemetry snapshots"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "global.sessionTelemetry",
+          summary: "Get compact session telemetry without instance bootstrap",
+          description:
+            "Read bounded live/settled session telemetry directly from global memory and durable telemetry storage. This endpoint never materializes directory config, plugins, providers, tools, or a workspace runtime.",
         }),
       ),
       HttpApiEndpoint.get("projects", GlobalPaths.projects, {

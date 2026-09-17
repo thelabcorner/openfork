@@ -6,6 +6,8 @@ import { Authorization } from "../middleware/authorization"
 
 export const UsagePaths = {
   summary: "/usage/summary",
+  modelProfile: "/usage/model-profile",
+  pricingCatalog: "/usage/pricing-catalog",
 } as const
 
 export const UsageSummaryQuery = Schema.Struct({
@@ -27,6 +29,30 @@ export const UsageApi = HttpApi.make("usage").add(
           summary: "Get global usage summary",
           description:
             "Aggregate token and cost usage across every session in the database, bucketed by provider, model, variant, project, and time.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("modelProfile", UsagePaths.modelProfile, {
+        success: described(Usage.ModelProfile, "Personal model usage profile"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "usage.modelProfile",
+          summary: "Get personal model usage profile",
+          description:
+            "Return compact per-model cost and cache-hit aggregates from recent settled generations without hydrating session history.",
+        }),
+      ),
+    )
+    .add(
+      HttpApiEndpoint.get("pricingCatalog", UsagePaths.pricingCatalog, {
+        success: described(Usage.PricingCatalog, "Global usage pricing catalog"),
+      }).annotateMerge(
+        OpenApi.annotations({
+          identifier: "usage.pricingCatalog",
+          summary: "Get the global usage pricing catalog",
+          description:
+            "Return model display metadata and base rate cards for usage valuation without loading workspace provider configuration.",
         }),
       ),
     )

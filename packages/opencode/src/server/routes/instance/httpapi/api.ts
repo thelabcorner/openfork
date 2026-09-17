@@ -22,6 +22,7 @@ import { PermissionApi } from "./groups/permission"
 import { ProjectApi } from "./groups/project"
 import { ProjectCopyApi } from "./groups/project-copy"
 import { ProviderApi } from "./groups/provider"
+import { ProviderSettingsApi } from "./groups/provider-settings"
 import { PtyApi, PtyConnectApi } from "./groups/pty"
 import { QuotaApi } from "./groups/quota"
 import { QuestionApi } from "./groups/question"
@@ -66,6 +67,8 @@ export const RootHttpApi = HttpApi.make("opencode-root")
   .addHttpApi(ControlPlaneApi)
   .addHttpApi(ForkCredentialApi)
   .addHttpApi(GlobalApi)
+  .addHttpApi(ProviderSettingsApi)
+  .addHttpApi(UsageApi)
   .middleware(SchemaErrorMiddleware)
   .middleware(Authorization)
 
@@ -89,7 +92,6 @@ export const InstanceHttpApi = HttpApi.make("opencode-instance")
   .addHttpApi(SyncApi)
   .addHttpApi(ToolApi)
   .addHttpApi(TuiApi)
-  .addHttpApi(UsageApi)
   .addHttpApi(WorkspaceApi)
   .addHttpApi(PromptRevisorApi)
   .middleware(SchemaErrorMiddleware)

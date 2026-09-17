@@ -12,9 +12,6 @@ import { Effect } from "effect"
 import * as Stream from "effect/Stream"
 import { jsonSchema, tool, type Tool } from "ai"
 import { canonicalMessagesToModelMessages } from "@/special-agent/model-message-bridge"
-import { InstanceState } from "@/effect/instance-state"
-import type { Interface as UsageInterface } from "@/usage/usage"
-import * as MaintenanceUsage from "@/usage/maintenance"
 
 const toTools = (definitions: readonly CanonicalToolDefinition[]): Record<string, Tool> =>
   Object.fromEntries(
@@ -45,7 +42,6 @@ export const makeRuntime = (
   provider: Provider.Interface,
   llm: SessionLLM.Interface,
   mcp?: MCP.Interface,
-  usage?: UsageInterface,
 ): PromptRevisor.Runtime => ({
   resolveModel: Effect.fn("PromptRevisorRuntime.resolveModel")(function* ({ candidates }) {
     const seen = new Set<string>()
@@ -83,7 +79,6 @@ export const makeRuntime = (
     const model = request.model.value as Provider.Model
     const capability = toolChoiceIdentity(model)
     const sessionID = request.sessionID ?? SessionID.create()
-    const instance = usage ? yield* InstanceState.context : undefined
     const user: SessionV1.User = {
       id: MessageID.ascending(),
       sessionID,
@@ -109,44 +104,26 @@ export const makeRuntime = (
     }
 
     const collect = (toolChoice: SessionLLM.StreamInput["toolChoice"]) => {
-      const startedAt = Date.now()
       const messages = canonicalMessagesToModelMessages(request.messages)
-      const trackingRequest = {
-        system: request.system,
-        messages,
-        tools: request.tools,
-        toolChoice,
-      }
+      // Provider events are forwarded to the owning special-agent transcript so
+      // this turn is durable in exactly the same pipeline normal chat uses.
+      // Maintenance accounting is owned by that same Core session, not the host.
       return collectUntilTerminalTool(
-        llm.stream({
-          user,
-          sessionID,
-          model,
-          agent,
-          system: [],
-          messages,
-          tools: toTools(request.tools),
-          retries: 0,
-          toolChoice,
-          maxOutputTokens: request.generation.maxTokens,
-        }),
+        llm
+          .stream({
+            user,
+            sessionID,
+            model,
+            agent,
+            system: [],
+            messages,
+            tools: toTools(request.tools),
+            retries: 0,
+            toolChoice,
+            maxOutputTokens: request.generation.maxTokens,
+          })
+          .pipe(Stream.tap((event) => (request.publish ? request.publish(event) : Effect.void))),
         "revised_prompt",
-      ).pipe(
-        Effect.tap((response) =>
-          response && usage
-            ? MaintenanceUsage.recordResponse({
-                usage,
-                agent: "prompt-revisor",
-                model,
-                response,
-                request: trackingRequest,
-                sessionID,
-                projectID: instance?.project.id,
-                variant: request.model.ref.variant,
-                startedAt,
-              })
-            : Effect.void,
-        ),
       )
     }
 

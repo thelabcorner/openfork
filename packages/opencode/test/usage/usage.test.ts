@@ -70,6 +70,7 @@ type SeedMessage = {
   completed: number
   requestSentAt?: number
   firstTokenAt?: number
+  streamedAt?: number
   cost?: number | null
   mode?: string
   agent?: string
@@ -86,6 +87,7 @@ const MESSAGES: SeedMessage[] = [
     completed: BASE + 10_000,
     requestSentAt: BASE,
     firstTokenAt: BASE + 400,
+    streamedAt: BASE + 9_000,
     cost: 0.003,
     tokens: { input: 100, cacheRead: 0, cacheWrite: 0, output: 50, reasoning: 0 },
   },
@@ -99,6 +101,7 @@ const MESSAGES: SeedMessage[] = [
     completed: BASE + 70_000,
     requestSentAt: BASE + 60_000,
     firstTokenAt: BASE + 60_300,
+    streamedAt: BASE + 69_000,
     cost: 0.002,
     tokens: { input: 50, cacheRead: 150, cacheWrite: 30, output: 80, reasoning: 20 },
   },
@@ -154,6 +157,7 @@ function seedMessage(db: Database.Interface["db"], message: SeedMessage) {
       completed: message.completed,
       ...(message.requestSentAt !== undefined ? { requestSentAt: message.requestSentAt } : {}),
       ...(message.firstTokenAt !== undefined ? { firstTokenAt: message.firstTokenAt } : {}),
+      ...(message.streamedAt !== undefined ? { streamedAt: message.streamedAt } : {}),
     },
     modelID: message.modelID,
     providerID: message.providerID,
@@ -178,6 +182,23 @@ function seedMessage(db: Database.Interface["db"], message: SeedMessage) {
   )
 }
 
+function seedUsageRecord(db: Database.Interface["db"], message: SeedMessage) {
+  return db.run(sql`
+    INSERT INTO usage_record (
+      message_id, session_id, provider_id, model_id, variant, agent, mode,
+      created_at, request_sent_at, first_token_at, streamed_at, completed_at,
+      cost_usd, input_tokens, cache_read_tokens, cache_write_tokens,
+      output_tokens, reasoning_tokens
+    ) VALUES (
+      ${message.id}, ${message.sessionID}, ${message.providerID}, ${message.modelID}, ${message.variant ?? null},
+      ${message.agent ?? "build"}, ${message.mode ?? "primary"}, ${message.created},
+      ${message.requestSentAt ?? null}, ${message.firstTokenAt ?? null}, ${message.streamedAt ?? null},
+      ${message.completed}, ${message.cost ?? null}, ${message.tokens.input}, ${message.tokens.cacheRead},
+      ${message.tokens.cacheWrite}, ${message.tokens.output}, ${message.tokens.reasoning}
+    )
+  `)
+}
+
 const seedDatabase = Effect.gen(function* () {
   const { db } = yield* Database.Service
   yield* db.run(sql`
@@ -191,7 +212,9 @@ const seedDatabase = Effect.gen(function* () {
            ('s2', 'p1', '/proj/a', 's2', 'Session 2', '1', ${BASE}, ${BASE}),
            ('s3', 'p2', '/proj/b', 's3', 'Session 3', '1', ${BASE}, ${BASE})
   `)
-  yield* Effect.forEach(MESSAGES, (message) => seedMessage(db, message))
+  yield* Effect.forEach(MESSAGES, (message) =>
+    Effect.all([seedMessage(db, message), seedUsageRecord(db, message)], { discard: true }),
+  )
   yield* db.run(sql`
     INSERT INTO maintenance_usage (
       agent, provider_id, model_id, variant, session_id, project_id, requests,
@@ -265,7 +288,10 @@ describe("usage summary aggregation", () => {
       expect(summary.totals.ttftMs).toBe(700)
       expect(summary.totals.ttftRecords).toBe(2)
 
-      expect(summary.rates.tokensPerSecond).toBeCloseTo(200 / 23, 4)
+      // Throughput uses provider generation time (first token -> stream end)
+      // when available, and only falls back to wall time for historical rows
+      // that predate the streamedAt projection.
+      expect(summary.rates.tokensPerSecond).toBeCloseTo(200 / 20.3, 4)
       expect(summary.rates.avgTokensPerTurn).toBeCloseTo(850 / 5, 4)
       expect(summary.rates.avgCostPerTurn).toBeCloseTo(0.006025 / 5, 6)
       expect(summary.rates.cacheHitRate).toBeCloseTo(250 / 620, 4)
@@ -285,10 +311,14 @@ describe("usage summary aggregation", () => {
       expect(anthropic?.sessions).toBe(1)
       expect(anthropic?.cost).toBeCloseTo(0.005, 6)
       expect(anthropic?.tokens.input).toBe(150)
+      expect(anthropic?.generationMs).toBe(17_300)
+      expect(anthropic?.generationRecords).toBe(2)
 
       const openai = summary.providers.find((p) => p.providerID === "openai")
       expect(openai?.sessions).toBe(2)
       expect(openai?.estimatedCost).toBeCloseTo(0.000925, 6)
+      expect(openai?.generationMs).toBe(2_000)
+      expect(openai?.generationRecords).toBe(2)
 
       const mystery = summary.providers.find((p) => p.providerID === "mystery")
       expect(mystery?.unpricedRecords).toBe(1)
@@ -298,6 +328,8 @@ describe("usage summary aggregation", () => {
       const claudeHigh = summary.models.find((m) => m.modelID === "claude-3.5" && m.variant === "high")
       expect(claudeHigh?.messages).toBe(1)
       expect(claudeHigh?.cacheSavings).toBeCloseTo(0.000405, 6)
+      expect(claudeHigh?.generationMs).toBe(8_700)
+      expect(claudeHigh?.generationRecords).toBe(1)
 
       const defaultVariant = summary.variants.find((v) => v.variant === null)
       expect(defaultVariant?.messages).toBe(4)

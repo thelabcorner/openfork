@@ -5,9 +5,13 @@ import * as Tool from "./tool"
 import { InstanceState } from "@/effect/instance-state"
 import { assertExternalDirectoryEffect } from "./external-directory"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Location } from "@opencode-ai/core/location"
+import { LocationServiceMap } from "@opencode-ai/core/location-services"
+import { ProjectInventory } from "@opencode-ai/core/project-inventory"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
 import { AppProcess } from "@opencode-ai/core/process"
+import { AbsolutePath } from "@opencode-ai/core/schema"
 import { ChildProcess } from "effect/unstable/process"
 import { which } from "@opencode-ai/core/util/which"
 import DESCRIPTION from "./project.txt"
@@ -780,16 +784,40 @@ type Presence = { path: string; kind: string }
 export const ProjectTool = Tool.define<
   typeof Parameters,
   Metadata,
-  Ripgrep.Service | RipgrepBinary.Service | AppProcess.Service
+  Ripgrep.Service | RipgrepBinary.Service | AppProcess.Service | LocationServiceMap.Service
 >(
   "project",
   Effect.gen(function* () {
     const ripgrep = yield* Ripgrep.Service
     const binary = yield* RipgrepBinary.Service
     const app = yield* AppProcess.Service
+    const locations = yield* LocationServiceMap.Service
     const rgPath = yield* binary.filepath.pipe(Effect.orDie)
 
+    // Project files are a project-owned fact: the canonical location inventory
+    // is seeded once and maintained incrementally, so N sessions/calls on one
+    // project do not each re-walk the tree. A missing inventory falls back to
+    // the query-specific ripgrep listing.
+    const inventoryFiles = Effect.fn("ProjectTool.inventoryFiles")(function* (directory: string) {
+      return yield* Effect.gen(function* () {
+        const inventory = yield* ProjectInventory.Service
+        return yield* inventory.files()
+      }).pipe(
+        Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(directory) }))),
+        Effect.catch(() => Effect.succeed(undefined as readonly string[] | undefined)),
+      )
+    })
+
     const listFiles = Effect.fn("ProjectTool.listFiles")(function* (cwd: string, limit: number, signal: AbortSignal) {
+      const inventory = yield* inventoryFiles(cwd)
+      if (inventory) {
+        // Preserve `rg --files` visibility exactly: hidden (dot-segment) paths
+        // are not part of this tool's listing domain.
+        return inventory
+          .filter((file) => !file.split("/").some((segment) => segment.startsWith(".")))
+          .slice(0, limit)
+          .map((path) => ({ path }))
+      }
       return yield* ripgrep
         .find({ cwd, pattern: "*", limit, signal })
         .pipe(Effect.catch(() => Effect.succeed([] as ReadonlyArray<{ path: string }>)))

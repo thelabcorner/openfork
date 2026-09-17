@@ -6,7 +6,13 @@ import { cmd } from "../cmd"
 export const SnapshotCommand = cmd({
   command: "snapshot",
   describe: "snapshot debugging utilities",
-  builder: (yargs) => yargs.command(TrackCommand).command(PatchCommand).command(DiffCommand).demandCommand(),
+  builder: (yargs) =>
+    yargs
+      .command(TrackCommand)
+      .command(PatchCommand)
+      .command(DiffCommand)
+      .command(DiagnosticsCommand)
+      .demandCommand(),
   async handler() {},
 })
 
@@ -31,6 +37,15 @@ const PatchCommand = effectCmd({
   handler: Effect.fn("Cli.debug.snapshot.patch")(function* (args) {
     const out = yield* Snapshot.Service.use((svc) => svc.patch(args.hash))
     console.log(out)
+  }),
+})
+
+const DiagnosticsCommand = effectCmd({
+  command: "diagnostics",
+  describe: "show project materialization counters (captures/cacheHits/invalidations)",
+  handler: Effect.fn("Cli.debug.snapshot.diagnostics")(function* () {
+    const out = yield* Snapshot.Service.use((svc) => svc.diagnostics())
+    console.log(JSON.stringify(out))
   }),
 })
 

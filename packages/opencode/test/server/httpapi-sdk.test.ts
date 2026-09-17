@@ -575,6 +575,10 @@ describe("HttpApi SDK", () => {
         const parentID = String(record(parent.data).id)
         const child = yield* capture(() => sdk.session.create({ title: "child", parentID }))
         const childID = String(record(child.data).id)
+        const invalidAgent = yield* capture(() =>
+          sdk.session.create({ title: "invalid-agent", agent: "definitely-not-an-agent" }),
+        )
+        expect(invalidAgent.status).toBe(400)
         const get = yield* capture(() => sdk.session.get({ sessionID: parentID }))
         const update = yield* capture(() => sdk.session.update({ sessionID: parentID, title: "renamed" }))
         const roots = yield* capture(() => sdk.session.list({ roots: true, limit: 10 }))
@@ -595,6 +599,7 @@ describe("HttpApi SDK", () => {
           statuses: statuses({
             parent,
             child,
+            invalidAgent,
             get,
             update,
             roots,

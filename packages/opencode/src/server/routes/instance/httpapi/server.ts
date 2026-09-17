@@ -88,6 +88,8 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { SessionExecution } from "@opencode-ai/core/session/execution"
 import * as SessionExecutionLocal from "@opencode-ai/core/session/execution/local"
 import { SessionUsage } from "@opencode-ai/core/session/usage"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import { UsageRecord } from "@opencode-ai/core/usage/record"
 import { Usage } from "@/usage/usage"
 import { lazy } from "@/util/lazy"
 import { CorsConfig, isAllowedCorsOrigin, type CorsOptions } from "@opencode-ai/server/cors"
@@ -122,6 +124,7 @@ import { permissionHandlers } from "./handlers/permission"
 import { projectHandlers } from "./handlers/project"
 import { projectCopyHandlers } from "./handlers/project-copy"
 import { providerHandlers } from "./handlers/provider"
+import { providerSettingsHandlers } from "./handlers/provider-settings"
 import { ptyConnectHandlers, ptyHandlers } from "./handlers/pty"
 import { questionHandlers } from "./handlers/question"
 import { quotaHandlers } from "./handlers/quota"
@@ -196,7 +199,14 @@ const ptyConnectHttpApiAuthLayer = ptyConnectAuthorizationLayer.pipe(Layer.provi
 const serverHttpApiAuthLayer = serverAuthorizationLayer.pipe(Layer.provide([ServerAuth.Config.layer, deviceNodeLayer]))
 const workspaceRoutingLive = workspaceRoutingLayer.pipe(Layer.provide(Socket.layerWebSocketConstructorGlobal))
 const rootApiRoutes = HttpApiBuilder.layer(RootHttpApi).pipe(
-  Layer.provide([controlHandlers, controlPlaneHandlers, forkCredentialHandlers, globalHandlers]),
+  Layer.provide([
+    controlHandlers,
+    controlPlaneHandlers,
+    forkCredentialHandlers,
+    globalHandlers,
+    providerSettingsHandlers,
+    usageHandlers,
+  ]),
   Layer.provide(schemaErrorLayer),
   Layer.provide(httpApiAuthLayer),
 )
@@ -243,7 +253,6 @@ const instanceApiRoutes = HttpApiBuilder.layer(InstanceHttpApi).pipe(
     syncHandlers,
     toolHandlers,
     tuiHandlers,
-    usageHandlers,
     workspaceHandlers,
     promptRevisorHandlers,
   ]),
@@ -338,6 +347,8 @@ const app = LayerNode.group([
   SessionContextProjector.node,
   SessionStatus.node,
   SessionUsage.node,
+  SessionTelemetry.node,
+  UsageRecord.node,
   BackgroundJob.node,
   RuntimeFlags.node,
   EventV2Bridge.node,
@@ -418,7 +429,13 @@ export function createRoutes(
     ),
     Layer.provide(locationServiceMapV2),
 
-    Layer.provide(AppNodeBuilderV1.build(app)),
+    // One canonical LocationServiceMap owns every project/location graph in
+    // this server. V1 historically constructed its own map while V2 and
+    // control-plane services used `locationServiceMapV2`; the same project
+    // could therefore own duplicate watcher/index/search/snapshot graphs.
+    // Replace by service identity at the V1 app boundary so every consumer
+    // shares the server-owned map and its canonicalized location cache.
+    Layer.provide(AppNodeBuilderV1.build(app, [[LocationServiceMap.node, locationServiceMapV2]])),
     // Must stay last: layers provided later in this pipe build beneath earlier ones,
     // so Observability must come after every service graph. Otherwise eagerly forked
     // fibers (e.g. the ModelsDev background refresh) capture Effect's default stdout

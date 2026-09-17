@@ -16,13 +16,23 @@ import { controlHandlers } from "../../src/server/routes/instance/httpapi/handle
 import { controlPlaneHandlers } from "../../src/server/routes/instance/httpapi/handlers/control-plane"
 import { forkCredentialHandlers } from "../../src/server/routes/instance/httpapi/handlers/fork-credential"
 import { globalHandlers } from "../../src/server/routes/instance/httpapi/handlers/global"
+import { providerSettingsHandlers } from "../../src/server/routes/instance/httpapi/handlers/provider-settings"
+import { usageHandlers } from "../../src/server/routes/instance/httpapi/handlers/usage"
+import { Usage } from "../../src/usage/usage"
 import { authorizationLayer } from "../../src/server/routes/instance/httpapi/middleware/authorization"
 import { schemaErrorLayer } from "../../src/server/routes/instance/httpapi/middleware/schema-error"
 import { testEffect } from "../lib/effect"
 
 const apiLayer = HttpRouter.serve(
   HttpApiBuilder.layer(RootHttpApi).pipe(
-    Layer.provide([controlHandlers, controlPlaneHandlers, forkCredentialHandlers, globalHandlers]),
+    Layer.provide([
+      controlHandlers,
+      controlPlaneHandlers,
+      forkCredentialHandlers,
+      globalHandlers,
+      providerSettingsHandlers,
+      usageHandlers,
+    ]),
     Layer.provide([authorizationLayer, schemaErrorLayer]),
     // Raw HttpApi routes expose an opaque handler context at the request boundary.
     // oxlint-disable-next-line typescript-eslint/no-unsafe-type-assertion
@@ -35,6 +45,13 @@ const apiLayer = HttpRouter.serve(
   Layer.provide(Layer.mock(Config.Service)({})),
   Layer.provide(Layer.mock(ForkCredentials.Service)({})),
   Layer.provide(Layer.mock(SessionUsage.Service)({})),
+  Layer.provide(
+    Layer.mock(Usage.Service)({
+      summary: () => Effect.die("unused usage summary"),
+      modelProfile: () => Effect.succeed({ models: [] }),
+      recordMaintenance: () => Effect.void,
+    }),
+  ),
   Layer.provide(Layer.mock(MoveSession.Service)({})),
   Layer.provide(
     Layer.mock(Installation.Service)({
@@ -48,6 +65,14 @@ const apiLayer = HttpRouter.serve(
 const it = testEffect(apiLayer)
 
 describe("global HttpApi", () => {
+  it.live("serves Tier-0 usage without workspace instance dependencies", () =>
+    Effect.gen(function* () {
+      const response = yield* HttpClientRequest.get("/usage/model-profile").pipe(HttpClient.execute)
+      expect(response.status).toBe(200)
+      expect(yield* response.json).toEqual({ models: [] })
+    }),
+  )
+
   it.live("upgrades to the requested version", () =>
     Effect.gen(function* () {
       const response = yield* HttpClientRequest.post(GlobalPaths.upgrade).pipe(

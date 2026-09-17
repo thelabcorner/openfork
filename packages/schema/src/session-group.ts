@@ -11,7 +11,7 @@ export type ID = SessionGroupID
 export const Kind = Schema.Literals(["user", "subagent", "plugin"])
 export type Kind = typeof Kind.Type
 
-export const MemberOrigin = Schema.Literals(["user", "auto_subagent", "plugin"])
+export const MemberOrigin = Schema.Literals(["user", "auto_subagent", "goal_auditor", "special_agent", "plugin"])
 export type MemberOrigin = typeof MemberOrigin.Type
 
 export interface Policy extends Schema.Schema.Type<typeof Policy> {}

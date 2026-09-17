@@ -40,7 +40,7 @@ import {
   SummarizePayload,
   UpdatePayload,
 } from "../groups/session"
-import { PermissionNotFoundError, ServiceUnavailableError } from "../errors"
+import { PermissionNotFoundError, ServiceUnavailableError, SessionBusyError } from "../errors"
 import * as SessionError from "./session-errors"
 
 const tryParseJson = (text: string) =>
@@ -87,6 +87,14 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
 
     const requireSession = Effect.fn("SessionHttpApi.requireSession")(function* (sessionID: SessionID) {
       return yield* SessionError.mapStorageNotFound(session.get(sessionID))
+    })
+
+    const requireInteractiveSession = Effect.fn("SessionHttpApi.requireInteractiveSession")(function* (
+      sessionID: SessionID,
+    ) {
+      const current = yield* requireSession(sessionID)
+      if (current.parentID) return yield* new HttpApiError.BadRequest({})
+      return current
     })
 
     const get = Effect.fn("SessionHttpApi.get")(function* (ctx: { params: { sessionID: SessionID } }) {
@@ -160,6 +168,15 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
     })
 
     const create = Effect.fn("SessionHttpApi.create")(function* (ctx: { payload?: Session.CreateInput }) {
+      // Keep create/update semantics aligned: a session carrying an unknown
+      // agent is not runnable, and persisting it defers a deterministic
+      // configuration error until the first prompt. Under automated callers
+      // that can become an async retry storm because prompt_async has already
+      // returned 204 by the time the run rejects. Reject the invalid state at
+      // admission instead.
+      if (ctx.payload?.agent && !(yield* agentSvc.get(ctx.payload.agent))) {
+        return yield* new HttpApiError.BadRequest({})
+      }
       return yield* shareSvc.create(ctx.payload)
     })
 
@@ -461,7 +478,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requireInteractiveSession(ctx.params.sessionID)
       const message = yield* promptSvc
         .prompt({
           ...ctx.payload,
@@ -477,11 +494,29 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof PromptPayload.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      // Async prompt acknowledges before its execution fiber settles. Reject a
+      // host-owned child synchronously here so callers can never receive a false
+      // 204-success for a prompt that the service boundary will refuse.
+      yield* requireInteractiveSession(ctx.params.sessionID)
+      // `prompt_async` acknowledges with 204 before the fork settles, so
+      // deterministic admission errors must be rejected BEFORE forking. An
+      // invalid agent used to return success and only fail asynchronously,
+      // which made automated callers believe the kickoff succeeded and could
+      // feed a retry loop. Session creation has the same invariant above; keep
+      // per-prompt overrides aligned with it.
+      if (ctx.payload.agent && !(yield* agentSvc.get(ctx.payload.agent))) {
+        return yield* new HttpApiError.BadRequest({})
+      }
       yield* promptSvc.prompt({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
         Effect.catchCause((cause) =>
           Effect.gen(function* () {
-            yield* Effect.logError("prompt_async failed", { sessionID: ctx.params.sessionID, cause })
+            const error = Cause.squash(cause)
+            yield* Effect.logError("prompt_async failed", {
+              sessionID: ctx.params.sessionID,
+              error: error instanceof Error ? error.message : String(error),
+              stack: error instanceof Error ? error.stack : undefined,
+              cause: Cause.pretty(cause),
+            })
             yield* events.publish(Session.Event.Error, {
               sessionID: ctx.params.sessionID,
               error: new NamedError.Unknown({ message: Cause.pretty(cause) }).toObject(),
@@ -497,7 +532,7 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof CommandPayload.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
+      yield* requireInteractiveSession(ctx.params.sessionID)
       return yield* promptSvc
         .command({ ...ctx.payload, sessionID: ctx.params.sessionID })
         .pipe(Effect.mapError(() => new HttpApiError.BadRequest({})))
@@ -507,8 +542,18 @@ export const sessionHandlers = HttpApiBuilder.group(InstanceHttpApi, "session", 
       params: { sessionID: SessionID }
       payload: typeof ShellPayload.Type
     }) {
-      yield* requireSession(ctx.params.sessionID)
-      return yield* SessionError.mapBusy(promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID }))
+      yield* requireInteractiveSession(ctx.params.sessionID)
+      return yield* promptSvc.shell({ ...ctx.payload, sessionID: ctx.params.sessionID }).pipe(
+        Effect.catchTag("SessionPrompt.HostOwnedSessionError", () => Effect.fail(new HttpApiError.BadRequest({}))),
+        Effect.catchTag("SessionBusyError", (error) =>
+          Effect.fail(
+            new SessionBusyError({
+              sessionID: error.sessionID,
+              message: `Session is busy: ${error.sessionID}`,
+            }),
+          ),
+        ),
+      )
     })
 
     const revert = Effect.fn("SessionHttpApi.revert")(function* (ctx: {

@@ -12,6 +12,11 @@ import { SessionCheckpointTable } from "@opencode-ai/core/session/sql"
 import { Checkpoint } from "@opencode-ai/core/checkpoint"
 import { define } from "@opencode-ai/schema/event"
 import { Snapshot } from "@/snapshot"
+import { Location } from "@opencode-ai/core/location"
+import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { ProjectInventory } from "@opencode-ai/core/project-inventory"
+import { AbsolutePath } from "@opencode-ai/core/schema"
+import { Watcher } from "@opencode-ai/core/filesystem/watcher"
 import { Config } from "@/config/config"
 import { InstanceState } from "@/effect/instance-state"
 import { EventV2Bridge } from "@/event-v2-bridge"
@@ -136,6 +141,7 @@ const layer = Layer.effect(
     const config = yield* Config.Service
     const database = yield* Database.Service
     const events = yield* EventV2Bridge.Service
+    const locations = yield* LocationServiceMap.Service
     const scope = yield* Scope.Scope
     const { db } = database
 
@@ -316,9 +322,26 @@ const layer = Layer.effect(
     const detectExcluded = Effect.fn("TurnCheckpoint.detectExcluded")(function* (after: string) {
       const ctx = yield* InstanceState.context
       const dir = yield* gitdir()
-      const others = yield* Effect.tryPromise(() =>
-        Bun.$`git ls-files --others --exclude-standard -z`.cwd(ctx.worktree).text(),
-      ).pipe(Effect.catch(() => Effect.succeed("")))
+      // The untracked set is a project-owned fact. Consume the canonical
+      // inventory so N turns/sessions share one authoritative enumeration
+      // instead of each running `git ls-files --others`. This path is
+      // explicitly approximate (reporting only), so an unavailable inventory
+      // falls back to a scoped Git read rather than failing the checkpoint.
+      const inventory =
+        ctx.project.vcs === "git" && ctx.worktree !== "/" && Watcher.hasActiveRoot(ctx.worktree)
+          ? yield* Effect.gen(function* () {
+              const projectInventory = yield* ProjectInventory.Service
+              return yield* projectInventory.untracked()
+            }).pipe(
+              Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.worktree) }))),
+              Effect.catch(() => Effect.succeed(undefined as readonly string[] | undefined)),
+            )
+          : undefined
+      const others =
+        inventory?.join("\0") ??
+        (yield* Effect.tryPromise(() => Bun.$`git ls-files --others --exclude-standard -z`.cwd(ctx.worktree).text()).pipe(
+          Effect.catch(() => Effect.succeed("")),
+        ))
       const candidates = others.split("\0").filter(Boolean)
       if (candidates.length === 0) return [] as Checkpoint.Excluded[]
       const listed = yield* Effect.tryPromise(() =>
@@ -588,8 +611,18 @@ const retainTree = Effect.fn("TurnCheckpoint.retainTree")(function* (tree: strin
   )
 })
 
+// Concrete fallback node for the canonical location map. Node identity is the
+// service key, so the server's canonical map replaces this by name at the app
+// boundary (see server.ts). Tests that compile this node directly still get a
+// working (lazily-built) map.
+const locationServiceMapNode = LayerNode.make({
+  service: LocationServiceMap.Service,
+  layer: locationServiceMapLayer,
+  deps: [],
+})
+
 export const node = LayerNode.make({
   service: Service,
   layer,
-  deps: [Snapshot.node, Config.node, Database.node, EventV2Bridge.node],
+  deps: [Snapshot.node, Config.node, Database.node, EventV2Bridge.node, locationServiceMapNode],
 })

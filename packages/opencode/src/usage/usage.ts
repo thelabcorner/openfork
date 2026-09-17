@@ -5,14 +5,17 @@ import { Context, Effect, Layer, Schema, Semaphore, Types } from "effect"
 import { Database, withBackfillDb } from "@opencode-ai/core/database/database"
 import { ModelsDev } from "@opencode-ai/core/models-dev"
 import { makeGlobalNode } from "@opencode-ai/core/effect/app-node"
+import { UsageRecord } from "@opencode-ai/core/usage/record"
 
 /**
  * Global usage aggregation across every session in the database.
  *
- * The message table is the canonical V1 assistant-message projection; each
- * assistant message is a physical row with its own id, so "work performed"
- * semantics hold by construction (forked sessions inherit rows, never duplicate
- * them). Time attribution uses `time.completed`, not session update time.
+ * `usage_record` is the compact, Usage-owned settlement projection for
+ * user-facing generations. V1/V2 producers write it once at settlement and the
+ * migration imports historical assistant rows once, so steady-state analytics
+ * never decodes conversation payloads. Forked sessions inherit records rather
+ * than duplicating work. Time attribution uses completion time, not session
+ * update time.
  */
 
 type Mutable<T> = Types.DeepMutable<T>
@@ -166,6 +169,9 @@ export const ProviderBucket = Schema.Struct({
   /** Sum of (completed - created) wall time, scoped to this provider — mirrors UsageTotals.durationMs. */
   durationMs: Schema.Finite,
   durationRecords: Schema.Finite,
+  /** Provider response generation window (first token -> stream end). */
+  generationMs: Schema.Finite,
+  generationRecords: Schema.Finite,
 })
 export type ProviderBucket = Schema.Schema.Type<typeof ProviderBucket>
 
@@ -181,6 +187,9 @@ export const ModelBucket = Schema.Struct({
   /** Sum of (completed - created) wall time, scoped to this model — mirrors UsageTotals.durationMs. */
   durationMs: Schema.Finite,
   durationRecords: Schema.Finite,
+  /** Provider response generation window (first token -> stream end). */
+  generationMs: Schema.Finite,
+  generationRecords: Schema.Finite,
 })
 export type ModelBucket = Schema.Schema.Type<typeof ModelBucket>
 
@@ -354,8 +363,47 @@ export const UsageSummaryRequest = Schema.Struct({
 })
 export type UsageSummaryRequest = Schema.Schema.Type<typeof UsageSummaryRequest>
 
+export const ModelProfileEntry = Schema.Struct({
+  providerID: Schema.String,
+  modelID: Schema.String,
+  costSamples: Schema.Finite,
+  averageCost: Schema.Finite,
+  cacheSamples: Schema.Finite,
+  cacheHitRate: Schema.Finite,
+})
+export type ModelProfileEntry = Schema.Schema.Type<typeof ModelProfileEntry>
+
+export const ModelProfile = Schema.Struct({
+  models: Schema.Array(ModelProfileEntry),
+})
+export type ModelProfile = Schema.Schema.Type<typeof ModelProfile>
+
+export const PricingCatalogModel = Schema.Struct({
+  providerID: Schema.String,
+  providerName: Schema.String,
+  modelID: Schema.String,
+  name: Schema.String,
+  family: Schema.optional(Schema.String),
+  cost: Schema.Struct({
+    input: Schema.Finite,
+    output: Schema.Finite,
+    cache: Schema.Struct({
+      read: Schema.Finite,
+      write: Schema.Finite,
+    }),
+  }),
+})
+export type PricingCatalogModel = Schema.Schema.Type<typeof PricingCatalogModel>
+
+export const PricingCatalog = Schema.Struct({
+  models: Schema.Array(PricingCatalogModel),
+})
+export type PricingCatalog = Schema.Schema.Type<typeof PricingCatalog>
+
 export interface Interface {
   readonly summary: (request: UsageSummaryRequest) => Effect.Effect<UsageSummary>
+  readonly modelProfile: () => Effect.Effect<ModelProfile>
+  readonly pricingCatalog: () => Effect.Effect<PricingCatalog>
   readonly recordMaintenance: (input: MaintenanceRecordInput) => Effect.Effect<void>
 }
 
@@ -371,6 +419,7 @@ type UsageRow = {
   completed_ms: number | null
   request_sent_ms: number | null
   first_token_ms: number | null
+  streamed_ms: number | null
   cost_usd: number | null
   input_tokens: number
   cache_read_tokens: number
@@ -403,6 +452,16 @@ type MaintenanceUsageRow = {
   total_tokens: number
   started_ms: number
   completed_ms: number
+}
+
+type ModelProfileRow = {
+  provider_id: string
+  model_id: string
+  cost_samples: number
+  cost_sum: number
+  cache_samples: number
+  input_tokens: number
+  cache_read_tokens: number
 }
 
 export type MaintenanceRecordInput = {
@@ -438,14 +497,25 @@ const MAX_SESSIONS = 50
 const MAX_SERIES_VALUES = 60_000
 
 // Summary results are aggregated and small; cache them briefly so repeated
-// panel opens and rapid range switching do not re-scan the message table. The
-// message-table max rowid is part of the key, so a newly-inserted message
-// invalidates the cache naturally and live usage never lags.
+// panel opens and rapid range switching do not re-scan usage_record. Cache
+// entries carry UsageRecord's monotonic in-process revision, so a new settled
+// generation invalidates them without adding a database watermark query to the
+// hot path.
 const SUMMARY_CACHE_TTL_MS = 3_000
-const summaryCache = new Map<string, { at: number; value: UsageSummary }>()
+const summaryCache = new Map<string, { at: number; revision: number; value: UsageSummary }>()
+const MODEL_PROFILE_CACHE_TTL_MS = 10_000
+let modelProfileCache: { at: number; database: string; revision: number; value: ModelProfile } | undefined
 
 /** Invalidate process-local analytics after an out-of-band history mutation. */
-export const resetUsageSummaryCache = () => summaryCache.clear()
+export const resetUsageSummaryCache = () => {
+  summaryCache.clear()
+  // modelProfile is derived from the same durable usage_record history as the
+  // range summaries. A reset/history rewrite must therefore invalidate both
+  // projections atomically; otherwise Settings/Usage can display a stale
+  // personal-model ranking for MODEL_PROFILE_CACHE_TTL_MS after the underlying
+  // records have already been removed or rewritten.
+  modelProfileCache = undefined
+}
 
 function downsample<T>(list: T[], max: number): T[] {
   if (list.length <= max) return list
@@ -481,13 +551,6 @@ const layer = Layer.effect(
     // range/project changes cannot create a concurrent scan storm.
     const queryPermit = yield* Semaphore.make(1)
 
-    yield* db
-      .run(
-        sql`CREATE INDEX IF NOT EXISTS idx_message_completed
-            ON message (json_extract(data, '$.time.completed'))`,
-      )
-      .pipe(Effect.orDie)
-
     const summary = Effect.fn("Usage.summary")(function* (request: UsageSummaryRequest) {
       const projectID = request.projectID ?? null
 
@@ -496,9 +559,10 @@ const layer = Layer.effect(
       // request. A short TTL bounds staleness while avoiding any shared-DB
       // watermark query on the hot path.
       const range = request.since === 0 ? "all" : String(request.until - request.since)
-      const key = `${range}:${request.resolution}:${projectID ?? ""}`
+      const key = `${filename}:${range}:${request.resolution}:${projectID ?? ""}`
+      const revision = UsageRecord.revision()
       const hit = summaryCache.get(key)
-      if (hit && Date.now() - hit.at < SUMMARY_CACHE_TTL_MS) return hit.value
+      if (hit && hit.revision === revision && Date.now() - hit.at < SUMMARY_CACHE_TTL_MS) return hit.value
 
       const catalog = yield* modelsDev.get()
       const rates = buildRates(catalog)
@@ -514,33 +578,33 @@ const layer = Layer.effect(
               .all<UsageRow>(
               sql`
                 SELECT
-                  m.id,
-                  m.session_id,
-                  json_extract(m.data, '$.providerID') AS provider_id,
-                  json_extract(m.data, '$.modelID') AS model_id,
-                  json_extract(m.data, '$.variant') AS variant,
-                  json_extract(m.data, '$.time.created') AS created_ms,
-                  json_extract(m.data, '$.time.completed') AS completed_ms,
-                  json_extract(m.data, '$.time.requestSentAt') AS request_sent_ms,
-                  json_extract(m.data, '$.time.firstTokenAt') AS first_token_ms,
-                  json_extract(m.data, '$.cost') AS cost_usd,
-                  COALESCE(json_extract(m.data, '$.tokens.input'), 0) AS input_tokens,
-                  COALESCE(json_extract(m.data, '$.tokens.cache.read'), 0) AS cache_read_tokens,
-                  COALESCE(json_extract(m.data, '$.tokens.cache.write'), 0) AS cache_write_tokens,
-                  COALESCE(json_extract(m.data, '$.tokens.output'), 0) AS output_tokens,
-                  COALESCE(json_extract(m.data, '$.tokens.reasoning'), 0) AS reasoning_tokens,
+                  r.message_id AS id,
+                  r.session_id,
+                  r.provider_id,
+                  r.model_id,
+                  r.variant,
+                  r.created_at AS created_ms,
+                  r.completed_at AS completed_ms,
+                  r.request_sent_at AS request_sent_ms,
+                  r.first_token_at AS first_token_ms,
+                  r.streamed_at AS streamed_ms,
+                  r.cost_usd,
+                  r.input_tokens,
+                  r.cache_read_tokens,
+                  r.cache_write_tokens,
+                  r.output_tokens,
+                  r.reasoning_tokens,
                   s.project_id,
                   s.directory,
                   s.title AS session_title,
                   p.name AS project_name,
-                  json_extract(m.data, '$.agent') AS agent,
-                  json_extract(m.data, '$.mode') AS mode
-                FROM message m
-                JOIN session s ON s.id = m.session_id
+                  r.agent,
+                  r.mode
+                FROM usage_record r
+                JOIN session s ON s.id = r.session_id
                 LEFT JOIN project p ON p.id = s.project_id
-                WHERE json_extract(m.data, '$.role') = 'assistant'
-                  AND json_extract(m.data, '$.time.completed') >= ${request.since}
-                  AND json_extract(m.data, '$.time.completed') < ${request.until}
+                WHERE r.completed_at >= ${request.since}
+                  AND r.completed_at < ${request.until}
                   AND (${projectID} IS NULL OR s.project_id = ${projectID})
                 ORDER BY completed_ms ASC
               `,
@@ -581,8 +645,90 @@ const layer = Layer.effect(
       )
 
       if (summaryCache.size > 100) summaryCache.clear()
-      summaryCache.set(key, { at: Date.now(), value: result })
+      summaryCache.set(key, { at: Date.now(), revision, value: result })
       return result
+    })
+
+    const modelProfile = Effect.fn("Usage.modelProfile")(function* () {
+      const revision = UsageRecord.revision()
+      const hit = modelProfileCache
+      if (
+        hit &&
+        hit.database === filename &&
+        hit.revision === revision &&
+        Date.now() - hit.at < MODEL_PROFILE_CACHE_TTL_MS
+      )
+        return hit.value
+      const rows = yield* queryPermit.withPermits(1)(
+        withBackfillDb(filename, (conn) =>
+          conn
+            .all<ModelProfileRow>(sql`
+              WITH recent AS (
+                SELECT
+                  provider_id,
+                  model_id,
+                  cost_usd,
+                  input_tokens,
+                  cache_read_tokens,
+                  ROW_NUMBER() OVER (
+                    PARTITION BY provider_id, model_id
+                    ORDER BY completed_at DESC, message_id DESC
+                  ) AS sample_rank
+                FROM usage_record
+              )
+              SELECT
+                provider_id,
+                model_id,
+                SUM(CASE WHEN cost_usd > 0 THEN 1 ELSE 0 END) AS cost_samples,
+                SUM(CASE WHEN cost_usd > 0 THEN cost_usd ELSE 0 END) AS cost_sum,
+                SUM(CASE WHEN input_tokens > 0 OR cache_read_tokens > 0 THEN 1 ELSE 0 END) AS cache_samples,
+                SUM(input_tokens) AS input_tokens,
+                SUM(cache_read_tokens) AS cache_read_tokens
+              FROM recent
+              WHERE sample_rank <= 200
+              GROUP BY provider_id, model_id
+            `)
+            .pipe(Effect.orDie),
+        ).pipe(Effect.orDie),
+      )
+      const value: ModelProfile = {
+        models: rows.map((row) => ({
+          providerID: row.provider_id,
+          modelID: row.model_id,
+          costSamples: row.cost_samples,
+          averageCost: row.cost_samples > 0 ? row.cost_sum / row.cost_samples : 0,
+          cacheSamples: row.cache_samples,
+          cacheHitRate:
+            row.input_tokens + row.cache_read_tokens > 0
+              ? row.cache_read_tokens / (row.input_tokens + row.cache_read_tokens)
+              : 0,
+        })),
+      }
+      modelProfileCache = { at: Date.now(), database: filename, revision, value }
+      return value
+    })
+
+    const pricingCatalog = Effect.fn("Usage.pricingCatalog")(function* () {
+      const catalog = yield* modelsDev.get()
+      return {
+        models: Object.values(catalog).flatMap((provider) =>
+          Object.entries(provider.models).map(([modelID, model]) => ({
+            providerID: provider.id,
+            providerName: provider.name,
+            modelID,
+            name: model.name,
+            ...(model.family === undefined ? {} : { family: model.family }),
+            cost: {
+              input: model.cost?.input ?? 0,
+              output: model.cost?.output ?? 0,
+              cache: {
+                read: model.cost?.cache_read ?? model.cost?.input ?? 0,
+                write: model.cost?.cache_write ?? model.cost?.input ?? 0,
+              },
+            },
+          })),
+        ),
+      }
     })
 
     /**
@@ -621,7 +767,7 @@ const layer = Layer.effect(
         summaryCache.clear()
       }).pipe(Effect.catch(() => Effect.void))
 
-    return Service.of({ summary, recordMaintenance })
+    return Service.of({ summary, modelProfile, pricingCatalog, recordMaintenance })
   }),
 )
 
@@ -683,6 +829,14 @@ function aggregate(
   let cacheSavings = 0
   let cacheSavingsRecords = 0
   let estimatedRecords = 0
+  let throughputMs = 0
+
+  const generationWindow = (row: UsageRow, completed: number) => {
+    if (row.first_token_ms !== null && row.streamed_ms !== null && row.streamed_ms >= row.first_token_ms)
+      return row.streamed_ms - row.first_token_ms
+    if (row.created_ms !== null && completed >= row.created_ms) return completed - row.created_ms
+    return undefined
+  }
 
   const maintenanceTotals: Mutable<MaintenanceTotals> = {
     requests: 0,
@@ -889,6 +1043,8 @@ function aggregate(
       totals.ttftMs += row.first_token_ms - row.request_sent_ms
       totals.ttftRecords += 1
     }
+    const generationMs = generationWindow(row, completed)
+    if (generationMs !== undefined) throughputMs += generationMs
 
     const saved = cacheSavingsFor(row, tokens, rate)
     cacheSavings += saved
@@ -905,6 +1061,8 @@ function aggregate(
       share: 0,
       durationMs: 0,
       durationRecords: 0,
+      generationMs: 0,
+      generationRecords: 0,
     }
     provider.messages += 1
     if (source === "recorded") provider.cost += cost
@@ -914,6 +1072,10 @@ function aggregate(
     if (row.created_ms !== null && completed >= row.created_ms) {
       provider.durationMs += completed - row.created_ms
       provider.durationRecords += 1
+    }
+    if (generationMs !== undefined) {
+      provider.generationMs += generationMs
+      provider.generationRecords += 1
     }
     providers.set(providerID, provider)
 
@@ -931,6 +1093,8 @@ function aggregate(
       cacheSavings: 0,
       durationMs: 0,
       durationRecords: 0,
+      generationMs: 0,
+      generationRecords: 0,
     }
     model.messages += 1
     if (source === "recorded") model.cost += cost
@@ -941,6 +1105,10 @@ function aggregate(
     if (row.created_ms !== null && completed >= row.created_ms) {
       model.durationMs += completed - row.created_ms
       model.durationRecords += 1
+    }
+    if (generationMs !== undefined) {
+      model.generationMs += generationMs
+      model.generationRecords += 1
     }
     models.set(modelKey, model)
 
@@ -1104,7 +1272,7 @@ function aggregate(
 
   const processedTokens = totals.tokens.output + totals.tokens.reasoning
   const ratesResult: UsageRates = {
-    tokensPerSecond: safeDiv(processedTokens, totals.durationMs) * 1000,
+    tokensPerSecond: safeDiv(processedTokens, throughputMs) * 1000,
     avgTokensPerTurn: safeDiv(totalTokens(totals.tokens), totals.messages),
     avgCostPerTurn: safeDiv(totals.cost + totals.estimatedCost, totals.messages),
     cacheHitRate: safeDiv(totals.tokens.cacheRead, totals.tokens.input + totals.tokens.cacheRead),

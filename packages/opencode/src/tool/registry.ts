@@ -1,4 +1,5 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
+import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
 import { httpClient } from "@opencode-ai/core/effect/app-node-platform"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { RipgrepBinary } from "@opencode-ai/core/ripgrep/binary"
@@ -104,6 +105,67 @@ type State = {
   read: ReadDef
 }
 
+const snapshotReadOnlyTools = new Set([
+  "invalid",
+  "question",
+  "read",
+  "find",
+  "web",
+  "todo",
+  "skill",
+  "memory",
+  "project",
+  "symbols",
+  "sympy",
+  "lsp",
+  // Delegators do not own the leaf operation lifetime. Their nested tools are
+  // independently guarded at the same registry boundary.
+  "task",
+  "session",
+  "goal",
+  TOOL_ACCESS_ID,
+])
+
+function inputRecord(value: unknown): Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : {}
+}
+
+/**
+ * Conservative worktree-mutation classification for Snapshot reuse.
+ *
+ * Unknown/custom/plugin tools intentionally default to `true`. Only operations
+ * whose semantics are provably read-only preserve a completed project tree.
+ * This function classifies filesystem authority, not DB/session mutation.
+ */
+export function toolMayMutateWorkspace(toolID: string, input: unknown): boolean {
+  if (snapshotReadOnlyTools.has(toolID)) return false
+  const args = inputRecord(input)
+
+  switch (toolID) {
+    case "archive":
+      return args.action !== "list" && args.action !== "read"
+    case "json": {
+      const mode = args.mode ?? "validate"
+      if (mode !== "format" && mode !== "patch") return false
+      return args.dryRun === false
+    }
+    case "sqlite":
+      return args.action === "run" || args.action === "export"
+    case "git": {
+      const mode = args.mode ?? "status"
+      return !["help", "status", "summary", "diff", "log", "show"].includes(String(mode))
+    }
+    case "checkpoint":
+      return args.mode === "restore"
+    case "background":
+      return !["list", "status", "read", "wait"].includes(String(args.action))
+    default:
+      return true
+  }
+}
+
 const delegatedPermissionTools = new Set([FindTool.id, WebTool.id, BrowserTool.id])
 
 function providerPolicy(toolID: string, ruleset: PermissionV1.Ruleset): PermissionV1.Rule {
@@ -146,6 +208,18 @@ const layer = Layer.effect(
     const truncate = yield* Truncate.Service
     const flags = yield* RuntimeFlags.Service
     const mcp = yield* MCP.Service
+    const snapshot = yield* Snapshot.Service
+
+    const guardSnapshot = <T extends Tool.Def>(tool: T): T => {
+      const execute = tool.execute
+      return {
+        ...tool,
+        execute: (args: unknown, ctx: Tool.Context) =>
+          toolMayMutateWorkspace(tool.id, args)
+            ? snapshot.withMutation(execute(args as never, ctx), `tool:${tool.id}`)
+            : execute(args as never, ctx),
+      } as T
+    }
 
     const invalid = yield* InvalidTool
     const task = yield* TaskTool
@@ -185,18 +259,20 @@ const layer = Layer.effect(
       Effect.fn("ToolRegistry.state")(function* (ctx) {
         const dirs = yield* config.directories()
         const plugins = yield* plugin.list()
-        const custom = yield* buildCustomTools(dirs, plugins, {
-          agent,
-          truncate,
-          directory: ctx.directory,
-          worktree: ctx.worktree,
-          waitForDependencies: config.waitForDependencies,
-        })
+        const custom = (
+          yield* buildCustomTools(dirs, plugins, {
+            agent,
+            truncate,
+            directory: ctx.directory,
+            worktree: ctx.worktree,
+            waitForDependencies: config.waitForDependencies,
+          })
+        ).map(guardSnapshot)
 
         yield* config.get()
         const questionEnabled = ["app", "cli", "desktop"].includes(flags.client) || flags.enableQuestionTool
 
-        const tool = yield* Effect.all({
+        const raw = yield* Effect.all({
           invalid: Tool.init(invalid),
           shell: Tool.init(shell),
           read: Tool.init(read),
@@ -230,6 +306,10 @@ const layer = Layer.effect(
           browser: Tool.init(browsertool),
           ...(codeModeTool ? { execute: Tool.init(codeModeTool) } : {}),
         })
+
+        const tool = Object.fromEntries(
+          Object.entries(raw).map(([key, value]) => [key, guardSnapshot(value)]),
+        ) as typeof raw
 
         const lazy = [...Object.values(tool), ...custom].filter(isLazyTool)
         const toolAccessDef = createToolAccessTool(lazy, plugin)
@@ -290,21 +370,22 @@ const layer = Layer.effect(
     const refreshCustom: Interface["refreshCustom"] = Effect.fn("ToolRegistry.refreshCustom")(function* (
       custom: Tool.Def[],
     ) {
+      const guarded = custom.map(guardSnapshot)
       const stateRef = yield* InstanceState.get(state)
       const current = yield* Ref.get(stateRef)
       // Invariant: in-flight execute closures were captured at build time (the
       // ai-sdk tool() wraps the def at resolve), so this swap affects only the
       // NEXT resolve ΓÇö a running tool call keeps the def it started with.
-      const lazy = [...current.builtin, ...custom].filter(isLazyTool)
+      const lazy = [...current.builtin, ...guarded].filter(isLazyTool)
       const builtin = current.builtin.map((tool) =>
         tool.id === TOOL_ACCESS_ID ? createToolAccessTool(lazy, plugin) : tool,
       )
-      yield* Ref.set(stateRef, { ...current, builtin, custom })
+      yield* Ref.set(stateRef, { ...current, builtin, custom: guarded })
       const currentIds = new Set(current.custom.map((tool) => tool.id))
-      const nextIds = new Set(custom.map((tool) => tool.id))
+      const nextIds = new Set(guarded.map((tool) => tool.id))
       return {
-        added: custom.filter((tool) => !currentIds.has(tool.id)).map((tool) => tool.id),
-        updated: custom.filter((tool) => currentIds.has(tool.id)).map((tool) => tool.id),
+        added: guarded.filter((tool) => !currentIds.has(tool.id)).map((tool) => tool.id),
+        updated: guarded.filter((tool) => currentIds.has(tool.id)).map((tool) => tool.id),
         removed: current.custom.filter((tool) => !nextIds.has(tool.id)).map((tool) => tool.id),
       }
     })
@@ -412,6 +493,16 @@ const layer = Layer.effect(
   }),
 )
 
+// Concrete fallback node for the canonical location map. Node identity is the
+// service key, so the server's canonical map replaces this by name at the app
+// boundary (see server.ts). Tests that compile this node directly still get a
+// working (lazily-built) map.
+const locationServiceMapNode = LayerNode.make({
+  service: LocationServiceMap.Service,
+  layer: locationServiceMapLayer,
+  deps: [],
+})
+
 export const node = LayerNode.make({
   service: Service,
   layer,
@@ -450,6 +541,7 @@ export const node = LayerNode.make({
     RipgrepBinary.node,
     BrokerClient.node,
     Memory.node,
+    locationServiceMapNode,
   ],
 })
 

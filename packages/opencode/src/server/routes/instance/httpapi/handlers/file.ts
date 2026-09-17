@@ -9,7 +9,7 @@ import { FileMutation } from "@opencode-ai/core/file-mutation"
 import { FileSystem } from "@opencode-ai/core/filesystem"
 import { FileIndex } from "@opencode-ai/core/filesystem/index"
 import { Watcher } from "@opencode-ai/core/filesystem/watcher"
-import { LocationServiceMap, locationServiceMapLayer } from "@opencode-ai/core/location-services"
+import { LocationServiceMap } from "@opencode-ai/core/location-services"
 import { LocationMutation } from "@opencode-ai/core/location-mutation"
 import { Ripgrep } from "@opencode-ai/core/ripgrep"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -17,7 +17,7 @@ import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath, RelativePath } from "@opencode-ai/core/schema"
 import { ExternalPath } from "@opencode-ai/schema/external-path"
 import { Hash } from "@opencode-ai/core/util/hash"
-import { Effect, Layer, Option } from "effect"
+import { Effect, Option } from "effect"
 import ignore from "ignore"
 import os from "os"
 import path from "path"
@@ -491,4 +491,4 @@ export const fileHandlers = HttpApiBuilder.group(InstanceHttpApi, "file", (handl
       .handle("status", status)
       .handle("externalList", externalList)
   }),
-).pipe(Layer.provide(locationServiceMapLayer))
+)

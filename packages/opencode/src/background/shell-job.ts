@@ -24,6 +24,7 @@ import path from "node:path"
 import * as Truncate from "@/tool/truncate"
 import type { SessionID } from "@/session/schema"
 import { rewriteBashHeredocsForPowerShell } from "@/util/powershell-heredoc"
+import { Snapshot } from "@/snapshot"
 
 const previewBound = (text: string, max = 30_000) => (text.length <= max ? text : "...\n\n" + text.slice(-max))
 
@@ -118,6 +119,7 @@ const layer = Layer.effect(
     const spawner = yield* ChildProcessSpawner
     const trunc = yield* Truncate.Service
     const monitor = yield* MonitorDelivery.Service
+    const snapshot = yield* Snapshot.Service
     const scope = yield* Scope.Scope
 
     // helper to validate and allocate job id
@@ -352,7 +354,10 @@ const layer = Layer.effect(
         type: "shell",
         title: input.command,
         metadata,
-        run: withBackgroundProcessSlot(run),
+        // The launch call returns while this effect continues running. Keep the
+        // Snapshot mutation lease on the actual process lifetime so captures
+        // cannot race a monitor/background command that is still writing files.
+        run: snapshot.withMutation(withBackgroundProcessSlot(run), `background:${kind}`),
       })
 
       yield* pollUntilRegistered(jobId)
@@ -417,7 +422,15 @@ const layer = Layer.effect(
 export const node = LayerNode.make({
   service: Service,
   layer,
-  deps: [BackgroundJob.node, ShellJobs.node, MonitorDelivery.node, Truncate.node, CrossSpawnSpawner.node, FSUtil.node],
+  deps: [
+    BackgroundJob.node,
+    ShellJobs.node,
+    MonitorDelivery.node,
+    Truncate.node,
+    CrossSpawnSpawner.node,
+    FSUtil.node,
+    Snapshot.node,
+  ],
 })
 
 export * as ShellJob from "./shell-job"

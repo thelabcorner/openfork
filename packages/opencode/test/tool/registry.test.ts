@@ -1,10 +1,10 @@
-import { afterEach, describe, expect } from "bun:test"
+import { afterEach, describe, expect, test } from "bun:test"
 import path from "path"
 import fs from "fs/promises"
 import { fileURLToPath, pathToFileURL } from "url"
 import { Effect, Exit, Layer, Result, Schema } from "effect"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
-import { ToolRegistry } from "@/tool/registry"
+import { ToolRegistry, toolMayMutateWorkspace } from "@/tool/registry"
 import { Tool } from "@/tool/tool"
 import { disposeAllInstances, TestInstance } from "../fixture/fixture"
 import { testEffect } from "../lib/effect"
@@ -859,4 +859,55 @@ describe("tool.registry", () => {
       expect(ids).toContain("cowsay")
     }),
   )
+})
+
+describe("toolMayMutateWorkspace policy", () => {
+  // Snapshot reuse correctness depends on conservative mutation authority:
+  // a false negative (treating a mutating tool as read-only) leaves a stale
+  // project tree served to the next checkpoint/diff/revert.
+
+  test("known read-only tools preserve a completed snapshot", () => {
+    for (const id of ["read", "find", "web", "todo", "skill", "project", "symbols", "sympy", "lsp"]) {
+      expect(`${id}=${toolMayMutateWorkspace(id, {})}`).toBe(`${id}=false`)
+    }
+  })
+
+  test("delegators are classified read-only; their nested tools are guarded separately", () => {
+    for (const id of ["task", "session", "goal", "invalid", "question"]) {
+      expect(`${id}=${toolMayMutateWorkspace(id, {})}`).toBe(`${id}=false`)
+    }
+  })
+
+  test("dynamic tools classify by their effective operation", () => {
+    expect(toolMayMutateWorkspace("archive", { action: "list" })).toBe(false)
+    expect(toolMayMutateWorkspace("archive", { action: "read" })).toBe(false)
+    expect(toolMayMutateWorkspace("archive", { action: "extract" })).toBe(true)
+
+    expect(toolMayMutateWorkspace("json", {})).toBe(false)
+    expect(toolMayMutateWorkspace("json", { mode: "format" })).toBe(false)
+    expect(toolMayMutateWorkspace("json", { mode: "format", dryRun: false })).toBe(true)
+    expect(toolMayMutateWorkspace("json", { mode: "patch", dryRun: false })).toBe(true)
+
+    expect(toolMayMutateWorkspace("sqlite", { action: "query" })).toBe(false)
+    expect(toolMayMutateWorkspace("sqlite", { action: "run" })).toBe(true)
+    expect(toolMayMutateWorkspace("sqlite", { action: "export" })).toBe(true)
+
+    expect(toolMayMutateWorkspace("git", { mode: "status" })).toBe(false)
+    expect(toolMayMutateWorkspace("git", {})).toBe(false)
+    expect(toolMayMutateWorkspace("git", { mode: "commit" })).toBe(true)
+
+    expect(toolMayMutateWorkspace("checkpoint", {})).toBe(false)
+    expect(toolMayMutateWorkspace("checkpoint", { mode: "restore" })).toBe(true)
+
+    expect(toolMayMutateWorkspace("background", { action: "list" })).toBe(false)
+    expect(toolMayMutateWorkspace("background", { action: "start" })).toBe(true)
+  })
+
+  test("unknown, custom, and plugin tools conservatively mutate", () => {
+    expect(toolMayMutateWorkspace("my_custom_tool", {})).toBe(true)
+    expect(toolMayMutateWorkspace("mcp__github__create_issue", {})).toBe(true)
+    // Even an unrecognised input shape on a dynamic tool defaults to mutating.
+    expect(toolMayMutateWorkspace("archive", 42)).toBe(true)
+    expect(toolMayMutateWorkspace("archive", null)).toBe(true)
+  })
 })

@@ -2,6 +2,7 @@ import { SessionV2 } from "@opencode-ai/core/session"
 import { Checkpoint } from "@opencode-ai/core/checkpoint"
 import { Snapshot } from "@opencode-ai/core/snapshot"
 import { EventV2 } from "@opencode-ai/core/event"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 import { DateTime, Effect, Schema, Stream } from "effect"
 import { HttpApiBuilder, HttpApiSchema } from "effect/unstable/httpapi"
 import { Api } from "../api"
@@ -57,6 +58,7 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
   Effect.gen(function* () {
     const session = yield* SessionV2.Service
     const events = yield* EventV2.Service
+    const telemetry = yield* SessionTelemetry.Service
     // Checkpoint/Snapshot are Location-scoped: they are provided per-request by
     // SessionLocationMiddleware (LocationServices), never at group-construction
     // time — requesting them here crashes the server at startup.
@@ -174,6 +176,14 @@ export const SessionHandler = HttpApiBuilder.group(Api, "server.session", (handl
           )
           for (const sessionID of paused) data.set(sessionID, { type: "paused" as const })
           return { data: Object.fromEntries(data) }
+        }),
+      )
+      .handle(
+        "session.telemetry",
+        Effect.fn(function* (ctx) {
+          if (ctx.payload.sessionIDs.length > 512)
+            return yield* new InvalidRequestError({ message: "At most 512 session IDs may be requested at once" })
+          return { data: yield* telemetry.snapshot(ctx.payload.sessionIDs) }
         }),
       )
       .handle(

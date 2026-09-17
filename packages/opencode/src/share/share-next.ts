@@ -167,13 +167,20 @@ const layer = Layer.effect(
           def: D,
           fn: (data: EventV2.Data<D>) => Effect.Effect<void, unknown>,
         ) =>
-          events.listen((event) => {
-            if (event.type !== def.type || event.location?.directory !== _ctx.directory) return Effect.void
-            return fn(event.data as EventV2.Data<D>).pipe(
-              Effect.catchCause((cause) =>
-                Effect.logError("share subscriber failed", { type: def.type, cause: cause }),
+          Effect.gen(function* () {
+            // Share state is per project. Keep it off the process-global event
+            // fanout, and—critically—bind the subscription lifetime to this
+            // InstanceState scope. The old helper returned an unsubscribe
+            // effect that every caller discarded, leaking FIVE listeners for
+            // every project ever initialized in the process.
+            const unsubscribe = yield* events.listenDirectory(def, _ctx.directory, (event) =>
+              fn(event.data as EventV2.Data<D>).pipe(
+                Effect.catchCause((cause) =>
+                  Effect.logError("share subscriber failed", { type: def.type, cause: cause }),
+                ),
               ),
             )
+            yield* Effect.addFinalizer(() => unsubscribe)
           })
 
         yield* watch(Session.Event.Updated, (data) =>

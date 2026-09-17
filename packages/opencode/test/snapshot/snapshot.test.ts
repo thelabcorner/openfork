@@ -3,10 +3,13 @@ import { $ } from "bun"
 import { CrossSpawnSpawner } from "@opencode-ai/core/cross-spawn-spawner"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
+import { Global } from "@opencode-ai/core/global"
+import { Hash } from "@opencode-ai/core/util/hash"
 import fs from "fs/promises"
 import path from "path"
-import { Effect, Fiber, Layer } from "effect"
+import { Deferred, Effect, Fiber, Layer } from "effect"
 import { Snapshot } from "../../src/snapshot"
+import { InstanceState } from "@/effect/instance-state"
 import {
   disposeAllInstances,
   provideInstance,
@@ -686,6 +689,7 @@ it.live(
       expect(patch2.files).not.toContain(fwd(tmp1.path, "project1.txt"))
     }).pipe(provideInstance(tmp2.path))
   }),
+  { timeout: 30_000 },
 )
 
 it.live(
@@ -775,6 +779,180 @@ it.instance(
     }),
   ),
   { git: true },
+)
+
+it.instance(
+  "patch between captured trees does not rescan later worktree changes",
+  withTrackedSnapshot(({ tmp, snapshot, before }) =>
+    Effect.gen(function* () {
+      yield* write(`${tmp.path}/a.txt`, "captured change")
+      const after = yield* snapshot.track()
+      expect(after).toBeTruthy()
+
+      // This mutation happened after `after` and must not be attributed to the
+      // immutable before->after step patch.
+      yield* write(`${tmp.path}/b.txt`, "later change")
+
+      const captured = yield* snapshot.patch(before, after!)
+      expect(captured.files).toContain(fwd(tmp.path, "a.txt"))
+      expect(captured.files).not.toContain(fwd(tmp.path, "b.txt"))
+
+      // Compatibility mode still compares against the live worktree/index.
+      const live = yield* snapshot.patch(before)
+      expect(live.files).toContain(fwd(tmp.path, "a.txt"))
+      expect(live.files).toContain(fwd(tmp.path, "b.txt"))
+    }),
+  ),
+  { git: true },
+)
+
+// --- project-owned materialization negative invariants -----------------------
+//
+// These assert COUNTS, not latency: the number of real project captures must
+// not scale with the number of concurrent callers on one canonical project.
+// `snapshot.diagnostics().captures` increments only when a capture actually runs
+// (not on an in-flight reuse), so it is the ownership signal under test.
+
+const BULK_COUNT = 200
+const BULK_MUTATED = 120
+
+// Seed a project large enough that a capture is genuinely in flight while the
+// gated callers below are admitted. This is what makes the count assertion
+// deterministic without relying on wall-clock overlap.
+const seedBulkProject = Effect.fn("SnapshotTest.seedBulkProject")(function* (dir: string) {
+  yield* Effect.forEach(
+    Array.from({ length: BULK_COUNT }, (_, index) => index),
+    (index) => write(`${dir}/bulk-${index}.txt`, `bulk ${index}`),
+    { concurrency: 8, discard: true },
+  )
+  const snapshot = yield* Snapshot.Service
+  expect(yield* snapshot.track()).toBeTruthy()
+  yield* Effect.forEach(
+    Array.from({ length: BULK_MUTATED }, (_, index) => index),
+    (index) => write(`${dir}/bulk-${index}.txt`, `changed ${index}`),
+    { concurrency: 8, discard: true },
+  )
+})
+
+const gatedConcurrentTracks = (snapshot: Snapshot.Interface, lanes: number) =>
+  Effect.gen(function* () {
+    const gate = yield* Deferred.make<void>()
+    const fiber = yield* Effect.all(
+      Array.from({ length: lanes }, () =>
+        Effect.gen(function* () {
+          yield* Deferred.await(gate)
+          return yield* snapshot.track()
+        }),
+      ),
+      { concurrency: "unbounded" },
+    ).pipe(Effect.forkScoped)
+    yield* Deferred.succeed(gate, undefined)
+    return yield* Fiber.join(fiber)
+  })
+
+it.instance(
+  "concurrent same-project track callers share one capture generation",
+  Effect.gen(function* () {
+    const tmp = yield* TestInstance
+    yield* seedBulkProject(tmp.directory)
+    const snapshot = yield* Snapshot.Service
+
+    const before = yield* snapshot.diagnostics()
+    // No native watcher owns this root in the test environment, so the
+    // coverage proof is false and capture uses the authoritative Git fallback.
+    // T2/T4 activation is verified against a real watcher by the core
+    // ProjectInventory suite; this asserts the safe fallback is what runs here.
+    expect(before.watcherOwnedRoot).toBe(false)
+    expect(before.completedReuse).toBe(false)
+    const trees = yield* gatedConcurrentTracks(snapshot, 6)
+    const after = yield* snapshot.diagnostics()
+
+    // Exactly one real capture, and the other five callers reused it.
+    expect(after.captures - before.captures).toBe(1)
+    expect(after.cacheHits - before.cacheHits).toBeGreaterThanOrEqual(5)
+    // Every caller observed the same immutable project tree.
+    expect(trees.every((tree) => tree === trees[0])).toBe(true)
+  }),
+  { git: true },
+  { timeout: 30_000 },
+)
+
+it.instance(
+  "one invalidation fans into exactly one refresh for concurrent callers",
+  Effect.gen(function* () {
+    const tmp = yield* TestInstance
+    yield* seedBulkProject(tmp.directory)
+    const snapshot = yield* Snapshot.Service
+
+    const before = yield* snapshot.diagnostics()
+    yield* snapshot.invalidate("test:fan-in")
+    const trees = yield* gatedConcurrentTracks(snapshot, 6)
+    const after = yield* snapshot.diagnostics()
+
+    expect(after.invalidations - before.invalidations).toBeGreaterThanOrEqual(1)
+    expect(after.captures - before.captures).toBe(1)
+    expect(trees.every((tree) => tree === trees[0])).toBe(true)
+  }),
+  { git: true },
+  { timeout: 30_000 },
+)
+
+it.instance(
+  "mutations may overlap but a capture never observes a half-applied write",
+  Effect.gen(function* () {
+    const tmp = yield* TestInstance
+    yield* initialize(tmp.directory)
+    const snapshot = yield* Snapshot.Service
+    expect(yield* snapshot.track()).toBeTruthy()
+
+    // Independent mutations are allowed to run concurrently (read side of the
+    // barrier). A capture started among them must wait for them to finish, so
+    // its tree always reflects fully written files.
+    const mutations = Effect.all(
+      Array.from({ length: 4 }, (_, lane) =>
+        snapshot.withMutation(
+          Effect.gen(function* () {
+            const marker = `${tmp.directory}/lane-${lane}.txt`
+            yield* write(`${marker}.tmp`, "partial")
+            yield* write(marker, `lane ${lane} complete`)
+            yield* rm(`${marker}.tmp`)
+          }),
+          `test:lane-${lane}`,
+        ),
+      ),
+      { concurrency: "unbounded" },
+    )
+    const capture = snapshot.track()
+
+    const [, tree] = yield* Effect.all([mutations, capture], { concurrency: "unbounded" })
+    expect(tree).toBeTruthy()
+    // No partial write may appear in the captured tree.
+    const patch = yield* snapshot.patch(tree!)
+    expect(patch.files.some((file) => file.endsWith(".tmp"))).toBe(false)
+  }),
+  { git: true },
+)
+
+
+it.instance(
+  "reconstructs a corrupt shadow index instead of failing every capture",
+  () =>
+    Effect.gen(function* () {
+      const snapshot = yield* Snapshot.Service
+      expect(yield* snapshot.track()).toBeTruthy()
+
+      const ctx = yield* InstanceState.context
+      const index = path.join(Global.Path.data, "snapshot", ctx.project.id, Hash.fast(ctx.worktree), "index")
+      // Simulate a crashed/raced seed: an all-zero index (bad signature).
+      yield* write(index, Buffer.alloc(4096))
+      expect((yield* readText(index)).slice(0, 4)).not.toBe("DIRC")
+
+      const healed = yield* snapshot.track()
+      expect(healed).toBeTruthy()
+      expect((yield* readText(index)).slice(0, 4)).toBe("DIRC")
+    }),
+  { git: true },
+  { timeout: 30_000 },
 )
 
 it.instance(

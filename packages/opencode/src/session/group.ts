@@ -2,6 +2,7 @@ import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { Database } from "@opencode-ai/core/database/database"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionGroupMemberTable, SessionGroupTable, SessionTable } from "@opencode-ai/core/session/sql"
+import { SessionV1 } from "@opencode-ai/core/v1/session"
 import { SessionGroup } from "@opencode-ai/schema/session-group"
 import { DateTime } from "effect"
 import { and, asc, eq, isNull, ne, sql } from "drizzle-orm"
@@ -678,10 +679,78 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
           "plugin-ownership",
           "member-reordering",
           "subagent-auto-grouping",
+          "goal-auditor-auto-grouping",
+          "special-agent-auto-grouping",
           "session-group-assign-hook",
           "plugin-stable-identity",
         ],
       }
+    })
+
+    /**
+     * Couple one host-owned special-agent transcript into the parent Session's
+     * subagent group as an irremovable, locked member. Goal Auditor keeps its
+     * dedicated `goal_auditor` origin; every other special agent (Prompt Revisor,
+     * Session Title) uses the generic `special_agent` origin.
+     */
+    const attachSpecialAgent = Effect.fn("SessionGroup.attachSpecialAgent")(function* (input: {
+      sessionID: string
+      parentSessionID: string
+      agent: string
+      originRef: string
+      parentTitle?: string
+    }) {
+      const group = yield* resolveOrCreate({
+        name: input.parentTitle || "Subagents",
+        kind: "subagent",
+        anchorSessionId: input.parentSessionID,
+        policy: { autoAddDescendants: true, lockAdded: true, autoDeleteWhenEmpty: true },
+      })
+      yield* addSession({ groupId: group.id, sessionId: input.parentSessionID, origin: "auto_subagent" })
+      yield* addSession({
+        groupId: group.id,
+        sessionId: input.sessionID,
+        locked: true,
+        origin: input.agent === "goal_auditor" ? "goal_auditor" : "special_agent",
+        originRef: input.originRef,
+      })
+    })
+
+    const specialAgentOriginRef = (input: {
+      sessionID: string
+      metadata?: Record<string, unknown> | null
+      agent: string
+    }) => {
+      if (input.agent === "goal_auditor") {
+        const goalID = typeof input.metadata?.goalID === "string" ? input.metadata.goalID : undefined
+        return goalID ? `goal:${goalID}` : undefined
+      }
+      const ownerID =
+        typeof input.metadata?.specialAgentOwnerID === "string" ? input.metadata.specialAgentOwnerID : input.sessionID
+      return `${input.agent}:${ownerID}`
+    }
+
+    const attachSpecialAgentFromInfo = Effect.fn("SessionGroup.attachSpecialAgentFromInfo")(function* (
+      info: SessionV1.SessionInfo,
+    ) {
+      if (!info.parentID) return
+      const agent = typeof info.metadata?.specialAgent === "string" ? info.metadata.specialAgent : undefined
+      if (!agent) return
+      const originRef = specialAgentOriginRef({ sessionID: info.id, metadata: info.metadata, agent })
+      if (!originRef) return
+      const parent = yield* database.db
+        .select({ title: SessionTable.title })
+        .from(SessionTable)
+        .where(eq(SessionTable.id, info.parentID))
+        .get()
+        .pipe(Effect.orDie)
+      yield* attachSpecialAgent({
+        sessionID: info.id,
+        parentSessionID: info.parentID,
+        agent,
+        originRef,
+        parentTitle: parent?.title,
+      })
     })
 
     const reconcileSubagents = Effect.gen(function* () {
@@ -689,7 +758,9 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
         .select({ id: SessionTable.id, parent_id: SessionTable.parent_id, title: SessionTable.title })
         .from(SessionTable)
         .where(
-          sql`${SessionTable.parent_id} IS NOT NULL AND NOT EXISTS (
+          sql`${SessionTable.parent_id} IS NOT NULL
+            AND json_extract(${SessionTable.metadata}, '$.specialAgent') IS NULL
+            AND NOT EXISTS (
             SELECT 1 FROM ${SessionGroupMemberTable}
             WHERE ${SessionGroupMemberTable.session_id} = ${SessionTable.id}
               AND ${SessionGroupMemberTable.origin} = 'auto_subagent'
@@ -734,7 +805,58 @@ const layer: Layer.Layer<Service, never, Database.Service | EventV2Bridge.Servic
       }
     }).pipe(Effect.catchCause((cause) => Effect.logError("failed to reconcile subagent groups", { cause })))
 
-    yield* reconcileSubagents.pipe(Effect.forkScoped)
+    const reconcileSpecialAgents = Effect.gen(function* () {
+      const candidates = yield* database.db
+        .select({
+          id: SessionTable.id,
+          parentID: SessionTable.parent_id,
+          metadata: SessionTable.metadata,
+        })
+        .from(SessionTable)
+        .where(
+          sql`${SessionTable.parent_id} IS NOT NULL
+            AND json_extract(${SessionTable.metadata}, '$.specialAgent') IS NOT NULL
+            AND NOT EXISTS (
+              SELECT 1 FROM ${SessionGroupMemberTable}
+              WHERE ${SessionGroupMemberTable.session_id} = ${SessionTable.id}
+                AND ${SessionGroupMemberTable.origin} IN ('goal_auditor', 'special_agent')
+            )`,
+        )
+        .limit(100)
+        .all()
+        .pipe(Effect.orDie)
+      for (const candidate of candidates) {
+        if (!candidate.parentID) continue
+        const agent = typeof candidate.metadata?.specialAgent === "string" ? candidate.metadata.specialAgent : undefined
+        if (!agent) continue
+        const originRef = specialAgentOriginRef({ sessionID: candidate.id, metadata: candidate.metadata, agent })
+        if (!originRef) continue
+        const parent = yield* database.db
+          .select({ title: SessionTable.title })
+          .from(SessionTable)
+          .where(eq(SessionTable.id, candidate.parentID))
+          .get()
+          .pipe(Effect.orDie)
+        yield* attachSpecialAgent({
+          sessionID: candidate.id,
+          parentSessionID: candidate.parentID,
+          agent,
+          originRef,
+          parentTitle: parent?.title,
+        })
+      }
+    }).pipe(Effect.catchCause((cause) => Effect.logError("failed to reconcile special-agent groups", { cause })))
+
+    const unsubscribeSessionCreated = yield* events.listen((event) =>
+      event.type === SessionV1.Event.Created.type
+        ? attachSpecialAgentFromInfo((event.data as { info: SessionV1.SessionInfo }).info).pipe(
+            Effect.catchCause((cause) => Effect.logError("failed to group special-agent Session", { cause })),
+          )
+        : Effect.void,
+    )
+    yield* Effect.addFinalizer(() => unsubscribeSessionCreated)
+
+    yield* Effect.all([reconcileSubagents, reconcileSpecialAgents], { concurrency: 2 }).pipe(Effect.forkScoped)
 
     return Service.of({
       list,
