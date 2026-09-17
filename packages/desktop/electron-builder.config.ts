@@ -47,6 +47,20 @@ const getBase = (appId: string): Configuration => ({
     output: "dist",
     buildResources: "resources",
   },
+  // OpenFork now publishes installers. Without a provider, electron-builder's
+  // update-info step (`computeChannelNames`) dereferences a null publish config
+  // and throws after the artifacts are already built. Point the feed at the
+  // fork (never anomalyco) and always mark these as prereleases. `--publish
+  // never` in CI still prevents electron-builder from uploading; our workflow
+  // attaches the artifacts explicitly.
+  publish: [
+    {
+      provider: "github",
+      owner: "thelabcorner",
+      repo: "openfork",
+      releaseType: "prerelease",
+    },
+  ],
   // Linux launchers are .desktop files, so this is the desktop file name,
   // not just the app id. For prod, app id "ai.opencode.desktop" becomes
   // "ai.opencode.desktop.desktop".
@@ -86,7 +100,9 @@ const getBase = (appId: string): Configuration => ({
     gatekeeperAssess: false,
     entitlements: "resources/entitlements.plist",
     entitlementsInherit: "resources/entitlements.plist",
-    notarize: true,
+    // Dev pre-releases are unsigned: Apple notarization needs credentials this
+    // fork does not have. Set OPENCODE_DESKTOP_NOTARIZE=1 for a signed release.
+    notarize: process.env.OPENCODE_DESKTOP_NOTARIZE === "1",
     target: ["dmg", "zip"],
   },
   dmg: {

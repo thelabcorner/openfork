@@ -5,6 +5,10 @@
   "type": "module",
   "license": "MIT",
   "homepage": "https://opencode.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/thelabcorner/openfork.git"
+  },
   "author": {
     "name": "OpenCode",
     "email": "hello@opencode.ai"
