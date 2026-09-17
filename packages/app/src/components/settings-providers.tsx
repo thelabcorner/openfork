@@ -3,7 +3,8 @@ import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { Tag } from "@opencode-ai/ui/tag"
 import { showToast } from "@/utils/toast"
-import { popularProviders, useProviders } from "@/hooks/use-providers"
+import { popularProviders } from "@/hooks/use-providers"
+import { useProviderSettings, type ProviderSettingsItem } from "@/hooks/use-provider-settings"
 import { createMemo, type Component, For, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
 import { useServerProtocol, useServerSDK } from "@/context/server-sdk"
@@ -14,7 +15,7 @@ import { SettingsList } from "./settings-list"
 import { SettingsServerPicker, SettingsServerScope } from "./settings-server-picker"
 
 type ProviderSource = "env" | "api" | "config" | "custom"
-type ProviderItem = ReturnType<ReturnType<typeof useProviders>["connected"]>[number]
+type ProviderItem = ProviderSettingsItem
 
 const PROVIDER_NOTES = [
   { match: (id: string) => id === "opencode", key: "dialog.provider.opencode.note" },
@@ -42,7 +43,7 @@ const SettingsProvidersContent: Component<{ onBack?: () => void }> = (props) => 
   const serverSDK = useServerSDK()
   const protocol = useServerProtocol()
   const serverSync = useServerSync()
-  const providers = useProviders(() => undefined)
+  const providers = useProviderSettings()
   const providerConnect = useProviderConnectController({ onBack: props.onBack })
 
   const connect = (provider?: string) => {
@@ -53,13 +54,14 @@ const SettingsProvidersContent: Component<{ onBack?: () => void }> = (props) => 
   const connected = createMemo(() => {
     return providers
       .connected()
-      .filter((p) => p.id !== "opencode" || Object.values(p.models).find((m) => m.cost?.input))
+      .filter((p) => p.id !== "opencode" || p.hasPaidModels)
   })
 
   const popular = createMemo(() => {
     const connectedIDs = new Set(connected().map((p) => p.id))
     const items = providers
-      .popular()
+      .data()
+      .providers.filter((p) => popularProviders.includes(p.id))
       .filter((p) => !connectedIDs.has(p.id))
       .slice()
     items.sort((a, b) => popularProviders.indexOf(a.id) - popularProviders.indexOf(b.id))
@@ -67,7 +69,6 @@ const SettingsProvidersContent: Component<{ onBack?: () => void }> = (props) => 
   })
 
   const source = (item: ProviderItem): ProviderSource | undefined => {
-    if (!("source" in item)) return
     const value = item.source
     if (value === "env" || value === "api" || value === "config" || value === "custom") return value
     return
@@ -85,8 +86,7 @@ const SettingsProvidersContent: Component<{ onBack?: () => void }> = (props) => 
     return language.t("settings.providers.tag.other")
   }
 
-  const canDisconnect = (item: ProviderItem) =>
-    source(item) !== "env" && (protocol() === "v1" || !isConfigCustom(item.id))
+  const canDisconnect = (item: ProviderItem) => source(item) !== "env"
 
   const note = (id: string) => PROVIDER_NOTES.find((item) => item.match(id))?.key
 
@@ -99,7 +99,6 @@ const SettingsProvidersContent: Component<{ onBack?: () => void }> = (props) => 
   }
 
   const disableProvider = async (providerID: string, name: string) => {
-    if (protocol() !== "v1") return
     const before = serverSync().data.config.disabled_providers ?? []
     const next = before.includes(providerID) ? before : [...before, providerID]
     serverSync().set("config", "disabled_providers", next)
@@ -122,17 +121,24 @@ const SettingsProvidersContent: Component<{ onBack?: () => void }> = (props) => 
   }
 
   const disconnect = async (providerID: string, name: string) => {
+    const item = providers.get(providerID)
+    const stored = item?.connections.filter((connection) => connection.type === "credential") ?? []
     if (isConfigCustom(providerID)) {
       await serverSDK()
         .client.auth.remove({ providerID })
         .catch(() => undefined)
+      await Promise.all(stored.map((connection) => providers.credential.remove(connection.id).catch(() => undefined)))
       await disableProvider(providerID, name)
+      await providers.refresh().catch(() => undefined)
       return
     }
-    await serverSDK()
-      .client.auth.remove({ providerID })
+    await Promise.all([
+      serverSDK().client.auth.remove({ providerID }).catch(() => undefined),
+      ...stored.map((connection) => providers.credential.remove(connection.id).catch(() => undefined)),
+    ])
       .then(async () => {
-        await serverSDK().client.global.dispose()
+        if (protocol() === "v1") await serverSDK().client.global.dispose().catch(() => undefined)
+        await providers.refresh().catch(() => undefined)
         showToast({
           variant: "success",
           icon: "circle-check",

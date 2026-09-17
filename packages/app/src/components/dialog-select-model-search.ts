@@ -66,3 +66,50 @@ export function filterPreparedModelGroupsForSearch<T extends SearchItem>(
   }
   return result
 }
+
+export type ModelSectionSelection<T> = {
+  favorites: T[]
+  recents: T[]
+}
+
+/**
+ * Favorites and Recent are projections of the search-filtered result list, not
+ * a second pass over the catalog: a section may only contain rows the query
+ * actually matched (including account-expanded variants), and each model group
+ * contributes at most one row. A favorite never repeats under Recent.
+ * `recentGroupKeys` supplies recency order.
+ */
+export function selectModelSections<T>(
+  models: readonly T[],
+  options: {
+    keyOf: (item: T) => string
+    groupKeyOf: (item: T) => string | undefined
+    isFavorite: (item: T) => boolean
+    recentGroupKeys: readonly string[]
+  },
+): ModelSectionSelection<T> {
+  const firstByGroup = new Map<string, T>()
+  for (const item of models) {
+    const groupKey = options.groupKeyOf(item)
+    if (groupKey === undefined || firstByGroup.has(groupKey)) continue
+    firstByGroup.set(groupKey, item)
+  }
+
+  const favorites: T[] = []
+  const consumed = new Set<string>()
+  for (const item of firstByGroup.values()) {
+    if (!options.isFavorite(item)) continue
+    favorites.push(item)
+    consumed.add(options.keyOf(item))
+  }
+
+  const recents: T[] = []
+  for (const groupKey of options.recentGroupKeys) {
+    const item = firstByGroup.get(groupKey)
+    if (!item) continue
+    if (consumed.has(options.keyOf(item))) continue
+    recents.push(item)
+  }
+
+  return { favorites, recents }
+}

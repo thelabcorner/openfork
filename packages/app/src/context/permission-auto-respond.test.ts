@@ -1,7 +1,13 @@
 import { describe, expect, test } from "bun:test"
 import type { PermissionRequest, Session } from "@opencode-ai/sdk/v2/client"
 import { base64Encode } from "@opencode-ai/core/util/encode"
-import { autoRespondsPermission, isDirectoryAutoAccepting, sessionAutoAccept } from "./permission-auto-respond"
+import {
+  autoRespondsPermission,
+  directoryAutoAccept,
+  isDirectoryAutoAccepting,
+  resolveNewSessionAutoAccept,
+  sessionAutoAccept,
+} from "./permission-auto-respond"
 
 const session = (input: { id: string; parentID?: string }) =>
   ({
@@ -121,5 +127,45 @@ describe("isDirectoryAutoAccepting", () => {
     const directory = "/tmp/project"
     const autoAccept = { [`${base64Encode(directory)}/*`]: false }
     expect(isDirectoryAutoAccepting(autoAccept, directory)).toBe(false)
+  })
+})
+
+describe("directoryAutoAccept", () => {
+  test("distinguishes an unset directory from an explicit false", () => {
+    const directory = "/tmp/project"
+    expect(directoryAutoAccept({}, directory)).toBeUndefined()
+    expect(directoryAutoAccept({ [`${base64Encode(directory)}/*`]: false }, directory)).toBe(false)
+    expect(directoryAutoAccept({ [`${base64Encode(directory)}/*`]: true }, directory)).toBe(true)
+  })
+})
+
+describe("resolveNewSessionAutoAccept", () => {
+  test("defaults to the configured preference when no directory is known", () => {
+    expect(resolveNewSessionAutoAccept({}, undefined, true)).toBe(true)
+    expect(resolveNewSessionAutoAccept({}, undefined, false)).toBe(false)
+  })
+
+  test("uses the ON preference for a new session when no saved preference exists", () => {
+    expect(resolveNewSessionAutoAccept({}, "/tmp/project", true)).toBe(true)
+  })
+
+  test("honors a persisted OFF preference for subsequent new sessions", () => {
+    expect(resolveNewSessionAutoAccept({}, "/tmp/project", false)).toBe(false)
+  })
+
+  test("lets an explicit directory-wide ON override an OFF preference", () => {
+    const directory = "/tmp/project"
+    expect(resolveNewSessionAutoAccept({ [`${base64Encode(directory)}/*`]: true }, directory, false)).toBe(true)
+  })
+
+  test("lets an explicit directory-wide OFF override an ON preference", () => {
+    const directory = "/tmp/project"
+    expect(resolveNewSessionAutoAccept({ [`${base64Encode(directory)}/*`]: false }, directory, true)).toBe(false)
+  })
+
+  test("ignores a per-session key because none exists for a new session", () => {
+    const directory = "/tmp/project"
+    const autoAccept = { [`${base64Encode(directory)}/other`]: false }
+    expect(resolveNewSessionAutoAccept(autoAccept, directory, true)).toBe(true)
   })
 })

@@ -1360,16 +1360,17 @@ export const PromptInput: Component<PromptInputProps> = (props) => {
   const showVariantControl = createMemo(() => props.controls.model.selection.variant.list().length > 0)
   // See prompt-input-v2.tsx's identical draft-scoped flag for why the
   // no-session case doesn't bind to permission.isAutoAcceptingDirectory.
-  const [draftAutoAccept, setDraftAutoAccept] = createSignal(false)
+  // Until toggled, the draft follows the configured new-session default.
+  const [draftAutoAccept, setDraftAutoAccept] = createSignal<boolean | undefined>(undefined)
   const accepting = createMemo(() => {
     const id = props.controls.session.id
-    if (!id) return draftAutoAccept()
+    if (!id) return draftAutoAccept() ?? permission.autoAcceptForNewSession(sdk().directory)
     return permission.isAutoAccepting(id, sdk().directory)
   })
   const toggleAutoAccept = () => {
     const id = props.controls.session.id
     if (!id) {
-      setDraftAutoAccept((value) => !value)
+      setDraftAutoAccept(!accepting())
       return
     }
     permission.toggleAutoAccept(id, sdk().directory)

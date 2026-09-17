@@ -467,7 +467,12 @@ export function createPromptSubmit(input: PromptSubmitInput) {
         session = created
         await startTransition(() => {
           if (!session) return
-          if (shouldAutoAccept) permissionState.enableAutoAccept(session.id, sessionDirectory)
+          // Materialize the effective new-session auto-accept as an explicit
+          // per-session choice. Stamping both ON and OFF means later default or
+          // directory changes cannot silently rewrite this session, and an
+          // explicit OFF is never overwritten by the ON default.
+          if (isNewSession)
+            permissionState.initializeAutoAccept(session.id, sessionDirectory, shouldAutoAccept)
           local.session.promote(sessionDirectory, session.id, {
             agent: currentAgent.name,
             model: { providerID: currentModel.provider.id, modelID: currentModel.id },
@@ -696,8 +701,6 @@ export function createPromptSubmit(input: PromptSubmitInput) {
       prepare: async (next) => {
         if (!next.goal) return
         await input.goal!.quickStart(next.sessionID, {
-          projectID: next.goal.projectID,
-          workspaceID: next.goal.workspaceID,
           objective: next.goal.objective,
           mode: next.goal.mode,
         })

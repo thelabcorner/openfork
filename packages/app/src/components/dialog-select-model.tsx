@@ -55,6 +55,8 @@ import { arrayMove } from "@dnd-kit/helpers"
 import {
   filterPreparedModelGroupsForSearch,
   prepareModelGroupSearchFields,
+  selectModelSections,
+  type ModelSectionSelection,
 } from "./dialog-select-model-search"
 import { applySectionOrder } from "./dialog-select-model-order"
 import { useForkUsage } from "@/context/fork-usage"
@@ -62,7 +64,6 @@ import { useWorkBuddyUsage, type WorkBuddyModelUsage } from "@/hooks/use-workbud
 import { useVerdentUsage } from "@/hooks/use-verdent-usage"
 import { useGensparkUsage, formatCreditsPerMillion, type GensparkModelUsage } from "@/hooks/use-genspark-usage"
 import { WorkBuddyFreeBadge, workBuddyFreeLabel } from "./workbuddy-free-badge"
-import { useSync } from "@/context/sync"
 import { useLayout } from "@/context/layout"
 import { useSDK } from "@/context/sdk"
 import { useServerSDK } from "@/context/server-sdk"
@@ -98,7 +99,6 @@ import {
   collectThresholdPricingFromIndex,
   prepareThresholdIndex,
 } from "@/utils/model-usage-profile"
-import { buildHitRateIndex, buildModelCostIndex } from "@/utils/model-usage-history"
 import { deepSeekRatePeriod, isDeepSeekPeakPricedModel } from "@/utils/model-peak-pricing"
 import { isUnlimitedModel, stripUnlimitedSuffix, hasPublishedPricing } from "@/utils/model-badges"
 import {
@@ -135,6 +135,11 @@ const modelKey = (model: ModelItem) => `${model.provider.id}:${model.id}`
 const manageKey = "action:manage"
 let persistedModelSearch = ""
 
+// OpenRouter's *quota-tracked* free models — the ones the FUT daily allowance
+// counts. Deliberately narrower than the shared free taxonomy
+// (`isFreeModel`/`freeTierOf`): a stealth/preview model is free but is NOT
+// drawn from the free-model allowance, so it must not render a quota bar. Do
+// not "unify" these two predicates.
 const isOpenRouterFreeModel = (item: ModelItem) =>
   item.provider.id === "openrouter" && (item.id === "openrouter/free" || item.id.endsWith(":free"))
 
@@ -1195,8 +1200,7 @@ export function ModelSelectorPopoverV2(props: {
       placement={props.placement}
       models={controller.models}
       groups={controller.groups}
-      favorites={controller.favorites}
-      recents={controller.recents}
+      sections={controller.sections}
       isFavorite={controller.isFavorite}
       onToggleFavorite={controller.toggleFavorite}
       current={controller.current}
@@ -1242,15 +1246,9 @@ function createModelSelectorController(input: {
 }) {
   const model = input.model ?? useLocal().model
   const lightweight = input.lightweight === true
-  // Personal measured $/request is more relevant than the generic corpus
-  // (§31). Build the per-model personal index once per sync-change and blend
-  // it heavily (70%) with the standardized corpus when ranking.
-  let sync: ReturnType<typeof useSync> | undefined
-  try {
-    sync = useSync()
-  } catch {
-    sync = undefined
-  }
+  // Personal measured $/request is more relevant than the generic corpus.
+  // Usage owns the compact historical aggregate; the selector never reads
+  // session/message history to reconstruct it.
   let personal: ReturnType<typeof usePersonalUsage> | undefined
   try {
     personal = usePersonalUsage()
@@ -1258,6 +1256,10 @@ function createModelSelectorController(input: {
     personal = undefined
   }
   const isOpen = () => input.open?.() ?? true
+  createEffect(() => {
+    if (lightweight || !isOpen()) return
+    void personal?.ensure()
+  })
   const [rankReady, setRankReady] = createSignal(false)
   createEffect(() => {
     if (lightweight) {
@@ -1296,32 +1298,10 @@ function createModelSelectorController(input: {
       if (timeoutHandle !== undefined) clearTimeout(timeoutHandle)
     })
   })
-  // Durable learner: ingest live assistant messages into the global persisted
-  // store so "your usage" survives LRU eviction (SESSION_CACHE_LIMIT=40) and
-  // cold restarts. The store is deduped by message id, capped at 200/model,
-  // and debounced globally via PersonalUsageIngest; this local ingest ensures
-  // the open selector's sort reflects very recent messages within <1s.
-  createEffect(() => {
-    if (lightweight) return
-    if (!isOpen()) return
-    if (!sync || !personal || !personal.ready()) return
-    const msgMap = sync().data.message
-    const total = Object.values(msgMap).reduce((sum, arr) => sum + (arr?.length ?? 0), 0)
-    void total
-    queueMicrotask(() => personal!.ingest(msgMap))
-  })
   const personalCosts = createMemo(() => {
     if (!isOpen() || !rankReady()) return undefined
     const durable = personal?.personalCosts()
-    if (durable && durable.size > 0) return durable
-    // Fallback: ephemeral scan before durable has been populated (first
-    // run after upgrade, or provider not mounted in tests/storybook).
-    if (!sync) return undefined
-    const idx = buildModelCostIndex(sync().data.message)
-    if (idx.size === 0) return undefined
-    const map = new Map<string, { cost: number; count: number }>()
-    for (const [k, entry] of idx.entries()) map.set(k, { cost: entry.sum / entry.count, count: entry.count })
-    return map.size > 0 ? map : undefined
+    return durable && durable.size > 0 ? durable : undefined
   })
   // §21.4, §28: the ranking corpus upgrades from the pinned fallback to the
   // live Go workload when the tables fetch succeeds — deterministic either way.
@@ -1683,18 +1663,7 @@ function createModelSelectorController(input: {
   const hitRates = createMemo(() => {
     if (!isOpen() || !rankReady()) return undefined
     const durable = personal?.hitRates()
-    if (durable && durable.size > 0) return durable
-    if (!sync) return undefined
-    const idx = buildHitRateIndex(sync().data.message)
-    if (idx.size === 0) return undefined
-    const map = new Map<string, number>()
-    for (const [k, entry] of idx.entries()) {
-      const denom = entry.input + entry.cacheRead
-      if (denom <= 0) continue
-      if (entry.count < 3) continue
-      map.set(k, entry.cacheRead / denom)
-    }
-    return map.size > 0 ? map : undefined
+    return durable && durable.size > 0 ? durable : undefined
   })
   const hitRateFallback = createMemo(() => {
     if (!isOpen() || !rankReady()) return undefined
@@ -1853,6 +1822,27 @@ function createModelSelectorController(input: {
     return splitModelIDForProvider(value.id, value.providerID).accountID
   })
 
+  // A favorited account variant marks its whole group favorited; the row that
+  // represents the group is whichever one the search actually matched.
+  const isFavoriteGroup = (group: ModelGroup<ModelItem> | undefined, item: ModelItem) =>
+    group
+      ? model.favorite.isFavorite(key(group.canonical)) ||
+        group.variants.some((variant) => model.favorite.isFavorite(key(variant.item)))
+      : model.favorite.isFavorite(key(item))
+  const recentGroupKeys = () => {
+    const groups = groupIndex()
+    const seen = new Set<string>()
+    const keys: string[] = []
+    for (const entry of model.recent() ?? []) {
+      if (!entry) continue
+      const group = groups.get(modelKey(entry))
+      if (!group || seen.has(group.key)) continue
+      seen.add(group.key)
+      keys.push(group.key)
+    }
+    return keys
+  }
+
   return {
     models: (search: string) => {
       const query = search.trim()
@@ -1868,45 +1858,18 @@ function createModelSelectorController(input: {
       }
       return Array.from(byProvider, ([category, items]) => ({ category, items })).sort(sortModelGroups)
     },
-    favorites: (_models: ModelItem[]) => {
-      const out: ModelItem[] = []
-      for (const group of collapsedGroups()) {
-        const favorited =
-          model.favorite.isFavorite(key(group.canonical)) ||
-          group.variants.some((variant) => model.favorite.isFavorite(key(variant.item)))
-        if (favorited) out.push(group.canonical)
-      }
-      return out
+    // Favorites/Recent are a projection of the search-filtered list, not a
+    // second catalog pass: a section may only hold rows the query matched.
+    sections: (models: ModelItem[]): ModelSectionSelection<ModelItem> => {
+      const groups = groupIndex()
+      return selectModelSections(models, {
+        keyOf: modelKey,
+        groupKeyOf: (item) => groups.get(modelKey(item))?.key ?? modelKey(item),
+        isFavorite: (item) => isFavoriteGroup(groups.get(modelKey(item)), item),
+        recentGroupKeys: recentGroupKeys(),
+      })
     },
-    recents: (models: ModelItem[]) => {
-      const byKey = groupIndex()
-      const available = new Set(models.map(modelKey))
-      const ordered: ModelItem[] = []
-      const seen = new Set<string>()
-      const recentItems = model.recent() ?? []
-      for (const entry of recentItems) {
-        if (!entry) continue
-        const k = modelKey(entry)
-        const group = byKey.get(k)
-        if (!group || seen.has(group.key)) continue
-        if (
-          model.favorite.isFavorite(key(group.canonical)) ||
-          group.variants.some((variant) => model.favorite.isFavorite(key(variant.item)))
-        )
-          continue
-        if (!available.has(modelKey(group.canonical))) continue
-        seen.add(group.key)
-        ordered.push(group.canonical)
-      }
-      return ordered
-    },
-    isFavorite: (item: ModelItem) => {
-      const group = groupIndex().get(modelKey(item))
-      return group
-        ? model.favorite.isFavorite(key(group.canonical)) ||
-            group.variants.some((variant) => model.favorite.isFavorite(key(variant.item)))
-        : model.favorite.isFavorite(key(item))
-    },
+    isFavorite: (item: ModelItem) => isFavoriteGroup(groupIndex().get(modelKey(item)), item),
     toggleFavorite: (item: ModelItem) => model.favorite.toggle(key(item)),
     current,
     currentVariant,
@@ -1944,8 +1907,7 @@ function ModelSelectorPopoverV2View(props: {
   placement?: ComponentProps<typeof MenuV2>["placement"]
   models: (search: string) => ModelItem[]
   groups: (models: ModelItem[]) => { category: string; items: ModelItem[] }[]
-  favorites: (models: ModelItem[]) => ModelItem[]
-  recents: (models: ModelItem[]) => ModelItem[]
+  sections: (models: ModelItem[]) => ModelSectionSelection<ModelItem>
   isFavorite: (item: ModelItem) => boolean
   onToggleFavorite: (item: ModelItem) => void
   current: () => string | undefined
@@ -1996,7 +1958,6 @@ function ModelSelectorPopoverV2View(props: {
     modelState()?.order?.set("rail", ids)
   }
   const forkUsage = useForkUsage()
-  const sync = useSync()
   // Provider catalog refresh (see selectAccount step 2b): the Verdent/Zen
   // models hooks emit per-account ids at provider-load time, but the app
   // caches that catalog while quota reads the vault live — accounts enrolled
@@ -2016,21 +1977,14 @@ function ModelSelectorPopoverV2View(props: {
       personal = undefined
     }
   }
+  createEffect(() => {
+    if (props.lightweight || !store.open) return
+    void personal?.ensure()
+  })
   const limitsNow = props.lightweight ? () => Date.now() : useNow(() => store.open)
   const limits = props.lightweight
     ? ({ providers: () => [] } as unknown as ReturnType<typeof useLimits>)
     : useLimits({ now: limitsNow, active: () => store.open })
-  // Ingest live messages into durable store while open - ensures very recent
-  // samples (post-debounce window) still affect the tooltip/stretch bars.
-  createEffect(() => {
-    if (props.lightweight) return
-    if (!store.open) return
-    if (!personal || !personal.ready()) return
-    const msgMap = sync().data.message
-    const total = Object.values(msgMap).reduce((sum, arr) => sum + (arr?.length ?? 0), 0)
-    void total
-    queueMicrotask(() => personal!.ingest(msgMap))
-  })
   // WorkBuddy bills credits-per-request across several independent accounts, so
   // its stretch estimate cannot ride the OpenCode-Go USD-window path. This is a
   // pure projection of the quota result `useLimits` already polls — no extra
@@ -2260,8 +2214,7 @@ function ModelSelectorPopoverV2View(props: {
     if (fromController) return fromController
     return mergePricingFallbacks(pricingFallbackForDisplay(), fuzzyPricingFallbackForDisplay())
   })
-  // Hit rate maps: durable personal aggregate (survives LRU) + openrouter telemetry.
-  // Personal is now the global persisted learner (deduped by message id, 200/model).
+  // Hit rate maps: Usage-owned personal aggregate + OpenRouter endpoint telemetry.
   // Openrouter is built from openRouterStore endpoints.
   // Both are per provider:model and also aggregated by model id for cross-provider fallback.
   // Gated on store.open: map derivation is cheap but still gated.
@@ -2269,17 +2222,7 @@ function ModelSelectorPopoverV2View(props: {
     if (props.lightweight) return undefined
     if (!store.open) return undefined
     const durable = personal?.hitRates()
-    if (durable && durable.size > 0) return durable
-    const idx = buildHitRateIndex(sync().data.message)
-    if (idx.size === 0) return undefined
-    const map = new Map<string, number>()
-    for (const [k, entry] of idx.entries()) {
-      const denom = entry.input + entry.cacheRead
-      if (denom <= 0) continue
-      if (entry.count < 3) continue
-      map.set(k, entry.cacheRead / denom)
-    }
-    return map.size > 0 ? map : undefined
+    return durable && durable.size > 0 ? durable : undefined
   })
   const personalHitRateFallback = createMemo(() => {
     if (!store.open) return undefined
@@ -2552,12 +2495,28 @@ function ModelSelectorPopoverV2View(props: {
     return models().filter((item) => item.provider.id === store.rail)
   })
   const groups = createMemo(() => props.groups(railModels()))
-  const favorites = createMemo(() => props.favorites(models()))
-  const recents = createMemo(() => props.recents(models()))
+  const sections = createMemo(() => props.sections(models()))
+  const favorites = createMemo(() => sections().favorites)
+  const recents = createMemo(() => sections().recents)
   const recentModelKeys = createMemo(() => new Set(recents().map(modelKey)))
   const showFavorites = () => favorites().length > 0 && (store.rail === "" || store.rail === favoritesRailKey)
   const showRecents = () => recents().length > 0 && (store.rail === "" || store.rail === recentRailKey)
   const showProviderGroups = () => store.rail !== favoritesRailKey && store.rail !== recentRailKey
+  // Favorites/Recent are a partition of the filtered list, so a row they render
+  // must not render a second time under its provider group. Only rows in a
+  // section that is actually displayed suppress a provider row - with a
+  // provider rail active the sections are hidden, so nothing is suppressed.
+  // Declared after showFavorites/showRecents: createMemo evaluates eagerly, so
+  // referencing them earlier would hit their temporal dead zone and throw.
+  const providerGroups = createMemo(() => {
+    const consumed = new Set<string>()
+    if (showFavorites()) for (const item of favorites()) consumed.add(modelKey(item))
+    if (showRecents()) for (const item of recents()) consumed.add(modelKey(item))
+    if (consumed.size === 0) return groups()
+    return groups()
+      .map((group) => ({ ...group, items: group.items.filter((item) => !consumed.has(modelKey(item))) }))
+      .filter((group) => group.items.length > 0)
+  })
   const hasContent = () => {
     if (store.rail === favoritesRailKey) return favorites().length > 0
     if (store.rail === recentRailKey) return recents().length > 0
@@ -2606,19 +2565,12 @@ function ModelSelectorPopoverV2View(props: {
     const windows = forkUsage.usageWindowsFor(forkUsage.activeCredentialID())
     return windows.find((entry) => entry.label === "5h")
   })
-  // Durable learner: personal $/request from the global persisted store
-  // (deduped, 200/model, survives LRU). Falls back to an ephemeral scan
-  // while the store is hydrating or on first run after upgrade.
+  // Personal $/request comes from the server-owned Usage projection.
   const durableCosts = createMemo(() => {
     if (props.lightweight) return undefined
     if (!store.open) return undefined
     const durable = personal?.personalCosts()
-    if (durable && durable.size > 0) return durable
-    const idx = buildModelCostIndex(sync().data.message)
-    if (idx.size === 0) return undefined
-    const map = new Map<string, { cost: number; count: number }>()
-    for (const [k, entry] of idx.entries()) map.set(k, { cost: entry.sum / entry.count, count: entry.count })
-    return map.size > 0 ? map : undefined
+    return durable && durable.size > 0 ? durable : undefined
   })
   const usageFor = (item: ModelItem) => {
     // WorkBuddy: credits-per-request funded by one account's remaining balance.
@@ -2855,7 +2807,7 @@ function ModelSelectorPopoverV2View(props: {
       result.push({ kind: "separator", key: "separator:recent" })
     }
     if (showProviderGroups()) {
-      for (const group of groups()) {
+      for (const group of providerGroups()) {
         result.push({
           kind: "header",
           key: `header:${group.category}`,

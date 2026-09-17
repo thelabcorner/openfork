@@ -7,28 +7,38 @@ import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { type Component, For, Show } from "solid-js"
 import { createStore } from "solid-js/store"
 import { useLanguage } from "@/context/language"
-import { ModelsProvider, useModels } from "@/context/models"
 import { useServerSDK } from "@/context/server-sdk"
 import { popularProviders } from "@/hooks/use-providers"
+import { useProviderSettingsModels } from "@/hooks/use-provider-settings"
+import { useModelVisibilitySettings } from "@/hooks/use-model-visibility-settings"
 import { stripUnlimitedSuffix } from "@/utils/model-badges"
 import { Persist, persisted } from "@/utils/persist"
 import { SettingsListV2 } from "./parts/list"
 import { SettingsRowV2 } from "./parts/row"
 import "./settings-v2.css"
 
-type ModelItem = ReturnType<ReturnType<typeof useModels>["list"]>[number]
+type ModelItem = {
+  id: string
+  name: string
+  releaseDate: string
+  provider: { id: string; name: string }
+}
 
 const PROVIDER_ICON_SIZE = 16
 
-export const SettingsModelsV2: Component = () => (
-  <ModelsProvider>
-    <SettingsModelsV2Content />
-  </ModelsProvider>
-)
+export const SettingsModelsV2: Component = () => <SettingsModelsV2Content />
 
 const SettingsModelsV2Content: Component = () => {
   const language = useLanguage()
-  const models = useModels()
+  const catalog = useProviderSettingsModels()
+  const visibility = useModelVisibilitySettings()
+  const models = () =>
+    catalog.data().models.map((model) => ({
+      id: model.modelID,
+      name: model.name,
+      releaseDate: model.releaseDate,
+      provider: { id: model.providerID, name: model.providerName },
+    }))
   const serverSdk = useServerSDK()
   const [store, setStore] = persisted(
     Persist.serverGlobal(serverSdk().scope, "settings-v2.models.providers"),
@@ -36,7 +46,7 @@ const SettingsModelsV2Content: Component = () => {
   )
 
   const list = useFilteredList<ModelItem>({
-    items: (_filter) => models.list(),
+    items: (_filter) => models(),
     key: (x) => `${x.provider.id}:${x.id}`,
     filterKeys: ["provider.name", "name", "id"],
     sortBy: (a, b) => a.name.localeCompare(b.name),
@@ -89,7 +99,7 @@ const SettingsModelsV2Content: Component = () => {
 
       <div class="settings-v2-tab-body settings-v2-models">
         <Show
-          when={!list.grouped.loading}
+          when={!catalog.query.isPending && !list.grouped.loading}
           fallback={
             <div class="settings-v2-models-status">
               {language.t("common.loading")}
@@ -167,9 +177,9 @@ const SettingsModelsV2Content: Component = () => {
                               <SettingsRowV2 title={stripUnlimitedSuffix(item.name)} description="">
                                 <div>
                                   <Switch
-                                    checked={models.visible(key)}
+                                    checked={visibility.visible({ ...key, releaseDate: item.releaseDate })}
                                     onChange={(checked) => {
-                                      models.setVisibility(key, checked)
+                                      visibility.setVisibility(key, checked)
                                     }}
                                     hideLabel
                                   >

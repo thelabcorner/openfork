@@ -327,6 +327,18 @@ export const SettingsGeneral: Component = () => {
         </SettingsRow>
 
         <SettingsRow
+          title={language.t("settings.general.row.autoAcceptPermissionsDefault.title")}
+          description={language.t("settings.general.row.autoAcceptPermissionsDefault.description")}
+        >
+          <div data-action="settings-auto-accept-permissions-default">
+            <Switch
+              checked={settings.general.autoAcceptPermissionsDefault()}
+              onChange={(checked) => settings.general.setAutoAcceptPermissionsDefault(checked)}
+            />
+          </div>
+        </SettingsRow>
+
+        <SettingsRow
           title={language.t("settings.general.row.shell.title")}
           description={language.t("settings.general.row.shell.description")}
         >

@@ -1079,6 +1079,18 @@ export const SettingsGeneralV2: Component<{
 
         <PermissionScopeSetting controller={permissionScope} />
 
+        <SettingsRowV2
+          title={language.t("settings.general.row.autoAcceptPermissionsDefault.title")}
+          description={language.t("settings.general.row.autoAcceptPermissionsDefault.description")}
+        >
+          <div data-action="settings-auto-accept-permissions-default">
+            <Switch
+              checked={settings.general.autoAcceptPermissionsDefault()}
+              onChange={(checked) => settings.general.setAutoAcceptPermissionsDefault(checked)}
+            />
+          </div>
+        </SettingsRowV2>
+
         <ShellSetting controller={shell} />
 
         <SettingsRowV2

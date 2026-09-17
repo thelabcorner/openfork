@@ -19,6 +19,34 @@ export function isDirectoryAutoAccepting(autoAccept: Record<string, boolean>, di
   return autoAccept[key] ?? false
 }
 
+/**
+ * Tri-state read of an explicit directory-wide choice. Unlike
+ * `isDirectoryAutoAccepting`, `undefined` means the directory has never been
+ * toggled, so a new-session default may apply; `false` is an explicit choice
+ * and must win over that default.
+ */
+export function directoryAutoAccept(autoAccept: Record<string, boolean>, directory: string) {
+  return autoAccept[directoryAcceptKey(directory)]
+}
+
+/**
+ * Effective auto-accept for a session that does not exist yet.
+ *
+ * Precedence: an explicit directory-wide choice (respect an established
+ * project decision) then the configured new-session preference. Per-session
+ * state cannot exist here; once the session is created the permission service
+ * materializes this value as an explicit per-session key, so later default
+ * changes or directory changes cannot silently rewrite it.
+ */
+export function resolveNewSessionAutoAccept(
+  autoAccept: Record<string, boolean>,
+  directory: string | undefined,
+  preference: boolean,
+) {
+  if (!directory) return preference
+  return directoryAutoAccept(autoAccept, directory) ?? preference
+}
+
 function sessionLineage(session: { id: string; parentID?: string }[], sessionID: string) {
   const parent = session.reduce((acc, item) => {
     if (item.parentID) acc.set(item.id, item.parentID)

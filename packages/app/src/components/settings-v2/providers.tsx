@@ -6,6 +6,7 @@ import { ProviderIcon } from "@opencode-ai/ui/provider-icon"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { showToast } from "@/utils/toast"
 import { popularProviders, useProviders } from "@/hooks/use-providers"
+import { useProviderSettings } from "@/hooks/use-provider-settings"
 import {
   createEffect,
   createMemo,
@@ -29,7 +30,13 @@ import { activeCredentialAccount, credentialAccounts } from "./provider-accounts
 import "./settings-v2.css"
 
 type ProviderSource = "env" | "api" | "config" | "custom"
-type ProviderItem = ReturnType<ReturnType<typeof useProviders>["connected"]>[number]
+type ProviderItem = {
+  id: string
+  name: string
+  source: ProviderSource
+  connected: boolean
+  hasPaidModels: boolean
+}
 
 const PROVIDER_NOTES = [
   { match: (id: string) => id === "opencode", key: "dialog.provider.opencode.note" },
@@ -55,6 +62,7 @@ export const SettingsProvidersV2: Component<{
   const protocol = useServerProtocol()
   const serverSync = useServerSync()
   const providers = useProviders(props.directory)
+  const providerSettings = useProviderSettings({ enabled: () => !props.directory() })
   const providerConnect = useProviderConnectController({ onBack: props.onBack })
 
   const connect = (provider?: string) => {
@@ -62,25 +70,33 @@ export const SettingsProvidersV2: Component<{
     void dialog.show(() => <DialogConnectProvider directory={props.directory} controller={providerConnect} />)
   }
 
-  const connected = createMemo(() => {
-    return providers
-      .connected()
-      .filter((p) => p.id !== "opencode" || Object.values(p.models).find((m) => m.cost?.input))
+  const items = createMemo<ProviderItem[]>(() => {
+    if (!props.directory()) return providerSettings.data().providers
+    const connected = new Set(providers.connected().map((provider) => provider.id))
+    return [...providers.all().values()].map((provider) => ({
+      id: provider.id,
+      name: provider.name,
+      source: provider.source,
+      connected: connected.has(provider.id),
+      hasPaidModels: Object.values(provider.models).some((model) => (model.cost?.input ?? 0) > 0),
+    }))
   })
+  const connected = createMemo(() => items().filter((provider) => provider.connected && (provider.id !== "opencode" || provider.hasPaidModels)))
 
   const integrationRequest = createMemo(() => {
     if (protocol() !== "v2") return
+    const directory = props.directory()
+    if (!directory) return
     const ids = connected().map((provider) => provider.id)
-    return { ids, directory: props.directory() }
+    return { ids, directory }
   })
   const [integrations, integrationActions] = createResource(
     integrationRequest,
     async ({ ids, directory }) => {
-      const location = directory ? { directory } : undefined
       const entries = await Promise.all(
         ids.map(async (providerID) => {
           const info = await serverSdk()
-            .api.integration.get({ integrationID: providerID, location })
+            .api.integration.get({ integrationID: providerID, location: { directory } })
             .then((result) => result.data)
             .catch(() => undefined)
           return info ? ([providerID, info] as const) : undefined
@@ -95,22 +111,26 @@ export const SettingsProvidersV2: Component<{
     if (protocol() !== "v2") return
     const unsub = serverSdk().event.listen((envelope) => {
       if (envelope.details.type !== "integration.connection.updated") return
-      void integrationActions.refetch()
+      if (props.directory()) void integrationActions.refetch()
+      else void providerSettings.refresh()
     })
     onCleanup(unsub)
   })
 
   const integration = (providerID: string) => (integrations.latest ?? EMPTY_INTEGRATIONS).get(providerID)
-  const accounts = (providerID: string) => credentialAccounts(integration(providerID)?.connections ?? [])
-  const activeAccount = (providerID: string) => activeCredentialAccount(integration(providerID)?.connections ?? [])
-  const canAddAccount = (providerID: string) =>
-    integration(providerID)?.methods.some((method) => method.type !== "env") ?? false
-  const location = () => {
-    const directory = props.directory()
-    return directory ? { directory } : undefined
+  const connections = (providerID: string) =>
+    props.directory() ? (integration(providerID)?.connections ?? []) : (providerSettings.get(providerID)?.connections ?? [])
+  const accounts = (providerID: string) => credentialAccounts(connections(providerID))
+  const activeAccount = (providerID: string) => activeCredentialAccount(connections(providerID))
+  const canAddAccount = (providerID: string) => {
+    if (!props.directory()) return protocol() === "v2"
+    return integration(providerID)?.methods.some((method) => method.type !== "env") ?? false
   }
-
   const refreshAccounts = async () => {
+    if (!props.directory()) {
+      await providerSettings.refresh()
+      return
+    }
     await Promise.allSettled([integrationActions.refetch(), serverSync().refreshProviders()])
   }
 
@@ -129,16 +149,15 @@ export const SettingsProvidersV2: Component<{
 
   const popular = createMemo(() => {
     const connectedIDs = new Set(connected().map((p) => p.id))
-    const items = providers
-      .popular()
+    const result = items()
+      .filter((p) => popularProviders.includes(p.id))
       .filter((p) => !connectedIDs.has(p.id))
       .slice()
-    items.sort((a, b) => popularProviders.indexOf(a.id) - popularProviders.indexOf(b.id))
-    return items
+    result.sort((a, b) => popularProviders.indexOf(a.id) - popularProviders.indexOf(b.id))
+    return result
   })
 
   const source = (item: ProviderItem): ProviderSource | undefined => {
-    if (!("source" in item)) return
     const value = item.source
     if (value === "env" || value === "api" || value === "config" || value === "custom") return value
     return
@@ -218,10 +237,12 @@ export const SettingsProvidersV2: Component<{
 
   const selectAccount = (credential: ConnectionCredentialInfo) =>
     mutateAccount(() =>
-      serverSdk().client.v2.credential.select(
-        { credentialID: credential.id, location: location() },
-        { throwOnError: true },
-      ),
+      props.directory()
+        ? serverSdk().client.v2.credential.select(
+            { credentialID: credential.id, location: { directory: props.directory()! } },
+            { throwOnError: true },
+          )
+        : providerSettings.credential.select(credential.id),
     )
 
   const renameAccount = (credential: ConnectionCredentialInfo) =>
@@ -230,10 +251,12 @@ export const SettingsProvidersV2: Component<{
         credential={credential}
         onSave={(label) =>
           mutateAccount(() =>
-            serverSdk().client.v2.credential.update(
-              { credentialID: credential.id, label, location: location() },
-              { throwOnError: true },
-            ),
+            props.directory()
+              ? serverSdk().client.v2.credential.update(
+                  { credentialID: credential.id, label, location: { directory: props.directory()! } },
+                  { throwOnError: true },
+                )
+              : providerSettings.credential.update(credential.id, label),
           )
         }
       />
@@ -246,10 +269,12 @@ export const SettingsProvidersV2: Component<{
         credential={credential}
         onRemove={() =>
           mutateAccount(() =>
-            serverSdk().client.v2.credential.remove(
-              { credentialID: credential.id, location: location() },
-              { throwOnError: true },
-            ),
+            props.directory()
+              ? serverSdk().client.v2.credential.remove(
+                  { credentialID: credential.id, location: { directory: props.directory()! } },
+                  { throwOnError: true },
+                )
+              : providerSettings.credential.remove(credential.id),
           )
         }
       />
@@ -275,7 +300,9 @@ export const SettingsProvidersV2: Component<{
                 {(item) => {
                   const providerAccounts = () => accounts(item.id)
                   const active = () => activeAccount(item.id)
-                  const accountReady = () => protocol() === "v2" && integration(item.id) !== undefined
+                  const accountReady = () =>
+                    protocol() === "v2" &&
+                    (props.directory() ? integration(item.id) !== undefined : providerSettings.get(item.id) !== undefined)
                   return (
                     <div class="settings-v2-provider-group">
                       <div class="settings-v2-provider-row settings-v2-provider-row--header group">

@@ -30,12 +30,13 @@ import {
 import { createStore, produce } from "solid-js/store"
 import { useParams } from "@solidjs/router"
 import { ExternalLink } from "@/components/external-link"
-import { useServerSDK } from "@/context/server-sdk"
+import { useServerProtocol, useServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
 import { useLanguage } from "@/context/language"
 import { usePlatform } from "@/context/platform"
 import { useSettings } from "@/context/settings"
 import { popularProviders, useProviders } from "@/hooks/use-providers"
+import { useProviderSettings } from "@/hooks/use-provider-settings"
 import { CustomProviderForm } from "./dialog-custom-provider"
 import { decode64 } from "@/utils/base64"
 
@@ -46,6 +47,11 @@ const providerDisplayName = (id: string, fallback: string) => {
   if (id === "claude") return "Claude Subscription"
   if (id === "claude-api") return "Claude API Key"
   return fallback
+}
+
+function useProviderDirectory(explicit?: Accessor<string | undefined>) {
+  const params = useParams()
+  return () => explicit?.() ?? decode64(params.dir)
 }
 
 export function useProviderConnectController(options: { onBack?: () => void } = {}) {
@@ -164,7 +170,9 @@ function ProviderPicker(props: {
   const settings = useSettings()
   if (settings.general.newLayoutDesigns())
     return <ProviderPickerV2 directory={props.directory} onSelect={props.onSelect} onPrepare={props.onPrepare} />
-  const providers = useProviders(() => props.directory?.())
+  const directory = useProviderDirectory(props.directory)
+  const providers = useProviders(directory)
+  const providerSettings = useProviderSettings({ enabled: () => !directory() })
   const language = useLanguage()
   const popularGroup = () => language.t("dialog.provider.group.popular")
   const otherGroup = () => language.t("dialog.provider.group.other")
@@ -187,9 +195,12 @@ function ProviderPicker(props: {
       key={(x) => x?.id}
       items={() => {
         language.locale()
+        const available = directory()
+          ? Array.from(providers.all().values(), (provider) => ({ id: provider.id, name: provider.name }))
+          : providerSettings.data().providers.map((provider) => ({ id: provider.id, name: provider.name }))
         return [
           { id: CUSTOM_ID, name: customLabel() },
-          ...Array.from(providers.all().values(), (provider) => ({
+          ...available.map((provider) => ({
             ...provider,
             name: providerDisplayName(provider.id, provider.name),
           })),
@@ -243,7 +254,9 @@ function ProviderPickerV2(props: {
   onSelect: (provider: string) => void
   onPrepare?: () => void
 }) {
-  const providers = useProviders(() => props.directory?.())
+  const directory = useProviderDirectory(props.directory)
+  const providers = useProviders(directory)
+  const providerSettings = useProviderSettings({ enabled: () => !directory() })
   const language = useLanguage()
   const [store, setStore] = createStore({
     filter: "",
@@ -255,9 +268,12 @@ function ProviderPickerV2(props: {
   const all = createMemo(() => {
     language.locale()
     const query = store.filter.trim().toLowerCase()
+    const available = directory()
+      ? Array.from(providers.all().values(), (provider) => ({ id: provider.id, name: provider.name }))
+      : providerSettings.data().providers.map((provider) => ({ id: provider.id, name: provider.name }))
     const values = [
       custom(),
-      ...Array.from(providers.all().values(), (provider) => ({
+      ...available.map((provider) => ({
         ...provider,
         name: providerDisplayName(provider.id, provider.name),
       })),
@@ -404,13 +420,14 @@ function ProviderConnection(props: {
   const dialog = useDialog()
   const serverSync = useServerSync()
   const serverSDK = useServerSDK()
-  const params = useParams()
+  const protocol = useServerProtocol()
   const language = useLanguage()
   const platform = usePlatform()
   const settings = useSettings()
   const newLayout = settings.general.newLayoutDesigns
-  const providers = useProviders(() => props.directory?.())
-  const directory = () => props.directory?.() ?? decode64(params.dir)
+  const directory = useProviderDirectory(props.directory)
+  const providers = useProviders(directory)
+  const providerSettings = useProviderSettings({ enabled: () => !directory() })
   const location = () => {
     const value = directory()
     return value ? { directory: value } : undefined
@@ -427,8 +444,9 @@ function ProviderConnection(props: {
   })
 
   const provider = createMemo(() => {
-    const value = providers.all().get(props.provider) ?? serverSync().data.provider.all.get(props.provider)!
-    return value ? { ...value, name: providerDisplayName(props.provider, value.name) } : value
+    const value = directory() ? providers.all().get(props.provider) : providerSettings.get(props.provider)
+    const name = providerDisplayName(props.provider, value?.name ?? props.provider)
+    return { ...(value ?? {}), id: props.provider, name }
   })
   const fallback = createMemo<ConnectMethod[]>(() => [
     {
@@ -437,17 +455,21 @@ function ProviderConnection(props: {
     },
   ])
   const [integration] = createResource(
-    () => ({ provider: props.provider, directory: directory() }),
+    () => {
+      const value = directory()
+      return value ? { provider: props.provider, directory: value } : undefined
+    },
     (input) =>
       serverSDK()
         .api.integration.get({
           integrationID: input.provider,
-          location: input.directory ? { directory: input.directory } : undefined,
+          location: { directory: input.directory },
         })
         .then((result) => result.data),
   )
   const loading = createMemo(() => integration.loading)
   const methods = createMemo<ConnectMethod[]>(() => {
+    if (!directory()) return fallback()
     const values = integration.latest?.methods.filter(
       (method): method is ConnectMethod => method.type === "key" || method.type === "oauth",
     )
@@ -568,6 +590,11 @@ function ProviderConnection(props: {
     dispatch({ type: "method.select", index })
 
     if (method.type === "oauth") {
+      const scopedLocation = location()
+      if (!scopedLocation) {
+        dispatch({ type: "auth.error", error: language.t("common.requestFailed") })
+        return
+      }
       if (method.prompts?.length && !inputs) {
         dispatch({ type: "auth.prompt" })
         return
@@ -578,7 +605,7 @@ function ProviderConnection(props: {
           integrationID: props.provider,
           methodID: method.id,
           inputs: inputs ?? {},
-          location: location(),
+          location: scopedLocation,
         })
         .then((x) => {
           if (!alive.value) return
@@ -738,6 +765,7 @@ function ProviderConnection(props: {
   let claudeAuto = false
   createEffect(() => {
     if (claudeAuto || props.provider !== "claude" || loading()) return
+    if (!directory()) return
     claudeAuto = true
     void (async () => {
       await serverSync().refreshProviders().catch(() => undefined)
@@ -752,9 +780,8 @@ function ProviderConnection(props: {
   })
 
   async function complete() {
-    await serverSync()
-      .refreshProviders()
-      .catch(() => undefined)
+    if (directory()) await serverSync().refreshProviders().catch(() => undefined)
+    else await providerSettings.refresh().catch(() => undefined)
     dialog.close()
     showToast({
       variant: "success",
@@ -865,12 +892,23 @@ function ProviderConnection(props: {
       }
 
       setFormStore("error", undefined)
-      await serverSDK().api.integration.connect.key({
-        integrationID: props.provider,
-        location: location(),
-        key: apiKey,
-        label: formStore.label.trim() || undefined,
-      })
+      const label = formStore.label.trim() || undefined
+      const scopedDirectory = directory()
+      if (scopedDirectory) {
+        await serverSDK().api.integration.connect.key({
+          integrationID: props.provider,
+          location: { directory: scopedDirectory },
+          key: apiKey,
+          label,
+        })
+      } else if (protocol() === "v1") {
+        await serverSDK().client.auth.set({
+          providerID: props.provider,
+          auth: { type: "api", key: apiKey },
+        })
+      } else {
+        await providerSettings.connectKey({ providerID: props.provider, key: apiKey, label })
+      }
       await complete()
     }
 
@@ -1009,11 +1047,16 @@ function ProviderConnection(props: {
       }
 
       setFormStore("error", undefined)
+      const scopedLocation = location()
+      if (!scopedLocation) {
+        setFormStore("error", language.t("common.requestFailed"))
+        return
+      }
       const result = await serverSDK()
         .api.integration.oauth.complete({
           integrationID: props.provider,
           attemptID: store.authorization!.attemptID,
-          location: location(),
+          location: scopedLocation,
           code,
         })
         .then(() => ({ ok: true as const }))
@@ -1108,11 +1151,13 @@ function ProviderConnection(props: {
       const poll = async () => {
         const authorization = store.authorization
         if (!authorization || !alive.value) return
+        const scopedLocation = location()
+        if (!scopedLocation) return
         const result = await serverSDK()
           .api.integration.oauth.status({
             integrationID: props.provider,
             attemptID: authorization.attemptID,
-            location: location(),
+            location: scopedLocation,
           })
           .then((value) => ({ ok: true as const, status: value.data }))
           .catch((error) => ({ ok: false as const, error }))

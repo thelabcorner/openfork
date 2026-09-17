@@ -21,7 +21,7 @@
 
 import type { UsageProfile } from "./usage-profile"
 import { DEEPSEEK_PEAK_RATES, isDeepSeekPeakPricedModel } from "./peak-pricing"
-import { hasPublishedPricing, isUnlimitedModel } from "./badges"
+import { freeTierOf, hasPublishedPricing, isUnlimitedModel } from "./badges"
 
 // ---------------------------------------------------------------------------
 //  Workload corpus (§5.1)
@@ -311,35 +311,13 @@ export function classifyMonetaryClass(model: {
   // model-badges.ts. These are monetarily ahead of every paid model.
   if (isUnlimitedModel(model)) return "quota-exempt"
 
-  // OpenRouter :free family and the synthetic "openrouter/free" id.
-  // Whether they are known-capacity depends on FUT: if the caller can supply a
-  // capacity hint (remaining/limit), they become free-limited-known; otherwise
-  // free-limited-unknown. The pure classification here is unknown — the yield
-  // layer that owns the FUT report can upgrade to known.
-  if (model.provider.id === "openrouter" && (model.id === "openrouter/free" || model.id.endsWith(":free"))) {
-    return "free-limited-unknown"
-  }
-
-  // Opencode (Zen) free tier: provider "opencode" with $0 published cost and
-  // no unlimited marker — still free, but capacity not expressed as a simple
-  // remaining/limit number in the selector (handled via limits panel).
-  if (model.provider.id === "opencode" && !hasPublishedPricing(model.cost)) {
-    // Distinguish true free ($0) from genuinely unpriced image models: image
-    // models also have $0 but carry no free semantics — they belong to paid
-    // but will be marked unpriced/low-confidence in the yield result.
-    // Heuristic: free Zen models are text-capable; image-only models are caught
-    // by the caller's hasPublishedPricing guard before reaching this classification
-    // for ranking purposes, but we keep the branch conservative.
-    return "free-limited-unknown"
-  }
-
-  // Opencode free with explicit $0 (Zen watch): still free tier, capacity
-  // unknown from the selector's vantage.
-  if (model.provider.id === "opencode" && (model.cost?.input === 0 || model.cost?.input === undefined) && !hasPublishedPricing(model.cost)) {
-    return "free-limited-unknown"
-  }
-
-  return "paid"
+  // Free tiers are a published catalog property, not merely an all-zero price:
+  // `freeTierOf` owns that decision for the badges and the ranking alike, so a
+  // model cannot be tagged "Free" in one surface and sorted as paid in the
+  // other. Whether a free tier is known-capacity depends on FUT: if the caller
+  // can supply a capacity hint (remaining/limit), the yield layer upgrades it
+  // to free-limited-known.
+  return freeTierOf(model) ?? "paid"
 }
 
 // ---------------------------------------------------------------------------

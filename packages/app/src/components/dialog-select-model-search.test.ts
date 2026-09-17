@@ -4,6 +4,7 @@ import {
   filterPreparedModelGroupsForSearch,
   matchesModelSearch,
   prepareModelGroupSearchFields,
+  selectModelSections,
 } from "./dialog-select-model-search"
 
 describe("matchesModelSearch", () => {
@@ -80,5 +81,48 @@ describe("filterPreparedModelGroupsForSearch", () => {
 
   test("canonical model matches stay collapsed even though variants share the model name", () => {
     expect(filterPreparedModelGroupsForSearch(groups, "sonnet", fields)).toEqual([canonical])
+  })
+})
+
+describe("selectModelSections", () => {
+  const key = (item: { provider: { name: string }; id: string }) => `${item.provider.name}:${item.id}`
+  const base = {
+    keyOf: key,
+    groupKeyOf: (item: { provider: { name: string }; id: string }) => item.id.replace(/@.*$/, ""),
+    recentGroupKeys: [] as string[],
+    isFavorite: () => false,
+  }
+  const sonnet = { provider: { name: "Anthropic" }, id: "claude-sonnet" }
+  const dana = { provider: { name: "Anthropic" }, id: "claude-sonnet@wb-dana" }
+  const gpt = { provider: { name: "OpenAI" }, id: "gpt-5" }
+
+  test("only projects rows present in the filtered list", () => {
+    const result = selectModelSections([gpt], { ...base, isFavorite: (item) => item.id === "claude-sonnet" })
+    expect(result.favorites).toEqual([])
+  })
+
+  test("a search-expanded account variant is what the section renders", () => {
+    const result = selectModelSections([dana], { ...base, isFavorite: () => true })
+    expect(result.favorites).toEqual([dana])
+  })
+
+  test("renders one row per model group even when variants collapse together", () => {
+    const result = selectModelSections([sonnet, dana], { ...base, isFavorite: () => true })
+    expect(result.favorites).toEqual([sonnet])
+  })
+
+  test("a favorite never repeats under Recent", () => {
+    const result = selectModelSections([sonnet, gpt], {
+      ...base,
+      recentGroupKeys: ["claude-sonnet", "gpt-5"],
+      isFavorite: (item) => item.id === "claude-sonnet",
+    })
+    expect(result.favorites).toEqual([sonnet])
+    expect(result.recents).toEqual([gpt])
+  })
+
+  test("recent order follows recentGroupKeys, not list order", () => {
+    const result = selectModelSections([sonnet, gpt], { ...base, recentGroupKeys: ["gpt-5", "claude-sonnet"] })
+    expect(result.recents).toEqual([gpt, sonnet])
   })
 })

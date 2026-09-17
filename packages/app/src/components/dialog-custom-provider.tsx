@@ -13,6 +13,7 @@ import { ExternalLink } from "@/components/external-link"
 import { useServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
 import { useLanguage } from "@/context/language"
+import { useProviderSettings } from "@/hooks/use-provider-settings"
 import { type FormState, headerRow, modelRow, validateCustomProvider } from "./dialog-custom-provider-form"
 
 type Props = {
@@ -45,6 +46,7 @@ export function CustomProviderForm(props: { autofocus?: boolean } = {}) {
   const dialog = useDialog()
   const serverSync = useServerSync()
   const serverSDK = useServerSDK()
+  const providerSettings = useProviderSettings()
   const language = useLanguage()
 
   const [form, setForm] = createStore<FormState>({
@@ -120,7 +122,7 @@ export function CustomProviderForm(props: { autofocus?: boolean } = {}) {
       form,
       t: language.t,
       disabledProviders: serverSync().data.config.disabled_providers ?? [],
-      existingProviderIDs: new Set(serverSync().data.provider.all.keys()),
+      existingProviderIDs: new Set(providerSettings.data().providers.map((provider) => provider.id)),
     })
     batch(() => {
       setForm("err", output.err)
@@ -153,6 +155,7 @@ export function CustomProviderForm(props: { autofocus?: boolean } = {}) {
       return result
     },
     onSuccess: (result) => {
+      void providerSettings.refresh().catch(() => undefined)
       dialog.close()
       showToast({
         variant: "success",

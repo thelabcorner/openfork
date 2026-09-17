@@ -85,6 +85,7 @@ export interface Settings {
     showReasoningSummaries: boolean
     shellToolPartsExpanded: boolean
     editToolPartsExpanded: boolean
+    autoAcceptPermissionsDefault: boolean
     showCustomAgents: boolean
     mobileTitlebarPosition: "top" | "bottom"
     newLayoutDesigns?: boolean
@@ -251,6 +252,7 @@ const defaultSettings: Settings = {
     showReasoningSummaries: false,
     shellToolPartsExpanded: false,
     editToolPartsExpanded: false,
+    autoAcceptPermissionsDefault: true,
     showCustomAgents: false,
     mobileTitlebarPosition: "top",
   },
@@ -475,6 +477,18 @@ export const { use: useSettings, provider: SettingsProvider } = createSimpleCont
         ),
         setEditToolPartsExpanded(value: boolean) {
           setStore("general", "editToolPartsExpanded", value)
+        },
+        // Default for sessions that have not made an explicit auto-accept
+        // choice yet. Distinct from the per-session/per-directory auto-accept
+        // override owned by the permission context: this is only consulted
+        // when a new session is initialized, or by the draft composer before
+        // that session exists. Absent stored value means ON.
+        autoAcceptPermissionsDefault: withFallback(
+          () => store.general?.autoAcceptPermissionsDefault,
+          defaultSettings.general.autoAcceptPermissionsDefault,
+        ),
+        setAutoAcceptPermissionsDefault(value: boolean) {
+          setStore("general", "autoAcceptPermissionsDefault", value)
         },
         showCustomAgents,
         setShowCustomAgents(value: boolean) {

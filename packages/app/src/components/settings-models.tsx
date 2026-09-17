@@ -6,13 +6,18 @@ import { IconButton } from "@opencode-ai/ui/icon-button"
 import { TextField } from "@opencode-ai/ui/text-field"
 import { type Component, For, Show } from "solid-js"
 import { useLanguage } from "@/context/language"
-import { useModels } from "@/context/models"
-import { ModelsProvider } from "@/context/models"
 import { popularProviders } from "@/hooks/use-providers"
+import { useProviderSettingsModels } from "@/hooks/use-provider-settings"
+import { useModelVisibilitySettings } from "@/hooks/use-model-visibility-settings"
 import { SettingsList } from "./settings-list"
 import { SettingsServerPicker, SettingsServerScope } from "./settings-server-picker"
 
-type ModelItem = ReturnType<ReturnType<typeof useModels>["list"]>[number]
+type ModelItem = {
+  id: string
+  name: string
+  releaseDate: string
+  provider: { id: string; name: string }
+}
 
 const ListLoadingState: Component<{ label: string }> = (props) => {
   return (
@@ -36,19 +41,25 @@ const ListEmptyState: Component<{ message: string; filter: string }> = (props) =
 export const SettingsModels: Component = () => {
   return (
     <SettingsServerScope>
-      <ModelsProvider>
-        <SettingsModelsContent />
-      </ModelsProvider>
+      <SettingsModelsContent />
     </SettingsServerScope>
   )
 }
 
 const SettingsModelsContent: Component = () => {
   const language = useLanguage()
-  const models = useModels()
+  const catalog = useProviderSettingsModels()
+  const visibility = useModelVisibilitySettings()
+  const models = () =>
+    catalog.data().models.map((model) => ({
+      id: model.modelID,
+      name: model.name,
+      releaseDate: model.releaseDate,
+      provider: { id: model.providerID, name: model.providerName },
+    }))
 
   const list = useFilteredList<ModelItem>({
-    items: (_filter) => models.list(),
+    items: (_filter) => models(),
     key: (x) => `${x.provider.id}:${x.id}`,
     filterKeys: ["provider.name", "name", "id"],
     sortBy: (a, b) => a.name.localeCompare(b.name),
@@ -100,7 +111,7 @@ const SettingsModelsContent: Component = () => {
 
       <div class="flex flex-col gap-8 max-w-[720px]">
         <Show
-          when={!list.grouped.loading}
+          when={!catalog.query.isPending && !list.grouped.loading}
           fallback={
             <ListLoadingState label={`${language.t("common.loading")}${language.t("common.loading.ellipsis")}`} />
           }
@@ -127,9 +138,9 @@ const SettingsModelsContent: Component = () => {
                             </div>
                             <div class="flex-shrink-0">
                               <Switch
-                                checked={models.visible(key)}
+                                checked={visibility.visible({ ...key, releaseDate: item.releaseDate })}
                                 onChange={(checked) => {
-                                  models.setVisibility(key, checked)
+                                  visibility.setVisibility(key, checked)
                                 }}
                                 hideLabel
                               >

@@ -23,7 +23,7 @@ import {
   compilePricingRegimes,
   priceWorkload,
 } from "./usage-yield"
-import { hasPublishedPricing, isUnlimitedModel } from "./badges"
+import { freeTierOf, hasPublishedPricing, isUnlimitedModel } from "./badges"
 import type { UsageProfile } from "./usage-profile"
 import { bigramCounts, normalizeModelName, similarityWithCounts } from "./string-similarity"
 
@@ -468,14 +468,18 @@ export function mergePricingFallbacks(
 
 /**
  * Whether a model should be treated as "free" for badge purposes (§10, §19).
- * Centralizes the three historical checks (isUnlimitedModel, isFree, :free id)
- * so badge logic doesn't diverge from ranking logic.
+ * Thin wrapper over `freeTierOf`, the single owner of free-tier
+ * classification, so the badge cannot diverge from the yield ranking
+ * (`classifyMonetaryClass`).
  */
-export function isFreeModel(model: { id: string; name?: string; provider: { id: string }; cost?: { input?: number } }): boolean {
+export function isFreeModel(model: {
+  id: string
+  name?: string
+  provider: { id: string }
+  cost?: { input?: number; output?: number }
+}): boolean {
   if (isUnlimitedModel(model)) return true
-  if (model.provider.id === "openrouter" && (model.id === "openrouter/free" || model.id.endsWith(":free"))) return true
-  if (model.provider.id === "opencode" && (!model.cost || model.cost.input === 0)) return true
-  return false
+  return freeTierOf(model) !== undefined
 }
 
 /**

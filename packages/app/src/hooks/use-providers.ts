@@ -19,16 +19,21 @@ export const popularProviders = [
 ]
 const popularProviderSet = new Set(popularProviders)
 
-export function useProviders(directory: Accessor<string | undefined>) {
+const EMPTY = selectProviderCatalog({ explicit: true, directory: undefined })
+
+export function useProviders(
+  directory: Accessor<string | undefined>,
+  options: { allowGlobal?: boolean } = {},
+) {
   const serverSync = useServerSync()
   const params = useParams()
   const dir = () => (directory ? directory() : decode64(params.dir))
-  // Global provider/model discovery is not startup infrastructure. Most
-  // session surfaces use a directory-scoped catalog, while the few truly
-  // global consumers (legacy layout/settings) opt into the global query simply
-  // by asking useProviders() without a directory.
+  // Undefined means "location not resolved", never "use process.cwd()".
+  // The compatibility global catalog is opt-in only; new server-level UI uses
+  // the Tier-0 provider-settings / usage-pricing surfaces instead.
   createEffect(() => {
     if (dir()) return
+    if (!options.allowGlobal) return
     serverSync().providers.ensure()
   })
   const providers = () => {
@@ -40,6 +45,7 @@ export function useProviders(directory: Accessor<string | undefined>) {
         directory: value,
         catalog: projectStore && { ready: projectStore.provider_ready, providers: projectStore.provider },
       })
+    if (!options.allowGlobal) return EMPTY
     return selectProviderCatalog({
       explicit: false,
       directory: value,

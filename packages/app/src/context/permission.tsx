@@ -20,6 +20,7 @@ import {
   isDirectoryAutoAccepting,
   autoRespondsPermission,
   sessionAutoAccept,
+  resolveNewSessionAutoAccept,
 } from "./permission-auto-respond"
 
 type PermissionRespondFn = (input: {
@@ -175,6 +176,9 @@ export const { use: usePermission, provider: PermissionProvider } = createSimple
       },
       disableAutoAccept(sessionID: string, directory?: string) {
         selected().disableAutoAccept(sessionID, directory)
+      },
+      autoAcceptForNewSession(directory?: string) {
+        return selected().newSessionAutoAccept(directory, settings.general.autoAcceptPermissionsDefault())
       },
       permissionsEnabled,
       isPermissionAllowAll(directory: string) {
@@ -392,17 +396,18 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
     )
   }
 
-  function enable(sessionID: string, directory: string) {
+  function setSessionAutoAccept(sessionID: string, directory: string, value: boolean) {
     if (meta.disposed) return
     const key = acceptKey(sessionID, directory)
     const version = bumpEnableVersion(sessionID, directory)
     setStore(
       produce((draft) => {
-        draft.autoAccept[key] = true
+        draft.autoAccept[key] = value
         delete draft.autoAccept[sessionID]
       }),
     )
 
+    if (!value) return
     list(directory)
       .then((permissions) => {
         if (meta.disposed) return
@@ -419,15 +424,20 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
       .catch(() => undefined)
   }
 
+  function enable(sessionID: string, directory: string) {
+    setSessionAutoAccept(sessionID, directory, true)
+  }
+
   function disable(sessionID: string, directory?: string) {
     if (meta.disposed) return
+    if (directory) {
+      setSessionAutoAccept(sessionID, directory, false)
+      return
+    }
     bumpEnableVersion(sessionID, directory)
-    const key = directory ? acceptKey(sessionID, directory) : sessionID
     setStore(
       produce((draft) => {
-        draft.autoAccept[key] = false
-        if (!directory) return
-        delete draft.autoAccept[sessionID]
+        draft.autoAccept[sessionID] = false
       }),
     )
   }
@@ -472,6 +482,24 @@ function createServerPermissionState(input: { sdk: ServerSDK; sync: ServerSync }
     disableAutoAccept(sessionID: string, directory?: string) {
       if (meta.disposed) return
       disable(sessionID, directory)
+    },
+    /**
+     * Materializes the effective new-session value as an explicit per-session
+     * choice. Unlike `enableAutoAccept`, this never short-circuits, so a
+     * session created while the default is OFF is stamped `false` and cannot
+     * later inherit a directory-wide ON or a changed default.
+     */
+    initializeAutoAccept(sessionID: string, directory: string, value: boolean) {
+      if (meta.disposed) return
+      setSessionAutoAccept(sessionID, directory, value)
+    },
+    newSessionAutoAccept(directory: string | undefined, preference: boolean) {
+      if (meta.disposed) return preference
+      return resolveNewSessionAutoAccept(store.autoAccept, directory, preference)
+    },
+    directoryAutoAccept(directory: string) {
+      if (meta.disposed) return undefined
+      return store.autoAccept[directoryAcceptKey(directory)]
     },
     isPermissionAllowAll(directory: string) {
       if (meta.disposed) return false
