@@ -1,25 +1,36 @@
 name: dev-pre-release
+run-name: "dev pre-release ${{ github.run_number }}"
 
 # OpenFork dev pre-release packaging.
 #
-# GitHub-hosted runners ONLY (ubuntu-latest). This workflow deliberately does
-# not use the `[self-hosted, homelab]` runner that `.github/workflows/ci.yml`
-# targets.
+# GitHub-hosted runners ONLY. This workflow deliberately does not use the
+# `[self-hosted, homelab]` runner that `.github/workflows/ci.yml` targets.
 #
 # This is the dev-channel counterpart to the upstream `publish.yml` that
 # `script/release` dispatches (`gh workflow run publish.yml`) and that
 # `script/publish.ts` drives for npm / desktop releases. That file is not
-# present in this fork, so the entry point is this workflow instead:
-#   - it packages the CLI from the same `packages/opencode/script/build.ts`
-#     that `script/publish.ts` invokes (here with `--single`, so the
-#     GitHub-hosted runner builds its own linux-x64 target);
-#   - it intentionally does NOT run `script/publish.ts`, which requires npm,
-#     AUR, and desktop signing secrets that a dev pre-release must not need.
-# A dev pre-release is always created as a GitHub pre-release.
+# present in this fork, so this workflow is the entry point:
 #
-# Trigger:  push to `main`, or `gh workflow run dev-pre-release.yml`.
-# Output:   opencode-dev-linux-x64.tar.gz + generated release notes that
-#           enumerate every changed package, file, and commit in the range.
+#   notes         - resolve a dev version/tag and create a DRAFT pre-release,
+#                   with release notes enumerating every commit, package, and
+#                   changed file in the range.
+#   build-cli     - `packages/opencode/script/build.ts` with OPENCODE_RELEASE=1
+#                   cross-compiles EVERY Bun target (linux glibc+musl x64/arm64
+#                   and baseline, darwin x64/arm64, windows x64/arm64/baseline)
+#                   on one ubuntu-latest runner, then archives and uploads each
+#                   (`opencode-windows-x64.zip` contains `opencode.exe`, etc.).
+#                   This is the same packaging block `script/publish.ts` uses.
+#   build-desktop - GitHub-hosted matrix (macOS Intel + Apple Silicon, Windows,
+#                   Linux) that builds the unsigned Electron installers
+#                   (.dmg/.zip, .exe, .AppImage/.deb/.rpm). Best-effort: it is
+#                   allowed to fail without blocking the CLI release because the
+#                   Electron tree still ships without Apple/Azure signing
+#                   credentials and without `packages/desktop/native/`.
+#   release       - flip the draft to a published pre-release.
+#
+# `script/publish.ts` itself is intentionally not run (it publishes npm/AUR/
+# desktop artifacts and needs secrets a dev pre-release must not require); its
+# CLI packaging is what build-cli mirrors.
 
 on:
   push:
@@ -30,6 +41,10 @@ on:
         description: "Optional explicit dev version (default 0.0.0-dev.<run>+<sha>)"
         required: false
         type: string
+      base:
+        description: "Optional commit/ref to enumerate release notes from (default: push range)"
+        required: false
+        type: string
 
 concurrency:
   group: dev-pre-release-${{ github.ref }}
@@ -38,9 +53,12 @@ concurrency:
 permissions:
   contents: write
 
+env:
+  GH_REPO: thelabcorner/openfork
+
 jobs:
   notes:
-    name: Compose dev version and release notes
+    name: Version, notes, and draft pre-release
     runs-on: ubuntu-latest
     outputs:
       version: ${{ steps.version.outputs.version }}
@@ -65,7 +83,9 @@ jobs:
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          if [ "${{ github.event_name }}" = "push" ] && git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
+          if [ -n "${{ inputs.base }}" ] && git cat-file -e "${{ inputs.base }}^{commit}" 2>/dev/null; then
+            echo "base=${{ inputs.base }}" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "push" ] && git cat-file -e "${{ github.event.before }}^{commit}" 2>/dev/null; then
             echo "base=${{ github.event.before }}" >> "$GITHUB_OUTPUT"
           else
             echo "base=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
@@ -110,17 +130,29 @@ jobs:
           } > release-notes.md
           cat release-notes.md
 
-      - name: Upload release notes
+      - name: Create draft pre-release (holds the tag for asset uploads)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${{ steps.version.outputs.tag }}" \
+            --draft \
+            --prerelease \
+            --target "${{ github.sha }}" \
+            --title "OpenFork dev pre-release ${{ steps.version.outputs.version }}" \
+            --notes-file release-notes.md
+
+      - name: Upload release notes artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-notes
           path: release-notes.md
 
   build-cli:
-    name: Build and package CLI (ubuntu-latest)
+    name: Build CLI (all targets)
     needs: notes
     runs-on: ubuntu-latest
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       CI: "true"
       HUSKY: "0"
@@ -131,32 +163,130 @@ jobs:
       - name: Setup Bun
         uses: ./.github/actions/setup-bun
 
-      - name: Build opencode CLI (single target)
+      - name: Install archive tools
+        run: sudo apt-get update && sudo apt-get install -y zip
+
+      - name: Build and upload all CLI targets
         env:
           OPENCODE_VERSION: ${{ needs.notes.outputs.version }}
           OPENCODE_CHANNEL: dev
-        run: bun ./packages/opencode/script/build.ts --single
+          OPENCODE_RELEASE: "1"
+          GH_TOKEN: ${{ github.token }}
+        run: bun ./packages/opencode/script/build.ts
 
-      - name: Package CLI archive
-        shell: bash
-        run: |
-          set -euo pipefail
-          NAME="opencode-dev-linux-x64"
-          rm -rf "packages/opencode/dist/${NAME}"
-          mkdir -p "packages/opencode/dist/${NAME}"
-          cp -r packages/opencode/dist/opencode-linux-x64/bin "packages/opencode/dist/${NAME}/bin"
-          tar -czf "packages/opencode/dist/${NAME}.tar.gz" -C "packages/opencode/dist/${NAME}" bin
-          ls -la "packages/opencode/dist/${NAME}.tar.gz"
+      - name: List uploaded CLI archives
+        run: ls -la packages/opencode/dist/*.zip packages/opencode/dist/*.tar.gz
 
-      - name: Upload CLI archive
+      - name: Upload CLI archives as workflow artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: opencode-dev-linux-x64
-          path: packages/opencode/dist/opencode-dev-linux-x64.tar.gz
+          name: opencode-cli-all-targets
+          path: |
+            packages/opencode/dist/*.zip
+            packages/opencode/dist/*.tar.gz
+
+  build-desktop:
+    name: Desktop ${{ matrix.label }}
+    needs: notes
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15-intel
+            label: macOS x64
+            flag: --mac --x64
+          - os: macos-15
+            label: macOS arm64
+            flag: --mac --arm64
+          - os: windows-2022
+            label: Windows x64
+            flag: --win
+          - os: ubuntu-latest
+            label: Linux x64
+            flag: --linux
+    env:
+      CI: "true"
+      HUSKY: "0"
+      OPENCODE_VERSION: ${{ needs.notes.outputs.version }}
+      OPENCODE_CHANNEL: dev
+      OPENCODE_DESKTOP_LOCAL_CLI: "1"
+      NODE_OPTIONS: --max-old-space-size=4096
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: ./.github/actions/setup-bun
+
+      - name: Install rpm tooling (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y rpm
+
+      - name: Ensure native resource dir exists
+        shell: bash
+        run: mkdir -p packages/desktop/native
+
+      - name: Prepare (version + node sidecar + local CLI)
+        working-directory: packages/desktop
+        run: bun ./scripts/prepare.ts
+
+      - name: Build renderer and main
+        working-directory: packages/desktop
+        run: bunx electron-vite build
+
+      - name: Package installers (unsigned)
+        working-directory: packages/desktop
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+          GH_TOKEN: ${{ github.token }}
+        run: npx electron-builder ${{ matrix.flag }} --publish never --config electron-builder.config.ts -c.mac.notarize=false
+
+      - name: Upload installers to draft pre-release
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(
+            packages/desktop/dist/*.dmg
+            packages/desktop/dist/*.zip
+            packages/desktop/dist/*.exe
+            packages/desktop/dist/*.AppImage
+            packages/desktop/dist/*.deb
+            packages/desktop/dist/*.rpm
+            packages/desktop/dist/latest*.yml
+            packages/desktop/dist/*.blockmap
+          )
+          if (( ${#files[@]} == 0 )); then
+            echo "No desktop installer artifacts produced on ${{ matrix.label }}"
+            exit 0
+          fi
+          printf 'Uploading:\n'; printf '  %s\n' "${files[@]}"
+          gh release upload "${{ needs.notes.outputs.tag }}" "${files[@]}" --clobber
+
+      - name: Upload installers as workflow artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: opencode-desktop-${{ matrix.label }}
+          path: |
+            packages/desktop/dist/*.dmg
+            packages/desktop/dist/*.zip
+            packages/desktop/dist/*.exe
+            packages/desktop/dist/*.AppImage
+            packages/desktop/dist/*.deb
+            packages/desktop/dist/*.rpm
+            packages/desktop/dist/latest*.yml
 
   release:
-    name: Create dev pre-release
-    needs: [notes, build-cli]
+    name: Publish pre-release
+    needs: [notes, build-cli, build-desktop]
+    if: always() && needs.build-cli.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -167,32 +297,32 @@ jobs:
         with:
           name: release-notes
 
-      - name: Download CLI archive
-        uses: actions/download-artifact@v4
-        with:
-          name: opencode-dev-linux-x64
-          path: assets
-
-      - name: Publish GitHub pre-release
+      - name: Publish (undraft) the pre-release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          gh release create "${{ needs.notes.outputs.tag }}" \
-            assets/*.tar.gz \
+          gh release edit "${{ needs.notes.outputs.tag }}" \
+            --draft=false \
             --prerelease \
-            --target "${{ github.sha }}" \
-            --title "OpenFork dev pre-release ${{ needs.notes.outputs.version }}" \
             --notes-file release-notes.md
 
-      - name: Job summary
+      - name: Summarize published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           {
             echo "## OpenFork dev pre-release ${{ needs.notes.outputs.version }}"
             echo
             echo "- Tag: \`${{ needs.notes.outputs.tag }}\`"
-            echo "- Runner: \`ubuntu-latest\` (GitHub-hosted; homelab/self-hosted never used)"
-            echo "- Artifact: \`opencode-dev-linux-x64.tar.gz\`"
+            echo "- Runner: GitHub-hosted (homelab/self-hosted never used)"
+            echo "- Desktop jobs: \`${{ needs.build-desktop.result }}\`"
+            echo
+            echo "### Release assets"
+            echo
+            echo '```'
+            gh release view "${{ needs.notes.outputs.tag }}" --json assets --jq '.assets[] | "\(.size)\t\(.name)"'
+            echo '```'
             echo
             cat release-notes.md
           } >> "$GITHUB_STEP_SUMMARY"
