@@ -74,5 +74,8 @@ workbuddy-usage-forensics.tar.br
 .tmp-special-agent.patch
 .tmp-full-status.txt
 packages/opencode/.tmp-spad-*
+# Root-level OneOff SPAD reasoning-analysis scratch scripts (write to the
+# operator's Downloads dir; local forensics only, never source).
+.tmp-spad-*
 packages/opencode/.opencode-runtime-locks/
 packages/browser-visual/.interop-*/
