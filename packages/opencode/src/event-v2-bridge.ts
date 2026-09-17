@@ -212,7 +212,11 @@ const layer = Layer.effect(
         const ctx = yield* InstanceRef
         const workspaceID = (yield* WorkspaceRef) ?? event.location?.workspaceID
         GlobalBus.emit("event", {
-          directory: event.location?.directory ?? ctx?.directory,
+          // Truly process-global events (for example the compact batched
+          // session telemetry projection) intentionally have neither a
+          // Location nor an InstanceRef. Keep that ownership explicit instead
+          // of leaking an undefined directory into the legacy transport.
+          directory: event.location?.directory ?? ctx?.directory ?? "global",
           project: ctx?.project.id,
           workspace: workspaceID,
           payload: { id: event.id, type: event.type, properties: event.data },
@@ -228,7 +232,7 @@ const layer = Layer.effect(
         }
         EventTrace.count("bridge.legacyEnvelopes", 2)
         GlobalBus.emit("event", {
-          directory: event.location?.directory ?? ctx?.directory,
+          directory: event.location?.directory ?? ctx?.directory ?? "global",
           project: ctx?.project.id,
           workspace: workspaceID,
           payload: {

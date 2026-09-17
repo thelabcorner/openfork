@@ -4,6 +4,7 @@ import { SessionID } from "./schema"
 import { Effect, Layer, Context } from "effect"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { SessionStatusEvent } from "@opencode-ai/schema/session-status-event"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
 
 export const Info = SessionStatusEvent.Info
 export type Info = SessionStatusEvent.Info
@@ -22,6 +23,7 @@ const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
     const events = yield* EventV2Bridge.Service
+    const telemetry = yield* SessionTelemetry.Service
 
     const state = yield* InstanceState.make(
       Effect.fn("SessionStatus.state")(() => Effect.succeed(new Map<SessionID, Info>())),
@@ -39,7 +41,9 @@ const layer = Layer.effect(
     const set = Effect.fn("SessionStatus.set")(function* (sessionID: SessionID, status: Info, reason?: "aborted") {
       const data = yield* InstanceState.get(state)
       yield* events.publish(Event.Status, { sessionID, status })
+      if (status.type === "retry") yield* telemetry.retry(sessionID)
       if (status.type === "idle") {
+        yield* telemetry.idle(sessionID)
         yield* events.publish(Event.Idle, reason ? { sessionID, reason } : { sessionID })
         data.delete(sessionID)
         return
@@ -51,6 +55,6 @@ const layer = Layer.effect(
   }),
 )
 
-export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node] })
+export const node = LayerNode.make({ service: Service, layer: layer, deps: [EventV2Bridge.node, SessionTelemetry.node] })
 
 export * as SessionStatus from "./status"

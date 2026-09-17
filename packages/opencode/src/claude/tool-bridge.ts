@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import type { Tool } from "@/tool/tool"
 import { PermissionV1 } from "@opencode-ai/core/v1/permission"
+import { registerDisposer } from "@/effect/instance-registry"
 import {
   BridgeStore,
   type BridgeRequest,
@@ -14,11 +15,12 @@ import {
 } from "./bridge"
 import { BridgeError } from "./errors"
 
-// In-process BridgeStore registry keyed by directory. Uses a plain Map
-// for typecheck-safe per-instance isolation; InstanceState.directory can
-// be used externally to select the correct store, but the map itself
-// remains testable without Scope/InstanceState.make.
+// In-process BridgeStore registry keyed by directory. Lifetime is tied to the
+// owning instance: the first store for a directory registers a disposer that
+// the instance teardown path (`InstanceStore` -> `disposeInstance`) invokes, so
+// per-directory bridge state does not outlive the instance that produced it.
 const storeByDirectory = new Map<string, BridgeStore>()
+const disposerRegistered = new Set<string>()
 
 export function getOrCreateStore(directory: string): BridgeStore {
   let s = storeByDirectory.get(directory)
@@ -26,12 +28,26 @@ export function getOrCreateStore(directory: string): BridgeStore {
     s = new BridgeStore()
     storeByDirectory.set(directory, s)
   }
+  if (!disposerRegistered.has(directory)) {
+    disposerRegistered.add(directory)
+    const unregister = registerDisposer(async (disposed) => {
+      if (disposed !== directory) return
+      const store = storeByDirectory.get(directory)
+      storeByDirectory.delete(directory)
+      disposerRegistered.delete(directory)
+      unregister()
+      store?.dispose()
+    })
+  }
   return s
 }
 
 export function clearAllStores(): void {
-  for (const s of storeByDirectory.values()) s.dispose()
-  storeByDirectory.clear()
+  for (const [directory, s] of storeByDirectory) {
+    s.dispose()
+    storeByDirectory.delete(directory)
+  }
+  disposerRegistered.clear()
 }
 
 export interface BridgeExecuteInput {

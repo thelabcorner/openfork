@@ -35,6 +35,11 @@ export type SpadPolicyReason =
   | "tool-loop-recovery-disabled"
   | "persisted-motif-recovery-disabled"
   | "heuristic-recovery-authorized"
+  // Termination authority is deliberately distinct from mutation authority. A proven
+  // reasoning attractor may be stopped without ever rewriting reasoning text.
+  | "reasoning-runaway-authorized"
+  | "reasoning-runaway-disabled"
+  | "reasoning-runaway-evidence-insufficient"
 
 export interface PeriodThresholdBand {
   readonly maxPeriod: number
@@ -69,6 +74,13 @@ export interface SpadConfig {
   readonly lowLexicalDistinctLetters: number
   readonly lowLexicalMinCoverage: number
   readonly autoRecoverThrash: boolean
+  /**
+   * Termination-only authority for proven reasoning attractors. Reasoning text is never
+   * rewritten; the stream is stopped once a raw-exact period has been independently
+   * verified and then persists for `reasoningRunawayChars` more characters.
+   */
+  readonly abortReasoningRunaway: boolean
+  readonly reasoningRunawayChars: number
   readonly thrashMinGenerations: number
   readonly thrashMinToolCalls: number
   readonly thrashNoMutationGens: number
@@ -98,6 +110,8 @@ export interface SpadEvidence {
   readonly exactMinimalPeriod?: number
   readonly exactPeriodComparisons?: number
   readonly exactPrefixComparisons?: number
+  /** Characters the proven period survived after its terminal proof. */
+  readonly runawayCharsAfterProof?: number
   /** Passive cross-generation unchanged-result recurrence evidence. */
   readonly informationResource?: string
   readonly informationRecurrences?: number
@@ -133,7 +147,7 @@ export type SpadAction =
   | {
       readonly type: "abort"
       readonly detection: SpadEvidence
-      readonly reason: "recovery-budget-exhausted" | "relapse"
+      readonly reason: "recovery-budget-exhausted" | "relapse" | "reasoning-runaway"
       readonly policyReason: SpadPolicyReason
     }
 

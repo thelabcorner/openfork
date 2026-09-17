@@ -105,6 +105,7 @@ function makeRuntime(
   const sinkEvents: Array<{ kind: string }> = []
   const runtime = new ClaudeAgentRuntime({
     loader: async () => module,
+    cwd: "/tmp/claude-test",
     killTree: (pid) => {
       killed.push(pid)
     },
@@ -200,7 +201,7 @@ describe("ClaudeAgentRuntime lifecycle", () => {
       loads += 1
       return module
     }
-    const runtime = new ClaudeAgentRuntime({ loader })
+    const runtime = new ClaudeAgentRuntime({ loader, cwd: "/tmp/claude-test" })
 
     const first = runtime.run({ prompt: "one" })
     streamA.push(initEvent)

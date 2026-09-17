@@ -146,7 +146,7 @@ describe("claude integration: persistence + bridge + fake SDK", () => {
 
     const ctrl = new Ctrl()
     const fakeModule = { query: () => ({ events: ctrl.events, interrupt: async () => {}, close: () => ctrl.end(), pid: 9999 }) }
-    const runtime = new ClaudeAgentRuntime({ loader: async () => fakeModule as any })
+    const runtime = new ClaudeAgentRuntime({ loader: async () => fakeModule as any, cwd: "/tmp/worktree" })
     const initEvent = { type: "system", subtype: "init", session_id: "ext-sdk-1" }
     const resultEvent = { type: "result", subtype: "success", is_error: false, result: "done", session_id: "ext-sdk-1" }
     const turnPromise = runtime.run({ prompt: "hi from test" })

@@ -24,6 +24,8 @@ import { errorMessage } from "@/util/error"
 import { isRecord } from "@/util/record"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { Database } from "@opencode-ai/core/database/database"
+import { SessionTelemetry } from "@opencode-ai/core/session/telemetry"
+import { UsageRecord } from "@opencode-ai/core/usage/record"
 import { Usage, type LLMEvent } from "@opencode-ai/llm"
 import { ForkCredentials } from "@/fork/credentials"
 import { splitAccountModelID } from "@opencode-ai/schema/model-account-identity"
@@ -59,6 +61,12 @@ type Input = {
   sessionID: SessionID
   model: Provider.Model
   spad?: SpadSupervisor
+  /**
+   * Optional pre-stream tree already captured by the turn owner. The first
+   * generation step can reuse TurnCheckpoint's authoritative pre-turn capture
+   * instead of immediately scanning the same worktree again.
+   */
+  initialSnapshot?: string
 }
 
 export interface Interface {
@@ -128,13 +136,17 @@ const layer = Layer.effect(
     const image = yield* Image.Service
     const events = yield* EventV2Bridge.Service
     const database = yield* Database.Service
+    const telemetry = yield* SessionTelemetry.Service
+    const usageRecord = yield* UsageRecord.Service
     const forkCredentials = yield* ForkCredentials.Service
 
     const create = Effect.fn("SessionProcessor.create")(function* (input: Input) {
       // Pre-capture snapshot before the LLM stream starts. The AI SDK
       // may execute tools internally before emitting start-step events,
-      // so capturing inside the event handler can be too late.
-      const initialSnapshot = yield* snapshot.track()
+      // so capturing inside the event handler can be too late. On the first
+      // logical step SessionPrompt can hand us the TurnCheckpoint capture that
+      // was already started at the same pre-tool ownership boundary.
+      const initialSnapshot = input.initialSnapshot ?? (yield* snapshot.track())
       const ctx: ProcessorContext = {
         needsSpadAbort: undefined,
         assistantMessage: input.assistantMessage,
@@ -415,6 +427,7 @@ const layer = Layer.effect(
         // chunk indefinitely. Delta events themselves batch via the
         // time/size thresholds in bufferTextDelta/bufferReasoningDelta.
         if (value.type !== "text-delta" && value.type !== "reasoning-delta") yield* flushAllDeltas()
+        yield* telemetry.observe({ sessionID: ctx.sessionID, event: value })
         switch (value.type) {
           case "reasoning-start":
             if (value.id in ctx.reasoningMap) return
@@ -672,6 +685,14 @@ const layer = Layer.effect(
             ctx.assistantMessage.cost += usage.cost
             ctx.assistantMessage.tokens = usage.tokens
             if (value.servedModel) ctx.assistantMessage.servedModel = value.servedModel
+            const completedAt = Date.now()
+            yield* telemetry.settle({
+              sessionID: ctx.sessionID,
+              assistantMessageID: ctx.assistantMessage.id,
+              completedAt,
+              cost: ctx.assistantMessage.cost,
+              tokens: usage.tokens,
+            })
             yield* session.updatePart({
               id: PartID.ascending(),
               reason: value.reason,
@@ -708,7 +729,10 @@ const layer = Layer.effect(
               }
             }
             if (ctx.snapshot) {
-              const patch = yield* snapshot.patch(ctx.snapshot)
+              // `completedSnapshot` is the exact post-step tree we just
+              // captured. Compare the immutable trees directly instead of
+              // forcing Snapshot.patch() to rescan and restage the worktree.
+              const patch = yield* snapshot.patch(ctx.snapshot, completedSnapshot)
               if (patch.files.length) {
                 ctx.spad?.markProgress()
                 yield* session.updatePart({
@@ -875,6 +899,28 @@ const layer = Layer.effect(
         ctx.toolcalls = {}
         ctx.assistantMessage.time.completed = Date.now()
         yield* session.updateMessage(ctx.assistantMessage)
+        yield* usageRecord.record({
+          messageID: ctx.assistantMessage.id,
+          sessionID: ctx.sessionID,
+          providerID: ctx.model.providerID,
+          modelID: ctx.model.id,
+          variant: ctx.assistantMessage.variant,
+          agent: ctx.assistantMessage.agent,
+          mode: ctx.assistantMessage.mode,
+          createdAt: ctx.assistantMessage.time.created,
+          requestSentAt: ctx.assistantMessage.time.requestSentAt,
+          firstTokenAt: ctx.assistantMessage.time.firstTokenAt,
+          streamedAt: ctx.assistantMessage.time.streamedAt,
+          completedAt: ctx.assistantMessage.time.completed,
+          cost: ctx.assistantMessage.cost,
+          tokens: {
+            input: ctx.assistantMessage.tokens.input,
+            cacheRead: ctx.assistantMessage.tokens.cache.read,
+            cacheWrite: ctx.assistantMessage.tokens.cache.write,
+            output: ctx.assistantMessage.tokens.output,
+            reasoning: ctx.assistantMessage.tokens.reasoning,
+          },
+        })
       })
 
       const halt = Effect.fn("SessionProcessor.halt")(function* (e: unknown) {
@@ -933,6 +979,18 @@ const layer = Layer.effect(
             ctx.assistantMessage.time.firstTokenAt = undefined
             ctx.assistantMessage.time.streamedAt = undefined
             yield* session.updateMessage(ctx.assistantMessage)
+            yield* telemetry.begin({
+              sessionID: ctx.sessionID,
+              assistantMessageID: ctx.assistantMessage.id,
+              requestSentAt: ctx.assistantMessage.time.requestSentAt,
+              model: {
+                providerID: ctx.model.providerID,
+                modelID: ctx.model.id,
+                name: ctx.model.name,
+                ...(ctx.assistantMessage.variant === undefined ? {} : { variant: ctx.assistantMessage.variant }),
+                contextLimit: ctx.model.limit.context,
+              },
+            })
 
             const stream = llm.stream(streamInput)
 
@@ -951,6 +1009,7 @@ const layer = Layer.effect(
             if (ctx.firstTokenRecorded && ctx.assistantMessage.time.streamedAt === undefined) {
               ctx.assistantMessage.time.streamedAt = Date.now()
               yield* session.updateMessage(ctx.assistantMessage)
+              yield* telemetry.streamed(ctx.sessionID, ctx.assistantMessage.time.streamedAt)
             }
           }).pipe(
             Effect.onInterrupt(() =>
@@ -1038,6 +1097,8 @@ export const node = LayerNode.make({
     Image.node,
     EventV2Bridge.node,
     Database.node,
+    SessionTelemetry.node,
+    UsageRecord.node,
     ForkCredentials.node,
   ],
 })

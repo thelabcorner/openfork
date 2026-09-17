@@ -9,6 +9,8 @@ export const MAX_OUTPUT_BYTES = 1_000_000
 export const MAX_TOOL_NAME_LENGTH = 128
 export const MAX_CALLID_LENGTH = 256
 export const MAX_INPUT_BYTES = 256 * 1024
+/** Hard cap on retained entries before terminal rows are pruned. */
+export const MAX_RETAINED_ENTRIES = 1024
 
 // ── Scope ──
 
@@ -155,6 +157,10 @@ export class BridgeStore {
     if (inputSize > MAX_INPUT_BYTES) {
       throw new BridgeError({ code: "overflow", message: "tool input too large", callID: request.callID })
     }
+    // Completed/denied/timed-out rows are only retained long enough to detect a
+    // duplicate continuation. Prune them under pressure so a shared per-directory
+    // store cannot grow with total tool calls for the life of the process.
+    if (this.entries.size >= MAX_RETAINED_ENTRIES) this.pruneTerminal()
     const entry: PendingEntry = {
       request,
       status: "pending",
@@ -272,7 +278,8 @@ export class BridgeStore {
     return affected
   }
 
-  // For tests: clear completed/terminal entries
+  // Drop every terminal row. Called on pressure and at turn teardown so the
+  // store remains bounded by in-flight work rather than total call history.
   pruneTerminal(): number {
     let n = 0
     for (const [id, entry] of this.entries) {

@@ -1,5 +1,8 @@
 import { describe, test, expect } from "bun:test"
 import { Effect } from "effect"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import path from "node:path"
 import {
   createBinding,
   validateBinding,
@@ -9,6 +12,9 @@ import {
   bindingKey,
   hashSettings,
   modelFamilyOf,
+  claudeProjectDirName,
+  findTranscript,
+  transcriptExists,
   MAX_HISTORY_TRANSFER_MESSAGES,
   MAX_HISTORY_TRANSFER_CHARS,
 } from "../../src/claude/sessions"
@@ -203,5 +209,42 @@ describe("ClaudeSessions binding lifecycle", () => {
     // Binding is not transcript authority: transcript missing => no resume
     const decision2 = decideResume({ binding: reloaded, ctx: { ...ctx, transcriptExists: false } })
     expect(decision2.strategy).toBe("fresh")
+  })
+})
+
+describe("Claude transcript lookup", () => {
+  test("claudeProjectDirName encodes separators and punctuation", () => {
+    expect(claudeProjectDirName("/repo/my-project")).toBe("-repo-my-project")
+    expect(claudeProjectDirName("C:\\Users\\me\\proj")).toBe("C--Users-me-proj")
+  })
+
+  test("resolves via the cwd-derived project directory fast path", async () => {
+    const config = await mkdtemp(path.join(tmpdir(), "claude-cfg-"))
+    try {
+      const cwd = "/repo/my-project"
+      const dir = path.join(config, "projects", claudeProjectDirName(cwd))
+      await mkdir(dir, { recursive: true })
+      const file = path.join(dir, "sess-fast.jsonl")
+      await writeFile(file, "")
+      const env = { CLAUDE_CONFIG_DIR: config }
+      await expect(findTranscript("sess-fast", { cwd, env })).resolves.toBe(file)
+      await expect(transcriptExists("sess-fast", { cwd, env })).resolves.toBe(true)
+      // A different (wrong) cwd still finds it via the bounded fallback scan.
+      await expect(findTranscript("sess-fast", { cwd: "/elsewhere", env })).resolves.toBe(file)
+    } finally {
+      await rm(config, { recursive: true, force: true })
+    }
+  })
+
+  test("missing transcript is reported absent without throwing", async () => {
+    const config = await mkdtemp(path.join(tmpdir(), "claude-cfg-"))
+    try {
+      const env = { CLAUDE_CONFIG_DIR: config }
+      await expect(findTranscript("nope", { cwd: "/x", env })).resolves.toBeUndefined()
+      await expect(transcriptExists("nope", { env })).resolves.toBe(false)
+      await expect(findTranscript("nope", { env: { CLAUDE_CONFIG_DIR: "" } })).resolves.toBeUndefined()
+    } finally {
+      await rm(config, { recursive: true, force: true })
+    }
   })
 })

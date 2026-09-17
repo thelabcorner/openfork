@@ -301,6 +301,13 @@ export class SpadSupervisor {
     const detection = this.detector.push(delta)
     if (!detection) return stateAction
     const policy = this.recoveryPolicy(detection)
+    // Termination authority is not recovery authority. A proven reasoning runaway is
+    // stopped outright: no truncation, no rewrite, no recovery prompt, and no consumption
+    // of the recovery budget. The reasoning part is preserved exactly as received.
+    if (policy.reason === "reasoning-runaway-authorized") {
+      this.lastDetection = detection
+      return { type: "abort", detection, reason: "reasoning-runaway", policyReason: policy.reason }
+    }
      if (!policy.allowed) return this.observe(detection, policy.reason)
     return this.triggerRecovery(detection, policy.reason)
   }

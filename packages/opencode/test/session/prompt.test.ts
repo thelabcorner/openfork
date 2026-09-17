@@ -443,6 +443,42 @@ const boot = Effect.fn("test.boot")(function* (input?: { title?: string }) {
   return { prompt, run, sessions, chat }
 })
 
+noLLMServer.instance(
+  "rejects direct user prompts to host-owned child Sessions before message admission",
+  () =>
+    Effect.gen(function* () {
+      const prompt = yield* SessionPrompt.Service
+      const sessions = yield* Session.Service
+      const parent = yield* sessions.create({ title: "Parent" })
+      const child = yield* sessions.create({
+        parentID: parent.id,
+        title: "Goal Auditor child",
+        metadata: { specialAgent: "goal_auditor", goalID: "goal_test" },
+      })
+
+      const exit = yield* prompt
+        .prompt({
+          sessionID: child.id,
+          agent: "build",
+          model: ref,
+          parts: [{ type: "text", text: "please change the implementation" }],
+        })
+        .pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      if (Exit.isFailure(exit)) {
+        expect(Cause.squash(exit.cause)).toMatchObject({
+          _tag: "SessionPrompt.HostOwnedSessionError",
+          sessionID: child.id,
+          parentID: parent.id,
+          kind: "goal_auditor",
+        })
+      }
+      expect(yield* sessions.messages({ sessionID: child.id })).toHaveLength(0)
+    }),
+  { config: cfg },
+)
+
 // Loop semantics
 
 noLLMServer.instance(

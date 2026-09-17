@@ -83,6 +83,13 @@ function fakeSdk(script: SdkScript) {
   }
 }
 
+const TEST_CONTEXT = { projectID: "claude", worktree: "/tmp/claude-wt", directory: "/tmp/claude-wt" }
+// Runtime is a low-level SDK boundary; always give it an explicit cwd so the
+// tests cannot silently rely on a process.cwd() fallback.
+const RuntimeCtor = ClaudeAgentRuntime
+const testRuntime = (options: ConstructorParameters<typeof ClaudeAgentRuntime>[0] = {}) =>
+  new RuntimeCtor({ cwd: TEST_CONTEXT.directory, ...options })
+
 const echoTool = {
   description: "echo fixture",
   execute: async (args: { text: string }) => `echo:${args.text}`,
@@ -106,6 +113,7 @@ function baseInput(overrides: Partial<Parameters<typeof ClaudeRuntimeAdapter.str
     abort,
     permission: { ask: () => Effect.void },
     ruleset: [],
+    context: TEST_CONTEXT,
     ...overrides,
   }
 }
@@ -118,7 +126,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
   test("tool_use executes through BridgeStore + Permission and the turn continues to completion", async () => {
     resetSharedState()
     const script = new SdkScript()
-    const runtime = new ClaudeAgentRuntime({ loader: async () => fakeSdk(script) as never })
+    const runtime = testRuntime({ loader: async () => fakeSdk(script) as never })
     const store = new BridgeStore()
     const bindings = makeMemoryStorage()
 
@@ -209,7 +217,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
   test("auto-heals upstream grep tool_use into canonical find in execution and transcript events", async () => {
     resetSharedState()
     const script = new SdkScript()
-    const runtime = new ClaudeAgentRuntime({ loader: async () => fakeSdk(script) as never })
+    const runtime = testRuntime({ loader: async () => fakeSdk(script) as never })
     const store = new BridgeStore()
     const permissions: string[] = []
     const pending = events(
@@ -271,7 +279,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     resetSharedState()
     const script = new SdkScript()
     let mcpOptions: any
-    const runtime = new ClaudeAgentRuntime({
+    const runtime = testRuntime({
       loader: async () =>
         ({
           createSdkMcpServer: (options: any) => {
@@ -322,7 +330,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     resetSharedState()
     const script = new SdkScript()
     let mcpOptions: any
-    const runtime = new ClaudeAgentRuntime({
+    const runtime = testRuntime({
       loader: async () =>
         ({
           createSdkMcpServer: (options: any) => {
@@ -407,7 +415,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     resetSharedState()
     const script = new SdkScript()
     let mcpOptions: any
-    const runtime = new ClaudeAgentRuntime({
+    const runtime = testRuntime({
       loader: async () =>
         ({
           createSdkMcpServer: (options: any) => {
@@ -479,7 +487,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
       description: "real grep fixture",
       execute: async () => "real-grep",
     } as unknown as Tool
-    const runtime = new ClaudeAgentRuntime({
+    const runtime = testRuntime({
       loader: async () =>
         ({
           createSdkMcpServer: (options: any) => {
@@ -523,7 +531,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
   test("second turn resumes the bound external session with only the new user text", async () => {
     resetSharedState()
     const script = new SdkScript()
-    const runtime = new ClaudeAgentRuntime({ loader: async () => fakeSdk(script) as never })
+    const runtime = testRuntime({ loader: async () => fakeSdk(script) as never })
     const bindings = makeMemoryStorage()
     const shared = { bindings: bindings as BindingStorage }
 
@@ -563,7 +571,7 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
   test("denied tool surfaces tool-error, feeds is_error back, and the turn still completes", async () => {
     resetSharedState()
     const script = new SdkScript()
-    const runtime = new ClaudeAgentRuntime({ loader: async () => fakeSdk(script) as never })
+    const runtime = testRuntime({ loader: async () => fakeSdk(script) as never })
     const store = new BridgeStore()
 
     const pending = events(
@@ -602,6 +610,57 @@ describe("claude runtime integration: fake SDK through the real adapter path", (
     expect(toolError?.message).toBe("tool denied: echo-claude")
     expect(store.get("call-deny")?.status).toBe("denied")
     expect(list.at(-1)?.type).toBe("finish")
+  })
+
+  test("permission infrastructure failure surfaces the real cause, not a denial", async () => {
+    resetSharedState()
+    const script = new SdkScript()
+    const runtime = testRuntime({ loader: async () => fakeSdk(script) as never })
+    const store = new BridgeStore()
+
+    const pending = events(
+      ClaudeRuntimeAdapter.stream(
+        baseInput({
+          runtime,
+          store,
+          // Mirrors a missing InstanceRef: the check cannot run at all, which
+          // must not be misreported to the model as a policy denial.
+          permission: { ask: () => Effect.die(new Error("InstanceRef not provided")) },
+        }),
+      ),
+    )
+
+    script.push({ type: "system", subtype: "init", session_id: "ext-rt-infra" })
+    script.push({
+      type: "assistant",
+      message: {
+        content: [{ type: "tool_use", id: "call-infra", name: "echo-claude", input: { text: "hi" } }],
+      },
+    })
+
+    await script.nextPromptMessage() // initial prompt
+    const fedBack = await script.nextPromptMessage()
+    const block = fedBack.message.content[0]
+    expect(block.is_error).toBe(true)
+    expect(block.content).toContain("permission check failed")
+
+    script.push({
+      type: "assistant",
+      message: { content: [{ type: "text", text: "understood" }] },
+    })
+    script.push({
+      type: "result",
+      subtype: "success",
+      is_error: false,
+      result: "understood",
+      session_id: "ext-rt-infra",
+    })
+    script.end()
+
+    const list = await pending
+    const toolError = list.find((event) => event.type === "tool-error")
+    expect(toolError?.message).toContain("tool permission check failed")
+    expect(store.get("call-infra")?.status).not.toBe("denied")
   })
 
   test("rollback gate disables selection without touching the SDK", async () => {

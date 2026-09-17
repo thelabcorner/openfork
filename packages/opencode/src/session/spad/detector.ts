@@ -33,6 +33,19 @@ export class SpadDetector {
   private readonly heuristicLanesEnabled: boolean
   private rawPosition = -1
   private rawLatched = false
+  // Post-proof survival tracking. Once the raw lane has latched a terminally proved
+  // exact period, keep verifying that same period character by character. This is O(1)
+  // per character and is the only evidence that distinguishes "repetition happened"
+  // from "repetition is not stopping".
+  private provenPeriod = 0
+  private provenSpan = 0
+  private provenLatchedAt = -1
+  private charsAfterProof = 0
+  private runawayEmitted = false
+  // Self-contained copy of the proved motif plus its current phase. Owned here because
+  // the raw lane ring stops advancing once the lane latches.
+  private provenMotif: Uint16Array | undefined
+  private provenPhase = 0
   private canonicalLatched = false
   private expansionLatched = false
 
@@ -53,6 +66,8 @@ export class SpadDetector {
   reset(): void {
     this.raw.reset(); this.canonical?.reset(); this.expansion?.reset(); this.canonicalizer?.reset(); this.format.reset()
     this.rawPosition = -1; this.rawLatched = false; this.canonicalLatched = false; this.expansionLatched = false
+    this.provenPeriod = 0; this.provenSpan = 0; this.provenLatchedAt = -1
+    this.charsAfterProof = 0; this.runawayEmitted = false
   }
 
   get length(): number { return this.rawPosition + 1 }
@@ -118,6 +133,33 @@ export class SpadDetector {
     return result
   }
 
+  /**
+   * Emit termination evidence for a proved period that refused to stop. The run spans
+   * the verified proof plus every subsequent surviving character, and it carries the
+   * same terminal certificate fields the policy gate requires.
+   */
+  private materializeRunaway(): PeriodDetection | undefined {
+    if (this.provenPeriod <= 0) return undefined
+    const runEnd = this.rawPosition + 1
+    const runLength = this.provenSpan + this.charsAfterProof
+    return {
+      kind: "periodic-attractor",
+      lane: "raw",
+      source: "raw-exact-period",
+      channel: this.channel,
+      period: this.provenPeriod,
+      runStart: Math.max(0, runEnd - runLength),
+      runEnd,
+      runLength,
+      exponent: runLength / this.provenPeriod,
+      agreement: 1,
+      insideCodeFence: this.format.insideCodeFence,
+      exactVerifiedSpan: this.provenSpan,
+      exactMinimalPeriod: this.provenPeriod,
+      runawayCharsAfterProof: this.charsAfterProof,
+    }
+  }
+
   push(delta: string): PeriodDetection | undefined {
     let first: PeriodDetection | undefined
     // Fence state can only change on a backtick. Keep the current multiplier
@@ -127,6 +169,26 @@ export class SpadDetector {
       const code = delta.charCodeAt(i)
       this.rawPosition++
       this.format.push(code)
+      // Survival clock for an already-proved period. Checked before the latch guard
+      // below because `rawLatched` stops the lane from producing further detections.
+      if (this.provenPeriod > 0 && !this.runawayEmitted) {
+        if (this.provenMotif && code === this.provenMotif[this.provenPhase]) {
+          this.provenPhase = this.provenPhase + 1 === this.provenPeriod ? 0 : this.provenPhase + 1
+          this.charsAfterProof++
+          if (this.charsAfterProof >= this.config.reasoningRunawayChars) {
+            this.runawayEmitted = true
+            const runaway = this.materializeRunaway()
+            if (runaway) first ??= runaway
+          }
+        } else {
+          // A single mismatch falsifies the continuation hypothesis outright. The period
+          // stopped, which is exactly what legitimate repetition does.
+          this.provenPeriod = 0
+          this.charsAfterProof = 0
+          this.provenMotif = undefined
+          this.provenPhase = 0
+        }
+      }
       if (code === 96) multiplier = this.dynamicMultiplier()
       if (!this.rawLatched) {
         const rawDetection = this.raw.push(code, this.rawPosition, multiplier)
@@ -137,6 +199,19 @@ export class SpadDetector {
             if (!lowLexical || materialized.runLength >= this.config.lowLexicalMinCoverage) {
               this.rawLatched = true
               first ??= materialized
+              // Arm the post-proof survival clock. Only a terminally proved minimal
+              // period is eligible to ever become termination evidence.
+              const proved = materialized.exactMinimalPeriod ?? 0
+              if (proved > 0 && (materialized.exactVerifiedSpan ?? 0) > proved) {
+                this.provenPeriod = proved
+                this.provenSpan = materialized.exactVerifiedSpan ?? 0
+                this.provenLatchedAt = this.rawPosition
+                this.charsAfterProof = 0
+                // Copy the motif and align phase so the next character is compared against
+                // the symbol that must follow the last one actually observed.
+                this.provenMotif = this.raw.extract(this.rawPosition - proved + 1, proved)
+                this.provenPhase = 0
+              }
             }
           }
         }

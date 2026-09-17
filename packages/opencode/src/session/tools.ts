@@ -27,6 +27,7 @@ import { PermissionV1 } from "@opencode-ai/core/v1/permission"
 import { isRecord } from "@/util/record"
 import { RuntimeFlags } from "@/effect/runtime-flags"
 import { markCanonicalFindToolMap } from "./llm/tool-call-heal"
+import { Snapshot } from "@/snapshot"
 
 const MCP_RESOURCE_TOOLS = {
   list: "list_mcp_resources",
@@ -251,6 +252,7 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
   const truncate = yield* Truncate.Service
   const flags = yield* RuntimeFlags.Service
   const interrupt = yield* ToolInterrupt.Service
+  const snapshot = yield* Snapshot.Service
   const canonicalFind = (yield* registry.all()).find((item) => item.id === "find")
   let canonicalFindTool: AITool | undefined
 
@@ -649,7 +651,14 @@ export const resolve = Effect.fn("SessionTools.resolve")(function* (input: {
           )
           const result: Awaited<ReturnType<NonNullable<typeof execute>>> = yield* Effect.gen(function* () {
             yield* ctx.ask({ permission: key, metadata: {}, patterns: ["*"], always: ["*"] })
-            return yield* Effect.promise(() => execute(args, opts))
+            // MCP tool semantics are server-defined and carry no universal
+            // read-only contract. Treat them as project mutators by default so
+            // a same-project Snapshot capture cannot overlap an arbitrary MCP
+            // filesystem operation or reuse the pre-call tree afterward.
+            return yield* snapshot.withMutation(
+              Effect.promise(() => execute(args, opts)),
+              `mcp:${key}`,
+            )
           }).pipe(
             Effect.withSpan("Tool.execute", {
               attributes: {

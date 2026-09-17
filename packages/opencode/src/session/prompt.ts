@@ -45,7 +45,7 @@ import { SessionIngress, formatMonitorEvents } from "./ingress"
 import { Question } from "@/question"
 import { decodeDataUrl } from "@/util/data-url"
 import { Process } from "@/util/process"
-import { Cause, Duration, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
+import { Cause, DateTime, Duration, Effect, Exit, Fiber, Latch, Layer, Option, Scope, Context, Schema, Types } from "effect"
 import { InstanceState } from "@/effect/instance-state"
 import { TaskTool, type TaskPromptOps } from "@/tool/task"
 import { SessionRunState } from "./run-state"
@@ -59,7 +59,7 @@ import { SessionTable } from "@opencode-ai/core/session/sql"
 import { SessionTitle } from "@opencode-ai/core/session/title"
 import { SessionReminders } from "./reminders"
 import { SessionTools } from "./tools"
-import { LLMEvent, LLMResponse, Usage as LLMUsage } from "@opencode-ai/llm"
+import { LLMEvent, LLMResponse } from "@opencode-ai/llm"
 import { SpadSupervisor } from "./spad/supervisor"
 import { makeTurnPolicy } from "./spad/intent"
 import { GoalContext } from "@opencode-ai/core/goal/context"
@@ -79,6 +79,7 @@ import { appendModelCompletionRepair } from "@/special-agent/model-message-bridg
 import { Usage as UsageAnalytics } from "@/usage/usage"
 import * as MaintenanceUsage from "@/usage/maintenance"
 import { SpadAuditor } from "@opencode-ai/core/spad-auditor"
+import { SpecialAgentSession } from "@opencode-ai/core/special-agent-session"
 
 // @ts-ignore
 globalThis.AI_SDK_LOG_WARNINGS = false
@@ -158,10 +159,10 @@ function isOrphanedInterruptedTool(part: SessionV1.ToolPart) {
 
 export interface Interface {
   readonly cancel: (sessionID: SessionID) => Effect.Effect<void>
-  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly prompt: (input: PromptInput) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
   readonly loop: (input: LoopInput) => Effect.Effect<SessionV1.WithParts>
-  readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError>
-  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error>
+  readonly shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError | HostOwnedSessionError>
+  readonly command: (input: CommandInput) => Effect.Effect<SessionV1.WithParts, Image.Error | HostOwnedSessionError>
   readonly resolvePromptParts: (template: string) => Effect.Effect<PromptInput["parts"]>
   /** Generates a fresh title from the session's conversation; returns the title or undefined when nothing usable is produced. */
   readonly regenerateTitle: (input: {
@@ -170,6 +171,15 @@ export interface Interface {
     prompt?: string
   }) => Effect.Effect<string | undefined>
 }
+
+export class HostOwnedSessionError extends Schema.TaggedErrorClass<HostOwnedSessionError>()(
+  "SessionPrompt.HostOwnedSessionError",
+  {
+    sessionID: SessionID,
+    parentID: SessionID,
+    kind: Schema.Literals(["child", "goal_auditor"]),
+  },
+) {}
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/SessionPrompt") {}
 
@@ -210,6 +220,7 @@ const layer = Layer.effect(
     const goalAutomation = yield* GoalAutomation.Service
     const locations = yield* LocationServiceMap.Service
     const database = yield* Database.Service
+    const specialAgents = yield* SpecialAgentSession.Service
     const { db } = database
     // Throttle for the end-of-turn compaction.prune maintenance fork below.
     // prune re-scans the session's full message history on every turn; with
@@ -236,8 +247,11 @@ const layer = Layer.effect(
       return {
         cancel: (sessionID: SessionID) => cancel(sessionID),
         resolvePromptParts: (template: string) => resolvePromptParts(template),
+        // Task/subagent dispatch is a trusted host capability. It may drive an
+        // ordinary child Session, but the dedicated Goal Auditor runtime remains
+        // the sole execution owner of goal_auditor children.
         prompt: ((input: PromptInput) =>
-          prompt(input).pipe(Effect.catch(Effect.die))) as unknown as TaskPromptOps["prompt"],
+          hostPrompt(input).pipe(Effect.catch(Effect.die))) as unknown as TaskPromptOps["prompt"],
         dispatch: ((input: PromptInput, options?: { wait?: boolean }) =>
           dispatchFn
             ? dispatchFn(input, options)
@@ -559,6 +573,7 @@ const layer = Layer.effect(
         return
       }
 
+      const auditPrompt = `${SpadAuditor.DEFAULT_PROMPT}\n\n${SpadAuditor.PROTOCOL_PROMPT}`
       const auditAgent: Agent.Info = {
         name: "spad-auditor",
         description: "Hidden bounded repetition-quality auditor",
@@ -568,7 +583,7 @@ const layer = Layer.effect(
         temperature: 0,
         permission: [],
         options: {},
-        prompt: `${SpadAuditor.DEFAULT_PROMPT}\n\n${SpadAuditor.PROTOCOL_PROMPT}`,
+        prompt: auditPrompt,
       }
       const verdictTool = tool({
         description:
@@ -592,6 +607,28 @@ const layer = Layer.effect(
         apiID: model.api?.id,
       }
 
+      const modelRef = ModelV2.Ref.make({ providerID: model.providerID, id: model.id })
+      // One durable transcript per owner Session, reused across cases and
+      // generations, matching every other host-owned special agent. A provision
+      // failure degrades to a live-only audit rather than skipping the guard.
+      const transcriptID = yield* specialAgents
+        .provision({
+          ownerKind: SpecialAgentSession.OWNER_SESSION,
+          ownerID: input.sessionID,
+          agent: "spad_auditor",
+          parentSessionID: input.sessionID,
+          title: "SPAD auditor",
+          model: modelRef,
+        })
+        .pipe(
+          Effect.tapError((error) =>
+            Effect.logWarning("spad auditor continuing without a durable transcript", {
+              sessionID: input.sessionID,
+              error: String(error),
+            }),
+          ),
+          Effect.catch(() => Effect.succeed(undefined)),
+        )
       // Keep the auditor economically bounded even if several heuristic lanes
       // observe the same generation. Remaining cases are still represented by
       // deterministic SPAD telemetry and can be sampled offline.
@@ -604,16 +641,17 @@ const layer = Layer.effect(
         const startedAt = Date.now()
         const run = Effect.gen(function* () {
           let preferred: "required" | "auto" = "required"
-          const collect = (messages: ReadonlyArray<ModelMessage>, toolChoice: "required" | "auto") => {
-            const request = {
-              agentPrompt: auditAgent.prompt,
-              messages,
-              tool: SpadAuditor.VERDICT_TOOL,
-              toolChoice,
-              maxOutputTokens: 256,
-            }
-            return collectUntilTerminalTool(
-              llm.stream({
+          const collect = (messages: ReadonlyArray<ModelMessage>, toolChoice: "required" | "auto") =>
+            Effect.gen(function* () {
+              // One publisher per physical provider request: terminal completion
+              // can stop a stream early, and adaptive/repair retries are separate
+              // turns that must each start and settle independently.
+              const publisher = transcriptID
+                ? specialAgents.publisher({ sessionID: transcriptID, agent: "spad_auditor", model: modelRef })
+                : undefined
+              if (publisher) publisher.setRequestSentAt(yield* DateTime.now)
+              const attemptStartedAt = Date.now()
+              const stream = llm.stream({
                 agent: auditAgent,
                 user: input.user,
                 system: [],
@@ -625,25 +663,53 @@ const layer = Layer.effect(
                 retries: 0,
                 messages: [...messages],
                 maxOutputTokens: 256,
-              }),
-              SpadAuditor.VERDICT_TOOL,
-            ).pipe(
-              Effect.tap((response) =>
-                response
-                  ? MaintenanceUsage.recordResponse({
-                      usage: usageAnalytics,
-                      agent: "spad-auditor",
-                      model,
-                      response,
-                      request,
-                      sessionID: input.sessionID,
-                      variant: input.variant,
-                      startedAt,
-                    })
-                  : Effect.void,
-              ),
-            )
-          }
+              })
+              const response = yield* collectUntilTerminalTool(
+                publisher ? stream.pipe(Stream.tap((event) => publisher.publish(event))) : stream,
+                SpadAuditor.VERDICT_TOOL,
+              ).pipe(
+                // A failed provider turn never reaches settleTurn, so terminate
+                // the durable step here to avoid an unterminated stream.
+                Effect.tapError(() =>
+                  publisher ? publisher.failAssistant("SPAD auditor provider turn failed") : Effect.void,
+                ),
+              )
+              if (!publisher || !transcriptID) return response
+              if (!response) {
+                yield* publisher.failAssistant("SPAD auditor ended without a terminal response")
+                return response
+              }
+              const reported = LLMResponse.usage(response)
+              const cacheRead = Math.max(0, reported?.cacheReadInputTokens ?? 0)
+              const cacheWrite = Math.max(0, reported?.cacheWriteInputTokens ?? 0)
+              const reasoning = Math.max(0, reported?.reasoningTokens ?? 0)
+              const tokens = {
+                input: Math.max(0, (reported?.inputTokens ?? 0) - cacheRead - cacheWrite),
+                output: Math.max(0, (reported?.outputTokens ?? 0) - reasoning),
+                reasoning,
+                cache: { read: cacheRead, write: cacheWrite },
+              }
+              yield* specialAgents.settleTurn({ sessionID: transcriptID, publisher, response, tokens })
+              yield* specialAgents.recordMaintenance({
+                agent: "spad_auditor",
+                providerID: modelRef.providerID,
+                modelID: modelRef.id,
+                variant: input.variant,
+                sessionID: input.sessionID,
+                costEstimated: reported === undefined,
+                tokens: {
+                  input: tokens.input,
+                  cacheRead,
+                  cacheWrite,
+                  output: tokens.output,
+                  reasoning,
+                },
+                totalTokens: reported?.totalTokens ?? tokens.input + tokens.output + reasoning,
+                startedAt: attemptStartedAt,
+                completedAt: Date.now(),
+              })
+              return response
+            })
           const terminal = yield* runTerminalCompletionWithTranscript<ModelMessage, SpadAuditor.Verdict, Error>({
             messages: baseMessages,
             toolName: SpadAuditor.VERDICT_TOOL,
@@ -1626,12 +1692,30 @@ const layer = Layer.effect(
       return { info, parts }
     }, Effect.scoped)
 
-    const prompt = Effect.fn("SessionPrompt.prompt")(function* (input: PromptInput) {
-      const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
+    const requirePromptable = Effect.fn("SessionPrompt.requirePromptable")(function* (
+      sessionID: SessionID,
+      origin: "user" | "host",
+    ) {
+      const session = yield* sessions.get(sessionID).pipe(Effect.orDie)
+      if (!session.parentID) return session
+      const goalAuditor = session.metadata?.specialAgent === "goal_auditor"
+      if (origin === "host" && !goalAuditor) return session
+      return yield* new HostOwnedSessionError({
+        sessionID,
+        parentID: session.parentID,
+        kind: goalAuditor ? "goal_auditor" : "child",
+      })
+    })
+
+    const promptInternal = Effect.fn("SessionPrompt.promptInternal")(function* (
+      input: PromptInput,
+      origin: "user" | "host",
+    ) {
+      const session = yield* requirePromptable(input.sessionID, origin)
       // A genuine user prompt always supersedes a reserved autonomous cycle.
       // If an automatic provider request is already in flight, its eventual
       // settlement observes the missing reservation and cannot resurrect it.
-      yield* goalAutomation.cancel(input.sessionID)
+      if (origin === "user") yield* goalAutomation.cancel(input.sessionID)
       yield* revert.cleanup(session)
       const message = yield* createUserMessage(input)
       yield* sessions.touch(input.sessionID)
@@ -1651,6 +1735,9 @@ const layer = Layer.effect(
       if (session.pausedAt !== undefined) return message
       return yield* loop({ sessionID: input.sessionID })
     })
+
+    const prompt = Effect.fn("SessionPrompt.prompt")((input: PromptInput) => promptInternal(input, "user"))
+    const hostPrompt = Effect.fn("SessionPrompt.hostPrompt")((input: PromptInput) => promptInternal(input, "host"))
 
     const lastAssistant = Effect.fnUntraced(function* (sessionID: SessionID) {
       const match = yield* sessions.findMessage(sessionID, (m) => m.info.role !== "user").pipe(Effect.orDie)
@@ -1914,12 +2001,20 @@ const layer = Layer.effect(
           yield* sessions.updateMessage(msg)
         })
 
+        // The durable TurnCheckpoint and SessionProcessor historically took
+        // two independent pre-turn snapshots on step 1. Processor creation is
+        // synchronous on its snapshot anyway, so joining the already-running
+        // checkpoint capture cannot add latency and removes one complete Git
+        // refresh/tree write. Later model steps still capture independently
+        // because tools may have mutated files between generations.
+        const initialSnapshot = step === 1 && turn ? yield* Fiber.join(turn.beforeFiber) : undefined
         const handle = yield* processor
           .create({
             assistantMessage: msg,
             sessionID,
             model,
             spad,
+            initialSnapshot,
           })
           .pipe(Effect.onInterrupt(() => finalizeInterruptedAssistant))
 
@@ -2145,46 +2240,6 @@ const layer = Layer.effect(
               latestWork: goalAuditLatestWork(auditHistory),
             })
           }).pipe(Effect.provide(locations.get(Location.Ref.make({ directory: AbsolutePath.make(ctx.directory) }))))
-          if (audit.model && audit.usage?.length) {
-            const auditModel = yield* provider
-              .getModel(audit.model.providerID, audit.model.id)
-              .pipe(Effect.option)
-            if (Option.isSome(auditModel)) {
-              yield* Effect.forEach(
-                audit.usage,
-                (sample) => {
-                  const raw = new LLMUsage({
-                    inputTokens: sample.inputTokens,
-                    outputTokens: sample.outputTokens,
-                    cacheReadInputTokens: sample.cacheReadInputTokens,
-                    cacheWriteInputTokens: sample.cacheWriteInputTokens,
-                    reasoningTokens: sample.reasoningTokens,
-                    totalTokens: sample.totalTokens,
-                  })
-                  const normalized = Session.getUsage({ model: auditModel.value, usage: raw })
-                  return usageAnalytics.recordMaintenance({
-                    agent: "goal-auditor",
-                    providerID: auditModel.value.providerID,
-                    modelID: auditModel.value.id,
-                    sessionID,
-                    cost: normalized.cost,
-                    costEstimated: sample.estimated,
-                    tokens: {
-                      input: normalized.tokens.input,
-                      cacheRead: normalized.tokens.cache.read,
-                      cacheWrite: normalized.tokens.cache.write,
-                      output: normalized.tokens.output,
-                      reasoning: normalized.tokens.reasoning,
-                    },
-                    totalTokens: sample.totalTokens,
-                    startedAt: sample.startedAt,
-                    completedAt: sample.completedAt,
-                  })
-                },
-                { concurrency: 4, discard: true },
-              )
-            }
-          }
           const decision = yield* goalAutomation.afterTurn({
             sessionID,
             origin: completedReservation ? "automatic" : "user",
@@ -2281,7 +2336,7 @@ const layer = Layer.effect(
     )
 
     dispatchFn = Effect.fn("SessionPrompt.dispatch")(function* (input: PromptInput, options?: { wait?: boolean }) {
-      const admitted = yield* prompt({ ...input, noReply: true })
+      const admitted = yield* hostPrompt({ ...input, noReply: true })
       const session = yield* sessions.get(input.sessionID).pipe(Effect.orDie)
       if (session.pausedAt !== undefined) {
         return { admitted, paused: true }
@@ -2316,14 +2371,20 @@ const layer = Layer.effect(
       return { admitted, paused: false }
     }) as unknown as TaskPromptOps["dispatch"]
 
-    const shell: (input: ShellInput) => Effect.Effect<SessionV1.WithParts, Session.BusyError> = Effect.fn(
+    const shell: (
+      input: ShellInput,
+    ) => Effect.Effect<SessionV1.WithParts, Session.BusyError | HostOwnedSessionError> = Effect.fn(
       "SessionPrompt.shell",
     )(function* (input: ShellInput) {
+      yield* requirePromptable(input.sessionID, "user")
       const ready = yield* Latch.make()
       return yield* state.startShell(input.sessionID, lastAssistant(input.sessionID), shellImpl(input, ready), ready)
     })
 
     const command = Effect.fn("SessionPrompt.command")(function* (input: CommandInput) {
+      // Commands may expand and execute !`shell` substitutions before they
+      // become a prompt, so reject host-owned children before any side effect.
+      yield* requirePromptable(input.sessionID, "user")
       yield* Effect.logInfo("command", {
         "session.id": input.sessionID,
         command: input.command,
@@ -2610,6 +2671,7 @@ export const node = LayerNode.make({
     Question.node,
     GoalContext.node,
     GoalAutomation.node,
+    SpecialAgentSession.node,
     locationServiceMapNode,
   ],
 })

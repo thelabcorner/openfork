@@ -1,5 +1,5 @@
 import { describe, test, expect } from "bun:test"
-import { BridgeStore, isSafeToolName, isAllowedTool, sanitizeOutput, validateScope, MAX_PENDING_PER_SESSION, MAX_OUTPUT_BYTES } from "../../src/claude/bridge"
+import { BridgeStore, isSafeToolName, isAllowedTool, sanitizeOutput, validateScope, MAX_PENDING_PER_SESSION, MAX_RETAINED_ENTRIES, MAX_OUTPUT_BYTES } from "../../src/claude/bridge"
 import { Effect } from "effect"
 
 const owner = { projectID: "proj-1", worktree: "/repo/proj1", directory: "/repo/proj1", cwd: "/repo/proj1" }
@@ -79,6 +79,16 @@ describe("ClaudeBridge state machine", () => {
     const store = new BridgeStore()
     store.park(req("dup"))
     expect(() => store.park(req("dup"))).toThrow()
+  })
+
+  test("terminal entries are pruned so a shared store stays bounded", () => {
+    const store = new BridgeStore()
+    for (let i = 0; i < MAX_RETAINED_ENTRIES + 5; i++) {
+      store.park(req(`p${i}`, "read", owner, "sess-prune"))
+      store.complete(`p${i}`, { callID: `p${i}`, status: "success", output: "x" })
+    }
+    // Every terminal row past the cap is dropped instead of accumulating.
+    expect(store.size).toBeLessThan(MAX_RETAINED_ENTRIES)
   })
 
   test("invalid tool names rejected", () => {

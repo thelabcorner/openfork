@@ -1,6 +1,7 @@
 import { Effect, Schema } from "effect"
 import { createHash } from "crypto"
-import { existsSync, readdirSync } from "node:fs"
+import { constants as fsConstants } from "node:fs"
+import { access, readdir } from "node:fs/promises"
 import path from "node:path"
 import { claudeConfigDir, homeDir, type ChildEnv } from "./env"
 import { SessionBindingError } from "./errors"
@@ -26,29 +27,74 @@ export type Binding = Schema.Schema.Type<typeof Binding>
 export const MAX_HISTORY_TRANSFER_MESSAGES = 50
 export const MAX_HISTORY_TRANSFER_CHARS = 200_000
 export const BINDING_KEY_PREFIX = "claude/binding"
+/**
+ * Hard cap on the number of Claude-owned project directories the fallback
+ * transcript scan will examine. A lookup for an explicit cwd resolves in O(1)
+ * via `claudeProjectDirName`; this cap only bounds the case where the cwd is
+ * unknown or its encoding does not match.
+ */
+export const MAX_PROJECT_DIRS_SCANNED = 500
+
+/**
+ * Claude Code names a session's project directory by encoding its working
+ * directory. We only need this as a fast-path hint: a mismatch merely skips
+ * the O(1) candidate and falls through to the bounded scan.
+ */
+export function claudeProjectDirName(cwd: string): string {
+  return cwd.replace(/[^A-Za-z0-9]/g, "-")
+}
+
+async function fileExists(candidate: string): Promise<boolean> {
+  try {
+    await access(candidate, fsConstants.F_OK)
+    return true
+  } catch {
+    return false
+  }
+}
 
 /** Locate a Claude-owned transcript without reading or mutating its contents. */
-export function findTranscript(claudeSessionID: string, env: ChildEnv = process.env): string | undefined {
+export async function findTranscript(
+  claudeSessionID: string,
+  options?: { cwd?: string; env?: ChildEnv },
+): Promise<string | undefined> {
+  const env = options?.env ?? process.env
   const id = claudeSessionID.trim()
   if (!id) return undefined
   const configDir = claudeConfigDir(env) ?? (homeDir(env) ? path.join(homeDir(env)!, ".claude") : undefined)
   if (!configDir) return undefined
   const projectsDir = path.join(configDir, "projects")
+  const fileName = `${id}.jsonl`
+
+  // O(1) fast path: an explicit cwd maps to exactly one project directory.
+  const cwd = options?.cwd?.trim()
+  if (cwd) {
+    const derived = path.join(projectsDir, claudeProjectDirName(cwd), fileName)
+    if (await fileExists(derived)) return derived
+  }
+
+  // Bounded fallback for an unknown cwd or unexpected encoding. Non-blocking
+  // and capped so a large history cannot turn one resume check into an
+  // unbounded synchronous directory walk.
   let projectDirs: string[]
   try {
-    projectDirs = readdirSync(projectsDir)
+    projectDirs = await readdir(projectsDir)
   } catch {
     return undefined
   }
-  for (const projectDir of projectDirs) {
-    const candidate = path.join(projectsDir, projectDir, `${id}.jsonl`)
-    if (existsSync(candidate)) return candidate
+  const limit = Math.min(projectDirs.length, MAX_PROJECT_DIRS_SCANNED)
+  for (let i = 0; i < limit; i++) {
+    const candidate = path.join(projectsDir, projectDirs[i], fileName)
+    if (await fileExists(candidate)) return candidate
   }
   return undefined
 }
 
-export function transcriptExists(claudeSessionID: string, env: ChildEnv = process.env): boolean {
-  return findTranscript(claudeSessionID, env) !== undefined
+export async function transcriptExists(
+  claudeSessionID: string,
+  options?: { cwd?: string; env?: ChildEnv },
+): Promise<boolean> {
+  return (await findTranscript(claudeSessionID, options)) !== undefined
 }
 
 export type ValidationContext = {

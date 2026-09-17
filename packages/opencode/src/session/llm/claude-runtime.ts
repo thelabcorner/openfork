@@ -136,13 +136,15 @@ export interface StreamInput {
   readonly store?: BridgeStore
   readonly runtime?: ClaudeAgentRuntime
   readonly timeouts?: RuntimeTimeouts
-  /** Instance scope; defaults keep scope validation self-consistent per process. */
-  readonly context?: { readonly projectID: string; readonly worktree: string; readonly directory: string }
+  /**
+   * Explicit instance scope. Required: a missing location must fail rather than
+   * silently fall back to `process.cwd()`.
+   */
+  readonly context: { readonly projectID: string; readonly worktree: string; readonly directory: string }
   /** Production-only transcript probe; omitted fixtures preserve legacy behavior. */
-  readonly transcriptExists?: (claudeSessionID: string) => boolean
+  readonly transcriptExists?: (claudeSessionID: string, cwd?: string) => Promise<boolean>
 }
 
-const DEFAULT_CONTEXT = { projectID: "claude", worktree: process.cwd(), directory: process.cwd() }
 const MCP_SERVER_NAME = "opencode"
 const MCP_TOOL_PREFIX = `mcp__${MCP_SERVER_NAME}__`
 const MCP_CALL_CLAIM_TIMEOUT_MS = 10_000
@@ -297,6 +299,18 @@ function sdkToolResult(text: string, isError = false): SdkToolResult {
     content: [{ type: "text", text }],
     ...(isError ? { isError: true as const } : {}),
   }
+}
+
+// A permission check can fail for two very different reasons: the policy
+// actually rejected the call, or the check itself could not run (missing
+// instance/permission context, service defect). Only the former is a denial;
+// conflating them hides infrastructure failures behind "tool denied".
+function isPermissionError(error: unknown): error is PermissionV1.Error {
+  return (
+    error instanceof PermissionV1.DeniedError ||
+    error instanceof PermissionV1.RejectedError ||
+    error instanceof PermissionV1.CorrectedError
+  )
 }
 
 export function toolOutput(value: unknown): string {
@@ -753,8 +767,10 @@ export function stream(input: StreamInput): Stream.Stream<LLMEvent, unknown> {
 
 async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<void> {
   let sdkIn: PushChannel<SdkUserPrompt> | undefined
+  let cleanupStore: BridgeStore | undefined
   try {
-    const context = input.context ?? DEFAULT_CONTEXT
+    const context = input.context
+    if (!context) throw new Error("claude runtime requires an explicit instance context (never process.cwd())")
     const ownerScope: Scope = {
       projectID: context.projectID,
       worktree: context.worktree,
@@ -762,6 +778,7 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
       cwd: context.directory,
     }
     const store = input.store ?? defaultStore()
+    cleanupStore = store
     const bindings = input.bindings ?? defaultBindings()
     const settings = { model: input.modelID, provider: input.providerID }
 
@@ -785,7 +802,7 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
           .map((message) => ({ role: message.role, content: messageText(message) }))
           .filter((message) => message.content.length > 0),
         transcriptExists: input.transcriptExists
-          ? (binding) => Effect.succeed(input.transcriptExists!(binding.claudeSessionID))
+          ? (binding) => Effect.promise(() => input.transcriptExists!(binding.claudeSessionID, binding.cwd))
           : undefined,
       }).pipe(Effect.orElseSucceed((): ResumeDecision => ({ strategy: "fresh" }))),
     )
@@ -868,11 +885,21 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
               ruleset: [...(input.ruleset ?? [])],
             }),
           )
-        } catch {
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (isPermissionError(error)) {
+            try {
+              store.deny(callID)
+            } catch {}
+            return failTool(`tool denied: ${name}`)
+          }
+          // Terminalize the bridge entry so an infrastructure failure does not
+          // leave a pending tool forever, but report the real cause instead of
+          // a bogus policy denial.
           try {
-            store.deny(callID)
+            store.complete(callID, { callID, status: "error", error: message })
           } catch {}
-          return failTool(`tool denied: ${name}`)
+          return failTool(`tool permission check failed: ${message}`)
         }
       }
       if (!validateScope(request.scope, ownerScope)) {
@@ -1079,6 +1106,12 @@ async function drive(input: StreamInput, out: PushChannel<LLMEvent>): Promise<vo
     out.push(LLMEvent.providerError({ message: raw + hintFor(kind) }))
   } finally {
     sdkIn?.end()
+    // Convergent teardown: never leave this session's bridge rows active.
+    // Terminal rows are retained (bounded by MAX_RETAINED_ENTRIES) so outcomes
+    // stay observable; the per-directory store is disposed with its instance.
+    try {
+      cleanupStore?.cancelSession(input.sessionID)
+    } catch {}
     out.end()
   }
 }

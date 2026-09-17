@@ -34,6 +34,7 @@ import * as OtelTracer from "@effect/opentelemetry/Tracer"
 import { LLMAISDK } from "./llm/ai-sdk"
 import { LLMNativeRuntime } from "./llm/native-runtime"
 import { LLMRequestPrep } from "./llm/request"
+import { bindPermission } from "./llm/permission-binding"
 import { healLegacyFindCall } from "./llm/tool-call-heal"
 
 export const OUTPUT_TOKEN_MAX = ProviderTransform.OUTPUT_TOKEN_MAX
@@ -178,9 +179,8 @@ const live: Layer.Layer<
           let unsub: EventV2.Unsubscribe | undefined
           try {
             unsub = await bridge.promise(
-              events.listen((event) => {
-                if (event.type !== Permission.Event.Replied.type) return Effect.void
-                const data = event.data as EventV2.Data<typeof Permission.Event.Replied>
+              events.listenType(Permission.Event.Replied, (event) => {
+                const data = event.data
                 if (data.requestID !== id) return Effect.void
                 void data.reply
                 return Effect.void
@@ -259,7 +259,7 @@ const live: Layer.Layer<
               providerID: input.model.providerID,
               effort: input.user.model.variant,
               abort: input.abort,
-              permission: perm,
+              permission: bindPermission(perm, bridge),
               ruleset: Permission.merge(input.agent.permission ?? [], input.permission ?? []),
               bindings: claudeBindings,
               store: ClaudeToolBridge.getOrCreateStore(context.directory),
@@ -268,7 +268,7 @@ const live: Layer.Layer<
                 worktree: context.worktree,
                 directory: context.directory,
               },
-              transcriptExists: ClaudeSessions.transcriptExists,
+              transcriptExists: (claudeSessionID, cwd) => ClaudeSessions.transcriptExists(claudeSessionID, { cwd }),
             }),
           }
         }

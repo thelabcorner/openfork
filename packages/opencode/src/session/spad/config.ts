@@ -43,6 +43,13 @@ export const DEFAULT_SPAD_CONFIG: SpadConfig = Object.freeze({
   lowLexicalDistinctLetters: 4,
   lowLexicalMinCoverage: 1024,
   autoRecoverThrash: false,
+  // Termination is not mutation. A reasoning attractor that survives its own
+  // independent terminal proof for another 8 KiB is information-free by
+  // construction, so stopping the stream costs nothing recoverable and needs no
+  // reasoning rewrite. Chosen so the shortest authorized run (proof span+ window) is
+  // orders of magnitude longer than any observed legitimate repetition.
+  abortReasoningRunaway: true,
+  reasoningRunawayChars: 8192,
   thrashMinGenerations: 3,
   thrashMinToolCalls: 8,
   thrashNoMutationGens: 3,
@@ -59,4 +66,9 @@ export function validateConfig(config: SpadConfig): void {
   if (config.maxPeriod <= 0 || config.maxPeriod + config.qgram >= config.ringSize)
     throw new Error("SPAD maxPeriod must fit inside the rolling ring")
   if (config.maxCandidates < 1 || config.maxCandidates > 16) throw new Error("SPAD maxCandidates must be in [1, 16]")
+  // A zero/negative window would turn termination authority into an immediate
+  // abort on first proof, which is exactly the false-positive mode this lane must not
+  // have. Require a real post-proof survival window.
+  if (!Number.isInteger(config.reasoningRunawayChars) || config.reasoningRunawayChars < 1024)
+    throw new Error("SPAD reasoningRunawayChars must be an integer >= 1024")
 }

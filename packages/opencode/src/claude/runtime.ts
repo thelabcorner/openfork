@@ -520,8 +520,13 @@ export class ClaudeAgentRuntime {
   private buildQueryOptions(request: TurnRequest, sdk: ClaudeSdkModuleShape): Record<string, unknown> {
     // Mirror @openchamber/opencode-claude query.ts defaults: Claude Code
     // preset, project/user/local settings, auto-compact, all skills.
+    const cwd = this.options.cwd
+    if (!cwd) {
+      // Missing location is toxic. Never silently target the server's cwd.
+      throw new Error("ClaudeAgentRuntime requires an explicit cwd; refusing to fall back to process.cwd()")
+    }
     const options: Record<string, unknown> = {
-      cwd: this.options.cwd ?? process.cwd(),
+      cwd,
       env: buildChildEnv(this.options.env ?? process.env),
       includePartialMessages: true,
       settingSources: ["user", "project", "local"],
