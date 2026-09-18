@@ -49,7 +49,7 @@ import { CommentsProvider, useComments } from "@/context/comments"
 import { useCommand } from "@/context/command"
 import { DirectoryDataProvider } from "@/pages/directory-layout"
 import { useServerSync } from "@/context/server-sync"
-import { basename, pathCandidates, setMarkdownPathResolver } from "@/components/markdown-path-resolve"
+import { basename, isAbbreviatedPath, pathCandidates, setMarkdownPathResolver } from "@/components/markdown-path-resolve"
 import { useLanguage } from "@/context/language"
 import { useLayout } from "@/context/layout"
 import { ModelsProvider } from "@/context/models"
@@ -516,7 +516,15 @@ export default function Page(props: { variant?: SessionPageVariant; suppressMobi
       const directory = sdk().directory
       // Search on the filename: the index matches leading path segments poorly
       // when prose writes a partial path, and ranking re-applies the full text.
-      const page = await file.searchMentions(basename(written), { limit: 50, symbols: false, strict: true })
+      const page = await file.searchMentions(basename(written), {
+        // An omitted middle can collapse many distinct paths onto one basename.
+        // Keep ordinary clicks at the smaller historical page, but give the
+        // explicit abbreviation path the same bounded candidate budget used by
+        // native resolution instead of turning result #51 into a false miss.
+        limit: isAbbreviatedPath(written) ? 128 : 50,
+        symbols: false,
+        strict: true,
+      })
       const matches = page.results.flatMap((entry) => (entry.kind === "file" ? [entry.path] : []))
       return pathCandidates({ written, directory, canonicalDirectory: page.base, matches })
     }),

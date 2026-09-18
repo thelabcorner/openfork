@@ -15,6 +15,11 @@ describe("parseMarkdownTarget paths", () => {
     expect(target?.line).toBeUndefined()
   })
 
+  test("preserves an internal omission marker for the resolver", () => {
+    const written = "E:\\...\\bigfootSalesForm\\forgeprint-output\\verify\\report.html"
+    expect(parseMarkdownTarget("path", written)).toMatchObject({ raw: written, value: written })
+  })
+
   test("splits an editor-style line suffix off the path", () => {
     expect(parseMarkdownTarget("path", "src/app.ts:42")).toMatchObject({ value: "src/app.ts", line: 42 })
   })

@@ -2,7 +2,7 @@
 
 Date: 2026-09-14
 
-Status: **implementation complete, focused verification complete, production builds green**
+Status: **reopened by 2026-09-18 runtime evidence, amended, re-verified, and re-closed**
 
 ## 1. Objective
 
@@ -16,6 +16,27 @@ This campaign covered the path-like inline-code interaction in the message timel
 - optimize using the adaptive experimental-design methodology rather than accepting locally faster guesses without confirmation.
 
 The work started from the existing markdown-target feature introduced by `e8db43e2` and did not redesign its UI.
+
+### 1.1 2026-09-18 runtime addendum: omission segments are not directories
+
+The original automated campaign did not exercise human-abbreviated absolute paths. Live
+interaction evidence later showed false `File not found` toasts for paths containing a
+whole `...` segment, including the ForgePrint and Bigfoot report examples captured in the
+follow-up. The old concrete-absolute fast path bypassed the session resolver and handed
+that `...` to the filesystem literally.
+
+That conclusion is now superseded. A whole path segment equal to `...` or `…` is treated
+as a presentation omission marker. Concrete absolute paths retain their zero-search fast
+path; abbreviated paths route through the session-owned resolver. The resolver uses the
+canonical `/find/search` base and bounded index candidates, accepts an abbreviated
+absolute prefix only when it is consistent with the current workspace root, and never
+recursively scans a drive/home directory to guess omitted content. Windows/UNC workspace
+prefix matching is case-insensitive; POSIX ownership matching remains case-sensitive.
+
+For omissions that occur only before the known workspace root, the remainder becomes one
+concrete candidate immediately. For omissions inside the workspace, segment-pattern
+matching ranks the bounded index results. The app asks for at most 128 search candidates
+for this uncommon explicit-action path; ordinary path clicks remain at 50.
 
 ## 2. Final data flow
 
@@ -88,6 +109,19 @@ Bare filenames such as `app.ts:42`, `app.ts:42:7`, `README.md#L42`, and `README.
 
 The final detector uses a backward character scan rather than a replacement regex, and the target parser strips both colon and hash-style locations before filesystem resolution.
 
+### 3.8 Abbreviated absolute paths bypassed semantic resolution
+
+`resolveMarkdownCandidates()` previously returned every syntactically absolute path
+directly. That was correct for a concrete path but wrong for a human abbreviation such as
+`E:\...\bigfootSalesForm\forgeprint-output\verify\report.html`: the omission is semantic
+text, not a filesystem component.
+
+The fast path now excludes paths with whole omission segments. Those paths are resolved
+against the session workspace facts already owned by the existing path-action chain. The
+negative invariants are explicit: no literal omission reaches native filesystem APIs; no
+unbounded recursive search was introduced; no unrelated workspace can satisfy an
+abbreviated absolute prefix.
+
 ## 4. Performance changes
 
 ### 4.1 Inline markdown decoration
@@ -140,6 +174,16 @@ While one target is active:
 - changing/closing the target invalidates that state.
 
 This avoids repeating mention search and filesystem probing when the user moves between Reveal, Open, and Open With for the same target.
+
+### 4.5 Abbreviation-path cost is isolated to explicit actions
+
+No abbreviation work runs while rendering markdown or merely hovering an ordinary target.
+It is entered only when Reveal/Open/Open-With asks to resolve a path containing a whole
+omission segment. A final five-sample microbenchmark on the implemented code measured
+median **0.386 µs/op** for the concrete absolute fast path, **104.28 µs/op** for an
+abbreviated 50-candidate page, and **254.857 µs/op** at the 128-candidate bound. This
+remains sub-millisecond CPU work on the interaction path; file-index transport and native
+I/O dominate end-to-end latency.
 
 ## 5. Adaptive experimental-design ledger
 
@@ -406,8 +450,16 @@ The currently running desktop process was **not restarted** solely for this camp
 3. `~/.config/...`;
 4. a deliberately missing path;
 5. a temporary server/index failure, confirming it is reported as a request failure rather than `path does not exist`.
+6. an omission inside the workspace, such as `...\forgeprint-output\iter00-baseline`;
+7. an omission in the absolute workspace prefix, such as `E:\...\bigfootSalesForm\forgeprint-output\verify\report.html`.
 
-No source defect remains known from the automated campaign.
+The original "no source defect remains" statement was invalidated by the 2026-09-18 live
+evidence. After the addendum, focused app tests report **69 pass / 0 fail**, the
+session-ui classifier reports **3 pass / 0 fail**, targeted Playwright reports **1 pass in
+5.1s**, session-ui typecheck passes, and the app production build passes with **4965
+modules in ~1m11s**. App-wide typecheck still reports unrelated dirty-tree diagnostics in
+`context-history`, `context-ledger`, `context/sdk.tsx`, `server-session.test.ts`, and
+`session-message.test.ts`; no addendum-owned file appears in those diagnostics.
 
 ## 11. Closeout decision
 
@@ -422,6 +474,6 @@ The final design moves the useful Pareto frontier:
 - no permanent transient-error downgrade remains;
 - no extra normal-timeline reactive or DOM work was introduced beyond one combined decoration traversal and active-only toolbar observation.
 
-**Campaign status: CLOSED.**
+**Campaign status: RE-CLOSED after the 2026-09-18 runtime addendum.**
 
-No commit was created as part of this closeout.
+The 2026-09-18 addendum is included in the dedicated highlight/path-interaction commit; unrelated dirty-worktree changes remain outside that slice.

@@ -54,6 +54,20 @@ bottom-up architecture rules.
   projection and consume it as O(1) data. Do not reconstruct semantic execution
   state by exclusion from rendered artifacts.
 
+## Markdown target filesystem actions
+
+- A whole path segment equal to `...` or `…` in assistant prose is a human
+  omission marker, not a literal filesystem directory. Never pass it directly to
+  `stat`, `shell.openPath`, `showItemInFolder`, or an editor launcher.
+- Resolve abbreviated paths from the session-owned workspace facts already in
+  the path-action chain: canonical `/find/search` base plus bounded index
+  candidates. An abbreviated absolute path may be re-rooted only when its
+  visible prefix/suffix is consistent with that workspace root; do not recursively
+  crawl a drive or home directory to guess omitted segments.
+- Preserve the concrete absolute-path fast path. Abbreviation matching belongs
+  only to the explicit Reveal/Open/Open-With interaction and must stay bounded;
+  it must not add timeline-render scans, per-span observers, or background I/O.
+
 ## Debugging
 
 - NEVER try to restart the app, or the server process, EVER.

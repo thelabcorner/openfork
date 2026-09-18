@@ -15,6 +15,7 @@
 
 const WINDOWS_DRIVE = /^[A-Za-z]:[\\/]/
 const WINDOWS_UNC = /^(?:\\\\|\/\/)/
+const PATH_OMISSION = /(?:^|[\\/])(?:\.\.\.|…)(?=$|[\\/])/
 
 const isHomeRelativePath = (value: string) =>
   value === "~" || value.startsWith("~/") || value.startsWith("~\\")
@@ -25,6 +26,12 @@ export function isAbsolutePath(value: string): boolean {
   // UNC shares (`\\server\share`) and Windows drives.
   if (WINDOWS_UNC.test(value)) return true
   return WINDOWS_DRIVE.test(value)
+}
+
+/** Human-written `...` / `…` path segments mean "middle omitted", not a literal directory. */
+export function isAbbreviatedPath(value: string): boolean {
+  if (!value.includes("...") && !value.includes("…")) return false
+  return PATH_OMISSION.test(value)
 }
 
 /** Whichever separator the directory already speaks. */
@@ -84,6 +91,41 @@ const normalize = (value: string) => {
   return body.replace(/[\\/]+/g, "/").toLowerCase()
 }
 
+const pathSegments = (value: string) => {
+  const normalized = normalize(value)
+  return normalized ? normalized.split("/") : []
+}
+
+const omittedSegment = (value: string | undefined) => value === "..." || value === "…"
+
+/** Segment glob where an omission marker matches zero or more complete path segments. */
+function matchesAbbreviatedPath(pattern: readonly string[], value: readonly string[]) {
+  let patternIndex = 0
+  let valueIndex = 0
+  let wildcardIndex = -1
+  let retryValueIndex = 0
+
+  while (valueIndex < value.length) {
+    const segment = pattern[patternIndex]
+    if (segment !== undefined && !omittedSegment(segment) && segment === value[valueIndex]) {
+      patternIndex++
+      valueIndex++
+      continue
+    }
+    if (omittedSegment(segment)) {
+      wildcardIndex = patternIndex++
+      retryValueIndex = valueIndex
+      continue
+    }
+    if (wildcardIndex === -1) return false
+    patternIndex = wildcardIndex + 1
+    valueIndex = ++retryValueIndex
+  }
+
+  while (omittedSegment(pattern[patternIndex])) patternIndex++
+  return patternIndex === pattern.length
+}
+
 const depth = (value: string) => {
   if (!value) return 0
   let out = 1
@@ -132,6 +174,63 @@ function rankEntries<T>(written: string, candidates: readonly T[], pathOf: (cand
   return out
 }
 
+function rankAbbreviatedEntries<T>(written: string, candidates: readonly T[], pathOf: (candidate: T) => string): T[] {
+  const pattern = pathSegments(written)
+  if (pattern.length === 0) return []
+  const suffixPattern = omittedSegment(pattern[0]) ? pattern : ["...", ...pattern]
+  const exact: T[][] = []
+  const suffixed: T[][] = []
+
+  const pushByDepth = (groups: T[][], candidate: T, candidateDepth: number) => {
+    const group = groups[candidateDepth]
+    if (group) group.push(candidate)
+    else groups[candidateDepth] = [candidate]
+  }
+
+  for (let index = 0; index < candidates.length; index++) {
+    const candidate = candidates[index]!
+    const segments = pathSegments(pathOf(candidate))
+    if (segments.length === 0) continue
+    if (matchesAbbreviatedPath(pattern, segments)) {
+      pushByDepth(exact, candidate, segments.length)
+      continue
+    }
+    if (matchesAbbreviatedPath(suffixPattern, segments)) pushByDepth(suffixed, candidate, segments.length)
+  }
+
+  const out: T[] = []
+  for (const group of exact) if (group) out.push(...group)
+  for (const group of suffixed) if (group) out.push(...group)
+  return out
+}
+
+/**
+ * Turns an abbreviated absolute display path back into a workspace-relative
+ * pattern, but only when the known workspace root satisfies its absolute prefix.
+ * This makes an abbreviated drive path actionable without walking an entire
+ * drive or guessing that an unrelated workspace owns the path.
+ */
+function abbreviatedWorkspacePattern(written: string, root: string): string | undefined {
+  if (!isAbsolutePath(written)) return written
+  const writtenBody = normalizeSeparators(written, "/").replace(/^\/+|\/+$/g, "")
+  const rootBody = normalizeSeparators(root, "/").replace(/^\/+|\/+$/g, "")
+  const raw = writtenBody ? writtenBody.split("/") : []
+  const rawBase = rootBody ? rootBody.split("/") : []
+  const caseInsensitive = WINDOWS_DRIVE.test(written) || WINDOWS_UNC.test(written)
+  const pattern = caseInsensitive ? raw.map((segment) => segment.toLowerCase()) : raw
+  const base = caseInsensitive ? rawBase.map((segment) => segment.toLowerCase()) : rawBase
+  if (pattern.length === 0 || base.length === 0) return undefined
+
+  for (let split = pattern.length; split > 0; split--) {
+    // Do not consume a trailing omission into the workspace root: in
+    // C:\\repo\\...\\src\\x.ts the omission belongs inside the workspace.
+    if (omittedSegment(pattern[split - 1])) continue
+    if (!matchesAbbreviatedPath(pattern.slice(0, split), base)) continue
+    return raw.slice(split).join("/")
+  }
+  return undefined
+}
+
 /**
  * Orders index entries by how much of the written path they corroborate:
  * an exact match, then a full trailing-segment match (`candidate/x.mjs` inside
@@ -175,7 +274,9 @@ export function pathCandidates(input: {
     out.push(value)
   }
 
-  if (isAbsolutePath(written)) {
+  const abbreviated = isAbbreviatedPath(written)
+
+  if (isAbsolutePath(written) && !abbreviated) {
     push(normalizeSeparators(written, preferredSeparator(written)))
     return out
   }
@@ -184,7 +285,39 @@ export function pathCandidates(input: {
   // Keep the tilde intact so the native bridge can expand it against the real
   // user home instead of accidentally constructing `<workspace>/~/.config/...`.
   if (isHomeRelativePath(written)) {
+    // Resolving ~/.../x would require an unbounded home-directory search.
+    // Never hand a literal omission marker to the filesystem as a directory.
+    if (abbreviated) return out
     push(written)
+    return out
+  }
+
+  if (abbreviated) {
+    const root = canonicalDirectory ?? directory
+    const pattern = abbreviatedWorkspacePattern(written, root)
+    if (pattern === undefined) return out
+    if (!pattern) {
+      push(root)
+      return out
+    }
+
+    // If the omission existed only in the absolute workspace prefix, the
+    // remaining suffix is concrete and takes the normal single-stat fast path.
+    // Otherwise the file index supplies a bounded candidate set: no recursive
+    // filesystem search is introduced.
+    if (!isAbbreviatedPath(pattern)) {
+      push(joinPath(root, pattern))
+      if (directory !== root) push(joinPath(directory, pattern))
+      return out
+    }
+
+    for (const match of rankAbbreviatedEntries(pattern, matches, (candidate) => candidate)) {
+      if (isAbsolutePath(match)) {
+        push(normalizeSeparators(match, preferredSeparator(match)))
+        continue
+      }
+      push(joinPath(root, match))
+    }
     return out
   }
 
@@ -262,7 +395,7 @@ export function setMarkdownPathResolver(resolver: MarkdownPathResolver | undefin
 
 export function resolveMarkdownCandidates(written: string): Promise<string[]> {
   if (!written) return Promise.resolve([])
-  if (isAbsolutePath(written)) {
+  if (isAbsolutePath(written) && !isAbbreviatedPath(written)) {
     return Promise.resolve([normalizeSeparators(written, preferredSeparator(written))])
   }
   const current = resolvers.at(-1)

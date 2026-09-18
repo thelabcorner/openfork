@@ -2,6 +2,7 @@ import { describe, expect, test } from "bun:test"
 import {
   basename,
   firstExistingPath,
+  isAbbreviatedPath,
   isAbsolutePath,
   joinPath,
   normalizeSeparators,
@@ -26,6 +27,16 @@ describe("isAbsolutePath", () => {
     expect(isAbsolutePath("./diff.mjs")).toBe(false)
     expect(isAbsolutePath("C:")).toBe(false)
     expect(isAbsolutePath("")).toBe(false)
+  })
+})
+
+describe("isAbbreviatedPath", () => {
+  test("recognizes only whole omission segments", () => {
+    expect(isAbbreviatedPath("C:\\repo\\...\\report.html")).toBe(true)
+    expect(isAbbreviatedPath("/repo/…/report.html")).toBe(true)
+    expect(isAbbreviatedPath("src/.../report.html")).toBe(true)
+    expect(isAbbreviatedPath("src/foo...bar/report.html")).toBe(false)
+    expect(isAbbreviatedPath("src/...ish/report.html")).toBe(false)
   })
 })
 
@@ -175,10 +186,85 @@ describe("rankPathMatches", () => {
 })
 
 describe("pathCandidates", () => {
-  const directory = "C:\\Users\\me\\presGEN_v2"
+  const directory = "C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2"
 
   test("an absolute mention is taken at its word", () => {
     expect(pathCandidates({ written: "C:\\a\\b.md", directory, matches: ["x/b.md"] })).toEqual(["C:\\a\\b.md"])
+  })
+
+  test("expands an omission inside an absolute workspace path through indexed candidates", () => {
+    const written =
+      "C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\third_party_modules\\forgeprint\\...\\forgeprint-output\\iter00-baseline"
+    expect(
+      pathCandidates({
+        written,
+        directory,
+        canonicalDirectory: directory,
+        matches: [
+          "other/iter00-baseline",
+          "third_party_modules/forgeprint/cache/run/forgeprint-output/iter00-baseline",
+        ],
+      }),
+    ).toEqual([
+      "C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\third_party_modules\\forgeprint\\cache\\run\\forgeprint-output\\iter00-baseline",
+    ])
+  })
+
+  test("expands an abbreviated absolute workspace prefix into one concrete suffix", () => {
+    const bigfoot = "E:\\Other computers\\Windows 11 - 2022\\Graphic Design\\Bigfoot Peanut Butter Co\\bigfootSalesForm"
+    expect(
+      pathCandidates({
+        written: "E:\\...\\bigfootSalesForm\\forgeprint-output\\verify\\report.html",
+        directory: bigfoot,
+        canonicalDirectory: bigfoot,
+        matches: [],
+      }),
+    ).toEqual([`${bigfoot}\\forgeprint-output\\verify\\report.html`])
+  })
+
+  test("supports a unicode omission marker and suffix-style relative matching", () => {
+    expect(
+      pathCandidates({
+        written: "src/…/report.html",
+        directory,
+        matches: ["packages/demo/src/generated/report.html", "packages/demo/report.html"],
+      }),
+    ).toEqual(["C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\packages\\demo\\src\\generated\\report.html"])
+  })
+
+  test("never reinterprets an abbreviated absolute path as belonging to another workspace", () => {
+    expect(
+      pathCandidates({
+        written: "E:\\...\\other-project\\report.html",
+        directory,
+        canonicalDirectory: directory,
+        matches: ["report.html"],
+      }),
+    ).toEqual([])
+  })
+
+  test("keeps POSIX workspace-prefix ownership case-sensitive", () => {
+    expect(
+      pathCandidates({
+        written: "/Home/me/.../repo/report.html",
+        directory: "/home/me/work/repo",
+        canonicalDirectory: "/home/me/work/repo",
+        matches: ["report.html"],
+      }),
+    ).toEqual([])
+  })
+
+  test("never emits a literal omission segment to the filesystem", () => {
+    const out = pathCandidates({
+      written: "src/.../report.html",
+      directory,
+      matches: ["src/build/report.html", "src/cache/report.html"],
+    })
+    expect(out).toEqual([
+      "C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\src\\build\\report.html",
+      "C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\src\\cache\\report.html",
+    ])
+    expect(out.every((candidate) => !isAbbreviatedPath(candidate))).toBe(true)
   })
 
   test("keeps home-relative mentions out of the project root", () => {
@@ -200,9 +286,9 @@ describe("pathCandidates", () => {
         matches: ["lane4-scratch/v3prod/sink_ab.mjs", "a/b/c/sink_ab.mjs"],
       }),
     ).toEqual([
-      "C:\\Users\\me\\presGEN_v2\\lane4-scratch\\v3prod\\sink_ab.mjs",
-      "C:\\Users\\me\\presGEN_v2\\a\\b\\c\\sink_ab.mjs",
-      "C:\\Users\\me\\presGEN_v2\\sink_ab.mjs",
+      "C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\lane4-scratch\\v3prod\\sink_ab.mjs",
+      "C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\a\\b\\c\\sink_ab.mjs",
+      "C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\sink_ab.mjs",
     ])
   })
 
@@ -238,13 +324,13 @@ describe("pathCandidates", () => {
 
   test("falls back to the literal mention when the index is empty", () => {
     expect(pathCandidates({ written: "docs/readme.md", directory, matches: [] })).toEqual([
-      "C:\\Users\\me\\presGEN_v2\\docs\\readme.md",
+      "C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\docs\\readme.md",
     ])
   })
 
   test("does not repeat a candidate", () => {
     const out = pathCandidates({ written: "README.md", directory, matches: ["README.md"] })
-    expect(out).toEqual(["C:\\Users\\me\\presGEN_v2\\README.md"])
+    expect(out).toEqual(["C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\README.md"])
   })
 
   test("deduplicates windows candidates that differ only by case or separator spelling", () => {
@@ -335,6 +421,35 @@ describe("firstExistingPath", () => {
 })
 
 describe("markdown resolver registry", () => {
+  test("routes abbreviated absolute paths through the workspace resolver", async () => {
+    const seen: string[] = []
+    const dispose = setMarkdownPathResolver(async (written) => {
+      seen.push(written)
+      return ["resolved"]
+    })
+    try {
+      const written = "E:\\...\\bigfootSalesForm\\forgeprint-output\\verify\\report.html"
+      await expect(resolveMarkdownCandidates(written)).resolves.toEqual(["resolved"])
+      expect(seen).toEqual([written])
+    } finally {
+      dispose()
+    }
+  })
+
+  test("keeps concrete absolute paths on the zero-search fast path", async () => {
+    let calls = 0
+    const dispose = setMarkdownPathResolver(async () => {
+      calls++
+      return ["wrong"]
+    })
+    try {
+      await expect(resolveMarkdownCandidates("C:\\repo\\report.html")).resolves.toEqual(["C:\\repo\\report.html"])
+      expect(calls).toBe(0)
+    } finally {
+      dispose()
+    }
+  })
+
   test("falls back to the previous resolver when an overlapping scope unmounts", async () => {
     const disposeOuter = setMarkdownPathResolver(async (written) => [`outer/${written}`])
     const disposeInner = setMarkdownPathResolver(async (written) => [`inner/${written}`])
