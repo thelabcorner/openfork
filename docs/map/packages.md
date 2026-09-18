@@ -46,7 +46,7 @@ called out below.
 | `packages/http-recorder` | HTTP recording/test support used by provider/runtime tests. |
 | `packages/httpapi-codegen` | Code generation support for HTTP APIs. |
 | `packages/llm` | Provider protocol and model-wire adapters. |
-| `packages/opencode` | Local OpenCode host/sidecar, legacy/V1 runtime, CLI compatibility host, full HTTP API composition, fork-rich tool/runtime integrations. |
+| `packages/opencode` | Local OpenCode host/sidecar, mature V1 OpenFork production runtime, CLI compatibility host, full HTTP API composition, fork-rich tool/runtime integrations. V1 is repaired/extended here and receives selective current/V2 backports. |
 | `packages/plugin` | Plugin contracts/runtime integration helpers. |
 | `packages/protocol` | Browser-safe current API contract built on Schema. |
 | `packages/schema` | Shared browser-safe domain/wire schemas and branded IDs. |

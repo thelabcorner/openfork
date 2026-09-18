@@ -71,6 +71,30 @@ upstream package tree:
 
 These are OpenFork product additions, not upstream hosted infrastructure.
 
+## V1/current lifecycle is an intentional fork divergence
+
+Upstream's architectural direction is replacement-oriented: current/V2 is the
+successor architecture and V1 is progressively migrated away from. OpenFork does
+**not** treat that lifecycle policy as part of the compatibility contract.
+
+For OpenFork:
+
+- V1 remains an active, mature production runtime that should be repaired rather
+  than allowed to decay;
+- current/V2 is a high-value source of corrected semantics, cleaner ownership,
+  and new capabilities;
+- suitable current/V2 improvements should be moved to the lowest shared owner and
+  backported into V1 rather than forcing a caller migration merely for version
+  convergence;
+- upstream changes that delete or bypass V1 require deliberate fork review when
+  OpenFork still depends on that path;
+- deleting V1 in OpenFork requires an explicit architecture decision backed by
+  proven parity and a product reason. It is not implied by upstream deprecation.
+
+This distinction is compatible with the fidelity goal. OpenFork aims for fidelity
+to upstream **local behavior, protocols, providers, and infrastructure contracts**,
+not necessarily to upstream's internal runtime-generation retirement schedule.
+
 ## Major fork-owned areas
 
 `FORK.md` is the canonical ownership list. Major fork-owned or fork-expanded areas
@@ -133,8 +157,8 @@ to validate the package-level comparison, but it is not the fork's merge policy.
 2. keep shared schemas/protocol/provider behavior compatible;
 3. make fork extensions compositional rather than rebuilding upstream infrastructure
    in parallel;
-4. backport/converge improvements across V1/current seams instead of letting two
-   implementations drift;
+4. treat current/V2 improvements as candidates for shared implementation and V1
+   backport instead of forcing V1 retirement or letting generations drift;
 5. do not import upstream hosted/SaaS architecture merely because it exists upstream;
 6. where OpenFork improves correctness, durability, performance, or architecture,
    preserve the stronger behavior through future tag merges.

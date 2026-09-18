@@ -13,6 +13,20 @@ upstream-vs-fork boundaries, and source-tree lookup. The map is an orientation
 layer; this file and `FORK.md` remain authoritative when a rule or ownership
 decision is normative.
 
+### V1/current lifecycle policy
+
+Current/V2 is a semantic/reference architecture for OpenFork, **not an automatic
+migration destination**. Upstream may retire V1 in favor of current/V2; OpenFork
+intentionally repairs and extends its mature V1 production path and selectively
+backports current/V2 capabilities into it.
+
+- Prefer a shared authoritative owner plus a narrow V1 adapter over duplicated
+  semantics.
+- Do not delete or bypass V1 merely to match upstream's lifecycle.
+- V1 removal requires an explicit OpenFork architecture decision with proven
+  parity and a product reason; it is never implied by an upstream migration,
+  rename, or current/V2 implementation existing.
+
 ## Architecture Before Call Sites
 
 For any change that crosses storage/runtime/server/client/UI boundaries, design

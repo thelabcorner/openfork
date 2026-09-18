@@ -24,6 +24,14 @@ local infrastructure and behavior where applicable, or improve it without breaki
 the contract**. Fork features should extend or harden the local architecture rather
 than create an unrelated backend platform.
 
+One lifecycle policy intentionally differs from upstream: **OpenFork is not trying
+to migrate off V1 merely because upstream is moving toward current/V2.** V1 is an
+active production architecture in this fork. OpenFork repairs and extends it, and
+current/V2 is frequently a semantic/reference implementation from which behavior
+and features should be selectively backported into V1. Fidelity means preserving
+compatible local behavior and contracts; it does not require adopting upstream's
+V1 retirement strategy.
+
 ## Atlas
 
 - [Architecture and control/data flow](./architecture.md)

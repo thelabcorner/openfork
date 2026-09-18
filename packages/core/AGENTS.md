@@ -4,6 +4,12 @@ Repository orientation: read `../../docs/map/architecture.md`,
 `../../docs/map/packages.md`, and `../../docs/map/v1-v2.md` before changing
 cross-generation ownership or package boundaries.
 
+Current/Core is a semantic reference and shared implementation source for
+OpenFork, not a mandate to retire V1. When a current capability should also exist
+in the mature V1 runtime, put semantics at the lowest correct shared owner and
+expose a narrow V1 adapter/backport. Keep Core independent of V1 implementation
+details; sharing must not invert the dependency direction.
+
 Core owns durable domain state, event projectors, process/global projections, and
 location-scoped runtime services. UI demand may reveal that Core needs a new
 projection, but UI code must not define the computation by reconstructing Core

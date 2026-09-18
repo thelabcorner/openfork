@@ -4,6 +4,14 @@ Before changing the local host, V1/current seams, or fork/upstream integration,
 read `../../docs/map/architecture.md`, `../../docs/map/v1-v2.md`, and
 `../../docs/map/upstream-fork.md`.
 
+## V1/current lifecycle
+
+OpenFork's V1 session/tool runtime is an active production target. Current/V2 is
+a semantic/reference architecture and backport source, not a mandate to retire
+V1. Put cross-generation behavior at the lowest correct shared owner, adapt it
+into V1 narrowly, and do not remove or bypass a V1 path merely because upstream
+migrated the equivalent behavior to current/V2.
+
 ## Server ownership and instance bootstrap — architecture before endpoint reuse
 
 Read the repository-root `AGENTS.md` architecture rules before changing server

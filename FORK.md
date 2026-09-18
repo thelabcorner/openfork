@@ -23,6 +23,29 @@ upstream local OpenCode infrastructure and behavior: preserve 1:1 fidelity where
 applicable, and keep stronger fork correctness/performance behavior when it can be
 composed without breaking that contract.
 
+## Runtime-generation policy
+
+OpenFork intentionally diverges from upstream on the **lifecycle** of V1.
+Upstream is moving its implementation and callers toward current/V2; OpenFork is
+not using that migration as a reason to retire its mature V1 runtime.
+
+- V1 is an active OpenFork production path. Repair it, harden it, and extend it.
+- Current/V2 is the semantic/reference architecture and a major source of
+  capabilities to backport into V1; it is not automatically OpenFork's replacement
+  destination.
+- Prefer moving a capability to the lowest correct shared owner, then adapting it
+  into both runtimes. Do not fork provider/domain semantics merely to keep V1 alive.
+- When an upstream change removes, bypasses, or stops maintaining a V1 path that
+  OpenFork still uses, preserve the fork path and port the relevant upstream fix or
+  behavior into it.
+- Do not delete V1 code, contracts, or tests merely because an equivalent current/V2
+  implementation exists upstream. V1 retirement requires a separate explicit
+  OpenFork architecture decision with proven parity and a product reason.
+
+Therefore, “1:1 upstream fidelity” means fidelity to applicable local behavior,
+contracts, protocols, and infrastructure—not mandatory fidelity to upstream's
+runtime-generation deprecation schedule.
+
 ```powershell
 bun run fork:sync preflight v1.18.29
 git merge v1.18.29
