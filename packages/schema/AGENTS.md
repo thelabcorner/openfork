@@ -1,5 +1,9 @@
 # Schema Package Guide
 
+Repository orientation: `../../docs/map/packages.md` defines package roles and
+`../../docs/map/v1-v2.md` defines the separate runtime/API/UI meanings of V1
+and V2/current. Read both before introducing compatibility contracts.
+
 `@opencode-ai/schema` owns browser-safe wire and storage contracts shared by protocol, server, core, and generated SDKs. Keep runtime behavior, service layers, side effects, and host-local implementation details in the domain package that owns them.
 
 ## Package Boundary

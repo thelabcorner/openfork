@@ -11,6 +11,18 @@ upstream  https://github.com/anomalyco/opencode.git
 
 Default branch: `main`. Fetch `upstream/dev` for curiosity. Merge **tags**.
 
+## Product boundary
+
+OpenFork `main` is a **client-side product fork**. It intentionally keeps the
+local OpenCode runtime/server infrastructure required by the desktop, browser, and
+mobile clients, while pruning upstream hosted SaaS/backend product infrastructure.
+
+The local sidecar is therefore part of the client architecture, not evidence that
+OpenFork carries the upstream hosted backend. Our compatibility target is the
+upstream local OpenCode infrastructure and behavior: preserve 1:1 fidelity where
+applicable, and keep stronger fork correctness/performance behavior when it can be
+composed without breaking that contract.
+
 ```powershell
 bun run fork:sync preflight v1.18.29
 git merge v1.18.29
@@ -32,13 +44,20 @@ and add a regression test in `script/fork-sync.test.ts` instead.
 
 `packages/app`, `client`, `codemode`, `core`, `desktop`, `effect-drizzle-sqlite`, `effect-sqlite-node`, `http-recorder`, `httpapi-codegen`, `llm`, `opencode`, `plugin`, `protocol`, `schema`, `script`, `sdk/js`, `server`, `session-ui`, `ui`.
 
-Machine copy: `openfork-isolation-plan/drafts/keep-manifest.json` until that file is moved to repo root as `keep-manifest.json`.
+Compatibility exception: `packages/tui` also remains in the workspace for now.
+It is **not an OpenFork product surface**; embedded upstream CLI code still imports
+it, so pruning it before that coupling is removed breaks install/typecheck. The
+machine-readable source of truth is `keep-manifest.json`, where this is recorded as
+`deferred-coupled-to-embedded-cli`.
 
 ## DROP — not on `main`
 
-`packages/console`, `stats`, `enterprise`, `function`, `slack`, `web`, `storybook`, `cli`, `tui`, `sdk-next`, `docs`, `identity`, `containers`, `infra/`, `sst.config.ts`, `github/`, `sdks/`, `nix/`.
+`packages/console`, `stats`, `enterprise`, `function`, `slack`, `web`, `storybook`, `cli`, `sdk-next`, `docs`, `identity`, `containers`, `infra/`, `sst.config.ts`, `github/`, `sdks/`, `nix/`.
 
-TUI is not a product. `packages/opencode/src/cli/tui` may still exist inside the sidecar package — take upstream on those files, do not maintain them.
+TUI is not a product. The embedded CLI/TUI compatibility code under
+`packages/opencode/src/cli` and the deferred `packages/tui` workspace leaf should
+normally take upstream behavior rather than accumulate fork-specific product work.
+Re-evaluate pruning only with a deliberate embedded-CLI decoupling design.
 
 These are deleted from the branch. After every tag merge run `bun run fork:prune`. A re-added DROP path is a failed sync, not something to "fix" by keeping.
 

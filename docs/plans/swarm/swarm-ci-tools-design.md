@@ -3,7 +3,7 @@
 Status: **AMENDED TO MATCH SHIPPED IMPLEMENTATION — all three tools built & ratified** (2026-08-15)
 Owner: ci-designer · Consumers: project-builder, symbols-builder, test-builder · Verifies: ci-verifier
 Date: 2026-08-15
-Companion docs: `docs/swarm-sqlite-design.md` (native-tool conventions, §2), `docs/swarm-tool-upgrade-design.md` (suite conventions).
+Companion docs: `docs/plans/swarm/swarm-sqlite-design.md` (native-tool conventions, §2), `docs/plans/swarm/swarm-tool-upgrade-design.md` (suite conventions).
 
 > **Amendment record (this doc tracks the shipped surface, not the pre-build spec):**
 > - `test` (§6): ratified build deviations — local-bin resolution (no npx/npm/.cmd), runtime auto = harness-native + explicit mismatch errors, temp-dir fixtures + hermetic live spawns, vitest `--outputFile` probe, failures cap 50.

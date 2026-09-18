@@ -3,7 +3,7 @@
 Status: READY FOR BUILD (analyst deliverable for `default-tools-upgrade` sqlite lane)
 Owner: analyst · Consumes: sqlite-builder · Verifies: sqlite-verifier
 Date: 2026-08-15
-Companion doc: `docs/swarm-tool-upgrade-design.md` (suite conventions, §2, §4, §5 apply here).
+Companion doc: `docs/plans/swarm/swarm-tool-upgrade-design.md` (suite conventions, §2, §4, §5 apply here).
 
 ---
 

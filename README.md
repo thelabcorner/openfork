@@ -99,9 +99,13 @@ Detailed evidence and methodology live in:
 - [`docs/handoff/CLOSEOUT-concurrent-session-contention-2026-09-13.md`](docs/handoff/CLOSEOUT-concurrent-session-contention-2026-09-13.md)
 - [`docs/handoff/CLOSEOUT-pwa-mobile-contention-2026-09-14.md`](docs/handoff/CLOSEOUT-pwa-mobile-contention-2026-09-14.md)
 - [`docs/handoff/CLOSEOUT-usage-limits-model-selector-performance-2026-09-14.md`](docs/handoff/CLOSEOUT-usage-limits-model-selector-performance-2026-09-14.md)
-- [`docs/event-loop-concurrency-audit.md`](docs/event-loop-concurrency-audit.md)
+- [`docs/handoff/AUDIT-event-loop-concurrency.md`](docs/handoff/AUDIT-event-loop-concurrency.md)
 
 ## Architecture
+
+For a repository-wide orientation map covering V1 vs V2/current, GUI/TUI/server
+surfaces, package ownership, execution flow, and the upstream-vs-fork boundary, start
+with [`docs/map/README.md`](docs/map/README.md).
 
 OpenFork keeps the OpenCode local-server model and builds a richer desktop runtime around it.
 
@@ -127,7 +131,7 @@ flowchart LR
 
 The desktop renderer is sandboxed Chromium. Native access goes through the preload IPC surface. The built-in browser uses renderer-composited `<webview>` content, while logical browser-tab authority and automation live in the Electron main process.
 
-For the deeper runtime map, see [`docs/desktop-build-and-architecture.md`](docs/desktop-build-and-architecture.md). For browser lifecycle design, see [`docs/handoff/AUDIT-browser-webview-v3-architecture-2026-09-13.md`](docs/handoff/AUDIT-browser-webview-v3-architecture-2026-09-13.md).
+For the deeper runtime map, see [`docs/architecture/desktop-build-and-architecture.md`](docs/architecture/desktop-build-and-architecture.md). For browser lifecycle design, see [`docs/handoff/AUDIT-browser-webview-v3-architecture-2026-09-13.md`](docs/handoff/AUDIT-browser-webview-v3-architecture-2026-09-13.md).
 
 ## Feature map
 

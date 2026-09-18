@@ -1,3 +1,8 @@
+## Repository map
+
+Read `../../docs/map/surfaces.md` and `../../docs/map/packages.md` before
+introducing product/domain dependencies into shared UI.
+
 ## Ownership in shared components
 
 - Shared UI primitives should own presentation mechanics, not product-domain

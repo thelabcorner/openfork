@@ -221,7 +221,7 @@
 - `packages/sdk/js/test/sse-parser.test.ts` and
   `packages/sdk/js/test/sse-transport.test.ts` — parser and generated-client
   adversarial coverage.
-- `docs/event-loop-concurrency-audit.md` — cumulative audit and corrected
+- `docs/handoff/AUDIT-event-loop-concurrency.md` — cumulative audit and corrected
   sixth/seventh/eighth-pass findings.
 - `docs/handoff/HANDOFF-event-loop-concurrency.md` — this handoff artifact.
 
@@ -280,7 +280,7 @@
   `packages/core/test/database/decompress-pool.test.ts` (modified),
   `packages/sdk/js/script/build.ts` (modified),
   `packages/sdk/js/src/v2/gen/core/serverSentEvents.gen.ts` (modified),
-  `docs/event-loop-concurrency-audit.md` (untracked), and this handoff file
+  `docs/handoff/AUDIT-event-loop-concurrency.md` (untracked), and this handoff file
   (untracked). The repository also has unrelated pre-existing dirty files;
   the receiver must inspect the full status before staging anything.
 
@@ -373,7 +373,7 @@
   scope to the project explorer, concurrent sessions, and the audit document.
   This authorizes continued in-scope investigation and patching, but is not an
   explicit acceptance of every individual code change.
-- **[USER]** The user asked that `docs/event-loop-concurrency-audit.md` include
+- **[USER]** The user asked that `docs/handoff/AUDIT-event-loop-concurrency.md` include
   “ALL of your comprehensive 6th/7th pass continuation findings, changes, etc.”
 
 ### Rejected or corrected

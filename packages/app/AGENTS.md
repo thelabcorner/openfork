@@ -1,3 +1,11 @@
+## Repository map
+
+Before changing cross-layer app behavior, read
+`../../docs/map/surfaces.md` and `../../docs/map/v1-v2.md`; use
+`../../docs/map/architecture.md` when the change crosses the HTTP/runtime
+boundary. A UI path or `v2` component name does not establish API/runtime
+ownership.
+
 ## Priorities
 
 - Prioritise, in this order: stability, simplicity, performance.

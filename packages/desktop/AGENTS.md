@@ -1,5 +1,9 @@
 # Desktop package notes
 
+For the process/product boundary, read `../../docs/map/surfaces.md` and
+`../../docs/map/architecture.md` before changing Electron/renderer/sidecar
+ownership.
+
 - The desktop app is the product integration surface, but the Electron renderer
   is not the default owner of domain state. For cross-layer features, trace from
   the authoritative server/domain producer through the sidecar/API into the UI

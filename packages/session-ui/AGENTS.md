@@ -1,3 +1,8 @@
+## Repository map
+
+Read `../../docs/map/surfaces.md` and `../../docs/map/v1-v2.md` before
+changing session presentation across legacy/current UI seams.
+
 ## Data / runtime boundary
 
 - Session UI components are presentation consumers, not owners of server/runtime

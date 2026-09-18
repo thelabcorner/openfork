@@ -1,5 +1,9 @@
 # Core Package Guide
 
+Repository orientation: read `../../docs/map/architecture.md`,
+`../../docs/map/packages.md`, and `../../docs/map/v1-v2.md` before changing
+cross-generation ownership or package boundaries.
+
 Core owns durable domain state, event projectors, process/global projections, and
 location-scoped runtime services. UI demand may reveal that Core needs a new
 projection, but UI code must not define the computation by reconstructing Core

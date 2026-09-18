@@ -1,5 +1,9 @@
 # opencode package guide
 
+Before changing the local host, V1/current seams, or fork/upstream integration,
+read `../../docs/map/architecture.md`, `../../docs/map/v1-v2.md`, and
+`../../docs/map/upstream-fork.md`.
+
 ## Server ownership and instance bootstrap — architecture before endpoint reuse
 
 Read the repository-root `AGENTS.md` architecture rules before changing server

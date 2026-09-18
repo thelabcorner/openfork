@@ -1,5 +1,9 @@
 # LLM Package Guide
 
+For the repository-level provider/runtime boundary, read
+`../../docs/map/architecture.md` and `../../docs/map/v1-v2.md` before
+changing lowering or cross-generation integration.
+
 ## Effect
 
 - Prefer `HttpClient.HttpClient` / `HttpClientResponse.HttpClientResponse` over web `fetch` / `Response` at package boundaries.

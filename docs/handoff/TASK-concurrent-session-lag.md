@@ -6,7 +6,7 @@
 - **Author**: Claude (Opus 4.6) via GetMCP
 - **Assignee**: DeepSeek V4.1 Flash (key3), reasoning variant `max`
 - **Scope root**: `/project/opencode`
-- **Predecessors**: `docs/event-loop-concurrency-audit.md` (Tenth Pass), `docs/handoff/HANDOFF-concurrent-sessions.md` (incl. Eleventh Pass addendum)
+- **Predecessors**: `docs/handoff/AUDIT-event-loop-concurrency.md` (Tenth Pass), `docs/handoff/HANDOFF-concurrent-sessions.md` (incl. Eleventh Pass addendum)
 
 ## 1. Mission
 

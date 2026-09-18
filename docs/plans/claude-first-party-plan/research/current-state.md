@@ -5,7 +5,7 @@ Date: 2026-08-24
 ## Repository Facts
 
 - This is OpenFork, a desktop plus sidecar fork. `../../../../FORK.md` marks `../../../../packages/opencode/src/plugin/index.ts` and `../../../../packages/opencode/src/provider/provider.ts` as union/conflict files and marks quota as fork-owned.
-- The desktop renderer has no Node access. The packaged Electron sidecar runs the Bun-built `../../../../packages/opencode/dist/node/node.js` under Node. `../../../desktop-build-and-architecture.md` and `../../../../packages/desktop/scripts/prebuild.ts` are authoritative for this boundary.
+- The desktop renderer has no Node access. The packaged Electron sidecar runs the Bun-built `../../../../packages/opencode/dist/node/node.js` under Node. `../../../architecture/desktop-build-and-architecture.md` and `../../../../packages/desktop/scripts/prebuild.ts` are authoritative for this boundary.
 - `../../../../packages/opencode/package.json` currently depends on `@ai-sdk/openai-compatible`, `@ai-sdk/anthropic`, and the OpenCode plugin SDK, but not `@anthropic-ai/claude-agent-sdk`.
 - `../../../../packages/opencode/script/build-node.ts` bundles `src/node.ts` for Node and treats source mtime as the freshness boundary. A new runtime dependency must be tested in both source/Bun and bundled/Node execution.
 

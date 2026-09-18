@@ -4,6 +4,15 @@ This file is the repository-wide architecture contract. Nested `AGENTS.md` files
 add package-specific rules; they do not make the rules below optional unless
 they explicitly document a narrower exception.
 
+## Repository map
+
+Before substantial cross-package or cross-runtime work, read
+`docs/map/README.md`. Its companion maps cover architecture/data flow,
+V1-vs-current/V2 semantics, runtime/product surfaces, package ownership,
+upstream-vs-fork boundaries, and source-tree lookup. The map is an orientation
+layer; this file and `FORK.md` remain authoritative when a rule or ownership
+decision is normative.
+
 ## Architecture Before Call Sites
 
 For any change that crosses storage/runtime/server/client/UI boundaries, design
