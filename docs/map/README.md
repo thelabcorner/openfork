@@ -32,6 +32,13 @@ and features should be selectively backported into V1. Fidelity means preserving
 compatible local behavior and contracts; it does not require adopting upstream's
 V1 retirement strategy.
 
+That applies to both the execution runtime **and the local client API strategy**.
+OpenFork does not have a product goal to finish upstream's migration onto the
+current Protocol/`/api/*` client APIs. V1 is the target; current/V2 client
+surfaces are donor/reference or transitional seams. This is separate from the
+OpenCode-hosted Zen/Go model-provider API, whose versioning is an independent
+external-provider concern.
+
 ## Atlas
 
 - [Architecture and control/data flow](./architecture.md)

@@ -12,6 +12,12 @@ V1. Put cross-generation behavior at the lowest correct shared owner, adapt it
 into V1 narrowly, and do not remove or bypass a V1 path merely because upstream
 migrated the equivalent behavior to current/V2.
 
+That rule includes the local HTTP/client layer: current Protocol/`/api/*` support
+is not an OpenFork parity goal. Keep already-used current routes where necessary,
+but do not add migrations merely to follow upstream's V1 -> current client API
+direction. The hosted Zen/Go provider API is orthogonal and remains a provider
+compatibility boundary.
+
 ## Server ownership and instance bootstrap — architecture before endpoint reuse
 
 Read the repository-root `AGENTS.md` architecture rules before changing server
@@ -62,6 +68,11 @@ routes, workspace routing, instance services, or any client-facing read path.
 ## HttpApi Surfaces and Client Generation — read before editing routes
 
 This package defines the **unified** `OpenCodeHttpApi` (`packages/opencode/src/server/routes/instance/httpapi/api.ts` = `ServerApi` from `@opencode-ai/protocol` + `InstanceHttpApi` + `RootHttpApi` + `EventApi` + `PtyConnect`). That is what the desktop/app actually calls.
+
+This is a description of the hybrid implementation, not a mandate to complete
+upstream's current-client migration. Prefer V1/fork local API semantics for new
+OpenFork product work unless a retained current route is clearly the correct
+existing owner.
 
 - **Protocol-only** (`packages/protocol` → `packages/client`): `ServerApi` alone (health/session/message/model/provider/etc.). Run `bun run generate` from `packages/client` after changing `packages/protocol`. Do not edit `src/generated`.
 - **Unified** (`packages/opencode` → `packages/sdk/js`): the full `OpenCodeHttpApi`. This is the **only** client that has `experimental/*`, `instance/*`, `control/*`, `workspace/*`, `pty/*`, `quota/*`, `sync/*`, `tool/*` (e.g. `experimental.openrouterEndpoints`, `experimental.openrouterTelemetry`). After changing ANY `packages/opencode/src/server/routes/**`, run `bun run build` from `packages/sdk/js` (which runs `bun dev generate > openapi.json` + hey-api codegen). Do not edit `src/v2/gen`.

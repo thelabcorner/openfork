@@ -39,9 +39,9 @@ docs/                 documentation
 | V1 session/prompt execution | `packages/opencode/src/session` |
 | V1/fork-rich tools | `packages/opencode/src/tool` |
 | Full local HTTP API composition | `packages/opencode/src/server/routes/instance/httpapi` |
-| Shared current API contract | `packages/protocol/src` |
+| Upstream-current API contract (donor/transitional, not OpenFork target) | `packages/protocol/src` |
 | Shared server middleware/handlers | `packages/server/src` |
-| Generated Protocol client | `packages/client` |
+| Generated upstream-current Protocol client (retained only where needed) | `packages/client` |
 | Generated unified OpenCode SDK | `packages/sdk/js` |
 | Provider wire protocols | `packages/llm/src` |
 | Shared browser-safe schemas/IDs | `packages/schema/src` |

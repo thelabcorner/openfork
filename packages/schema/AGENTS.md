@@ -53,7 +53,10 @@ and V2/current. Read both before introducing compatibility contracts.
 
 - Classify event definitions by protocol role before adding them to a public manifest: `current`, `shared transitional`, or `V1-only`.
 - Being emitted by V1 is not enough to include an event in Protocol or SDK Next.
-- Keep clearly V1-only events, such as `message.updated` and `message.part.*`, out of the current Protocol/SDK Next event surface unless a current-client requirement is documented.
+- Keep clearly V1-only events, such as `message.updated` and `message.part.*`, out
+  of the current Protocol/SDK Next event surface unless retained hybrid code has
+  a documented requirement. Do not broaden the current client surface merely to
+  make it feature-parallel with V1; Protocol parity is not an OpenFork goal.
 - Keep compatibility events available only to the existing App/TUI/CLI compatibility surface while they are still needed.
 - Preserve a single canonical event definition. Do not duplicate definitions for generation convenience.
 
@@ -116,4 +119,7 @@ and V2/current. Read both before introducing compatibility contracts.
 ## Tests For Contract Changes
 
 - Add focused tests when changing contract behavior or generated surface.
-- Cover optional properties omitting `undefined`, no accidental current-contract `Schema.Any`, stable and unique public identifiers, exact facade/schema identity, and current Protocol manifests excluding V1-only events.
+- Cover optional properties omitting `undefined`, no accidental current-contract
+  `Schema.Any`, stable and unique public identifiers, exact facade/schema
+  identity, and retained current Protocol manifests excluding V1-only events
+  unless an explicit hybrid compatibility requirement exists.

@@ -1,6 +1,23 @@
-# V1 API Migration Checklist
+# Historical upstream V1 API Migration Checklist
 
-The app is currently hybrid. In this document, V1 refers to the legacy unprefixed server APIs used by `@opencode-ai/sdk/v2`, despite the SDK package name.
+> **OpenFork policy: this is not an active migration roadmap.**
+>
+> The app is currently hybrid because substantial upstream V1 -> current client API
+> migration work already landed. OpenFork's product target is V1, with selected
+> current/V2 behavior backported into the V1-oriented architecture. Do **not**
+> complete unchecked items merely to migrate onto `packages/protocol`,
+> `packages/client`, or current `/api/*` routes. Checked items record existing
+> repository state; they do not imply that the current API is preferred.
+>
+> Existing current API calls may remain when they are working, cheaper, or useful
+> to a fork feature. Replacing them should be a deliberate V1-oriented
+> simplification, not churn for version naming. This ledger remains useful for
+> understanding the hybrid tree and upstream history.
+
+In this document, V1 refers to the legacy unprefixed local server APIs used by
+`@opencode-ai/sdk/v2`, despite the SDK package name. This local API distinction is
+unrelated to the OpenCode-hosted Zen/Go provider gateway and its independent API
+version.
 
 ## Events
 
@@ -74,7 +91,10 @@ The app is currently hybrid. In this document, V1 refers to the legacy unprefixe
 
 ## Session Compatibility Fallbacks
 
-These calls are retained as fallback adapters. The current production path supplies the current session and message APIs.
+Historically these were described as fallback adapters while upstream moved the app
+to the current API. Under OpenFork policy, their V1 semantics are not deprecated by
+that upstream migration. Treat the entries below as a map of the current hybrid
+implementation, not a removal queue.
 
 - [ ] Remove fallback `GET /session/:sessionID` after compatibility support is unnecessary.
   - `src/context/server-session.ts`
@@ -197,7 +217,8 @@ These calls are retained as fallback adapters. The current production path suppl
 
 ## Legacy Types And Adapters
 
-These are not V1 network requests, but they keep the UI coupled to V1 data contracts.
+These are not V1 network requests. Upstream tracked them as migration work away
+from V1 data contracts; OpenFork does not treat that decoupling as a goal by itself.
 
 - [ ] Replace the current-session-to-legacy-session adapter.
   - `src/utils/session.ts`
@@ -210,6 +231,9 @@ These are not V1 network requests, but they keep the UI coupled to V1 data contr
   - `package.json`
 
 ## Test Infrastructure
+
+The unchecked items below are likewise **not OpenFork TODOs** merely because they
+replace V1 fixtures or mocks with current equivalents.
 
 - [ ] Replace V1 endpoint mocks with current API mocks.
   - `e2e/utils/mock-server.ts`

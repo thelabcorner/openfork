@@ -26,6 +26,12 @@ backports current/V2 capabilities into it.
 - V1 removal requires an explicit OpenFork architecture decision with proven
   parity and a product reason; it is never implied by an upstream migration,
   rename, or current/V2 implementation existing.
+- This applies to the **local client API** too. Do not migrate V1 callers onto
+  current Protocol/`/api/*` surfaces merely to match upstream. Existing current
+  calls are transitional/implementation facts, not a compatibility target.
+- The OpenCode-hosted Zen/Go model-provider API is a separate external-provider
+  concern. Its versioning must not be conflated with local V1/current client API
+  generation.
 
 ## Architecture Before Call Sites
 
@@ -225,6 +231,11 @@ host/runtime implementation details.
 This repository is hybrid. Choose a client from the endpoint's actual owning API,
 not from a UI component name.
 
+This section describes how to work safely with the **current hybrid tree**; it does
+not make both client families OpenFork product targets. OpenFork is V1-first. Do
+not migrate a V1 call onto Protocol/current `/api/*` merely because the generated
+client exists.
+
 - **Protocol client**: `packages/client` / `@opencode-ai/client`, generated from
   `packages/protocol` `ServerApi`. After changing Protocol, run `bun run generate`
   from `packages/client`.
@@ -237,6 +248,8 @@ not from a UI component name.
 - If both API layers changed, regenerate both. Never edit generated client files
   by hand.
 - A "V2" suffix in a UI component is not an API-version decision.
+- Protocol/current-client parity is not an OpenFork release requirement. Maintain
+  it only where retained code actually depends on it.
 
 API availability is separate from architecture correctness. Finding an existing
 SDK method does not establish that the route has the right ownership tier.

@@ -6,6 +6,14 @@ Before changing cross-layer app behavior, read
 boundary. A UI path or `v2` component name does not establish API/runtime
 ownership.
 
+OpenFork is **V1-first** for the local client/runtime contract. The existing app is
+hybrid because upstream current-API migration already landed, but completing that
+migration is not a product goal. Do not replace a V1 call/type with
+`packages/protocol`, `packages/client`, or a current `/api/*` route merely for
+version convergence. Backport useful current/V2 semantics into the V1-oriented
+architecture; retain existing current calls only where they remain deliberately
+useful.
+
 ## Priorities
 
 - Prioritise, in this order: stability, simplicity, performance.

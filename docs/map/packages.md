@@ -34,10 +34,10 @@ called out below.
 
 | Package | Role |
 | --- | --- |
-| `packages/app` | Main Solid GUI. Browser-capable and embedded by desktop. Hybrid while API/runtime migration continues. |
+| `packages/app` | Main Solid GUI. Browser-capable and embedded by desktop. Currently hybrid because upstream migration work is already present; OpenFork is not committed to completing that migration. |
 | `packages/browser-visual` | Fork-owned browser visual capture/runtime support shared with desktop browser features. |
 | `packages/mobile` | Fork-owned mobile PWA client. |
-| `packages/client` | Generated client for the Protocol `ServerApi` only. |
+| `packages/client` | Generated client for the upstream-current Protocol `ServerApi`; transitional/reference surface for OpenFork unless explicitly retained by a fork feature. |
 | `packages/codemode` | Code-mode support package. |
 | `packages/core` | Durable domain state, current/V2 session runtime, event/projector services, persistence, location services, shared process/runtime primitives. |
 | `packages/desktop` | Electron main/preload/renderer host, native integration, browser authority, sidecar lifecycle. |
@@ -48,7 +48,7 @@ called out below.
 | `packages/llm` | Provider protocol and model-wire adapters. |
 | `packages/opencode` | Local OpenCode host/sidecar, mature V1 OpenFork production runtime, CLI compatibility host, full HTTP API composition, fork-rich tool/runtime integrations. V1 is repaired/extended here and receives selective current/V2 backports. |
 | `packages/plugin` | Plugin contracts/runtime integration helpers. |
-| `packages/protocol` | Browser-safe current API contract built on Schema. |
+| `packages/protocol` | Browser-safe upstream-current API contract built on Schema. Useful as a donor/shared contract surface, but not an OpenFork product compatibility target by itself. |
 | `packages/schema` | Shared browser-safe domain/wire schemas and branded IDs. |
 | `packages/script` | Shared script/build utilities. |
 | `packages/sdk/js` | Generated unified SDK for the complete `OpenCodeHttpApi`. |
@@ -62,10 +62,14 @@ called out below.
 ### Browser-safe contracts
 
 - `packages/schema`
-- `packages/protocol`
-- generated client surfaces in `packages/client` and `packages/sdk/js`
+- V1 browser-safe contracts retained by the local product;
+- `packages/protocol` and `packages/client` where the existing hybrid tree or a
+  deliberate fork feature still consumes them;
+- generated surfaces in `packages/sdk/js` where required by the V1/fork local host.
 
-These are the preferred boundary for client/runtime separation.
+Client/runtime separation remains required, but **current Protocol is not the
+required destination**. Prefer a stable V1/fork browser-safe contract rather than
+coupling presentation directly to Core/Server internals.
 
 ### Domain/runtime implementation
 
@@ -97,9 +101,11 @@ Current manifests/source still include Core dependencies/imports in:
 - `packages/session-ui`;
 - `packages/tui`.
 
-This map records that as **current migration debt**. Do not use the existing imports
-as precedent for adding more client-to-Core coupling. Prefer moving browser-safe
-types/projections into Schema/Protocol or exposing them through the correct API.
+This map records that as **layering debt**, not evidence that OpenFork should finish
+the upstream current-client migration. Do not use the existing imports as precedent
+for adding more client-to-Core coupling. Prefer moving browser-safe types/projections
+into Schema or a V1/fork-owned browser-safe API boundary; use Protocol only when it
+is deliberately retained rather than by default.
 
 ## API generation ownership
 
@@ -111,7 +117,9 @@ packages/protocol
     -> packages/client
 ```
 
-Use this for Protocol-owned current endpoints.
+This is upstream's current-client generation path. In OpenFork it is **not a product
+target or parity requirement**. Regenerate it when retained code actually changes
+Protocol; do not migrate V1 callers onto it merely to advance upstream's migration.
 
 ### Unified SDK
 
@@ -125,8 +133,9 @@ packages/opencode
       -> packages/sdk/js
 ```
 
-Use the unified SDK for OpenCode-owned routes such as instance/control/workspace/tool
-and other groups that do not exist in Protocol alone.
+The unified SDK remains relevant to the hybrid local host and fork-owned routes.
+Its current/v2-generated namespaces are implementation details, not a mandate to
+adopt the current client API architecture.
 
 ## Repository-level support directories
 

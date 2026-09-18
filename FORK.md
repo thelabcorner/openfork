@@ -46,6 +46,31 @@ Therefore, “1:1 upstream fidelity” means fidelity to applicable local behavi
 contracts, protocols, and infrastructure—not mandatory fidelity to upstream's
 runtime-generation deprecation schedule.
 
+### Local client/API policy
+
+The same divergence applies to the **local client/server API generation**.
+OpenFork is not pursuing upstream's migration from the V1 local API/client model
+to the current Protocol/`/api/*` client surface as a product goal.
+
+- The OpenFork product target is the mature **V1 local client/runtime contract**,
+  repaired and extended with selected current/V2 capabilities.
+- `packages/protocol`, `packages/client`, current `/api/*` routes, and other
+  upstream current-client surfaces are reference/donor or transitional
+  implementation surfaces unless an OpenFork feature has an explicit reason to
+  retain them.
+- Do not add work merely to complete upstream V1 -> current client API migration,
+  achieve current Protocol parity, or remove V1 client contracts.
+- Existing current-client calls are **not automatically wrong**: the tree is
+  already hybrid. Preserve working code until there is a deliberate simplification
+  or V1-oriented replacement; do not churn routes only to satisfy naming policy.
+- Backport the useful behavior, ownership model, durability, performance, or
+  semantics from current/V2. Do not inherit its client API migration merely
+  because that is upstream's packaging.
+
+This policy is about OpenCode's **local client/server API**. It does not refer to
+the OpenCode-controlled hosted model gateway (Zen/Go). Hosted provider API
+versioning is orthogonal and remains a provider-adapter compatibility concern.
+
 ```powershell
 bun run fork:sync preflight v1.18.29
 git merge v1.18.29

@@ -17,9 +17,8 @@ Presentation / interaction
             v
 Browser-safe contracts / clients
   packages/schema
-  packages/protocol
-  packages/client
-  packages/sdk/js
+  V1/fork contracts + packages/sdk/js
+  packages/protocol + packages/client (current donor/transitional)
             |
             v
 Local HTTP/runtime host
@@ -42,11 +41,13 @@ session · tool · provider   session · tool · event · DB
           local workspace / model providers
 ```
 
-The repository contract in `AGENTS.md` sets the intended dependency direction:
-Schema -> Core/Protocol -> Server/OpenCode, with browser clients consuming browser-safe
-Schema/Protocol contracts rather than importing host/runtime implementation details.
-The current tree still contains transitional Core imports in client-facing packages;
-those are migration debt, not a new ownership rule.
+The repository contract in `AGENTS.md` still requires browser clients to consume
+browser-safe contracts rather than host/runtime implementation details. That does
+**not** make the upstream-current Protocol/client family OpenFork's destination.
+V1/fork browser-safe contracts are the product target; Protocol/client are
+transitional/reference surfaces where already useful. The current tree also contains
+Core imports in client-facing packages; those are layering debt, not a new ownership
+rule.
 
 ## 2. Desktop process model
 
@@ -103,6 +104,11 @@ The root and `packages/opencode/AGENTS.md` files define four ownership tiers:
 
 Do not use “the server” as one undifferentiated layer. An endpoint that only reads
 global metadata must not accidentally materialize a workspace execution instance.
+
+The presence of `ServerApi` in the composed host is **descriptive current state**,
+not an OpenFork requirement to support the upstream-current client API indefinitely.
+Do not add or migrate routes solely for current Protocol parity. Existing current
+routes can remain until a V1-oriented simplification is deliberate and proven safe.
 
 ## 4. Session execution
 
@@ -207,5 +213,9 @@ packages/opencode OpenCodeHttpApi
 The unified SDK includes the Protocol surface **plus** OpenCode-owned route groups.
 Changing Protocol and changing the full OpenCode route tree therefore have different
 generation commands and outputs.
+
+For OpenFork, this describes the hybrid tree rather than two equally supported
+product contracts. The V1/fork local client contract is the target; Protocol/client
+generation is maintained only where retained code still depends on it.
 
 See [packages.md](./packages.md) and the root `AGENTS.md` API-surface rules.

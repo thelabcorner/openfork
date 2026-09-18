@@ -95,6 +95,17 @@ This distinction is compatible with the fidelity goal. OpenFork aims for fidelit
 to upstream **local behavior, protocols, providers, and infrastructure contracts**,
 not necessarily to upstream's internal runtime-generation retirement schedule.
 
+The same principle applies to upstream's **current local client API**. OpenFork
+does not need to finish the upstream migration from V1 local APIs onto
+`packages/protocol` / `packages/client` / current `/api/*` merely to stay
+architecturally “current.” Those surfaces may remain where the existing hybrid tree
+uses them, but they are not a fork compatibility target. The fork's target is V1
+local behavior plus selectively backported current/V2 improvements.
+
+Do not confuse that with the OpenCode-hosted Zen/Go provider gateway. Hosted model
+API compatibility is independent of the local V1/current client split and remains
+required for whichever hosted provider interface OpenCode actually operates.
+
 ## Major fork-owned areas
 
 `FORK.md` is the canonical ownership list. Major fork-owned or fork-expanded areas
@@ -154,7 +165,8 @@ to validate the package-level comparison, but it is not the fork's merge policy.
 
 1. retain upstream local contracts and bug fixes unless a fork feature intentionally
    changes the behavior;
-2. keep shared schemas/protocol/provider behavior compatible;
+2. keep shared schemas/provider behavior compatible where OpenFork consumes it;
+   current local Protocol/client parity is not independently required;
 3. make fork extensions compositional rather than rebuilding upstream infrastructure
    in parallel;
 4. treat current/V2 improvements as candidates for shared implementation and V1
