@@ -10,6 +10,7 @@ import { AppProcess } from "./process"
 import { makeGlobalNode } from "./effect/app-node"
 import { File } from "./file"
 import { KeyedMutex } from "./effect/keyed-mutex"
+import { GitRuntime } from "./git-runtime"
 
 export class Repository extends Schema.Class<Repository>("Git.Repository")({
   worktree: AbsolutePath,
@@ -331,13 +332,8 @@ const layer = Layer.effect(
       yield* operation("reset", repository.worktree, ["reset", "--hard", revision])
     })
 
-    const repositoryArgs = (repository: Repository, args: string[]) => [
-      "--git-dir",
-      repository.gitDirectory,
-      "--work-tree",
-      repository.worktree,
-      ...args,
-    ]
+    const repositoryArgs = (repository: Repository, args: string[]) =>
+      GitRuntime.args(["--git-dir", repository.gitDirectory, "--work-tree", repository.worktree, ...args])
 
     const repositoryOperation = Effect.fnUntraced(function* (
       operationName: OperationError["operation"],
@@ -885,7 +881,7 @@ const layer = Layer.effect(
     }) {
       const result = yield* proc
         .run(
-          ChildProcess.make("git", ["apply", "-"], {
+          ChildProcess.make("git", GitRuntime.args(["apply", "-"]), {
             cwd: input.path,
             extendEnv: true,
             stdin: Stream.make(new TextEncoder().encode(input.changes)),
@@ -952,7 +948,7 @@ const layer = Layer.effect(
       cwd = repository.worktree,
     ) {
       const result = yield* proc
-        .run(ChildProcess.make("git", args, { cwd, extendEnv: true, stdin: "ignore" }))
+        .run(ChildProcess.make("git", GitRuntime.args(args), { cwd, extendEnv: true, stdin: "ignore" }))
         .pipe(
           Effect.mapError(
             (cause) => new WorktreeError({ operation, directory: worktreeDirectory, message: cause.message, cause }),
@@ -1052,7 +1048,7 @@ function execute(cwd: string, proc: AppProcess.Interface) {
   return (args: string[]) =>
     proc
       .run(
-        ChildProcess.make("git", args, {
+        ChildProcess.make("git", GitRuntime.args(args), {
           cwd,
           extendEnv: true,
           stdin: "ignore",

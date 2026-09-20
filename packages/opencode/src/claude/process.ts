@@ -6,6 +6,7 @@
 
 import { spawn, spawnSync } from "node:child_process"
 import type { ChildEnv } from "./env"
+import { GitRuntime } from "@opencode-ai/core/git-runtime"
 
 export interface ExecOptions {
   readonly cwd?: string
@@ -164,7 +165,7 @@ export const nodeProcessPort: ClaudeProcessPort = {
       const result = spawnSync(file, [...args], {
         encoding: "utf8",
         timeout: options?.timeoutMs,
-        env: options?.env as NodeJS.ProcessEnv | undefined,
+        env: GitRuntime.environment(options?.env === undefined ? process.env : undefined, options?.env as NodeJS.ProcessEnv | undefined),
         cwd: options?.cwd,
         windowsHide: true,
         stdio: ["ignore", "pipe", "pipe"],
@@ -186,7 +187,7 @@ export const nodeProcessPort: ClaudeProcessPort = {
   async spawn(file, args, options) {
     const child = spawn(file, [...args], {
       cwd: options?.cwd,
-      env: options?.env as NodeJS.ProcessEnv | undefined,
+      env: GitRuntime.environment(options?.env === undefined ? process.env : undefined, options?.env as NodeJS.ProcessEnv | undefined),
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
     })

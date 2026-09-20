@@ -1,12 +1,12 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { AppProcess } from "@opencode-ai/core/process"
+import { GitRuntime } from "@opencode-ai/core/git-runtime"
 import { Effect, Layer, Context, Stream } from "effect"
 import { ChildProcess } from "effect/unstable/process"
 
 const cfg = [
   "--no-optional-locks",
-  "-c",
-  "core.autocrlf=false",
+  ...GitRuntime.args([]),
   "-c",
   "core.fsmonitor=false",
   "-c",

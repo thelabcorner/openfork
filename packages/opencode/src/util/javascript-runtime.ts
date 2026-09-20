@@ -1,5 +1,7 @@
 import fs from "node:fs"
 import path from "node:path"
+import { GitRuntime } from "@opencode-ai/core/git-runtime"
+import * as ProcessEnvironment from "@opencode-ai/core/process-environment"
 
 export type JavaScriptRuntimeKind = "bun" | "node" | "electron"
 
@@ -116,12 +118,25 @@ export type NestedScriptRequest = {
 }
 
 export function userChildEnvironment(base: NodeJS.ProcessEnv, overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
-  const env = { ...base, ...overrides }
+  const env = ProcessEnvironment.merge(base, overrides)
 
   // ELECTRON_RUN_AS_NODE is an OpenCode host-runtime compatibility flag, not a
   // user-shell setting. Do not leak it into arbitrary shell commands such as
   // `electron .`; a shell.env plugin may still opt in explicitly.
-  if (!Object.hasOwn(overrides, "ELECTRON_RUN_AS_NODE")) delete env.ELECTRON_RUN_AS_NODE
+  const runAsNode = "ELECTRON_RUN_AS_NODE"
+  const explicit =
+    process.platform === "win32"
+      ? Object.keys(overrides).some((key) => key.toLowerCase() === runAsNode.toLowerCase())
+      : Object.hasOwn(overrides, runAsNode)
+  if (!explicit) {
+    if (process.platform === "win32") {
+      for (const key of Object.keys(env)) {
+        if (key.toLowerCase() === runAsNode.toLowerCase()) delete env[key]
+      }
+    } else {
+      delete env[runAsNode]
+    }
+  }
   return env
 }
 
@@ -164,10 +179,7 @@ export async function rerouteNestedStandaloneScript(): Promise<number | undefine
   const runtime = javascriptRuntime()
   try {
     const child = Bun.spawn([runtime.script.command, ...runtime.script.args, request.file, ...request.args], {
-      env: {
-        ...process.env,
-        ...runtime.script.env,
-      },
+      env: GitRuntime.environment(process.env, runtime.script.env),
       stdin: "inherit",
       stdout: "inherit",
       stderr: "inherit",

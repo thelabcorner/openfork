@@ -3,6 +3,7 @@ import path from "path"
 import fs from "node:fs/promises"
 import * as Tool from "./tool"
 import { AppProcess } from "@opencode-ai/core/process"
+import { GitRuntime } from "@opencode-ai/core/git-runtime"
 import { ChildProcess } from "effect/unstable/process"
 import { InstanceState } from "@/effect/instance-state"
 import { TypecheckScope } from "./typecheck-scope"
@@ -24,6 +25,7 @@ const GIT_ARGS = [
   "--no-optional-locks",
   "-c",
   "core.quotepath=false",
+  ...GitRuntime.args([]),
 ] as const
 
 export const Parameters = Schema.Struct({

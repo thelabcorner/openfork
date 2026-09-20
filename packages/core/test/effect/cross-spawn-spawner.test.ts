@@ -2,6 +2,7 @@ import { describe, expect } from "bun:test"
 import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
+import { spawnSync } from "node:child_process"
 import { Effect, Exit, Stream } from "effect"
 import type * as PlatformError from "effect/PlatformError"
 import { ChildProcess, ChildProcessSpawner } from "effect/unstable/process"
@@ -154,6 +155,120 @@ describe("cross-spawn spawner", () => {
         )
         const out = yield* decodeByteStream(handle.stdout)
         expect(out).toBe("one-two-three")
+      }),
+    )
+
+    fx.effect(
+      "injects deterministic Git line-ending policy into every child process",
+      Effect.gen(function* () {
+        const names = ["GIT_CONFIG_COUNT", "GIT_CONFIG_KEY_0", "GIT_CONFIG_VALUE_0"] as const
+        yield* Effect.acquireUseRelease(
+          Effect.sync(() => {
+            const prior = Object.fromEntries(names.map((name) => [name, process.env[name]]))
+            process.env.GIT_CONFIG_COUNT = "1"
+            process.env.GIT_CONFIG_KEY_0 = "core.autocrlf"
+            process.env.GIT_CONFIG_VALUE_0 = "true"
+            return prior
+          }),
+          () =>
+            Effect.gen(function* () {
+              const handle = yield* ChildProcess.make("git", ["config", "--get", "core.autocrlf"], { extendEnv: true })
+              const out = yield* decodeByteStream(handle.stdout)
+              expect(out).toBe("false")
+              expect(yield* handle.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+            }),
+          (prior) =>
+            Effect.sync(() => {
+              for (const name of names) {
+                const value = prior[name]
+                if (value === undefined) delete process.env[name]
+                else process.env[name] = value
+              }
+            }),
+        )
+      }),
+    )
+
+    fx.effect(
+      "keeps explicit non-extended env isolated while still adding the Git invariant",
+      Effect.gen(function* () {
+        const marker = "OPENCODE_PARENT_ENV_ISOLATION_TEST"
+        const prior = process.env[marker]
+        process.env[marker] = "parent"
+        try {
+          const handle = yield* js(
+            `process.stdout.write(JSON.stringify({ child: process.env.CHILD_ONLY, parent: process.env.${marker}, git: process.env.GIT_CONFIG_COUNT }))`,
+            { env: { CHILD_ONLY: "child" } },
+          )
+          const out = JSON.parse(yield* decodeByteStream(handle.stdout))
+          expect(out).toEqual({ child: "child", git: "2" })
+        } finally {
+          if (prior === undefined) delete process.env[marker]
+          else process.env[marker] = prior
+        }
+      }),
+    )
+
+    fx.effect(
+      "allows an explicit git -c option to override the process default",
+      Effect.gen(function* () {
+        const handle = yield* ChildProcess.make(
+          "git",
+          ["-c", "core.autocrlf=true", "config", "--get", "core.autocrlf"],
+          { extendEnv: true },
+        )
+        const out = yield* decodeByteStream(handle.stdout)
+        expect(out).toBe("true")
+        expect(yield* handle.exitCode).toBe(ChildProcessSpawner.ExitCode(0))
+      }),
+    )
+
+    fx.effect(
+      "keeps a hostile autocrlf setting from rewriting LF bytes during git worktree materialization",
+      Effect.gen(function* () {
+        const tmp = yield* Effect.acquireRelease(
+          Effect.promise(() => tmpdir()),
+          (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
+        )
+        const repo = path.join(tmp.path, "repo")
+        const worktree = path.join(tmp.path, "worktree")
+        yield* Effect.promise(() => fs.mkdir(repo, { recursive: true }))
+        const git = (args: string[]) => {
+          const out = spawnSync("git", ["-c", "core.autocrlf=false", "-c", "core.eol=lf", ...args], {
+            cwd: repo,
+            encoding: "utf8",
+          })
+          expect(out.status, `${args.join(" ")}: ${out.stderr}`).toBe(0)
+        }
+        git(["init", "-q"])
+        git(["config", "user.email", "eol-test@example.invalid"])
+        git(["config", "user.name", "EOL Test"])
+        yield* Effect.promise(() => fs.writeFile(path.join(repo, "sample.txt"), "alpha\nbeta\n", "utf8"))
+        git(["add", "sample.txt"])
+        git(["commit", "-qm", "base"])
+
+        const code = yield* ChildProcessSpawner.ChildProcessSpawner.use((svc) =>
+          Effect.scoped(
+            Effect.gen(function* () {
+              const handle = yield* svc.spawn(
+                ChildProcess.make("git", ["worktree", "add", "-q", "--detach", worktree, "HEAD"], {
+                  cwd: repo,
+                  extendEnv: true,
+                  env: {
+                    GIT_CONFIG_COUNT: "1",
+                    GIT_CONFIG_KEY_0: "core.autocrlf",
+                    GIT_CONFIG_VALUE_0: "true",
+                  },
+                }),
+              )
+              return yield* handle.exitCode
+            }),
+          ),
+        )
+        expect(code).toBe(ChildProcessSpawner.ExitCode(0))
+        const bytes = yield* Effect.promise(() => fs.readFile(path.join(worktree, "sample.txt")))
+        expect(bytes.includes(13)).toBe(false)
+        expect(bytes.toString("utf8")).toBe("alpha\nbeta\n")
       }),
     )
   })

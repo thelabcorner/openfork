@@ -25,6 +25,7 @@ import * as NodeChildProcess from "node:child_process"
 import { PassThrough } from "node:stream"
 import launch from "cross-spawn"
 import { makeGlobalNode } from "./effect/app-node"
+import { GitRuntime } from "./git-runtime"
 import { filesystem, path } from "./effect/app-node-platform"
 
 const toError = (err: unknown): Error => (err instanceof globalThis.Error ? err : new globalThis.Error(String(err)))
@@ -106,8 +107,13 @@ export const make = Effect.gen(function* () {
     return path.resolve(opts.cwd)
   })
 
-  const env = (opts: ChildProcess.CommandOptions) =>
-    opts.extendEnv ? { ...globalThis.process.env, ...opts.env } : opts.env
+  const env = (opts: ChildProcess.CommandOptions) => {
+    // Preserve ChildProcess semantics while establishing one process-boundary
+    // Git policy. With no explicit env, Node would inherit process.env; with an
+    // explicit env and extendEnv=false it would receive only that map.
+    const base = opts.extendEnv || Predicate.isUndefined(opts.env) ? globalThis.process.env : undefined
+    return GitRuntime.environment(base, opts.env)
+  }
 
   const input = (x: ChildProcess.CommandInput | undefined): NodeChildProcess.IOType | undefined =>
     Stream.isStream(x) ? "pipe" : x

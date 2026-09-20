@@ -151,25 +151,17 @@ const layer: Layer.Layer<
     const project = yield* Project.Service
     const store = yield* InstanceStore.Service
 
-    const git = Effect.fnUntraced(
-      function* (args: string[], opts?: { cwd?: string }) {
-        const result = yield* appProcess.run(
-          ChildProcess.make("git", args, { cwd: opts?.cwd, extendEnv: true, stdin: "ignore" }),
-        )
-        return {
-          code: result.exitCode,
-          text: result.stdout.toString("utf8"),
-          stderr: result.stderr.toString("utf8"),
-        } satisfies GitResult
-      },
-      Effect.catch((e) =>
-        Effect.succeed({
-          code: 1,
-          text: "",
-          stderr: e instanceof Error ? e.message : String(e),
-        } satisfies GitResult),
-      ),
-    )
+    const git = Effect.fnUntraced(function* (args: string[], opts: { cwd: string }) {
+      // Worktree materialization must use the shared Git service. A private
+      // raw-Git path here previously bypassed its deterministic checkout
+      // policy and let Git for Windows inherit system core.autocrlf=true.
+      const result = yield* gitSvc.run(args, { cwd: opts.cwd })
+      return {
+        code: result.exitCode,
+        text: result.text(),
+        stderr: result.stderr.toString("utf8"),
+      } satisfies GitResult
+    })
 
     const MAX_NAME_ATTEMPTS = 26
     const candidate = Effect.fn("Worktree.candidate")(function* (input: {
