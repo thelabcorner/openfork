@@ -48,7 +48,7 @@ const benchLayer = (filename: string) =>
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
       yield* ensureChunkDB(db)
-      return { db, filename }
+      return { db, readDb: db, filename }
     }).pipe(Effect.orDie),
   ).pipe(
     Layer.provide(

@@ -24,6 +24,7 @@
  * this test verifies the refs it produces are resolvable + byte-exact.
  */
 import { describe, expect, test } from "bun:test"
+import { createHash } from "node:crypto"
 import { Effect, Layer } from "effect"
 import { mkdtempSync, rmSync, existsSync, statSync } from "node:fs"
 import { tmpdir } from "node:os"
@@ -36,7 +37,7 @@ import type { DatabaseShape } from "../../src/database/database"
 import { DatabaseMigration } from "../../src/database/migration"
 import { ensureChunkDB } from "../../src/database/chunkdb"
 import { rebuildDatabase } from "../../src/database/chunk-rebuild"
-import { decodeValueBytes } from "../../src/database/json-codec"
+import { compressDeltaRef, compressText, decodeValueBytes, isV5Frame } from "../../src/database/json-codec"
 import { sql } from "drizzle-orm"
 
 // NOTE: env is set/RESTORED inside each test (not at module scope) so it never
@@ -76,7 +77,7 @@ const seedLayer = (filename: string) =>
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
       yield* ensureChunkDB(db)
-      return { db, filename }
+      return { db, readDb: db, filename }
     }).pipe(Effect.orDie),
   ).pipe(
     Layer.provide(
@@ -230,6 +231,84 @@ describe("ChunkDB rebuildDatabase (#8)", () => {
       await withSealEnv(async () => {
         const exit = await Effect.runPromise(rebuildDatabase(join(dir, "does-not-exist.sqlite")).pipe(Effect.exit))
         expect(exit._tag).toBe("Failure")
+      })
+    } finally {
+      try {
+        rmSync(dir, { recursive: true, force: true })
+      } catch {
+        /* best-effort */
+      }
+    }
+  })
+
+  test("preserves and verifies an existing v5 delta_ref canonical value", async () => {
+    const { dir, path } = tmpDb()
+    try {
+      await withSealEnv(async () => {
+        await seedAll(path)
+
+        const encoder = new TextEncoder()
+        const baseText = bigJson("v5-base")
+        const childText = baseText.replace('"v5-base"', '"v5-child"')
+        const baseRaw = encoder.encode(baseText)
+        const childRaw = encoder.encode(childText)
+        const baseValueID = `${SESSION_ID}:v5-base`
+        const childValueID = `${SESSION_ID}:v5-child`
+        const baseFrame = compressText(baseText)
+        expect(baseFrame).toBeInstanceOf(Uint8Array)
+        const childFrame = compressDeltaRef(childRaw, baseRaw, baseValueID, 1, 1)
+        expect(isV5Frame(childFrame)).toBe(true)
+
+        await runWith(path, (db) =>
+          Effect.gen(function* () {
+            yield* db.run(sql`
+              INSERT INTO event_value (
+                aggregate_id, value_id, sha256, raw_len, bytes, refs, time_promoted
+              ) VALUES (
+                ${SESSION_ID},
+                ${baseValueID},
+                ${createHash("sha256").update(baseRaw).digest("hex")},
+                ${baseRaw.byteLength},
+                ${baseFrame as Uint8Array},
+                1,
+                ${Date.now()}
+              )
+            `).pipe(Effect.orDie)
+            yield* db.run(sql`
+              INSERT INTO event_value (
+                aggregate_id, value_id, sha256, raw_len, bytes, refs, time_promoted
+              ) VALUES (
+                ${SESSION_ID},
+                ${childValueID},
+                ${createHash("sha256").update(childRaw).digest("hex")},
+                ${childRaw.byteLength},
+                ${childFrame},
+                1,
+                ${Date.now()}
+              )
+            `).pipe(Effect.orDie)
+            yield* db.run(sql`
+              INSERT INTO event_value_dependency (aggregate_id, value_id, base_value_id)
+              VALUES (${SESSION_ID}, ${childValueID}, ${baseValueID})
+            `).pipe(Effect.orDie)
+          }),
+        )
+
+        const result = await Effect.runPromise(rebuildDatabase(path))
+        expect(result.rebuiltSize).toBeGreaterThan(0)
+
+        await runWith(path, (db) =>
+          Effect.gen(function* () {
+            const rows = yield* db.all<{ bytes: Uint8Array }>(sql`
+              SELECT bytes
+              FROM event_value
+              WHERE aggregate_id = ${SESSION_ID}
+                AND value_id = ${childValueID}
+            `).pipe(Effect.orDie)
+            expect(rows).toHaveLength(1)
+            expect(isV5Frame(rows[0]!.bytes)).toBe(true)
+          }),
+        )
       })
     } finally {
       try {
