@@ -26,6 +26,7 @@ import { SessionSchema } from "@opencode-ai/core/session/schema"
 import { SessionTable } from "@opencode-ai/core/session/sql"
 import sessionMetadataMigration from "@opencode-ai/core/database/migration/20260511173437_session-metadata"
 import sessionGroupMembershipMigration from "@opencode-ai/core/database/migration/20260904000000_add_session_group_membership"
+import workspaceTimeUsedDefaultMigration from "@opencode-ai/core/database/migration/20260920035341_workspace_time_used_default"
 import type { SqlClient as SqlClientService } from "effect/unstable/sql/SqlClient"
 import { Database } from "@opencode-ai/core/database/database"
 import { SessionProjector } from "@opencode-ai/core/session/projector"
@@ -38,6 +39,167 @@ const run = <A, E>(effect: Effect.Effect<A, E, SqlClientService>) =>
   )
 
 const makeDb = EffectDrizzleSqlite.makeWithDefaults()
+
+type TestDatabase = Effect.Success<typeof makeDb>
+
+function normalizePartialIndex(sqlText: string | null) {
+  if (!sqlText) return null
+  const where = sqlText.match(/\bWHERE\b([\s\S]*)$/i)?.[1]
+  if (!where) return null
+  return where
+    .replaceAll(/[`\"]/g, "")
+    .replaceAll(/\b[a-zA-Z_][a-zA-Z0-9_]*\./g, "")
+    .replaceAll(/\s+/g, " ")
+    .trim()
+    .toLowerCase()
+}
+
+function normalizeDefault(value: string | null) {
+  if (value === null) return null
+  const normalized = value.trim().toLowerCase()
+  if (normalized === "false") return "0"
+  if (normalized === "true") return "1"
+  return value.trim()
+}
+
+function schemaShape(db: TestDatabase) {
+  return Effect.gen(function* () {
+    const tables = yield* db.all<{
+      name: string
+      type: string
+      ncol: number
+      wr: number
+      strict: number
+    }>(sql`
+      SELECT name, type, ncol, wr, strict
+      FROM pragma_table_list
+      WHERE schema = 'main' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `)
+
+    const columns = (
+      yield* db.all<{
+        table_name: string
+        cid: number
+        name: string
+        type: string
+        notnull: number
+        dflt_value: string | null
+        pk: number
+        hidden: number
+      }>(sql`
+        SELECT master.name AS table_name, info.cid, info.name, info.type, info."notnull",
+               info.dflt_value, info.pk, info.hidden
+        FROM sqlite_master AS master, pragma_table_xinfo(master.name) AS info
+        WHERE master.type = 'table' AND master.name NOT LIKE 'sqlite_%'
+        ORDER BY master.name, info.cid
+      `)
+    )
+      .map(({ cid: _cid, ...column }) => ({
+        ...column,
+        // INTEGER PRIMARY KEY aliases SQLite ROWID: inserting NULL allocates a
+        // non-null rowid even when PRAGMA reports notnull=0. Treat explicit
+        // NOT NULL and the implicit ROWID invariant as structurally equivalent.
+        // Do not normalize TEXT primary keys; SQLite really can store NULL there.
+        notnull:
+          column.notnull || (column.pk > 0 && column.type.toUpperCase() === "INTEGER")
+            ? 1
+            : 0,
+        dflt_value: normalizeDefault(column.dflt_value),
+      }))
+      .sort((a, b) => `${a.table_name}\0${a.name}`.localeCompare(`${b.table_name}\0${b.name}`))
+
+    const foreignKeys = yield* db.all<{
+      table_name: string
+      id: number
+      seq: number
+      ref_table: string
+      from_column: string
+      to_column: string | null
+      on_update: string
+      on_delete: string
+      match: string
+    }>(sql`
+      SELECT master.name AS table_name, fk.id, fk.seq, fk."table" AS ref_table,
+             fk."from" AS from_column, fk."to" AS to_column, fk.on_update, fk.on_delete, fk.match
+      FROM sqlite_master AS master, pragma_foreign_key_list(master.name) AS fk
+      WHERE master.type = 'table' AND master.name NOT LIKE 'sqlite_%'
+      ORDER BY master.name, fk.id, fk.seq
+    `)
+
+    const indexRows = yield* db.all<{
+      table_name: string
+      index_name: string
+      unique_index: number
+      origin: string
+      partial: number
+      index_sql: string | null
+      seqno: number
+      cid: number
+      column_name: string | null
+      desc: number
+      coll: string
+      key: number
+    }>(sql`
+      SELECT master.name AS table_name, indexes.name AS index_name, indexes."unique" AS unique_index,
+             indexes.origin, indexes.partial, definition.sql AS index_sql,
+             info.seqno, info.cid, info.name AS column_name, info."desc", info.coll, info."key"
+      FROM sqlite_master AS master,
+           pragma_index_list(master.name) AS indexes,
+           pragma_index_xinfo(indexes.name) AS info
+      LEFT JOIN sqlite_master AS definition ON definition.type = 'index' AND definition.name = indexes.name
+      WHERE master.type = 'table' AND master.name NOT LIKE 'sqlite_%'
+      ORDER BY master.name, indexes.name, info.seqno
+    `)
+    const indexes = new Map<
+      string,
+      {
+        table_name: string
+        name: string | null
+        unique: number
+        origin: string
+        partial: number
+        where: string | null
+        columns: Array<{ seqno: number; name: string | null; desc: number; coll: string; key: number }>
+      }
+    >()
+    for (const row of indexRows) {
+      const key = `${row.table_name}\0${row.index_name}`
+      let index = indexes.get(key)
+      if (!index) {
+        index = {
+          table_name: row.table_name,
+          name: row.index_name.startsWith("sqlite_autoindex_") ? null : row.index_name,
+          unique: row.unique_index,
+          origin: row.origin,
+          partial: row.partial,
+          where: normalizePartialIndex(row.index_sql),
+          columns: [],
+        }
+        indexes.set(key, index)
+      }
+      index.columns.push({
+        seqno: row.seqno,
+        name: row.column_name,
+        desc: row.desc,
+        coll: row.coll,
+        key: row.key,
+      })
+    }
+
+    const normalizedIndexes = [...indexes.values()].sort((a, b) =>
+      JSON.stringify(a).localeCompare(JSON.stringify(b)),
+    )
+    const triggers = yield* db.all<{ name: string; table_name: string }>(sql`
+      SELECT name, tbl_name AS table_name
+      FROM sqlite_master
+      WHERE type = 'trigger' AND name NOT LIKE 'sqlite_%'
+      ORDER BY name
+    `)
+
+    return { tables, columns, foreignKeys, indexes: normalizedIndexes, triggers }
+  })
+}
 
 describe("DatabaseMigration", () => {
   test("backfills session-group memberships and remains re-runnable", async () => {
@@ -149,6 +311,81 @@ describe("DatabaseMigration", () => {
     ).rejects.toThrow("does not match any known migration")
   })
 
+  test("preserves workspace foreign-key associations while adding the SQL default", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* db.run(sql`PRAGMA foreign_keys = ON`)
+        yield* db.run(sql`CREATE TABLE project (id text PRIMARY KEY)`)
+        yield* db.run(sql`
+          CREATE TABLE workspace (
+            id text PRIMARY KEY,
+            type text NOT NULL,
+            name text DEFAULT '' NOT NULL,
+            branch text,
+            directory text,
+            extra text,
+            project_id text NOT NULL REFERENCES project(id) ON DELETE CASCADE,
+            time_used integer NOT NULL
+          )
+        `)
+        yield* db.run(sql`
+          CREATE TABLE goal (
+            id text PRIMARY KEY,
+            workspace_id text REFERENCES workspace(id) ON DELETE SET NULL
+          )
+        `)
+        yield* db.run(sql`
+          CREATE TABLE swarm (
+            id text PRIMARY KEY,
+            workspace_id text REFERENCES workspace(id) ON DELETE SET NULL
+          )
+        `)
+        yield* db.run(sql`INSERT INTO project (id) VALUES ('project_test')`)
+        yield* db.run(
+          sql`INSERT INTO workspace (id, type, project_id, time_used) VALUES ('workspace_test', 'local', 'project_test', 123)`,
+        )
+        yield* db.run(sql`INSERT INTO goal (id, workspace_id) VALUES ('goal_test', 'workspace_test')`)
+        yield* db.run(sql`INSERT INTO swarm (id, workspace_id) VALUES ('swarm_test', 'workspace_test')`)
+
+        yield* DatabaseMigration.applyOnly(db, [workspaceTimeUsedDefaultMigration])
+
+        expect(yield* db.get(sql`SELECT workspace_id FROM goal WHERE id = 'goal_test'`)).toEqual({
+          workspace_id: "workspace_test",
+        })
+        expect(yield* db.get(sql`SELECT workspace_id FROM swarm WHERE id = 'swarm_test'`)).toEqual({
+          workspace_id: "workspace_test",
+        })
+        expect(
+          yield* db.get(sql`SELECT dflt_value FROM pragma_table_info('workspace') WHERE name = 'time_used'`),
+        ).toEqual({ dflt_value: "0" })
+        expect(yield* db.all(sql`PRAGMA foreign_key_check`)).toEqual([])
+      }),
+    )
+  })
+
+  test("rejects mutation of a checksummed completed migration", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        const original: DatabaseMigration.Migration = {
+          id: "20990101000000_checksum_test",
+          checksum: "aaaaaaaa",
+          up: (tx) => tx.run(sql`CREATE TABLE checksum_test (id text PRIMARY KEY)`),
+        }
+        yield* DatabaseMigration.applyOnly(db, [original])
+
+        const mutated: DatabaseMigration.Migration = {
+          ...original,
+          checksum: "bbbbbbbb",
+        }
+        const exit = yield* Effect.exit(DatabaseMigration.applyOnly(db, [mutated]))
+        if (exit._tag === "Success") throw new Error("expected migration checksum mismatch")
+        expect(String(exit.cause)).toContain("Migration checksum mismatch for 20990101000000_checksum_test")
+      }),
+    )
+  })
+
   test("serializes concurrent embedded initialization for one database path", async () => {
     await using tmp = await tmpdir()
     const filename = path.join(tmp.path, "embedded.sqlite")
@@ -161,15 +398,110 @@ describe("DatabaseMigration", () => {
       ),
     )
   })
-  if (process.platform === "linux") {
-    test("declared schema has no ungenerated migrations", async () => {
-      const result = await $`bun ${fileURLToPath(new URL("../script/migration.ts", import.meta.url))} --check`
-        .quiet()
-        .nothrow()
-      expect(result.exitCode, result.stderr.toString()).toBe(0)
-      expect(result.stdout.toString()).toContain("No schema changes, nothing to migrate")
-    }, 30_000)
-  }
+
+  test("serializes concurrent initialization across processes before SQLite opens", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "multiprocess.sqlite")
+    const helper = fileURLToPath(new URL("./fixture/database-open.ts", import.meta.url))
+    // Exercise materially more contention than normal Desktop/ACP/CLI startup.
+    // The original race happened before migration DDL, while native handles
+    // contended over first-open SQLite/WAL initialization.
+    const processes = Array.from({ length: 24 }, () =>
+      Bun.spawn(["bun", helper, filename], {
+        stdout: "ignore",
+        stderr: "pipe",
+      }),
+    )
+    const results = await Promise.all(
+      processes.map(async (process) => ({
+        exitCode: await process.exited,
+        stderr: await new Response(process.stderr).text(),
+      })),
+    )
+
+    for (const result of results) {
+      expect(result.exitCode, result.stderr).toBe(0)
+    }
+  }, 30_000)
+
+  test("serializes concurrent initialization with the Node SQLite driver", async () => {
+    await using tmp = await tmpdir()
+    const filename = path.join(tmp.path, "multiprocess-node.sqlite")
+    const helper = fileURLToPath(new URL("./fixture/database-open.ts", import.meta.url))
+    const bundled = path.join(tmp.path, "database-open-node.mjs")
+    const build = await $`bun build ${helper} --target=node --format=esm --outfile=${bundled}`.quiet().nothrow()
+    expect(build.exitCode, build.stderr.toString()).toBe(0)
+
+    const processes = Array.from({ length: 8 }, () =>
+      Bun.spawn(["node", bundled, filename], {
+        env: { ...process.env, NODE_NO_WARNINGS: "1" },
+        stdout: "ignore",
+        stderr: "pipe",
+      }),
+    )
+    const results = await Promise.all(
+      processes.map(async (process) => ({
+        exitCode: await process.exited,
+        stderr: await new Response(process.stderr).text(),
+      })),
+    )
+
+    for (const result of results) {
+      expect(result.exitCode, result.stderr).toBe(0)
+    }
+  }, 30_000)
+
+  test("declared schema has no ungenerated migrations", async () => {
+    const result = await $`bun ${fileURLToPath(new URL("../script/migration.ts", import.meta.url))} --check`
+      .quiet()
+      .nothrow()
+    expect(result.exitCode, result.stderr.toString()).toBe(0)
+    expect(result.stdout.toString()).toContain("No schema changes, nothing to migrate")
+  }, 30_000)
+
+  test("replays the complete tracked migration chain from zero", async () => {
+    await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.applyOnly(db, migrations)
+
+        expect(yield* db.get<{ count: number }>(sql`SELECT count(*) AS count FROM migration`)).toEqual({
+          count: migrations.length,
+        })
+        expect(yield* db.get(sql`SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'event_value'`)).toEqual({
+          name: "event_value",
+        })
+        expect(
+          yield* db.get<{ unique: number }>(
+            sql`SELECT "unique" FROM pragma_index_list('session_checkpoint') WHERE name = 'session_checkpoint_session_ordinal_idx'`,
+          ),
+        ).toEqual({ unique: 1 })
+        expect(yield* db.get<{ integrity_check: string }>(sql`PRAGMA integrity_check`)).toEqual({
+          integrity_check: "ok",
+        })
+        expect(yield* db.all(sql`PRAGMA foreign_key_check`)).toEqual([])
+      }),
+    )
+  }, 30_000)
+
+  test("fresh schema structurally matches the complete migration chain", async () => {
+    const fresh = await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.apply(db)
+        return yield* schemaShape(db)
+      }),
+    )
+    const upgraded = await run(
+      Effect.gen(function* () {
+        const db = yield* makeDb
+        yield* DatabaseMigration.applyOnly(db, migrations)
+        return yield* schemaShape(db)
+      }),
+    )
+
+    expect(upgraded).toEqual(fresh)
+  }, 30_000)
 
   test("applies tracked migrations to an empty database", async () => {
     await run(
@@ -202,13 +534,15 @@ describe("DatabaseMigration", () => {
         expect(partFtsTrigger?.sql).toContain("AFTER UPDATE OF `search_text` ON `part`")
         expect(
           yield* db.all(
-            sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('event_aggregate_seq_idx', 'event_aggregate_type_seq_idx', 'session_input_session_pending_seq_idx', 'session_input_session_pending_delivery_seq_idx', 'session_input_session_admitted_seq_idx', 'session_input_session_promoted_seq_idx', 'session_message_session_idx', 'session_message_session_type_idx', 'session_message_session_seq_idx', 'session_message_session_type_seq_idx', 'session_message_session_time_created_id_idx') ORDER BY name`,
+            sql`SELECT name FROM sqlite_master WHERE type = 'index' AND name IN ('event_aggregate_seq_idx', 'event_aggregate_type_seq_idx', 'session_input_session_pending_class_delivery_seq_idx', 'session_input_session_latest_user_idx', 'session_input_session_preemptible_seq_idx', 'session_input_session_admitted_seq_idx', 'session_input_session_promoted_seq_idx', 'session_message_session_idx', 'session_message_session_type_idx', 'session_message_session_seq_idx', 'session_message_session_type_seq_idx', 'session_message_session_time_created_id_idx') ORDER BY name`,
           ),
         ).toEqual([
           { name: "event_aggregate_seq_idx" },
           { name: "event_aggregate_type_seq_idx" },
           { name: "session_input_session_admitted_seq_idx" },
-          { name: "session_input_session_pending_delivery_seq_idx" },
+          { name: "session_input_session_latest_user_idx" },
+          { name: "session_input_session_pending_class_delivery_seq_idx" },
+          { name: "session_input_session_preemptible_seq_idx" },
           { name: "session_input_session_promoted_seq_idx" },
           { name: "session_message_session_seq_idx" },
           { name: "session_message_session_time_created_id_idx" },
@@ -388,7 +722,7 @@ describe("DatabaseMigration", () => {
         yield* db.run(sql`DELETE FROM migration WHERE id = ${simplifySessionInputMigration.id}`)
         yield* DatabaseMigration.applyOnly(db, [simplifySessionInputMigration])
 
-        const database = Layer.succeed(Database.Service, { db, filename: ":memory:" })
+        const database = Layer.succeed(Database.Service, { db, readDb: db, filename: ":memory:" })
         yield* EventV2.Service.use((service) =>
           service.publish(SessionV1.Event.Updated, {
             sessionID: SessionSchema.ID.make("session"),

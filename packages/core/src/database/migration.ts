@@ -12,6 +12,13 @@ const lock = Semaphore.makeUnsafe(1)
 
 export type Migration = {
   id: string
+  /**
+   * SHA-256 of the tracked migration source, injected by migration.gen.ts.
+   * Directly imported migrations used by focused tests may omit it, but the
+   * production registry fingerprints every migration so completed history is
+   * immutable rather than merely identified by filename.
+   */
+  checksum?: string
   up: (tx: Transaction) => Effect.Effect<void, unknown>
   // Idempotent DDL for objects drizzle-kit cannot express (FTS5 virtual tables,
   // triggers). Fresh databases are built from the generated full schema and
@@ -35,11 +42,11 @@ export function apply(db: Database) {
           yield* schema.up(tx)
           yield* reconcileSupplements(tx, migrations)
           yield* tx.run(
-            sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
+            sql`CREATE TABLE ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL, checksum TEXT)`,
           )
           yield* Effect.forEach(migrations, (migration) =>
             tx.run(
-              sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed) VALUES (${migration.id}, ${Date.now()})`,
+              sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed, checksum) VALUES (${migration.id}, ${Date.now()}, ${migration.checksum ?? null})`,
             ),
           )
         }),
@@ -51,8 +58,14 @@ export function apply(db: Database) {
 export function applyOnly(db: Database, input: Migration[]) {
   return Effect.gen(function* () {
     yield* db.run(
-      sql`CREATE TABLE IF NOT EXISTS ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL)`,
+      sql`CREATE TABLE IF NOT EXISTS ${sql.identifier("migration")} (id TEXT PRIMARY KEY, time_completed INTEGER NOT NULL, checksum TEXT)`,
     )
+    const journalColumns = yield* db.all<{ name: string }>(
+      sql`SELECT name FROM pragma_table_info('migration')`,
+    )
+    if (!journalColumns.some((column) => column.name === "checksum")) {
+      yield* db.run(sql`ALTER TABLE ${sql.identifier("migration")} ADD COLUMN checksum TEXT`)
+    }
     let completed = new Set(
       (yield* db.all<{ id: string }>(sql`SELECT id FROM ${sql.identifier("migration")}`)).map((row) => row.id),
     )
@@ -101,13 +114,40 @@ export function applyOnly(db: Database, input: Migration[]) {
       }
     }
 
+    // A migration id is not sufficient proof of history: if the source behind
+    // an already-completed id changes, silently trusting the journal can leave
+    // the database claiming a schema transition that no longer corresponds to
+    // the code being shipped. Legacy rows predate checksums and are enrolled
+    // once against the current tracked source; after that any mutation fails
+    // closed before new migrations execute.
+    const journal = yield* db.all<{ id: string; checksum: string | null }>(
+      sql`SELECT id, checksum FROM ${sql.identifier("migration")}`,
+    )
+    const byID = new Map(input.map((migration) => [migration.id, migration]))
+    for (const row of journal) {
+      const migration = byID.get(row.id)
+      if (!migration?.checksum) continue
+      if (row.checksum && row.checksum !== migration.checksum) {
+        return yield* Effect.die(
+          new Error(
+            `Migration checksum mismatch for ${row.id}: database=${row.checksum} source=${migration.checksum}`,
+          ),
+        )
+      }
+      if (!row.checksum) {
+        yield* db.run(
+          sql`UPDATE ${sql.identifier("migration")} SET checksum = ${migration.checksum} WHERE id = ${row.id} AND checksum IS NULL`,
+        )
+      }
+    }
+
     for (const migration of input) {
       if (completed.has(migration.id)) continue
       yield* db.transaction((tx) =>
         Effect.gen(function* () {
           yield* migration.up(tx)
           yield* tx.run(
-            sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed) VALUES (${migration.id}, ${Date.now()})`,
+            sql`INSERT INTO ${sql.identifier("migration")} (id, time_completed, checksum) VALUES (${migration.id}, ${Date.now()}, ${migration.checksum ?? null})`,
           )
         }),
       )

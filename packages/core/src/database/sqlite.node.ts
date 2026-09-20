@@ -183,10 +183,29 @@ const nativeLayer = (config: Config) =>
       )
       // Create-time-only pragmas MUST precede WAL: page_size/auto_vacuum are
       // silent no-ops once WAL is enabled or any table exists. On existing DBs
-      // they are harmless no-ops, so applying unconditionally is safe.
+      // they are harmless no-ops, so applying unconditionally is safe. Multiple
+      // processes may still open the same brand-new file before the higher-level
+      // database bootstrap lock exists. These are storage-tuning writes rather
+      // than correctness writes, so match the Bun driver and let the winning
+      // initializer apply them instead of failing startup on SQLITE_BUSY.
       if (config.createTimePragmas) {
-        native.exec(`PRAGMA page_size = ${config.createTimePragmas.page_size}`)
-        native.exec(`PRAGMA auto_vacuum = ${config.createTimePragmas.auto_vacuum}`)
+        const runCreateTime = (statement: string) => {
+          try {
+            native.exec(statement)
+          } catch (error) {
+            const sqlite = error as { code?: string; errcode?: number; errno?: number }
+            if (
+              sqlite?.code === "SQLITE_BUSY" ||
+              sqlite?.code === "ERR_SQLITE_ERROR" && (sqlite?.errcode === 5 || sqlite?.errno === 5) ||
+              sqlite?.errcode === 5 ||
+              sqlite?.errno === 5
+            )
+              return
+            throw error
+          }
+        }
+        runCreateTime(`PRAGMA page_size = ${config.createTimePragmas.page_size}`)
+        runCreateTime(`PRAGMA auto_vacuum = ${config.createTimePragmas.auto_vacuum}`)
       }
       if (config.disableWAL !== true && config.readonly !== true) native.exec("PRAGMA journal_mode = WAL;")
       return native

@@ -1,9 +1,9 @@
 {
   "version": "7",
   "dialect": "sqlite",
-  "id": "5b424cea-b4f6-40bd-8631-e3cd625e23d2",
+  "id": "8199226b-e14d-4129-ba35-1efe268bb287",
   "prevIds": [
-    "e86210e7-42bd-4312-90bf-92901fb8b0b3"
+    "e2b5c266-737e-475e-b26d-43615e46e15c"
   ],
   "ddl": [
     {
@@ -12,6 +12,26 @@
     },
     {
       "name": "data_migration",
+      "entityType": "tables"
+    },
+    {
+      "name": "revision_draft_claim",
+      "entityType": "tables"
+    },
+    {
+      "name": "revision_draft",
+      "entityType": "tables"
+    },
+    {
+      "name": "runtime_owner",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_execution_boundary",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_execution_owner",
       "entityType": "tables"
     },
     {
@@ -111,6 +131,22 @@
       "entityType": "tables"
     },
     {
+      "name": "oxp_correlation_ref",
+      "entityType": "tables"
+    },
+    {
+      "name": "oxp_invocation_link",
+      "entityType": "tables"
+    },
+    {
+      "name": "oxp_invocation",
+      "entityType": "tables"
+    },
+    {
+      "name": "oxp_parent_activity",
+      "entityType": "tables"
+    },
+    {
       "name": "permission",
       "entityType": "tables"
     },
@@ -131,6 +167,26 @@
       "entityType": "tables"
     },
     {
+      "name": "scheduled_task_control",
+      "entityType": "tables"
+    },
+    {
+      "name": "scheduled_task_lease",
+      "entityType": "tables"
+    },
+    {
+      "name": "scheduled_task_run",
+      "entityType": "tables"
+    },
+    {
+      "name": "scheduled_task_session_binding",
+      "entityType": "tables"
+    },
+    {
+      "name": "scheduled_task",
+      "entityType": "tables"
+    },
+    {
       "name": "message",
       "entityType": "tables"
     },
@@ -144,6 +200,10 @@
     },
     {
       "name": "search_backfill",
+      "entityType": "tables"
+    },
+    {
+      "name": "session_checkpoint_search",
       "entityType": "tables"
     },
     {
@@ -204,6 +264,50 @@
     },
     {
       "name": "session_share",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_blackboard",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_claim",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_deliverable",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_member",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_message_delivery",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_message",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_task_dependency",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_task_lease",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_task_run",
+      "entityType": "tables"
+    },
+    {
+      "name": "swarm_task",
       "entityType": "tables"
     },
     {
@@ -288,7 +392,7 @@
       "type": "integer",
       "notNull": true,
       "autoincrement": false,
-      "default": null,
+      "default": "0",
       "generated": null,
       "name": "time_used",
       "entityType": "columns",
@@ -313,6 +417,316 @@
       "name": "time_completed",
       "entityType": "columns",
       "table": "data_migration"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "target_kind",
+      "entityType": "columns",
+      "table": "revision_draft_claim"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "target_key",
+      "entityType": "columns",
+      "table": "revision_draft_claim"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "claim_id",
+      "entityType": "columns",
+      "table": "revision_draft_claim"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_fingerprint",
+      "entityType": "columns",
+      "table": "revision_draft_claim"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_claimed",
+      "entityType": "columns",
+      "table": "revision_draft_claim"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "revision_draft"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "revision_draft"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "target_kind",
+      "entityType": "columns",
+      "table": "revision_draft"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "target_key",
+      "entityType": "columns",
+      "table": "revision_draft"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "purpose",
+      "entityType": "columns",
+      "table": "revision_draft"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_fingerprint",
+      "entityType": "columns",
+      "table": "revision_draft"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "prompt",
+      "entityType": "columns",
+      "table": "revision_draft"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'[]'",
+      "generated": null,
+      "name": "references",
+      "entityType": "columns",
+      "table": "revision_draft"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "revision_draft"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "runtime_owner"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "pid",
+      "entityType": "columns",
+      "table": "runtime_owner"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "started_at",
+      "entityType": "columns",
+      "table": "runtime_owner"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "heartbeat_at",
+      "entityType": "columns",
+      "table": "runtime_owner"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "control_epoch",
+      "entityType": "columns",
+      "table": "runtime_owner"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_execution_boundary"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "boundary",
+      "entityType": "columns",
+      "table": "session_execution_boundary"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "session_execution_boundary"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "session_execution_owner"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "session_execution_owner"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_id",
+      "entityType": "columns",
+      "table": "session_execution_owner"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "acquired_at",
+      "entityType": "columns",
+      "table": "session_execution_owner"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "interrupt_generation",
+      "entityType": "columns",
+      "table": "session_execution_owner"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "interrupt_reason",
+      "entityType": "columns",
+      "table": "session_execution_owner"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "interrupt_requested_at",
+      "entityType": "columns",
+      "table": "session_execution_owner"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "recovery_owner_id",
+      "entityType": "columns",
+      "table": "session_execution_owner"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "recovery_started_at",
+      "entityType": "columns",
+      "table": "session_execution_owner"
     },
     {
       "type": "integer",
@@ -1030,6 +1444,46 @@
       "autoincrement": false,
       "default": null,
       "generated": null,
+      "name": "audit_requested_at",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "auditing_at",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "auditor_session_id",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "runtime_error",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
       "name": "previous_revision",
       "entityType": "columns",
       "table": "goal_automation"
@@ -1061,6 +1515,26 @@
       "default": null,
       "generated": null,
       "name": "reservation_created_at",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "continuation_source_message_id",
+      "entityType": "columns",
+      "table": "goal_automation"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "continuation_expected_user_seq",
       "entityType": "columns",
       "table": "goal_automation"
     },
@@ -1551,6 +2025,16 @@
       "default": "0",
       "generated": null,
       "name": "revision",
+      "entityType": "columns",
+      "table": "goal"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "auditor_runs",
       "entityType": "columns",
       "table": "goal"
     },
@@ -2306,6 +2790,406 @@
     },
     {
       "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "scheme",
+      "entityType": "columns",
+      "table": "oxp_correlation_ref"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "digest",
+      "entityType": "columns",
+      "table": "oxp_correlation_ref"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "activity_id",
+      "entityType": "columns",
+      "table": "oxp_correlation_ref"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "scope",
+      "entityType": "columns",
+      "table": "oxp_correlation_ref"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "first_seen_at",
+      "entityType": "columns",
+      "table": "oxp_correlation_ref"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_seen_at",
+      "entityType": "columns",
+      "table": "oxp_correlation_ref"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "invocation_id",
+      "entityType": "columns",
+      "table": "oxp_invocation_link"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "oxp_invocation_link"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "ref",
+      "entityType": "columns",
+      "table": "oxp_invocation_link"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "label",
+      "entityType": "columns",
+      "table": "oxp_invocation_link"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "relation",
+      "entityType": "columns",
+      "table": "oxp_invocation_link"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "activity_id",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "host_run_id",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "observed_epoch",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "plane",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "tool",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "action",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_id",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "root_alias",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'running'",
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error_code",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "mutation_attempted",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "mutation_committed",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "safe_summary",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_started",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_completed",
+      "entityType": "columns",
+      "table": "oxp_invocation"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "title",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "first_seen_at",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_seen_at",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "call_count",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "failure_count",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "augmentation_calls",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "supervision_calls",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "delegation_calls",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "observed_epoch_count",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_tool",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_root_alias",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_archived",
+      "entityType": "columns",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "type": "text",
       "notNull": false,
       "autoincrement": false,
       "default": null,
@@ -2662,6 +3546,576 @@
       "generated": null,
       "name": "id",
       "entityType": "columns",
+      "table": "scheduled_task_control"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "paused",
+      "entityType": "columns",
+      "table": "scheduled_task_control"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "scheduled_task_control"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "scheduled_task_control"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_id",
+      "entityType": "columns",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "fire_for",
+      "entityType": "columns",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "lease_id",
+      "entityType": "columns",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner",
+      "entityType": "columns",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "acquired_at",
+      "entityType": "columns",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "heartbeat_at",
+      "entityType": "columns",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "1",
+      "generated": null,
+      "name": "attempt",
+      "entityType": "columns",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_id",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "fire_for",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "trigger",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "goal_id",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "workspace_id",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "skip_reason",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error_kind",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error_message",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "1",
+      "generated": null,
+      "name": "attempt",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "acknowledged_at",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "started_at",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "finished_at",
+      "entityType": "columns",
+      "table": "scheduled_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_id",
+      "entityType": "columns",
+      "table": "scheduled_task_session_binding"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "scheduled_task_session_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_revision",
+      "entityType": "columns",
+      "table": "scheduled_task_session_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "user_seq_fence",
+      "entityType": "columns",
+      "table": "scheduled_task_session_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "1",
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "scheduled_task_session_binding"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "scheduled_task_session_binding"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_id",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "target_directory",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "target",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'{\"kind\":\"new\"}'",
+      "generated": null,
+      "name": "session_policy",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "name",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "enabled",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "revision",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "schedule",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "timezone",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "action",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "policy",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "next_run_at",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_run_at",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_run_status",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "last_run_id",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "consecutive_failures",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'api'",
+      "generated": null,
+      "name": "source",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_path",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_message_id",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_ref",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "source_principal",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "scheduled_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
       "table": "message"
     },
     {
@@ -2833,6 +4287,26 @@
       "name": "done",
       "entityType": "columns",
       "table": "search_backfill"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "checkpoint_id",
+      "entityType": "columns",
+      "table": "session_checkpoint_search"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "''",
+      "generated": null,
+      "name": "paths",
+      "entityType": "columns",
+      "table": "session_checkpoint_search"
     },
     {
       "type": "text",
@@ -3488,6 +4962,46 @@
       "type": "text",
       "notNull": true,
       "autoincrement": false,
+      "default": "'user'",
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "session_input"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'user'",
+      "generated": null,
+      "name": "admission_class",
+      "entityType": "columns",
+      "table": "session_input"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "false",
+      "generated": null,
+      "name": "user_preemptible",
+      "entityType": "columns",
+      "table": "session_input"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "input",
+      "entityType": "columns",
+      "table": "session_input"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
       "default": null,
       "generated": null,
       "name": "prompt",
@@ -3501,6 +5015,16 @@
       "default": null,
       "generated": null,
       "name": "delivery",
+      "entityType": "columns",
+      "table": "session_input"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "provenance",
       "entityType": "columns",
       "table": "session_input"
     },
@@ -3521,6 +5045,26 @@
       "default": null,
       "generated": null,
       "name": "promoted_seq",
+      "entityType": "columns",
+      "table": "session_input"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "revoked_seq",
+      "entityType": "columns",
+      "table": "session_input"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "revoked_reason",
       "entityType": "columns",
       "table": "session_input"
     },
@@ -4325,6 +5869,1346 @@
       "table": "session_share"
     },
     {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "swarm_id",
+      "entityType": "columns",
+      "table": "swarm_blackboard"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "key",
+      "entityType": "columns",
+      "table": "swarm_blackboard"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "value",
+      "entityType": "columns",
+      "table": "swarm_blackboard"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "content_type",
+      "entityType": "columns",
+      "table": "swarm_blackboard"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "version",
+      "entityType": "columns",
+      "table": "swarm_blackboard"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "author_member_id",
+      "entityType": "columns",
+      "table": "swarm_blackboard"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_id",
+      "entityType": "columns",
+      "table": "swarm_blackboard"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "swarm_blackboard"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "swarm_blackboard"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "swarm_id",
+      "entityType": "columns",
+      "table": "swarm_claim"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "member_id",
+      "entityType": "columns",
+      "table": "swarm_claim"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "scope",
+      "entityType": "columns",
+      "table": "swarm_claim"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "swarm_claim"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "expires_at",
+      "entityType": "columns",
+      "table": "swarm_claim"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "released_at",
+      "entityType": "columns",
+      "table": "swarm_claim"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "swarm_claim"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "swarm_claim"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "swarm_id",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "member_id",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_run_id",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "summary",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'[]'",
+      "generated": null,
+      "name": "refs",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'[]'",
+      "generated": null,
+      "name": "files",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "verdict",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "verdict_by_member_id",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "verdict_at",
+      "entityType": "columns",
+      "table": "swarm_deliverable"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "swarm_id",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "name",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "role",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'active'",
+      "generated": null,
+      "name": "lifecycle",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "binding_generation",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "desired_profile",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "workspace_policy",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "capabilities",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_stopped",
+      "entityType": "columns",
+      "table": "swarm_member"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "message_id",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "recipient_member_id",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'pending'",
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_input_id",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "claim_generation",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "claim_owner",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "claim_expires_at",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "next_attempt_at",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "attempt_count",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "admitted_session_id",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "admitted_seq",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "admitted_at",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "error",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "swarm_id",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "sender_member_id",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "sender_session_id",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "sender_binding_generation",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "kind",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "body",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_id",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "correlation_id",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "response_to",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'normal'",
+      "generated": null,
+      "name": "priority",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "true",
+      "generated": null,
+      "name": "reply_expected",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "expires_at",
+      "entityType": "columns",
+      "table": "swarm_message"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "project_id",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "directory",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "workspace_id",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "name",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'creating'",
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "coordinator_member_id",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'{}'",
+      "generated": null,
+      "name": "policy",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "revision",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_completed",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_archived",
+      "entityType": "columns",
+      "table": "swarm"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_id",
+      "entityType": "columns",
+      "table": "swarm_task_dependency"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "depends_on_task_id",
+      "entityType": "columns",
+      "table": "swarm_task_dependency"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'require_success'",
+      "generated": null,
+      "name": "requirement",
+      "entityType": "columns",
+      "table": "swarm_task_dependency"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_id",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "generation",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_member_id",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_session_id",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "owner_binding_generation",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "lease_owner_process",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'active'",
+      "generated": null,
+      "name": "state",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "hold_user_seq",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "hold_started_at",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "hold_deadline",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "retire_reason",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "retire_requested_at",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "acquired_at",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "expires_at",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "renewed_at",
+      "entityType": "columns",
+      "table": "swarm_task_lease"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "task_id",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "member_id",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_id",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "binding_generation",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "lease_generation",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "session_input_id",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "failure_kind",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "failure_detail",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "admitted_at",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "started_at",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "ended_at",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "swarm_task_run"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "id",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "swarm_id",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "title",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "description",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'pending'",
+      "generated": null,
+      "name": "status",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "priority",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "created_by_member_id",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "text",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reserved_member_id",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "reserved_until",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "reservation_revision",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "lease_generation",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "0",
+      "generated": null,
+      "name": "semantic_retry_count",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'{\"criteria\":[]}'",
+      "generated": null,
+      "name": "acceptance",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "text",
+      "notNull": true,
+      "autoincrement": false,
+      "default": "'{}'",
+      "generated": null,
+      "name": "metadata",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "ready_at",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_created",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "integer",
+      "notNull": true,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_updated",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
+      "type": "integer",
+      "notNull": false,
+      "autoincrement": false,
+      "default": null,
+      "generated": null,
+      "name": "time_completed",
+      "entityType": "columns",
+      "table": "swarm_task"
+    },
+    {
       "type": "integer",
       "notNull": false,
       "autoincrement": true,
@@ -4701,6 +7585,66 @@
     },
     {
       "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_execution_boundary_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_execution_boundary"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_execution_owner_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "session_execution_owner"
+    },
+    {
+      "columns": [
+        "owner_id"
+      ],
+      "tableTo": "runtime_owner",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_execution_owner_owner_id_runtime_owner_id_fk",
+      "entityType": "fks",
+      "table": "session_execution_owner"
+    },
+    {
+      "columns": [
+        "recovery_owner_id"
+      ],
+      "tableTo": "runtime_owner",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_session_execution_owner_recovery_owner_id_runtime_owner_id_fk",
+      "entityType": "fks",
+      "table": "session_execution_owner"
+    },
+    {
+      "columns": [
         "active_account_id"
       ],
       "tableTo": "account",
@@ -4986,6 +7930,51 @@
     },
     {
       "columns": [
+        "activity_id"
+      ],
+      "tableTo": "oxp_parent_activity",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_oxp_correlation_ref_activity_id_oxp_parent_activity_id_fk",
+      "entityType": "fks",
+      "table": "oxp_correlation_ref"
+    },
+    {
+      "columns": [
+        "invocation_id"
+      ],
+      "tableTo": "oxp_invocation",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_oxp_invocation_link_invocation_id_oxp_invocation_id_fk",
+      "entityType": "fks",
+      "table": "oxp_invocation_link"
+    },
+    {
+      "columns": [
+        "activity_id"
+      ],
+      "tableTo": "oxp_parent_activity",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_oxp_invocation_activity_id_oxp_parent_activity_id_fk",
+      "entityType": "fks",
+      "table": "oxp_invocation"
+    },
+    {
+      "columns": [
         "project_id"
       ],
       "tableTo": "project",
@@ -5016,6 +8005,66 @@
     },
     {
       "columns": [
+        "task_id"
+      ],
+      "tableTo": "scheduled_task",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_scheduled_task_lease_task_id_scheduled_task_id_fk",
+      "entityType": "fks",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "columns": [
+        "task_id"
+      ],
+      "tableTo": "scheduled_task",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_scheduled_task_run_task_id_scheduled_task_id_fk",
+      "entityType": "fks",
+      "table": "scheduled_task_run"
+    },
+    {
+      "columns": [
+        "task_id"
+      ],
+      "tableTo": "scheduled_task",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_scheduled_task_session_binding_task_id_scheduled_task_id_fk",
+      "entityType": "fks",
+      "table": "scheduled_task_session_binding"
+    },
+    {
+      "columns": [
+        "project_id"
+      ],
+      "tableTo": "project",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_scheduled_task_project_id_project_id_fk",
+      "entityType": "fks",
+      "table": "scheduled_task"
+    },
+    {
+      "columns": [
         "session_id"
       ],
       "tableTo": "session",
@@ -5043,6 +8092,21 @@
       "name": "fk_part_message_id_message_id_fk",
       "entityType": "fks",
       "table": "part"
+    },
+    {
+      "columns": [
+        "checkpoint_id"
+      ],
+      "tableTo": "session_checkpoint",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_session_checkpoint_search_checkpoint_id_session_checkpoint_id_fk",
+      "entityType": "fks",
+      "table": "session_checkpoint_search"
     },
     {
       "columns": [
@@ -5271,6 +8335,346 @@
     },
     {
       "columns": [
+        "swarm_id"
+      ],
+      "tableTo": "swarm",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_blackboard_swarm_id_swarm_id_fk",
+      "entityType": "fks",
+      "table": "swarm_blackboard"
+    },
+    {
+      "columns": [
+        "author_member_id"
+      ],
+      "tableTo": "swarm_member",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_swarm_blackboard_author_member_id_swarm_member_id_fk",
+      "entityType": "fks",
+      "table": "swarm_blackboard"
+    },
+    {
+      "columns": [
+        "swarm_id"
+      ],
+      "tableTo": "swarm",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_claim_swarm_id_swarm_id_fk",
+      "entityType": "fks",
+      "table": "swarm_claim"
+    },
+    {
+      "columns": [
+        "member_id"
+      ],
+      "tableTo": "swarm_member",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_swarm_claim_member_id_swarm_member_id_fk",
+      "entityType": "fks",
+      "table": "swarm_claim"
+    },
+    {
+      "columns": [
+        "swarm_id"
+      ],
+      "tableTo": "swarm",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_deliverable_swarm_id_swarm_id_fk",
+      "entityType": "fks",
+      "table": "swarm_deliverable"
+    },
+    {
+      "columns": [
+        "member_id"
+      ],
+      "tableTo": "swarm_member",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_swarm_deliverable_member_id_swarm_member_id_fk",
+      "entityType": "fks",
+      "table": "swarm_deliverable"
+    },
+    {
+      "columns": [
+        "task_run_id"
+      ],
+      "tableTo": "swarm_task_run",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_swarm_deliverable_task_run_id_swarm_task_run_id_fk",
+      "entityType": "fks",
+      "table": "swarm_deliverable"
+    },
+    {
+      "columns": [
+        "swarm_id"
+      ],
+      "tableTo": "swarm",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_member_swarm_id_swarm_id_fk",
+      "entityType": "fks",
+      "table": "swarm_member"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "tableTo": "session",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "SET NULL",
+      "nameExplicit": false,
+      "name": "fk_swarm_member_session_id_session_id_fk",
+      "entityType": "fks",
+      "table": "swarm_member"
+    },
+    {
+      "columns": [
+        "message_id"
+      ],
+      "tableTo": "swarm_message",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_message_delivery_message_id_swarm_message_id_fk",
+      "entityType": "fks",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "columns": [
+        "recipient_member_id"
+      ],
+      "tableTo": "swarm_member",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_swarm_message_delivery_recipient_member_id_swarm_member_id_fk",
+      "entityType": "fks",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "columns": [
+        "swarm_id"
+      ],
+      "tableTo": "swarm",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_message_swarm_id_swarm_id_fk",
+      "entityType": "fks",
+      "table": "swarm_message"
+    },
+    {
+      "columns": [
+        "sender_member_id"
+      ],
+      "tableTo": "swarm_member",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_swarm_message_sender_member_id_swarm_member_id_fk",
+      "entityType": "fks",
+      "table": "swarm_message"
+    },
+    {
+      "columns": [
+        "project_id"
+      ],
+      "tableTo": "project",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_project_id_project_id_fk",
+      "entityType": "fks",
+      "table": "swarm"
+    },
+    {
+      "columns": [
+        "workspace_id"
+      ],
+      "tableTo": "workspace",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "SET NULL",
+      "nameExplicit": false,
+      "name": "fk_swarm_workspace_id_workspace_id_fk",
+      "entityType": "fks",
+      "table": "swarm"
+    },
+    {
+      "columns": [
+        "task_id"
+      ],
+      "tableTo": "swarm_task",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_task_dependency_task_id_swarm_task_id_fk",
+      "entityType": "fks",
+      "table": "swarm_task_dependency"
+    },
+    {
+      "columns": [
+        "depends_on_task_id"
+      ],
+      "tableTo": "swarm_task",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_task_dependency_depends_on_task_id_swarm_task_id_fk",
+      "entityType": "fks",
+      "table": "swarm_task_dependency"
+    },
+    {
+      "columns": [
+        "task_id"
+      ],
+      "tableTo": "swarm_task",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_task_lease_task_id_swarm_task_id_fk",
+      "entityType": "fks",
+      "table": "swarm_task_lease"
+    },
+    {
+      "columns": [
+        "owner_member_id"
+      ],
+      "tableTo": "swarm_member",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_swarm_task_lease_owner_member_id_swarm_member_id_fk",
+      "entityType": "fks",
+      "table": "swarm_task_lease"
+    },
+    {
+      "columns": [
+        "task_id"
+      ],
+      "tableTo": "swarm_task",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_task_run_task_id_swarm_task_id_fk",
+      "entityType": "fks",
+      "table": "swarm_task_run"
+    },
+    {
+      "columns": [
+        "member_id"
+      ],
+      "tableTo": "swarm_member",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "NO ACTION",
+      "nameExplicit": false,
+      "name": "fk_swarm_task_run_member_id_swarm_member_id_fk",
+      "entityType": "fks",
+      "table": "swarm_task_run"
+    },
+    {
+      "columns": [
+        "swarm_id"
+      ],
+      "tableTo": "swarm",
+      "columnsTo": [
+        "id"
+      ],
+      "onUpdate": "NO ACTION",
+      "onDelete": "CASCADE",
+      "nameExplicit": false,
+      "name": "fk_swarm_task_swarm_id_swarm_id_fk",
+      "entityType": "fks",
+      "table": "swarm_task"
+    },
+    {
+      "columns": [
+        "target_kind",
+        "target_key"
+      ],
+      "nameExplicit": false,
+      "name": "revision_draft_claim_pk",
+      "entityType": "pks",
+      "table": "revision_draft_claim"
+    },
+    {
+      "columns": [
         "email",
         "url"
       ],
@@ -5308,6 +8712,28 @@
       "name": "goal_auditor_session_pk",
       "entityType": "pks",
       "table": "goal_auditor_session"
+    },
+    {
+      "columns": [
+        "scheme",
+        "digest"
+      ],
+      "nameExplicit": false,
+      "name": "oxp_correlation_ref_pk",
+      "entityType": "pks",
+      "table": "oxp_correlation_ref"
+    },
+    {
+      "columns": [
+        "invocation_id",
+        "kind",
+        "ref",
+        "relation"
+      ],
+      "nameExplicit": false,
+      "name": "oxp_invocation_link_pk",
+      "entityType": "pks",
+      "table": "oxp_invocation_link"
     },
     {
       "columns": [
@@ -5361,6 +8787,37 @@
     },
     {
       "columns": [
+        "swarm_id",
+        "key"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_blackboard_pk",
+      "entityType": "pks",
+      "table": "swarm_blackboard"
+    },
+    {
+      "columns": [
+        "swarm_id",
+        "member_id",
+        "scope"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_claim_pk",
+      "entityType": "pks",
+      "table": "swarm_claim"
+    },
+    {
+      "columns": [
+        "task_id",
+        "depends_on_task_id"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_task_dependency_pk",
+      "entityType": "pks",
+      "table": "swarm_task_dependency"
+    },
+    {
+      "columns": [
         "id"
       ],
       "nameExplicit": false,
@@ -5375,6 +8832,42 @@
       "nameExplicit": false,
       "name": "data_migration_pk",
       "table": "data_migration",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "revision_draft_pk",
+      "table": "revision_draft",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "runtime_owner_pk",
+      "table": "runtime_owner",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_execution_boundary_pk",
+      "table": "session_execution_boundary",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "session_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_execution_owner_pk",
+      "table": "session_execution_owner",
       "entityType": "pks"
     },
     {
@@ -5562,6 +9055,24 @@
         "id"
       ],
       "nameExplicit": false,
+      "name": "oxp_invocation_pk",
+      "table": "oxp_invocation",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "oxp_parent_activity_pk",
+      "table": "oxp_parent_activity",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
       "name": "permission_pk",
       "table": "permission",
       "entityType": "pks"
@@ -5598,6 +9109,51 @@
         "id"
       ],
       "nameExplicit": false,
+      "name": "scheduled_task_control_pk",
+      "table": "scheduled_task_control",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "task_id"
+      ],
+      "nameExplicit": false,
+      "name": "scheduled_task_lease_pk",
+      "table": "scheduled_task_lease",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "scheduled_task_run_pk",
+      "table": "scheduled_task_run",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "task_id"
+      ],
+      "nameExplicit": false,
+      "name": "scheduled_task_session_binding_pk",
+      "table": "scheduled_task_session_binding",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "scheduled_task_pk",
+      "table": "scheduled_task",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
       "name": "message_pk",
       "table": "message",
       "entityType": "pks"
@@ -5627,6 +9183,15 @@
       "nameExplicit": false,
       "name": "search_backfill_pk",
       "table": "search_backfill",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "checkpoint_id"
+      ],
+      "nameExplicit": false,
+      "name": "session_checkpoint_search_pk",
+      "table": "session_checkpoint_search",
       "entityType": "pks"
     },
     {
@@ -5733,6 +9298,78 @@
         "id"
       ],
       "nameExplicit": false,
+      "name": "swarm_deliverable_pk",
+      "table": "swarm_deliverable",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_member_pk",
+      "table": "swarm_member",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_message_delivery_pk",
+      "table": "swarm_message_delivery",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_message_pk",
+      "table": "swarm_message",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_pk",
+      "table": "swarm",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "task_id"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_task_lease_pk",
+      "table": "swarm_task_lease",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_task_run_pk",
+      "table": "swarm_task_run",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
+      "name": "swarm_task_pk",
+      "table": "swarm_task",
+      "entityType": "pks"
+    },
+    {
+      "columns": [
+        "id"
+      ],
+      "nameExplicit": false,
       "name": "maintenance_usage_pk",
       "table": "maintenance_usage",
       "entityType": "pks"
@@ -5745,6 +9382,52 @@
       "name": "usage_record_pk",
       "table": "usage_record",
       "entityType": "pks"
+    },
+    {
+      "columns": [
+        {
+          "value": "target_kind",
+          "isExpression": false
+        },
+        {
+          "value": "target_key",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "revision_draft_target_idx",
+      "entityType": "indexes",
+      "table": "revision_draft"
+    },
+    {
+      "columns": [
+        {
+          "value": "owner_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_execution_owner_owner_idx",
+      "entityType": "indexes",
+      "table": "session_execution_owner"
+    },
+    {
+      "columns": [
+        {
+          "value": "recovery_owner_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_execution_owner_recovery_owner_idx",
+      "entityType": "indexes",
+      "table": "session_execution_owner"
     },
     {
       "columns": [
@@ -6403,6 +10086,184 @@
     {
       "columns": [
         {
+          "value": "activity_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "oxp_correlation_ref_activity_idx",
+      "entityType": "indexes",
+      "table": "oxp_correlation_ref"
+    },
+    {
+      "columns": [
+        {
+          "value": "kind",
+          "isExpression": false
+        },
+        {
+          "value": "ref",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "oxp_invocation_link_ref_idx",
+      "entityType": "indexes",
+      "table": "oxp_invocation_link"
+    },
+    {
+      "columns": [
+        {
+          "value": "invocation_id",
+          "isExpression": false
+        },
+        {
+          "value": "kind",
+          "isExpression": false
+        },
+        {
+          "value": "ref",
+          "isExpression": false
+        },
+        {
+          "value": "relation",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "oxp_invocation_link_invocation_ref_idx",
+      "entityType": "indexes",
+      "table": "oxp_invocation_link"
+    },
+    {
+      "columns": [
+        {
+          "value": "activity_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_started",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "oxp_invocation_activity_started_idx",
+      "entityType": "indexes",
+      "table": "oxp_invocation"
+    },
+    {
+      "columns": [
+        {
+          "value": "activity_id",
+          "isExpression": false
+        },
+        {
+          "value": "status",
+          "isExpression": false
+        },
+        {
+          "value": "time_started",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "oxp_invocation_activity_status_started_idx",
+      "entityType": "indexes",
+      "table": "oxp_invocation"
+    },
+    {
+      "columns": [
+        {
+          "value": "activity_id",
+          "isExpression": false
+        },
+        {
+          "value": "host_run_id",
+          "isExpression": false
+        },
+        {
+          "value": "observed_epoch",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "oxp_invocation_activity_host_epoch_idx",
+      "entityType": "indexes",
+      "table": "oxp_invocation"
+    },
+    {
+      "columns": [
+        {
+          "value": "status",
+          "isExpression": false
+        },
+        {
+          "value": "host_run_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "oxp_invocation_status_host_idx",
+      "entityType": "indexes",
+      "table": "oxp_invocation"
+    },
+    {
+      "columns": [
+        {
+          "value": "time_started",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "oxp_invocation_started_idx",
+      "entityType": "indexes",
+      "table": "oxp_invocation"
+    },
+    {
+      "columns": [
+        {
+          "value": "time_archived",
+          "isExpression": false
+        },
+        {
+          "value": "last_seen_at",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "oxp_parent_activity_last_seen_idx",
+      "entityType": "indexes",
+      "table": "oxp_parent_activity"
+    },
+    {
+      "columns": [
+        {
           "value": "project_id",
           "isExpression": false
         },
@@ -6421,6 +10282,184 @@
       "name": "permission_project_action_resource_idx",
       "entityType": "indexes",
       "table": "permission"
+    },
+    {
+      "columns": [
+        {
+          "value": "lease_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_lease_id_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "heartbeat_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_lease_heartbeat_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "task_id",
+          "isExpression": false
+        },
+        {
+          "value": "fire_for",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_run_logical_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task_run"
+    },
+    {
+      "columns": [
+        {
+          "value": "goal_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_run_goal_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task_run"
+    },
+    {
+      "columns": [
+        {
+          "value": "task_id",
+          "isExpression": false
+        },
+        {
+          "value": "started_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_run_task_started_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task_run"
+    },
+    {
+      "columns": [
+        {
+          "value": "started_at",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_run_started_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task_run"
+    },
+    {
+      "columns": [
+        {
+          "value": "acknowledged_at",
+          "isExpression": false
+        },
+        {
+          "value": "started_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_run_inbox_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task_run"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_session_binding_session_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task_session_binding"
+    },
+    {
+      "columns": [
+        {
+          "value": "enabled",
+          "isExpression": false
+        },
+        {
+          "value": "next_run_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_due_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task"
+    },
+    {
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        },
+        {
+          "value": "name",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_project_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task"
+    },
+    {
+      "columns": [
+        {
+          "value": "source_path",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "scheduled_task_source_path_idx",
+      "entityType": "indexes",
+      "table": "scheduled_task"
     },
     {
       "columns": [
@@ -6501,7 +10540,7 @@
           "isExpression": false
         }
       ],
-      "isUnique": false,
+      "isUnique": true,
       "where": null,
       "origin": "manual",
       "name": "session_checkpoint_session_ordinal_idx",
@@ -6523,6 +10562,24 @@
       "where": null,
       "origin": "manual",
       "name": "session_checkpoint_session_user_message_idx",
+      "entityType": "indexes",
+      "table": "session_checkpoint"
+    },
+    {
+      "columns": [
+        {
+          "value": "epoch",
+          "isExpression": false
+        },
+        {
+          "value": "created_at",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "session_checkpoint_epoch_created_idx",
       "entityType": "indexes",
       "table": "session_checkpoint"
     },
@@ -6665,7 +10722,7 @@
           "isExpression": false
         },
         {
-          "value": "promoted_seq",
+          "value": "admission_class",
           "isExpression": false
         },
         {
@@ -6678,9 +10735,45 @@
         }
       ],
       "isUnique": false,
-      "where": null,
+      "where": "\"session_input\".\"promoted_seq\" IS NULL AND \"session_input\".\"revoked_seq\" IS NULL",
       "origin": "manual",
-      "name": "session_input_session_pending_delivery_seq_idx",
+      "name": "session_input_session_pending_class_delivery_seq_idx",
+      "entityType": "indexes",
+      "table": "session_input"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "admitted_seq",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"session_input\".\"kind\" = 'user' AND \"session_input\".\"admission_class\" = 'user'",
+      "origin": "manual",
+      "name": "session_input_session_latest_user_idx",
+      "entityType": "indexes",
+      "table": "session_input"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        },
+        {
+          "value": "admitted_seq",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"session_input\".\"user_preemptible\" = 1 AND \"session_input\".\"promoted_seq\" IS NULL AND \"session_input\".\"revoked_seq\" IS NULL",
+      "origin": "manual",
+      "name": "session_input_session_preemptible_seq_idx",
       "entityType": "indexes",
       "table": "session_input"
     },
@@ -6813,6 +10906,24 @@
     {
       "columns": [
         {
+          "value": "message_id",
+          "isExpression": false
+        },
+        {
+          "value": "call_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "(\"session_message_tool_overlay\".\"settlement_event_id\" is null)",
+      "origin": "manual",
+      "name": "session_message_tool_overlay_unsettled_idx",
+      "entityType": "indexes",
+      "table": "session_message_tool_overlay"
+    },
+    {
+      "columns": [
+        {
           "value": "project_id",
           "isExpression": false
         }
@@ -6843,6 +10954,28 @@
       "where": "(\"session\".\"parent_id\" is null)",
       "origin": "manual",
       "name": "session_project_directory_root_updated_idx",
+      "entityType": "indexes",
+      "table": "session"
+    },
+    {
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_updated",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "(\"session\".\"parent_id\" is null)",
+      "origin": "manual",
+      "name": "session_project_root_updated_id_idx",
       "entityType": "indexes",
       "table": "session"
     },
@@ -6923,6 +11056,698 @@
       "name": "todo_session_idx",
       "entityType": "indexes",
       "table": "todo"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "task_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_blackboard_task_idx",
+      "entityType": "indexes",
+      "table": "swarm_blackboard"
+    },
+    {
+      "columns": [
+        {
+          "value": "expires_at",
+          "isExpression": false
+        },
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "member_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"swarm_claim\".\"released_at\" IS NULL AND \"swarm_claim\".\"expires_at\" IS NOT NULL",
+      "origin": "manual",
+      "name": "swarm_claim_expiry_idx",
+      "entityType": "indexes",
+      "table": "swarm_claim"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_deliverable_stream_idx",
+      "entityType": "indexes",
+      "table": "swarm_deliverable"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "member_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_deliverable_member_idx",
+      "entityType": "indexes",
+      "table": "swarm_deliverable"
+    },
+    {
+      "columns": [
+        {
+          "value": "task_run_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_deliverable_task_run_idx",
+      "entityType": "indexes",
+      "table": "swarm_deliverable"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"swarm_deliverable\".\"verdict\" IS NULL",
+      "origin": "manual",
+      "name": "swarm_deliverable_open_idx",
+      "entityType": "indexes",
+      "table": "swarm_deliverable"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "name",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_member_name_idx",
+      "entityType": "indexes",
+      "table": "swarm_member"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": "\"swarm_member\".\"session_id\" IS NOT NULL",
+      "origin": "manual",
+      "name": "swarm_member_bound_session_idx",
+      "entityType": "indexes",
+      "table": "swarm_member"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_member_session_idx",
+      "entityType": "indexes",
+      "table": "swarm_member"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "lifecycle",
+          "isExpression": false
+        },
+        {
+          "value": "kind",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_member_roster_idx",
+      "entityType": "indexes",
+      "table": "swarm_member"
+    },
+    {
+      "columns": [
+        {
+          "value": "message_id",
+          "isExpression": false
+        },
+        {
+          "value": "recipient_member_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_message_delivery_recipient_idx",
+      "entityType": "indexes",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_input_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_message_delivery_input_idx",
+      "entityType": "indexes",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "columns": [
+        {
+          "value": "recipient_member_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"swarm_message_delivery\".\"state\" = 'pending'",
+      "origin": "manual",
+      "name": "swarm_message_delivery_recipient_pending_idx",
+      "entityType": "indexes",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "columns": [
+        {
+          "value": "next_attempt_at",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"swarm_message_delivery\".\"state\" = 'pending'",
+      "origin": "manual",
+      "name": "swarm_message_delivery_due_idx",
+      "entityType": "indexes",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "columns": [
+        {
+          "value": "claim_expires_at",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"swarm_message_delivery\".\"state\" = 'claimed'",
+      "origin": "manual",
+      "name": "swarm_message_delivery_claim_expiry_idx",
+      "entityType": "indexes",
+      "table": "swarm_message_delivery"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_message_stream_idx",
+      "entityType": "indexes",
+      "table": "swarm_message"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "correlation_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_message_correlation_idx",
+      "entityType": "indexes",
+      "table": "swarm_message"
+    },
+    {
+      "columns": [
+        {
+          "value": "expires_at",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"swarm_message\".\"expires_at\" IS NOT NULL",
+      "origin": "manual",
+      "name": "swarm_message_expiry_idx",
+      "entityType": "indexes",
+      "table": "swarm_message"
+    },
+    {
+      "columns": [
+        {
+          "value": "project_id",
+          "isExpression": false
+        },
+        {
+          "value": "status",
+          "isExpression": false
+        },
+        {
+          "value": "time_updated",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_project_status_updated_idx",
+      "entityType": "indexes",
+      "table": "swarm"
+    },
+    {
+      "columns": [
+        {
+          "value": "workspace_id",
+          "isExpression": false
+        },
+        {
+          "value": "status",
+          "isExpression": false
+        },
+        {
+          "value": "time_updated",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_workspace_idx",
+      "entityType": "indexes",
+      "table": "swarm"
+    },
+    {
+      "columns": [
+        {
+          "value": "depends_on_task_id",
+          "isExpression": false
+        },
+        {
+          "value": "task_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_dependency_reverse_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_dependency"
+    },
+    {
+      "columns": [
+        {
+          "value": "expires_at",
+          "isExpression": false
+        },
+        {
+          "value": "task_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_lease_due_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "lease_owner_process",
+          "isExpression": false
+        },
+        {
+          "value": "expires_at",
+          "isExpression": false
+        },
+        {
+          "value": "task_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_lease_process_due_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "state",
+          "isExpression": false
+        },
+        {
+          "value": "lease_owner_process",
+          "isExpression": false
+        },
+        {
+          "value": "task_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_lease_state_owner_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "hold_deadline",
+          "isExpression": false
+        },
+        {
+          "value": "task_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"swarm_task_lease\".\"state\" = 'human_hold' AND \"swarm_task_lease\".\"hold_deadline\" IS NOT NULL",
+      "origin": "manual",
+      "name": "swarm_task_lease_hold_due_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "state",
+          "isExpression": false
+        },
+        {
+          "value": "retire_requested_at",
+          "isExpression": false
+        },
+        {
+          "value": "task_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_lease_state_retire_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "owner_member_id",
+          "isExpression": false
+        },
+        {
+          "value": "task_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_lease_member_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_lease"
+    },
+    {
+      "columns": [
+        {
+          "value": "session_input_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": true,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_run_input_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_run"
+    },
+    {
+      "columns": [
+        {
+          "value": "task_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_run_task_created_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_run"
+    },
+    {
+      "columns": [
+        {
+          "value": "member_id",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_run_member_created_idx",
+      "entityType": "indexes",
+      "table": "swarm_task_run"
+    },
+    {
+      "columns": [
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        },
+        {
+          "value": "status",
+          "isExpression": false
+        },
+        {
+          "value": "\"priority\" DESC",
+          "isExpression": true
+        },
+        {
+          "value": "ready_at",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_ready_idx",
+      "entityType": "indexes",
+      "table": "swarm_task"
+    },
+    {
+      "columns": [
+        {
+          "value": "\"priority\" DESC",
+          "isExpression": true
+        },
+        {
+          "value": "ready_at",
+          "isExpression": false
+        },
+        {
+          "value": "time_created",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        },
+        {
+          "value": "swarm_id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"swarm_task\".\"status\" = 'ready'",
+      "origin": "manual",
+      "name": "swarm_task_dispatch_ready_idx",
+      "entityType": "indexes",
+      "table": "swarm_task"
+    },
+    {
+      "columns": [
+        {
+          "value": "reserved_member_id",
+          "isExpression": false
+        },
+        {
+          "value": "status",
+          "isExpression": false
+        },
+        {
+          "value": "reserved_until",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": null,
+      "origin": "manual",
+      "name": "swarm_task_reserved_member_idx",
+      "entityType": "indexes",
+      "table": "swarm_task"
+    },
+    {
+      "columns": [
+        {
+          "value": "reserved_until",
+          "isExpression": false
+        },
+        {
+          "value": "id",
+          "isExpression": false
+        }
+      ],
+      "isUnique": false,
+      "where": "\"swarm_task\".\"status\" = 'ready' AND \"swarm_task\".\"reserved_until\" IS NOT NULL",
+      "origin": "manual",
+      "name": "swarm_task_reservation_due_idx",
+      "entityType": "indexes",
+      "table": "swarm_task"
     },
     {
       "columns": [
@@ -7045,6 +11870,12 @@
       "name": "push_subscription_endpoint_unique",
       "entityType": "uniques",
       "table": "push_subscription"
+    },
+    {
+      "value": "\"task_id\" != \"depends_on_task_id\"",
+      "name": "swarm_task_dependency_no_self_check",
+      "entityType": "checks",
+      "table": "swarm_task_dependency"
     }
   ],
   "renames": []

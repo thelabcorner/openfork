@@ -14,7 +14,7 @@ export const AccountTable = sqliteTable("account", {
 })
 
 export const AccountStateTable = sqliteTable("account_state", {
-  id: integer().primaryKey(),
+  id: integer().primaryKey().notNull(),
   active_account_id: text()
     .$type<AccountV2.ID>()
     .references(() => AccountTable.id, { onDelete: "set null" }),

@@ -5,7 +5,7 @@ import { layer as sqliteLayer } from "#sqlite"
 import { Context, Duration, Effect, Layer } from "effect"
 import { Global } from "../global"
 import { Flag } from "../flag/flag"
-import { dirname, isAbsolute, join } from "path"
+import { dirname, isAbsolute, join, resolve } from "path"
 import { DatabaseMigration } from "./migration"
 import { ensureChunkDB, CHUNKDB_PAGE_SIZE, CHUNKDB_AUTO_VACUUM } from "./chunkdb"
 import { runSealerLoop } from "./chunk-sealer"
@@ -58,15 +58,34 @@ const layer = (filename: string) =>
       }
 
       const db = yield* makeDatabase
-
-      yield* db.run("PRAGMA journal_mode = WAL")
-      yield* db.run("PRAGMA synchronous = NORMAL")
-      yield* db.run("PRAGMA busy_timeout = 5000")
-      yield* db.run("PRAGMA cache_size = -64000")
-      yield* db.run("PRAGMA foreign_keys = ON")
-      yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
-      yield* DatabaseMigration.apply(db)
-      yield* ensureChunkDB(db)
+      const configurePrimary = Effect.gen(function* () {
+        // Install the wait policy before any pragma that may need a SQLite lock.
+        // In particular, journal_mode can transiently contend with another
+        // already-running host even after bootstrap creation itself is
+        // serialized.
+        yield* db.run("PRAGMA busy_timeout = 5000")
+        const journal = yield* db.get<{ journal_mode: string }>("PRAGMA journal_mode")
+        if (journal?.journal_mode.toLowerCase() !== "wal") {
+          yield* db.run("PRAGMA journal_mode = WAL")
+        }
+        yield* db.run("PRAGMA synchronous = NORMAL")
+        yield* db.run("PRAGMA cache_size = -64000")
+        yield* db.run("PRAGMA foreign_keys = ON")
+        yield* db.run("PRAGMA wal_checkpoint(PASSIVE)")
+      })
+      if (filename === ":memory:") {
+        yield* configurePrimary
+        yield* DatabaseMigration.apply(db)
+        yield* ensureChunkDB(db)
+      } else {
+        // layerFromPath acquires the DB-local bootstrap lease *before this
+        // connection exists*. That ordering matters: merely locking around DDL
+        // after opening every contender still lets their native handles prevent
+        // the winner from changing journal_mode on a brand-new database.
+        yield* configurePrimary
+        yield* DatabaseMigration.apply(db)
+        yield* ensureChunkDB(db)
+      }
 
       // WAL allows readers to observe the last committed snapshot while a
       // writer transaction is active, but that concurrency is lost if reads and
@@ -84,7 +103,12 @@ const layer = (filename: string) =>
         yield* readDb.run("PRAGMA cache_size = -32000")
         yield* readDb.run("PRAGMA foreign_keys = ON")
       }
-      if (Flag.OPENCODE_SEAL_ENABLED) {
+      // The sealer intentionally owns a second SQLite connection so maintenance
+      // cannot monopolize the foreground client's single permit. Plain
+      // `:memory:` handles are independent databases, not shared connections;
+      // forking the file-backed sealer topology here would therefore maintain an
+      // empty unrelated database and fail on missing ChunkDB tables.
+      if (Flag.OPENCODE_SEAL_ENABLED && filename !== ":memory:") {
         yield* Effect.forkScoped(runSealerLoop(filename).pipe(Effect.ignore))
       }
 
@@ -133,7 +157,54 @@ export function layerFromPath(filename: string) {
   const createTimePragmas = Flag.OPENCODE_SEAL_ENABLED
     ? { page_size: CHUNKDB_PAGE_SIZE, auto_vacuum: CHUNKDB_AUTO_VACUUM }
     : undefined
-  return layer(filename).pipe(Layer.provide(sqliteLayer({ filename, createTimePragmas })))
+  // The Database service owns cooperative PASSIVE checkpointing while alive.
+  // A connection-finalizer TRUNCATE is not safe for a shared database: one
+  // Desktop/ACP process can exit while another is migrating and turn the
+  // latter's first write into SQLITE_BUSY. Never perform that uncoordinated
+  // exclusive-ish checkpoint on the production primary handle.
+  //
+  // Likewise, do not let the native layer switch journal_mode to WAL before the
+  // DB-local bootstrap lock is acquired. journal_mode mutates the database
+  // header and participates in SQLite's lock graph; doing it eagerly would leave
+  // a pre-lock race even though the actual migration body is serialized below.
+  const databaseLayer = layer(filename).pipe(
+    Layer.provide(
+      sqliteLayer({
+        filename,
+        createTimePragmas,
+        disableWAL: filename !== ":memory:",
+        checkpointOnClose: false,
+      }),
+    ),
+  )
+  if (filename === ":memory:") return databaseLayer
+
+  // Acquire admission before the native SQLite handle exists. SQLite requires
+  // an exclusive-ish header transition when a new database first enters WAL
+  // mode, so opening all contenders first and locking only the migration body
+  // is insufficient: the idle losing handles can make the winning
+  // PRAGMA journal_mode = WAL fail with SQLITE_BUSY.
+  //
+  // Layer.effectContext supplies the caller's Scope to Layer.build, so the
+  // database resources remain alive after the bootstrap lease is released. The
+  // lease protects construction only, not the lifetime of the process.
+  const databaseFile = resolve(filename)
+  const bootstrapLockDir = join(dirname(databaseFile), ".opencode-runtime-locks")
+  return Layer.effectContext(
+    Effect.acquireUseRelease(
+      Effect.promise(() =>
+        Flock.acquire(`database-schema-bootstrap:${databaseFile}`, {
+          dir: bootstrapLockDir,
+          staleMs: 60_000,
+          timeoutMs: 5 * 60_000,
+          baseDelayMs: 25,
+          maxDelayMs: 500,
+        }),
+      ),
+      () => Layer.build(databaseLayer),
+      (lease) => Effect.promise(() => lease.release()),
+    ),
+  )
 }
 
 // Runs `body` with a dedicated second SQLite connection to the same database
@@ -146,20 +217,25 @@ export function layerFromPath(filename: string) {
 export function withBackfillDb<A, E, R>(
   filename: string,
   body: (db: DatabaseShape) => Effect.Effect<A, E, R>,
+  options?: { readonly busyTimeoutMs?: number },
 ): Effect.Effect<A, EffectDrizzleQueryError | E, R> {
   return Effect.gen(function* () {
     const db = yield* makeDatabase
-    yield* db.run("PRAGMA journal_mode = WAL")
+    // Background maintenance is lower priority than interactive writes. Install
+    // its wait policy before *any* pragma that can participate in SQLite's lock
+    // graph. In particular, changing journal_mode can need a header/write lock.
+    // The native layer is also told not to switch to WAL eagerly, otherwise that
+    // transition would still happen before this timeout exists.
+    const busyTimeoutMs = Math.max(0, Math.floor(options?.busyTimeoutMs ?? 100))
+    yield* db.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`)
+    const journal = yield* db.get<{ journal_mode: string }>("PRAGMA journal_mode")
+    if (journal?.journal_mode.toLowerCase() !== "wal") {
+      yield* db.run("PRAGMA journal_mode = WAL")
+    }
     yield* db.run("PRAGMA synchronous = NORMAL")
-    // Background maintenance is lower priority than interactive writes. The
-    // primary connection is willing to wait up to 5s for a writer; the sealer
-    // must do the opposite and get out of the way quickly when the foreground
-    // owns SQLite's single-writer slot. Busy slices are retried by the sealer
-    // after a short yield instead of monopolizing the lock queue.
-    yield* db.run("PRAGMA busy_timeout = 100")
     yield* db.run("PRAGMA foreign_keys = ON")
     return yield* body(db)
-  }).pipe(Effect.provide(sqliteLayer({ filename, checkpointOnClose: false })))
+  }).pipe(Effect.provide(sqliteLayer({ filename, disableWAL: true, checkpointOnClose: false })))
 }
 
 export function path() {

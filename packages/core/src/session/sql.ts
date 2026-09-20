@@ -12,6 +12,7 @@ import type { MessageID, PartID, SessionV1 } from "../v1/session"
 import { WorkspaceV2 } from "../workspace"
 import { Timestamps } from "../database/schema.sql"
 import type { SystemContext } from "../system-context/index"
+import type { SessionContextEpochState } from "./context-epoch-state"
 import { AgentV2 } from "../agent"
 import { isNull, sql } from "drizzle-orm"
 import type { Revert } from "@opencode-ai/schema/revert"
@@ -72,6 +73,7 @@ export const SessionTable = sqliteTable(
     model: text({ mode: "json" }).$type<{
       id: string
       providerID: string
+      accountID?: string
       variant?: string
     }>(),
     ...Timestamps,
@@ -91,6 +93,16 @@ export const SessionTable = sqliteTable(
     // reverse order, avoiding the temporary sort used by session_project_idx.
     index("session_project_directory_root_updated_idx")
       .on(table.project_id, table.directory, table.time_updated)
+      .where(isNull(table.parent_id)),
+    // Project-wide sidebar/root census:
+    //   WHERE project_id=? AND parent_id IS NULL
+    //   ORDER BY time_updated DESC, id DESC LIMIT ?
+    //
+    // The canonical project store intentionally spans worker directories (for
+    // example Scheduled Task run roots), so directory cannot participate in
+    // this access path. Include id as the deterministic ordering tie-breaker.
+    index("session_project_root_updated_id_idx")
+      .on(table.project_id, table.time_updated, table.id)
       .where(isNull(table.parent_id)),
     // V2 sidebar/session-list hot path:
     //   WHERE directory=? AND parent_id IS NULL
@@ -114,7 +126,7 @@ export const SessionGroupTable = sqliteTable(
     id: text().primaryKey(),
     name: text().notNull(),
     position: integer().notNull(),
-    kind: text().$type<"user" | "subagent" | "plugin">().notNull().default("user"),
+    kind: text().$type<"user" | "subagent" | "plugin" | "delegation">().notNull().default("user"),
     owner_plugin: text(),
     owner_ref: text(),
     anchor_session_id: text().$type<SessionSchema.ID>(),
@@ -129,8 +141,8 @@ export const SessionGroupTable = sqliteTable(
   },
   (table) => [
     // A root session has one automatic subagent tree. Plugin groups need a
-    // different identity: a coordinator may own several independent plugin
-    // groups (for example, several OpenSwarm swarms) at the same time.
+    // different identity: one anchor may participate in several independent
+    // groups owned by the same unrelated plugin/integration at the same time.
     uniqueIndex("session_group_subagent_anchor_idx")
       .on(table.kind, table.anchor_session_id)
       .where(sql`${table.kind} = 'subagent' AND ${table.anchor_session_id} IS NOT NULL`),
@@ -308,6 +320,9 @@ export const SessionMessageToolOverlayTable = sqliteTable(
   (table) => [
     primaryKey({ columns: [table.message_id, table.call_id] }),
     index("session_message_tool_overlay_message_idx").on(table.message_id),
+    index("session_message_tool_overlay_unsettled_idx")
+      .on(table.message_id, table.call_id)
+      .where(isNull(table.settlement_event_id)),
   ],
 )
 
@@ -319,21 +334,39 @@ export const SessionInputTable = sqliteTable(
       .$type<SessionSchema.ID>()
       .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
+    kind: text().$type<SessionInput.Kind>().notNull().default("user"),
+    admission_class: text().$type<SessionInput.AdmissionClass>().notNull().default("user"),
+    user_preemptible: integer({ mode: "boolean" }).notNull().default(false),
+    /**
+     * Canonical current-model input. Nullable only for pre-migration rows while
+     * compatibility mirrors remain; new writers always populate it.
+     */
+    input: text({ mode: "json" }).$type<SessionInput.Item>(),
+    // Transitional mirrors retained while old PromptAdmitted rows/consumers
+    // coexist with the generalized inbox. They are not the new authority.
     prompt: text({ mode: "json" }).notNull().$type<Prompt>(),
     delivery: text().$type<SessionInput.Delivery>().notNull(),
+    provenance: text({ mode: "json" }).$type<SessionMessage.Provenance>(),
     admitted_seq: integer().notNull(),
     promoted_seq: integer(),
+    revoked_seq: integer(),
+    revoked_reason: text().$type<SessionInput.RevocationReason>(),
     time_created: integer()
       .notNull()
       .$default(() => Date.now()),
   },
   (table) => [
-    index("session_input_session_pending_delivery_seq_idx").on(
-      table.session_id,
-      table.promoted_seq,
-      table.delivery,
-      table.admitted_seq,
-    ),
+    index("session_input_session_pending_class_delivery_seq_idx")
+      .on(table.session_id, table.admission_class, table.delivery, table.admitted_seq)
+      .where(sql`${table.promoted_seq} IS NULL AND ${table.revoked_seq} IS NULL`),
+    index("session_input_session_latest_user_idx")
+      .on(table.session_id, table.admitted_seq)
+      .where(sql`${table.kind} = 'user' AND ${table.admission_class} = 'user'`),
+    index("session_input_session_preemptible_seq_idx")
+      .on(table.session_id, table.admitted_seq)
+      .where(
+        sql`${table.user_preemptible} = 1 AND ${table.promoted_seq} IS NULL AND ${table.revoked_seq} IS NULL`,
+      ),
     uniqueIndex("session_input_session_admitted_seq_idx").on(table.session_id, table.admitted_seq),
     uniqueIndex("session_input_session_promoted_seq_idx").on(table.session_id, table.promoted_seq),
   ],
@@ -345,7 +378,11 @@ export const SessionContextEpochTable = sqliteTable("session_context_epoch", {
     .primaryKey()
     .references(() => SessionTable.id, { onDelete: "cascade" }),
   baseline: text().notNull(),
-  snapshot: text({ mode: "json" }).notNull().$type<SystemContext.Snapshot>(),
+  // Lazy migration: existing rows may still contain the pre-SystemSurface typed
+  // snapshot until that Session is prepared once under the new epoch engine.
+  snapshot: text({ mode: "json" })
+    .notNull()
+    .$type<SessionContextEpochState.Checkpoint | SystemContext.LegacySnapshot>(),
   baseline_seq: integer().notNull(),
 })
 
@@ -392,9 +429,33 @@ export const SessionCheckpointTable = sqliteTable(
   },
   (table) => [
     index("session_checkpoint_session_id_idx").on(table.session_id),
-    index("session_checkpoint_session_ordinal_idx").on(table.session_id, table.ordinal),
+    // Ordinals are the durable, monotonic checkpoint identity within a session.
+    // Keep the database invariant aligned with SessionCheckpoint's contract and
+    // the original migration: a retry may reconcile an existing checkpoint, but
+    // it must never create a second row for the same ordinal.
+    uniqueIndex("session_checkpoint_session_ordinal_idx").on(table.session_id, table.ordinal),
     uniqueIndex("session_checkpoint_session_user_message_idx").on(table.session_id, table.user_message_id),
+    index("session_checkpoint_epoch_created_idx").on(table.epoch, table.created_at),
   ],
+)
+
+/**
+ * Compact search projection for checkpoint file paths.
+ *
+ * The authoritative checkpoint diff remains SessionCheckpointTable.diff. This
+ * row stores only newline-joined paths so search never scans cached patch
+ * bodies. A supplemental trigram FTS table + storage triggers maintain it for
+ * every checkpoint producer (V1 and current/Core).
+ */
+export const SessionCheckpointSearchTable = sqliteTable(
+  "session_checkpoint_search",
+  {
+    checkpoint_id: text()
+      .notNull()
+      .references(() => SessionCheckpointTable.id, { onDelete: "cascade" }),
+    paths: text().notNull().default(""),
+  },
+  (table) => [primaryKey({ columns: [table.checkpoint_id] })],
 )
 
 // ── Conversation Control: Context State Overlay ─────────────────────
@@ -424,7 +485,11 @@ export const SessionContextStateTable = sqliteTable(
 export const SessionContextOpsTable = sqliteTable(
   "session_context_ops",
   {
-    id: text().primaryKey(),
+    // Keep NOT NULL explicit in generated SQLite. Drizzle elides NOT NULL for a
+    // column-level TEXT PRIMARY KEY, but SQLite permits NULL in that form. The
+    // historical migration correctly created PRIMARY KEY NOT NULL, so use a
+    // table-level PK to make fresh installs preserve the same invariant.
+    id: text().notNull(),
     session_id: text()
       .$type<SessionSchema.ID>()
       .notNull()
@@ -434,6 +499,7 @@ export const SessionContextOpsTable = sqliteTable(
     timestamp: integer().notNull(),
   },
   (table) => [
+    primaryKey({ columns: [table.id] }),
     index("session_context_ops_session_idx").on(table.session_id),
     index("session_context_ops_session_time_idx").on(table.session_id, table.timestamp),
   ],
@@ -444,7 +510,7 @@ export const SessionForkOriginTable = sqliteTable(
   {
     session_id: text()
       .$type<SessionSchema.ID>()
-      .primaryKey()
+      .notNull()
       .references(() => SessionTable.id, { onDelete: "cascade" }),
     parent_session_id: text().$type<SessionSchema.ID>().notNull(),
     source_message_id: text().$type<MessageID>(),
@@ -454,5 +520,8 @@ export const SessionForkOriginTable = sqliteTable(
     workspace_mode: text().$type<"shared-current" | "new-worktree">().notNull(),
     created_at: integer().notNull(),
   },
-  (table) => [index("session_fork_origin_parent_idx").on(table.parent_session_id)],
+  (table) => [
+    primaryKey({ columns: [table.session_id] }),
+    index("session_fork_origin_parent_idx").on(table.parent_session_id),
+  ],
 )

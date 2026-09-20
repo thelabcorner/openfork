@@ -20,6 +20,7 @@ export const GoalTable = sqliteTable(
     constraints: text({ mode: "json" }).$type<string[]>().notNull().default([]),
     status: text().$type<Goal.Status>().notNull().default("draft"),
     revision: integer().notNull().default(0),
+    auditor_runs: integer().notNull().default(0),
     continuation_policy: text({ mode: "json" })
       .$type<Goal.ContinuationPolicy>()
       .notNull()
@@ -163,10 +164,21 @@ export const GoalAutomationTable = sqliteTable(
     consumed_tokens: integer().notNull().default(0),
     last_auditor_decision: text().$type<Goal.AuditorDecision>(),
     last_auditor_rationale: text(),
+    audit_requested_at: integer(),
+    auditing_at: integer(),
+    auditor_session_id: text().$type<typeof SessionTable.$inferSelect.id>(),
+    runtime_error: text(),
     previous_revision: integer(),
     reservation_id: text(),
     reservation_owner: text(),
     reservation_created_at: integer(),
+    continuation_source_message_id: text(),
+    /**
+     * Frozen semantic-User admission sequence observed when this continuation
+     * was authorized. SessionInput admission compares against this exact value;
+     * it is never refreshed at materialization time.
+     */
+    continuation_expected_user_seq: integer(),
     continuation_prompt: text(),
     time_updated: integer()
       .notNull()

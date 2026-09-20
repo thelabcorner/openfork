@@ -13,7 +13,7 @@ export default {
           \`directory\` text,
           \`extra\` text,
           \`project_id\` text NOT NULL,
-          \`time_used\` integer NOT NULL,
+          \`time_used\` integer DEFAULT 0 NOT NULL,
           CONSTRAINT \`fk_workspace_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
         );
       `)
@@ -21,6 +21,62 @@ export default {
         CREATE TABLE \`data_migration\` (
           \`name\` text PRIMARY KEY,
           \`time_completed\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`revision_draft_claim\` (
+          \`target_kind\` text NOT NULL,
+          \`target_key\` text NOT NULL,
+          \`claim_id\` text NOT NULL,
+          \`source_fingerprint\` text NOT NULL,
+          \`time_claimed\` integer NOT NULL,
+          CONSTRAINT \`revision_draft_claim_pk\` PRIMARY KEY(\`target_kind\`, \`target_key\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`revision_draft\` (
+          \`id\` text PRIMARY KEY,
+          \`directory\` text NOT NULL,
+          \`target_kind\` text NOT NULL,
+          \`target_key\` text NOT NULL,
+          \`purpose\` text NOT NULL,
+          \`source_fingerprint\` text NOT NULL,
+          \`prompt\` text NOT NULL,
+          \`references\` text DEFAULT '[]' NOT NULL,
+          \`time_created\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`runtime_owner\` (
+          \`id\` text PRIMARY KEY,
+          \`pid\` integer NOT NULL,
+          \`started_at\` integer NOT NULL,
+          \`heartbeat_at\` integer NOT NULL,
+          \`control_epoch\` integer DEFAULT 0 NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_execution_boundary\` (
+          \`session_id\` text PRIMARY KEY,
+          \`boundary\` text NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`fk_session_execution_boundary_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_execution_owner\` (
+          \`session_id\` text PRIMARY KEY,
+          \`generation\` integer NOT NULL,
+          \`owner_id\` text,
+          \`acquired_at\` integer,
+          \`interrupt_generation\` integer,
+          \`interrupt_reason\` text,
+          \`interrupt_requested_at\` integer,
+          \`recovery_owner_id\` text,
+          \`recovery_started_at\` integer,
+          CONSTRAINT \`fk_session_execution_owner_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_session_execution_owner_owner_id_runtime_owner_id_fk\` FOREIGN KEY (\`owner_id\`) REFERENCES \`runtime_owner\`(\`id\`),
+          CONSTRAINT \`fk_session_execution_owner_recovery_owner_id_runtime_owner_id_fk\` FOREIGN KEY (\`recovery_owner_id\`) REFERENCES \`runtime_owner\`(\`id\`)
         );
       `)
       yield* tx.run(`
@@ -149,10 +205,16 @@ export default {
           \`consumed_tokens\` integer DEFAULT 0 NOT NULL,
           \`last_auditor_decision\` text,
           \`last_auditor_rationale\` text,
+          \`audit_requested_at\` integer,
+          \`auditing_at\` integer,
+          \`auditor_session_id\` text,
+          \`runtime_error\` text,
           \`previous_revision\` integer,
           \`reservation_id\` text,
           \`reservation_owner\` text,
           \`reservation_created_at\` integer,
+          \`continuation_source_message_id\` text,
+          \`continuation_expected_user_seq\` integer,
           \`continuation_prompt\` text,
           \`time_updated\` integer NOT NULL,
           CONSTRAINT \`fk_goal_automation_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE,
@@ -235,6 +297,7 @@ export default {
           \`constraints\` text DEFAULT '[]' NOT NULL,
           \`status\` text DEFAULT 'draft' NOT NULL,
           \`revision\` integer DEFAULT 0 NOT NULL,
+          \`auditor_runs\` integer DEFAULT 0 NOT NULL,
           \`continuation_policy\` text DEFAULT '{"mode":"manual"}' NOT NULL,
           \`auditor_policy\` text DEFAULT '{}' NOT NULL,
           \`blocker\` text,
@@ -342,6 +405,67 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`oxp_correlation_ref\` (
+          \`scheme\` text NOT NULL,
+          \`digest\` text NOT NULL,
+          \`activity_id\` text NOT NULL,
+          \`scope\` text NOT NULL,
+          \`first_seen_at\` integer NOT NULL,
+          \`last_seen_at\` integer NOT NULL,
+          CONSTRAINT \`oxp_correlation_ref_pk\` PRIMARY KEY(\`scheme\`, \`digest\`),
+          CONSTRAINT \`fk_oxp_correlation_ref_activity_id_oxp_parent_activity_id_fk\` FOREIGN KEY (\`activity_id\`) REFERENCES \`oxp_parent_activity\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`oxp_invocation_link\` (
+          \`invocation_id\` text NOT NULL,
+          \`kind\` text NOT NULL,
+          \`ref\` text NOT NULL,
+          \`label\` text,
+          \`relation\` text NOT NULL,
+          CONSTRAINT \`oxp_invocation_link_pk\` PRIMARY KEY(\`invocation_id\`, \`kind\`, \`ref\`, \`relation\`),
+          CONSTRAINT \`fk_oxp_invocation_link_invocation_id_oxp_invocation_id_fk\` FOREIGN KEY (\`invocation_id\`) REFERENCES \`oxp_invocation\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`oxp_invocation\` (
+          \`id\` text PRIMARY KEY,
+          \`activity_id\` text NOT NULL,
+          \`host_run_id\` text NOT NULL,
+          \`observed_epoch\` integer,
+          \`plane\` text NOT NULL,
+          \`tool\` text NOT NULL,
+          \`action\` text,
+          \`root_id\` text,
+          \`root_alias\` text,
+          \`status\` text DEFAULT 'running' NOT NULL,
+          \`error_code\` text,
+          \`mutation_attempted\` integer DEFAULT false NOT NULL,
+          \`mutation_committed\` integer DEFAULT false NOT NULL,
+          \`safe_summary\` text,
+          \`time_started\` integer NOT NULL,
+          \`time_completed\` integer,
+          CONSTRAINT \`fk_oxp_invocation_activity_id_oxp_parent_activity_id_fk\` FOREIGN KEY (\`activity_id\`) REFERENCES \`oxp_parent_activity\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`oxp_parent_activity\` (
+          \`id\` text PRIMARY KEY,
+          \`title\` text,
+          \`first_seen_at\` integer NOT NULL,
+          \`last_seen_at\` integer NOT NULL,
+          \`call_count\` integer DEFAULT 0 NOT NULL,
+          \`failure_count\` integer DEFAULT 0 NOT NULL,
+          \`augmentation_calls\` integer DEFAULT 0 NOT NULL,
+          \`supervision_calls\` integer DEFAULT 0 NOT NULL,
+          \`delegation_calls\` integer DEFAULT 0 NOT NULL,
+          \`observed_epoch_count\` integer DEFAULT 0 NOT NULL,
+          \`last_tool\` text,
+          \`last_root_alias\` text,
+          \`time_archived\` integer
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`permission\` (
           \`id\` text PRIMARY KEY,
           \`project_id\` text NOT NULL,
@@ -400,6 +524,87 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`scheduled_task_control\` (
+          \`id\` text PRIMARY KEY,
+          \`paused\` integer DEFAULT false NOT NULL,
+          \`generation\` integer DEFAULT 0 NOT NULL,
+          \`time_updated\` integer NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`scheduled_task_lease\` (
+          \`task_id\` text PRIMARY KEY,
+          \`fire_for\` integer NOT NULL,
+          \`lease_id\` text NOT NULL,
+          \`owner\` text,
+          \`acquired_at\` integer NOT NULL,
+          \`heartbeat_at\` integer NOT NULL,
+          \`attempt\` integer DEFAULT 1 NOT NULL,
+          CONSTRAINT \`fk_scheduled_task_lease_task_id_scheduled_task_id_fk\` FOREIGN KEY (\`task_id\`) REFERENCES \`scheduled_task\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`scheduled_task_run\` (
+          \`id\` text PRIMARY KEY,
+          \`task_id\` text NOT NULL,
+          \`fire_for\` integer NOT NULL,
+          \`trigger\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`session_id\` text,
+          \`goal_id\` text,
+          \`workspace_id\` text,
+          \`directory\` text,
+          \`skip_reason\` text,
+          \`error_kind\` text,
+          \`error_message\` text,
+          \`attempt\` integer DEFAULT 1 NOT NULL,
+          \`acknowledged_at\` integer,
+          \`started_at\` integer NOT NULL,
+          \`finished_at\` integer,
+          CONSTRAINT \`fk_scheduled_task_run_task_id_scheduled_task_id_fk\` FOREIGN KEY (\`task_id\`) REFERENCES \`scheduled_task\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`scheduled_task_session_binding\` (
+          \`task_id\` text PRIMARY KEY,
+          \`session_id\` text NOT NULL,
+          \`task_revision\` integer NOT NULL,
+          \`user_seq_fence\` integer,
+          \`generation\` integer DEFAULT 1 NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`fk_scheduled_task_session_binding_task_id_scheduled_task_id_fk\` FOREIGN KEY (\`task_id\`) REFERENCES \`scheduled_task\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`scheduled_task\` (
+          \`id\` text PRIMARY KEY,
+          \`project_id\` text,
+          \`target_directory\` text NOT NULL,
+          \`target\` text NOT NULL,
+          \`session_policy\` text DEFAULT '{"kind":"new"}' NOT NULL,
+          \`name\` text NOT NULL,
+          \`enabled\` integer DEFAULT false NOT NULL,
+          \`revision\` integer DEFAULT 0 NOT NULL,
+          \`schedule\` text NOT NULL,
+          \`timezone\` text,
+          \`action\` text NOT NULL,
+          \`policy\` text NOT NULL,
+          \`next_run_at\` integer,
+          \`last_run_at\` integer,
+          \`last_run_status\` text,
+          \`last_run_id\` text,
+          \`consecutive_failures\` integer DEFAULT 0 NOT NULL,
+          \`source\` text DEFAULT 'api' NOT NULL,
+          \`source_path\` text,
+          \`source_message_id\` text,
+          \`source_ref\` text,
+          \`source_principal\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`fk_scheduled_task_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`message\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
@@ -433,6 +638,13 @@ export default {
           \`id\` integer PRIMARY KEY,
           \`watermark_rowid\` integer DEFAULT -1 NOT NULL,
           \`done\` integer DEFAULT 0 NOT NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`session_checkpoint_search\` (
+          \`checkpoint_id\` text PRIMARY KEY NOT NULL,
+          \`paths\` text DEFAULT '' NOT NULL,
+          CONSTRAINT \`fk_session_checkpoint_search_checkpoint_id_session_checkpoint_id_fk\` FOREIGN KEY (\`checkpoint_id\`) REFERENCES \`session_checkpoint\`(\`id\`) ON DELETE CASCADE
         );
       `)
       yield* tx.run(`
@@ -470,7 +682,7 @@ export default {
       `)
       yield* tx.run(`
         CREATE TABLE \`session_context_ops\` (
-          \`id\` text PRIMARY KEY,
+          \`id\` text PRIMARY KEY NOT NULL,
           \`session_id\` text NOT NULL,
           \`batch_id\` text NOT NULL,
           \`operations\` text NOT NULL,
@@ -494,7 +706,7 @@ export default {
       `)
       yield* tx.run(`
         CREATE TABLE \`session_fork_origin\` (
-          \`session_id\` text PRIMARY KEY,
+          \`session_id\` text PRIMARY KEY NOT NULL,
           \`parent_session_id\` text NOT NULL,
           \`source_message_id\` text,
           \`source_seq\` integer,
@@ -539,10 +751,17 @@ export default {
         CREATE TABLE \`session_input\` (
           \`id\` text PRIMARY KEY,
           \`session_id\` text NOT NULL,
+          \`kind\` text DEFAULT 'user' NOT NULL,
+          \`admission_class\` text DEFAULT 'user' NOT NULL,
+          \`user_preemptible\` integer DEFAULT false NOT NULL,
+          \`input\` text,
           \`prompt\` text NOT NULL,
           \`delivery\` text NOT NULL,
+          \`provenance\` text,
           \`admitted_seq\` integer NOT NULL,
           \`promoted_seq\` integer,
+          \`revoked_seq\` integer,
+          \`revoked_reason\` text,
           \`time_created\` integer NOT NULL,
           CONSTRAINT \`fk_session_input_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE CASCADE
         );
@@ -664,6 +883,210 @@ export default {
         );
       `)
       yield* tx.run(`
+        CREATE TABLE \`swarm_blackboard\` (
+          \`swarm_id\` text NOT NULL,
+          \`key\` text NOT NULL,
+          \`value\` text NOT NULL,
+          \`content_type\` text NOT NULL,
+          \`version\` integer DEFAULT 0 NOT NULL,
+          \`author_member_id\` text NOT NULL,
+          \`task_id\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`swarm_blackboard_pk\` PRIMARY KEY(\`swarm_id\`, \`key\`),
+          CONSTRAINT \`fk_swarm_blackboard_swarm_id_swarm_id_fk\` FOREIGN KEY (\`swarm_id\`) REFERENCES \`swarm\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_blackboard_author_member_id_swarm_member_id_fk\` FOREIGN KEY (\`author_member_id\`) REFERENCES \`swarm_member\`(\`id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm_claim\` (
+          \`swarm_id\` text NOT NULL,
+          \`member_id\` text NOT NULL,
+          \`scope\` text NOT NULL,
+          \`generation\` integer DEFAULT 0 NOT NULL,
+          \`expires_at\` integer,
+          \`released_at\` integer,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          CONSTRAINT \`swarm_claim_pk\` PRIMARY KEY(\`swarm_id\`, \`member_id\`, \`scope\`),
+          CONSTRAINT \`fk_swarm_claim_swarm_id_swarm_id_fk\` FOREIGN KEY (\`swarm_id\`) REFERENCES \`swarm\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_claim_member_id_swarm_member_id_fk\` FOREIGN KEY (\`member_id\`) REFERENCES \`swarm_member\`(\`id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm_deliverable\` (
+          \`id\` text PRIMARY KEY,
+          \`swarm_id\` text NOT NULL,
+          \`member_id\` text NOT NULL,
+          \`task_run_id\` text,
+          \`summary\` text NOT NULL,
+          \`refs\` text DEFAULT '[]' NOT NULL,
+          \`files\` text DEFAULT '[]' NOT NULL,
+          \`verdict\` text,
+          \`verdict_by_member_id\` text,
+          \`time_created\` integer NOT NULL,
+          \`verdict_at\` integer,
+          CONSTRAINT \`fk_swarm_deliverable_swarm_id_swarm_id_fk\` FOREIGN KEY (\`swarm_id\`) REFERENCES \`swarm\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_deliverable_member_id_swarm_member_id_fk\` FOREIGN KEY (\`member_id\`) REFERENCES \`swarm_member\`(\`id\`),
+          CONSTRAINT \`fk_swarm_deliverable_task_run_id_swarm_task_run_id_fk\` FOREIGN KEY (\`task_run_id\`) REFERENCES \`swarm_task_run\`(\`id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm_member\` (
+          \`id\` text PRIMARY KEY,
+          \`swarm_id\` text NOT NULL,
+          \`name\` text NOT NULL,
+          \`kind\` text NOT NULL,
+          \`role\` text NOT NULL,
+          \`lifecycle\` text DEFAULT 'active' NOT NULL,
+          \`session_id\` text,
+          \`binding_generation\` integer DEFAULT 0 NOT NULL,
+          \`desired_profile\` text,
+          \`workspace_policy\` text NOT NULL,
+          \`capabilities\` text,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          \`time_stopped\` integer,
+          CONSTRAINT \`fk_swarm_member_swarm_id_swarm_id_fk\` FOREIGN KEY (\`swarm_id\`) REFERENCES \`swarm\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_member_session_id_session_id_fk\` FOREIGN KEY (\`session_id\`) REFERENCES \`session\`(\`id\`) ON DELETE SET NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm_message_delivery\` (
+          \`id\` text PRIMARY KEY,
+          \`message_id\` text NOT NULL,
+          \`recipient_member_id\` text NOT NULL,
+          \`state\` text DEFAULT 'pending' NOT NULL,
+          \`session_input_id\` text NOT NULL,
+          \`claim_generation\` integer DEFAULT 0 NOT NULL,
+          \`claim_owner\` text,
+          \`claim_expires_at\` integer,
+          \`next_attempt_at\` integer,
+          \`attempt_count\` integer DEFAULT 0 NOT NULL,
+          \`admitted_session_id\` text,
+          \`admitted_seq\` integer,
+          \`admitted_at\` integer,
+          \`error\` text,
+          \`time_created\` integer NOT NULL,
+          CONSTRAINT \`fk_swarm_message_delivery_message_id_swarm_message_id_fk\` FOREIGN KEY (\`message_id\`) REFERENCES \`swarm_message\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_message_delivery_recipient_member_id_swarm_member_id_fk\` FOREIGN KEY (\`recipient_member_id\`) REFERENCES \`swarm_member\`(\`id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm_message\` (
+          \`id\` text PRIMARY KEY,
+          \`swarm_id\` text NOT NULL,
+          \`sender_member_id\` text NOT NULL,
+          \`sender_session_id\` text NOT NULL,
+          \`sender_binding_generation\` integer NOT NULL,
+          \`kind\` text NOT NULL,
+          \`body\` text NOT NULL,
+          \`task_id\` text,
+          \`correlation_id\` text,
+          \`response_to\` text,
+          \`priority\` text DEFAULT 'normal' NOT NULL,
+          \`reply_expected\` integer DEFAULT true NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`expires_at\` integer,
+          CONSTRAINT \`fk_swarm_message_swarm_id_swarm_id_fk\` FOREIGN KEY (\`swarm_id\`) REFERENCES \`swarm\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_message_sender_member_id_swarm_member_id_fk\` FOREIGN KEY (\`sender_member_id\`) REFERENCES \`swarm_member\`(\`id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm\` (
+          \`id\` text PRIMARY KEY,
+          \`project_id\` text NOT NULL,
+          \`directory\` text NOT NULL,
+          \`workspace_id\` text,
+          \`name\` text NOT NULL,
+          \`status\` text DEFAULT 'creating' NOT NULL,
+          \`coordinator_member_id\` text,
+          \`policy\` text DEFAULT '{}' NOT NULL,
+          \`revision\` integer DEFAULT 0 NOT NULL,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          \`time_completed\` integer,
+          \`time_archived\` integer,
+          CONSTRAINT \`fk_swarm_project_id_project_id_fk\` FOREIGN KEY (\`project_id\`) REFERENCES \`project\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_workspace_id_workspace_id_fk\` FOREIGN KEY (\`workspace_id\`) REFERENCES \`workspace\`(\`id\`) ON DELETE SET NULL
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm_task_dependency\` (
+          \`task_id\` text NOT NULL,
+          \`depends_on_task_id\` text NOT NULL,
+          \`requirement\` text DEFAULT 'require_success' NOT NULL,
+          CONSTRAINT \`swarm_task_dependency_pk\` PRIMARY KEY(\`task_id\`, \`depends_on_task_id\`),
+          CONSTRAINT \`fk_swarm_task_dependency_task_id_swarm_task_id_fk\` FOREIGN KEY (\`task_id\`) REFERENCES \`swarm_task\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_task_dependency_depends_on_task_id_swarm_task_id_fk\` FOREIGN KEY (\`depends_on_task_id\`) REFERENCES \`swarm_task\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT "swarm_task_dependency_no_self_check" CHECK("task_id" != "depends_on_task_id")
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm_task_lease\` (
+          \`task_id\` text PRIMARY KEY,
+          \`generation\` integer NOT NULL,
+          \`owner_member_id\` text NOT NULL,
+          \`owner_session_id\` text NOT NULL,
+          \`owner_binding_generation\` integer NOT NULL,
+          \`lease_owner_process\` text NOT NULL,
+          \`state\` text DEFAULT 'active' NOT NULL,
+          \`hold_user_seq\` integer,
+          \`hold_started_at\` integer,
+          \`hold_deadline\` integer,
+          \`retire_reason\` text,
+          \`retire_requested_at\` integer,
+          \`acquired_at\` integer NOT NULL,
+          \`expires_at\` integer NOT NULL,
+          \`renewed_at\` integer,
+          CONSTRAINT \`fk_swarm_task_lease_task_id_swarm_task_id_fk\` FOREIGN KEY (\`task_id\`) REFERENCES \`swarm_task\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_task_lease_owner_member_id_swarm_member_id_fk\` FOREIGN KEY (\`owner_member_id\`) REFERENCES \`swarm_member\`(\`id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm_task_run\` (
+          \`id\` text PRIMARY KEY,
+          \`task_id\` text NOT NULL,
+          \`member_id\` text NOT NULL,
+          \`session_id\` text NOT NULL,
+          \`binding_generation\` integer NOT NULL,
+          \`lease_generation\` integer NOT NULL,
+          \`session_input_id\` text NOT NULL,
+          \`status\` text NOT NULL,
+          \`failure_kind\` text,
+          \`failure_detail\` text,
+          \`admitted_at\` integer,
+          \`started_at\` integer,
+          \`ended_at\` integer,
+          \`time_created\` integer NOT NULL,
+          CONSTRAINT \`fk_swarm_task_run_task_id_swarm_task_id_fk\` FOREIGN KEY (\`task_id\`) REFERENCES \`swarm_task\`(\`id\`) ON DELETE CASCADE,
+          CONSTRAINT \`fk_swarm_task_run_member_id_swarm_member_id_fk\` FOREIGN KEY (\`member_id\`) REFERENCES \`swarm_member\`(\`id\`)
+        );
+      `)
+      yield* tx.run(`
+        CREATE TABLE \`swarm_task\` (
+          \`id\` text PRIMARY KEY,
+          \`swarm_id\` text NOT NULL,
+          \`title\` text NOT NULL,
+          \`description\` text,
+          \`status\` text DEFAULT 'pending' NOT NULL,
+          \`priority\` integer DEFAULT 0 NOT NULL,
+          \`created_by_member_id\` text,
+          \`reserved_member_id\` text,
+          \`reserved_until\` integer,
+          \`reservation_revision\` integer DEFAULT 0 NOT NULL,
+          \`lease_generation\` integer DEFAULT 0 NOT NULL,
+          \`semantic_retry_count\` integer DEFAULT 0 NOT NULL,
+          \`acceptance\` text DEFAULT '{"criteria":[]}' NOT NULL,
+          \`metadata\` text DEFAULT '{}' NOT NULL,
+          \`ready_at\` integer,
+          \`time_created\` integer NOT NULL,
+          \`time_updated\` integer NOT NULL,
+          \`time_completed\` integer,
+          CONSTRAINT \`fk_swarm_task_swarm_id_swarm_id_fk\` FOREIGN KEY (\`swarm_id\`) REFERENCES \`swarm\`(\`id\`) ON DELETE CASCADE
+        );
+      `)
+      yield* tx.run(`
         CREATE TABLE \`maintenance_usage\` (
           \`id\` integer PRIMARY KEY AUTOINCREMENT,
           \`agent\` text NOT NULL,
@@ -707,6 +1130,13 @@ export default {
           \`reasoning_tokens\` integer DEFAULT 0 NOT NULL
         );
       `)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`revision_draft_target_idx\` ON \`revision_draft\` (\`target_kind\`,\`target_key\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`session_execution_owner_owner_idx\` ON \`session_execution_owner\` (\`owner_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`session_execution_owner_recovery_owner_idx\` ON \`session_execution_owner\` (\`recovery_owner_id\`);`,
+      )
       yield* tx.run(
         `CREATE INDEX \`event_payload_chunk_time_created_idx\` ON \`event_payload_chunk\` (\`time_created\`);`,
       )
@@ -770,9 +1200,53 @@ export default {
       )
       yield* tx.run(`CREATE INDEX \`memory_topic_project_idx\` ON \`memory_topic\` (\`project_id\`);`)
       yield* tx.run(`CREATE INDEX \`memory_topic_workspace_idx\` ON \`memory_topic\` (\`workspace_id\`);`)
+      yield* tx.run(`CREATE INDEX \`oxp_correlation_ref_activity_idx\` ON \`oxp_correlation_ref\` (\`activity_id\`);`)
+      yield* tx.run(`CREATE INDEX \`oxp_invocation_link_ref_idx\` ON \`oxp_invocation_link\` (\`kind\`,\`ref\`);`)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`oxp_invocation_link_invocation_ref_idx\` ON \`oxp_invocation_link\` (\`invocation_id\`,\`kind\`,\`ref\`,\`relation\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`oxp_invocation_activity_started_idx\` ON \`oxp_invocation\` (\`activity_id\`,\`time_started\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`oxp_invocation_activity_status_started_idx\` ON \`oxp_invocation\` (\`activity_id\`,\`status\`,\`time_started\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`oxp_invocation_activity_host_epoch_idx\` ON \`oxp_invocation\` (\`activity_id\`,\`host_run_id\`,\`observed_epoch\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`oxp_invocation_status_host_idx\` ON \`oxp_invocation\` (\`status\`,\`host_run_id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`oxp_invocation_started_idx\` ON \`oxp_invocation\` (\`time_started\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`oxp_parent_activity_last_seen_idx\` ON \`oxp_parent_activity\` (\`time_archived\`,\`last_seen_at\`,\`id\`);`,
+      )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`permission_project_action_resource_idx\` ON \`permission\` (\`project_id\`,\`action\`,\`resource\`);`,
       )
+      yield* tx.run(`CREATE UNIQUE INDEX \`scheduled_task_lease_id_idx\` ON \`scheduled_task_lease\` (\`lease_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`scheduled_task_lease_heartbeat_idx\` ON \`scheduled_task_lease\` (\`heartbeat_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`scheduled_task_run_logical_idx\` ON \`scheduled_task_run\` (\`task_id\`,\`fire_for\`);`,
+      )
+      yield* tx.run(`CREATE UNIQUE INDEX \`scheduled_task_run_goal_idx\` ON \`scheduled_task_run\` (\`goal_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`scheduled_task_run_task_started_idx\` ON \`scheduled_task_run\` (\`task_id\`,\`started_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`scheduled_task_run_started_idx\` ON \`scheduled_task_run\` (\`started_at\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`scheduled_task_run_inbox_idx\` ON \`scheduled_task_run\` (\`acknowledged_at\`,\`started_at\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`scheduled_task_session_binding_session_idx\` ON \`scheduled_task_session_binding\` (\`session_id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`scheduled_task_due_idx\` ON \`scheduled_task\` (\`enabled\`,\`next_run_at\`);`)
+      yield* tx.run(`CREATE INDEX \`scheduled_task_project_idx\` ON \`scheduled_task\` (\`project_id\`,\`name\`);`)
+      yield* tx.run(`CREATE UNIQUE INDEX \`scheduled_task_source_path_idx\` ON \`scheduled_task\` (\`source_path\`);`)
       yield* tx.run(
         `CREATE INDEX \`message_session_time_created_id_idx\` ON \`message\` (\`session_id\`,\`time_created\`,\`id\`);`,
       )
@@ -780,10 +1254,13 @@ export default {
       yield* tx.run(`CREATE INDEX \`part_session_idx\` ON \`part\` (\`session_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_checkpoint_session_id_idx\` ON \`session_checkpoint\` (\`session_id\`);`)
       yield* tx.run(
-        `CREATE INDEX \`session_checkpoint_session_ordinal_idx\` ON \`session_checkpoint\` (\`session_id\`,\`ordinal\`);`,
+        `CREATE UNIQUE INDEX \`session_checkpoint_session_ordinal_idx\` ON \`session_checkpoint\` (\`session_id\`,\`ordinal\`);`,
       )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`session_checkpoint_session_user_message_idx\` ON \`session_checkpoint\` (\`session_id\`,\`user_message_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_checkpoint_epoch_created_idx\` ON \`session_checkpoint\` (\`epoch\`,\`created_at\`);`,
       )
       yield* tx.run(`CREATE INDEX \`session_context_ops_session_idx\` ON \`session_context_ops\` (\`session_id\`);`)
       yield* tx.run(
@@ -804,7 +1281,13 @@ export default {
         `CREATE UNIQUE INDEX \`session_group_plugin_owner_ref_idx\` ON \`session_group\` (\`kind\`,\`owner_plugin\`,\`owner_ref\`) WHERE "session_group"."kind" = 'plugin' AND "session_group"."owner_plugin" IS NOT NULL AND "session_group"."owner_ref" IS NOT NULL;`,
       )
       yield* tx.run(
-        `CREATE INDEX \`session_input_session_pending_delivery_seq_idx\` ON \`session_input\` (\`session_id\`,\`promoted_seq\`,\`delivery\`,\`admitted_seq\`);`,
+        `CREATE INDEX \`session_input_session_pending_class_delivery_seq_idx\` ON \`session_input\` (\`session_id\`,\`admission_class\`,\`delivery\`,\`admitted_seq\`) WHERE "session_input"."promoted_seq" IS NULL AND "session_input"."revoked_seq" IS NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_input_session_latest_user_idx\` ON \`session_input\` (\`session_id\`,\`admitted_seq\`) WHERE "session_input"."kind" = 'user' AND "session_input"."admission_class" = 'user';`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_input_session_preemptible_seq_idx\` ON \`session_input\` (\`session_id\`,\`admitted_seq\`) WHERE "session_input"."user_preemptible" = 1 AND "session_input"."promoted_seq" IS NULL AND "session_input"."revoked_seq" IS NULL;`,
       )
       yield* tx.run(
         `CREATE UNIQUE INDEX \`session_input_session_admitted_seq_idx\` ON \`session_input\` (\`session_id\`,\`admitted_seq\`);`,
@@ -825,9 +1308,15 @@ export default {
       yield* tx.run(
         `CREATE INDEX \`session_message_tool_overlay_message_idx\` ON \`session_message_tool_overlay\` (\`message_id\`);`,
       )
+      yield* tx.run(
+        `CREATE INDEX \`session_message_tool_overlay_unsettled_idx\` ON \`session_message_tool_overlay\` (\`message_id\`,\`call_id\`) WHERE ("session_message_tool_overlay"."settlement_event_id" is null);`,
+      )
       yield* tx.run(`CREATE INDEX \`session_project_idx\` ON \`session\` (\`project_id\`);`)
       yield* tx.run(
         `CREATE INDEX \`session_project_directory_root_updated_idx\` ON \`session\` (\`project_id\`,\`directory\`,\`time_updated\`) WHERE ("session"."parent_id" is null);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`session_project_root_updated_id_idx\` ON \`session\` (\`project_id\`,\`time_updated\`,\`id\`) WHERE ("session"."parent_id" is null);`,
       )
       yield* tx.run(
         `CREATE INDEX \`session_directory_root_created_id_idx\` ON \`session\` (\`directory\`,\`time_created\`,\`id\`) WHERE ("session"."parent_id" is null);`,
@@ -836,6 +1325,94 @@ export default {
       yield* tx.run(`CREATE INDEX \`session_parent_idx\` ON \`session\` (\`parent_id\`);`)
       yield* tx.run(`CREATE INDEX \`session_group_idx\` ON \`session\` (\`group_id\`);`)
       yield* tx.run(`CREATE INDEX \`todo_session_idx\` ON \`todo\` (\`session_id\`);`)
+      yield* tx.run(`CREATE INDEX \`swarm_blackboard_task_idx\` ON \`swarm_blackboard\` (\`swarm_id\`,\`task_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`swarm_claim_expiry_idx\` ON \`swarm_claim\` (\`expires_at\`,\`swarm_id\`,\`member_id\`) WHERE "swarm_claim"."released_at" IS NULL AND "swarm_claim"."expires_at" IS NOT NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_deliverable_stream_idx\` ON \`swarm_deliverable\` (\`swarm_id\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_deliverable_member_idx\` ON \`swarm_deliverable\` (\`swarm_id\`,\`member_id\`,\`time_created\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`swarm_deliverable_task_run_idx\` ON \`swarm_deliverable\` (\`task_run_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`swarm_deliverable_open_idx\` ON \`swarm_deliverable\` (\`swarm_id\`,\`time_created\`,\`id\`) WHERE "swarm_deliverable"."verdict" IS NULL;`,
+      )
+      yield* tx.run(`CREATE UNIQUE INDEX \`swarm_member_name_idx\` ON \`swarm_member\` (\`swarm_id\`,\`name\`);`)
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`swarm_member_bound_session_idx\` ON \`swarm_member\` (\`swarm_id\`,\`session_id\`) WHERE "swarm_member"."session_id" IS NOT NULL;`,
+      )
+      yield* tx.run(`CREATE INDEX \`swarm_member_session_idx\` ON \`swarm_member\` (\`session_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`swarm_member_roster_idx\` ON \`swarm_member\` (\`swarm_id\`,\`lifecycle\`,\`kind\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`swarm_message_delivery_recipient_idx\` ON \`swarm_message_delivery\` (\`message_id\`,\`recipient_member_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE UNIQUE INDEX \`swarm_message_delivery_input_idx\` ON \`swarm_message_delivery\` (\`session_input_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_message_delivery_recipient_pending_idx\` ON \`swarm_message_delivery\` (\`recipient_member_id\`,\`time_created\`,\`id\`) WHERE "swarm_message_delivery"."state" = 'pending';`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_message_delivery_due_idx\` ON \`swarm_message_delivery\` (\`next_attempt_at\`,\`id\`) WHERE "swarm_message_delivery"."state" = 'pending';`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_message_delivery_claim_expiry_idx\` ON \`swarm_message_delivery\` (\`claim_expires_at\`,\`id\`) WHERE "swarm_message_delivery"."state" = 'claimed';`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_message_stream_idx\` ON \`swarm_message\` (\`swarm_id\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_message_correlation_idx\` ON \`swarm_message\` (\`swarm_id\`,\`correlation_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_message_expiry_idx\` ON \`swarm_message\` (\`expires_at\`,\`id\`) WHERE "swarm_message"."expires_at" IS NOT NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_project_status_updated_idx\` ON \`swarm\` (\`project_id\`,\`status\`,\`time_updated\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`swarm_workspace_idx\` ON \`swarm\` (\`workspace_id\`,\`status\`,\`time_updated\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_dependency_reverse_idx\` ON \`swarm_task_dependency\` (\`depends_on_task_id\`,\`task_id\`);`,
+      )
+      yield* tx.run(`CREATE INDEX \`swarm_task_lease_due_idx\` ON \`swarm_task_lease\` (\`expires_at\`,\`task_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_lease_process_due_idx\` ON \`swarm_task_lease\` (\`lease_owner_process\`,\`expires_at\`,\`task_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_lease_state_owner_idx\` ON \`swarm_task_lease\` (\`state\`,\`lease_owner_process\`,\`task_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_lease_hold_due_idx\` ON \`swarm_task_lease\` (\`hold_deadline\`,\`task_id\`) WHERE "swarm_task_lease"."state" = 'human_hold' AND "swarm_task_lease"."hold_deadline" IS NOT NULL;`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_lease_state_retire_idx\` ON \`swarm_task_lease\` (\`state\`,\`retire_requested_at\`,\`task_id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_lease_member_idx\` ON \`swarm_task_lease\` (\`owner_member_id\`,\`task_id\`);`,
+      )
+      yield* tx.run(`CREATE UNIQUE INDEX \`swarm_task_run_input_idx\` ON \`swarm_task_run\` (\`session_input_id\`);`)
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_run_task_created_idx\` ON \`swarm_task_run\` (\`task_id\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_run_member_created_idx\` ON \`swarm_task_run\` (\`member_id\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_ready_idx\` ON \`swarm_task\` (\`swarm_id\`,\`status\`,"priority" DESC,\`ready_at\`,\`time_created\`,\`id\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_dispatch_ready_idx\` ON \`swarm_task\` ("priority" DESC,\`ready_at\`,\`time_created\`,\`id\`,\`swarm_id\`) WHERE "swarm_task"."status" = 'ready';`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_reserved_member_idx\` ON \`swarm_task\` (\`reserved_member_id\`,\`status\`,\`reserved_until\`);`,
+      )
+      yield* tx.run(
+        `CREATE INDEX \`swarm_task_reservation_due_idx\` ON \`swarm_task\` (\`reserved_until\`,\`id\`) WHERE "swarm_task"."status" = 'ready' AND "swarm_task"."reserved_until" IS NOT NULL;`,
+      )
       yield* tx.run(`CREATE INDEX \`maintenance_usage_completed_idx\` ON \`maintenance_usage\` (\`time_completed\`);`)
       yield* tx.run(
         `CREATE INDEX \`maintenance_usage_project_completed_idx\` ON \`maintenance_usage\` (\`project_id\`,\`time_completed\`);`,
