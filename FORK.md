@@ -13,15 +13,68 @@ Default branch: `main`. Fetch `upstream/dev` for curiosity. Merge **tags**.
 
 ## Product boundary
 
-OpenFork `main` is a **client-side product fork**. It intentionally keeps the
-local OpenCode runtime/server infrastructure required by the desktop, browser, and
-mobile clients, while pruning upstream hosted SaaS/backend product infrastructure.
+OpenFork `main` is an **independent product implemented as a source-level branch
+fork of OpenCode**. It owns its local client, local sidecar/server, runtime, APIs,
+plugins/extensions, UI, tools, persistence, and product behavior.
 
-The local sidecar is therefore part of the client architecture, not evidence that
-OpenFork carries the upstream hosted backend. Our compatibility target is the
-upstream local OpenCode infrastructure and behavior: preserve 1:1 fidelity where
-applicable, and keep stronger fork correctness/performance behavior when it can be
-composed without breaking that contract.
+OpenFork is **not** an OpenCode-compatible distribution or wrapper. Shared ancestry,
+package names, and tag merges do not imply that OpenCode plugins, clients,
+extensions, scripts, or local API consumers work with OpenFork.
+
+Upstream hosted backend implementation packages are pruned, but OpenFork still
+consumes selected **upstream-operated remote OpenCode services**. Those deployed
+remote contracts are the strict compatibility boundary because they are outside the
+fork's control.
+
+### Compatibility contract
+
+- **Strict:** upstream-operated remote OpenCode APIs actually consumed by OpenFork
+  (for example Zen/Go provider/model services and any auth/account/usage/sharing
+  endpoints the fork uses). Preserve required wire, auth, streaming, model,
+  response/error, and quota semantics.
+- **Fork-owned:** local HTTP APIs, V1/current client APIs, runtime behavior,
+  plugin/extension APIs, UI, tools, local configuration, events, and persistence.
+  These may intentionally diverge from OpenCode.
+- **No implicit plugin compatibility:** a plugin that works in OpenCode may not work
+  in OpenFork. Support exists only when an exact integration is explicitly named,
+  tested, and documented.
+- **Source sync is not compatibility:** merging OpenCode release tags is how the
+  fork acquires useful upstream code. Each local change may be taken, adapted,
+  backported, or rejected.
+
+### Brand boundary
+
+OpenFork-owned presentation and attribution use **OpenFork**. This includes desktop,
+web/PWA, mobile, CLI/TUI, OAuth/error/help surfaces, local API documentation,
+package/repository metadata, and third-party attribution headers. Product links
+belong under `https://github.com/thelabcorner/openfork`.
+
+Names that are contracts rather than presentation remain unchanged until a deliberate
+migration exists: the `opencode` executable, `opencode.json`, `.opencode/`,
+`OPENCODE_*`, `@opencode-ai/*`, provider IDs, persisted/protocol identifiers,
+and `opencode://`. Likewise, upstream service brands such as **OpenCode Zen**,
+**OpenCode Go**, and **OpenCode Console** remain upstream names. This distinction
+prevents both accidental upstream branding and accidental compatibility breakage.
+
+### Distribution boundary
+
+Compatibility names are not distribution ownership. OpenFork releases, installers,
+containers, update checks, and self-update paths must resolve to fork-owned
+`thelabcorner/openfork` infrastructure. They must not silently install or publish
+through upstream OpenCode npm, Homebrew, Scoop, Chocolatey, GitHub-release, container,
+or install-script channels.
+
+The current CLI self-updater owns only direct POSIX installations at
+`~/.opencode/bin/opencode`. It stages and verifies the downloaded OpenFork binary
+before atomically replacing the compatibility executable. Package-manager installs,
+Windows CLI installs, and any path whose ownership is not explicit are treated as
+externally managed: OpenFork may report that an update exists, but it does not replace
+the executable through an upstream distribution channel.
+
+The desktop update feed is pinned to `thelabcorner/openfork`, but automatic desktop
+updates remain disabled until release-channel metadata and signing policy are
+explicitly defined. Retained npm/package identifiers similarly do not authorize
+OpenFork to publish into upstream-owned namespaces.
 
 ## Runtime-generation policy
 
@@ -42,9 +95,26 @@ not using that migration as a reason to retire its mature V1 runtime.
   implementation exists upstream. V1 retirement requires a separate explicit
   OpenFork architecture decision with proven parity and a product reason.
 
-Therefore, “1:1 upstream fidelity” means fidelity to applicable local behavior,
-contracts, protocols, and infrastructure—not mandatory fidelity to upstream's
-runtime-generation deprecation schedule.
+Therefore, **1:1 upstream fidelity applies to consumed upstream-operated remote
+service contracts, not to upstream local behavior or architecture**.
+
+### UI-generation policy
+
+OpenFork's V1-first runtime strategy does **not** imply a V1-first interface.
+
+The new/V2 presentation system is the preferred OpenFork UI direction. The current
+desktop app defaults to the new layout, the legacy-layout sunset has passed, and the
+primary routes compose V2/new-layout surfaces such as settings, prompt input,
+project explorer, browser, terminal/file presentation, and newer session actions.
+
+- Continue building and improving the V2/new-layout UI.
+- Do not replace V2 UI with legacy presentation merely because the underlying
+  execution runtime or local HTTP contract is V1-oriented.
+- UI generation, runtime generation, and local API generation are independent axes.
+- A V2 UI component does not require the current/V2 local API or current/V2
+  execution runner. Adapt it to the best OpenFork-owned contract.
+- Backporting a current/V2 runtime capability into V1 does not require abandoning
+  the newer presentation.
 
 ### Local client/API policy
 
@@ -67,9 +137,9 @@ to the current Protocol/`/api/*` client surface as a product goal.
   semantics from current/V2. Do not inherit its client API migration merely
   because that is upstream's packaging.
 
-This policy is about OpenCode's **local client/server API**. It does not refer to
-the OpenCode-controlled hosted model gateway (Zen/Go). Hosted provider API
-versioning is orthogonal and remains a provider-adapter compatibility concern.
+This policy is about OpenFork's **local client/server API**. It does not weaken the
+separate requirement to remain compatible with the OpenCode-controlled hosted
+services that OpenFork consumes.
 
 ```powershell
 bun run fork:sync preflight v1.18.29
@@ -92,7 +162,7 @@ and add a regression test in `script/fork-sync.test.ts` instead.
 
 `packages/app`, `client`, `codemode`, `core`, `desktop`, `effect-drizzle-sqlite`, `effect-sqlite-node`, `http-recorder`, `httpapi-codegen`, `llm`, `opencode`, `plugin`, `protocol`, `schema`, `script`, `sdk/js`, `server`, `session-ui`, `ui`.
 
-Compatibility exception: `packages/tui` also remains in the workspace for now.
+Retained-coupling exception: `packages/tui` also remains in the workspace for now.
 It is **not an OpenFork product surface**; embedded upstream CLI code still imports
 it, so pruning it before that coupling is removed breaks install/typecheck. The
 machine-readable source of truth is `keep-manifest.json`, where this is recorded as
@@ -102,9 +172,10 @@ machine-readable source of truth is `keep-manifest.json`, where this is recorded
 
 `packages/console`, `stats`, `enterprise`, `function`, `slack`, `web`, `storybook`, `cli`, `sdk-next`, `docs`, `identity`, `containers`, `infra/`, `sst.config.ts`, `github/`, `sdks/`, `nix/`.
 
-TUI is not a product. The embedded CLI/TUI compatibility code under
+TUI is not a product. The retained embedded CLI/TUI code under
 `packages/opencode/src/cli` and the deferred `packages/tui` workspace leaf should
-normally take upstream behavior rather than accumulate fork-specific product work.
+generally receive only low-cost maintenance. Upstream changes may be used as a
+source donor when useful; there is no TUI compatibility obligation.
 Re-evaluate pruning only with a deliberate embedded-CLI decoupling design.
 
 These are deleted from the branch. After every tag merge run `bun run fork:prune`. A re-added DROP path is a failed sync, not something to "fix" by keeping.
@@ -139,13 +210,13 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 
 | Path | Rule |
 |---|---|
-| `packages/opencode/src/tool/registry.ts` | Fork tools **plus** every new upstream tool |
+| `packages/opencode/src/tool/registry.ts` | Preserve the OpenFork tool set. Treat new upstream tools as candidates: adopt only when they fit OpenFork's product and pass explicit review/tests. |
 | `packages/opencode/src/agent/agent.ts` | Take upstream agent fixes; keep native `yolo` primary mode and its final permission-allow policy |
 | `packages/opencode/src/tool/shell.ts` | Take upstream shell/parser fixes; keep the `catastrophicDeleteReason` pre-execution guard |
-| `packages/opencode/src/plugin/index.ts` | Union provider/plugin hooks |
+| `packages/opencode/src/plugin/index.ts` | Preserve the OpenFork plugin surface. Take upstream hooks only when deliberately useful; prioritize changes required by consumed remote provider/backend contracts. No generic plugin parity. |
 | `packages/opencode/src/session/prompt.ts` | Take upstream loop/safety fixes; keep fork hooks (SPAD, quota, pause, **conversation-control compiler**, **Goal context + durable continuation + GoalAuditor semantic gate**) |
 | `packages/opencode/src/session/message-v2.ts` | Keep fork hook (effective-context compiler) — upstream has no context overlay |
-| `packages/opencode/src/provider/provider.ts` | Take upstream provider fixes; keep fork credential/usage hooks |
+| `packages/opencode/src/provider/provider.ts` | Take upstream changes required for consumed remote provider/backend contracts and useful provider fixes; keep fork credential/usage hooks. Local provider architecture may diverge. |
 | `packages/opencode/src/server/routes/instance/httpapi/api.ts` | Re-register fork groups after upstream edits |
 | `packages/opencode/src/server/routes/instance/httpapi/server.ts` | Same |
 | root / package `package.json` | Canonical union in `mergePackageJson` (`script/fork-sync.ts`): **upstream versions**; union deps (upstream wins overlaps); union scripts minus `dev:console/dev:stats/dev:storybook/sso` (fork wins `dev`); union `exports`/`imports` (fork wins overlaps, reported); union `files`; **curated explicit `workspaces.packages`** — never upstream `packages/*` globs (v1.18.29 broke `bun install` via pruned `packages/slack`). |
@@ -198,12 +269,12 @@ tracked, no conflict markers). The rest still needs eyes:
 - Locked session-group memberships enforced
 - Session-group plugin hooks registered
 - Quota routes registered
-- Extra tools present **and** new upstream tools present
+- OpenFork tool set intact; any new upstream tool is present only if explicitly adopted
 - JetBrains custom `OpenCode (OpenFork)` ACP installer still preserves existing `~/.jetbrains/acp.json` entries
 - Native YOLO ACP mode remains permission-frictionless while catastrophic recursive root/home deletion stays hard-blocked
 - ACP runtime still exposes fork tools including `checkpoint`; automatic per-turn checkpoints remain active
-- Websearch = fork engines ∪ upstream additions
-- Plugin/provider unions intact
+- Explicitly adopted websearch engines intact
+- Remote provider/backend compatibility intact; OpenFork plugin hooks intact
 - Explorer/tab e2e match fork UI
 - `bun run --cwd packages/desktop dev` boots
 - Channel DB still fork-specific

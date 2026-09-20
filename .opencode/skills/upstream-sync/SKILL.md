@@ -91,7 +91,7 @@ bun --cwd packages/desktop typecheck
 
 `verify` enforces the semantic checklist below as code (quota routes, fork
 tools, pause/regenerate-title, session groups, updater pin, core memory
-export, websearch union, workspaces installability). Run focused tests for
+export, explicitly adopted websearch engines, workspaces installability). Run focused tests for
 touched KEEP packages. Then tell the user to run `bun run --cwd packages/desktop dev` and look at the window. Do not claim desktop works from typecheck alone.
 
 ## Semantic checklist (all must be considered)
@@ -100,9 +100,10 @@ touched KEEP packages. Then tell the user to run `bun run --cwd packages/desktop
 - Pause / resume / regenerate-title
 - Session groups
 - Quota routes still registered in `api.ts` + `server.ts`
-- Extra tools still in `tool/registry.ts` and new upstream tools present
-- Websearch union
-- Plugin/provider unions
+- OpenFork tools still in `tool/registry.ts`; new upstream tools are reviewed and
+  added only when explicitly adopted
+- Explicitly adopted websearch engines intact
+- Remote provider/backend compatibility preserved; OpenFork plugin hooks intact
 - Fork UI tests not replaced by `#review-panel` assumptions
 - Channel DB name still fork-specific
 - Updater still disabled or still `thelabcorner/openfork`

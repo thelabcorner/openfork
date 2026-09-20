@@ -12,7 +12,7 @@ The docs tree explains and records those contracts; it does not replace them.
 | Directory | Purpose | Expected lifetime |
 | --- | --- | --- |
 | [`map/`](./map/README.md) | Canonical orientation map of the repository, runtimes, packages, V1/V2 boundaries, and fork/upstream split. Start here. | Long-lived; update with architecture changes. |
-| [`architecture/`](./architecture/) | Durable design truths and cross-cutting architecture decisions. | Long-lived. |
+| [`architecture/`](./architecture/) | Durable design truths and cross-cutting architecture decisions, including the [OpenFork compatibility boundary](./architecture/compatibility-boundary.md) and [OXP parent-tool epoch / durable continuation contract](./architecture/oxp-parent-tool-epoch.md). | Long-lived. |
 | [`specs/`](./specs/) | Normative subsystem/API/package specifications. A spec should state whether it describes current behavior or a migration target. | Long-lived while the contract exists. |
 | [`plans/`](./plans/) | Active implementation plans, research ledgers, migration plans, and design campaigns. | Active until closed or superseded. |
 | [`handoff/`](./handoff/) | Campaign handoffs, audits, closeouts, incident notes, and worktree/state transfer documents. | Historical/operational evidence. |
@@ -43,11 +43,15 @@ appropriate.
 
 1. [Repository agent contract](../AGENTS.md)
 2. [Codebase map](./map/README.md)
-3. [Fork ownership and sync policy](../FORK.md)
-4. The relevant package `AGENTS.md`
-5. The relevant durable architecture/spec document
-6. Any active plan or handoff for the campaign being continued
+3. [OpenFork compatibility boundary](./architecture/compatibility-boundary.md)
+4. For OXP work, [parent-tool epoch and durable continuation](./architecture/oxp-parent-tool-epoch.md)
+5. [Fork ownership and sync policy](../FORK.md)
+6. The relevant package `AGENTS.md`
+7. The relevant durable architecture/spec document
+8. Any active plan or handoff for the campaign being continued
 
-The codebase is intentionally hybrid during the V1-to-current/V2 migration. Do not
-infer ownership from a directory named `v2`, an SDK suffix, or a UI component name.
-The dedicated [V1/V2 map](./map/v1-v2.md) defines those axes.
+The codebase contains hybrid V1/current artifacts because upstream migration work
+already landed, but **OpenFork is not pursuing V1-to-current/V2 migration as a
+product goal**. Do not infer ownership from a directory named `v2`, an SDK suffix,
+or a UI component name. The dedicated [V1/V2 map](./map/v1-v2.md) defines those
+axes.

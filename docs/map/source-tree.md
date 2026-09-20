@@ -18,7 +18,7 @@ extensions/           client extensions
 benchmarks/           reusable benchmark harnesses
 experiments/          prototypes / experimental evidence
 docs/                 documentation
-.opencode/            repo-local OpenCode configuration/tools/agents
+.opencode/            repo-local OpenFork configuration/tools/agents (legacy directory name)
 ```
 
 ## “I need to change …”
@@ -39,14 +39,16 @@ docs/                 documentation
 | V1 session/prompt execution | `packages/opencode/src/session` |
 | V1/fork-rich tools | `packages/opencode/src/tool` |
 | Full local HTTP API composition | `packages/opencode/src/server/routes/instance/httpapi` |
+| OXP external-agent semantics / MCP endpoint / parent-tool continuity | `packages/opencode/src/oxp` |
+| OXP tunnel, secure credentials, tray/autostart, standalone migration | `packages/desktop/src/main/oxp`, `packages/desktop/src/main/sidecar.ts` |
 | Upstream-current API contract (donor/transitional, not OpenFork target) | `packages/protocol/src` |
 | Shared server middleware/handlers | `packages/server/src` |
 | Generated upstream-current Protocol client (retained only where needed) | `packages/client` |
-| Generated unified OpenCode SDK | `packages/sdk/js` |
+| Generated unified local-host SDK (legacy OpenCode naming) | `packages/sdk/js` |
 | Provider wire protocols | `packages/llm/src` |
 | Shared browser-safe schemas/IDs | `packages/schema/src` |
-| Plugin contracts | `packages/plugin` |
-| TUI compatibility code | `packages/tui/src`, embedded CLI host under `packages/opencode/src/cli` |
+| OpenFork plugin contracts (not generic OpenCode compatibility) | `packages/plugin` |
+| Retained TUI/CLI coupling code | `packages/tui/src`, embedded CLI host under `packages/opencode/src/cli` |
 | Fork sync/prune behavior | `script/fork-sync.ts`, `script/fork-prune.ts`, `FORK.md`, `keep-manifest.json` |
 
 ## Core/current domain tree
@@ -65,20 +67,21 @@ effect/             Effect runtime/service composition
 filesystem/         filesystem services
 project/            project domain
 observability/      logging/metrics/runtime observation
-v1/                 centralized V1 compatibility helpers
+v1/                 centralized V1 internal-compatibility helpers
 ```
 
 Many top-level Core modules also expose domain services such as Git, shell, PTY,
 snapshot, provider, project inventory, process environment, system projection, and
 tool-output retention/projection.
 
-## OpenCode local-host tree
+## OpenFork local-host tree
 
-`packages/opencode/src` is the local host and major compatibility layer:
+`packages/opencode/src` is the OpenFork local host. The package name is inherited;
+it is not a generic OpenCode compatibility layer:
 
 ```text
 server/             full local HTTP server + route composition
-session/            legacy/V1 execution + compatibility seams
+session/            legacy/V1 execution + internal bridge seams
 tool/               V1/fork-rich tool implementations
 provider/           provider host/runtime integration
 project/            project/instance host integration
@@ -86,6 +89,7 @@ config/             host config resolution
 plugin/             plugin activation
 cli/                embedded legacy CLI/TUI host code
 acp/                ACP integration
+oxp/                ChatGPT/OpenAI external-agent adapter + MCP endpoint
 background/         background execution support
 browser/            browser-related runtime support
 goal/               Goal host integration
@@ -97,7 +101,7 @@ util/               host/runtime utilities
 ```
 
 When adding new behavior, first decide whether it belongs in durable/shared Core or
-only in the OpenCode host adapter. Do not default to `packages/opencode` merely
+only in the OpenFork host adapter. Do not default to `packages/opencode` merely
 because that is where an HTTP route lives.
 
 ## GUI tree
@@ -109,7 +113,7 @@ components/         reusable app-level interaction surfaces
 context/            server state, projections, settings, files, tabs, runtime state
 pages/              route/page composition
 hooks/              reusable reactive data hooks
-utils/              browser/app utilities and compatibility adapters
+utils/              browser/app utilities and internal migration adapters
 i18n/               app strings/localization
 wsl/                Windows/WSL client support
 ```

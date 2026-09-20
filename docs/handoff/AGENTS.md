@@ -1,6 +1,10 @@
 # OpenFork
 
-This repository is **OpenFork**: a branch-fork of [OpenCode](https://github.com/anomalyco/opencode) Desktop. It is not an independent product and it is not OpenChamber.
+This repository is **OpenFork**: an **independent product** implemented as a
+branch-fork of [OpenCode](https://github.com/anomalyco/opencode) Desktop. It is not
+an OpenChamber-style compatible wrapper and it does not promise drop-in OpenCode
+local/plugin/API compatibility. The branch-fork relationship describes Git ancestry
+and source-sync strategy, not product compatibility.
 
 - Default branch: `main`
 - Upstream: `upstream` → `https://github.com/anomalyco/opencode.git`
@@ -8,6 +12,10 @@ This repository is **OpenFork**: a branch-fork of [OpenCode](https://github.com/
 - Ownership map: `../../FORK.md`
 
 This tree is desktop + sidecar only. Ignore and prune: console, stats, enterprise, slack, web, infra, TUI. Those paths are **not on `main`**. If a merge puts them back, `bun run fork:prune` — do not keep them. Do not maintain `../../packages/opencode/src/cli/tui`; take upstream there.
+
+The compatibility-critical upstream boundary is remote OpenCode-operated services
+that OpenFork actually consumes. Local OpenFork APIs/plugins/runtime/UI are
+fork-owned. See `../architecture/compatibility-boundary.md`.
 
 ## Instruction order
 
@@ -83,7 +91,12 @@ There are two generated clients — both are HttpApi-based, but they cover diffe
 - **Protocol client** (`../../packages/client` → `@opencode-ai/client`): generated from `../../packages/protocol` (`makeDefaultApi` / `makeApi`). Covers `ServerApi` only (health, session, message, model, provider, integration, credential, usage, permission, fs, command, skill, event, pty, question, reference, projectCopy). Run `bun run generate` from `../../packages/client` after changing `../../packages/protocol`. Do not edit `src/generated` or `src/generated-effect` directly.
 - **Unified SDK** (`../../packages/sdk/js` → `@opencode-ai/sdk/v2/client` → `createOpencodeClient`): generated from `../../packages/opencode` `OpenCodeHttpApi` (composes `ServerApi` + `InstanceHttpApi` + `RootHttpApi` + `EventApi` + `PtyConnect`). This is the ONLY client that sees `experimental/*`, `instance/*`, `control/*`, `workspace/*`, `quota/*`, etc. (e.g. `experimental.openrouterEndpoints`, `experimental.openrouterTelemetry`). After changing ANY `packages/opencode/src/server/routes/**` HttpApi, run `bun run build` from `../../packages/sdk/js` (runs `bun dev generate > openapi.json` + hey-api codegen). Do not edit `src/v2/gen`.
 
-If you changed both layers, run BOTH. Desktop `../../packages/app` imports the unified SDK via `useSDK()` (`@/context/sdk` → `createOpencodeClient` from `@opencode-ai/sdk/v2/client`) — not `@opencode-ai/client` — for any `sdk().client.experimental.*` call. The old doc label "legacy JavaScript SDK" for `../../packages/sdk/js` is misleading: it is now the canonical unified SDK.
+If you changed both layers, run BOTH. Desktop `../../packages/app` currently imports
+the unified SDK via `useSDK()` (`@/context/sdk` → `createOpencodeClient` from
+`@opencode-ai/sdk/v2/client`) — not `@opencode-ai/client` — for
+`sdk().client.experimental.*` calls. This describes the **current hybrid tree**,
+not an OpenFork commitment to upstream's current/V2 client API or generic OpenCode
+client compatibility.
 
 ## Branch names
 

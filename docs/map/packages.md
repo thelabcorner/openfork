@@ -10,11 +10,11 @@ flowchart TD
   Protocol --> Client["client"]
   Core --> Server["server"]
   Protocol --> Server
-  Core --> OpenCode["opencode local host"]
-  LLM --> OpenCode
-  Protocol --> OpenCode
-  Server --> OpenCode
-  OpenCode --> SDK["sdk/js generated unified client"]
+  Core --> Host["OpenFork local host<br/>packages/opencode"]
+  LLM --> Host
+  Protocol --> Host
+  Server --> Host
+  Host --> SDK["sdk/js generated unified client"]
 
   SDK --> App["app"]
   Schema --> App
@@ -23,7 +23,7 @@ flowchart TD
   App --> Desktop["desktop"]
   SDK --> Mobile["mobile"]
   UI --> Mobile
-  SDK --> TUI["tui compatibility"]
+  SDK --> TUI["retained tui dependency"]
 ```
 
 This diagram shows architectural intent and primary edges, not every current
@@ -34,27 +34,27 @@ called out below.
 
 | Package | Role |
 | --- | --- |
-| `packages/app` | Main Solid GUI. Browser-capable and embedded by desktop. Currently hybrid because upstream migration work is already present; OpenFork is not committed to completing that migration. |
+| `packages/app` | Main Solid GUI. Browser-capable and embedded by desktop. **V2/new-layout is the primary presentation direction** even though runtime/API generations remain hybrid. |
 | `packages/browser-visual` | Fork-owned browser visual capture/runtime support shared with desktop browser features. |
 | `packages/mobile` | Fork-owned mobile PWA client. |
 | `packages/client` | Generated client for the upstream-current Protocol `ServerApi`; transitional/reference surface for OpenFork unless explicitly retained by a fork feature. |
 | `packages/codemode` | Code-mode support package. |
 | `packages/core` | Durable domain state, current/V2 session runtime, event/projector services, persistence, location services, shared process/runtime primitives. |
-| `packages/desktop` | Electron main/preload/renderer host, native integration, browser authority, sidecar lifecycle. |
+| `packages/desktop` | Electron main/preload/renderer host, native integration, browser authority, sidecar lifecycle, and OXP native tunnel/secure-secret/tray/autostart lifecycle. |
 | `packages/effect-drizzle-sqlite` | Effect/Drizzle SQLite integration support. |
 | `packages/effect-sqlite-node` | Node SQLite Effect integration support. |
 | `packages/http-recorder` | HTTP recording/test support used by provider/runtime tests. |
 | `packages/httpapi-codegen` | Code generation support for HTTP APIs. |
 | `packages/llm` | Provider protocol and model-wire adapters. |
-| `packages/opencode` | Local OpenCode host/sidecar, mature V1 OpenFork production runtime, CLI compatibility host, full HTTP API composition, fork-rich tool/runtime integrations. V1 is repaired/extended here and receives selective current/V2 backports. |
-| `packages/plugin` | Plugin contracts/runtime integration helpers. |
+| `packages/opencode` | OpenFork local host/sidecar (legacy package name), mature V1 production runtime, retained CLI host, full HTTP API composition, fork-rich tool/runtime integrations, and the first-party OXP semantic/MCP endpoint. V1 is repaired/extended here and receives selective current/V2 backports. |
+| `packages/plugin` | OpenFork's inherited/forked plugin contracts and runtime helpers. No generic compatibility with OpenCode plugins is promised. |
 | `packages/protocol` | Browser-safe upstream-current API contract built on Schema. Useful as a donor/shared contract surface, but not an OpenFork product compatibility target by itself. |
 | `packages/schema` | Shared browser-safe domain/wire schemas and branded IDs. |
 | `packages/script` | Shared script/build utilities. |
 | `packages/sdk/js` | Generated unified SDK for the complete `OpenCodeHttpApi`. |
 | `packages/server` | Shared server middleware/handlers/location infrastructure used by the local host. |
-| `packages/session-ui` | Shared session/message GUI components, including newer V2 presentation components. |
-| `packages/tui` | Upstream-coupled TUI compatibility package; retained but not an OpenFork product. |
+| `packages/session-ui` | Shared session/message GUI components. Its V2 presentation components are first-class OpenFork UI building blocks, not merely migration artifacts. |
+| `packages/tui` | Upstream-coupled retained dependency; not an OpenFork product or compatibility promise. |
 | `packages/ui` | Shared low-level UI system/primitives. |
 
 ## Contract packages vs implementation packages
@@ -70,6 +70,9 @@ called out below.
 Client/runtime separation remains required, but **current Protocol is not the
 required destination**. Prefer a stable V1/fork browser-safe contract rather than
 coupling presentation directly to Core/Server internals.
+
+These contracts are OpenFork-local contracts. Matching an upstream OpenCode package
+or namespace does not imply that third-party OpenCode clients/plugins are supported.
 
 ### Domain/runtime implementation
 
@@ -88,7 +91,12 @@ browser code as the long-term design.
 - `packages/mobile`
 - `packages/session-ui`
 - `packages/ui`
-- `packages/tui` (compatibility-only in OpenFork product terms)
+- `packages/tui` (retained coupling only; not an OpenFork product)
+
+For desktop/browser product work, prefer the established **V2/new-layout
+presentation system**. This preference does not authorize pulling the current/V2
+runtime or Protocol API into the client; presentation and transport/runtime
+generation are independent.
 
 ## Current transitional dependency debt
 

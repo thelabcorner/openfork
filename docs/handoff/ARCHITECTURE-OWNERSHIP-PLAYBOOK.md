@@ -121,6 +121,19 @@ If the runtime emits `reasoning/text/tool/step/status` events, the UI should not
 infer state from absence, message shape, or rendered part structure. Project the
 semantic lifecycle where it happens.
 
+### Transport encoding is not domain truth
+
+Do not let an external protocol role become the application's semantic source of
+truth. A provider `user` message may represent a human User turn, a host-owned
+Synthetic continuation, Shell output, or Compaction context. Conversely,
+host-authored content is not automatically privileged System policy.
+
+Keep at least ownership/provenance, semantic kind, instruction authority, trust,
+lineage/correlation, and provider projection separable. The provider/runtime
+compiler derives the wire representation last. If a route cannot faithfully
+encode required privileged authority, choose an authority-preserving projection
+or fail closed; never weaken authority merely to preserve chronology/cache reuse.
+
 ### Hidden UI as a worker
 
 Keep-mounted panels, hidden tabs, popovers, inactive context panes, and invisible

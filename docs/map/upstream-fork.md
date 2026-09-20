@@ -2,25 +2,31 @@
 
 ## Product-scope rule
 
-OpenFork follows upstream OpenCode's **local client/runtime infrastructure**, but it
-does not carry upstream's hosted product/backend infrastructure on this branch.
+OpenFork is an **independent product surface** implemented as a source-level branch
+fork of OpenCode. It does not promise local client/runtime/plugin compatibility with
+OpenCode, and it does not carry upstream's hosted backend implementation on this
+branch.
 
 This is the central fork rule:
 
 ```text
 upstream local runtime/client substrate
-  -> keep in sync, preserve semantics, improve carefully
+  -> source donor/reference; take, adapt, backport, or reject
 
-upstream hosted SaaS / cloud / console infrastructure
+OpenFork local runtime/client/plugin/API surface
+  -> fork-owned independent product; no implicit OpenCode compatibility
+
+upstream-operated remote OpenCode services consumed by OpenFork
+  -> strict external compatibility; OpenFork must adapt to their contracts
+
+upstream hosted backend implementation source
   -> prune from OpenFork main
-
-OpenFork client/runtime features
-  -> preserve across upstream tag merges
 ```
 
-The fork is therefore “client-side-only” in product scope while still containing a
-substantial **local server/runtime**. That local server is required to run the client
-and is not equivalent to hosted backend infrastructure.
+The fork therefore owns a substantial **local server/runtime** while depending on
+selected remote services that OpenCode operates. Not carrying their backend source
+does not remove the need to remain wire-compatible with the deployed endpoints
+OpenFork uses.
 
 ## Upstream concerns deliberately absent
 
@@ -43,9 +49,10 @@ These paths are not “missing implementations” to restore during an upstream 
 Their reappearance on `main` is a sync/prune failure unless the fork architecture is
 deliberately changed.
 
-## Local infrastructure intentionally retained
+## Local source ancestry intentionally retained
 
-OpenFork retains the packages required for upstream-compatible local behavior:
+OpenFork retains substantial upstream-derived packages because they are useful source
+and remain part of the fork's implementation:
 
 - app/UI contracts and generated clients;
 - Schema/Protocol;
@@ -54,12 +61,16 @@ OpenFork retains the packages required for upstream-compatible local behavior:
 - OpenCode sidecar/runtime;
 - LLM/provider protocol support;
 - desktop;
-- plugin support;
+- plugin infrastructure;
 - persistence/runtime support packages.
+
+Retention does **not** imply drop-in OpenCode compatibility. These packages are
+OpenFork code once they are in this branch and may diverge.
 
 `packages/tui` is a special case. It remains because embedded CLI code under
 `packages/opencode` still depends on it; the manifest explicitly marks it as a
-deferred compatibility leaf. It is not an OpenFork product commitment.
+deferred coupled leaf. It is not an OpenFork product commitment or compatibility
+promise.
 
 ## Fork-only product packages
 
@@ -91,9 +102,9 @@ For OpenFork:
 - deleting V1 in OpenFork requires an explicit architecture decision backed by
   proven parity and a product reason. It is not implied by upstream deprecation.
 
-This distinction is compatible with the fidelity goal. OpenFork aims for fidelity
-to upstream **local behavior, protocols, providers, and infrastructure contracts**,
-not necessarily to upstream's internal runtime-generation retirement schedule.
+This distinction is independent of remote compatibility. OpenFork does not target
+fidelity with upstream local behavior. It targets the best OpenFork V1 architecture
+while borrowing useful current/V2 semantics.
 
 The same principle applies to upstream's **current local client API**. OpenFork
 does not need to finish the upstream migration from V1 local APIs onto
@@ -102,9 +113,28 @@ architecturally “current.” Those surfaces may remain where the existing hybr
 uses them, but they are not a fork compatibility target. The fork's target is V1
 local behavior plus selectively backported current/V2 improvements.
 
-Do not confuse that with the OpenCode-hosted Zen/Go provider gateway. Hosted model
-API compatibility is independent of the local V1/current client split and remains
-required for whichever hosted provider interface OpenCode actually operates.
+Do not confuse that with the OpenCode-hosted Zen/Go provider gateway or other
+upstream-operated remote services OpenFork actually calls. Those external contracts
+are the compatibility-critical boundary because OpenFork cannot change the server
+implementation.
+
+## OpenFork is not an OpenCode-compatible distribution
+
+OpenFork and OpenCode are separate product surfaces.
+
+- OpenCode plugins may not work in OpenFork.
+- OpenCode local API clients may not work in OpenFork.
+- OpenCode extensions, scripts, configuration assumptions, and UI integrations may
+  not work in OpenFork.
+- OpenFork-specific integrations may not work in OpenCode.
+
+Shared package names, source ancestry, or successful operation today do not create a
+support promise. A local compatibility guarantee exists only when OpenFork explicitly
+names, tests, and documents that exact integration.
+
+This differs from an OpenChamber-style wrapper/distribution, where preserving the
+underlying OpenCode runtime surface is part of the architecture. OpenFork changes
+the underlying runtime and contracts themselves.
 
 ## Major fork-owned areas
 
@@ -124,6 +154,9 @@ include:
 - conversation control/context overlays;
 - throughput instrumentation/projection;
 - Goal Mode and Goal Auditor behavior;
+- first-party OXP / ChatGPT external-agent integration, including the dedicated
+  Secure-MCP endpoint, supervision/delegation surfaces, and parent-tool-epoch
+  durable-continuation contract;
 - related server routes, schemas, migrations, tests, and GUI surfaces.
 
 Newer active campaigns such as provenance, scheduled tasks, shell reliability, and
@@ -145,8 +178,9 @@ Examples called out in `FORK.md` include:
 - package manifests: upstream versions plus curated fork workspace/dependency union;
 - generated clients: regenerate rather than hand-merge.
 
-This union model is how OpenFork can preserve 1:1 upstream local-infrastructure
-fidelity while still being a materially richer client.
+This union model is a **source-sync strategy**, not a compatibility strategy. It
+lets OpenFork harvest useful upstream work without surrendering ownership of its
+local architecture.
 
 ## Sync model
 
@@ -161,16 +195,16 @@ to validate the package-level comparison, but it is not the fork's merge policy.
 
 ## Fidelity principle
 
-“Fidelity with upstream” means:
+“Fidelity with upstream” is reserved for **remote upstream-operated contracts that
+OpenFork consumes**:
 
-1. retain upstream local contracts and bug fixes unless a fork feature intentionally
-   changes the behavior;
-2. keep shared schemas/provider behavior compatible where OpenFork consumes it;
-   current local Protocol/client parity is not independently required;
-3. make fork extensions compositional rather than rebuilding upstream infrastructure
-   in parallel;
-4. treat current/V2 improvements as candidates for shared implementation and V1
-   backport instead of forcing V1 retirement or letting generations drift;
-5. do not import upstream hosted/SaaS architecture merely because it exists upstream;
-6. where OpenFork improves correctness, durability, performance, or architecture,
-   preserve the stronger behavior through future tag merges.
+1. preserve the request/response/auth/streaming/error semantics required by those
+   deployed services;
+2. track upstream changes to those remote contracts and adapt OpenFork promptly;
+3. isolate remote-service compatibility in provider/backend adapters rather than
+   forcing upstream local architecture into the fork;
+4. do not treat upstream local APIs, plugin APIs, CLI behavior, UI behavior, or
+   current/V2 migration as compatibility requirements;
+5. treat upstream source as a donor for fixes/features and current/V2 as a donor for
+   semantics to backport into V1;
+6. preserve stronger OpenFork local behavior through future tag merges.

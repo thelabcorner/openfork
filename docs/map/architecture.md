@@ -2,16 +2,16 @@
 
 ## 1. Architectural layers
 
-OpenFork is a local-first, multi-surface client architecture. The important boundary
-is not “frontend vs backend”; it is **presentation vs local domain/runtime ownership
-vs hosted infrastructure**.
+OpenFork is a local-first, multi-surface independent product architecture. The
+important boundary is not “frontend vs backend”; it is **fork-owned local
+presentation/runtime vs remote infrastructure outside the fork's control**.
 
 ```text
 Presentation / interaction
-  packages/app
+  packages/app (V2/new-layout primary)
   packages/mobile
-  packages/tui (compatibility, not OpenFork product)
-  packages/session-ui
+  packages/tui (retained coupling, not OpenFork product)
+  packages/session-ui (V2 presentation first-class)
   packages/ui
             |
             v
@@ -41,6 +41,16 @@ session · tool · provider   session · tool · event · DB
           local workspace / model providers
 ```
 
+The local layers above are OpenFork-owned even when their package names and source
+originate in OpenCode. Their APIs are not required to remain compatible with
+upstream. The strict external boundary is any upstream-operated remote service
+OpenFork elects to consume.
+
+The presentation layer deliberately does **not** follow the V1-first runtime rule:
+V2/new-layout UI is the primary product direction. The generation split is allowed
+and expected: newer V2 presentation can consume V1/fork execution and local API
+contracts.
+
 The repository contract in `AGENTS.md` still requires browser clients to consume
 browser-safe contracts rather than host/runtime implementation details. That does
 **not** make the upstream-current Protocol/client family OpenFork's destination.
@@ -60,7 +70,7 @@ runtime zones:
    should not bypass it for native behavior.
 3. **Renderer** (`src/renderer`) hosts the Solid GUI from `packages/app`.
 
-The desktop main process starts the local OpenCode server as an Electron utility
+The desktop main process starts the OpenFork local server as an Electron utility
 process. The renderer then communicates with that server over authenticated loopback
 HTTP/SSE. Native desktop operations travel over preload IPC instead.
 
@@ -80,6 +90,41 @@ sequenceDiagram
   S-->>R: response + replayable event stream
 ```
 
+### 2.1 OXP external-agent path and parent tool epochs
+
+OXP is a separate first-party external-agent surface hosted by the same sidecar.
+Electron main owns native tunnel/process/secure-credential lifecycle; the sidecar
+owns the OXP MCP endpoint, authority composition, capability adapters, Session
+supervision, and durable worker delegation.
+
+```text
+ChatGPT parent
+  -> OpenAI Secure MCP Tunnel
+  -> dedicated OXP loopback MCP endpoint in sidecar
+  -> OXP adapter
+  -> authoritative Core/V1 owners
+```
+
+The ChatGPT parent does **not** receive a backing OpenFork Session. Its current
+ability to invoke OXP is additionally bounded by a host-side, non-renewing
+25-minute **parent tool epoch**. OXP calls inside that epoch do not
+extend it.
+
+The sidecar therefore tracks a small process-local epoch record per stable
+ChatGPT parent-session correlation key. The first observed call anchors
+`epochObservedAt`; at the first call at/after 20 minutes, the common OXP response
+boundary appends a durable-handoff reminder. At 25 minutes the observed epoch is
+treated as dead. A later successful OXP call for the same parent proves that the
+user/host reopened tool access and begins a new observed epoch.
+
+This tracker is transport-liveness state, **not an authority plane** and not
+durable correctness state. It uses request-time observation rather than periodic
+polling. The durable escape hatch is `openfork_worker`: unfinished work should be
+delegated into a real native worker Session before parent OXP access expires, and
+that worker can continue without the ChatGPT parent.
+
+See [OXP parent-tool epoch and durable continuation](../architecture/oxp-parent-tool-epoch.md).
+
 ## 3. Server/API composition
 
 `packages/opencode/src/server/routes/instance/httpapi/api.ts` composes the full
@@ -89,7 +134,9 @@ sequenceDiagram
 - root/global APIs;
 - event, pairing, device, PTY-connect, and instance-scoped APIs;
 - fork-owned groups such as Goal, quota, session groups, control surfaces, and
-  scheduled tasks.
+  scheduled tasks;
+- first-party native Swarm as a Tier-0 durable collaboration domain with
+  execution adapters owned separately at Tier 3.
 
 The route tree is deliberately split by ownership. Root/global operations are expected
 to remain bootstrap-free where their semantics are process/global or durable-state
@@ -106,7 +153,8 @@ Do not use “the server” as one undifferentiated layer. An endpoint that only
 global metadata must not accidentally materialize a workspace execution instance.
 
 The presence of `ServerApi` in the composed host is **descriptive current state**,
-not an OpenFork requirement to support the upstream-current client API indefinitely.
+not an OpenFork requirement to support the upstream-current client API indefinitely
+or accept arbitrary OpenCode clients/plugins.
 Do not add or migrate routes solely for current Protocol parity. Existing current
 routes can remain until a V1-oriented simplification is deliberate and proven safe.
 
@@ -116,7 +164,7 @@ Two execution generations coexist.
 
 ### Legacy/V1 path
 
-The V1 production/compatibility stack is centered in:
+The V1 production stack and its internal backward-bridge seams are centered in:
 
 - `packages/opencode/src/session/prompt.ts`
 - `packages/opencode/src/session/processor.ts`
@@ -124,7 +172,7 @@ The V1 production/compatibility stack is centered in:
 - `packages/opencode/src/tool/registry.ts`
 - `packages/opencode/src/tool/*`
 
-This path remains important because much of the mature local OpenCode execution
+This path remains important because much of the mature local OpenFork execution
 behavior and fork tooling still runs through it. It is not “dead code”.
 
 ### Current/V2 path
@@ -143,10 +191,43 @@ projection. `session_input` is the durable inbox; execution promotes admitted in
 through the serialized runner and event/projector pipeline.
 
 The architectural direction is **semantic convergence**, not two independently
-invented systems. V1 compatibility should use V2/current semantics as the oracle for
-provenance, ownership, authority, and lifecycle behavior where the models overlap.
+invented systems. V1 internal adaptation should use V2/current semantics as the
+oracle for provenance, ownership, authority, and lifecycle behavior where the
+models overlap.
 
 See [v1-v2.md](./v1-v2.md).
+
+### 4.1 Native Swarm
+
+Native Swarm is an OpenFork-owned collaboration aggregate over ordinary root
+Sessions. It is **not** the OpenSwarm plugin embedded into the product.
+
+Ownership is deliberately split:
+
+- `packages/schema/src/swarm.ts` and
+  `packages/core/src/swarm/*` own durable identity, membership, tasks/DAG,
+  leases/runs, peer mail/receipts, blackboard, claims, deliverables, fencing,
+  compact projections, and EventV2 facts;
+- `packages/opencode/src/swarm/*` owns disposable/process-global dispatch,
+  deadlines, managed-member Session materialization, recovery, and thin
+  execution adapters;
+- root `/swarm` HTTP routes expose bounded Tier-0 projections and authenticated
+  operator intent without becoming execution owners;
+- the generated SDK is the browser/client contract;
+- SessionGroup `kind:"swarm"` is a read-only navigation projection, never
+  membership authority;
+- `packages/app/src/pages/swarm/*` consumes compact Swarm projections plus
+  SessionTelemetry/Permission/Question overlays. It does not reconstruct Swarm
+  state from transcripts.
+
+Conversational provenance is semantic and producer-stamped:
+`swarm.assignment`, `swarm.peer`, `swarm.continuation`,
+`swarm.recovery`, and `swarm.notice` are host-owned synthetic sources.
+Provider wire role does not grant user authority.
+
+Legacy OpenSwarm files/source may be inspected by a future bounded importer, but
+the plugin is not a runtime, storage, API, tool, or UI dependency of native
+Swarm.
 
 ## 5. Provider and model boundary
 

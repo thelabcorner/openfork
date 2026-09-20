@@ -13,12 +13,68 @@ upstream-vs-fork boundaries, and source-tree lookup. The map is an orientation
 layer; this file and `FORK.md` remain authoritative when a rule or ownership
 decision is normative.
 
+### Product and compatibility boundary
+
+OpenFork is an **independent product surface**, not an OpenCode-compatible
+distribution. Shared source ancestry and `@opencode-ai/*` names do not imply local
+API, plugin, extension, CLI, config, or behavioral compatibility.
+
+- Local client/server APIs, runtime behavior, plugin contracts, UI, tools,
+  persistence, and configuration are fork-owned and may diverge.
+- OpenCode plugins/clients/extensions must be assumed **unsupported** unless the
+  exact integration is explicitly named, tested, and documented.
+- The strict upstream compatibility boundary is any **upstream-operated remote
+  OpenCode service that OpenFork actually consumes**. Preserve its required
+  request/auth/header/streaming/response/error/model/quota semantics.
+- Upstream release tags are source donors. Tag syncing does not create a local
+  compatibility obligation.
+- Read `docs/architecture/compatibility-boundary.md` before changing upstream
+  service adapters or making any compatibility claim.
+
+#### Brand and compatibility identifiers
+
+- **Product identity is OpenFork.** User-visible UI, CLI/TUI copy, local API/OpenAPI
+  descriptions, OAuth pages, crash/help/support surfaces, package metadata, and
+  third-party app-attribution headers owned by this fork must identify OpenFork.
+- Support, documentation, bug reports, and product metadata must point at
+  `https://github.com/thelabcorner/openfork` (or a path beneath it), not upstream
+  OpenCode support channels.
+- Preserve **OpenCode Zen**, **OpenCode Go**, and **OpenCode Console** when those
+  names identify upstream-operated services that OpenFork consumes.
+- Preserve compatibility identifiers such as the `opencode` executable,
+  `opencode.json`, `.opencode/`, `OPENCODE_*`, `@opencode-ai/*`, provider
+  IDs, database/protocol keys, and `opencode://` unless an explicit migration
+  changes that contract. A compatibility identifier is not product branding.
+- Upstream-sync work must not reintroduce generic OpenCode product branding onto
+  OpenFork-owned surfaces.
+- **Distribution is fork-owned.** OpenFork update/install/release code must never
+  route through upstream OpenCode npm, Homebrew, Scoop, Chocolatey, GitHub release,
+  container, or install-script channels merely because compatibility identifiers are
+  retained. Fork-owned binaries come from `thelabcorner/openfork` releases.
+- Treat package-manager installs that OpenFork does not publish/manage as
+  **externally managed**: they may receive update-available notifications, but
+  OpenFork must not invoke an upstream package manager to replace itself.
+- The CLI may self-replace only when ownership and replacement semantics are
+  explicit. Today that is the POSIX `~/.opencode/bin/opencode` direct-install
+  path; Windows and other installations fail closed to the OpenFork releases page.
+- Retaining `@opencode-ai/*`, `opencode-ai`, or `opencode` as compatibility
+  names does **not** grant OpenFork ownership of the corresponding public package
+  namespace or distribution feed. Publishing there requires a separate explicit
+  architecture/product decision.
+
 ### V1/current lifecycle policy
 
-Current/V2 is a semantic/reference architecture for OpenFork, **not an automatic
-migration destination**. Upstream may retire V1 in favor of current/V2; OpenFork
-intentionally repairs and extends its mature V1 production path and selectively
-backports current/V2 capabilities into it.
+Do not collapse runtime/API/UI generation into one "V1 vs V2" choice.
+
+- **Execution/runtime:** current/V2 is a semantic/reference architecture for
+  OpenFork, **not an automatic migration destination**. OpenFork repairs and
+  extends its mature V1 production execution path and selectively backports
+  current/V2 capabilities into it.
+- **Local client/server API:** V1/fork contracts remain the target. Do not migrate
+  callers onto current Protocol/`/api/*` merely to match upstream.
+- **Presentation/UI:** the new/V2 UI is the primary OpenFork product direction.
+  Continue developing V2/new-layout presentation components; do not backport the UI
+  to legacy presentation merely because execution remains V1.
 
 - Prefer a shared authoritative owner plus a narrow V1 adapter over duplicated
   semantics.
@@ -26,11 +82,14 @@ backports current/V2 capabilities into it.
 - V1 removal requires an explicit OpenFork architecture decision with proven
   parity and a product reason; it is never implied by an upstream migration,
   rename, or current/V2 implementation existing.
-- This applies to the **local client API** too. Do not migrate V1 callers onto
+- The execution policy applies to the **local client API** too. Do not migrate V1 callers onto
   current Protocol/`/api/*` surfaces merely to match upstream. Existing current
   calls are transitional/implementation facts, not a compatibility target.
-- The OpenCode-hosted Zen/Go model-provider API is a separate external-provider
-  concern. Its versioning must not be conflated with local V1/current client API
+- It explicitly does **not** mean "V1 UI." A V2-named component or V2 presentation
+  system may be the canonical OpenFork UI while consuming V1/fork runtime contracts.
+- The OpenCode-hosted Zen/Go model-provider API and any other consumed
+  upstream-operated services are the compatibility-critical external boundary.
+  Their versioning must not be conflated with local V1/current client API
   generation.
 
 ## Architecture Before Call Sites
@@ -98,6 +157,63 @@ bug.
 - Dense navigation surfaces (sidebars, lists, badges, tab strips) should consume
   O(1) materialized metadata or compact projections. Rich history hydration is
   for an explicitly opened detail surface, not for background row decoration.
+
+### Turn provenance is not provider role
+
+Conversation semantics and LLM protocol roles are separate facts. In particular,
+V1 stores several host/runtime turns with `role: "user"` because they must lower
+to a provider user message; that does **not** make them human/user-owned turns.
+
+- Persist turn ownership/provenance at the durable message producer. Do not infer
+  human/user ownership from `role === "user"`, text shape, or `part.synthetic` in
+  downstream consumers when explicit provenance is available.
+- `part.synthetic` describes an individual content fragment, not ownership of the
+  whole conversational turn. A user-owned prompt may contain synthetic MCP/file
+  expansion, and a host-owned continuation may consist entirely of synthetic text.
+- Keep semantic message kind/ownership separate from provider lowering. Host
+  continuations, shell followups, compaction, and other synthetic turns may
+  legitimately lower to provider role `user` while remaining semantically
+  non-user turns.
+- Keep **authority** separate from both ownership and semantic origin.
+  `owner=host` does not mean privileged/System authority. Goal continuations,
+  scheduled input, peer/swarm messages, recovery turns, monitor observations,
+  and other host-authored conversational state should normally remain
+  Synthetic/conversational and may lower to provider `user`.
+- Conversely, genuinely privileged host policy must not be demoted to provider
+  `user` merely because a selected SDK/route has weaker System-message support.
+  Resolve exact provider/model semantics and concrete runtime encoder
+  capability, then choose an authority-preserving projection (for example a
+  privileged head/top-level System representation) or fail closed.
+- Provider wire role is therefore a **derived projection**, never the canonical
+  source of ownership, provenance, trust, or authority. The durable/runtime
+  model must remain truthful even when several semantic kinds lower to the same
+  provider role.
+- Keep **domain ownership** and **authorization/origin lineage** separate from
+  turn ownership and instruction authority. Example: a Goal specification
+  projection is a host-owned Synthetic turn whose current truth is owned by the
+  Goal domain (`goalID` + revision). The human turn that authorized Goal creation
+  is durable audit lineage, not a permanent privileged/instruction-authority
+  token. Consumers must read current Goal state from the Goal owner rather than
+  re-deriving it from the original prompt.
+- Prefer the term **instruction authority** for model-priority semantics:
+  conversational/user-lane versus privileged/operator-lane. Do not call causal
+  provenance "authority"; use lineage/origin/authorization so it cannot be
+  mistaken for provider instruction priority.
+- The canonical lowering law is:
+  `User/Synthetic/Shell/Compaction -> conversational provider lane`, normally
+  provider `user`; `System -> authority-preserving privileged representation`
+  chosen by the exact provider/API-route/model/runtime compiler. A provider
+  `user` role does not assert that a human typed the bytes.
+- Current/V2 `SessionMessage.User` / `Synthetic` / `Shell` / `Compaction` behavior
+  is the architectural oracle. V1 compatibility code should converge toward that
+  taxonomy rather than creating feature-specific ownership heuristics.
+- Legacy V1 ownership inference belongs in one compatibility boundary. Do not
+  duplicate part-scanning heuristics across Goal, compaction, title, fork/revert,
+  timeline, or authorization code.
+- When reviewing `role === "user"`, classify the use: provider/structural turn
+  mechanics may remain role-based; user-intent, authorization, causality,
+  checkpoint, title, model-source, replay, and UI attribution must use semantic
+  provenance/kind.
 
 For deeper examples and review heuristics, read
 `docs/handoff/ARCHITECTURE-OWNERSHIP-PLAYBOOK.md` before starting a substantial
@@ -221,6 +337,18 @@ architecture proof.
 
 ## Workspace
 
+### Text and Git line-ending ownership
+
+Line endings are repository/runtime state, not an ambient Windows preference.
+
+- `.gitattributes` is authoritative for tracked-file checkout policy: text is canonical LF, with narrow explicit exceptions such as Windows batch entrypoints.
+- `.editorconfig` is the editor-facing default, not a substitute for Git attributes.
+- `packages/core/src/git-runtime.ts` owns OpenCode's Git EOL process policy. App-owned Git argv and the shared child-process boundary must derive from it rather than spelling `core.autocrlf`/`core.eol` independently.
+- OpenCode-owned child processes pin Git command-scope config so nested/raw Git invoked through tools cannot inherit Git-for-Windows `core.autocrlf=true`. An explicit later `git -c ...` is the intentional escape hatch.
+- Git worktree/reset/checkout code must go through the shared Git service/process policy. Do not add private raw-Git materialization paths.
+- Edit/write/patch own mutation-byte preservation: editing an existing CRLF or mixed-EOL file must not cause whole-file churn merely because canonical repository policy is LF.
+- Global/user Git config is convenience only. Tests must prove behavior under a hostile inherited `core.autocrlf=true` setting.
+
 Runtime dependencies stay directed from Schema to Core and Protocol, then from
 Core and Protocol to Server/OpenCode. Client runtime code may depend on Schema
 and Protocol but never on Core or Server. Keep browser-safe contracts free of
@@ -232,9 +360,10 @@ This repository is hybrid. Choose a client from the endpoint's actual owning API
 not from a UI component name.
 
 This section describes how to work safely with the **current hybrid tree**; it does
-not make both client families OpenFork product targets. OpenFork is V1-first. Do
-not migrate a V1 call onto Protocol/current `/api/*` merely because the generated
-client exists.
+not make both client families OpenFork product targets. OpenFork is V1-first on the
+**execution/local-API axis**, while V2/new-layout remains the preferred UI
+generation. Do not migrate a V1 call onto Protocol/current `/api/*` merely because
+the generated client exists.
 
 - **Protocol client**: `packages/client` / `@opencode-ai/client`, generated from
   `packages/protocol` `ServerApi`. After changing Protocol, run `bun run generate`
