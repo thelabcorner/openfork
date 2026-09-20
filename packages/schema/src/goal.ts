@@ -95,6 +95,47 @@ export const AuditorDecision = Schema.Literals(["continue", "complete", "blocked
 })
 export type AuditorDecision = typeof AuditorDecision.Type
 
+/**
+ * Session-local Goal automation phase. This is a compact live/runtime
+ * projection, not durable Goal lifecycle state: a Goal remains `active` while
+ * the independent auditor is inspecting the latest worker cycle.
+ */
+export const AutomationPhase = Schema.Literals([
+  "working",
+  "audit_requested",
+  "auditing",
+  "continuation_pending",
+  "audit_error",
+]).annotate({ identifier: "Goal.AutomationPhase" })
+export type AutomationPhase = typeof AutomationPhase.Type
+
+export const AutomationRuntime = Schema.Union([
+  Schema.Struct({
+    phase: Schema.Literal("working"),
+    since: DateTimeUtcFromMillis,
+  }),
+  Schema.Struct({
+    phase: Schema.Literal("audit_requested"),
+    since: DateTimeUtcFromMillis,
+  }),
+  Schema.Struct({
+    phase: Schema.Literal("continuation_pending"),
+    since: DateTimeUtcFromMillis,
+  }),
+  Schema.Struct({
+    phase: Schema.Literal("auditing"),
+    since: DateTimeUtcFromMillis,
+    /** Durable child transcript owned by the currently executing auditor. */
+    auditorSessionID: SessionID,
+  }),
+  Schema.Struct({
+    phase: Schema.Literal("audit_error"),
+    since: DateTimeUtcFromMillis,
+    error: Schema.String,
+  }),
+]).annotate({ identifier: "Goal.AutomationRuntime" })
+export type AutomationRuntime = typeof AutomationRuntime.Type
+
 const AuditorVerdictBase = {
   rationale: Schema.String,
   progressMade: Schema.Boolean,
@@ -169,6 +210,7 @@ export const Info = Schema.Struct({
   constraints: Schema.Array(Schema.String),
   status: Status,
   revision: Schema.Number,
+  auditorRuns: Schema.Number,
   continuationPolicy: ContinuationPolicy,
   auditorPolicy: AuditorPolicy,
   blocker: optional(Schema.String),
@@ -193,6 +235,21 @@ export const Focus = Schema.Struct({
   role: FocusRole,
   focusedAt: DateTimeUtcFromMillis,
 }).annotate({ identifier: "Goal.Focus" })
+
+/** Browser-safe focused Goal projection composed by the server. */
+export interface FocusedGoal extends Schema.Schema.Type<typeof FocusedGoal> {}
+export const FocusedGoal = Schema.Struct({
+  focus: Focus,
+  detail: Detail,
+  /**
+   * Stable host-owned child Session linked to this exact parent Session + Goal.
+   * Unlike AutomationRuntime.auditorSessionID, this survives audit completion so
+   * clients can enter the durable auditor transcript before, during, or after a
+   * verification cycle without reconstructing identity from history or groups.
+   */
+  auditorSessionID: SessionID.pipe(optional),
+  automation: AutomationRuntime.pipe(optional),
+}).annotate({ identifier: "Goal.FocusedGoal" })
 
 export const AuditActor = Schema.Literals(["user", "agent", "auditor", "system"]).annotate({ identifier: "Goal.AuditActor" })
 export type AuditActor = typeof AuditActor.Type
@@ -244,13 +301,18 @@ export const AuditEvent = Schema.Struct({
 // truth, while these notifications keep clients incrementally coherent.
 const Created = define({ type: "goal.created", schema: { goalID: ID, info: Info } })
 const Updated = define({ type: "goal.updated", schema: { goalID: ID, info: Info } })
-const Focused = define({ type: "goal.focused", schema: { goalID: ID, sessionID: SessionID, role: FocusRole } })
+const FocusedEvent = define({ type: "goal.focused", schema: { goalID: ID, sessionID: SessionID, role: FocusRole } })
 const Unfocused = define({ type: "goal.unfocused", schema: { goalID: ID, sessionID: SessionID } })
+const AutomationUpdated = define({
+  type: "goal.automation.updated",
+  schema: { goalID: ID, sessionID: SessionID, automation: AutomationRuntime.pipe(optional) },
+})
 
 export const Event = {
   Created,
   Updated,
-  Focused,
+  Focused: FocusedEvent,
   Unfocused,
-  Definitions: [Created, Updated, Focused, Unfocused],
+  AutomationUpdated,
+  Definitions: [Created, Updated, FocusedEvent, Unfocused, AutomationUpdated],
 } as const

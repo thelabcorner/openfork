@@ -4,6 +4,11 @@ Repository orientation: `../../docs/map/packages.md` defines package roles and
 `../../docs/map/v1-v2.md` defines the separate runtime/API/UI meanings of V1
 and V2/current. Read both before introducing compatibility contracts.
 
+Do not use "OpenCode compatibility" as a reason to freeze a local schema. OpenFork
+is its own local product/API surface. A schema is compatibility-critical with
+OpenCode only when it is part of an explicitly consumed upstream-operated remote
+service contract or an explicitly documented local compatibility exception.
+
 `@opencode-ai/schema` owns browser-safe wire and storage contracts shared by protocol, server, core, and generated SDKs. Keep runtime behavior, service layers, side effects, and host-local implementation details in the domain package that owns them.
 
 ## Package Boundary
@@ -49,6 +54,28 @@ and V2/current. Read both before introducing compatibility contracts.
   consumer that still depends on it.
 - `@opencode-ai/protocol` and `@opencode-ai/sdk-next` are current `/api/...` surfaces.
 
+### V1 turn provenance compatibility
+
+The active V1 message schema historically uses `role: "user"` for both genuine
+user turns and host/runtime turns that must project to a provider user message.
+When V1 compatibility needs to distinguish those cases, model the durable
+ownership/provenance explicitly on the message contract; do not encode semantic
+ownership in part metadata or infer it from text shape.
+
+- `TextPart.synthetic` is content-fragment provenance, not whole-turn ownership.
+- Keep V1 provenance additive/optional for old persisted rows, but new producers
+  should stamp it explicitly.
+- Host provenance does not imply privileged/System authority, and a provider
+  `user` projection does not imply human ownership. Do not add schema fields or
+  enums that collapse producer ownership, semantic kind, authority, and provider
+  wire role into one discriminator.
+- Do not put runtime inference/service behavior in Schema. Schema owns the
+  serializable provenance contract; Core owns legacy inference/classification.
+- Current `SessionMessage.User`, `Synthetic`, `Shell`, and `Compaction` are the
+  semantic reference taxonomy. V1 provenance should backport/converge on those
+  semantics where applicable without implying V1 runtime retirement, while
+  provider-role lowering remains a runtime concern outside Schema.
+
 ## Events
 
 - Classify event definitions by protocol role before adding them to a public manifest: `current`, `shared transitional`, or `V1-only`.
@@ -57,7 +84,9 @@ and V2/current. Read both before introducing compatibility contracts.
   of the current Protocol/SDK Next event surface unless retained hybrid code has
   a documented requirement. Do not broaden the current client surface merely to
   make it feature-parallel with V1; Protocol parity is not an OpenFork goal.
-- Keep compatibility events available only to the existing App/TUI/CLI compatibility surface while they are still needed.
+- Keep legacy bridge events available only to the retained App/TUI/CLI paths that
+  still consume them. This is OpenFork internal backward compatibility, not an
+  OpenCode cross-product support promise.
 - Preserve a single canonical event definition. Do not duplicate definitions for generation convenience.
 
 ## Module Shape

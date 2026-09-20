@@ -3,16 +3,69 @@ export * as SessionGroup from "./session-group"
 import { Schema } from "effect"
 import { DateTimeUtcFromMillis, optional } from "./schema"
 import { SessionGroupID } from "./session-group-id"
+import { SwarmID } from "./swarm-id"
 import { define } from "./event"
 
 export const ID = SessionGroupID
 export type ID = SessionGroupID
 
-export const Kind = Schema.Literals(["user", "subagent", "plugin"])
+/** Persisted/generic SessionGroup kinds writable through the group domain. */
+export const MutableKind = Schema.Literals(["user", "subagent", "plugin", "delegation"]).annotate({
+  identifier: "SessionGroup.MutableKind",
+})
+export type MutableKind = typeof MutableKind.Type
+
+/** Read-model kinds. Swarm is virtual and owned by the Swarm domain. */
+export const Kind = Schema.Literals(["user", "subagent", "plugin", "delegation", "swarm"]).annotate({
+  identifier: "SessionGroup.Kind",
+})
 export type Kind = typeof Kind.Type
 
-export const MemberOrigin = Schema.Literals(["user", "auto_subagent", "goal_auditor", "special_agent", "plugin"])
+/** Origins that may be materialized in session_group_member. */
+export const MutableMemberOrigin = Schema.Literals([
+  "user",
+  "auto_subagent",
+  "goal_auditor",
+  "special_agent",
+  "plugin",
+  "delegation",
+]).annotate({ identifier: "SessionGroup.MutableMemberOrigin" })
+export type MutableMemberOrigin = typeof MutableMemberOrigin.Type
+
+/** Read-model member origins. Swarm never implies a persisted group edge. */
+export const MemberOrigin = Schema.Literals([
+  "user",
+  "auto_subagent",
+  "goal_auditor",
+  "special_agent",
+  "plugin",
+  "delegation",
+  "swarm",
+]).annotate({ identifier: "SessionGroup.MemberOrigin" })
 export type MemberOrigin = typeof MemberOrigin.Type
+
+const SWARM_GROUP_PREFIX = "grp_swarm_"
+const SWARM_ID_PREFIX = "swr_"
+
+/**
+ * Collision-free virtual SessionGroup identity for one first-party Swarm.
+ * No session_group row is required or implied.
+ */
+export function groupIDForSwarm(swarmID: SwarmID): ID {
+  return ID.make(SWARM_GROUP_PREFIX + swarmID.slice(SWARM_ID_PREFIX.length))
+}
+
+/** Reverse the canonical virtual group mapping without consulting storage. */
+export function swarmIDFromGroupID(groupID: ID): SwarmID | undefined {
+  if (!groupID.startsWith(SWARM_GROUP_PREFIX)) return undefined
+  const suffix = groupID.slice(SWARM_GROUP_PREFIX.length)
+  if (!suffix) return undefined
+  return SwarmID.make(SWARM_ID_PREFIX + suffix)
+}
+
+export function isSwarmGroupID(groupID: ID) {
+  return swarmIDFromGroupID(groupID) !== undefined
+}
 
 export interface Policy extends Schema.Schema.Type<typeof Policy> {}
 export const Policy = Schema.Struct({
@@ -28,8 +81,9 @@ export const Info = Schema.Struct({
   position: Schema.Number,
   kind: Kind,
   ownerPlugin: optional(Schema.String),
-  /** Stable identity supplied by a plugin for one logical group. Unlike the
-   * anchor session, this survives coordinator/session re-rooting. */
+  /** Stable producer identity for one logical group. Plugin groups pair this
+   * with ownerPlugin; first-party delegation groups use it directly. Unlike
+   * the anchor session, this survives coordinator/session re-rooting. */
   ownerRef: optional(Schema.String),
   anchorSessionID: optional(Schema.String),
   policy: optional(Policy),

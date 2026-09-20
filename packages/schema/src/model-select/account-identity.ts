@@ -21,6 +21,22 @@ export function splitModelIDForProvider(modelID: string, providerID: string): Ac
   return provider ? splitAccountModelID(modelID, [provider]) : { baseModelID: modelID }
 }
 
+/**
+ * Lower first-class model/account identity into the provider catalog/runtime's
+ * current model-id ABI. Callers should persist and expose the account-neutral
+ * model id plus accountID; only provider-facing lookup/execution code should
+ * consume this helper.
+ *
+ * Legacy callers may still supply an already-qualified modelID. When an
+ * explicit accountID is also present, strip the legacy suffix first so account
+ * identity cannot be duplicated or drift across boundaries.
+ */
+export function providerModelID(modelID: string, providerID: string, accountID?: string): string {
+  if (!accountID) return modelID
+  const parts = splitModelIDForProvider(modelID, providerID)
+  return joinAccountModelID(parts.baseModelID, accountID)
+}
+
 export function accountShortLabel(label: string): string {
   const trimmed = label.trim()
   const at = trimmed.indexOf("@")

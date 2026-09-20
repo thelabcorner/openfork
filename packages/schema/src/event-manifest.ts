@@ -12,6 +12,7 @@ import { LegacyEvent } from "./legacy-event"
 import { LspEvent } from "./lsp-event"
 import { McpEvent } from "./mcp-event"
 import { ModelsDev } from "./models-dev"
+import { OxpActivity } from "./oxp-activity"
 import { Permission } from "./permission"
 import { PermissionV1 } from "./permission-v1"
 import { Plugin } from "./plugin"
@@ -21,6 +22,8 @@ import { Pty } from "./pty"
 import { Question } from "./question"
 import { QuestionV1 } from "./question-v1"
 import { Reference } from "./reference"
+import { ScheduledTask } from "./scheduled-task"
+import { Swarm } from "./swarm"
 import { ServerEvent } from "./server-event"
 import { SessionCompactionEvent } from "./session-compaction-event"
 import { SessionGroup } from "./session-group"
@@ -50,6 +53,9 @@ const foundationDefinitions = Event.inventory(
 const featureDefinitions = Event.inventory(
   ...FileSystem.Event.Definitions,
   ...Goal.Event.Definitions,
+  ...OxpActivity.Event.Definitions,
+  ...ScheduledTask.Event.Definitions,
+  ...Swarm.Event.Definitions,
   ...Reference.Event.Definitions,
   ...Permission.Event.Definitions,
   ...Plugin.Event.Definitions,
