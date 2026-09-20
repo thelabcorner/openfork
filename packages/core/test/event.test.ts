@@ -21,7 +21,7 @@ import { isCompactedSequence, loadCompaction } from "@opencode-ai/core/database/
 import { Location } from "@opencode-ai/core/location"
 import { AbsolutePath } from "@opencode-ai/core/schema"
 import { WorkspaceV2 } from "@opencode-ai/core/workspace"
-import { and, eq } from "drizzle-orm"
+import { and, eq, inArray } from "drizzle-orm"
 import { location } from "./fixture/location"
 import { testEffect } from "./lib/effect"
 
@@ -725,6 +725,51 @@ describe("EventV2", () => {
 
       const exit = yield* events.durable({ aggregateID }).pipe(Stream.take(1), Stream.runCollect, Effect.exit)
       expect(Exit.isFailure(exit)).toBe(true)
+    }),
+  )
+
+  it.effect("atomically counts concurrent durable owners of the same staged jumbo payload", () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2.Service
+      const { db } = yield* Database.Service
+      const text = `shared:${"z".repeat(1024 * 1024)}`
+      const aggregateID = Session.ID.create()
+      const messageID = SessionMessage.ID.create()
+
+      const [first, second] = yield* Effect.all(
+        [
+          events.publish(SessionEvent.Synthetic, {
+            sessionID: aggregateID,
+            messageID,
+            timestamp: DateTime.makeUnsafe(700),
+            text,
+          }),
+          events.publish(SessionEvent.Synthetic, {
+            sessionID: aggregateID,
+            messageID,
+            timestamp: DateTime.makeUnsafe(700),
+            text,
+          }),
+        ],
+        { concurrency: 2 },
+      )
+      const stored = yield* db
+        .select({ data: EventTable.data })
+        .from(EventTable)
+        .where(inArray(EventTable.id, [first.id, second.id]))
+        .all()
+        .pipe(Effect.orDie)
+      expect(stored).toHaveLength(2)
+      const refs = stored.map((row) => (row.data as { $eventPayload: { id: string } }).$eventPayload.id)
+      expect(new Set(refs).size).toBe(1)
+
+      const meta = yield* db
+        .select({ refs: EventPayloadMetaTable.refs })
+        .from(EventPayloadMetaTable)
+        .where(eq(EventPayloadMetaTable.payload_id, refs[0]!))
+        .get()
+        .pipe(Effect.orDie)
+      expect(meta).toEqual({ refs: 2 })
     }),
   )
 

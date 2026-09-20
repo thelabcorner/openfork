@@ -4,7 +4,7 @@
 **Repository baseline:** `anomalyco/opencode` `v1.18.18`  
 **Pinned commit:** `31406ccc51b4bd2a4e1e086b2bcaa5f7f804f26d`  
 **Primary database:** `opencode.db`  
-**Product surface:** packaged OpenCode desktop application, with compatibility across every legitimate runtime that can open the database  
+**Historical product wording:** this research began against packaged OpenCode/OpenFork ancestry. For current policy, the database is an **OpenFork-owned local format**. Cross-runtime compatibility is required only among OpenFork runtimes explicitly declared to share that database; generic OpenCode database compatibility is not a product promise.
 **Research date:** 2026-08-14  
 **Production API ownership rule:** V1 is the production desktop/app surface; V2 is beta/incomplete infrastructure and is not a migration target for this storage work.
 

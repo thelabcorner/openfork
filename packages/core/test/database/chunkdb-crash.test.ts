@@ -39,6 +39,7 @@ import {
   semanticScanCooldownMs,
   shouldDrainFreelist,
 } from "../../src/database/chunk-sealer"
+import { compressDeltaRef, compressText, isV5Frame } from "../../src/database/json-codec"
 import { rehydrateEvents, CdbRehydrateError } from "../../src/event"
 import { EventV2 } from "../../src/event"
 import { Event } from "@opencode-ai/schema/event"
@@ -64,7 +65,7 @@ const crashLayer = (filename: string) =>
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
       yield* ensureChunkDB(db)
-      return { db, filename }
+      return { db, readDb: db, filename }
     }).pipe(Effect.orDie),
   ).pipe(
     Layer.provide(
@@ -98,7 +99,7 @@ const plainLayer = (filename: string) =>
       yield* db.run("PRAGMA cache_size = -64000")
       yield* db.run("PRAGMA foreign_keys = ON")
       yield* DatabaseMigration.apply(db)
-      return { db, filename }
+      return { db, readDb: db, filename }
     }).pipe(Effect.orDie),
   ).pipe(Layer.provide(sqliteLayer({ filename })))
 
@@ -121,6 +122,18 @@ function makePayload(seed: number) {
     index: seed,
     content: Array.from({ length: 32 }, (_, i) => ({ role: "user", i, text: unit })),
   }
+}
+
+function deterministicNoise(length: number) {
+  let state = 0x9e3779b9
+  let out = ""
+  for (let index = 0; index < length; index++) {
+    state ^= state << 13
+    state ^= state >>> 17
+    state ^= state << 5
+    out += String.fromCharCode(32 + ((state >>> 0) % 95))
+  }
+  return out
 }
 
 const ChunkEvent = EventV2.define({
@@ -357,6 +370,83 @@ describe("ChunkDB crash recovery", () => {
         }),
       )
     } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test.serial("DELTA WRITER RETIRED: even an explicit legacy flag emits independent frames", async () => {
+    const { dir, path } = tmpDb()
+    const previous = process.env.OPENCODE_SEAL_DELTA
+    process.env.OPENCODE_SEAL_DELTA = "1"
+    try {
+      await runWith(path, (db) =>
+        Effect.gen(function* () {
+          const agg = "agg_retired_delta_writer"
+          const base = deterministicNoise(20 * 1024)
+          const payloads = Array.from({ length: 4 }, (_, index) => {
+            const position = 1000 + index * 127
+            const replacement = base[position] === "~" ? "!" : "~"
+            return {
+              aggregateID: agg,
+              payload: {
+                text: base.slice(0, position) + replacement + base.slice(position + 1),
+              },
+            }
+          })
+
+          // Prove this fixture exercises the historical writer's acceptance
+          // region rather than merely setting a now-unused flag.
+          const encoder = new TextEncoder()
+          const baseRaw = encoder.encode(JSON.stringify(payloads[0]))
+          const childRaw = encoder.encode(JSON.stringify(payloads[1]))
+          const full = compressText(JSON.stringify(payloads[1]))
+          expect(full).toBeInstanceOf(Uint8Array)
+          const delta = compressDeltaRef(childRaw, baseRaw, `${agg}:1`, 1, 1)
+          expect(delta.byteLength).toBeLessThan((full as Uint8Array).byteLength * 0.7)
+
+          yield* db
+            .insert(EventSequenceTable)
+            .values({ aggregate_id: agg, seq: payloads.length, owner_id: null })
+            .run()
+            .pipe(Effect.orDie)
+          yield* db
+            .insert(EventTable)
+            .values(
+              payloads.map((data, index) => ({
+                id: `${agg}:${index + 1}` as never,
+                aggregate_id: agg,
+                seq: index + 1,
+                type: "test.crash",
+                data,
+              })),
+            )
+            .run()
+            .pipe(Effect.orDie)
+
+          const result = yield* runPassV2(db).pipe(Effect.orDie)
+          expect(result.promoted).toBe(4)
+          const values = yield* db
+            .all<{ bytes: Uint8Array }>(sql`
+              SELECT bytes FROM event_value
+              WHERE aggregate_id = ${agg}
+              ORDER BY value_id
+            `)
+            .pipe(Effect.orDie)
+          expect(values).toHaveLength(4)
+          expect(values.some((row) => isV5Frame(row.bytes))).toBe(false)
+          const dependencies = yield* db
+            .get<{ count: number }>(sql`
+              SELECT count(*) AS count
+              FROM event_value_dependency
+              WHERE aggregate_id = ${agg}
+            `)
+            .pipe(Effect.orDie)
+          expect(dependencies?.count ?? 0).toBe(0)
+        }),
+      )
+    } finally {
+      if (previous === undefined) delete process.env.OPENCODE_SEAL_DELTA
+      else process.env.OPENCODE_SEAL_DELTA = previous
       rmSync(dir, { recursive: true, force: true })
     }
   })

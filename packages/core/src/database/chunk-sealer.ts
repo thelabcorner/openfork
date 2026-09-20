@@ -5,12 +5,17 @@ import type { SqlError } from "effect/unstable/sql/SqlError"
 import { sql } from "drizzle-orm"
 import type { EffectDrizzleQueryError } from "drizzle-orm/effect-core/errors"
 import { withBackfillDb, type DatabaseShape } from "./database"
-import { compressText, chooseCodec, compressDeltaRef, isV5Frame, parseV5Header } from "./json-codec"
+import { compressSmallText, compressText, SMALL_TEXT_THRESHOLD, THRESHOLD } from "./json-codec"
 import { compressTextAsync } from "./compress-pool"
 import { runSemanticPrunePass, type SemanticPruneOutcome } from "./chunk-prune"
-import { isSqliteBusy } from "./sqlite-busy"
+import { isSqliteBusy, retrySqliteBusy } from "./sqlite-busy"
+import {
+  makeSqliteMaintenanceQuietGate,
+  type SqliteMaintenanceQuietGate,
+} from "./sqlite-maintenance"
 import { Flag } from "../flag/flag"
 import { Flock } from "../util/flock"
+import { reclaimOrphanedEventPayloads } from "../event-payload"
 import {
   CHUNKDB_BATCH_SIZE,
   CHUNKDB_COOLING_MS,
@@ -47,7 +52,7 @@ const encoder = new TextEncoder()
  *   AND (session is cooled OR row is outside the live hot tail OR session row
  *        no longer exists)
  *   AND typeof(event.data) = 'text'              (idempotent: skip framed/ref)
- *   AND length(event.data) >= 4096               (code units; see threshold)
+ *   AND length(event.data) >= 512                (code units; see threshold)
  * `event_sequence.owner_id` is intentionally NOT an activity gate: it is durable
  * workspace/sync ownership and can remain populated for the lifetime of a
  * session. Treating it as "running" permanently excluded normal synced history.
@@ -192,6 +197,8 @@ interface SealerOptions {
   readonly batchSize?: number
   /** Override the per-pass row cap (default `MAX_ROWS_PER_PASS`). */
   readonly maxRowsPerPass?: number
+  /** Production-only cross-process foreground-activity gate. */
+  readonly quietGate?: SqliteMaintenanceQuietGate
 }
 
 /**
@@ -223,7 +230,11 @@ export function shouldDrainFreelist(freePages: number, pageCount: number): boole
   return freePages / pageCount > CHUNKDB_RECLAIM_DRAIN_FREE_RATIO
 }
 
-function reclaimSpace(db: DatabaseShape, mode: ReclaimMode = "maintenance"): Effect.Effect<ReclaimStats> {
+function reclaimSpace(
+  db: DatabaseShape,
+  mode: ReclaimMode = "maintenance",
+  quietGate?: SqliteMaintenanceQuietGate,
+): Effect.Effect<ReclaimStats> {
   return Effect.gen(function* () {
     const rows = yield* db.all<{ auto_vacuum: number }>(`PRAGMA auto_vacuum`).pipe(Effect.orDie)
     if ((rows[0]?.auto_vacuum ?? 0) !== 2) {
@@ -252,6 +263,7 @@ function reclaimSpace(db: DatabaseShape, mode: ReclaimMode = "maintenance"): Eff
         break
       }
 
+      if (quietGate) yield* quietGate.wait()
       const vacuum = yield* db.run(`PRAGMA incremental_vacuum(${CHUNKDB_VACUUM_PAGES_PER_PASS})`).pipe(
         Effect.map(() => true),
         Effect.catch((error) => {
@@ -282,7 +294,7 @@ function reclaimSpace(db: DatabaseShape, mode: ReclaimMode = "maintenance"): Eff
       currentFree = nextFree
       currentPageCount = nextPageCount
       yield* Effect.yieldNow
-      if (mode === "drain") yield* Effect.sleep(Duration.millis(CHUNKDB_RECLAIM_DRAIN_PAUSE_MS))
+      if (mode === "drain" && !quietGate) yield* Effect.sleep(Duration.millis(CHUNKDB_RECLAIM_DRAIN_PAUSE_MS))
     }
 
     const needsMore = mode === "drain" && shouldDrainFreelist(currentFree, currentPageCount)
@@ -305,9 +317,10 @@ function reclaimSpace(db: DatabaseShape, mode: ReclaimMode = "maintenance"): Eff
  * is already a frame / `$cdbRef` and is never re-selected as a text candidate.
  * Keeps the journal from growing 1:1 with every sealed event over the DB's life.
  */
-function pruneSealJournal(db: DatabaseShape): Effect.Effect<void> {
+function pruneSealJournal(db: DatabaseShape, quietGate?: SqliteMaintenanceQuietGate): Effect.Effect<void> {
   return Effect.gen(function* () {
     const cutoff = Date.now() - CHUNKDB_SEAL_JOURNAL_RETENTION_DAYS * 24 * 60 * 60 * 1000
+    if (quietGate) yield* quietGate.wait()
     yield* db.run(sql`DELETE FROM ocdb_seal WHERE time_sealed < ${cutoff}`).pipe(Effect.orDie)
   })
 }
@@ -344,7 +357,7 @@ export function runPass(
             OR e.seq <= es.seq - ${CHUNKDB_HOT_TAIL_EVENTS}
           )
           AND typeof(e.data) = 'text'
-          AND length(e.data) >= 4096
+          AND length(e.data) >= ${SMALL_TEXT_THRESHOLD}
           AND NOT EXISTS (
             SELECT 1 FROM ocdb_seal os
             WHERE os.table_name = 'event'
@@ -360,16 +373,21 @@ export function runPass(
 
       for (const candidate of candidates) {
         const rawLen = encoder.encode(candidate.data).byteLength
-        const frame = compressText(candidate.data)
+        const frame =
+          candidate.data.length < THRESHOLD
+            ? compressSmallText(candidate.data)
+            : compressText(candidate.data)
         processed += 1
         if (typeof frame === "string") {
           // Candidate discovery and compression happen outside the writer
           // transaction. Revalidate under an IMMEDIATE transaction before
           // recording any derived state: a factory reset (or any concurrent
           // delete/update) may have invalidated this candidate meanwhile.
-          yield* db.transaction(
-            (tx) =>
-              Effect.gen(function* () {
+          yield* retrySqliteBusy(
+            () =>
+              db.transaction(
+                (tx) =>
+                  Effect.gen(function* () {
                 const current = yield* tx.get<{ one: number }>(sql`
                   SELECT 1 AS one FROM event
                   WHERE id = ${candidate.id} AND typeof(data) = 'text' AND data = ${candidate.data}
@@ -384,14 +402,19 @@ export function runPass(
                     stored_bytes = excluded.stored_bytes,
                     time_sealed = excluded.time_sealed
                 `)
-              }),
-            { behavior: "immediate" },
+                  }),
+                { behavior: "immediate" },
+              ),
+            CHUNKDB_BUSY_RETRY_MS,
+            options?.quietGate?.wait,
           )
           continue
         }
-        const committed = yield* db.transaction(
-          (tx) =>
-            Effect.gen(function* () {
+        const committed = yield* retrySqliteBusy(
+          () =>
+            db.transaction(
+              (tx) =>
+                Effect.gen(function* () {
               const current = yield* tx.get<{ one: number }>(sql`
                 SELECT 1 AS one FROM event
                 WHERE id = ${candidate.id} AND typeof(data) = 'text' AND data = ${candidate.data}
@@ -408,8 +431,11 @@ export function runPass(
                   time_sealed = excluded.time_sealed
               `)
               return true
-            }),
-          { behavior: "immediate" },
+                }),
+              { behavior: "immediate" },
+            ),
+          CHUNKDB_BUSY_RETRY_MS,
+          options?.quietGate?.wait,
         )
         if (!committed) continue
         promoted += 1
@@ -421,10 +447,10 @@ export function runPass(
     }
 
     // Reclaim freed pages (bounded) so the file does not grow unbounded.
-    yield* reclaimSpace(db)
+    yield* reclaimSpace(db, "maintenance", options?.quietGate)
     // Drop stale audit-journal entries so ocdb_seal does not grow 1:1 with
     // every sealed event over the DB's lifetime.
-    yield* pruneSealJournal(db)
+    yield* pruneSealJournal(db, options?.quietGate)
 
     return { promoted, bytes, processed }
   })
@@ -467,13 +493,6 @@ export function runPassV2(
     let repeated = 0
     let bytes = 0
     let processed = 0
-    // Epoch-4 #10: track the last NON-delta (full-frame) promoted value per
-    // aggregate so subsequent candidates can be stored as a sparse correction
-    // (v5 delta_ref) against it. Only non-delta bases are tracked — a delta_ref
-    // value is never used as a base, which avoids nested deltas (the read path
-    // resolves a base via decodeValueBytesRaw, which only handles v1-v4).
-    const lastBaseByAggregate = new Map<string, { valueId: string; raw: Uint8Array }>()
-
     for (;;) {
       // IMPORTANT: candidate discovery MUST stay bounded. The previous
       // `agg_total` CTE evaluated SUM(length(data)) over the entire eligible
@@ -500,7 +519,7 @@ export function runPassV2(
             OR e.seq <= es.seq - ${CHUNKDB_HOT_TAIL_EVENTS}
           )
           AND typeof(e.data) = 'text'
-          AND length(e.data) >= 4096
+          AND length(e.data) >= ${SMALL_TEXT_THRESHOLD}
           AND NOT EXISTS (
             SELECT 1 FROM ocdb_seal os
             WHERE os.table_name = 'event'
@@ -520,7 +539,13 @@ export function runPassV2(
       // transaction below only applies the precomputed writes (crash-consistent
       // as before — either the whole batch commits or none of it).
       type Candidate = (typeof candidates)[number]
-      type Prepared = { candidate: Candidate; rawBytes: Uint8Array; externalize: boolean; sha?: string }
+      type Prepared = {
+        candidate: Candidate
+        rawBytes: Uint8Array
+        small: boolean
+        externalize: boolean
+        sha?: string
+      }
       type PendingPlan =
         | { kind: "skip" }
         | { kind: "inline"; prepared: Prepared }
@@ -539,9 +564,14 @@ export function runPassV2(
       // batch already plans to promote so the second occurrence becomes a
       // "repeat" pointing at the first's value_id.
       const batchSeen = new Map<string, string>()
-      const rawPrepared = candidates.map((candidate) => ({ candidate, rawBytes: encoder.encode(candidate.data) }))
+      const rawPrepared = candidates.map((candidate) => ({
+        candidate,
+        rawBytes: encoder.encode(candidate.data),
+        small: candidate.data.length < THRESHOLD,
+      }))
       const batchBytesByAggregate = new Map<string, number>()
-      for (const { candidate, rawBytes } of rawPrepared) {
+      for (const { candidate, rawBytes, small } of rawPrepared) {
+        if (small) continue
         batchBytesByAggregate.set(
           candidate.aggregate_id,
           (batchBytesByAggregate.get(candidate.aggregate_id) ?? 0) + rawBytes.byteLength,
@@ -552,7 +582,9 @@ export function runPassV2(
       // Once an aggregate has event_value rows, keep externalizing subsequent
       // batches even if the remaining tail alone is below the size threshold.
       const aggregatesWithValues = new Set<string>()
-      const aggregateIDs = [...new Set(candidates.map((candidate) => candidate.aggregate_id))]
+      const aggregateIDs = [
+        ...new Set(rawPrepared.filter((entry) => !entry.small).map((entry) => entry.candidate.aggregate_id)),
+      ]
       if (aggregateIDs.length > 0) {
         const ids = sql.join(aggregateIDs.map((id) => sql`${id}`), sql`, `)
         const rows = yield* db.all<{ aggregate_id: string }>(sql`
@@ -569,12 +601,18 @@ export function runPassV2(
       // ORDER BY (aggregate_id, seq) means only the final aggregate can be cut
       // by LIMIT. If its visible slice is below the 64 KiB externalization gate,
       // probe only enough of that aggregate to decide the threshold exactly.
-      // Every candidate is >=4 KiB, so 17 rows are sufficient to prove >64 KiB;
-      // this stays O(1) and never reintroduces a full-history SUM(length(data)).
+      // Only >=4 KiB values participate in event_value externalization. Small
+      // candidates always remain independently framed inline, so 17 large rows
+      // are still sufficient to prove >64 KiB without coupling small frames to
+      // aggregate heap ownership.
       if (candidates.length === batchSize) {
         const trailingAggregate = candidates.at(-1)?.aggregate_id
+        const trailingHasLarge = rawPrepared.some(
+          (entry) => !entry.small && entry.candidate.aggregate_id === trailingAggregate,
+        )
         if (
           trailingAggregate !== undefined &&
+          trailingHasLarge &&
           !aggregatesWithValues.has(trailingAggregate) &&
           !externalizeAggregates.has(trailingAggregate)
         ) {
@@ -591,7 +629,7 @@ export function runPassV2(
                 OR e.seq <= es.seq - ${CHUNKDB_HOT_TAIL_EVENTS}
               )
               AND typeof(e.data) = 'text'
-              AND length(e.data) >= 4096
+              AND length(e.data) >= ${THRESHOLD}
               AND NOT EXISTS (
                 SELECT 1 FROM ocdb_seal os
                 WHERE os.table_name = 'event'
@@ -609,13 +647,15 @@ export function runPassV2(
         }
       }
 
-      const prepared: Prepared[] = rawPrepared.map(({ candidate, rawBytes }) => {
+      const prepared: Prepared[] = rawPrepared.map(({ candidate, rawBytes, small }) => {
         const externalize =
-          externalizeAggregates.has(candidate.aggregate_id) ||
-          aggregatesWithValues.has(candidate.aggregate_id)
+          !small &&
+          (externalizeAggregates.has(candidate.aggregate_id) ||
+            aggregatesWithValues.has(candidate.aggregate_id))
         return {
           candidate,
           rawBytes,
+          small,
           externalize,
           sha: externalize ? createHash("sha256").update(rawBytes).digest("hex") : undefined,
         }
@@ -638,7 +678,7 @@ export function runPassV2(
       for (const item of prepared) {
         const { candidate } = item
         // Idempotency: a row already promoted to a reference is short TEXT, so
-        // the length >= 4096 filter already excludes it; bail early if one
+        // the >=512 candidate filter still excludes normal refs; bail early if one
         // slips through (defensive, never re-promote a ref).
         if (candidate.data.startsWith(`{"${CDB_REF}"`)) {
           pending.push({ kind: "skip" })
@@ -685,9 +725,11 @@ export function runPassV2(
       const compressed = yield* Effect.all(
         compressionTargets.map((plan) => {
           const raw = plan.prepared.candidate.data
-          const effect = useWorkers
-            ? Effect.promise(() => compressTextAsync(raw))
-            : Effect.sync(() => compressText(raw))
+          const effect = plan.prepared.small
+            ? Effect.sync(() => compressSmallText(raw))
+            : useWorkers
+              ? Effect.promise(() => compressTextAsync(raw))
+              : Effect.sync(() => compressText(raw))
           return effect.pipe(Effect.map((frame) => [plan.prepared.candidate.id, frame] as const))
         }),
         { concurrency: useWorkers ? 16 : 1 },
@@ -695,13 +737,6 @@ export function runPassV2(
       const frameByID = new Map(compressed)
 
       const plans: Plan[] = []
-      // Delta matching is useful for modest record-shaped values, but it is the
-      // wrong representation for jumbo rows. Besides adding read amplification,
-      // building a correction requires indexing/comparing both raw values. Keep
-      // jumbo payloads on the independently-decodable v4 segmented frame path.
-      // This also makes a corrupted/hostile giant event incapable of monopolizing
-      // a background sealing pass when delta mode is explicitly enabled.
-      const deltaMaxRawBytes = 4 * 1024 * 1024
       for (const plan of pending) {
         if (plan.kind === "skip") {
           plans.push(plan)
@@ -718,22 +753,13 @@ export function runPassV2(
           continue
         }
 
+        // v5 delta_ref emission was retired after whole-corpus measurement on
+        // opencode-main.db: 8,244 live children + their otherwise-dead support
+        // bases occupied 7.8% MORE bytes than independently compressed children,
+        // before dependency metadata, while also adding encode/read/GC cost.
+        // Historical v5 decode/integrity/GC support remains fully supported.
         const frame = frameByID.get(candidate.id) ?? candidate.data
-        let finalFrame: string | Uint8Array = frame
-        if (
-          Flag.OPENCODE_SEAL_DELTA &&
-          typeof frame !== "string" &&
-          rawBytes.byteLength <= deltaMaxRawBytes
-        ) {
-          const base = lastBaseByAggregate.get(candidate.aggregate_id)
-          if (base !== undefined && base.raw.byteLength <= deltaMaxRawBytes) {
-            const { codec, level } = chooseCodec(rawBytes.byteLength)
-            const delta = compressDeltaRef(rawBytes, base.raw, base.valueId, codec, level)
-            if (delta.byteLength < frame.byteLength * 0.7) finalFrame = delta
-          }
-        }
-        if (finalFrame === frame) lastBaseByAggregate.set(candidate.aggregate_id, { valueId: plan.valueId, raw: rawBytes })
-        plans.push({ kind: "first", candidate, sha: plan.sha, frame: finalFrame, valueId: plan.valueId, rawLen })
+        plans.push({ kind: "first", candidate, sha: plan.sha, frame, valueId: plan.valueId, rawLen })
       }
 
       const writePlans = plans.filter((plan): plan is Exclude<Plan, { kind: "skip" }> => plan.kind !== "skip")
@@ -762,6 +788,7 @@ export function runPassV2(
 
       for (const writeSlice of slices) {
         for (;;) {
+          if (options?.quietGate) yield* options.quietGate.wait()
           const outcome = yield* db
             .transaction(
               (tx) =>
@@ -847,15 +874,6 @@ export function runPassV2(
                     INSERT INTO event_value (aggregate_id, value_id, sha256, raw_len, bytes, refs, time_promoted)
                     VALUES (${candidate.aggregate_id}, ${plan.valueId}, ${plan.sha}, ${plan.rawLen}, ${stored}, 1, ${Date.now()})
                   `)
-                  if (stored instanceof Uint8Array && isV5Frame(stored)) {
-                    const dependency = parseV5Header(stored)
-                    yield* tx.run(sql`
-                      INSERT INTO event_value_dependency (aggregate_id, value_id, base_value_id)
-                      VALUES (${candidate.aggregate_id}, ${plan.valueId}, ${dependency.baseValueId})
-                      ON CONFLICT(aggregate_id, value_id) DO UPDATE SET
-                        base_value_id = excluded.base_value_id
-                    `)
-                  }
                   yield* tx.run(sql`
                     INSERT INTO ocdb_seal (table_name, row_id, column_name, raw_bytes, stored_bytes, codec, frame_version, time_sealed, reseal_needed)
                       VALUES ('event', ${candidate.id}, 'data', ${plan.rawLen}, ${stored.byteLength}, ${codec}, ${typeof frame === "string" ? 0 : frame[4]}, ${Date.now()}, 0)
@@ -895,16 +913,16 @@ export function runPassV2(
         }
 
         yield* Effect.yieldNow
-        yield* Effect.sleep(Duration.millis(CHUNKDB_WRITE_SLICE_PAUSE_MS))
+        if (!options?.quietGate) yield* Effect.sleep(Duration.millis(CHUNKDB_WRITE_SLICE_PAUSE_MS))
       }
       if (processed >= maxRowsPerPass) break
     }
 
     // Reclaim freed pages (bounded) so the file does not grow unbounded.
-    yield* reclaimSpace(db)
+    yield* reclaimSpace(db, "maintenance", options?.quietGate)
     // Drop stale audit-journal entries so ocdb_seal does not grow 1:1 with
     // every sealed event over the DB's lifetime.
-    yield* pruneSealJournal(db)
+    yield* pruneSealJournal(db, options?.quietGate)
 
     return { promoted, repeated, bytes, processed }
   })
@@ -977,7 +995,7 @@ export function inspectSealerBacklog(
         LEFT JOIN session se ON se.id = e.aggregate_id
         WHERE e.seq <= es.seq
           AND typeof(e.data) = 'text'
-          AND length(e.data) >= 4096
+          AND length(e.data) >= ${SMALL_TEXT_THRESHOLD}
           AND NOT EXISTS (
             SELECT 1 FROM ocdb_seal os
             WHERE os.table_name = 'event'
@@ -1054,19 +1072,28 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               )
               if (!lock) return false
 
-              yield* withBackfillDb(filename, (db) =>
-                Effect.gen(function* () {
+              yield* withBackfillDb(
+                filename,
+                (db) =>
+                  Effect.gen(function* () {
+          const quietGate = makeSqliteMaintenanceQuietGate(db)
           yield* Effect.logInfo("ChunkDB sealer started", {
             filename,
             pid: process.pid,
             dedup: Flag.OPENCODE_SEAL_DEDUP,
             workers: Flag.OPENCODE_SEAL_WORKERS,
-            delta: Flag.OPENCODE_SEAL_DELTA,
+            deltaWriter: false,
             semanticPrune: Flag.OPENCODE_SEAL_PRUNE,
             backfill: backfillAllowed,
             coolingMs: CHUNKDB_COOLING_MS,
             hotTailEvents: CHUNKDB_HOT_TAIL_EVENTS,
           })
+          if (Flag.OPENCODE_SEAL_DELTA) {
+            yield* Effect.logWarning("ChunkDB delta writer is retired; OPENCODE_SEAL_DELTA is ignored", {
+              filename,
+              pid: process.pid,
+            })
+          }
           let previousHitCap: boolean = false
           let reclaimDraining = false
           let backoffMs = BACKOFF_BASE_MS
@@ -1084,6 +1111,7 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
                 | { readonly kind: "failed" }
               const semanticOutcome: SemanticLoopOutcome = yield* runSemanticPrunePass(db, {
                 limit: Math.min(cap, 8_192),
+                quietGate,
               }).pipe(
                 Effect.map((value): SemanticLoopOutcome => ({ kind: "ok", value })),
                 // Some migration/backfill helpers intentionally fail closed via
@@ -1144,7 +1172,10 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
                 semanticNoProgressStreak = 0
               }
             }
-            const outcome: SealerPassOutcome = yield* runSealerPass(db, { maxRowsPerPass: cap }).pipe(
+            const outcome: SealerPassOutcome = yield* runSealerPass(db, {
+              maxRowsPerPass: cap,
+              quietGate,
+            }).pipe(
               Effect.catch((error) =>
                 Effect.logError("ChunkDB sealer pass failed; backing off", { filename, error }).pipe(
                   Effect.as({ kind: "failed" as const, promoted: 0, repeated: 0, processed: 0, bytes: 0 }),
@@ -1194,8 +1225,24 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
             // maintenance reclaims. This also repairs a DB that finished its
             // backfill in a previous process before this policy existed.
             if (!previousHitCap && !semanticScanBacklog) {
-              const reclaim = yield* reclaimSpace(db, "drain")
-              reclaimDraining = reclaim.needsMore
+              const payloadReclaim = yield* reclaimOrphanedEventPayloads(db, { quietGate }).pipe(
+                Effect.catchCause((cause) => {
+                  if (Cause.hasInterrupts(cause)) return Effect.failCause(cause).pipe(Effect.orDie)
+                  return Effect.logWarning("ChunkDB staged-payload reclaim failed; deferring", {
+                    filename,
+                    cause: Cause.pretty(cause),
+                  }).pipe(Effect.as({ reclaimed: 0, hasMore: false }))
+                }),
+              )
+              if (payloadReclaim.reclaimed > 0) {
+                yield* Effect.logInfo("ChunkDB staged-payload reclaim progress", {
+                  filename,
+                  reclaimed: payloadReclaim.reclaimed,
+                  draining: payloadReclaim.hasMore,
+                })
+              }
+              const reclaim = yield* reclaimSpace(db, "drain", quietGate)
+              reclaimDraining = reclaim.needsMore || payloadReclaim.hasMore
               if (reclaim.reclaimedPages > 0) {
                 yield* Effect.logInfo("ChunkDB space reclaim progress", {
                   filename,
@@ -1220,7 +1267,8 @@ export function runSealerLoop(filename: string): Effect.Effect<void> {
               : regularWait
             yield* Effect.sleep(Duration.millis(wait))
           }
-                }),
+                  }),
+                { busyTimeoutMs: 0 },
               )
               return true
             }),

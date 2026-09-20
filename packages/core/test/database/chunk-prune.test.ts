@@ -8,7 +8,7 @@ import { asc, eq, sql } from "drizzle-orm"
 import { EffectDrizzleSqlite } from "@opencode-ai/effect-drizzle-sqlite"
 import { layer as sqliteLayer } from "../../src/database/sqlite.bun"
 import { DatabaseMigration } from "../../src/database/migration"
-import { ensureChunkDB } from "../../src/database/chunkdb"
+import { CHUNKDB_MAX_USER_VERSION, ensureChunkDB } from "../../src/database/chunkdb"
 import { runSemanticPrunePass, SemanticPrune } from "../../src/database/chunk-prune"
 import { indexSemanticEvent, SemanticKind } from "../../src/database/chunk-semantic"
 import { compressDeltaRef } from "../../src/database/json-codec"
@@ -133,6 +133,7 @@ describe("ChunkDB semantic prune", () => {
     )
     expect(defect._tag).toBe("Failure")
     if (defect._tag === "Failure") expect(isSqliteBusy(defect.cause)).toBe(true)
+    expect(isSqliteBusy({ code: "SQLITE_BUSY_SNAPSHOT", errno: 517, message: "database is locked" })).toBe(true)
   })
   test("write-time semantic identity indexing is tiny and exact", async () => {
     const { dir, path } = tempDb()
@@ -168,7 +169,7 @@ describe("ChunkDB semantic prune", () => {
             proven: 1,
           })
           const epoch = yield* db.get<{ user_version: number }>(sql`PRAGMA user_version`).pipe(Effect.orDie)
-          expect(epoch?.user_version).toBe(4)
+          expect(epoch?.user_version).toBe(CHUNKDB_MAX_USER_VERSION)
         }).pipe(Effect.provide(sqliteLayer({ filename: path }))),
       )
     } finally {
@@ -296,6 +297,95 @@ describe("ChunkDB semantic prune", () => {
     }
   })
 
+  test("backfills staged jumbo semantic identity and releases its payload ownership when pruned", async () => {
+    const { dir, path } = tempDb()
+    try {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const db = yield* makeDatabase
+          yield* DatabaseMigration.apply(db)
+          yield* ensureChunkDB(db)
+
+          const sessionID = "ses_staged_prune"
+          const messageID = "msg_staged_prune"
+          const oldText = message(messageID, sessionID, "before")
+          const payloadID = createHash("sha256").update(oldText, "utf8").digest("hex")
+          const stagedRef = JSON.stringify({ $eventPayload: { id: payloadID, count: 1 } })
+          const now = Date.now()
+
+          yield* db.run(sql`
+            INSERT INTO project (id, worktree, sandboxes, time_created, time_updated)
+            VALUES ('global', '/tmp', '[]', ${now}, ${now})
+          `).pipe(Effect.orDie)
+          yield* db.run(sql`
+            INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+            VALUES (${sessionID}, 'global', 'staged', '/tmp', 'staged', 'test', 1, 1)
+          `).pipe(Effect.orDie)
+          yield* db.run(sql`
+            INSERT INTO event_sequence (aggregate_id, seq, owner_id)
+            VALUES (${sessionID}, 1, NULL)
+          `).pipe(Effect.orDie)
+          yield* db.run(sql`
+            INSERT INTO message (id, session_id, time_created, time_updated, data)
+            VALUES (
+              ${messageID},
+              ${sessionID},
+              1,
+              1,
+              ${JSON.stringify({
+                role: "user",
+                time: { created: 1 },
+                agent: "after",
+                model: { providerID: "provider", modelID: "model" },
+              })}
+            )
+          `).pipe(Effect.orDie)
+          yield* db.run(sql`
+            INSERT INTO event_payload_meta (payload_id, chunk_count, refs, time_touched)
+            VALUES (${payloadID}, 1, 1, ${now})
+          `).pipe(Effect.orDie)
+          yield* db.run(sql`
+            INSERT INTO event_payload_chunk (payload_id, chunk_index, text, time_created)
+            VALUES (${payloadID}, 0, ${oldText}, ${now})
+          `).pipe(Effect.orDie)
+          yield* db.run(sql`
+            INSERT INTO event (id, aggregate_id, seq, type, data)
+            VALUES
+              ('evt_staged_old', ${sessionID}, 0, 'message.updated.1', ${stagedRef}),
+              ('evt_staged_new', ${sessionID}, 1, 'message.updated.1', ${message(messageID, sessionID, "after")})
+          `).pipe(Effect.orDie)
+
+          // Deliberately do NOT call indexSemanticEvent(): this exercises the
+          // historical/transformed backfill path that previously skipped
+          // $eventPayload rows entirely.
+          const result = yield* runSemanticPrunePass(db, { limit: 16, now })
+          expect(result.indexBackfilled).toBeGreaterThanOrEqual(2)
+          expect(result.compacted).toBe(1)
+
+          expect(
+            (yield* db.get<{ count: number }>(sql`
+              SELECT count(*) AS count FROM event WHERE id = 'evt_staged_old'
+            `).pipe(Effect.orDie))?.count,
+          ).toBe(0)
+          expect(
+            yield* db.get<{ refs: number }>(sql`
+              SELECT refs FROM event_payload_meta WHERE payload_id = ${payloadID}
+            `).pipe(Effect.orDie),
+          ).toEqual({ refs: 0 })
+          // Chunk-body deletion remains intentionally deferred/age-gated; prune
+          // only releases durable ownership inside its short writer slice.
+          expect(
+            (yield* db.get<{ count: number }>(sql`
+              SELECT count(*) AS count FROM event_payload_chunk WHERE payload_id = ${payloadID}
+            `).pipe(Effect.orDie))?.count,
+          ).toBe(1)
+        }).pipe(Effect.provide(sqliteLayer({ filename: path }))),
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test("keeps semantic drain mode active after a mismatch-only aggregate advances the cursor", async () => {
     const { dir, path } = tempDb()
     try {
@@ -364,6 +454,76 @@ describe("ChunkDB semantic prune", () => {
           const next = yield* runSemanticPrunePass(db, { limit: 16, now })
           expect(next.aggregateID).toBe("ses_drain_b")
           expect(next.compacted).toBe(1)
+        }).pipe(Effect.provide(sqliteLayer({ filename: path }))),
+      )
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
+  test("keeps semantic drain mode active after a successfully exhausted aggregate", async () => {
+    const { dir, path } = tempDb()
+    try {
+      await Effect.runPromise(
+        Effect.gen(function* () {
+          const db = yield* makeDatabase
+          yield* db.run("PRAGMA journal_mode=WAL").pipe(Effect.orDie)
+          yield* db.run("PRAGMA foreign_keys=ON").pipe(Effect.orDie)
+          yield* DatabaseMigration.apply(db)
+          yield* ensureChunkDB(db)
+
+          const now = Date.now()
+          yield* db.run(sql`
+            INSERT INTO project (id, worktree, sandboxes, time_created, time_updated)
+            VALUES ('global', '/tmp', '[]', ${now}, ${now})
+          `).pipe(Effect.orDie)
+
+          for (const suffix of ["a", "b"] as const) {
+            const sessionID = `ses_success_drain_${suffix}`
+            const messageID = `msg_success_drain_${suffix}`
+            yield* db.run(sql`
+              INSERT INTO session (id, project_id, slug, directory, title, version, time_created, time_updated)
+              VALUES (${sessionID}, 'global', ${suffix}, '/tmp', ${suffix}, 'test', 1, 1)
+            `).pipe(Effect.orDie)
+            yield* db.run(sql`
+              INSERT INTO event_sequence (aggregate_id, seq, owner_id)
+              VALUES (${sessionID}, 1, NULL)
+            `).pipe(Effect.orDie)
+            yield* db.run(sql`
+              INSERT INTO message (id, session_id, time_created, time_updated, data)
+              VALUES (
+                ${messageID},
+                ${sessionID},
+                1,
+                1,
+                ${JSON.stringify({
+                  role: "user",
+                  time: { created: 1 },
+                  agent: "after",
+                  model: { providerID: "provider", modelID: "model" },
+                })}
+              )
+            `).pipe(Effect.orDie)
+            yield* db.run(sql`
+              INSERT INTO event (id, aggregate_id, seq, type, data)
+              VALUES
+                (${`evt_success_drain_${suffix}_old`}, ${sessionID}, 0, 'message.updated.1', ${message(messageID, sessionID, "before")}),
+                (${`evt_success_drain_${suffix}_new`}, ${sessionID}, 1, 'message.updated.1', ${message(messageID, sessionID, "after")})
+            `).pipe(Effect.orDie)
+          }
+
+          const first = yield* runSemanticPrunePass(db, { limit: 16, now })
+          expect(first.aggregateID).toBe("ses_success_drain_a")
+          expect(first.compacted).toBe(1)
+          // Aggregate A is fully drained, but B is immediately eligible. The
+          // scheduler must not mistake "current aggregate exhausted" for
+          // "semantic work globally exhausted".
+          expect(first.hasMore).toBe(true)
+
+          const second = yield* runSemanticPrunePass(db, { limit: 16, now })
+          expect(second.aggregateID).toBe("ses_success_drain_b")
+          expect(second.compacted).toBe(1)
+          expect(second.hasMore).toBe(false)
         }).pipe(Effect.provide(sqliteLayer({ filename: path }))),
       )
     } finally {
@@ -465,7 +625,10 @@ describe("ChunkDB semantic prune", () => {
             ) VALUES (${sessionID}, 'global', 's', '/tmp', 's', 'test', 1, 1, 0, 0, 0, 0, 0, 0)
           `).pipe(Effect.orDie)
 
-          const database = Layer.succeed(Database.Service, { db, filename: path })
+          // This fixture owns one manually constructed handle. Projection replay
+          // does not need the production query-only connection, so alias the
+          // read surface exactly as Database.layerFromPath does for :memory:.
+          const database = Layer.succeed(Database.Service, { db, readDb: db, filename: path })
           const layer = AppNodeBuilder.build(
             LayerNode.group([EventV2.node, SessionProjector.node]),
             [[Database.node, database]],

@@ -3,7 +3,7 @@ export * as EventV2 from "./event"
 import { Cause, Context, Effect, Layer, Option, PubSub, Queue, Schema, Stream } from "effect"
 import { Event } from "@opencode-ai/schema/event"
 import type { Data, Definition, Payload } from "@opencode-ai/schema/event"
-import { and, asc, eq, gt, inArray, lt } from "drizzle-orm"
+import { and, asc, eq, gt, inArray } from "drizzle-orm"
 import { Database } from "./database/database"
 import type { DatabaseShape } from "./database/database"
 import {
@@ -19,7 +19,7 @@ import {
   preencodeJson,
   preencodedJsonText,
 } from "./database/json-codec"
-import { decompressValueAsync } from "./database/decompress-pool"
+import { decompressValueAsync, shouldUseDecompressPool } from "./database/decompress-pool"
 import {
   EventPayloadChunkTable,
   EventPayloadMetaTable,
@@ -37,6 +37,18 @@ import { Durable } from "@opencode-ai/schema/durable-event-manifest"
 import { estimateEventBytes } from "./event-replay"
 import { indexSemanticEvent } from "./database/chunk-semantic"
 import { isCompactedSequence, loadCompaction, recordCompactedSequences } from "./database/chunk-compaction"
+import {
+  decrementEventPayloadRefs,
+  EVENT_PAYLOAD_REF,
+  EventPayloadRehydrateError,
+  incrementEventPayloadRef,
+  type EventPayloadRef,
+  isEventPayloadRef,
+  reclaimOrphanedEventPayloads,
+  rehydrateStagedEventPayloads,
+} from "./event-payload"
+
+export { EventPayloadRehydrateError } from "./event-payload"
 
 const streamingDecoder = new TextDecoder()
 type DatabaseReader = Pick<DatabaseShape, "select">
@@ -90,30 +102,12 @@ export class CdbRehydrateError extends Schema.TaggedErrorClass<CdbRehydrateError
   reason: Schema.String,
 }) {}
 
-export class EventPayloadRehydrateError extends Schema.TaggedErrorClass<EventPayloadRehydrateError>()(
-  "EventV2.EventPayloadRehydrateError",
-  {
-    payloadID: Schema.String,
-    reason: Schema.String,
-  },
-) {}
-
 const CDB_REF = "$cdbRef"
-const EVENT_PAYLOAD_REF = "$eventPayload"
 // Bound each implicit SQLite writer transaction to at most ~768 KiB even for
 // three-byte UTF-8 BMP code points. ASCII/base64 payloads are exactly 256 KiB.
 // A trailing high surrogate is carried into the next chunk so round-trip UTF-8
 // encoding never substitutes U+FFFD at a chunk boundary.
 const EVENT_PAYLOAD_CHUNK_CHARS = 256 * 1024
-const EVENT_PAYLOAD_ORPHAN_GRACE_MS = 24 * 60 * 60 * 1000
-const EVENT_PAYLOAD_STARTUP_CLEANUP_LIMIT = 8
-
-type EventPayloadRef = {
-  readonly [EVENT_PAYLOAD_REF]: {
-    readonly id: string
-    readonly count: number
-  }
-}
 
 /**
  * A promoted reference is EXACTLY `{"$cdbRef": "<value_id>"}` — a sole-key JSON
@@ -126,16 +120,6 @@ function isCdbRef(data: unknown): data is { readonly [CDB_REF]: string } {
   const record = data as Record<string, unknown>
   if (Object.keys(record).length !== 1) return false
   return typeof record[CDB_REF] === "string"
-}
-
-function isEventPayloadRef(data: unknown): data is EventPayloadRef {
-  if (typeof data !== "object" || data === null || Array.isArray(data)) return false
-  const record = data as Record<string, unknown>
-  if (Object.keys(record).length !== 1) return false
-  const ref = record[EVENT_PAYLOAD_REF]
-  if (typeof ref !== "object" || ref === null || Array.isArray(ref)) return false
-  const value = ref as Record<string, unknown>
-  return typeof value.id === "string" && Number.isSafeInteger(value.count) && Number(value.count) > 0
 }
 
 function payloadChunkEnd(text: string, start: number) {
@@ -212,51 +196,6 @@ const stageEventPayload = Effect.fnUntraced(function* (db: DatabaseShape, text: 
 })
 
 /**
- * Reclaim crash residue from prior processes. This runs while the EventV2
- * service is still constructing, before this process can publish anything.
- * A 24-hour grace window protects payloads another process may be staging; the
- * candidate is rechecked under IMMEDIATE writer ownership before deletion.
- */
-const cleanupOrphanedEventPayloads = Effect.fnUntraced(function* (db: DatabaseShape) {
-  const cutoff = Date.now() - EVENT_PAYLOAD_ORPHAN_GRACE_MS
-  const candidates = yield* db
-    .select({ payloadID: EventPayloadMetaTable.payload_id })
-    .from(EventPayloadMetaTable)
-    .where(and(eq(EventPayloadMetaTable.refs, 0), lt(EventPayloadMetaTable.time_touched, cutoff)))
-    .limit(EVENT_PAYLOAD_STARTUP_CLEANUP_LIMIT)
-    .all()
-    .pipe(Effect.orDie)
-
-  for (const candidate of candidates) {
-    yield* db
-      .transaction(
-        () =>
-          Effect.gen(function* () {
-            const meta = yield* db
-              .select({ refs: EventPayloadMetaTable.refs, touched: EventPayloadMetaTable.time_touched })
-              .from(EventPayloadMetaTable)
-              .where(eq(EventPayloadMetaTable.payload_id, candidate.payloadID))
-              .get()
-              .pipe(Effect.orDie)
-            if (!meta || meta.refs !== 0 || meta.touched >= cutoff) return
-            yield* db
-              .delete(EventPayloadChunkTable)
-              .where(eq(EventPayloadChunkTable.payload_id, candidate.payloadID))
-              .run()
-              .pipe(Effect.orDie)
-            yield* db
-              .delete(EventPayloadMetaTable)
-              .where(eq(EventPayloadMetaTable.payload_id, candidate.payloadID))
-              .run()
-              .pipe(Effect.orDie)
-          }),
-        { behavior: "immediate" },
-      )
-      .pipe(Effect.orDie)
-  }
-})
-
-/**
  * Epoch-3 HOT-VALUE rehydration cache: a per-database, size-bounded,
  * frequency-aware cache of `(aggregate_id, value_id)` -> decoded payload.
  *
@@ -265,9 +204,11 @@ const cleanupOrphanedEventPayloads = Effect.fnUntraced(function* (db: DatabaseSh
  *   entry first, so the most-referenced payloads — the "compiled hot set" —
  *   stay PRE-DECODED (parsed object) and replay at ZERO decompress + ZERO
  *   JSON.parse. A generic LRU would evict them under read churn; this does not.
- * - BOUNDED: capped at `REHYDRATE_CACHE_MAX_ENTRIES` entries and
- *   `REHYDRATE_CACHE_MAX_BYTES` of raw payload bytes, so a long-lived process
- *   can never grow the cache without bound.
+ * - LOGICALLY BOUNDED: capped at `REHYDRATE_CACHE_MAX_ENTRIES` entries and
+ *   `REHYDRATE_CACHE_MAX_BYTES` of source `raw_len`. This is an admission
+ *   budget, NOT a JS heap/RSS estimate: parsed objects and runtime-managed
+ *   strings can retain several times their UTF-8 source bytes. Keep the raw-byte
+ *   charge observable and do not describe this setting as a process-memory cap.
  * - VALIDATED: a cached payload is byte-identical to the original. Frames are
  *   CRC-verified by `decodeValueBytesObject`; raw BLOBs are SHA-256 verified
  *   against `event_value.sha256` at decode time, so the memoized object is safe
@@ -340,6 +281,10 @@ class RehydrateCache {
   get size(): number {
     return this.map.size
   }
+
+  get chargedBytes(): number {
+    return this.totalBytes
+  }
 }
 
 const rehydrateCache = new WeakMap<object, RehydrateCache>()
@@ -353,8 +298,8 @@ const rehydrateCacheKey = (aggregateID: string, valueID: string) => `${aggregate
  */
 export const rehydrateCacheStats = (db: object) => {
   const cache = rehydrateCache.get(db)
-  if (cache === undefined) return { hits: 0, misses: 0, entries: 0 }
-  return { hits: cache.hits, misses: cache.misses, entries: cache.size }
+  if (cache === undefined) return { hits: 0, misses: 0, entries: 0, chargedBytes: 0 }
+  return { hits: cache.hits, misses: cache.misses, entries: cache.size, chargedBytes: cache.chargedBytes }
 }
 
 /**
@@ -436,7 +381,7 @@ export const resolveCdbRef = Effect.fn("EventV2.resolveCdbRef")(function* (
   }
   const useWorkers = Flag.OPENCODE_SEAL_WORKERS
   const decoded =
-    useWorkers && bytes.length >= DECOMPRESS_POOL_THRESHOLD
+    useWorkers && shouldUseDecompressPool(bytes.length)
       ? yield* Effect.promise(() => decompressValueAsync(bytes))
       : yield* decodeValueBytesObjectStreaming(bytes)
   const { value, raw } = decoded
@@ -509,13 +454,6 @@ const REHYDRATE_CACHE_BYTES = Math.max(
   (Number(process.env.OPENCODE_SEAL_CACHE_BYTES_MB) || REHYDRATE_CACHE_MAX_BYTES / (1024 * 1024)) * 1024 * 1024,
 )
 
-/**
- * Below this compressed size a reference decodes inline (sync) to avoid the
- * worker round-trip; at/above it the read path uses the decompress worker pool
- * so jumbo payloads and wide batches decompress in parallel off the main thread.
- */
-const DECOMPRESS_POOL_THRESHOLD = 64 * 1024
-
 /** Epoch-3 rehydration cache capacity (entries). Exposed for tests. */
 export const REHYDRATE_CACHE_CAP_ENTRIES = REHYDRATE_CACHE_MAX_ENTRIES
 
@@ -577,83 +515,6 @@ export const decodeValueBytesObjectStreaming = (bytes: Uint8Array) =>
  *   fail sha256 validation, throws CdbRehydrateError rather than returning a
  *   fabricated value.
  */
-const rehydrateStagedEventPayloads = Effect.fnUntraced(function* <
-  R extends { readonly data: Record<string, unknown> },
->(db: DatabaseReader, rows: ReadonlyArray<R>) {
-  const refs: Array<{ readonly row: R; readonly ref: EventPayloadRef[typeof EVENT_PAYLOAD_REF] }> = []
-  for (const row of rows) {
-    if (isEventPayloadRef(row.data)) refs.push({ row, ref: row.data[EVENT_PAYLOAD_REF] })
-  }
-  if (refs.length === 0) return rows
-
-  const ids = Array.from(new Set(refs.map(({ ref }) => ref.id)))
-  const stored = yield* db
-    .select({
-      payloadID: EventPayloadChunkTable.payload_id,
-      index: EventPayloadChunkTable.chunk_index,
-      text: EventPayloadChunkTable.text,
-    })
-    .from(EventPayloadChunkTable)
-    .where(inArray(EventPayloadChunkTable.payload_id, ids))
-    .orderBy(asc(EventPayloadChunkTable.payload_id), asc(EventPayloadChunkTable.chunk_index))
-    .all()
-    .pipe(Effect.orDie)
-
-  const grouped = Map.groupBy(stored, (chunk) => chunk.payloadID)
-  const resolved = new Map<string, Record<string, unknown>>()
-  let resolvedCount = 0
-  for (const { ref } of refs) {
-    if (resolved.has(ref.id)) continue
-    const chunks = grouped.get(ref.id) ?? []
-    if (chunks.length !== ref.count) {
-      throw new EventPayloadRehydrateError({
-        payloadID: ref.id,
-        reason: `expected ${ref.count} chunks, found ${chunks.length}`,
-      })
-    }
-    const hash = createHash("sha256")
-    const parts: string[] = []
-    for (let index = 0; index < chunks.length; index++) {
-      const chunk = chunks[index]!
-      if (chunk.index !== index) {
-        throw new EventPayloadRehydrateError({
-          payloadID: ref.id,
-          reason: `expected chunk ${index}, found ${chunk.index}`,
-        })
-      }
-      hash.update(chunk.text, "utf8")
-      parts.push(chunk.text)
-      if ((index + 1) % 8 === 0 && index + 1 < chunks.length) yield* Effect.yieldNow
-    }
-    if (hash.digest("hex") !== ref.id) {
-      throw new EventPayloadRehydrateError({ payloadID: ref.id, reason: "sha256 mismatch" })
-    }
-    try {
-      const value = JSON.parse(parts.join(""))
-      if (typeof value !== "object" || value === null || Array.isArray(value)) {
-        throw new Error("event payload is not an object")
-      }
-      resolved.set(ref.id, value as Record<string, unknown>)
-      resolvedCount += 1
-      // Parsing itself is intentionally fail-closed and synchronous, but never
-      // parse several independent jumbo event bodies back-to-back in one
-      // Effect turn. This bounds a cold multi-session replay burst to one JSON
-      // construction before the scheduler can service other Sessions.
-      if (resolvedCount < ids.length) yield* Effect.yieldNow
-    } catch (cause) {
-      if (cause instanceof EventPayloadRehydrateError) throw cause
-      throw new EventPayloadRehydrateError({ payloadID: ref.id, reason: `invalid JSON: ${String(cause)}` })
-    }
-  }
-
-  return rows.map((row) => {
-    if (!isEventPayloadRef(row.data)) return row
-    const value = resolved.get(row.data[EVENT_PAYLOAD_REF].id)
-    if (!value) return row
-    return { ...row, data: value }
-  }) as R[]
-})
-
 export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
   R extends { readonly data: Record<string, unknown> },
 >(db: DatabaseReader, aggregateID: string, rows: ReadonlyArray<R>) {
@@ -666,37 +527,23 @@ export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
   }
   if (refs.length === 0) return source
 
-  const valueIDs = Array.from(new Set(refs.map((ref) => ref.valueID)))
-  const stored = yield* db
-    .select({
-      valueID: EventValueTable.value_id,
-      bytes: EventValueTable.bytes,
-      sha256: EventValueTable.sha256,
-      rawLen: EventValueTable.raw_len,
-      refs: EventValueTable.refs,
-    })
-    .from(EventValueTable)
-    .where(and(eq(EventValueTable.aggregate_id, aggregateID), inArray(EventValueTable.value_id, valueIDs)))
-    .all()
-    .pipe(Effect.orDie)
-
-  const byID = new Map(stored.map((row) => [row.valueID, row] as const))
-
   let cache = rehydrateCache.get(db)
   if (cache === undefined) {
     cache = new RehydrateCache(REHYDRATE_CACHE_ENTRIES, REHYDRATE_CACHE_BYTES)
     rehydrateCache.set(db, cache)
   }
 
-  // Split references into cache hits (served inline) and misses (need decode).
+  // Split references into cache hits and misses BEFORE touching event_value.
+  // A decoded cache hit is already CRC/SHA validated and immutable, so fetching
+  // its BLOB again merely to discover that no decode is needed defeats the
+  // large-value heap's warm-read locality. Only misses reach SQLite.
   // Misses are deduped by value_id: under dedup many events share one payload,
   // so we decode each unique payload ONCE (also avoids transferring the same
   // underlying buffer to the worker pool more than once, which would detach it).
   const missSet = new Set<string>()
   const resolved = new Map<string, unknown>()
-  for (const row of source) {
-    if (!isCdbRef(row.data)) continue
-    const valueID = row.data[CDB_REF]
+  for (const ref of refs) {
+    const valueID = ref.valueID
     const cached = cache.get(rehydrateCacheKey(aggregateID, valueID))
     if (cached !== undefined) {
       cache.hits++
@@ -706,7 +553,73 @@ export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
     }
   }
   cache.misses += missSet.size
-  const misses = Array.from(missSet, (valueID) => ({ valueID }))
+  const misses = Array.from(missSet)
+
+  const stored =
+    misses.length === 0
+      ? []
+      : yield* db
+          .select({
+            valueID: EventValueTable.value_id,
+            bytes: EventValueTable.bytes,
+            sha256: EventValueTable.sha256,
+            rawLen: EventValueTable.raw_len,
+            refs: EventValueTable.refs,
+          })
+          .from(EventValueTable)
+          .where(and(eq(EventValueTable.aggregate_id, aggregateID), inArray(EventValueTable.value_id, misses)))
+          .all()
+          .pipe(Effect.orDie)
+  const byID = new Map(stored.map((row) => [row.valueID, row] as const))
+
+  // v5 is reader-only historical compatibility now, but existing databases can
+  // contain thousands of delta children. The old path issued one SELECT for
+  // every child and decoded a shared base repeatedly. Pre-parse the already
+  // loaded children, fetch every missing base in ONE aggregate-scoped query,
+  // and memoize reconstructed base bytes for this replay page.
+  const v5Headers = new Map<string, ReturnType<typeof parseV5Header>>()
+  const baseBytesByID = new Map<string, Uint8Array>()
+  const missingBaseIDs = new Set<string>()
+  for (const [valueID, row] of byID) {
+    const bytes = row.bytes as Uint8Array
+    if (!isV5Frame(bytes)) continue
+    let header: ReturnType<typeof parseV5Header>
+    try {
+      header = parseV5Header(bytes)
+    } catch (cause) {
+      throw new CdbRehydrateError({
+        aggregateID,
+        valueID,
+        reason: `invalid delta_ref header: ${cause instanceof Error ? cause.message : String(cause)}`,
+      })
+    }
+    v5Headers.set(valueID, header)
+    const loadedBase = byID.get(header.baseValueId)
+    if (loadedBase !== undefined) {
+      baseBytesByID.set(header.baseValueId, loadedBase.bytes as Uint8Array)
+    } else {
+      missingBaseIDs.add(header.baseValueId)
+    }
+  }
+
+  if (missingBaseIDs.size > 0) {
+    const baseRows = yield* db
+      .select({
+        valueID: EventValueTable.value_id,
+        bytes: EventValueTable.bytes,
+      })
+      .from(EventValueTable)
+      .where(
+        and(
+          eq(EventValueTable.aggregate_id, aggregateID),
+          inArray(EventValueTable.value_id, Array.from(missingBaseIDs)),
+        ),
+      )
+      .all()
+      .pipe(Effect.orDie)
+    for (const base of baseRows) baseBytesByID.set(base.valueID, base.bytes as Uint8Array)
+  }
+  const baseRawByID = new Map<string, Uint8Array>()
 
   // Decompress misses. When `OPENCODE_SEAL_WORKERS` is on, payloads at/above
   // DECOMPRESS_POOL_THRESHOLD (and any batch of them) decompress IN PARALLEL
@@ -725,22 +638,22 @@ export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
       }
       const bytes = storedRow.bytes as Uint8Array
       if (isV5Frame(bytes)) {
-        const header = parseV5Header(bytes)
-        const baseRow = yield* db
-          .select({ bytes: EventValueTable.bytes })
-          .from(EventValueTable)
-          .where(
-            and(
-              eq(EventValueTable.aggregate_id, aggregateID),
-              eq(EventValueTable.value_id, header.baseValueId),
-            ),
-          )
-          .all()
-          .pipe(Effect.orDie)
-        if (baseRow.length === 0) {
+        const header = v5Headers.get(valueID)
+        if (header === undefined) {
+          throw new CdbRehydrateError({ aggregateID, valueID, reason: "delta_ref header missing from replay plan" })
+        }
+        const baseBytes = baseBytesByID.get(header.baseValueId)
+        if (baseBytes === undefined) {
           throw new CdbRehydrateError({ aggregateID, valueID, reason: "delta_ref base missing" })
         }
-        const baseRaw = decodeValueBytesRaw(baseRow[0].bytes as Uint8Array)
+        if (isV5Frame(baseBytes)) {
+          throw new CdbRehydrateError({ aggregateID, valueID, reason: "nested delta_ref base is outside the v5 format contract" })
+        }
+        let baseRaw = baseRawByID.get(header.baseValueId)
+        if (baseRaw === undefined) {
+          baseRaw = decodeValueBytesRaw(baseBytes)
+          baseRawByID.set(header.baseValueId, baseRaw)
+        }
         const correction = decodeV5Correction(header.correction, header.codec, header.storedCrc)
         const raw = applyV5Correction(baseRaw, correction, header.totalRawLen)
         const actualSha = createHash("sha256").update(raw).digest("hex")
@@ -755,7 +668,7 @@ export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
         }
       }
       const decodedBytes =
-        useWorkers && bytes.length >= DECOMPRESS_POOL_THRESHOLD
+        useWorkers && shouldUseDecompressPool(bytes.length)
           ? yield* Effect.promise(() => decompressValueAsync(bytes))
           : yield* decodeValueBytesObjectStreaming(bytes)
       const { value, raw } = decodedBytes
@@ -766,7 +679,7 @@ export const rehydrateEvents = Effect.fn("EventV2.rehydrateEvents")(function* <
       return { valueID, value, rawLen: storedRow.rawLen, refs: storedRow.refs }
     })
   const decoded = yield* Effect.all(
-    misses.map((m) => decodeOne(m.valueID)),
+    misses.map((valueID) => decodeOne(valueID)),
     {
       concurrency: useWorkers ? 16 : 1,
     },
@@ -1108,7 +1021,7 @@ export const layerWith = (options?: LayerOptions) =>
       const directoryTypeListeners = new Map<string, Subscriber[]>()
       const aggregateListeners = new Map<string, Subscriber[]>()
       const { db, readDb } = yield* Database.Service
-      yield* cleanupOrphanedEventPayloads(db)
+      yield* reclaimOrphanedEventPayloads(db)
 
       const locatedKey = (type: string, location: Location.Ref) =>
         `${type}\0${location.directory}\0${location.workspaceID ?? ""}`
@@ -1323,26 +1236,7 @@ export const layerWith = (options?: LayerOptions) =>
                             .pipe(Effect.orDie)
                           if (staged) {
                             const payloadID = staged[EVENT_PAYLOAD_REF].id
-                            const meta = yield* db
-                              .select({ refs: EventPayloadMetaTable.refs })
-                              .from(EventPayloadMetaTable)
-                              .where(eq(EventPayloadMetaTable.payload_id, payloadID))
-                              .get()
-                              .pipe(Effect.orDie)
-                            if (!meta) {
-                              return yield* Effect.die(
-                                new EventPayloadRehydrateError({
-                                  payloadID,
-                                  reason: "staged payload metadata disappeared before event commit",
-                                }),
-                              )
-                            }
-                            yield* db
-                              .update(EventPayloadMetaTable)
-                              .set({ refs: meta.refs + 1, time_touched: Date.now() })
-                              .where(eq(EventPayloadMetaTable.payload_id, payloadID))
-                              .run()
-                              .pipe(Effect.orDie)
+                            yield* incrementEventPayloadRef(db, payloadID)
                           }
                           if (Flag.OPENCODE_SEAL_PRUNE) {
                             yield* indexSemanticEvent(db, {
@@ -1677,21 +1571,10 @@ export const layerWith = (options?: LayerOptions) =>
               }
               yield* db.delete(EventSequenceTable).where(eq(EventSequenceTable.aggregate_id, aggregateID)).run()
               yield* db.delete(EventTable).where(eq(EventTable.aggregate_id, aggregateID)).run()
-              for (const [payloadID, count] of payloadRefs) {
-                const meta = yield* db
-                  .select({ refs: EventPayloadMetaTable.refs })
-                  .from(EventPayloadMetaTable)
-                  .where(eq(EventPayloadMetaTable.payload_id, payloadID))
-                  .get()
-                  .pipe(Effect.orDie)
-                if (!meta) continue
-                yield* db
-                  .update(EventPayloadMetaTable)
-                  .set({ refs: Math.max(0, meta.refs - count), time_touched: Date.now() })
-                  .where(eq(EventPayloadMetaTable.payload_id, payloadID))
-                  .run()
-                  .pipe(Effect.orDie)
-              }
+              yield* decrementEventPayloadRefs(
+                db,
+                Array.from(payloadRefs, ([payloadID, count]) => ({ payloadID, count })),
+              )
             }),
             { behavior: "immediate" },
           )
