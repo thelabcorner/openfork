@@ -72,4 +72,31 @@ describe("Auth", () => {
       expect(after["anthropic"]).toBeUndefined()
     }),
   )
+
+  it.instance("concurrent mutations preserve every auth entry", () =>
+    Effect.gen(function* () {
+      const auth = yield* Auth.Service
+      const prefix = `auth-concurrency-${Date.now()}-`
+      const keys = Array.from({ length: 16 }, (_, index) => `${prefix}${index}`)
+
+      yield* Effect.all(
+        keys.map((key, index) =>
+          auth.set(key, {
+            type: "api",
+            key: `secret-${index}`,
+          }),
+        ),
+        { concurrency: "unbounded" },
+      )
+
+      const data = yield* auth.all()
+      for (const [index, key] of keys.entries()) {
+        const entry = data[key]
+        expect(entry?.type).toBe("api")
+        if (entry?.type === "api") expect(entry.key).toBe(`secret-${index}`)
+      }
+
+      yield* Effect.all(keys.map((key) => auth.remove(key)), { concurrency: "unbounded" })
+    }),
+  )
 })

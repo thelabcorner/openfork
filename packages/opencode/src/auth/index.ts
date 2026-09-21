@@ -1,6 +1,6 @@
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import path from "path"
-import { Effect, Layer, Record, Result, Schema, Context } from "effect"
+import { Effect, Layer, Record, Result, Schedule, Schema, Context, Semaphore } from "effect"
 import { NonNegativeInt } from "@opencode-ai/core/schema"
 import { Global } from "@opencode-ai/core/global"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -54,6 +54,7 @@ const layer = Layer.effect(
   Effect.gen(function* () {
     const fsys = yield* FSUtil.Service
     const decode = Schema.decodeUnknownOption(Info)
+    const mutation = yield* Semaphore.make(1)
 
     const all = Effect.fn("Auth.all")(function* () {
       if (process.env.OPENCODE_AUTH_CONTENT) {
@@ -70,23 +71,44 @@ const layer = Layer.effect(
       return (yield* all())[providerID]
     })
 
-    const set = Effect.fn("Auth.set")(function* (key: string, info: Info) {
-      const norm = key.replace(/\/+$/, "")
-      const data = yield* all()
-      if (norm !== key) delete data[key]
-      delete data[norm + "/"]
-      yield* fsys
-        .writeJson(file, { ...data, [norm]: info }, 0o600)
-        .pipe(Effect.mapError(fail("Failed to write auth data")))
+    const writeAtomic = Effect.fn("Auth.writeAtomic")(function* (data: Record<string, Info>) {
+      const temp = `${file}.${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+      const content = JSON.stringify(data, null, 2)
+      yield* fsys.writeFileString(temp, content).pipe(Effect.mapError(fail("Failed to write auth data")))
+      yield* fsys.chmod(temp, 0o600).pipe(
+        Effect.mapError(fail("Failed to secure auth data")),
+        Effect.catch((cause) => fsys.remove(temp, { force: true }).pipe(Effect.ignore, Effect.andThen(Effect.fail(cause)))),
+      )
+      yield* fsys.rename(temp, file).pipe(
+        Effect.retry({ times: 8, schedule: Schedule.spaced("20 millis") }),
+        Effect.mapError(fail("Failed to replace auth data")),
+        Effect.catch((cause) => fsys.remove(temp, { force: true }).pipe(Effect.ignore, Effect.andThen(Effect.fail(cause)))),
+      )
     })
 
-    const remove = Effect.fn("Auth.remove")(function* (key: string) {
-      const norm = key.replace(/\/+$/, "")
-      const data = yield* all()
-      delete data[key]
-      delete data[norm]
-      yield* fsys.writeJson(file, data, 0o600).pipe(Effect.mapError(fail("Failed to write auth data")))
-    })
+    const set = Effect.fn("Auth.set")((key: string, info: Info) =>
+      mutation.withPermits(1)(
+        Effect.gen(function* () {
+          const norm = key.replace(/\/+$/, "")
+          const data = yield* all()
+          if (norm !== key) delete data[key]
+          delete data[norm + "/"]
+          yield* writeAtomic({ ...data, [norm]: info })
+        }),
+      ),
+    )
+
+    const remove = Effect.fn("Auth.remove")((key: string) =>
+      mutation.withPermits(1)(
+        Effect.gen(function* () {
+          const norm = key.replace(/\/+$/, "")
+          const data = yield* all()
+          delete data[key]
+          delete data[norm]
+          yield* writeAtomic(data)
+        }),
+      ),
+    )
 
     return Service.of({ get, all, set, remove })
   }),
