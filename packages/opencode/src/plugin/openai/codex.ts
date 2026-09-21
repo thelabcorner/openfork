@@ -336,7 +336,7 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
           websocketFetches.push(websocketFetch)
           websocketFetchInstalled = true
         }
-        if (auth.type !== "oauth") return websocketFetch ? { fetch: websocketFetch } : {}
+        if (!auth || auth.type !== "oauth") return websocketFetch ? { fetch: websocketFetch } : {}
 
         let refreshPromise:
           | Promise<{
@@ -361,6 +361,9 @@ export async function CodexAuthPlugin(input: PluginInput, options: CodexAuthPlug
             }
 
             const currentAuth = await getAuth()
+            if (!currentAuth) {
+              throw new Error("OpenAI authentication became unavailable while preparing the request")
+            }
             if (currentAuth.type !== "oauth")
               return websocketFetch ? websocketFetch(requestInput, init) : fetch(requestInput, init)
 

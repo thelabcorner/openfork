@@ -12,6 +12,7 @@ import { claude, claudeQuotaStatusSummary, parseClaudeCredentials } from "../../
 import { codex } from "../../src/quota/providers/codex"
 import { nvidia } from "../../src/quota/providers/nvidia"
 import { resetNvidiaUsage, trackNvidiaRequest } from "../../src/quota/providers/nvidia-usage"
+import { resetZenPoolForTest, setTestZenVaultCredentials } from "../../src/plugin/zen"
 
 function authWith(entries: Record<string, Auth.Info>): Auth.Interface {
   return {
@@ -227,6 +228,35 @@ describe("QuotaProviders", () => {
     const second = await run(adapter.fetch())
     expect(second.ok).toBe(true)
     expect(gateFetches).toBe(1)
+  })
+
+  test("opencode-go usage follows a direct provider key ahead of the shared pool default", async () => {
+    setTestZenVaultCredentials([{ apiKey: "pool-usage-key", label: "pool", isDefault: true }])
+    try {
+      const auth = authWith({ "opencode-go": { type: "api", key: "direct-go-usage-key" } })
+      let authorization: string | null = null
+      const usageCache = createOfficialUsageCache({
+        fetch: (_input, init) => {
+          authorization = new Headers(init?.headers).get("authorization")
+          return Promise.resolve(
+            new Response(
+              JSON.stringify({
+                usage: { rolling: { percent: 1, resetsAt: new Date(Date.now() + 3_600_000).toISOString() } },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            ),
+          )
+        },
+      })
+      const adapter = opencodeGo(auth, credentialsWith(undefined), usageCache)
+
+      const result = await run(adapter.fetch())
+      expect(result.ok).toBe(true)
+      expect(authorization ?? "").toBe("Bearer direct-go-usage-key")
+    } finally {
+      setTestZenVaultCredentials(undefined)
+      resetZenPoolForTest()
+    }
   })
 
   test("opencode-go without any credential reports not-configured", async () => {

@@ -115,7 +115,7 @@ const seedDatabase = Effect.gen(function* () {
 })
 
 await using tmp = await tmpdir()
-const dbPath = path.join(tmp.path, "opencode.db")
+const dbPath = path.join(tmp.path, "openfork.db")
 const databaseLayer = Database.layerFromPath(dbPath)
 await Effect.runPromise(seedDatabase.pipe(Effect.provide(databaseLayer)))
 

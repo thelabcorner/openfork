@@ -56,6 +56,7 @@ const modelsDevStub = Layer.succeed(
   ModelsDev.Service,
   ModelsDev.Service.of({
     get: () => Effect.succeed(CATALOG),
+    getDecisionModels: () => Effect.succeed({}),
     refresh: () => Effect.void,
   }),
 )
@@ -229,7 +230,7 @@ const seedDatabase = Effect.gen(function* () {
 })
 
 const tmp = await tmpdir()
-const dbPath = path.join(tmp.path, "opencode.db")
+const dbPath = path.join(tmp.path, "openfork.db")
 const usageLayer = LayerNode.compile(Usage.node, [
   [Database.node, Database.layerFromPath(dbPath)],
   [ModelsDev.node, modelsDevStub],

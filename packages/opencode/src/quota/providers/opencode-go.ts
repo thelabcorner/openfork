@@ -15,12 +15,10 @@ import { authKey } from "./key"
  * (>=5 min per credential, single-flight, stale-last-good) so the quota
  * surface can never add a second caller of the usage endpoint.
  *
- * Key resolution follows the unified pool: the ROUTED key for a bare
- * opencode-go request is the pool's default account (env-first, else the
- * vault-designated default), so the card reflects exactly what a request will
- * be charged against. Vault-only pools fall back to `credentials.active()`
- * before the legacy auth-token path, which keeps this adapter honest in
- * processes where the pool has not been synced yet.
+ * Key resolution mirrors request routing: a directly connected opencode-go
+ * credential wins for a bare Go request; otherwise the shared pool default
+ * is used. Vault-only pools fall back to credentials.active() before the
+ * generic opencode auth alias.
  */
 
 const ALIASES = ["opencode-go", "opencode"]
@@ -43,13 +41,17 @@ export const opencodeGo = (
     }),
   fetch: () =>
     Effect.gen(function* () {
+      const directGo = yield* authKey(auth, ["opencode-go"])
+      if (directGo) {
+        return snapshotToResult(yield* usageCache.get(`auth:${directGo.id}`, directGo.key))
+      }
       const poolDefault = zenQuotaAccounts().find((account) => account.isDefault) ?? zenQuotaAccounts()[0]
       if (poolDefault) {
         return snapshotToResult(yield* usageCache.get(poolDefault.accountId, poolDefault.apiKey))
       }
       const active = yield* credentials.active()
       if (active) return snapshotToResult(yield* usageCache.get(active.id, active.key))
-      const resolved = yield* authKey(auth, ALIASES)
+      const resolved = yield* authKey(auth, ["opencode"])
       if (!resolved) {
         return buildResult({ providerId: "opencode-go", providerName: NAME, ok: false, configured: false, error: "Not configured" })
       }

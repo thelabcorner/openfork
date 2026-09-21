@@ -216,6 +216,22 @@ describe("plugin.codex", () => {
     await enabled.dispose?.()
   })
 
+  test("fails explicitly if OAuth auth disappears after the provider is loaded", async () => {
+    const hooks = await CodexAuthPlugin({} as never)
+    let auth: any = {
+      type: "oauth",
+      refresh: "refresh",
+      access: createTestJwt({}),
+      expires: Date.now() + 60_000,
+    }
+    const loaded = await hooks.auth!.loader!(async () => auth as never, {} as never)
+    auth = undefined
+
+    await expect(loaded.fetch!("https://api.openai.com/v1/responses")).rejects.toThrow(
+      "OpenAI authentication became unavailable while preparing the request",
+    )
+  })
+
   test("sends token residency only to the ChatGPT Codex backend", async () => {
     const requests: Array<{ path: string; residency: string | null }> = []
     using server = Bun.serve({

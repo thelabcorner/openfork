@@ -48,26 +48,28 @@ async function readGskFileKey(): Promise<string | undefined> {
   }
 }
 
-async function readLegacyConfigKey(): Promise<string | undefined> {
+async function readFallbackConfigKey(): Promise<string | undefined> {
   if (process.env.BUN_TEST || process.env.NODE_ENV === "test" || !!process.env.OPENCODE_TEST_HOME || !!process.env.VITEST) return undefined
-  // Best-effort legacy compat: key only in .opencode.json under
-  // provider.genspark-llm-proxy.options.apiKey (from `gsk init-opencode`).
+  // Best-effort direct fallback for canonical OpenFork config and the legacy
+  // `.opencode.json` emitted by older `gsk init-opencode` integrations.
   // We read the file directly here because the Quota layer has no Config service.
   // Search cwd and parent dirs up to 5 levels (mirrors config discovery).
   let dir = process.cwd()
   for (let i = 0; i < 6; i++) {
-    try {
-      const raw = await readFile(join(dir, ".opencode.json"), "utf8")
-      const parsed = JSON.parse(raw) as { provider?: Record<string, { options?: { apiKey?: unknown } }> }
-      const candidates = [
-        parsed.provider?.["genspark"]?.options?.apiKey,
-        parsed.provider?.["genspark-llm-proxy"]?.options?.apiKey,
-        parsed.provider?.["genspark-gemini-proxy"]?.options?.apiKey,
-      ]
-      for (const c of candidates) {
-        if (typeof c === "string" && c.trim()) return c.trim()
-      }
-    } catch {}
+    for (const file of ["openfork.json", ".opencode.json"]) {
+      try {
+        const raw = await readFile(join(dir, file), "utf8")
+        const parsed = JSON.parse(raw) as { provider?: Record<string, { options?: { apiKey?: unknown } }> }
+        const candidates = [
+          parsed.provider?.["genspark"]?.options?.apiKey,
+          parsed.provider?.["genspark-llm-proxy"]?.options?.apiKey,
+          parsed.provider?.["genspark-gemini-proxy"]?.options?.apiKey,
+        ]
+        for (const c of candidates) {
+          if (typeof c === "string" && c.trim()) return c.trim()
+        }
+      } catch {}
+    }
     const parent = join(dir, "..")
     if (parent === dir) break
     dir = parent
@@ -87,8 +89,8 @@ async function resolveQuotaKey(auth: Auth.Interface): Promise<string | undefined
   // 3. gsk CLI file
   const fileKey = await readGskFileKey()
   if (fileKey) return fileKey
-  // 4. Legacy .opencode.json
-  return readLegacyConfigKey()
+  // 4. Direct config fallback (OpenFork first, legacy OpenCode file second)
+  return readFallbackConfigKey()
 }
 
 export const genspark = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapter => {
@@ -105,7 +107,7 @@ export const genspark = (http: HttpClient.HttpClient, auth: Auth.Interface): Ada
         if ((yield* authKey(auth, ALIASES)) !== undefined) return true
         if ((process.env.GSK_API_KEY ?? process.env.GENSPARK_API_KEY)?.trim()) return true
         if ((yield* Effect.promise(readGskFileKey)) !== undefined) return true
-        if ((yield* Effect.promise(readLegacyConfigKey)) !== undefined) return true
+        if ((yield* Effect.promise(readFallbackConfigKey)) !== undefined) return true
         return false
       }),
     fetch: () =>
@@ -116,7 +118,7 @@ export const genspark = (http: HttpClient.HttpClient, auth: Auth.Interface): Ada
           (envKey && envKey.length > 0 ? envKey : undefined) ??
           (yield* Effect.promise(readGskFileKey)) ??
           (yield* Effect.promise(readGskFileKey)) ??
-          (yield* Effect.promise(readLegacyConfigKey))
+          (yield* Effect.promise(readFallbackConfigKey))
 
         if (!key) {
           return buildResult({ providerId: "genspark", providerName: NAME, ok: false, configured: false, error: "Not configured — run Genspark Sign in or set GSK_API_KEY" })

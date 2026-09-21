@@ -90,7 +90,7 @@ export const claude = (http: HttpClient.HttpClient, auth: Auth.Interface): Adapt
     aliases: ALIASES,
     configured: () =>
       Effect.gen(function* () {
-        // Claude Code is a machine account, not an opencode.json provider.
+        // Claude Code is a machine account, not an openfork.json provider.
         // Presence of its local OAuth credential is sufficient to show the card.
         if ((yield* Effect.promise(readExternalAccessToken)) !== undefined) return true
         return yield* Effect.map(authKey(auth, ALIASES), (key) => key !== undefined)

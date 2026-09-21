@@ -8,6 +8,7 @@ import {
 } from "jsonc-parser"
 
 import * as ConfigPaths from "@/config/paths"
+import { CONFIG_BASENAME } from "@opencode-ai/core/storage-identity"
 import { Global } from "@opencode-ai/core/global"
 import { Filesystem } from "@/util/filesystem"
 import { Flock } from "@opencode-ai/core/util/flock"
@@ -334,11 +335,11 @@ function patchDir(input: PatchInput) {
   if (input.global) return input.config ?? Global.Path.config
   const git = input.vcs === "git" && input.worktree !== "/"
   const root = git ? input.worktree : input.directory
-  return path.join(root, ".opencode")
+  return ConfigPaths.projectConfigDirectory(root)
 }
 
-function patchName(kind: Kind): "opencode" | "tui" {
-  if (kind === "server") return "opencode"
+function patchName(kind: Kind): typeof CONFIG_BASENAME | "tui" {
+  if (kind === "server") return CONFIG_BASENAME
   return "tui"
 }
 

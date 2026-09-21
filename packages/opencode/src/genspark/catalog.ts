@@ -1,6 +1,6 @@
 // Genspark LLM-proxy provider metadata.
 //
-// The catalog is the same payload `gsk init-opencode` writes to opencode.json:
+// The catalog mirrors the provider payload users configure in openfork.json.
 // `GET {host}/api/tool_cli/opencode-config` (client.js getOpencodeConfig) — an
 // authenticated metadata endpoint, NOT a chat completion, so refreshing it
 // costs no credits. We call that endpoint directly instead of shelling out to
