@@ -1,5 +1,6 @@
 import { Effect } from "effect"
 import { define } from "../internal"
+import { PRODUCT_NAME, PRODUCT_REPOSITORY_URL } from "../../brand"
 
 export const ZenmuxPlugin = define({
   id: "zenmux",
@@ -11,8 +12,8 @@ export const ZenmuxPlugin = define({
           if (item.provider.api.package !== "@ai-sdk/openai-compatible") continue
           if (item.provider.api.url !== "https://zenmux.ai/api/v1") continue
           evt.provider.update(item.provider.id, (provider) => {
-            provider.request.headers["HTTP-Referer"] ??= "https://opencode.ai/"
-            provider.request.headers["X-Title"] ??= "opencode"
+            provider.request.headers["HTTP-Referer"] ??= PRODUCT_REPOSITORY_URL
+            provider.request.headers["X-Title"] ??= PRODUCT_NAME
           })
         }
       }),

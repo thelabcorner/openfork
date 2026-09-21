@@ -169,7 +169,7 @@ describe("Config", () => {
     ),
   )
 
-  it.live("loads opencode JSON and JSONC files from lowest to highest priority", () =>
+  it.live("loads legacy and OpenFork config files with OpenFork taking precedence", () =>
     Effect.acquireRelease(
       Effect.promise(() => tmpdir()),
       (tmp) => Effect.promise(() => tmp[Symbol.asyncDispose]()),
@@ -190,18 +190,28 @@ describe("Config", () => {
                   "providers": { "last": ${JSON.stringify(provider)} },
                 }`,
               ),
+              fs.writeFile(
+                path.join(tmp.path, "openfork.json"),
+                JSON.stringify({ $schema: "openfork", providers: { fork: provider } }),
+              ),
+              fs.writeFile(path.join(tmp.path, "openfork.jsonc"), JSON.stringify({ $schema: "openfork-last" })),
             ]),
           )
           return yield* Effect.gen(function* () {
             const config = yield* Config.Service
             const documents = (yield* config.entries()).filter((entry) => entry.type === "document")
 
-            expect(documents).toHaveLength(2)
-            expect(documents.map((document) => document.type)).toEqual(["document", "document"])
-            expect(documents.map((document) => document.info.$schema)).toEqual(["base", "last"])
+            expect(documents).toHaveLength(4)
+            expect(documents.map((document) => document.type)).toEqual(["document", "document", "document", "document"])
+            expect(documents.map((document) => document.info.$schema)).toEqual([
+              "base",
+              "last",
+              "openfork",
+              "openfork-last",
+            ])
             expect(documents[0]).toBeInstanceOf(Config.Document)
             expect(documents[0]?.path).toBe(path.join(tmp.path, "opencode.json"))
-            expect(documents[1]?.info.providers?.last).toBeInstanceOf(ConfigProvider.Info)
+            expect(documents[2]?.info.providers?.fork).toBeInstanceOf(ConfigProvider.Info)
 
             yield* Effect.promise(() =>
               fs.writeFile(path.join(tmp.path, "opencode.jsonc"), JSON.stringify({ $schema: "changed" })),
@@ -210,7 +220,7 @@ describe("Config", () => {
               (yield* config.entries())
                 .filter((entry) => entry.type === "document")
                 .map((document) => document.info.$schema),
-            ).toEqual(["base", "last"])
+            ).toEqual(["base", "last", "openfork", "openfork-last"])
           }).pipe(Effect.provide(testLayer(tmp.path)))
         }),
       ),

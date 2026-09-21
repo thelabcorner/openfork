@@ -74,7 +74,9 @@ describe("OpencodePlugin", () => {
   it.effect("registers account and service account methods", () =>
     Effect.gen(function* () {
       yield* addPlugin()
-      expect((yield* (yield* Integration.Service).get(Integration.ID.make("opencode")))?.methods).toEqual([
+      const integration = yield* (yield* Integration.Service).get(Integration.ID.make("opencode"))
+      expect(integration?.name).toBe("OpenCode Console")
+      expect(integration?.methods).toEqual([
         {
           id: Integration.MethodID.make("device"),
           type: "oauth",
