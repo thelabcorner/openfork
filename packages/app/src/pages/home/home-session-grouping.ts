@@ -1,7 +1,9 @@
+import type { SessionGroupKind } from "@opencode-ai/sdk/v2/client"
+
 export type PersistentSessionGroupProjection<T> = {
   id: string
   title: string
-  kind: "user" | "subagent" | "plugin"
+  kind: SessionGroupKind
   sessions: T[]
 }
 
@@ -16,7 +18,7 @@ export function projectPersistentSessionGroups<T extends { session: { id: string
   groups: Array<{
     id: string
     name: string
-    kind: "user" | "subagent" | "plugin"
+    kind: SessionGroupKind
     sessionIds: string[]
   }>,
 ) {

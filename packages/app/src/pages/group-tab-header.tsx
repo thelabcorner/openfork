@@ -4,11 +4,16 @@ import { useLanguage } from "@/context/language"
 import { useSessionGroups, type SessionGroupEntry } from "@/context/session-groups"
 import { useTabs, groupHref } from "@/context/tabs"
 import type { ServerConnection } from "@/context/server"
+import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
+import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
+import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 
 type GroupTabHeaderProps = {
   group: SessionGroupEntry
   activeSessionId: string | undefined
   server: ServerConnection.Key
+  swarmPanelOpen?: boolean
+  onToggleSwarmPanel?: () => void
 }
 
 export function GroupTabHeader(props: GroupTabHeaderProps) {
@@ -34,6 +39,8 @@ export function GroupTabHeader(props: GroupTabHeaderProps) {
       tabs.removeGroupTab({ server: props.server, groupId: props.group.id })
     }
   }
+  const lockedMembershipLabel = () =>
+    props.group.kind === "swarm" ? language.t("swarm.panel.membershipLocked") : language.t("groupTab.lockedMembership")
 
   return (
     <div class="flex h-10 shrink-0 items-center gap-2 border-b border-v2-border-border-base px-3">
@@ -64,8 +71,8 @@ export function GroupTabHeader(props: GroupTabHeaderProps) {
                 fallback={
                   <span
                     class="ml-0.5"
-                    title={language.t("groupTab.lockedMembership")}
-                    aria-label={language.t("groupTab.lockedMembership")}
+                    title={lockedMembershipLabel()}
+                    aria-label={lockedMembershipLabel()}
                   >
                     🔒
                   </span>
@@ -90,6 +97,25 @@ export function GroupTabHeader(props: GroupTabHeaderProps) {
       </div>
       <Show when={props.group.sessionIds.length === 0}>
         <span class="text-12-regular text-v2-text-text-muted">{language.t("groupTab.noSessions")}</span>
+      </Show>
+      <Show when={props.group.kind === "swarm" && props.onToggleSwarmPanel}>
+        <div class="ms-auto">
+          <TooltipV2
+            value={props.swarmPanelOpen ? language.t("swarm.panel.close") : language.t("swarm.panel.open")}
+          >
+            <IconButtonV2
+              type="button"
+              variant="ghost-muted"
+              size="large"
+              state={props.swarmPanelOpen ? "pressed" : undefined}
+              aria-label={props.swarmPanelOpen ? language.t("swarm.panel.close") : language.t("swarm.panel.open")}
+              aria-expanded={props.swarmPanelOpen}
+              aria-controls="swarm-panel"
+              onClick={props.onToggleSwarmPanel}
+              icon={<IconV2 name="layers" />}
+            />
+          </TooltipV2>
+        </div>
       </Show>
     </div>
   )

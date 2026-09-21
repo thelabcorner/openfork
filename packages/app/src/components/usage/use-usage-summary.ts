@@ -17,8 +17,8 @@ export type UsageWindowDef = (typeof USAGE_WINDOWS)[number]
 
 export const USAGE_WINDOW_MAP = new Map<string, UsageWindowDef>(USAGE_WINDOWS.map((window) => [window.key, window]))
 
-export function usageSummaryCacheKey(windowKey: string, projectID: string | null) {
-  return `${windowKey}\u0000${projectID ?? ""}`
+export function usageSummaryCacheKey(serverScope: string, windowKey: string, projectID: string | null) {
+  return `${serverScope}\u0000${windowKey}\u0000${projectID ?? ""}`
 }
 
 // Client-side memo so switching back to a previously-viewed range (or
@@ -35,7 +35,10 @@ export function createUsageSummary(input: {
   let activeController: AbortController | undefined
   let seenRefreshRevision = input.refreshTick()
   const [summary] = createResource(
-    () => ({ key: usageSummaryCacheKey(input.windowDef().key, input.projectID()), refresh: input.refreshTick() }),
+    () => ({
+      key: usageSummaryCacheKey(serverSDK().scope, input.windowDef().key, input.projectID()),
+      refresh: input.refreshTick(),
+    }),
     async ({ key, refresh }) => {
       activeController?.abort()
       const cached = clientCache.get(key)
@@ -44,10 +47,14 @@ export function createUsageSummary(input: {
       // Refresh is an invalidation signal, not part of the logical cache key.
       // Otherwise every manual refresh creates a permanently distinct cache
       // entry and switching back to the same window can never reuse it.
-      if (!forceRefresh && cached && Date.now() - cached.at < CLIENT_CACHE_TTL_MS) return cached.data
+      if (!forceRefresh && cached && Date.now() - cached.at < CLIENT_CACHE_TTL_MS) {
+        clientCache.delete(key)
+        clientCache.set(key, cached)
+        return cached.data
+      }
       const controller = new AbortController()
       activeController = controller
-      const [windowKey, projectID] = key.split("\u0000")
+      const [, windowKey, projectID] = key.split("\u0000")
       const win = USAGE_WINDOW_MAP.get(windowKey) ?? USAGE_WINDOWS[4]
       const now = Date.now()
       const client = serverSDK().client
@@ -71,8 +78,15 @@ export function createUsageSummary(input: {
         throw error
       }
       const data = response.data ?? null
-      if (data) clientCache.set(key, { at: Date.now(), data })
-      if (clientCache.size > 40) clientCache.clear()
+      if (data) {
+        clientCache.delete(key)
+        clientCache.set(key, { at: Date.now(), data })
+      }
+      while (clientCache.size > 40) {
+        const oldest = clientCache.keys().next().value
+        if (oldest === undefined) break
+        clientCache.delete(oldest)
+      }
       return data
     },
   )

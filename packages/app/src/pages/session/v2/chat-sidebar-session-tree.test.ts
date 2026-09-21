@@ -188,7 +188,6 @@ describe("buildChatSidebarSessionTreeRows", () => {
     const swarm = group({
       id: "swarm-a",
       kind: "plugin",
-      ownerPlugin: "openswarm",
       anchorSessionID: coordinator.id,
       sessionIds: [coordinator.id, workerA.id, workerB.id],
     })
@@ -206,6 +205,82 @@ describe("buildChatSidebarSessionTreeRows", () => {
     ])
     expect(rows[0]?.treeKey).toBe(`session-tree:${coordinator.id}`)
     expect(rows[0]?.visibleCount).toBe(3)
+  })
+
+  test("renders a native Swarm as its own collection and uses member projections for roots absent from the loaded slice", () => {
+    const coordinator = session("coordinator")
+    const worker = session("worker")
+    const native = group({
+      id: "grp_swarm_native",
+      kind: "swarm",
+      ownerRef: "swr_native",
+      anchorSessionID: coordinator.id,
+      sessionIds: [coordinator.id, worker.id],
+      sessions: [coordinator, worker].map((item, position) => ({
+        id: item.id,
+        title: item.title,
+        slug: item.slug,
+        projectID: item.projectID,
+        directory: item.directory,
+        parentID: item.parentID,
+        version: item.version,
+        time: item.time,
+        position,
+        locked: true,
+        origin: "swarm" as const,
+        originRef: position === 0 ? "swm_coordinator" : "swm_worker",
+        timeAdded: position + 1,
+      })),
+    })
+
+    const rows = buildChatSidebarSessionTreeRows({
+      roots: [coordinator],
+      groups: [native],
+      sessionByID: () => undefined,
+    })
+
+    expect(rows.map((row) => [row.session.id, row.depth, row.group?.id])).toEqual([
+      [coordinator.id, 1, native.id],
+      [worker.id, 1, native.id],
+    ])
+    expect(rows[0]?.first).toBe(true)
+    expect(rows[0]?.treeKey).toBeUndefined()
+    expect(rows[0]?.visibleCount).toBe(2)
+  })
+
+  test("preserves one Session appearing in multiple native Swarms instead of collapsing memberships by anchor or Session id", () => {
+    const coordinator = session("coordinator")
+    const workerA = session("worker-a")
+    const workerB = session("worker-b")
+    const first = group({
+      id: "grp_swarm_a",
+      kind: "swarm",
+      position: 1,
+      ownerRef: "swr_a",
+      anchorSessionID: coordinator.id,
+      sessionIds: [coordinator.id, workerA.id],
+    })
+    const second = group({
+      id: "grp_swarm_b",
+      kind: "swarm",
+      position: 2,
+      ownerRef: "swr_b",
+      anchorSessionID: coordinator.id,
+      sessionIds: [coordinator.id, workerB.id],
+    })
+
+    const rows = buildChatSidebarSessionTreeRows({
+      roots: [coordinator, workerA, workerB],
+      groups: [first, second],
+      sessionByID: () => undefined,
+    })
+
+    expect(rows.map((row) => [row.session.id, row.group?.id, row.first])).toEqual([
+      [coordinator.id, first.id, true],
+      [workerA.id, first.id, false],
+      [coordinator.id, second.id, true],
+      [workerB.id, second.id, false],
+    ])
   })
 
   test("merges multiple anchored plugin groups under one coordinator without duplicating the parent", () => {

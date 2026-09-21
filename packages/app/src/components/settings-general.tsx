@@ -373,6 +373,18 @@ export const SettingsGeneral: Component = () => {
         </SettingsRow>
 
         <SettingsRow
+          title={language.t("settings.general.row.systemInjections.title")}
+          description={language.t("settings.general.row.systemInjections.description")}
+        >
+          <div data-action="settings-feed-system-injections">
+            <Switch
+              checked={settings.general.showSystemInjections()}
+              onChange={(checked) => settings.general.setShowSystemInjections(checked)}
+            />
+          </div>
+        </SettingsRow>
+
+        <SettingsRow
           title={language.t("settings.general.row.shellToolPartsExpanded.title")}
           description={language.t("settings.general.row.shellToolPartsExpanded.description")}
         >
@@ -495,7 +507,7 @@ export const SettingsGeneral: Component = () => {
           description={
             <>
               {language.t("settings.general.row.theme.description")}{" "}
-              <ExternalLink href="https://opencode.ai/docs/themes/">{language.t("common.learnMore")}</ExternalLink>
+              <ExternalLink href="https://github.com/thelabcorner/openfork/tree/main/docs">{language.t("common.learnMore")}</ExternalLink>
             </>
           }
         >

@@ -65,7 +65,6 @@ import { useVerdentUsage } from "@/hooks/use-verdent-usage"
 import { useGensparkUsage, formatCreditsPerMillion, type GensparkModelUsage } from "@/hooks/use-genspark-usage"
 import { WorkBuddyFreeBadge, workBuddyFreeLabel } from "./workbuddy-free-badge"
 import { useLayout } from "@/context/layout"
-import { useSDK } from "@/context/sdk"
 import { useServerSDK } from "@/context/server-sdk"
 import { useServerSync } from "@/context/server-sync"
 import { usePersonalUsage } from "@/context/personal-usage"
@@ -112,7 +111,15 @@ import {
 } from "@/utils/model-cost"
 import { buildStandardWorkloadCorpus, type CorpusBands } from "@/utils/model-usage-yield"
 
-type ModelState = ReturnType<typeof useLocal>["model"]
+type LocalModelState = ReturnType<typeof useLocal>["model"]
+export type ModelSelectorModelState = Pick<
+  LocalModelState,
+  "current" | "recent" | "list" | "set" | "visible" | "favorite"
+> & {
+  subProvider: Pick<LocalModelState["subProvider"], "get" | "set">
+  order: Pick<LocalModelState["order"], "get" | "set" | "clear">
+}
+type ModelState = ModelSelectorModelState
 type ModelItem = ReturnType<ModelState["list"]>[number]
 type UsageTone = "danger" | "warning" | "success"
 type ModelUsage = {
@@ -1150,9 +1157,11 @@ export function ModelSelectorPopover(props: {
 export function ModelSelectorPopoverV2(props: {
   provider?: string
   model?: ModelState
+  directory?: string
   trigger: ModelSelectorTrigger
   placement?: ComponentProps<typeof MenuV2>["placement"]
   onClose?: () => void
+  onOpenChange?: (open: boolean) => void
   defaultOpen?: boolean
   /**
    * Nested/portalled embeddings (settings rows, Goal popovers) can be unmounted
@@ -1177,7 +1186,7 @@ export function ModelSelectorPopoverV2(props: {
   } catch {
     local = undefined
   }
-  const directory = () => (local ? decode64(local.slug()) : undefined)
+  const directory = () => props.directory || (local ? decode64(local.slug()) : undefined)
   // Lift open state so the controller's heavy memos (message scans, yield sorts)
   // are gated while the popover is closed — otherwise every `message.updated`
   // token during streaming re-sorts the full catalog idle.
@@ -1214,7 +1223,10 @@ export function ModelSelectorPopoverV2(props: {
       subProviderSet={controller.subProviderSet}
       pricingFallback={controller.mergedPricingFallback}
       tables={controller.tables}
-      onExternalOpenChange={setIsOpen}
+      onExternalOpenChange={(open) => {
+        setIsOpen(open)
+        props.onOpenChange?.(open)
+      }}
       onCompare={handleCompare}
       onManage={() => {
         void import("./dialog-manage-models").then((module) => {
@@ -2154,7 +2166,10 @@ function ModelSelectorPopoverV2View(props: {
   const tablesLatest = () => props.tables?.() ?? localTables.latest
   const profileTable = () => tablesLatest()?.profile ?? []
   const pricingTable = () => tablesLatest()?.pricing ?? []
-  const sdk = useSDK()
+  // OpenRouter endpoint metadata is server-scoped. Do not acquire the
+  // directory-owned SDK merely to reach these unified-SDK routes; global
+  // surfaces such as /scheduled intentionally have no ambient SDKProvider.
+  const serverSDK = useServerSDK()
   const freeUsage = props.lightweight
     ? ({
         data: () => undefined,
@@ -2314,7 +2329,10 @@ function ModelSelectorPopoverV2View(props: {
   // model are tri-ranked by equal-weight speed, displayed $/M, and cache-hit
   // percentile. See openrouter-endpoint-ranking.ts for the scale-free fusion.
   const fetchOpenRouterEndpoints = async (model: string): Promise<OpenRouterEndpoint[]> => {
-    const endpointsResponse = await sdk().client.experimental.openrouterEndpoints.get({ model }, { throwOnError: true })
+    const endpointsResponse = await serverSDK().client.experimental.openrouterEndpoints.get(
+      { model },
+      { throwOnError: true },
+    )
     const perMillion = (value: number) => (Math.abs(value) > 0 && Math.abs(value) < 1e-4 ? value * 1_000_000 : value)
     const endpoints: OpenRouterEndpoint[] = endpointsResponse.data.map((entry) => {
       return {
@@ -2349,7 +2367,7 @@ function ModelSelectorPopoverV2View(props: {
     // Best-effort: telemetry augments uptime/price but must never break the submenu.
     // The server now never 500s (returns [] on no telemetry), so this is silent.
     try {
-      const response = await sdk().client.experimental.openrouterTelemetry.get(
+      const response = await serverSDK().client.experimental.openrouterTelemetry.get(
         { model, timeRange: "1w" },
         { throwOnError: true },
       )
@@ -2787,6 +2805,13 @@ function ModelSelectorPopoverV2View(props: {
 
   const renderRows = createMemo<SelectorRenderRow[]>(() => {
     const result: SelectorRenderRow[] = []
+    if (showRecents()) {
+      result.push({ kind: "header", key: "header:recent", title: language.t("dialog.model.recent") })
+      result.push(
+        ...recents().map((item) => ({ kind: "item" as const, key: recentKey(item), navKey: recentKey(item), item })),
+      )
+      result.push({ kind: "separator", key: "separator:recent" })
+    }
     if (showFavorites()) {
       result.push({ kind: "header", key: "header:favorites", title: language.t("dialog.model.favorites") })
       result.push(
@@ -2798,13 +2823,6 @@ function ModelSelectorPopoverV2View(props: {
         })),
       )
       result.push({ kind: "separator", key: "separator:favorites" })
-    }
-    if (showRecents()) {
-      result.push({ kind: "header", key: "header:recent", title: language.t("dialog.model.recent") })
-      result.push(
-        ...recents().map((item) => ({ kind: "item" as const, key: recentKey(item), navKey: recentKey(item), item })),
-      )
-      result.push({ kind: "separator", key: "separator:recent" })
     }
     if (showProviderGroups()) {
       for (const group of providerGroups()) {
@@ -3546,29 +3564,6 @@ function ModelSelectorPopoverV2View(props: {
                 placement="right-start"
                 gutter={6}
                 openDelay={0}
-                value={<span class="text-[12px] font-[500]">{language.t("dialog.model.favorites")}</span>}
-              >
-                <button
-                  type="button"
-                  class="relative flex size-7 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"
-                  classList={{ "!text-v2-state-fg-warning": store.rail === favoritesRailKey }}
-                  aria-label={language.t("dialog.model.favorites")}
-                  onClick={() => {
-                    tooltipSuppressedFor = store.tooltip
-                    setTooltipPos(null)
-                    setStore("rail", store.rail === favoritesRailKey ? "" : favoritesRailKey)
-                  }}
-                >
-                  <Show when={store.rail === favoritesRailKey}>
-                    <span class="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-v2-state-fg-warning" />
-                  </Show>
-                  <Icon name="star-filled" size="small" class="shrink-0" />
-                </button>
-              </TooltipV2>
-              <TooltipV2
-                placement="right-start"
-                gutter={6}
-                openDelay={0}
                 value={<span class="text-[12px] font-[500]">{language.t("dialog.model.recent")}</span>}
               >
                 <button
@@ -3586,6 +3581,29 @@ function ModelSelectorPopoverV2View(props: {
                     <span class="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-v2-text-text-accent" />
                   </Show>
                   <Icon name="clock" size="small" class="shrink-0" />
+                </button>
+              </TooltipV2>
+              <TooltipV2
+                placement="right-start"
+                gutter={6}
+                openDelay={0}
+                value={<span class="text-[12px] font-[500]">{language.t("dialog.model.favorites")}</span>}
+              >
+                <button
+                  type="button"
+                  class="relative flex size-7 items-center justify-center rounded-sm text-v2-icon-icon-muted hover:bg-v2-overlay-simple-overlay-hover"
+                  classList={{ "!text-v2-state-fg-warning": store.rail === favoritesRailKey }}
+                  aria-label={language.t("dialog.model.favorites")}
+                  onClick={() => {
+                    tooltipSuppressedFor = store.tooltip
+                    setTooltipPos(null)
+                    setStore("rail", store.rail === favoritesRailKey ? "" : favoritesRailKey)
+                  }}
+                >
+                  <Show when={store.rail === favoritesRailKey}>
+                    <span class="absolute left-0 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-v2-state-fg-warning" />
+                  </Show>
+                  <Icon name="star-filled" size="small" class="shrink-0" />
                 </button>
               </TooltipV2>
               <DragDropProvider

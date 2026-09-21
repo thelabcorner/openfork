@@ -270,12 +270,12 @@ describe("pathCandidates", () => {
   test("keeps home-relative mentions out of the project root", () => {
     expect(
       pathCandidates({
-        written: "~/.config/opencode/opencode.json",
+        written: "~/.config/openfork/openfork.json",
         directory,
         canonicalDirectory: "D:\\canonical\\presGEN_v2",
         matches: [],
       }),
-    ).toEqual(["~/.config/opencode/opencode.json"])
+    ).toEqual(["~/.config/openfork/openfork.json"])
   })
 
   test("ranks index hits first, normalized, then the literal mention", () => {

@@ -7,10 +7,11 @@ import { ModelSelectorPopoverV2 } from "@/components/dialog-select-model"
 import { useLanguage } from "@/context/language"
 import { useLocal } from "@/context/local"
 import { stripUnlimitedSuffix } from "@/utils/model-badges"
+import { SettingsLocalScope } from "./local-scope"
 
 export type SettingsModelRef = { providerID: string; modelID: string }
 
-export const SettingsModelPickerV2: Component<{
+type SettingsModelPickerProps = {
   value: SettingsModelRef | undefined
   defaultLabel: string
   action: string
@@ -18,7 +19,17 @@ export const SettingsModelPickerV2: Component<{
   compact?: boolean
   /** Use the catalog/search selector without session-history/quota analytics. */
   lightweightSelector?: boolean
-}> = (props) => {
+}
+
+export const SettingsModelPickerV2: Component<SettingsModelPickerProps> = (props) => (
+  // Routed settings can render outside DirectoryLayout. Keep the context
+  // boundary with the reusable picker so new settings callers cannot forget it.
+  <SettingsLocalScope>
+    <SettingsModelPickerContent {...props} />
+  </SettingsLocalScope>
+)
+
+const SettingsModelPickerContent: Component<SettingsModelPickerProps> = (props) => {
   const language = useLanguage()
   const local = useLocal()
   const model = {

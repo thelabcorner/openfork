@@ -7,9 +7,9 @@ import { Accessibility, AutoScroller, Feedback, PointerActivationConstraints } f
 import { RestrictToHorizontalAxis } from "@dnd-kit/abstract/modifiers"
 import { RestrictToElement } from "@dnd-kit/dom/modifiers"
 import { arrayMove } from "@dnd-kit/helpers"
-import { tabHref, tabKey, type GroupTab, type SessionTab, type Tab } from "@/context/tabs"
+import { tabHref, tabKey, type AppTab, type GroupTab, type SessionTab, type Tab } from "@/context/tabs"
 import { ServerConnection, serverName } from "@/context/server"
-import { DraftTabItem, GroupTabNavItem, TabNavItem } from "@/components/titlebar-tab-nav"
+import { AppTabItem, DraftTabItem, GroupTabNavItem, TabNavItem } from "@/components/titlebar-tab-nav"
 import type { TabPreviewGroupSession } from "@/components/titlebar-tab-popover"
 import { TitlebarTabContextMenu } from "@/components/titlebar-tab-context-menu"
 import { useGlobal, type ServerCtx } from "@/context/global"
@@ -224,6 +224,53 @@ function DraftTabSlot(props: {
   )
 }
 
+function AppTabSlot(props: {
+  tab: AppTab
+  id: string
+  index: () => number
+  active: () => boolean
+  pending: boolean
+  title: string
+  onNavigate: (element: HTMLDivElement) => void
+  onClose: () => void
+}) {
+  const sortable = useSortable({
+    get id() {
+      return props.id
+    },
+    get index() {
+      return props.index()
+    },
+  })
+  let ref!: HTMLDivElement
+
+  return (
+    <div
+      ref={sortable.ref}
+      data-titlebar-tab-slot
+      data-tab-key={props.id}
+      data-active={props.active()}
+      class="relative flex w-56 min-w-7 max-w-56 flex-shrink"
+    >
+      <TitlebarTabContextMenu id={props.id}>
+        <AppTabItem
+          ref={(el) => {
+            ref = el
+          }}
+          href={tabHref(props.tab)}
+          page={props.tab.page}
+          title={props.title}
+          onNavigate={() => props.onNavigate(ref)}
+          onClose={props.onClose}
+          active={props.active()}
+          pending={props.pending}
+          dragging={sortable.isDragSource()}
+        />
+      </TitlebarTabContextMenu>
+    </div>
+  )
+}
+
 function GroupTabSlot(props: {
   tab: GroupTab
   id: string
@@ -344,7 +391,9 @@ export function TitlebarTabStrip(props: {
   let listRef!: HTMLDivElement
   let resizeFrame: number | undefined
   const [visibility, setVisibility] = createStore<Record<string, boolean>>({})
-  const visibleTabs = createMemo(() => props.tabs.filter((tab) => tab.type === "draft" || visibility[tabKey(tab)]))
+  const visibleTabs = createMemo(() =>
+    props.tabs.filter((tab) => tab.type === "draft" || tab.type === "app" || visibility[tabKey(tab)]),
+  )
   const visibleTabIds = () => visibleTabs().map(tabKey)
   const visibleIndexMap = createMemo(() => {
     const map = new Map<string, number>()
@@ -489,13 +538,39 @@ export function TitlebarTabStrip(props: {
                 const visibleIndex = () => visibleIndexMap().get(id) ?? -1
                 const pending = () => props.pendingTabKey?.() === id
                 const serverCtx = createMemo(() => {
+                  if (tab.type === "app") return
                   const conn = serverConnections().get(tab.server)
                   if (conn) return global.ensureServerCtx(conn)
                 })
                 const serverLabel = () => {
+                  if (tab.type === "app") return
                   if (!multipleServers()) return
                   const conn = serverConnections().get(tab.server)
                   return conn ? serverName(conn) : undefined
+                }
+
+                if (tab.type === "app") {
+                  const title = () => {
+                    if (tab.page === "settings") return language.t("sidebar.settings")
+                    if (tab.page === "usage") return language.t("usage.panel.title")
+                    if (tab.page === "oxp") return language.t("oxpActivity.tab.title")
+                    return language.t("scheduledTasks.title")
+                  }
+                  return (
+                    <AppTabSlot
+                      tab={tab}
+                      id={id}
+                      index={visibleIndex}
+                      active={() => props.currentTab() === tab}
+                      pending={pending()}
+                      title={title()}
+                      onNavigate={(element) => {
+                        ref = element
+                        props.onNavigate(tab, element)
+                      }}
+                      onClose={() => props.onClose(tab)}
+                    />
+                  )
                 }
 
                 if (tab.type === "session") {

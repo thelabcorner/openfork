@@ -38,7 +38,10 @@ import { CommandProvider, useCommand, type CommandOption } from "@/context/comma
 import { ForkUsageProvider } from "@/context/fork-usage"
 import { SessionGroupsProvider } from "@/context/session-groups"
 import { GoalsProvider } from "@/context/goals"
+import { OxpActivityProvider } from "@/context/oxp-activity"
+import { ScheduledTasksProvider } from "@/context/scheduled-tasks"
 import { ServerSDKProvider } from "@/context/server-sdk"
+import { OfxpServerSeedBridge } from "@/context/ofxp-server-seed-bridge"
 import { ServerSyncProvider } from "@/context/server-sync"
 import { GlobalProvider, useGlobal } from "@/context/global"
 import { LanguageProvider, type Locale, useLanguage } from "@/context/language"
@@ -68,6 +71,13 @@ const DirectoryLayout = lazy(() => import("@/pages/directory-layout"))
 const DraftRoute = lazy(() => import("@/pages/draft-route"))
 const LegacyHome = lazy(() => import("@/pages/home/legacy-home").then((m) => ({ default: m.LegacyHome })))
 const UsagePage = lazy(() => import("@/pages/usage-page").then((m) => ({ default: m.UsagePage })))
+const OxpActivityPage = lazy(() =>
+  import("@/pages/oxp-activity-page").then((m) => ({ default: m.OxpActivityPage })),
+)
+const OxpActivityLandingPage = lazy(() =>
+  import("@/pages/oxp-activity-page").then((m) => ({ default: m.OxpActivityLandingPage })),
+)
+const ScheduledPage = lazy(() => import("@/pages/scheduled-page").then((m) => ({ default: m.ScheduledPage })))
 const SettingsPage = lazy(() =>
   import("@/components/settings-v2/settings-screen").then((m) => ({ default: m.SettingsScreen })),
 )
@@ -160,11 +170,16 @@ function SelectedServerProviders(props: ParentProps) {
   return (
     <ServerKey>
       <ServerSDKProvider>
+        <OfxpServerSeedBridge />
         <PersonalUsageProvider>
           <ServerSyncProvider>
             <GoalsProvider>
               <SessionGroupsProvider>
-                <ForkUsageProvider>{props.children}</ForkUsageProvider>
+                <ForkUsageProvider>
+                  <ScheduledTasksProvider>
+                    <OxpActivityProvider>{props.children}</OxpActivityProvider>
+                  </ScheduledTasksProvider>
+                </ForkUsageProvider>
               </SessionGroupsProvider>
             </GoalsProvider>
           </ServerSyncProvider>
@@ -283,9 +298,17 @@ function DesktopCommands() {
   const command = useCommand()
   const language = useLanguage()
   const platform = usePlatform()
+  const navigate = useNavigate()
 
   command.register("desktop", () => {
-    const commands: CommandOption[] = []
+    const commands: CommandOption[] = [
+      {
+        id: "scheduledTasks.open",
+        title: language.t("command.scheduledTasks.open"),
+        category: language.t("command.category.view"),
+        onSelect: () => navigate("/scheduled"),
+      },
+    ]
     if (platform.platform === "desktop" && platform.exportDebugLogs) {
       commands.push({
         id: "logs.export",
@@ -622,6 +645,9 @@ function Routes(props: { serverScoped?: JSX.Element }) {
       <Show when={settings.general.newLayoutDesigns()}>
         <Route path="/" component={NewHome} />
         <Route path="/usage" component={UsagePage} />
+        <Route path="/oxp" component={OxpActivityLandingPage} />
+        <Route path="/oxp/activity/:activityID" component={OxpActivityPage} />
+        <Route path="/scheduled" component={ScheduledPage} />
         <Route path="/:dir/session/:id" component={NewLayoutLegacySessionRedirect} />
         <Route
           path="/server/:serverKey/session/:id"

@@ -197,7 +197,7 @@ const AppearanceSection: Component<{ controller: AppearanceSettingsController }>
           description={
             <>
               {language.t("settings.general.row.theme.description")}{" "}
-              <ExternalLink class="settings-v2-link" href="https://opencode.ai/docs/themes/">
+              <ExternalLink class="settings-v2-link" href="https://github.com/thelabcorner/openfork/tree/main/docs">
                 {language.t("common.learnMore")}
               </ExternalLink>
             </>
@@ -1101,6 +1101,18 @@ export const SettingsGeneralV2: Component<{
             <Switch
               checked={settings.general.showReasoningSummaries()}
               onChange={(checked) => settings.general.setShowReasoningSummaries(checked)}
+            />
+          </div>
+        </SettingsRowV2>
+
+        <SettingsRowV2
+          title={language.t("settings.general.row.systemInjections.title")}
+          description={language.t("settings.general.row.systemInjections.description")}
+        >
+          <div data-action="settings-feed-system-injections">
+            <Switch
+              checked={settings.general.showSystemInjections()}
+              onChange={(checked) => settings.general.setShowSystemInjections(checked)}
             />
           </div>
         </SettingsRowV2>

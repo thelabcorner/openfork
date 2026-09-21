@@ -32,13 +32,16 @@ export function agentColor(name: string, custom?: string) {
 }
 
 export function messageAgentColor(
-  list: readonly { role: string; agent?: string }[] | undefined,
+  list: readonly Message[] | undefined,
   agents: readonly { name: string; color?: string }[],
 ) {
   if (!list) return undefined
   for (let i = list.length - 1; i >= 0; i--) {
     const item = list[i]
-    if (item.role !== "user" || !item.agent) continue
+    if (item.role !== "user" || !isWorkerPromptMessage(item) || !item.agent) continue
     return agentColor(item.agent, agents.find((agent) => agent.name === item.agent)?.color)
   }
 }
+import type { Message } from "@opencode-ai/sdk/v2"
+import { isWorkerPromptMessage } from "@/utils/session-message"
+

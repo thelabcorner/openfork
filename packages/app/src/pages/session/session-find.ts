@@ -36,7 +36,10 @@ function partSearchText(part: Part): string {
 function messageSearchText(message: Message, parts: Part[]): string {
   if (message.role === "user")
     return parts
-      .filter((part) => part.type === "text")
+      .filter(
+        (part): part is Extract<Part, { type: "text" }> =>
+          part.type === "text" && part.synthetic !== true && part.ignored !== true,
+      )
       .map((part) => truncate(part.text, MAX_PART_TEXT_LENGTH))
       .join(" ")
   return parts.map(partSearchText).join(" ")

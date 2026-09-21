@@ -28,6 +28,14 @@ const session: SessionInfo = {
 }
 
 describe("command palette sessions", () => {
+  test("does not inject an upstream OpenCode product avatar", () => {
+    const legacyOpenCodeProjectID = "4b0ea68d7af9a6031a7ffda7ad66e0cb83315750"
+    expect(getProjectAvatarSource(legacyOpenCodeProjectID)).toBeUndefined()
+    expect(getProjectAvatarSource(legacyOpenCodeProjectID, { url: "openfork-project-avatar" })).toBe(
+      "openfork-project-avatar",
+    )
+  })
+
   test("uses the home project avatar and cancels superseded searches", async () => {
     const server = ServerConnection.Key.make("selected-server")
     const opened: LocalProject = {

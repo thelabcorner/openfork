@@ -6,6 +6,7 @@ import { ServerSDKProvider } from "@/context/server-sdk"
 import { ServerSyncProvider } from "@/context/server-sync"
 import { useSettings } from "@/context/settings"
 import { SettingsRouteSurface } from "./dialog-settings-v2"
+import { OfxpServerSeedBridge } from "@/context/ofxp-server-seed-bridge"
 
 export function SettingsScreen() {
   const settings = useSettings()
@@ -21,6 +22,7 @@ export function SettingsScreen() {
   return (
     <Show when={settings.general.newLayoutDesigns()} fallback={<Navigate href="/" />}>
       <ServerSDKProvider server={connection}>
+        <OfxpServerSeedBridge />
         <ServerSyncProvider server={connection}>
           <SettingsRouteSurface />
         </ServerSyncProvider>

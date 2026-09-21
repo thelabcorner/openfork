@@ -142,6 +142,10 @@ describe("browserHostClient state identity", () => {
     const preview = await browserHostClient.visualArtifactPreview(input)
     expect(preview?.bytes).toEqual(bytes)
     expect(preview?.sha256).toBe("a".repeat(64))
+    const explicitContext = { sessionId: "ses_timeline", directory: "C:/timeline" }
+    const explicitPreview = await browserHostClient.visualArtifactPreviewFor(explicitContext, input)
+    expect(explicitPreview?.bytes).toEqual(bytes)
+    expect(calls.at(-1)?.context).toEqual(explicitContext)
     const expected = {
       currentSha256: "a".repeat(64),
       resultSha256: "b".repeat(64),
@@ -149,8 +153,11 @@ describe("browserHostClient state identity", () => {
       baselineMetadataSha256: "d".repeat(64),
     }
     expect((await browserHostClient.visualApproveRun("r1", expected)).sourceRunId).toBe("r1")
-    expect(calls.map((call) => call.method)).toEqual(["history", "artifact", "preview", "approve"])
-    for (const call of calls) expect(call.context).toEqual({ sessionId: "ses_visual", directory: "C:/project" })
+    expect(calls.map((call) => call.method)).toEqual(["history", "artifact", "preview", "preview", "approve"])
+    for (const index of [0, 1, 2, 4]) {
+      expect(calls[index]?.context).toEqual({ sessionId: "ses_visual", directory: "C:/project" })
+    }
+    expect(calls[3]?.context).toEqual(explicitContext)
 
     browserHostClient.setAnnotationTarget(null)
     expect(browserHostClient.visualProjectContext()).toBeNull()

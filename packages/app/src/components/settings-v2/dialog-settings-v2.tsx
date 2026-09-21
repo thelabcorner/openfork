@@ -1,4 +1,4 @@
-import { Component, createMemo, createSignal, onMount, startTransition, type Accessor } from "solid-js"
+import { Component, createEffect, createMemo, createSignal, onMount, Show, startTransition, type Accessor } from "solid-js"
 import { useLocation, useNavigate, useSearchParams } from "@solidjs/router"
 import { Dialog } from "@opencode-ai/ui/v2/dialog-v2"
 import { TabsV2 } from "@opencode-ai/ui/v2/tabs-v2"
@@ -12,6 +12,7 @@ import { SettingsModelsV2 } from "./models"
 import "./settings-v2.css"
 import { SettingsServersV2 } from "./servers"
 import { SettingsDevicesV2 } from "./devices"
+import { SettingsOxpV2 } from "./oxp"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { useLayout } from "@/context/layout"
 import { useTabs } from "@/context/tabs"
@@ -30,6 +31,10 @@ type SettingsViewProps = {
 const SettingsView: Component<SettingsViewProps> = (props) => {
   const language = useLanguage()
   const platform = usePlatform()
+
+  createEffect(() => {
+    if (props.tab() === "oxp" && !platform.oxp) props.setTab("general")
+  })
 
   return (
     <TabsV2
@@ -60,6 +65,12 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
                     <Icon name="keyboard" />
                     {language.t("settings.tab.shortcuts")}
                   </TabsV2.Trigger>
+                  <Show when={platform.oxp}>
+                    <TabsV2.Trigger value="oxp">
+                      <Icon name="link" />
+                      {language.t("settings.oxp.nav")}
+                    </TabsV2.Trigger>
+                  </Show>
                 </div>
               </div>
 
@@ -97,6 +108,9 @@ const SettingsView: Component<SettingsViewProps> = (props) => {
       </TabsV2.Content>
       <TabsV2.Content value="shortcuts" class="settings-v2-panel">
         <SettingsKeybinds v2 />
+      </TabsV2.Content>
+      <TabsV2.Content value="oxp" class="settings-v2-panel">
+        <SettingsOxpV2 />
       </TabsV2.Content>
       <TabsV2.Content value="servers" class="settings-v2-panel">
         <SettingsServersV2 />

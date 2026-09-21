@@ -4,7 +4,7 @@ import { useServer } from "@/context/server"
 import { useServerSync } from "@/context/server-sync"
 import { useTabs } from "@/context/tabs"
 
-export const settingsTabs = ["general", "shortcuts", "servers", "providers", "models", "devices"] as const
+export const settingsTabs = ["general", "shortcuts", "oxp", "servers", "providers", "models", "devices"] as const
 export type SettingsTab = (typeof settingsTabs)[number]
 
 const settingsTabSet = new Set<string>(settingsTabs)
@@ -41,7 +41,12 @@ export function useSettingsNavigation() {
         const draft = route.type === "draft"
           ? tabs.store.find((item) => item.type === "draft" && item.draftID === route.draftID)
           : undefined
-        const serverKey = "server" in route && route.server ? route.server : draft?.server ?? server.key
+        const serverKey =
+          "server" in route && route.server
+            ? route.server
+            : draft?.type === "draft"
+              ? draft.server
+              : server.key
         query.set("server", serverKey)
 
         const directory = (() => {
@@ -55,13 +60,20 @@ export function useSettingsNavigation() {
         if (route.type === "session") query.set("session", route.sessionId)
       }
 
-      navigate(`/settings?${query}`, {
-        replace: route.type === "settings",
-        state: route.type === "settings" ? location.state : { settings: true },
-      })
+      const href = `/settings?${query}`
+      if (route.type === "settings") {
+        navigate(href, { replace: true, state: location.state })
+        return
+      }
+      tabs.openAppTab("settings", href)
     },
     close() {
       if (layout.route().type !== "settings") return
+      const index = tabs.store.findIndex((item) => item.type === "app" && item.page === "settings")
+      if (index !== -1) {
+        tabs.closeTab(index)
+        return
+      }
       if (location.state?.settings) {
         navigate(-1)
         return

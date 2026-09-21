@@ -1,5 +1,12 @@
-import { useEffect, useState } from "react"
+import { createEffect, createSignal, For, Show } from "solid-js"
 import { getOpsHistory, applyContextOps } from "../../utils/session-context-client"
+
+type HistoryEntry = {
+  id: string
+  batchID: string
+  operations: any[]
+  timestamp: number
+}
 
 function formatOp(op: any) {
   switch (op.type) {
@@ -45,60 +52,62 @@ function invertOps(ops: any[]): any[] {
     .filter(Boolean)
 }
 
-export function ContextHistory({ sessionID, onChange }: { sessionID: string; onChange?: () => void }) {
-  const [history, setHistory] = useState<Array<{ id: string; batchID: string; operations: any[]; timestamp: number }>>([])
-  const [busy, setBusy] = useState<string | null>(null)
+export function ContextHistory(props: { sessionID: string; onChange?: () => void }) {
+  const [history, setHistory] = createSignal<HistoryEntry[]>([])
+  const [busy, setBusy] = createSignal<string>()
 
   const refresh = () => {
-    getOpsHistory(sessionID)
+    getOpsHistory(props.sessionID)
       .then(setHistory)
       .catch(() => {})
   }
 
-  useEffect(() => {
+  createEffect(() => {
+    props.sessionID
     refresh()
-  }, [sessionID])
+  })
 
-  const undo = async (entry: (typeof history)[number]) => {
+  const undo = async (entry: HistoryEntry) => {
     const inverted = invertOps(entry.operations)
     if (inverted.length === 0) return
     setBusy(entry.id)
     try {
-      await applyContextOps(sessionID, inverted)
+      await applyContextOps(props.sessionID, inverted)
       refresh()
-      onChange?.()
+      props.onChange?.()
     } finally {
-      setBusy(null)
+      setBusy(undefined)
     }
   }
 
-  if (history.length === 0) return <div className="text-xs opacity-60">No context changes yet.</div>
-
   return (
-    <div className="space-y-2">
-      <div className="text-sm font-medium">Context History</div>
-      <div className="space-y-1">
-        {history
-          .slice()
-          .reverse()
-          .map((entry) => (
-            <div key={entry.id} className="flex items-center gap-2 rounded border px-2 py-1.5 text-xs">
-              <div className="min-w-0 flex-1">
-                <div className="truncate">
-                  {entry.operations.length === 1 ? formatOp(entry.operations[0]) : `${entry.operations.length} operations`}
+    <Show when={history().length > 0} fallback={<div class="text-xs opacity-60">No context changes yet.</div>}>
+      <div class="space-y-2">
+        <div class="text-sm font-medium">Context History</div>
+        <div class="space-y-1">
+          <For each={[...history()].reverse()}>
+            {(entry) => (
+              <div class="flex items-center gap-2 rounded border px-2 py-1.5 text-xs">
+                <div class="min-w-0 flex-1">
+                  <div class="truncate">
+                    {entry.operations.length === 1
+                      ? formatOp(entry.operations[0])
+                      : `${entry.operations.length} operations`}
+                  </div>
+                  <div class="opacity-60">{new Date(entry.timestamp).toLocaleString()}</div>
                 </div>
-                <div className="opacity-60">{new Date(entry.timestamp).toLocaleString()}</div>
+                <button
+                  class="shrink-0 rounded bg-muted px-2 py-1 text-[11px] hover:bg-muted/80 disabled:opacity-50"
+                  disabled={!!busy()}
+                  onClick={() => void undo(entry)}
+                >
+                  {busy() === entry.id ? "…" : "Undo"}
+                </button>
               </div>
-              <button
-                className="shrink-0 rounded bg-muted px-2 py-1 text-[11px] hover:bg-muted/80 disabled:opacity-50"
-                disabled={!!busy}
-                onClick={() => undo(entry)}
-              >
-                {busy === entry.id ? "…" : "Undo"}
-              </button>
-            </div>
-          ))}
+            )}
+          </For>
+        </div>
       </div>
-    </div>
+    </Show>
   )
 }

@@ -97,6 +97,7 @@ export async function setupTimeline(
     locale?: string
     deviceScaleFactor?: number
     seedHistory?: boolean
+    waitForConnection?: boolean
     protocol?: "v1" | "v2"
   } = {},
 ) {
@@ -160,7 +161,7 @@ export async function setupTimeline(
     })
   }
   await page.goto(`/${base64Encode(directory)}/session/${sessionID}`)
-  await transport.waitForConnection()
+  if (input.waitForConnection !== false) await transport.waitForConnection()
   await expectSessionTitle(page, title)
   if (input.cpuRate && input.cpuRate > 1) {
     const devtools = await page.context().newCDPSession(page)

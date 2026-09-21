@@ -53,12 +53,12 @@ export const DialogCredentialSwitcherV2: Component<{
     await serverSync().refreshProviders().catch(() => undefined)
   }
 
-  // The pool account a bare request routes to (env-first, else the vault
-  // designated default). The vault rows are keyed by UUID; locate the vault
-  // row whose pool identity matches so the badge is exact even when env keys
-  // outrank a vault-designated default.
+  // The actual bare-Go route on new servers; fall back to the historical pool
+  // default envelope on old servers. The vault rows are keyed by UUID, so map
+  // the stable routing identity back when possible.
+  const routedAccountID = () => forkUsage.usage.latest?.routedAccountID ?? forkUsage.usage.latest?.defaultAccountID
   const defaultVaultID = () => {
-    const defaultAccountID = forkUsage.usage.latest?.defaultAccountID
+    const defaultAccountID = routedAccountID()
     if (!defaultAccountID) return undefined
     return forkUsage.usage.latest?.byCredential.find((entry) => entry.accountID === defaultAccountID)?.credentialID
   }
@@ -75,12 +75,15 @@ export const DialogCredentialSwitcherV2: Component<{
       readonly: false,
       isDefault: activeID() === credential.id,
     }))
-    const defaultAccountID = forkUsage.usage.latest?.defaultAccountID
+    const defaultAccountID = routedAccountID()
     const covered = out.some((row) => row.isDefault)
     if (defaultAccountID && !covered) {
       out.push({
         id: defaultAccountID,
-        label: forkUsage.usage.latest?.defaultAccountLabel ?? language.t("dialog.credential.envSource"),
+        label:
+          forkUsage.usage.latest?.routedAccountLabel ??
+          forkUsage.usage.latest?.defaultAccountLabel ??
+          language.t("dialog.credential.envSource"),
         active: false,
         timeCreated: 0,
         readonly: true,
@@ -130,7 +133,7 @@ export const DialogCredentialSwitcherV2: Component<{
     showToast({
       variant: "success",
       icon: "circle-check",
-      title: language.t("provider.connect.toast.connected.title", { provider: "OpenCode" }),
+      title: language.t("provider.connect.toast.connected.title", { provider: "OpenCode Zen" }),
     })
   }
 

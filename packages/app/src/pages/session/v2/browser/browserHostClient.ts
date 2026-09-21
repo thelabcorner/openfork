@@ -655,9 +655,13 @@ export const browserHostClient = {
     return api.visualArtifact(context, input)
   },
   visualArtifactPreview: (input: VisualArtifactInput) => {
-    const api = rawBrowser()
     const context = browserHostClient.visualProjectContext()
-    if (!api || !context) return Promise.resolve(null)
+    if (!context) return Promise.resolve(null)
+    return browserHostClient.visualArtifactPreviewFor(context, input)
+  },
+  visualArtifactPreviewFor: (context: VisualProjectContext, input: VisualArtifactInput) => {
+    const api = rawBrowser()
+    if (!api) return Promise.resolve(null)
     return api.visualArtifactPreview(context, input)
   },
   visualApproveRun: (runId: string, expected: VisualApprovalExpectation) => {

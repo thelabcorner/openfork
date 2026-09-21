@@ -10,6 +10,15 @@ const user = (id: string) => {
   } as unknown as Message
 }
 
+const synthetic = (id: string) => {
+  return {
+    id,
+    role: "user",
+    provenance: { owner: "host", source: "goal.continuation" },
+    time: { created: 1 },
+  } as unknown as Message
+}
+
 const assistant = (id: string) => {
   return {
     id,
@@ -57,5 +66,20 @@ describe("estimateSessionContextBreakdown", () => {
     const total = output.reduce((sum, segment) => sum + segment.tokens, 0)
     expect(total).toBeLessThanOrEqual(10)
     expect(output.every((segment) => segment.width <= 100)).toBeTrue()
+  })
+
+  test("separates host synthetic input from human user input without changing totals", () => {
+    const messages = [user("u1"), synthetic("s1")]
+    const parts = {
+      u1: [{ type: "text", text: "human prompt" }] as unknown as Part[],
+      s1: [{ type: "text", text: "host continuation" }] as unknown as Part[],
+    }
+
+    const output = estimateSessionContextBreakdown({ messages, parts, input: 20 })
+    const map = Object.fromEntries(output.map((segment) => [segment.key, segment.tokens]))
+
+    expect(map.user).toBe(3)
+    expect(map.synthetic).toBe(5)
+    expect(output.reduce((sum, segment) => sum + segment.tokens, 0)).toBe(20)
   })
 })

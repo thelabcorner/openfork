@@ -26,8 +26,9 @@ export interface TabPreviewGroupSession {
   id: string
   title: string
   project?: string
-  /** Optional owning-group label. Useful when one coordinator anchors several
-   * plugin groups (for example multiple OpenSwarm swarms). */
+  /** Optional owning-group label. Useful when one anchor participates in
+   * several independent generic plugin groups. Native Swarms use their own
+   * first-party group kind and do not rely on this plugin convention. */
   group?: string
 }
 

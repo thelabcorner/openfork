@@ -1,6 +1,8 @@
 import { ButtonV2 } from "@opencode-ai/ui/v2/button-v2"
+import { Tag } from "@opencode-ai/ui/v2/badge-v2"
 import { Dialog, DialogBody, DialogFooter, DialogHeader, DialogTitle } from "@opencode-ai/ui/v2/dialog-v2"
 import { DividerV2 } from "@opencode-ai/ui/v2/divider-v2"
+import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { TextInputV2 } from "@opencode-ai/ui/v2/text-input-v2"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type Component, Show, createEffect, createSignal, onCleanup, onMount } from "solid-js"
@@ -8,6 +10,12 @@ import { useLanguage } from "@/context/language"
 import { type ServerConnection } from "@/context/server"
 import { useServerManagementController } from "../dialog-select-server"
 import "./settings-v2.css"
+
+function shortID(value: string | undefined) {
+  if (!value) return "—"
+  if (value.length <= 18) return value
+  return `${value.slice(0, 8)}…${value.slice(-8)}`
+}
 
 export const DialogServerV2: Component<{
   mode: "add" | "edit"
@@ -50,6 +58,30 @@ export const DialogServerV2: Component<{
     if (controller.formBusy()) return language.t("dialog.server.add.checking")
     if (props.mode === "add") return language.t("dialog.server.add.button")
     return language.t("common.save")
+  }
+
+  const ofxpLabel = () => {
+    if (controller.formStatus() === false) return language.t("settings.ofxp.connections.unreachable")
+    const identity = controller.formOfxp()
+    if (!identity) return language.t("settings.ofxp.connections.identityUnavailable")
+    if (!identity.enabled) return language.t("settings.ofxp.connections.networkOff")
+    if (!identity.compatible) return language.t("settings.ofxp.connections.protocolMismatch")
+    return language.t("settings.ofxp.connections.verifiedIdentity")
+  }
+
+  const peerID = () => {
+    const identity = controller.formOfxp()
+    return identity?.enabled === true ? identity.peerID : undefined
+  }
+
+  const fingerprint = () => {
+    const identity = controller.formOfxp()
+    return identity?.enabled === true ? identity.fingerprint : undefined
+  }
+
+  const compatibleIdentity = () => {
+    const identity = controller.formOfxp()
+    return identity?.enabled === true && identity.compatible
   }
 
   return (
@@ -119,6 +151,46 @@ export const DialogServerV2: Component<{
               />
             </div>
           </div>
+          <Show when={controller.formValue().trim()}>
+            <div
+              class="settings-v2-server-dialog-ofxp"
+              data-health={
+                controller.formStatus() === false
+                  ? "offline"
+                  : controller.formStatus() === true
+                    ? "online"
+                    : "checking"
+              }
+            >
+              <div class="settings-v2-server-dialog-ofxp-icon">
+                <IconV2
+                  name={
+                    controller.formStatus() === false
+                      ? "warning"
+                      : compatibleIdentity()
+                        ? "check"
+                        : "link"
+                  }
+                  size="small"
+                />
+              </div>
+              <div class="settings-v2-server-dialog-ofxp-copy">
+                <span>{language.t("settings.ofxp.connections.networkIdentity")}</span>
+                <strong>{controller.formStatus() === undefined ? language.t("settings.ofxp.connections.checkingIdentity") : ofxpLabel()}</strong>
+                <Show when={peerID()}>
+                  <div>
+                    <code>{language.t("settings.ofxp.connections.peerID", { id: shortID(peerID()) })}</code>
+                    <span>·</span>
+                    <code title={fingerprint()}>{shortID(fingerprint())}</code>
+                  </div>
+                </Show>
+              </div>
+              <Show when={compatibleIdentity()}>
+                <Tag>{language.t("settings.ofxp.connections.verifiedIdentity")}</Tag>
+              </Show>
+              <p>{language.t("settings.ofxp.connections.previewNotice")}</p>
+            </div>
+          </Show>
         </div>
       </DialogBody>
       <DialogFooter>

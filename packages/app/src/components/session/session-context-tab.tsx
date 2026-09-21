@@ -1,5 +1,6 @@
 import { createMemo, createEffect, createSignal, on, onCleanup, untrack, For, Show } from "solid-js"
 import type { Accessor, JSX } from "solid-js"
+import { useNavigate } from "@solidjs/router"
 import { useSync } from "@/context/sync"
 import { useServerSync } from "@/context/server-sync"
 import { sampledChecksum } from "@opencode-ai/core/util/encode"
@@ -19,7 +20,13 @@ import { TooltipV2 } from "@opencode-ai/ui/v2/tooltip-v2"
 import { Icon as IconV2 } from "@opencode-ai/ui/v2/icon"
 import { LoaderV2 } from "@opencode-ai/ui/v2/loader-v2"
 import { ProgressCircleV2 } from "@opencode-ai/ui/v2/progress-circle-v2"
-import type { AssistantMessage, Message, Part, UserMessage } from "@opencode-ai/sdk/v2/client"
+import type {
+  AssistantMessage,
+  Message,
+  OxpResourceProvenanceInfo,
+  Part,
+  UserMessage,
+} from "@opencode-ai/sdk/v2/client"
 import { showToast } from "@/utils/toast"
 import { downloadSessionExport, fetchSessionExport, sessionExportFilename } from "@/utils/session-export"
 import { useLanguage } from "@/context/language"
@@ -27,6 +34,7 @@ import { useLocal } from "@/context/local"
 import { usePlatform } from "@/context/platform"
 import { useProviders } from "@/hooks/use-providers"
 import { useSDK } from "@/context/sdk"
+import { useServerSDK } from "@/context/server-sdk"
 import { useSessionLayout } from "@/pages/session/session-layout"
 import { formatCostPerMillion } from "@/components/model-tooltip"
 import { formatPercent } from "@/components/usage/usage-format"
@@ -43,6 +51,7 @@ import {
   type ModelCostRate,
 } from "./session-context-model-metrics"
 import { createSessionContextFormatter } from "./session-context-format"
+import { isSemanticUserMessage } from "@/utils/session-message"
 import {
   boundedPartsText,
   newestRawMessages,
@@ -58,6 +67,9 @@ const emptyProviderList: SessionProviderList = []
 const BREAKDOWN_COLOR: Record<SessionContextBreakdownKey, string> = {
   system: "var(--syntax-info)",
   user: "var(--syntax-success)",
+  synthetic: "var(--syntax-comment)",
+  shell: "var(--syntax-constant)",
+  compaction: "var(--syntax-keyword)",
   assistant: "var(--syntax-property)",
   tool: "var(--syntax-warning)",
   other: "var(--syntax-comment)",
@@ -238,6 +250,8 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const serverSync = useServerSync()
   const language = useLanguage()
   const sdk = useSDK()
+  const serverSDK = useServerSDK()
+  const navigate = useNavigate()
   const platform = usePlatform()
   const local = useLocal()
   const providers = useProviders(() => sdk().directory)
@@ -245,6 +259,53 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const active = () => props.active?.() ?? true
 
   const info = createMemo(() => (params.id ? sync().session.get(params.id) : undefined))
+  const [oxpOrigins, setOxpOrigins] = createSignal<OxpResourceProvenanceInfo[]>([])
+  let oxpOriginRequest = 0
+
+  createEffect(
+    on(
+      () => [active(), params.id] as const,
+      ([isActive, sessionID]) => {
+        const request = ++oxpOriginRequest
+        if (!isActive || !sessionID) {
+          setOxpOrigins([])
+          return
+        }
+        const global = serverSDK().client.global
+        void Promise.all([
+          global.oxpResource(
+            { kind: "session", ref: sessionID, limit: "5" },
+            { throwOnError: true },
+          ),
+          global.oxpResource(
+            { kind: "worker_session", ref: sessionID, limit: "5" },
+            { throwOnError: true },
+          ),
+        ])
+          .then(([session, worker]) => {
+            if (request !== oxpOriginRequest) return
+            const rows = [...(session.data ?? []), ...(worker.data ?? [])]
+            const unique = new Map(
+              rows.map((row) => [
+                row.activityID + ":" + row.invocationID,
+                row,
+              ]),
+            )
+            setOxpOrigins(
+              [...unique.values()]
+                .sort(
+                  (left, right) =>
+                    Number(right.startedAt) - Number(left.startedAt),
+                )
+                .slice(0, 5),
+            )
+          })
+          .catch(() => {
+            if (request === oxpOriginRequest) setOxpOrigins([])
+          })
+      },
+    ),
+  )
 
   const messages = createMemo<Message[]>(
     (previous) => {
@@ -258,11 +319,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   )
   const getParts = (id: string) => (sync().data.part[id] ?? []) as Part[]
 
-  const userMessages = createMemo(
-    () => messages().filter((m) => m.role === "user") as UserMessage[],
-    emptyUserMessages,
-    { equals: same },
-  )
+  const userMessages = createMemo(() => messages().filter(isSemanticUserMessage), emptyUserMessages, { equals: same })
 
   const visibleUserMessages = createMemo(
     () => {
@@ -420,7 +477,7 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
 
   const counts = createMemo(() => {
     const all = messages()
-    const user = all.reduce((count, x) => count + (x.role === "user" ? 1 : 0), 0)
+    const user = all.reduce((count, x) => count + (isSemanticUserMessage(x) ? 1 : 0), 0)
     const assistant = all.reduce((count, x) => count + (x.role === "assistant" ? 1 : 0), 0)
     return {
       all: all.length,
@@ -506,6 +563,9 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
   const breakdownLabel = (key: SessionContextBreakdownKey) => {
     if (key === "system") return language.t("context.breakdown.system")
     if (key === "user") return language.t("context.breakdown.user")
+    if (key === "synthetic") return language.t("context.breakdown.synthetic", { defaultValue: "Automation" })
+    if (key === "shell") return language.t("context.breakdown.shell", { defaultValue: "Shell" })
+    if (key === "compaction") return language.t("context.breakdown.compaction", { defaultValue: "Compaction" })
     if (key === "assistant") return language.t("context.breakdown.assistant")
     if (key === "tool") return language.t("context.breakdown.tool")
     return language.t("context.breakdown.other")
@@ -1344,6 +1404,39 @@ export function SessionContextTab(props: { active?: Accessor<boolean> }) {
               value={subsidyShareValue()}
             />
           </div>
+
+          <Show when={oxpOrigins().length > 0}>
+            <Section title="Origin">
+              <InfoCard>
+                <For each={oxpOrigins()}>
+                  {(origin) => (
+                    <InfoRow
+                      label={
+                        <span class="inline-flex items-center gap-1">
+                          <span>ChatGPT / OXP</span>
+                          <span class="text-v2-text-text-faint">
+                            {origin.relation}
+                          </span>
+                        </span>
+                      }
+                      value={
+                        <button
+                          type="button"
+                          class="max-w-[180px] truncate text-v2-text-text-accent hover:underline"
+                          title={origin.activityID}
+                          onClick={() =>
+                            navigate(`/oxp/activity/${origin.activityID}`)
+                          }
+                        >
+                          Open OXP activity
+                        </button>
+                      }
+                    />
+                  )}
+                </For>
+              </InfoCard>
+            </Section>
+          </Show>
 
           <Section title={language.t("context.overview.title")} tooltip={language.t("context.tooltip.overview")}>
             <InfoCard>

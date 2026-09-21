@@ -140,11 +140,12 @@ for (let i = 0; i < TURNS; i++) {
 }
 
 function buildRows() {
-  return Timeline.constructSessionMessageRows(
-    sessionInfos,
-    (id) => messagesByID.get(id) as UserMessage | undefined,
-    (id) => partsByMessage.get(id) ?? [],
-    true,
+  return Timeline.constructSessionMessageRows(
+    sessionInfos,
+    (id) => messagesByID.get(id) as UserMessage | undefined,
+    (id) => partsByMessage.get(id) ?? [],
+    true,
+    false,
     "idle",
     true,
     allUsers,
@@ -428,6 +429,7 @@ describe("timeline hot-path benchmark", () => {
           parts: (id) => partsByMessage.get(id) ?? [],
           status,
           showReasoningSummaries: () => true,
+          showSystemInjections: () => false,
           inlineComments: () => true,
         })
         projection.rows()

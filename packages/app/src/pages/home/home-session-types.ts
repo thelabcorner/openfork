@@ -1,4 +1,5 @@
 import type { Session } from "@opencode-ai/sdk/v2/client"
+import type { SessionGroupKind } from "@opencode-ai/sdk/v2/client"
 import type { LocalProject } from "@/context/layout"
 
 export type HomeSessionRecord = {
@@ -12,7 +13,7 @@ export type HomeSessionGroup = {
   title: string
   sessions: HomeSessionRecord[]
   isUserGroup: boolean
-  kind?: "user" | "subagent" | "plugin"
+  kind?: SessionGroupKind
 }
 
 export type OpenSessionOptions = { background?: boolean }

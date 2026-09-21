@@ -32,6 +32,7 @@ import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { getProjectAvatarVariant, useLayout, type LocalProject } from "@/context/layout"
 import { useServerSync } from "@/context/server-sync"
 import { useNotification } from "@/context/notification"
+import { useOxpActivity } from "@/context/oxp-activity"
 import { usePermission } from "@/context/permission"
 import { usePlatform } from "@/context/platform"
 import { useServerSDK } from "@/context/server-sdk"
@@ -264,8 +265,15 @@ export function ChatSidebarPane(props: {
   const dialog = useDialog()
   const platform = usePlatform()
   const notification = useNotification()
+  const oxpActivity = useOxpActivity()
   const permission = usePermission()
   const sessionGroups = useSessionGroups()
+  const [oxpLimit, setOxpLimit] = createSignal(5)
+  const visibleOxpActivities = createMemo(() =>
+    oxpActivity.activities().slice(0, oxpLimit()),
+  )
+
+  onMount(() => oxpActivity.ensureLoaded())
 
   // One shared ticker for every live timer in the pane — per-row intervals
   // would multiply timers by the number of visible sessions.
@@ -393,10 +401,17 @@ export function ChatSidebarPane(props: {
     if (cached) return cached
     const created = runWithOwner(paneOwner, () =>
       createMemo(() => {
-        const rows = [
-          ...directorySlice(project.worktree, project.id)(),
-          ...(project.sandboxes ?? []).flatMap((sandbox) => directorySlice(sandbox)()),
-        ]
+        // A known project's canonical worktree store is the project-wide,
+        // bootstrap-free root Session index. Do not merge sandbox stores back
+        // into it: project-scoped roots already include them, and doing so would
+        // duplicate the same Session in Recent/project groups. ID-less legacy
+        // projects retain the older exact-directory aggregation.
+        const rows = project.id
+          ? directorySlice(project.worktree, project.id)()
+          : [
+              ...directorySlice(project.worktree)(),
+              ...(project.sandboxes ?? []).flatMap((sandbox) => directorySlice(sandbox)()),
+            ]
         return rows.sort(compareSessionTime)
       }),
     )!
@@ -446,9 +461,10 @@ export function ChatSidebarPane(props: {
       .list()
       .filter(
         (group) =>
-          (group.kind === "subagent" || group.kind === "plugin") &&
-          !!group.anchorSessionID &&
-          roots.has(group.anchorSessionID),
+          (group.kind === "swarm" && group.sessions.some((member) => roots.has(member.id))) ||
+          ((group.kind === "subagent" || group.kind === "plugin") &&
+            !!group.anchorSessionID &&
+            roots.has(group.anchorSessionID)),
       )
   })
 
@@ -583,7 +599,13 @@ export function ChatSidebarPane(props: {
   // would undo itself on the next store tick and collapse would feel broken.
   // The dir-slug fallback covers sessions that are roots of no listed slice
   // (child sessions, rows beyond the store cap): their project still opens.
-  const params = useParams<{ serverKey?: string; dir?: string; id?: string; sessionId?: string }>()
+  const params = useParams<{
+    serverKey?: string
+    dir?: string
+    id?: string
+    sessionId?: string
+    activityID?: string
+  }>()
   const routing = useIsRouting()
   const [pendingSessionId, setPendingSessionId] = createSignal<string | null>(null)
   // The titlebar navigates to canonical /server/... routes while sidebar rows
@@ -622,7 +644,10 @@ export function ChatSidebarPane(props: {
     if (!id || revealedFor === id) return
     const current = stableGroups()
     const memberships = sessionGroups.list().filter((group) => group.sessionIds.includes(id))
-    const membership = memberships.find((group) => !!group.anchorSessionID) ?? memberships[0]
+    const membership =
+      memberships.find((group) => group.kind === "swarm") ??
+      memberships.find((group) => !!group.anchorSessionID) ??
+      memberships[0]
     const anchorID = membership?.anchorSessionID
     const target =
       current.find((group) => group.sessions.some((session) => session.id === id || session.id === anchorID))?.key ??
@@ -630,7 +655,8 @@ export function ChatSidebarPane(props: {
     if (!target) return
     revealedFor = id
     props.state.revealGroup(target)
-    if (anchorID) props.state.revealGroup(`session-tree:${anchorID}`)
+    if (membership?.kind === "swarm") props.state.revealGroup(`session-group:${membership.id}`)
+    else if (anchorID) props.state.revealGroup(`session-tree:${anchorID}`)
     else if (membership) props.state.revealGroup(`session-group:${membership.id}`)
   })
 
@@ -1287,6 +1313,20 @@ export function ChatSidebarPane(props: {
         </Show>
 
         <div class="ms-auto flex items-center gap-0.5">
+          <span
+            class="flex"
+            data-chat-tooltip-text={language.t("scheduledTasks.title")}
+            data-chat-tooltip-placement="bottom"
+          >
+            <IconButtonV2
+              type="button"
+              variant="ghost-muted"
+              size="small"
+              onClick={() => navigate("/scheduled")}
+              aria-label={language.t("scheduledTasks.title")}
+              icon={<IconV2 name="clock" />}
+            />
+          </span>
           <span class="flex" data-chat-tooltip-text={language.t("usage.panel.title")} data-chat-tooltip-placement="bottom">
             <IconButtonV2
               type="button"
@@ -1460,6 +1500,98 @@ export function ChatSidebarPane(props: {
 
       {/* ── Session tree ──────────────────────────────────────── */}
       <ScrollView class="min-h-0 flex-1">
+        <Show when={oxpActivity.activities().length > 0}>
+          <section
+            class="flex flex-col border-b border-v2-border-border-muted pb-1.5"
+            data-component="chats-oxp-activity-group"
+          >
+            <div class="sticky top-0 z-10 flex h-[22px] items-center gap-1.5 bg-v2-background-bg-base/95 px-2 backdrop-blur-[6px]">
+              <span class="min-w-0 flex-1 truncate text-[10px] font-[620] uppercase leading-none tracking-[0.07em] text-v2-text-text-faint">
+                CHATGPT / OXP
+              </span>
+              <span class="shrink-0 text-[10px] tabular-nums text-v2-text-text-faint opacity-70">
+                {oxpActivity.activities().length}
+              </span>
+            </div>
+            <nav class="flex flex-col px-1">
+              <For each={visibleOxpActivities()}>
+                {(activity) => {
+                  const failures = () => Number(activity.failureCount) || 0
+                  const calls = () => Number(activity.callCount) || 0
+                  const selected = () => params.activityID === activity.id
+                  return (
+                    <button
+                      type="button"
+                      data-component="chats-oxp-activity-row"
+                      data-activity-id={activity.id}
+                      class="group/oxp flex min-h-[34px] min-w-0 items-center gap-2 rounded-[5px] px-2 text-left transition-colors hover:bg-v2-background-bg-layer-01 focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none"
+                      classList={{
+                        "bg-v2-background-bg-layer-02": selected(),
+                      }}
+                      onClick={() => navigate(`/oxp/activity/${activity.id}`)}
+                    >
+                      <span
+                        class="size-1.5 shrink-0 rounded-full bg-v2-icon-icon-muted"
+                        classList={{
+                          "opacity-100": failures() === 0,
+                          "bg-v2-state-fg-danger": failures() > 0,
+                        }}
+                      />
+                      <span class="flex min-w-0 flex-1 flex-col gap-[2px]">
+                        <span class="truncate text-[11px] font-[520] leading-[14px] text-v2-text-text-base">
+                          {activity.title ??
+                            activity.lastRootAlias ??
+                            "ChatGPT activity"}
+                        </span>
+                        <span class="truncate text-[9.5px] leading-[12px] tabular-nums text-v2-text-text-faint">
+                          {calls()} calls
+                          {failures() > 0 ? ` · ${failures()} failed` : ""}
+                          {" · "}
+                          {relativeStamp(activity.lastSeenAt, minuteNow())}
+                        </span>
+                      </span>
+                    </button>
+                  )
+                }}
+              </For>
+              <Show when={oxpActivity.activities().length > oxpLimit()}>
+                <button
+                  type="button"
+                  class="ms-5 flex h-6 items-center rounded-md px-1 text-start text-[10px] text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none"
+                  onClick={() =>
+                    setOxpLimit((current) =>
+                      Math.min(current + 10, oxpActivity.activities().length),
+                    )
+                  }
+                >
+                  Show {Math.min(10, oxpActivity.activities().length - oxpLimit())} more
+                </button>
+              </Show>
+              <Show
+                when={
+                  oxpActivity.activities().length <= oxpLimit() &&
+                  oxpActivity.hasMoreActivities()
+                }
+              >
+                <button
+                  type="button"
+                  disabled={oxpActivity.loadingMoreActivities()}
+                  class="ms-5 flex h-6 items-center rounded-md px-1 text-start text-[10px] text-v2-text-text-faint transition-colors hover:text-v2-text-text-muted focus-visible:bg-v2-background-bg-layer-01 focus-visible:outline-none disabled:opacity-50"
+                  onClick={() => {
+                    void oxpActivity.loadOlderActivities().then(() => {
+                      setOxpLimit((current) => current + 10)
+                    })
+                  }}
+                >
+                  {oxpActivity.loadingMoreActivities()
+                    ? "Loading older activity…"
+                    : "Load older activity"}
+                </button>
+              </Show>
+            </nav>
+          </section>
+        </Show>
+
         <Show
           when={(groups() ?? []).length > 0}
           fallback={
@@ -1661,7 +1793,9 @@ export function ChatSidebarPane(props: {
                             }
                             const [, setStore] = serverSync().child(group.directory, { bootstrap: false })
                             setStore("limit", (prev) => (prev ?? 5) + 5)
-                            void serverSync().project.loadSessions(group.directory)
+                            void serverSync().project.loadSessions(group.directory, {
+                              projectID: group.project?.id,
+                            })
                           }}
                         >
                           {language.plural("chats.showMoreCount", group.total - group.sessions.length)}
@@ -1685,6 +1819,7 @@ export function ChatSidebarPane(props: {
                             const [store] = serverSync().child(group.directory, { bootstrap: false })
                             void serverSync().project.loadSessions(group.directory, {
                               shrinkTo: Math.max(5, (store.limit ?? 5) - 5),
+                              projectID: group.project?.id,
                             })
                           }}
                         >
@@ -1976,6 +2111,7 @@ function ChatRow(props: {
   const modelLabel = runtime.modelLabel
   const live = runtime.live
   const hasTreeDisclosure = createMemo(() => props.treeExpanded !== undefined && !!props.onToggleTree)
+  const rowIndent = () => Math.min(Math.max(props.depth ?? 0, 0), 8) * 14
 
   const slug = () => base64Encode(currentDir || props.session.directory || "")
   const warm = () => props.prefetchSession()
@@ -2005,8 +2141,11 @@ function ChatRow(props: {
       <div
           data-chat-tooltip-session={props.session.id}
           data-chat-tooltip-placement="right"
-          class="group/session relative w-full min-w-0 rounded-[5px] transition-[background-color,box-shadow] duration-100 hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 has-[.active]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] has-[data-selected]:bg-v2-background-bg-layer-02 has-[data-selected]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
-          style={{ "margin-inline-start": `${Math.min(Math.max(props.depth ?? 0, 0), 8) * 14}px` }}
+          class="group/session relative min-w-0 rounded-[5px] transition-[background-color,box-shadow] duration-100 hover:bg-v2-background-bg-layer-01 focus-within:bg-v2-background-bg-layer-01 has-[.active]:bg-v2-background-bg-layer-02 has-[.active]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] has-[data-selected]:bg-v2-background-bg-layer-02 has-[data-selected]:shadow-[inset_0_0_0_0.5px_var(--v2-alpha-dark-8)] [[data-model-picker-open]_&]:bg-v2-background-bg-layer-01"
+          style={{
+            "margin-inline-start": `${rowIndent()}px`,
+            width: `calc(100% - ${rowIndent()}px)`,
+          }}
           onContextMenu={(event) => {
             event.preventDefault()
             setContextMenu({ x: event.clientX, y: event.clientY })

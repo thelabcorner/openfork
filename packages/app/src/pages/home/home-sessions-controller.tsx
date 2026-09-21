@@ -463,7 +463,7 @@ function mergeGroupSessions(
   const projection = projectPersistentSessionGroups(records, persistentGroups)
   const persistentGroupResults: HomeSessionGroup[] = projection.groups.map((entry) => ({
     ...entry,
-    isUserGroup: true,
+    isUserGroup: entry.kind === "user",
   }))
 
   const remaining = records.filter((r) => !projection.groupedSessionIDs.has(r.session.id))

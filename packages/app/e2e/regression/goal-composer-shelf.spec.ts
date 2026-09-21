@@ -330,7 +330,7 @@ test("places the inactive Goal entrypoint between add and agent as an icon-only 
   const createScroll = creation.locator("[data-goal-create-scroll]")
   await expect(createScroll).toBeVisible()
   expect(await createScroll.evaluate((element) => element.scrollWidth <= element.clientWidth)).toBe(true)
-  const objectivePlaceholder = creation.getByPlaceholder("What should OpenCode accomplish?")
+  const objectivePlaceholder = creation.getByPlaceholder("What should OpenFork accomplish?")
   await expect(objectivePlaceholder).toBeVisible()
   expect(
     await objectivePlaceholder.evaluate((element) => Number.parseFloat(getComputedStyle(element, "::placeholder").opacity)),

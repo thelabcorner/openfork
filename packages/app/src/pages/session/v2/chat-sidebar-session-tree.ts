@@ -20,11 +20,12 @@ export type ChatSidebarSessionTreeRow = {
  *
  * Anchored groups are structural relationships:
  * - native subagent groups preserve real `parentID` lineage;
- * - plugin groups use their anchor as the visual parent for root worker chats.
+ * - generic plugin groups may use their anchor as the visual parent.
  *
- * Several plugin groups may share one coordinator anchor, so structural groups
- * are merged per anchor for presentation while each member retains its owning
- * group for context-menu/ownership semantics.
+ * Native Swarms are intentionally different: one Session may belong to several
+ * Swarms, so every virtual `kind="swarm"` group is rendered as its own
+ * collection and membership is never collapsed by Session identity. The same
+ * ordinary Session row/chat surface is reused beneath each Swarm collection.
  */
 export function buildChatSidebarSessionTreeRows(input: {
   roots: Session[]
@@ -39,8 +40,42 @@ export function buildChatSidebarSessionTreeRows(input: {
   const result: ChatSidebarSessionTreeRow[] = []
   const orderedGroups = [...input.groups].sort((a, b) => a.position - b.position)
 
+  // Native Swarm groups are first-party many-to-many navigation projections,
+  // not plugin-style structural lineage. Render one collection per Swarm and
+  // deliberately allow a Session to appear in more than one Swarm collection.
+  // Only groups intersecting this root slice are emitted, which prevents a
+  // project/Recent slice from painting unrelated Swarms.
+  const swarmClaimedRoots = new Set<string>()
+  for (const group of orderedGroups) {
+    if (group.kind !== "swarm") continue
+    if (!group.sessions.some((member) => rootByID.has(member.id))) continue
+    const members: Session[] = []
+    const seen = new Set<string>()
+    for (const member of [...group.sessions].sort((a, b) => {
+      const left = typeof a.position === "number" && Number.isFinite(a.position) ? a.position : Number.MAX_SAFE_INTEGER
+      const right = typeof b.position === "number" && Number.isFinite(b.position) ? b.position : Number.MAX_SAFE_INTEGER
+      return left - right
+    })) {
+      const session = rootByID.get(member.id) ?? input.sessionByID(member.id) ?? sessionGroupMemberSession(member)
+      if (!session || session.time?.archived != null || seen.has(session.id)) continue
+      seen.add(session.id)
+      members.push(session)
+      if (rootByID.has(session.id)) swarmClaimedRoots.add(session.id)
+    }
+    members.forEach((session, index) => {
+      result.push({
+        session,
+        group,
+        first: index === 0,
+        depth: 1,
+        visibleCount: index === 0 ? members.length : undefined,
+      })
+    })
+  }
+
   // Structural lineage wins over cosmetic/manual grouping. A coordinator can
-  // own multiple plugin groups, so aggregate by anchor before claiming rows.
+  // own multiple generic plugin groups, so aggregate those by anchor before
+  // claiming rows. Native Swarms never enter this merge.
   const structuralByAnchor = new Map<string, SessionGroupEntry[]>()
   for (const group of orderedGroups) {
     if (!group.anchorSessionID || (group.kind !== "subagent" && group.kind !== "plugin")) continue
@@ -119,6 +154,11 @@ export function buildChatSidebarSessionTreeRows(input: {
     })
   }
 
+  // Suppress a third standalone/manual copy of roots already represented by a
+  // native Swarm, while preserving deliberate duplicates across Swarms and any
+  // independent structural lineage rendered above.
+  for (const sessionID of swarmClaimedRoots) claimedRoots.add(sessionID)
+
   // Unanchored groups remain ordinary visual containers. Index the first
   // owning group once, then walk the root list once to preserve root ordering.
   // The previous implementation filtered the entire root array for every
@@ -126,6 +166,7 @@ export function buildChatSidebarSessionTreeRows(input: {
   // recomputation.
   const ordinaryOwner = new Map<string, SessionGroupEntry>()
   for (const group of orderedGroups) {
+    if (group.kind === "swarm") continue
     if (group.anchorSessionID && (group.kind === "subagent" || group.kind === "plugin")) continue
     for (const member of group.sessions) {
       if (!ordinaryOwner.has(member.id)) ordinaryOwner.set(member.id, group)

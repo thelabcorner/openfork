@@ -1,6 +1,15 @@
 import type { Message, Part } from "@opencode-ai/sdk/v2/client"
+import { userTurnPresentation } from "@/utils/session-message"
 
-export type SessionContextBreakdownKey = "system" | "user" | "assistant" | "tool" | "other"
+export type SessionContextBreakdownKey =
+  | "system"
+  | "user"
+  | "synthetic"
+  | "shell"
+  | "compaction"
+  | "assistant"
+  | "tool"
+  | "other"
 
 export type SessionContextBreakdownSegment = {
   key: SessionContextBreakdownKey
@@ -33,7 +42,16 @@ const charsFromAssistantPart = (part: Part) => {
 }
 
 const build = (
-  tokens: { system: number; user: number; assistant: number; tool: number; other: number },
+  tokens: {
+    system: number
+    user: number
+    synthetic: number
+    shell: number
+    compaction: number
+    assistant: number
+    tool: number
+    other: number
+  },
   input: number,
 ) => {
   return [
@@ -44,6 +62,18 @@ const build = (
     {
       key: "user",
       tokens: tokens.user,
+    },
+    {
+      key: "synthetic",
+      tokens: tokens.synthetic,
+    },
+    {
+      key: "shell",
+      tokens: tokens.shell,
+    },
+    {
+      key: "compaction",
+      tokens: tokens.compaction,
     },
     {
       key: "assistant",
@@ -79,8 +109,12 @@ export function estimateSessionContextBreakdown(args: {
     (acc, msg) => {
       const parts = args.parts[msg.id] ?? []
       if (msg.role === "user") {
-        const user = parts.reduce((sum, part) => sum + charsFromUserPart(part), 0)
-        return { ...acc, user: acc.user + user }
+        const chars = parts.reduce((sum, part) => sum + charsFromUserPart(part), 0)
+        const presentation = userTurnPresentation(msg)
+        if (presentation === "user") return { ...acc, user: acc.user + chars }
+        if (presentation === "shell") return { ...acc, shell: acc.shell + chars }
+        if (presentation === "compaction") return { ...acc, compaction: acc.compaction + chars }
+        return { ...acc, synthetic: acc.synthetic + chars }
       }
 
       if (msg.role !== "assistant") return acc
@@ -103,6 +137,9 @@ export function estimateSessionContextBreakdown(args: {
     {
       system: args.systemPrompt?.length ?? 0,
       user: 0,
+      synthetic: 0,
+      shell: 0,
+      compaction: 0,
       assistant: 0,
       tool: 0,
     },
@@ -111,10 +148,20 @@ export function estimateSessionContextBreakdown(args: {
   const tokens = {
     system: estimateTokens(counts.system),
     user: estimateTokens(counts.user),
+    synthetic: estimateTokens(counts.synthetic),
+    shell: estimateTokens(counts.shell),
+    compaction: estimateTokens(counts.compaction),
     assistant: estimateTokens(counts.assistant),
     tool: estimateTokens(counts.tool),
   }
-  const estimated = tokens.system + tokens.user + tokens.assistant + tokens.tool
+  const estimated =
+    tokens.system +
+    tokens.user +
+    tokens.synthetic +
+    tokens.shell +
+    tokens.compaction +
+    tokens.assistant +
+    tokens.tool
 
   if (estimated <= args.input) {
     return build({ ...tokens, other: args.input - estimated }, args.input)
@@ -124,9 +171,19 @@ export function estimateSessionContextBreakdown(args: {
   const scaled = {
     system: Math.floor(tokens.system * scale),
     user: Math.floor(tokens.user * scale),
+    synthetic: Math.floor(tokens.synthetic * scale),
+    shell: Math.floor(tokens.shell * scale),
+    compaction: Math.floor(tokens.compaction * scale),
     assistant: Math.floor(tokens.assistant * scale),
     tool: Math.floor(tokens.tool * scale),
   }
-  const total = scaled.system + scaled.user + scaled.assistant + scaled.tool
+  const total =
+    scaled.system +
+    scaled.user +
+    scaled.synthetic +
+    scaled.shell +
+    scaled.compaction +
+    scaled.assistant +
+    scaled.tool
   return build({ ...scaled, other: Math.max(0, args.input - total) }, args.input)
 }

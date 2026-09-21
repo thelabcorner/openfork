@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test"
+import { expect, test, type Page } from "@playwright/test"
 import {
   defineVisualRegions,
   reportVisualStability,
@@ -6,7 +6,193 @@ import {
   stopVisualProbe,
   visualPlan,
 } from "../../utils/visual-stability"
-import { assistantMessage, setupTimeline, shell, textPart, toolPart, userMessage, waitForVisualSettle } from "./fixture"
+import {
+  assistantMessage,
+  directory,
+  sessionID,
+  setupTimeline,
+  shell,
+  textPart,
+  toolPart,
+  userMessage,
+  waitForVisualSettle,
+} from "./fixture"
+
+const ONE_PIXEL_PNG =
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZkKsAAAAASUVORK5CYII="
+
+async function installVisualPreviewHost(page: Page) {
+  await page.evaluate((png) => {
+    const binary = atob(png)
+    const bytes = Uint8Array.from(binary, (value) => value.charCodeAt(0))
+    const calls: Array<{ context: unknown; input: unknown }> = []
+    ;(window as any).__snapeyePreviewCalls = calls
+    const api = (window as any).api ?? {}
+    ;(window as any).api = {
+      ...api,
+      browser: {
+        ...(api.browser ?? {}),
+        visualArtifactPreview: async (context: unknown, input: any) => {
+          calls.push({ context, input })
+          const path =
+            input.source === "baseline"
+              ? `.snapeye/baselines/${input.name}.png`
+              : `.snapeye/runs/${input.runId}/${input.artifact}.png`
+          return {
+            descriptor: {
+              kind: input.source === "baseline" ? "baseline" : input.artifact,
+              path,
+              mime: "image/png",
+              byteLength: bytes.byteLength,
+            },
+            bytes,
+            sha256: "a".repeat(64),
+          }
+        },
+      },
+    }
+  }, ONE_PIXEL_PNG)
+}
+
+test("surfaces browser screenshots outside collapsed tool details with premium visual controls", async ({ page }) => {
+  const screenshotID = "prt_interaction_visual_screenshot"
+  const followingID = "prt_interaction_visual_following"
+  await setupTimeline(page, {
+    messages: [
+      userMessage(),
+      assistantMessage([
+        toolPart(
+          screenshotID,
+          "browser",
+          "completed",
+          { action: "call", operation: "screenshot", args: {} },
+          {
+            output: "captured image/png screenshot",
+            metadata: {
+              browserAction: "call",
+              operation: "screenshot",
+              delegatedTool: "browser_screenshot",
+              op: "screenshot",
+              mime: "image/png",
+              data: ONE_PIXEL_PNG,
+              width: 1440,
+              height: 900,
+            },
+          },
+        ),
+        textPart(followingID, "Following visual verification"),
+      ]),
+    ],
+    cpuRate: 4,
+    seedHistory: true,
+    // Static completed history is sufficient for this visual-control test.
+    // The worktree's current SSE harness is independently failing to observe
+    // its backend connection even in untouched interaction tests.
+    waitForConnection: false,
+  })
+
+  const part = page.locator(`[data-timeline-part-id="${screenshotID}"]`)
+  const trigger = part.locator('[data-slot="collapsible-trigger"]')
+  const visual = part.locator('[data-component="tool-visual-media"]')
+  const visualShell = part.locator('[data-component="tool-visual-media-shell"]')
+  const visualRow = part.locator('xpath=ancestor::*[@data-timeline-row="AssistantPart"]')
+  await waitForVisualSettle(page, [`[data-timeline-part-id="${screenshotID}"]`])
+
+  await expect(trigger).toHaveAttribute("aria-expanded", "false")
+  await expect(visual).toBeVisible()
+  await expect(visual.locator("img")).toBeVisible()
+  await expect(part).toContainText("1440×900")
+  const collapsedShell = await visualShell.boundingBox()
+  const collapsedRow = await visualRow.boundingBox()
+  expect(collapsedShell).not.toBeNull()
+  expect(collapsedRow).not.toBeNull()
+
+  await visual.getByRole("button", { name: "Zoom in" }).click()
+  await expect(visual.getByRole("button", { name: "Reset zoom" })).toContainText("125%")
+
+  await visual.getByRole("button", { name: "Expand visual" }).click()
+  await expect(visual).toHaveAttribute("data-expanded", "true")
+  const expandedShell = await visualShell.boundingBox()
+  const expandedRow = await visualRow.boundingBox()
+  expect(Math.abs((expandedShell?.height ?? 0) - (collapsedShell?.height ?? 0))).toBeLessThanOrEqual(1)
+  expect(Math.abs((expandedRow?.height ?? 0) - (collapsedRow?.height ?? 0))).toBeLessThanOrEqual(1)
+  expect(Math.abs((expandedRow?.y ?? 0) - (collapsedRow?.y ?? 0))).toBeLessThanOrEqual(1)
+  await page.keyboard.press("Escape")
+  await expect(visual).not.toHaveAttribute("data-expanded", "true")
+  await expect(visual.getByRole("button", { name: "Reset zoom" })).toContainText("100%")
+})
+
+test("surfaces SnapEye diff artifacts through the session-scoped lazy preview resolver", async ({ page }) => {
+  const diffID = "prt_interaction_snapeye_diff"
+  await setupTimeline(page, {
+    messages: [
+      userMessage(),
+      assistantMessage([
+        toolPart(
+          diffID,
+          "browser_visual_diff",
+          "completed",
+          { name: "settings" },
+          {
+            output: "SnapEye settings: changed (1.2500%, 3 regions)",
+            metadata: {
+              op: "visual_diff",
+              runId: "run_snapeye_1",
+              status: "ok",
+              name: "settings",
+              image: { pixelWidth: 1440, pixelHeight: 900 },
+              diff: { changed: true, changedRatio: 0.0125, regionCount: 3, regionsTruncated: false },
+              artifacts: {
+                baseline: "../../baselines/settings.png",
+                current: "current.png",
+                diff: "diff.png",
+              },
+            },
+          },
+        ),
+      ]),
+    ],
+    cpuRate: 4,
+    // Static completed history is enough to validate projection + lazy preview
+    // routing; the current worktree's SSE harness is independently unable to
+    // observe its mock-backend connection in this suite.
+    waitForConnection: false,
+  })
+
+  const part = page.locator(`[data-timeline-part-id="${diffID}"]`)
+  const trigger = part.locator('[data-slot="collapsible-trigger"]')
+  const visual = part.locator('[data-component="tool-visual-media"]')
+  await expect(trigger).toHaveAttribute("aria-expanded", "false")
+  await expect(visual).toBeVisible()
+  await expect(visual.getByRole("tab", { name: "Diff" })).toHaveAttribute("aria-selected", "true")
+  await expect(part).toContainText("Changed")
+
+  // Web fixtures intentionally have no Electron bridge. Install only the
+  // bounded preview capability after normal app bootstrap, then select a new
+  // source so the card resolves through the exact same app-owned adapter used
+  // by Desktop.
+  await installVisualPreviewHost(page)
+  await visual.getByRole("tab", { name: "Current" }).click()
+  await expect(visual.locator("img")).toBeVisible()
+  await expect.poll(() => page.evaluate(() => (window as any).__snapeyePreviewCalls?.length ?? 0)).toBe(1)
+  await visual.getByRole("tab", { name: "Diff" }).click()
+  await expect.poll(() => page.evaluate(() => (window as any).__snapeyePreviewCalls?.length ?? 0)).toBe(2)
+  await visual.getByRole("tab", { name: "Baseline" }).click()
+  await expect.poll(() => page.evaluate(() => (window as any).__snapeyePreviewCalls?.length ?? 0)).toBe(3)
+
+  const calls = await page.evaluate(() => (window as any).__snapeyePreviewCalls)
+  expect(calls.map((call: any) => call.context)).toEqual([
+    { sessionId: sessionID, directory },
+    { sessionId: sessionID, directory },
+    { sessionId: sessionID, directory },
+  ])
+  expect(calls.map((call: any) => call.input)).toEqual([
+    { source: "run", runId: "run_snapeye_1", artifact: "current" },
+    { source: "run", runId: "run_snapeye_1", artifact: "diff" },
+    { source: "baseline", name: "settings" },
+  ])
+  await expect(trigger).toHaveAttribute("aria-expanded", "false")
+})
 
 test("expands and collapses a long completed shell without overlap", async ({ page }, testInfo) => {
   const shellID = "prt_interaction_01_shell"

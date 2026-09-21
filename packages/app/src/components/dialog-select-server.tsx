@@ -20,6 +20,10 @@ import { type ServerHealth, useCheckServerHealth } from "@/utils/server-health"
 import { useSettings } from "@/context/settings"
 import { useTabs } from "@/context/tabs"
 import { useServerManagementState } from "@/components/server-management-state"
+import {
+  probeConfiguredServerOfxp,
+  type ConfiguredServerOfxpIdentity,
+} from "@/utils/ofxp-server-seeds"
 
 const DEFAULT_USERNAME = "opencode"
 
@@ -42,6 +46,10 @@ interface ServerFormProps {
 
 function useServerPreview() {
   const checkServerHealth = useCheckServerHealth()
+  const platform = usePlatform()
+  const fetcher = platform.fetch ?? globalThis.fetch
+  let generation = 0
+  let pending: AbortController | undefined
 
   const looksComplete = (value: string) => {
     const normalized = normalizeServerUrl(value)
@@ -56,20 +64,45 @@ function useServerPreview() {
     value: string,
     username: string,
     password: string,
-    setStatus: (value: boolean | undefined) => void,
+    setPreview: (value: { status: boolean | undefined; ofxp?: ConfiguredServerOfxpIdentity }) => void,
   ) => {
-    setStatus(undefined)
-    if (!looksComplete(value)) return
-    const normalized = normalizeServerUrl(value)
-    if (!normalized) return
-    const http: ServerConnection.HttpBase = { url: normalized }
-    if (username) http.username = username
-    if (password) http.password = password
-    const result = await checkServerHealth(http)
-    setStatus(result.healthy)
+    pending?.abort()
+    const controller = new AbortController()
+    pending = controller
+    const requestID = ++generation
+    const deadline = setTimeout(() => controller.abort(), 8_000)
+    setPreview({ status: undefined, ofxp: undefined })
+    try {
+      if (!looksComplete(value)) return
+      const normalized = normalizeServerUrl(value)
+      if (!normalized) return
+      const http: ServerConnection.HttpBase = { url: normalized }
+      if (username) http.username = username
+      if (password) http.password = password
+      const result = await checkServerHealth(http, { signal: controller.signal, retryCount: 0 })
+      if (requestID !== generation) return
+      if (!result.healthy) {
+        setPreview({ status: false, ofxp: undefined })
+        return
+      }
+      const connection: ServerConnection.Http = { type: "http", http }
+      const ofxp = await probeConfiguredServerOfxp(connection, fetcher, 5_000, controller.signal)
+      if (requestID !== generation) return
+      setPreview({ status: true, ofxp: ofxp?.ofxp })
+    } finally {
+      clearTimeout(deadline)
+      if (pending === controller) pending = undefined
+    }
   }
 
-  return { previewStatus }
+  return {
+    previewStatus,
+    invalidate() {
+      generation += 1
+      pending?.abort()
+      pending = undefined
+    },
+  }
 }
 
 function ServerForm(props: ServerFormProps) {
@@ -161,7 +194,7 @@ export function useServerManagementController(options: { onSelect?: () => void; 
   const language = useLanguage()
   const serverManagement = useServerManagementState()
   const { defaultKey, canDefault, setDefault } = serverManagement
-  const { previewStatus } = useServerPreview()
+  const preview = useServerPreview()
   const checkServerHealth = useCheckServerHealth()
   const [store, setStore] = createStore({
     addServer: {
@@ -172,6 +205,7 @@ export function useServerManagementController(options: { onSelect?: () => void; 
       error: "",
       showForm: false,
       status: undefined as boolean | undefined,
+      ofxp: undefined as ConfiguredServerOfxpIdentity | undefined,
     },
     editServer: {
       id: undefined as string | undefined,
@@ -181,10 +215,12 @@ export function useServerManagementController(options: { onSelect?: () => void; 
       password: "",
       error: "",
       status: undefined as boolean | undefined,
+      ofxp: undefined as ConfiguredServerOfxpIdentity | undefined,
     },
   })
 
   const resetAdd = () => {
+    preview.invalidate()
     setStore("addServer", {
       url: "",
       name: "",
@@ -193,9 +229,11 @@ export function useServerManagementController(options: { onSelect?: () => void; 
       error: "",
       showForm: false,
       status: undefined,
+      ofxp: undefined,
     })
   }
   const resetEdit = () => {
+    preview.invalidate()
     setStore("editServer", {
       id: undefined,
       value: "",
@@ -204,6 +242,7 @@ export function useServerManagementController(options: { onSelect?: () => void; 
       password: "",
       error: "",
       status: undefined,
+      ofxp: undefined,
     })
   }
 
@@ -359,8 +398,8 @@ export function useServerManagementController(options: { onSelect?: () => void; 
   const handleAddChange = (value: string) => {
     if (addMutation.isPending) return
     setStore("addServer", { url: value, error: "" })
-    void previewStatus(value, store.addServer.username, store.addServer.password, (next) =>
-      setStore("addServer", { status: next }),
+    void preview.previewStatus(value, store.addServer.username, store.addServer.password, (next) =>
+      setStore("addServer", next),
     )
   }
 
@@ -372,24 +411,24 @@ export function useServerManagementController(options: { onSelect?: () => void; 
   const handleAddUsernameChange = (value: string) => {
     if (addMutation.isPending) return
     setStore("addServer", { username: value, error: "" })
-    void previewStatus(store.addServer.url, value, store.addServer.password, (next) =>
-      setStore("addServer", { status: next }),
+    void preview.previewStatus(store.addServer.url, value, store.addServer.password, (next) =>
+      setStore("addServer", next),
     )
   }
 
   const handleAddPasswordChange = (value: string) => {
     if (addMutation.isPending) return
     setStore("addServer", { password: value, error: "" })
-    void previewStatus(store.addServer.url, store.addServer.username, value, (next) =>
-      setStore("addServer", { status: next }),
+    void preview.previewStatus(store.addServer.url, store.addServer.username, value, (next) =>
+      setStore("addServer", next),
     )
   }
 
   const handleEditChange = (value: string) => {
     if (editMutation.isPending) return
     setStore("editServer", { value, error: "" })
-    void previewStatus(value, store.editServer.username, store.editServer.password, (next) =>
-      setStore("editServer", { status: next }),
+    void preview.previewStatus(value, store.editServer.username, store.editServer.password, (next) =>
+      setStore("editServer", next),
     )
   }
 
@@ -401,16 +440,16 @@ export function useServerManagementController(options: { onSelect?: () => void; 
   const handleEditUsernameChange = (value: string) => {
     if (editMutation.isPending) return
     setStore("editServer", { username: value, error: "" })
-    void previewStatus(store.editServer.value, value, store.editServer.password, (next) =>
-      setStore("editServer", { status: next }),
+    void preview.previewStatus(store.editServer.value, value, store.editServer.password, (next) =>
+      setStore("editServer", next),
     )
   }
 
   const handleEditPasswordChange = (value: string) => {
     if (editMutation.isPending) return
     setStore("editServer", { password: value, error: "" })
-    void previewStatus(store.editServer.value, store.editServer.username, value, (next) =>
-      setStore("editServer", { status: next }),
+    void preview.previewStatus(store.editServer.value, store.editServer.username, value, (next) =>
+      setStore("editServer", next),
     )
   }
 
@@ -440,6 +479,7 @@ export function useServerManagementController(options: { onSelect?: () => void; 
       password: "",
       error: "",
       status: undefined,
+      ofxp: undefined,
     })
   }
 
@@ -453,6 +493,7 @@ export function useServerManagementController(options: { onSelect?: () => void; 
       password: conn.http.password ?? "",
       error: "",
       status: global.servers.health[ServerConnection.key(conn)]?.healthy,
+      ofxp: global.servers.health[ServerConnection.key(conn)]?.ofxp,
     })
   }
 
@@ -506,6 +547,7 @@ export function useServerManagementController(options: { onSelect?: () => void; 
     formPassword: () => (isAddMode() ? store.addServer.password : store.editServer.password),
     formError: () => (isAddMode() ? store.addServer.error : store.editServer.error),
     formStatus: () => (isAddMode() ? store.addServer.status : store.editServer.status),
+    formOfxp: () => (isAddMode() ? store.addServer.ofxp : store.editServer.ofxp),
     select,
     setDefault,
     startAdd,

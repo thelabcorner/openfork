@@ -11,6 +11,7 @@ import { displayName, projectForSession } from "@/pages/layout/helpers"
 import { SessionTabAvatar } from "@/pages/layout/session-tab-avatar"
 import type { Session } from "@opencode-ai/sdk/v2"
 import type { GroupTab } from "@/context/tabs"
+import type { AppTabPage } from "@/context/app-tabs"
 import { canOpenTabRename, forwardTabRef } from "./titlebar-tab-gesture"
 import { sessionApiOf } from "./titlebar-tab-actions"
 import { tabSessionState } from "./titlebar-tab-state"
@@ -474,6 +475,107 @@ export function DraftTabItem(props: {
             event.stopPropagation()
           }}
           class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100 group-data-[editing=true]:opacity-100"
+          onClick={closeTab}
+          icon={<IconV2 name="xmark-small" />}
+          aria-label={language.t("common.closeTab")}
+        />
+      </div>
+    </div>
+  )
+}
+
+export function AppTabItem(props: {
+  ref?: Ref<HTMLDivElement>
+  href: string
+  page: AppTabPage
+  title: string
+  active?: boolean
+  pending?: boolean
+  onNavigate: () => void
+  onClose: () => void
+  suppressNavigation?: () => boolean
+  dragging?: boolean
+}) {
+  const language = useLanguage()
+  const closeTab = (event: MouseEvent) => {
+    event.preventDefault()
+    event.stopPropagation()
+    props.onClose()
+  }
+  const icon = () => {
+    if (props.page === "settings") return "settings-gear" as const
+    if (props.page === "usage") return "usage" as const
+    if (props.page === "oxp") return "chats" as const
+    return "clock" as const
+  }
+
+  return (
+    <div
+      ref={(el) => forwardTabRef(props.ref, el)}
+      data-titlebar-tab
+      data-slot="titlebar-tab-item"
+      data-active={props.active}
+      data-dragging={props.dragging}
+      data-state={props.active ? "pressed" : undefined}
+      class="group relative flex h-7 w-full min-w-0 select-none flex-row items-center gap-1.5 overflow-hidden whitespace-nowrap rounded-[6px] px-1.5 [container-type:inline-size]"
+      onMouseDown={(event) => {
+        if (event.button !== MIDDLE_MOUSE_BUTTON) return
+        event.preventDefault()
+        event.stopPropagation()
+      }}
+      onAuxClick={(event) => {
+        if (event.button !== MIDDLE_MOUSE_BUTTON) return
+        closeTab(event)
+      }}
+    >
+      <a
+        data-slot="tab-link"
+        data-titlebar-tab-link
+        href={props.href}
+        draggable={false}
+        onDragStart={(event) => {
+          event.preventDefault()
+          event.stopPropagation()
+        }}
+        onMouseDown={(event) => {
+          if (event.button !== 0) return
+          if (props.suppressNavigation?.()) return
+          props.onNavigate()
+        }}
+        onClick={(event) => {
+          event.preventDefault()
+          if (event.detail > 0) return
+          if (props.suppressNavigation?.()) return
+          props.onNavigate()
+        }}
+        class="flex h-full min-w-0 flex-1 flex-row items-center gap-1.5 text-[13px] font-medium text-v2-text-text-faint group-data-[active='true']:text-v2-text-text-base [-webkit-user-drag:none]"
+      >
+        <span class="flex size-4 shrink-0 items-center justify-center">
+          <Show when={props.pending} fallback={<IconV2 name={icon()} />}>
+            <LoaderV2 class="size-4" aria-hidden="true" />
+          </Show>
+        </span>
+        <span
+          data-titlebar-tab-title
+          dir="auto"
+          class="min-w-0 flex-1 overflow-hidden text-clip whitespace-nowrap outline-none leading-4"
+        >
+          {props.title}
+        </span>
+      </a>
+      <div data-slot="tab-close">
+        <IconButtonV2
+          size="small"
+          variant="ghost-muted"
+          onPointerDown={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+          }}
+          onMouseDown={(event) => {
+            event.preventDefault()
+            event.stopPropagation()
+          }}
+          class="hover-reveal relative z-10 group-hover:opacity-100 group-data-[active=true]:opacity-100"
           onClick={closeTab}
           icon={<IconV2 name="xmark-small" />}
           aria-label={language.t("common.closeTab")}

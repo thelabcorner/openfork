@@ -6,7 +6,7 @@ import { IconButtonV2 } from "@opencode-ai/ui/v2/icon-button-v2"
 import { MenuV2 } from "@opencode-ai/ui/v2/menu-v2"
 import { useMutation } from "@tanstack/solid-query"
 import fuzzysort from "fuzzysort"
-import { type Accessor, For, Show, createMemo } from "solid-js"
+import { type Accessor, For, Show, createMemo, type JSX } from "solid-js"
 import type { useServerManagementController } from "@/components/dialog-select-server"
 import { ServerHealthIndicator } from "@/components/server/server-row"
 import { useLanguage } from "@/context/language"
@@ -69,6 +69,11 @@ export function useFilteredWslServers(filter: Accessor<string>) {
 export function WslServerSettings(props: {
   controller: Controller
   servers: ReturnType<typeof useFilteredWslServers>
+  activeKey?: ServerConnection.Key
+  scopedKey?: ServerConnection.Key
+  onManage?: (key: ServerConnection.Key) => void
+  onUse?: (key: ServerConnection.Key) => void
+  renderNetwork?: (key: ServerConnection.Key) => JSX.Element
 }) {
   const platform = usePlatform()
   const language = useLanguage()
@@ -97,73 +102,107 @@ export function WslServerSettings(props: {
           const check = () => wsl.data?.opencodeChecks[item.config.distro]
           const opencodeAction = () => wslOpencodeAction(check())
           const busy = () => wsl.data?.job?.kind === "install-opencode" && wsl.data.job.distro === item.config.distro
+          const health = () => props.controller.status()[key]
+          const configured = () => props.controller.sortedItems().some((connection) => ServerConnection.key(connection) === key)
           return (
-            <div class="settings-v2-servers-row">
-              <div class="settings-v2-servers-lead">
-                <ServerHealthIndicator health={props.controller.status()[key]} />
-                <div class="settings-v2-servers-copy">
-                  <span class="flex min-w-0 items-center gap-1">
-                    <span class="settings-v2-servers-name">{item.config.distro}</span>
-                    <span class="shrink-0 rounded-[3px] border border-v2-border-border-base px-1 py-0.5 text-[9px] leading-none text-v2-text-text-muted">
-                      {language.t("wsl.server.label")}
+            <div
+              class="settings-v2-server-card settings-v2-server-card--wsl"
+              data-health={health()?.healthy === false ? "offline" : health()?.healthy === true ? "online" : "checking"}
+            >
+              <div class="settings-v2-server-card-main settings-v2-server-card-main--wsl">
+                <div class="settings-v2-servers-lead">
+                  <ServerHealthIndicator health={health()} />
+                  <div class="settings-v2-servers-copy">
+                    <span class="flex min-w-0 items-center gap-1">
+                      <span class="settings-v2-servers-name">{item.config.distro}</span>
+                      <span class="shrink-0 rounded-[3px] border border-v2-border-border-base px-1 py-0.5 text-[9px] leading-none text-v2-text-text-muted">
+                        {language.t("wsl.server.label")}
+                      </span>
                     </span>
-                  </span>
-                  <span class="settings-v2-servers-meta">
-                    <Show when={check()?.version}>{(version) => `v${version()}`}</Show>
-                  </span>
+                    <span class="settings-v2-servers-meta">
+                      <Show when={check()?.version}>{(version) => `v${version()}`}</Show>
+                    </span>
+                  </div>
                 </div>
-              </div>
-              <div class="settings-v2-servers-actions">
-                <Show when={props.controller.canDefault() && props.controller.defaultKey() === key}>
-                  <Tag>{language.t("dialog.server.status.default")}</Tag>
-                </Show>
-                <Show when={opencodeAction()}>
-                  {(label) => (
+                <div class="settings-v2-servers-actions">
+                  <Show when={props.activeKey === key}>
+                    <Tag variant="accent">{language.t("settings.ofxp.connections.activeBackend")}</Tag>
+                  </Show>
+                  <Show when={props.scopedKey === key}>
+                    <Tag>{language.t("settings.ofxp.connections.managingHere")}</Tag>
+                  </Show>
+                  <Show when={props.controller.canDefault() && props.controller.defaultKey() === key}>
+                    <Tag>{language.t("dialog.server.status.default")}</Tag>
+                  </Show>
+                  <Show when={configured() && props.scopedKey !== key && props.onManage}>
                     <ButtonV2
                       size="small"
-                      disabled={busy() || request.isPending}
-                      onClick={() => api && request.mutate(() => api.installOpencode(item.config.distro))}
+                      variant="ghost-muted"
+                      disabled={health()?.healthy === false}
+                      onClick={() => props.onManage?.(key)}
                     >
-                      {busy() ? language.t("wsl.server.updating") : language.t(label())}
+                      {language.t("settings.ofxp.connections.manage")}
                     </ButtonV2>
-                  )}
-                </Show>
-                <MenuV2 gutter={4} modal={false} placement="bottom-end">
-                  <MenuV2.Trigger
-                    as={IconButtonV2}
-                    variant="ghost-muted"
-                    size="small"
-                    icon={<IconV2 name="outline-dots" />}
-                    aria-label={language.t("common.moreOptions")}
-                  />
-                  <MenuV2.Portal>
-                    <MenuV2.Content>
-                      <MenuV2.Group>
-                        <MenuV2.GroupLabel>{language.t("wsl.server.menu.label")}</MenuV2.GroupLabel>
-                        <Show when={wslRuntimeRetryable(item.runtime)}>
-                          <MenuV2.Item onSelect={() => api && request.mutate(() => api.startServer(key))}>
-                            {language.t("wsl.server.retryStart")}
+                  </Show>
+                  <Show when={configured() && props.activeKey !== key && props.onUse}>
+                    <ButtonV2
+                      size="small"
+                      variant="outline"
+                      disabled={health()?.healthy === false}
+                      onClick={() => props.onUse?.(key)}
+                    >
+                      {language.t("settings.ofxp.connections.use")}
+                    </ButtonV2>
+                  </Show>
+                  <Show when={opencodeAction()}>
+                    {(label) => (
+                      <ButtonV2
+                        size="small"
+                        disabled={busy() || request.isPending}
+                        onClick={() => api && request.mutate(() => api.installOpencode(item.config.distro))}
+                      >
+                        {busy() ? language.t("wsl.server.updating") : language.t(label())}
+                      </ButtonV2>
+                    )}
+                  </Show>
+                  <MenuV2 gutter={4} modal={false} placement="bottom-end">
+                    <MenuV2.Trigger
+                      as={IconButtonV2}
+                      variant="ghost-muted"
+                      size="small"
+                      icon={<IconV2 name="outline-dots" />}
+                      aria-label={language.t("common.moreOptions")}
+                    />
+                    <MenuV2.Portal>
+                      <MenuV2.Content>
+                        <MenuV2.Group>
+                          <MenuV2.GroupLabel>{language.t("wsl.server.menu.label")}</MenuV2.GroupLabel>
+                          <Show when={wslRuntimeRetryable(item.runtime)}>
+                            <MenuV2.Item onSelect={() => api && request.mutate(() => api.startServer(key))}>
+                              {language.t("wsl.server.retryStart")}
+                            </MenuV2.Item>
+                          </Show>
+                          <Show when={props.controller.canDefault() && props.controller.defaultKey() !== key}>
+                            <MenuV2.Item onSelect={() => props.controller.setDefault(key)}>
+                              {language.t("dialog.server.menu.default")}
+                            </MenuV2.Item>
+                          </Show>
+                          <Show when={props.controller.canDefault() && props.controller.defaultKey() === key}>
+                            <MenuV2.Item onSelect={() => props.controller.setDefault(null)}>
+                              {language.t("dialog.server.menu.defaultRemove")}
+                            </MenuV2.Item>
+                          </Show>
+                          <MenuV2.Separator />
+                          <MenuV2.Item onSelect={() => remove(key)}>
+                            {language.t("dialog.server.menu.delete")}
                           </MenuV2.Item>
-                        </Show>
-                        <Show when={props.controller.canDefault() && props.controller.defaultKey() !== key}>
-                          <MenuV2.Item onSelect={() => props.controller.setDefault(key)}>
-                            {language.t("dialog.server.menu.default")}
-                          </MenuV2.Item>
-                        </Show>
-                        <Show when={props.controller.canDefault() && props.controller.defaultKey() === key}>
-                          <MenuV2.Item onSelect={() => props.controller.setDefault(null)}>
-                            {language.t("dialog.server.menu.defaultRemove")}
-                          </MenuV2.Item>
-                        </Show>
-                        <MenuV2.Separator />
-                        <MenuV2.Item onSelect={() => remove(key)}>
-                          {language.t("dialog.server.menu.delete")}
-                        </MenuV2.Item>
-                      </MenuV2.Group>
-                    </MenuV2.Content>
-                  </MenuV2.Portal>
-                </MenuV2>
+                        </MenuV2.Group>
+                      </MenuV2.Content>
+                    </MenuV2.Portal>
+                  </MenuV2>
+                </div>
               </div>
+              {props.renderNetwork?.(key)}
             </div>
           )
         }}

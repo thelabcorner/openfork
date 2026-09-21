@@ -5,6 +5,7 @@ describe("routed settings navigation", () => {
   test("normalizes invalid or absent tabs to general", () => {
     expect(normalizeSettingsTab(undefined)).toBe("general")
     expect(normalizeSettingsTab("providers")).toBe("providers")
+    expect(normalizeSettingsTab("oxp")).toBe("oxp")
     expect(normalizeSettingsTab("not-a-tab")).toBe("general")
   })
 

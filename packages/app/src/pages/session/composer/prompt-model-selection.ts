@@ -7,6 +7,7 @@ import { useSDK } from "@/context/sdk"
 import { useSync } from "@/context/sync"
 import { useProviders } from "@/hooks/use-providers"
 import { resolveDefaultModel } from "@/hooks/provider-catalog"
+import { Model as ModelContract } from "@opencode-ai/schema/model"
 
 export function createPromptModelSelection(input: { agent: () => { model?: ModelKey; variant?: string } | undefined }) {
   const sdk = useSDK()
@@ -18,7 +19,13 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
 
   const valid = (model: ModelKey) => {
     const provider = providers.all().get(model.providerID)
-    return !!provider?.models[model.modelID] && connected().has(model.providerID)
+    const info = provider?.models[model.modelID]
+    return (
+      !!provider &&
+      !!info &&
+      connected().has(model.providerID) &&
+      ModelContract.isLanguageModel(provider.id, info)
+    )
   }
 
   const configured = () => {
@@ -31,7 +38,14 @@ export function createPromptModelSelection(input: { agent: () => { model?: Model
   const fallback = () => {
     const defaults = providers.default()
     return providers.connected().flatMap((provider) => {
-      const modelID = defaults[provider.id] ?? Object.values(provider.models)[0]?.id
+      const preferred = defaults[provider.id]
+      const preferredModel = preferred ? provider.models[preferred] : undefined
+      const modelID =
+        preferredModel && ModelContract.isLanguageModel(provider.id, preferredModel)
+          ? preferred
+          : Object.values(provider.models).find(
+              (model) => ModelContract.isLanguageModel(provider.id, model),
+            )?.id
       return modelID ? [{ providerID: provider.id, modelID }] : []
     })[0]
   }

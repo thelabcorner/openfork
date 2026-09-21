@@ -1,4 +1,4 @@
-import { createMemo, Show, type ParentProps } from "solid-js"
+import { createMemo, Show, type JSX, type ParentProps } from "solid-js"
 import { useLayout } from "@/context/layout"
 import { useLocal } from "@/context/local"
 import { SDKProvider } from "@/context/sdk"
@@ -30,15 +30,15 @@ function useSettingsDirectory() {
   })
 }
 
-export function SettingsLocalScope(props: ParentProps) {
+export function SettingsLocalScope(props: ParentProps<{ fallback?: JSX.Element }>) {
   if (tryUseLocal()) return props.children
-  return <SettingsLocalScopeMount>{props.children}</SettingsLocalScopeMount>
+  return <SettingsLocalScopeMount fallback={props.fallback}>{props.children}</SettingsLocalScopeMount>
 }
 
-function SettingsLocalScopeMount(props: ParentProps) {
+function SettingsLocalScopeMount(props: ParentProps<{ fallback?: JSX.Element }>) {
   const directory = useSettingsDirectory()
   return (
-    <Show when={directory()} keyed fallback={props.children}>
+    <Show when={directory()} keyed fallback={props.fallback ?? null}>
       {(dir) => (
         <SDKProvider directory={dir}>
           <DirectoryDataProvider directory={dir}>{props.children}</DirectoryDataProvider>

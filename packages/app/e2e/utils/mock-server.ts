@@ -59,6 +59,14 @@ export async function mockOpenCodeServer(page: Page, config: MockServerConfig) {
             ? { id: "evt_mock_connected", type: "server.connected", data: {} }
             : { payload: { id: "evt_mock_connected", type: "server.connected", properties: {} } },
         events: (path) => {
+          // Protocol probing / parallel server contexts can leave both the
+          // legacy and native SSE endpoints connected at once. Stateful test
+          // fixtures commonly expose events via splice(), so allowing both
+          // sockets to consume the same callback makes delivery race-dependent:
+          // the inactive protocol can drain an event before the authoritative
+          // stream sees it. Only the configured protocol owns fixture events.
+          const eventPath = config.protocol === "v2" ? "/api/event" : "/global/event"
+          if (path !== eventPath) return []
           const events = config.events?.() ?? []
           return path === "/api/event" ? events.map(currentEvent) : events
         },
@@ -465,6 +473,19 @@ export function flatSession(session: { id: string } & Record<string, unknown>, f
 }
 
 function currentMessage(value: unknown) {
+  // Current/V2 tests may provide an already-projected Session message. Preserve
+  // that native shape verbatim so fixtures can represent message kinds that do
+  // not exist in the legacy { info, parts } envelope (for example host-owned
+  // synthetic turns used by special-agent Sessions).
+  if (
+    value !== null &&
+    typeof value === "object" &&
+    !("info" in value) &&
+    typeof (value as { id?: unknown }).id === "string" &&
+    typeof (value as { type?: unknown }).type === "string"
+  ) {
+    return value
+  }
   const item = value as {
     info: Record<string, unknown> & { id: string; role: "user" | "assistant"; time: { created: number } }
     parts: Array<Record<string, unknown> & { type: string }>
