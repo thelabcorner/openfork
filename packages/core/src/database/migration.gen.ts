@@ -94,12 +94,15 @@ const checksums = [
   "319b58228d38ce7391fb80ce6b582bebccb53ee263421b684dd9e0e03c0edc0f",
   "4f5cfdc1b42876b02331f5d8bfc075ab284443e2c543d2879cb5e2b71d1ceb7e",
   "efdbefb2b1523581b39f6737bf081178bee3e64e0613dff07248197fbde9c508",
-  "357ae708c1e188cd672b39bbac599ab1a6c2d6851bd8774015518cdf080c479c",
+  "e010f3f0a9b9e5b457e5e38cc91dcb08e3555d02b9fc5753434abdc5461d13ef",
   "b19436fd5d1ec5172ff041e8995663a62eab8c81be64deb309ad23f382a61236",
-  "b2ef21144060c67f7a5d9f33c97c83e5fa186357464f354b230b9ee8aacda23c",
+  "b757a6bd6c240aea8dba0bb88abffeefd13fe6690759c4166ebe5d2b1735ab56",
   "a6fb0beb98445cfbbf0b8725d7e300bae7f77be83d3d28201061ad854f4fedef",
   "0af4c818880cf85e4211ef99d7e8cefb2601ba785e55091a8a0d8bb67ff460db",
   "99503e6a41045d9ff9cd9c5564d4b8fd84fb9fe755e57c01934d947e95b7cd9a",
+  "3a99936f443a46ed88796b4ee89af62d3f3a8329b5c4681a7594af8a50809876",
+  "4898183641d39784c6ba7aa5814ce5cd478d9f9d38e6fa907907557c7831611b",
+  "66ebcf2d24be8d3fa703c360f5cb7ac2d58358aebce1fca2295ba500c1e3a738",
 ] as const
 
 export const migrations = (
@@ -203,6 +206,9 @@ export const migrations = (
     import("./migration/20260920035341_workspace_time_used_default"),
     import("./migration/20260920040500_text_primary_key_not_null_convergence"),
     import("./migration/20260920041939_retire_orphan_tool_call"),
+    import("./migration/20260920163326_ofxp_peer_trust"),
+    import("./migration/20260920180747_ofxp_invocation_receipt"),
+    import("./migration/20260921032422_ofxp_peer_authority_epoch"),
   ])
 ).map((module, index) => ({
   ...module.default,
