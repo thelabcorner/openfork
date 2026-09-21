@@ -185,8 +185,21 @@ const layer = Layer.effect(
           },
         })
       }
+      const service = error.message.match(/Service not found:\s*([^\s)]+)/i)?.[1]
+      if (service) {
+        return new OxpError.DependencyUnavailable({
+          detail: `Native delegated-worker runtime dependency is unavailable: ${service}`,
+          metadata: {
+            dependency: service.slice(0, 256),
+            nativeError: error.name.slice(0, 256),
+          },
+        })
+      }
       return new OxpError.DependencyUnavailable({
-        detail: "Native delegated-worker operation failed",
+        detail: OxpError.boundDetail(error.message || "Native delegated-worker operation failed"),
+        metadata: {
+          nativeError: error.name.slice(0, 256),
+        },
       })
     }
 

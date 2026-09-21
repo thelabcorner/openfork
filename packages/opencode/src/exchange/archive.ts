@@ -174,7 +174,16 @@ export function execute<E>(
           try: () => ArchiveSystem.resolveBackend(format),
           catch: (error) => operationError(error, [[archive.native, archive.virtual]]),
         })
-        const result = yield* hooks.runSystem(backend.tool, ArchiveSystem.listArgs(backend, archive.native), signal)
+        const args = ArchiveSystem.listArgs(backend, archive.native)
+        let result = yield* hooks.runSystem(backend.tool, args, signal)
+        // Windows system archive tools can occasionally exit 0 before any
+        // piped listing bytes are observed by the parent under process load.
+        // The direct ArchiveSystem path already retries this exact ambiguous
+        // success once. Keep Exchange/OXP behavior identical: a second empty
+        // success still represents a legitimate empty archive.
+        if (result.code === 0 && result.stdout.length === 0) {
+          result = yield* hooks.runSystem(backend.tool, args, signal)
+        }
         if (result.code !== 0) {
           return yield* new ExchangeError.InvalidArgument({
             detail: `Archive backend failed: ${virtualize(result.stderr.trim() || new TextDecoder().decode(result.stdout).slice(0, 300), [[archive.native, archive.virtual]])}`,
@@ -222,7 +231,7 @@ export function execute<E>(
           try: () => ArchiveSystem.resolveBackend(format),
           catch: (error) => operationError(error, [[archive.native, archive.virtual]]),
         })
-        const result = yield* hooks.runSystem(
+        let result = yield* hooks.runSystem(
           backend.tool,
           ArchiveSystem.readArgs(
             backend,
@@ -231,6 +240,21 @@ export function execute<E>(
           ),
           signal,
         )
+        // On Windows, the same pipe-capture race that affects system archive
+        // listings can also yield exit code 0 with an empty stdout buffer for
+        // a real non-empty entry. Retry that ambiguous success exactly once.
+        // Legitimately empty archive entries remain empty after the retry.
+        if (result.code === 0 && result.stdout.length === 0) {
+          result = yield* hooks.runSystem(
+            backend.tool,
+            ArchiveSystem.readArgs(
+              backend,
+              archive.native,
+              format.kind === "compressed" && format.container === "single" ? "" : entry!,
+            ),
+            signal,
+          )
+        }
         if (result.code !== 0) {
           return yield* new ExchangeError.InvalidArgument({
             detail: `Archive backend could not read the entry: ${virtualize(result.stderr.trim() || "entry not found", [[archive.native, archive.virtual]])}`,

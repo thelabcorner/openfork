@@ -53,6 +53,7 @@ const calls: Call[] = []
 let beforeGuard: (() => Promise<void>) | undefined
 let afterCommit: (() => void) | undefined
 let batchStartError: Error | undefined
+let resolveSelectionError: Error | undefined
 
 const guard = (target: OxpWorkerControl.Target) =>
   Effect.tryPromise({
@@ -77,10 +78,12 @@ const controlLayer = Layer.succeed(
   OxpWorkerControl.Service,
   OxpWorkerControl.Service.of({
     resolveSelection: (_target, input) =>
-      Effect.succeed({
-        agent: input.agent ?? "build",
-        model: input.model ?? MODEL,
-      }),
+      resolveSelectionError
+        ? Effect.fail(resolveSelectionError)
+        : Effect.succeed({
+            agent: input.agent ?? "build",
+            model: input.model ?? MODEL,
+          }),
     start: (target, input) =>
       Effect.gen(function* () {
         yield* guard(target)
@@ -183,6 +186,7 @@ beforeEach(async () => {
   beforeGuard = undefined
   afterCommit = undefined
   batchStartError = undefined
+  resolveSelectionError = undefined
   await fs.rm(suite, { recursive: true, force: true })
   await fs.mkdir(configDir, { recursive: true })
   await fs.mkdir(stateDir, { recursive: true })
@@ -325,7 +329,7 @@ const seedBatch = Effect.fnUntraced(function* (input: {
 
 describe("OxpWorker", () => {
   it.live(
-    "starts with exact provider/account/agent policy and preserves external invocation lineage",
+    "starts with exact provider/account/agent selection and preserves external invocation lineage",
     Effect.gen(function* () {
       const { root } = yield* prepare()
       const workers = yield* OxpWorker.Service
@@ -411,6 +415,33 @@ describe("OxpWorker", () => {
         action: "start",
         input: { model: MODEL_2, agent: "review" },
       })
+    }),
+  )
+
+  it.live(
+    "preserves actionable missing-runtime dependency identity from native selection",
+    Effect.gen(function* () {
+      const { root } = yield* prepare()
+      const workers = yield* OxpWorker.Service
+      resolveSelectionError = new Error(
+        "Service not found: @opencode/v2/SessionExecutionOwner",
+      )
+
+      const error = yield* workers
+        .execute({
+          action: "start",
+          rootID: root.id,
+          prompt: "exercise native dependency projection",
+        })
+        .pipe(Effect.flip)
+
+      expect(error._tag).toBe("OXP_DEPENDENCY_UNAVAILABLE")
+      expect(error.detail).toContain("@opencode/v2/SessionExecutionOwner")
+      expect(error.metadata).toMatchObject({
+        dependency: "@opencode/v2/SessionExecutionOwner",
+        nativeError: "Error",
+      })
+      expect(calls).toEqual([])
     }),
   )
 

@@ -6,6 +6,7 @@ import { QuestionID } from "./schema"
 import { EventV2Bridge } from "@/event-v2-bridge"
 import { QuestionV1 } from "@opencode-ai/schema/question-v1"
 import { QuestionV2 } from "@opencode-ai/core/question"
+import type { ExternalActor } from "@/session/external-actor"
 
 export const Option = QuestionV1.Option
 export type Option = typeof Option.Type
@@ -62,8 +63,12 @@ export interface Interface {
     requestID: QuestionID
     answers: ReadonlyArray<Answer>
     details?: ReadonlyArray<string>
+    actor?: ExternalActor.Ref
   }) => Effect.Effect<void, NotFoundError>
-  readonly reject: (requestID: QuestionID) => Effect.Effect<void, NotFoundError>
+  readonly reject: (
+    requestID: QuestionID,
+    actor?: ExternalActor.Ref,
+  ) => Effect.Effect<void, NotFoundError>
   readonly list: () => Effect.Effect<ReadonlyArray<Request>>
 }
 
@@ -130,6 +135,7 @@ const layer = Layer.effect(
       requestID: QuestionID
       answers: ReadonlyArray<Answer>
       details?: ReadonlyArray<string>
+      actor?: ExternalActor.Ref
     }) {
       const pending = (yield* InstanceState.get(state)).pending
       const existing = pending.get(input.requestID)
@@ -145,11 +151,14 @@ const layer = Layer.effect(
         requestID: existing.info.id,
         answers: QuestionV2.flattenResolved(resolved).map((answer) => [...answer]),
         details: [...resolved.details],
-      })
+      }, input.actor ? { metadata: { actor: input.actor } } : undefined)
       yield* Deferred.succeed(existing.deferred, resolved)
     })
 
-    const reject = Effect.fn("Question.reject")(function* (requestID: QuestionID) {
+    const reject = Effect.fn("Question.reject")(function* (
+      requestID: QuestionID,
+      actor?: ExternalActor.Ref,
+    ) {
       const pending = (yield* InstanceState.get(state)).pending
       const existing = pending.get(requestID)
       if (!existing) {
@@ -161,7 +170,7 @@ const layer = Layer.effect(
       yield* events.publish(Event.Rejected, {
         sessionID: existing.info.sessionID,
         requestID: existing.info.id,
-      })
+      }, actor ? { metadata: { actor } } : undefined)
       yield* Deferred.fail(existing.deferred, new RejectedError())
     })
 

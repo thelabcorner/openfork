@@ -360,6 +360,21 @@ export const OUTPUT_SCHEMA = Object.freeze({
   additionalProperties: false,
 } as const satisfies Tool["outputSchema"])
 
+/**
+ * ChatGPT's currently deployed connector transport still speaks the 2025 MCP
+ * era. The v2 MCP compatibility projector wraps structured output differently
+ * for that era, so making `output` required there causes the transport adapter
+ * to reject otherwise-valid results before they leave OXP.
+ *
+ * Keep this as a transport-only compatibility schema. Runtime semantics,
+ * authority, correlation, and canonical surface ownership remain 2026-era.
+ */
+export const LEGACY_OUTPUT_SCHEMA = Object.freeze({
+  type: "object",
+  properties: OUTPUT_SCHEMA.properties,
+  additionalProperties: false,
+} as const satisfies Tool["outputSchema"])
+
 const NOAUTH = Object.freeze([{ type: "noauth" as const }])
 
 export const TOOLS: readonly ChatGptTool[] = Object.freeze(

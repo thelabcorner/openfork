@@ -8,6 +8,8 @@ import type { IncomingMessage, ServerResponse } from "node:http"
 import { connect as connectSocket } from "node:net"
 import { EventEmitter } from "node:events"
 import { Effect, Layer } from "effect"
+import { Client as LegacyClient } from "@modelcontextprotocol/sdk/client/index.js"
+import { StreamableHTTPClientTransport as LegacyStreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js"
 import {
   Client as ModernClient,
   StreamableHTTPClientTransport as ModernStreamableHTTPClientTransport,
@@ -379,34 +381,53 @@ describe("OxpServer", () => {
   )
 
   it.live(
-    "rejects 2025-era MCP traffic instead of negotiating down",
+    "serves ChatGPT's current 2025 transport through a stateless adapter without downgrading OXP semantics",
     Effect.gen(function* () {
       const config = yield* OxpConfig.Service
+      const roots = yield* OxpRoot.Service
       const server = yield* OxpServer.Service
+      const rootDir = path.join(suite, "legacy-transport-workspace")
+      yield* Effect.promise(() => fs.mkdir(rootDir))
+      yield* Effect.promise(() =>
+        fs.writeFile(path.join(rootDir, "hello.txt"), "hello legacy transport\n"),
+      )
+      const root = yield* roots.approve(rootDir)
       yield* config.setEnabled(true)
+      yield* config.setGrant({ read: true })
       const endpoint = yield* server.start()
+      const client = new LegacyClient({
+        name: "oxp-legacy-transport-test",
+        version: "1.0.0",
+      })
       try {
-        const response = yield* Effect.promise(() =>
-          fetch(endpoint.url, {
-            method: "POST",
-            headers: { "content-type": "application/json" },
-            body: JSON.stringify({
-              jsonrpc: "2.0",
-              id: 1,
-              method: "initialize",
-              params: {
-                protocolVersion: "2025-11-25",
-                capabilities: {},
-                clientInfo: { name: "legacy-probe", version: "1.0.0" },
-              },
-            }),
+        yield* Effect.promise(() =>
+          client.connect(
+            new LegacyStreamableHTTPClientTransport(new URL(endpoint.url)),
+          ),
+        )
+        const listed = yield* Effect.promise(() => client.listTools())
+        const readTool = listed.tools.find((tool) => tool.name === "read")
+        expect(readTool?.outputSchema).toEqual(OxpSurface.LEGACY_OUTPUT_SCHEMA)
+        expect(
+          (readTool?.outputSchema as { required?: string[] } | undefined)?.required,
+        ).toBeUndefined()
+
+        const result = yield* Effect.promise(() =>
+          client.callTool({
+            name: "read",
+            arguments: { rootID: root.id, path: "hello.txt" },
           }),
         )
-        const body = yield* Effect.promise(() => response.text())
-        expect(response.status).toBe(400)
-        expect(body).toContain("Unsupported protocol version")
-        expect(body).toContain("2026-07-28")
+        expect(result.isError).not.toBe(true)
+        expect(
+          result.content.find((item) => item.type === "text")?.text,
+        ).toContain("hello legacy transport")
+        expect(result.structuredContent).toMatchObject({
+          output: expect.stringContaining("hello legacy transport"),
+          metadata: { action: "read", grounded: true },
+        })
       } finally {
+        yield* Effect.promise(() => client.close().catch(() => undefined))
         yield* Effect.promise(() => endpoint.stop({ forceAfterMs: 1_000 }))
       }
     }),

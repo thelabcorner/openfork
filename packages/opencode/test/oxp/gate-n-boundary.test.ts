@@ -16,7 +16,7 @@ describe("OXP Gate N continuity boundary", () => {
     expect(epoch).toContain("EPOCH_MAX_MS = 25 * 60 * 1000")
     expect(epoch).toContain("MAX_TRACKED_PARENTS = 256")
     expect(server).toMatch(/request\.params\??\._meta/)
-    expect(server).toContain('{ legacy: "reject" }')
+    expect(server).toContain('{ legacy: "stateless" }')
     expect(server).not.toMatch(/headers\.get\(["']mcp-session-id["']\)/)
     expect(server).not.toContain("legacySessionIDFromHeader")
     expect(server).toContain("parentCorrelation(")

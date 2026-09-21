@@ -264,6 +264,72 @@ it.instance(
 )
 
 it.instance(
+  "reply and reject preserve external supervisor attribution on native events",
+  () =>
+    Effect.gen(function* () {
+      const question = yield* Question.Service
+      const events = yield* EventV2Bridge.Service
+      const actor = {
+        type: "external" as const,
+        source: "oxp.supervisor",
+        ref: "oxp:test-connector",
+      }
+      const seen: Array<{
+        type: string
+        metadata?: Record<string, unknown>
+      }> = []
+      const unsub = yield* events.listen((event) => {
+        if (
+          event.type === Question.Event.Replied.type ||
+          event.type === Question.Event.Rejected.type
+        ) {
+          seen.push({ type: event.type, metadata: event.metadata })
+        }
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+
+      const answered = yield* askEffect({
+        sessionID: SessionID.make("ses_oxp_question"),
+        questions: [
+          {
+            question: "Continue?",
+            header: "Continue",
+            options: [{ label: "Yes", description: "Continue work" }],
+          },
+        ],
+      }).pipe(Effect.forkScoped)
+      const first = (yield* waitForPending(1))[0]!
+      yield* question.reply({
+        requestID: first.id,
+        answers: [["Yes"]],
+        actor,
+      })
+      expect(yield* Fiber.join(answered)).toEqual([["Yes"]])
+
+      const rejected = yield* askEffect({
+        sessionID: SessionID.make("ses_oxp_question"),
+        questions: [
+          {
+            question: "Stop?",
+            header: "Stop",
+            options: [{ label: "Stop", description: "Stop work" }],
+          },
+        ],
+      }).pipe(Effect.forkScoped)
+      const second = (yield* waitForPending(1))[0]!
+      yield* question.reject(second.id, actor)
+      expect((yield* Fiber.await(rejected))._tag).toBe("Failure")
+
+      expect(seen).toEqual([
+        { type: Question.Event.Replied.type, metadata: { actor } },
+        { type: Question.Event.Rejected.type, metadata: { actor } },
+      ])
+    }),
+  { git: true },
+)
+
+it.instance(
   "reject - fails for unknown requestID",
   () =>
     Effect.gen(function* () {

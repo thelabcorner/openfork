@@ -528,14 +528,25 @@ const layer = Layer.effect(
             )
           }
 
-          const mcpHandler = createMcpHandler(() => {
+          const mcpHandler = createMcpHandler((requestContext) => {
+            const outputSchema =
+              requestContext.era === "legacy"
+                ? OxpSurface.LEGACY_OUTPUT_SCHEMA
+                : OxpSurface.OUTPUT_SCHEMA
+            const tools =
+              requestContext.era === "legacy"
+                ? OxpSurface.TOOLS.map((tool) => ({
+                    ...tool,
+                    outputSchema,
+                  }))
+                : OxpSurface.TOOLS
             const mcp = new Server(
               { name: "OpenFork OXP", version: VERSION },
               { capabilities: { tools: {} }, instructions: OxpSurface.SERVER_INSTRUCTIONS },
             )
-            const outputValidator = fromJsonSchema(OxpSurface.OUTPUT_SCHEMA)
+            const outputValidator = fromJsonSchema(outputSchema)
             mcp.setRequestHandler("tools/list", async (request) =>
-              paginateToolList(OxpSurface.TOOLS, request.params?.cursor),
+              paginateToolList(tools, request.params?.cursor),
             )
             mcp.setRequestHandler("tools/call", async (request, ctx) => {
               const result = await executeToolCall(
@@ -553,10 +564,10 @@ const layer = Layer.effect(
                   }
                 }
               }
-              return mcp.projectCallToolResult(result, OxpSurface.OUTPUT_SCHEMA)
+              return mcp.projectCallToolResult(result, outputSchema)
             })
             return mcp
-          }, { legacy: "reject" })
+          }, { legacy: "stateless" })
 
           const server = createServer((req, res) => {
             const pathOnly = (req.url ?? "").split("?", 1)[0] ?? ""

@@ -52,6 +52,39 @@ describe("OxpProcess", () => {
     expect(JSON.stringify(result)).not.toContain(rootDir)
   }))
 
+  it.live("captures short-lived foreground stdout under concurrent spawn pressure", Effect.gen(function* () {
+    const config = yield* OxpConfig.Service
+    const roots = yield* OxpRoot.Service
+    const proc = yield* OxpProcess.Service
+    const rootDir = path.join(suite, "workspace")
+    yield* Effect.promise(() => fs.mkdir(rootDir))
+    const root = yield* roots.approve(rootDir)
+    yield* config.setEnabled(true)
+    yield* config.setGrant({ process: true })
+
+    const outputs = yield* Effect.forEach(
+      Array.from({ length: 12 }, (_, index) => index),
+      (index) => {
+        const marker = `OXP_FAST_${index}`
+        const script = `process.stdout.write(${JSON.stringify(marker)})`
+        const command =
+          JSON.stringify(process.execPath) + " -e " + JSON.stringify(script)
+        return proc.execute({
+          action: "start",
+          rootID: root.id,
+          command,
+          mode: "foreground",
+          yieldMs: 5_000,
+        }).pipe(Effect.map((result) => result.output))
+      },
+      { concurrency: "unbounded" },
+    )
+
+    expect(outputs).toEqual(
+      Array.from({ length: 12 }, (_, index) => `OXP_FAST_${index}`),
+    )
+  }))
+
   it.live("returns opaque handles and actively retires owned trees when process authority is revoked", Effect.gen(function* () {
     const config = yield* OxpConfig.Service
     const roots = yield* OxpRoot.Service

@@ -174,6 +174,13 @@ export const make = Effect.gen(function* () {
               ),
           ),
         )
+      if (!Provider.isLanguageModel(resolved)) {
+        return yield* Effect.fail(
+          new SelectionMismatch(
+            "Requested delegated-worker model is not a conversational language model",
+          ),
+        )
+      }
       if (
         selection.variant &&
         selection.variant !== "default" &&
@@ -201,21 +208,43 @@ export const make = Effect.gen(function* () {
       agentName?: string,
       selection?: ModelSelection,
     ) {
-      const agent = agentName ?? (yield* agents.defaultAgent())
+      const agentInfo = agentName
+        ? (yield* agents.list()).find(
+            (candidate) =>
+              candidate.name === agentName && candidate.hidden !== true,
+          )
+        : yield* agents.defaultInfo()
+      if (!agentInfo) {
+        return yield* Effect.fail(
+          new SelectionMismatch(
+            "Requested delegated-worker agent is unavailable",
+          ),
+        )
+      }
+      const agent = agentInfo.name
       const model =
         selection ??
-        (yield* provider.defaultModel().pipe(
-          Effect.map((fallback) => ({
-            providerID: String(fallback.providerID),
-            modelID: String(fallback.modelID),
-          })),
-          Effect.mapError(
-            () =>
-              new SelectionMismatch(
-                "No delegated-worker model is available from the live provider catalog",
+        (agentInfo.model
+          ? {
+              providerID: String(agentInfo.model.providerID),
+              modelID: String(agentInfo.model.modelID),
+              ...(agentInfo.model.accountID
+                ? { accountID: agentInfo.model.accountID }
+                : {}),
+              ...(agentInfo.variant ? { variant: agentInfo.variant } : {}),
+            }
+          : yield* provider.defaultModel().pipe(
+              Effect.map((fallback) => ({
+                providerID: String(fallback.providerID),
+                modelID: String(fallback.modelID),
+              })),
+              Effect.mapError(
+                () =>
+                  new SelectionMismatch(
+                    "No delegated-worker language model is available from the live provider catalog",
+                  ),
               ),
-          ),
-        ))
+            ))
       const selected = yield* validateSelection(agent, model)
       return {
         agent: selected.agent.name,

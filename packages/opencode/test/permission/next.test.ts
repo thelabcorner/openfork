@@ -90,6 +90,7 @@ const pluginIt = (onAsk: (input: unknown, output: { status: "ask" | "deny" | "al
           return output
         }),
       list: () => Effect.succeed([]),
+      transformChatMessages: (messages) => Effect.succeed(messages),
       init: () => Effect.void,
     }),
   )
@@ -1017,6 +1018,62 @@ it.instance(
         requestID: PermissionV1.ID.make("per_test7"),
         reply: "once",
       })
+    }),
+  { git: true },
+)
+
+it.instance(
+  "reply - preserves external supervisor attribution across always cascades",
+  () =>
+    Effect.gen(function* () {
+      const events = yield* EventV2Bridge.Service
+      const actor = {
+        type: "external" as const,
+        source: "oxp.supervisor",
+        ref: "oxp:test-connector",
+      }
+      const seen: Array<Record<string, unknown> | undefined> = []
+      const unsub = yield* events.listen((event) => {
+        if (event.type === Permission.Event.Replied.type) {
+          seen.push(event.metadata)
+        }
+        return Effect.void
+      })
+      yield* Effect.addFinalizer(() => unsub)
+
+      const first = yield* ask({
+        id: PermissionV1.ID.make("per_oxp_actor_a"),
+        sessionID: SessionID.make("session_oxp_actor"),
+        permission: "bash",
+        patterns: ["git status"],
+        metadata: {},
+        always: ["git *"],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      const second = yield* ask({
+        id: PermissionV1.ID.make("per_oxp_actor_b"),
+        sessionID: SessionID.make("session_oxp_actor"),
+        permission: "bash",
+        patterns: ["git diff"],
+        metadata: {},
+        always: ["git *"],
+        ruleset: [],
+      }).pipe(Effect.forkScoped)
+      yield* waitForPending(2)
+
+      yield* reply({
+        requestID: PermissionV1.ID.make("per_oxp_actor_a"),
+        reply: "always",
+        actor,
+      })
+      yield* Fiber.join(first)
+      yield* Fiber.join(second)
+
+      expect(seen).toHaveLength(2)
+      expect(seen).toEqual([
+        { actor },
+        { actor },
+      ])
     }),
   { git: true },
 )

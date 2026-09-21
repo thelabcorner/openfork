@@ -268,14 +268,6 @@ const layer = Layer.effect(
         truncated: false,
       }
       jobs.set(handle, job)
-      yield* authority.revalidate(admission, "spawn").pipe(
-        Effect.catch((error) =>
-          retire(job).pipe(
-            Effect.andThen(Effect.sync(() => jobs.delete(handle))),
-            Effect.andThen(Effect.fail(error)),
-          ),
-        ),
-      )
       const observe = (kind: "stdout" | "stderr", chunk: string) =>
         Effect.sync(() => {
           append(job, chunk)
@@ -303,6 +295,22 @@ const layer = Layer.effect(
         Effect.catch(() => Effect.void),
         Effect.ensuring(Effect.sync(resolveOutputDrained)),
         Effect.forkIn(scope, { startImmediately: true }),
+      )
+      // Attach output capture before the second authority check. Extremely
+      // short-lived Windows children can emit and exit while revalidation is
+      // still doing filesystem/root work; delaying the capture fiber until
+      // after that check creates an avoidable pipe-observation race.
+      //
+      // This does not weaken authority: the child is still not returned to the
+      // caller until revalidation succeeds, and a failed check immediately
+      // retires the owned tree and its capture scope.
+      yield* authority.revalidate(admission, "spawn").pipe(
+        Effect.catch((error) =>
+          retire(job).pipe(
+            Effect.andThen(Effect.sync(() => jobs.delete(handle))),
+            Effect.andThen(Effect.fail(error)),
+          ),
+        ),
       )
       // A process is not settled until both its exit status and its output pipes
       // are drained. Otherwise wait/status can race the final stdout chunk.

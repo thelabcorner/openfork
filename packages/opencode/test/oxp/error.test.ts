@@ -7,7 +7,9 @@ describe("OXP error contract", () => {
     const detail = OxpError.boundDetail(source)
     expect(detail.length).toBe(OxpError.MAX_DETAIL_LENGTH)
     expect(detail.endsWith("...")).toBe(true)
-    expect(() => new OxpError.Conflict({ detail })).not.toThrow()
+    const error = new OxpError.Conflict({ detail })
+    expect(error.detail).toBe(detail)
+    expect(error._tag).toBe("OXP_CONFLICT")
   })
 
   test("normalizes empty or non-string diagnostics to a valid detail", () => {
