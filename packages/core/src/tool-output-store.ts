@@ -1,8 +1,6 @@
 export * as ToolOutputStore from "./tool-output-store"
 
 import path from "path"
-import { brotliCompress, constants } from "node:zlib"
-import { promisify } from "node:util"
 import { Context, Duration, Effect, Layer, Option, Schedule, Schema } from "effect"
 import { Config } from "./config"
 import { FSUtil } from "./fs-util"
@@ -11,19 +9,14 @@ import { makeGlobalNode, makeLocationNode } from "./effect/app-node"
 import { SessionSchema } from "./session/schema"
 import { Identifier } from "./util/identifier"
 import type { ToolOutput } from "@opencode-ai/llm"
+import { ToolOutputProjection } from "./tool-output-projection"
+import { ToolOutputRetention } from "./tool-output-retention"
 
 export const MAX_LINES = 2_000
 export const MAX_BYTES = 50 * 1024
 export const RETENTION = Duration.days(7)
 
 export const MANAGED_DIRECTORY = "tool-output"
-
-// Callback-based zlib runs on the libuv threadpool, so compressing a large tool
-// output never blocks the server event loop. A synchronous quality-4 pass over a
-// multi-megabyte payload costs hundreds of milliseconds, which stalls every SSE
-// subscriber and HTTP route for the duration and invalidates transport latency
-// measurements. The same lesson is documented in the desktop main process.
-const brotliCompressAsync = promisify(brotliCompress)
 
 export interface BoundInput {
   readonly sessionID: SessionSchema.ID
@@ -56,130 +49,6 @@ export interface Interface {
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/v2/ToolOutputStore") {}
 
-const utf8Forward = (input: string, index: number) => {
-  const code = input.charCodeAt(index)
-  if (code < 0x80) return { bytes: 1, units: 1 }
-  if (code < 0x800) return { bytes: 2, units: 1 }
-  if (code >= 0xd800 && code <= 0xdbff && index + 1 < input.length) {
-    const low = input.charCodeAt(index + 1)
-    if (low >= 0xdc00 && low <= 0xdfff) return { bytes: 4, units: 2 }
-  }
-  return { bytes: 3, units: 1 }
-}
-
-const utf8Backward = (input: string, end: number) => {
-  const code = input.charCodeAt(end - 1)
-  if (code >= 0xdc00 && code <= 0xdfff && end >= 2) {
-    const high = input.charCodeAt(end - 2)
-    if (high >= 0xd800 && high <= 0xdbff) return { bytes: 4, units: 2 }
-  }
-  if (code < 0x80) return { bytes: 1, units: 1 }
-  if (code < 0x800) return { bytes: 2, units: 1 }
-  return { bytes: 3, units: 1 }
-}
-
-const takePrefix = (input: string, maximumBytes: number) => {
-  let bytes = 0
-  let index = 0
-  while (index < input.length) {
-    const width = utf8Forward(input, index)
-    if (bytes + width.bytes > maximumBytes) break
-    bytes += width.bytes
-    index += width.units
-  }
-  return input.slice(0, index)
-}
-
-const takeSuffix = (input: string, maximumBytes: number) => {
-  let bytes = 0
-  let index = input.length
-  while (index > 0) {
-    const width = utf8Backward(input, index)
-    if (bytes + width.bytes > maximumBytes) break
-    bytes += width.bytes
-    index -= width.units
-  }
-  return input.slice(index)
-}
-
-const withinByteLimit = (input: string, maximumBytes: number) => {
-  let bytes = 0
-  for (let index = 0; index < input.length; ) {
-    const width = utf8Forward(input, index)
-    bytes += width.bytes
-    if (bytes > maximumBytes) return false
-    index += width.units
-  }
-  return true
-}
-
-const hasMoreThanLines = (input: string, maximumLines: number) => {
-  if (maximumLines < 1) return input.length > 0
-  let at = -1
-  for (let line = 0; line < maximumLines; line++) {
-    at = input.indexOf("\n", at + 1)
-    if (at === -1) return false
-  }
-  return true
-}
-
-const takeHeadLines = (input: string, count: number) => {
-  if (count <= 0) return ""
-  let at = -1
-  for (let line = 0; line < count; line++) {
-    at = input.indexOf("\n", at + 1)
-    if (at === -1) return input
-  }
-  return input.slice(0, at)
-}
-
-const takeTailLines = (input: string, count: number) => {
-  if (count <= 0) return ""
-  let at = input.length
-  for (let line = 0; line < count; line++) {
-    const previous = input.lastIndexOf("\n", at - 1)
-    if (previous === -1) return input
-    at = previous
-  }
-  return input.slice(at + 1)
-}
-
-const preview = (text: string, maxLines: number, maxBytes: number) => {
-  const overLines = hasMoreThanLines(text, maxLines)
-  const headLines = Math.ceil(maxLines / 2)
-  const tailLines = Math.floor(maxLines / 2)
-  const head = overLines ? takeHeadLines(text, headLines) : text
-  const tail = overLines && tailLines > 0 ? takeTailLines(text, tailLines) : ""
-  const sampled = overLines ? `${head}\n${tail}` : head
-  if (withinByteLimit(sampled, maxBytes)) {
-    return overLines ? { head, tail } : { head: sampled, tail: "" }
-  }
-  const headBytes = Math.ceil(maxBytes / 2)
-  const tailBytes = Math.floor(maxBytes / 2)
-  return { head: takePrefix(sampled, headBytes), tail: takeSuffix(sampled, tailBytes) }
-}
-
-const boundedPreview = (text: string, marker: string, maxLines: number, maxBytes: number) => {
-  const markerOnly = takePrefix(marker, maxBytes).split("\n").slice(0, maxLines).join("\n")
-  const markerBytes = Buffer.byteLength(marker, "utf-8")
-  if (maxLines <= 4 || maxBytes <= markerBytes + 4) return markerOnly
-  const bounded = preview(text, maxLines - 4, maxBytes - markerBytes - 4)
-  return bounded.tail ? `${bounded.head}\n\n${marker}\n\n${bounded.tail}` : `${bounded.head}\n\n${marker}`
-}
-
-const withinLimits = (text: string, maxLines: number, maxBytes: number) => {
-  let lines = 1
-  let bytes = 0
-  for (let index = 0; index < text.length; ) {
-    const width = utf8Forward(text, index)
-    bytes += width.bytes
-    if (bytes > maxBytes) return false
-    if (text.charCodeAt(index) === 10 && ++lines > maxLines) return false
-    index += width.units
-  }
-  return lines <= maxLines
-}
-
 const layer = Layer.effect(
   Service,
   Effect.gen(function* () {
@@ -201,13 +70,7 @@ const layer = Layer.effect(
       const file = path.join(directory, `tool_${Identifier.ascending()}.br`)
       yield* fs.ensureDir(directory).pipe(Effect.mapError((cause) => new StorageError({ operation: "write", cause })))
       const compressed = yield* Effect.tryPromise({
-        try: () =>
-          brotliCompressAsync(Buffer.from(content, "utf-8"), {
-            params: {
-              [constants.BROTLI_PARAM_MODE]: constants.BROTLI_MODE_TEXT,
-              [constants.BROTLI_PARAM_QUALITY]: 4,
-            },
-          }),
+        try: () => ToolOutputRetention.compressText(content),
         catch: (cause) => new StorageError({ operation: "write", cause }),
       })
       yield* fs
@@ -227,14 +90,40 @@ const layer = Layer.effect(
               catch: (cause) => new StorageError({ operation: "encode", cause }),
             })
           : text.map((item) => item.text).join("")
-      if (withinLimits(contextual, outputLimits.maxLines, outputLimits.maxBytes))
+      const analysis = ToolOutputProjection.analyze(contextual, outputLimits)
+      if (!analysis.truncated)
         return {
           output: input.output,
           outputPaths: [],
         }
 
-      const outputPath = yield* write(contextual)
-      const marker = `... output truncated; full content saved to ${outputPath} (brotli compressed). Use the archive tool to view it: archive({action:"read", path:"${outputPath}"}) ...`
+      // Retention is a recovery optimization, not part of tool success. Once
+      // the producer has succeeded, a disk-full/permission/compression failure
+      // must not rewrite that semantic success into a tool failure. The bounded
+      // preview remains a valid (explicitly lossy) settlement.
+      const outputPath = yield* write(contextual).pipe(
+        Effect.map((file) => Option.some(file)),
+        Effect.catch((error) =>
+          Effect.logWarning("failed to retain full tool output; returning bounded preview", {
+            sessionID: input.sessionID,
+            toolCallID: input.toolCallID,
+            error: error.message,
+          }).pipe(Effect.as(Option.none<string>())),
+        ),
+      )
+      const retained = Option.getOrUndefined(outputPath)
+      const marker = retained
+        ? `... output truncated (original: ${analysis.originalLines} lines, ${analysis.originalBytes} bytes; showing beginning + end). Full content saved to ${retained} (brotli compressed). Use archive({action:"read", path:"${retained}"}) to inspect it. ...`
+        : `... output truncated (original: ${analysis.originalLines} lines, ${analysis.originalBytes} bytes; showing beginning + end). Full-output retention failed; omitted content is unavailable from managed storage. ...`
+      const projected = ToolOutputProjection.project(
+        contextual,
+        {
+          ...outputLimits,
+          marker,
+          strategy: "balanced",
+        },
+        analysis,
+      )
 
       return {
         output: {
@@ -242,12 +131,12 @@ const layer = Layer.effect(
           content: [
             {
               type: "text" as const,
-              text: boundedPreview(contextual, marker, outputLimits.maxLines, outputLimits.maxBytes),
+              text: projected.content,
             },
             ...media,
           ],
         },
-        outputPaths: [outputPath],
+        outputPaths: retained ? [retained] : [],
       }
     })
 

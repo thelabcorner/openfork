@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import path from "path"
 import { brotliDecompressSync } from "node:zlib"
-import { Cause, Effect, Exit, Fiber, Layer, Option } from "effect"
+import { Cause, Effect, Exit, Fiber, Layer } from "effect"
 import { AppNodeBuilder } from "@opencode-ai/core/effect/app-node-builder"
 import { LayerNode } from "@opencode-ai/core/effect/layer-node"
 import { FSUtil } from "@opencode-ai/core/fs-util"
@@ -153,20 +153,23 @@ describe("ToolOutputStore", () => {
     ),
   )
 
-  it.live("fails oversized settlement when complete retention cannot be written", () =>
+  it.live("preserves successful bounded settlement when complete retention cannot be written", () =>
     withStore(({ root, store, fs }) =>
       Effect.gen(function* () {
         yield* fs.writeFileString(path.join(root, "tool-output"), "not a directory")
-        const exit = yield* store
-          .bound({
-            sessionID,
-            toolCallID: "call-lossy",
-            output: { structured: {}, content: [{ type: "text", text: "x".repeat(ToolOutputStore.MAX_BYTES + 1) }] },
-          })
-          .pipe(Effect.exit)
-        expect(Exit.isFailure(exit)).toBe(true)
-        if (Exit.isFailure(exit))
-          expect(Option.getOrUndefined(Cause.findErrorOption(exit.cause))?._tag).toBe("ToolOutputStore.StorageError")
+        const result = yield* store.bound({
+          sessionID,
+          toolCallID: "call-lossy",
+          output: { structured: {}, content: [{ type: "text", text: "x".repeat(ToolOutputStore.MAX_BYTES + 1) }] },
+        })
+        expect(result.outputPaths).toEqual([])
+        expect(result.output.content[0]?.type).toBe("text")
+        if (result.output.content[0]?.type === "text") {
+          expect(result.output.content[0].text).toContain("Full-output retention failed")
+          expect(Buffer.byteLength(result.output.content[0].text, "utf-8")).toBeLessThanOrEqual(
+            ToolOutputStore.MAX_BYTES,
+          )
+        }
       }),
     ),
   )
