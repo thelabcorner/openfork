@@ -161,11 +161,42 @@ export interface McpTool {
   readonly timeout?: number
 }
 
+/**
+ * Exact MCP tool identity retained at the native owner. Unlike the legacy
+ * provider-facing flattened key, server + native tool name cannot collide.
+ */
+export interface ExactMcpTool {
+  readonly server: string
+  /** Shared cached definition; consumers must copy rather than mutate it. */
+  readonly def: MCPToolDef
+  readonly timeout?: number
+}
+
+export class ToolNotFoundError extends Schema.TaggedErrorClass<ToolNotFoundError>()(
+  "MCP.ToolNotFoundError",
+  {
+    server: Schema.String,
+    tool: Schema.String,
+  },
+) {}
+
 export interface Interface {
   readonly status: () => Effect.Effect<Record<string, Status>>
   readonly clients: () => Effect.Effect<Record<string, MCPClient>>
   readonly instructions: () => Effect.Effect<ServerInstructions[]>
   readonly tools: () => Effect.Effect<Record<string, McpTool>>
+  /** Collision-free native tool catalog for brokers/adapters. */
+  readonly exactTools: () => Effect.Effect<readonly ExactMcpTool[]>
+  /** Invoke one exact native server/tool pair. No retry is performed here. */
+  readonly invokeTool: (input: {
+    readonly server: string
+    readonly tool: string
+    readonly args: unknown
+    readonly signal?: AbortSignal
+  }) => Effect.Effect<
+    Awaited<ReturnType<typeof McpCatalog.invokeTool>>,
+    ToolNotFoundError | Error
+  >
   readonly prompts: () => Effect.Effect<Record<string, PromptInfo & { client: string }>>
   readonly resources: (clientName?: string) => Effect.Effect<Record<string, ResourceInfo & { client: string }>>
   readonly resourceTemplates: (
@@ -687,6 +718,79 @@ const layer = Layer.effect(
       return result
     })
 
+    const exactTools = Effect.fn("MCP.exactTools")(function* () {
+      const result: ExactMcpTool[] = []
+      const s = yield* InstanceState.get(state)
+      const cfg = yield* cfgSvc.get()
+      const config = cfg.mcp ?? {}
+      const defaultTimeout = cfg.experimental?.mcp_timeout
+
+      for (const clientName of Object.keys(s.clients).sort((a, b) =>
+        a.localeCompare(b),
+      )) {
+        if (s.status[clientName]?.status !== "connected") continue
+        const listed = s.defs[clientName]
+        if (!listed) continue
+        const timeout = requestTimeout(
+          s,
+          clientName,
+          config[clientName],
+          defaultTimeout,
+        )
+        for (const def of [...listed].sort((a, b) =>
+          a.name.localeCompare(b.name),
+        )) {
+          result.push({
+            server: clientName,
+            def,
+            ...(timeout !== undefined ? { timeout } : {}),
+          })
+        }
+      }
+      return result
+    })
+
+    const invokeTool = Effect.fn("MCP.invokeTool")(function* (input: {
+      readonly server: string
+      readonly tool: string
+      readonly args: unknown
+      readonly signal?: AbortSignal
+    }) {
+      const s = yield* InstanceState.get(state)
+      const client = s.clients[input.server]
+      const def = s.defs[input.server]?.find(
+        (candidate) => candidate.name === input.tool,
+      )
+      if (
+        !client ||
+        s.status[input.server]?.status !== "connected" ||
+        !def
+      ) {
+        return yield* new ToolNotFoundError({
+          server: input.server,
+          tool: input.tool,
+        })
+      }
+      const cfg = yield* cfgSvc.get()
+      const timeout = requestTimeout(
+        s,
+        input.server,
+        cfg.mcp?.[input.server],
+        cfg.experimental?.mcp_timeout,
+      )
+      return yield* Effect.tryPromise({
+        try: () =>
+          McpCatalog.invokeTool(client, def.name, input.args, {
+            timeout,
+            signal: input.signal,
+          }),
+        catch: (cause) =>
+          cause instanceof Error
+            ? cause
+            : new Error("Native MCP tool call failed"),
+      })
+    })
+
     function collectFromConnected<T extends { name: string }>(
       s: State,
       listFn: (c: Client, timeout?: number) => Promise<T[]>,
@@ -974,6 +1078,8 @@ const layer = Layer.effect(
       clients,
       instructions,
       tools,
+      exactTools,
+      invokeTool,
       prompts,
       resources,
       resourceTemplates,

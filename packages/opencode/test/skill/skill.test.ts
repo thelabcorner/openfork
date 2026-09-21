@@ -91,13 +91,13 @@ describe("skill", () => {
     }),
   )
 
-  it.live("discovers skills from .opencode/skill/ directory", () =>
+  it.live("discovers skills from .openfork/skill/ directory", () =>
     provideTmpdirInstance(
       (dir) =>
         Effect.gen(function* () {
           yield* Effect.promise(() =>
             Bun.write(
-              path.join(dir, ".opencode", "skill", "test-skill", "SKILL.md"),
+              path.join(dir, ".openfork", "skill", "test-skill", "SKILL.md"),
               `---
 name: test-skill
 description: A test skill for verification.
@@ -122,6 +122,30 @@ Instructions here.
     ),
   )
 
+  it.live("discovers skills from legacy .opencode/skill/ as a migration source", () =>
+    provideTmpdirInstance(
+      (dir) =>
+        Effect.gen(function* () {
+          yield* Effect.promise(() =>
+            Bun.write(
+              path.join(dir, ".opencode", "skill", "legacy-skill", "SKILL.md"),
+              `---
+name: legacy-skill
+description: Legacy OpenCode project skill.
+---
+
+# Legacy Skill
+`,
+            ),
+          )
+          const skill = yield* Skill.Service
+          const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
+          expect(list.map((item) => item.name)).toEqual(["legacy-skill"])
+        }),
+      { git: true },
+    ),
+  )
+
   it.live("returns skill directories from Skill.dirs", () =>
     provideTmpdirInstance(
       (dir) =>
@@ -130,7 +154,7 @@ Instructions here.
           Effect.gen(function* () {
             yield* Effect.promise(() =>
               Bun.write(
-                path.join(dir, ".opencode", "skill", "dir-skill", "SKILL.md"),
+                path.join(dir, ".openfork", "skill", "dir-skill", "SKILL.md"),
                 `---
 name: dir-skill
 description: Skill for dirs test.
@@ -143,7 +167,7 @@ description: Skill for dirs test.
 
             const skill = yield* Skill.Service
             const dirs = yield* skill.dirs()
-            expect(dirs).toContain(path.join(dir, ".opencode", "skill", "dir-skill"))
+            expect(dirs).toContain(path.join(dir, ".openfork", "skill", "dir-skill"))
             expect(dirs.length).toBe(1)
           }),
         ),
@@ -151,14 +175,14 @@ description: Skill for dirs test.
     ),
   )
 
-  it.live("discovers multiple skills from .opencode/skill/ directory", () =>
+  it.live("discovers multiple skills from .openfork/skill/ directory", () =>
     provideTmpdirInstance(
       (dir) =>
         Effect.gen(function* () {
           yield* Effect.promise(() =>
             Promise.all([
               Bun.write(
-                path.join(dir, ".opencode", "skill", "skill-one", "SKILL.md"),
+                path.join(dir, ".openfork", "skill", "skill-one", "SKILL.md"),
                 `---
 name: skill-one
 description: First test skill.
@@ -168,7 +192,7 @@ description: First test skill.
 `,
               ),
               Bun.write(
-                path.join(dir, ".opencode", "skill", "skill-two", "SKILL.md"),
+                path.join(dir, ".openfork", "skill", "skill-two", "SKILL.md"),
                 `---
 name: skill-two
 description: Second test skill.
@@ -196,7 +220,7 @@ description: Second test skill.
         Effect.gen(function* () {
           yield* Effect.promise(() =>
             Bun.write(
-              path.join(dir, ".opencode", "skill", "no-frontmatter", "SKILL.md"),
+              path.join(dir, ".openfork", "skill", "no-frontmatter", "SKILL.md"),
               `# No Frontmatter
 
 Just some content without YAML frontmatter.
@@ -217,7 +241,7 @@ Just some content without YAML frontmatter.
         Effect.gen(function* () {
           yield* Effect.promise(() =>
             Bun.write(
-              path.join(dir, ".opencode", "skill", "manual-skill", "SKILL.md"),
+              path.join(dir, ".openfork", "skill", "manual-skill", "SKILL.md"),
               `---
 name: manual-skill
 ---
@@ -507,13 +531,13 @@ description: A skill in the .agents/skills directory.
 `,
               ),
               Bun.write(
-                path.join(dir, ".opencode", "skill", "opencode-skill", "SKILL.md"),
+                path.join(dir, ".openfork", "skill", "openfork-skill", "SKILL.md"),
                 `---
-name: opencode-skill
-description: A skill in the .opencode/skill directory.
+name: openfork-skill
+description: A skill in the .openfork/skill directory.
 ---
 
-# OpenCode Skill
+# OpenFork Skill
 `,
               ),
             ]),
@@ -521,7 +545,7 @@ description: A skill in the .opencode/skill directory.
 
           const skill = yield* Skill.Service
           const list = (yield* skill.all()).filter((s) => s.location !== "<built-in>")
-          expect(list.map((s) => s.name)).toEqual(["opencode-skill"])
+          expect(list.map((s) => s.name)).toEqual(["openfork-skill"])
         }),
       { git: true },
     ),
@@ -554,23 +578,23 @@ description: A skill in the .agents/skills directory.
 `,
               ),
               Bun.write(
-                path.join(dir, ".opencode", "skill", "agent-skill", "SKILL.md"),
+                path.join(dir, ".openfork", "skill", "agent-skill", "SKILL.md"),
                 `---
-name: opencode-skill
-description: A skill in the .opencode/skill directory.
+name: openfork-skill
+description: A skill in the .openfork/skill directory.
 ---
 
-# OpenCode Skill
+# OpenFork Skill
 `,
               ),
               Bun.write(
-                path.join(dir, ".opencode", "skills", "agent-skill", "SKILL.md"),
+                path.join(dir, ".openfork", "skills", "agent-skill", "SKILL.md"),
                 `---
-name: opencode-skill
-description: A skill in the .opencode/skills directory.
+name: openfork-skill
+description: A skill in the .openfork/skills directory.
 ---
 
-# OpenCode Skill
+# OpenFork Skill
 `,
               ),
             ]),

@@ -6,6 +6,7 @@ import { FetchHttpClient, HttpClient, HttpClientRequest, HttpClientResponse } fr
 import { withTransientReadRetry } from "@/util/effect-http-client"
 import { FSUtil } from "@opencode-ai/core/fs-util"
 import { Global } from "@opencode-ai/core/global"
+import { LEGACY_SKILL_VERSION_FILENAME, SKILL_VERSION_FILENAME } from "@opencode-ai/core/storage-identity"
 
 const skillConcurrency = 4
 const fileConcurrency = 8
@@ -77,12 +78,26 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
         (skill) =>
           Effect.gen(function* () {
             const root = path.join(cache, skill.name)
-            const versionFile = path.join(root, ".opencode-version")
+            const versionFile = path.join(root, SKILL_VERSION_FILENAME)
+            const legacyVersionFile = path.join(root, LEGACY_SKILL_VERSION_FILENAME)
             const version = skill.version
             const current =
               version === undefined
                 ? undefined
-                : yield* fs.readFileStringSafe(versionFile).pipe(Effect.catch(() => Effect.succeed(undefined)))
+                : yield* Effect.gen(function* () {
+                    const canonical = yield* fs
+                      .readFileStringSafe(versionFile)
+                      .pipe(Effect.catch(() => Effect.succeed(undefined)))
+                    if (canonical !== undefined) return canonical
+                    const legacy = yield* fs
+                      .readFileStringSafe(legacyVersionFile)
+                      .pipe(Effect.catch(() => Effect.succeed(undefined)))
+                    if (legacy !== undefined) {
+                      yield* fs.writeFileString(versionFile, legacy).pipe(Effect.ignore)
+                      yield* fs.remove(legacyVersionFile, { force: true }).pipe(Effect.ignore)
+                    }
+                    return legacy
+                  })
 
             if (version === undefined || current === version) {
               yield* Effect.forEach(
@@ -102,7 +117,7 @@ const layer: Layer.Layer<Service, never, FSUtil.Service | Path.Path | HttpClient
                 )
                 if (!downloaded.every(Boolean)) return
                 if (!(yield* fs.exists(path.join(staging, "SKILL.md")).pipe(Effect.orDie))) return
-                yield* fs.writeFileString(path.join(staging, ".opencode-version"), version)
+                yield* fs.writeFileString(path.join(staging, SKILL_VERSION_FILENAME), version)
                 yield* Effect.uninterruptible(
                   Effect.gen(function* () {
                     const cached = yield* fs.exists(root).pipe(Effect.orDie)

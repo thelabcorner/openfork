@@ -4,6 +4,7 @@ import { expect } from "bun:test"
 import { Server } from "@modelcontextprotocol/sdk/server/index.js"
 import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js"
 import {
+  CallToolRequestSchema,
   GetPromptRequestSchema,
   ListPromptsRequestSchema,
   ListResourcesRequestSchema,
@@ -39,6 +40,7 @@ interface LifecycleServerState {
   requestDelay?: number
   roots?: Array<{ uri: string; name?: string }>
   requests: string[]
+  toolCalls: Array<{ name: string; args: unknown }>
   aborted: number
 }
 
@@ -52,6 +54,7 @@ function lifecycleServer(input?: { capabilities?: ServerCapabilities; instructio
         resources: [],
         resourceTemplates: [],
         requests: [],
+        toolCalls: [],
         aborted: 0,
       }
 
@@ -70,6 +73,20 @@ function lifecycleServer(input?: { capabilities?: ServerCapabilities; instructio
             if (state.listToolsError) throw new Error(state.listToolsError)
             const page = state.toolPages?.[request.params?.cursor ?? "initial"]
             return Promise.resolve({ tools: page?.items ?? state.tools, nextCursor: page?.nextCursor })
+          })
+          protocol.setRequestHandler(CallToolRequestSchema, ({ params }) => {
+            state.toolCalls.push({
+              name: params.name,
+              args: params.arguments,
+            })
+            return Promise.resolve({
+              content: [
+                {
+                  type: "text" as const,
+                  text: `called:${params.name}`,
+                },
+              ],
+            })
           })
         }
         if (capabilities.prompts) {
@@ -234,6 +251,46 @@ it.instance("tools() reuses cached definitions until a protocol notification", (
     )
     expect(Object.keys(yield* mcp.tools())).toEqual(["cache-server_next_tool"])
   }),
+)
+
+it.instance(
+  "exactTools() preserves server/tool identity across legacy flattened-key collisions and invokeTool() targets exactly one server",
+  () =>
+    Effect.gen(function* () {
+      const first = yield* lifecycleServer()
+      const second = yield* lifecycleServer()
+      const mcp = yield* MCP.Service
+      yield* mcp.add("a/b", remote(first.url))
+      yield* mcp.add("a?b", remote(second.url))
+
+      // Legacy provider projection deliberately remains backward compatible and
+      // can collapse these two server names to the same sanitized key.
+      expect(Object.keys(yield* mcp.tools())).toEqual(["a_b_test_tool"])
+
+      const exact = yield* mcp.exactTools()
+      expect(exact).toHaveLength(2)
+      expect(
+        exact.map((entry) => [entry.server, entry.def.name]),
+      ).toEqual(
+        expect.arrayContaining([
+          ["a/b", "test_tool"],
+          ["a?b", "test_tool"],
+        ]),
+      )
+
+      const result = yield* mcp.invokeTool({
+        server: "a/b",
+        tool: "test_tool",
+        args: { value: 1 },
+      })
+      expect(result.content).toEqual([
+        { type: "text", text: "called:test_tool" },
+      ])
+      expect(first.state.toolCalls).toEqual([
+        { name: "test_tool", args: { value: 1 } },
+      ])
+      expect(second.state.toolCalls).toEqual([])
+    }),
 )
 
 it.instance("instructions() returns non-empty connected server instructions with tool names", () =>

@@ -25,14 +25,14 @@ const SKILL_PATTERN = "**/SKILL.md"
 const LOCAL_SKILL_DIR_NAMES = ["agent-skills", "skills", ".skills", "agent_skills", ".agent-skills", "custom-skills"]
 const SKILL_MD_CANDIDATES = ["SKILL.md", "skill.md", "Skill.md"]
 
-// Built-in skill that ships with opencode. The model's intuition for what an
-// opencode.json should look like is often wrong, and opencode hard-fails on
+// Built-in skill that ships with OpenFork. The model's intuition for what an
+// openfork.json should look like is often wrong, and OpenFork hard-fails on
 // invalid config, so users hit cryptic startup errors. Loading this skill
 // when the model is asked to touch opencode's own config files gives it the
 // actual schemas instead of guesses.
 const CUSTOMIZE_OPENCODE_SKILL_NAME = "customize-opencode"
 const CUSTOMIZE_OPENCODE_SKILL_DESCRIPTION =
-  "Use ONLY when the user is editing or creating opencode's own configuration: opencode.json, opencode.jsonc, files under .opencode/, or files under ~/.config/opencode/. Also use when creating or fixing opencode agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring opencode itself."
+  "Use ONLY when the user is editing or creating OpenFork's own configuration: openfork.json, openfork.jsonc, files under .openfork/, or files under ~/.config/openfork/. Legacy opencode.json/.opencode paths may be read only as migration inputs. Also use when creating or fixing OpenFork agents, subagents, skills, plugins, MCP servers, or permission rules. Do not use for the user's own application code, or for any project that is not configuring OpenFork itself."
 const CUSTOMIZE_OPENCODE_SKILL_BODY = SkillPlugin.CustomizeOpencodeContent
 
 export const Info = Schema.Struct({
@@ -60,7 +60,7 @@ function isSkillFrontmatter(data: unknown): data is { name: string; description?
 }
 
 // Self-healing helpers: normalize names (kebab/snake/case/space tolerant) for local agent-skills
-const normalizeSkillName = (n: string) =>
+export const normalizeSkillName = (n: string) =>
   n.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "")
 
 const findByNormalized = (skills: Record<string, Info>, name: string) => {
@@ -131,6 +131,42 @@ export class NotFoundError extends Schema.TaggedErrorClass<NotFoundError>()("Ski
     return `Skill "${this.name}" not found. Not in local skills folders (agent-skills/, skills/, .skills/, etc.) or registered.\nAvailable: ${list}\nTip: Use skill({ mode: "list" }), a normalized name, or skill({ filePath: "..." }) for a skill outside this project (Downloads, another repo, etc.).`
   }
 }
+
+/**
+ * Parse one explicit skill path without mutating native discovery/registry state.
+ * Discovery policy stays adapter-owned: native OpenFork may aggregate configured,
+ * global, remote, and project skills, while OXP can constrain discovery to one
+ * explicitly approved root and still reuse the canonical parser.
+ */
+export const readInfoFromPath = Effect.fn("Skill.readInfoFromPath")(function* (
+  fsys: FSUtil.Interface,
+  fileOrDir: string,
+) {
+  const file = yield* resolveSkillMarkdown(fsys, fileOrDir)
+  const md = yield* Effect.tryPromise({
+    try: () => ConfigMarkdown.parse(file),
+    catch: (err) => err,
+  }).pipe(
+    Effect.catch((err) =>
+      Effect.fail(
+        new InvalidError({
+          path: file,
+          message: FrontmatterError.isInstance(err)
+            ? err.data.message
+            : `Failed to parse skill markdown: ${err instanceof Error ? err.message : String(err)}`,
+        }),
+      ),
+    ),
+  )
+  const name = isSkillFrontmatter(md.data) ? md.data.name : deriveSkillName(file)
+  const description = isSkillFrontmatter(md.data) ? md.data.description : undefined
+  return {
+    name,
+    description,
+    location: file,
+    content: md.content,
+  } satisfies Info
+})
 
 type State = {
   skills: Record<string, Info>
@@ -364,33 +400,10 @@ const layer = Layer.effect(
     })
 
     const loadFromPath = Effect.fn("Skill.loadFromPath")(function* (fileOrDir: string) {
-      const file = yield* resolveSkillMarkdown(fsys, fileOrDir)
-      const md = yield* Effect.tryPromise({
-        try: () => ConfigMarkdown.parse(file),
-        catch: (err) => err,
-      }).pipe(
-        Effect.catch((err) =>
-          Effect.fail(
-            new InvalidError({
-              path: file,
-              message: FrontmatterError.isInstance(err)
-                ? err.data.message
-                : `Failed to parse skill markdown: ${err instanceof Error ? err.message : String(err)}`,
-            }),
-          ),
-        ),
-      )
-      const name = isSkillFrontmatter(md.data) ? md.data.name : deriveSkillName(file)
-      const description = isSkillFrontmatter(md.data) ? md.data.description : undefined
-      const info: Info = {
-        name,
-        description,
-        location: file,
-        content: md.content,
-      }
+      const info = yield* readInfoFromPath(fsys, fileOrDir)
       const s = yield* InstanceState.get(state)
-      s.skills[name] = info
-      s.dirs.add(path.dirname(file))
+      s.skills[info.name] = info
+      s.dirs.add(path.dirname(info.location))
       return info
     })
 
