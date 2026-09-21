@@ -693,9 +693,15 @@ yield *
   LLM.generate({
     model,
     prompt,
-    cache: "none", // Explicit opt-out.
+    cache: "none", // Disable framework automatic breakpoint placement.
   })
 ```
+
+`cache:"none"` is a placement-policy opt-out, not a universal promise to disable
+provider-side caching. Manual `CacheHint`s remain explicit caller intent, and a
+provider with independent implicit caching may still cache the request. A future
+provider-neutral remote-cache disable contract, if needed, must be modeled
+separately and capability-gated.
 
 Granular cache policy remains available as an advanced request option.
 

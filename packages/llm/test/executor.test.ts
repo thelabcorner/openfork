@@ -265,6 +265,27 @@ describe("RequestExecutor", () => {
     ),
   )
 
+  it.effect("supports an explicit zero-retry semantic request policy", () =>
+    Effect.gen(function* () {
+      const attempts = yield* Ref.make(0)
+      return yield* Effect.gen(function* () {
+        const executor = yield* RequestExecutor.Service
+        const error = yield* executor.execute(request, { retry: false }).pipe(Effect.flip)
+
+        expectLLMError(error)
+        expect(error.reason).toMatchObject({ _tag: "RateLimit" })
+        expect(yield* Ref.get(attempts)).toBe(1)
+      }).pipe(
+        Effect.provide(
+          countedResponsesLayer(attempts, [
+            new Response("rate limited", { status: 429, headers: { "retry-after": "30" } }),
+            new Response("should never be reached", { status: 200 }),
+          ]),
+        ),
+      )
+    }),
+  )
+
   it.effect("marks 504 and 529 status responses retryable", () =>
     Effect.gen(function* () {
       const failWith = (status: number) =>

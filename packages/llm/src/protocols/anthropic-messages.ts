@@ -19,6 +19,7 @@ import {
   type ToolResultPart,
 } from "../schema"
 import { JsonObject, optionalArray, optionalNull, ProviderShared } from "./shared"
+import { anthropicSystemMessageCapability } from "./anthropic-capability"
 import { isContextOverflow } from "../provider-error"
 import * as Cache from "./utils/cache"
 import { Lifecycle } from "./utils/lifecycle"
@@ -350,10 +351,11 @@ const lowerToolResultContent = Effect.fn("AnthropicMessages.lowerToolResultConte
   return yield* Effect.forEach(content, lowerToolResultContentItem)
 })
 
-// Mid-conversation system messages are a native Claude API feature only for
-// Opus 4.8. Other Anthropic models intentionally use the same visible wrapped-
-// user fallback as non-Anthropic routes rather than sending a role they reject.
-const supportsNativeSystemUpdates = (request: LLMRequest) => String(request.model.id) === "claude-opus-4-8"
+// Provider support is exact-model state and deliberately fail-closed. This is
+// provider semantics only; higher layers still need to intersect it with the
+// selected runtime encoder before choosing a model-visible projection.
+const supportsNativeSystemUpdates = (request: LLMRequest) =>
+  anthropicSystemMessageCapability(String(request.model.id)).history === "cumulative-privileged"
 
 const endsInServerToolUse = (message: LLMRequest["messages"][number]) => {
   const last = message.content.at(-1)
@@ -361,13 +363,15 @@ const endsInServerToolUse = (message: LLMRequest["messages"][number]) => {
 }
 
 const canUseNativeSystemUpdate = (messages: LLMRequest["messages"], index: number) => {
-  const previous = messages[index - 1]
-  const next = messages[index + 1]
+  let first = index
+  let last = index
+  while (first > 0 && messages[first - 1]?.role === "system") first -= 1
+  while (last + 1 < messages.length && messages[last + 1]?.role === "system") last += 1
+  const previous = messages[first - 1]
+  const next = messages[last + 1]
   return (
     previous !== undefined &&
-    previous.role !== "system" &&
     (previous.role === "user" || previous.role === "tool" || endsInServerToolUse(previous)) &&
-    next?.role !== "system" &&
     (next === undefined || next.role === "assistant")
   )
 }
@@ -409,7 +413,12 @@ const lowerMessages = Effect.fn("AnthropicMessages.lowerMessages")(function* (
     if (message.role === "system") {
       if (splitsLocalToolResults(request.messages, index))
         return yield* invalid("Anthropic Messages system updates cannot split a local tool call from its tool result")
-      if (supportsNativeSystemUpdates(request) && canUseNativeSystemUpdate(request.messages, index)) {
+      if (supportsNativeSystemUpdates(request)) {
+        if (!canUseNativeSystemUpdate(request.messages, index)) {
+          return yield* invalid(
+            "Anthropic Messages chronological System update violates the provider placement contract; reproject the complete privileged state at the top-level system field instead of demoting authority",
+          )
+        }
         messages.push(yield* lowerNativeSystemUpdate(message, breakpoints))
         continue
       }

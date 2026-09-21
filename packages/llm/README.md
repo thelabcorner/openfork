@@ -35,7 +35,15 @@ Run `LLMClient.stream(request)` instead of `generate` when you want incremental 
 
 ## Caching
 
-Prompt caching is **on by default**. Every `LLMRequest` resolves to `cache: "auto"` unless the caller opts out with `cache: "none"`. Each protocol translates `CacheHint`s to its wire format (`cache_control` on Anthropic, `cachePoint` on Bedrock; OpenAI and Gemini do implicit caching server-side and don't need inline markers — auto is a no-op there).
+Framework cache placement is **on by default**. Every `LLMRequest` resolves to
+`cache: "auto"` unless the caller selects `cache: "none"`. `"none"` means **no
+automatic OpenFork placement**; it does not promise to disable independent
+provider-managed implicit caching, and manual `CacheHint`s still flow.
+
+Each protocol translates representable `CacheHint`s to its wire format:
+`cache_control` on Anthropic, `cachePoint` on Bedrock, and GPT-5.6+ direct OpenAI
+content-block hints to `prompt_cache_breakpoint`. OpenAI `"auto"` intentionally
+remains provider implicit; Gemini uses provider implicit/out-of-band caching.
 
 ### Auto placement
 
@@ -43,7 +51,7 @@ Prompt caching is **on by default**. Every `LLMRequest` resolves to `cache: "aut
 
 The math justifies the default: Anthropic's 5-minute cache write is 1.25× base, read is 0.1×, so a single reuse within 5 minutes already wins. One-shot completions below the per-model minimum-cacheable-token threshold silently no-op on the wire, so the worst case is harmless.
 
-### Opting out
+### Disabling framework auto placement
 
 ```ts
 LLM.request({
@@ -85,7 +93,7 @@ LLM.request({
 | ----------------------- | ------------------------------------------------------------------------- |
 | Anthropic Messages      | emits up to 3 `cache_control` markers (4-breakpoint cap enforced)         |
 | Bedrock Converse        | emits up to 3 `cachePoint` blocks (4-breakpoint cap enforced)             |
-| OpenAI Chat / Responses | no-op (implicit caching above 1024 tokens)                                |
+| OpenAI Chat / Responses | no framework marker injection; provider implicit by default; manual GPT-5.6+ content hints lower explicitly |
 | Gemini                  | no-op (implicit caching on 2.5+; explicit `CachedContent` is out-of-band) |
 
 Normalized cache usage is read back into `response.usage.cacheReadInputTokens` and `cacheWriteInputTokens` across every provider.

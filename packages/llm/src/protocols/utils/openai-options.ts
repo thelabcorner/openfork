@@ -1,5 +1,5 @@
 import { Schema } from "effect"
-import type { LLMRequest, ReasoningEffort, TextVerbosity as TextVerbosityValue } from "../../schema"
+import type { CacheHint, LLMRequest, ReasoningEffort, TextVerbosity as TextVerbosityValue } from "../../schema"
 import { ReasoningEfforts, TextVerbosity } from "../../schema"
 
 export const OpenAIReasoningEfforts = ReasoningEfforts.filter(
@@ -22,12 +22,28 @@ export const OpenAIResponseIncludables = [
 export type OpenAIResponseIncludable = (typeof OpenAIResponseIncludables)[number]
 export const OpenAIServiceTiers = ["auto", "default", "flex", "priority"] as const
 export type OpenAIServiceTier = (typeof OpenAIServiceTiers)[number]
+export const OpenAIPromptCacheMode = Schema.Literals(["implicit", "explicit"])
+export type OpenAIPromptCacheMode = typeof OpenAIPromptCacheMode.Type
+export const OpenAIPromptCacheOptions = Schema.Struct({
+  mode: Schema.optional(OpenAIPromptCacheMode),
+  ttl: Schema.optional(Schema.Literal("30m")),
+})
+export type OpenAIPromptCacheOptions = typeof OpenAIPromptCacheOptions.Type
+export const OpenAIResponsesPromptCacheOptions = Schema.Struct({
+  mode: Schema.optional(OpenAIPromptCacheMode),
+  ttl: Schema.optional(Schema.Literal("30m")),
+  comparison_response_id: Schema.optional(Schema.String),
+})
+export type OpenAIResponsesPromptCacheOptions = typeof OpenAIResponsesPromptCacheOptions.Type
+export const OpenAIPromptCacheBreakpoint = Schema.Struct({ mode: Schema.Literal("explicit") })
+export type OpenAIPromptCacheBreakpoint = typeof OpenAIPromptCacheBreakpoint.Type
 
 const REASONING_EFFORTS = new Set<string>(ReasoningEfforts)
 const OPENAI_REASONING_EFFORTS = new Set<string>(OpenAIReasoningEfforts)
 const TEXT_VERBOSITY = new Set<string>(["low", "medium", "high"])
 const INCLUDABLES = new Set<string>(OpenAIResponseIncludables)
 const SERVICE_TIERS = new Set<string>(OpenAIServiceTiers)
+const PROMPT_CACHE_MODES = new Set<string>(["implicit", "explicit"])
 
 export const OpenAIReasoningEffort = Schema.Literals(OpenAIReasoningEfforts)
 export const OpenAITextVerbosity = TextVerbosity
@@ -74,6 +90,48 @@ export const promptCacheKey = (request: LLMRequest) => {
   const value = options(request)?.promptCacheKey
   return typeof value === "string" ? value : undefined
 }
+
+/**
+ * Current explicit prompt-cache controls are an OpenAI GPT-5.6+ API contract.
+ * Keep aliases/proxies/Azure fail-closed until their exact route documents the
+ * same contract; sharing the Responses/Chat wire shape is not proof of support.
+ */
+export const supportsPromptCacheControls = (request: LLMRequest) => {
+  if (String(request.model.provider) !== "openai") return false
+  const match = /^gpt-(\d+)(?:\.(\d+))?(?:-|$)/i.exec(String(request.model.id))
+  if (!match) return false
+  const major = Number(match[1])
+  const minor = Number(match[2] ?? 0)
+  return major > 5 || (major === 5 && minor >= 6)
+}
+
+export const promptCacheOptions = (request: LLMRequest): OpenAIPromptCacheOptions | undefined => {
+  const value = options(request)?.promptCacheOptions
+  if (!value || typeof value !== "object") return undefined
+  const record = value as Record<string, unknown>
+  const mode = typeof record.mode === "string" && PROMPT_CACHE_MODES.has(record.mode) ? (record.mode as OpenAIPromptCacheMode) : undefined
+  const ttl = record.ttl === "30m" ? "30m" as const : undefined
+  return mode === undefined && ttl === undefined ? undefined : { mode, ttl }
+}
+
+/**
+ * Responses-only diagnostic comparison cursor. It never loads prior
+ * conversation state and must not be confused with previous_response_id or the
+ * prompt cache isolation key.
+ */
+export const promptCacheComparisonResponseId = (request: LLMRequest): string | undefined => {
+  const value = options(request)?.promptCacheOptions
+  if (!value || typeof value !== "object") return undefined
+  const comparisonResponseId = (value as Record<string, unknown>).comparisonResponseId
+  return typeof comparisonResponseId === "string" && comparisonResponseId.length > 0 ? comparisonResponseId : undefined
+}
+
+/** A semantic CacheHint maps to one OpenAI explicit boundary on supported routes. */
+export const promptCacheBreakpoint = (
+  request: LLMRequest,
+  cache: CacheHint | undefined,
+): OpenAIPromptCacheBreakpoint | undefined =>
+  supportsPromptCacheControls(request) && cache !== undefined ? { mode: "explicit" } : undefined
 
 export const textVerbosity = (request: LLMRequest) => {
   const value = options(request)?.textVerbosity

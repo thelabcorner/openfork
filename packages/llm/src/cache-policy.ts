@@ -28,7 +28,8 @@ const NONE: CachePolicyObject = {}
 //                   Anthropic 5m-cache write is 1.25x base, read is 0.1x,
 //                   so a single reuse within 5 minutes already wins.
 //   - "auto"      → tools + system + latest user msg.
-//   - "none"      → no auto placement; manual `CacheHint`s still flow.
+//   - "none"      → no framework auto placement; manual `CacheHint`s still flow
+//                   and provider-managed implicit caching is not disabled.
 //   - object form → exactly what the caller asked for.
 const resolve = (policy: CachePolicy | undefined): CachePolicyObject => {
   if (policy === undefined || policy === "auto") return AUTO
@@ -36,9 +37,10 @@ const resolve = (policy: CachePolicy | undefined): CachePolicyObject => {
   return policy
 }
 
-// Protocols whose wire format ignores inline cache markers (OpenAI's implicit
-// prefix caching, Gemini's implicit + out-of-band CachedContent). Skip the
-// whole policy pass for these — emitting hints would be harmless but pointless.
+// Protocols where this *automatic placement policy* is not used. OpenAI GPT-5.6+
+// can now lower explicit manual CacheHints, but its default provider-managed
+// implicit breakpoint is a different policy/economic model; do not synthesize
+// Anthropic-style automatic markers here. Gemini remains implicit/out-of-band.
 const RESPECTS_INLINE_HINTS = new Set(["anthropic-messages", "bedrock-converse"])
 
 const makeHint = (ttlSeconds: number | undefined): CacheHint =>

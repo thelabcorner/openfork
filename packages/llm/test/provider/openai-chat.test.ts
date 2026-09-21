@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { Effect, Schema, Stream } from "effect"
 import { HttpClientRequest } from "effect/unstable/http"
-import { LLM, LLMError, LLMEvent, Message, Model, ToolCallPart, Usage } from "../../src"
+import { CacheHint, LLM, LLMError, LLMEvent, Message, Model, ToolCallPart, Usage } from "../../src"
 import * as Azure from "../../src/providers/azure"
 import * as OpenAI from "../../src/providers/openai"
 import * as OpenAIChat from "../../src/protocols/openai-chat"
@@ -48,6 +48,52 @@ describe("OpenAI Chat route", () => {
         max_tokens: 20,
         temperature: 0,
       })
+    }),
+  )
+
+  it.effect("lowers GPT-5.6 Chat prompt-cache options and explicit content breakpoints", () =>
+    Effect.gen(function* () {
+      const cache = new CacheHint({ type: "ephemeral" })
+      const prepared = yield* LLMClient.prepare<OpenAIChat.OpenAIChatBody>(
+        LLM.request({
+          model: OpenAI.configure({ baseURL: "https://api.openai.test/v1/", apiKey: "test" }).chat("gpt-5.6"),
+          system: [{ type: "text", text: "Stable operator prefix.", cache }],
+          messages: [Message.user({ type: "text", text: "User turn.", cache })],
+          providerOptions: { openai: { promptCacheOptions: { mode: "explicit", ttl: "30m" } } },
+          cache: "none",
+        }),
+      )
+      expect(prepared.body.prompt_cache_options).toEqual({ mode: "explicit", ttl: "30m" })
+      expect(prepared.body.messages).toEqual([
+        {
+          role: "system",
+          content: [
+            {
+              type: "text",
+              text: "Stable operator prefix.",
+              prompt_cache_breakpoint: { mode: "explicit" },
+            },
+          ],
+        },
+        {
+          role: "user",
+          content: [{ type: "text", text: "User turn.", prompt_cache_breakpoint: { mode: "explicit" } }],
+        },
+      ])
+    }),
+  )
+
+  it.effect("rejects Responses-only cache diagnostics on Chat", () =>
+    Effect.gen(function* () {
+      const error = yield* LLMClient.prepare(
+        LLM.request({
+          model: OpenAI.configure({ baseURL: "https://api.openai.test/v1/", apiKey: "test" }).chat("gpt-5.6"),
+          prompt: "hi",
+          providerOptions: { openai: { promptCacheOptions: { comparisonResponseId: "resp_reference" } } },
+          cache: "none",
+        }),
+      ).pipe(Effect.flip)
+      expect(error.message).toContain("Responses-only")
     }),
   )
 
@@ -486,7 +532,7 @@ describe("OpenAI Chat route", () => {
           prompt_tokens: 5,
           completion_tokens: 2,
           total_tokens: 7,
-          prompt_tokens_details: { cached_tokens: 1 },
+          prompt_tokens_details: { cached_tokens: 1, cache_write_tokens: 2 },
           completion_tokens_details: { reasoning_tokens: 0 },
         }),
       )
@@ -494,8 +540,9 @@ describe("OpenAI Chat route", () => {
       const usage = new Usage({
         inputTokens: 5,
         outputTokens: 2,
-        nonCachedInputTokens: 4,
+        nonCachedInputTokens: 2,
         cacheReadInputTokens: 1,
+        cacheWriteInputTokens: 2,
         reasoningTokens: 0,
         totalTokens: 7,
         providerMetadata: {
@@ -503,7 +550,7 @@ describe("OpenAI Chat route", () => {
             prompt_tokens: 5,
             completion_tokens: 2,
             total_tokens: 7,
-            prompt_tokens_details: { cached_tokens: 1 },
+            prompt_tokens_details: { cached_tokens: 1, cache_write_tokens: 2 },
             completion_tokens_details: { reasoning_tokens: 0 },
           },
         },

@@ -2,7 +2,16 @@
 
 For the repository-level provider/runtime boundary, read
 `../../docs/map/architecture.md` and `../../docs/map/v1-v2.md` before
-changing lowering or cross-generation integration.
+changing lowering or cross-generation integration. Also read
+`../../docs/architecture/compatibility-boundary.md` before changing any adapter
+that talks to an upstream-operated OpenCode service.
+
+OpenFork's local APIs are fork-owned, but remote provider/backend contracts are not.
+For OpenCode-operated services such as Zen/Go, wire compatibility is a hard
+constraint: endpoint, auth, headers, payload lowering, framing, model IDs,
+responses/errors, and quota semantics must match the deployed service. Isolate that
+compatibility here or in the owning provider adapter; never force upstream local
+client/runtime architecture into OpenFork merely to satisfy a remote wire contract.
 
 ## Effect
 
@@ -179,7 +188,39 @@ If you find yourself copying a 3-to-5-line snippet between two protocols, lift i
 
 `LLMRequest.system` is the initial privileged prompt that applies ahead of the conversation. `Message.system(...)` is a separate, provider-neutral chronological operator update inside `LLMRequest.messages`; it applies only from its position in history onward and accepts text content only.
 
-Native chronological system messages are route/model-specific. Anthropic Messages lowers them natively for Claude Opus 4.8 (`claude-opus-4-8`). Other routes and models intentionally lower the update in place into ordinary user-compatible text using this stable escaped representation:
+Provider wire role is a projection, not a source of conversational ownership.
+Higher layers may deliberately lower host-authored conversational/Synthetic state
+to provider `user`; this package must not reinterpret that as human authorship.
+Likewise, host origin alone is not sufficient reason to promote content into
+System. Required privileged authority is explicit in the request semantics and
+must remain privileged through lowering.
+
+Do not model support as one boolean. Provider contracts currently distinguish at
+least these meanings:
+
+- `head-only` — no authority-preserving later privileged message is available;
+- `cumulative-privileged` — later privileged instructions apply from that point
+  onward and can supersede conflicting earlier instructions, but omission does
+  not structurally revoke unrelated earlier state;
+- `replace-complete` — the provider explicitly defines the newest later System
+  message as the complete effective privileged prompt;
+- turn-scoped lifetime is an orthogonal capability for temporary privileged
+  overlays.
+
+`src/system-message-capability.ts` owns the provider-neutral vocabulary and the
+fail-closed provider ∩ encoder intersection. Protocol/provider code owns exact
+API-route/model semantics; a Claude-looking model behind Bedrock, Vertex,
+OpenRouter, or another proxy must not inherit Anthropic Messages semantics by
+name alone.
+
+Current Anthropic Messages support is centralized in
+`protocols/anthropic-capability.ts`. Keep that allowlist fail-closed and grounded
+in Anthropic primary documentation. Do not duplicate Claude model-name tables in
+callers.
+
+The existing protocol implementations still contain a compatibility fallback for
+unsupported chronological System messages: they lower the update in place into
+ordinary user-compatible text using this stable escaped representation:
 
 ```text
 <system-update>
@@ -187,7 +228,52 @@ Native chronological system messages are route/model-specific. Anthropic Message
 </system-update>
 ```
 
-The wrapped-user fallback preserves ordering while visibly lowering authority. Never silently pass a raw chronological `role: "system"` through a route that might reject it. Do not insert raw retrieved documents, tool output, or web content into privileged chronological system updates; keep untrusted content in ordinary user/tool channels.
+That fallback preserves ordering while visibly lowering authority; it is **not**
+semantic equivalence for required System authority. Higher-level semantic
+compilers must choose an authority-preserving strategy (typically complete
+privileged-head projection) before provider lowering rather than relying on this
+wrapper as a repair mechanism.
+
+Never silently pass a raw chronological `role: "system"` through an exact
+route/model that does not support it. Never infer capability from foundation-model
+family through a different API route. Do not insert raw retrieved documents, tool
+output, or web content into privileged chronological System updates; keep
+untrusted content in ordinary user/tool channels.
+
+### Prompt-cache controls
+
+Cache mechanism, automatic placement policy, semantic prompt identity, and cache
+isolation identity are separate concerns.
+
+- `CacheHint` is the provider-neutral explicit boundary marker. For exact direct
+  OpenAI GPT-5.6+ routes it may lower to
+  `prompt_cache_breakpoint: { mode: "explicit" }`; Anthropic/Bedrock use their own
+  native cache marker representation.
+- OpenAI `prompt_cache_options` is capability-gated to the exact direct-OpenAI
+  GPT-5.6+ contract. Do not infer that support through Azure or a generic
+  OpenAI-compatible proxy merely because the JSON shape looks compatible.
+- Do not make OpenAI `cache:"auto"` copy Anthropic's marker-placement heuristic.
+  GPT-5.6+ already provides implicit caching and explicit writes have their own
+  economics. Automatic explicit placement requires a separately proven policy.
+- `prompt_cache_key` is cache-domain/isolation metadata, not semantic model
+  content. A key-only change may leave the entire provider model input unchanged.
+  Do not widen/remove a session/account/workspace isolation boundary merely to
+  improve hit rate without an explicit owner for that confidentiality/accounting
+  decision.
+- Responses-only cache diagnostics such as `comparison_response_id` are
+  observation metadata. They must not be modeled as Session continuation,
+  semantic prompt content, cache-isolation identity, or cache-admission state.
+  Prefer existing provider metadata for returned diagnostics; do not create a
+  new durable cache/diagnostic owner.
+- A field merely appearing in a provider API schema is not enough to implement
+  it. For cache controls such as `prewarm`, require documented lifecycle, cost,
+  admission, and response semantics before adding behavior.
+- Cache token accounting must stay non-overlapping:
+  `nonCachedInputTokens + cacheReadInputTokens + cacheWriteInputTokens = inputTokens`
+  whenever the provider supplies all components.
+- Keep deterministic cache-shape diagnostics test/debug-only unless production
+  observability proves necessary. Cache analysis must not add history scans,
+  workspace materialization, timers, or per-message runtime bookkeeping.
 
 ### Tools
 

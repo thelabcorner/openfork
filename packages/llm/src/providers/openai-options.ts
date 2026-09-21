@@ -1,13 +1,21 @@
 import type { ProviderOptions, ReasoningEffort, TextVerbosity } from "../schema"
 import { mergeProviderOptions } from "../schema"
-import type { OpenAIResponseIncludable, OpenAIServiceTier } from "../protocols/utils/openai-options"
+import type {
+  OpenAIPromptCacheOptions,
+  OpenAIResponseIncludable,
+  OpenAIServiceTier,
+} from "../protocols/utils/openai-options"
 
-export type { OpenAIResponseIncludable, OpenAIServiceTier } from "../protocols/utils/openai-options"
+export type { OpenAIPromptCacheOptions, OpenAIResponseIncludable, OpenAIServiceTier } from "../protocols/utils/openai-options"
 
 export interface OpenAIOptionsInput {
   readonly [key: string]: unknown
   readonly store?: boolean
   readonly promptCacheKey?: string
+  readonly promptCacheOptions?: OpenAIPromptCacheOptions & {
+    /** Responses-only cache diagnostic comparison; does not load prior conversation state. */
+    readonly comparisonResponseId?: string
+  }
   readonly reasoningEffort?: ReasoningEffort
   readonly reasoningSummary?: "auto"
   // OpenAI Responses `include` wire field. Mirrors the official SDK's
@@ -30,6 +38,7 @@ const openAIProviderOptions = (options: OpenAIOptionsInput | undefined): Provide
     definedEntries({
       store: options?.store,
       promptCacheKey: options?.promptCacheKey,
+      promptCacheOptions: options?.promptCacheOptions,
       reasoningEffort: options?.reasoningEffort,
       reasoningSummary: options?.reasoningSummary,
       include: options?.include,

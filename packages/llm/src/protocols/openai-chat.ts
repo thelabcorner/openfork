@@ -56,8 +56,14 @@ const OpenAIChatAssistantToolCall = Schema.Struct({
 })
 type OpenAIChatAssistantToolCall = Schema.Schema.Type<typeof OpenAIChatAssistantToolCall>
 
+const OpenAIChatTextContent = Schema.Struct({
+  type: Schema.Literal("text"),
+  text: Schema.String,
+  prompt_cache_breakpoint: Schema.optional(OpenAIOptions.OpenAIPromptCacheBreakpoint),
+})
+
 const OpenAIChatUserContent = Schema.Union([
-  Schema.Struct({ type: Schema.Literal("text"), text: Schema.String }),
+  OpenAIChatTextContent,
   Schema.Struct({
     type: Schema.Literal("image_url"),
     image_url: Schema.Struct({ url: Schema.String }),
@@ -65,7 +71,10 @@ const OpenAIChatUserContent = Schema.Union([
 ])
 
 const OpenAIChatMessage = Schema.Union([
-  Schema.Struct({ role: Schema.Literal("system"), content: Schema.String }),
+  Schema.Struct({
+    role: Schema.Literal("system"),
+    content: Schema.Union([Schema.String, Schema.Array(OpenAIChatTextContent)]),
+  }),
   Schema.Struct({
     role: Schema.Literal("user"),
     content: Schema.Union([Schema.String, Schema.Array(OpenAIChatUserContent)]),
@@ -76,7 +85,11 @@ const OpenAIChatMessage = Schema.Union([
     tool_calls: optionalArray(OpenAIChatAssistantToolCall),
     reasoning_content: Schema.optional(Schema.String),
   }),
-  Schema.Struct({ role: Schema.Literal("tool"), tool_call_id: Schema.String, content: Schema.String }),
+  Schema.Struct({
+    role: Schema.Literal("tool"),
+    tool_call_id: Schema.String,
+    content: Schema.Union([Schema.String, Schema.Array(OpenAIChatTextContent)]),
+  }),
 ]).pipe(Schema.toTaggedUnion("role"))
 type OpenAIChatMessage = Schema.Schema.Type<typeof OpenAIChatMessage>
 
@@ -96,6 +109,8 @@ export const bodyFields = {
   stream: Schema.Literal(true),
   stream_options: Schema.optional(Schema.Struct({ include_usage: Schema.Boolean })),
   store: Schema.optional(Schema.Boolean),
+  prompt_cache_key: Schema.optional(Schema.String),
+  prompt_cache_options: Schema.optional(OpenAIOptions.OpenAIPromptCacheOptions),
   reasoning_effort: Schema.optional(OpenAIOptions.OpenAIReasoningEffort),
   max_tokens: Schema.optional(Schema.Number),
   temperature: Schema.optional(Schema.Number),
@@ -121,6 +136,7 @@ const OpenAIChatUsage = Schema.Struct({
   prompt_tokens_details: optionalNull(
     Schema.Struct({
       cached_tokens: Schema.optional(Schema.Number),
+      cache_write_tokens: Schema.optional(Schema.Number),
     }),
   ),
   completion_tokens_details: optionalNull(
@@ -210,11 +226,18 @@ const lowerMedia = Effect.fn("OpenAIChat.lowerMedia")(function* (part: MediaPart
 const openAICompatibleReasoningContent = (native: unknown) =>
   isRecord(native) && typeof native.reasoning_content === "string" ? native.reasoning_content : undefined
 
-const lowerUserMessage = Effect.fn("OpenAIChat.lowerUserMessage")(function* (message: OpenAIChatRequestMessage) {
+const lowerUserMessage = Effect.fn("OpenAIChat.lowerUserMessage")(function* (
+  request: LLMRequest,
+  message: OpenAIChatRequestMessage,
+) {
   const content: Array<Schema.Schema.Type<typeof OpenAIChatUserContent>> = []
   for (const part of message.content) {
     if (part.type === "text") {
-      content.push({ type: "text", text: part.text })
+      content.push({
+        type: "text",
+        text: part.text,
+        prompt_cache_breakpoint: OpenAIOptions.promptCacheBreakpoint(request, part.cache),
+      })
       continue
     }
     if (part.type === "media") {
@@ -223,8 +246,8 @@ const lowerUserMessage = Effect.fn("OpenAIChat.lowerUserMessage")(function* (mes
     }
     return yield* ProviderShared.unsupportedContent("OpenAI Chat", "user", ["text", "media"])
   }
-  if (content.every((part) => part.type === "text"))
-    return { role: "user" as const, content: content.map((part) => part.text).join("") }
+  if (content.every((part) => part.type === "text" && part.prompt_cache_breakpoint === undefined))
+    return { role: "user" as const, content: content.map((part) => (part.type === "text" ? part.text : "")).join("") }
   return { role: "user" as const, content }
 })
 
@@ -261,19 +284,33 @@ const lowerAssistantMessage = Effect.fn("OpenAIChat.lowerAssistantMessage")(func
   }
 })
 
-const lowerToolMessages = Effect.fn("OpenAIChat.lowerToolMessages")(function* (message: OpenAIChatRequestMessage) {
+const lowerToolMessages = Effect.fn("OpenAIChat.lowerToolMessages")(function* (
+  request: LLMRequest,
+  message: OpenAIChatRequestMessage,
+) {
   const messages: OpenAIChatMessage[] = []
   const images: Array<Schema.Schema.Type<typeof OpenAIChatUserContent>> = []
   for (const part of message.content) {
     if (!ProviderShared.supportsContent(part, ["tool-result"]))
       return yield* ProviderShared.unsupportedContent("OpenAI Chat", "tool", ["tool-result"])
+    const breakpoint = OpenAIOptions.promptCacheBreakpoint(request, part.cache)
     if (part.result.type !== "content") {
-      messages.push({ role: "tool", tool_call_id: part.id, content: ProviderShared.toolResultText(part) })
+      const text = ProviderShared.toolResultText(part)
+      messages.push({
+        role: "tool",
+        tool_call_id: part.id,
+        content: breakpoint ? [{ type: "text", text, prompt_cache_breakpoint: breakpoint }] : text,
+      })
       continue
     }
     const content: ReadonlyArray<ToolContent> = part.result.value
     const text = content.filter((item) => item.type === "text").map((item) => item.text)
-    messages.push({ role: "tool", tool_call_id: part.id, content: text.join("\n") })
+    const joined = text.join("\n")
+    messages.push({
+      role: "tool",
+      tool_call_id: part.id,
+      content: breakpoint && joined.length > 0 ? [{ type: "text", text: joined, prompt_cache_breakpoint: breakpoint }] : joined,
+    })
     const files = content.filter((item) => item.type === "file")
     images.push(
       ...(yield* Effect.forEach(files, (item) =>
@@ -284,15 +321,27 @@ const lowerToolMessages = Effect.fn("OpenAIChat.lowerToolMessages")(function* (m
   return { messages, images }
 })
 
-const lowerMessage = Effect.fn("OpenAIChat.lowerMessage")(function* (message: OpenAIChatRequestMessage) {
-  if (message.role === "user") return [yield* lowerUserMessage(message)]
+const lowerMessage = Effect.fn("OpenAIChat.lowerMessage")(function* (
+  request: LLMRequest,
+  message: OpenAIChatRequestMessage,
+) {
+  if (message.role === "user") return [yield* lowerUserMessage(request, message)]
   if (message.role === "assistant") return [yield* lowerAssistantMessage(message)]
-  return (yield* lowerToolMessages(message)).messages
+  return (yield* lowerToolMessages(request, message)).messages
 })
 
 const lowerMessages = Effect.fn("OpenAIChat.lowerMessages")(function* (request: LLMRequest) {
+  const systemBreakpoint = OpenAIOptions.promptCacheBreakpoint(request, request.system.at(-1)?.cache)
+  const systemText = ProviderShared.joinText(request.system)
   const system: OpenAIChatMessage[] =
-    request.system.length === 0 ? [] : [{ role: "system", content: ProviderShared.joinText(request.system) }]
+    request.system.length === 0
+      ? []
+      : [{
+          role: "system",
+          content: systemBreakpoint
+            ? [{ type: "text", text: systemText, prompt_cache_breakpoint: systemBreakpoint }]
+            : systemText,
+        }]
   const messages = [...system]
   const pendingImages: Array<Schema.Schema.Type<typeof OpenAIChatUserContent>> = []
   const flushImages = () => {
@@ -318,13 +367,13 @@ const lowerMessages = Effect.fn("OpenAIChat.lowerMessages")(function* (request: 
       continue
     }
     if (message.role === "tool") {
-      const lowered = yield* lowerToolMessages(message)
+      const lowered = yield* lowerToolMessages(request, message)
       messages.push(...lowered.messages)
       pendingImages.push(...lowered.images)
       continue
     }
     flushImages()
-    messages.push(...(yield* lowerMessage(message)))
+    messages.push(...(yield* lowerMessage(request, message)))
   }
   flushImages()
   return messages
@@ -332,11 +381,20 @@ const lowerMessages = Effect.fn("OpenAIChat.lowerMessages")(function* (request: 
 
 const lowerOptions = Effect.fn("OpenAIChat.lowerOptions")(function* (request: LLMRequest) {
   const store = OpenAIOptions.store(request)
+  const promptCacheKey = OpenAIOptions.promptCacheKey(request)
+  const promptCacheOptions = OpenAIOptions.promptCacheOptions(request)
+  const comparisonResponseId = OpenAIOptions.promptCacheComparisonResponseId(request)
+  if (comparisonResponseId)
+    return yield* invalid("OpenAI prompt-cache comparison_response_id diagnostics are Responses-only")
+  if (promptCacheOptions && !OpenAIOptions.supportsPromptCacheControls(request))
+    return yield* invalid("OpenAI prompt_cache_options require the direct OpenAI GPT-5.6+ contract")
   const reasoningEffort = OpenAIOptions.reasoningEffort(request)
   if (reasoningEffort && !OpenAIOptions.isReasoningEffort(reasoningEffort))
     return yield* invalid(`OpenAI Chat does not support reasoning effort ${reasoningEffort}`)
   return {
     ...(store !== undefined ? { store } : {}),
+    ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
+    ...(promptCacheOptions ? { prompt_cache_options: promptCacheOptions } : {}),
     ...(reasoningEffort ? { reasoning_effort: reasoningEffort } : {}),
   }
 })
@@ -391,13 +449,15 @@ const mapFinishReason = (reason: string | null | undefined): FinishReason => {
 const mapUsage = (usage: OpenAIChatEvent["usage"]): Usage | undefined => {
   if (!usage) return undefined
   const cached = usage.prompt_tokens_details?.cached_tokens
+  const written = usage.prompt_tokens_details?.cache_write_tokens
   const reasoning = usage.completion_tokens_details?.reasoning_tokens
-  const nonCached = ProviderShared.subtractTokens(usage.prompt_tokens, cached)
+  const nonCached = ProviderShared.subtractTokens(usage.prompt_tokens, ProviderShared.sumTokens(cached, written))
   return new Usage({
     inputTokens: usage.prompt_tokens,
     outputTokens: usage.completion_tokens,
     nonCachedInputTokens: nonCached,
     cacheReadInputTokens: cached,
+    cacheWriteInputTokens: written,
     reasoningTokens: reasoning,
     totalTokens: ProviderShared.totalTokens(usage.prompt_tokens, usage.completion_tokens, usage.total_tokens),
     providerMetadata: { openai: usage },

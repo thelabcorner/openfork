@@ -35,10 +35,12 @@ export const PATH = "/responses"
 const OpenAIResponsesInputText = Schema.Struct({
   type: Schema.tag("input_text"),
   text: Schema.String,
+  prompt_cache_breakpoint: Schema.optional(OpenAIOptions.OpenAIPromptCacheBreakpoint),
 })
 const OpenAIResponsesInputImage = Schema.Struct({
   type: Schema.tag("input_image"),
   image_url: Schema.String,
+  prompt_cache_breakpoint: Schema.optional(OpenAIOptions.OpenAIPromptCacheBreakpoint),
 })
 const OpenAIResponsesInputContent = Schema.Union([OpenAIResponsesInputText, OpenAIResponsesInputImage])
 type OpenAIResponsesInputContent = Schema.Schema.Type<typeof OpenAIResponsesInputContent>
@@ -76,7 +78,10 @@ const OpenAIResponsesFunctionCallOutput = Schema.Union([
 ])
 
 const OpenAIResponsesInputItem = Schema.Union([
-  Schema.Struct({ role: Schema.tag("system"), content: Schema.String }),
+  Schema.Struct({
+    role: Schema.tag("system"),
+    content: Schema.Union([Schema.String, Schema.Array(OpenAIResponsesInputText)]),
+  }),
   Schema.Struct({ role: Schema.tag("user"), content: Schema.Array(OpenAIResponsesInputContent) }),
   Schema.Struct({ role: Schema.tag("assistant"), content: Schema.Array(OpenAIResponsesOutputText) }),
   OpenAIResponsesReasoningItem,
@@ -132,6 +137,7 @@ const OpenAIResponsesCoreFields = {
   store: Schema.optional(Schema.Boolean),
   service_tier: Schema.optional(OpenAIOptions.OpenAIServiceTier),
   prompt_cache_key: Schema.optional(Schema.String),
+  prompt_cache_options: Schema.optional(OpenAIOptions.OpenAIResponsesPromptCacheOptions),
   include: optionalArray(OpenAIOptions.OpenAIResponseIncludable),
   reasoning: Schema.optional(
     Schema.Struct({
@@ -167,7 +173,12 @@ const encodeWebSocketMessage = Schema.encodeSync(Schema.fromJsonString(OpenAIRes
 
 const OpenAIResponsesUsage = Schema.Struct({
   input_tokens: Schema.optional(Schema.Number),
-  input_tokens_details: optionalNull(Schema.Struct({ cached_tokens: Schema.optional(Schema.Number) })),
+  input_tokens_details: optionalNull(
+    Schema.Struct({
+      cached_tokens: Schema.optional(Schema.Number),
+      cache_write_tokens: Schema.optional(Schema.Number),
+    }),
+  ),
   output_tokens: Schema.optional(Schema.Number),
   output_tokens_details: optionalNull(Schema.Struct({ reasoning_tokens: Schema.optional(Schema.Number) })),
   total_tokens: Schema.optional(Schema.Number),
@@ -209,6 +220,16 @@ const OpenAIResponsesErrorPayload = Schema.Struct({
   param: optionalNull(Schema.String),
 })
 
+const OpenAIPromptCacheDiagnostics = Schema.StructWithRest(
+  Schema.Struct({
+    type: Schema.Literals(["cache_hit", "cache_miss", "comparison_response_not_found", "unavailable"]),
+    reason: Schema.optional(Schema.String),
+    comparison_reusable_tokens: Schema.optional(Schema.Number),
+    cache_missed_tokens: Schema.optional(Schema.Number),
+  }),
+  [Schema.Record(Schema.String, Schema.Unknown)],
+)
+
 const OpenAIResponsesEvent = Schema.Struct({
   type: Schema.String,
   delta: Schema.optional(Schema.String),
@@ -223,6 +244,7 @@ const OpenAIResponsesEvent = Schema.Struct({
         incomplete_details: optionalNull(Schema.Struct({ reason: Schema.String })),
         usage: optionalNull(OpenAIResponsesUsage),
         error: optionalNull(OpenAIResponsesErrorPayload),
+        prompt_cache_diagnostics: optionalNull(OpenAIPromptCacheDiagnostics),
       }),
       [Schema.Record(Schema.String, Schema.Unknown)],
     ),
@@ -306,9 +328,15 @@ const hostedToolItemID = (part: ToolResultPart) => {
 }
 
 const lowerUserContent = Effect.fn("OpenAIResponses.lowerUserContent")(function* (
+  request: LLMRequest,
   part: LLMRequest["messages"][number]["content"][number],
 ) {
-  if (part.type === "text") return { type: "input_text" as const, text: part.text }
+  if (part.type === "text")
+    return {
+      type: "input_text" as const,
+      text: part.text,
+      prompt_cache_breakpoint: OpenAIOptions.promptCacheBreakpoint(request, part.cache),
+    }
   if (part.type === "media") {
     const media = yield* ProviderShared.validateMedia(
       "OpenAI Responses",
@@ -334,18 +362,37 @@ const lowerToolResultContentItem = Effect.fn("OpenAIResponses.lowerToolResultCon
   return { type: "input_image" as const, image_url: media.dataUrl }
 })
 
-const lowerToolResultOutput = Effect.fn("OpenAIResponses.lowerToolResultOutput")(function* (part: ToolResultPart) {
+const lowerToolResultOutput = Effect.fn("OpenAIResponses.lowerToolResultOutput")(function* (
+  request: LLMRequest,
+  part: ToolResultPart,
+) {
+  const breakpoint = OpenAIOptions.promptCacheBreakpoint(request, part.cache)
   // Text/json/error results are encoded as a plain string for backward
   // compatibility with existing cassettes and provider expectations.
-  if (part.result.type !== "content") return ProviderShared.toolResultText(part)
+  if (part.result.type !== "content") {
+    const text = ProviderShared.toolResultText(part)
+    return breakpoint ? [{ type: "input_text" as const, text, prompt_cache_breakpoint: breakpoint }] : text
+  }
   // Preserve the narrowed array element type when compiled through a consumer package.
   const content: ReadonlyArray<ToolContent> = part.result.value
-  return yield* Effect.forEach(content, lowerToolResultContentItem)
+  const lowered = yield* Effect.forEach(content, lowerToolResultContentItem)
+  if (!breakpoint || lowered.length === 0) return lowered
+  const last = lowered.length - 1
+  return lowered.map((item, index) => index === last ? { ...item, prompt_cache_breakpoint: breakpoint } : item)
 })
 
 const lowerMessages = Effect.fn("OpenAIResponses.lowerMessages")(function* (request: LLMRequest) {
+  const systemBreakpoint = OpenAIOptions.promptCacheBreakpoint(request, request.system.at(-1)?.cache)
+  const systemText = ProviderShared.joinText(request.system)
   const system: OpenAIResponsesInputItem[] =
-    request.system.length === 0 ? [] : [{ role: "system", content: ProviderShared.joinText(request.system) }]
+    request.system.length === 0
+      ? []
+      : [{
+          role: "system",
+          content: systemBreakpoint
+            ? [{ type: "input_text", text: systemText, prompt_cache_breakpoint: systemBreakpoint }]
+            : systemText,
+        }]
   const input: OpenAIResponsesInputItem[] = [...system]
   const store = OpenAIOptions.store(request)
 
@@ -363,7 +410,7 @@ const lowerMessages = Effect.fn("OpenAIResponses.lowerMessages")(function* (requ
     }
 
     if (message.role === "user") {
-      input.push({ role: "user", content: yield* Effect.forEach(message.content, lowerUserContent) })
+      input.push({ role: "user", content: yield* Effect.forEach(message.content, (part) => lowerUserContent(request, part)) })
       continue
     }
 
@@ -438,7 +485,7 @@ const lowerMessages = Effect.fn("OpenAIResponses.lowerMessages")(function* (requ
       input.push({
         type: "function_call_output",
         call_id: part.id,
-        output: yield* lowerToolResultOutput(part),
+        output: yield* lowerToolResultOutput(request, part),
       })
     }
   }
@@ -456,6 +503,17 @@ const lowerMessages = Effect.fn("OpenAIResponses.lowerMessages")(function* (requ
 const lowerOptions = Effect.fn("OpenAIResponses.lowerOptions")(function* (request: LLMRequest) {
   const store = OpenAIOptions.store(request)
   const promptCacheKey = OpenAIOptions.promptCacheKey(request)
+  const commonPromptCacheOptions = OpenAIOptions.promptCacheOptions(request)
+  const comparisonResponseId = OpenAIOptions.promptCacheComparisonResponseId(request)
+  const promptCacheOptions =
+    commonPromptCacheOptions || comparisonResponseId
+      ? {
+          ...commonPromptCacheOptions,
+          ...(comparisonResponseId ? { comparison_response_id: comparisonResponseId } : {}),
+        }
+      : undefined
+  if (promptCacheOptions && !OpenAIOptions.supportsPromptCacheControls(request))
+    return yield* invalid("OpenAI prompt_cache_options require the direct OpenAI GPT-5.6+ contract")
   const effort = OpenAIOptions.reasoningEffort(request)
   if (effort && !OpenAIOptions.isReasoningEffort(effort))
     return yield* invalid(`OpenAI Responses does not support reasoning effort ${effort}`)
@@ -468,6 +526,7 @@ const lowerOptions = Effect.fn("OpenAIResponses.lowerOptions")(function* (reques
     ...(instructions ? { instructions } : {}),
     ...(store !== undefined ? { store } : {}),
     ...(promptCacheKey ? { prompt_cache_key: promptCacheKey } : {}),
+    ...(promptCacheOptions ? { prompt_cache_options: promptCacheOptions } : {}),
     ...(include ? { include } : {}),
     ...(effort || summary ? { reasoning: { effort, summary } } : {}),
     ...(verbosity ? { text: { verbosity } } : {}),
@@ -507,13 +566,15 @@ const fromRequest = Effect.fn("OpenAIResponses.fromRequest")(function* (request:
 const mapUsage = (usage: OpenAIResponsesUsage | null | undefined) => {
   if (!usage) return undefined
   const cached = usage.input_tokens_details?.cached_tokens
+  const written = usage.input_tokens_details?.cache_write_tokens
   const reasoning = usage.output_tokens_details?.reasoning_tokens
-  const nonCached = ProviderShared.subtractTokens(usage.input_tokens, cached)
+  const nonCached = ProviderShared.subtractTokens(usage.input_tokens, ProviderShared.sumTokens(cached, written))
   return new Usage({
     inputTokens: usage.input_tokens,
     outputTokens: usage.output_tokens,
     nonCachedInputTokens: nonCached,
     cacheReadInputTokens: cached,
+    cacheWriteInputTokens: written,
     reasoningTokens: reasoning,
     totalTokens: ProviderShared.totalTokens(usage.input_tokens, usage.output_tokens, usage.total_tokens),
     providerMetadata: { openai: usage },
@@ -878,10 +939,11 @@ const onResponseFinish = (state: ParserState, event: OpenAIResponsesEvent): Step
     reason: mapFinishReason(event, state.hasFunctionCall),
     usage: mapUsage(event.response?.usage),
     providerMetadata:
-      event.response?.id || event.response?.service_tier
+      event.response?.id || event.response?.service_tier || event.response?.prompt_cache_diagnostics
         ? openaiMetadata({
             responseId: event.response.id,
             serviceTier: event.response.service_tier,
+            promptCacheDiagnostics: event.response.prompt_cache_diagnostics,
           })
         : undefined,
   })

@@ -6,6 +6,7 @@ export type {
   RouteDefaults,
   RouteDefaultsInput,
   AnyRoute,
+  CompiledRequest,
   Interface as LLMClientShape,
   Service as LLMClientService,
 } from "./client"

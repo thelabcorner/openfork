@@ -256,8 +256,11 @@ export class CacheHint extends Schema.Class<CacheHint>("LLM.CacheHint")({
 // hierarchy (tools → system → messages) and Anthropic/Bedrock's 20-block
 // lookback means three trailing breakpoints reliably cover the static prefix.
 //
-// Pass `"none"` to opt out entirely (the legacy behavior). Pass the granular
-// object form to override individual choices.
+// Pass `"none"` to disable framework automatic placement (the legacy behavior).
+// Manual CacheHints still flow, and providers with independent implicit caching
+// may still cache. A provider-neutral "disable remote caching" contract would be
+// a separate capability because not every provider exposes one. Pass the
+// granular object form to override individual placement choices.
 export const CachePolicyObject = Schema.Struct({
   tools: Schema.optional(Schema.Boolean),
   system: Schema.optional(Schema.Boolean),

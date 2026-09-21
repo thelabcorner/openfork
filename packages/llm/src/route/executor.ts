@@ -27,7 +27,19 @@ import { isContextOverflow } from "../provider-error"
 export interface Interface {
   readonly execute: (
     request: HttpClientRequest.HttpClientRequest,
+    options?: ExecuteOptions,
   ) => Effect.Effect<HttpClientResponse.HttpClientResponse, LLMError>
+}
+
+export interface ExecuteOptions {
+  /**
+   * Whether retryable HTTP status failures use the shared retry policy.
+   *
+   * Omitted/true preserves the shared chat/default behavior. Semantic
+   * control-plane callers may set false when the first provider classification
+   * is more valuable than transparent backoff.
+   */
+  readonly retry?: boolean
 }
 
 export class Service extends Context.Service<Service, Interface>()("@opencode/LLM/RequestExecutor") {}
@@ -375,7 +387,8 @@ export const layer: Layer.Layer<Service, never, HttpClient.HttpClient> = Layer.e
           .pipe(Effect.mapError(toHttpError(redactedNames)), Effect.flatMap(statusError(request, redactedNames)))
       })
     return Service.of({
-      execute: (request) => retryStatusFailures(executeOnce(request)),
+      execute: (request, options) =>
+        retryStatusFailures(executeOnce(request), options?.retry === false ? 0 : MAX_RETRIES),
     })
   }),
 )

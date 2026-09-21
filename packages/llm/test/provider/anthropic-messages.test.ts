@@ -1,5 +1,5 @@
 import { describe, expect } from "bun:test"
-import { Effect } from "effect"
+import { Effect, Stream } from "effect"
 import { HttpClientRequest } from "effect/unstable/http"
 import { CacheHint, LLM, LLMError, Message, ToolCallPart, Usage } from "../../src"
 import { Auth, LLMClient } from "../../src/route"
@@ -82,6 +82,54 @@ describe("Anthropic Messages route", () => {
     }),
   )
 
+  it.effect("uses native chronological System only for the documented supported Claude model families", () =>
+    Effect.gen(function* () {
+      const ids = [
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-fable-5",
+        "claude-fable-5-1",
+        "claude-mythos-5",
+        "claude-mythos-5-1",
+      ]
+
+      for (const id of ids) {
+        const current = AnthropicMessages.route
+          .with({ endpoint: { baseURL: "https://api.anthropic.test/v1/" }, auth: Auth.header("x-api-key", "test") })
+          .model({ id })
+        const prepared = yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(
+          LLM.request({
+            model: current,
+            messages: [Message.user("Before."), Message.system("Operator update."), Message.assistant("After.")],
+            cache: "none",
+          }),
+        )
+        expect(prepared.body.messages[1]).toEqual({
+          role: "system",
+          content: [{ type: "text", text: "Operator update." }],
+        })
+      }
+
+      const sonnet5 = AnthropicMessages.route
+        .with({ endpoint: { baseURL: "https://api.anthropic.test/v1/" }, auth: Auth.header("x-api-key", "test") })
+        .model({ id: "claude-sonnet-5" })
+      const unsupported = yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(
+        LLM.request({
+          model: sonnet5,
+          messages: [Message.user("Before."), Message.system("Operator update."), Message.assistant("After.")],
+          cache: "none",
+        }),
+      )
+      expect(unsupported.body.messages[0]).toEqual({
+        role: "user",
+        content: [
+          { type: "text", text: "Before." },
+          { type: "text", text: "<system-update>\nOperator update.\n</system-update>" },
+        ],
+      })
+    }),
+  )
+
   it.effect("lowers chronological system updates to wrapped user text for unsupported Anthropic models", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(
@@ -125,45 +173,45 @@ describe("Anthropic Messages route", () => {
     }),
   )
 
-  it.effect("falls back for unsupported native chronological system update placement", () =>
+  it.effect("fails closed when a supported native chronological System update violates provider placement", () =>
     Effect.gen(function* () {
-      expect(
-        (yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(
+      for (const messages of [
+        [Message.assistant("Plain."), Message.system("After plain assistant.")],
+        [Message.system("First.")],
+        [Message.user("Before."), Message.system("One."), Message.system("Two."), Message.user("Wrong successor.")],
+      ]) {
+        const error = yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(
           LLM.request({
             model: opus48,
-            messages: [Message.assistant("Plain."), Message.system("After plain assistant.")],
+            messages,
             cache: "none",
           }),
-        )).body.messages,
-      ).toEqual([
-        { role: "assistant", content: [{ type: "text", text: "Plain." }] },
+        ).pipe(Effect.flip)
+        expect(error.message).toContain("violates the provider placement contract")
+      }
+    }),
+  )
+
+  it.effect("treats consecutive supported System messages as one valid provider placement group", () =>
+    Effect.gen(function* () {
+      const prepared = yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(
+        LLM.request({
+          model: opus48,
+          messages: [Message.user("Before."), Message.system("One."), Message.system("Two."), Message.assistant("After.")],
+          cache: "none",
+        }),
+      )
+      expect(prepared.body.messages).toEqual([
+        { role: "user", content: [{ type: "text", text: "Before." }] },
         {
-          role: "user",
-          content: [{ type: "text", text: "<system-update>\nAfter plain assistant.\n</system-update>" }],
+          role: "system",
+          content: [{ type: "text", text: "One." }],
         },
-      ])
-      expect(
-        (yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(
-          LLM.request({ model: opus48, messages: [Message.system("First.")], cache: "none" }),
-        )).body.messages,
-      ).toEqual([{ role: "user", content: [{ type: "text", text: "<system-update>\nFirst.\n</system-update>" }] }])
-      expect(
-        (yield* LLMClient.prepare<AnthropicMessages.AnthropicMessagesBody>(
-          LLM.request({
-            model: opus48,
-            messages: [Message.user("Before."), Message.system("One."), Message.system("Two.")],
-            cache: "none",
-          }),
-        )).body.messages,
-      ).toEqual([
         {
-          role: "user",
-          content: [
-            { type: "text", text: "Before." },
-            { type: "text", text: "<system-update>\nOne.\n</system-update>" },
-            { type: "text", text: "<system-update>\nTwo.\n</system-update>" },
-          ],
+          role: "system",
+          content: [{ type: "text", text: "Two." }],
         },
+        { role: "assistant", content: [{ type: "text", text: "After." }] },
       ])
     }),
   )
@@ -760,6 +808,46 @@ describe("Anthropic Messages route", () => {
       )
 
       expect(response.text).toBe("An image.")
+    }),
+  )
+
+  it.effect("compile exposes the exact provider body used by its captured transport stream", () =>
+    Effect.gen(function* () {
+      let sent: unknown
+      let prepared: AnthropicMessages.AnthropicMessagesBody | undefined
+      yield* Effect.gen(function* () {
+        const compiled = yield* LLMClient.compile<AnthropicMessages.AnthropicMessagesBody>(
+          LLM.request({
+            id: "req_compile_once",
+            model,
+            system: "Stable policy.",
+            messages: [Message.user("Before."), Message.assistant("After."), Message.user("Continue.")],
+            cache: "none",
+          }),
+        )
+        prepared = compiled.prepared.body
+        yield* compiled.stream.pipe(Stream.runDrain)
+      }).pipe(
+        Effect.provide(
+          dynamicResponse((input) =>
+            Effect.sync(() => {
+              sent = JSON.parse(input.text)
+              return input.respond(
+                sseEvents(
+                  { type: "content_block_start", index: 0, content_block: { type: "text", text: "" } },
+                  { type: "content_block_delta", index: 0, delta: { type: "text_delta", text: "ok" } },
+                  { type: "content_block_stop", index: 0 },
+                  { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { output_tokens: 1 } },
+                  { type: "message_stop" },
+                ),
+                { headers: { "content-type": "text/event-stream" } },
+              )
+            }),
+          ),
+        ),
+      )
+
+      expect(sent).toEqual(prepared)
     }),
   )
 

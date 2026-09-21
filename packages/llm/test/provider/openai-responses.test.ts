@@ -1,7 +1,7 @@
 import { describe, expect } from "bun:test"
 import { ConfigProvider, Effect, Layer, Stream } from "effect"
 import { Headers, HttpClientRequest } from "effect/unstable/http"
-import { LLM, LLMError, Message, Model, ToolCallPart, Usage } from "../../src"
+import { CacheHint, LLM, LLMError, Message, Model, ToolCallPart, ToolResultPart, Usage } from "../../src"
 import { Auth, LLMClient, RequestExecutor, WebSocketExecutor } from "../../src/route"
 import * as Azure from "../../src/providers/azure"
 import * as OpenAI from "../../src/providers/openai"
@@ -571,6 +571,141 @@ describe("OpenAI Responses route", () => {
     }),
   )
 
+  it.effect("lowers GPT-5.6 explicit prompt-cache controls only on the direct OpenAI contract", () =>
+    Effect.gen(function* () {
+      const cache = new CacheHint({ type: "ephemeral" })
+      const prepared = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
+        LLM.request({
+          model: OpenAI.configure({ baseURL: "https://api.openai.test/v1/", apiKey: "test" }).responses("gpt-5.6"),
+          system: [{ type: "text", text: "Stable operator prefix.", cache }],
+          messages: [
+            Message.user({ type: "text", text: "User turn.", cache }),
+            Message.assistant([ToolCallPart.make({ id: "call_1", name: "lookup", input: {} })]),
+            Message.tool(
+              ToolResultPart.make({ id: "call_1", name: "lookup", result: "Done.", resultType: "text", cache }),
+            ),
+          ],
+          providerOptions: { openai: { promptCacheOptions: { mode: "explicit", ttl: "30m" } } },
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body.prompt_cache_options).toEqual({ mode: "explicit", ttl: "30m" })
+      expect(prepared.body.input[0]).toEqual({
+        role: "system",
+        content: [
+          {
+            type: "input_text",
+            text: "Stable operator prefix.",
+            prompt_cache_breakpoint: { mode: "explicit" },
+          },
+        ],
+      })
+      expect(prepared.body.input[1]).toEqual({
+        role: "user",
+        content: [{ type: "input_text", text: "User turn.", prompt_cache_breakpoint: { mode: "explicit" } }],
+      })
+      expect(prepared.body.input.at(-1)).toEqual({
+        type: "function_call_output",
+        call_id: "call_1",
+        output: [{ type: "input_text", text: "Done.", prompt_cache_breakpoint: { mode: "explicit" } }],
+      })
+    }),
+  )
+
+  it.effect("fails closed for GPT-5.6 prompt-cache options on a non-OpenAI API route", () =>
+    Effect.gen(function* () {
+      const azure = Azure.configure({
+        baseURL: "https://azure.openai.test/openai/v1",
+        apiKey: "test",
+      }).responses("gpt-5.6")
+      const error = yield* LLMClient.prepare(
+        LLM.request({
+          model: azure,
+          prompt: "hi",
+          providerOptions: { openai: { promptCacheOptions: { mode: "explicit" } } },
+        }),
+      ).pipe(Effect.flip)
+      expect(error.message).toContain("direct OpenAI GPT-5.6+ contract")
+    }),
+  )
+
+  it.effect("does not emit explicit breakpoint fields for pre-5.6 OpenAI models", () =>
+    Effect.gen(function* () {
+      const cache = new CacheHint({ type: "ephemeral" })
+      const prepared = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
+        LLM.request({
+          model: OpenAI.configure({ baseURL: "https://api.openai.test/v1/", apiKey: "test" }).responses("gpt-5.5"),
+          system: [{ type: "text", text: "Stable.", cache }],
+          messages: [Message.user({ type: "text", text: "Hi.", cache })],
+          cache: "none",
+        }),
+      )
+      expect(JSON.stringify(prepared.body)).not.toContain("prompt_cache_breakpoint")
+    }),
+  )
+
+  it.effect("lowers Responses-only prompt-cache comparison diagnostics without changing input", () =>
+    Effect.gen(function* () {
+      const prepared = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
+        LLM.request({
+          model: OpenAI.configure({ baseURL: "https://api.openai.test/v1/", apiKey: "test" }).responses("gpt-5.6"),
+          system: "Stable operator policy.",
+          prompt: "Stable user turn.",
+          providerOptions: {
+            openai: { promptCacheOptions: { comparisonResponseId: "resp_reference" } },
+          },
+          cache: "none",
+        }),
+      )
+
+      expect(prepared.body.prompt_cache_options).toEqual({ comparison_response_id: "resp_reference" })
+      expect(prepared.body.input).toEqual([
+        { role: "system", content: "Stable operator policy." },
+        { role: "user", content: [{ type: "input_text", text: "Stable user turn." }] },
+      ])
+    }),
+  )
+
+  it.effect("surfaces prompt-cache diagnostics on finish provider metadata", () =>
+    Effect.gen(function* () {
+      const body = sseEvents({
+        type: "response.completed",
+        response: {
+          id: "resp_current",
+          prompt_cache_diagnostics: {
+            type: "cache_miss",
+            reason: "tools_changed",
+            comparison_reusable_tokens: 5629,
+            cache_missed_tokens: 5629,
+          },
+          usage: { input_tokens: 10, output_tokens: 1 },
+        },
+      })
+      const response = yield* LLMClient.generate(
+        LLM.request({
+          model: OpenAI.configure({ baseURL: "https://api.openai.test/v1/", apiKey: "test" }).responses("gpt-5.6"),
+          prompt: "diagnose",
+          cache: "none",
+        }),
+      ).pipe(Effect.provide(fixedResponse(body)))
+
+      const finish = response.events.find((event) => event.type === "finish")
+      expect(finish?.providerMetadata).toEqual({
+        openai: {
+          responseId: "resp_current",
+          serviceTier: undefined,
+          promptCacheDiagnostics: {
+            type: "cache_miss",
+            reason: "tools_changed",
+            comparison_reusable_tokens: 5629,
+            cache_missed_tokens: 5629,
+          },
+        },
+      })
+    }),
+  )
+
   it.effect("accepts the full ResponseIncludable union", () =>
     Effect.gen(function* () {
       const prepared = yield* LLMClient.prepare<OpenAIResponses.OpenAIResponsesBody>(
@@ -705,7 +840,7 @@ describe("OpenAI Responses route", () => {
               input_tokens: 5,
               output_tokens: 2,
               total_tokens: 7,
-              input_tokens_details: { cached_tokens: 1 },
+              input_tokens_details: { cached_tokens: 1, cache_write_tokens: 2 },
               output_tokens_details: { reasoning_tokens: 0 },
             },
           },
@@ -715,8 +850,9 @@ describe("OpenAI Responses route", () => {
       const usage = new Usage({
         inputTokens: 5,
         outputTokens: 2,
-        nonCachedInputTokens: 4,
+        nonCachedInputTokens: 2,
         cacheReadInputTokens: 1,
+        cacheWriteInputTokens: 2,
         reasoningTokens: 0,
         totalTokens: 7,
         providerMetadata: {
@@ -724,7 +860,7 @@ describe("OpenAI Responses route", () => {
             input_tokens: 5,
             output_tokens: 2,
             total_tokens: 7,
-            input_tokens_details: { cached_tokens: 1 },
+            input_tokens_details: { cached_tokens: 1, cache_write_tokens: 2 },
             output_tokens_details: { reasoning_tokens: 0 },
           },
         },
