@@ -1,8 +1,17 @@
-# OpenSwarm → OpenCode Native Port — Investigation Deliverables
+# Legacy OpenSwarm investigation archive
 
 Investigation date: 2026-08-21. Produced by a 5-member planning swarm (all `opencode-go/ox-alpha-free`, max reasoning).
 
-**Goal:** a comprehensive, decision-grade plan for porting the openswarm plugin (`C:\Users\slooshied\Documents\openswarm`) into OpenCode **natively** — first-class architecture, API, and premium UX/UI for swarm control & management. Planning only; no implementation.
+**Historical goal:** inventory the old OpenSwarm plugin and extract useful
+behavioral requirements for a first-party implementation.
+
+**Current authority:** OpenFork's native Swarm implementation is independent of
+the plugin. The plugin is not a runtime, API, storage, UI, or compatibility
+dependency. Documents in this folder that describe OpenSwarm mechanics are
+requirements archaeology only; current architecture is defined by
+`00-first-party-overhaul-2026-09-18.md`,
+`06-implementation-roadmap-v2.md`, the repository maps, and live source/tests.
+Any future OpenSwarm support is a bounded **read/import migration source** only.
 
 ## Reading order
 
@@ -17,4 +26,4 @@ Investigation date: 2026-08-21. Produced by a 5-member planning swarm (all `open
 
 ## Status
 
-IN PROGRESS — documents appear as lanes complete.
+HISTORICAL / MIGRATION INPUT — not an active plugin-port plan.

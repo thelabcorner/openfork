@@ -177,7 +177,7 @@ No timed-out or interrupted operation may later publish a terminal result.
 
 ## 6. Persistence contract
 
-OpenCode preserves the upstream-compatible layout:
+OpenFork preserves the **SnapEye-upstream interoperable** layout:
 
 ```text
 .snapeye/
@@ -757,7 +757,7 @@ p95 sample 214 ms
 
 ---
 
-## 20. Upstream compatibility and upgrade policy
+## 20. SnapEye-upstream interoperability and upgrade policy
 
 The visual engine versions are exact-pinned because a visual renderer upgrade can legitimately change pixels and therefore baseline identity.
 

@@ -1,27 +1,38 @@
-# 01 — Strategy: Branch-Fork, Not OpenChamber
+# 01 — Strategy: Source Branch-Fork, Independent Product
 
-> **STATUS: COMPLETE** — this is the load-bearing document. If a later file conflicts with this one, this one wins.
+> **STATUS: HISTORICAL / PARTIALLY SUPERSEDED.** The Git-history/tag-merge strategy
+> remains valid. The old implication that a branch-fork is "not an independent
+> product" is superseded by
+> `../../architecture/compatibility-boundary.md` and `../../../FORK.md`.
 
 ## 1. Two products people keep conflating
 
 ### OpenChamber (`github.com/openchamber/openchamber`)
 
-An **independent product**. Packages: `ui`, `web`, `electron`, `vscode`, `mobile`, `docs`. It talks to official OpenCode through `@opencode-ai/sdk/v2` and a bundled/installed CLI. Their `../../handoff/AGENTS.md` literally says: do not modify `../opencode`; it is a separate repository.
+A separate product with a **compatibility-wrapper architecture** around official
+OpenCode. Packages: `ui`, `web`, `electron`, `vscode`, `mobile`, `docs`.
+It talks to OpenCode through its supported client/runtime surfaces rather than
+forking those surfaces in place.
 
 Upgrade path: bump the OpenCode CLI / SDK version. Git never merges `anomalyco/opencode`. Conflict cost is zero because there is no shared tree. Feature cost is total: they rewrote the UI, the shell, and a lot of the control plane.
 
 ### This tree (`openfork`)
 
-A **patched OpenCode**. Features live in the same files upstream owns:
+An **independent OpenFork product implemented by patching/forking OpenCode source in
+place**. Features live in the same files upstream owns:
 
 - project explorer, tab chrome, models/usage panels → `../../../packages/app`
 - pause/resume, session groups, SPAD, quota, extra tools → `../../../packages/opencode` + `../../../packages/core`
 - hosted browser → `../../../packages/desktop` + `../../../packages/app` + protocol/server
 - search matcher → `../../../packages/core/src/search`
 
-Upgrade path: `git merge v1.18.x`. That only works if the trees stay related.
+Source-intake path: `git merge v1.18.x`. That works because the Git trees stay
+related; it does **not** require local product/API/plugin compatibility.
 
-You said you want to stay "relatively in-line" and "not an independent fork but a branch-fork." That sentence forbids the OpenChamber architecture even though their *slimness* is what you like.
+The historical phrase "not an independent fork but a branch-fork" referred to
+preserving mergeable Git ancestry. It no longer defines product compatibility.
+OpenFork is product-independent while deliberately retaining a branch-fork source
+relationship.
 
 ## 2. The real problem you are solving
 

@@ -1,4 +1,4 @@
-# OpenCode Desktop — Build, Runtime Map (Bun vs Node) & V1/V2 Reality
+# OpenFork Desktop — Build, Runtime Map (Bun vs Node) & V1/V2 Reality
 
 > Authoritative reference for the patched working tree. Fact-checked against the repo at
 > branch `api-keys-tab-menu` (2026-08-13). Every claim below was verified by reading the
@@ -97,23 +97,50 @@ source runs under **two different JavaScript runtimes**, selected by where it ex
    through the preload `window.api` surface (contextIsolation:true, nodeIntegration:false,
    sandbox:true — verified `packages/desktop/src/main/windows.ts:199-204`).
 
+7. **OXP has two separate external lifetimes.** Electron main owns the OpenAI
+   Secure MCP Tunnel process/credential/recovery lifecycle, while the sidecar owns
+   the dedicated OXP MCP endpoint and semantic runtime. A healthy tunnel does not
+   imply that a ChatGPT parent can still call OXP: parent tool access is modeled as
+   a separate, non-renewing observed 25-minute epoch per ChatGPT
+   parent session. Calls do not extend that epoch. At the first call at/after 20
+   minutes, the sidecar response boundary should advise durable worker handoff;
+   after 25 minutes, the next successful call begins a new observed epoch. See
+   [OXP parent-tool epoch and durable continuation](./oxp-parent-tool-epoch.md).
+
 ---
 
 ## 1. The V1/V2 reality (read this second)
 
-OpenCode Desktop is a **deliberate mix of V1 and V2 libraries and surfaces**. There is no
-consistency. Key facts, each verified:
+OpenFork's inherited desktop tree is a **deliberate mix of V1 and V2 libraries and
+surfaces**. This describes implementation ancestry, not an OpenCode compatibility
+promise. Key facts, each verified:
 
-### 1.1 The Desktop app still uses the V1 API; V2 is opt-in
+### 1.1 Runtime/API generation and UI generation are different
+
+The desktop's local execution/API strategy can remain V1-oriented while its
+presentation is V2/new-layout-first. Do not infer UI direction from server protocol
+selection.
 
 - `packages/app/src/utils/server-protocol.ts` (`detectServerProtocol`): probes
   `/global/health`; the legacy `{healthy:true}` shape resolves `"v1"`, otherwise probes the
   V2 surface. `ServerProtocol = "v1" | "v2"`.
 - `packages/app/src/utils/server-compat.ts`: `createV1Api(input)` is built unconditionally
   (line 87); the effective API is `protocol === "v1" ? v1 : input.current` (line 89).
-  **V1 is the default compatibility surface; V2 only when the server declares it.**
+  **V1 is the default OpenFork local client/server surface; V2 is used only where
+  the retained implementation explicitly selects it.**
 - Desktop sidecar defaults to V1: `SIDECAR_VERSION = OPENCODE_SIDECAR_V2 === "1" ? "v2" : "v1"`
   (verified `packages/desktop/src/main/index.ts:67`).
+
+For presentation, the opposite generation choice is intentional:
+
+- `newLayoutDesignsDefault = true`;
+- the legacy interface sunset is September 14, 2026 and retirement forces the new
+  layout on;
+- desktop/web routes use `NewAppLayout` when the new layout is active;
+- primary product surfaces include V2/new-layout settings, composer, project
+  explorer, browser, terminal/file presentation, and session actions.
+
+So **V1-first runtime/API does not mean V1-first UI**.
 
 ### 1.2 Two permission engines, different event names
 
@@ -214,8 +241,8 @@ bun run build
 bun run package:win
 ```
 
-- **`OPENCODE_CHANNEL='prod'` is REQUIRED.** Default `dev` builds a separate "OpenCode Dev"
-  app. Prod installs to `%LOCALAPPDATA%\Programs\OpenCode` and produces `OpenCode.exe`.
+- **`OPENCODE_CHANNEL='prod'` is REQUIRED.** Default `dev` builds a separate "OpenFork Dev"
+  app. Prod installs to `%LOCALAPPDATA%\Programs\OpenFork` and produces `OpenFork.exe`.
 - `bun run build` runs `prebuild` first (`bun ./scripts/prebuild.ts`) which runs
   `cd ../opencode && bun script/build-node.ts` — regenerating `dist/node/node.js` (the
   sidecar bundle) — then electron-vite bundles main/sidecar/renderer. The sidecar imports
@@ -229,13 +256,13 @@ bun run package:win
 ### 2.4 Output
 
 ```text
-packages/desktop/dist/opencode-desktop-win-x64.exe   (~124-130 MB)
+packages/desktop/dist/openfork-desktop-win-x64.exe   (~124-130 MB)
 ```
 
 - **Do NOT run the installer yourself.** Silent install (`/S`) can terminate the running
-  OpenCode/chat process. Hand the `.exe` to the user.
-- Verify: size, timestamp, SHA-256, and that `win-unpacked/OpenCode.exe` (prod) exists
-  rather than `OpenCode Dev.exe`.
+  OpenFork/chat process. Hand the `.exe` to the user.
+- Verify: size, timestamp, SHA-256, and that `win-unpacked/OpenFork.exe` (prod) exists
+  rather than `OpenFork Dev.exe`.
 
 ### 2.5 Rebuild discipline
 
@@ -252,7 +279,7 @@ packages/desktop/dist/opencode-desktop-win-x64.exe   (~124-130 MB)
 ```text
 Electron main + renderer (packages/desktop)
        ↕ authenticated local HTTP (Basic auth, random per-launch password)
-OpenCode agent sidecar (virtual:opencode-server = ../opencode/dist/node/node.js)
+OpenFork agent sidecar (virtual:opencode-server = ../opencode/dist/node/node.js)
 ```
 
 - Sidecar spawn: `packages/desktop/src/main/server.ts` (`utilityProcess.fork(sidecar.js)`
@@ -357,5 +384,5 @@ bun ./script/build.ts   # src/gen (v1) + src/v2/gen (v2) from openapi.json
 5. Typecheck from package dirs; distinguish pre-existing noise (chunk-sealer.ts, i18n
    parity) from your breakage.
 6. Build: `$env:OPENCODE_CHANNEL='prod'` + `bun run build` + `bun run package:win` in ONE
-   shell; verify `win-unpacked/OpenCode.exe` (prod).
+   shell; verify `win-unpacked/OpenFork.exe` (prod).
 7. Hand the exe to the user; never run the installer.

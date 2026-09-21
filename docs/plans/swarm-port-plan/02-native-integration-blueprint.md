@@ -1,7 +1,11 @@
 # 02 — Native Integration Blueprint: where swarms live in the opencode monorepo
 
 **Author:** architect (native core architect)
-**Status:** DRAFT v1 — planning only, no code written
+**Status:** HISTORICAL DRAFT — superseded by
+`00-first-party-overhaul-2026-09-18.md`; concurrency/runtime details are further
+superseded by `09-concurrency-handoff-protocol.md`. Do not implement schema,
+polling, event, permission, or lease mechanics from this file when they conflict
+with those sources.
 **Inputs:** openswarm plugin source (`C:\Users\slooshied\Documents\openswarm`, 14 modules under `src/`), host repo survey (`C:\Users\slooshied\WebstormProjects\opencode`), binding doctrine in root `../../handoff/AGENTS.md` + `../../../packages/opencode/AGENTS.md` + `../../../packages/schema/AGENTS.md`.
 **Peer inputs pending:** scout's hack inventory (`01-plugin-capability-map.md`) for §6 cross-check; api-designer owns final wire contracts (§5 marks the seam).
 
@@ -177,7 +181,13 @@ Event-loop contention mitigation (see §8): bounded, jittered sweeps; no unbound
 | **A. Host drizzle store (chosen)** | 11 `swarm_*` tables in `packages/core/src/swarm.sql.ts`, migrations applied by core, `project_id` scoping like other tables | One connection/lock regime; transactions can span session+swarm state; one migration system; multi-project scoping solved by existing columns; backup/restore is one file | Swarm growth shares DB budget with everything else (WAL + short writes make this fine at swarm scale) | ✅ |
 | B. Dedicated DB (status quo) | Keep `.opencode/swarms/swarms.db` | Blast-radius isolation; portable | Two drivers, two lock regimes, no cross joins (member↔session integrity enforced by app code — the exact bug class openswarm fights with ownership guards), two migration stories, discovery/scoping hacks | ❌ |
 
-Table set (carried over from openswarm's proven schema, STORAGE.md §2): `swarm`, `swarm_member` (+ `human_chat_at`), `swarm_task` (+ lease columns), `swarm_task_dependency`, `swarm_message`, `swarm_blackboard`, `swarm_path_claim`, `swarm_artifact_annotation`, `swarm_belief`, `swarm_subscription`, `swarm_event`. Column style per root AGENTS.md (snake_case, no string-renamed fields). Invariants worth keeping verbatim: partial UNIQUE for active path claims, CAS guards on blackboard/task-claim/message-claim, terminal-state guards, cascade deletes scoped by `project_id` + `swarm_id`.
+Historical candidate table set (not authoritative): `swarm`, `swarm_member`,
+`swarm_task`, `swarm_task_dependency`, `swarm_message`, `swarm_blackboard`,
+`swarm_path_claim`, `swarm_artifact_annotation`, `swarm_belief`,
+`swarm_subscription`, `swarm_event`. The authoritative overhaul deliberately
+removes several of these mirrors/mechanisms, including per-member
+`human_chat_at` and a duplicate `swarm_event` history table. Preserve only the
+behavioral invariants from this draft; use the later source-of-truth schemas.
 
 **Migration story for existing `.opencode/swarms/swarms.db`:** one-time, read-only importer (new module `packages/opencode/src/swarm/migrate-legacy.ts`). Reads the legacy DB (its `user_version` chain ≤7 is documented and stable), maps workspace dir → host project id, inserts rows into native tables, records imported-at marker, leaves the legacy file untouched (rollback = delete native rows). Runs lazily on first swarm-service init per project, or via an explicit CLI/API verb. Legacy child-session members import as-is; they keep working (all machinery is session-id keyed) and re-root naturally on next respawn — same passive-migration stance openswarm chose (ROOT_MEMBER_SESSIONS_PLAN §5.10).
 

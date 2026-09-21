@@ -1,6 +1,11 @@
 # 00 — Index & Decision Log
 
 > **STATUS: COMPLETE** — 2026-08-22. Facts verified against this working tree on branch `openfork` @ `a747d51764`, `gh` identity `thelabcorner`, and OpenChamber's public repo.
+>
+> **SUPERSEDED PRODUCT INTERPRETATION:** the Git decisions in this plan remain useful,
+> but "branch-fork" now means source ancestry/tag-sync only. OpenFork is an
+> independent product and does not promise OpenCode local API/plugin compatibility.
+> See `../../architecture/compatibility-boundary.md`.
 
 ## One-sentence brief
 
@@ -26,16 +31,16 @@ Recommended answers. Change them here; every other file assumes these.
 
 | ID | Decision | Recommendation | Why |
 |---|---|---|---|
-| D1 | Product shape | **Branch-fork of OpenCode Desktop**, not an OpenChamber-style rewrite | Fork features live *inside* `../../../packages/app`, `../../../packages/opencode`, `../../../packages/desktop`. Rewriting the UI would throw away the product. |
+| D1 | Product/source shape | **Independent OpenFork product implemented as a branch-fork of OpenCode Desktop**, not an OpenChamber-style wrapper | Fork features live *inside* `../../../packages/app`, `../../../packages/opencode`, `../../../packages/desktop`. Shared Git history is a source-sync mechanism, not a compatibility promise. |
 | D2 | GitHub shape | **New empty repo** `thelabcorner/openfork`. Do **not** press GitHub's Fork button. | Different name, no accidental PRs to anomalyco, we already have the history locally. Keep `anomalyco/opencode` as `upstream`. |
 | D3 | Default branch | `main` = today's `openfork` line | Personal repo convention. Document that `upstream/dev` and tags are sync sources, not the default branch. |
-| D4 | History | **Keep full history.** No `git filter-repo`. No orphan branch. | Filter-repo makes every future upstream merge a rewrite. That is how independent forks are born by accident. |
+| D4 | History | **Keep full history.** No `git filter-repo`. No orphan branch. | Filter-repo makes every future upstream merge a rewrite. OpenFork is already product-independent; preserving history is about retaining a practical merge-base for selective upstream source intake. |
 | D5 | How clutter dies | **Delete unused trees from `main`.** Keep history (no filter-repo). After every tag merge, run `../../../script/fork-prune.ts` and resolve DROP-path conflicts as delete. | You do not want console/web/sst in the repo. Scorched-earth history rewrite would kill merges. Prune-after-merge is the only way to have both. |
 | D6 | TUI | **Do not maintain TUI.** Inline the 3 sidecar util re-exports into `../../../packages/opencode`, then `git rm packages/tui`. Leave `../../../packages/opencode/src/cli/tui` in place (same package as the sidecar — stripping it is scorched earth). | Desktop never runs the terminal UI. Only three tiny util files are on the sidecar graph. |
 | D7 | Sync cadence | Keep **tag merges** (`v1.18.x`) as the default. Cherry-pick individual PRs only when a fix is needed before the next tag. | This is already how the last two syncs worked. Floating `origin/dev` is stale and noisy. |
 | D8 | Conflict doctrine | **Union, not ours/theirs.** Path ownership map in `drafts/FORK.md`. | The v1.18.21 merge already did this (websearch engines ∪ opencode-go check). Blind `-X ours` would drop upstream security/provider fixes. |
 | D9 | Branding / updater | Distinct product name `OpenFork`. Disable or retarget `electron-updater`. Distinct channel DB (already `opencode-openfork.db`). | Shipping with anomalyco's updater installs official OpenCode over the fork. |
-| D10 | Agent docs | Replace root `../../handoff/AGENTS.md` with the fork guide. Add `../../../.opencode/skills/upstream-sync`. Keep upstream style/API rules. | Agents currently have no sync doctrine. The two merge commits are the only source. |
+| D10 | Agent docs | Replace root `../../handoff/AGENTS.md` with the fork guide. Add `../../../.opencode/skills/upstream-sync`. Reuse useful upstream engineering/style rules, but do **not** inherit local API/plugin compatibility requirements. | Agents currently have no sync doctrine. The two merge commits are the only source. |
 | D11 | First push contents | Commit all wanted fork work first. Do **not** push swarm DBs, CDP logs, vendor tgz, sample DBs, or `_archivetest`. | Isolation from a dirty tree silently drops quota and publishes junk. |
 
 ## What OpenChamber taught us (and what it did not)

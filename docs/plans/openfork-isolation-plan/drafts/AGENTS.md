@@ -1,6 +1,9 @@
 # OpenFork
 
-This repository is **OpenFork**: a branch-fork of [OpenCode](https://github.com/anomalyco/opencode) Desktop. It is not an independent product and it is not OpenChamber.
+This repository is **OpenFork**: an independent product implemented as a
+branch-fork of [OpenCode](https://github.com/anomalyco/opencode) Desktop. The
+branch-fork relationship is a Git/source-sync strategy, not a local compatibility
+promise. OpenFork is not an OpenChamber-style wrapper.
 
 - Default branch: `main`
 - Upstream: `upstream` → `https://github.com/anomalyco/opencode.git`

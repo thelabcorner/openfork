@@ -55,7 +55,7 @@ Default sidecar is **V1 Node**. `OPENCODE_SIDECAR_V2=1` is opt-in and needs the 
 | `.husky` oxlint prettier | Quality |
 | `../../../script/sign-windows.ps1` | Windows packaging |
 | `../../../script/translate-app.ts` | i18n |
-| `../../desktop-build-and-architecture.md` | Useful; most other `../..` is design notes |
+| `../../architecture/desktop-build-and-architecture.md` | Useful; most other `../..` is design notes |
 
 ## DROP FROM `main` — `git rm` these (history keeps them)
 

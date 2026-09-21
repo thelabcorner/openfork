@@ -4,7 +4,7 @@ Status: DESIGN ONLY — ideation for the swarm's tab-stop-pause effort. No code 
 Scope: project-related actions in the session tab's right-click context menu
 (`packages/app/src/components/titlebar-tab-context-menu.tsx`, currently CLOSE-ONLY).
 Companion designs: uxsmith t4 (Stop/Pause/Resume items + inline tab button, deliverable/t4),
-retitler t6 (Regenerate session title — LANDED, docs/swarm-session-retitle.md §5.1 adopts the
+retitler t6 (Regenerate session title — LANDED, docs/plans/swarm/swarm-session-retitle.md §5.1 adopts the
 4-group layout below). The full-menu layout below assumes t4's session-state group and a title
 group from t6; the coordination contract is confirmed on all sides — see §4 and §9.
 
@@ -249,7 +249,7 @@ All new keys added to en.ts AND every locale (parity test packages/app/src/i18n/
 3. **P2 toast description**: show the full path as the toast description (session-header
    precedent) — confirm it isn't noisy for long paths; alternative is title-only "Copied".
 4. **retitler coordination**: RESOLVED — retitler adopted the exact 4-group ordering in
-   docs/swarm-session-retitle.md §5.1: [t4 Stop/Pause/Resume] → [Regenerate title] →
+   docs/plans/swarm/swarm-session-retitle.md §5.1: [t4 Stop/Pause/Resume] → [Regenerate title] →
    [P1/P2/P3 project actions] → divider → [existing Close group]; no icons, no keybinds
    for the retitle item (palette command only).
 
@@ -317,7 +317,7 @@ client-side — promote the queued-badge read (`SessionInput.hasPending`-style) 
 store in slice 3; the badge overlay and this rule share it. **Interim fallback if the badge
 slice lands late:** keep `!working` in the menu, keep palette `pause` always-available,
 flip to the R6 rule with the badge slice. (Amended in stop-pause doc §4.1 R6 +
-docs/swarm-cross-doc-review.md §8.5.)
+docs/plans/swarm/swarm-cross-doc-review.md §8.5.)
 
 Retitle item: enabled in ALL session states (runs while paused — retitler Q6 signed off;
 never touches the state group's disabled flags), disabled only while pending.

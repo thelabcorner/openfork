@@ -2,9 +2,21 @@
 
 Investigation date: 2026-08-22. Planning only — no repo created, no remotes changed, no history rewritten.
 
-**Goal:** move the local `openfork` branch into `https://github.com/thelabcorner/openfork`, leave only desktop + sidecar on `main`, and stay a **branch-fork** of `anomalyco/opencode` (tag merge + prune, not an independent product).
+> **Current-policy note:** this historical isolation plan predates OpenFork's
+> explicit independent-product compatibility doctrine. "Branch-fork" below refers
+> to Git ancestry and tag-sync mechanics only. It does **not** mean OpenFork is an
+> OpenCode-compatible distribution. See
+> `../../architecture/compatibility-boundary.md`.
 
-**Non-goal:** become OpenChamber. OpenChamber is a separate UI that consumes OpenCode as a black box. This fork *is* OpenCode Desktop with patches. That difference decides every git decision in this folder.
+**Goal:** move the local `openfork` branch into
+`https://github.com/thelabcorner/openfork`, leave only desktop + sidecar on
+`main`, and preserve a **branch-fork** relationship with `anomalyco/opencode`
+for source acquisition (tag merge + prune).
+
+**Product distinction:** OpenChamber is a compatibility-oriented wrapper around
+OpenCode. OpenFork is a source-level fork that owns and changes its local runtime,
+APIs, plugins, UI, and features. The two products may borrow ideas from each other,
+but OpenFork is not required to remain locally compatible with OpenCode.
 
 ## Reading order
 

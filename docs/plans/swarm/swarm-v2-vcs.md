@@ -4,9 +4,9 @@
 refs are from the working tree (branch `openfork`) at time of writing and were re-verified
 after the store reset.
 **Author:** coremith (t8) — backend design for the 'Open repository' tab context-menu action
-(pathfinder's P3, docs/swarm-tab-project-actions.md §6/§9).
-**Inputs:** docs/swarm-tab-project-actions.md (pathfinder §1-§9, uxsmith §10), source refs below.
-**Companion:** critic's t7 cross-doc review (docs/swarm-cross-doc-review.md) ruled this plan
+(pathfinder's P3, docs/plans/swarm/swarm-tab-project-actions.md §6/§9).
+**Inputs:** docs/plans/swarm/swarm-tab-project-actions.md (pathfinder §1-§9, uxsmith §10), source refs below.
+**Companion:** critic's t7 cross-doc review (docs/plans/swarm/swarm-cross-doc-review.md) ruled this plan
 consistent with the V1-first contract — no corrections needed.
 
 ---

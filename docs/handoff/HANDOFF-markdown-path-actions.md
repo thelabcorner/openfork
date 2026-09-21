@@ -2,7 +2,7 @@
 
 ## Status
 
-**Resolved in source and verified through the full deterministic path chain.**
+**Resolved in source and verified through the full deterministic path chain, including the 2026-09-18 abbreviated-path regression.**
 
 The original `sink_ab.mjs` exemplar from the earlier handoff no longer exists anywhere
 under `/webstormprojects`, and `lane4-scratch` is also gone, so that exact historical
@@ -14,6 +14,27 @@ because of aliases, symlinks, worktrees, or compatibility routing.
 The fix makes `/find/search` return one authoritative `base` for the page, uses that base
 for markdown path actions, probes candidate existence before reveal/open, and preserves
 old-server/old-desktop fallbacks.
+
+### 2026-09-18 addendum — human-abbreviated absolute paths
+
+Fresh runtime evidence exposed one case the original closeout did not cover. Assistant
+prose can intentionally shorten a long path with a whole `...` or `…` segment, e.g.
+`C:\Users\slooshied\WebstormProjects\presGEN_v2\third_party_modules\forgeprint\...\forgeprint-output\iter00-baseline`
+or `E:\...\bigfootSalesForm\forgeprint-output\verify\report.html`. The previous
+absolute-path fast path treated that omission marker as a real directory and sent the
+literal path to the desktop filesystem, producing a false `File not found`.
+
+The corrected ownership model is: written target -> session workspace identity ->
+canonical `/find/search` base + bounded file-index candidates -> native existence probe.
+Concrete absolute paths still bypass search. Only paths containing a whole omission
+segment enter abbreviation resolution. An abbreviated absolute prefix is accepted only
+when it matches the current workspace root; omissions inside the workspace are expanded
+against bounded index results. The implementation never recursively crawls a drive or
+home directory and never emits a literal omission segment to `stat`/Open/Reveal.
+
+The abbreviated search page is capped at 128 candidates while ordinary path actions keep
+the historical 50-result page. This is interaction-only work: no new timeline scan,
+observer, subscription, backend route, or background filesystem activity was added.
 
 ## What the feature does
 
@@ -66,7 +87,9 @@ Changed:
 3. **Resolution returns ranked candidates, not one path.** `pathCandidates()` now prefers
    an explicit relative subpath joined to the server-authoritative search `base`, then
    ranked index hits under that same base, then the client-directory literal fallback.
-   Absolute mentions remain direct. The toolbar probes with `platform.pathExists` and
+    Concrete absolute mentions remain direct. Abbreviated absolute mentions route through
+    the session resolver and are re-rooted only when the canonical workspace satisfies the
+    visible path pattern. The toolbar probes with `platform.pathExists` and
    uses the first existing candidate. Older desktop builds without the probe still use
    the first ranked candidate.
 
@@ -135,6 +158,16 @@ is both more canonical and substantially smaller on the wire.
 - The desktop process was not restarted during this work. Source-level desktop IPC
   behavior is compiled/audited, while live manual click-through requires the normal next
   desktop launch to load changed main/preload code.
+- 2026-09-18 abbreviation addendum verification: app-focused path suite **69 pass / 0
+  fail**, session-ui classifier **3 pass / 0 fail**, targeted Playwright regression **1
+  pass in 5.1s**, session-ui typecheck **PASS**, app production build **PASS** (4965
+  modules, ~1m11s). Current app-wide typecheck remains blocked by unrelated dirty-tree
+  diagnostics in `context-history`, `context-ledger`, `context/sdk.tsx`,
+  `server-session.test.ts`, and `session-message.test.ts`.
+- Final interaction microbench (5 samples, median): concrete absolute fast path **0.386
+  µs/op**; 50-candidate abbreviation ranking **104.28 µs/op**; full 128-candidate bound
+  **254.857 µs/op**. The added work is therefore sub-millisecond even at the hard search
+  bound and is paid only after an explicit filesystem action.
 
 ## Unrelated work in the same working tree
 

@@ -4,6 +4,13 @@ Status: architecture/research phase
 
 Date opened: 2026-09-18
 
+Normative credential/authentication correction (2026-09-20):
+`docs/specs/oxp-upstream-auth-boundary.md` is the implementation source of truth
+for the ChatGPT-parent authentication/credential tranche. It supersedes any later
+section of this plan that models the upstream pre-invocation problem as a generic
+OpenFork credential tool, credential broker/registry, credential-manager UI, or
+generic credential-bound HTTP subsystem.
+
 Primary objective: make OpenFork the first-party **local support substrate for already-running ChatGPT-side agents**. An OpenFork installation should replace the standalone localMCP-chat client while preserving LocalMCP's mature tunnel/security/tool behavior and adding direct access to OpenFork-native capabilities, supervision of existing OpenFork agents, and delegation into new OpenFork subagent Sessions.
 
 **OXP = OpenAI Exchange Protocol.** OXP is the OpenFork-defined first-party exchange surface purpose-built for ChatGPT/OpenAI Secure MCP Tunnel connectivity. It is not an OpenAI-authored public standard, and it is not an MCP-to-ACP translator.
@@ -17,6 +24,15 @@ ChatGPT remains the upper-level external agent and retains its own conversation/
 1. **Augmentation** — directly use OXP-safe OpenFork/local capabilities.
 2. **Supervision** — inspect and control authorized existing OpenFork Sessions and their requests/state.
 3. **Delegation** — create and supervise new OpenFork worker/subagent Sessions.
+
+There is also one orthogonal **transport-liveness concern**: the ChatGPT parent
+has an observed, non-renewing 25-minute OXP tool epoch. Calls inside
+that epoch do not extend it. OXP tracks the epoch per stable parent-session
+identity, appends a durable-handoff reminder on the first call at/after 20 minutes,
+and treats any successful post-25-minute call as evidence of a newly reopened
+epoch. This is **not a fourth authority plane**. Delegation into a durable native
+worker is the continuity mechanism. The durable contract is
+`docs/architecture/oxp-parent-tool-epoch.md`.
 
 OXP is structurally modeled after ACP only at the adapter/lifecycle boundary. MCP is the ChatGPT-facing wire protocol; OXP is the OpenFork semantic/product contract for augmenting, supervising, and delegating on behalf of an external agent.
 
@@ -63,6 +79,7 @@ Read before implementation:
 - docs/map/architecture.md
 - docs/map/surfaces.md
 - docs/map/v1-v2.md
+- docs/architecture/oxp-parent-tool-epoch.md
 - docs/handoff/ARCHITECTURE-OWNERSHIP-PLAYBOOK.md
 - packages/opencode/src/acp/**
 - packages/opencode/src/tool/registry.ts
@@ -218,11 +235,22 @@ OXP's root semantic state is therefore:
       + invocation/provenance lineage
       + explicit durable handles
 
+plus a separate process-local transport observation:
+
+    parent tool epoch
+      + stable external parent-session correlation key
+      + epochObservedAt
+      + lastCallAt / callCount
+      + handoff-reminder state
+
 not:
 
     current backing OpenFork session
 
 OpenFork Sessions are one resource domain OXP can address. They are not the container that gives OXP meaning.
+
+The parent tool epoch is advisory liveness state only. It does not grant,
+attenuate, or revoke authority and must never become durable correctness state.
 
 ### 2.3 OXP has three simultaneous roles
 
@@ -242,6 +270,35 @@ OXP should explicitly support three modes without conflating them:
    - OXP preserves explicit model policy, provenance, authorization lineage, cancellation, and durable worker handles.
 
 This is broader than ACP's normal initiating-client role without making OXP a replacement for ACP. ACP remains the correct first-party surface when an IDE wants **OpenFork itself to be the agent**. OXP is the correct surface when an external agent wants **OpenFork to augment and orchestrate its work**.
+
+### 2.3.1 Parent-tool continuity is orthogonal to the three planes
+
+Augmentation, supervision, and delegation classify **what the external principal
+is doing**. Parent-tool epochs classify **whether the ChatGPT parent is still able
+to call OXP in the current host window**.
+
+The two axes must not be conflated:
+
+- an epoch tracker never grants permission;
+- tunnel connectivity does not prove parent-tool availability;
+- another OXP call inside the epoch does not renew the deadline;
+- a tunnel reconnect does not begin a new parent epoch;
+- worker Sessions do not share the parent epoch lifetime;
+- a durable worker can continue after the parent loses all OXP calls.
+
+The canonical observed state machine is:
+
+    first observed call
+      -> epochObservedAt = now
+      -> calls update lastCallAt/callCount only
+      -> first call at/after +20m gets handoff reminder
+      -> +25m old observed epoch is dead
+      -> next successful call begins a new epoch
+
+The first-call anchor is intentionally conservative: it may occur after ChatGPT
+actually opened the host tool window. If installed evidence later proves that a
+stable parent-correlated `initialize` or `tools/list` event is emitted earlier,
+that event may become the anchor. Do not infer renewal from ordinary calls.
 
 ### 2.4 Session topology consequence
 
@@ -598,6 +655,44 @@ Owns the state machine:
 
 Preserve proven standalone rules: one recovery owner per tunnel, distinguish auth/config failure from network outage, do not kill a healthy tunnel on one missed probe, explicitly own child process trees, make teardown convergent, and push status rather than making each UI consumer poll.
 
+Tunnel health is deliberately separate from ChatGPT parent-tool liveness. A
+healthy connected tunnel may remain up while the parent session's approximately
+25-minute OXP tool epoch has expired. Tunnel keepalive, reconnect, progress
+notifications, or schema refreshes must never be treated as renewing that epoch.
+
+### 6.7 OxpParentToolEpochTracker
+
+Owns process-local per-parent continuity observations at the OXP MCP boundary.
+
+Required state:
+
+    parentSessionRef
+    epoch
+    epochObservedAt
+    lastCallAt
+    callCount
+    handoffReminderDelivered
+    optional workerIDs advisory set
+
+Rules:
+
+- the key is a proven stable ChatGPT parent-session identity, not tunnel,
+  connection, transport, request, connector, or native Session identity;
+- calls inside an epoch never move `epochObservedAt`;
+- the first normal response at/after 20 minutes receives the durable-handoff
+  reminder;
+- at 25 minutes the observed epoch is considered dead;
+- the next successful call for that parent begins a new epoch and resets reminder
+  state;
+- evaluation is request-driven; there is no periodic epoch timer;
+- the tracker is advisory only and must remain safe to lose on sidecar restart;
+- response decoration belongs at the common OXP server/result boundary, not in
+  individual filesystem/Git/process/Session/domain owners.
+
+The reminder directs substantial unfinished work into `openfork_worker start`
+and explicitly warns against consuming the remaining parent window by repeatedly
+polling `wait`.
+
 ---
 
 ## 7. Capability disposition matrix
@@ -664,7 +759,7 @@ Preserve and re-evaluate the current action inventory:
 
 - **info/discovery**: status, capabilities, providers, models, agents, limits, usage;
 - **session supervision**: list, get, messages, children, selection, set_selection, send/turn where explicitly authorized, pause, resume, abort, background_subagents;
-- **worker delegation**: model_policy, set_default_model, clear_default_model, start/list/get/wait/result/continue/cancel, grouped worker operations;
+- **worker delegation**: model_policy, set_default_model, clear_default_model, start/list/get/wait/result/continue/cancel, grouped worker operations. `set_default_model` / `clear_default_model` are user-directed preference mutations: the external agent may call them when the user explicitly asks, but must never autonomously rewrite the user's default as an optimization decision;
 - **request supervision**: list, reply_permission, answer_question, reject_question.
 
 Same-machine service discovery, OpenFork device pairing, realm routing, and LocalMCP-to-OpenFork HTTP mediation should disappear from this first-party path. Those were necessary between independent applications, not permanent semantic requirements.
@@ -677,12 +772,39 @@ Moving opencode_* to openfork_* is a deliberate model-facing schema break and ma
 
 ## 9. Approved roots and workspace authority
 
-OpenFork knowing that a project exists is not equivalent to ChatGPT being authorized to access it. OXP therefore retains a dedicated approved-root concept.
+OXP retains a dedicated approved-root concept, but OpenFork's **local project
+selector is itself an approval surface**. A user who has already added a local
+folder to OpenFork's project catalog must not be required to approve that same
+folder a second time for OXP. OXP therefore reconciles local project-catalog
+roots into approved roots continuously. Manually approved folders remain a
+supplemental source for locations that are not OpenFork projects.
 
 Required properties:
 
-- user explicitly selects roots;
+- roots have explicit provenance: local-project selection and/or manual OXP approval;
+- the local project catalog is continuously reconciled, not copied once; removing a project revokes its project-derived approval unless an independent manual approval remains;
+- remote/WSL/SSH project catalogs are not projected into the local desktop filesystem boundary;
+- only the canonical desktop-local project scope may mint project-derived roots; a generic localhost connection is not evidence that its filesystem namespace matches the OXP sidecar;
+- native paths are accepted only when already expressed in the OXP execution host's path namespace (for example `E:\\repo` on Windows or `/srv/repo` on POSIX). OXP must never guess or translate cross-OS mount spellings such as `/mnt/e/repo` -> `E:\\repo`;
+- a root already authorized by the OpenFork project selector cannot be added again as a manual OXP root. Manual authority is supplemental for non-project locations, not a way to make project-derived authority silently survive project removal;
 - each root has a stable model-facing alias;
+
+### ChatGPT / MCP descriptor contract
+
+The permanent OXP tool projection is a first-class ChatGPT MCP contract, not a
+minimal compatibility shim. Every direct tool publishes a human-readable title,
+accurate MCP behavior annotations, an explicit no-auth scheme (also mirrored in
+`_meta` for older ChatGPT clients), a structured-output schema, and short ChatGPT
+invocation status text. Native ChatGPT file ingress is declared with
+`_meta["openai/fileParams"]` on the capability broker's top-level `source_file`
+parameter and is accepted only for `file.transfer`.
+
+`content` remains the canonical human/model-readable result. `structuredContent`
+is deliberately compact machine-readable state (`data`, attachments, metadata,
+mutation/error state, and OXP continuity) and must conform to `outputSchema`.
+Do not duplicate the full text result into structured output merely to make it
+visible twice. Capability-specific large schemas remain progressive/lazy rather
+than expanding the permanent ChatGPT manifest.
 - native absolute paths need not cross the MCP boundary;
 - symlink/junction escape is rejected at operation time;
 - removing a root immediately revokes future operations;
@@ -691,6 +813,18 @@ Required properties:
 - Session supervision is allowed only when the durable target Session directory resolves inside an approved root unless the user explicitly enables a separately defined broader supervision policy;
 
 The approved-root layer should answer one question: is this external principal authorized to address this OpenFork location? It should then pass a canonical location to the shared capability owner. It should not become another filesystem implementation.
+
+Project-derived and manual authority may coexist on one canonical root only when
+the manual authority was independently present before that folder became an
+OpenFork project (or equivalent compatible legacy state). While the project
+selector owns a root, a later manual approval/import of that same root is
+rejected/ignored rather than creating a second lifetime for the same user choice.
+If independent manual authority already exists, closing/removing the project
+removes only the project-derived source and the earlier manual approval survives.
+A project-managed root cannot be revoked from the OXP settings list while that
+project remains selected; the project selector owns that source of authority.
+Nested project roots are permitted and native-path resolution chooses the deepest
+matching approved root, while manual-vs-manual overlap remains rejected.
 
 ---
 
@@ -795,6 +929,18 @@ Delegation creates a real native OpenFork worker/subagent Session for work the e
 
 The returned worker handle is an explicit durable object. ChatGPT may wait/result/continue/cancel it independently of the MCP request that created it.
 
+Delegation is also OXP's **continuity boundary**. A parent nearing the end of its
+observed tool epoch should transfer substantial unfinished work into a durable
+worker with a self-contained handoff. Once committed, that worker continues under
+native OpenFork execution ownership even if the ChatGPT parent can no longer issue
+OXP calls. When the user later reopens OXP, the parent can recover the worker by
+handle or durable `list/get/result` discovery and continue supervising it.
+
+The epoch tracker may remember worker IDs only as a response-guidance optimization.
+Durable worker recovery remains owned by native Session metadata/history plus
+SessionExecutionOwner; transport-liveness memory must never become the worker
+source of truth.
+
 ### Preserve strict model authority
 
 ChatGPT may not silently choose a delegated worker model/agent policy the user has not authorized.
@@ -824,6 +970,8 @@ Rules:
 - Model/account catalogs should project account identity and availability as structured fields rather than making account-qualified model IDs the only discovery mechanism.
 - Existing native Session selections that internally store account-qualified IDs must be projected back to `{ providerId, modelId, accountId, variant }` before crossing OXP.
 - `set_default_model`, worker `start`/`continue`, Session `set_selection`, and worker-group defaults/overrides all reuse this one typed selection contract. Batch workers may inherit a group default selection or provide a per-worker override, but account identity may never disappear during that merge.
+- The OXP delegation default is one durable user preference, not a Desktop-only preference and not an agent-owned optimization knob. The user may change/clear it manually in OXP Settings or explicitly instruct the ChatGPT parent to call `set_default_model` / `clear_default_model`. Absent such an explicit user directive, the external agent must not mutate the default on its own.
+- New worker creation resolves model selection as **explicit per-delegation model -> configured OXP default -> fail closed**. Existing worker continuation remains pinned to that worker's durable original model; changing the default does not retarget already-created workers.
 - Persist the user-authorized requested selection on the delegated worker/session domain. Where the provider reports the effective account, retain that effective account separately for audit/status; never rewrite requested explicit account authority after the fact.
 
 ### Nested delegation is separately authorized
@@ -1085,6 +1233,11 @@ Standalone LocalMCP remains available while OpenFork OXP is experimental. Do not
 
 Offer one-way import of non-secret configuration where safe: connector label, approved roots, capability toggles, tunnel kind/ID if treated as non-secret configuration, preferences, and external MCP declarations that map cleanly to OpenFork MCP configuration.
 
+Desktop UX provides both **Auto-import** and **Manual import**. Auto-import
+locates the standalone `localmcp-chat.json` under the platform Electron app-data
+directory; Manual import retains the native file picker for nonstandard or moved
+installations. Both routes feed the same strict parser and import transaction.
+
 Do not assume standalone secrets.bin is portable merely because both applications use Electron. Prefer re-authentication/re-entry unless a separately reviewed migration can prove secure decryption without unintended plaintext exposure.
 
 ### Stage C - connector cutover
@@ -1251,7 +1404,7 @@ This section tracks questions that were open early in the audit and records the 
 | OpenAI Files credential | **Resolved for v1:** dedicated OXP connector/file-exchange secret; never silently reuse an arbitrary provider key. | Sections 14 and 31.16. Explicit future opt-in reuse could be separately designed. |
 | Standalone config importer | **Still open in detail:** one-way non-secret import only. | Exact field compatibility and UX need implementation-time audit; secrets require re-entry unless a separately reviewed migration proves safe. |
 | External MCP resources/prompts | **Still open:** start with tool brokering; resource/prompt projection needs usage-driven schema decision. | Section 30.7. |
-| Browser/computer-use exposure | **Resolved for v1:** unavailable/off by default. | Requires explicit OXP browser grant + separate threat model before exposure. |
+| Browser/computer-use exposure | **Implemented, explicit and default-off:** brokered `browser` capability reuses the native Desktop `BrowserHostBroker`; OXP is an opaque external browser principal, not a fabricated OpenFork Session. | Native Session owners and OXP connector owners are isolated at the browser ownership source. SnapEye project operations additionally require an explicit approved OXP root and carry only the verified canonical directory into the host. Human tab takeover/claim semantics remain owned by the existing browser broker/host. |
 | Goal/scheduled-task exposure | **Deferred:** brokered only after provenance/authority semantics are complete and reviewed. | Do not add direct top-level tools in v1. |
 
 ---
@@ -1389,12 +1542,35 @@ As of 2026-09-18:
 - OpenAI documents Secure MCP Tunnel as the supported path for connecting ChatGPT and other supported OpenAI products to MCP servers on a developer machine/private network without exposing the local server directly to the public internet.
 - ChatGPT custom-app discovery is explicitly refreshed/scanned; server action changes are not something OXP should assume become live inside existing model context automatically. This reinforces a deliberately stable top-level schema.
 - MCP revision 2026-07-28 removed protocol-level initialize/initialized sessions and the Mcp-Session-Id transport session. Request identity/capabilities are carried per request and application state should use explicit model-visible handles when state must span calls.
+- OpenAI documents `_meta["openai/session"]` on tool calls as an anonymized
+  conversation ID specifically for correlating calls within the same ChatGPT
+  session. That is OXP's canonical ChatGPT parent-correlation primitive.
+  `_meta["openai/subject"]` is a separate anonymized user identifier and must
+  not be substituted for conversation identity.
 - The same MCP revision adds stateless multi-round-trip input requests and moves tasks to an extension. OXP should prefer the simplest ChatGPT-supported subset and must not require an optional MCP feature for its core workstation capability path.
+- OpenFork's outbound/native MCP client remains on the monolithic
+  `@modelcontextprotocol/sdk` v1 line (`1.29.0` in the live package), while OXP
+  ingress now independently uses `@modelcontextprotocol/server` v2 and serves
+  MCP `2026-07-28` plus the SDK's stateless legacy fallback. This split is
+  intentional: modernize the ChatGPT-facing boundary without forcing an
+  unrelated outbound-MCP migration.
+- Installed ChatGPT/OXP behavior adds a separate host-liveness constraint: one
+  parent session's OXP tool access is observed as a 25-minute
+  non-renewing epoch. Calls inside that epoch do not extend it; after expiry the
+  user must send another parent message before ChatGPT can call OXP again. This
+  behavior is an OXP product/runtime constraint even though it is not represented
+  by an MCP transport session object.
 
 External references used for this baseline:
 
 - OpenAI Help Center: Developer mode and MCP apps in ChatGPT.
+- OpenAI Plugins reference: client-provided tool-call `_meta` fields
+  (`openai/session` = anonymized conversation ID; `openai/subject` =
+  anonymized user ID).
+- OpenAI Plugins changelog, 2026-01-15: session metadata for tool calls.
 - Model Context Protocol: 2026-07-28 specification release.
+- Model Context Protocol TypeScript SDK roadmap/migration guides: v1.x targets
+  `2025-11-25`; v2 implements `2026-07-28`.
 
 ### 26.2 Architectural consequence: stateless wire, explicit durable OpenFork handles
 
@@ -1416,6 +1592,12 @@ Examples:
 
 Transport connection identity, ChatGPT conversation identity, OpenFork Session identity, and OXP durable object handles are separate concepts.
 
+Parent-tool epoch identity is a fifth distinct concept. It is correlated to the
+stable ChatGPT parent-session identity but is not the conversation itself, not the
+tunnel connection, and not a native OpenFork Session. Its timestamps/call counters
+are advisory process-local state; durable continuity belongs to explicit worker
+handles.
+
 ### 26.3 OXP semantic planes and supporting layers
 
 OXP has exactly three **actor-operation planes**. These are the valid `OxpInvocation.plane` values:
@@ -1427,6 +1609,8 @@ OXP has exactly three **actor-operation planes**. These are the valid `OxpInvoca
 Everything else is a supporting protocol/runtime layer, not a fourth actor plane:
 
 - **Transport** — Streamable HTTP MCP endpoint behavior and OpenAI tunnel compatibility.
+- **Parent-tool continuity** — observed per-parent non-renewing tool epoch,
+  20-minute handoff advisory, 25-minute rollover, and response decoration.
 - **Connector Identity** — stable local connector identity, endpoint secret, config revision, tunnel lifecycle.
 - **Authority** — approved roots plus augmentation, supervision, delegation, integration, and egress policy.
 - **Workspace Addressing** — virtual approved-root aliases and explicit OpenFork location resolution; no implicit cwd.
@@ -1580,7 +1764,12 @@ Standalone LocalMCP already uses the split Model Context Protocol v2 packages:
 
 OpenFork's outbound MCP client currently uses @modelcontextprotocol/sdk 1.29.0.
 
-OXP ingress should initially treat these as independent dependency domains. Port the proven v2 server/node endpoint boundary into the OXP side without forcing an unrelated outbound-MCP migration.
+OXP ingress treats these as independent dependency domains. **Implemented
+2026-09-20:** OXP ingress now uses `@modelcontextprotocol/server` v2's
+`createMcpHandler`, serving MCP `2026-07-28` plus stateless legacy fallback,
+without forcing an unrelated outbound-MCP migration. The dedicated ChatGPT
+descriptor/result contract is maintained in
+`docs/specs/oxp-chatgpt-mcp-contract.md`.
 
 Only converge the MCP dependencies after a separate compatibility/performance audit proves that doing so preserves OpenFork's existing outbound clients/OAuth/resources behavior.
 
@@ -1918,12 +2107,80 @@ Workspace construction is staged:
 2. Tier 2 operations may resolve project/worktree identity if needed.
 3. Tier 3 operations may enter InstanceRef/WorkspaceRef only for the exact duration required by the shared executor.
 
-#### 29.3.1 Scheduled automation ownership decision — 2026-09-19
+#### 29.3.1 Scheduled automation ownership decision — 2026-09-20
 
-`schedule.create` is a Tier-1 durable mutation after OXP has authorized and
-canonicalized an approved target directory. Its persistence path is the existing
-Core `ScheduledTask` writer; it does not create a Session, workspace,
-scheduler, timer, runner, or executor.
+The canonical OXP surface is brokered capability `schedule`. `schedule.create`
+remains a compatibility alias for older clients, but it is no longer the extent
+of the model-facing scheduler contract. The canonical lifecycle actions are:
+
+- `create`, `list`, `get`, `update`, `remove`, and `set_enabled`;
+- `runs`, `inbox`, `unread_count`, and checked `acknowledge`;
+- `run_now`, `preview`, and `agenda`.
+
+Every OXP lifecycle call is admitted through the independent, default-off
+`automation` authority. Every management/read call names one explicit approved
+root. A task/run ID is an identifier, never authority: OXP first proves that the
+task's current canonical `targetDirectory` is contained by the selected root and
+revalidates that root at the read/commit boundary. A task ID belonging to a
+different root therefore fails as unavailable rather than revealing cross-root
+existence.
+
+Persistence remains the existing Core `ScheduledTask` owner. OXP's narrow writer
+materializes only that Tier-0 graph after authorization; it does not manufacture
+`Tool.Context`, a native Session, a workspace runtime, scheduler, timer, runner,
+or executor. `preview` uses the shared recurrence owner without persistence.
+
+Mutation concurrency is fenced by the task revision observed by the caller.
+`update` and `set_enabled` already use Core CAS semantics; model-facing
+`remove`, `run_now`, and `acknowledge` use checked Core variants that validate
+`expectedRevision` in the same SQLite transaction as the mutation.
+`acknowledge` additionally proves the selected run belongs to that exact task.
+This prevents an inspected task from being moved/edited concurrently and then
+mutated under stale root/task assumptions.
+
+Inbox visibility is scoped in the storage query, not filtered only after a
+global limit: OXP derives the task IDs currently visible in the selected root,
+then Core applies those IDs before `LIMIT`/`count(*)`. OXP re-checks current
+root-visible task membership before projecting inbox rows. The normal
+provider-visible `scheduled_task` tool uses the same Core primitives but scopes
+to the durable parent Session's directory tree instead of an OXP root.
+
+The direct `scheduled_task` tool is backward compatible: omitting `action`
+still means `create`. Read-only inspection does not need fresh mutation consent,
+but create/update/remove/enable-disable/run-now/acknowledge require the current
+human turn to explicitly request the operation or confirm the immediately
+preceding proposal. Host/scheduled/subagent turns cannot borrow an older user's
+authorization.
+
+`run_now` remains a Tier-0 durable enqueue. OXP does not instantiate a second
+runner. In Desktop production the ordinary OpenFork server and OXP host live in
+the same utility sidecar process; the one native `ScheduledTaskRunner` installs
+a token-fenced process-local `ScheduledTaskWake` driver. OXP requests that wake
+after the durable enqueue. The database generation epoch plus the runner's
+bounded reconciliation/startup scan remain the authoritative lost-wake/crash
+fallback, so correctness never depends on the ephemeral poke.
+
+The OXP run projection is intentionally narrower than the native run row.
+Automation authority may observe scheduler facts (run/task IDs, logical time,
+trigger/status, scheduler error kind, acknowledgement/attempt/timestamps, and a
+virtualized directory), but it does **not** receive native `sessionID`, `goalID`,
+`workspaceID`, or raw `errorMessage`. Those identities/details belong to other
+authority domains and must not leak merely because scheduling is enabled.
+
+Two backend surfaces remain intentionally outside the model-facing management
+contract:
+
+- `scheduled_task_control` pause/resume is a **global cross-root kill switch**.
+  A root-scoped automation grant or one parent Session is not sufficient
+  authority to pause every task on the installation.
+- session-binding internals (`getBinding`, `clearBinding`, candidate discovery)
+  and `sessionPolicy={kind:"existing"}` can target user-owned native Sessions.
+  Arbitrary Existing-Session binding therefore requires a supervision-aware
+  surface rather than being smuggled through automation authority. Model-facing
+  updates may use scheduler-owned `new`, `reuse`, or `auto` continuity.
+
+Creation itself is a Tier-1 durable mutation after OXP has authorized and
+canonicalized an approved target directory.
 
 Core currently has no cheap durable reverse resolver from an arbitrary canonical
 directory/worktree to a native project ID. `ProjectDirectories` can
@@ -1943,14 +2200,31 @@ bootstrap cost at a Tier-1 boundary.
 
 The canonical native `targetDirectory` is durable internal truth, not
 model-facing output. OXP projects the freshly revalidated approved-root virtual
-path (`/alias/...</BT>) back across the protocol boundary, so schedule
-creation does not become an accidental native-path disclosure channel.
+path (`/alias/...`) back across the protocol boundary, so schedule lifecycle
+operations do not become accidental native-path disclosure channels.
 
 If Core later gains an authoritative bootstrap-free reverse index, OXP may reuse
 that owner and populate `projectID` only on an exact durable match. Until
-then, absence is intentional. Tests must prove the schedule bridge has no
-Project/Instance resolver dependency and that same-name projectless collisions
-fail closed rather than inferring ownership.
+then, absence is intentional. Tests prove the schedule bridge has no
+Project/Instance resolver dependency, same-name projectless collisions fail
+closed rather than inferring ownership, cross-root task IDs do not grant access,
+native run identities/details stay redacted, and run-now wake delivery never
+creates a second scheduler.
+
+Verification closeout on 2026-09-20 after the lifecycle expansion:
+
+- Core Scheduled Task suite: **82/82** passing, plus Scheduled Push ownership
+  **5/5**;
+- OpenFork Scheduled Task architecture/HTTP/executor/runner/end-to-end suite:
+  **58/58**;
+- provider-visible `scheduled_task` adapter: **3/3**;
+- full OXP suite: **244/244**, including broker describe/call dispatch for the
+  canonical `schedule` capability and all authority/composition gates;
+- permanent OXP MCP prefix: **17,539 bytes** against the enforced **17,550-byte**
+  Gate-C threshold (12 direct tools);
+- scoped TypeScript diagnostics contain no changed-code P0/P1 failures; the
+  remaining diagnostics are pre-existing environment/declaration gaps for Bun,
+  WASM imports, `seek-bzip`, and existing `TextDecoder` typing.
 
 ### 29.4 CapabilityAuthority
 
@@ -2350,6 +2624,8 @@ Conceptual schema:
 
 Do not put all long-tail schemas into the result of list.
 
+**Implemented prose ownership invariant (2026-09-20):** model-facing first-party OXP tool/capability descriptions are owned by `packages/opencode/src/oxp/prose.ts`, not independently rewritten at each transport/registry call site. Permanent-tool descriptions and first-party capability summaries are intentionally concise, single-line, decision-useful prose; tests require complete canonical coverage and bounded length. Native-lazy schemas remain absent from the permanent MCP manifest and appear only at `describe`. External MCP prose is normalized separately: list rows are capped at 220 characters, while describe-time prose is capped at 2,000 characters with the exact live input schema. Gate C continues to enforce the permanent-prefix budget rather than trading schema bloat for better copy.
+
 ### 30.6 Initial brokered OpenFork capabilities
 
 Candidates:
@@ -2444,7 +2720,10 @@ Initial actions:
 - batch_cancel;
 - batch_continue.
 
-Use batch_* rather than swarm_* for OXP independent-worker groups. OpenSwarm remains a distinct native coordination system.
+Use batch_* rather than swarm_* for OXP independent-worker groups. **Native
+Swarm** remains a distinct first-party coordination domain. The former OpenSwarm
+plugin is not an OXP or OpenFork runtime dependency; it is historical/migration
+input only.
 
 Every start/continue operation must enforce delegation/nested-delegation policy and user-authorized model/agent policy. Returned handles name subordinate OpenFork objects, not transport sessions.
 
@@ -2580,6 +2859,7 @@ Initial desktop topology:
            |- secret random path
            |- MCP v2 server
            |- OXP authority/catalog/invocation
+           |- per-parent observed tool-epoch tracker
            `- direct OpenFork domain/service access
 
     tunnel-client
@@ -2588,6 +2868,11 @@ Initial desktop topology:
       `- outbound OpenAI Secure MCP Tunnel
 
 Do not add a second heavyweight OpenFork/OXP sidecar process for v1. The existing sidecar already owns the authoritative runtime and has a privileged Electron parentPort channel.
+
+The per-parent epoch tracker belongs beside the OXP MCP server in this sidecar
+because it observes ChatGPT-facing calls and decorates their responses. It does
+not belong in Electron tunnel supervision: the tunnel can remain connected after
+the parent's tool epoch has expired.
 
 ### 31.3 Dedicated OXP loopback listener, not an OpenFork HTTP route
 
@@ -2678,8 +2963,13 @@ Split configuration by semantic owner instead of one monolithic oxp.json.
 
 **Electron safe storage**:
 
-- OpenAI control-plane API key;
-- any dedicated OpenAI Files API credential if OXP file exchange requires one.
+- one OXP OpenAI API key, shared by the Secure MCP Tunnel control plane and
+  OXP-owned OpenAI API capabilities such as Files.
+
+This is one **OXP credential domain**, not an alias for provider/model auth.
+OXP must never infer this key from an OpenAI model-provider account. Conversely,
+Files must not grow a second independently mutable OpenAI key merely because it
+is a different API surface.
 
 This refines section 28: tunnel/lifecycle settings do not belong in the sidecar core OXP config merely because they are non-secret. They belong to the desktop transport owner that consumes them.
 
@@ -2811,21 +3101,61 @@ Preserve:
 
 OXP should use its own secret namespace/file rather than silently adopting OpenFork provider auth storage.
 
-### 31.16 File-transfer secret bridge
+### 31.16 OXP OpenAI credential bridge and cross-machine portability
 
-For v1, prefer a narrow privileged main<->sidecar request for the dedicated OpenAI Files API credential when a file-transfer operation actually needs it.
+Electron main owns exactly one durable OXP OpenAI API key in OS-backed secure
+storage. The tunnel supervisor receives that key only in the explicitly
+allowlisted `CONTROL_PLANE_API_KEY` child environment. The OXP sidecar receives
+the same credential only through the privileged utility-process control channel
+and keeps only an in-memory projection for OXP-owned OpenAI API calls such as
+Files. Renderer code sees only `apiKeyPresent`.
 
-Recommended flow:
+The sidecar remains the file-transfer execution owner: it resolves root
+authority/local file identity, performs the OpenAI request, and enforces stable
+source/atomic publication checks. Electron main must not become a filesystem
+proxy merely because it owns secure storage.
 
-1. OXP sidecar resolves root authority and local file identity itself.
-2. Immediately before remote OpenAI request, sidecar requests the credential from Electron main over privileged utility-process IPC using a request ID and operation purpose.
-3. Main returns the plaintext only to the sidecar process, never renderer; sidecar holds it only for the operation lifetime.
-4. Sidecar performs the network request and local stable-file/atomic-publication checks, so filesystem authority remains in one place.
-5. Credential is never persisted or logged by sidecar.
+Legacy builds may contain `openaiFilesApiKey`. Migration is deterministic:
+`openaiApiKey` wins when both exist; a Files-only legacy value is accepted as
+the canonical OXP key; the next explicit key mutation removes the legacy field.
 
-This is preferable to making Electron main read arbitrary approved local files merely because it owns safeStorage.
+#### Upstream-auth boundary correction — superseded by normative UAB spec
 
-If later security review prefers keeping plaintext completely out of sidecar, replace this with a purpose-built streaming OpenAI request proxy. Do not prebuild that complexity before evidence requires it.
+The credential-indirection/product architecture previously described in this
+section was a design error and is no longer current. The authoritative contract
+for this problem is `docs/specs/oxp-upstream-auth-boundary.md`.
+
+The observed failure occurs before OXP invocation: ChatGPT/OpenAI may reject a
+model-authored operation whose payload performs secret extraction or
+authentication construction. A local generic credential registry, opaque
+`credentialRef` catalog, normal-session credential tool, generic credential-bound
+HTTP adapter, credential-manager UI, or runtime syntax scanner cannot repair a
+tool call the parent never sends. Those surfaces must not be treated as OXP
+architecture.
+
+The retained design is purpose-specific:
+
+- Electron main may securely own the OXP OpenAI API key because the Secure MCP
+  Tunnel and OpenAI Files exchange independently require it.
+- The sidecar may receive that exact purpose-specific key over its privileged
+  control channel and expose only high-level OpenAI-authenticated operations.
+- Model-authored OXP processes do not inherit ambient host/provider secrets by
+  default as an independent least-authority rule; this is not presented as an
+  upstream-admission workaround.
+- Other provider/account authentication remains with its existing owner
+  (including OpenCode Go/Zen) and is not merged into an OXP credential product.
+
+The parent-facing solution is contract design: server instructions, tool prose,
+schemas, and capability descriptions tell the parent to express the intended
+authenticated action through a purpose-specific high-level operation whose
+trusted implementation owns authentication. OXP must not require the model to
+read a stored secret, select a generic credential reference, or construct an
+authentication header. Obfuscation, encoding, command splitting, and similar
+attempts to evade upstream admission are explicitly out of scope.
+
+Historical validation numbers and implementation notes for the removed generic
+credential subsystem are intentionally not retained here as current architecture.
+Use the UAB ledger for cleanup status and regression evidence.
 
 ### 31.17 Renderer/UI boundary
 
@@ -2839,7 +3169,7 @@ Renderer gets only redacted DTOs:
 - redacted OxpGrant projection, including augmentation/supervision/delegation policy;
 - last handshake/request/operation timestamps;
 - bounded per-plane metrics;
-- integration status.
+- integration status;
 
 Renderer never receives:
 
@@ -2889,6 +3219,9 @@ These open questions are resolved for the initial desktop implementation:
 - capability/session execution: sidecar direct domain services;
 - sidecar restart: stop tunnel and reconnect to fresh endpoint generation;
 - no secret OXP endpoint details cross into renderer.
+- ChatGPT parent-tool lifetime: independent process-local OXP server concern;
+  ordinary calls do not renew the observed 25-minute epoch, and tunnel reconnect
+  does not imply epoch renewal.
 
 ---
 
@@ -2926,8 +3259,8 @@ Prefer one optional typed platform capability rather than importing Electron glo
       revealRoot(rootID: string): Promise<boolean>
 
       setTunnelID(value: string): Promise<OxpDesktopState>
-      setTunnelApiKey(value: string): Promise<OxpDesktopState>
-      clearTunnelApiKey(): Promise<OxpDesktopState>
+      setOpenAiApiKey(value: string): Promise<OxpDesktopState>
+      clearOpenAiApiKey(): Promise<OxpDesktopState>
 
       setLifecycle(patch: OxpLifecyclePatch): Promise<OxpDesktopState>
       connect(): Promise<OxpDesktopState>
@@ -2948,7 +3281,7 @@ Expose a dedicated namespace:
       getState, subscribe,
       setEnabled, setGrant,
       addRoot, renameRoot, removeRoot, revealRoot,
-      setTunnelID, setTunnelApiKey, clearTunnelApiKey,
+      setTunnelID, setOpenAiApiKey, clearOpenAiApiKey,
       setLifecycle, connect, disconnect, exportDiagnostics
     }
 
@@ -3431,6 +3764,9 @@ Acceptance:
 - no secret argv/log exposure;
 - secureStorage fallback hardening preserved;
 - sidecar restart converges automatically.
+- connected tunnel status must not be interpreted as proof that the current
+  ChatGPT parent can still invoke OXP; parent-tool epoch liveness is tracked
+  separately at the OXP server boundary.
 
 At this gate OXP becomes usable from ChatGPT for read-only repo work.
 
@@ -3587,6 +3923,37 @@ Acceptance:
 - signed URL/API-key separation;
 - ambiguous upload recovery.
 
+**Gate L implementation/certification (2026-09-20): parent-auth boundary corrected; full installed transfer matrix remains before final Gate-L close.** `OxpFileExchange` remains the authoritative file-exchange owner. ChatGPT-native file ingress stays brokered as `file.transfer`, whose model-visible schema is intentionally limited to `save_chatgpt_file`. Authenticated OpenAI Files list/get/upload/download are projected through the permanent purpose-specific `openai_files` tool so the ChatGPT parent does not express authentication through the generic capability broker. Receive and send remain independent authorities: ingress requires `filesReceive + write`; egress requires `filesSend + read`; filesystem operations are explicitly approved-root/path bound and revalidate authority at network/commit boundaries.
+
+The transfer owner enforces the 512 MiB ceiling, stable regular-file/no-follow checks for egress, exclusive temporary files, no-overwrite semantics, atomic hard-link publication for ingress, and SHA-256/byte-count reporting. ChatGPT-native ingress consumes a structured `source_file` supplied by ChatGPT rather than model-invented IDs, restricts download URLs to HTTPS plus pinned ChatGPT/OpenAI file-delivery hosts, and bounds/revalidates redirects. OpenAI upload uncertainty after invocation begins is fail-closed as `OXP_AMBIGUOUS_EXTERNAL_RESULT`; no automatic retry can duplicate a potentially committed upload.
+
+OpenAI Files API authentication is intentionally **not** inferred from
+provider/model accounts. It uses the same OXP OpenAI API key as Secure MCP
+Tunnel control-plane authentication. Electron main owns that single
+`openaiApiKey` in the existing OS-backed `OxpCredentialStore`; renderer code
+can only set/clear it through trusted IPC and sees only `apiKeyPresent`. Main
+passes the key to tunnel-client through its explicit secret environment and
+projects the same key through the privileged utility-process control channel
+into sidecar process memory for Files. It never enters `oxp.json`, renderer
+persistence, tool schemas, diagnostics, or model-visible state. Settings exposes
+one OXP OpenAI API-key field.
+
+The former generic credential-identity/alias UX proposal is superseded by
+`docs/specs/oxp-upstream-auth-boundary.md`. Authentication-relevant parent
+operations must use purpose-specific semantic tools whose trusted implementation
+already owns authentication; OXP does not expose a general credential registry,
+credentialRef workflow, or credential-manager UI.
+
+Gate L remains **implementation-complete but externally unclosed** for its full
+file-transfer matrix. The installed ChatGPT parent now admits the direct
+`openai_files` metadata-list operation and OXP successfully executes it through
+its purpose-specific OpenAI connection with no model-authored secret handling.
+That closes the upstream-auth admission question for this tranche, but final
+Gate-L closure still requires real installed upload/download exercises in both
+directions, including cancellation, large-file, duplicate-destination, and
+credential-revocation cases; those are intentionally not claimed from the
+metadata-list proof alone.
+
 ### Gate M — standalone replacement tranche
 
 Add tray/start-hidden/launch-at-login/close-to-tray and one-way LocalMCP config migration.
@@ -3599,11 +3966,126 @@ Acceptance:
 - importer never moves plaintext secrets;
 - standalone connector can be disabled after successful OXP verification.
 
+**Gate M implementation/local certification (2026-09-19): complete; current installed replacement proof remains before final close.** Electron main owns the replacement lifecycle: close-to-tray hides ordinary closes behind the global quitting fence; tray Quit crosses that fence; start-hidden is applied before window restoration; Windows/macOS login startup uses Electron's login-item owner; Linux writes the bounded `openfork-oxp.desktop` autostart entry; and explicit application Quit closes admission, drains controller work, proves tunnel retirement, then stops the local OXP endpoint before the outer sidecar owner exits.
+
+Standalone migration is one-way and secret-safe. The legacy parser has a strict documented-field whitelist and refuses unknown fields rather than giving a hand-edited plaintext secret a second lifetime. Migration copies approved roots, mapped grants, a valid OpenAI tunnel ID, and lifecycle preferences only; credentials do not cross. Retirement rewrites only documented autonomous-startup preferences to false and is enabled only after OXP is enabled, its endpoint generation is ready, and a live tunnel handshake has been proven.
+
+Local certification is **65/65 desktop OXP tests** plus **3/3 privileged sidecar-protocol tests**. The dedicated Gate-M boundary suite is **4/4**, and the tunnel-supervisor tests launch a real fake tunnel-client process tree and prove child-tree kill, terminal auth failure, bounded crash recovery, stop-vs-reconnect convergence, stale control-plane/offline projection, and no premature connected state. The repository's existing Windows package also passes `verify:oxp-package`: exactly one pinned tunnel-client `0.0.14` is present outside app.asar with VERSION/LICENSE/NOTICE and SBOM/license evidence, and its `--version` smoke succeeds. That artifact predates the current 2026-09-19 OXP source, so it certifies packaged **tunnel payload contents**, not the current application's end-to-end Gate-M semantics.
+
+Gate M therefore still requires a fresh installed package exercise for launch-at-login + start-hidden, close-to-tray persistence, explicit Quit teardown, and post-migration standalone retirement before the replacement gate is called externally closed.
+
 ### Gate N — closeout
 
 Run packaged soak + performance/security matrix across augmentation, supervision, and delegation.
 
+Parent-tool-epoch survivability is a release blocker, not optional polish. Packaged
+closeout must additionally prove:
+
+- the installed ChatGPT/OpenAI request path exposes or supports a stable
+  parent-session correlation key; if it does not, precise per-parent epoch
+  tracking remains blocked rather than substituting tunnel/connection identity;
+- calls inside one parent epoch do not renew its observed deadline;
+- the first call at/after 20 minutes gets the handoff reminder without corrupting
+  the underlying tool result;
+- unfinished work can be delegated before expiry and continues with **zero**
+  parent OXP availability;
+- the parent can later reopen OXP and rediscover/result/continue that worker;
+- a successful call after the old 25-minute epoch begins a new epoch and clears
+  prior reminder state;
+- multiple ChatGPT parent sessions maintain independent epochs;
+- tunnel reconnect/recovery cannot masquerade as epoch renewal;
+- losing the process-local tracker cannot alter authority or durable worker
+  correctness;
+- no timer/ping/no-op mechanism attempts to keep the ChatGPT window alive.
+
 Do not call OXP a standalone LocalMCP replacement until all replacement blockers pass.
+
+**Gate N local continuity implementation/certification (2026-09-19): complete; installed ChatGPT/packaged soak remains before final close.** The common OXP HTTP/MCP boundary now owns one bounded process-local `OxpParentToolEpochTracker`. It prefers the documented tool-call `_meta["openai/session"]` conversation identifier; a bounded `Mcp-Session-Id` is accepted only as handshake-era/unspecified-protocol compatibility correlation with unknown scope. The correlation policy refuses that fallback for explicitly declared MCP `2026-07-28` or later; the v2 OXP ingress now serves that modern era directly and receives per-request metadata through the SDK handler context. `openai/subject` is never used as conversation identity. Raw values are hashed before tracker storage and HMAC-pseudonymized before durable Core activity state. The tracker holds at most 256 parents, runs no timer, and refuses to infer identity from sockets, tunnel processes, request IDs, connector identity, native Session identity, or user identity. Calls within an observed epoch update activity only; the first call at/after 20 minutes receives the durable-worker handoff notice; the next successful call at/after 25 minutes starts a fresh observed epoch.
+
+The continuity decorator is applied to both success and error results. Worker start/continue/batch-start/batch-continue establish durable-continuation evidence even when the external caller receives a post-commit error whose metadata truthfully says `committed=true`; a pre-commit denial does not. This preserves Gate-J commit truth and prevents the near-expiry advisory from suggesting duplicate delegation after a worker already became durable.
+
+Executable continuity proof now includes **8/8 parent-tool-epoch unit tests**,
+**3/3 Gate-N architecture-boundary tests**, **10/10 OXP server tests**, and the full
+**210/210 OXP regression**. The canonical `openai/session` warm epoch hot path
+measured **~0.0021 ms median / ~0.0051 ms p95** across 10,000 observations in an
+isolated run, well below the provisional sub-millisecond wrapper target. The
+fixed manifest is now measured as the richer ChatGPT contract (titles,
+`outputSchema`, annotations/security metadata, invocation UX, native file
+parameters, and Swarm) rather than against the obsolete pre-contract byte target.
+
+Installed Gate-N blockers remain intentionally explicit. The first item is now
+runtime conformance, not semantic discovery:
+
+- prove the real packaged ChatGPT/OpenAI tunnel forwards the documented
+  `_meta["openai/session"]` value on every relevant OXP tool call, remains stable
+  within one ChatGPT conversation, and differs across distinct conversations.
+  Use the privacy-safe `conversationCorrelatedCalls`,
+  `legacyTransportCorrelatedCalls`, and `unattributedParentCalls` counters to
+  prove which ingress path the package actually exercises without logging the
+  underlying identifiers;
+- exercise a real 20-minute reminder and 25-minute rollover in ChatGPT;
+- delegate near expiry, lose **all** parent OXP access, prove the native worker continues, then reopen OXP from a later user message and recover/result/continue that worker;
+- run the packaged augmentation/supervision/delegation concurrency/security/soak matrix;
+- complete Gate L's installed file-transfer matrix and Gate M's fresh installed lifecycle proof.
+
+### Gate O — delegated-worker defaults and root-scoped agent policy
+
+Expose one durable OXP delegation default model that is usable from both the
+privileged Desktop Settings surface and an explicit user instruction to the
+ChatGPT parent, and make delegated-agent authorization/defaults truthful to the
+workspace that owns the agent catalog.
+
+Acceptance:
+
+- one canonical durable owner: `workerPolicy.defaultModel`; no duplicate
+  Desktop-only or agent-only preference;
+- Settings exposes a real provider/model picker and preserves provider-account
+  identity as first-class `accountID`, never `model@account` persistence;
+- selecting a default is an explicit user authorization of that exact
+  provider/model/account/variant selection and therefore adds it to the
+  user-authorized worker model set when necessary;
+- `openfork_worker model_policy` remains read-only discovery;
+- `set_default_model` and `clear_default_model` remain model-callable so the
+  user can say "change the OXP default model", but the model-facing contract
+  explicitly forbids autonomous default changes without that user directive;
+- explicit `start.model` / per-worker batch model overrides the default;
+- omitted model on new start/batch-start inherits the default;
+- if neither an explicit model nor a default exists, delegation fails closed;
+- changing/clearing the default never mutates an existing worker's durable model;
+  `continue` stays pinned to worker provenance;
+- default mutations revalidate live delegation authority at commit and retain
+  exact provider/account semantics.
+- agent authorization is scoped by approved `rootID`, not one connector-global
+  list that can silently apply an agent name to an unrelated workspace;
+- each approved root may have its own authorized agent set and optional default;
+  delegation resolves **explicit agent -> that root's default -> fail closed**;
+- Settings loads the native agent catalog only after the user explicitly selects
+  one approved root. Merely opening Settings does not materialize every approved
+  workspace or hydrate N agent/provider/plugin catalogs;
+- the native agent catalog is a shared lower owner used by ACP and OXP. OXP
+  reaches it through an unbound Tier-2 port whose V1 adapter enters the exact
+  approved workspace lazily; OXP does not depend on ACP and does not own a second
+  agent-resolution implementation;
+- `agent_catalog`, `set_default_agent`, and `clear_default_agent` remain callable
+  for an explicit user directive, while the permanent model-facing contract
+  forbids autonomous default-model **or default-agent** mutation;
+- legacy connector-global `agents/defaultAgent` policy is migration-compatible:
+  on the first root/policy mutation it is frozen onto roots that already existed.
+  A newly approved root never inherits that old authority implicitly;
+- removing an approved root removes its scoped worker-agent policy, so stale
+  authority cannot survive root revocation.
+
+Gate O is complete only when both the conversational mutation path and the
+Desktop Settings mutation path converge on the same lower config owner and the
+fixed OXP manifest remains within the Gate C prefix budget.
+
+**Gate O local certification (2026-09-19): CLOSED.** There is one durable model-default owner, `workerPolicy.defaultModel`, plus root-scoped worker-agent policy under `workerPolicy.agentRoots[]`. Desktop Settings reaches both through the trusted preload/IPC -> Electron-main controller -> closed sidecar request -> `OxpHost` -> `OxpConfig` path. The model-facing `openfork_worker set_default_model` / `clear_default_model` and `agent_catalog` / `set_default_agent` / `clear_default_agent` actions converge on those same lower owners and remain available for an explicit conversational user directive. The permanent model-facing instructions explicitly prohibit autonomous mutation of either default.
+
+Selecting a default normalizes provider/model/account/variant identity and adds that exact selection to the authorized worker-model set when necessary. New `start` and each `batch_start` member resolve **explicit selection -> default -> fail closed** independently. Existing workers never drift: `continue` remains pinned to the worker's durable origin model even after the default changes or clears. Provider account identity stays first-class; no `model@account` string becomes the OXP contract.
+
+Agent defaults are workspace-owned. The shared `AgentCatalog` lower owner projects native agent identity/description/mode/default semantics; ACP captures `Agent.Service` at its layer boundary and consumes that projection without returning an effect that still leaks the service environment. OXP binds an abstract `OxpAgentCatalog` port to a lazy V1 adapter that enters only the explicitly addressed workspace. This preserves the Tier-2 ownership rule and the disabled/enabled-idle invariant: no implicit workspace is created merely to make OXP or Settings aware that agent catalogs exist.
+
+Certification is **15/15 delegated-worker domain tests**, including root-scoped catalog/default mutation, cross-root fail-closed isolation, conversational set/clear, model-default inheritance, explicit override, per-batch-member resolution, and no-default fail-closed behavior; **13/13 approved-root tests**, including legacy-global-agent freeze and new-root non-inheritance; **5/5 Gate-O architecture-boundary tests**; **6/6 ACP directory/catalog tests**; **65/65 desktop OXP tests**; **3/3 privileged sidecar-protocol tests**; and the full **196/196 OXP suite**. Gate C remains green at **12 tools / 17,344 bytes / 74.12%** of the standalone planning baseline. A scoped TypeScript pass reports **no diagnostics in the Gate-O/AgentCatalog/ACP/OXP files**; the remaining 16 diagnostics are pre-existing/concurrent errors elsewhere in control-plane, Session/SPAD, WASM, and seek-bzip code.
 
 ---
 
@@ -3618,6 +4100,8 @@ Disabled target:
 - 0 OXP listener sockets;
 - 0 tunnel processes;
 - 0 periodic OXP timers;
+- 0 parent-tool-epoch timers; epoch state is evaluated only when an OXP request is
+  observed;
 - 0 workspace Instances;
 - no provider/MCP catalog hydration;
 - no measurable startup regression beyond module-registration noise; target <1 ms median main-thread work attributable to OXP and <1 MiB steady RSS, then tighten with data.
@@ -3636,6 +4120,7 @@ Connected idle target:
 - only the proven bounded health/recovery timers;
 - no renderer polling;
 - no workspace/session polling.
+- no parent-tool-epoch polling or keepalive traffic.
 
 ### 35.2 Call-path budget
 
@@ -3651,6 +4136,8 @@ Benchmark median/p95 over warm runs:
 - no-op denied call;
 - existing-Session supervision list projection;
 - delegated worker start + wait handle path.
+- parent-epoch observation + response-decoration overhead below/above the
+  20-minute threshold.
 
 Record both total wall time and OXP wrapper overhead by instrumenting around the underlying executor.
 
@@ -3683,6 +4170,10 @@ Test:
 - connector disable during each category;
 - root removal during each category;
 - sidecar restart under idle and active calls.
+- independent parent-tool epochs for 1, 3, and 6 concurrent ChatGPT parent
+  sessions;
+- synthetic-clock calls before/after 20-minute reminder and 25-minute rollover;
+- worker handoff near expiry followed by complete parent-tool unavailability.
 
 Track CPU, RSS, event loop delay, SQLite writer occupancy where session operations are involved, and spawned process count.
 
@@ -3695,6 +4186,8 @@ OXP is successful only if unification produces a measurable architectural gain:
 - lower setup/maintenance burden than standalone LocalMCP;
 - equal or stronger root/secret/mutation security;
 - direct augmentation capabilities plus explicit supervision of existing OpenFork Sessions and delegation into subordinate OpenFork workers, with truthful provenance throughout;
+- long-running work survives the finite ChatGPT parent-tool epoch by transferring
+  execution into durable native workers before expiry;
 - near-zero disabled cost;
 - no meaningful latency tax on common direct filesystem operations.
 

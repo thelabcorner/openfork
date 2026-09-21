@@ -154,5 +154,5 @@ adopt the current client API architecture.
 | `extensions/` | Client-side extensions such as the Chrome integration. |
 | `benchmarks/` | Repository-level benchmark harnesses. |
 | `experiments/` | Prototypes and measured experiments that are not production packages. |
-| `.opencode/` | Repository-local OpenCode agents, commands, tools, themes, and config. |
+| `.openfork/` | Repository-local OpenFork agents, commands, tools, themes, and config. |
 | `docs/` | Architecture, maps, plans, specs, handoffs, and evidence. |

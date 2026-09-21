@@ -51,6 +51,7 @@ backend contracts.
 
 - [OpenFork compatibility boundary](../architecture/compatibility-boundary.md)
 - [OXP parent-tool epoch and durable continuation](../architecture/oxp-parent-tool-epoch.md)
+- [OXP upstream authentication boundary](../specs/oxp-upstream-auth-boundary.md)
 - [Architecture and control/data flow](./architecture.md)
 - [V1 vs V2/current](./v1-v2.md)
 - [Runtime and product surfaces](./surfaces.md)

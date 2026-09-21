@@ -1,5 +1,10 @@
 # OpenFork ownership
 
+> **Historical draft:** current product/compatibility policy lives in
+> `../../../../FORK.md` and
+> `../../../architecture/compatibility-boundary.md`. In particular, branch-fork
+> ancestry does not imply OpenCode local API/plugin compatibility.
+
 Canonical map for humans and for the `upstream-sync` skill. If this file and a merge commit message disagree, believe the newer of the two and update this file.
 
 ## Remotes
@@ -56,10 +61,10 @@ Replay an upstream hunk only when it is a clear bugfix in the same file and does
 
 | Path | Rule |
 |---|---|
-| `../../../../packages/opencode/src/tool/registry.ts` | Fork tools **plus** every new upstream tool |
-| `../../../../packages/opencode/src/plugin/index.ts` | Union provider/plugin hooks |
+| `../../../../packages/opencode/src/tool/registry.ts` | Preserve the OpenFork tool set. New upstream tools are candidates, not automatic support obligations. |
+| `../../../../packages/opencode/src/plugin/index.ts` | Preserve OpenFork plugin behavior; adopt upstream hooks only deliberately. |
 | `../../../../packages/opencode/src/session/prompt.ts` | Take upstream loop/safety fixes; keep fork hooks (SPAD, quota, pause) |
-| `../../../../packages/opencode/src/provider/provider.ts` | Take upstream provider fixes; keep fork credential/usage hooks |
+| `../../../../packages/opencode/src/provider/provider.ts` | Take remote-contract/provider fixes needed by OpenFork; keep fork credential/usage hooks. |
 | `../../../../packages/opencode/src/server/routes/instance/httpapi/api.ts` | Re-register fork groups after upstream edits |
 | `../../../../packages/opencode/src/server/routes/instance/httpapi/server.ts` | Same |
 | root / package `../../../../package.json` | **Upstream versions.** Union fork deps. |
@@ -90,9 +95,9 @@ Keep the fork stub. Do not restore `#review-panel` because an upstream e2e wants
 - Pause / resume / regenerate-title on V1 HttpApi
 - Session groups listed
 - Quota routes registered
-- Extra tools present **and** new upstream tools present
-- Websearch = fork engines ∪ upstream additions
-- Plugin/provider unions intact
+- OpenFork tool set intact; new upstream tools only if explicitly adopted
+- Explicitly adopted websearch engines intact
+- Remote provider compatibility and OpenFork plugin hooks intact
 - Explorer/tab e2e match fork UI
 - `bun run --cwd packages/desktop dev` boots
 - Channel DB still fork-specific

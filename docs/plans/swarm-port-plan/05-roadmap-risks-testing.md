@@ -1,6 +1,11 @@
 # 05 — Roadmap, Risks & Testing Strategy
 
-> **STATUS: WORKING DRAFT (Phase A groundwork)** — authored by migration-chief from independent
+> **STATUS: HISTORICAL WORKING DRAFT (Phase A groundwork)** — superseded for
+> implementation by `00-first-party-overhaul-2026-09-18.md`,
+> `06-implementation-roadmap-v2.md`, `07-openswarm-test-invariant-ledger.md`, and
+> `09-concurrency-handoff-protocol.md`. Entries below remain evidence of plugin-era
+> failure modes, not authority to preserve polling/dual-runtime/lease mechanics.
+> Originally authored by migration-chief from independent
 > reading of openswarm (`C:\Users\slooshied\Documents\openswarm`) and the host monorepo
 > (`packages/*`, `../../handoff/AGENTS.md`). Sections marked **[DRAFT]** are pending synthesis against peer
 > documents 01–04 (scout/architect/api-designer/ux-designer). Final version replaces this file;

@@ -18,7 +18,7 @@ extensions/           client extensions
 benchmarks/           reusable benchmark harnesses
 experiments/          prototypes / experimental evidence
 docs/                 documentation
-.opencode/            repo-local OpenFork configuration/tools/agents (legacy directory name)
+.openfork/            repo-local OpenFork configuration/tools/agents
 ```
 
 ## “I need to change …”
@@ -84,6 +84,7 @@ server/             full local HTTP server + route composition
 session/            legacy/V1 execution + internal bridge seams
 tool/               V1/fork-rich tool implementations
 provider/           provider host/runtime integration
+system-one/         typed non-generative semantic-inference host integration
 project/            project/instance host integration
 config/             host config resolution
 plugin/             plugin activation

@@ -72,9 +72,10 @@ Run focused tests for touched KEEP packages. Then tell the user to run `bun run 
 - Pause / resume / regenerate-title
 - Session groups
 - Quota routes still registered in `api.ts` + `server.ts`
-- Extra tools still in `tool/registry.ts` and new upstream tools present
-- Websearch union
-- Plugin/provider unions
+- OpenFork tools still in `tool/registry.ts`; new upstream tools are candidates,
+  not automatic support obligations
+- Explicitly adopted websearch engines intact
+- Remote provider compatibility preserved; OpenFork plugin hooks intact
 - Fork UI tests not replaced by `#review-panel` assumptions
 - Channel DB name still fork-specific
 - Updater still disabled or still `thelabcorner/openfork`

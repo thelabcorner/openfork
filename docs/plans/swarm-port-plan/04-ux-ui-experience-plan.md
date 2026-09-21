@@ -1,6 +1,8 @@
 # 04 — Native UX/UI Experience Plan (Desktop · Web App · TUI)
 
-Owner: ux-designer · Status: complete for planning round · Date: 2026-08-21
+Owner: ux-designer · Status: UX COMPANION — subordinate to
+`00-first-party-overhaul-2026-09-18.md` and the concurrency handoff protocol in
+`09-concurrency-handoff-protocol.md` · Original planning round: 2026-08-21
 
 **Scope.** The complete native experience for swarms in OpenCode: where swarms live in the app, every screen, the state machines behind them, command-palette/keyboard surface, polish standards, TUI parity, and the realtime data contract the UI needs from the backend (§8 → api-designer).
 
@@ -234,35 +236,50 @@ Emergency surfaces: dashboard header menu, palette commands, and a global keyboa
               [Spawning] ──cancel──► (removed)
                   │ ready
                   ▼
-   ┌─────────[Working]◄────wake/claim────[Idle]◄────────┐
-   │            │  human msg       │ human msg          │
-   │            ▼                  ▼                    │
-   │      (absorb mid-turn)   [Chatting—paused]─────────┤
-   │            │                │ lull expires OR      │
-   │            └────continue───┘ [Release now]         │
-   ▼ any state                                          │
-[Stopped] ──resume──► [Idle]                            │
+   ┌─────────[Working]◄────wake/claim────[Idle]◄─────────────┐
+   │            │  human msg       │ human msg               │
+   │            ▼                  ▼                         │
+   │      (settle boundary)   [Chatting—held]────────────────┤
+   │            │                │ focus clears              │
+   │            └────continue───┘                            │
+   │                             │ deadline / release now    │
+   │                             ▼                           │
+   │                        [Retiring] ──quiescent──► [Idle] │
+   ▼ any state                                               │
+[Stopped] ──resume──► [Idle]                                 │
    │ stop w/o crash                                     │
 [Dead/crashed] ──auto-respawn──► [Spawning]             │
 (any) ──remove──► [Removed] (history only)
 transient: [Re-rooted] flash on session.next.moved
 ```
 
-Rendering rules: exactly one glyph per member at a time; precedence Working > Chatting-paused > Dead > Stopped > Idle > Spawning for badge collisions; transitions animate via `motion-spring` (150–200 ms, no bounce on state glyphs — calm).
+Rendering rules: exactly one glyph per member at a time; precedence Retiring >
+Working > Chatting-held > Dead > Stopped > Idle > Spawning for badge collisions.
+`Retiring` means "waiting for a proven safe execution boundary", not ordinary
+progress. Transitions animate via `motion-spring` (150–200 ms, no bounce on
+state glyphs — calm).
 
 ### 4.2 Task lifecycle (rendered)
 
 ```
 [Blocked] ──deps met──► [Ready] ──claim──► [Claimed/Working]
      ▲                                            │
-     │            ┌────lease expires──────────────┤
-     │            ▼                               ├──complete──►[Complete]
-  [Ready] ◄──release──┘                          ├──fail──────►[Failed]──retry(budget)──►[Ready]
-                                                 └──cancel───►[Cancelled]
-special: [Lease-expiring] amber pulse (T-60s), [Retrying] shows attempt n/budget
+     │                                            ├──complete──►[Complete]
+     │                                            ├──fail──────►[Failed]──retry(budget)──►[Ready]
+     │                                            ├──cancel───►[Retiring]
+     │                                            └──expiry / human release / rebind
+     │                                                              │
+     │                                                              ▼
+  [Ready] ◄────policy/requeue────[Retiring / safe-boundary wait]──quiescent
+special: [Lease-expiring] amber pulse, [Retrying] shows attempt n/budget
 ```
 
-Rendering: node edge color + fill intensity encode state; retry budget renders as `↻ n/N`; blocked nodes show their missing dep names on hover. Failed-with-exhausted-budget escalates visually (red + "needs human" chip) and can ping OS notification per §4.3.
+Rendering: node edge color + fill intensity encode state; retry budget renders as
+`↻ n/N`; blocked nodes show their missing dep names on hover.
+`Retiring / safe-boundary wait` is an execution-safety overlay: expiry does not
+mean the task is immediately claimable by another member. Failed-with-exhausted-
+budget escalates visually (red + "needs human" chip) and can ping OS notification
+per §4.3.
 
 ### 4.3 Notification model (OS vs in-app)
 

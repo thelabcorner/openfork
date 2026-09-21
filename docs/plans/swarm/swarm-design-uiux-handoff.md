@@ -26,7 +26,7 @@
   (d) how to verify work. Trustworthiness = every claim sourced, hedged where uncertain.
 - Known ambiguities I inferred, flag for confirmation:
   - Whether the user wants the brief *delivered to uxsmith in the swarm* or merely stored
-    in the repo. I stored it at `docs/swarm-design-uiux-handoff.md`; not yet sent.
+    in the repo. I stored it at `docs/plans/swarm/swarm-design-uiux-handoff.md`; not yet sent.
   - Whether "design ui/ux agent" is uxsmith specifically. Only one swarm exists
     (`tab-stop-pause`) and uxsmith is its frontend engineer — consistent, but unconfirmed.
 
@@ -35,7 +35,7 @@
 - **Done and verified (on disk, this session):**
   - Located the agent tool UI stack: desktop shell → `@opencode-ai/app` →
     `session-ui` tool components (§3). Every line ref cross-checked with grep/read.
-  - Wrote `docs/swarm-design-uiux-handoff.md` (this file) following the
+  - Wrote `docs/plans/swarm/swarm-design-uiux-handoff.md` (this file) following the
     AGENT_HANDOFF_SKILL structure (`C:\Program Files\Adobe\Adobe Illustrator
     2026\Presets\en_US\Scripts\agent-skills\AGENT_HANDOFF_SKILL.md`).
   - Ran the skill's §11 quality checklist over this draft; the attempted/verified
@@ -68,7 +68,7 @@ Files read (not modified): all verified present on disk.
 | `.opencode/skills/rtl-aware-development/SKILL.md` | Mandatory RTL guidance | read |
 | Root `handoff/AGENTS.md`, `packages/app/AGENTS.md`, `packages/desktop/AGENTS.md`, `packages/ui/AGENTS.md` | Repo rules (§4) | read |
 
-Files created: `docs/swarm-design-uiux-handoff.md` (this file — the only artifact).
+Files created: `docs/plans/swarm/swarm-design-uiux-handoff.md` (this file — the only artifact).
 
 Commands run this session (all read-only): glob over desktop/session-ui/ui sources;
 grep for `BasicTool`/`ToolErrorCard`/`ToolPart` usage; `swarm_list`; `swarm_roster`.
@@ -111,7 +111,7 @@ Dead ends worth recording (from the exploration):
 
 ## 6. Decisions made and rationale
 
-- Decision: store the brief at `docs/swarm-design-uiux-handoff.md` (repo convention —
+- Decision: store the brief at `docs/plans/swarm/swarm-design-uiux-handoff.md` (repo convention —
   sibling docs `swarm-*.md` exist for agent-produced work).
   Alternatives: chat-only (lost), a new skills file (not a skill), `docs/design-*.md`.
   Reversibility: easy (delete file). Approved by: me alone — flag if user prefers
@@ -200,7 +200,7 @@ Dead ends worth recording (from the exploration):
 
 1. **User confirms recipient + delivery channel** — because §1 ambiguity is
    load-bearing. Expected signal: "yes, send to uxsmith" (or a correction).
-2. **Deliver to uxsmith** (if confirmed): reference `docs/swarm-design-uiux-handoff.md`
+2. **Deliver to uxsmith** (if confirmed): reference `docs/plans/swarm/swarm-design-uiux-handoff.md`
    and the anchor topic (agent tool UI in chat sessions). Expected signal: uxsmith's
    read-back restates the goal before acting (per §13).
 3. **Re-verify §3 line refs** at edit time — because refs drift. Expected signal:

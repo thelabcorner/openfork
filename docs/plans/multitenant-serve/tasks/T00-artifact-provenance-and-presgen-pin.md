@@ -75,7 +75,7 @@ Minimum metadata:
 
 ```text
 product = openfork
-upstreamCompatibleVersion = <semver>
+openCodeSourceBaselineVersion = <semver>
 forkCommit = <git sha>
 channel = <channel>
 target = linux-x64
@@ -84,9 +84,10 @@ buildTimestamp or reproducible build id
 
 ### 2. Produce a pinned artifact
 
-Use OpenFork's existing Bun compile pipeline. Artifact naming may stay
-upstream-compatible internally, but PresGen's source URL/pin must point to an
-OpenFork-controlled release namespace or build artifact store.
+Use OpenFork's existing Bun compile pipeline. Artifact naming may retain inherited
+OpenCode-shaped conventions internally when convenient, but that is not a
+compatibility claim. PresGen's source URL/pin must point to an OpenFork-controlled
+release namespace or build artifact store.
 
 Record SHA-256 in PresGen configuration/build arguments. PresGen must verify the
 digest before installing the binary.
@@ -141,7 +142,8 @@ Mandatory:
 
 ## Adversarial checks
 
-- Same upstream-compatible version but wrong product/build identity must fail.
+- Same OpenCode source-baseline version but wrong OpenFork product/build identity
+  must fail.
 - Digest mismatch must fail before install.
 - Missing expected archive member must fail.
 - Cache hit path must still validate the cached binary/digest; do not trust a

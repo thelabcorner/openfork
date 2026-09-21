@@ -6,13 +6,23 @@ Before changing cross-layer app behavior, read
 boundary. A UI path or `v2` component name does not establish API/runtime
 ownership.
 
-OpenFork is **V1-first** for the local client/runtime contract. The existing app is
-hybrid because upstream current-API migration already landed, but completing that
-migration is not a product goal. Do not replace a V1 call/type with
-`packages/protocol`, `packages/client`, or a current `/api/*` route merely for
-version convergence. Backport useful current/V2 semantics into the V1-oriented
-architecture; retain existing current calls only where they remain deliberately
-useful.
+OpenFork is **V1-first for execution and the local transport/API contract, but
+V2/new-layout-first for presentation**. These are separate axes.
+
+The new layout is the primary UI direction. Keep developing V2/new-layout settings,
+composer, session, file/review, browser, terminal, and other presentation surfaces
+when they are the stronger product UI. Do **not** translate them back into legacy UI
+just because the runtime underneath is V1.
+
+The existing app is also hybrid at the API layer because upstream current-API
+migration already landed, but completing that API migration is not a product goal.
+Do not replace a V1 call/type with `packages/protocol`, `packages/client`, or a
+current `/api/*` route merely for version convergence. A V2 UI may consume a
+V1/fork-owned browser-safe contract.
+
+The app is an **OpenFork client**, not a generic OpenCode client. Do not preserve or
+add local API behavior merely so third-party OpenCode clients/plugins continue to
+work. Cross-product compatibility must be an explicit, tested exception.
 
 ## Priorities
 

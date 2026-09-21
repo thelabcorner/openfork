@@ -1,12 +1,12 @@
 # Cross-doc consistency review — Stop/Pause · Retitle · Tab Project Actions
 
-**Status:** DESIGN REVIEW — no code changed except a flagged amendment to `docs/swarm-tab-stop-pause.md`
+**Status:** DESIGN REVIEW — no code changed except a flagged amendment to `docs/plans/swarm/swarm-tab-stop-pause.md`
 (critic's own doc; recorded in §R of this file).
 **Author:** critic (NIAMH), returning after the store reset — all source claims re-verified on disk 2026-08-13.
 **Reviewed docs:**
-- `docs/swarm-tab-stop-pause.md` (critic's t5 synthesis) — Stop/Pause chat
-- `docs/swarm-session-retitle.md` (retitler) — Regenerate session title (§9 rulings routed to critic)
-- `docs/swarm-tab-project-actions.md` (pathfinder) — tab context-menu project actions
+- `docs/plans/swarm/swarm-tab-stop-pause.md` (critic's t5 synthesis) — Stop/Pause chat
+- `docs/plans/swarm/swarm-session-retitle.md` (retitler) — Regenerate session title (§9 rulings routed to critic)
+- `docs/plans/swarm/swarm-tab-project-actions.md` (pathfinder) — tab context-menu project actions
 
 **Why this review exists:** the three features share ONE surface
 (`packages/app/src/components/titlebar-tab-context-menu.tsx`) and overlapping infra
@@ -323,15 +323,15 @@ not touched.
 
 ## 10. Files changed by this review
 
-- `docs/swarm-cross-doc-review.md` — this deliverable (NEW).
-- `docs/swarm-tab-stop-pause.md` — amendments R1, R2, R4, R6 (critic's own doc; flagged above).
+- `docs/plans/swarm/swarm-cross-doc-review.md` — this deliverable (NEW).
+- `docs/plans/swarm/swarm-tab-stop-pause.md` — amendments R1, R2, R4, R6 (critic's own doc; flagged above).
 
 ---
 
 ## 12. t8 merge review — coremith §5.1 `CompatibleVcsApi` re-type (2026-08-13)
 
 coremith requested a double-check of the `CompatibleVcsApi` re-type after the t8 handoff
-(docs/swarm-v2-vcs.md §5.1). Source-verified verdict:
+(docs/plans/swarm/swarm-v2-vcs.md §5.1). Source-verified verdict:
 
 **CONFIRMED necessary + directionally correct. One scope expansion — MEDIUM (compile break
 across 9 files if missed; mechanical fix, caught at typecheck).**
@@ -376,5 +376,5 @@ Verified:
 Everything else in t8 is consistent with the t7 verdicts (V1-first contract, single compat entry,
 menu never branches on protocol, `webUrl` port-preservation is an improvement over pathfinder's
 accepted §6.4 edge case, one-protocol-group-serves-both-servers verified via
-opencode server.ts:181-185/ProjectV2.node :272). No correction to docs/swarm-v2-vcs.md made by
+opencode server.ts:181-185/ProjectV2.node :272). No correction to docs/plans/swarm/swarm-v2-vcs.md made by
 critic; flag delivered to coremith for §5.1/§11.1 scoping.

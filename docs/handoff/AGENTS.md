@@ -21,7 +21,7 @@ fork-owned. See `../architecture/compatibility-boundary.md`.
 
 1. This file.
 2. `../../FORK.md` for remotes, KEEP/DROP, or conflict ownership.
-3. Every matching skill under `../../.opencode/skills`.
+3. Every matching skill under `../../.openfork/skills`.
 4. Nearest package `AGENTS.md`.
 5. Local code precedent.
 

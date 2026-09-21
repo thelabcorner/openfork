@@ -241,6 +241,52 @@ Higher layers decide *what* session/tool work should happen. The LLM layer decid
 This is especially important for System-message authority: provider wire roles are a
 projection of semantic authority and capability, not the canonical ownership model.
 
+### Model primitives and semantic inference
+
+The catalog distinguishes the model's computational primitive from its provider wire
+adapter. `language` is the compatibility default; `system-one` identifies typed
+non-generative semantic inference. An OpenAI-compatible catalog entry therefore does
+not imply that the model is a conversational language model.
+
+Primitive ownership is bottom-up:
+
+```text
+packages/schema Model.Primitive
+  -> models.dev/config projection
+  -> provider host primitive guard
+  -> primitive-specific transport
+  -> local API / generated SDK
+  -> presentation selection
+```
+
+Conversation-facing resolution (`getLanguage`, default/small-model selection, the
+desktop/session composer, legacy run/TUI picker, ACP model/config options, OXP Session
+selection, and the ordinary model picker/store) admits only `language`. System One
+models remain visible in provider/catalog inventory but cannot silently become chat,
+title, summary, or housekeeping models.
+
+`packages/llm/src/system-one.ts` owns only the TypeSafe/System One wire contract and
+typed response validation. `packages/opencode/src/system-one` owns host concerns:
+provider/model resolution, credentials, OpenCode-hosted Zen/Go request identity,
+catalog cost, and telemetry. The Tier-2 `POST /system-one/infer` route is explicitly
+workspace-scoped but does **not** create or mutate a durable Session.
+
+`affinityID` is caller-owned semantic routing/cache affinity, not Session ownership.
+For OpenCode-hosted Zen or Go it is deterministically lowered to a non-persisted `ses_…`
+transport token; omitted affinity receives a one-shot token. Raw provider
+probabilities/scores are preserved. System One opts out of shared chat retry backoff
+so the first typed provider failure (`RateLimit`, `QuotaExceeded`, authentication,
+timeout, or upstream failure) remains observable to the control-plane caller.
+
+OpenCode Go does not currently advertise a Jev model in its public catalog. OpenFork
+must not synthesize one. The shared compatibility classifier recognizes an existing
+`opencode-go/jev-*` row as `system-one`, however, so a future Go catalog addition
+automatically uses the Go base URL (`/zen/go/v1/systemone`) instead of entering chat.
+
+See `docs/architecture/jev-system-one.md` for the upstream donor findings, remote
+Zen/Go compatibility record, error semantics, verification matrix, and ProofGate
+integration handoff.
+
 ## 6. Tool architecture
 
 There are two corresponding tool surfaces:

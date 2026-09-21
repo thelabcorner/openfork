@@ -1,7 +1,7 @@
 # Regenerate Session Title — Feature Design (retitler / JUNIPER)
 
 Status: DESIGN ONLY — no code changed. Standalone doc for the "Regenerate session title"
-feature; independent of `docs/swarm-tab-stop-pause.md` (critic owns that one) except for the
+feature; independent of `docs/plans/swarm/swarm-tab-stop-pause.md` (critic owns that one) except for the
 shared tab context-menu surface, where placement is coordinated below with t4 (uxsmith) and
 task_35c8ab37 (pathfinder).
 
@@ -58,18 +58,18 @@ The repo is on the V2 session core, but the **desktop app's actual surface is V1
 - `packages/app/src/utils/server-protocol.ts:24-35` — `detectServerProtocol` probes `/global/health`;
   the legacy `{healthy:true}` shape resolves `"v1"`. The desktop sidecar defaults to V1
   (`packages/desktop/src/main/index.ts:67`, `OPENCODE_SIDECAR_V2` opt-in) per
-  `docs/desktop-build-and-architecture.md §1.1`.
+  `docs/architecture/desktop-build-and-architecture.md §1.1`.
 - `packages/app/src/utils/server-compat.ts:86-92` — `createCompatibleApi` picks the V1 API when
   the server is v1. Rename today: `server-compat.ts:183-185` → legacy `session.update`.
 - Both message stores coexist in one SQLite DB (V1 `message`/`part` + V2 `session_message`),
-  and the V2 `session` table is shared (title lives there). `docs/desktop-build-and-architecture.md §1.3`.
+  and the V2 `session` table is shared (title lives there). `docs/architecture/desktop-build-and-architecture.md §1.3`.
 - V2 protocol (`packages/protocol/src/groups/session.ts`) has NO rename/update endpoint today;
   `Session.Info` has `title` only (`packages/core/src/session/info.ts:14-49`).
 
 Consequence: the **primary implementation surface is the V1 httpapi** (what the desktop talks
 to), backed by core code that the V2 server can reuse. Protocol changes (V2 endpoint + event)
 require BOTH regen steps (`packages/client` `bun run generate` + `packages/sdk/js`
-`bun ./script/build.ts`) per `docs/desktop-build-and-architecture.md §4`.
+`bun ./script/build.ts`) per `docs/architecture/desktop-build-and-architecture.md §4`.
 
 ---
 

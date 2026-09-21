@@ -2109,12 +2109,12 @@ This tranche gives us multiple clean abort points. If the tenant Effect refactor
 Work:
 
 1. use OpenFork's existing `packages/opencode/script/build.ts` pipeline to produce the Linux x64 binary (`dist/opencode-linux-x64/bin/opencode`) and release tarball shape already supported by the build tooling
-2. define OpenFork release provenance in addition to the upstream-compatible semantic version: fork commit SHA, build channel, artifact SHA-256, and build timestamp/reproducibility metadata
+2. define OpenFork release provenance in addition to the OpenCode **source-baseline version** used for that build: fork commit SHA, build channel, artifact SHA-256, and build timestamp/reproducibility metadata; the source-baseline version records ancestry and does not claim local API/plugin compatibility
 3. publish/fetch the artifact from the OpenFork release namespace rather than `opencode-linux-x64` on upstream npm
 4. update PresGen `prepare_opencode.py`/Docker build to consume the pinned OpenFork artifact
 5. verify checksum/signature before copying the binary into the sandbox image
 6. run binary smoke (`--version`) plus hosted-capability/build-manifest probe so a same-version upstream binary cannot be mistaken for OpenFork
-7. preserve CLI/API compatibility in per-session mode
+7. preserve **PresGen's currently consumed OpenFork CLI/API contract** in per-session mode; this is an OpenFork/PresGen integration contract, not generic OpenCode compatibility
 8. run the existing PresGen agent integration suite
 9. retain a rollback pin to the known upstream binary until the OpenFork artifact lane and hosted mode both prove stable
 

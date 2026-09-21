@@ -11,7 +11,7 @@
 | `../../../.opencode/skills/upstream-sync/SKILL.md` | The merge/cherry-pick workflow. Agents must load it before any git sync. |
 | Existing `../../../.opencode/skills/effect` | Keep. |
 | Existing `../../../.opencode/skills/rtl-aware-development` | Keep. |
-| Package `../../handoff/AGENTS.md` files | Keep upstream + existing desktop/app notes. |
+| Package `../../handoff/AGENTS.md` files | Reuse useful upstream engineering rules plus OpenFork notes; local API/plugin parity is not a requirement. |
 
 OpenChamber's lesson: `../../handoff/AGENTS.md` is routing, not a novel. Workflows live in skills.
 
