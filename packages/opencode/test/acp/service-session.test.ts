@@ -13,6 +13,8 @@ import type {
 import type { AssistantMessage, Event, OpencodeClient } from "@opencode-ai/sdk/v2"
 import { ProviderV2 } from "@opencode-ai/core/provider"
 import { ModelV2 } from "@opencode-ai/core/model"
+import { SessionTurnProvenance } from "@opencode-ai/core/v1/session-turn-provenance"
+import { SessionV1 } from "@opencode-ai/schema/session-v1"
 import { Effect } from "effect"
 import * as ACPService from "@/acp/service"
 import * as ACPError from "@/acp/error"
@@ -23,6 +25,7 @@ const providerID = ProviderV2.ID.make("test")
 const modelID = ModelV2.ID.make("test-model")
 const configuredModelID = ModelV2.ID.make("configured-model")
 const secondModelID = ModelV2.ID.make("second-model")
+const semanticModelID = ModelV2.ID.make("jev-1.13")
 
 function createEventStream() {
   const queue: Event[] = []
@@ -185,6 +188,40 @@ const provider: Provider.Info = {
         low: { reasoningEffort: "low" },
         medium: { reasoningEffort: "medium" },
       },
+    },
+    [semanticModelID]: {
+      id: semanticModelID,
+      providerID,
+      primitive: "system-one",
+      api: {
+        id: semanticModelID,
+        url: "https://example.com/systemone",
+        npm: "@ai-sdk/openai-compatible",
+      },
+      name: "Jev",
+      family: "jev",
+      capabilities: {
+        temperature: false,
+        reasoning: false,
+        attachment: false,
+        toolcall: false,
+        input: { text: true, audio: false, image: false, video: false, pdf: false },
+        output: { text: false, audio: false, image: false, video: false, pdf: false },
+        interleaved: false,
+      },
+      cost: {
+        input: 0,
+        output: 0,
+        cache: { read: 0, write: 0 },
+      },
+      limit: {
+        context: 128000,
+        output: 0,
+      },
+      status: "active",
+      options: {},
+      headers: {},
+      release_date: "2026-01-01",
     },
   },
 }
@@ -586,6 +623,37 @@ describe("ACP service sessions", () => {
     expect(result.configOptions?.find((option) => option.id === "mode")?.currentValue).toBe("plan")
   })
 
+  it("restores config from the latest worker prompt instead of a newer host continuation", async () => {
+    const { service } = makeService([
+      {
+        info: {
+          role: "user",
+          provenance: SessionTurnProvenance.user(SessionTurnProvenance.Source.Prompt),
+          model: { providerID: "test", modelID: "test-model", variant: "high" },
+          agent: "plan",
+        },
+        parts: [],
+      },
+      {
+        info: {
+          role: "user",
+          provenance: SessionTurnProvenance.host(SessionTurnProvenance.Source.GoalContinuation, {
+            sourceMessageID: SessionV1.MessageID.make("msg_user_root"),
+          }),
+          model: { providerID: "test", modelID: "test-model", variant: "default" },
+          agent: "build",
+        },
+        parts: [],
+      },
+    ])
+    const result = await Effect.runPromise(
+      service.loadSession({ cwd: "/workspace", sessionId: "ses_loaded", mcpServers: [] }),
+    )
+
+    expect(result.configOptions?.find((option) => option.id === "effort")?.currentValue).toBe("high")
+    expect(result.configOptions?.find((option) => option.id === "mode")?.currentValue).toBe("plan")
+  })
+
   it("maps provider auth failures to auth-required request errors", async () => {
     const service = ACPService.make({
       sdk: {
@@ -785,6 +853,24 @@ describe("ACP service sessions", () => {
     expect(select(updated, "model")?.currentValue).toBe("test/second-model")
     expect(select(updated, "effort")?.currentValue).toBe("low")
     expect(flattenSelectOptions(select(updated, "effort")).map((option) => option.value)).toEqual(["low", "medium"])
+  })
+
+  it("does not expose or accept System One as an ACP conversational model", async () => {
+    const { service } = makeService()
+    const session = await Effect.runPromise(service.newSession({ cwd: "/workspace", mcpServers: [] }))
+    const models = flattenSelectOptions(select(session, "model")).map((option) => option.value)
+    expect(models).not.toContain("test/" + semanticModelID)
+
+    const error = await Effect.runPromise(
+      service
+        .setSessionConfigOption({
+          sessionId: session.sessionId,
+          configId: "model",
+          value: "test/" + semanticModelID,
+        })
+        .pipe(Effect.mapError(ACPError.toRequestError), Effect.flip),
+    )
+    expect(error.code).toBe(-32602)
   })
 
   it("switches effort and returns the updated effort current value", async () => {
