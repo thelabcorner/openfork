@@ -8,6 +8,7 @@ import { useRoute } from "../../context/route"
 import { useDialog, type DialogContext } from "../../ui/dialog"
 import type { PromptInfo } from "../../component/prompt/history"
 import { stripPromptPartIDs as strip } from "../../prompt/part"
+import { isSemanticUserMessage } from "../../util/session-message"
 
 export function DialogForkFromTimeline(props: { sessionID: string; onMove: (messageID?: string) => void }) {
   const sync = useSync()
@@ -35,7 +36,7 @@ export function DialogForkFromTimeline(props: { sessionID: string; onMove: (mess
     } satisfies DialogSelectOption<string | undefined>
     const result = [] as DialogSelectOption<string | undefined>[]
     for (const message of messages) {
-      if (message.role !== "user") continue
+      if (!isSemanticUserMessage(message)) continue
       const part = (sync.data.part[message.id] ?? []).find(
         (x) => x.type === "text" && !x.synthetic && !x.ignored,
       ) as TextPart

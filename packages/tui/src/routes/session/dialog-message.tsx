@@ -6,6 +6,7 @@ import { useRoute } from "../../context/route"
 import { useClipboard } from "../../context/clipboard"
 import type { PromptInfo } from "../../component/prompt/history"
 import { stripPromptPartIDs as strip } from "../../prompt/part"
+import { isSemanticUserMessage } from "../../util/session-message"
 
 export function DialogMessage(props: {
   messageID: string
@@ -35,7 +36,7 @@ export function DialogMessage(props: {
               messageID: msg.id,
             })
 
-            if (props.setPrompt) {
+            if (props.setPrompt && isSemanticUserMessage(msg)) {
               const parts = sync.data.part[msg.id]
               const promptInfo = parts.reduce(
                 (agg, part) => {
@@ -83,7 +84,7 @@ export function DialogMessage(props: {
               messageID: props.messageID,
             })
             const msg = message()
-            const prompt = msg
+            const prompt = msg && isSemanticUserMessage(msg)
               ? sync.data.part[msg.id].reduce(
                   (agg, part) => {
                     if (part.type === "text") {

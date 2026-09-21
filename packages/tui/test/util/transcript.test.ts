@@ -349,6 +349,44 @@ describe("transcript", () => {
       expect(result).toContain("---")
     })
 
+    test("labels host-owned synthetic turns as automation and preserves their durable text", () => {
+      const message = {
+        info: {
+          id: "msg_goal",
+          sessionID: "ses_abc123",
+          role: "user" as const,
+          agent: "build",
+          model: { providerID: "anthropic", modelID: "claude-sonnet-4-20250514" },
+          provenance: {
+            owner: "host" as const,
+            source: "goal.continuation",
+            sourceMessageID: "msg_user",
+          },
+          time: { created: 1000000000000 },
+        },
+        parts: [
+          {
+            id: "p_goal",
+            sessionID: "ses_abc123",
+            messageID: "msg_goal",
+            type: "text" as const,
+            text: "Continue from the auditor verdict.",
+            synthetic: true,
+          },
+        ],
+      }
+
+      const result = formatTranscript(
+        { id: "ses_abc123", title: "Goal", time: { created: 1, updated: 2 } },
+        [message],
+        { thinking: false, toolDetails: false, assistantMetadata: false },
+      )
+
+      expect(result).toContain("## Automation")
+      expect(result).toContain("Continue from the auditor verdict.")
+      expect(result).not.toContain("## User")
+    })
+
     test("orders messages by creation time and preserves part order", () => {
       const message = (id: string, created: number, parts: string[]) => ({
         info: {

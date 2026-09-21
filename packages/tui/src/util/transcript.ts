@@ -1,6 +1,7 @@
 import type { AssistantMessage, Part, Provider, UserMessage } from "@opencode-ai/sdk/v2"
 import { Locale } from "./locale"
 import * as Model from "./model"
+import { semanticKind } from "./session-message"
 
 export type TranscriptOptions = {
   thinking: boolean
@@ -53,14 +54,23 @@ export function formatMessage(
 ): string {
   let result = ""
 
+  const kind = semanticKind(msg)
   if (msg.role === "user") {
-    result += `## User\n\n`
+    result += `## ${
+      kind === "user"
+        ? "User"
+        : kind === "shell"
+          ? "Shell"
+          : kind === "compaction"
+            ? "Compaction"
+            : "Automation"
+    }\n\n`
   } else {
     result += formatAssistantHeader(msg, options.assistantMetadata, providers ?? options.providers)
   }
 
   for (const part of parts) {
-    result += formatPart(part, options)
+    result += formatPart(part, options, { includeSyntheticText: msg.role === "user" && kind === "synthetic" })
   }
 
   return result
@@ -83,8 +93,8 @@ export function formatAssistantHeader(
   return `## Assistant (${Locale.titlecase(msg.agent)} · ${modelName}${duration ? ` · ${duration}` : ""})\n\n`
 }
 
-export function formatPart(part: Part, options: TranscriptOptions): string {
-  if (part.type === "text" && !part.synthetic) {
+export function formatPart(part: Part, options: TranscriptOptions, input?: { includeSyntheticText?: boolean }): string {
+  if (part.type === "text" && (!part.synthetic || input?.includeSyntheticText)) {
     return `${part.text}\n\n`
   }
 

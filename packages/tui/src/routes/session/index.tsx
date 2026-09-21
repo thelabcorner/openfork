@@ -58,6 +58,7 @@ import { filetype } from "../../util/filetype"
 import parsers from "../../parsers-config"
 import { errorMessage } from "../../util/error"
 import { Toast, useToast } from "../../ui/toast"
+import { isSemanticUserMessage, isWorkerPromptMessage } from "../../util/session-message"
 import { useKV } from "../../context/kv.tsx"
 import stripAnsi from "strip-ansi"
 import { usePromptRef } from "../../context/prompt"
@@ -617,7 +618,9 @@ export function Session() {
       run: async () => {
         const status = sync.data.session_status?.[route.sessionID]
         if (status?.type !== "idle") await sdk.client.session.abort({ sessionID: route.sessionID }).catch(() => {})
-        const message = messagesBeforeRevert().findLast((item) => item.role === "user")
+        const message = messagesBeforeRevert().findLast(
+          (item) => isSemanticUserMessage(item) && isWorkerPromptMessage(item),
+        )
         if (!message) return
         void sdk.client.session
           .revert({
@@ -655,7 +658,14 @@ export function Session() {
         dialog.clear()
         const messageID = session()?.revert?.messageID
         if (!messageID) return
-        const message = messages().find((x) => x.role === "user" && x.id > messageID)
+        const history = messages()
+        const boundary = history.findIndex((item) => item.id === messageID)
+        const message =
+          boundary < 0
+            ? undefined
+            : history
+                .slice(boundary + 1)
+                .find((item) => isSemanticUserMessage(item) && isWorkerPromptMessage(item))
         if (!message) {
           void sdk.client.session.unrevert({
             sessionID: route.sessionID,
@@ -840,7 +850,7 @@ export function Session() {
         // Find the most recent user message with non-ignored, non-synthetic text parts
         for (let i = messages.length - 1; i >= 0; i--) {
           const message = messages[i]
-          if (!message || message.role !== "user") continue
+          if (!message || !isSemanticUserMessage(message)) continue
 
           const parts = sync.data.part[message.id]
           if (!parts || !Array.isArray(parts)) continue
@@ -1136,7 +1146,7 @@ export function Session() {
     if (index === -1) return []
     return messages()
       .slice(index)
-      .filter((message) => message.role === "user")
+      .filter(isSemanticUserMessage)
   })
 
   const revert = createMemo(() => {
@@ -1264,7 +1274,7 @@ export function Session() {
                       >
                         <></>
                       </Match>
-                      <Match when={message.role === "user"}>
+                      <Match when={isSemanticUserMessage(message)}>
                         <UserMessage
                           index={index()}
                           onMouseUp={() => {
@@ -2285,7 +2295,7 @@ function Task(props: ToolProps) {
   })
 
   const duration = createMemo(() => {
-    const first = messages().find((x) => x.role === "user")?.time.created
+    const first = messages().find(isWorkerPromptMessage)?.time.created
     const assistant = messages().findLast((x) => x.role === "assistant")?.time.completed
     if (!first || !assistant) return 0
     return assistant - first

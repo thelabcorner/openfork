@@ -25,7 +25,7 @@ export function cliErrorMessage(input: unknown): string | undefined {
       `Model not found: ${field(model, "providerID")}/${field(model, "modelID")}`,
       ...(suggestions.length ? ["Did you mean: " + suggestions.join(", ")] : []),
       "Try: `opencode models` to list available models",
-      "Or check your config (opencode.json) provider/model names",
+      "Or check your config (openfork.json) provider/model names",
     ].join("\n")
   }
 
@@ -70,7 +70,7 @@ export function cliErrorMessage(input: unknown): string | undefined {
   if (tagged(input, "UICancelledError") || named(input, "UICancelledError")) return ""
   if (isRecord(input) && named(input, "MCPFailed")) {
     const name = isRecord(input.data) ? field(input.data, "name") : undefined
-    return `MCP server "${name}" failed. Note, opencode does not support MCP authentication yet.`
+    return `MCP server "${name}" failed. Note, OpenFork does not support MCP authentication yet.`
   }
   return undefined
 }

@@ -32,6 +32,7 @@ import { batch, onMount } from "solid-js"
 import path from "path"
 import { useKV } from "./kv"
 import { usePermission } from "./permission"
+import { isHistoricalMessage, isStateProjectionMessage } from "../util/session-message"
 
 const emptyConsoleState: ConsoleState = {
   consoleManagedProviders: [],
@@ -586,7 +587,12 @@ export const {
           if (!session) return "idle"
           if (session.time.compacting) return "compacting"
           const messages = store.message[sessionID] ?? []
-          const last = messages.at(-1)
+          // STATE is transparent model context and imported/historical rows are
+          // completed history. Neither can make a Session look actively
+          // generating merely because their compatibility wire role is `user`.
+          const last = messages.findLast(
+            (message) => !isStateProjectionMessage(message) && !isHistoricalMessage(message),
+          )
           if (!last) return "idle"
           if (last.role === "user") return "working"
           return last.time.completed ? "idle" : "working"
