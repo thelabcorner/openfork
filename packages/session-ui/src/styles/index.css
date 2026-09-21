@@ -15,3 +15,4 @@
 @import "../components/tool-parts.css" layer(components);
 @import "../components/tool-error-card.css" layer(components);
 @import "../components/tool-status-title.css" layer(components);
+@import "../components/tool-visual-media.css" layer(components);

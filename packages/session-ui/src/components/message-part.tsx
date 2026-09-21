@@ -32,7 +32,8 @@ import {
   QuestionAnswer,
   QuestionInfo,
 } from "@opencode-ai/sdk/v2"
-import { useData } from "../context"
+import { SessionTurnProvenance } from "@opencode-ai/schema/session-turn-provenance"
+import { useData, useSessionNavigation } from "../context"
 import { useFileComponent } from "@opencode-ai/ui/context/file"
 import { useDialog } from "@opencode-ai/ui/context/dialog"
 import { type UiI18n, useI18n } from "@opencode-ai/ui/context/i18n"
@@ -50,8 +51,10 @@ import { Markdown } from "./markdown"
 import { ImagePreview } from "@opencode-ai/ui/image-preview"
 import { getDirectory as _getDirectory, getFilename } from "@opencode-ai/core/util/path"
 import { SessionThroughput } from "@opencode-ai/core/session/throughput"
+import { toThroughputMessage } from "./throughput-message"
 import { AttachmentCardV2 } from "../v2/components/attachment-card-v2"
 import { CommentCardV2 } from "../v2/components/comment-card-v2"
+import { SystemInjectionCardV2 } from "../v2/components/system-injection-v2"
 import { checksum, sampledChecksum } from "@opencode-ai/core/util/encode"
 import { Tooltip } from "@opencode-ai/ui/tooltip"
 import { IconButton } from "@opencode-ai/ui/icon-button"
@@ -64,6 +67,7 @@ import { AnimatedCountList } from "./tool-count-summary"
 import { ToolStatusTitle } from "./tool-status-title"
 import { patchFiles } from "./apply-patch-file"
 import { partDefaultOpen } from "./part-default-open"
+import { messageProvenancePresentation } from "./message-provenance-presentation"
 import { animate } from "motion"
 import { attached, inline, kind, typeLabel } from "./message-file"
 import { readPartText } from "./message-part-text"
@@ -95,6 +99,12 @@ import {
 } from "./builtin-tools"
 import { SessionProgressIndicatorV2 } from "../v2/components/session-progress-indicator-v2"
 import { traceMarkdown } from "./markdown-trace"
+import { ToolVisualMedia } from "./tool-visual-media"
+import {
+  type VisualArtifactPreviewResolver,
+  type VisualToolPresentation,
+  visualToolPresentation,
+} from "./tool-visual-media-model"
 
 async function writeClipboard(text: string): Promise<boolean> {
   const body = typeof document === "undefined" ? undefined : document.body
@@ -237,6 +247,7 @@ export interface MessagePartProps {
   turnDurationMs?: number
   turnThroughputRate?: number
   useV2Actions?: boolean
+  resolveVisualArtifact?: VisualArtifactPreviewResolver
 }
 
 function MessageActionButton(
@@ -787,11 +798,6 @@ function urls(text: string | undefined) {
     })
 }
 
-function sessionLink(id: string | undefined, href?: (id: string) => string | undefined) {
-  if (!id) return undefined
-  return href?.(id)
-}
-
 function taskSession(
   input: Record<string, any>,
   parentID: string | undefined,
@@ -935,21 +941,7 @@ export { partDefaultOpen } from "./part-default-open"
  * Single definition shared by every footer call site so the field mapping
  * cannot drift between them.
  */
-export function toThroughputMessage(message: MessageType): SessionThroughput.ThroughputMessage {
-  if (message.role !== "assistant") return { id: message.id, role: message.role }
-  const served = message.servedModel
-  return {
-    id: message.id,
-    role: "assistant",
-    modelKey: served ? `${served.providerID ?? message.providerID}:${served.modelID}` : `${message.providerID}:${message.modelID}`,
-    output: message.tokens.output,
-    reasoning: message.tokens.reasoning,
-    requestSentAt: message.time.requestSentAt,
-    firstTokenAt: message.time.firstTokenAt,
-    streamedAt: message.time.streamedAt,
-    failed: message.error !== undefined,
-  }
-}
+export { toThroughputMessage } from "./throughput-message"
 
 export function AssistantParts(props: {
   messages: AssistantMessage[]
@@ -1230,9 +1222,39 @@ export function registerPartComponent(type: string, component: PartComponent) {
 }
 
 export function Message(props: MessageProps) {
+  const i18n = useI18n()
+  const [automationOpen, setAutomationOpen] = createSignal(false)
+  const automation = createMemo(() => {
+    const presentation = messageProvenancePresentation(props.message)
+    if (!presentation) return
+    const segments = props.parts.flatMap((part) =>
+      part.type === "text" && part.text.trim() ? [{ id: part.id, text: part.text }] : [],
+    )
+    return {
+      presentation,
+      segments,
+    }
+  })
+  const semanticUser = createMemo(
+    () => props.message.role === "user" && SessionTurnProvenance.isSemanticUserInfo(props.message),
+  )
+
   return (
     <Switch>
-      <Match when={props.message.role === "user" && props.message}>
+      <Match when={automation()}>
+        {(entry) => (
+          <SystemInjectionCardV2
+            badge={i18n.t(entry().presentation.badgeKey, { defaultValue: entry().presentation.badgeDefault })}
+            preview={i18n.t(entry().presentation.previewKey, { defaultValue: entry().presentation.previewDefault })}
+            segments={entry().segments}
+            open={automationOpen()}
+            onOpenChange={setAutomationOpen}
+            expandLabel={i18n.t(entry().presentation.expandKey, { defaultValue: entry().presentation.expandDefault })}
+            collapseLabel={i18n.t(entry().presentation.collapseKey, { defaultValue: entry().presentation.collapseDefault })}
+          />
+        )}
+      </Match>
+      <Match when={semanticUser() && props.message}>
         {(userMessage) => (
           <UserMessageDisplay
             message={userMessage() as UserMessage}
@@ -1926,6 +1948,7 @@ export function Part(props: MessagePartProps) {
         deferToolContent={props.deferToolContent}
         virtualizeDiff={props.virtualizeDiff}
         onContentRendered={props.onContentRendered}
+        resolveVisualArtifact={props.resolveVisualArtifact}
         showAssistantCopyPartID={props.showAssistantCopyPartID}
         turnDurationMs={props.turnDurationMs}
         turnThroughputRate={props.turnThroughputRate}
@@ -1952,6 +1975,7 @@ export interface ToolProps {
   onContentRendered?: () => void
   forceOpen?: boolean
   locked?: boolean
+  resolveVisualArtifact?: VisualArtifactPreviewResolver
 }
 
 export type ToolComponent = Component<ToolProps>
@@ -2036,10 +2060,7 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
     const value = partMetadata().sessionId
     if (typeof value === "string" && value) return value
   })
-  const taskHref = createMemo(() => {
-    if (part().tool !== "task") return
-    return sessionLink(taskId(), data.sessionHref)
-  })
+  const taskNavigation = useSessionNavigation(taskId)
   const taskSubtitle = createMemo(() => {
     if (part().tool !== "task") return undefined
     const value = input().description
@@ -2082,15 +2103,8 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
                   open={controlledOpen()}
                   onOpenChange={props.onToolOpenChange ? handleToolOpenChange : undefined}
                   subtitle={taskSubtitle()}
-                  href={taskHref()}
-                  onSubtitleClick={(event) => {
-                    if (!data.navigateToSession) return
-                    if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
-                    const id = taskId()
-                    if (!id) return
-                    event.preventDefault()
-                    data.navigateToSession(id)
-                  }}
+                  href={taskNavigation.href()}
+                  onSubtitleClick={taskNavigation.navigate}
                 />
               )
             }}
@@ -2113,6 +2127,7 @@ PART_MAPPING["tool"] = function ToolPartDisplay(props) {
               deferContent={props.deferToolContent}
               virtualizeDiff={props.virtualizeDiff}
               onContentRendered={props.onContentRendered}
+              resolveVisualArtifact={props.resolveVisualArtifact}
             />
           </Match>
         </Switch>
@@ -2770,28 +2785,7 @@ ToolRegistry.register({
       return value
     })
     const running = createMemo(() => props.status === "pending" || props.status === "running")
-
-    const href = createMemo(() => sessionLink(childSessionId(), data.sessionHref))
-    const clickable = createMemo(() => !!(childSessionId() && (data.navigateToSession || href())))
-
-    const open = () => {
-      const id = childSessionId()
-      if (!id) return
-      data.navigateToSession?.(id)
-    }
-
-    const navigate = (event: MouseEvent) => {
-      if (!data.navigateToSession) return
-      if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
-      event.preventDefault()
-      open()
-    }
-    const navigateKey = (event: KeyboardEvent) => {
-      if (!clickable() || href()) return
-      if (event.key !== "Enter" && event.key !== " ") return
-      event.preventDefault()
-      open()
-    }
+    const navigation = useSessionNavigation(childSessionId)
 
     /**
      * A subagent call is a tool call, so it gets the same row as any other:
@@ -2802,7 +2796,7 @@ ToolRegistry.register({
     const trigger = (): TriggerTitle => ({
       title: title(),
       subtitle: subtitle(),
-      action: clickable() ? (
+      action: navigation.clickable() ? (
         <span data-slot="task-open-affordance">
           <Icon name="square-arrow-top-right" size="small" />
         </span>
@@ -2822,10 +2816,10 @@ ToolRegistry.register({
         trigger={trigger()}
         hideDetails
         triggerAsLink
-        triggerHref={href()}
-        clickable={clickable()}
-        onTriggerClick={navigate}
-        onTriggerKeyDown={navigateKey}
+        triggerHref={navigation.href()}
+        clickable={navigation.clickable()}
+        onTriggerClick={navigation.navigate}
+        onTriggerKeyDown={navigation.navigateKey}
       />
     )
   },
@@ -3566,7 +3560,6 @@ const BROWSER_TOOLS = [
   "browser_recording_start",
   "browser_recording_stop",
   "browser_resize",
-  "browser_screenshot",
   "browser_scroll",
   "browser_set_appearance",
   "browser_snapshot",
@@ -3574,6 +3567,68 @@ const BROWSER_TOOLS = [
   "browser_type",
   "browser_wait_for",
 ]
+
+const BROWSER_VISUAL_TOOLS = [
+  "browser_screenshot",
+  "browser_visual_capture",
+  "browser_visual_diff",
+  "browser_visual_record",
+] as const
+
+function visualToolResult(
+  presentation: VisualToolPresentation,
+  i18n: ReturnType<typeof useI18n>,
+): Pick<TriggerTitle, "result" | "resultTone"> {
+  if (presentation.kind === "diff" && presentation.diff) {
+    return {
+      result: i18n.t(presentation.diff.changed ? "ui.tool.visual.changed" : "ui.tool.visual.unchanged"),
+      resultTone: presentation.diff.changed ? "warning" : "success",
+    }
+  }
+  if (presentation.width && presentation.height) {
+    return { result: `${presentation.width}×${presentation.height}` }
+  }
+  return {}
+}
+
+function BrowserVisualTool(props: ToolProps) {
+  const i18n = useI18n()
+  const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
+  const visual = createMemo(() => visualToolPresentation(props.tool, props.input, props.metadata))
+  const trigger = createMemo<TriggerTitle>(() => {
+    const presentation = visual()
+    return {
+      ...toolTrigger(props),
+      ...(presentation ? visualToolResult(presentation, i18n) : {}),
+    }
+  })
+  const params = createMemo(() => {
+    const input = props.input ?? {}
+    if (props.tool !== "browser" || input.action !== "call") return input
+    const nested = input.args
+    return nested && typeof nested === "object" && !Array.isArray(nested) ? nested : {}
+  })
+
+  return (
+    <div data-component="browser-visual-tool">
+      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+        <ToolParams input={params()} skip={["action", "operation"]} />
+        <Show when={props.output}>
+          <BrowserOutput output={props.output!} />
+        </Show>
+      </BasicTool>
+      <Show when={visual()}>
+        {(presentation) => (
+          <ToolVisualMedia
+            presentation={presentation()}
+            resolveArtifact={props.resolveVisualArtifact}
+            onContentRendered={props.onContentRendered}
+          />
+        )}
+      </Show>
+    </div>
+  )
+}
 
 ToolRegistry.register({
   name: "background",
@@ -3790,9 +3845,14 @@ for (const name of BROWSER_TOOLS) {
   ToolRegistry.register({ name, render: builtinRenderer(BrowserOutput) })
 }
 
+for (const name of BROWSER_VISUAL_TOOLS) {
+  ToolRegistry.register({ name, render: BrowserVisualTool })
+}
+
 ToolRegistry.register({
   name: "browser",
   render(props) {
+    const visual = createMemo(() => visualToolPresentation(props.tool, props.input, props.metadata))
     const info = createMemo(() => getToolInfo(props.tool, props.input, props.metadata))
     const trigger = createMemo(() => toolTrigger(props))
     const params = createMemo(() => {
@@ -3802,12 +3862,19 @@ ToolRegistry.register({
       return nested && typeof nested === "object" && !Array.isArray(nested) ? nested : {}
     })
     return (
-      <BasicTool {...props} icon={info().icon} trigger={trigger()}>
-        <ToolParams input={params()} skip={["action", "operation"]} />
-        <Show when={props.output}>
-          <BrowserOutput output={props.output!} />
-        </Show>
-      </BasicTool>
+      <Show
+        when={visual()}
+        fallback={
+          <BasicTool {...props} icon={info().icon} trigger={trigger()}>
+            <ToolParams input={params()} skip={["action", "operation"]} />
+            <Show when={props.output}>
+              <BrowserOutput output={props.output!} />
+            </Show>
+          </BasicTool>
+        }
+      >
+        <BrowserVisualTool {...props} />
+      </Show>
     )
   },
 })

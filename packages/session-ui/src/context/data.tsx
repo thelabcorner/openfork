@@ -59,6 +59,48 @@ export type KillShellResult = {
 
 export type KillShellFn = (input: KillShellInput) => Promise<KillShellResult>
 
+export type SessionNavigationInput = {
+  sessionID: () => string | undefined
+  href: () => string | undefined
+  navigateToSession?: NavigateToSessionFn
+}
+
+/**
+ * Shared Session-entry interaction semantics.
+ *
+ * This layer is deliberately context-free: callers own Session addressing
+ * (directory-scoped, global, group-scoped, etc.) and provide only an href plus
+ * optional in-app navigation callback. Modifier clicks retain ordinary anchor
+ * behavior; plain clicks use the app router when available.
+ */
+export function createSessionNavigation(input: SessionNavigationInput) {
+  const clickable = () => !!(input.sessionID() && (input.navigateToSession || input.href()))
+
+  const open = () => {
+    const id = input.sessionID()
+    if (!id) return
+    input.navigateToSession?.(id)
+  }
+
+  const navigate = (event: MouseEvent) => {
+    if (!input.navigateToSession) return
+    if (event.button !== 0 || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return
+    const id = input.sessionID()
+    if (!id) return
+    event.preventDefault()
+    input.navigateToSession(id)
+  }
+
+  const navigateKey = (event: KeyboardEvent) => {
+    if (!clickable() || input.href()) return
+    if (event.key !== "Enter" && event.key !== " ") return
+    event.preventDefault()
+    open()
+  }
+
+  return { href: input.href, clickable, open, navigate, navigateKey }
+}
+
 export const { use: useData, provider: DataProvider } = createSimpleContext({
   name: "Data",
   init: (props: {
@@ -85,3 +127,24 @@ export const { use: useData, provider: DataProvider } = createSimpleContext({
     }
   },
 })
+
+/**
+ * Shared child-Session navigation contract.
+ *
+ * Session-producing surfaces (Task, Goal Auditor, future special agents) supply
+ * only an already-materialized Session ID. This helper owns the common
+ * href/in-app-navigation/modifier-key behavior so each presentation surface does
+ * not reimplement Session entry semantics.
+ */
+export function useSessionNavigation(sessionID: () => string | undefined) {
+  const data = useData()
+  return createSessionNavigation({
+    sessionID,
+    href: () => {
+      const id = sessionID()
+      if (!id) return undefined
+      return data.sessionHref?.(id)
+    },
+    navigateToSession: data.navigateToSession,
+  })
+}

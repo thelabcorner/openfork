@@ -32,7 +32,7 @@ describe("inlineCodeKind", () => {
     expect(inlineCodeKind(`terraform.tfvars`)).toBe("path")
     expect(inlineCodeKind(`pnpm-lock.yaml`)).toBe("path")
     expect(inlineCodeKind(`packages/desktop-electron`)).toBe("path")
-    expect(inlineCodeKind(`~/.config/opencode`)).toBe("path")
+    expect(inlineCodeKind(`~/.config/openfork`)).toBe("path")
     expect(inlineCodeKind(`@opencode-ai/app`)).toBe("path")
     expect(inlineCodeKind(`session/status`)).toBe("path")
     expect(inlineCodeKind(`C:\\Users\\slooshied\\WebstormProjects\\presGEN_v2\\...\\report.html`)).toBe("path")
