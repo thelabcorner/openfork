@@ -8,6 +8,11 @@ import { pack } from "./pack"
 
 process.chdir(fileURLToPath(new URL("..", import.meta.url)))
 
+if (!Script.publishUpstreamNpmNamespace) {
+  console.log("Skipping UI npm publication: OpenFork does not publish the upstream @opencode-ai namespace.")
+  process.exit(0)
+}
+
 const pkg = (await Bun.file("package.json").json()) as { name: string; version: string }
 const tarball = `${pkg.name.replace("@", "").replace("/", "-")}-${pkg.version}.tgz`
 
